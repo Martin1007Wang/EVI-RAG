@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - override /data: webqsp_quick
+  - override /model: evidential_edl
+  - override /trainer: quick
+  - override /logger: wandb
+
+tags: ["webqsp", "debug"]

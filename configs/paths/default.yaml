@@ -1,10 +1,8 @@
-# path to root directory
-# this requires PROJECT_ROOT environment variable to exist
-# you can replace it with "." if you want the root to be the current working directory
-root_dir: ${oc.env:PROJECT_ROOT}
+# path to root directory (defaults to the directory where the entry script was launched)
+root_dir: ${hydra:runtime.cwd}
 
-# path to data directory
-data_dir: ${paths.root_dir}/data/
+# path to data directory (relative to project root by default)
+data_dir: /mnt/data/retrieve
 
 # path to logging directory
 log_dir: ${paths.root_dir}/logs/

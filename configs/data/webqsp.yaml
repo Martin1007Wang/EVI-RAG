@@ -1,0 +1,7 @@
+defaults:
+  - base
+  - _self_
+
+dataset_cfg:
+  name: webqsp
+  data_dir: ${paths.data_dir}/webqsp

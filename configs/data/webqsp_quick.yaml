@@ -1,0 +1,16 @@
+defaults:
+  - base
+  - _self_
+
+dataset_cfg:
+  name: webqsp
+  data_dir: ${paths.data_dir}/webqsp
+  sampler:
+    # dataloader-level throttling; trainer.limit_* still applies on top
+    train_batches_per_epoch: 4
+
+batch_size: 4
+num_workers: 0
+pin_memory: false
+drop_last: true
+persistent_workers: false

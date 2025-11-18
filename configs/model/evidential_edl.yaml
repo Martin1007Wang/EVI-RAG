@@ -1,0 +1,9 @@
+defaults:
+  - base_evidential
+  - _self_
+
+loss_cfg:
+  type: edl
+  kl_weight: 0.1
+  prior_alpha: 1.0
+  prior_beta: 1.0

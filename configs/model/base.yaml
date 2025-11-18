@@ -1,0 +1,13 @@
+_target_: src.models.retriever_module.RetrieverModule
+
+model_cfg:
+  topic_pe: true
+  num_topics: 2
+  dde_cfg:
+    num_rounds: 2
+    num_reverse_rounds: 2
+  fusion_method: film
+  dropout_p: 0.1
+  enable_entity_finetune: false
+  enable_query_finetune: false
+  enable_relation_finetune: false

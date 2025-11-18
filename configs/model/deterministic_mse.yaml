@@ -1,0 +1,6 @@
+defaults:
+  - base_deterministic
+  - _self_
+
+loss_cfg:
+  type: det_mse

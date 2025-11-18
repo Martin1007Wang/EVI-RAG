@@ -2,17 +2,45 @@
 
 defaults:
   - _self_
-  - data: mnist # choose datamodule with `test_dataloader()` for evaluation
-  - model: mnist
+  - data: webqsp # choose datamodule with `test_dataloader()` for evaluation
+  - model: evidential_edl
   - logger: null
   - trainer: default
   - paths: default
   - extras: default
   - hydra: default
+  - experiment: null
 
 task_name: "eval"
 
 tags: ["dev"]
 
-# passing checkpoint path is necessary for evaluation
-ckpt_path: ???
+# optional: leave null to auto-discover the latest best checkpoint for the selected run
+ckpt_path: null
+
+optimization:
+  optimizer_cfg:
+    type: adamw
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    type: plateau
+    mode: max
+    factor: 0.5
+    patience: 5
+    min_lr: 1.0e-5
+
+evaluation:
+  ranking_k: [1, 10, 25, 50, 100, 200, 300, 400]
+  answer_recall_k: [1, 10, 25, 50, 100, 200, 300, 400]
+  partial_coverages: [0.05, 0.1, 0.2, 0.5, 0.7, 0.8, 0.9, 0.95]
+  partial_coverages_extra: []
+  reliability_bins: 20
+  selective_top_k: 1
+  selective_concentration_offset: 3.4657359027997265 # ln(32)
+  selective_concentration_scale: 8.0
+
+model:
+  optimizer_cfg: ${optimization.optimizer_cfg}
+  scheduler_cfg: ${optimization.scheduler_cfg}
+  evaluation_cfg: ${evaluation}

@@ -1,0 +1,7 @@
+defaults:
+  - base
+  - _self_
+
+dataset_cfg:
+  name: cwq
+  data_dir: ${paths.data_dir}/cwq

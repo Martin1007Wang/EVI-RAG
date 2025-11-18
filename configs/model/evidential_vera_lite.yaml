@@ -1,0 +1,13 @@
+defaults:
+  - base_evidential
+  - _self_
+
+loss_cfg:
+  type: vera_lite
+  # 对极度不平衡的 webqsp，可以按全局正负比粗调这两个权重
+  # 例如正负比约 1:200，则 w_pos≈200, w_neg=1
+  w_pos: 200.0
+  w_neg: 1.0
+  kl_weight: 0.1
+  prior_alpha: 1.0
+  prior_beta: 1.0

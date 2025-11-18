@@ -155,7 +155,7 @@ conda activate myenv
 pip install -r requirements.txt
 ```
 
-Template contains example with MNIST classification.<br>
+Template contains an evidential retrieval example.<br>
 When running `python src/train.py` you should see something like this:
 
 <div align="center">
@@ -192,7 +192,7 @@ python train.py trainer=cpu
 python train.py trainer=gpu
 
 # train on TPU
-python train.py +trainer.tpu_cores=8
+python train.py trainer.accelerator=tpu trainer.devices=8
 
 # train with DDP (Distributed Data Parallel) (4 GPUs)
 python train.py trainer=ddp trainer.devices=4
@@ -372,12 +372,12 @@ python train.py -m data.batch_size=32,64,128 model.lr=0.001,0.0005
 <summary><b>Create a sweep over hyperparameters with Optuna</b></summary>
 
 ```bash
-# this will run hyperparameter search defined in `configs/hparams_search/mnist_optuna.yaml`
+# this will run hyperparameter search defined in `configs/hparams_search/retriever_optuna.yaml`
 # over chosen experiment config
-python train.py -m hparams_search=mnist_optuna experiment=example
+python train.py -m hparams_search=retriever_optuna experiment=example
 ```
 
-> **Note**: Using [Optuna Sweeper](https://hydra.cc/docs/next/plugins/optuna_sweeper) doesn't require you to add any boilerplate to your code, everything is defined in a [single config file](configs/hparams_search/mnist_optuna.yaml).
+> **Note**: Using [Optuna Sweeper](https://hydra.cc/docs/next/plugins/optuna_sweeper) doesn't require you to add any boilerplate to your code, everything is defined in a [single config file](configs/hparams_search/retriever_optuna.yaml).
 
 > **Warning**: Optuna sweeps are not failure-resistant (if one job crashes then the whole sweep crashes).
 
@@ -465,10 +465,10 @@ pytest -k "not slow"
 Each experiment should be tagged in order to easily filter them across files or in logger UI:
 
 ```bash
-python train.py tags=["mnist","experiment_X"]
+python train.py tags=["retriever","experiment_X"]
 ```
 
-> **Note**: You might need to escape the bracket characters in your shell with `python train.py tags=\["mnist","experiment_X"\]`.
+> **Note**: You might need to escape the bracket characters in your shell with `python train.py tags=\["retriever","experiment_X"\]`.
 
 If no tags are provided, you will be asked to input them from command line:
 
@@ -514,15 +514,12 @@ Suggestions for improvements are always welcome!
 All PyTorch Lightning modules are dynamically instantiated from module paths specified in config. Example model config:
 
 ```yaml
-_target_: src.models.mnist_model.MNISTLitModule
-lr: 0.001
-net:
-  _target_: src.models.components.simple_dense_net.SimpleDenseNet
-  input_size: 784
-  lin1_size: 256
-  lin2_size: 256
-  lin3_size: 256
-  output_size: 10
+_target_: src.models.retriever_module.RetrieverModule
+model_cfg:
+  model_type: evidential
+  emb_dim: 256
+loss_cfg:
+  type: edl
 ```
 
 Using this config we can instantiate the object with the following line:
@@ -536,7 +533,7 @@ This allows you to easily iterate over new models! Every time you create a new o
 Switch between models and datamodules with command line arguments:
 
 ```bash
-python train.py model=mnist
+python train.py model=retriever
 ```
 
 Example pipeline managing the instantiation logic: [src/train.py](src/train.py).
@@ -556,8 +553,8 @@ It determines how config is composed when simply executing command `python train
 # order of defaults determines the order in which configs override each other
 defaults:
   - _self_
-  - data: mnist.yaml
-  - model: mnist.yaml
+  - data: retrieval.yaml
+  - model: retriever.yaml
   - callbacks: default.yaml
   - logger: null # set logger here or use command line (e.g. `python train.py logger=csv`)
   - trainer: default.yaml
@@ -623,15 +620,15 @@ For example, you can use them to version control best hyperparameters for each c
 # python train.py experiment=example
 
 defaults:
-  - override /data: mnist.yaml
-  - override /model: mnist.yaml
+  - override /data: retrieval.yaml
+  - override /model: retriever.yaml
   - override /callbacks: default.yaml
   - override /trainer: default.yaml
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-tags: ["mnist", "simple_dense_net"]
+tags: ["retrieval", "retriever"]
 
 seed: 12345
 
@@ -641,12 +638,11 @@ trainer:
   gradient_clip_val: 0.5
 
 model:
-  optimizer:
-    lr: 0.002
-  net:
-    lin1_size: 128
-    lin2_size: 256
-    lin3_size: 64
+  model_cfg:
+    dropout_p: 0.2
+    hidden_dim: 384
+  optimizer_cfg:
+    lr: 0.0003
 
 data:
   batch_size: 64
@@ -654,7 +650,7 @@ data:
 logger:
   wandb:
     tags: ${tags}
-    group: "mnist"
+    group: "retrieval"
 ```
 
 </details>
@@ -665,8 +661,8 @@ logger:
 
 **Basic workflow**
 
-1. Write your PyTorch Lightning module (see [models/mnist_module.py](src/models/mnist_module.py) for example)
-2. Write your PyTorch Lightning datamodule (see [data/mnist_datamodule.py](src/data/mnist_datamodule.py) for example)
+1. Write your PyTorch Lightning module (see [models/retriever_module.py](src/models/retriever_module.py) for example)
+2. Write your PyTorch Lightning datamodule (see [data/datamodule.py](src/data/datamodule.py) for example)
 3. Write your experiment config, containing paths to model and datamodule
 4. Run training with chosen experiment config:
    ```bash
@@ -736,7 +732,7 @@ You can use many of them at once (see [configs/logger/many_loggers.yaml](configs
 
 You can also write your own logger.
 
-Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [MNIST example](src/models/mnist_module.py).
+Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the retriever example](src/models/retriever_module.py).
 
 <br>
 
@@ -816,7 +812,7 @@ hydra:
 
 </details>
 
-Next, execute it with: `python train.py -m hparams_search=mnist_optuna`
+Next, execute it with: `python train.py -m hparams_search=retriever_optuna`
 
 Using this approach doesn't require adding any boilerplate to code, everything is defined in a single config file. The only necessary thing is to return the optimized metric value from the launch file.
 
@@ -842,7 +838,7 @@ Template comes with CI workflows implemented in Github Actions:
 
 Lightning supports multiple ways of doing distributed training. The most common one is DDP, which spawns separate process for each GPU and averages gradients between them. To learn about other approaches read the [lightning docs](https://lightning.ai/docs/pytorch/latest/advanced/speed.html).
 
-You can run DDP on mnist example with 4 GPUs like this:
+You can run DDP on the retrieval example with 4 GPUs like this:
 
 ```bash
 python train.py trainer=ddp
@@ -883,7 +879,7 @@ some_param: ${data.some_param}
 Another approach is to access datamodule in LightningModule directly through Trainer:
 
 ```python
-# ./src/models/mnist_module.py
+# ./src/models/retriever_module.py
 def on_train_start(self):
   self.some_param = self.trainer.datamodule.some_param
 ```
@@ -1132,8 +1128,8 @@ pip install git+git://github.com/YourGithubName/your-repo-name.git --upgrade
 So any file can be easily imported into any other file like so:
 
 ```python
-from project_name.models.mnist_module import MNISTLitModule
-from project_name.data.mnist_datamodule import MNISTDataModule
+from project_name.models.retriever_module import RetrieverModule
+from project_name.data.datamodule import RetrievalDataModule
 ```
 
 </details>

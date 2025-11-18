@@ -35,6 +35,7 @@ from src.utils import (
     log_hyperparameters,
     task_wrapper,
 )
+from src.utils.run_context import apply_run_name
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -54,11 +55,20 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
 
+    resolved_run_name = apply_run_name(cfg)
+    log.info(f"Resolved run name: {resolved_run_name}")
+
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
+    if hasattr(model, "set_run_context"):
+        model.set_run_context(
+            run_name=resolved_run_name,
+            output_dir=cfg.paths.output_dir,
+            metrics_root=cfg.paths.log_dir,
+        )
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
@@ -120,12 +130,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     metric_dict, _ = train(cfg)
 
     # safely retrieve metric value for hydra-based hyperparameter optimization
-    metric_value = get_metric_value(
-        metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
-    )
-
-    # return optimized metric
-    return metric_value
+    return get_metric_value(metric_dict=metric_dict, metric_name=cfg.get("optimized_metric"))
 
 
 if __name__ == "__main__":

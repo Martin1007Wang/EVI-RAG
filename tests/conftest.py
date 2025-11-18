@@ -1,12 +1,26 @@
 """This file prepares config fixtures for other tests."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import rootutils
-from hydra import compose, initialize
-from hydra.core.global_hydra import GlobalHydra
-from omegaconf import DictConfig, open_dict
+import sys
+
+ROOT = rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+SRC_DIR = ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.append(str(SRC_DIR))
+
+try:  # hydra may be absent in lightweight test environments
+    from hydra import compose, initialize  # type: ignore
+    from hydra.core.global_hydra import GlobalHydra  # type: ignore
+    from omegaconf import DictConfig, open_dict  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    compose = initialize = None
+    GlobalHydra = None
+    DictConfig = Any  # type: ignore
+    open_dict = None
 
 
 @pytest.fixture(scope="package")
@@ -15,6 +29,8 @@ def cfg_train_global() -> DictConfig:
 
     :return: A DictConfig object containing a default Hydra configuration for training.
     """
+    if compose is None or initialize is None or open_dict is None:
+        pytest.skip("hydra-core is not available")
     with initialize(version_base="1.3", config_path="../configs"):
         cfg = compose(config_name="train.yaml", return_hydra_config=True, overrides=[])
 
@@ -81,7 +97,8 @@ def cfg_train(cfg_train_global: DictConfig, tmp_path: Path) -> DictConfig:
 
     yield cfg
 
-    GlobalHydra.instance().clear()
+    if GlobalHydra is not None:
+        GlobalHydra.instance().clear()
 
 
 @pytest.fixture(scope="function")
@@ -104,4 +121,7 @@ def cfg_eval(cfg_eval_global: DictConfig, tmp_path: Path) -> DictConfig:
 
     yield cfg
 
-    GlobalHydra.instance().clear()
+    if GlobalHydra is not None:
+        GlobalHydra.instance().clear()
+    if compose is None or initialize is None or open_dict is None:
+        pytest.skip("hydra-core is not available")

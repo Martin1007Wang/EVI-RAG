@@ -1,0 +1,61 @@
+catalog:
+  models:
+    evidential:
+      config: model=evidential_edl
+      description: Evidential retriever (Beta head with FiLM fusion)
+      variants:
+        edl: model=evidential_edl
+        redl: model=evidential_redl
+        type2: model=evidential_type2
+    deterministic:
+      config: model=deterministic_bce
+      description: Deterministic retriever baseline
+      variants:
+        bce: model=deterministic_bce
+        mse: model=deterministic_mse
+        infonce: model=deterministic_infonce
+  datasets:
+    webqsp:
+      config: data=webqsp
+      description: WebQuestionsSP benchmark
+    webqsp_quick:
+      config: data=webqsp_quick
+      description: Small debug slice of WebQSP
+    cwq:
+      config: data=cwq
+      description: ComplexWebQuestions benchmark
+  trainers:
+    standard:
+      config: trainer=standard
+      description: 200 epoch GPU schedule
+    quick:
+      config: trainer=quick
+      description: CPU-friendly debug loop
+  evaluations:
+    standard:
+      ranking_k: [1, 5, 10]
+      partial_coverages: [0.8, 0.9, 0.95]
+      reliability_bins: 20
+
+experiments:
+  webqsp_evidential_edl:
+    config: experiment=webqsp_evidential_edl
+    description: WebQSP evidential baseline (EDL loss)
+  webqsp_evidential_redl:
+    config: experiment=webqsp_evidential_redl
+    description: WebQSP evidential + REDL objective
+  webqsp_evidential_type2:
+    config: experiment=webqsp_evidential_type2
+    description: WebQSP evidential + Type-II loss
+  webqsp_det_bce:
+    config: experiment=webqsp_det_bce
+    description: WebQSP deterministic BCE baseline
+  webqsp_det_mse:
+    config: experiment=webqsp_det_mse
+    description: WebQSP deterministic MSE baseline
+  webqsp_det_infonce:
+    config: experiment=webqsp_det_infonce
+    description: WebQSP deterministic InfoNCE contrastive baseline
+  webqsp_evidential_quick:
+    config: experiment=webqsp_evidential_quick
+    description: Debug run on WebQSP slice (CPU)
