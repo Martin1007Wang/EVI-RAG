@@ -2,4 +2,4 @@ defaults:
   - default
 
 accelerator: gpu
-devices: 0,1
+devices: [0]

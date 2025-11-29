@@ -1,8 +1,8 @@
 # path to root directory (defaults to the directory where the entry script was launched)
 root_dir: ${hydra:runtime.cwd}
 
-# path to data directory (relative to project root by default)
-data_dir: /mnt/data/retrieve
+# path to data directory (absolute to avoid ambiguity)
+data_dir: /mnt/data/retrieval_dataset
 
 # path to logging directory
 log_dir: ${paths.root_dir}/logs/

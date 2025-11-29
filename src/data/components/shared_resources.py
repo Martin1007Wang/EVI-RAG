@@ -13,7 +13,7 @@ class SharedDataResources:
     """Handle shared heavy-weight stores for multiple datasets.
 
     Lightning's :class:`~lightning.LightningDataModule` may construct several
-    :class:`RetrievalDataset` instances (train/val/test). Each dataset used to
+    :class:`GRetrievalDataset` instances (train/val/test). Each dataset used to
     build its own :class:`GraphStore` and :class:`GlobalEmbeddingStore`, which
     duplicates expensive vocabulary/embedding loads. ``SharedDataResources``
     keeps a single copy that can be injected wherever needed, aligning with the

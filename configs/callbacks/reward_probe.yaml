@@ -1,0 +1,5 @@
+defaults:
+  - _self_
+
+reward_probe:
+  _target_: src.callbacks.RewardProbeCallback

@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - override /dataset: webqsp
+  - override /data: llm_generation
+  - override /model: llm_generation/default
+  - override /trainer: predict
+  - override /logger: wandb
+
+task_name: "llm_generation"
+tags: ["llm_generation", "predict"]
+seed: 42

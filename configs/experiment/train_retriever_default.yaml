@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  # Common wiring for all retriever training runs; dataset is overridden per experiment.
+  - override /data: retriever
+  - override /model: retriever_module
+  - override /trainer: gpu
+  - override /logger: wandb
+
+tags: ["train_retriever"]
+
+# Shared training knobs for retriever runs.
+data:
+  dataset_cfg:
+    sampler:
+      train_batches_per_epoch: 8
+      train_samples_per_epoch: null
+
+callbacks:
+  monitor: "val/ranking/mrr"
+  patience: 10
+  mode: "max"

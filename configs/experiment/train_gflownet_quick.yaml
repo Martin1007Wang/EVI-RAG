@@ -1,0 +1,41 @@
+# @package _global_
+
+# Quick sanity variant of train_gflownet:
+# - small batch limits via trainer/quick
+# - no checkpoint/logger/callbacks
+# - shorter rollout and no exploration to ease convergence
+
+defaults:
+  - override /dataset: webqsp
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: none
+  - override /logger: null
+  - override /trainer: quick
+
+task_name: "gflownet_train_quick"
+tags: ["gflownet", "quick"]
+train: true
+test: false
+ckpt_path: null
+seed: 42
+optimized_metric: "train/success"
+
+# resources for embeddings/vocab (materialized)
+resources:
+  vocabulary_path: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+  embeddings_dir: ${dataset.materialized_dir}/embeddings
+
+data:
+  num_workers: 4
+  persistent_workers: false
+  batch_size: 2   # smaller batch to ease overfit debugging
+
+model:
+  evaluation_cfg:
+    num_eval_rollouts: 1
+  env_cfg:
+    max_steps: 3
+  exploration_epsilon: 0.0
+  debug_numeric: true
+  debug_actions: true

@@ -1,0 +1,43 @@
+# @package _global_
+
+# 共用的 GFlowNet 训练模板；数据集由具体 experiment 覆盖。
+defaults:
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: default
+  - override /logger: null
+  - override /trainer: standard
+
+task_name: "gflownet_train"
+tags: ["gflownet"]
+train: true
+test: true
+ckpt_path: null
+seed: 42
+optimized_metric: "val/success"
+
+# 打开 GFlowNet 专用 debug 日志（独立文件 logs/gflownet_debug.log）。
+gflownet_debug: true
+# 若需环境内对拍 success/hit（首图详细命中日志），打开 env_debug
+env_debug: true
+
+# resources for embeddings/vocab (materialized)
+resources:
+  vocabulary_path: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+  embeddings_dir: ${dataset.materialized_dir}/embeddings
+
+# Ensure validation runs every epoch for early stopping/monitoring.
+trainer:
+  check_val_every_n_epoch: 1
+
+# Override callback monitors for GFlowNet (no ranking/mrr available)
+callbacks:
+  model_checkpoint:
+    monitor: val/success
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+  early_stopping:
+    monitor: val/success
+    mode: max
+    patience: 20

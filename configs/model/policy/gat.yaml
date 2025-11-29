@@ -1,0 +1,5 @@
+_target_: src.models.components.gflownet_policies.EdgeGATPolicy
+
+hidden_dim: ${model.hidden_dim}
+dropout: 0.1
+frontier_bonus: 0.5

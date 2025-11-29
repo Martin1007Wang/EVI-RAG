@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - train_gflownet_default
+  - override /dataset: webqsp
+
+model:
+  projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-11-27_19-37-05/checkpoints/last.ckpt"
+tags: ["webqsp", "gflownet"]

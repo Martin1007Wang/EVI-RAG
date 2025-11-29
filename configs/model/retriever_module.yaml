@@ -1,0 +1,42 @@
+# configs/model/retriever_module.yaml
+
+_target_: src.models.retriever_module.RetrieverModule
+
+compile_model: true 
+
+retriever:
+  _target_: src.models.components.retriever.Retriever
+  emb_dim: 1024
+  hidden_dim: 512
+  kge_interaction: concat
+  topic_pe: true
+  num_topics: 2
+  dde_cfg:
+    num_rounds: 2
+    num_reverse_rounds: 2
+  fusion_method: film
+  dropout_p: 0.1
+  enable_entity_finetune: true
+  enable_query_finetune: false
+  enable_relation_finetune: true
+
+loss:
+  _target_: src.losses.retriever_loss.RetrieverBCELoss
+  pos_weight: 1.0 
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 3.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _partial_: true
+  T_max: ${trainer.max_epochs}
+  eta_min: 1.0e-6
+
+evaluation_cfg:
+  ranking_k: [1, 5, 10, 25, 50, 100, 200, 300, 400]
+  answer_recall_k: [1, 5, 10, 25, 50, 100, 200, 300, 400]

@@ -1,0 +1,22 @@
+# @package _global_
+
+# Evaluate GFlowNet checkpoints via `python src/eval.py experiment=eval_gflownet`.
+defaults:
+  - override /dataset: webqsp
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: none
+  - override /logger: null
+  - override /trainer: standard
+
+task_name: "eval_gflownet"
+tags: ["gflownet", "eval"]
+train: false
+test: true
+ckpt_path: null
+seed: 42
+
+# resources for embeddings/vocab (materialized)
+resources:
+  vocabulary_path: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+  embeddings_dir: ${dataset.materialized_dir}/embeddings

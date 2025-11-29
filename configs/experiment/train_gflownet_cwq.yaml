@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - train_gflownet_default
+  - override /dataset: cwq
+
+model:
+  projector_checkpoint: "logs/train_retriever_cwq/runs/2025-11-27_23-15-47/checkpoints/epoch_189.ckpt"
+  
+tags: ["cwq", "gflownet"]

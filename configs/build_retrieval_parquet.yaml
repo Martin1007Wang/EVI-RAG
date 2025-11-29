@@ -1,0 +1,26 @@
+defaults:
+  - paths: default
+  - dataset: webqsp
+  - _self_
+
+# dataset config will inject dataset/kb/raw_root/out_dir/column_map/entity_normalization
+dataset_name: ${dataset.name}
+kb: ${dataset.kb}
+raw_root: ${dataset.raw_root}
+out_dir: ${dataset.out_dir}
+column_map: ${dataset.column_map}
+entity_normalization: ${dataset.entity_normalization}
+undirected_traversal: ${dataset.undirected_traversal}
+
+# filtering / labeling knobs (train vs eval can differ)
+filter:
+  train:
+    skip_no_topic: true
+    skip_no_ans: true
+    skip_no_path: true
+    use_shortest_path_positive: true
+  eval:
+    skip_no_topic: true
+    skip_no_ans: true
+    skip_no_path: true
+    use_shortest_path_positive: true

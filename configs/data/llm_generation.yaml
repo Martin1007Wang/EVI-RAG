@@ -1,0 +1,13 @@
+_target_: src.llm_generation.datamodule.LLMGenerationDataModule
+
+dataset: ${dataset.name}
+split: test
+score_dict_path: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
+questions_path: ${dataset.out_dir}/questions.parquet
+entity_vocab_path: ${dataset.out_dir}/embedding_vocab.parquet
+relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+
+triplet_limit: 100
+system_prompt: "You are a concise QA agent. Use only the provided triplets to answer with the format 'Ans: <entity>'."
+num_workers: 0
+prompt_tag: "g_agent_top100"

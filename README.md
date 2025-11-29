@@ -100,7 +100,7 @@ The directory structure of new project looks like this:
 │   ├── paths                    <- Project paths configs
 │   ├── trainer                  <- Trainer configs
 │   │
-│   ├── eval.yaml             <- Main config for evaluation
+│   ├── eval.yaml             <- Main config for retriever evaluation
 │   └── train.yaml            <- Main config for training
 │
 ├── data                   <- Project data
@@ -118,7 +118,7 @@ The directory structure of new project looks like this:
 │   ├── models                   <- Model scripts
 │   ├── utils                    <- Utility scripts
 │   │
-│   ├── eval.py                  <- Run evaluation
+│   ├── eval.py               <- Evaluate retriever checkpoints
 │   └── train.py                 <- Run training
 │
 ├── tests                  <- Tests of any kind
@@ -348,7 +348,7 @@ python train.py ckpt_path="/path/to/ckpt/name.ckpt"
 <summary><b>Evaluate checkpoint on test dataset</b></summary>
 
 ```yaml
-python eval.py ckpt_path="/path/to/ckpt/name.ckpt"
+python src/eval.py ckpt_path="/path/to/ckpt/name.ckpt"
 ```
 
 > **Note**: Checkpoint can be either path or URL.
@@ -553,14 +553,15 @@ It determines how config is composed when simply executing command `python train
 # order of defaults determines the order in which configs override each other
 defaults:
   - _self_
-  - data: retrieval.yaml
-  - model: retriever.yaml
-  - callbacks: default.yaml
-  - logger: null # set logger here or use command line (e.g. `python train.py logger=csv`)
-  - trainer: default.yaml
-  - paths: default.yaml
-  - extras: default.yaml
-  - hydra: default.yaml
+  - dataset: webqsp
+  - data: retriever
+  - model: deterministic_bce
+  - callbacks: default
+  - logger: wandb
+  - trainer: default
+  - paths: default
+  - extras: default
+  - hydra: default
 
   # experiment configs allow for version control of specific hyperparameters
   # e.g. best hyperparameters for given model and datamodule
@@ -620,10 +621,11 @@ For example, you can use them to version control best hyperparameters for each c
 # python train.py experiment=example
 
 defaults:
-  - override /data: retrieval.yaml
-  - override /model: retriever.yaml
-  - override /callbacks: default.yaml
-  - override /trainer: default.yaml
+  - override /dataset: webqsp
+  - override /data: retriever
+  - override /model: deterministic_bce
+  - override /callbacks: default
+  - override /trainer: standard
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
@@ -653,6 +655,8 @@ logger:
     group: "retrieval"
 ```
 
+预置 alias 速查（可再用 CLI 覆盖 dataset）：`train_retriever[_cwq|_gtsqa|_kgqagen]`, `eval_retriever[_cwq|_gtsqa|_kgqagen]`, `train_gflownet`, `train_gflownet_quick`, `eval_gflownet`, `llm_generation`.
+
 </details>
 
 <br>
@@ -662,7 +666,7 @@ logger:
 **Basic workflow**
 
 1. Write your PyTorch Lightning module (see [models/retriever_module.py](src/models/retriever_module.py) for example)
-2. Write your PyTorch Lightning datamodule (see [data/datamodule.py](src/data/datamodule.py) for example)
+2. Write your PyTorch Lightning datamodule (see [data/g_retrieval_datamodule.py](src/data/g_retrieval_datamodule.py) for example)
 3. Write your experiment config, containing paths to model and datamodule
 4. Run training with chosen experiment config:
    ```bash
@@ -1129,7 +1133,7 @@ So any file can be easily imported into any other file like so:
 
 ```python
 from project_name.models.retriever_module import RetrieverModule
-from project_name.data.datamodule import RetrievalDataModule
+from project_name.data.g_retrieval_datamodule import GRetrievalDataModule
 ```
 
 </details>
@@ -1247,47 +1251,4 @@ cd your-repo-name
 conda create -n myenv python=3.9
 conda activate myenv
 
-# install pytorch according to instructions
-# https://pytorch.org/get-started/
-
-# install requirements
-pip install -r requirements.txt
-```
-
-#### Conda
-
-```bash
-# clone project
-git clone https://github.com/YourGithubName/your-repo-name
-cd your-repo-name
-
-# create conda environment and install dependencies
-conda env create -f environment.yaml -n myenv
-
-# activate conda environment
-conda activate myenv
-```
-
-## How to run
-
-Train model with default configuration
-
-```bash
-# train on CPU
-python src/train.py trainer=cpu
-
-# train on GPU
-python src/train.py trainer=gpu
-```
-
-Train model with chosen experiment configuration from [configs/experiment/](configs/experiment/)
-
-```bash
-python src/train.py experiment=experiment_name.yaml
-```
-
-You can override any parameter from command line like this
-
-```bash
-python src/train.py trainer.max_epochs=20 data.batch_size=64
-```
+# install pytorch

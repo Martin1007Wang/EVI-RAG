@@ -1,9 +1,0 @@
-# @package _global_
-
-defaults:
-  - override /data: webqsp
-  - override /model: deterministic_mse
-  - override /trainer: standard
-  - override /logger: wandb
-
-tags: ["webqsp", "deterministic", "mse"]

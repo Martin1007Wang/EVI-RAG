@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import BatchSampler
 from torch_geometric.loader import DataLoader
 
-from ..dataset import RetrievalDataset
+from ..g_retrieval_dataset import GRetrievalDataset
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class UnifiedDataLoader(DataLoader):
 
     def __init__(
         self,
-        dataset: RetrievalDataset,
+        dataset: GRetrievalDataset,
         batch_size: int = 32,
         shuffle: bool = True,
         num_workers: int = 0,
@@ -183,57 +183,34 @@ class UnifiedDataLoader(DataLoader):
         if entity_table is None or relation_table is None:
             raise RuntimeError("Global embeddings not loaded before iteration")
 
-        entity_count = entity_table.size(0)
-        relation_count = relation_table.size(0)
-
         for batch in super().__iter__():
-            if not hasattr(batch, "node_global_ids") or batch.node_global_ids is None:
-                raise AttributeError("Batch missing node_global_ids required for embedding lookup")
-            if not hasattr(batch, "edge_attr") or batch.edge_attr is None:
-                raise AttributeError("Batch missing edge_attr required for embedding lookup")
-
-            node_global_ids = batch.node_global_ids
-            if not isinstance(node_global_ids, torch.Tensor):
-                raise TypeError("node_global_ids must be a torch.Tensor")
-            if node_global_ids.dtype != torch.long:
-                node_global_ids = node_global_ids.to(torch.long)
-                batch.node_global_ids = node_global_ids
-            if node_global_ids.device.type != "cpu":
-                node_global_ids = node_global_ids.cpu()
-                batch.node_global_ids = node_global_ids
-            if node_global_ids.numel() > 0:
-                max_node_id = int(node_global_ids.max())
-                min_node_id = int(node_global_ids.min())
-                if min_node_id < 0 or max_node_id >= entity_count:
-                    raise IndexError(
-                        f"node_global_ids out of range: [{min_node_id}, {max_node_id}] vs entity count {entity_count}"
-                    )
-
-            relation_ids = batch.edge_attr
-            if not isinstance(relation_ids, torch.Tensor):
-                raise TypeError("edge_attr must be a torch.Tensor of global relation IDs")
-            if relation_ids.dtype != torch.long:
-                relation_ids = relation_ids.to(torch.long)
-                batch.edge_attr = relation_ids
-            if relation_ids.device.type != "cpu":
-                relation_ids = relation_ids.cpu()
-                batch.edge_attr = relation_ids
-            if relation_ids.numel() > 0:
-                max_rel_id = int(relation_ids.max())
-                min_rel_id = int(relation_ids.min())
-                if min_rel_id < 0 or max_rel_id >= relation_count:
-                    raise IndexError(
-                        f"edge_attr IDs out of range: [{min_rel_id}, {max_rel_id}] vs relation count {relation_count}"
-                    )
+            node_embedding_ids = torch.as_tensor(batch.node_embedding_ids, dtype=torch.long, device="cpu")
+            relation_ids = torch.as_tensor(batch.edge_attr, dtype=torch.long, device="cpu")
 
             if hasattr(batch, "edge_index") and batch.edge_index is not None:
                 batch.reverse_edge_index = batch.edge_index.flip(0)
 
-            node_embeddings = self.global_embeddings.get_entity_embeddings(node_global_ids)
-            relation_embeddings = self.global_embeddings.get_relation_embeddings(relation_ids)
+            batch.node_embeddings = self.global_embeddings.get_entity_embeddings(node_embedding_ids)
+            batch.edge_embeddings = self.global_embeddings.get_relation_embeddings(relation_ids)
 
-            batch.node_embeddings = node_embeddings
-            batch.edge_embeddings = relation_embeddings
+            if not hasattr(batch, "answer_entity_ids"):
+                raise AttributeError("Batch missing answer_entity_ids required for metrics.")
+            ans = batch.answer_entity_ids
+            ans = torch.as_tensor(ans, dtype=torch.long, device="cpu")
+            batch.answer_entity_ids = ans
+
+            answer_ptr = getattr(batch, "answer_entity_ids_ptr", None)
+            if answer_ptr is None and hasattr(batch, "_slice_dict"):
+                answer_ptr = batch._slice_dict.get("answer_entity_ids")
+            if answer_ptr is None and hasattr(batch, "answer_entity_ids_len"):
+                lens = torch.as_tensor(batch.answer_entity_ids_len, dtype=torch.long, device="cpu").view(-1)
+                answer_ptr = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)], dim=0)
+            if answer_ptr is None:
+                raise AttributeError("Batch missing answer_entity_ids_ptr; PyG collate may have failed.")
+            batch.answer_entity_ids_ptr = torch.as_tensor(answer_ptr, dtype=torch.long, device="cpu")
+            # Clean up intermediate length to keep batch light
+            if hasattr(batch, "answer_entity_ids_len"):
+                del batch.answer_entity_ids_len
 
             self._attach_hard_negatives(batch)
 

@@ -1,6 +1,0 @@
-defaults:
-  - base_evidential
-  - _self_
-
-loss_cfg:
-  type: redl

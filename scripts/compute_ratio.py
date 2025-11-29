@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 import torch
 
-from src.data.dataset import RetrievalDataset
+from src.data.g_retrieval_dataset import GRetrievalDataset
 
 log = logging.getLogger("compute_ratio")
 
@@ -23,7 +23,7 @@ def _build_dataset_config(args: argparse.Namespace) -> Dict[str, Any]:
     return cfg
 
 
-def compute_ratio(dataset: RetrievalDataset, max_samples: int | None = None) -> float:
+def compute_ratio(dataset: GRetrievalDataset, max_samples: int | None = None) -> float:
     total_pos = 0
     total = 0
     limit = len(dataset) if max_samples is None else min(len(dataset), max_samples)
@@ -56,7 +56,7 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     cfg = _build_dataset_config(args)
-    dataset = RetrievalDataset(cfg)
+    dataset = GRetrievalDataset(cfg)
     ratio = compute_ratio(dataset, max_samples=args.max_samples)
     log.info("Positive ratio: %.4f", ratio)
 

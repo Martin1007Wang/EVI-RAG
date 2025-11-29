@@ -35,9 +35,57 @@ from src.utils import (
     log_hyperparameters,
     task_wrapper,
 )
+
+# --------------------------------------------------------------------------
+# GFlowNet 专用 debug 日志：独立文件，避免和 tqdm/CLI 混杂。
+# --------------------------------------------------------------------------
+import logging
+from pathlib import Path
+
+
+def _setup_gflownet_debug_logging(cfg) -> None:
+    enable = cfg.get("gflownet_debug", False)
+    if not enable:
+        return
+
+    out_dir = Path(cfg.paths.output_dir)
+    log_dir = out_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "gflownet_debug.log"
+
+    base_logger = logging.getLogger("gflownet.debug")
+    base_logger.setLevel(logging.INFO)
+
+    # 防止重复添加 handler
+    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == str(log_path) for h in base_logger.handlers):
+        handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        base_logger.addHandler(handler)
+    base_logger.propagate = False
 from src.utils.run_context import apply_run_name
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _run_data_loading_preflight(cfg: DictConfig) -> None:
+    """Run a minimal fast_dev_run to surface dataloader/worker crashes early."""
+    log.info("Running data-loading preflight with fast_dev_run=1 batch...")
+    preflight_datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+    preflight_model: LightningModule = hydra.utils.instantiate(cfg.model)
+    preflight_trainer: Trainer = hydra.utils.instantiate(
+        cfg.trainer,
+        callbacks=[],
+        logger=False,
+        enable_checkpointing=False,
+        fast_dev_run=True,
+    )
+    preflight_trainer.fit(model=preflight_model, datamodule=preflight_datamodule, ckpt_path=None)
+    log.info("Preflight passed; proceeding to full training run.")
 
 
 @task_wrapper
@@ -55,6 +103,12 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
 
+    # GFlowNet 深度调试日志重定向（独立文件）。
+    _setup_gflownet_debug_logging(cfg)
+
+    if cfg.get("debug_data_loading"):
+        _run_data_loading_preflight(cfg)
+
     resolved_run_name = apply_run_name(cfg)
     log.info(f"Resolved run name: {resolved_run_name}")
 
@@ -63,12 +117,6 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
-    if hasattr(model, "set_run_context"):
-        model.set_run_context(
-            run_name=resolved_run_name,
-            output_dir=cfg.paths.output_dir,
-            metrics_root=cfg.paths.log_dir,
-        )
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
@@ -100,10 +148,26 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     if cfg.get("test"):
         log.info("Starting testing!")
-        ckpt_path = trainer.checkpoint_callback.best_model_path
-        if ckpt_path == "":
-            log.warning("Best ckpt not found! Using current weights for testing...")
-            ckpt_path = None
+        test_ckpt_path: Optional[str] = cfg.get("test_ckpt_path")
+        if test_ckpt_path not in (None, ""):
+            ckpt_path = test_ckpt_path
+        else:
+            checkpoint_callback = trainer.checkpoint_callback
+            if checkpoint_callback is None:
+                raise RuntimeError(
+                    "Testing requested but no checkpoint callback is configured. "
+                    "Provide `test_ckpt_path` or enable a checkpoint callback."
+                )
+            ckpt_path = checkpoint_callback.best_model_path
+            if ckpt_path == "":
+                if cfg.get("allow_test_without_checkpoint", False):
+                    log.warning("Best ckpt not found! Using current weights for testing...")
+                    ckpt_path = None
+                else:
+                    raise RuntimeError(
+                        "Best checkpoint path is empty. Set `allow_test_without_checkpoint=True` "
+                        "or provide `test_ckpt_path` to proceed explicitly."
+                    )
         trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
         log.info(f"Best ckpt path: {ckpt_path}")
 

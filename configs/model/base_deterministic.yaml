@@ -1,9 +1,0 @@
-defaults:
-  - base
-  - _self_
-
-model_cfg:
-  model_type: deterministic
-  emb_dim: 1024
-  kge_interaction: concat
-  hidden_dim: 512

@@ -1,0 +1,25 @@
+# configs/experiment/eval_retriever_default.yaml
+
+# @package _global_
+
+defaults:
+  - override /data: retriever
+  - override /dataset: null
+  - override /model: retriever_module
+
+tags: ["eval", "retriever"]
+
+task_name: "eval_retriever"
+
+data:
+  sampler:
+    train_batches_per_epoch: null
+
+# 默认开启 g_agent 生成，依赖 dataset.paths.embeddings 解析 LMDB。
+g_agent:
+  enabled: true
+  splits: ["train", "validation", "test"]
+  output_dir: ${dataset.materialized_dir}/g_agent
+  beam_width_hop1: 50
+  final_k: 100
+  skip_retriever_metrics: false

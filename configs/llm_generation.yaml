@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - dataset: webqsp
+  - data: llm_generation
+  - model: llm_generation/default
+  - logger: wandb
+  - trainer: predict
+  - paths: default
+  - extras: default
+  - hydra: default
+  - optional local: default
+  - debug: null
+
+task_name: "llm_generation"
+tags: ["llm_generation"]
+seed: 42
+
+train: false
+test: false
+ckpt_path: null

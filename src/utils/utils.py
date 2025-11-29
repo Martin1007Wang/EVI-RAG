@@ -2,6 +2,7 @@ import warnings
 from importlib.util import find_spec
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import torch
 from omegaconf import DictConfig
 
 from src.utils import pylogger, rich_utils
@@ -33,6 +34,12 @@ def extras(cfg: DictConfig) -> None:
     if cfg.extras.get("enforce_tags"):
         log.info("Enforcing tags! <cfg.extras.enforce_tags=True>")
         rich_utils.enforce_tags(cfg, save_to_file=True)
+
+    # allow opt-in/opt-out Tensor Core friendly matmul precision for FP32
+    precision = cfg.extras.get("torch_float32_matmul_precision")
+    if precision:
+        torch.set_float32_matmul_precision(str(precision))
+        log.info("torch.set_float32_matmul_precision(%s)", precision)
 
     # pretty print config tree using Rich library
     if cfg.extras.get("print_config"):

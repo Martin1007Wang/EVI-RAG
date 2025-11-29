@@ -1,0 +1,40 @@
+paths:
+  root_dir: ${hydra:runtime.cwd}
+  data_dir: /mnt/data/retrieval_dataset
+  log_dir: ${paths.root_dir}/logs/
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+dataset:
+  name: webqsp
+  kb: freebase
+  raw_root: ${paths.data_dir}/webqsp/raw/data
+  out_dir: ${paths.data_dir}/webqsp/normalized
+  materialized_dir: ${paths.data_dir}/webqsp/materialized
+  paths:
+    vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+    embeddings: ${dataset.materialized_dir}/embeddings
+    processed: ${dataset.materialized_dir}/processed
+  entity_normalization: none
+  undirected_traversal: false
+  hard_negative_k: 4
+  hard_negative_similarity: cosine
+  column_map:
+    question_id_field: id
+    question_field: question
+    answer_text_field: answer
+    q_entity_field: q_entity
+    a_entity_field: a_entity
+    graph_field: graph
+parquet_dir: ${dataset.out_dir}
+output_dir: ${dataset.materialized_dir}
+encoder: Alibaba-NLP/gte-large-en-v1.5
+device: cuda
+batch_size: 64
+progress_bar: true
+fp16: true
+num_topics: 2
+map_size_gb: ${oc.select:dataset.map_size_gb,8}
+vocab_map_size_gb: ${oc.select:dataset.vocab_map_size_gb,1}
+txn_size: 512
+seed: 42
+deterministic: false

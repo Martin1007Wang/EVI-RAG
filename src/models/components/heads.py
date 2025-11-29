@@ -37,16 +37,4 @@ class DeterministicHead(nn.Module):
     def forward(self, features):
         return self.linear(features).squeeze(-1)
 
-
-class EvidentialHead(nn.Module):
-    """Predicts positive/negative evidence logits."""
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.evidence = nn.Linear(hidden_dim, 2)
-
-    def forward(self, features):
-        return self.evidence(features)
-
-
-__all__ = ["DenseFeatureExtractor", "DeterministicHead", "EvidentialHead"]
+__all__ = ["DenseFeatureExtractor", "DeterministicHead"]

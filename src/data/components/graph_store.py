@@ -1,4 +1,4 @@
-"""Minimal vocabulary-backed graph store used by retrieval datasets."""
+"""Minimal vocabulary-backed graph store used by retrieval datasets (G_global)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class GraphStore:
-    """Thin wrapper around the vocabulary LMDB.
+    """Thin wrapper around the vocabulary LMDB (G_global metadata).
 
     The previous implementation attempted to materialize adjacency matrices
     and legacy pickle formats. Those code paths added branching, memory use and

@@ -4,18 +4,16 @@
 # order of defaults determines the order in which configs override each other
 defaults:
   - _self_
-  - data: webqsp
-  - model: evidential_edl
+  - dataset: null
+  - data: null
+  - model: null
   - callbacks: default
-  - logger: wandb
+  - logger: null
   - trainer: default
   - paths: default
   - extras: default
   - hydra: default
-
-  # experiment configs allow for version control of specific hyperparameters
-  # e.g. best hyperparameters for given model and datamodule
-  - experiment: null
+  - experiment: null 
 
   # config for hyperparameter optimization
   - hparams_search: null
@@ -42,33 +40,17 @@ train: True
 # lightning chooses best weights based on the metric specified in checkpoint callback
 test: True
 
+# opt-in preflight check to catch dataloader/worker crashes early
+debug_data_loading: False
+
+# explicitly set checkpoint for testing; defaults to best checkpoint from callback
+test_ckpt_path: null
+
+# enforce explicit intent before falling back to current weights during testing
+allow_test_without_checkpoint: False
+
 # simply provide checkpoint path to resume training
 ckpt_path: null
 
 # seed for random number generators in pytorch, numpy and python.random
 seed: 42
-
-optimization:
-  optimizer_cfg:
-    type: adamw
-    lr: 3.0e-4
-    weight_decay: 0.01
-  scheduler_cfg:
-    type: cosine
-    t_max: ${trainer.max_epochs}
-    eta_min: 0.0
-
-evaluation:
-  ranking_k: [1, 10, 25, 50, 100, 200, 300, 400]
-  answer_recall_k: [1, 10, 25, 50, 100, 200, 300, 400]
-  partial_coverages: [0.05, 0.1, 0.2, 0.5, 0.7, 0.8, 0.9, 0.95]
-  partial_coverages_extra: []
-  reliability_bins: 20
-  selective_top_k: 1
-  selective_concentration_offset: 3.4657359027997265 # ln(32)
-  selective_concentration_scale: 8.0
-
-model:
-  optimizer_cfg: ${optimization.optimizer_cfg}
-  scheduler_cfg: ${optimization.scheduler_cfg}
-  evaluation_cfg: ${evaluation}

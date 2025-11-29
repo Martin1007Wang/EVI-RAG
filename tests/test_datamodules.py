@@ -9,7 +9,9 @@ from torch.testing import assert_close
 
 pytest.importorskip("lightning")
 
-from src.data import RetrievalDataModule
+from src.data import GRetrievalDataModule
+from src.models.candidate_pool import CandidatePool
+from src.models.deterministic_retriever import DeterministicRetriever
 
 
 def _write_lmdb(path: Path, entries) -> None:
@@ -75,7 +77,7 @@ def _setup_mock_retrieval_root(tmp_path: Path):
 def test_retrieval_datamodule_preserves_indices(tmp_path) -> None:
     root, entity_emb, relation_emb = _setup_mock_retrieval_root(tmp_path)
     cfg = {"name": "mock_retrieval", "data_dir": str(root)}
-    dm = RetrievalDataModule(
+    dm = GRetrievalDataModule(
         dataset_cfg=cfg,
         batch_size=1,
         num_workers=0,
@@ -116,7 +118,7 @@ def test_retrieval_datamodule_real_dataset(tmp_path) -> None:
         "data_dir": str(root),
         "sample_limit": {"train": 2},
     }
-    dm = RetrievalDataModule(
+    dm = GRetrievalDataModule(
         dataset_cfg=cfg,
         batch_size=1,
         num_workers=0,
@@ -136,3 +138,82 @@ def test_retrieval_datamodule_real_dataset(tmp_path) -> None:
 
     assert_close(batch.node_embeddings.cpu(), ref_nodes)
     assert_close(batch.edge_embeddings.cpu(), ref_edges)
+
+
+def test_candidate_pool_topk(tmp_path) -> None:
+    root, _, _ = _setup_mock_retrieval_root(tmp_path)
+    cfg = {"name": "mock_retrieval", "data_dir": str(root)}
+    dm = GRetrievalDataModule(
+        dataset_cfg=cfg,
+        batch_size=1,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+    dm.prepare_data()
+    dm.setup()
+
+    batch = next(iter(dm.train_dataloader()))
+    model = DeterministicRetriever(
+        emb_dim=int(batch.question_emb.shape[-1]),
+        topic_pe=False,
+        dde_cfg={"num_rounds": 0, "num_reverse_rounds": 0},
+        fusion_method="concat",
+        kge_interaction="concat",
+        dropout_p=0.0,
+    )
+    model.eval()
+    with torch.no_grad():
+        output = model(batch, return_candidate_tokens=True)
+    pool = CandidatePool.from_batch(batch, output)
+    samples = list(pool.iter_topk(k=2))
+    expected = sum(int((pool.query_ids == idx).any().item()) for idx in range(len(pool.sample_ids)))
+    assert len(samples) == expected
+    sample = samples[0]
+    assert sample.candidate_embeddings.shape[-1] == pool.candidate_embeddings.shape[-1]
+    assert sample.query_embedding.shape[-1] == pool.candidate_embeddings.shape[-1]
+    assert sample.candidate_scores.numel() == min(2, pool.candidate_scores.numel())
+
+
+def test_retrieval_datamodule_validates_sampler(tmp_path) -> None:
+    cfg = {
+        "name": "mock",
+        "data_dir": str(tmp_path),
+        "sampler": {"train_batches_per_epoch": 0},
+    }
+    with pytest.raises(ValueError, match="dataset_cfg\\.sampler\\.train_batches_per_epoch"):
+        GRetrievalDataModule(
+            dataset_cfg=cfg,
+            batch_size=1,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+        )
+
+
+def test_retrieval_datamodule_validates_similarity(tmp_path) -> None:
+    cfg = {
+        "name": "mock",
+        "data_dir": str(tmp_path),
+        "hard_negative_similarity": "l2",
+    }
+    with pytest.raises(ValueError, match="hard_negative_similarity"):
+        GRetrievalDataModule(
+            dataset_cfg=cfg,
+            batch_size=1,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+        )
+
+
+def test_retrieval_datamodule_requires_data_dir() -> None:
+    cfg = {"name": "mock"}
+    with pytest.raises(ValueError, match="data_dir"):
+        GRetrievalDataModule(
+            dataset_cfg=cfg,
+            batch_size=1,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+        )

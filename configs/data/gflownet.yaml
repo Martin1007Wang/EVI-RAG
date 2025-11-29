@@ -1,0 +1,13 @@
+_target_: src.data.g_agent_datamodule.GAgentDataModule
+
+cache_paths:
+  train: ${dataset.materialized_dir}/g_agent/train_g_agent.pt   # g_agent (G_oracle)
+  validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt # g_agent (G_oracle)
+  test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt     # g_agent (G_pruned)
+
+batch_size: 128
+num_workers: 8
+pin_memory: true
+drop_last: false
+persistent_workers: true
+shuffle_train: true

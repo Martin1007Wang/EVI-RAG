@@ -1,0 +1,5 @@
+_target_: src.models.components.gflownet_policies.EdgeMLPMixerPolicy
+
+hidden_dim: ${model.hidden_dim}
+dropout: 0.1
+num_layers: 2

@@ -1,6 +1,9 @@
 from typing import List
 
-import hydra
+try:  # pragma: no cover - optional dependency guard
+    import hydra
+except ModuleNotFoundError:  # pragma: no cover
+    hydra = None
 from lightning import Callback
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
@@ -25,6 +28,8 @@ def instantiate_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
     if not isinstance(callbacks_cfg, DictConfig):
         raise TypeError("Callbacks config must be a DictConfig!")
 
+    _ensure_hydra_available("instantiate_callbacks")
+
     for _, cb_conf in callbacks_cfg.items():
         if isinstance(cb_conf, DictConfig) and "_target_" in cb_conf:
             log.info(f"Instantiating callback <{cb_conf._target_}>")
@@ -48,9 +53,18 @@ def instantiate_loggers(logger_cfg: DictConfig) -> List[Logger]:
     if not isinstance(logger_cfg, DictConfig):
         raise TypeError("Logger config must be a DictConfig!")
 
+    _ensure_hydra_available("instantiate_loggers")
+
     for _, lg_conf in logger_cfg.items():
         if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
             log.info(f"Instantiating logger <{lg_conf._target_}>")
             logger.append(hydra.utils.instantiate(lg_conf))
 
     return logger
+
+
+def _ensure_hydra_available(entrypoint: str) -> None:
+    if hydra is None:
+        raise ModuleNotFoundError(
+            f"hydra is required to call {entrypoint}. Install hydra-core or disable Hydra-dependent features."
+        )

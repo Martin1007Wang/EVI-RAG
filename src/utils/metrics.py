@@ -61,16 +61,24 @@ def extract_answer_entity_ids(
     node_ptr: Optional[torch.Tensor],
     node_ids: torch.Tensor,
 ) -> torch.Tensor:
+    def _get_attr(obj: Any, name: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name)
+        return getattr(obj, name, None)
+
     if node_ptr is None or node_ptr.numel() <= sample_idx + 1:
         return torch.empty(0, dtype=torch.long)
-    attr = getattr(batch, "a_local_indices", None)
+
+    attr = _get_attr(batch, "a_local_indices")
     if attr is None:
         return torch.empty(0, dtype=torch.long)
     if isinstance(attr, (list, tuple)):
         local = attr[sample_idx] if sample_idx < len(attr) else []
         local_tensor = torch.as_tensor(local, dtype=torch.long)
     elif torch.is_tensor(attr):
-        ptr = getattr(batch, "a_local_indices_ptr", None)
+        ptr = _get_attr(batch, "a_local_indices_ptr")
+        if ptr is None and hasattr(batch, "_slice_dict"):
+            ptr = batch._slice_dict.get("a_local_indices")
         if ptr is None or ptr.numel() <= sample_idx + 1:
             return torch.empty(0, dtype=torch.long)
         start = int(ptr[sample_idx].item())
@@ -208,171 +216,6 @@ def summarize_uncertainty(values: Iterable[torch.Tensor], quantile: float = 0.95
     return mean, quant
 
 
-# --------------------------------------------------------------------------- #
-# Selective rejection metrics
-# --------------------------------------------------------------------------- #
-def compute_selective_metrics(
-    labels: torch.Tensor,
-    confidence: torch.Tensor,
-    *,
-    partial_coverages: Sequence[float] = (0.8, 0.9, 0.95),
-    reliability_bins: int = 10,
-) -> Dict[str, Any]:
-    if labels.numel() == 0:
-        return {}
-    labels = labels.float()
-    confidence = confidence.float()
-    order = torch.argsort(confidence, descending=True)
-    sorted_labels = labels[order]
-    errors = 1.0 - sorted_labels
-    idx = torch.arange(1, sorted_labels.numel() + 1, dtype=torch.float32)
-    coverage = idx / float(sorted_labels.numel())
-    cum_errors = torch.cumsum(errors, dim=0)
-    risk = cum_errors / idx
-
-    aurc = float(torch.trapz(risk, coverage).item())
-    metrics: Dict[str, Any] = {"aurc": aurc}
-
-    # Exact AUGRC per NeurIPS definition
-    aug_rc = _compute_augrc(labels, confidence)
-    metrics["aug_rc"] = aug_rc
-
-    tp = torch.cumsum(sorted_labels, dim=0)
-    accuracy = tp / idx
-    rejection = 1.0 - coverage
-    arc_auc = float(torch.trapz(accuracy.flip(0), rejection.flip(0)).item())
-    metrics["arc_auc"] = arc_auc
-
-    total_pos = max(sorted_labels.sum().item(), 1.0)
-    fp = torch.cumsum(1.0 - sorted_labels, dim=0)
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / total_pos
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    f1_auc = float(torch.trapz(f1, coverage).item())
-    metrics["f1_auc"] = f1_auc
-
-    for cov in partial_coverages:
-        cov = float(cov)
-        if cov <= 0 or cov > 1:
-            continue
-        mask = coverage <= cov
-        if mask.sum().item() == 0:
-            continue
-        cov_axis = coverage[mask]
-        risk_axis = risk[mask]
-        partial_area = float(torch.trapz(risk_axis, cov_axis).item())
-        metrics[f"aurc_partial@{cov}"] = partial_area
-        acc_mask = accuracy[mask]
-        risk_mask = risk[mask]
-        if acc_mask.numel() > 0:
-            metrics[f"accuracy@{cov}"] = float(acc_mask[-1].item())
-        if risk_mask.numel() > 0:
-            metrics[f"risk@{cov}"] = float(risk_mask[-1].item())
-
-    # Error (OOD) detection AUROC treating errors as positives
-    error_flags = 1.0 - labels
-    pos = int(error_flags.sum().item())
-    neg = int(labels.sum().item())
-    if pos > 0 and neg > 0:
-        auc = _rank_statistic_auc(error_flags, -confidence)
-        metrics["error_detection_auroc"] = auc
-
-    # Reliability diagram data
-    reliability = compute_reliability_diagram(labels, confidence, n_bins=reliability_bins)
-    metrics["ece_bin"] = float(_expected_calibration_error(reliability))
-    metrics["mce"] = float(_maximum_calibration_error(reliability))
-    metrics["brier"] = float(torch.mean((confidence - labels) ** 2).item())
-    metrics["reliability"] = reliability
-
-    return metrics
-
-
-def compute_reliability_diagram(
-    labels: torch.Tensor,
-    predicted: torch.Tensor,
-    *,
-    n_bins: int = 10,
-) -> Dict[str, List[float]]:
-    labels = labels.float()
-    predicted = predicted.float()
-    if labels.numel() == 0 or n_bins <= 0:
-        return {"predicted": [], "observed": [], "count": []}
-    edges = torch.linspace(0.0, 1.0, n_bins + 1, device=predicted.device)
-    bin_ids = torch.bucketize(predicted, edges) - 1
-    bin_ids = bin_ids.clamp(0, n_bins - 1)
-    bin_conf: List[float] = []
-    bin_cnt: List[float] = []
-    bin_edges: List[float] = [float(e.item()) for e in edges]
-    bin_centers: List[float] = []
-    bin_acc: List[float] = []
-    for b in range(n_bins):
-        mask = bin_ids == b
-        count = int(mask.sum().item())
-        center = (bin_edges[b] + bin_edges[b + 1]) / 2.0
-        bin_centers.append(center)
-        if count == 0:
-            bin_conf.append(center)
-            bin_acc.append(0.0)
-            bin_cnt.append(0.0)
-            continue
-        bin_conf.append(float(predicted[mask].mean().item()))
-        bin_acc.append(float(labels[mask].mean().item()))
-        bin_cnt.append(float(count))
-    return {
-        "edges": bin_edges,
-        "centers": bin_centers,
-        "predicted": bin_conf,
-        "observed": bin_acc,
-        "count": bin_cnt,
-    }
-
-
-def _rank_statistic_auc(pos_flags: torch.Tensor, scores: torch.Tensor) -> float:
-    order = torch.argsort(scores, descending=False)
-    ranks = torch.empty_like(order, dtype=torch.float32)
-    ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float32, device=scores.device)
-    pos_mask = pos_flags > 0.5
-    neg_mask = ~pos_mask
-    n_pos = int(pos_mask.sum().item())
-    n_neg = int(neg_mask.sum().item())
-    if n_pos == 0 or n_neg == 0:
-        return 0.0
-    rank_sum = float(ranks[pos_mask].sum().item())
-    auc = (rank_sum - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-    return float(auc)
-
-
-def _compute_augrc(labels: torch.Tensor, confidence: torch.Tensor) -> float:
-    n = labels.numel()
-    if n == 0:
-        return 0.0
-    order = torch.argsort(confidence, descending=False)
-    ranked_errors = (1.0 - labels)[order]
-    ranks = torch.arange(1, n + 1, dtype=torch.float32, device=labels.device)
-    cdf = ranks / (n + 1)
-    alpha = -torch.log1p(-cdf)
-    aug = float((alpha * ranked_errors).mean().item())
-    return aug
-
-
-def _expected_calibration_error(reliability: Dict[str, List[float]]) -> float:
-    counts = torch.tensor(reliability["count"], dtype=torch.float32)
-    total = counts.sum().item()
-    if total <= 0:
-        return 0.0
-    pred = torch.tensor(reliability["predicted"], dtype=torch.float32)
-    obs = torch.tensor(reliability["observed"], dtype=torch.float32)
-    return float((counts * (pred - obs).abs()).sum().item() / total)
-
-
-def _maximum_calibration_error(reliability: Dict[str, List[float]]) -> float:
-    if not reliability["predicted"]:
-        return 0.0
-    pred = torch.tensor(reliability["predicted"], dtype=torch.float32)
-    obs = torch.tensor(reliability["observed"], dtype=torch.float32)
-    return float((pred - obs).abs().max().item())
-
-
 __all__ = [
     "normalize_k_values",
     "extract_sample_ids",
@@ -381,5 +224,4 @@ __all__ = [
     "compute_ranking_metrics",
     "compute_answer_recall",
     "summarize_uncertainty",
-    "compute_selective_metrics",
 ]

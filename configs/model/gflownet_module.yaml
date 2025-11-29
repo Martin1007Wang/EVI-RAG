@@ -1,0 +1,52 @@
+defaults:
+  - _self_
+  - env@env_cfg: graph
+  - policy@policy_cfg: mixer
+  - reward@reward_cfg: system1_guided
+
+_target_: src.models.gflownet_module.GFlowNetModule
+
+hidden_dim: 512
+exploration_epsilon: 0.1
+# 推理阶段不再注入随机探索，避免评估噪声。
+eval_exploration_epsilon: 0.0
+policy_temperature: 1.0
+log_reward_inv_temp: 1.0
+gt_replay_weight: 1.0
+log_z_init_bias: 15.0
+debug_numeric: true
+debug_actions: true
+use_retriever_projectors: true
+projector_checkpoint: null
+freeze_projectors: true
+
+lr_actor: 1.0e-4
+lr_z: 1.0e-3
+
+# 残差式策略：由 retriever edge_scores 提供 logit bias，再由策略网络学习残差。
+policy_edge_score_bias: 1.0
+
+resources:
+  vocabulary_path: ${resources.vocabulary_path}
+  embeddings_dir: ${resources.embeddings_dir}
+evaluation_cfg:
+  num_eval_rollouts: 1
+  path_recall_k: 10
+  weak_link_rank_cutoff: 50
+
+optimizer_cfg:
+  type: adamw
+  lr: ${model.lr_actor}
+  weight_decay: 1.0e-4
+  param_groups:
+    - params:
+        - log_z_head
+        - log_z_condition
+      lr: ${model.lr_z}
+
+scheduler_cfg:
+  type: cosine
+  t_max: 200
+  eta_min: 1.0e-6
+  interval: epoch
+  monitor: val/reward

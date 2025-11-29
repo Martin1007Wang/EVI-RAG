@@ -1,0 +1,15 @@
+name: kgqagen
+kb: wikidata
+raw_root: ${paths.data_dir}/KGQAGen-10k/raw/data
+out_dir: ${paths.data_dir}/KGQAGen-10k/normalized
+materialized_dir: ${paths.data_dir}/KGQAGen-10k/materialized
+# graph/seed/answers混用 label+Qid，需要归一化到 Qid
+entity_normalization: qid_in_parentheses
+undirected_traversal: true
+column_map:
+  question_id_field: id
+  question_field: question
+  answer_text_field: answer
+  q_entity_field: seed
+  a_entity_field: answer
+  graph_field: proof

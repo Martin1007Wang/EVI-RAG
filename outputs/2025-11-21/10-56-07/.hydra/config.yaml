@@ -1,0 +1,12 @@
+paths:
+  root_dir: ${hydra:runtime.cwd}
+  data_dir: /mnt/data/retrieval_dataset
+  log_dir: ${paths.root_dir}/logs/
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+dataset: webqsp
+raw_root: ${paths.data_dir}/${dataset}/raw/data
+out_dir: ${paths.data_dir}/${dataset}/normalized
+skip_no_topic: true
+skip_no_ans: true
+use_shortest_path_positive: true

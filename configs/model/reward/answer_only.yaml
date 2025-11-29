@@ -1,0 +1,11 @@
+_target_: src.models.components.gflownet_rewards.AnswerOnlyReward
+
+# 拉大成功/失败间隔，避免 log_reward 平原。
+success_reward: 5.0
+# 抬高失败奖励，防止 -inf 平台；仍保持明显差距。
+failure_reward: 0.5
+
+# 软奖励：覆盖率 + retriever 分数双平滑，让模型有连续信号。
+beta_reach: 1.0
+# retriever 分数 shaping 默认关闭；若要开启，请同时在代码中保留 clamp，防止失败样本奖励爆炸。
+beta_score: 0.0

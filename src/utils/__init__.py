@@ -1,5 +1,5 @@
 from src.utils.instantiators import instantiate_callbacks, instantiate_loggers
-from src.utils.logging_utils import log_hyperparameters
+from src.utils.logging_utils import log_hyperparameters, infer_batch_size, log_metric
 from src.utils.metrics import (
     normalize_k_values,
     extract_sample_ids,
@@ -7,7 +7,6 @@ from src.utils.metrics import (
     compute_ranking_metrics,
     compute_answer_recall,
     summarize_uncertainty,
-    compute_selective_metrics,
     RankingStats,
 )
 from src.utils.optimization import setup_optimizer
@@ -20,6 +19,8 @@ __all__ = [
     "instantiate_callbacks",
     "instantiate_loggers",
     "log_hyperparameters",
+    "infer_batch_size",
+    "log_metric",
     "RankedLogger",
     "Registry",
     "enforce_tags",
@@ -33,7 +34,6 @@ __all__ = [
     "compute_ranking_metrics",
     "compute_answer_recall",
     "summarize_uncertainty",
-    "compute_selective_metrics",
     "RankingStats",
     "setup_optimizer",
 ]

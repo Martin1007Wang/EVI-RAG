@@ -1,0 +1,7 @@
+# @package _global_
+
+defaults:
+  - eval_retriever_default
+  - override /dataset: gtsqa
+
+tags: ["retriever", "eval", "gtsqa"]

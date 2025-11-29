@@ -1,8 +1,0 @@
-defaults:
-  - base_deterministic
-  - _self_
-
-loss_cfg:
-  type: det_infonce
-  hard_negative_mining: true
-  hard_negative_ratio: 0.5
