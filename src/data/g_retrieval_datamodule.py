@@ -143,9 +143,24 @@ class GRetrievalDataModule(LightningDataModule):
     def test_dataloader(self):
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
 
-    def predict_dataloader(self):
+    def predict_dataloader(self) -> UnifiedDataLoader:
         # Support for GAgent generation pipeline
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
+
+    def train_eval_dataloader(self) -> UnifiedDataLoader:
+        """
+        Deterministic loader for train split during evaluation/export stages.
+        """
+        return self._build_loader(self.train_dataset, shuffle=False, drop_last=False)
+
+    def get_split_dataloader(self, split: str) -> UnifiedDataLoader:
+        if split == "train":
+            return self.train_eval_dataloader()
+        if split in ("val", "validation"):
+            return self.val_dataloader()
+        if split == "test":
+            return self.test_dataloader()
+        raise ValueError(f"Unsupported split: {split}")
 
     def _build_loader(
         self,

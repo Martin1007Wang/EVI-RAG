@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - eval_gflownet_default
+  - override /dataset: webqsp
+  - override /logger: null
+
+tags: ["eval", "gflownet", "webqsp"]
+
+model:
+  embedder_cfg:
+    projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-12-02_19-26-32/checkpoints/epoch_094.ckpt"
+
+ckpt_path: "logs/train_gflownet_webqsp/runs/2025-12-05_14-32-36/checkpoints/epoch_006.ckpt"
+task_name: "eval_gflownet_webqsp"

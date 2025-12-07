@@ -54,9 +54,9 @@ class Retriever(nn.Module):
         self.use_topic_pe = bool(topic_pe)
         self.num_topics = int(num_topics)
 
-        self.entity_proj = EmbeddingProjector(self.emb_dim, finetune=enable_entity_finetune)
-        self.relation_proj = EmbeddingProjector(self.emb_dim, finetune=enable_relation_finetune)
-        self.query_proj = EmbeddingProjector(self.emb_dim, finetune=enable_query_finetune)
+        self.entity_proj = EmbeddingProjector(self.emb_dim, input_dim=self.emb_dim, finetune=enable_entity_finetune)
+        self.relation_proj = EmbeddingProjector(self.emb_dim, input_dim=self.emb_dim, finetune=enable_relation_finetune)
+        self.query_proj = EmbeddingProjector(self.emb_dim, input_dim=self.emb_dim, finetune=enable_query_finetune)
 
         self.dde = DDE(**(dde_cfg or {})) if self.use_topic_pe else None
 

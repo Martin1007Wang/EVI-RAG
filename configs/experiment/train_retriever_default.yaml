@@ -17,6 +17,15 @@ data:
       train_samples_per_epoch: null
 
 callbacks:
-  monitor: "val/ranking/mrr"
-  patience: 10
-  mode: "max"
+  model_checkpoint:
+    monitor: val/ranking/mrr
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+  early_stopping:
+    monitor: val/ranking/mrr
+    mode: max
+    patience: 50
+
+trainer:
+  check_val_every_n_epoch: 1

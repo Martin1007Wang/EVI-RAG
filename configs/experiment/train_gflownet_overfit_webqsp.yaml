@@ -1,0 +1,92 @@
+# @package _global_
+
+# 最小 overfit 配置：WebQSP 上抽一个 batch，强先验 + 可选退火，验证收敛/调试。
+
+defaults:
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /trainer: gpu
+  - _self_
+
+task_name: "gflownet_overfit_webqsp"
+tags: ["gflownet", "webqsp", "overfit"]
+train: true
+test: false
+ckpt_path: null
+seed: 42
+optimized_metric: "train/success_mean"
+env_debug: false   # 避免缺失插值
+
+dataset:
+  name: webqsp
+  paths:
+    vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+    embeddings: ${dataset.materialized_dir}/embeddings
+    out_dir: ${paths.data_dir}/${dataset.name}
+    data_dir: ${paths.data_dir}/${dataset.name}
+  materialized_dir: ${paths.data_dir}/${dataset.name}/materialized
+
+# 数据：只取一个 batch，固定顺序便于对拍。
+data:
+  batch_size: 1
+  num_workers: 0
+  pin_memory: false
+  drop_last: false
+  persistent_workers: false
+  shuffle_train: false
+  cache_paths:
+    train: ${dataset.materialized_dir}/g_agent/train_g_agent.pt
+    validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt
+    test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
+  resources:
+    vocabulary_path: ${dataset.paths.vocabulary}
+    embeddings_dir: ${dataset.paths.embeddings}
+
+model:
+  training_cfg:
+    # 固定强先验，不退火，便于对拍；需要退火再改成字典
+    retriever_prior_alpha: 0.5
+    retriever_prior_anneal: null
+    gt_replay_ratio: 1.0
+    debug_batches_to_log: 4
+    debug_graphs_to_log: 1
+  evaluation_cfg:
+    num_eval_rollouts: 1
+    path_hit_k: [1, 3]
+  embedder_cfg:
+    projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-11-30_14-48-31/checkpoints/epoch_189.ckpt"
+  # 默认 policy/reward/env 取 gflownet_module 的配置，若需要更快收敛可调 hidden_dim 较小。
+
+trainer:
+  max_epochs: 5000
+  min_epochs: 1
+  max_steps: 200          # 直接用步数上限，避免长时间空转
+  limit_train_batches: 1   # 只走一个 batch（整数表示绝对批次数）
+  limit_val_batches: 0
+  accelerator: gpu
+  devices: [0]
+  gradient_clip_val: 1.0
+  deterministic: false
+  log_every_n_steps: 1
+  check_val_every_n_epoch: 100000  # effectively disable val
+
+callbacks:
+  model_checkpoint:
+    monitor: train/success_mean
+    mode: max
+    filename: "overfit"
+    save_last: true
+    save_top_k: 1
+  early_stopping:
+    monitor: train/success_mean
+    mode: max
+    patience: 500
+    min_delta: 0.0
+
+logger:
+  wandb:
+    project: "gflownet_overfit"
+    name: "webqsp_onebatch"
+    offline: true  # 避免网络依赖

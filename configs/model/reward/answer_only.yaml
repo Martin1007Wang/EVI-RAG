@@ -1,11 +1,20 @@
 _target_: src.models.components.gflownet_rewards.AnswerOnlyReward
 
-# 拉大成功/失败间隔，避免 log_reward 平原。
-success_reward: 5.0
-# 抬高失败奖励，防止 -inf 平台；仍保持明显差距。
-failure_reward: 0.5
+# 纯命中目标：成功与失败的 reward 基线（正数，进入 log-domain 叠加）。
+success_reward: 10.0
+failure_reward: 0.01
 
-# 软奖励：覆盖率 + retriever 分数双平滑，让模型有连续信号。
-beta_reach: 1.0
-# retriever 分数 shaping 默认关闭；若要开启，请同时在代码中保留 clamp，防止失败样本奖励爆炸。
-beta_score: 0.0
+# 可选 shaping：log_reward += lambda_reach * reach_fraction
+lambda_reach: 0.0
+
+# 结构 shaping（默认 0 保持旧行为）
+# log_reward += gamma_len * (-num_selected_edges)
+gamma_len: 0.0
+# log_reward += gamma_score * mean(log(edge_scores))
+gamma_score: 0.0
+score_clip_max: 1.0   # 限定 edge_scores<=1, log<=0，避免归一化溢出
+score_eps: 1.0e-8
+# log_reward += gamma_gt * gt_path_f1（与 path_mask 联动）
+gamma_gt: 0.0
+# log_reward += gamma_answer_div * (#answers hit)，用于多答案覆盖（单答案时可保持 0）
+gamma_answer_div: 0.0

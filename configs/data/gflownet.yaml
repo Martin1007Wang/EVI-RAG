@@ -5,9 +5,13 @@ cache_paths:
   validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt # g_agent (G_oracle)
   test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt     # g_agent (G_pruned)
 
-batch_size: 128
+batch_size: 64
 num_workers: 8
 pin_memory: true
 drop_last: false
 persistent_workers: true
 shuffle_train: true
+
+resources:
+  vocabulary_path: ${dataset.paths.vocabulary}
+  embeddings_dir: ${dataset.paths.embeddings}

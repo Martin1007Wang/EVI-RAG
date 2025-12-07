@@ -44,9 +44,9 @@
   - `System1GuidedReward`：综合正边/答案/GT 路径覆盖 + retriever 分数（长度惩罚、terminal 奖励、语义阈值，可选“仅语义成功”）。
   - `AnswerOnlyReward`：命中答案为主，reach_fraction/score 作为平滑 shaping。
 
-## 6. LLM 生成（src/llm_generation.py）
-- **数据准备**：`LLMGenerationDataModule` 读取 g_agent 缓存与 `questions/entity_vocab/relation_vocab.parquet`，按分数降序截断 `triplet_limit`，反查三元组文本并构造 `system_prompt` + `user_prompt`。
-- **推理**：`LLMGenerationModule` 通过 vLLM 或 OpenAI 接口运行 `run_chat`，写出 `${paths.output_dir}/{dataset}-{prompt_tag}-{model}-{split}.jsonl` 与 `.metrics.json`。
+## 6. LLM Reasoner（triplet）
+- **数据准备**：`LLMReasonerTripletDataModule`（`src/data/llm_reasoner_triplet_datamodule.py`）读取 g_agent 缓存与 `questions/entity_vocab/relation_vocab.parquet`，按分数降序截断 `triplet_limit`，反查三元组文本并构造 `system_prompt` + `user_prompt`。
+- **推理**：`LLMReasonerModule`（`src/models/llm_reasoner_module.py`）通过 vLLM 或 OpenAI 接口运行 `run_chat`，写出 `${paths.output_dir}/{dataset}-{prompt_tag}-{model}-{split}.jsonl` 与 `.metrics.json`。
 
 ## 7. 已知风险
 - g_agent 聚合全量样本后一次性保存，长尾数据集可能占用大内存。

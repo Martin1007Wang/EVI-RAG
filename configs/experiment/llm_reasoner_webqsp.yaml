@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - override /dataset: webqsp
+  - override /data: llm_reasoner
+  - override /model: llm_reasoner/ollama
+  - override /trainer: gpu
+
+tags: ["eval", "llm_reasoner", "paths", "webqsp"]
+task_name: "llm_reasoner_webqsp"
+
+ckpt_path: null
+
+g_agent:
+  skip_retriever_metrics: true
+  enabled: false
+
+# prediction-only; metrics computed inside model.on_predict_epoch_end

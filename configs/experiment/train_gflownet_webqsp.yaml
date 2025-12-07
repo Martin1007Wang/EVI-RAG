@@ -5,5 +5,19 @@ defaults:
   - override /dataset: webqsp
 
 model:
-  projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-11-27_19-37-05/checkpoints/last.ckpt"
+  embedder_cfg:
+    projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-12-02_19-26-32/checkpoints/epoch_094.ckpt"
+  training_cfg:
+    retriever_prior_alpha: 2.0            # 先强依赖 retriever，后期完全交给策略
+    retriever_prior_anneal:
+      start: 2.0
+      end: 0.5
+      steps: 10000
+    pb_loss_weight: 1.0
+    pb_loss_anneal:
+      start: 1.0
+      end: 0
+      steps: 10000
+
+task_name: "train_gflownet_webqsp_rpa=0.0"
 tags: ["webqsp", "gflownet"]

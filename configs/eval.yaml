@@ -14,3 +14,19 @@ defaults:
   - experiment: null 
 
 task_name: "eval_retriever"
+
+# seed for reproducibility; keep configurable via CLI override
+seed: 42
+
+# 持久化评估产物（默认关闭，在具体 experiment 中开启）
+eval_persist:
+  retriever:
+    enabled: false
+    output_dir: ${dataset.materialized_dir}/eval_retriever
+    splits: ["test"]
+    textualize: false
+  gflownet:
+    enabled: false
+    output_dir: ${dataset.materialized_dir}/eval_gflownet
+    splits: ["test"]
+    textualize: false

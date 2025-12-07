@@ -1,0 +1,24 @@
+# DataModule for LLM reasoning over persisted GFlowNet eval rollouts (path-based).
+_target_: src.data.llm_reasoner_path_datamodule.LLMReasonerPathDataModule
+
+# Required paths
+eval_cache_path: ${dataset.materialized_dir}/eval_gflownet/test_gflownet_eval.pt
+entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+
+# Metadata for downstream logging / naming
+dataset: ${dataset.name}
+split: test
+prompt_tag: paths
+
+# Chain filtering / prompt construction
+max_chains_per_sample: 20
+min_chain_length: 1
+max_chain_length: null
+include_meta: true
+sort_by: ["-frequency", "-length"]
+system_prompt: "You are a concise QA agent. Use the provided paths as evidence."
+user_instruction: "Copy the answer entity exactly as it appears in the paths (no paraphrase or alias). Prefix with 'Ans:'. If the answer is absent, reply 'Ans: Unknown'."
+
+# Loader
+num_workers: 0

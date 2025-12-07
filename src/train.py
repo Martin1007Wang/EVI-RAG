@@ -4,6 +4,8 @@ import hydra
 import lightning as L
 import rootutils
 import torch
+
+torch.autograd.set_detect_anomaly(True)
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
@@ -48,25 +50,35 @@ def _setup_gflownet_debug_logging(cfg) -> None:
     if not enable:
         return
 
+    log_paths = []
     out_dir = Path(cfg.paths.output_dir)
-    log_dir = out_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "gflownet_debug.log"
+    run_log_dir = out_dir / "logs"
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    log_paths.append(run_log_dir / "gflownet_debug.log")
+
+    debug_log_path = getattr(cfg.paths, "debug_log_path", None)
+    if debug_log_path:
+        debug_log = Path(debug_log_path).expanduser()
+        debug_log.parent.mkdir(parents=True, exist_ok=True)
+        log_paths.append(debug_log)
 
     base_logger = logging.getLogger("gflownet.debug")
     base_logger.setLevel(logging.INFO)
 
     # 防止重复添加 handler
-    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == str(log_path) for h in base_logger.handlers):
-        handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-        handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
-        base_logger.addHandler(handler)
+    for path in log_paths:
+        if not any(isinstance(h, logging.FileHandler) and Path(h.baseFilename) == Path(path) for h in base_logger.handlers):
+            handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+            handler.setLevel(logging.INFO)
+            formatter = logging.Formatter(
+                fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            handler.setFormatter(formatter)
+            base_logger.addHandler(handler)
     base_logger.propagate = False
+
+
 from src.utils.run_context import apply_run_name
 
 log = RankedLogger(__name__, rank_zero_only=True)

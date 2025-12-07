@@ -1,0 +1,14 @@
+_target_: src.models.components.gflownet_actor.GFlowNetActor
+
+# policy_temperature: train-time sampling temperature; <1e-5 degenerates to greedy
+# eval_policy_temperature: eval-time temperature; null -> reuse train temperature; set 0 for argmax eval
+# stop_logit_bias: bias on stop action; negative discourages early stop
+# random_action_prob: epsilon-greedy mixing weight during training; set 0 for eval
+# debug_actions: emit per-step action debug logs for first batch
+# debug_actions_steps: how many steps to log when debug_actions is true
+policy_temperature: 1.0
+eval_policy_temperature: 0.7
+stop_logit_bias: -1.0
+random_action_prob: 0.1
+debug_actions: false
+debug_actions_steps: 0

@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class GAgentSettings:
     """Declarative configuration for constructing g_agent."""
+
     enabled: bool = True
     # anchors: top-K edges (by retrieval score) define the high-belief region
     anchor_top_k: int = 50
@@ -39,12 +40,14 @@ class GAgentSettings:
 @dataclass(frozen=True)
 class _GraphSlice:
     """Internal helper to hold GPU tensors for a single sample graph."""
-    heads: torch.Tensor # Local indices in G_retrieval (0 ~ N_retrieval)
+
+    heads: torch.Tensor  # Local indices in G_retrieval (0 ~ N_retrieval)
     tails: torch.Tensor
     relations: torch.Tensor
     labels: torch.Tensor
     scores: torch.Tensor
-    node_global_ids: torch.Tensor # Global Entity IDs
+    node_global_ids: torch.Tensor  # Global Entity IDs
+    node_embedding_ids: torch.Tensor  # Embedding table row per node
     # Edge indices within the per-sample retrieval graph (0 ~ E_retrieval-1).
     # Needed to align GT edge indices stored in LMDB with selected edges.
     retrieval_edge_indices: torch.Tensor
@@ -67,7 +70,7 @@ class GAgentBuilder:
         self.cfg = settings
         self.embedding_store = embedding_store
         self.samples: List[GAgentSample] = []
-        
+
         # Counters
         self.stats = {
             "num_samples": 0,
@@ -75,7 +78,7 @@ class GAgentBuilder:
             "retrieval_failed": 0,
             "gt_broken": 0,
             "edge_counts": [],
-            "path_lengths": []
+            "path_lengths": [],
         }
 
     def reset(self):
@@ -92,27 +95,27 @@ class GAgentBuilder:
         # 1. Extract basic info from batch
         if not hasattr(batch, "ptr"):
             raise ValueError("Batch must have 'ptr' for slicing.")
-        
+
         ptr = batch.ptr
         batch_size = ptr.numel() - 1
-        
+
         # Detach tensors to CPU to avoid CUDA OOM during graph algo
         scores = model_output.scores.detach().cpu()
         edge_index = batch.edge_index.detach().cpu()
         relations = batch.edge_attr.detach().cpu()
         labels = batch.labels.detach().cpu()
         node_global_ids = batch.node_global_ids.detach().cpu()
-        
+
         # Sample IDs list
         sample_ids = getattr(batch, "sample_id", [])
-        
+
         # Group edges by sample index (using model_output.query_ids or ptr logic)
         # Here we use query_ids for robustness if available, otherwise infer from ptr?
-        # Usually retriever output aligns with edge_index. 
+        # Usually retriever output aligns with edge_index.
         # But edge_index is sparse. We need to know which edges belong to which sample.
         # 'query_ids' from RetrieverOutput maps each edge to a sample index [0, B-1]
         query_ids = model_output.query_ids.detach().cpu()
-        
+
         # Pre-calculate edge ranges for each sample
         # Assumes edges are sorted by query_id (which they usually are in PyG batch)
         # But let's be safe and use a grouping map
@@ -126,20 +129,23 @@ class GAgentBuilder:
             edge_indices = edge_indices_by_sample[i]
             if not edge_indices:
                 continue
-            
+
             edge_indices_tensor = torch.tensor(edge_indices, dtype=torch.long)
-            
+
             node_start = int(ptr[i].item())
-            node_end = int(ptr[i+1].item())
+            node_end = int(ptr[i + 1].item())
             node_slice = node_global_ids[node_start:node_end]
-            
+            if not hasattr(batch, "node_embedding_ids"):
+                raise AttributeError("Batch missing node_embedding_ids; retriever dataset must provide embedding ids per node.")
+            node_embedding_slice = batch.node_embedding_ids.detach().cpu()[node_start:node_end]
+
             # Convert global edge_index to local (0~N_retrieval)
             # Note: edge_index in batch is already offset-adjusted if using PyG Batch?
             # Usually PyG Batch stacks node indices (0~N1, N1~N2...).
             # So we subtract node_start.
             heads = edge_index[0, edge_indices_tensor] - node_start
             tails = edge_index[1, edge_indices_tensor] - node_start
-            
+
             graph_slice = _GraphSlice(
                 heads=heads,
                 tails=tails,
@@ -147,15 +153,16 @@ class GAgentBuilder:
                 labels=labels[edge_indices_tensor],
                 scores=scores[edge_indices_tensor],
                 node_global_ids=node_slice,
+                node_embedding_ids=node_embedding_slice,
                 retrieval_edge_indices=edge_indices_tensor,
             )
-            
+
             # 3. Process Single Sample
             try:
                 sid = str(sample_ids[i])
             except IndexError:
                 sid = f"unknown_{i}"
-                
+
             # Get question local indices for seeding beam search
             # Assuming these are available in batch
             q_ptr = getattr(batch, "q_local_indices_ptr", None)
@@ -181,12 +188,12 @@ class GAgentBuilder:
             seeds=seeds,
             anchor_top_k=self.cfg.anchor_top_k,
         )
-        
+
         # Convert to sorted tensor list for deterministic indexing
         selected_indices = sorted(list(selected_indices_set))
         if not selected_indices:
-            return # Empty graph
-            
+            return  # Empty graph
+
         selected_idx_tensor = torch.tensor(selected_indices, dtype=torch.long)
 
         # === B. Fetch Metadata from LMDB ===
@@ -200,26 +207,26 @@ class GAgentBuilder:
             log.warning(f"Sample {sample_id} not found in LMDB.")
             return
 
-        question_raw = raw_data.get('question_emb', [])
+        question_raw = raw_data.get("question_emb", [])
         question_emb = torch.as_tensor(question_raw, dtype=torch.float32).detach().clone()
-        question_text = raw_data.get('question', "")
+        question_text = raw_data.get("question", "")
         # Standardize to LongTensor
-        start_entity_ids = torch.as_tensor(raw_data.get('seed_entity_ids', []), dtype=torch.long).detach().clone()
+        start_entity_ids = torch.as_tensor(raw_data.get("seed_entity_ids", []), dtype=torch.long).detach().clone()
         if start_entity_ids.numel() == 0:
             raise ValueError(f"Sample {sample_id} missing seed_entity_ids (start_entity_ids).")
 
-        answer_entity_ids = torch.as_tensor(raw_data.get('answer_entity_ids', []), dtype=torch.long).detach().clone()
+        answer_entity_ids = torch.as_tensor(raw_data.get("answer_entity_ids", []), dtype=torch.long).detach().clone()
         if answer_entity_ids.numel() == 0:
             raise ValueError(f"Sample {sample_id} missing answer_entity_ids.")
 
         # === C. Construct Subgraph Data (Global & Local) ===
-        
+
         # 1. Extract Edge Attributes (Global IDs for Heads/Tails)
         # heads/tails in graph_slice are local to G_retrieval (0~N_retr)
         # We map them to Global Entity IDs
         sel_heads_local = graph.heads[selected_idx_tensor]
         sel_tails_local = graph.tails[selected_idx_tensor]
-        
+
         edge_heads_global = graph.node_global_ids[sel_heads_local]
         edge_tails_global = graph.node_global_ids[sel_tails_local]
         edge_relations = graph.relations[selected_idx_tensor]
@@ -229,10 +236,17 @@ class GAgentBuilder:
         # 2. Build Subgraph Topology (0 ~ N_subgraph-1)
         # Collect all unique nodes in this new small subgraph
         unique_nodes, _ = torch.sort(torch.cat([edge_heads_global, edge_tails_global]).unique())
-        
-        # Map Global ID -> Subgraph Index
+
+        # Map Global ID -> Subgraph Index / Embedding Row
         node_map = {gid.item(): i for i, gid in enumerate(unique_nodes)}
-        
+        embedding_lookup = {int(g.item()): int(e.item()) for g, e in zip(graph.node_global_ids, graph.node_embedding_ids)}
+        unique_embedding_ids = []
+        for gid in unique_nodes.tolist():
+            if gid not in embedding_lookup:
+                raise ValueError(f"Missing embedding_id for global entity {gid} in sample {sample_id}")
+            unique_embedding_ids.append(embedding_lookup[gid])
+        node_embedding_ids = torch.tensor(unique_embedding_ids, dtype=torch.long)
+
         # Compute edge topology indices
         edge_head_locals = torch.tensor([node_map[h.item()] for h in edge_heads_global], dtype=torch.long)
         edge_tail_locals = torch.tensor([node_map[t.item()] for t in edge_tails_global], dtype=torch.long)
@@ -277,9 +291,9 @@ class GAgentBuilder:
         # We need to find which edges in our selected subgraph correspond to the GT path.
         # raw_data['gt_path_edge_indices'] contains indices in G_retrieval (0~E_retr-1).
         # We need to map them to indices in G_agent (0~E_agent-1).
-        
+
         gt_path_indices: List[int] = []
-        raw_gt_indices = raw_data.get('gt_path_edge_indices', []) # Ensure this key matches build script
+        raw_gt_indices = raw_data.get("gt_path_edge_indices", [])  # Ensure this key matches build script
         if not raw_gt_indices:
             # 兼容 build_retrieval_dataset.py 存储的三元组路径：gt_paths_triples=[[(h,r,t),...]]
             gt_triples = raw_data.get("gt_paths_triples", [])
@@ -311,7 +325,7 @@ class GAgentBuilder:
                 retrieval_idx_to_agent[r_global] = aidx
                 if graph.retrieval_edge_indices.numel() > r_global:
                     retrieval_idx_to_agent[int(graph.retrieval_edge_indices[r_global].item())] = aidx
-            
+
             for ridx in raw_gt_indices:
                 # Handle tensor or int
                 r_val = ridx if isinstance(ridx, int) else ridx.item()
@@ -344,27 +358,30 @@ class GAgentBuilder:
         top_edge_mask = torch.ones(num_edges, dtype=torch.bool)
 
         gt_path_edge_local_ids = torch.tensor(gt_path_indices, dtype=torch.long)
-        gt_path_node_local_ids = torch.tensor(sorted({int(edge_head_locals[i].item()) for i in gt_path_indices} | {int(edge_tail_locals[i].item()) for i in gt_path_indices}), dtype=torch.long)
+        gt_path_node_local_ids = torch.tensor(
+            sorted(
+                {int(edge_head_locals[i].item()) for i in gt_path_indices}
+                | {int(edge_tail_locals[i].item()) for i in gt_path_indices}
+            ),
+            dtype=torch.long,
+        )
 
         sample = GAgentSample(
             sample_id=sample_id,
             question=question_text,
             question_emb=question_emb,
-
             edge_relations=edge_relations,
             edge_scores=edge_scores,
             edge_labels=edge_labels,
-
             edge_head_locals=edge_head_locals,
             edge_tail_locals=edge_tail_locals,
             node_entity_ids=unique_nodes,
+            node_embedding_ids=node_embedding_ids,
             top_edge_mask=top_edge_mask,
-
             start_entity_ids=start_entity_ids,
             answer_entity_ids=answer_entity_ids,
             start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
-
             gt_path_edge_local_ids=gt_path_edge_local_ids,
             gt_path_node_local_ids=gt_path_node_local_ids,
             gt_path_exists=gt_exists,
@@ -372,10 +389,12 @@ class GAgentBuilder:
         )
         # 数据完整性：可达必有路径，不可达不得有路径
         if sample.is_answer_reachable:
-            assert gt_path_edge_local_ids.numel() > 0, f"Sample {sample_id} is marked reachable but GT path is empty! Logic Error."
+            assert (
+                gt_path_edge_local_ids.numel() > 0
+            ), f"Sample {sample_id} is marked reachable but GT path is empty! Logic Error."
         else:
             assert gt_path_edge_local_ids.numel() == 0, f"Sample {sample_id} is unreachable but has GT path! Logic Error."
-        
+
         self.samples.append(sample)
         self.stats["num_samples"] += 1
 
@@ -383,18 +402,18 @@ class GAgentBuilder:
         if not self.samples:
             log.warning("No samples collected.")
             return None
-            
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Compute final stats
         final_stats = {
             "num_samples": self.stats["num_samples"],
             "path_exists_ratio": self.stats["path_exists"] / max(1, self.stats["num_samples"]),
             "retrieval_failed_ratio": self.stats["retrieval_failed"] / max(1, self.stats["num_samples"]),
             "avg_edges": statistics.mean(self.stats["edge_counts"]) if self.stats["edge_counts"] else 0,
-            "avg_gt_len": statistics.mean(self.stats["path_lengths"]) if self.stats["path_lengths"] else 0
+            "avg_gt_len": statistics.mean(self.stats["path_lengths"]) if self.stats["path_lengths"] else 0,
         }
-        
+
         records = [self._sample_to_record(s) for s in self.samples]
         payload = {
             "settings": self.cfg.to_metadata(),
@@ -419,6 +438,7 @@ class GAgentBuilder:
             "edge_head_locals": sample.edge_head_locals,
             "edge_tail_locals": sample.edge_tail_locals,
             "node_entity_ids": sample.node_entity_ids,
+            "node_embedding_ids": sample.node_embedding_ids,
             "top_edge_mask": sample.top_edge_mask.to(dtype=torch.bool),
             "start_entity_ids": sample.start_entity_ids,
             "start_node_locals": sample.start_node_locals,
@@ -494,5 +514,6 @@ class GAgentBuilder:
                     selected.update(hop1_edges)
 
         return selected
+
 
 __all__ = ["GAgentBuilder", "GAgentSettings"]

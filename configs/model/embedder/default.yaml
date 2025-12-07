@@ -1,0 +1,17 @@
+_target_: src.models.components.gflownet_embedder.GraphEmbedder
+
+hidden_dim: ${model.hidden_dim}
+# Projector仅用于推理复用 retriever 权重，关闭 dropout。
+proj_dropout: 0.0
+projector_checkpoint: ???
+freeze_projectors: true
+kge_interaction: concat
+projector_key_prefixes:
+  - retriever.model._orig_mod
+  - retriever.model
+  - retriever
+  - model._orig_mod
+  - model
+  - ""
+# 默认开启 GFN 投影，将 retriever 空间映射到 GFlowNet hidden_dim，保留 retriever 权重冻结。
+use_gfn_projectors: true

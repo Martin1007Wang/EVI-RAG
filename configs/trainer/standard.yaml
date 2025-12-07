@@ -1,8 +1,0 @@
-defaults:
-  - default
-  - _self_
-
-max_epochs: 200
-accelerator: gpu
-devices: 1
-check_val_every_n_epoch: 10

@@ -69,7 +69,7 @@ class GRetrievalDataset(Dataset):
         if sample_limit:
             self._apply_sample_limit(sample_limit, random_seed)
 
-        self._drop_empty_samples()
+        self._assert_all_samples_valid()
 
         logger.info(
             f"GRetrievalDataset[{self.split}] initialized: {len(self.sample_ids)} samples."
@@ -84,28 +84,20 @@ class GRetrievalDataset(Dataset):
         return len(self.sample_ids)
 
     def get(self, idx: int) -> GraphData:
-        """Load single sample from LMDB."""
+        """Load single sample from LMDB with strict PyG validation."""
         sample_id = self.sample_ids[idx]
         raw = self._get_sample_store().load_sample(sample_id)
+        _validate_raw_sample(raw, sample_id)
 
-        # Basic Checks
         edge_index = torch.as_tensor(raw["edge_index"], dtype=torch.long)
-        if edge_index.numel() == 0:
-            raise RuntimeError(f"Empty graph detected: {sample_id}")
-        num_nodes = raw["num_nodes"]
-
-        # Features
+        num_nodes = int(raw["num_nodes"])
         node_global_ids = torch.as_tensor(raw["node_global_ids"], dtype=torch.long)
-        node_embedding_ids = raw.get("node_embedding_ids")
-        if node_embedding_ids is None:
-            raise RuntimeError(f"Missing node_embedding_ids in {sample_id}")
-        node_embedding_ids = torch.as_tensor(node_embedding_ids, dtype=torch.long)
+        node_embedding_ids = torch.as_tensor(raw["node_embedding_ids"], dtype=torch.long)
 
         question_emb = torch.as_tensor(raw["question_emb"], dtype=torch.float32)
         if question_emb.dim() == 1:
             question_emb = question_emb.unsqueeze(0)
 
-        # Answers (always 1D long tensor + length tensor)
         answer_ids = raw.get("answer_entity_ids")
         if answer_ids is None:
             answer_ids = torch.empty(0, dtype=torch.long)
@@ -116,7 +108,7 @@ class GRetrievalDataset(Dataset):
         q_local_indices = torch.as_tensor(raw.get("q_local_indices", []), dtype=torch.long).view(-1)
         a_local_indices = torch.as_tensor(raw.get("a_local_indices", []), dtype=torch.long).view(-1)
 
-        return GraphData(
+        data = GraphData(
             num_nodes=num_nodes,
             edge_index=edge_index,
             edge_attr=torch.as_tensor(raw["edge_attr"], dtype=torch.long), # Global relation IDs
@@ -130,10 +122,12 @@ class GRetrievalDataset(Dataset):
             a_local_indices=a_local_indices,
             answer_entity_ids=answer_ids,
             answer_entity_ids_len=answer_ids_len,
-            # Metadata
             sample_id=sample_id,
             idx=idx,
         )
+        # PyG 强校验，防止批内索引错乱
+        data.validate(raise_on_error=True)
+        return data
 
     def close(self) -> None:
         if getattr(self, "sample_store", None) is not None:
@@ -165,59 +159,21 @@ class GRetrievalDataset(Dataset):
         self.sample_ids = [self.sample_ids[i] for i in perm[:limit]]
         logger.info(f"Subsampled {self.split} to {len(self.sample_ids)} samples.")
 
-    def _drop_empty_samples(self) -> None:
+    def _assert_all_samples_valid(self) -> None:
         """
-        Filter out IDs that map to empty graphs in LMDB.
-        Note: This requires a full scan, which might be slow for huge datasets.
-        Optimization: Trust the preprocessing pipeline instead of checking here?
-        Current: Check checks existence of keys, fast enough for LMDB.
+        Eagerly validate every sample in the split and fail fast on malformed graphs.
+        This prevents静默丢样本导致的数据分布漂移。
         """
         if not self.sample_ids:
             return
 
-        invalid: Set[str] = set()
         temp_store = EmbeddingStore(self.split_path)
         try:
             for sid in self.sample_ids:
-                try:
-                    raw = temp_store.load_sample(sid)
-                except Exception as e:  # pragma: no cover - defensive guardrail
-                    logger.warning("Failed to load sample %s: %s. Dropping.", sid, e)
-                    invalid.add(sid)
-                    continue
-
-                edge_index = raw.get("edge_index")
-                num_nodes = int(raw.get("num_nodes", 0) or 0)
-                node_embedding_ids = raw.get("node_embedding_ids")
-
-                if not isinstance(edge_index, torch.Tensor) or edge_index.numel() == 0:
-                    invalid.add(sid)
-                    continue
-                if num_nodes <= 0:
-                    invalid.add(sid)
-                    continue
-                if node_embedding_ids is None:
-                    invalid.add(sid)
-                    continue
-                if hasattr(node_embedding_ids, "numel") and node_embedding_ids.numel() == 0:
-                    invalid.add(sid)
-                    continue
-                if not hasattr(node_embedding_ids, "numel") and len(node_embedding_ids) == 0:
-                    invalid.add(sid)
+                raw = temp_store.load_sample(sid)
+                _validate_raw_sample(raw, sid)
         finally:
             temp_store.close()
-
-        if invalid:
-            before = len(self.sample_ids)
-            self.sample_ids = [sid for sid in self.sample_ids if sid not in invalid]
-            logger.warning(
-                "Pruned %d invalid/empty samples from %s: %d -> %d. Examples: %s",
-                len(invalid),
-                self.split,
-                before,
-                len(self.sample_ids),
-                list(invalid)[:5],
-            )
 
     def _apply_sample_filter(self, path: Path) -> None:
         if not path.exists():
@@ -358,3 +314,106 @@ def create_g_retrieval_dataset(
         random_seed=cfg.get("random_seed"),
         gpt_triples_path=gpt_path
     )
+
+
+def _validate_local_indices(local_idx: torch.Tensor, num_nodes: int, field: str, sample_id: str) -> None:
+    if local_idx.numel() == 0:
+        return
+    if local_idx.dim() != 1:
+        raise ValueError(f"{field} for {sample_id} must be 1D.")
+    if local_idx.min().item() < 0 or local_idx.max().item() >= num_nodes:
+        raise ValueError(f"{field} out of range for {sample_id}: num_nodes={num_nodes}, values={local_idx.tolist()}")
+
+
+def _ensure_tensor(obj: Any, dtype: torch.dtype, name: str, sample_id: str) -> torch.Tensor:
+    try:
+        return torch.as_tensor(obj, dtype=dtype)
+    except Exception as e:  # pragma: no cover - defensive guardrail
+        raise ValueError(f"Failed to convert {name} for {sample_id} to tensor: {e}") from e
+
+
+def _validate_topic_one_hot(topic_one_hot: torch.Tensor, num_nodes: int, sample_id: str) -> None:
+    if topic_one_hot.dim() == 1:
+        topic_one_hot = topic_one_hot.unsqueeze(-1)
+    if topic_one_hot.size(0) != num_nodes:
+        raise ValueError(f"topic_one_hot first dim {topic_one_hot.size(0)} != num_nodes {num_nodes} for {sample_id}")
+
+
+def _validate_answer_ids(answer_ids: torch.Tensor, sample_id: str) -> None:
+    if answer_ids.dim() != 1:
+        raise ValueError(f"answer_entity_ids for {sample_id} must be 1D.")
+
+
+def _validate_raw_sample(raw: Dict[str, Any], sample_id: str) -> None:
+    """Shared raw-schema validation to guarantee PyG Data integrity."""
+    required_keys = [
+        "edge_index",
+        "edge_attr",
+        "labels",
+        "num_nodes",
+        "node_global_ids",
+        "node_embedding_ids",
+        "question_emb",
+        "topic_one_hot",
+    ]
+    missing = [k for k in required_keys if k not in raw]
+    if missing:
+        raise KeyError(f"Sample {sample_id} missing keys: {missing}")
+
+    edge_index = _ensure_tensor(raw["edge_index"], torch.long, "edge_index", sample_id)
+    if edge_index.dim() != 2 or edge_index.size(0) != 2:
+        raise ValueError(f"edge_index must have shape [2, E] for {sample_id}, got {tuple(edge_index.shape)}")
+    num_edges = edge_index.size(1)
+    if num_edges == 0:
+        raise ValueError(f"edge_index empty for {sample_id}")
+
+    num_nodes = int(raw.get("num_nodes", 0) or 0)
+    if num_nodes <= 0:
+        raise ValueError(f"num_nodes must be positive for {sample_id}, got {num_nodes}")
+    if edge_index.min().item() < 0 or edge_index.max().item() >= num_nodes:
+        raise ValueError(
+            f"edge_index out of range for {sample_id}: min={edge_index.min().item()} max={edge_index.max().item()} num_nodes={num_nodes}"
+        )
+
+    node_global_ids = _ensure_tensor(raw["node_global_ids"], torch.long, "node_global_ids", sample_id).view(-1)
+    if node_global_ids.numel() != num_nodes:
+        raise ValueError(
+            f"node_global_ids length {node_global_ids.numel()} != num_nodes {num_nodes} for {sample_id}"
+        )
+    if torch.unique(node_global_ids).numel() != num_nodes:
+        raise ValueError(f"node_global_ids must be unique per sample: {sample_id}")
+
+    node_embedding_ids = _ensure_tensor(raw["node_embedding_ids"], torch.long, "node_embedding_ids", sample_id).view(-1)
+    if node_embedding_ids.numel() != num_nodes:
+        raise ValueError(
+            f"node_embedding_ids length {node_embedding_ids.numel()} != num_nodes {num_nodes} for {sample_id}"
+        )
+
+    edge_attr = _ensure_tensor(raw["edge_attr"], torch.long, "edge_attr", sample_id).view(-1)
+    labels = _ensure_tensor(raw["labels"], torch.float32, "labels", sample_id).view(-1)
+    if edge_attr.numel() != num_edges:
+        raise ValueError(f"edge_attr length {edge_attr.numel()} != num_edges {num_edges} for {sample_id}")
+    if labels.numel() != num_edges:
+        raise ValueError(f"labels length {labels.numel()} != num_edges {num_edges} for {sample_id}")
+
+    topic_one_hot = _ensure_tensor(raw["topic_one_hot"], torch.float32, "topic_one_hot", sample_id)
+    _validate_topic_one_hot(topic_one_hot, num_nodes, sample_id)
+
+    q_local_indices = _ensure_tensor(raw.get("q_local_indices", []), torch.long, "q_local_indices", sample_id).view(-1)
+    a_local_indices = _ensure_tensor(raw.get("a_local_indices", []), torch.long, "a_local_indices", sample_id).view(-1)
+    _validate_local_indices(q_local_indices, num_nodes, "q_local_indices", sample_id)
+    _validate_local_indices(a_local_indices, num_nodes, "a_local_indices", sample_id)
+
+    answer_ids = raw.get("answer_entity_ids")
+    if answer_ids is None:
+        answer_ids = torch.empty(0, dtype=torch.long)
+    else:
+        answer_ids = _ensure_tensor(answer_ids, torch.long, "answer_entity_ids", sample_id).view(-1)
+    _validate_answer_ids(answer_ids, sample_id)
+    answer_len = raw.get("answer_entity_ids_len")
+    if answer_len is not None:
+        answer_len_tensor = _ensure_tensor(answer_len, torch.long, "answer_entity_ids_len", sample_id).view(-1)
+        if answer_len_tensor.numel() != 1 or int(answer_len_tensor.item()) != answer_ids.numel():
+            raise ValueError(
+                f"answer_entity_ids_len mismatch for {sample_id}: declared {answer_len_tensor.tolist()} vs actual {answer_ids.numel()}"
+            )

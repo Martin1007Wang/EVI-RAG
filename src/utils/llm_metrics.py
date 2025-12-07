@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import string
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List
 
 
 def _normalize(text: str) -> str:
@@ -28,14 +28,12 @@ def _match(pred: str, answer: str) -> bool:
     return _normalize(pred) == _normalize(answer) or _normalize(answer) in _normalize(pred)
 
 
-def evaluate_predictions(
-    predictions: List[Dict],
-) -> Dict[str, float]:
+def evaluate_predictions(predictions: List[Dict]) -> Dict[str, float]:
     """Compute simple hit@1 / macro precision / recall / f1 against string answers."""
-    hits = []
-    precisions = []
-    recalls = []
-    f1s = []
+    hits: List[float] = []
+    precisions: List[float] = []
+    recalls: List[float] = []
+    f1s: List[float] = []
     total = 0
 
     for item in predictions:
@@ -56,12 +54,11 @@ def evaluate_predictions(
         # Precision / recall
         matched = 0
         remaining_preds = preds.copy()
-        remaining_gold = gold_answers.copy()
-        for g in gold_answers:
-            for p in remaining_preds:
-                if _match(p, g):
+        for gold in gold_answers:
+            for pred in remaining_preds:
+                if _match(pred, gold):
                     matched += 1
-                    remaining_preds.remove(p)
+                    remaining_preds.remove(pred)
                     break
         precision = matched / max(len(preds), 1)
         recall = matched / len(gold_answers)

@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 from torch import nn
 
 
 class EmbeddingProjector(nn.Module):
-    """Lazy projection layer that still registers parameters for optimizers."""
+    """Deterministic projection MLP (Linear + activation)."""
 
-    def __init__(self, output_dim: int, *, finetune: bool = False, activation: nn.Module | None = None) -> None:
+    def __init__(
+        self,
+        output_dim: int,
+        *,
+        input_dim: Optional[int] = None,
+        finetune: bool = False,
+        activation: nn.Module | None = None,
+    ) -> None:
         super().__init__()
-        layers: list[nn.Module] = [nn.LazyLinear(output_dim)]
+        if input_dim is None or input_dim <= 0:
+            raise ValueError("EmbeddingProjector requires a positive input_dim; lazy layers are disallowed.")
+        layers: list[nn.Module] = [nn.Linear(input_dim, output_dim)]
         if activation is None:
             activation = nn.Tanh()
         layers.append(activation)

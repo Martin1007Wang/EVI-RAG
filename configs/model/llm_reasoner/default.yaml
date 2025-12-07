@@ -1,4 +1,4 @@
-_target_: src.llm_generation.module.LLMGenerationModule
+_target_: src.models.llm_reasoner_module.LLMReasonerModule
 
 model_name: meta-llama/Meta-Llama-3.1-8B-Instruct
 tensor_parallel_size: 1
@@ -12,3 +12,8 @@ output_dir: ${paths.output_dir}
 dataset: ${data.dataset}
 split: ${data.split}
 prompt_tag: ${data.prompt_tag}
+
+# Backend selection: auto | vllm | openai | ollama
+backend: auto
+ollama_base_url: "http://localhost:11434"
+ollama_timeout: 120.0

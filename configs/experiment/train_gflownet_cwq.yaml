@@ -5,6 +5,9 @@ defaults:
   - override /dataset: cwq
 
 model:
-  projector_checkpoint: "logs/train_retriever_cwq/runs/2025-11-27_23-15-47/checkpoints/epoch_189.ckpt"
+  env_cfg:
+    max_steps: 6
+  embedder_cfg:
+    projector_checkpoint: "logs/train_retriever_cwq/runs/2025-12-02_22-43-12/checkpoints/epoch_194.ckpt"
   
 tags: ["cwq", "gflownet"]

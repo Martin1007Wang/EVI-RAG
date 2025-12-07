@@ -13,8 +13,9 @@
 
 3.  **Technical Rigor (技术严谨性):**
     *   **PyTorch Lightning Strictness:** 必须遵循 PL 的生命周期。`LightningModule` 必须自包含。训练逻辑与数据逻辑（`DataModule`）必须解耦。
-    *   **Hydra Configuration:** 所有的超参数必须暴露在 `configs/*.yaml` 中，严禁在 Python 代码中出现 Magic Numbers。
-    *   **Performance:** 优先使用向量化操作（Vectorization）而非循环。关注内存占用和计算图的效率。
+*   **Hydra Configuration:** 所有的超参数必须暴露在 `configs/*.yaml` 中，严禁在 Python 代码中出现 Magic Numbers。
+    *   **实例化单一路径（cfg-only）**：默认仅传递配置（cfg），由外层模块内部实例化依赖。禁止混用“有的传 cfg、有的传已实例化对象”。对于嵌套子模块（如 policy/env/actor），在顶层 `configs/model/*.yaml` 使用 `_recursive_: false`，把 cfg 原样传入 LightningModule，再由其注入依赖后调用 `hydra.utils.instantiate`。如需部分实例化，必须显式 `_partial_: true` 并在 cfg 中写清楚依赖来源，避免双重实例化。
+*   **Performance:** 优先使用向量化操作（Vectorization）而非循环。关注内存占用和计算图的效率。
     *   **Root Cause First:** 出现问题必须追溯根源解决，而不是用 clip、硬屏蔽等掩盖症状的权宜之计。
     *   **No Gratuitous Fallbacks:** 如无必要，不要添加 if/回退分支；优先修正/重建源头数据或流程，消除不确定性，再通过确定性的路径解决问题。
 

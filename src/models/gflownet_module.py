@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import hydra
+import pandas as pd
+from omegaconf import ListConfig
 import torch
+import torch.distributed as dist
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
-from src.data.components import SharedDataResources
-from src.models.components import GraphEnv, GraphState, RewardOutput
-from src.models.components.projections import EmbeddingProjector
+from src.models.components import GFlowNetActor, GFlowNetEstimator, GraphEmbedder, GraphEnv, RewardOutput
 from src.utils import setup_optimizer
 from src.utils.logging_utils import log_metric
 from src.utils.pylogger import RankedLogger
+from src.data.components import SharedDataResources
 
 logger = logging.getLogger(__name__)
 debug_logger = RankedLogger("gflownet.debug", rank_zero_only=True)
@@ -31,92 +34,77 @@ class GFlowNetModule(LightningModule):
         policy_cfg: Any,
         reward_cfg: Any,
         env_cfg: Any,
+        actor_cfg: Any,
+        embedder_cfg: Any,
+        estimator_cfg: Any,
+        training_cfg: Any,
         evaluation_cfg: Optional[Dict[str, Any]] = None,
         optimizer_cfg: Optional[Dict[str, Any]] = None,
         scheduler_cfg: Optional[Dict[str, Any]] = None,
-        resources: Optional[Dict[str, Any]] = None,
-        exploration_epsilon: float = 0.1,
-        eval_exploration_epsilon: float | None = None,
-        policy_edge_score_bias: float = 0.0,
-        policy_temperature: float = 1.0,
-        log_reward_inv_temp: float = 1.0,
-        gt_replay_weight: float = 1.0,
-        log_z_init_bias: float = 15.0,
-        lr_actor: float = 1e-4,
-        lr_z: float = 1e-3,
-        debug_numeric: bool = False,
-        debug_numeric_freq: int = 1000,
-        debug_actions: bool = False,
-        debug_actions_steps: int = 1,
-        use_retriever_projectors: bool = True,
-        projector_checkpoint: Optional[str] = None,
-        freeze_projectors: bool = True,
+        logging_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
-        self.exploration_epsilon = float(exploration_epsilon)
-        self.eval_exploration_epsilon = float(exploration_epsilon if eval_exploration_epsilon is None else eval_exploration_epsilon)
-        self.policy_edge_score_bias = float(policy_edge_score_bias)
-        self.policy_temperature = max(float(policy_temperature), 1e-6)
-        self.log_reward_inv_temp = float(log_reward_inv_temp)
-        self.gt_replay_weight = float(gt_replay_weight)
-        self.log_z_init_bias = float(log_z_init_bias)
-        self.lr_actor = float(lr_actor)
-        self.lr_z = float(lr_z)
 
-        self.reward_cfg = self._to_plain_dict(reward_cfg)
-        self.evaluation_cfg = self._to_plain_dict(evaluation_cfg)
-        self.optimizer_cfg = self._to_plain_dict(optimizer_cfg)
-        self.scheduler_cfg = self._to_plain_dict(scheduler_cfg)
-        self.resources_cfg = resources or {}
-        self.debug_numeric = bool(debug_numeric)
-        self.debug_numeric_freq = max(int(debug_numeric_freq), 1)
-        self.debug_actions = bool(debug_actions)
-        self.debug_actions_steps = max(int(debug_actions_steps), 0)
-        self.use_retriever_projectors = bool(use_retriever_projectors)
-        self.projector_checkpoint = projector_checkpoint
-        self.freeze_projectors = bool(freeze_projectors)
-        self._projectors_loaded = False
-        self._proj_dropout = self._extract_dropout(policy_cfg)
+        self.reward_cfg = reward_cfg
+        self.actor_cfg = actor_cfg
+        self.estimator_cfg = estimator_cfg
+        self.training_cfg = training_cfg
+        self.evaluation_cfg = evaluation_cfg or {}
+        self.optimizer_cfg = optimizer_cfg or {}
+        self.scheduler_cfg = scheduler_cfg or {}
+        self.logging_cfg = logging_cfg or {}
+        self.retriever_prior_alpha = float(self._cfg_get(self.training_cfg, "retriever_prior_alpha", 0.0))
+        self.retriever_prior_anneal = self._cfg_get(self.training_cfg, "retriever_prior_anneal", None)
+        self.pb_loss_weight = float(self._cfg_get(self.training_cfg, "pb_loss_weight", 1.0))
+        self.pb_loss_anneal = self._cfg_get(self.training_cfg, "pb_loss_anneal", None)
+        eval_rollouts_cfg = self._cfg_get(self.evaluation_cfg, "num_eval_rollouts", 1)
+        if isinstance(eval_rollouts_cfg, (list, tuple, ListConfig)):
+            self._eval_rollout_prefixes = sorted({int(max(1, v)) for v in eval_rollouts_cfg})
+            self._eval_rollouts = max(self._eval_rollout_prefixes)
+        else:
+            self._eval_rollouts = int(max(1, self._cfg_get_int(self.evaluation_cfg, "num_eval_rollouts", 1)))
+            self._eval_rollout_prefixes = [self._eval_rollouts]
+        self._path_hit_k = self._parse_int_list(self._cfg_get(self.evaluation_cfg, "path_hit_k", [5]))
+        self.normalize_log_reward = bool(self._cfg_get(self.training_cfg, "normalize_log_reward", True))
+        self._log_reward_offset = self._infer_log_reward_offset(self.reward_cfg) if self.normalize_log_reward else 0.0
+        self.gt_replay_ratio = float(self._cfg_get(self.training_cfg, "gt_replay_ratio", 0.1))
+        self.learn_pb = bool(self._cfg_get(self.training_cfg, "learn_pb", True))
+        self._debug_batches_to_log = max(int(self._cfg_get(self.training_cfg, "debug_batches_to_log", 0)), 0)
+        self._debug_graphs_to_log = max(int(self._cfg_get(self.training_cfg, "debug_graphs_to_log", 1)), 1)
+        self._debug_batches_logged = 0
+        self._train_prog_bar = set(self._cfg_get(self.logging_cfg, "train_prog_bar", []))
+        self._eval_prog_bar = set(self._cfg_get(self.logging_cfg, "eval_prog_bar", []))
+        self._auto_success_k = bool(self._cfg_get(self.logging_cfg, "auto_add_success_at_k", True))
+        self._auto_path_hit_f1 = bool(self._cfg_get(self.logging_cfg, "auto_add_path_hit_f1", True))
+        self._log_on_step_train = bool(self._cfg_get(self.logging_cfg, "log_on_step_train", False))
+        # Eval 持久化配置（由 eval.py 注入），仅在 eval 阶段使用
+        self.eval_persist_cfg: Optional[Dict[str, Any]] = None
+        self._eval_rollout_storage: Dict[str, list] = {"val": [], "test": []}
+        self._active_eval_split: Optional[str] = None
 
-        self.policy: nn.Module = policy_cfg if isinstance(policy_cfg, nn.Module) else hydra.utils.instantiate(policy_cfg)
-        self.reward_fn: nn.Module = reward_cfg if isinstance(reward_cfg, nn.Module) else hydra.utils.instantiate(reward_cfg)
-        self.env: GraphEnv = env_cfg if isinstance(env_cfg, GraphEnv) else hydra.utils.instantiate(env_cfg)
+        self.policy: nn.Module = hydra.utils.instantiate(policy_cfg)
+        self.reward_fn: nn.Module = hydra.utils.instantiate(reward_cfg)
+        self.env: GraphEnv = hydra.utils.instantiate(env_cfg)
         self.max_steps = int(self.env.max_steps)
-        self.bidir_token = bool(getattr(self.env, "bidir_token", False))
-
-        self.log_z_head = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, 1),
+        self.embedder = hydra.utils.instantiate(embedder_cfg)
+        self.estimator = hydra.utils.instantiate(estimator_cfg)
+        # 反向策略配置：禁用 tree，默认 uniform/learned
+        self.estimator.learn_pb = self.learn_pb  # type: ignore[attr-defined]
+        if self.estimator.log_pb_mode == "tree":
+            raise ValueError("log_pb_mode 'tree' is invalid for hub-heavy graphs; use 'uniform' or 'learned'.")
+        if not self.learn_pb:
+            self.estimator.log_pb_mode = "uniform"
+            if getattr(self.estimator, "backward_head", None) is not None:
+                for param in self.estimator.backward_head.parameters():
+                    param.requires_grad_(False)
+        self.actor = hydra.utils.instantiate(
+            actor_cfg,
+            policy=self.policy,
+            env=self.env,
+            max_steps=self.max_steps,
         )
-        if self.log_z_head[2].bias is not None:
-            nn.init.constant_(self.log_z_head[2].bias, self.log_z_init_bias)
-        self.log_z_condition: Optional[nn.Module] = None
-
-        self._shared_resources: Optional[SharedDataResources] = None
-        self._global_embeddings = None
-        self._entity_dim: Optional[int] = None
-        self._relation_dim: Optional[int] = None
-        self._num_entities: Optional[int] = None
-        self._num_relations: Optional[int] = None
-        self._question_dim: Optional[int] = None
-        self.retriever_entity_projector: Optional[EmbeddingProjector] = None
-        self.retriever_relation_projector: Optional[EmbeddingProjector] = None
-        self.retriever_query_projector: Optional[EmbeddingProjector] = None
-        self.entity_projector: Optional[nn.Module] = None
-        self.relation_projector: Optional[nn.Module] = None
-        self.query_projector: Optional[nn.Module] = None
-
-        self._init_projection_layers(dropout=self._proj_dropout)
-        ignore_params = []
-        if isinstance(policy_cfg, nn.Module):
-            ignore_params.append("policy_cfg")
-        if isinstance(reward_cfg, nn.Module):
-            ignore_params.append("reward_cfg")
-        if isinstance(env_cfg, nn.Module):
-            ignore_params.append("env_cfg")
-        self.save_hyperparameters(logger=False, ignore=ignore_params or None)
+        self.save_hyperparameters(logger=False)
 
     def configure_optimizers(self):
         optimizer = setup_optimizer(self, self.optimizer_cfg)
@@ -133,69 +121,134 @@ class GFlowNetModule(LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "interval": self.scheduler_cfg.get("interval", "epoch"),
-                    "monitor": self.scheduler_cfg.get("monitor", "val/loss"),
+                    "interval": self._cfg_get(self.scheduler_cfg, "interval", "epoch"),
+                    "monitor": self._cfg_get(self.scheduler_cfg, "monitor", "val/loss"),
                 },
             }
         return optimizer
 
     @staticmethod
-    def _to_plain_dict(config: Any) -> Dict[str, Any]:
-        if isinstance(config, DictConfig):
-            return dict(OmegaConf.to_container(config, resolve=True))  # type: ignore[arg-type]
-        if isinstance(config, dict):
-            return dict(config)
-        return {}
+    def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
+        if cfg is None:
+            return default
+        if isinstance(cfg, DictConfig):
+            return cfg.get(key, default)
+        if isinstance(cfg, dict):
+            return cfg.get(key, default)
+        return getattr(cfg, key, default)
+
+    @staticmethod
+    def _cfg_get_int(cfg: Any, key: str, default: int) -> int:
+        value = GFlowNetModule._cfg_get(cfg, key, default)
+        if value is None:
+            return int(default)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            try:
+                return int(value[0]) if len(value) > 0 else int(default)
+            except Exception:
+                return int(default)
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _parse_int_list(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, int):
+            return [int(value)]
+        if isinstance(value, (list, tuple, ListConfig)):
+            result: list[int] = []
+            for v in value:
+                iv = int(v)
+                if iv <= 0:
+                    continue
+                result.append(iv)
+            return result or [1]
+        try:
+            iv = int(value)
+            return [iv] if iv > 0 else [1]
+        except Exception:
+            return [1]
+
+    @staticmethod
+    def _infer_log_reward_offset(cfg: Any) -> float:
+        """Infer a log-scale offset so that success reward is normalized near zero."""
+        success_reward = 1.0
+        if cfg is not None:
+            try:
+                success_reward = float(GFlowNetModule._cfg_get(cfg, "success_reward", 1.0))
+            except Exception:
+                success_reward = 1.0
+        safe_reward = max(success_reward, 1e-8)
+        return float(math.log(safe_reward))
+
+    def _reward_offset_tensor(self, ref: torch.Tensor) -> torch.Tensor:
+        return torch.as_tensor(self._log_reward_offset, device=ref.device, dtype=ref.dtype)
+
+    def _sample_path_exists_for_gt(self, path_exists: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if path_exists is None or not self.training or self.gt_replay_ratio <= 0:
+            return None
+        mask = path_exists.bool()
+        if not mask.any():
+            return None
+        if self.gt_replay_ratio >= 1.0:
+            return mask
+        rand = torch.rand_like(mask.float())
+        return mask & (rand < self.gt_replay_ratio)
+
+    def _current_prior_alpha(self) -> float:
+        """Compute retriever soft-prior weight with optional linear annealing."""
+        alpha = float(self.retriever_prior_alpha)
+        cfg = self.retriever_prior_anneal
+        if cfg is None:
+            return alpha
+        try:
+            alpha_start = float(cfg.get("start", alpha))
+            alpha_end = float(cfg.get("end", 0.0))
+            steps = float(cfg.get("steps", 0.0))
+        except Exception:
+            return alpha
+        if steps <= 0:
+            return alpha_end
+        gstep = float(getattr(getattr(self, "trainer", None), "global_step", 0.0) or 0.0)
+        frac = min(max(gstep / steps, 0.0), 1.0)
+        return alpha_start + (alpha_end - alpha_start) * frac
+
+    def _current_pb_loss_weight(self) -> float:
+        """Weight for PB auxiliary losses; supports linear anneal."""
+        weight = float(self.pb_loss_weight)
+        cfg = self.pb_loss_anneal
+        if cfg is None:
+            return weight
+        try:
+            w_start = float(cfg.get("start", weight))
+            w_end = float(cfg.get("end", 0.0))
+            steps = float(cfg.get("steps", 0.0))
+        except Exception:
+            return weight
+        if steps <= 0:
+            return w_end
+        gstep = float(getattr(getattr(self, "trainer", None), "global_step", 0.0) or 0.0)
+        frac = min(max(gstep / steps, 0.0), 1.0)
+        return w_start + (w_end - w_start) * frac
 
     def setup(self, stage: str | None = None) -> None:
-        self._setup_resources()
-        self._setup_components()
-
-    def on_after_backward(self) -> None:
-        """梯度范数调试：按 debug_numeric_freq 将 Z 与 Actor 的梯度比写入独立日志。"""
-        if not self.debug_numeric:
-            return
         trainer = getattr(self, "trainer", None)
-        global_step = int(getattr(trainer, "global_step", 0)) if trainer is not None else 0
-        if global_step % self.debug_numeric_freq != 0:
-            return
-
-        z_params = list(self.log_z_head.parameters())
-        if self.log_z_condition is not None:
-            z_params += list(self.log_z_condition.parameters())
-        z_norm_sq = 0.0
-        for p in z_params:
-            if p.grad is not None:
-                g = p.grad.detach()
-                z_norm_sq += float(g.norm().item() ** 2)
-
-        actor_norm_sq = 0.0
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-            if name.startswith("log_z_head") or name.startswith("log_z_condition"):
-                continue
-            if p.grad is not None:
-                g = p.grad.detach()
-                actor_norm_sq += float(g.norm().item() ** 2)
-
-        z_norm = z_norm_sq ** 0.5
-        actor_norm = actor_norm_sq ** 0.5
-        ratio = z_norm / (actor_norm + 1e-8)
-
-        debug_logger.info(
-            "[GRAD_DEBUG] global_step=%d z_norm=%.4g actor_norm=%.4g ratio=%.4g",
-            global_step,
-            z_norm,
-            actor_norm,
-            ratio,
-        )
-        return
+        if trainer is None or getattr(trainer, "datamodule", None) is None:
+            raise ValueError("Shared resources must be provided via datamodule.shared_resources; trainer/datamodule missing.")
+        resources = getattr(trainer.datamodule, "shared_resources", None)
+        if resources is None:
+            raise ValueError("Shared resources not found on datamodule; ensure GAgentDataModule constructs SharedDataResources.")
+        self.embedder.setup(resources, device=self.device)
 
     def training_step(self, batch, batch_idx: int):
-        loss, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
+        # 强制开启梯度，防止上游误用了 no_grad/inference_mode 使图被剥离。
+        with torch.autograd.enable_grad():
+            loss, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
         batch_size = int(batch.num_graphs)
-        log_metric(self, "train/loss", loss, on_step=True, prog_bar=True, batch_size=batch_size)
+        log_metric(self, "train/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
         self._log_metrics(metrics, prefix="train", batch_size=batch_size)
         self._last_debug = {
             "reward": metrics.get("reward"),
@@ -207,25 +260,37 @@ class GFlowNetModule(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx: int):
+        self._active_eval_split = "val"
         _, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
         self._log_metrics(metrics, prefix="val", batch_size=int(batch.num_graphs))
+        self._active_eval_split = None
 
     def test_step(self, batch, batch_idx: int):
+        self._active_eval_split = "test"
         _, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
         self._log_metrics(metrics, prefix="test", batch_size=int(batch.num_graphs))
+        self._active_eval_split = None
+
+    def on_validation_epoch_end(self):
+        self._persist_eval_rollouts("val")
+
+    def on_test_epoch_end(self):
+        self._persist_eval_rollouts("test")
 
     def _log_metrics(self, metrics: Dict[str, torch.Tensor], prefix: str, batch_size: int) -> None:
         sync_dist = bool(self.trainer and getattr(self.trainer, "num_devices", 1) > 1)
         is_train = prefix == "train"
-        step_keys = {"reward", "success", "answer_reach_frac", "length", "avg_step_entropy"}
-        prog_bar_keys = {"reward", "success", "answer_reach_frac", "length"}
-        val_prog_bar_keys = {"success", "answer_f1"}
-        prog_bar_set = prog_bar_keys if is_train else val_prog_bar_keys
+        max_eval_prefix = max(self._eval_rollout_prefixes) if hasattr(self, "_eval_rollout_prefixes") else self._eval_rollouts
+        prog_bar_set = set(self._train_prog_bar if is_train else self._eval_prog_bar)
+        if not is_train and self._auto_success_k and max_eval_prefix > 1:
+            prog_bar_set.add(f"success@{max_eval_prefix}")
+        if not is_train and self._auto_path_hit_f1 and self._path_hit_k:
+            prog_bar_set.add(f"path_hit_f1@{max(self._path_hit_k)}")
         for name, value in metrics.items():
             if not torch.is_floating_point(value):
                 value = value.float()
             scalar = value.mean()
-            log_on_step = is_train and name in step_keys
+            log_on_step = self._log_on_step_train if is_train else False
             prog_bar = name in prog_bar_set
             log_metric(
                 self,
@@ -240,623 +305,819 @@ class GFlowNetModule(LightningModule):
 
     def _compute_batch_loss(self, batch: Any, batch_idx: int | None = None) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = self.device
-        self._ensure_embeddings()
-        self._validate_batch(batch)
+        should_debug = self._should_log_debug(batch_idx)
+        if not self.training:
+            self._refresh_eval_settings()
+        split = self._active_eval_split
+        collect_rollouts = (not self.training) and self._should_persist(split)
 
-        edge_index = batch.edge_index.to(device)
-        edge_batch = batch.batch[edge_index[0]].to(device)
-        node_global_ids = batch.node_global_ids.to(device)
-        node_ptr = batch.ptr.to(device)
+        embed = self.embedder.embed_batch(batch, device=device)
+        if should_debug:
+            self._log_batch_debug(batch=batch, embed=embed, batch_idx=batch_idx)
+            self._debug_batches_logged += 1
+        edge_tokens = embed.edge_tokens
+        edge_batch = embed.edge_batch
+        edge_ptr = embed.edge_ptr
+        node_ptr = embed.node_ptr
         num_graphs = int(node_ptr.numel() - 1)
-
-        edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
-        edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
-        edge_ptr[1:] = edge_counts.cumsum(0)
-
-        edge_labels = batch.edge_labels.to(device)
-        edge_scores = batch.edge_scores.to(device)
-        edge_relations = batch.edge_attr.to(device)
-
-        path_mask = None
-        if hasattr(batch, "gt_path_edge_local_ids") and batch.gt_path_edge_local_ids.numel() > 0:
-            path_mask = torch.zeros(edge_index.size(1), dtype=torch.bool, device=device)
-            gt_ids = batch.gt_path_edge_local_ids.to(device)
-            path_mask[gt_ids] = True
-        path_exists = batch.gt_path_exists.to(device)
-
-        heads_global = node_global_ids[edge_index[0]]
-        tails_global = node_global_ids[edge_index[1]]
-        head_emb = self._lookup_entities(heads_global)
-        tail_emb = self._lookup_entities(tails_global)
-        rel_emb = self._lookup_relations(edge_relations)
-        edge_features = torch.cat([head_emb, rel_emb, tail_emb], dim=-1)
-        edge_tokens = self.edge_projector(edge_features)
-        safe_scores = torch.nan_to_num(edge_scores, nan=0.0, posinf=0.0, neginf=0.0)
-        score_std = self._standardize_scores_flat(safe_scores, edge_batch)
-
-        question_tokens = self._prepare_question_tokens(batch.question_emb, batch_size=num_graphs, device=device)
-
-        rollout = self._rollout(
-            edge_tokens,
-            question_tokens,
-            batch,
-            edge_batch=edge_batch,
-            edge_ptr=edge_ptr,
-            node_ptr=node_ptr,
-            score_std=score_std,
-            safe_edge_scores=safe_scores,
-            path_mask=path_mask if path_mask is not None and path_mask.any() else None,
-            path_exists=path_exists,
-            batch_idx=batch_idx,
+        edge_scores = embed.edge_scores
+        edge_index = embed.edge_index
+        edge_relations = embed.edge_relations
+        edge_labels = embed.edge_labels
+        path_mask = embed.path_mask
+        path_exists = embed.path_exists
+        heads_global = embed.heads_global
+        tails_global = embed.tails_global
+        node_tokens = embed.node_tokens
+        question_tokens = embed.question_tokens
+        answer_ptr = batch._slice_dict["answer_entity_ids"].to(device)
+        start_node_ptr = batch._slice_dict.get("start_node_locals")
+        if start_node_ptr is None:
+            raise ValueError("Batch missing start_node_locals slice info; g_agent cache may be corrupt.")
+        start_summary = self.estimator.aggregate_start(
+            node_tokens=node_tokens,
+            start_node_locals=batch.start_node_locals.to(device),
+            start_node_ptr=start_node_ptr.to(device),
+            num_graphs=num_graphs,
+            question_tokens=question_tokens,
+            device=device,
         )
 
-        reward_out: RewardOutput = self.reward_fn(
-            selected_mask=rollout["selected_mask"],
-            edge_labels=edge_labels,
-            edge_scores=edge_scores,
-            edge_batch=edge_batch,
-            edge_heads=heads_global,
-            edge_tails=tails_global,
-            answer_entity_ids=batch.answer_entity_ids.to(device),
-            answer_ptr=batch._slice_dict["answer_entity_ids"].to(device),
-            path_mask=path_mask,
-            path_exists=path_exists,
-            reach_success=rollout["reach_success"],
-            reach_fraction=self._compute_answer_reach_fraction(
+        path_exists_tf = self._sample_path_exists_for_gt(path_exists)
+        log_z_context = self.estimator.build_context(start_summary, question_tokens)
+        log_z = self.estimator.log_z(log_z_context)
+
+        if self.training:
+            num_rollouts = 1
+        else:
+            try:
+                num_rollouts = int(self._eval_rollouts)
+            except Exception:
+                num_rollouts = 1
+            if num_rollouts <= 0:
+                num_rollouts = 1
+                debug_logger.warning(
+                    "[EVAL_ROLLOUTS_FIX] _eval_rollouts<=0 detected; clamped to 1 (batch_idx=%s).",
+                    str(batch_idx),
+                )
+        loss_list = []
+        metrics_list: list[Dict[str, torch.Tensor]] = []
+        use_gt_replay = self.training and path_exists_tf is not None and bool(path_exists_tf.any().item())
+        diversity_answers: list[set[int]] = [set() for _ in range(num_graphs)] if not self.training else []
+        diversity_paths: list[set[tuple[int, ...]]] = [set() for _ in range(num_graphs)] if not self.training else []
+        answers_hits_per_rollout: list[list[set[int]]] = [] if not self.training else []
+        log_pf_all: list[torch.Tensor] = []
+        log_reward_all: list[torch.Tensor] = []
+        # Success@K / path_hit_any@K 统计：eval 多次 roll-out 内只要命中一次即为 1
+        success_hits: list[torch.Tensor] = []
+        path_hits: list[torch.Tensor] = []
+        rollout_logs: list[Dict[str, torch.Tensor]] = []
+
+        for _ in range(num_rollouts):
+            rollout = self.actor.rollout(
+                batch=batch,
+                edge_tokens=edge_tokens,
+                question_tokens=question_tokens,
+                edge_batch=edge_batch,
+                edge_ptr=edge_ptr,
+                node_ptr=node_ptr,
+                edge_scores=edge_scores,
+                path_mask=path_mask if path_mask is not None and path_mask.any() else None,
+                path_exists=path_exists_tf,
+                training=self.training,
+                gt_replay=use_gt_replay,
+                prior_alpha=self._current_prior_alpha(),
+                batch_idx=batch_idx,
+            )
+            gt_log_pf = rollout.get("log_pf_gt") if isinstance(rollout, dict) else None
+
+            reward_out: RewardOutput = self.reward_fn(
                 selected_mask=rollout["selected_mask"],
+                edge_labels=edge_labels,
                 edge_batch=edge_batch,
                 edge_heads=heads_global,
                 edge_tails=tails_global,
+                edge_scores=edge_scores,
                 answer_entity_ids=batch.answer_entity_ids.to(device),
                 answer_ptr=batch._slice_dict["answer_entity_ids"].to(device),
-            ),
-        )
-
-        log_reward = torch.log(reward_out.reward.clamp(min=1e-6)) * self.log_reward_inv_temp
-        log_z = self.log_z_head(rollout["log_z_context"]).squeeze(-1)
-
-        length_int = rollout["length"].detach().clamp(min=0)
-        log_pb = torch.zeros_like(length_int)
-        self._assert_finite(log_reward, "log_reward")
-        self._assert_finite(log_z, "log_z")
-        self._assert_finite(rollout["log_pf"], "log_pf")
-        tb_loss = torch.mean((log_z + rollout["log_pf"] - log_pb - log_reward) ** 2)
-        loss = tb_loss
-
-        gt_log_pf = None
-        gt_loss_value = None
-        if self.gt_replay_weight > 0 and hasattr(batch, "gt_path_edge_local_ids") and batch.gt_path_edge_local_ids.numel() > 0:
-            gt_log_pf = self._compute_gt_log_pf(
-                edge_tokens=edge_tokens,
-                question_tokens=question_tokens,
-                batch=batch,
-                edge_batch=edge_batch,
-                edge_ptr=edge_ptr,
-                score_bias=score_std,
-                path_exists=path_exists,
-                heads_global=heads_global,
-                tails_global=tails_global,
-            )
-            mask_gt = path_exists.bool() if path_exists is not None else torch.zeros_like(length_int, dtype=torch.bool)
-            if mask_gt.any():
-                gt_loss_value = -gt_log_pf[mask_gt].mean()
-                loss = loss + self.gt_replay_weight * gt_loss_value
-        else:
-            gt_log_pf = None
-
-        length_safe = rollout["length"].detach().clamp(min=1.0)
-        avg_step_entropy = (-rollout["log_pf"].detach() / length_safe).mean()
-
-        metrics: Dict[str, torch.Tensor] = {
-            **reward_out.as_dict(),
-            "length": rollout["length"].detach(),
-            "path_exists_ratio": reward_out.path_exists.detach().float().mean() if hasattr(reward_out, "path_exists") else torch.tensor(0.0, device=device),
-            "tb_loss": tb_loss.detach(),
-            "avg_step_entropy": avg_step_entropy,
-        }
-
-        # Debug: reward / reach_fraction / success 关系 + reach_fraction 对拍
-        if self.debug_numeric and batch_idx is not None and batch_idx % self.debug_numeric_freq == 0:
-            try:
-                reward_vals = reward_out.reward.detach()
-                success_vals = reward_out.success.detach()
-                answer_frac = reward_out.answer_reach_frac.detach()
-                rollout_frac = rollout["reach_fraction"].detach()
-                length_vals = rollout["length"].detach()
-                path_exists_vals = reward_out.path_exists.detach().float() if hasattr(reward_out, "path_exists") else torch.zeros_like(success_vals)
-
-                debug_logger.info(
-                    "[REWARD_DEBUG] batch=%d reward(min/mean/max)=%.4g/%.4g/%.4g "
-                    "success(mean)=%.4g answer_reach_frac(mean)=%.4g rollout_reach_frac(mean)=%.4g "
-                    "length(mean)=%.4g path_exists(mean)=%.4g",
-                    batch_idx,
-                    reward_vals.min().item(), reward_vals.mean().item(), reward_vals.max().item(),
-                    success_vals.mean().item(),
-                    answer_frac.mean().item(),
-                    rollout_frac.mean().item(),
-                    length_vals.mean().item(),
-                    path_exists_vals.mean().item(),
-                )
-
-                # 小样本对拍 reach_fraction：impl vs naive（最多前 3 个图）
-                num_graphs = int(batch.ptr.numel() - 1)
-                num_check = min(3, num_graphs)
-                edge_batch_debug = edge_batch
-                heads_debug = heads_global
-                tails_debug = tails_global
-                selected_mask_debug = rollout["selected_mask"].detach()
-                success_debug = reward_out.success.detach()
-                answer_ids_debug = batch.answer_entity_ids.to(device)
-                answer_ptr_debug = batch._slice_dict["answer_entity_ids"].to(device)
-
-                frac_impl = self._compute_answer_reach_fraction(
-                    selected_mask=selected_mask_debug,
-                    edge_batch=edge_batch_debug,
-                    edge_heads=heads_debug,
-                    edge_tails=tails_debug,
-                    answer_entity_ids=answer_ids_debug,
-                    answer_ptr=answer_ptr_debug,
-                )
-
-                edge_ptr_debug = rollout.get("edge_ptr") if isinstance(rollout, dict) else None
-                if edge_ptr_debug is None:
-                    edge_ptr_debug = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
-                    edge_counts_debug = torch.bincount(edge_batch_debug, minlength=num_graphs)
-                    edge_ptr_debug[1:] = edge_counts_debug.cumsum(0)
-
-                for g in range(num_check):
-                    f_impl = frac_impl[g].item()
-
-                    es, ee = int(edge_ptr_debug[g].item()), int(edge_ptr_debug[g + 1].item())
-                    mask_g = (edge_batch_debug == g)
-                    selected_g = selected_mask_debug[mask_g]
-                    heads_g = heads_debug[mask_g]
-                    tails_g = tails_debug[mask_g]
-
-                    a_start, a_end = int(answer_ptr_debug[g].item()), int(answer_ptr_debug[g + 1].item())
-                    answers_g = answer_ids_debug[a_start:a_end]
-                    if answers_g.numel() == 0:
-                        continue
-
-                    selected_nodes = torch.cat([heads_g[selected_g], tails_g[selected_g]], dim=0)
-                    if selected_nodes.numel() == 0:
-                        f_naive = 0.0
-                    else:
-                        hits = []
-                        for a in answers_g.tolist():
-                            hits.append(int((selected_nodes == a).any().item()))
-                        f_naive = sum(hits) / max(len(hits), 1)
-
-                    success_g = float(success_debug[g].item()) if success_debug.numel() > g else float("nan")
-                    debug_logger.info(
-                        "[REACH_CHECK] batch=%d graph=%d success=%.4g frac_impl=%.4g frac_naive=%.4g answers=%d",
-                        batch_idx, g, success_g, f_impl, f_naive, answers_g.numel(),
-                    )
-
-                # 统计 success 与 frac_impl 的不一致情况，便于快速定位比例
-                if frac_impl.numel() == success_debug.numel():
-                    mismatch_pos = ((success_debug == 0) & (frac_impl > 0)).sum().item()
-                    mismatch_neg = ((success_debug > 0) & (frac_impl == 0)).sum().item()
-                    debug_logger.info(
-                        "[SUCCESS_MISMATCH] batch=%d mismatch_pos=%d mismatch_neg=%d total=%d",
-                        batch_idx,
-                        int(mismatch_pos),
-                        int(mismatch_neg),
-                        int(success_debug.numel()),
-                    )
-            except Exception as exc:  # pragma: no cover - debug 期间不抛训练
-                debug_logger.error("[REWARD_DEBUG_ERROR] batch=%s exc=%s", str(batch_idx), exc)
-
-        if gt_log_pf is not None:
-            metrics["gt_log_pf"] = gt_log_pf.detach()
-            mask_gt = path_exists.bool() if path_exists is not None else torch.zeros_like(length_int, dtype=torch.bool)
-            if mask_gt.any() and self.gt_replay_weight > 0:
-                if gt_loss_value is None:
-                    gt_loss_value = -gt_log_pf[mask_gt].mean()
-                metrics["gt_replay_loss"] = gt_loss_value.detach()
-
-        if not self.training:
-            extra_eval = self._compute_multi_path_metrics(
-                edge_tokens,
-                question_tokens,
-                batch,
-                edge_mask=None,
                 path_mask=path_mask,
                 path_exists=path_exists,
-            )
-            for name, tensor in extra_eval.items():
-                metrics[name] = tensor.detach()
-            if gt_log_pf is None and path_exists.any() and hasattr(batch, "gt_path_edge_local_ids") and batch.gt_path_edge_local_ids.numel() > 0:
-                gt_log_pf = self._compute_gt_log_pf(
-                    edge_tokens=edge_tokens,
-                    question_tokens=question_tokens,
-                    batch=batch,
+                reach_success=rollout["reach_success"],
+                reach_fraction=self._compute_answer_reach_fraction(
+                    selected_mask=rollout["selected_mask"],
                     edge_batch=edge_batch,
-                    edge_ptr=edge_ptr,
-                    score_bias=score_std,
-                    path_exists=path_exists,
-                    heads_global=heads_global,
-                    tails_global=tails_global,
+                    edge_heads=heads_global,
+                    edge_tails=tails_global,
+                    answer_entity_ids=batch.answer_entity_ids.to(device),
+                    answer_ptr=batch._slice_dict["answer_entity_ids"].to(device),
+                ),
+                edge_index=edge_index,
+                node_ptr=node_ptr,
+                edge_ptr=edge_ptr,
+                answer_node_locals=batch.answer_node_locals.to(device),
+                answer_node_ptr=batch._slice_dict["answer_node_locals"].to(device),
+                is_answer_reachable=batch.is_answer_reachable.view(-1).to(device),
+            )
+
+            # reward_out.log_reward 已经在 Reward 内部完成归一化，不再做二次偏移
+            log_reward = reward_out.log_reward
+            length_int = rollout["length"].detach().clamp(min=0)
+            log_pb, pb_losses = self.estimator.log_pb(
+                edge_tokens=edge_tokens,
+                node_tokens=node_tokens,
+                edge_batch=edge_batch,
+                selected_mask=rollout["selected_mask"],
+                question_tokens=question_tokens,
+                edge_index=edge_index,
+            )
+            self._assert_finite(log_reward, "log_reward")
+            self._assert_finite(log_z, "log_z")
+            self._assert_finite(rollout["log_pf"], "log_pf")
+            tb_loss = torch.mean((log_z + rollout["log_pf"] - log_pb - log_reward) ** 2)
+            pb_weight = self._current_pb_loss_weight() if self.learn_pb else 0.0
+            pb_loss_total = sum(pb_losses.values()) if pb_losses else torch.zeros((), device=device, dtype=log_z.dtype)
+            loss = tb_loss + pb_weight * pb_loss_total
+
+            if should_debug:
+                self._log_reward_prior_debug(
+                    rollout=rollout,
+                    reward_out=reward_out,
+                    edge_scores=edge_scores,
+                    edge_batch=edge_batch,
+                    log_reward=log_reward,
+                    batch_idx=batch_idx,
                 )
+
+            gt_loss_value = None
+            gt_ce_weight = float(self._cfg_get(self.training_cfg, "gt_loss_weight", 0.0))
+            if gt_ce_weight > 0.0 and use_gt_replay and gt_log_pf is not None and path_exists_tf is not None:
+                mask_gt = path_exists_tf.bool()
+                if mask_gt.any():
+                    self._assert_finite(gt_log_pf, "log_pf_gt")
+                    gt_loss_value = -gt_log_pf[mask_gt].mean() * gt_ce_weight
+                    loss = loss + gt_loss_value
+
+            length_safe = rollout["length"].detach().clamp(min=1.0)
+            avg_step_entropy = (-rollout["log_pf"].detach() / length_safe).mean()
+
+            reward_metrics = reward_out.as_dict()
+            rollout_reward = reward_metrics.pop("reward")
+            success_mean = reward_metrics.pop("success")
+            answer_coverage = reward_metrics.pop("answer_reach_frac")
+            if "gt_path_precision" in reward_metrics:
+                reward_metrics["path_hit_precision"] = reward_metrics.pop("gt_path_precision")
+            if "gt_path_recall" in reward_metrics:
+                reward_metrics["path_hit_recall"] = reward_metrics.pop("gt_path_recall")
+            if "gt_path_f1" in reward_metrics:
+                reward_metrics["path_hit_f1"] = reward_metrics.pop("gt_path_f1")
+
+            valid_graphs = (
+                path_exists.bool() if path_exists is not None else torch.ones(num_graphs, device=device, dtype=torch.bool)
+            )
+
+            # Top-K 边回溯命中率（按选择顺序前 K 条边）
+            if not self.training and self._path_hit_k:
+                sel_order = rollout["selection_order"]
+                for k_val in self._path_hit_k:
+                    k_int = int(k_val)
+                    topk_mask = (sel_order >= 0) & (sel_order < k_int)
+                    if path_mask is not None and path_mask.numel() == topk_mask.numel():
+                        edge_valid = path_mask.bool() & topk_mask & valid_graphs[edge_batch]
+                    else:
+                        edge_valid = torch.zeros_like(topk_mask, dtype=torch.bool)
+                    hits_topk = torch.bincount(
+                        edge_batch,
+                        weights=edge_valid.float(),
+                        minlength=num_graphs,
+                    )
+                    if path_mask is not None and path_mask.numel() == topk_mask.numel():
+                        gt_edge_mask = path_mask.bool() & valid_graphs[edge_batch]
+                        gt_counts = torch.bincount(
+                            edge_batch,
+                            weights=gt_edge_mask.float(),
+                            minlength=num_graphs,
+                        )
+                    else:
+                        gt_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+                    selected_counts = torch.bincount(
+                        edge_batch,
+                        weights=(rollout["selected_mask"].bool() & valid_graphs[edge_batch]).float(),
+                        minlength=num_graphs,
+                    )
+                    denom = torch.minimum(torch.full_like(selected_counts, float(k_int)), selected_counts)
+                    precision_topk = torch.where(
+                        valid_graphs & (denom > 0),
+                        hits_topk / denom.clamp(min=1.0),
+                        torch.zeros_like(hits_topk),
+                    )
+                    recall_topk = torch.where(
+                        valid_graphs & (gt_counts > 0),
+                        hits_topk / gt_counts.clamp(min=1.0),
+                        torch.zeros_like(hits_topk),
+                    )
+                    f1_topk = torch.where(
+                        (precision_topk + recall_topk) > 0,
+                        2 * precision_topk * recall_topk / (precision_topk + recall_topk),
+                        torch.zeros_like(precision_topk),
+                    )
+                    reward_metrics[f"path_hit_precision@{k_int}"] = precision_topk.mean()
+                    reward_metrics[f"path_hit_recall@{k_int}"] = recall_topk.mean()
+                    reward_metrics[f"path_hit_f1@{k_int}"] = f1_topk.mean()
+            # 确保所有配置的 K 都有键（即便 path_mask 为空）
+            if not self.training and self._path_hit_k:
+                zero = torch.tensor(0.0, device=device)
+                for k_val in self._path_hit_k:
+                    k_int = int(k_val)
+                    reward_metrics.setdefault(f"path_hit_precision@{k_int}", zero)
+                    reward_metrics.setdefault(f"path_hit_recall@{k_int}", zero)
+                    reward_metrics.setdefault(f"path_hit_f1@{k_int}", zero)
+
+            metrics: Dict[str, torch.Tensor] = {
+                **reward_metrics,
+                "rollout_reward": rollout_reward,
+                "success_mean": success_mean,
+                "answer_coverage": answer_coverage,
+                "length_mean": rollout["length"].detach(),
+                "path_exists_ratio": (
+                    reward_out.path_exists.detach().float().mean()
+                    if hasattr(reward_out, "path_exists")
+                    else torch.tensor(0.0, device=device)
+                ),
+                "tb_loss": tb_loss.detach(),
+                "avg_step_entropy": avg_step_entropy,
+                "pb_nll": pb_losses.get("pb_nll", torch.tensor(0.0, device=device)).detach(),
+            }
+            for key in ("pb_entropy", "pb_l2", "pb_avg_entropy"):
+                if key in pb_losses:
+                    metrics[key] = pb_losses[key].detach()
+            if gt_loss_value is not None:
+                metrics["gt_loss"] = gt_loss_value.detach()
+            if gt_log_pf is not None:
                 metrics["gt_log_pf"] = gt_log_pf.detach()
 
-        if self.debug_numeric:
-            split = "train" if self.training else "eval"
-            debug_logger.info(
-                f"[NUMERIC] {split} batch={batch_idx} "
-                f"reward(min/mean/max)=({reward_out.reward.min().item():.4g}/"
-                f"{reward_out.reward.mean().item():.4g}/"
-                f"{reward_out.reward.max().item():.4g}) "
-                f"log_z(min/mean/max)=({log_z.min().item():.4g}/"
-                f"{log_z.mean().item():.4g}/"
-                f"{log_z.max().item():.4g}) "
-                f"log_pf(min/mean/max)=({rollout['log_pf'].min().item():.4g}/"
-                f"{rollout['log_pf'].mean().item():.4g}/"
-                f"{rollout['log_pf'].max().item():.4g}) "
-                f"tb_loss={tb_loss.item():.4g}"
+            loss_list.append(loss)
+            metrics_list.append(metrics)
+            if collect_rollouts:
+                rollout_logs.append(
+                    {
+                        "selected_mask": rollout["selected_mask"].detach().cpu(),
+                        "selection_order": rollout["selection_order"].detach().cpu(),
+                        "log_pf": rollout["log_pf"].detach().cpu(),
+                        "log_reward": log_reward.detach().cpu(),
+                        "reach_success": rollout["reach_success"].detach().cpu(),
+                    }
+                )
+
+            if not self.training:
+                log_pf_all.append(rollout["log_pf"].detach())
+                log_reward_all.append(log_reward.detach())
+                success_hits.append(rollout["reach_success"].bool())
+                if path_mask is not None and path_mask.numel() == rollout["selected_mask"].numel():
+                    hit_edge = rollout["selected_mask"].bool() & path_mask.bool() & valid_graphs[edge_batch]
+                else:
+                    hit_edge = torch.zeros_like(rollout["selected_mask"], dtype=torch.bool)
+                per_graph_hit = torch.zeros(num_graphs, device=device, dtype=torch.bool)
+                if hit_edge.any():
+                    per_graph_hit = torch.bincount(edge_batch, weights=hit_edge.float(), minlength=num_graphs) > 0
+                per_graph_hit = per_graph_hit & valid_graphs
+                path_hits.append(per_graph_hit)
+                per_graph_answer_hits: list[set[int]] = [set() for _ in range(num_graphs)]
+                sel_mask = rollout["selected_mask"].bool()
+                sel_order = rollout["selection_order"]
+                for g in range(num_graphs):
+                    es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
+                    mask_g = sel_mask[es:ee]
+                    if mask_g.any():
+                        order_g = sel_order[es:ee][mask_g]
+                        idx_g = torch.where(mask_g)[0]
+                        sorted_edges = idx_g[torch.argsort(order_g)]
+                        path_sig = tuple(int(es + e.item()) for e in sorted_edges)
+                    else:
+                        path_sig = ()
+                    diversity_paths[g].add(path_sig)
+
+                    answers_start, answers_end = int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())
+                    answers = batch.answer_entity_ids[answers_start:answers_end].to(device)
+                    if answers.numel() == 0:
+                        continue
+                    if mask_g.any():
+                        selected_nodes = torch.unique(torch.cat([heads_global[es:ee][mask_g], tails_global[es:ee][mask_g]]))
+                    else:
+                        selected_nodes = torch.empty(0, device=device, dtype=torch.long)
+                    if selected_nodes.numel() == 0:
+                        continue
+                    found = set(int(x) for x in selected_nodes.tolist()) & set(int(x) for x in answers.tolist())
+                    diversity_answers[g].update(found)
+                    per_graph_answer_hits[g] = found
+                answers_hits_per_rollout.append(per_graph_answer_hits)
+
+        if not loss_list:
+            # Defensive: avoid empty TensorList when eval rollouts unexpectedly skipped.
+            loss = torch.zeros((), device=device, dtype=torch.float32)
+            metrics: Dict[str, torch.Tensor] = {}
+            if not self.training:
+                debug_logger.warning(
+                    "[EVAL_EMPTY] No eval rollouts recorded (batch_idx=%s, num_rollouts=%s).",
+                    str(batch_idx),
+                    str(self._eval_rollouts),
+                )
+        elif num_rollouts > 1:
+            loss = torch.stack(loss_list, dim=0).mean()
+            metrics = self._aggregate_metrics(metrics_list)
+        else:
+            loss = loss_list[0]
+            metrics = metrics_list[0]
+
+        if self.training and not loss.requires_grad:
+
+            def _flag(t: torch.Tensor, name: str) -> str:
+                return f"{name}: req={t.requires_grad} grad_fn={t.grad_fn is not None} shape={tuple(t.shape)}"
+
+            debug_logger.error(
+                "[LOSS_STATUS] grad_enabled=%s loss_is_leaf=%s len_loss_list=%d loss_list_req=%s | %s | %s | %s | %s | pb_loss_total req=%s grad_fn=%s pb_losses_keys=%s",
+                torch.is_grad_enabled(),
+                loss.is_leaf,
+                len(loss_list),
+                [t.requires_grad for t in loss_list],
+                _flag(loss, "loss"),
+                _flag(tb_loss, "tb_loss"),
+                _flag(log_z, "log_z"),
+                _flag(rollout["log_pf"], "log_pf"),
+                pb_loss_total.requires_grad,
+                pb_loss_total.grad_fn is not None,
+                list(pb_losses.keys()) if pb_losses else [],
+            )
+            raise RuntimeError("Training loss has no grad; check LOSS_STATUS log for detached tensors.")
+
+        if not self.training:
+            if not log_pf_all:
+                # No rollouts recorded (defensive for empty eval), return zeros.
+                metrics["modes_found"] = torch.tensor(0.0, device=device)
+                metrics["modes_recall"] = torch.tensor(0.0, device=device)
+                metrics["unique_paths"] = torch.tensor(0.0, device=device)
+                metrics["logpf_logr_corr"] = torch.tensor(0.0, device=device)
+                metrics["logpf_logr_spearman"] = torch.tensor(0.0, device=device)
+                debug_logger.warning(
+                    "[EVAL_EMPTY] log_pf_all empty after rollouts (batch_idx=%s, num_rollouts=%s).",
+                    str(batch_idx),
+                    str(self._eval_rollouts),
+                )
+                return loss, metrics
+
+            modes_found = torch.tensor([len(diversity_answers[g]) for g in range(num_graphs)], device=device, dtype=torch.float32)
+            answer_counts = (answer_ptr[1:] - answer_ptr[:-1]).to(device).clamp(min=1)
+            modes_recall = modes_found / answer_counts
+            unique_paths = torch.tensor([len(diversity_paths[g]) for g in range(num_graphs)], device=device, dtype=torch.float32)
+            log_pf_flat = torch.cat(log_pf_all).flatten()
+            log_reward_flat = torch.cat(log_reward_all).flatten()
+            corr = torch.tensor(0.0, device=device)
+            if log_pf_flat.numel() > 1 and torch.var(log_pf_flat) > 0 and torch.var(log_reward_flat) > 0:
+                corr = torch.corrcoef(torch.stack([log_pf_flat, log_reward_flat]))[0, 1]
+            # Spearman:对排名一致性更鲁棒
+            spearman = torch.tensor(0.0, device=device)
+            if log_pf_flat.numel() > 1 and torch.var(log_pf_flat) > 0 and torch.var(log_reward_flat) > 0:
+                rank_pf = torch.argsort(torch.argsort(log_pf_flat))
+                rank_r = torch.argsort(torch.argsort(log_reward_flat))
+                spearman = torch.corrcoef(torch.stack([rank_pf.float(), rank_r.float()]))[0, 1]
+
+            metrics["modes_found"] = modes_found.mean()
+            metrics["modes_recall"] = modes_recall.mean()
+            metrics["unique_paths"] = unique_paths.mean()
+            metrics["logpf_logr_corr"] = corr
+            metrics["logpf_logr_spearman"] = spearman
+            if self._eval_rollout_prefixes:
+                k_values = [int(k) for k in self._eval_rollout_prefixes]
+                valid_graphs = (
+                    path_exists.bool() if path_exists is not None else torch.ones(num_graphs, device=device, dtype=torch.bool)
+                )
+                success_stack = (
+                    torch.stack(success_hits, dim=0)
+                    if success_hits
+                    else torch.zeros(1, num_graphs, device=device, dtype=torch.bool)
+                )
+                path_stack = (
+                    torch.stack(path_hits, dim=0) if path_hits else torch.zeros(1, num_graphs, device=device, dtype=torch.bool)
+                )
+                rollouts_avail = success_stack.size(0)
+                answer_counts = (answer_ptr[1:] - answer_ptr[:-1]).to(device)
+                valid_answers = (answer_counts > 0) & valid_graphs
+                for k_int in k_values:
+                    k_clamped = min(max(k_int, 1), rollouts_avail)
+                    success_k = success_stack[:k_clamped].any(dim=0).float().mean()
+                    metrics[f"success@{k_int}"] = success_k
+                    hit_any = path_stack[:k_clamped].any(dim=0)
+                    if valid_graphs.any():
+                        denom = valid_graphs.float().sum().clamp(min=1.0)
+                        hit_k = (hit_any & valid_graphs).float().sum() / denom
+                    else:
+                        hit_k = torch.tensor(0.0, device=device)
+                    metrics[f"path_hit_any@{k_int}"] = hit_k
+                    # 答案覆盖（并集）与命中（Best-of-K）
+                    if answers_hits_per_rollout and valid_answers.any():
+                        hits_union = []
+                        hit_any_answer = []
+                        for g in range(num_graphs):
+                            union_set: set[int] = set()
+                            for r in range(k_clamped):
+                                union_set.update(answers_hits_per_rollout[r][g])
+                            hits_union.append(len(union_set))
+                            hit_any_answer.append(len(union_set) > 0)
+                        hits_union_t = torch.tensor(hits_union, device=device, dtype=torch.float32)
+                        hit_any_answer_t = torch.tensor(hit_any_answer, device=device, dtype=torch.bool)
+                        denom = valid_answers.float().sum().clamp(min=1.0)
+                        recall_union = torch.where(
+                            valid_answers,
+                            hits_union_t / answer_counts.clamp(min=1.0),
+                            torch.zeros_like(hits_union_t),
+                        )
+                        metrics[f"answer_hit_any@{k_int}"] = (hit_any_answer_t & valid_answers).float().sum() / denom
+                        metrics[f"answer_recall_union@{k_int}"] = (recall_union * valid_answers.float()).sum() / denom
+        if collect_rollouts and rollout_logs:
+            self._buffer_rollout_records(
+                split=split or "test",
+                batch=batch,
+                rollout_logs=rollout_logs,
+                heads_global=heads_global.detach().cpu(),
+                tails_global=tails_global.detach().cpu(),
+                edge_relations=edge_relations.detach().cpu(),
+                edge_scores=edge_scores.detach().cpu(),
+                edge_labels=edge_labels.detach().cpu(),
+                edge_ptr=edge_ptr.detach().cpu(),
+                node_ptr=node_ptr.detach().cpu(),
+                start_node_ptr=batch._slice_dict["start_node_locals"].detach().cpu(),
+                start_node_locals=batch.start_node_locals.detach().cpu(),
             )
         return loss, metrics
 
-    def _rollout(
-        self,
-        edge_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        batch: Any,
-        edge_batch: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        node_ptr: torch.Tensor,
-        score_std: torch.Tensor,
-        safe_edge_scores: torch.Tensor,
-        path_mask: Optional[torch.Tensor],
-        path_exists: Optional[torch.Tensor],
-        batch_idx: int | None = None,
-    ) -> Dict[str, torch.Tensor]:
-        device = edge_tokens.device
-        num_graphs = int(node_ptr.numel() - 1)
-        # PyG slice sanity: pointers must be per-field, not cross-field reused.
-        assert batch._slice_dict["answer_entity_ids"].shape == batch._slice_dict["answer_node_locals"].shape, (
-            "answer_entity_ids ptr must align with answer_node_locals ptr"
-        )
-        if batch.gt_path_edge_local_ids.numel() > 0:
-            max_gt = int(batch.gt_path_edge_local_ids.max().item())
-            assert max_gt < batch.edge_index.size(1), "gt_path_edge_local_ids exceeds edge_index size"
-        graph_dict = {
-            "edge_index": batch.edge_index.to(device),
-            "edge_batch": edge_batch,
-            "node_global_ids": batch.node_global_ids.to(device),
-            "node_ptr": node_ptr,
-            "edge_ptr": edge_ptr,
-            "start_node_locals": batch.start_node_locals.to(device),
-            "start_ptr": batch._slice_dict["start_node_locals"].to(device),
-            "start_entity_ids": batch.start_entity_ids.to(device),
-            "start_entity_ptr": batch._slice_dict["start_entity_ids"].to(device),
-            "answer_node_locals": batch.answer_node_locals.to(device),
-            "answer_ptr": batch._slice_dict["answer_entity_ids"].to(device),
-            "answer_entity_ids": batch.answer_entity_ids.to(device),
-            "edge_relations": batch.edge_attr.to(device),
-            "edge_scores": batch.edge_scores.to(device),
-            "edge_labels": batch.edge_labels.to(device),
-            "top_edge_mask": batch.top_edge_mask.to(device),
-            "gt_path_edge_local_ids": batch.gt_path_edge_local_ids.to(device),
-            "gt_edge_ptr": batch._slice_dict["gt_path_edge_local_ids"].to(device),
-            "gt_path_exists": batch.gt_path_exists.to(device),
-            "is_answer_reachable": batch.is_answer_reachable.to(device),
-        }
-        state = self.env.reset(graph_dict, device=device)
+    @staticmethod
+    def _sort_edges_by_graph(batch: Any) -> Any:
+        edge_index = batch.edge_index
+        edge_batch = batch.batch[edge_index[0]]
+        perm = torch.argsort(edge_batch)
+        if perm.numel() == 0:
+            return batch
+        # 重排所有按边对齐的字段，确保同图边连续，edge_ptr 合法。
+        batch.edge_index = edge_index[:, perm]
+        if hasattr(batch, "edge_attr"):
+            batch.edge_attr = batch.edge_attr[perm]
+        if hasattr(batch, "edge_labels"):
+            batch.edge_labels = batch.edge_labels[perm]
+        if hasattr(batch, "top_edge_mask"):
+            batch.top_edge_mask = batch.top_edge_mask[perm]
+        if hasattr(batch, "edge_relations"):
+            batch.edge_relations = batch.edge_relations[perm]
 
-        log_pf = torch.zeros(num_graphs, dtype=torch.float32, device=device)
-        log_z_context: Optional[torch.Tensor] = None
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
+        if hasattr(batch, "gt_path_edge_local_ids") and batch.gt_path_edge_local_ids.numel() > 0:
+            batch.gt_path_edge_local_ids = inv_perm[batch.gt_path_edge_local_ids]
+        return batch
 
-        edge_logit_bias = self.policy_edge_score_bias * score_std
-        debug_logged = False
+    def _should_log_debug(self, batch_idx: int | None) -> bool:
+        if self._debug_batches_to_log <= 0:
+            return False
+        if not debug_logger.isEnabledFor(logging.INFO):
+            return False
+        return self._debug_batches_logged < self._debug_batches_to_log
 
-        for step in range(self.max_steps + 1):
-            if state.done.all():
-                break
-
-            action_mask_edges = self.env.action_mask_edges(state)
-            edge_logits, stop_logits, cls_out = self.policy(
-                edge_tokens,
-                question_tokens,
-                edge_batch,
-                state.selected_mask,
-                edge_heads=batch.node_global_ids[batch.edge_index[0]].to(device),
-                edge_tails=batch.node_global_ids[batch.edge_index[1]].to(device),
-                current_tail=state.current_tail,
-            )
-
-            if (
-                self.debug_actions
-                and self.debug_actions_steps > 0
-                and step < self.debug_actions_steps
-                and (batch_idx is None or batch_idx == 0)
-                and not debug_logged
-            ):
-                g_idx = 0
-                start_idx = int(edge_ptr[g_idx].item())
-                end_idx = int(edge_ptr[g_idx + 1].item())
-                edge_count = end_idx - start_idx
-                start_ptr = graph_dict["start_ptr"]
-                s0, s1 = int(start_ptr[g_idx].item()), int(start_ptr[g_idx + 1].item())
-                start_nodes = graph_dict["start_node_locals"][s0:s1].detach().cpu().tolist()
-                current_tail = int(state.current_tail[g_idx].item()) if state.current_tail.numel() > g_idx else -1
-                debug_logger.info(
-                    "[DEBUG_ACTION] g0 step=%d edges=%d starts_local=%s current_tail=%d",
-                    step,
-                    edge_count,
-                    start_nodes,
-                    current_tail,
-                )
-                if edge_count > 0:
-                    mask_slice = action_mask_edges[start_idx:end_idx]
-                    local_logits = edge_logits[start_idx:end_idx]
-                    local_bias = edge_logit_bias[start_idx:end_idx]
-                    local_scores = safe_edge_scores[start_idx:end_idx]
-                    if mask_slice.any():
-                        masked_logits = local_logits.masked_fill(~mask_slice, float("-inf"))
-                        top_local_idx = int(torch.argmax(masked_logits).item())
-                        edge_id = start_idx + top_local_idx
-                        head_id = int(batch.node_global_ids[batch.edge_index[0, edge_id]].item())
-                        tail_id = int(batch.node_global_ids[batch.edge_index[1, edge_id]].item())
-                        debug_logger.info(
-                            "[DEBUG_ACTION] g0 top_edge=%d head=%d tail=%d logit=%.4g bias=%.4g score=%.4g masked=%s",
-                            edge_id,
-                            head_id,
-                            tail_id,
-                            float(local_logits[top_local_idx].item()),
-                            float(local_bias[top_local_idx].item()),
-                            float(local_scores[top_local_idx].item()),
-                            bool(mask_slice[top_local_idx].item()),
-                        )
-                    else:
-                        debug_logger.info("[DEBUG_ACTION] g0 has no valid edges under mask at step %d", step)
-                debug_logged = True
-
-            if log_z_context is None:
-                start_ptr = batch._slice_dict["start_entity_ids"].to(device)
-                max_start = int((start_ptr[1:] - start_ptr[:-1]).max().item()) if start_ptr.numel() > 1 else 0
-                start_entity_ids = torch.full((num_graphs, max_start), -1, dtype=torch.long, device=device) if max_start > 0 else torch.empty(num_graphs, 0, dtype=torch.long, device=device)
-                start_entity_mask = torch.zeros_like(start_entity_ids, dtype=torch.bool)
-                for g in range(num_graphs):
-                    s, e = int(start_ptr[g].item()), int(start_ptr[g + 1].item())
-                    if s == e:
-                        continue
-                    vals = batch.start_entity_ids[s:e].to(device)
-                    l = min(max_start, vals.numel())
-                    start_entity_ids[g, :l] = vals[:l]
-                    start_entity_mask[g, :l] = True
-                log_z_context = self._build_log_z_context(
-                    cls_out,
-                    start_entity_ids,
-                    start_entity_mask if start_entity_ids.numel() > 0 else torch.zeros(num_graphs, 0, dtype=torch.bool, device=device),
-                    question_tokens,
-                )
-
-            actions = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
-            log_pf_vec = torch.zeros(num_graphs, dtype=torch.float32, device=device)
-
-            epsilon = self.exploration_epsilon if self.training else self.eval_exploration_epsilon
-            for g in range(num_graphs):
-                es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
-                if es == ee or state.done[g]:
-                    actions[g] = ee
-                    continue
-                mask_slice = action_mask_edges[es:ee]
-                if not mask_slice.any():
-                    actions[g] = ee
-                    continue
-                logits_slice = edge_logits[es:ee] + edge_logit_bias[es:ee]
-                stop_logit = stop_logits[g]
-                # 只对合法动作分布混入 epsilon，非法动作概率为 0
-                valid_mask = torch.cat([mask_slice, torch.tensor([True], device=device)])  # stop 一直合法
-                logits_slice = logits_slice.masked_fill(~mask_slice, -1e9)
-                cat_logits = torch.cat([logits_slice, stop_logit.view(1)])
-                cat_logits = cat_logits.masked_fill(~valid_mask, -1e9)
-                if self.policy_temperature != 1.0:
-                    cat_logits = cat_logits / self.policy_temperature
-                probs = torch.softmax(cat_logits, dim=0)
-                if epsilon and epsilon > 0:
-                    uniform = valid_mask.float()
-                    uniform = uniform / uniform.sum().clamp(min=1.0)
-                    probs = (1 - epsilon) * probs + epsilon * uniform
-                action = torch.distributions.Categorical(probs=probs).sample()
-                log_pf_vec[g] = torch.log(probs[action].clamp(min=torch.finfo(probs.dtype).eps))
-                if action == logits_slice.numel():
-                    actions[g] = ee
-                else:
-                    actions[g] = es + action
-
-            log_pf = log_pf + log_pf_vec
-            state = self.env.step(state, actions, step_index=step)
-
-        reach_success = state.answer_hits.float()
-        reach_fraction = reach_success
-        length = torch.zeros(num_graphs, dtype=torch.float32, device=device)
-        for g in range(num_graphs):
-            es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
-            length[g] = state.selected_mask[es:ee].sum().float()
-
-        if log_z_context is None:
-            raise RuntimeError("log_z_context was not set during rollout.")
-
-        return {
-            "log_pf": log_pf,
-            "log_z_context": log_z_context,
-            "selected_mask": state.selected_mask,
-            "selection_order": state.selection_order,
-            "actions": actions,
-            "reach_fraction": reach_fraction,
-            "reach_success": reach_success.float(),
-            "length": length,
-        }
-
-    def _compute_gt_log_pf(
+    def _log_reward_prior_debug(
         self,
         *,
-        edge_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        batch: Any,
+        rollout: Dict[str, torch.Tensor],
+        reward_out: RewardOutput,
+        edge_scores: torch.Tensor,
         edge_batch: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        score_bias: torch.Tensor,
-        path_exists: torch.Tensor,
+        log_reward: torch.Tensor,
+        batch_idx: int | None,
+        top_pct: float = 0.1,
+    ) -> None:
+        """粗粒度打印 reward vs retriever score，用于 overfit / 逸出先验的对拍。"""
+        try:
+            sel = rollout["selected_mask"].detach().cpu()
+            scores = edge_scores.detach().cpu()
+            e_batch = edge_batch.detach().cpu()
+            reward = reward_out.reward.detach().cpu()
+            log_r = log_reward.detach().cpu()
+            success = reward_out.success.detach().cpu()
+        except Exception as exc:  # pragma: no cover - debug only
+            debug_logger.error("Failed to collect reward/prior debug tensors (batch_idx=%s): %s", str(batch_idx), exc)
+            return
+
+        num_graphs = int(reward.numel())
+        graphs_to_log = min(num_graphs, self._debug_graphs_to_log)
+        for g in range(graphs_to_log):
+            mask_g = e_batch == g
+            sel_g = sel[mask_g]
+            scores_g = scores[mask_g]
+            if scores_g.numel() == 0:
+                continue
+            sel_any = sel_g.any().item()
+            mean_all = float(scores_g.mean().item())
+            mean_sel = float(scores_g[sel_g].mean().item()) if sel_any else 0.0
+            max_sel = float(scores_g[sel_g].max().item()) if sel_any else 0.0
+            try:
+                # torch.quantile 不可用时回退 numpy
+                q_thr = float(torch.quantile(scores_g, 1.0 - top_pct).item())
+            except Exception:
+                import numpy as np  # lazy import
+
+                q_thr = float(np.quantile(scores_g.numpy(), 1.0 - top_pct))
+            sel_frac_top = (
+                float(((sel_g) & (scores_g >= q_thr)).float().sum().item()) / float(max(sel_g.float().sum().item(), 1.0))
+                if sel_any
+                else 0.0
+            )
+
+    def _log_batch_debug(self, *, batch: Any, embed, batch_idx: int | None) -> None:
+        try:
+            node_ptr = batch.ptr.detach().cpu()
+            edge_ptr = embed.edge_ptr.detach().cpu()
+            edge_index = batch.edge_index.detach().cpu()
+            edge_batch = embed.edge_batch.detach().cpu()
+            node_global_ids = batch.node_global_ids.detach().cpu()
+            start_node_locals = batch.start_node_locals.detach().cpu()
+            answer_node_locals = batch.answer_node_locals.detach().cpu()
+            gt_edges = batch.gt_path_edge_local_ids.detach().cpu()
+            start_ptr = batch._slice_dict.get("start_node_locals")
+            answer_ptr = batch._slice_dict.get("answer_node_locals")
+            start_entity_ptr = batch._slice_dict.get("start_entity_ids")
+            answer_entity_ptr = batch._slice_dict.get("answer_entity_ids")
+            path_ptr = batch._slice_dict.get("gt_path_edge_local_ids")
+        except Exception as exc:  # pragma: no cover - defensive
+            debug_logger.error("Failed to collect debug tensors (batch_idx=%s): %s", str(batch_idx), exc)
+            return
+
+        num_graphs = int(node_ptr.numel() - 1)
+        total_edges = int(edge_index.size(1))
+        total_nodes = int(node_global_ids.numel())
+        monotonic_edge_batch = bool(edge_batch.numel() < 2 or torch.all(edge_batch[:-1] <= edge_batch[1:]))
+        debug_logger.info(
+            "[BATCH_DEBUG] batch_idx=%s num_graphs=%d nodes=%d edges=%d edge_batch_sorted=%s",
+            str(batch_idx),
+            num_graphs,
+            total_nodes,
+            total_edges,
+            monotonic_edge_batch,
+        )
+
+        graphs_to_log = min(num_graphs, self._debug_graphs_to_log)
+        for g in range(graphs_to_log):
+            ns, ne = int(node_ptr[g].item()), int(node_ptr[g + 1].item())
+            es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
+            nodes = node_global_ids[ns:ne]
+            start_slice = slice(int(start_ptr[g].item()), int(start_ptr[g + 1].item())) if start_ptr is not None else slice(0, 0)
+            answer_slice = (
+                slice(int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())) if answer_ptr is not None else slice(0, 0)
+            )
+            path_slice = slice(int(path_ptr[g].item()), int(path_ptr[g + 1].item())) if path_ptr is not None else slice(0, 0)
+
+            start_nodes = start_node_locals[start_slice]
+            answer_nodes = answer_node_locals[answer_slice]
+            path_edges = gt_edges[path_slice]
+
+            start_oob = start_nodes.numel() > 0 and ((start_nodes < ns) | (start_nodes >= ne)).any().item()
+            answer_oob = answer_nodes.numel() > 0 and ((answer_nodes < ns) | (answer_nodes >= ne)).any().item()
+            path_oob = path_edges.numel() > 0 and ((path_edges < es) | (path_edges >= ee)).any().item()
+
+            edge_batch_slice = edge_batch[es:ee]
+            edge_batch_mismatch = bool(edge_batch_slice.numel() > 0 and torch.unique(edge_batch_slice).numel() != 1)
+            node_dup = max(int(nodes.numel() - torch.unique(nodes).numel()), 0)
+
+            start_entities = (
+                int(start_entity_ptr[g + 1].item() - start_entity_ptr[g].item()) if start_entity_ptr is not None else 0
+            )
+            answer_entities = (
+                int(answer_entity_ptr[g + 1].item() - answer_entity_ptr[g].item()) if answer_entity_ptr is not None else 0
+            )
+
+            summary: Dict[str, Any] = {
+                "graph": g,
+                "node_span": [ns, ne],
+                "edge_span": [es, ee],
+                "node_dup": node_dup,
+                "edge_batch_ok": not edge_batch_mismatch,
+                "start_locals": (start_nodes - ns).tolist(),
+                "start_entities": start_entities,
+                "answer_locals": (answer_nodes - ns).tolist(),
+                "answer_entities": answer_entities,
+                "path_edges_local": (path_edges - es).tolist(),
+                "flags": {
+                    "start_oob": bool(start_oob),
+                    "answer_oob": bool(answer_oob),
+                    "path_oob": bool(path_oob),
+                },
+            }
+            debug_logger.info("[GRAPH_DEBUG] %s", summary)
+
+    @staticmethod
+    def _aggregate_metrics(metrics_list: list[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        if not metrics_list:
+            return {}
+        keys = metrics_list[0].keys()
+        aggregated: Dict[str, torch.Tensor] = {}
+        for key in keys:
+            stack = torch.stack([m[key] for m in metrics_list], dim=0)
+            aggregated[key] = stack.float().mean(dim=0)
+        return aggregated
+
+    def _refresh_eval_settings(self) -> None:
+        """Ensure eval rollouts and path_hit_k reflect current config (even when loading old checkpoints)."""
+        eval_cfg = self.evaluation_cfg or {}
+        rollouts_cfg = self._cfg_get(eval_cfg, "num_eval_rollouts", self._eval_rollouts if hasattr(self, "_eval_rollouts") else 1)
+        if isinstance(rollouts_cfg, (list, tuple, ListConfig)):
+            prefixes = sorted({int(max(1, v)) for v in rollouts_cfg})
+            self._eval_rollouts = max(prefixes) if prefixes else 1
+            self._eval_rollout_prefixes = prefixes or [self._eval_rollouts]
+        else:
+            self._eval_rollouts = int(max(1, self._cfg_get_int(eval_cfg, "num_eval_rollouts", 1)))
+            self._eval_rollout_prefixes = [self._eval_rollouts]
+        self._path_hit_k = self._parse_int_list(self._cfg_get(eval_cfg, "path_hit_k", getattr(self, "_path_hit_k", [5])))
+
+    def _should_persist(self, split: Optional[str]) -> bool:
+        cfg = getattr(self, "eval_persist_cfg", None) or {}
+        if not cfg.get("enabled"):
+            return False
+        splits = cfg.get("splits") or ["test"]
+        return (split or "test") in splits
+
+    @staticmethod
+    def _extract_batch_meta(batch: Any, num_graphs: int) -> tuple[list[str], list[str]]:
+        raw_ids = getattr(batch, "sample_id", None)
+        if raw_ids is None:
+            sample_ids = [str(i) for i in range(num_graphs)]
+        elif isinstance(raw_ids, (list, tuple)):
+            sample_ids = [str(s) for s in raw_ids]
+        elif torch.is_tensor(raw_ids):
+            sample_ids = [str(x.item()) for x in raw_ids.view(-1)]
+        else:
+            sample_ids = [str(raw_ids) for _ in range(num_graphs)]
+
+        raw_q = getattr(batch, "question", None)
+        if raw_q is None:
+            questions = ["" for _ in range(num_graphs)]
+        elif isinstance(raw_q, (list, tuple)):
+            questions = [str(q) for q in raw_q]
+        elif torch.is_tensor(raw_q):
+            if raw_q.numel() == num_graphs:
+                questions = [str(v.item()) for v in raw_q.view(-1)]
+            else:
+                questions = [str(raw_q.cpu().tolist()) for _ in range(num_graphs)]
+        else:
+            questions = [str(raw_q) for _ in range(num_graphs)]
+        return sample_ids, questions
+
+    @staticmethod
+    def _value_at(tensor: torch.Tensor, idx: int) -> torch.Tensor:
+        flat = tensor.view(-1)
+        if flat.numel() == 0:
+            return torch.tensor(0.0)
+        if idx < flat.numel():
+            return flat[idx]
+        return flat[-1]
+
+    def _buffer_rollout_records(
+        self,
+        *,
+        split: str,
+        batch: Any,
+        rollout_logs: list[Dict[str, torch.Tensor]],
         heads_global: torch.Tensor,
         tails_global: torch.Tensor,
-    ) -> torch.Tensor:
-        """Off-policy 计算 GT 路径的 log_pf（仅在 eval 调用，避免训练期开销）。"""
-        device = edge_tokens.device
+        edge_relations: torch.Tensor,
+        edge_scores: torch.Tensor,
+        edge_labels: torch.Tensor,
+        edge_ptr: torch.Tensor,
+        node_ptr: torch.Tensor,
+        start_node_ptr: torch.Tensor,
+        start_node_locals: torch.Tensor,
+    ) -> None:
+        if not self._should_persist(split):
+            return
+
         num_graphs = int(edge_ptr.numel() - 1)
-        gt_edges = batch.gt_path_edge_local_ids.to(device)
-        gt_ptr = batch._slice_dict["gt_path_edge_local_ids"].to(device)
-        if gt_edges.numel() == 0 or gt_ptr.numel() != num_graphs + 1:
-            return torch.zeros(num_graphs, device=device)
+        sample_ids, questions = self._extract_batch_meta(batch, num_graphs)
+        answer_ptr = batch._slice_dict["answer_entity_ids"].cpu()
+        answers_all = batch.answer_entity_ids.detach().cpu()
+        storage = self._eval_rollout_storage.setdefault(split, [])
 
-        selected_mask = torch.zeros_like(edge_batch, dtype=torch.bool, device=device)
-        edge_logits, _, _ = self.policy(
-            edge_tokens,
-            question_tokens,
-            edge_batch,
-            selected_mask,
-            edge_heads=heads_global,
-            edge_tails=tails_global,
-            current_tail=None,
-        )
-        if self.policy_edge_score_bias != 0.0:
-            edge_logits = edge_logits + self.policy_edge_score_bias * score_bias
-
-        log_probs = torch.empty_like(edge_logits)
         for g in range(num_graphs):
             es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
-            if es == ee:
-                continue
-            log_probs[es:ee] = torch.log_softmax(edge_logits[es:ee], dim=0)
+            answer_start, answer_end = int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())
+            answer_ids = answers_all[answer_start:answer_end].tolist()
+            node_offset = int(node_ptr[g].item())
+            start_local_slice = start_node_locals[start_node_ptr[g] : start_node_ptr[g + 1]]
+            start_nodes_batch = {int(node_offset + s.item()) for s in start_local_slice}
 
-        log_pf = torch.zeros(num_graphs, device=device)
-        for g in range(num_graphs):
-            if not path_exists[g]:
-                continue
-            gs, ge = int(gt_ptr[g].item()), int(gt_ptr[g + 1].item())
-            if gs == ge:
-                continue
-            local_gt_indices = gt_edges[gs:ge]
-            log_pf[g] = log_probs[local_gt_indices].sum()
-        return log_pf
+            rollouts: list[Dict[str, Any]] = []
+            for ridx, log in enumerate(rollout_logs):
+                sel_mask = log["selected_mask"][es:ee].bool()
+                sel_order = log["selection_order"][es:ee]
+                edge_range = torch.arange(es, ee)
+                selected_global = edge_range[sel_mask]
+                order_selected = sel_order[sel_mask]
+                if order_selected.numel() > 0:
+                    perm = torch.argsort(order_selected)
+                    ordered_global = selected_global[perm]
+                else:
+                    ordered_global = torch.empty(0, dtype=torch.long)
 
-    def _prepare_question_tokens(self, question_emb: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
-        if question_emb is None or question_emb.numel() == 0:
-            raise ValueError(
-                "question_emb is missing or empty; g_agent cache must provide question embeddings for every graph."
+                edges: list[Dict[str, Any]] = []
+                current_tail_gid: Optional[int] = None
+                for edge_idx in ordered_global.tolist():
+                    h_idx = int(batch.edge_index[0, edge_idx].item())
+                    t_idx = int(batch.edge_index[1, edge_idx].item())
+                    h_gid = int(heads_global[edge_idx].item())
+                    t_gid = int(tails_global[edge_idx].item())
+                    # 定向：优先保持路径连通性；step0 以 start_node 判断方向
+                    if current_tail_gid is None:
+                        h_is_start = h_idx in start_nodes_batch
+                        t_is_start = t_idx in start_nodes_batch
+                        if h_is_start and not t_is_start:
+                            src_gid, dst_gid = h_gid, t_gid
+                        elif t_is_start and not h_is_start:
+                            src_gid, dst_gid = t_gid, h_gid
+                        else:
+                            src_gid, dst_gid = h_gid, t_gid
+                    else:
+                        if h_gid == current_tail_gid:
+                            src_gid, dst_gid = h_gid, t_gid
+                        elif t_gid == current_tail_gid:
+                            src_gid, dst_gid = t_gid, h_gid
+                        else:
+                            src_gid, dst_gid = h_gid, t_gid
+                    current_tail_gid = dst_gid
+                    edges.append(
+                        {
+                            "head_entity_id": h_gid,
+                            "relation_id": int(edge_relations[edge_idx].item()),
+                            "tail_entity_id": t_gid,
+                            "edge_score": float(edge_scores[edge_idx].item()),
+                            "edge_label": float(edge_labels[edge_idx].item()),
+                            "edge_local_index": int(edge_idx - es),
+                            "src_entity_id": src_gid,
+                            "dst_entity_id": dst_gid,
+                        }
+                    )
+
+                rollouts.append(
+                    {
+                        "rollout_index": ridx,
+                        "success": bool(self._value_at(log["reach_success"], g).item()),
+                        "log_pf": float(self._value_at(log["log_pf"], g).item()),
+                        "log_reward": float(self._value_at(log["log_reward"], g).item()),
+                        "edges": edges,
+                    }
+                )
+
+            storage.append(
+                {
+                    "sample_id": sample_ids[g] if g < len(sample_ids) else str(g),
+                    "question": questions[g] if g < len(questions) else "",
+                    "answer_entity_ids": [int(x) for x in answer_ids],
+                    "rollouts": rollouts,
+                }
             )
-        if question_emb.dim() == 1:
-            if question_emb.numel() % max(batch_size, 1) != 0:
-                raise ValueError(f"question_emb flatten length {question_emb.numel()} not divisible by batch_size={batch_size}")
-            dim = question_emb.numel() // max(batch_size, 1)
-            question_emb = question_emb.view(batch_size, dim)
-        elif question_emb.dim() == 2:
-            if question_emb.size(0) == 1 and batch_size > 1:
-                question_emb = question_emb.expand(batch_size, -1)
-            elif question_emb.size(0) != batch_size:
-                raise ValueError(f"question_emb batch mismatch: {question_emb.size(0)} vs {batch_size}")
-        else:
-            raise ValueError(f"Unsupported question_emb rank={question_emb.dim()}")
 
-        tokens = question_emb.to(device)
-        if self._question_dim is None:
-            self._question_dim = int(tokens.size(1))
-        elif int(tokens.size(1)) != self._question_dim:
-            raise ValueError(f"Inconsistent question_dim: current {tokens.size(1)} vs expected {self._question_dim}")
-        if self.retriever_query_projector is not None:
-            tokens = self.retriever_query_projector(tokens)
-        tokens = self.query_projector(tokens)
-        return tokens
+    def _persist_eval_rollouts(self, split: str) -> None:
+        if not self._should_persist(split):
+            return
+        records = self._eval_rollout_storage.get(split, [])
+        if not records:
+            return
 
-    def _standardize_scores_flat(self, scores: torch.Tensor, edge_batch: torch.Tensor) -> torch.Tensor:
-        num_graphs = int(edge_batch.max().item()) + 1 if edge_batch.numel() > 0 else 0
-        mean = torch.zeros(num_graphs, device=scores.device)
-        var = torch.zeros(num_graphs, device=scores.device)
-        counts = torch.bincount(edge_batch, minlength=num_graphs).clamp(min=1).float()
-        mean.scatter_add_(0, edge_batch, scores)
-        mean = mean / counts
-        diff = scores - mean[edge_batch]
-        var.scatter_add_(0, edge_batch, diff * diff)
-        var = var / counts
-        std = torch.sqrt(var).clamp(min=1e-6)
-        standardized = (scores - mean[edge_batch]) / std[edge_batch]
-        return standardized
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        merged = records
+        if world_size > 1:
+            gathered: list[Optional[list]] = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered, records)
+            if rank != 0:
+                self._eval_rollout_storage[split] = []
+                return
+            merged = []
+            for part in gathered:
+                if part:
+                    merged.extend(part)
 
-    def _validate_batch(self, batch: Any) -> None:
-        num_graphs = int(batch.ptr.numel() - 1)
-        num_edges = int(batch.edge_index.size(1))
-        required_fields = (
-            "start_node_locals",
-            "answer_node_locals",
-            "start_entity_ids",
-            "answer_entity_ids",
-            "top_edge_mask",
-            "gt_path_edge_local_ids",
-            "gt_path_exists",
-            "is_answer_reachable",
-        )
-        for field in required_fields:
-            if not hasattr(batch, field):
-                raise ValueError(f"Batch missing required field {field}; g_agent cache must materialize it.")
-        if not hasattr(batch, "question_emb"):
-            raise ValueError("Batch missing question_emb; g_agent cache must store question embeddings for each sample.")
-        start_ptr = batch._slice_dict.get("start_node_locals")
-        if start_ptr is None:
-            raise ValueError("Batch missing start_node_locals slice info; PyG collate may be broken.")
-        per_graph_start = start_ptr[1:] - start_ptr[:-1]
-        if per_graph_start.numel() != num_graphs:
-            raise ValueError("start_ptr length mismatch; expected one count per graph.")
-        if (per_graph_start <= 0).any():
-            missing = torch.nonzero(per_graph_start <= 0, as_tuple=False).view(-1).cpu().tolist()
-            raise ValueError(
-                f"Batch contains graphs without start_node_locals at indices {missing}; "
-                "g_agent cache must provide non-empty start anchors per graph."
-            )
-        start_entity_ptr = batch._slice_dict.get("start_entity_ids")
-        if start_entity_ptr is None:
-            raise ValueError("Batch missing start_entity_ids slice info; g_agent cache may be corrupt.")
-        per_graph_start_entities = start_entity_ptr[1:] - start_entity_ptr[:-1]
-        if per_graph_start_entities.numel() != num_graphs:
-            raise ValueError("start_entity_ptr length mismatch; expected one count per graph.")
-        if (per_graph_start_entities <= 0).any():
-            missing = torch.nonzero(per_graph_start_entities <= 0, as_tuple=False).view(-1).cpu().tolist()
-            raise ValueError(
-                f"Batch contains graphs without start_entity_ids at indices {missing}; "
-                "g_agent cache must preserve the seed entities instead of relying on runtime defaults."
-            )
-        answer_entity_ptr = batch._slice_dict.get("answer_entity_ids")
-        if answer_entity_ptr is None:
-            raise ValueError("Batch missing answer_entity_ids slice info; g_agent cache may be corrupt.")
-        if answer_entity_ptr.numel() != num_graphs + 1:
-            raise ValueError("answer_entity_ptr length mismatch; expected one offset per graph.")
-        if (answer_entity_ptr[1:] - answer_entity_ptr[:-1] <= 0).any():
-            missing = torch.nonzero((answer_entity_ptr[1:] - answer_entity_ptr[:-1]) <= 0, as_tuple=False).view(-1).cpu().tolist()
-            raise ValueError(
-                f"Batch contains graphs without answer_entity_ids at indices {missing}; "
-                "g_agent cache must include supervised answer anchors."
-            )
-        if "gt_path_edge_local_ids" not in batch._slice_dict:
-            raise ValueError("Batch missing gt_path_edge_local_ids slice info; ensure g_agent cache persisted gt paths.")
-        if hasattr(batch, "edge_scores") and batch.edge_scores.numel() != num_edges:
-            raise ValueError(f"edge_scores numel {batch.edge_scores.numel()} != num_edges {num_edges}")
-        if hasattr(batch, "edge_labels") and batch.edge_labels.numel() != num_edges:
-            raise ValueError(f"edge_labels numel {batch.edge_labels.numel()} != num_edges {num_edges}")
-        if hasattr(batch, "edge_attr") and batch.edge_attr.numel() != num_edges:
-            raise ValueError(f"edge_attr numel {batch.edge_attr.numel()} != num_edges {num_edges}")
-        if hasattr(batch, "top_edge_mask") and batch.top_edge_mask.numel() != num_edges:
-            raise ValueError(f"top_edge_mask numel {batch.top_edge_mask.numel()} != num_edges {num_edges}")
-        if hasattr(batch, "question_emb"):
-            q = batch.question_emb
-            if q.dim() == 1:
-                if q.numel() % max(num_graphs, 1) != 0:
-                    raise ValueError(f"question_emb numel {q.numel()} not divisible by num_graphs {num_graphs}")
-            elif q.dim() == 2:
-                if q.size(0) not in (1, num_graphs):
-                    raise ValueError(f"question_emb first dim {q.size(0)} incompatible with num_graphs {num_graphs}")
-            else:
-                raise ValueError(f"Unsupported question_emb rank={q.dim()}")
+        self._eval_rollout_storage[split] = []
+        cfg = getattr(self, "eval_persist_cfg", None) or {}
+        output_dir = Path(cfg.get("output_dir", "eval_gflownet"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{split}_gflownet_eval.pt"
+        k_values = [int(k) for k in getattr(self, "_eval_rollout_prefixes", [self._eval_rollouts])]
+        processor = _EvalPersistProcessor(cfg)
+        merged = processor.process(merged)
+
+        payload = {
+            "settings": {
+                "split": split,
+                "num_eval_rollouts": k_values,
+                "path_hit_k": [int(k) for k in getattr(self, "_path_hit_k", [])],
+            },
+            "samples": merged,
+        }
+        torch.save(payload, output_path)
+        logger.info("Persisted gflownet eval outputs to %s (samples=%d)", output_path, len(merged))
 
     def _compute_answer_reach_fraction(
         self,
@@ -898,275 +1159,153 @@ class GFlowNetModule(LightningModule):
             bad = (~torch.isfinite(tensor)).sum().item()
             raise ValueError(f"{name} contains {bad} non-finite values.")
 
-    def _setup_resources(self):
-        if self._shared_resources is not None:
-            return
-        self._shared_resources = SharedDataResources(**self.resources_cfg)
-        self._global_embeddings = self._shared_resources.global_embeddings
-        self._entity_dim = self._global_embeddings.entity_embeddings.size(1)
-        self._relation_dim = self._global_embeddings.relation_embeddings.size(1)
-        self._num_entities = self._global_embeddings.entity_embeddings.size(0)
-        self._num_relations = self._global_embeddings.relation_embeddings.size(0)
-
-    def _ensure_embeddings(self) -> None:
-        if self._shared_resources is None or self._global_embeddings is None:
-            self._setup_resources()
-        if self.entity_projector is None or self.relation_projector is None or self.query_projector is None or self.edge_projector is None:
-            self._init_projection_layers(dropout=self._proj_dropout)
-
-    def _load_projector_checkpoint(self) -> None:
-        if self.projector_checkpoint is None:
-            raise ValueError("use_retriever_projectors=True 但未提供 projector_checkpoint。")
-        ckpt_path = Path(self.projector_checkpoint).expanduser()
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"projector_checkpoint 不存在: {ckpt_path}")
-        try:
-            import collections
-            import functools
-            import typing
-            from torch.serialization import add_safe_globals
-            import omegaconf
-            from omegaconf.base import ContainerMetadata, Metadata
-            from omegaconf.nodes import AnyNode
-            from src.losses.retriever_loss import RetrieverBCELoss
-
-            add_safe_globals(
-                [
-                    omegaconf.listconfig.ListConfig,
-                    omegaconf.dictconfig.DictConfig,
-                    ContainerMetadata,
-                    Metadata,
-                    AnyNode,
-                    typing.Any,
-                    list,
-                    dict,
-                    tuple,
-                    set,
-                    frozenset,
-                    type(None),
-                    str,
-                    int,
-                    float,
-                    bool,
-                    collections.defaultdict,
-                    functools.partial,
-                    torch.optim.AdamW,
-                    torch.optim.lr_scheduler.CosineAnnealingLR,
-                    RetrieverBCELoss,
-                ]
-            )
-        except Exception as exc:  # pragma: no cover - 仅用于兼容老 PyTorch
-            logger.warning("注册 checkpoint safe globals 失败，尝试继续加载: %s", exc)
-
-        checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-        state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-        self.retriever_entity_projector = self._load_single_projector(
-            state_dict,
-            name="entity_proj",
-            prefixes=[
-                "model._orig_mod.entity_proj.network.0",
-                "model.entity_proj.network.0",
-                "entity_proj.network.0",
-            ],
-        )
-        self.retriever_relation_projector = self._load_single_projector(
-            state_dict,
-            name="relation_proj",
-            prefixes=[
-                "model._orig_mod.relation_proj.network.0",
-                "model.relation_proj.network.0",
-                "relation_proj.network.0",
-            ],
-        )
-        self.retriever_query_projector = self._load_single_projector(
-            state_dict,
-            name="query_proj",
-            prefixes=[
-                "model._orig_mod.query_proj.network.0",
-                "model.query_proj.network.0",
-                "query_proj.network.0",
-            ],
-        )
-        self._projectors_loaded = True
-
-    def _load_single_projector(self, state_dict: Dict[str, torch.Tensor], *, name: str, prefixes: list[str]) -> EmbeddingProjector:
-        weight_key = None
-        bias_key = None
-        for prefix in prefixes:
-            candidate_weight = f"{prefix}.weight"
-            candidate_bias = f"{prefix}.bias"
-            if candidate_weight in state_dict and candidate_bias in state_dict:
-                weight_key, bias_key = candidate_weight, candidate_bias
-                break
-        if weight_key is None or bias_key is None:
-            raise KeyError(f"在 checkpoint 中未找到 {name} 权重，prefixes={prefixes}")
-        weight = state_dict[weight_key]
-        bias = state_dict[bias_key]
-        projector = EmbeddingProjector(output_dim=int(weight.shape[0]), finetune=False)
-        load_state = {"network.0.weight": weight, "network.0.bias": bias}
-        missing, unexpected = projector.load_state_dict(load_state, strict=False)
-        if missing:
-            raise RuntimeError(f"{name} projector 缺失权重: {missing}")
-        if unexpected and any("network.0" not in key for key in unexpected):
-            raise RuntimeError(f"{name} projector 出现多余键: {unexpected}")
-        projector.eval()
-        return projector
-
-    def _freeze_retriever_projectors(self) -> None:
-        for module in [self.retriever_entity_projector, self.retriever_relation_projector, self.retriever_query_projector]:
-            if module is None:
-                continue
-            for param in module.parameters():
-                param.requires_grad = False
-
-    def _setup_components(self):
-        self._ensure_embeddings()
-        if self.use_retriever_projectors and not self._projectors_loaded:
-            self._load_projector_checkpoint()
-        if self.freeze_projectors:
-            self._freeze_retriever_projectors()
-        self.log_z_condition = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-
-    def _init_projection_layers(self, dropout: float) -> None:
-        self.entity_projector = self._build_projection_head(dropout)
-        self.relation_projector = self._build_projection_head(dropout)
-        self.query_projector = self._build_projection_head(dropout)
-        self.edge_projector = nn.Sequential(
-            nn.LayerNorm(3 * self.hidden_dim),
-            nn.Linear(3 * self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
-        )
-
-    def _build_projection_head(self, dropout: float) -> nn.Sequential:
-        return nn.Sequential(
-            nn.LazyLinear(self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.Dropout(dropout),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-
-    def _lookup_entities(self, ids: torch.Tensor) -> torch.Tensor:
-        ids = ids.clamp(min=0, max=self._num_entities - 1)
-        embeddings = self._global_embeddings.get_entity_embeddings(ids)
-        if self.retriever_entity_projector is not None:
-            embeddings = self.retriever_entity_projector(embeddings)
-        return self.entity_projector(embeddings)
-
-    def _lookup_relations(self, ids: torch.Tensor) -> torch.Tensor:
-        ids = ids.clamp(min=0, max=self._num_relations - 1)
-        embeddings = self._global_embeddings.get_relation_embeddings(ids)
-        if self.retriever_relation_projector is not None:
-            embeddings = self.retriever_relation_projector(embeddings)
-        return self.relation_projector(embeddings)
-
-    def _build_log_z_context(
-        self,
-        cls_out: torch.Tensor,
-        start_entity_ids: torch.Tensor,
-        start_entity_mask: torch.Tensor,
-        question_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        start_summary = self._aggregate_start_entities(start_entity_ids, start_entity_mask)
-        conditioned = self.log_z_condition(start_summary) if self.log_z_condition is not None else start_summary
-        return cls_out + conditioned + question_tokens
-
-    def _aggregate_start_entities(self, start_entity_ids: torch.Tensor, start_entity_mask: torch.Tensor) -> torch.Tensor:
-        device = start_entity_ids.device
-        if start_entity_ids.numel() == 0:
-            return torch.zeros(start_entity_ids.size(0), self.hidden_dim, device=device)
-        safe_ids = torch.where(start_entity_mask, start_entity_ids, torch.zeros_like(start_entity_ids))
-        flat = safe_ids.view(-1)
-        projected = self._lookup_entities(flat).view(*start_entity_ids.shape, -1)
-        weights = start_entity_mask.float().unsqueeze(-1)
-        total = weights.sum(dim=1, keepdim=True).clamp(min=1.0)
-        pooled = (projected * weights).sum(dim=1) / total
-        return pooled
-
-    def _gather_entity_embeddings(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        num_entities = int(self._num_entities or self._global_embeddings.entity_embeddings.size(0))
-        max_id = max(num_entities - 1, 0)
-        safe_ids = torch.where(mask, ids, torch.zeros_like(ids))
-        safe_ids = safe_ids.clamp(min=0, max=max_id)
-        flat = safe_ids.view(-1)
-        embeddings = self._global_embeddings.get_entity_embeddings(flat)
-        embeddings = embeddings.view(*ids.shape, -1)
-        return embeddings
-
-    @staticmethod
-    def _extract_dropout(policy_cfg: Any) -> float:
-        if isinstance(policy_cfg, DictConfig):
-            try:
-                return float(policy_cfg.get("dropout", 0.0))
-            except Exception:
-                return 0.0
-        if isinstance(policy_cfg, nn.Module):
-            return float(getattr(policy_cfg, "dropout", 0.0) or 0.0)
-        return 0.0
-
-    def _edge_ranks_flat(self, edge_scores: torch.Tensor, edge_batch: torch.Tensor, path_mask: torch.Tensor, num_graphs: int) -> torch.Tensor:
-        device = edge_scores.device
-        ranks = torch.full_like(edge_scores, fill_value=-1.0)
-        for g in range(num_graphs):
-            mask = (edge_batch == g)
-            if not mask.any():
-                continue
-            scores_g = torch.where(path_mask[mask], edge_scores[mask], torch.full_like(edge_scores[mask], -1e9))
-            order = scores_g.argsort(descending=True)
-            rank = torch.full_like(scores_g, fill_value=float(scores_g.numel() + 1))
-            rank[order] = torch.arange(scores_g.numel(), device=device, dtype=torch.float32)
-            ranks[mask] = rank
-        return ranks
-
-    def _compute_multi_path_metrics(
-        self,
-        edge_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        batch: Any,
-        edge_mask: Optional[torch.Tensor],
-        path_mask: Optional[torch.Tensor],
-        path_exists: Optional[torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        if path_mask is None or path_exists is None or not path_mask.any():
-            zeros = torch.zeros(1, device=edge_tokens.device)
-            return {"vpr": zeros, "path_recall@1": zeros, "wlrr": zeros}
-        device = edge_tokens.device
-        num_graphs = int(batch.ptr.numel() - 1)
-        if path_mask.numel() != edge_tokens.size(0):
-            raise ValueError(f"path_mask length {path_mask.numel()} != num_edges {edge_tokens.size(0)}")
-        if path_exists.numel() != num_graphs:
-            raise ValueError(f"path_exists length {path_exists.numel()} != num_graphs {num_graphs}")
-        scores = batch.edge_scores.to(device).float()
-        edge_batch = batch.batch[batch.edge_index[0]].to(device)
-        ranks = self._edge_ranks_flat(scores, edge_batch, path_mask, num_graphs)
-        k = 1
-        vpr = torch.zeros(1, device=device)
-        path_recall_at_k = torch.zeros(1, device=device)
-        wlrr = torch.zeros(1, device=device)
-        for g in range(num_graphs):
-            mask = (edge_batch == g)
-            if not mask.any():
-                continue
-            ranks_g = ranks[mask]
-            path_mask_g = path_mask[mask]
-            if not path_mask_g.any():
-                continue
-            path_ranks = ranks_g[path_mask_g]
-            path_recall_at_k += (path_ranks < k).float().mean()
-            vpr += (path_ranks < 5).float().mean()
-            hard = path_ranks > 10
-            if hard.any():
-                wlrr += (path_ranks[hard] < 1000).float().mean()
-        denom = max(num_graphs, 1)
-        return {
-            "vpr": vpr / denom,
-            f"path_recall@{k}": path_recall_at_k / denom,
-            "wlrr": wlrr / denom,
-        }
-
 
 __all__ = ["GFlowNetModule"]
+
+
+class _EvalPersistProcessor:
+    """
+    精简的持久化处理器：文本化 edges，构造 chains（连续 head==prev_tail），再聚合为 candidate_chains。
+    """
+
+    def __init__(self, cfg: Dict[str, Any]) -> None:
+        self.cfg = cfg
+        self.ent_map, self.rel_map = self._resolve_vocab_maps(cfg)
+
+    def process(self, records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        if self.ent_map is not None or self.rel_map is not None:
+            self._inject_text(records)
+        for sample in records:
+            sample["candidate_chains"] = self._build_candidate_paths(sample)
+        return records
+
+    def _inject_text(self, records: list[Dict[str, Any]]) -> None:
+        for sample in records:
+            for rollout in sample.get("rollouts", []):
+                for edge in rollout.get("edges", []):
+                    h = edge.get("head_entity_id")
+                    r = edge.get("relation_id")
+                    t = edge.get("tail_entity_id")
+                    s_id = edge.get("src_entity_id")
+                    d_id = edge.get("dst_entity_id")
+                    if self.ent_map is not None:
+                        edge["head_text"] = self.ent_map.get(h, str(h) if h is not None else None)
+                        edge["tail_text"] = self.ent_map.get(t, str(t) if t is not None else None)
+                        edge["src_text"] = self.ent_map.get(s_id, str(s_id) if s_id is not None else None)
+                        edge["dst_text"] = self.ent_map.get(d_id, str(d_id) if d_id is not None else None)
+                    if self.rel_map is not None:
+                        edge["relation_text"] = self.rel_map.get(r, str(r) if r is not None else None)
+
+    def _build_candidate_paths(self, sample: Dict[str, Any]) -> list[Dict[str, Any]]:
+        answer_ids = set(int(x) for x in sample.get("answer_entity_ids", []))
+        chain_stats: Dict[tuple, Dict[str, Any]] = {}
+        for rollout in sample.get("rollouts", []):
+            ridx = int(rollout.get("rollout_index", 0) or 0)
+            succ = bool(rollout.get("success", False))
+            path = rollout.get("edges") or []
+            sig = tuple((e.get("head_entity_id"), e.get("relation_id"), e.get("tail_entity_id")) for e in path)
+            if not sig:
+                continue
+            stat = chain_stats.setdefault(
+                sig,
+                {
+                    "frequency": 0,
+                    "success_hits": 0,
+                    "from_rollouts": set(),
+                    "example_edges": path,
+                },
+            )
+            stat["frequency"] += 1
+            if succ:
+                stat["success_hits"] += 1
+            stat["from_rollouts"].add(ridx)
+
+        candidates: list[Dict[str, Any]] = []
+        for sig, stat in chain_stats.items():
+            edges = stat["example_edges"]
+            tail_ids = [e.get("tail_entity_id") for e in edges]
+            is_answer_hit = any(t in answer_ids for t in tail_ids)
+            chain_text = " -> ".join(self._fmt_edge(e) for e in edges)
+            candidates.append(
+                {
+                    "signature": sig,
+                    "length": len(edges),
+                    "frequency": stat["frequency"],
+                    "success_hits": stat["success_hits"],
+                    "from_rollouts": sorted(stat["from_rollouts"]),
+                    "is_answer_hit": is_answer_hit,
+                    "chain_edges": [
+                        {
+                            "head_entity_id": e.get("head_entity_id"),
+                            "relation_id": e.get("relation_id"),
+                            "tail_entity_id": e.get("tail_entity_id"),
+                            "head_text": e.get("head_text"),
+                            "relation_text": e.get("relation_text"),
+                            "tail_text": e.get("tail_text"),
+                            "edge_score": e.get("edge_score"),
+                            "edge_label": e.get("edge_label"),
+                            # 保留实际行走方向，便于文本化时使用 src->dst 而非图定义的 head->tail
+                            "src_entity_id": e.get("src_entity_id"),
+                            "dst_entity_id": e.get("dst_entity_id"),
+                        }
+                        for e in edges
+                    ],
+                    "chain_text": chain_text,
+                }
+            )
+
+        candidates.sort(key=lambda c: (-c["frequency"], -c["length"], -c["success_hits"]))
+        for i, c in enumerate(candidates, 1):
+            c["rank"] = i
+        return candidates
+
+    @staticmethod
+    def _fmt_edge(e: Dict[str, Any]) -> str:
+        def _txt(val_text: Any, val_id: Any) -> str:
+            if val_text is not None:
+                return str(val_text)
+            if val_id is None:
+                return "UNK"
+            return str(val_id)
+
+        # 优先使用 roll-out 实际的 src/dst，以避免 head/tail 方向与游走方向不一致
+        h = _txt(e.get("src_text"), e.get("src_entity_id"))
+        t = _txt(e.get("dst_text"), e.get("dst_entity_id"))
+        if h == "UNK" and t == "UNK":
+            # 回退到图定义的 head/tail
+            h = _txt(e.get("head_text"), e.get("head_entity_id"))
+            t = _txt(e.get("tail_text"), e.get("tail_entity_id"))
+        r = _txt(e.get("relation_text"), e.get("relation_id"))
+        return f"{h} -[{r}]-> {t}"
+
+    def _resolve_vocab_maps(self, cfg: Dict[str, Any]) -> tuple[Optional[Dict[int, str]], Optional[Dict[int, str]]]:
+        if not cfg.get("textualize"):
+            return None, None
+        entity_path = cfg.get("entity_vocab_path")
+        relation_path = cfg.get("relation_vocab_path")
+        if not entity_path or not relation_path:
+            ds = cfg.get("dataset_cfg") or {}
+            out_dir = ds.get("out_dir")
+            if out_dir:
+                base = Path(out_dir)
+                if not entity_path:
+                    if (base / "entity_vocab.parquet").exists():
+                        entity_path = base / "entity_vocab.parquet"
+                    else:
+                        entity_path = base / "embedding_vocab.parquet"
+                relation_path = relation_path or (base / "relation_vocab.parquet")
+        ent_map: Optional[Dict[int, str]] = None
+        rel_map: Optional[Dict[int, str]] = None
+        try:
+            if entity_path and Path(entity_path).exists():
+                ent_df = pd.read_parquet(entity_path)
+                if "entity_id" in ent_df.columns:
+                    ent_map = dict(zip(ent_df.entity_id.astype(int), ent_df.label.astype(str)))
+                elif "embedding_id" in ent_df.columns:
+                    ent_map = dict(zip(ent_df.embedding_id.astype(int), ent_df.label.astype(str)))
+            if relation_path and Path(relation_path).exists():
+                rel_df = pd.read_parquet(relation_path)
+                rel_map = dict(zip(rel_df.relation_id.astype(int), rel_df.label.astype(str)))
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to load vocab for textualize: %s", exc)
+        return ent_map, rel_map

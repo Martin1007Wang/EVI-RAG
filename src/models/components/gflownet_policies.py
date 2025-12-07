@@ -6,7 +6,34 @@ import torch
 from torch import nn
 
 TYPE_SELECTED = 2
-TYPE_CANDIDATE = 3
+
+
+def _compute_lookahead_states(
+    edge_repr_selected: torch.Tensor,
+    edge_batch: torch.Tensor,
+    selected_mask: torch.Tensor,
+    question_tokens: torch.Tensor,
+    *,
+    graph_norm: nn.LayerNorm,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute phi(s) / phi(s') with a vectorized look-ahead aggregation."""
+    device = edge_repr_selected.device
+    hidden_dim = edge_repr_selected.size(-1)
+    num_graphs = int(question_tokens.size(0))
+
+    selected_mask_f = selected_mask.float().unsqueeze(-1)
+    selected_sum = torch.zeros(num_graphs, hidden_dim, device=device)
+    selected_sum.index_add_(0, edge_batch, edge_repr_selected * selected_mask_f)
+    selected_count = torch.bincount(edge_batch, weights=selected_mask.float(), minlength=num_graphs)
+    selected_count = selected_count.clamp(min=1.0).unsqueeze(-1)
+    current_state = selected_sum / selected_count
+    current_state = graph_norm(current_state + question_tokens)
+
+    next_sum = selected_sum[edge_batch] + edge_repr_selected
+    next_count = selected_count[edge_batch] + 1.0
+    next_state = next_sum / next_count
+    next_state = graph_norm(next_state + question_tokens[edge_batch])
+    return current_state, next_state
 
 
 class EdgeMLPMixerPolicy(nn.Module):
@@ -21,6 +48,13 @@ class EdgeMLPMixerPolicy(nn.Module):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.type_embeddings = nn.Embedding(5, self.hidden_dim)
+        self.graph_norm = nn.LayerNorm(self.hidden_dim)
+        # FiLM-style调制：让 question_tokens 直接作用到每条边的表示上，避免“只靠结构”忽略语义。
+        self.q_film = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+        )
         layers: list[nn.Module] = []
         for _ in range(max(1, num_layers)):
             layers.extend(
@@ -32,7 +66,13 @@ class EdgeMLPMixerPolicy(nn.Module):
                 ]
             )
         self.edge_mlp = nn.Sequential(*layers)
-        self.selection_head = nn.Linear(self.hidden_dim, 1)
+        self.lookahead_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
         self.stop_proj = nn.Sequential(
             nn.LayerNorm(self.hidden_dim * 2),
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
@@ -49,22 +89,24 @@ class EdgeMLPMixerPolicy(nn.Module):
         **_: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
-        num_graphs = int(question_tokens.size(0))
 
-        base_types = torch.full_like(selected_mask, TYPE_CANDIDATE, dtype=torch.long, device=device)
-        base_types = torch.where(selected_mask, torch.full_like(base_types, TYPE_SELECTED), base_types)
-        type_embed = self.type_embeddings(base_types)
-        mixed_edges = self.edge_mlp(edge_tokens + type_embed)
+        edge_tokens = edge_tokens + self.q_film(question_tokens[edge_batch])
+        selected_types = torch.full_like(selected_mask, TYPE_SELECTED, dtype=torch.long, device=device)
+        type_embed_selected = self.type_embeddings(selected_types)
+        edge_selected = self.edge_mlp(edge_tokens + type_embed_selected)
 
-        edge_logits = self.selection_head(mixed_edges).squeeze(-1)
+        current_state, next_state = _compute_lookahead_states(
+            edge_selected,
+            edge_batch,
+            selected_mask,
+            question_tokens,
+            graph_norm=self.graph_norm,
+        )
 
-        denom = torch.bincount(edge_batch, minlength=num_graphs).clamp(min=1).to(device).unsqueeze(-1)
-        pooled_edges = torch.zeros(num_graphs, mixed_edges.size(-1), device=device)
-        pooled_edges.index_add_(0, edge_batch, mixed_edges)
-        pooled_edges = pooled_edges / denom
-        stop_input = torch.cat([pooled_edges, question_tokens], dim=-1)
+        edge_logits = self.lookahead_head(torch.cat([current_state[edge_batch], next_state], dim=-1)).squeeze(-1)
+        stop_input = torch.cat([current_state, question_tokens], dim=-1)
         stop_logits = self.stop_proj(stop_input).squeeze(-1)
-        cls_out = pooled_edges
+        cls_out = current_state
         return edge_logits, stop_logits, cls_out
 
 
@@ -80,6 +122,12 @@ class EdgeFrontierPolicy(nn.Module):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.frontier_bonus = float(frontier_bonus)
+        self.graph_norm = nn.LayerNorm(self.hidden_dim)
+        self.q_film = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+        )
         self.edge_proj = nn.Sequential(
             nn.LayerNorm(self.hidden_dim + 2),
             nn.Linear(self.hidden_dim + 2, self.hidden_dim),
@@ -88,7 +136,13 @@ class EdgeFrontierPolicy(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
         )
-        self.selection_head = nn.Linear(self.hidden_dim, 1)
+        self.lookahead_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
         self.stop_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim * 2),
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
@@ -106,40 +160,49 @@ class EdgeFrontierPolicy(nn.Module):
         edge_heads: Optional[torch.Tensor] = None,  # [E_total]
         edge_tails: Optional[torch.Tensor] = None,  # [E_total]
         current_tail: Optional[torch.Tensor] = None,  # [B]
+        frontier_mask: Optional[torch.Tensor] = None,  # [E_total]
         **_: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
-        num_graphs = int(question_tokens.size(0))
 
+        edge_tokens = edge_tokens + self.q_film(question_tokens[edge_batch])
         candidate_mask = ~selected_mask
-        frontier_mask = candidate_mask
-        if current_tail is not None and edge_heads is not None and edge_tails is not None:
-            cur = current_tail.to(device)
-            heads = edge_heads.to(device)
-            tails = edge_tails.to(device)
-            frontier_mask = candidate_mask & (
-                (heads == cur[edge_batch]) | (tails == cur[edge_batch])
-            )
+        if frontier_mask is None:
+            frontier_mask = candidate_mask
+            if current_tail is not None and edge_heads is not None and edge_tails is not None:
+                cur = current_tail.to(device)
+                heads = edge_heads.to(device)
+                tails = edge_tails.to(device)
+                frontier_mask = candidate_mask & (
+                    (heads == cur[edge_batch]) | (tails == cur[edge_batch])
+                )
+        else:
+            frontier_mask = frontier_mask.to(device) & candidate_mask
 
-        aux_features = torch.stack(
+        aux_selected = torch.stack(
             [
-                candidate_mask.float(),
+                torch.zeros_like(candidate_mask, dtype=torch.float, device=device),
                 frontier_mask.float(),
             ],
             dim=-1,
         )
-        expanded_aux = torch.cat([edge_tokens, aux_features], dim=-1)
-        edge_repr = self.edge_proj(expanded_aux)
-        edge_logits = self.selection_head(edge_repr).squeeze(-1)
+        expanded_selected = torch.cat([edge_tokens, aux_selected], dim=-1)
+        edge_repr_selected = self.edge_proj(expanded_selected)
+
+        current_state, next_state = _compute_lookahead_states(
+            edge_repr_selected,
+            edge_batch,
+            selected_mask,
+            question_tokens,
+            graph_norm=self.graph_norm,
+        )
+
+        edge_logits = self.lookahead_head(torch.cat([current_state[edge_batch], next_state], dim=-1)).squeeze(-1)
         edge_logits = edge_logits + self.frontier_bonus * frontier_mask.float()
 
-        denom = torch.bincount(edge_batch, minlength=num_graphs).clamp(min=1).to(device).unsqueeze(-1)
-        pooled_edges = torch.zeros(num_graphs, edge_repr.size(-1), device=device)
-        pooled_edges.index_add_(0, edge_batch, edge_repr)
-        pooled_edges = pooled_edges / denom
-        stop_input = torch.cat([pooled_edges, question_tokens], dim=-1)
+        stop_input = torch.cat([current_state, question_tokens], dim=-1)
         stop_logits = self.stop_head(stop_input).squeeze(-1)
-        cls_out = pooled_edges
+        cls_out = current_state
         return edge_logits, stop_logits, cls_out
 
 
@@ -156,11 +219,19 @@ class EdgeGATPolicy(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.frontier_bonus = float(frontier_bonus)
         self.edge_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.att_vec = nn.Parameter(torch.empty(self.hidden_dim))
-        nn.init.xavier_uniform_(self.att_vec.unsqueeze(0))
-        self.leaky_relu = nn.LeakyReLU(0.2)
-        self.dropout = nn.Dropout(dropout)
+        self.graph_norm = nn.LayerNorm(self.hidden_dim)
+        self.q_film = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+        )
+        self.lookahead_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
         self.stop_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim * 2),
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
@@ -178,45 +249,41 @@ class EdgeGATPolicy(nn.Module):
         edge_heads: Optional[torch.Tensor] = None,  # [E_total]
         edge_tails: Optional[torch.Tensor] = None,  # [E_total]
         current_tail: Optional[torch.Tensor] = None,  # [B]
+        frontier_mask: Optional[torch.Tensor] = None,  # [E_total]
         **_: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
-        num_graphs = int(question_tokens.size(0))
 
+        edge_tokens = edge_tokens + self.q_film(question_tokens[edge_batch])
         candidate_mask = ~selected_mask
-        frontier_mask = candidate_mask
-        if current_tail is not None and edge_heads is not None and edge_tails is not None:
-            cur = current_tail.to(device)
-            heads = edge_heads.to(device)
-            tails = edge_tails.to(device)
-            frontier_mask = candidate_mask & (
-                (heads == cur[edge_batch]) | (tails == cur[edge_batch])
-            )
+        if frontier_mask is None:
+            frontier_mask = candidate_mask
+            if current_tail is not None and edge_heads is not None and edge_tails is not None:
+                cur = current_tail.to(device)
+                heads = edge_heads.to(device)
+                tails = edge_tails.to(device)
+                frontier_mask = candidate_mask & (
+                    (heads == cur[edge_batch]) | (tails == cur[edge_batch])
+                )
+        else:
+            frontier_mask = frontier_mask.to(device) & candidate_mask
 
-        edge_h = self.edge_proj(edge_tokens)
-        q_h = self.query_proj(question_tokens)
-        att_inp = edge_h + q_h[edge_batch]
-        att_raw = (att_inp * self.att_vec.view(1, -1)).sum(dim=-1)
-        att_raw = self.leaky_relu(att_raw)
-        att_raw = att_raw + self.frontier_bonus * frontier_mask.float()
+        edge_repr = self.edge_proj(edge_tokens)
 
-        max_per_graph = torch.full((num_graphs,), float("-inf"), device=device)
-        max_per_graph.scatter_reduce_(0, edge_batch, att_raw, reduce="amax", include_self=True)
-        norm_logits = att_raw - max_per_graph[edge_batch]
-        exp = torch.exp(norm_logits) * candidate_mask.float()
-        sum_per_graph = torch.zeros(num_graphs, device=device)
-        sum_per_graph.scatter_add_(0, edge_batch, exp)
-        edge_probs = exp / sum_per_graph.clamp(min=torch.finfo(exp.dtype).eps)[edge_batch]
-        edge_probs = self.dropout(edge_probs)
-        edge_logits = torch.log(edge_probs.clamp(min=torch.finfo(edge_probs.dtype).eps))
+        current_state, next_state = _compute_lookahead_states(
+            edge_repr,
+            edge_batch,
+            selected_mask,
+            question_tokens,
+            graph_norm=self.graph_norm,
+        )
 
-        denom = torch.bincount(edge_batch, minlength=num_graphs).clamp(min=1).to(device).unsqueeze(-1)
-        pooled_edges = torch.zeros(num_graphs, edge_h.size(-1), device=device)
-        pooled_edges.index_add_(0, edge_batch, edge_h)
-        pooled_edges = pooled_edges / denom
-        stop_input = torch.cat([pooled_edges, question_tokens], dim=-1)
+        edge_logits = self.lookahead_head(torch.cat([current_state[edge_batch], next_state], dim=-1)).squeeze(-1)
+        edge_logits = edge_logits + self.frontier_bonus * frontier_mask.float()
+
+        stop_input = torch.cat([current_state, question_tokens], dim=-1)
         stop_logits = self.stop_head(stop_input).squeeze(-1)
-        cls_out = pooled_edges
+        cls_out = current_state
         return edge_logits, stop_logits, cls_out
 
 

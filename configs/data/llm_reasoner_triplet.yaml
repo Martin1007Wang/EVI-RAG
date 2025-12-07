@@ -1,0 +1,19 @@
+# DataModule for LLM reasoning over g_agent/GFlowNet-selected triplets.
+_target_: src.data.llm_reasoner_triplet_datamodule.LLMReasonerTripletDataModule
+
+dataset: ${dataset.name}
+split: test
+prompt_tag: triplets
+
+# Required paths
+score_dict_path: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
+questions_path: ${dataset.out_dir}/questions.parquet
+entity_vocab_path: ${dataset.paths.vocabulary}
+relation_vocab_path: ${dataset.paths.vocabulary}
+
+# Prompt construction
+triplet_limit: 50
+system_prompt: "You are a concise QA agent. Use the given triplets to answer with `Ans: <entity>`."
+
+# Loader
+num_workers: 0

@@ -23,6 +23,7 @@ class GAgentSample:
     question_emb: torch.FloatTensor  # [1, D] (batched-friendly)
     # 本地拓扑 + 全局实体
     node_entity_ids: torch.LongTensor  # [N] global entity id
+    node_embedding_ids: torch.LongTensor  # [N] embedding table row ids
     edge_head_locals: torch.LongTensor  # [E] 0..N-1
     edge_tail_locals: torch.LongTensor  # [E] 0..N-1
     edge_relations: torch.LongTensor  # [E]
@@ -61,6 +62,7 @@ def _builder_sample_to_record(sample: GAgentSample) -> Dict:
             "local_index": i,
             "entity_id": int(sample.node_entity_ids[i].item()),
             "id": int(sample.node_entity_ids[i].item()),
+            "embedding_id": int(sample.node_embedding_ids[i].item()),
         }
         for i in range(num_nodes)
     ]
@@ -97,6 +99,7 @@ def _builder_sample_to_record(sample: GAgentSample) -> Dict:
         "question_emb": sample.question_emb,
         "selected_edges": edges,
         "selected_nodes": nodes,
+        "node_embedding_ids": sample.node_embedding_ids.tolist(),
         "top_edge_local_indices": edge_local_ids,
         "gt_path_edge_local_indices": gt_edges,
         "gt_path_node_local_indices": gt_nodes,
@@ -120,6 +123,7 @@ def _parse_sample(record: Dict) -> GAgentSample:
         "edge_head_locals",
         "edge_tail_locals",
         "node_entity_ids",
+        "node_embedding_ids",
         "top_edge_mask",
         "start_entity_ids",
         "start_node_locals",
@@ -145,6 +149,7 @@ def _parse_sample(record: Dict) -> GAgentSample:
     edge_scores = as_float("edge_scores")
     edge_labels = as_float("edge_labels")
     top_edge_mask = as_bool("top_edge_mask")
+    node_embedding_ids = as_long("node_embedding_ids")
 
     num_edges = edge_head_locals.numel()
     num_nodes = node_entity_ids.numel()
@@ -160,6 +165,11 @@ def _parse_sample(record: Dict) -> GAgentSample:
     for name, tensor in tensors_with_expected_edges.items():
         if tensor.numel() != num_edges:
             raise ValueError(f"{name} length {tensor.numel()} != num_edges {num_edges} for {record.get('sample_id')}")
+
+    if node_embedding_ids.numel() != num_nodes:
+        raise ValueError(
+            f"node_embedding_ids length {node_embedding_ids.numel()} != num_nodes {num_nodes} for {record.get('sample_id')}"
+        )
 
     if num_nodes == 0:
         raise ValueError(f"g_agent record has no nodes: {record.get('sample_id')}")
@@ -224,6 +234,7 @@ def _parse_sample(record: Dict) -> GAgentSample:
         question=str(record.get("question", "")),
         question_emb=torch.as_tensor(record["question_emb"], dtype=torch.float32).view(-1),
         node_entity_ids=node_entity_ids,
+        node_embedding_ids=node_embedding_ids,
         edge_head_locals=edge_head_locals,
         edge_tail_locals=edge_tail_locals,
         edge_relations=edge_relations,
@@ -305,7 +316,7 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
         raise ValueError(
             f"GAgentSample {sample.sample_id} missing start_node_locals; "
             "dataset must materialize start anchors instead of inferring from start_entity_ids."
-        )
+    )
     data = GAgentData(
         edge_index=edge_index,
         edge_attr=sample.edge_relations,
@@ -313,6 +324,7 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
         edge_labels=sample.edge_labels,
         top_edge_mask=sample.top_edge_mask,
         node_global_ids=sample.node_entity_ids,
+        node_embedding_ids=sample.node_embedding_ids,
         question_emb=question_emb,
         start_node_locals=start_node_locals,
         answer_node_locals=sample.answer_node_locals,
@@ -326,6 +338,8 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
         question=sample.question,
     )
     data.num_nodes = int(sample.node_entity_ids.numel())
+    # 强制 PyG 校验，防止批内 offset 错乱
+    data.validate(raise_on_error=True)
     return data
 
 

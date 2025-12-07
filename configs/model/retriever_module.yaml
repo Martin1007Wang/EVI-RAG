@@ -2,12 +2,13 @@
 
 _target_: src.models.retriever_module.RetrieverModule
 
-compile_model: true 
+compile_model: true
+compile_dynamic: true
 
 retriever:
   _target_: src.models.components.retriever.Retriever
   emb_dim: 1024
-  hidden_dim: 512
+  hidden_dim: 1024
   kge_interaction: concat
   topic_pe: true
   num_topics: 2

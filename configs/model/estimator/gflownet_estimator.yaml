@@ -1,0 +1,7 @@
+_target_: src.models.components.gflownet_estimator.GFlowNetEstimator
+
+hidden_dim: ${model.hidden_dim}
+log_pb_mode: learned
+learn_pb: true
+pb_entropy_coef: 0.0
+pb_l2_reg: 0.0

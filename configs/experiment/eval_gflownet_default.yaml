@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - override /data: gflownet            # 使用 gflownet 数据模块
+  - override /model: gflownet_module    # 使用 GFlowNet 模型
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /trainer: gpu
+
+tags: ["eval", "gflownet"]
+task_name: "eval_gflownet"
+train: false
+test: true
+ckpt_path: null   # 评估时可通过 CLI 传入 ckpt_path
+
+seed: 42
+gflownet_debug: false
+env_debug: false
+
+data:
+  drop_unreachable_train: true   # 训练段（若触发）保持严格
+  drop_unreachable_eval: false   # 评估时保留所有样本
+
+model:
+  evaluation_cfg:
+    num_eval_rollouts: [1, 5, 10, 20]   # Best-of-K 候选
+    path_hit_k: [1, 5, 10, 20]          # 单路径前 K 条边诊断
+
+eval_persist:
+  gflownet:
+    enabled: true
+    output_dir: ${dataset.materialized_dir}/eval_gflownet
+    splits: ["test"]
+    textualize: true
+
+logging_cfg:
+  train_prog_bar: ["rollout_reward", "success_mean", "answer_coverage", "length_mean"]
+  eval_prog_bar: ["success_mean", "answer_f1"]
+  auto_add_success_at_k: true
+  auto_add_path_hit_f1: true
+  log_on_step_train: false

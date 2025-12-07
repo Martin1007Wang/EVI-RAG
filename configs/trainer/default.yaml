@@ -18,6 +18,9 @@ gradient_clip_val: 1.0
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 10
 
+# log interval (steps); set small to avoid skipping logs when epoch has few batches
+log_every_n_steps: 1
+
 # set True to to ensure deterministic results
 # makes training slower but gives more reproducibility than just setting seeds
 deterministic: False

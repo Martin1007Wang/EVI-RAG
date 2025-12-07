@@ -655,7 +655,7 @@ logger:
     group: "retrieval"
 ```
 
-预置 alias 速查（可再用 CLI 覆盖 dataset）：`train_retriever[_cwq|_gtsqa|_kgqagen]`, `eval_retriever[_cwq|_gtsqa|_kgqagen]`, `train_gflownet`, `train_gflownet_quick`, `eval_gflownet`, `llm_generation`.
+预置 alias 速查（可再用 CLI 覆盖 dataset）：`train_retriever[_cwq|_gtsqa|_kgqagen]`, `eval_retriever[_cwq|_gtsqa|_kgqagen]`, `train_gflownet`, `train_gflownet_quick`, `eval_gflownet`, `llm_reasoner`.
 
 </details>
 

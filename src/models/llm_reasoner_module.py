@@ -7,12 +7,12 @@ from typing import Any, Dict, List, Optional
 from lightning import LightningModule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
-from src.llm_generation.llm import init_llm, run_chat
-from src.llm_generation.metrics import evaluate_predictions
+from src.utils.llm_client import init_llm, run_chat
+from src.utils.llm_metrics import evaluate_predictions
 
 
-class LLMGenerationModule(LightningModule):
-    """Prediction-only module that runs LLMs over prepared triplet prompts."""
+class LLMReasonerModule(LightningModule):
+    """Prediction-only module that runs LLMs over prepared prompts."""
 
     def __init__(
         self,
@@ -28,6 +28,9 @@ class LLMGenerationModule(LightningModule):
         dataset: str,
         split: str,
         prompt_tag: str = "triplets",
+        backend: str = "auto",
+        ollama_base_url: str = "http://localhost:11434",
+        ollama_timeout: float = 120.0,
     ) -> None:
         super().__init__()
         self.model_name = model_name
@@ -44,6 +47,9 @@ class LLMGenerationModule(LightningModule):
             seed=seed,
             temperature=temperature,
             frequency_penalty=frequency_penalty,
+            backend=backend,
+            ollama_base_url=ollama_base_url,
+            ollama_timeout=ollama_timeout,
         )
 
     def predict_step(self, batch: List[Dict[str, Any]], batch_idx: int) -> List[Dict[str, Any]]:
@@ -61,12 +67,29 @@ class LLMGenerationModule(LightningModule):
                     "answers": sample.get("answers", []),
                     "prediction": prediction,
                     "triplets": sample.get("triplets", []),
+                    "paths": sample.get("paths", []),
                 }
             )
         return outputs
 
-    def on_predict_epoch_end(self, results: List[List[Dict[str, Any]]]) -> None:
-        flat = [item for sub in results for item in sub]
+    def on_predict_epoch_end(self, results: Optional[List[List[Dict[str, Any]]]] = None) -> None:
+        """
+        Lightning does not pass predict outputs into this hook; we must pull from trainer.predict_loop.predictions.
+        """
+        batches: Optional[List[Any]] = results
+        if batches is None and self.trainer is not None:
+            predict_loop = getattr(self.trainer, "predict_loop", None)
+            if predict_loop is not None:
+                batches = getattr(predict_loop, "predictions", None)
+
+        flat: List[Dict[str, Any]] = []
+        if batches:
+            for batch in batches:
+                if isinstance(batch, list):
+                    flat.extend(batch)
+                elif batch is not None:
+                    flat.append(batch)  # pragma: no cover - defensive branch
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         pred_path = self._prediction_path()
         with pred_path.open("w") as f:
@@ -91,3 +114,5 @@ class LLMGenerationModule(LightningModule):
     def configure_optimizers(self) -> Optional[Any]:
         return None
 
+
+__all__ = ["LLMReasonerModule"]

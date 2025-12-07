@@ -9,6 +9,7 @@ from torch_geometric.loader import DataLoader as PyGDataLoader
 from .g_agent_dataset import (
     GAgentPyGDataset,
 )
+from .components import SharedDataResources
 
 
 class GAgentDataModule(LightningDataModule):
@@ -26,6 +27,7 @@ class GAgentDataModule(LightningDataModule):
         shuffle_train: bool = True,
         drop_unreachable_train: bool = True,
         drop_unreachable_eval: bool = False,
+        resources: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
         self.cache_paths = {split: Path(path).expanduser().resolve() for split, path in cache_paths.items()}
@@ -37,12 +39,19 @@ class GAgentDataModule(LightningDataModule):
         self.shuffle_train = bool(shuffle_train)
         self.drop_unreachable_train = bool(drop_unreachable_train)
         self.drop_unreachable_eval = bool(drop_unreachable_eval)
+        self.resources_cfg = resources
 
         self.train_dataset: Optional[GAgentPyGDataset] = None
         self.val_dataset: Optional[GAgentPyGDataset] = None
         self.test_dataset: Optional[GAgentPyGDataset] = None
+        self.shared_resources: Optional[SharedDataResources] = None
 
     def setup(self, stage: Optional[str] = None) -> None:
+        if self.shared_resources is None and self.resources_cfg is not None:
+            vocab = Path(self.resources_cfg["vocabulary_path"]).expanduser().resolve()
+            emb = Path(self.resources_cfg["embeddings_dir"]).expanduser().resolve()
+            self.shared_resources = SharedDataResources(vocabulary_path=vocab, embeddings_dir=emb)
+
         if stage in (None, "fit"):
             self.train_dataset = self._build_dataset("train")
             self.val_dataset = self._build_dataset("validation")
