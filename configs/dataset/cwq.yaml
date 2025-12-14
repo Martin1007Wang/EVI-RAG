@@ -14,8 +14,6 @@ paths:
 
 entity_normalization: none
 undirected_traversal: false
-hard_negative_k: 4
-hard_negative_similarity: cosine
 
 column_map:
   question_id_field: id

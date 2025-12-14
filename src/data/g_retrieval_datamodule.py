@@ -43,7 +43,6 @@ class GRetrievalDataModule(LightningDataModule):
         drop_last: bool = True,
         persistent_workers: bool = False,
         splits: Optional[Dict[str, str]] = None,
-        sampler: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -65,7 +64,6 @@ class GRetrievalDataModule(LightningDataModule):
         
         # Default splits mapping if not provided in `data/retriever.yaml`
         self.splits = splits or {"train": "train", "validation": "validation", "test": "test"}
-        self.sampler = sampler or {}
         # 3. Runtime State
         self.train_dataset: Optional[GRetrievalDataset] = None
         self.val_dataset: Optional[GRetrievalDataset] = None
@@ -175,10 +173,6 @@ class GRetrievalDataModule(LightningDataModule):
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Did you run setup()?")
         
-        # Extract Hard Negative settings (Dataset Property)
-        hard_neg_k = self.dataset_cfg.get("hard_negative_k", 0)
-        hard_neg_sim = self.dataset_cfg.get("hard_negative_similarity", "cosine")
-
         return UnifiedDataLoader(
             dataset,
             batch_size=self.batch_size_per_device,
@@ -187,15 +181,7 @@ class GRetrievalDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
-            
-            # Sampler logic (Throttling)
-            samples_per_epoch=self.sampler.get("train_samples_per_epoch") if shuffle else None,
-            batches_per_epoch=self.sampler.get("train_batches_per_epoch") if shuffle else None,
-            
-            # Hard Negatives
-            hard_negative_k=hard_neg_k,
-            hard_negative_similarity=hard_neg_sim,
-            
+
             # Reproducibility
             random_seed=self.dataset_cfg.get("random_seed"),
         )

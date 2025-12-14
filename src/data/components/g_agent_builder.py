@@ -24,10 +24,6 @@ class GAgentSettings:
     enabled: bool = True
     # anchors: top-K edges (by retrieval score) define the high-belief region
     anchor_top_k: int = 50
-    # compatibility knobs (unused in new topology logic but kept for backward config parsing)
-    beam_width_hop1: int = 50
-    final_k: int = 50
-    use_log_scores: bool = True
     output_path: Path = Path("g_agent/g_agent_samples.pt")
     force_include_gt: bool = False
 

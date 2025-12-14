@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - train_retriever_default
+
+tags: ["train_retriever", "perf"]
+
+trainer:
+  precision: 16-mixed
+
+model:
+  compile_model: true
+

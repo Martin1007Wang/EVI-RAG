@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import hydra
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -12,11 +11,7 @@ from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 
 from src.models.components.retriever import RetrieverOutput
-from src.losses import create_loss_function
 from src.utils import (
-    RankingStats,
-    compute_answer_recall,
-    compute_ranking_metrics,
     extract_sample_ids,
     infer_batch_size,
     log_metric,
@@ -31,63 +26,55 @@ class RetrieverModule(LightningModule):
         self,
         retriever: torch.nn.Module,
         loss: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+        optimizer: Any,
+        scheduler: Any = None,
         evaluation_cfg: Optional[DictConfig | Dict] = None,
         compile_model: bool = False,
         compile_dynamic: bool = True,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(logger=False,ignore=["retriever"]) 
+        self.save_hyperparameters(logger=False, ignore=["retriever"])
 
         self.model = retriever
-        
-        # Optional: Torch 2.0 Compile
         if compile_model and hasattr(torch, "compile"):
-            logger.info("Compiling model backbone with torch.compile (dynamic=%s)...", compile_dynamic)
+            logger.info("Compiling retriever with torch.compile (dynamic=%s)...", compile_dynamic)
             self.model = torch.compile(self.model, dynamic=compile_dynamic)
 
-        self.loss =loss
+        self.loss = loss
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-        # 3. Evaluation Settings
         eval_cfg = self._to_dict(evaluation_cfg or {})
         self._ranking_k = normalize_k_values(eval_cfg.get("ranking_k", [1, 5, 10]), default=[1, 5, 10])
         self._answer_k = normalize_k_values(eval_cfg.get("answer_recall_k", [5, 10]), default=[5, 10])
-        
-        # Buffer for accumulating eval predictions
-        self._ranking_storage: Dict[str, List[Dict[str, Any]]] = {"val": [], "test": []}
-        # Optional eval-time persistence config (注入自 eval.py)
+
+        self._streaming_state: Dict[str, Dict[str, Any]] = {}
         self.eval_persist_cfg: Optional[Dict[str, Any]] = None
 
     @staticmethod
-    def _to_dict(cfg: Union[DictConfig, Dict]) -> Dict:
-        """Helper to sanitize Omegaconf configs."""
+    def _to_dict(cfg: Union[DictConfig, Dict]) -> Dict[str, Any]:
         if isinstance(cfg, DictConfig):
-            return OmegaConf.to_container(cfg, resolve=True)
-        return cfg
+            return OmegaConf.to_container(cfg, resolve=True)  # type: ignore[return-value]
+        return dict(cfg)
 
     # ------------------------------------------------------------------ #
     # Core Forward & Prediction
     # ------------------------------------------------------------------ #
-    def forward(self, batch) -> RetrieverOutput:
-        """Training/Eval forward pass."""
+    def forward(self, batch: Any) -> RetrieverOutput:
         return self.model(batch)
-    
-    def predict_step(self, batch, batch_idx, dataloader_idx=0) -> Dict[str, Any]:
+
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Dict[str, Any]:
         """
-        Interface for GAgent / Inference.
-        Returns a lightweight dict on CPU (mostly) to avoid VRAM leaks in loops.
+        Interface for g_agent / inference.
+        Returns a lightweight dict on CPU (mostly) to avoid VRAM retention in downstream graph ops.
         """
         output = self(batch)
-        # Detach + move to CPU to allow downstream CPU graph ops without GPU retention
         scores = output.scores.detach().cpu()
         logits = output.logits.detach().cpu()
         query_ids = output.query_ids.detach().cpu()
         relation_ids = output.relation_ids.detach().cpu() if output.relation_ids is not None else None
 
-        def _maybe_cpu(attr_name: str):
+        def _maybe_cpu(attr_name: str) -> Any:
             val = getattr(batch, attr_name, None)
             if val is None:
                 return None
@@ -102,7 +89,6 @@ class RetrieverModule(LightningModule):
             "scores": scores,
             "logits": logits,
             "relation_ids": relation_ids,
-            # Topology + metadata needed by GAgentBuilder
             "edge_index": _maybe_cpu("edge_index"),
             "edge_attr": _maybe_cpu("edge_attr"),
             "node_global_ids": _maybe_cpu("node_global_ids"),
@@ -117,208 +103,394 @@ class RetrieverModule(LightningModule):
     # ------------------------------------------------------------------ #
     # Training Loop
     # ------------------------------------------------------------------ #
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        num_graphs = infer_batch_size(batch)
         output = self(batch)
-        loss_output = self.loss(output, batch.labels, training_step=self.global_step)
-        batch_size = infer_batch_size(batch)
-        
-        log_metric(self, "train/loss", loss_output.loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        
-        # Log auxiliary components if any (e.g. regularization terms)
+        loss_output = self.loss(
+            output,
+            batch.labels,
+            training_step=self.global_step,
+            edge_batch=output.query_ids,
+            num_graphs=num_graphs,
+        )
+        log_metric(self, "train/loss", loss_output.loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=num_graphs)
+
         for k, v in getattr(loss_output, "components", {}).items():
-            log_metric(self, f"train/loss/{k}", v, on_step=False, on_epoch=True, batch_size=batch_size)
-            
+            log_metric(self, f"train/loss/{k}", v, on_step=False, on_epoch=True, batch_size=num_graphs)
+        for k, v in getattr(loss_output, "metrics", {}).items():
+            log_metric(self, f"train/metric/{k}", v, on_step=False, on_epoch=True, batch_size=num_graphs)
+
         return loss_output.loss
 
     def configure_optimizers(self):
-        # 1. 实例化优化器
-        # params=self.parameters() 是必须在运行时注入的，所以用 partial instantiation
         optimizer = self.optimizer(params=self.parameters())
+        if self.scheduler is None:
+            return optimizer
         scheduler = self.scheduler(optimizer)
-        
-        lr_scheduler_config = {
-            "scheduler": scheduler,
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler},
         }
-        
-        return {"optimizer": optimizer, "lr_scheduler_config": lr_scheduler_config}
 
     # ------------------------------------------------------------------ #
     # Evaluation Loop (Validation & Test)
     # ------------------------------------------------------------------ #
-    def validation_step(self, batch, batch_idx):
+    def on_validation_epoch_start(self) -> None:
+        self._reset_streaming_state(split="val")
+
+    def on_test_epoch_start(self) -> None:
+        self._reset_streaming_state(split="test")
+
+    def validation_step(self, batch: Any, batch_idx: int) -> None:
         self._shared_eval_step(batch, batch_idx, split="val")
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch: Any, batch_idx: int) -> None:
         self._shared_eval_step(batch, batch_idx, split="test")
 
-    def _shared_eval_step(self, batch, batch_idx, split: str):
-        """Unified evaluation logic: Calc Loss -> Log -> Buffer Predictions."""
+    def on_validation_epoch_end(self) -> None:
+        self._finalize_streaming_state(split="val")
+
+    def on_test_epoch_end(self) -> None:
+        self._finalize_streaming_state(split="test")
+
+    def _shared_eval_step(self, batch: Any, batch_idx: int, *, split: str) -> None:
+        num_graphs = infer_batch_size(batch)
         output = self(batch)
-        loss_out = self.loss(output, batch.labels, training_step=self.global_step)
-        batch_size = infer_batch_size(batch)
-        
+        loss_out = self.loss(
+            output,
+            batch.labels,
+            training_step=self.global_step,
+            edge_batch=output.query_ids,
+            num_graphs=num_graphs,
+        )
+
         log_metric(
             self,
             f"{split}/loss",
             loss_out.loss,
-            batch_size=batch_size,
+            batch_size=num_graphs,
             prog_bar=True,
             sync_dist=True,
             on_step=False,
             on_epoch=True,
         )
-
-        # Buffer predictions for epoch-end ranking metrics (all CPU to save VRAM)
-        head_ids = batch.node_global_ids[batch.edge_index[0]].detach().cpu()
-        tail_ids = batch.node_global_ids[batch.edge_index[1]].detach().cpu()
-        relation_ids = batch.edge_attr.detach().cpu() if hasattr(batch, "edge_attr") else None
-        if not hasattr(batch, "answer_entity_ids") or not hasattr(batch, "answer_entity_ids_ptr"):
-            raise ValueError("Batch must provide answer_entity_ids and answer_entity_ids_ptr for metrics.")
-        answer_ids = batch.answer_entity_ids.detach().cpu()
-        answer_ptr = batch.answer_entity_ids_ptr.detach().cpu()
-        sample_ids = extract_sample_ids(batch)
-        questions = self._extract_questions(batch, len(sample_ids))
-        self._ranking_storage[split].append({
-            "scores": output.scores.detach().cpu(),
-            "labels": batch.labels.detach().cpu(),
-            "query_ids": output.query_ids.detach().cpu(),
-            "head_ids": head_ids,
-            "tail_ids": tail_ids,
-            "answer_entity_ids": answer_ids,
-            "answer_entity_ids_ptr": answer_ptr,
-            "relation_ids": relation_ids,
-            "sample_ids": sample_ids,
-            "questions": questions,
-        })
-
-    def on_validation_epoch_end(self):
-        self._compute_and_log_epoch_metrics(split="val")
-
-    def on_test_epoch_end(self):
-        self._compute_and_log_epoch_metrics(split="test")
+        self._update_streaming_state(split=split, batch=batch, output=output, num_graphs=num_graphs)
 
     # ------------------------------------------------------------------ #
-    # Metrics Aggregation
+    # Streaming Metrics (no epoch-sized buffering)
     # ------------------------------------------------------------------ #
-    def _compute_and_log_epoch_metrics(self, split: str):
-        local_samples = self._ranking_storage[split]
-        if not local_samples:
+    def _reset_streaming_state(self, *, split: str) -> None:
+        device = self.device
+        ranking_k = [int(k) for k in self._ranking_k]
+        max_ranking_k = max(ranking_k) if ranking_k else 1
+        answer_k = [int(k) for k in self._answer_k]
+        max_answer_k = max(answer_k) if answer_k else 0
+        max_top_k = max(max_ranking_k, max_answer_k)
+
+        positions = torch.arange(1, max_ranking_k + 1, device=device, dtype=torch.float32)
+        discounts = 1.0 / torch.log2(positions + 1.0)
+
+        self._streaming_state[split] = {
+            "device": device,
+            "max_ranking_k": int(max_ranking_k),
+            "max_answer_k": int(max_answer_k),
+            "max_top_k": int(max_top_k),
+            "discounts": discounts,
+            "discounts_cumsum": discounts.cumsum(0),
+            "ranking_count": torch.zeros((), device=device, dtype=torch.float32),
+            "mrr_sum": torch.zeros((), device=device, dtype=torch.float32),
+            "precision_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in ranking_k},
+            "recall_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in ranking_k},
+            "f1_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in ranking_k},
+            "ndcg_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in ranking_k},
+            "answer_count": torch.zeros((), device=device, dtype=torch.float32),
+            "answer_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in answer_k},
+            "persist_samples": [],
+        }
+
+    @staticmethod
+    def _all_reduce_inplace(value: torch.Tensor) -> None:
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    def _finalize_streaming_state(self, *, split: str) -> None:
+        state = self._streaming_state.get(split)
+        if not state:
             return
 
-        # 1. DDP Gather: Collect samples from all GPUs
-        all_samples_batches = self._ddp_gather(local_samples)
-        
-        # 2. Clear Buffer
-        self._ranking_storage[split] = []
-        
-        # 3. Group by query_id on the fly to avoid extra tensor copies
-        samples = list(self._iter_query_samples(all_samples_batches))
+        self._all_reduce_inplace(state["ranking_count"])
+        self._all_reduce_inplace(state["mrr_sum"])
+        for metric in ("precision_sum", "recall_sum", "f1_sum", "ndcg_sum"):
+            for tensor in state[metric].values():
+                self._all_reduce_inplace(tensor)
+        self._all_reduce_inplace(state["answer_count"])
+        for tensor in state["answer_sum"].values():
+            self._all_reduce_inplace(tensor)
 
-        # 4. Compute Metrics (Standard Utils)
-        ranking_stats = compute_ranking_metrics(samples, self._ranking_k)
-        answer_stats = compute_answer_recall(samples, self._answer_k)
-        effective_batch = max(len(samples), 1)
-        
-        # 5. Log Results
-        self._log_ranking_stats(split, ranking_stats, batch_size=effective_batch)
-        for k, v in answer_stats.items():
-            log_metric(
-                self,
-                f"{split}/answer/{k}",
-                v,
-                batch_size=effective_batch,
-                sync_dist=False,
-                on_step=False,
-                on_epoch=True,
-            )
-        # 6. Optional persistence for downstream LLM 评估
-        self._maybe_persist_retriever_outputs(split, samples)
+        ranking_count = state["ranking_count"]
+        denom = ranking_count.clamp_min(1.0)
+        effective_ranking_count = int(ranking_count.detach().cpu().item())
+        batch_size = max(effective_ranking_count, 1)
 
-    def _ddp_gather(self, local_samples: List[Dict]) -> List[Dict]:
-        """Gather data from all ranks."""
-        if not dist.is_available() or not dist.is_initialized():
-            return local_samples
-            
-        world_size = dist.get_world_size()
-        gathered = [None for _ in range(world_size)]
-        # distinct from all_gather, this handles pickles
-        dist.all_gather_object(gathered, local_samples)
-        
-        # Flatten the list of lists: [Rank0_List, Rank1_List] -> Combined_List
-        combined = []
-        for rank_list in gathered:
-            combined.extend(rank_list)
-        return combined
-
-    def _log_ranking_stats(self, split: str, stats: RankingStats, *, batch_size: int) -> None:
         log_metric(
             self,
             f"{split}/ranking/mrr",
-            stats.mrr,
+            state["mrr_sum"] / denom,
             batch_size=batch_size,
             sync_dist=False,
             on_step=False,
             on_epoch=True,
         )
-        for k, v in stats.ndcg_at_k.items():
-            log_metric(
-                self,
-                f"{split}/ranking/ndcg@{k}",
-                v,
-                batch_size=batch_size,
-                sync_dist=False,
-                on_step=False,
-                on_epoch=True,
-            )
-        for k, v in stats.recall_at_k.items():
+        for k in sorted(state["recall_sum"].keys()):
             log_metric(
                 self,
                 f"{split}/ranking/recall@{k}",
-                v,
+                state["recall_sum"][k] / denom,
+                batch_size=batch_size,
+                sync_dist=False,
+                on_step=False,
+                on_epoch=True,
+            )
+        for k in sorted(state["precision_sum"].keys()):
+            log_metric(
+                self,
+                f"{split}/ranking/precision@{k}",
+                state["precision_sum"][k] / denom,
+                batch_size=batch_size,
+                sync_dist=False,
+                on_step=False,
+                on_epoch=True,
+            )
+        for k in sorted(state["f1_sum"].keys()):
+            log_metric(
+                self,
+                f"{split}/ranking/f1@{k}",
+                state["f1_sum"][k] / denom,
+                batch_size=batch_size,
+                sync_dist=False,
+                on_step=False,
+                on_epoch=True,
+            )
+        for k in sorted(state["ndcg_sum"].keys()):
+            log_metric(
+                self,
+                f"{split}/ranking/ndcg@{k}",
+                state["ndcg_sum"][k] / denom,
                 batch_size=batch_size,
                 sync_dist=False,
                 on_step=False,
                 on_epoch=True,
             )
 
-    def _iter_query_samples(self, batch_list: List[Dict]) -> List[Dict]:
-        """
-        Generates per-query samples for metric computation directly from buffered batches.
-        Avoids an additional flattening pass and keeps tensors on CPU.
-        """
-        for batch_data in batch_list:
-            scores = batch_data["scores"]
-            labels = batch_data["labels"]
-            query_ids = batch_data["query_ids"]
-            head_ids = batch_data.get("head_ids")
-            tail_ids = batch_data.get("tail_ids")
-            relation_ids = batch_data.get("relation_ids")
-            answer_ids = batch_data.get("answer_entity_ids")
-            answer_ptr = batch_data.get("answer_entity_ids_ptr")
-            sample_ids = batch_data.get("sample_ids") or []
-            questions = batch_data.get("questions") or []
-            if head_ids is None or tail_ids is None or answer_ids is None or answer_ptr is None:
+        answer_count = state["answer_count"]
+        answer_denom = answer_count.clamp_min(1.0)
+        effective_answer_count = int(answer_count.detach().cpu().item())
+        answer_batch_size = max(effective_answer_count, 1)
+        for k in sorted(state["answer_sum"].keys()):
+            log_metric(
+                self,
+                f"{split}/answer/answer_recall@{k}",
+                state["answer_sum"][k] / answer_denom,
+                batch_size=answer_batch_size,
+                sync_dist=False,
+                on_step=False,
+                on_epoch=True,
+            )
+
+        self._maybe_persist_retriever_outputs(split, state["persist_samples"])
+        state["persist_samples"] = []
+
+    def _update_streaming_state(
+        self,
+        *,
+        split: str,
+        batch: Any,
+        output: RetrieverOutput,
+        num_graphs: int,
+    ) -> None:
+        state = self._streaming_state.get(split)
+        if state is None or state.get("device") != output.scores.device:
+            self._reset_streaming_state(split=split)
+            state = self._streaming_state[split]
+
+        scores_all = output.scores.detach().view(-1)
+        labels_all = batch.labels.detach().view(-1).to(dtype=torch.float32)
+        if scores_all.numel() != labels_all.numel():
+            raise ValueError(f"scores/labels shape mismatch: {scores_all.shape} vs {labels_all.shape}")
+
+        answer_ids_all = getattr(batch, "answer_entity_ids", None)
+        if answer_ids_all is None:
+            raise ValueError("Batch missing answer_entity_ids required for metrics.")
+        slice_dict = getattr(batch, "_slice_dict", None)
+        answer_ptr_raw = getattr(batch, "answer_entity_ids_ptr", None)
+        if answer_ptr_raw is None and isinstance(slice_dict, dict):
+            answer_ptr_raw = slice_dict.get("answer_entity_ids")
+        if answer_ptr_raw is None:
+            raise ValueError("Batch missing answer_entity_ids_ptr required for metrics.")
+        answer_ptr = torch.as_tensor(answer_ptr_raw, dtype=torch.long).view(-1).tolist()
+        if len(answer_ptr) != num_graphs + 1:
+            raise ValueError(f"answer_entity_ids_ptr length mismatch: {len(answer_ptr)} vs expected {num_graphs + 1}")
+
+        edge_ptr: Optional[List[int]] = None
+        if isinstance(slice_dict, dict) and "edge_index" in slice_dict:
+            candidate = torch.as_tensor(slice_dict.get("edge_index"), dtype=torch.long).view(-1)
+            if candidate.numel() == num_graphs + 1:
+                edge_ptr = candidate.tolist()
+        query_ids = output.query_ids.detach().view(-1)
+        if edge_ptr is None and query_ids.numel() != scores_all.numel():
+            raise ValueError(f"query_ids/scores mismatch: {query_ids.shape} vs {scores_all.shape}")
+
+        persist_cfg = getattr(self, "eval_persist_cfg", None) or {}
+        persist_splits = persist_cfg.get("splits") or ["test"]
+        persist_enabled = bool(persist_cfg.get("enabled")) and split in persist_splits
+        sample_ids = extract_sample_ids(batch) if persist_enabled else []
+        questions = self._extract_questions(batch, num_graphs) if persist_enabled else []
+
+        max_ranking_k = int(state["max_ranking_k"])
+        max_answer_k = int(state["max_answer_k"])
+        max_top_k = int(state["max_top_k"])
+        discounts = state["discounts"]
+        discounts_cumsum = state["discounts_cumsum"]
+
+        for gid in range(int(num_graphs)):
+            if edge_ptr is not None:
+                start = int(edge_ptr[gid])
+                end = int(edge_ptr[gid + 1])
+                if end <= start:
+                    continue
+                scores = scores_all[start:end]
+                labels = labels_all[start:end]
+                edge_index_g = batch.edge_index[:, start:end] if (max_answer_k > 0 or persist_enabled) else None
+                edge_attr_g = batch.edge_attr[start:end] if persist_enabled else None
+            else:
+                mask = query_ids == gid
+                if not bool(mask.any().item()):
+                    continue
+                scores = scores_all[mask]
+                labels = labels_all[mask]
+                edge_index_g = batch.edge_index[:, mask] if (max_answer_k > 0 or persist_enabled) else None
+                edge_attr_g = batch.edge_attr[mask] if persist_enabled else None
+
+            num_edges = int(scores.numel())
+            if num_edges <= 0:
                 continue
 
-            unique_queries = query_ids.unique()
-            for q_idx in unique_queries:
-                mask = query_ids == q_idx
-                start = int(answer_ptr[int(q_idx)].item())
-                end = int(answer_ptr[int(q_idx) + 1].item())
-                sample_answers = answer_ids[start:end]
-                sample_index = int(q_idx)
-                sample_id = sample_ids[sample_index] if sample_index < len(sample_ids) else str(sample_index)
-                question = questions[sample_index] if sample_index < len(questions) else ""
-                yield {
-                    "scores": scores[mask],
-                    "labels": labels[mask],
-                    "answer_ids": sample_answers,
-                    "head_ids": head_ids[mask] if head_ids is not None else None,
-                    "tail_ids": tail_ids[mask] if tail_ids is not None else None,
-                    "relation_ids": relation_ids[mask] if relation_ids is not None else None,
-                    "sample_id": sample_id,
-                    "question": question,
-                }
+            k_top = min(num_edges, max_top_k)
+            top_scores, top_idx = torch.topk(scores, k=k_top, largest=True, sorted=True)
+
+            # --- Ranking metrics (only defined when positives exist) ---
+            pos_mask = labels > 0.5
+            pos_count = int(pos_mask.sum().item())
+            if pos_count > 0:
+                best_pos = scores[pos_mask].max()
+                rank = (scores > best_pos).sum() + 1
+                state["mrr_sum"].add_(1.0 / rank.to(dtype=torch.float32))
+                state["ranking_count"].add_(1.0)
+
+                k_rank = min(k_top, max_ranking_k)
+                ranked_labels = labels[top_idx[:k_rank]].to(dtype=torch.float32)
+                hits_prefix = ranked_labels.cumsum(0)
+                dcg_prefix = (ranked_labels * discounts[:k_rank]).cumsum(0)
+                pos_denom = ranked_labels.new_tensor(float(pos_count))
+
+                for k in state["recall_sum"].keys():
+                    k_int = int(k)
+                    k_used = min(k_int, k_rank)
+                    hits = hits_prefix[k_used - 1] if k_used > 0 else ranked_labels.new_zeros(())
+                    recall = hits / pos_denom
+                    precision = hits / ranked_labels.new_tensor(float(k_int))
+                    denom_f1 = (precision + recall).clamp_min(1e-12)
+                    f1 = (2 * precision * recall) / denom_f1
+
+                    state["precision_sum"][k].add_(precision)
+                    state["recall_sum"][k].add_(recall)
+                    state["f1_sum"][k].add_(f1)
+
+                    ideal_k = min(pos_count, k_used)
+                    if ideal_k <= 0:
+                        state["ndcg_sum"][k].add_(ranked_labels.new_zeros(()))
+                    else:
+                        ideal_dcg = discounts_cumsum[ideal_k - 1]
+                        state["ndcg_sum"][k].add_(dcg_prefix[k_used - 1] / ideal_dcg)
+
+            # --- Answer recall (depends on top-k endpoints, independent of positives) ---
+            if state["answer_sum"]:
+                a_start = int(answer_ptr[gid])
+                a_end = int(answer_ptr[gid + 1])
+                answer_ids = answer_ids_all[a_start:a_end]
+                if answer_ids.numel() > 0 and max_answer_k > 0:
+                    if edge_index_g is None:
+                        raise ValueError("edge_index_g required for answer recall but missing.")
+                    k_ans = min(k_top, max_answer_k)
+                    top_edges = top_idx[:k_ans]
+                    edge_index_top = edge_index_g[:, top_edges]
+                    head_ids = batch.node_global_ids[edge_index_top[0]]
+                    tail_ids = batch.node_global_ids[edge_index_top[1]]
+
+                    answer_unique = torch.unique(answer_ids)
+                    if answer_unique.numel() > 0:
+                        answer_unique, _ = torch.sort(answer_unique)
+                        num_answers = int(answer_unique.numel())
+                        ranks = torch.arange(1, k_ans + 1, device=scores.device, dtype=torch.long)
+                        first_rank = torch.full((num_answers,), k_ans + 1, dtype=torch.long, device=scores.device)
+
+                        def _update_first_rank(entity_ids: torch.Tensor) -> None:
+                            idx = torch.searchsorted(answer_unique, entity_ids)
+                            valid = idx < num_answers
+                            if not bool(valid.any().item()):
+                                return
+                            idx_valid = idx[valid]
+                            ent_valid = entity_ids[valid]
+                            match = answer_unique[idx_valid] == ent_valid
+                            if not bool(match.any().item()):
+                                return
+                            first_rank.scatter_reduce_(
+                                0,
+                                idx_valid[match],
+                                ranks[valid][match],
+                                reduce="amin",
+                                include_self=True,
+                            )
+
+                        _update_first_rank(head_ids)
+                        _update_first_rank(tail_ids)
+
+                        state["answer_count"].add_(1.0)
+                        for k in state["answer_sum"].keys():
+                            k_used = min(int(k), k_ans)
+                            state["answer_sum"][k].add_((first_rank <= k_used).to(dtype=torch.float32).mean())
+
+            # --- Optional persistence (store only top max_ranking_k edges) ---
+            if persist_enabled:
+                k_persist = min(k_top, max_ranking_k)
+                if k_persist <= 0:
+                    continue
+                top_edges = top_idx[:k_persist]
+                if edge_index_g is None or edge_attr_g is None:
+                    raise ValueError("edge_index_g/edge_attr_g required for persistence but missing.")
+                edge_index_top = edge_index_g[:, top_edges]
+                head_ids = batch.node_global_ids[edge_index_top[0]].detach().cpu()
+                tail_ids = batch.node_global_ids[edge_index_top[1]].detach().cpu()
+                relation_ids = edge_attr_g[top_edges].detach().cpu()
+
+                sample_id = sample_ids[gid] if gid < len(sample_ids) else str(gid)
+                question = questions[gid] if gid < len(questions) else ""
+                a_start = int(answer_ptr[gid])
+                a_end = int(answer_ptr[gid + 1])
+                answer_ids = answer_ids_all[a_start:a_end].detach().cpu()
+
+                state["persist_samples"].append(
+                    {
+                        "scores": top_scores[:k_persist].detach().cpu(),
+                        "labels": labels[top_edges].detach().cpu(),
+                        "head_ids": head_ids,
+                        "tail_ids": tail_ids,
+                        "relation_ids": relation_ids,
+                        "sample_id": sample_id,
+                        "question": question,
+                        "answer_ids": answer_ids,
+                    }
+                )
 
     @staticmethod
     def _extract_questions(batch: Any, num_graphs: int) -> List[str]:
@@ -333,6 +505,9 @@ class RetrieverModule(LightningModule):
             return [str(raw.cpu().tolist()) for _ in range(num_graphs)]
         return [str(raw) for _ in range(num_graphs)]
 
+    # ------------------------------------------------------------------ #
+    # Optional persistence for downstream evaluation
+    # ------------------------------------------------------------------ #
     def _maybe_persist_retriever_outputs(self, split: str, samples: List[Dict[str, Any]]) -> None:
         cfg = getattr(self, "eval_persist_cfg", None) or {}
         if not cfg.get("enabled"):
@@ -370,17 +545,15 @@ class RetrieverModule(LightningModule):
             sample_id = sample.get("sample_id", "")
             question = sample.get("question", "")
             answer_ids = sample.get("answer_ids")
-            order = torch.argsort(scores, descending=True)
 
             triplets_by_k: Dict[int, List[Dict[str, Any]]] = {}
             for k in ranking_k:
-                top_indices = order[:k]
+                top_k = min(int(k), int(scores.numel()))
                 edges: List[Dict[str, Any]] = []
-                for rank_idx, edge_idx in enumerate(top_indices, start=1):
-                    idx = int(edge_idx)
-                    head_val = int(head_ids[idx].item()) if head_ids is not None else None
-                    rel_val = int(relation_ids[idx].item()) if relation_ids is not None else None
-                    tail_val = int(tail_ids[idx].item()) if tail_ids is not None else None
+                for rank_idx in range(top_k):
+                    head_val = int(head_ids[rank_idx].item()) if head_ids is not None else None
+                    rel_val = int(relation_ids[rank_idx].item()) if relation_ids is not None else None
+                    tail_val = int(tail_ids[rank_idx].item()) if tail_ids is not None else None
                     edges.append(
                         {
                             "head_entity_id": head_val,
@@ -389,9 +562,9 @@ class RetrieverModule(LightningModule):
                             "head_text": entity_map.get(head_val) if entity_map is not None else None,
                             "relation_text": relation_map.get(rel_val) if relation_map is not None else None,
                             "tail_text": entity_map.get(tail_val) if entity_map is not None else None,
-                            "score": float(scores[idx].item()),
-                            "label": float(labels[idx].item()),
-                            "rank": rank_idx,
+                            "score": float(scores[rank_idx].item()),
+                            "label": float(labels[rank_idx].item()),
+                            "rank": int(rank_idx + 1),
                         }
                     )
                 triplets_by_k[int(k)] = edges
@@ -427,14 +600,11 @@ class RetrieverModule(LightningModule):
             out_dir = ds.get("out_dir")
             if out_dir:
                 base = Path(out_dir)
-                # 优先使用 entity_vocab.parquet（entity_id -> label），其次 embedding_vocab.parquet
                 if not entity_path:
-                    if (base / "entity_vocab.parquet").exists():
-                        entity_path = base / "entity_vocab.parquet"
-                    else:
-                        entity_path = base / "embedding_vocab.parquet"
+                    entity_path = base / "entity_vocab.parquet"
                 if not relation_path:
                     relation_path = base / "relation_vocab.parquet"
+
         ent_map: Optional[Dict[int, str]] = None
         rel_map: Optional[Dict[int, str]] = None
         try:
@@ -442,11 +612,10 @@ class RetrieverModule(LightningModule):
                 ent_df = pd.read_parquet(entity_path)
                 if "entity_id" in ent_df.columns:
                     ent_map = dict(zip(ent_df.entity_id.astype(int), ent_df.label.astype(str)))
-                elif "embedding_id" in ent_df.columns:
-                    ent_map = dict(zip(ent_df.embedding_id.astype(int), ent_df.label.astype(str)))
             if relation_path and Path(relation_path).exists():
                 rel_df = pd.read_parquet(relation_path)
                 rel_map = dict(zip(rel_df.relation_id.astype(int), rel_df.label.astype(str)))
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to load vocab for textualize: %s", exc)
         return ent_map, rel_map
+

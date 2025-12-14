@@ -15,7 +15,3 @@ splits:
   train: train
   validation: validation
   test: test
-
-sampler:
-  train_batches_per_epoch: 8
-  train_samples_per_epoch: null

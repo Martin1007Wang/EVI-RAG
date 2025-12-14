@@ -164,10 +164,10 @@ def _run_g_agent_generation(
         include_gt_map = g_agent_cfg.get("include_gt", {})
         force_gt = include_gt_map.get(split, False) if isinstance(include_gt_map, dict) else False
 
+        anchor_top_k = int(g_agent_cfg.get("anchor_top_k", GAgentSettings.anchor_top_k))
         settings = GAgentSettings(
             enabled=True,
-            beam_width_hop1=g_agent_cfg.beam_width_hop1,
-            final_k=g_agent_cfg.final_k,
+            anchor_top_k=anchor_top_k,
             output_path=output_dir / f"{split}_g_agent.pt",
             force_include_gt=force_gt,
         )

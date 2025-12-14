@@ -9,23 +9,18 @@ defaults:
 
 tags: ["train_retriever"]
 
-# Shared training knobs for retriever runs.
-data:
-  dataset_cfg:
-    sampler:
-      train_batches_per_epoch: 8
-      train_samples_per_epoch: null
-
 callbacks:
   model_checkpoint:
-    monitor: val/ranking/mrr
+    monitor: val/ranking/recall@100
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
   early_stopping:
-    monitor: val/ranking/mrr
+    monitor: val/ranking/recall@100
     mode: max
-    patience: 50
+    patience: 10
 
 trainer:
+  min_epochs: 0
+  max_epochs: 10000
   check_val_every_n_epoch: 1

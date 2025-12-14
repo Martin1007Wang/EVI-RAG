@@ -4,4 +4,4 @@ defaults:
   - train_retriever_default
   - override /dataset: webqsp
 
-tags: ["webqsp", "train","retriever"]
+tags: ["webqsp", "train_retriever"]

@@ -12,10 +12,6 @@ tags: ["eval", "retriever"]
 task_name: "eval_retriever"
 ckpt_path: null  # 评估时可通过 CLI 传入
 
-data:
-  sampler:
-    train_batches_per_epoch: null
-
 # 默认开启 g_agent 生成，依赖 dataset.paths.embeddings 解析 LMDB。
 eval_persist:
   retriever:
@@ -30,6 +26,8 @@ g_agent:
   enabled: true
   splits: ["train", "validation", "test"]
   output_dir: ${dataset.materialized_dir}/g_agent
-  beam_width_hop1: 50
-  final_k: 100
+  anchor_top_k: 200
+  include_gt:
+    train: true
+    validation: true
   skip_retriever_metrics: false
