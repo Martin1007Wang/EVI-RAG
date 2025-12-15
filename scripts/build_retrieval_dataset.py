@@ -19,15 +19,23 @@ path materialization (avoid recomputing shortest paths later).
 
 from __future__ import annotations
 
+import os
 import pickle
+import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import hydra
+try:
+    import hydra
+except ModuleNotFoundError:  # pragma: no cover
+    hydra = None  # type: ignore[assignment]
 import lmdb
 import torch
 import numpy as np
-from omegaconf import DictConfig
+try:
+    from omegaconf import DictConfig
+except ModuleNotFoundError:  # pragma: no cover
+    DictConfig = object  # type: ignore[assignment]
 from tqdm import tqdm
 
 try:
@@ -177,6 +185,38 @@ def _encode_to_memmap(
     return tensor
 
 
+def _ensure_symlink(link_path: Path, target_path: Path) -> None:
+    if link_path.exists() or link_path.is_symlink():
+        return
+    _ensure_dir(link_path.parent)
+    os.symlink(str(target_path), str(link_path))
+
+
+def _prepare_lmdb_dir(path: Path, *, overwrite: bool) -> Path:
+    """Prepare a clean temporary LMDB directory and return its path.
+
+    We always write into a sibling ``*.tmp`` directory and atomically swap on success.
+    This prevents stale keys from older builds from leaking into the current dataset.
+    """
+    tmp_path = Path(str(path) + ".tmp")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"LMDB already exists at {path}; set overwrite_lmdb=true to rebuild deterministically.")
+    _ensure_dir(tmp_path)
+    return tmp_path
+
+
+def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> None:
+    if not tmp_path.exists():
+        raise FileNotFoundError(f"Temporary LMDB dir missing: {tmp_path}")
+    if final_path.exists():
+        if not overwrite:
+            raise FileExistsError(f"Refusing to overwrite existing LMDB at {final_path}")
+        shutil.rmtree(final_path)
+    tmp_path.rename(final_path)
+
+
 def build_dataset(cfg: DictConfig) -> None:
     if cfg.get("seed") is not None:
         torch.manual_seed(int(cfg.seed))
@@ -185,9 +225,11 @@ def build_dataset(cfg: DictConfig) -> None:
     if cfg.get("deterministic", False):
         torch.use_deterministic_algorithms(True)
 
+    # Topic features follow SubgraphRAG parity: 2-class one-hot {non-topic, topic}.
+    # Topic is defined by query entities only; answers are supervision and must NOT leak into inputs.
     num_topics = int(cfg.get("num_topics", 2))
-    if num_topics <= 0:
-        raise ValueError("num_topics must be positive to build topic features.")
+    if num_topics < 2:
+        raise ValueError("num_topics must be >= 2 to build SubgraphRAG-parity topic features.")
 
     # Load vocabulary tables (small) and convert to Python dicts
     entity_vocab = _load_parquet(Path(cfg.parquet_dir) / "entity_vocab.parquet").to_pydict()
@@ -231,6 +273,34 @@ def build_dataset(cfg: DictConfig) -> None:
     relation_emb = encoder.encode(relation_labels, cfg.batch_size, show_progress=cfg.progress_bar, desc="Relations")
     torch.save(relation_emb, emb_dir / "relation_embeddings.pt")
 
+    sub_cfg = cfg.get("sub", {})
+    build_sub = bool(sub_cfg.get("enabled", False))
+    sub_parquet_dir = Path(sub_cfg.get("parquet_dir", ""))
+    sub_output_dir = Path(sub_cfg.get("output_dir", ""))
+    share_artifacts = bool(sub_cfg.get("share_vocab_and_embeddings", True))
+    sub_graph_ids: Set[str] = set()
+    if build_sub:
+        if not sub_parquet_dir.exists():
+            build_sub = False
+        else:
+            sub_questions_path = sub_parquet_dir / "questions.parquet"
+            if not sub_questions_path.exists():
+                build_sub = False
+            else:
+                sub_graph_ids = set(pq.read_table(sub_questions_path, columns=["graph_id"]).column("graph_id").to_pylist())
+
+    if build_sub and share_artifacts:
+        _ensure_dir(sub_output_dir)
+        base_vocab_dir = Path(cfg.output_dir) / "vocabulary" / "vocabulary.lmdb"
+        sub_vocab_dir = sub_output_dir / "vocabulary" / "vocabulary.lmdb"
+        _ensure_symlink(sub_vocab_dir, base_vocab_dir)
+        sub_emb_dir = sub_output_dir / "embeddings"
+        _ensure_dir(sub_emb_dir)
+        _ensure_symlink(sub_emb_dir / "entity_embeddings.pt", emb_dir / "entity_embeddings.pt")
+        _ensure_symlink(sub_emb_dir / "relation_embeddings.pt", emb_dir / "relation_embeddings.pt")
+    elif build_sub and not share_artifacts:
+        raise NotImplementedError("sub.share_vocab_and_embeddings=false is not supported; use symlinks to enforce SSOT.")
+
     # Load main tables as pyarrow objects without converting to dicts
     graphs_table = _load_parquet(Path(cfg.parquet_dir) / "graphs.parquet")
     questions_table = _load_parquet(Path(cfg.parquet_dir) / "questions.parquet")
@@ -247,35 +317,81 @@ def build_dataset(cfg: DictConfig) -> None:
 
     graph_id_list = graph_ids_all.to_pylist()
     graph_id_to_row: Dict[str, int] = {gid: idx for idx, gid in enumerate(graph_id_list)}
-    graph_cols = {
+    graph_cols: Dict[str, List] = {
         "node_entity_ids": graphs_table.column("node_entity_ids").to_pylist(),
         "node_embedding_ids": graphs_table.column("node_embedding_ids").to_pylist(),
         "edge_src": graphs_table.column("edge_src").to_pylist(),
         "edge_dst": graphs_table.column("edge_dst").to_pylist(),
         "edge_relation_ids": graphs_table.column("edge_relation_ids").to_pylist(),
         "positive_edge_mask": graphs_table.column("positive_edge_mask").to_pylist(),
+        # Optional newer schema fields (produced by scripts/build_retrieval_parquet.py).
+        # - positive_triple_mask: edge-level mask (canonical edge ids on GT paths)
+        # - gt_source: provenance of GT (answer_subgraph vs shortest_path)
+        "positive_triple_mask": graphs_table.column("positive_triple_mask").to_pylist()
+        if "positive_triple_mask" in graphs_table.schema.names
+        else [],
         "gt_path_edge_indices": graphs_table.column("gt_path_edge_indices").to_pylist(),
         "gt_path_node_indices": graphs_table.column("gt_path_node_indices").to_pylist(),
+        "gt_source": graphs_table.column("gt_source").to_pylist() if "gt_source" in graphs_table.schema.names else [],
     }
+
+    labels_cfg: Dict[str, Any] = cfg.get("labels", {}) or {}
+    label_source: str = str(labels_cfg.get("source", "transition"))
+    store_aux_labels: bool = bool(labels_cfg.get("store_aux", True))
+    valid_sources = {"transition", "triple", "hybrid"}
+    if label_source not in valid_sources:
+        raise ValueError(f"labels.source must be one of {sorted(valid_sources)}, got {label_source!r}")
+    if label_source in {"triple", "hybrid"} and not graph_cols["positive_triple_mask"]:
+        raise RuntimeError(
+            "graphs.parquet is missing `positive_triple_mask` required by labels.source="
+            f"{label_source!r}. Re-run scripts/build_retrieval_parquet.py with the updated code."
+        )
+    if label_source == "hybrid" and not graph_cols["gt_source"]:
+        raise RuntimeError(
+            "graphs.parquet is missing `gt_source` required by labels.source='hybrid'. "
+            "Re-run scripts/build_retrieval_parquet.py with the updated code."
+        )
 
     questions_rows = questions_table.num_rows
     print(f"Preparing {questions_rows} samples...")
 
+    overwrite_lmdb = bool(cfg.get("overwrite_lmdb", True))
+
     # Set up LMDB environments
     envs: Dict[str, lmdb.Environment] = {}
+    sub_envs: Dict[str, lmdb.Environment] = {}
     map_size = cfg.map_size_gb * (1 << 30)
     all_splits = questions_table.column("split").unique().to_pylist()
+    tmp_dirs: Dict[str, Path] = {}
+    sub_tmp_dirs: Dict[str, Path] = {}
     for split in all_splits:
+        final_dir = emb_dir / f"{split}.lmdb"
+        tmp_dir = _prepare_lmdb_dir(final_dir, overwrite=overwrite_lmdb)
+        tmp_dirs[str(split)] = tmp_dir
         envs[split] = lmdb.open(
-            str(emb_dir / f"{split}.lmdb"),
+            str(tmp_dir),
             map_size=map_size,
             subdir=True,
             lock=False,
         )
+        if build_sub and share_artifacts:
+            sub_emb_dir = sub_output_dir / "embeddings"
+            sub_final_dir = sub_emb_dir / f"{split}.lmdb"
+            sub_tmp_dir = _prepare_lmdb_dir(sub_final_dir, overwrite=overwrite_lmdb)
+            sub_tmp_dirs[str(split)] = sub_tmp_dir
+            sub_envs[split] = lmdb.open(
+                str(sub_tmp_dir),
+                map_size=map_size,
+                subdir=True,
+                lock=False,
+            )
 
+    success = False
     try:
         txn_cache: Dict[str, lmdb.Transaction] = {split: env.begin(write=True) for split, env in envs.items()}
         pending: Dict[str, int] = {split: 0 for split in envs.keys()}
+        sub_txn_cache: Dict[str, lmdb.Transaction] = {split: env.begin(write=True) for split, env in sub_envs.items()}
+        sub_pending: Dict[str, int] = {split: 0 for split in sub_envs.keys()}
 
         question_batches = questions_table.to_batches(max_chunksize=cfg.batch_size)
         total_batches = questions_table.num_rows / cfg.batch_size
@@ -317,25 +433,52 @@ def build_dataset(cfg: DictConfig) -> None:
                 edge_src = graph_cols["edge_src"][g_idx]
                 edge_dst = graph_cols["edge_dst"][g_idx]
                 edge_rel = graph_cols["edge_relation_ids"][g_idx]
-                labels = graph_cols["positive_edge_mask"][g_idx]
+                labels_transition = graph_cols["positive_edge_mask"][g_idx]
+                labels_triple = (
+                    graph_cols["positive_triple_mask"][g_idx] if graph_cols["positive_triple_mask"] else None
+                )
+                gt_source = graph_cols["gt_source"][g_idx] if graph_cols["gt_source"] else "unknown"
+
+                if label_source == "transition":
+                    labels = labels_transition
+                elif label_source == "triple":
+                    labels = labels_triple
+                elif label_source == "hybrid":
+                    if gt_source == "answer_subgraph":
+                        labels = labels_triple
+                    else:
+                        labels = labels_transition
+                else:
+                    raise RuntimeError("unreachable label_source")
 
                 num_nodes = len(node_entity_ids)
                 num_edges = len(edge_src)
+                if num_edges <= 0:
+                    raise ValueError(
+                        f"Invalid graph with zero edges for {graph_id} (split={split}). "
+                        "Fix raw parquet/filters and rebuild; empty edge_index is unsupported."
+                    )
                 node_global_ids = torch.tensor(node_entity_ids, dtype=torch.long)
                 node_emb_ids = torch.tensor(node_embedding_ids, dtype=torch.long)
                 edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
                 edge_attr = torch.tensor(edge_rel, dtype=torch.long)
+                if labels is None:
+                    raise RuntimeError(f"labels resolved to None for {graph_id}; check labels.source={label_source!r}")
                 label_tensor = torch.tensor(labels, dtype=torch.float32)
-                topic_one_hot = torch.zeros((num_nodes, num_topics), dtype=torch.float32)
+                if label_tensor.numel() != num_edges:
+                    raise ValueError(
+                        f"Label length mismatch for {graph_id}: labels={label_tensor.numel()} vs num_edges={num_edges}. "
+                        "Rebuild normalized parquet caches to match the updated schema."
+                    )
+                topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long)
 
                 q_entities = q_batch_dict["seed_entity_ids"][i] or []
                 a_entities = q_batch_dict["answer_entity_ids"][i] or []
                 q_local = _local_indices(node_entity_ids, q_entities)
                 a_local = _local_indices(node_entity_ids, a_entities)
-                if q_local and num_topics > 0:
-                    topic_one_hot[torch.as_tensor(q_local, dtype=torch.long), 0] = 1.0
-                if a_local and num_topics > 1:
-                    topic_one_hot[torch.as_tensor(a_local, dtype=torch.long), 1] = 1.0
+                if q_local:
+                    topic_entity_mask[torch.as_tensor(q_local, dtype=torch.long)] = 1
+                topic_one_hot = torch.nn.functional.one_hot(topic_entity_mask, num_classes=num_topics).float()
                 q_emb_ids = (q_batch_dict.get("seed_embedding_ids", [[]] * (i + 1)) or [[]])[i] or []
                 a_emb_ids = (q_batch_dict.get("answer_embedding_ids", [[]] * (i + 1)) or [[]])[i] or []
 
@@ -369,17 +512,24 @@ def build_dataset(cfg: DictConfig) -> None:
                     "answer_entity_ids": torch.as_tensor(a_entities, dtype=torch.long),
                     "answer_entity_ids_len": torch.tensor([len(a_entities)], dtype=torch.long),
                     "q_embedding_ids": q_emb_ids,
-                "a_embedding_ids": a_emb_ids,
-                "gt_paths_nodes": [path_node_indices] if path_node_indices else [],
-                "gt_paths_triples": [_edge_triples(path_edge_indices)] if path_edge_indices else [],
-                # 直接存检索图中的 GT 边索引，便于下游无需反推
-                "gt_path_edge_indices": path_edge_indices if path_edge_indices else [],
-                # 兼容性：存原始节点索引列表（非必需）
-                "gt_path_node_indices": path_node_indices if path_node_indices else [],
-                "sample_id": graph_id,
-                "idx": processed + i,
-                "metadata": meta_val,
-            }
+                    "a_embedding_ids": a_emb_ids,
+                    "gt_paths_nodes": [path_node_indices] if path_node_indices else [],
+                    "gt_paths_triples": [_edge_triples(path_edge_indices)] if path_edge_indices else [],
+                    # 直接存检索图中的 GT 边索引，便于下游无需反推
+                    "gt_path_edge_indices": path_edge_indices if path_edge_indices else [],
+                    # 兼容性：存原始节点索引列表（非必需）
+                    "gt_path_node_indices": path_node_indices if path_node_indices else [],
+                    # Debug-only provenance (safe to ignore downstream)
+                    "gt_source": str(gt_source),
+                    "labels_source": str(label_source),
+                    "sample_id": graph_id,
+                    "idx": processed + i,
+                    "metadata": meta_val,
+                }
+                if store_aux_labels:
+                    sample["labels_transition"] = torch.tensor(labels_transition, dtype=torch.float32)
+                    if labels_triple is not None:
+                        sample["labels_triple"] = torch.tensor(labels_triple, dtype=torch.float32)
 
                 txn = txn_cache[split]
                 _write_sample(txn, graph_id, sample)
@@ -388,20 +538,54 @@ def build_dataset(cfg: DictConfig) -> None:
                     txn.commit()
                     txn_cache[split] = envs[split].begin(write=True)
                     pending[split] = 0
+
+                if sub_envs and graph_id in sub_graph_ids:
+                    sub_txn = sub_txn_cache[split]
+                    _write_sample(sub_txn, graph_id, sample)
+                    sub_pending[split] += 1
+                    if sub_pending[split] >= cfg.txn_size:
+                        sub_txn.commit()
+                        sub_txn_cache[split] = sub_envs[split].begin(write=True)
+                        sub_pending[split] = 0
             processed += q_batch.num_rows
 
         for split, txn in txn_cache.items():
             if pending[split] > 0:
                 txn.commit()
+        for split, txn in sub_txn_cache.items():
+            if sub_pending[split] > 0:
+                txn.commit()
+        success = True
     finally:
         for env in envs.values():
             env.close()
+        for env in sub_envs.values():
+            env.close()
+        if success:
+            for split in all_splits:
+                split_key = str(split)
+                final_dir = emb_dir / f"{split}.lmdb"
+                _finalize_lmdb_dir(tmp_path=tmp_dirs[split_key], final_path=final_dir, overwrite=overwrite_lmdb)
+                if build_sub and share_artifacts and split_key in sub_tmp_dirs:
+                    sub_emb_dir = sub_output_dir / "embeddings"
+                    sub_final_dir = sub_emb_dir / f"{split}.lmdb"
+                    _finalize_lmdb_dir(tmp_path=sub_tmp_dirs[split_key], final_path=sub_final_dir, overwrite=overwrite_lmdb)
+        else:
+            # Keep tmp dirs for debugging, but avoid silently masking partial builds.
+            pass
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="build_retrieval_dataset")
-def main(cfg: DictConfig) -> None:
-    _ensure_dir(Path(cfg.output_dir))
-    build_dataset(cfg)
+if hydra is not None:
+
+    @hydra.main(version_base=None, config_path="../configs", config_name="build_retrieval_dataset")
+    def main(cfg: DictConfig) -> None:
+        _ensure_dir(Path(cfg.output_dir))
+        build_dataset(cfg)
+
+else:  # pragma: no cover
+
+    def main(cfg: DictConfig) -> None:
+        raise ModuleNotFoundError("hydra-core is required to run scripts/build_retrieval_dataset.py")
 
 
 if __name__ == "__main__":

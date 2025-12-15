@@ -161,10 +161,13 @@ def _run_g_agent_generation(
         logger.info(f"\n[GAgent] Processing split: {split}")
         loader = _get_split_loader(datamodule, split)
         lmdb_path = _resolve_lmdb_path(cfg, split)
-        include_gt_map = g_agent_cfg.get("include_gt", {})
-        force_gt = include_gt_map.get(split, False) if isinstance(include_gt_map, dict) else False
 
         anchor_top_k = int(g_agent_cfg.get("anchor_top_k", GAgentSettings.anchor_top_k))
+        include_cfg = g_agent_cfg.get("force_include_gt", g_agent_cfg.get("include_gt", GAgentSettings.force_include_gt))
+        if isinstance(include_cfg, (dict, DictConfig)):
+            force_gt = bool(include_cfg.get(split, False))
+        else:
+            force_gt = bool(include_cfg)
         settings = GAgentSettings(
             enabled=True,
             anchor_top_k=anchor_top_k,

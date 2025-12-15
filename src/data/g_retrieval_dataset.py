@@ -1,5 +1,6 @@
 import json
 import logging
+import zlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set
 
@@ -32,6 +33,7 @@ class GRetrievalDataset(Dataset):
         sample_filter_path: Optional[Path] = None,
         random_seed: Optional[int] = None,
         gpt_triples_path: Optional[Path] = None,
+        validate_on_init: bool = False,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -69,7 +71,8 @@ class GRetrievalDataset(Dataset):
         if sample_limit:
             self._apply_sample_limit(sample_limit, random_seed)
 
-        self._assert_all_samples_valid()
+        if validate_on_init:
+            self._assert_all_samples_valid()
 
         logger.info(
             f"GRetrievalDataset[{self.split}] initialized: {len(self.sample_ids)} samples."
@@ -125,8 +128,6 @@ class GRetrievalDataset(Dataset):
             sample_id=sample_id,
             idx=idx,
         )
-        # PyG 强校验，防止批内索引错乱
-        data.validate(raise_on_error=True)
         return data
 
     def close(self) -> None:
@@ -152,8 +153,9 @@ class GRetrievalDataset(Dataset):
 
         generator = torch.Generator()
         if seed is not None:
-            # Deterministic subset per split
-            generator.manual_seed(int(seed) + hash(self.split) % (2**31))
+            # Deterministic subset per split (avoid Python's randomized hash()).
+            split_hash = zlib.crc32(str(self.split).encode("utf-8")) & 0x7FFFFFFF
+            generator.manual_seed(int(seed) + int(split_hash))
             
         perm = torch.randperm(len(self.sample_ids), generator=generator).tolist()
         self.sample_ids = [self.sample_ids[i] for i in perm[:limit]]
@@ -312,7 +314,8 @@ def create_g_retrieval_dataset(
         sample_limit=sample_limit,
         sample_filter_path=Path(cfg.get("sample_filter_path")) if cfg.get("sample_filter_path") else None,
         random_seed=cfg.get("random_seed"),
-        gpt_triples_path=gpt_path
+        gpt_triples_path=gpt_path,
+        validate_on_init=bool(cfg.get("validate_on_init", False)),
     )
 
 

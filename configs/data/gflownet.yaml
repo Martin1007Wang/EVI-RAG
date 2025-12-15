@@ -1,9 +1,9 @@
 _target_: src.data.g_agent_datamodule.GAgentDataModule
 
 cache_paths:
-  train: ${dataset.materialized_dir}/g_agent/train_g_agent.pt   # g_agent (G_oracle)
-  validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt # g_agent (G_oracle)
-  test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt     # g_agent (G_pruned)
+  train: ${dataset.materialized_dir}/g_agent/train_g_agent.pt
+  validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt
+  test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
 
 batch_size: 64
 num_workers: 8
@@ -11,6 +11,7 @@ pin_memory: true
 drop_last: false
 persistent_workers: true
 shuffle_train: true
+drop_unreachable: false
 
 resources:
   vocabulary_path: ${dataset.paths.vocabulary}

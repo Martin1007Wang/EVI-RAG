@@ -159,6 +159,13 @@ class Retriever(nn.Module):
             raise ValueError("topic_pe is enabled but batch.topic_one_hot is missing.")
         if topic.dim() == 1:
             topic = topic.unsqueeze(-1)
+        if topic.size(-1) < self.num_topics:
+            raise ValueError(
+                f"topic_one_hot feature dim {topic.size(-1)} < num_topics={self.num_topics}; "
+                "rebuild g_retrieval caches or update configs/build_retrieval_dataset.yaml."
+            )
+        if topic.size(-1) != self.num_topics:
+            topic = topic[..., : self.num_topics]
         features = [topic]  # [N, num_topics]
         if self.dde is not None:
             features.extend(self.dde(topic, batch.edge_index, getattr(batch, "reverse_edge_index", None)))

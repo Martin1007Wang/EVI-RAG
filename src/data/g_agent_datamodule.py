@@ -13,7 +13,7 @@ from .components import SharedDataResources
 
 
 class GAgentDataModule(LightningDataModule):
-    """LightningDataModule wrapping g_agent caches (train/val: G_oracle, test: G_pruned) for GFlowNet."""
+    """LightningDataModule wrapping g_agent caches for GFlowNet (no split-specific filtering)."""
 
     def __init__(
         self,
@@ -25,8 +25,7 @@ class GAgentDataModule(LightningDataModule):
         drop_last: bool = False,
         persistent_workers: bool = False,
         shuffle_train: bool = True,
-        drop_unreachable_train: bool = True,
-        drop_unreachable_eval: bool = False,
+        drop_unreachable: bool = False,
         resources: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
@@ -37,8 +36,7 @@ class GAgentDataModule(LightningDataModule):
         self.drop_last = bool(drop_last)
         self.persistent_workers = bool(persistent_workers)
         self.shuffle_train = bool(shuffle_train)
-        self.drop_unreachable_train = bool(drop_unreachable_train)
-        self.drop_unreachable_eval = bool(drop_unreachable_eval)
+        self.drop_unreachable = bool(drop_unreachable)
         self.resources_cfg = resources
 
         self.train_dataset: Optional[GAgentPyGDataset] = None
@@ -103,8 +101,7 @@ class GAgentDataModule(LightningDataModule):
             raise FileNotFoundError(f"g_agent cache path not configured for split={split}")
         if not path.exists():
             raise FileNotFoundError(f"g_agent cache not found for split={split}: {path}")
-        drop_unreachable = self.drop_unreachable_train if split == "train" else self.drop_unreachable_eval
-        return GAgentPyGDataset(path, drop_unreachable=drop_unreachable)
+        return GAgentPyGDataset(path, drop_unreachable=self.drop_unreachable)
 
 
 __all__ = ["GAgentDataModule"]

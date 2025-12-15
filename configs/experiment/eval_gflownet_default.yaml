@@ -18,8 +18,8 @@ gflownet_debug: false
 env_debug: false
 
 data:
-  drop_unreachable_train: true   # 训练段（若触发）保持严格
-  drop_unreachable_eval: false   # 评估时保留所有样本
+  # 统一过滤策略：不做 split-specific drop；GT 注入由 g_agent 生成阶段按 split 决定（通常仅 train）。
+  drop_unreachable: false
 
 model:
   evaluation_cfg:

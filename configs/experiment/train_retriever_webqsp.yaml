@@ -2,6 +2,7 @@
 
 defaults:
   - train_retriever_default
-  - override /dataset: webqsp
+  # Train on the filtered dataset to guarantee valid graphs/supervision.
+  - override /dataset: webqsp-sub
 
 tags: ["webqsp", "train_retriever"]

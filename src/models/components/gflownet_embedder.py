@@ -354,12 +354,14 @@ class GraphEmbedder(nn.Module):
         return torch.where(non_text_mask.unsqueeze(-1), non_text_proj.unsqueeze(0), node_tokens)
 
     def _build_topic_one_hot(self, *, batch: Any, num_nodes_total: int, device: torch.device) -> torch.Tensor:
-        topic = torch.zeros((num_nodes_total, self.num_topics), device=device, dtype=torch.float32)
+        if self.num_topics < 2:
+            raise ValueError(f"num_topics={self.num_topics} < 2; cannot build SubgraphRAG-parity topic_one_hot.")
+        topic_entity_mask = torch.zeros((num_nodes_total,), device=device, dtype=torch.long)
         start_node_locals = getattr(batch, "start_node_locals", None)
         if start_node_locals is None or start_node_locals.numel() == 0:
             raise ValueError("g_agent batch missing non-empty start_node_locals; cannot build topic_one_hot.")
-        topic[start_node_locals.to(device).long(), 0] = 1.0
-        return topic
+        topic_entity_mask[start_node_locals.to(device).long()] = 1
+        return torch.nn.functional.one_hot(topic_entity_mask, num_classes=self.num_topics).to(dtype=torch.float32)
 
     def _build_structure_features(
         self,

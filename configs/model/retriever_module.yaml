@@ -17,8 +17,12 @@ retriever:
   dropout_p: 0.1
 
 loss:
-  _target_: src.losses.retriever_loss.RetrieverBCELoss
-  pos_weight: 1.0 
+  _target_: src.losses.retriever_loss.RetrieverListwiseHardNegLoss
+  temperature: 1.0
+  listwise_weight: 1.0
+  hard_neg_k: 64
+  pairwise_margin: 1.0
+  pairwise_weight: 1.0
 
 optimizer:
   _target_: torch.optim.Adam

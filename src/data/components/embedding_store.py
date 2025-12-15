@@ -116,7 +116,7 @@ class EmbeddingStore:
     def load_sample(self, sample_id: str) -> Dict:
         self._init_env()
         with self.env.begin(write=False) as txn:
-            data = txn.get(sample_id.encode("ascii"))
+            data = txn.get(sample_id.encode("utf-8"))
             if data is None:
                 raise KeyError(f"Sample {sample_id} not found in {self.path}")
             return pickle.loads(data)
@@ -130,7 +130,7 @@ class EmbeddingStore:
         with self.env.begin(write=False) as txn:
             cursor = txn.cursor()
             for key in cursor.iternext(values=False):
-                keys.append(key.decode("ascii"))
+                keys.append(key.decode("utf-8"))
         return keys
 
     def close(self):

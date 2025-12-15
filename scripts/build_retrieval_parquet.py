@@ -17,14 +17,28 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import hydra
+try:
+    import hydra
+except ModuleNotFoundError:  # pragma: no cover
+    hydra = None  # type: ignore[assignment]
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-from omegaconf import DictConfig
+try:
+    from omegaconf import DictConfig
+except ModuleNotFoundError:  # pragma: no cover
+    DictConfig = object  # type: ignore[assignment]
 from tqdm import tqdm
+
+
+@dataclass(frozen=True)
+class SplitFilter:
+    skip_no_topic: bool
+    skip_no_ans: bool
+    skip_no_path: bool
+    use_shortest_path_positive: bool
 
 
 @dataclass(frozen=True)
@@ -53,9 +67,17 @@ class GraphRecord:
     edge_src: List[int]
     edge_dst: List[int]
     edge_relation_ids: List[int]
+    # Transition-level positives: supervision defined on node transitions (u->v),
+    # then lifted to all parallel edges between the same endpoints.
     positive_edge_mask: List[bool]
+    # Triple-level positives: supervision defined on a specific edge id in the
+    # preserved multi-edge list (h,r,t). For shortest-path supervision this is
+    # the canonical edge id induced by SubgraphRAG-parity collapsing.
+    positive_triple_mask: List[bool]
     gt_path_edge_indices: List[int]
     gt_path_node_indices: List[int]
+    # Provenance of gt_path_* (used for downstream label selection).
+    gt_source: str
 
 
 class EntityVocab:
@@ -160,6 +182,96 @@ class RelationVocab:
         return self._records
 
 
+@dataclass
+class ParquetDatasetWriter:
+    out_dir: Path
+    graphs: List[GraphRecord] = field(default_factory=list)
+    questions: List[Dict[str, object]] = field(default_factory=list)
+    graph_writer: pq.ParquetWriter | None = None
+    question_writer: pq.ParquetWriter | None = None
+
+    def append(self, graph: GraphRecord, question: Dict[str, object]) -> None:
+        self.graphs.append(graph)
+        self.questions.append(question)
+
+    def flush(self) -> None:
+        if self.graphs:
+            table = pa.table(
+                {
+                    "graph_id": pa.array([g.graph_id for g in self.graphs], type=pa.string()),
+                    "node_entity_ids": pa.array([g.node_entity_ids for g in self.graphs], type=pa.list_(pa.int64())),
+                    "node_embedding_ids": pa.array(
+                        [g.node_embedding_ids for g in self.graphs], type=pa.list_(pa.int64())
+                    ),
+                    "node_labels": pa.array([g.node_labels for g in self.graphs], type=pa.list_(pa.string())),
+                    "edge_src": pa.array([g.edge_src for g in self.graphs], type=pa.list_(pa.int64())),
+                    "edge_dst": pa.array([g.edge_dst for g in self.graphs], type=pa.list_(pa.int64())),
+                    "edge_relation_ids": pa.array(
+                        [g.edge_relation_ids for g in self.graphs], type=pa.list_(pa.int64())
+                    ),
+                    "positive_edge_mask": pa.array(
+                        [g.positive_edge_mask for g in self.graphs], type=pa.list_(pa.bool_())
+                    ),
+                    "positive_triple_mask": pa.array(
+                        [g.positive_triple_mask for g in self.graphs], type=pa.list_(pa.bool_())
+                    ),
+                    "gt_path_edge_indices": pa.array(
+                        [g.gt_path_edge_indices for g in self.graphs], type=pa.list_(pa.int64())
+                    ),
+                    "gt_path_node_indices": pa.array(
+                        [g.gt_path_node_indices for g in self.graphs], type=pa.list_(pa.int64())
+                    ),
+                    "gt_source": pa.array([g.gt_source for g in self.graphs], type=pa.string()),
+                }
+            )
+            if self.graph_writer is None:
+                self.graph_writer = pq.ParquetWriter(self.out_dir / "graphs.parquet", table.schema, compression="zstd")
+            self.graph_writer.write_table(table)
+            self.graphs = []
+
+        if self.questions:
+            table_q = pa.table(
+                {
+                    "question_uid": pa.array([row["question_uid"] for row in self.questions], type=pa.string()),
+                    "dataset": pa.array([row["dataset"] for row in self.questions], type=pa.string()),
+                    "split": pa.array([row["split"] for row in self.questions], type=pa.string()),
+                    "kb": pa.array([row["kb"] for row in self.questions], type=pa.string()),
+                    "question": pa.array([row["question"] for row in self.questions], type=pa.string()),
+                    "paraphrased_question": pa.array(
+                        [row.get("paraphrased_question") for row in self.questions], type=pa.string()
+                    ),
+                    "seed_entity_ids": pa.array(
+                        [row["seed_entity_ids"] for row in self.questions], type=pa.list_(pa.int64())
+                    ),
+                    "answer_entity_ids": pa.array(
+                        [row["answer_entity_ids"] for row in self.questions], type=pa.list_(pa.int64())
+                    ),
+                    "seed_embedding_ids": pa.array(
+                        [row["seed_embedding_ids"] for row in self.questions], type=pa.list_(pa.int64())
+                    ),
+                    "answer_embedding_ids": pa.array(
+                        [row["answer_embedding_ids"] for row in self.questions], type=pa.list_(pa.int64())
+                    ),
+                    "answer_texts": pa.array([row["answer_texts"] for row in self.questions], type=pa.list_(pa.string())),
+                    "graph_id": pa.array([row["graph_id"] for row in self.questions], type=pa.string()),
+                    "metadata": pa.array([row["metadata"] for row in self.questions], type=pa.string()),
+                }
+            )
+            if self.question_writer is None:
+                self.question_writer = pq.ParquetWriter(
+                    self.out_dir / "questions.parquet", table_q.schema, compression="zstd"
+                )
+            self.question_writer.write_table(table_q)
+            self.questions = []
+
+    def close(self) -> None:
+        self.flush()
+        if self.graph_writer is not None:
+            self.graph_writer.close()
+        if self.question_writer is not None:
+            self.question_writer.close()
+
+
 # Helpers
 
 
@@ -179,48 +291,108 @@ def shortest_path_edge_indices_directed(
     answers: Sequence[int],
     undirected: bool,
 ) -> Tuple[List[int], List[int]]:
-    """Directed BFS to get one shortest path (edge indices + node indices)."""
-    if not seeds or not answers or num_nodes == 0:
+    """Bidirectional shortest-path union (SubgraphRAG parity), preserving multi-edges.
+
+    - Compute all shortest paths seed->answer (forward) and answer->seed (backward).
+    - If only one direction exists, use that direction.
+    - If both exist, keep only the direction(s) with minimal hop length (could be one side or both).
+    - Return the union of edge indices that appear in these shortest paths, plus incident nodes.
+    """
+    if not seeds or not answers or num_nodes <= 0:
         return [], []
+
     from collections import deque
 
-    adjacency: List[List[Tuple[int, int]]] = [[] for _ in range(num_nodes)]
-    for idx, (u, v) in enumerate(zip(edge_src, edge_dst)):
-        adjacency[u].append((v, idx))
-        if undirected:
-            adjacency[v].append((u, idx))
+    # SubgraphRAG uses `nx.DiGraph()` which collapses parallel edges by (u,v) with last-write-wins
+    # on edge attributes. We mirror that behavior by:
+    #   - storing a canonical `pair_to_edge_idx[(u,v)] = last_edge_idx`
+    #   - building adjacency over unique (u,v) pairs (in first-seen order)
+    pair_to_edge_idx: Dict[Tuple[int, int], int] = {}
+    adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
+    for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
+        u = int(u_raw)
+        v = int(v_raw)
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            if (u, v) not in pair_to_edge_idx:
+                adjacency[u].append(v)
+            pair_to_edge_idx[(u, v)] = idx
+            if undirected:
+                if (v, u) not in pair_to_edge_idx:
+                    adjacency[v].append(u)
+                pair_to_edge_idx[(v, u)] = idx
 
-    answer_set = set(answers)
-    visited = [-1] * num_nodes
-    parent_edge = [-1] * num_nodes
-    queue: deque[int] = deque()
-    for seed in seeds:
-        if 0 <= seed < num_nodes:
-            queue.append(seed)
-            visited[seed] = seed
+    def _all_shortest_paths(src: int, dst: int) -> List[List[int]]:
+        """Return all shortest node paths (inclusive) from src->dst on the collapsed adjacency."""
+        if src == dst:
+            return []
 
-    while queue:
-        node = queue.popleft()
-        if node in answer_set:
-            path_edges: List[int] = []
-            path_nodes: List[int] = []
-            cur = node
-            while visited[cur] != cur:
-                path_nodes.append(cur)
-                e_idx = parent_edge[cur]
-                path_edges.append(e_idx)
-                cur = visited[cur]
-            path_nodes.append(cur)
-            path_nodes.reverse()
-            path_edges.reverse()
-            return path_edges, path_nodes
-        for nb, e_idx in adjacency[node]:
-            if visited[nb] != -1:
+        dist = [-1] * num_nodes
+        parents: List[List[int]] = [[] for _ in range(num_nodes)]
+        dist[src] = 0
+        q: deque[int] = deque([src])
+        while q:
+            cur = q.popleft()
+            next_dist = dist[cur] + 1
+            for nb in adjacency[cur]:
+                if dist[nb] == -1:
+                    dist[nb] = next_dist
+                    q.append(nb)
+                if dist[nb] == next_dist:
+                    parents[nb].append(cur)
+
+        if dist[dst] == -1:
+            return []
+
+        paths: List[List[int]] = []
+
+        def _dfs(node: int, suffix: List[int]) -> None:
+            if node == src:
+                paths.append([src] + list(reversed(suffix)))
+                return
+            for p in parents[node]:
+                _dfs(p, suffix + [node])
+
+        _dfs(dst, [])
+        return paths
+
+    seeds_unique = [int(s) for s in seeds if 0 <= int(s) < num_nodes]
+    answers_unique = [int(a) for a in answers if 0 <= int(a) < num_nodes]
+    if not seeds_unique or not answers_unique:
+        return [], []
+
+    # SubgraphRAG parity: refine per (seed, answer) pair.
+    selected_paths: List[List[int]] = []
+    for s in seeds_unique:
+        for a in answers_unique:
+            forward_paths = _all_shortest_paths(s, a)
+            backward_paths = _all_shortest_paths(a, s)
+            full_paths = forward_paths + backward_paths
+            if not full_paths:
                 continue
-            visited[nb] = node
-            parent_edge[nb] = e_idx
-            queue.append(nb)
-    return [], []
+
+            # If either direction is missing, keep the existing one(s).
+            if (len(forward_paths) == 0) or (len(backward_paths) == 0):
+                selected_paths.extend(full_paths)
+                continue
+
+            # Both directions exist: keep only shortest-length paths.
+            min_len = min(len(p) for p in full_paths)
+            selected_paths.extend([p for p in full_paths if len(p) == min_len])
+
+    if not selected_paths:
+        return [], []
+
+    edge_set: Set[int] = set()
+    node_set: Set[int] = set()
+    for path in selected_paths:
+        for u, v in zip(path[:-1], path[1:]):
+            node_set.add(u)
+            node_set.add(v)
+            e_idx = pair_to_edge_idx.get((u, v))
+            if e_idx is not None:
+                edge_set.add(int(e_idx))
+
+    return sorted(edge_set), sorted(node_set)
 
 
 def has_connectivity(
@@ -286,6 +458,44 @@ def load_split(raw_root: Path, split: str) -> ds.Dataset:
     if not paths:
         raise FileNotFoundError(f"No parquet shards found for split '{split}' under {raw_root}")
     return ds.dataset([str(p) for p in paths])
+
+
+def _resolve_split_filter(
+    split: str, train_filter: SplitFilter, eval_filter: SplitFilter, override_filters: Dict[str, SplitFilter]
+) -> SplitFilter:
+    override = override_filters.get(split)
+    if override is not None:
+        return override
+    return train_filter if split == "train" else eval_filter
+
+
+def _should_keep_sample(
+    sample: Sample,
+    split_filter: SplitFilter,
+    undirected_traversal: bool,
+    connectivity_cache: Dict[Tuple[str, str], bool],
+) -> bool:
+    node_strings = {h for h, _, t in sample.graph} | {t for _, _, t in sample.graph}
+    has_topic = any(ent in node_strings for ent in sample.q_entity)
+    has_answer = any(ent in node_strings for ent in sample.a_entity)
+
+    has_path = connectivity_cache.get((sample.split, sample.question_id))
+    if has_path is None:
+        if sample.answer_subgraph:
+            has_path = True
+        elif split_filter.skip_no_path:
+            has_path = has_connectivity(sample.graph, sample.q_entity, sample.a_entity, undirected=undirected_traversal)
+        else:
+            has_path = True
+        connectivity_cache[(sample.split, sample.question_id)] = has_path
+
+    if split_filter.skip_no_topic and not has_topic:
+        return False
+    if split_filter.skip_no_ans and not has_answer:
+        return False
+    if split_filter.skip_no_path and not has_path:
+        return False
+    return True
 
 
 def iter_samples(
@@ -375,17 +585,14 @@ def preprocess(
     kb: str,
     raw_root: Path,
     out_dir: Path,
+    sub_out_dir: Optional[Path],
     column_map: Dict[str, str],
     entity_normalization: str,
     undirected_traversal: bool,
-    skip_no_topic_train: bool,
-    skip_no_ans_train: bool,
-    skip_no_path_train: bool,
-    use_shortest_path_positive_train: bool,
-    skip_no_topic_eval: bool,
-    skip_no_ans_eval: bool,
-    skip_no_path_eval: bool,
-    use_shortest_path_positive_eval: bool,
+    train_filter: SplitFilter,
+    eval_filter: SplitFilter,
+    override_filters: Dict[str, SplitFilter],
+    write_sub_if_filtered: bool,
 ) -> None:
     ensure_dir(out_dir)
     entity_vocab = EntityVocab(kb=kb)
@@ -394,6 +601,11 @@ def preprocess(
     available_files = {p.name for p in raw_root.glob("*.parquet")}
     splits = sorted({name.split("-")[0] for name in available_files})
     connectivity_cache: Dict[Tuple[str, str], bool] = {}
+    total_by_split: Dict[str, int] = {}
+    kept_by_split: Dict[str, int] = {}
+    empty_graph_by_split: Dict[str, int] = {}
+    empty_graph_ids: List[str] = []
+    empty_graph_id_set: Set[str] = set()
 
     # Pass 1: Build vocabularies
     print("Pass 1: Building vocabularies...")
@@ -401,27 +613,14 @@ def preprocess(
         iter_samples(dataset, kb, raw_root, splits, column_map, entity_normalization),
         desc=f"Pass 1/2: Vocab from {dataset}",
     ):
-        node_strings = {h for h, _, t in sample.graph} | {t for _, _, t in sample.graph}
-        has_topic = any(ent in node_strings for ent in sample.q_entity)
-        has_answer = any(ent in node_strings for ent in sample.a_entity)
-        is_train_split = sample.split == "train"
-        use_sp = use_shortest_path_positive_train if is_train_split else use_shortest_path_positive_eval
-        skip_no_path = skip_no_path_train if is_train_split else skip_no_path_eval
-
-        has_path = True
-        if sample.answer_subgraph:
-            has_path = True
-        elif skip_no_path or use_sp:
-            has_path = has_connectivity(sample.graph, sample.q_entity, sample.a_entity, undirected=undirected_traversal)
-        connectivity_cache[(sample.split, sample.question_id)] = has_path
-
-        if is_train_split:
-            if (skip_no_topic_train and not has_topic) or (skip_no_ans_train and not has_answer) or (skip_no_path_train and not has_path):
-                continue
-        else:
-            if (skip_no_topic_eval and not has_topic) or (skip_no_ans_eval and not has_answer) or (skip_no_path_eval and not has_path):
-                continue
-
+        graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
+        total_by_split[sample.split] = total_by_split.get(sample.split, 0) + 1
+        if not sample.graph:
+            empty_graph_by_split[sample.split] = empty_graph_by_split.get(sample.split, 0) + 1
+            empty_graph_id_set.add(graph_id)
+            if len(empty_graph_ids) < 20:
+                empty_graph_ids.append(graph_id)
+            continue
         for h, r, t in sample.graph:
             entity_vocab.add_entity(h)
             entity_vocab.add_entity(t)
@@ -429,101 +628,67 @@ def preprocess(
         for ent in sample.q_entity + sample.a_entity:
             entity_vocab.add_entity(ent)
 
+        split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
+        if _should_keep_sample(sample, split_filter, undirected_traversal, connectivity_cache):
+            kept_by_split[sample.split] = kept_by_split.get(sample.split, 0) + 1
+
     entity_vocab.finalize()
 
-    # Pass 2: Build graphs and questions
-    graphs: List[GraphRecord] = []
-    questions: List[Dict[str, object]] = []
-    print("Pass 2: Building graphs and questions...")
-    graph_writer: pq.ParquetWriter | None = None
-    question_writer: pq.ParquetWriter | None = None
-    chunk_size = 2000
+    filtered_any = any(kept_by_split.get(s, 0) != total_by_split.get(s, 0) for s in total_by_split)
+    write_sub = bool(write_sub_if_filtered) and bool(sub_out_dir) and filtered_any
+    if write_sub:
+        ensure_dir(sub_out_dir)
 
-    def flush_buffers() -> None:
-        nonlocal graph_writer, question_writer, graphs, questions
-        if graphs:
-            table = pa.table(
-                {
-                    "graph_id": pa.array([g.graph_id for g in graphs], type=pa.string()),
-                    "node_entity_ids": pa.array([g.node_entity_ids for g in graphs], type=pa.list_(pa.int64())),
-                    "node_embedding_ids": pa.array([g.node_embedding_ids for g in graphs], type=pa.list_(pa.int64())),
-                    "node_labels": pa.array([g.node_labels for g in graphs], type=pa.list_(pa.string())),
-                    "edge_src": pa.array([g.edge_src for g in graphs], type=pa.list_(pa.int64())),
-                    "edge_dst": pa.array([g.edge_dst for g in graphs], type=pa.list_(pa.int64())),
-                    "edge_relation_ids": pa.array([g.edge_relation_ids for g in graphs], type=pa.list_(pa.int64())),
-                    "positive_edge_mask": pa.array([g.positive_edge_mask for g in graphs], type=pa.list_(pa.bool_())),
-                    "gt_path_edge_indices": pa.array([g.gt_path_edge_indices for g in graphs], type=pa.list_(pa.int64())),
-                    "gt_path_node_indices": pa.array([g.gt_path_node_indices for g in graphs], type=pa.list_(pa.int64())),
-                }
-            )
-            if graph_writer is None:
-                graph_writer = pq.ParquetWriter(out_dir / "graphs.parquet", table.schema, compression="zstd")
-            graph_writer.write_table(table)
-            graphs = []
-        if questions:
-            table_q = pa.table(
-                {
-                    "question_uid": pa.array([row["question_uid"] for row in questions], type=pa.string()),
-                    "dataset": pa.array([row["dataset"] for row in questions], type=pa.string()),
-                    "split": pa.array([row["split"] for row in questions], type=pa.string()),
-                    "kb": pa.array([row["kb"] for row in questions], type=pa.string()),
-                    "question": pa.array([row["question"] for row in questions], type=pa.string()),
-                    "paraphrased_question": pa.array([row.get("paraphrased_question") for row in questions], type=pa.string()),
-                    "seed_entity_ids": pa.array([row["seed_entity_ids"] for row in questions], type=pa.list_(pa.int64())),
-                    "answer_entity_ids": pa.array([row["answer_entity_ids"] for row in questions], type=pa.list_(pa.int64())),
-                    "seed_embedding_ids": pa.array([row["seed_embedding_ids"] for row in questions], type=pa.list_(pa.int64())),
-                    "answer_embedding_ids": pa.array([row["answer_embedding_ids"] for row in questions], type=pa.list_(pa.int64())),
-                    "answer_texts": pa.array([row["answer_texts"] for row in questions], type=pa.list_(pa.string())),
-                    "graph_id": pa.array([row["graph_id"] for row in questions], type=pa.string()),
-                    "metadata": pa.array([row["metadata"] for row in questions], type=pa.string()),
-                }
-            )
-            if question_writer is None:
-                question_writer = pq.ParquetWriter(out_dir / "questions.parquet", table_q.schema, compression="zstd")
-            question_writer.write_table(table_q)
-            questions = []
+    def _format_counts(counts: Dict[str, int]) -> str:
+        return ", ".join(f"{s}={counts.get(s, 0)}" for s in splits)
+
+    print(f"Samples total: {_format_counts(total_by_split)}")
+    print(f"Samples kept : {_format_counts(kept_by_split)}")
+    if empty_graph_by_split:
+        print(f"Samples dropped (empty graph): {_format_counts(empty_graph_by_split)}")
+        if empty_graph_ids:
+            print(f"Empty-graph examples: {empty_graph_ids}")
+    print(f"Write sub dataset: {write_sub}")
+
+    # Pass 2: Build graphs and questions
+    print("Pass 2: Building graphs and questions...")
+    chunk_size = 2000
+    base_writer = ParquetDatasetWriter(out_dir=out_dir)
+    sub_writer = ParquetDatasetWriter(out_dir=sub_out_dir) if write_sub and sub_out_dir is not None else None
 
     for sample in tqdm(
         iter_samples(dataset, kb, raw_root, splits, column_map, entity_normalization),
         desc=f"Pass 2/2: Graphs from {dataset}",
     ):
-        node_strings = {h for h, _, t in sample.graph} | {t for _, _, t in sample.graph}
-        has_topic = any(ent in node_strings for ent in sample.q_entity)
-        has_answer = any(ent in node_strings for ent in sample.a_entity)
-        is_train_split = sample.split == "train"
-        use_sp = use_shortest_path_positive_train if is_train_split else use_shortest_path_positive_eval
-        skip_no_path = skip_no_path_train if is_train_split else skip_no_path_eval
-        has_path = connectivity_cache.get((sample.split, sample.question_id))
-        if (skip_no_path or use_sp) and has_path is None:
-            if sample.answer_subgraph:
-                has_path = True
-            else:
-                has_path = has_connectivity(sample.graph, sample.q_entity, sample.a_entity, undirected=undirected_traversal)
-            connectivity_cache[(sample.split, sample.question_id)] = has_path
-
-        if is_train_split:
-            if (skip_no_topic_train and not has_topic) or (skip_no_ans_train and not has_answer) or (skip_no_path_train and not has_path):
-                continue
-        else:
-            if (skip_no_topic_eval and not has_topic) or (skip_no_ans_eval and not has_answer) or (skip_no_path_eval and not has_path):
-                continue
-
         graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
-        graphs.append(build_graph(sample, entity_vocab, relation_vocab, graph_id, use_sp, undirected_traversal))
-        questions.append(build_question_record(sample, entity_vocab, graph_id, use_sp))
+        if graph_id in empty_graph_id_set:
+            continue
+        split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
+        keep_for_sub = _should_keep_sample(sample, split_filter, undirected_traversal, connectivity_cache) if write_sub else False
 
-        if len(graphs) >= chunk_size or len(questions) >= chunk_size:
-            flush_buffers()
+        use_sp = split_filter.use_shortest_path_positive
+        graph = build_graph(sample, entity_vocab, relation_vocab, graph_id, use_sp, undirected_traversal)
+        question = build_question_record(sample, entity_vocab, graph_id, use_sp)
+        base_writer.append(graph, question)
+        if sub_writer is not None and keep_for_sub:
+            sub_writer.append(graph, question)
 
-    flush_buffers()
-    if graph_writer is not None:
-        graph_writer.close()
-    if question_writer is not None:
-        question_writer.close()
+        if len(base_writer.graphs) >= chunk_size or len(base_writer.questions) >= chunk_size:
+            base_writer.flush()
+        if sub_writer is not None and (len(sub_writer.graphs) >= chunk_size or len(sub_writer.questions) >= chunk_size):
+            sub_writer.flush()
+
+    base_writer.close()
+    if sub_writer is not None:
+        sub_writer.close()
 
     write_entity_vocab(entity_vocab.struct_records, out_dir / "entity_vocab.parquet")
     write_embedding_vocab(entity_vocab.embedding_records, out_dir / "embedding_vocab.parquet")
     write_relation_vocab(relation_vocab.records, out_dir / "relation_vocab.parquet")
+    if write_sub and sub_out_dir is not None:
+        write_entity_vocab(entity_vocab.struct_records, sub_out_dir / "entity_vocab.parquet")
+        write_embedding_vocab(entity_vocab.embedding_records, sub_out_dir / "embedding_vocab.parquet")
+        write_relation_vocab(relation_vocab.records, sub_out_dir / "relation_vocab.parquet")
 
 
 def build_graph(
@@ -584,15 +749,12 @@ def build_graph(
                 seen.add(idx)
                 dedup_answer_edges.append(idx)
         path_edge_indices = dedup_answer_edges
+        gt_source = "answer_subgraph"
         node_set = set()
         for idx in path_edge_indices:
             node_set.add(edge_src[idx])
             node_set.add(edge_dst[idx])
         path_node_indices = sorted(node_set)
-        positive_edge_mask = [False] * len(edge_src)
-        for idx in path_edge_indices:
-            if 0 <= idx < len(positive_edge_mask):
-                positive_edge_mask[idx] = True
     else:
         # Fallback: shortest-path labelling or dense positives.
         path_edge_indices, path_node_indices = shortest_path_edge_indices_directed(
@@ -603,14 +765,18 @@ def build_graph(
             answers=a_local,
             undirected=undirected_traversal,
         )
+        gt_source = "shortest_path" if path_edge_indices else "none"
 
-        if use_shortest_path_positive:
-            positive_edge_mask = [False] * len(edge_src)
-            for idx in path_edge_indices:
-                if 0 <= idx < len(positive_edge_mask):
-                    positive_edge_mask[idx] = True
-        else:
-            positive_edge_mask = [True] * len(edge_src)
+    num_edges = len(edge_src)
+    positive_triple_set = {int(idx) for idx in path_edge_indices if 0 <= int(idx) < num_edges}
+    positive_triple_mask = [i in positive_triple_set for i in range(num_edges)]
+
+    if use_shortest_path_positive:
+        # Transition-level supervision: lift GT transitions (u->v) to all parallel edges.
+        positive_pairs = {(edge_src[idx], edge_dst[idx]) for idx in positive_triple_set}
+        positive_edge_mask = [(u, v) in positive_pairs for u, v in zip(edge_src, edge_dst)]
+    else:
+        positive_edge_mask = [True] * num_edges
 
     return GraphRecord(
         graph_id=graph_id,
@@ -621,8 +787,10 @@ def build_graph(
         edge_dst=edge_dst,
         edge_relation_ids=edge_relation_ids,
         positive_edge_mask=positive_edge_mask,
+        positive_triple_mask=positive_triple_mask,
         gt_path_edge_indices=path_edge_indices,
         gt_path_node_indices=path_node_indices,
+        gt_source=gt_source,
     )
 
 
@@ -676,8 +844,10 @@ def write_graphs(graphs: List[GraphRecord], output_path: Path) -> None:
             "edge_dst": pa.array([g.edge_dst for g in graphs], type=pa.list_(pa.int64())),
             "edge_relation_ids": pa.array([g.edge_relation_ids for g in graphs], type=pa.list_(pa.int64())),
             "positive_edge_mask": pa.array([g.positive_edge_mask for g in graphs], type=pa.list_(pa.bool_())),
+            "positive_triple_mask": pa.array([g.positive_triple_mask for g in graphs], type=pa.list_(pa.bool_())),
             "gt_path_edge_indices": pa.array([g.gt_path_edge_indices for g in graphs], type=pa.list_(pa.int64())),
             "gt_path_node_indices": pa.array([g.gt_path_node_indices for g in graphs], type=pa.list_(pa.int64())),
+            "gt_source": pa.array([g.gt_source for g in graphs], type=pa.string()),
         }
     )
     pq.write_table(table, output_path, compression="zstd")
@@ -742,28 +912,52 @@ def write_relation_vocab(vocab_records: List[Dict[str, object]], output_path: Pa
     pq.write_table(table, output_path, compression="zstd")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="build_retrieval_parquet")
-def main(cfg: DictConfig) -> None:
-    raw_root = Path(hydra.utils.to_absolute_path(cfg.raw_root))
-    out_dir = Path(hydra.utils.to_absolute_path(cfg.out_dir))
-    dataset_name = cfg.get("dataset_name") or cfg.get("dataset") or "dataset"
-    preprocess(
-        dataset=dataset_name,
-        kb=cfg.kb,
-        raw_root=raw_root,
-        out_dir=out_dir,
-        column_map=dict(cfg.column_map),
-        entity_normalization=cfg.entity_normalization,
-        undirected_traversal=cfg.undirected_traversal,
-        skip_no_topic_train=cfg.filter.train.skip_no_topic,
-        skip_no_ans_train=cfg.filter.train.skip_no_ans,
-        skip_no_path_train=cfg.filter.train.skip_no_path,
-        use_shortest_path_positive_train=cfg.filter.train.use_shortest_path_positive,
-        skip_no_topic_eval=cfg.filter.eval.skip_no_topic,
-        skip_no_ans_eval=cfg.filter.eval.skip_no_ans,
-        skip_no_path_eval=cfg.filter.eval.skip_no_path,
-        use_shortest_path_positive_eval=cfg.filter.eval.use_shortest_path_positive,
-    )
+if hydra is not None:
+
+    @hydra.main(version_base=None, config_path="../configs", config_name="build_retrieval_parquet")
+    def main(cfg: DictConfig) -> None:
+        raw_root = Path(hydra.utils.to_absolute_path(cfg.raw_root))
+        out_dir = Path(hydra.utils.to_absolute_path(cfg.out_dir))
+        sub_out_dir = None
+        if cfg.get("sub") and bool(cfg.sub.get("enabled", True)):
+            sub_out_dir = Path(hydra.utils.to_absolute_path(cfg.sub.out_dir))
+        dataset_name = cfg.get("dataset_name") or cfg.get("dataset") or "dataset"
+
+        def _as_filter(section: DictConfig) -> SplitFilter:
+            return SplitFilter(
+                skip_no_topic=bool(section.get("skip_no_topic", False)),
+                skip_no_ans=bool(section.get("skip_no_ans", False)),
+                skip_no_path=bool(section.get("skip_no_path", False)),
+                use_shortest_path_positive=bool(section.get("use_shortest_path_positive", False)),
+            )
+
+        train_filter = _as_filter(cfg.filter.train)
+        eval_filter = _as_filter(cfg.filter.eval)
+        override_filters: Dict[str, SplitFilter] = {}
+        for key in cfg.filter.keys():
+            if key in {"train", "eval"}:
+                continue
+            override_filters[str(key)] = _as_filter(cfg.filter[key])
+
+        preprocess(
+            dataset=dataset_name,
+            kb=cfg.kb,
+            raw_root=raw_root,
+            out_dir=out_dir,
+            sub_out_dir=sub_out_dir,
+            column_map=dict(cfg.column_map),
+            entity_normalization=cfg.entity_normalization,
+            undirected_traversal=cfg.undirected_traversal,
+            train_filter=train_filter,
+            eval_filter=eval_filter,
+            override_filters=override_filters,
+            write_sub_if_filtered=bool(cfg.get("sub", {}).get("enabled", True)),
+        )
+
+else:  # pragma: no cover
+
+    def main(cfg: DictConfig) -> None:
+        raise ModuleNotFoundError("hydra-core is required to run scripts/build_retrieval_parquet.py")
 
 
 if __name__ == "__main__":

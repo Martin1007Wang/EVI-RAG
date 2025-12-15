@@ -6,7 +6,7 @@ defaults:
 
 model:
   embedder_cfg:
-    projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-12-02_19-26-32/checkpoints/epoch_094.ckpt"
+    projector_checkpoint: "logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/checkpoints/epoch_021.ckpt"
   training_cfg:
     retriever_prior_alpha: 2.0            # 先强依赖 retriever，后期完全交给策略
     retriever_prior_anneal:

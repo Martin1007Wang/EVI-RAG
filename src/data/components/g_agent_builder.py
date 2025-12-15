@@ -22,7 +22,8 @@ class GAgentSettings:
     """Declarative configuration for constructing g_agent."""
 
     enabled: bool = True
-    # anchors: top-K edges (by retrieval score) define the high-belief region
+    # Top-K edges kept from retriever scores (per-sample, retrieval graph space).
+    # Final g_agent edges = Top-K ∪ GT-path edges, then deduplicated by (h,r,t) triple.
     anchor_top_k: int = 50
     output_path: Path = Path("g_agent/g_agent_samples.pt")
     force_include_gt: bool = False
@@ -59,7 +60,7 @@ class _GraphSlice:
 
 class GAgentBuilder:
     """
-    The Producer: Responsible for running Beam Search and materializing clean GAgentSample objects.
+    The Producer: Materialize clean GAgentSample objects from retriever scores.
     """
 
     def __init__(self, settings: GAgentSettings, embedding_store: Optional[EmbeddingStore] = None) -> None:
@@ -159,38 +160,23 @@ class GAgentBuilder:
             except IndexError:
                 sid = f"unknown_{i}"
 
-            # Get question local indices for seeding beam search
-            # Assuming these are available in batch
-            q_ptr = getattr(batch, "q_local_indices_ptr", None)
-            if q_ptr is None and hasattr(batch, "_slice_dict"):
-                q_ptr = batch._slice_dict.get("q_local_indices")
-            q_locals = getattr(batch, "q_local_indices", None)
+            self._build_and_add_sample(sid, graph_slice)
 
-            start_node_locals = set()
-            if q_ptr is not None and q_locals is not None:
-                q_start, q_end = int(q_ptr[i]), int(q_ptr[i + 1])
-                # These are local to the sample graph (0~N_retrieval)
-                start_node_locals = set(q_locals[q_start:q_end].tolist())
-
-            self._build_and_add_sample(sid, graph_slice, start_node_locals)
-
-    def _build_and_add_sample(self, sample_id: str, graph: _GraphSlice, seeds: Set[int]):
+    def _build_and_add_sample(self, sample_id: str, graph: _GraphSlice) -> None:
         """
-        Core Logic: Beam Search -> Re-index -> Create Object
+        Core Logic: Top-K by score -> Union GT -> Dedup by triple -> Re-index -> Create Object
         """
-        # === A. Beam Search Filter ===
-        selected_indices_set = self._select_edges_seed_anchor(
-            graph=graph,
-            seeds=seeds,
-            anchor_top_k=self.cfg.anchor_top_k,
-        )
-
-        # Convert to sorted tensor list for deterministic indexing
-        selected_indices = sorted(list(selected_indices_set))
-        if not selected_indices:
-            return  # Empty graph
-
-        selected_idx_tensor = torch.tensor(selected_indices, dtype=torch.long)
+        # === A. Top-K Filter (retriever space) ===
+        num_edges_full = graph.num_edges
+        if num_edges_full <= 0:
+            return
+        top_k = int(self.cfg.anchor_top_k)
+        if top_k <= 0:
+            raise ValueError(f"anchor_top_k must be > 0, got {top_k} (sample_id={sample_id}).")
+        k = min(top_k, num_edges_full)
+        scores_full = graph.scores.float()
+        _, top_idx = torch.topk(scores_full, k=k, largest=True, sorted=True)
+        top_locals: Set[int] = {int(i) for i in top_idx.tolist()}
 
         # === B. Fetch Metadata from LMDB ===
         # This is crucial for "One Source of Truth"
@@ -215,19 +201,98 @@ class GAgentBuilder:
         if answer_entity_ids.numel() == 0:
             raise ValueError(f"Sample {sample_id} missing answer_entity_ids.")
 
-        # === C. Construct Subgraph Data (Global & Local) ===
+        # === B.1 Resolve GT edge ids (retrieval space) ===
+        # Note: some splits/samples may not have GT paths materialized. GT is required only when we
+        # explicitly force-include it (training/oracle graph); otherwise we treat it as absent.
+        raw_gt_indices = raw_data.get("gt_path_edge_indices", [])  # retrieval-local or batch-global ids
+        if not raw_gt_indices:
+            gt_triples = raw_data.get("gt_paths_triples", [])
+            if gt_triples:
+                # Map (h,r,t) triples to retrieval-local edge ids using the full retrieval graph.
+                edge_triples_full = []
+                for e_idx in range(graph.num_edges):
+                    h_global = int(graph.node_global_ids[int(graph.heads[e_idx])].item())
+                    t_global = int(graph.node_global_ids[int(graph.tails[e_idx])].item())
+                    r_global = int(graph.relations[e_idx].item())
+                    edge_triples_full.append((h_global, r_global, t_global))
+                triple_to_edge_idx_full: Dict[Tuple[int, int, int], List[int]] = {}
+                for idx, triple in enumerate(edge_triples_full):
+                    triple_to_edge_idx_full.setdefault(triple, []).append(idx)
+                raw_gt_indices = []
+                for path in gt_triples:
+                    for triple in path:
+                        triple_tuple = tuple(int(x) for x in triple)
+                        cand = triple_to_edge_idx_full.get(triple_tuple)
+                        if cand:
+                            raw_gt_indices.append(cand[0])  # 取首个匹配
+        if not raw_gt_indices:
+            if self.cfg.force_include_gt:
+                self.stats["gt_broken"] += 1
+                return
+            raw_gt_indices = []
 
-        # 1. Extract Edge Attributes (Global IDs for Heads/Tails)
-        # heads/tails in graph_slice are local to G_retrieval (0~N_retr)
-        # We map them to Global Entity IDs
-        sel_heads_local = graph.heads[selected_idx_tensor]
-        sel_tails_local = graph.tails[selected_idx_tensor]
+        gt_locals: Set[int] = set()
+        if raw_gt_indices:
+            # Defensive: accept "batch-global" edge indices by mapping them back to local indices.
+            global_to_local = {
+                int(val.item()): i for i, val in enumerate(graph.retrieval_edge_indices.view(-1))
+            }
 
-        edge_heads_global = graph.node_global_ids[sel_heads_local]
-        edge_tails_global = graph.node_global_ids[sel_tails_local]
-        edge_relations = graph.relations[selected_idx_tensor]
-        edge_scores = graph.scores[selected_idx_tensor]
-        edge_labels = graph.labels[selected_idx_tensor]
+            # Map GT edges to retrieval-local indices (0..E_retr-1 of this sample graph slice).
+            for ridx in raw_gt_indices:
+                r_val = int(ridx) if isinstance(ridx, int) else int(ridx.item())
+                if 0 <= r_val < graph.num_edges:
+                    gt_locals.add(r_val)
+                    continue
+                local_idx = global_to_local.get(r_val)
+                if local_idx is not None:
+                    gt_locals.add(local_idx)
+
+            if not gt_locals:
+                if self.cfg.force_include_gt:
+                    self.stats["gt_broken"] += 1
+                    return
+        # === C. Union (Top-K ∪ GT) + Deduplicate by (h,r,t) ===
+        # Order matters for determinism: first Top-K (sorted by score desc), then GT-only edges (sorted by score desc).
+        selected_locals: List[int] = [int(i) for i in top_idx.tolist()]
+        if self.cfg.force_include_gt:
+            gt_only = [int(i) for i in gt_locals if int(i) not in top_locals]
+            gt_only.sort(key=lambda idx: (-float(scores_full[idx].item()), int(idx)))
+            selected_locals.extend(gt_only)
+
+        # Dedup dictionary: triple -> aggregated attributes.
+        # We aggregate score by max, label by max, and top_edge_mask as OR over Top-K membership.
+        triple_to_agg: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        for eidx in selected_locals:
+            h_local = int(graph.heads[eidx].item())
+            t_local = int(graph.tails[eidx].item())
+            h_global = int(graph.node_global_ids[h_local].item())
+            t_global = int(graph.node_global_ids[t_local].item())
+            r_global = int(graph.relations[eidx].item())
+            triple = (h_global, r_global, t_global)
+            score = float(graph.scores[eidx].item())
+            label = float(graph.labels[eidx].item())
+            in_top = eidx in top_locals
+            agg = triple_to_agg.get(triple)
+            if agg is None:
+                triple_to_agg[triple] = {"score": score, "label": label, "in_top": in_top}
+                continue
+            # Aggregate
+            agg["score"] = max(float(agg["score"]), score)
+            agg["label"] = max(float(agg["label"]), label)
+            agg["in_top"] = bool(agg["in_top"]) or in_top
+
+        triples = list(triple_to_agg.keys())
+        if not triples:
+            return
+        num_edges = len(triples)
+
+        edge_heads_global = torch.tensor([t[0] for t in triples], dtype=torch.long)
+        edge_relations = torch.tensor([t[1] for t in triples], dtype=torch.long)
+        edge_tails_global = torch.tensor([t[2] for t in triples], dtype=torch.long)
+        edge_scores = torch.tensor([float(triple_to_agg[t]["score"]) for t in triples], dtype=torch.float32)
+        edge_labels = torch.tensor([float(triple_to_agg[t]["label"]) for t in triples], dtype=torch.float32)
+        top_edge_mask = torch.tensor([bool(triple_to_agg[t]["in_top"]) for t in triples], dtype=torch.bool)
 
         # 2. Build Subgraph Topology (0 ~ N_subgraph-1)
         # Collect all unique nodes in this new small subgraph
@@ -281,78 +346,34 @@ class GAgentBuilder:
             return
         answer_entity_ids = torch.tensor([p[0] for p in answer_pairs], dtype=torch.long)
         answer_node_locals = torch.tensor([p[1] for p in answer_pairs], dtype=torch.long)
-        has_answer = True  # 非空已提前 return
 
-        # === E. Ground Truth Path Mapping ===
-        # We need to find which edges in our selected subgraph correspond to the GT path.
-        # raw_data['gt_path_edge_indices'] contains indices in G_retrieval (0~E_retr-1).
-        # We need to map them to indices in G_agent (0~E_agent-1).
+        # === E. Ground Truth Path Mapping (by triple, after dedup) ===
+        triple_to_agent = {triple: idx for idx, triple in enumerate(triples)}
+        gt_triples_set: Set[Tuple[int, int, int]] = set()
+        for ridx in gt_locals:
+            h_local = int(graph.heads[int(ridx)].item())
+            t_local = int(graph.tails[int(ridx)].item())
+            h_global = int(graph.node_global_ids[h_local].item())
+            t_global = int(graph.node_global_ids[t_local].item())
+            r_global = int(graph.relations[int(ridx)].item())
+            gt_triples_set.add((h_global, r_global, t_global))
 
-        gt_path_indices: List[int] = []
-        raw_gt_indices = raw_data.get("gt_path_edge_indices", [])  # Ensure this key matches build script
-        if not raw_gt_indices:
-            # 兼容 build_retrieval_dataset.py 存储的三元组路径：gt_paths_triples=[[(h,r,t),...]]
-            gt_triples = raw_data.get("gt_paths_triples", [])
-            # Build mapping: agent edge idx -> (h_global, r_global, t_global)
-            edge_triples = []
-            for e_idx in range(num_edges):
-                h_global = int(edge_heads_global[e_idx].item())
-                t_global = int(edge_tails_global[e_idx].item())
-                r_global = int(edge_relations[e_idx].item())
-                edge_triples.append((h_global, r_global, t_global))
-            triple_to_edge_idx: Dict[Tuple[int, int, int], List[int]] = {}
-            for idx, triple in enumerate(edge_triples):
-                triple_to_edge_idx.setdefault(triple, []).append(idx)
-            raw_gt_indices = []
-            for path in gt_triples:
-                for triple in path:
-                    triple_tuple = tuple(int(x) for x in triple)
-                    cand = triple_to_edge_idx.get(triple_tuple)
-                    if cand:
-                        raw_gt_indices.append(cand[0])  # 取首个匹配
+        gt_set: Set[int] = set()
+        for triple in gt_triples_set:
+            agent_idx = triple_to_agent.get(triple)
+            if agent_idx is not None:
+                gt_set.add(int(agent_idx))
+        gt_path_indices = sorted(gt_set)
+        gt_path_exists = len(gt_path_indices) > 0
+        if self.cfg.force_include_gt and not gt_path_exists:
+            raise ValueError(f"Sample {sample_id} GT triples missing in selected subgraph after union/dedup.")
 
-        if raw_gt_indices:
-            # Map: Retrieval Edge Index -> Agent Edge Index
-            retr_to_agent = {int(ridx): aidx for aidx, ridx in enumerate(selected_indices)}
-            # For clarity, also accept retrieval-edge indices stored in LMDB that refer to original retrieval graph.
-            retrieval_idx_to_agent: Dict[int, int] = {}
-            for aidx, ridx in enumerate(selected_indices):
-                r_global = int(ridx)
-                retrieval_idx_to_agent[r_global] = aidx
-                if graph.retrieval_edge_indices.numel() > r_global:
-                    retrieval_idx_to_agent[int(graph.retrieval_edge_indices[r_global].item())] = aidx
-
-            for ridx in raw_gt_indices:
-                # Handle tensor or int
-                r_val = ridx if isinstance(ridx, int) else ridx.item()
-                if r_val in retr_to_agent:
-                    gt_path_indices.append(retr_to_agent[r_val])
-                elif r_val in retrieval_idx_to_agent:
-                    gt_path_indices.append(retrieval_idx_to_agent[r_val])
-                else:
-                    # Path broken! Stop.
-                    self.stats["gt_broken"] += 1
-                    break
-        else:
-            # Label-based fallback：在 g_retrieval 视图中已给出正例标签的边，直接作为 GT 路径。
-            positive_edges = torch.nonzero(edge_labels > 0.5, as_tuple=False).view(-1).tolist()
-            gt_path_indices = positive_edges
-
-        gt_exists = (len(gt_path_indices) > 0) and has_answer
-        if not gt_exists:
-            # 严格模式：可达但无路径视为损坏样本，丢弃
-            self.stats["gt_broken"] += 1
-            return
-        if gt_exists:
+        if gt_path_exists:
             self.stats["path_exists"] += 1
             self.stats["path_lengths"].append(len(gt_path_indices))
-
-        self.stats["edge_counts"].append(len(selected_indices))
+        self.stats["edge_counts"].append(num_edges)
 
         # === F. Create the Object (fully specified schema) ===
-        num_edges = len(selected_indices)
-        top_edge_mask = torch.ones(num_edges, dtype=torch.bool)
-
         gt_path_edge_local_ids = torch.tensor(gt_path_indices, dtype=torch.long)
         gt_path_node_local_ids = torch.tensor(
             sorted(
@@ -361,6 +382,8 @@ class GAgentBuilder:
             ),
             dtype=torch.long,
         )
+
+        is_answer_reachable = bool(answer_node_locals.numel() > 0)
 
         sample = GAgentSample(
             sample_id=sample_id,
@@ -380,16 +403,12 @@ class GAgentBuilder:
             answer_node_locals=answer_node_locals,
             gt_path_edge_local_ids=gt_path_edge_local_ids,
             gt_path_node_local_ids=gt_path_node_local_ids,
-            gt_path_exists=gt_exists,
-            is_answer_reachable=gt_exists,
+            gt_path_exists=gt_path_exists,
+            is_answer_reachable=is_answer_reachable,
         )
-        # 数据完整性：可达必有路径，不可达不得有路径
-        if sample.is_answer_reachable:
-            assert (
-                gt_path_edge_local_ids.numel() > 0
-            ), f"Sample {sample_id} is marked reachable but GT path is empty! Logic Error."
-        else:
-            assert gt_path_edge_local_ids.numel() == 0, f"Sample {sample_id} is unreachable but has GT path! Logic Error."
+        # Invariance: GT path implies reachability, but not vice versa.
+        if sample.gt_path_exists:
+            assert sample.is_answer_reachable, f"Sample {sample_id} has GT path but is_answer_reachable=False."
 
         self.samples.append(sample)
         self.stats["num_samples"] += 1
@@ -449,67 +468,5 @@ class GAgentBuilder:
     def _log_stats(self, stats):
         for k, v in stats.items():
             log.info(f"  {k}: {v}")
-
-    # === Helper Logic (Copied & Adapted from your code) ===
-    def _select_edges_seed_anchor(
-        self,
-        graph: _GraphSlice,
-        seeds: Set[int],
-        anchor_top_k: int,
-    ) -> Set[int]:
-        """
-        Seed→Anchor 2-hop builder:
-        1) Anchors: heads/tails appearing in top-K edges by retrieval score.
-        2) Hop1: edges from seeds; keep direct hits to anchors; otherwise track frontier nodes.
-        3) Hop2: from each frontier, keep edges hitting anchors and also keep the preceding Hop1 edge.
-        Only edges that connect Seeds to Anchors (directly or via a 1-hop bridge) survive.
-        """
-        num_edges = graph.num_edges
-        if num_edges == 0:
-            return set()
-
-        # normalize seeds to valid locals
-        seeds = {int(s) for s in seeds if 0 <= int(s) < graph.num_nodes}
-        scores = graph.scores.float()
-        heads = graph.heads
-        tails = graph.tails
-
-        k = max(1, int(anchor_top_k))
-        topk = min(k, num_edges)
-        _, top_idx = torch.topk(scores, k=topk)
-        anchor_nodes = {int(heads[i].item()) for i in top_idx.tolist()} | {int(tails[i].item()) for i in top_idx.tolist()}
-
-        if not seeds:
-            best_idx = int(torch.argmax(scores).item())
-            seeds = {int(heads[best_idx].item()), int(tails[best_idx].item())}
-
-        # adjacency: head -> [edge_idx]
-        adj_out: Dict[int, List[int]] = {}
-        for idx in range(num_edges):
-            h = int(heads[idx].item())
-            adj_out.setdefault(h, []).append(idx)
-
-        selected: Set[int] = set()
-        frontier_edges: Dict[int, List[int]] = {}
-
-        # Hop1
-        for s in seeds:
-            for idx in adj_out.get(s, []):
-                tgt = int(tails[idx].item())
-                if tgt in anchor_nodes:
-                    selected.add(idx)
-                else:
-                    frontier_edges.setdefault(tgt, []).append(idx)
-
-        # Hop2
-        for mid, hop1_edges in frontier_edges.items():
-            for idx in adj_out.get(mid, []):
-                tgt = int(tails[idx].item())
-                if tgt in anchor_nodes:
-                    selected.add(idx)
-                    selected.update(hop1_edges)
-
-        return selected
-
 
 __all__ = ["GAgentBuilder", "GAgentSettings"]

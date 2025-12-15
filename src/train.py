@@ -5,7 +5,6 @@ import lightning as L
 import rootutils
 import torch
 
-torch.autograd.set_detect_anomaly(True)
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig

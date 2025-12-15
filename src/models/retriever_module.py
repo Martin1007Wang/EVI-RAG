@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import pandas as pd
 import torch
 import torch.distributed as dist
 from lightning import LightningModule
@@ -83,6 +82,8 @@ class RetrieverModule(LightningModule):
         q_ptr = getattr(batch, "q_local_indices_ptr", None)
         if q_ptr is None and hasattr(batch, "_slice_dict"):
             q_ptr = batch._slice_dict.get("q_local_indices")
+        if torch.is_tensor(q_ptr):
+            q_ptr = q_ptr.detach().cpu()
 
         return {
             "query_ids": query_ids,
@@ -96,7 +97,7 @@ class RetrieverModule(LightningModule):
             "answer_entity_ids": _maybe_cpu("answer_entity_ids"),
             "answer_entity_ids_ptr": _maybe_cpu("answer_entity_ids_ptr"),
             "sample_id": getattr(batch, "sample_id", None),
-            "q_local_indices": getattr(batch, "q_local_indices", None),
+            "q_local_indices": _maybe_cpu("q_local_indices"),
             "q_local_indices_ptr": q_ptr,
         }
 
@@ -608,14 +609,18 @@ class RetrieverModule(LightningModule):
         ent_map: Optional[Dict[int, str]] = None
         rel_map: Optional[Dict[int, str]] = None
         try:
+            import pyarrow.parquet as pq
+
             if entity_path and Path(entity_path).exists():
-                ent_df = pd.read_parquet(entity_path)
-                if "entity_id" in ent_df.columns:
-                    ent_map = dict(zip(ent_df.entity_id.astype(int), ent_df.label.astype(str)))
+                ent_table = pq.read_table(entity_path, columns=["entity_id", "label"])
+                ent_ids = ent_table.column("entity_id").to_pylist()
+                ent_labels = ent_table.column("label").to_pylist()
+                ent_map = {int(i): str(l) for i, l in zip(ent_ids, ent_labels) if i is not None and l is not None}
             if relation_path and Path(relation_path).exists():
-                rel_df = pd.read_parquet(relation_path)
-                rel_map = dict(zip(rel_df.relation_id.astype(int), rel_df.label.astype(str)))
+                rel_table = pq.read_table(relation_path, columns=["relation_id", "label"])
+                rel_ids = rel_table.column("relation_id").to_pylist()
+                rel_labels = rel_table.column("label").to_pylist()
+                rel_map = {int(i): str(l) for i, l in zip(rel_ids, rel_labels) if i is not None and l is not None}
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to load vocab for textualize: %s", exc)
         return ent_map, rel_map
-

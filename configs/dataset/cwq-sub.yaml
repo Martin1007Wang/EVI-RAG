@@ -1,0 +1,27 @@
+# configs/dataset/cwq-sub.yaml
+
+name: cwq-sub
+kb: freebase
+
+# NOTE: raw_root follows base cwq; this config is primarily for consuming the
+# materialized `cwq-sub` dataset (produced by the base build with filtering).
+raw_root: ${paths.data_dir}/cwq/raw/data
+out_dir: ${paths.data_dir}/cwq-sub/normalized
+materialized_dir: ${paths.data_dir}/cwq-sub/materialized
+
+paths:
+  vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+  embeddings: ${dataset.materialized_dir}/embeddings
+  processed: ${dataset.materialized_dir}/processed
+
+entity_normalization: none
+undirected_traversal: false
+
+column_map:
+  question_id_field: id
+  question_field: question
+  answer_text_field: answer
+  q_entity_field: q_entity
+  a_entity_field: a_entity
+  graph_field: graph
+

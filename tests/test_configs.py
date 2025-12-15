@@ -1,4 +1,7 @@
-import hydra
+import pytest
+
+hydra = pytest.importorskip("hydra")
+pytest.importorskip("omegaconf")
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 

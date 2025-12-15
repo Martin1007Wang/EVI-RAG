@@ -1,0 +1,567 @@
+[[36m2025-12-15 17:40:20,595[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Enforcing tags! <cfg.extras.enforce_tags=True>[0m
+[[36m2025-12-15 17:40:20,597[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] torch.set_float32_matmul_precision(high)[0m
+[[36m2025-12-15 17:40:20,597[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Printing config tree with Rich! <cfg.extras.print_config=True>[0m
+CONFIG
+├── data
+│   └── _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule          
+│       dataset_cfg:                                                            
+│         name: webqsp-sub                                                      
+│         kb: freebase                                                          
+│         raw_root: /mnt/data/retrieval_dataset/webqsp/raw/data                 
+│         out_dir: /mnt/data/retrieval_dataset/webqsp-sub/normalized            
+│         materialized_dir: /mnt/data/retrieval_dataset/webqsp-sub/materialized 
+│         paths:                                                                
+│           vocabulary: /mnt/data/retrieval_dataset/webqsp-sub/materialized/voca
+│           embeddings: /mnt/data/retrieval_dataset/webqsp-sub/materialized/embe
+│           processed: /mnt/data/retrieval_dataset/webqsp-sub/materialized/proce
+│         entity_normalization: none                                            
+│         undirected_traversal: false                                           
+│         column_map:                                                           
+│           question_id_field: id                                               
+│           question_field: question                                            
+│           answer_text_field: answer                                           
+│           q_entity_field: q_entity                                            
+│           a_entity_field: a_entity                                            
+│           graph_field: graph                                                  
+│       batch_size: 32                                                          
+│       num_workers: 8                                                          
+│       pin_memory: true                                                        
+│       drop_last: false                                                        
+│       persistent_workers: false                                               
+│       splits:                                                                 
+│         train: train                                                          
+│         validation: validation                                                
+│         test: test                                                            
+│                                                                               
+├── model
+│   └── _target_: src.models.retriever_module.RetrieverModule                   
+│       compile_model: false                                                    
+│       compile_dynamic: true                                                   
+│       retriever:                                                              
+│         _target_: src.models.components.retriever.Retriever                   
+│         emb_dim: 1024                                                         
+│         hidden_dim: 1024                                                      
+│         topic_pe: true                                                        
+│         num_topics: 2                                                         
+│         dde_cfg:                                                              
+│           num_rounds: 2                                                       
+│           num_reverse_rounds: 2                                               
+│         dropout_p: 0.1                                                        
+│       loss:                                                                   
+│         _target_: src.losses.retriever_loss.RetrieverListwiseHardNegLoss      
+│         temperature: 1.0                                                      
+│         listwise_weight: 1.0                                                  
+│         hard_neg_k: 64                                                        
+│         pairwise_margin: 1.0                                                  
+│         pairwise_weight: 1.0                                                  
+│       optimizer:                                                              
+│         _target_: torch.optim.Adam                                            
+│         _partial_: true                                                       
+│         lr: 0.001                                                             
+│         weight_decay: 0.0                                                     
+│         betas:                                                                
+│         - 0.9                                                                 
+│         - 0.999                                                               
+│       scheduler: null                                                         
+│       evaluation_cfg:                                                         
+│         ranking_k:                                                            
+│         - 1                                                                   
+│         - 5                                                                   
+│         - 10                                                                  
+│         - 25                                                                  
+│         - 50                                                                  
+│         - 100                                                                 
+│         - 200                                                                 
+│         - 300                                                                 
+│         - 400                                                                 
+│         answer_recall_k:                                                      
+│         - 1                                                                   
+│         - 5                                                                   
+│         - 10                                                                  
+│         - 25                                                                  
+│         - 50                                                                  
+│         - 100                                                                 
+│         - 200                                                                 
+│         - 300                                                                 
+│         - 400                                                                 
+│                                                                               
+├── callbacks
+│   └── model_checkpoint:                                                       
+│         _target_: lightning.pytorch.callbacks.ModelCheckpoint                 
+│         dirpath: /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/2
+│         filename: epoch_{epoch:03d}                                           
+│         monitor: val/ranking/recall@100                                       
+│         verbose: false                                                        
+│         save_last: true                                                       
+│         save_top_k: 1                                                         
+│         mode: max                                                             
+│         auto_insert_metric_name: false                                        
+│         save_weights_only: false                                              
+│         every_n_train_steps: null                                             
+│         train_time_interval: null                                             
+│         every_n_epochs: null                                                  
+│         save_on_train_epoch_end: null                                         
+│       early_stopping:                                                         
+│         _target_: lightning.pytorch.callbacks.EarlyStopping                   
+│         monitor: val/ranking/recall@100                                       
+│         min_delta: 0.0                                                        
+│         patience: 10                                                          
+│         verbose: false                                                        
+│         mode: max                                                             
+│         strict: true                                                          
+│         check_finite: true                                                    
+│         stopping_threshold: null                                              
+│         divergence_threshold: null                                            
+│         check_on_train_epoch_end: null                                        
+│       model_summary:                                                          
+│         _target_: lightning.pytorch.callbacks.RichModelSummary                
+│         max_depth: -1                                                         
+│       rich_progress_bar:                                                      
+│         _target_: lightning.pytorch.callbacks.RichProgressBar                 
+│                                                                               
+├── logger
+│   └── wandb:                                                                  
+│         _target_: lightning.pytorch.loggers.wandb.WandbLogger                 
+│         name: train                                                           
+│         save_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/
+│         offline: false                                                        
+│         id: null                                                              
+│         anonymous: null                                                       
+│         project: evi-rag                                                      
+│         log_model: false                                                      
+│         prefix: ''                                                            
+│         entity: null                                                          
+│         group: ''                                                             
+│         tags: []                                                              
+│         job_type: ''                                                          
+│                                                                               
+├── trainer
+│   └── _target_: lightning.pytorch.trainer.Trainer                             
+│       default_root_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp
+│       min_epochs: 0                                                           
+│       max_epochs: 10000                                                       
+│       accelerator: gpu                                                        
+│       devices: 1                                                              
+│       gradient_clip_val: 1.0                                                  
+│       check_val_every_n_epoch: 1                                              
+│       log_every_n_steps: 1                                                    
+│       deterministic: false                                                    
+│                                                                               
+├── paths
+│   └── root_dir: /mnt/wangjingxiong/EVI-RAG                                    
+│       data_dir: /mnt/data/retrieval_dataset                                   
+│       log_dir: /mnt/wangjingxiong/EVI-RAG/logs/                               
+│       debug_log_path: /mnt/wangjingxiong/EVI-RAG/logs//debug.log              
+│       output_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/
+│       work_dir: /mnt/wangjingxiong/EVI-RAG                                    
+│                                                                               
+├── extras
+│   └── ignore_warnings: false                                                  
+│       enforce_tags: true                                                      
+│       print_config: true                                                      
+│       torch_float32_matmul_precision: high                                    
+│                                                                               
+├── task_name
+│   └── train                                                                   
+├── tags
+│   └── ['webqsp', 'train_retriever']                                           
+├── train
+│   └── True                                                                    
+├── test
+│   └── True                                                                    
+├── debug_data_loading
+│   └── False                                                                   
+├── test_ckpt_path
+│   └── None                                                                    
+├── allow_test_without_checkpoint
+│   └── False                                                                   
+├── ckpt_path
+│   └── None                                                                    
+├── seed
+│   └── 42                                                                      
+└── dataset
+    └── name: webqsp-sub                                                        
+        kb: freebase                                                            
+        raw_root: /mnt/data/retrieval_dataset/webqsp/raw/data                   
+        out_dir: /mnt/data/retrieval_dataset/webqsp-sub/normalized              
+        materialized_dir: /mnt/data/retrieval_dataset/webqsp-sub/materialized   
+        paths:                                                                  
+          vocabulary: /mnt/data/retrieval_dataset/webqsp-sub/materialized/vocabu
+          embeddings: /mnt/data/retrieval_dataset/webqsp-sub/materialized/embedd
+          processed: /mnt/data/retrieval_dataset/webqsp-sub/materialized/process
+        entity_normalization: none                                              
+        undirected_traversal: false                                             
+        column_map:                                                             
+          question_id_field: id                                                 
+          question_field: question                                              
+          answer_text_field: answer                                             
+          q_entity_field: q_entity                                              
+          a_entity_field: a_entity                                              
+          graph_field: graph                                                    
+                                                                                
+Seed set to 42
+[[36m2025-12-15 17:40:20,635[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Resolved run name: train_retriever_webqsp[0m
+[[36m2025-12-15 17:40:20,635[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating datamodule <src.data.g_retrieval_datamodule.GRetrievalDataModule>[0m
+[[36m2025-12-15 17:40:20,896[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating model <src.models.retriever_module.RetrieverModule>[0m
+/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/utilities/parsing.py:210: Attribute 'loss' is an instance of `nn.Module` and is already saved during checkpointing. It is recommended to ignore them using `self.save_hyperparameters(ignore=['loss'])`.
+[[36m2025-12-15 17:40:20,955[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating callbacks...[0m
+[[36m2025-12-15 17:40:20,956[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.ModelCheckpoint>[0m
+[[36m2025-12-15 17:40:20,957[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.EarlyStopping>[0m
+[[36m2025-12-15 17:40:20,958[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichModelSummary>[0m
+[[36m2025-12-15 17:40:20,958[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichProgressBar>[0m
+[[36m2025-12-15 17:40:20,958[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating loggers...[0m
+[[36m2025-12-15 17:40:20,958[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating logger <lightning.pytorch.loggers.wandb.WandbLogger>[0m
+[[36m2025-12-15 17:40:20,961[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating trainer <lightning.pytorch.trainer.Trainer>[0m
+Trainer already configured with model summary callbacks: [<class 'lightning.pytorch.callbacks.rich_model_summary.RichModelSummary'>]. Skipping setting a default `ModelSummary` callback.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+[[36m2025-12-15 17:40:20,999[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Logging hyperparameters![0m
+wandb: Currently logged in as: martin1007wang (martin1007wang-wuhan-university) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: creating run
+wandb: Tracking run with wandb version 0.21.1
+wandb: Run data is saved locally in /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/wandb/run-20251215_174022-sd5gljug
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run train_retriever_webqsp
+wandb: ⭐️ View project at https://wandb.ai/martin1007wang-wuhan-university/evi-rag
+wandb: 🚀 View run at https://wandb.ai/martin1007wang-wuhan-university/evi-rag/runs/sd5gljug
+[[36m2025-12-15 17:40:24,519[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting training![0m
+[[36m2025-12-15 17:40:25,119[0m][[34msrc.data.components.graph_store[0m][[32mINFO[0m] - Loaded vocabulary: 1316464 entities / 6094 relations[0m
+[[36m2025-12-15 17:40:25,473[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Loading /mnt/data/retrieval_dataset/webqsp-sub/materialized/embeddings/entity_embeddings.pt...[0m
+[[36m2025-12-15 17:40:26,387[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Loading /mnt/data/retrieval_dataset/webqsp-sub/materialized/embeddings/relation_embeddings.pt...[0m
+[[36m2025-12-15 17:40:26,398[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Entity embedding rows: 539675 (vocab entities: 1316464). Non-text entities use embedding_id=0; textual entities occupy 1..max_id.[0m
+[[36m2025-12-15 17:40:26,399[0m][[34msrc.data.g_retrieval_dataset[0m][[32mINFO[0m] - GRetrievalDataset[train] initialized: 2708 samples.[0m
+[[36m2025-12-15 17:40:26,400[0m][[34msrc.data.g_retrieval_dataset[0m][[32mINFO[0m] - GRetrievalDataset[validation] initialized: 234 samples.[0m
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0,1]
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃    ┃ Name                                   ┃ Type          ┃ Params ┃ Mode  ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ 0  │ model                                  │ Retriever     │  8.4 M │ train │
+│ 1  │ model.entity_proj                      │ EmbeddingPro… │  1.0 M │ train │
+│ 2  │ model.entity_proj.network              │ Sequential    │  1.0 M │ train │
+│ 3  │ model.entity_proj.network.0            │ Linear        │  1.0 M │ train │
+│ 4  │ model.entity_proj.network.1            │ Tanh          │      0 │ train │
+│ 5  │ model.relation_proj                    │ EmbeddingPro… │  1.0 M │ train │
+│ 6  │ model.relation_proj.network            │ Sequential    │  1.0 M │ train │
+│ 7  │ model.relation_proj.network.0          │ Linear        │  1.0 M │ train │
+│ 8  │ model.relation_proj.network.1          │ Tanh          │      0 │ train │
+│ 9  │ model.query_proj                       │ EmbeddingPro… │  1.0 M │ train │
+│ 10 │ model.query_proj.network               │ Sequential    │  1.0 M │ train │
+│ 11 │ model.query_proj.network.0             │ Linear        │  1.0 M │ train │
+│ 12 │ model.query_proj.network.1             │ Tanh          │      0 │ train │
+│ 13 │ model.non_text_entity_emb              │ Embedding     │  1.0 K │ train │
+│ 14 │ model.dde                              │ DDE           │      0 │ train │
+│ 15 │ model.dde.layers                       │ ModuleList    │      0 │ train │
+│ 16 │ model.dde.layers.0                     │ PEConv        │      0 │ train │
+│ 17 │ model.dde.layers.0.aggr_module         │ MeanAggregat… │      0 │ train │
+│ 18 │ model.dde.layers.1                     │ PEConv        │      0 │ train │
+│ 19 │ model.dde.layers.1.aggr_module         │ MeanAggregat… │      0 │ train │
+│ 20 │ model.dde.reverse_layers               │ ModuleList    │      0 │ train │
+│ 21 │ model.dde.reverse_layers.0             │ PEConv        │      0 │ train │
+│ 22 │ model.dde.reverse_layers.0.aggr_module │ MeanAggregat… │      0 │ train │
+│ 23 │ model.dde.reverse_layers.1             │ PEConv        │      0 │ train │
+│ 24 │ model.dde.reverse_layers.1.aggr_module │ MeanAggregat… │      0 │ train │
+│ 25 │ model.feature_extractor                │ DenseFeature… │  5.3 M │ train │
+│ 26 │ model.feature_extractor.network        │ Sequential    │  5.3 M │ train │
+│ 27 │ model.feature_extractor.network.0      │ Linear        │  4.2 M │ train │
+│ 28 │ model.feature_extractor.network.1      │ ReLU          │      0 │ train │
+│ 29 │ model.feature_extractor.network.2      │ Dropout       │      0 │ train │
+│ 30 │ model.feature_extractor.network.3      │ Linear        │  1.0 M │ train │
+│ 31 │ model.feature_extractor.network.4      │ ReLU          │      0 │ train │
+│ 32 │ model.feature_extractor.network.5      │ Dropout       │      0 │ train │
+│ 33 │ model.head                             │ Deterministi… │  1.0 K │ train │
+│ 34 │ model.head.linear                      │ Linear        │  1.0 K │ train │
+│ 35 │ model.dropout                          │ Dropout       │      0 │ train │
+│ 36 │ loss                                   │ RetrieverLis… │      0 │ train │
+└────┴────────────────────────────────────────┴───────────────┴────────┴───────┘
+Trainable params: 8.4 M                                                         
+Non-trainable params: 0                                                         
+Total params: 8.4 M                                                             
+Total estimated model params size (MB): 33                                      
+Modules in train mode: 37                                                       
+Modules in eval mode: 0                                                         
+[[36m2025-12-15 17:40:26,560[0m][[34msrc.data.components.loader[0m][[32mINFO[0m] - UnifiedDataLoader initialized: batch_size=32 shuffle=False[0m
+[[36m2025-12-15 17:40:28,779[0m][[34msrc.data.components.loader[0m][[32mINFO[0m] - UnifiedDataLoader initialized: batch_size=32 shuffle=True[0m
+Epoch 31/9999 ━━━━━━━━━━━━━━━━ 85/85 0:00:39 •        2.20it/s v_num: ljug      
+                                     0:00:00                   val/loss: 2.683  
+                                                               train/loss: 0.347
+[[36m2025-12-15 18:03:51,479[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting testing![0m
+[[36m2025-12-15 18:03:51,481[0m][[34msrc.data.g_retrieval_dataset[0m][[32mINFO[0m] - GRetrievalDataset[test] initialized: 1628 samples.[0m
+Restoring states from the checkpoint path at /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/checkpoints/epoch_021.ckpt
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0,1]
+Loaded model weights from the checkpoint at /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/checkpoints/epoch_021.ckpt
+[[36m2025-12-15 18:03:51,567[0m][[34msrc.data.components.loader[0m][[32mINFO[0m] - UnifiedDataLoader initialized: batch_size=32 shuffle=False[0m
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃          Test metric          ┃         DataLoader 0          ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│  test/answer/answer_recall@1  │      0.3445131778717041       │
+│ test/answer/answer_recall@10  │      0.6823616623878479       │
+│ test/answer/answer_recall@100 │       0.872272789478302       │
+│ test/answer/answer_recall@200 │      0.9036312699317932       │
+│ test/answer/answer_recall@25  │       0.772223949432373       │
+│ test/answer/answer_recall@300 │      0.9141727685928345       │
+│ test/answer/answer_recall@400 │      0.9203988313674927       │
+│  test/answer/answer_recall@5  │      0.5881935358047485       │
+│ test/answer/answer_recall@50  │       0.835922122001648       │
+│           test/loss           │      2.4047985076904297       │
+│       test/ranking/f1@1       │      0.2681293785572052       │
+│      test/ranking/f1@10       │      0.3531244695186615       │
+│      test/ranking/f1@100      │      0.16137531399726868      │
+│      test/ranking/f1@200      │      0.11557865142822266      │
+│      test/ranking/f1@25       │      0.2719324231147766       │
+│      test/ranking/f1@300      │      0.09173966199159622      │
+│      test/ranking/f1@400      │      0.07660181820392609      │
+│       test/ranking/f1@5       │      0.39084768295288086      │
+│      test/ranking/f1@50       │      0.2145523577928543       │
+│       test/ranking/mrr        │      0.7885057330131531       │
+│      test/ranking/ndcg@1      │      0.7042526006698608       │
+│     test/ranking/ndcg@10      │      0.7091875076293945       │
+│     test/ranking/ndcg@100     │       0.760725200176239       │
+│     test/ranking/ndcg@200     │      0.7734463214874268       │
+│     test/ranking/ndcg@25      │       0.729238748550415       │
+│     test/ranking/ndcg@300     │      0.7794814109802246       │
+│     test/ranking/ndcg@400     │      0.7833081483840942       │
+│      test/ranking/ndcg@5      │      0.6996493935585022       │
+│     test/ranking/ndcg@50      │      0.7461276650428772       │
+│   test/ranking/precision@1    │      0.7042526006698608       │
+│   test/ranking/precision@10   │      0.39555490016937256      │
+│  test/ranking/precision@100   │      0.12938755750656128      │
+│  test/ranking/precision@200   │      0.08410737663507462      │
+│   test/ranking/precision@25   │      0.26414909958839417      │
+│  test/ranking/precision@300   │      0.06272587925195694      │
+│  test/ranking/precision@400   │     0.050159357488155365      │
+│   test/ranking/precision@5    │      0.5190733671188354       │
+│   test/ranking/precision@50   │      0.1898706704378128       │
+│     test/ranking/recall@1     │      0.20296317338943481      │
+│    test/ranking/recall@10     │      0.6074238419532776       │
+│    test/ranking/recall@100    │      0.8660544157028198       │
+│    test/ranking/recall@200    │      0.9154476523399353       │
+│    test/ranking/recall@25     │      0.7249078750610352       │
+│    test/ranking/recall@300    │      0.9385174512863159       │
+│    test/ranking/recall@400    │      0.9510320425033569       │
+│     test/ranking/recall@5     │      0.4975273609161377       │
+│    test/ranking/recall@50     │      0.8012620806694031       │
+└───────────────────────────────┴───────────────────────────────┘
+Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 51/51 0:00:24 • 0:00:00 2.07it/s 
+[[36m2025-12-15 18:04:17,012[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Best ckpt path: /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/checkpoints/epoch_021.ckpt[0m
+[[36m2025-12-15 18:04:17,013[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Output dir: /mnt/wangjingxiong/EVI-RAG/logs/train_retriever_webqsp/runs/2025-12-15_17-40-20[0m
+[[36m2025-12-15 18:04:17,014[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Closing wandb![0m
+wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb:                                                                                
+wandb: 
+wandb: Run history:
+wandb:                            epoch ▁▁▁▂▂▂▂▂▂▃▃▃▃▃▃▄▄▄▄▄▄▅▅▅▅▅▆▆▆▆▆▆▆▇▇▇▇███
+wandb:      test/answer/answer_recall@1 ▁
+wandb:     test/answer/answer_recall@10 ▁
+wandb:    test/answer/answer_recall@100 ▁
+wandb:    test/answer/answer_recall@200 ▁
+wandb:     test/answer/answer_recall@25 ▁
+wandb:    test/answer/answer_recall@300 ▁
+wandb:    test/answer/answer_recall@400 ▁
+wandb:      test/answer/answer_recall@5 ▁
+wandb:     test/answer/answer_recall@50 ▁
+wandb:                        test/loss ▁
+wandb:                test/ranking/f1@1 ▁
+wandb:               test/ranking/f1@10 ▁
+wandb:              test/ranking/f1@100 ▁
+wandb:              test/ranking/f1@200 ▁
+wandb:               test/ranking/f1@25 ▁
+wandb:              test/ranking/f1@300 ▁
+wandb:              test/ranking/f1@400 ▁
+wandb:                test/ranking/f1@5 ▁
+wandb:               test/ranking/f1@50 ▁
+wandb:                 test/ranking/mrr ▁
+wandb:              test/ranking/ndcg@1 ▁
+wandb:             test/ranking/ndcg@10 ▁
+wandb:            test/ranking/ndcg@100 ▁
+wandb:            test/ranking/ndcg@200 ▁
+wandb:             test/ranking/ndcg@25 ▁
+wandb:            test/ranking/ndcg@300 ▁
+wandb:            test/ranking/ndcg@400 ▁
+wandb:              test/ranking/ndcg@5 ▁
+wandb:             test/ranking/ndcg@50 ▁
+wandb:         test/ranking/precision@1 ▁
+wandb:        test/ranking/precision@10 ▁
+wandb:       test/ranking/precision@100 ▁
+wandb:       test/ranking/precision@200 ▁
+wandb:        test/ranking/precision@25 ▁
+wandb:       test/ranking/precision@300 ▁
+wandb:       test/ranking/precision@400 ▁
+wandb:         test/ranking/precision@5 ▁
+wandb:        test/ranking/precision@50 ▁
+wandb:            test/ranking/recall@1 ▁
+wandb:           test/ranking/recall@10 ▁
+wandb:          test/ranking/recall@100 ▁
+wandb:          test/ranking/recall@200 ▁
+wandb:           test/ranking/recall@25 ▁
+wandb:          test/ranking/recall@300 ▁
+wandb:          test/ranking/recall@400 ▁
+wandb:            test/ranking/recall@5 ▁
+wandb:           test/ranking/recall@50 ▁
+wandb:                       train/loss █▅▄▃▃▃▂▂▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:              train/loss/listwise █▅▄▃▃▂▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:              train/loss/pairwise █▆▅▄▄▃▃▃▃▃▂▂▂▂▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁
+wandb:            train/metric/neg_prob █▅▃▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: train/metric/num_pairwise_graphs ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:      train/metric/num_pos_graphs ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:            train/metric/pos_prob ██▄▂▂▂▂▁▁▃▂▂▂▁▁▂▂▁▂▁▁▁▂▁▂▂▁▂▂▁▂▁
+wandb:          train/metric/separation ▁█▆▅▆▇▆▆▆█▇▇▇▆▆▇█▇▇▇▇▆█▇▇▇▇▇▇▇▇▇
+wandb:              trainer/global_step ▁▁▁▁▁▂▂▂▂▂▃▃▃▃▄▄▄▄▄▄▅▅▅▅▅▆▆▆▆▆▆▆▇▇▇▇▇███
+wandb:       val/answer/answer_recall@1 ▁▅▄▆▅▆▆▆▇█▇▇▇▇▇▆▇▇▇█▇▇▆██▇▇▇█▇▇█
+wandb:      val/answer/answer_recall@10 ▁▅▆▆▅▆▆▅▆█▇█▆▇▆▇▆██▆▆▇▆▇█▇▅▆▇▆▇▇
+wandb:     val/answer/answer_recall@100 ▁▄▆▆▅▅▇▇▆▆▆▆▇▆▇▇▇▇▇▇▇▇▇▇▇▆▆▆██▆▇
+wandb:     val/answer/answer_recall@200 ▁▅▅▅▄▄▅▆▆▅▅▅▅▆▆▅▅▆▆▄▇▅▆▇▅▆▃▄█▆▅▅
+wandb:      val/answer/answer_recall@25 ▁▆▆▇▆▆▆▇▆██▇▆▇▆█▇█▇▇▇█▇▇█▇▆▆█▇▇▇
+wandb:     val/answer/answer_recall@300 ▃▅▆▆▅▂▄▇▅▅▅▄▅▄▅▅▃▄▄▂▆▆▅▅▃▅▁▃█▅▆█
+wandb:     val/answer/answer_recall@400 ▄▄▄▅▄▃▆▆▆▇▄▅▅▄▄▆▅▁▇▃▅▅▆▆▂▄▂▆▇▆▇█
+wandb:       val/answer/answer_recall@5 ▁▅▅▇▆▆▇▆▇█▇█▇▇▇▇▆█▇▇▇▇▇▇██▆▇▇▇▇█
+wandb:      val/answer/answer_recall@50 ▁▅▆▆▅▅▆█▆█▇▇▇▇▇███▇▇▇█▇▇█▇▆▆▇█▇█
+wandb:                         val/loss █▃▃▂▃▁▃▂▁▁▁▁▁▁▂▂▂▄▂▂▂▂▂▄▂▂▄▃▂▂▃▃
+wandb:                 val/ranking/f1@1 ▁▆▅▇▇█▇▇███████▆▇▅▇██▇▇██▇▇▇▇▇▆▇
+wandb:                val/ranking/f1@10 ▁▆▅▇▆▇▇▇▇██▇█▇█▇█▇█▇██▇█████████
+wandb:               val/ranking/f1@100 ▁▅▅▅▅▆▆▇▇▇▇▇█▆▇▇█▇▇▇▇█▇▇▇▇▇██▇▇▇
+wandb:               val/ranking/f1@200 ▁▄▅▅▅▆▆▆▇▆▇▇█▇▇▇▇▇▇▇▆▇▇▇▇▇▇███▇█
+wandb:                val/ranking/f1@25 ▁▆▅▆▆▇▆▇▇▇████▇▇█▇█▇▇█▇█████████
+wandb:               val/ranking/f1@300 ▁▄▄▅▅▆▆▆▆▆▇▇█▇▇▇▇▆▇▇▇▇▇▇▇█▇███▇█
+wandb:               val/ranking/f1@400 ▁▄▄▅▅▇▆▆▆▆▇▇█▇▇▇▇▆▇▆▆▇▇▇▇███▇█▇█
+wandb:                 val/ranking/f1@5 ▁▆▄▇▆▇▇▇▇█▇▇▇▇▇▇▇▇███▇▇▇█▇▇▇▇█▇█
+wandb:                val/ranking/f1@50 ▁▅▆▆▆▇▆▇▇████▇▇██▇█▇██▇███▇█████
+wandb:                  val/ranking/mrr ▁▆▆▇▆▇▇▇██▇▇▇▇█▇▇▇▇██▇▇███▇▇██▇█
+wandb:               val/ranking/ndcg@1 ▁▆▅▇▆█▇▇██▇▇███▇▇▆▇██▇▇████▇██▇█
+wandb:              val/ranking/ndcg@10 ▁▆▅▇▆▇▇▇▇▇▇▇▇▇▇▇▇▇██▇▇▇██▇▇▇██▇█
+wandb:             val/ranking/ndcg@100 ▁▆▅▇▆▇▇▇▇████▇█▇█▇████▇███████▇█
+wandb:             val/ranking/ndcg@200 ▁▆▅▇▆▇▇▇▇████▇█▇█▇████▇███▇███▇█
+wandb:              val/ranking/ndcg@25 ▁▆▅▇▆▇▇▇▇██████▇█▇████▇███████▇█
+wandb:             val/ranking/ndcg@300 ▁▆▅▆▆▇▇▇▇████▇▇▇█▇████▇███▇▇██▇█
+wandb:             val/ranking/ndcg@400 ▁▆▅▆▆▇▇▇▇████▇█▇█▇████▇███▇███▇█
+wandb:               val/ranking/ndcg@5 ▁▅▅▆▆▇▇▇▇▇▇▇▇▇▇▇▇▇██▇▇▇██▇▇▇██▇█
+wandb:              val/ranking/ndcg@50 ▁▆▅▇▆▇▇▇▇████▇█▇█▇████▇███▇▇██▇█
+wandb:          val/ranking/precision@1 ▁▆▅▇▆█▇▇██▇▇███▇▇▆▇██▇▇████▇██▇█
+wandb:         val/ranking/precision@10 ▁▆▅▆▆▇▆▇▇▇▇▇▇▇▇▇▇▇█▇▇█▇███████▇█
+wandb:        val/ranking/precision@100 ▁▅▄▆▅▇▆▇▇▇▇▆█▇▇▇█▇▇▇▇█▇▇▇█████▇█
+wandb:        val/ranking/precision@200 ▁▄▄▆▅▇▆▆▇▆▇▇█▇▆▇▇▇▇▇▇▇▇▇▇███████
+wandb:         val/ranking/precision@25 ▁▅▅▆▆▇▆▇▇▇▇▇▇▇▇▇▇▇▇▇▇█▇█████████
+wandb:        val/ranking/precision@300 ▁▄▄▅▅▇▆▆▇▆▇▇█▇▇▇▇▆▇▇▇█▇▇▇█████▇█
+wandb:        val/ranking/precision@400 ▁▄▄▆▅▇▆▇▇▆▇▇█▇▇▇▇▇▇▇▆█▇▇▇███▇█▇▇
+wandb:          val/ranking/precision@5 ▁▅▄▆▆▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇█
+wandb:         val/ranking/precision@50 ▁▅▅▆▆▇▆▇▇▇▇▇█▇▇██▇█▇██▇▇████████
+wandb:             val/ranking/recall@1 ▁▆▅▆▇█▇▇███████▆█▅▇██▇▇██▇▇▇▇▇▅▇
+wandb:            val/ranking/recall@10 ▁▆▅▇▆▇▆▇▇▇█▇▇▇▇▇▇▇█▇██▇▇██▇▇▇███
+wandb:           val/ranking/recall@100 ▁▆▅▆▆▆▆▇▆▇▇██▆▇▇███▇▇█▇█▇█▇███▇█
+wandb:           val/ranking/recall@200 ▁▅▅▆▅▆▆▆▇▇▇▇█▆▇▇▇▇█▇▇▇▇█▇▇▇███▇█
+wandb:            val/ranking/recall@25 ▁▆▅▇▆▇▆▇▇███▇▇▇▇█▇█▇▇█▇███▇▇███▇
+wandb:           val/ranking/recall@300 ▁▄▅▅▅▆▅▆▆▆▇▇▇▆▇▇▇▇▇▆▇▇▇▇▇▇▇▇██▇█
+wandb:           val/ranking/recall@400 ▁▄▄▄▅▆▅▆▆▇▇▇█▆▇▇▇▆▇▆▆▇▇▇▇▇▇▇██▇█
+wandb:             val/ranking/recall@5 ▁▆▄▆▇▇▇▆▇█▇▇▇▇▇▇▇▇▇██▇▇▇▇█▇▇██▇█
+wandb:            val/ranking/recall@50 ▁▆▆▆▆▇▆▇▇█▇█▇▇▇██▇▇▇██▆▇▇▇▇▇▇███
+wandb: 
+wandb: Run summary:
+wandb:                            epoch 32
+wandb:      test/answer/answer_recall@1 0.34451
+wandb:     test/answer/answer_recall@10 0.68236
+wandb:    test/answer/answer_recall@100 0.87227
+wandb:    test/answer/answer_recall@200 0.90363
+wandb:     test/answer/answer_recall@25 0.77222
+wandb:    test/answer/answer_recall@300 0.91417
+wandb:    test/answer/answer_recall@400 0.9204
+wandb:      test/answer/answer_recall@5 0.58819
+wandb:     test/answer/answer_recall@50 0.83592
+wandb:                        test/loss 2.4048
+wandb:                test/ranking/f1@1 0.26813
+wandb:               test/ranking/f1@10 0.35312
+wandb:              test/ranking/f1@100 0.16138
+wandb:              test/ranking/f1@200 0.11558
+wandb:               test/ranking/f1@25 0.27193
+wandb:              test/ranking/f1@300 0.09174
+wandb:              test/ranking/f1@400 0.0766
+wandb:                test/ranking/f1@5 0.39085
+wandb:               test/ranking/f1@50 0.21455
+wandb:                 test/ranking/mrr 0.78851
+wandb:              test/ranking/ndcg@1 0.70425
+wandb:             test/ranking/ndcg@10 0.70919
+wandb:            test/ranking/ndcg@100 0.76073
+wandb:            test/ranking/ndcg@200 0.77345
+wandb:             test/ranking/ndcg@25 0.72924
+wandb:            test/ranking/ndcg@300 0.77948
+wandb:            test/ranking/ndcg@400 0.78331
+wandb:              test/ranking/ndcg@5 0.69965
+wandb:             test/ranking/ndcg@50 0.74613
+wandb:         test/ranking/precision@1 0.70425
+wandb:        test/ranking/precision@10 0.39555
+wandb:       test/ranking/precision@100 0.12939
+wandb:       test/ranking/precision@200 0.08411
+wandb:        test/ranking/precision@25 0.26415
+wandb:       test/ranking/precision@300 0.06273
+wandb:       test/ranking/precision@400 0.05016
+wandb:         test/ranking/precision@5 0.51907
+wandb:        test/ranking/precision@50 0.18987
+wandb:            test/ranking/recall@1 0.20296
+wandb:           test/ranking/recall@10 0.60742
+wandb:          test/ranking/recall@100 0.86605
+wandb:          test/ranking/recall@200 0.91545
+wandb:           test/ranking/recall@25 0.72491
+wandb:          test/ranking/recall@300 0.93852
+wandb:          test/ranking/recall@400 0.95103
+wandb:            test/ranking/recall@5 0.49753
+wandb:           test/ranking/recall@50 0.80126
+wandb:                       train/loss 0.34716
+wandb:              train/loss/listwise 0.08212
+wandb:              train/loss/pairwise 0.26504
+wandb:            train/metric/neg_prob 0.0085
+wandb: train/metric/num_pairwise_graphs 31.91137
+wandb:      train/metric/num_pos_graphs 31.91137
+wandb:            train/metric/pos_prob 0.50492
+wandb:          train/metric/separation 0.49642
+wandb:              trainer/global_step 2720
+wandb:       val/answer/answer_recall@1 0.36641
+wandb:      val/answer/answer_recall@10 0.69005
+wandb:     val/answer/answer_recall@100 0.9006
+wandb:     val/answer/answer_recall@200 0.92796
+wandb:      val/answer/answer_recall@25 0.80069
+wandb:     val/answer/answer_recall@300 0.96342
+wandb:     val/answer/answer_recall@400 0.97383
+wandb:       val/answer/answer_recall@5 0.60339
+wandb:      val/answer/answer_recall@50 0.86565
+wandb:                         val/loss 2.68338
+wandb:                 val/ranking/f1@1 0.24737
+wandb:                val/ranking/f1@10 0.3528
+wandb:               val/ranking/f1@100 0.153
+wandb:               val/ranking/f1@200 0.10892
+wandb:                val/ranking/f1@25 0.28
+wandb:               val/ranking/f1@300 0.08898
+wandb:               val/ranking/f1@400 0.07509
+wandb:                 val/ranking/f1@5 0.39286
+wandb:                val/ranking/f1@50 0.21456
+wandb:                  val/ranking/mrr 0.77547
+wandb:               val/ranking/ndcg@1 0.69658
+wandb:              val/ranking/ndcg@10 0.70534
+wandb:             val/ranking/ndcg@100 0.74378
+wandb:             val/ranking/ndcg@200 0.76026
+wandb:              val/ranking/ndcg@25 0.71401
+wandb:             val/ranking/ndcg@300 0.76958
+wandb:             val/ranking/ndcg@400 0.77361
+wandb:               val/ranking/ndcg@5 0.70318
+wandb:              val/ranking/ndcg@50 0.72908
+wandb:          val/ranking/precision@1 0.69658
+wandb:         val/ranking/precision@10 0.40855
+wandb:        val/ranking/precision@100 0.12316
+wandb:        val/ranking/precision@200 0.08248
+wandb:         val/ranking/precision@25 0.27111
+wandb:        val/ranking/precision@300 0.06467
+wandb:        val/ranking/precision@400 0.05281
+wandb:          val/ranking/precision@5 0.5359
+wandb:         val/ranking/precision@50 0.18718
+wandb:             val/ranking/recall@1 0.17866
+wandb:            val/ranking/recall@10 0.58483
+wandb:           val/ranking/recall@100 0.84014
+wandb:           val/ranking/recall@200 0.89445
+wandb:            val/ranking/recall@25 0.69696
+wandb:           val/ranking/recall@300 0.93062
+wandb:           val/ranking/recall@400 0.94718
+wandb:             val/ranking/recall@5 0.48477
+wandb:            val/ranking/recall@50 0.77616
+wandb: 
+wandb: 🚀 View run train_retriever_webqsp at: https://wandb.ai/martin1007wang-wuhan-university/evi-rag/runs/sd5gljug
+wandb: ⭐️ View project at: https://wandb.ai/martin1007wang-wuhan-university/evi-rag
+wandb: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/wandb/run-20251215_174022-sd5gljug/logs
+[[36m2025-12-15 18:04:18,834[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Metric name is None! Skipping metric value retrieval...[0m

@@ -2,6 +2,6 @@
 
 defaults:
   - eval_retriever_default
-  - override /dataset: cwq
+  - override /dataset: cwq-sub
 
 tags: ["retriever", "eval", "cwq"]

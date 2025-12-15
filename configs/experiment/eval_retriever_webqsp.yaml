@@ -2,9 +2,10 @@
 
 defaults:
   - eval_retriever_default
-  - override /dataset: webqsp
+  # Use the same filtered dataset used for retriever training.
+  - override /dataset: webqsp-sub
 
 tags: ["eval", "retriever", "webqsp"]
 
-ckpt_path: "logs/train_retriever_webqsp/runs/2025-11-30_14-48-31/checkpoints/epoch_189.ckpt"
+ckpt_path: "logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/checkpoints/epoch_021.ckpt"
 task_name: "eval_retriever_webqsp"

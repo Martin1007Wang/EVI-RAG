@@ -9,6 +9,14 @@ parquet_dir: ${dataset.out_dir}
 # Output directory for LMDB and embeddings
 output_dir: ${dataset.materialized_dir}
 
+# Optional: also materialize a `${dataset.name}-${sub.suffix}` dataset if its normalized parquet exists.
+sub:
+  enabled: true
+  suffix: sub
+  parquet_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/normalized
+  output_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/materialized
+  share_vocab_and_embeddings: true
+
 # HF model name or path for text encoding.
 encoder: "Alibaba-NLP/gte-large-en-v1.5"
 
@@ -25,14 +33,26 @@ progress_bar: true
 fp16: True
 
 # Number of topic feature channels used in preprocessing.
-# Convention: col0=question/topic entities, col1=answer entities.
+# SubgraphRAG parity: 2-class one-hot {non-topic, topic} built from query entities only.
 num_topics: 2
+
+# Which supervision mask to write into LMDB as `labels` (consumed by GRetrievalDataset/Retriever).
+# - transition: (u->v) transitions on GT paths, lifted to all parallel edges (legacy behavior)
+# - triple: exact (h,r,t) edges on GT paths (canonical edge ids / answer_subgraph edges)
+# - hybrid: use `triple` when GT comes from answer_subgraph, else `transition`
+labels:
+  source: hybrid
+  store_aux: true
 
 # LMDB map size in GB.
 map_size_gb: 32
 
 # LMDB map size for vocabulary (GB).
 vocab_map_size_gb: 4
+
+# Rebuild semantics: LMDB writes are not "incremental". If an LMDB already exists, we must
+# overwrite it to avoid stale keys leaking into the current dataset build.
+overwrite_lmdb: true
 
 # Number of samples per LMDB transaction commit.
 txn_size: 512

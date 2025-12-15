@@ -70,6 +70,8 @@ class UnifiedDataLoader(DataLoader):
         if entity_table is None or relation_table is None:
             raise RuntimeError("Global embeddings not loaded before iteration")
 
+        pin_outputs = bool(getattr(self, "pin_memory", False)) and torch.cuda.is_available()
+
         for batch in super().__iter__():
             node_embedding_ids = torch.as_tensor(batch.node_embedding_ids, dtype=torch.long, device="cpu")
             relation_ids = torch.as_tensor(batch.edge_attr, dtype=torch.long, device="cpu")
@@ -79,6 +81,9 @@ class UnifiedDataLoader(DataLoader):
 
             batch.node_embeddings = self.global_embeddings.get_entity_embeddings(node_embedding_ids)
             batch.edge_embeddings = self.global_embeddings.get_relation_embeddings(relation_ids)
+            if pin_outputs:
+                batch.node_embeddings = batch.node_embeddings.pin_memory()
+                batch.edge_embeddings = batch.edge_embeddings.pin_memory()
 
             if not hasattr(batch, "answer_entity_ids"):
                 raise AttributeError("Batch missing answer_entity_ids required for metrics.")
@@ -93,8 +98,10 @@ class UnifiedDataLoader(DataLoader):
             if answer_ptr is None:
                 raise AttributeError("Batch missing answer_entity_ids_ptr; PyG collate may have failed.")
             batch.answer_entity_ids_ptr = torch.as_tensor(answer_ptr, dtype=torch.long, device="cpu")
+            if pin_outputs:
+                batch.answer_entity_ids = batch.answer_entity_ids.pin_memory()
+                batch.answer_entity_ids_ptr = batch.answer_entity_ids_ptr.pin_memory()
             if hasattr(batch, "answer_entity_ids_len"):
                 del batch.answer_entity_ids_len
 
             yield batch
-

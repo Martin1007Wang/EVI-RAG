@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from lightning import LightningDataModule
-from omegaconf import DictConfig, OmegaConf
+try:
+    from omegaconf import DictConfig, OmegaConf  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    DictConfig = ()  # type: ignore[assignment]
+    OmegaConf = None  # type: ignore[assignment]
 from torch.utils.data import Dataset
 
 from .components import SharedDataResources
@@ -12,14 +16,35 @@ from .components.loader import UnifiedDataLoader
 from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
 
 
+def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize dataset_cfg to the SSOT representation: `paths.vocabulary` + `paths.embeddings`."""
+
+    cfg = dict(dataset_cfg)
+    paths = cfg.get("paths")
+    if isinstance(paths, dict) and paths.get("vocabulary") and paths.get("embeddings"):
+        return cfg
+
+    data_dir = cfg.get("data_dir")
+    if data_dir:
+        root = Path(str(data_dir)).expanduser().resolve()
+        cfg["paths"] = {
+            "vocabulary": str(root / "vocabulary" / "vocabulary.lmdb"),
+            "embeddings": str(root / "embeddings"),
+        }
+        return cfg
+
+    raise ValueError("dataset_cfg must define either `paths.{vocabulary,embeddings}` or `data_dir`.")
+
+
 def _infer_batch_size(total_batch: int, world_size: int) -> int:
     """Helper to split batch size across GPUs."""
     if world_size <= 1:
         return total_batch
     if total_batch % world_size != 0:
-        # 严谨性：如果不能整除，为了保证梯度一致性，必须报错或警告
-        # 这里选择简单处理：整除
-        pass 
+        raise ValueError(
+            f"batch_size={total_batch} must be divisible by world_size={world_size}. "
+            "Please adjust `data.batch_size` or trainer devices to keep per-rank batch sizes equal."
+        )
     return total_batch // world_size
 
 
@@ -50,10 +75,14 @@ class GRetrievalDataModule(LightningDataModule):
         # 1. Store Configuration (The Source of Truth)
         # Convert DictConfig to primitive dict if necessary, or keep it wrapper
         # Using OmegaConf.to_container allows downstream code to be simple dict-based
-        if isinstance(dataset_cfg, DictConfig):
-            self.dataset_cfg = OmegaConf.to_container(dataset_cfg, resolve=True)
+        if OmegaConf is not None and isinstance(dataset_cfg, DictConfig):
+            cfg = OmegaConf.to_container(dataset_cfg, resolve=True)  # type: ignore[arg-type]
         else:
-            self.dataset_cfg = dataset_cfg
+            cfg = dataset_cfg
+
+        if not isinstance(cfg, dict):
+            raise TypeError(f"dataset_cfg must be a mapping, got {type(cfg)!r}")
+        self.dataset_cfg = _canonicalize_dataset_cfg(cfg)
 
         # 2. Store Logistics
         self.batch_size = batch_size
@@ -78,12 +107,14 @@ class GRetrievalDataModule(LightningDataModule):
         """
         # Defensive check: ensure the injected config has what we need
         # This replaces the complex `resolve_dataset_paths` logic
-        try:
-            paths = self.dataset_cfg.get("paths", {})
-            vocab_path = Path(paths.get("vocabulary", ""))
-            emb_dir = Path(paths.get("embeddings", ""))
-        except Exception as e:
-            raise ValueError("Invalid dataset_cfg structure. Expected 'paths.vocabulary' and 'paths.embeddings'.") from e
+        paths = self.dataset_cfg.get("paths")
+        if not isinstance(paths, dict):
+            raise ValueError("Invalid dataset_cfg: expected mapping at `paths`.")
+        if "vocabulary" not in paths or "embeddings" not in paths:
+            raise ValueError("Invalid dataset_cfg: expected `paths.vocabulary` and `paths.embeddings`.")
+
+        vocab_path = Path(paths["vocabulary"])
+        emb_dir = Path(paths["embeddings"])
 
         missing = []
         if not vocab_path.exists():
