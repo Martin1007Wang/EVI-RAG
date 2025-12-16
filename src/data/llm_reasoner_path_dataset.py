@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.utils.llm_prompting import build_path_prompt
+from src.utils.text_utils import count_tokens
 
 
 def _load_torch(path: Path) -> Any:
@@ -104,6 +105,7 @@ class LLMReasonerPathDataset(Dataset):
             include_meta=self.include_meta,
             instruction=self.user_instruction,
         )
+        evidence_lines = [c.get("chain_text", "") for c in chains[: self.max_chains_per_sample]]
 
         return {
             "id": sample_id,
@@ -114,6 +116,13 @@ class LLMReasonerPathDataset(Dataset):
             "system_prompt": self.system_prompt,
             "user_prompt": user_prompt,
             "prompt_tag": self.prompt_tag,
+            "retrieved_edge_ids": [],
+            "visible_edge_ids": [],
+            "gt_path_edge_local_ids": raw.get("gt_path_edge_local_ids", []),
+            "evidence_token_count": count_tokens("\n".join(evidence_lines)),
+            "prompt_token_count": count_tokens(f"{self.system_prompt}\n{user_prompt}"),
+            "token_budget": None,
+            "evidence_truncated": False,
         }
 
     def _prepare_chains(self, chains: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -155,8 +164,13 @@ class LLMReasonerPathDataset(Dataset):
                 return "UNK"
             return self._ent_map.get(int(val_id), str(val_id))
 
-        h = _txt(e.get("head_text"), e.get("head_entity_id"))
-        t = _txt(e.get("tail_text"), e.get("tail_entity_id"))
+        # 必须按 agent 实际行走方向构造文本：若逆着图中 head->tail 行走，
+        # 需要使用 src_entity_id/dst_entity_id 交换方向，避免语义错误。
+        h = _txt(e.get("src_text"), e.get("src_entity_id"))
+        t = _txt(e.get("dst_text"), e.get("dst_entity_id"))
+        if h == "UNK" and t == "UNK":
+            h = _txt(e.get("head_text"), e.get("head_entity_id"))
+            t = _txt(e.get("tail_text"), e.get("tail_entity_id"))
         r = e.get("relation_text")
         if r is None:
             rid = e.get("relation_id")

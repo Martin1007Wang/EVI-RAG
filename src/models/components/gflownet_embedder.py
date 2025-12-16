@@ -8,10 +8,10 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from src.data.components import SharedDataResources
 from src.models.components.graph import DDE
-from src.models.components.heads import DenseFeatureExtractor
 from src.models.components.projections import EmbeddingProjector
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 class GraphEmbedder(nn.Module):
     """
     GFlowNet 图嵌入器：复用 Retriever checkpoint 中的投影器 + DenseFeatureExtractor 权重，
-    并严格对齐 SubgraphRAG parity 的结构特征（topic seed + DDE forward/reverse）。
+    作为 trainable warm-start（可微调热启动），并严格保持 g_agent 的 SSOT 字段不引入额外结构特征。
+
+    结构特征（topic/DDE）仅在 retriever checkpoint 明确启用时计算，且完全由 g_agent SSOT 字段
+    （start_node_locals + edge_index）确定性派生，不要求缓存额外字段。
     """
 
     def __init__(
@@ -30,13 +33,11 @@ class GraphEmbedder(nn.Module):
         proj_dropout: float,
         projector_checkpoint: str,
         projector_key_prefixes: Optional[Sequence[str]] = None,
-        freeze_retriever: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.proj_dropout = float(proj_dropout)
         self.projector_checkpoint = str(projector_checkpoint)
-        self.freeze_retriever = bool(freeze_retriever)
 
         self.projector_key_prefixes = self._normalize_prefixes(projector_key_prefixes or ["model._orig_mod", "model", ""])
 
@@ -47,19 +48,17 @@ class GraphEmbedder(nn.Module):
         self._num_entities: Optional[int] = None
         self._num_relations: Optional[int] = None
 
-        self.use_topic_pe: bool = True
-        self.num_topics: int = 2
-        self.num_rounds: int = 0
-        self.num_reverse_rounds: int = 0
         self._edge_in_dim: Optional[int] = None
+        self._use_topic_pe: bool = False
+        self._num_topics: int = 0
+        self._struct_dim: int = 0
+        self._dde: Optional[DDE] = None
 
         self.entity_proj: Optional[EmbeddingProjector] = None
         self.relation_proj: Optional[EmbeddingProjector] = None
         self.query_proj: Optional[EmbeddingProjector] = None
         self.non_text_entity_emb: Optional[nn.Embedding] = None
-        self.dde: Optional[DDE] = None
-        self.fused_dropout: Optional[nn.Dropout] = None
-        self.feature_extractor: Optional[DenseFeatureExtractor] = None
+        self.edge_adapter: Optional[nn.Module] = None
 
     @staticmethod
     def _normalize_prefixes(prefixes: Sequence[str]) -> list[str]:
@@ -102,15 +101,13 @@ class GraphEmbedder(nn.Module):
 
         state_dict = self._load_checkpoint_state()
         self._load_retriever_components(state_dict)
-        if self.freeze_retriever:
-            self._freeze_modules()
         if device is not None:
             self.to(device)
 
     def embed_batch(self, batch: Any, *, device: torch.device) -> "EmbedOutputs":
         if self._shared_resources is None:
             raise RuntimeError("GraphEmbedder.setup() must be called before embed_batch.")
-        if self.feature_extractor is None or self.entity_proj is None or self.relation_proj is None or self.query_proj is None:
+        if self.edge_adapter is None or self.entity_proj is None or self.relation_proj is None or self.query_proj is None:
             raise RuntimeError("GraphEmbedder not initialized; call setup() first.")
 
         edge_index = batch.edge_index.to(device)
@@ -119,8 +116,9 @@ class GraphEmbedder(nn.Module):
         if num_graphs <= 0:
             raise ValueError("Batch must contain at least one graph.")
 
-        edge_batch, edge_ptr = self._compute_edge_batch(edge_index, batch=batch, num_graphs=num_graphs, device=device)
-        edge_relations = batch.edge_attr.to(device)
+        edge_batch, edge_ptr = self._compute_edge_batch(edge_index, node_ptr=node_ptr, num_graphs=num_graphs, device=device)
+        edge_relations_raw = batch.edge_attr
+        edge_relations = edge_relations_raw.to(device)
         edge_labels = batch.edge_labels.to(device)
         edge_scores = batch.edge_scores.to(device)
         path_mask, path_exists = self._build_path_mask(batch=batch, edge_index=edge_index, device=device)
@@ -132,51 +130,41 @@ class GraphEmbedder(nn.Module):
         node_global_ids = getattr(batch, "node_global_ids", None)
         if node_embedding_ids is None or node_global_ids is None:
             raise ValueError("Batch missing node_embedding_ids/node_global_ids; g_agent cache must include them.")
-        node_embedding_ids = node_embedding_ids.to(device)
-        node_global_ids = node_global_ids.to(device)
         if node_embedding_ids.shape != node_global_ids.shape:
             raise ValueError("node_embedding_ids shape mismatch with node_global_ids in g_agent batch.")
 
-        node_embeddings = self._lookup_entities(node_embedding_ids)
+        node_global_ids = node_global_ids.to(device)
+        node_embeddings = self._lookup_entities(node_embedding_ids, device=device)
         node_tokens = self.entity_proj(node_embeddings)
-        node_tokens = self._apply_non_text_override(node_tokens=node_tokens, node_embedding_ids=node_embedding_ids)
+        non_text_mask = (node_embedding_ids == 0).to(device=device, dtype=torch.bool)
+        node_tokens = self._apply_non_text_override(node_tokens=node_tokens, non_text_mask=non_text_mask)
 
-        relation_embeddings = self._lookup_relations(edge_relations)
+        relation_embeddings = self._lookup_relations(edge_relations_raw, device=device)
         relation_tokens = self.relation_proj(relation_embeddings)
 
         heads_global = node_global_ids[edge_index[0]]
         tails_global = node_global_ids[edge_index[1]]
 
-        semantic = torch.cat(
-            [
-                question_tokens[edge_batch],
-                node_tokens[edge_index[0]],
-                relation_tokens,
-                node_tokens[edge_index[1]],
-            ],
-            dim=-1,
-        )
-        if self.dde is not None:
-            topic_one_hot = self._build_topic_one_hot(batch=batch, num_nodes_total=int(node_global_ids.numel()), device=device)
+        # Interaction: Linear([Question, Head, Relation, Tail] (+struct)) without materializing the giant concat.
+        q_edge = question_tokens[edge_batch]
+        head_edge = node_tokens[edge_index[0]]
+        tail_edge = node_tokens[edge_index[1]]
+        struct: Optional[torch.Tensor] = None
+        if self._use_topic_pe:
             struct = self._build_structure_features(
-                topic_one_hot=topic_one_hot,
+                batch=batch,
                 edge_index=edge_index,
-                head_idx=edge_index[0],
-                tail_idx=edge_index[1],
+                num_nodes=int(node_tokens.size(0)),
                 device=device,
+                dtype=q_edge.dtype,
             )
-            fused = torch.cat([semantic, struct], dim=-1)
-        else:
-            fused = semantic
-
-        if self._edge_in_dim is None:
-            raise RuntimeError("edge_in_dim is not initialized; setup() must load retriever feature_extractor weights.")
-        if int(fused.size(1)) != int(self._edge_in_dim):
-            raise ValueError(f"edge feature dim mismatch: got {int(fused.size(1))}, expected {int(self._edge_in_dim)}")
-
-        if self.fused_dropout is None:
-            raise RuntimeError("fused_dropout is not initialized.")
-        edge_tokens = self.feature_extractor(self.fused_dropout(fused))
+        edge_tokens = self._edge_adapter_forward_parts(
+            q_edge=q_edge,
+            head_edge=head_edge,
+            relation_edge=relation_tokens,
+            tail_edge=tail_edge,
+            struct_edge=struct,
+        )
 
         start_entity_ids, start_entity_mask = self._pad_start_entities(
             batch.start_entity_ids.to(device),
@@ -184,7 +172,7 @@ class GraphEmbedder(nn.Module):
             num_graphs=num_graphs,
             device=device,
         )
-        return EmbedOutputs(
+        outputs = EmbedOutputs(
             edge_tokens=edge_tokens,
             edge_batch=edge_batch,
             edge_ptr=edge_ptr,
@@ -202,6 +190,8 @@ class GraphEmbedder(nn.Module):
             start_entity_ids=start_entity_ids,
             start_entity_mask=start_entity_mask,
         )
+        outputs.validate_device(device)
+        return outputs
 
     # ------------------------------------------------------------------ #
     # Checkpoint loading
@@ -252,19 +242,6 @@ class GraphEmbedder(nn.Module):
         return projector
 
     def _load_retriever_components(self, state_dict: Dict[str, torch.Tensor]) -> None:
-        meta_key = self._find_first_match(state_dict, "parity_meta")
-        meta = state_dict[meta_key].view(-1).to(dtype=torch.long)
-        if meta.numel() != 4:
-            raise ValueError(f"parity_meta must have 4 entries, got shape {tuple(meta.shape)}")
-        self.use_topic_pe = bool(int(meta[0].item()))
-        self.num_topics = int(meta[1].item())
-        self.num_rounds = int(meta[2].item())
-        self.num_reverse_rounds = int(meta[3].item())
-        if self.use_topic_pe:
-            self.dde = DDE(num_rounds=self.num_rounds, num_reverse_rounds=self.num_reverse_rounds)
-        else:
-            self.dde = None
-
         self.entity_proj = self._load_projector(state_dict, name="entity_proj")
         self.relation_proj = self._load_projector(state_dict, name="relation_proj")
         self.query_proj = self._load_projector(state_dict, name="query_proj")
@@ -292,49 +269,121 @@ class GraphEmbedder(nn.Module):
             raise ValueError(f"feature_extractor layer1 in-dim mismatch: ckpt={tuple(w1.shape)}")
 
         semantic_dim = 4 * self.hidden_dim
-        struct_dim_expected = 0
-        if self.use_topic_pe:
-            struct_dim_expected = 2 * self.num_topics * (1 + self.num_rounds + self.num_reverse_rounds)
-        if edge_in_dim != semantic_dim + struct_dim_expected:
+        use_topic_pe, num_topics, num_rounds, num_rev = self._load_retriever_parity_meta(
+            state_dict,
+            edge_in_dim=edge_in_dim,
+            semantic_dim=semantic_dim,
+        )
+        struct_dim = 0
+        if use_topic_pe:
+            if num_topics <= 1:
+                raise ValueError(f"Invalid retriever parity_meta: num_topics must be >= 2 when topic_pe=1, got {num_topics}")
+            struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_rev))
+        expected_in_dim = semantic_dim + struct_dim
+        if edge_in_dim != expected_in_dim:
             raise ValueError(
-                f"feature_extractor input_dim mismatch: ckpt={edge_in_dim} vs expected={semantic_dim + struct_dim_expected} "
-                f"(semantic={semantic_dim}, struct={struct_dim_expected})"
+                f"feature_extractor input_dim mismatch: ckpt={edge_in_dim} vs expected={expected_in_dim} "
+                f"(semantic={semantic_dim}, struct={struct_dim}; topic_pe={int(use_topic_pe)}, "
+                f"num_topics={int(num_topics)}, dde_rounds={int(num_rounds)}, dde_reverse_rounds={int(num_rev)})."
             )
         self._edge_in_dim = edge_in_dim
-        self.fused_dropout = nn.Dropout(self.proj_dropout)
-        self.feature_extractor = DenseFeatureExtractor(
-            input_dim=edge_in_dim,
-            emb_dim=emb_dim,
-            hidden_dim=self.hidden_dim,
-            dropout_p=self.proj_dropout,
-        )
-        fe_state = self.feature_extractor.state_dict()
-        fe_state["network.0.weight"] = w0
-        fe_state["network.0.bias"] = b0
-        fe_state["network.3.weight"] = w1
-        fe_state["network.3.bias"] = b1
-        missing, unexpected = self.feature_extractor.load_state_dict(fe_state, strict=False)
-        if missing:
-            raise RuntimeError(f"feature_extractor missing keys: {missing}")
-        if unexpected and any("network" not in k for k in unexpected):
-            raise RuntimeError(f"feature_extractor unexpected keys: {unexpected}")
+        self._use_topic_pe = bool(use_topic_pe)
+        self._num_topics = int(num_topics) if use_topic_pe else 0
+        self._struct_dim = int(struct_dim)
+        self._dde = DDE(num_rounds=int(num_rounds), num_reverse_rounds=int(num_rev)) if use_topic_pe else None
 
-    def _freeze_modules(self) -> None:
-        for module in (self.entity_proj, self.relation_proj, self.query_proj, self.non_text_entity_emb, self.feature_extractor):
-            if module is None:
-                continue
-            for p in module.parameters():
-                p.requires_grad = False
+        # Adapter: Linear -> LayerNorm -> GELU -> Linear, warm-start from retriever DenseFeatureExtractor linears.
+        self.edge_adapter = nn.Sequential(
+            nn.Linear(edge_in_dim, emb_dim),
+            nn.LayerNorm(emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, self.hidden_dim),
+        )
+        with torch.no_grad():
+            self.edge_adapter[0].weight.copy_(w0)
+            self.edge_adapter[0].bias.copy_(b0)
+            self.edge_adapter[3].weight.copy_(w1)
+            self.edge_adapter[3].bias.copy_(b1)
+
+    def _load_retriever_parity_meta(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        *,
+        edge_in_dim: int,
+        semantic_dim: int,
+    ) -> tuple[bool, int, int, int]:
+        """Load minimal feature parity metadata from retriever checkpoint.
+
+        Returns (use_topic_pe, num_topics, num_rounds, num_reverse_rounds). If metadata is missing,
+        semantic-only checkpoints (edge_in_dim==semantic_dim) are accepted; otherwise we fail fast.
+        """
+        try:
+            meta_key = self._find_first_match(state_dict, "parity_meta")
+        except KeyError:
+            if int(edge_in_dim) == int(semantic_dim):
+                return False, 0, 0, 0
+            raise ValueError(
+                "Retriever checkpoint is missing parity_meta required to disambiguate structural features "
+                f"(edge_in_dim={edge_in_dim}, semantic_dim={semantic_dim}). Re-export/retrain retriever with updated code."
+            )
+        meta = state_dict[meta_key]
+        if not torch.is_tensor(meta):
+            raise ValueError(f"Invalid parity_meta type: expected torch.Tensor but got {type(meta)}")
+        meta = meta.to(dtype=torch.long).view(-1)
+        if meta.numel() < 4:
+            raise ValueError(f"Invalid parity_meta length: expected >=4 but got {int(meta.numel())}")
+        use_topic_pe = bool(int(meta[0].item()))
+        num_topics = int(meta[1].item())
+        num_rounds = int(meta[2].item())
+        num_rev = int(meta[3].item())
+        return use_topic_pe, num_topics, num_rounds, num_rev
+
+    def _build_structure_features(
+        self,
+        *,
+        batch: Any,
+        edge_index: torch.Tensor,
+        num_nodes: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not self._use_topic_pe or self._num_topics <= 0:
+            raise RuntimeError("_build_structure_features called but topic_pe is disabled.")
+        start_nodes = getattr(batch, "start_node_locals", None)
+        if start_nodes is None:
+            raise ValueError("topic_pe is enabled in retriever checkpoint but batch.start_node_locals is missing.")
+        start_nodes = start_nodes.to(device=device, dtype=torch.long).view(-1)
+        if start_nodes.numel() > 0:
+            if (start_nodes < 0).any() or (start_nodes >= num_nodes).any():
+                raise ValueError("start_node_locals out of range for topic_pe feature construction.")
+
+        topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long, device=device)
+        if start_nodes.numel() > 0:
+            topic_entity_mask[start_nodes] = 1
+        topic_one_hot = F.one_hot(topic_entity_mask, num_classes=int(self._num_topics)).to(dtype=dtype)
+
+        feats: list[torch.Tensor] = [topic_one_hot]
+        if self._dde is not None:
+            reverse_edge_index = getattr(batch, "reverse_edge_index", None)
+            if reverse_edge_index is not None:
+                reverse_edge_index = reverse_edge_index.to(device=device)
+            feats.extend(self._dde(topic_one_hot, edge_index, reverse_edge_index))
+
+        stacked = torch.stack(feats, dim=-1)
+        node_struct = stacked.reshape(num_nodes, -1)
+        head_struct = node_struct[edge_index[0]]
+        tail_struct = node_struct[edge_index[1]]
+        return torch.cat([head_struct, tail_struct], dim=-1)
 
     # ------------------------------------------------------------------ #
     # Embedding + feature construction
     # ------------------------------------------------------------------ #
-    def _lookup_entities(self, embedding_ids: torch.Tensor) -> torch.Tensor:
+    def _lookup_entities(self, embedding_ids: torch.Tensor, *, device: torch.device) -> torch.Tensor:
         if self._num_entities is None:
             raise RuntimeError("GraphEmbedder.setup() must be called before use.")
-        return self._global_embeddings.get_entity_embeddings(embedding_ids)  # type: ignore[call-arg]
+        return self._global_embeddings.get_entity_embeddings(embedding_ids, device=device)  # type: ignore[call-arg]
 
-    def _lookup_relations(self, ids: torch.Tensor) -> torch.Tensor:
+    def _lookup_relations(self, ids: torch.Tensor, *, device: torch.device) -> torch.Tensor:
         if self._num_relations is None:
             raise RuntimeError("GraphEmbedder.setup() must be called before use.")
         if ids.numel() > 0:
@@ -342,45 +391,91 @@ class GraphEmbedder(nn.Module):
             max_id = int(ids.max().item())
             if min_id < 0 or max_id >= self._num_relations:
                 raise ValueError(f"Relation ids out of range: min={min_id} max={max_id} valid=[0,{self._num_relations - 1}]")
-        return self._global_embeddings.get_relation_embeddings(ids)  # type: ignore[call-arg]
+        return self._global_embeddings.get_relation_embeddings(ids, device=device)  # type: ignore[call-arg]
 
-    def _apply_non_text_override(self, *, node_tokens: torch.Tensor, node_embedding_ids: torch.Tensor) -> torch.Tensor:
+    def _edge_adapter_forward_parts(
+        self,
+        *,
+        q_edge: torch.Tensor,         # [E_total, H]
+        head_edge: torch.Tensor,      # [E_total, H]
+        relation_edge: torch.Tensor,  # [E_total, H]
+        tail_edge: torch.Tensor,      # [E_total, H]
+        struct_edge: Optional[torch.Tensor],  # [E_total, S] or None
+    ) -> torch.Tensor:
+        if self.edge_adapter is None:
+            raise RuntimeError("edge_adapter is not initialized; call setup() first.")
+        if self._edge_in_dim is None:
+            raise RuntimeError("edge_in_dim is not initialized; setup() must load retriever adapter weights.")
+
+        if not isinstance(self.edge_adapter, nn.Sequential) or len(self.edge_adapter) != 4:
+            raise TypeError("edge_adapter must be a 4-layer Sequential: Linear -> LayerNorm -> GELU -> Linear.")
+        linear0, norm0, act0, linear1 = self.edge_adapter
+        if not isinstance(linear0, nn.Linear) or not isinstance(linear1, nn.Linear):
+            raise TypeError("edge_adapter linear layers are malformed; expected nn.Linear at positions 0 and 3.")
+
+        hidden_dim = int(self.hidden_dim)
+        in_dim = int(linear0.in_features)
+        expected_min = 4 * hidden_dim
+        if in_dim < expected_min:
+            raise ValueError(f"edge_adapter in_features={in_dim} < semantic_dim={expected_min}")
+
+        w = linear0.weight
+        b = linear0.bias
+        offset = 0
+        w_q = w[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        w_h = w[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        w_r = w[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        w_t = w[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+
+        out0 = (
+            F.linear(q_edge, w_q)
+            + F.linear(head_edge, w_h)
+            + F.linear(relation_edge, w_r)
+            + F.linear(tail_edge, w_t)
+        )
+        if struct_edge is not None:
+            struct_dim = int(struct_edge.size(1))
+            if in_dim != offset + struct_dim:
+                raise ValueError(
+                    f"edge_adapter input dim mismatch: in_features={in_dim}, semantic={offset}, struct={struct_dim}"
+                )
+            w_s = w[:, offset:]
+            out0 = out0 + F.linear(struct_edge, w_s)
+        else:
+            if in_dim != offset:
+                raise ValueError(
+                    f"edge_adapter expects struct features (in_features={in_dim}, semantic_only={offset}) "
+                    "but struct_edge is None; ensure retriever parity_meta matches g_agent feature construction."
+                )
+        if b is not None:
+            out0 = out0 + b
+
+        out = norm0(out0)
+        out = act0(out)
+        return linear1(out)
+
+    def _apply_non_text_override(
+        self,
+        *,
+        node_tokens: torch.Tensor,
+        non_text_mask: Optional[torch.Tensor] = None,
+        node_embedding_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self.non_text_entity_emb is None or self.entity_proj is None:
             return node_tokens
-        non_text_mask = node_embedding_ids == 0
+        if non_text_mask is None:
+            if node_embedding_ids is None:
+                return node_tokens
+            non_text_mask = node_embedding_ids == 0
+        non_text_mask = non_text_mask.to(device=node_tokens.device, dtype=torch.bool)
         if not bool(non_text_mask.any().item()):
             return node_tokens
         non_text_proj = self.entity_proj(self.non_text_entity_emb.weight.to(device=node_tokens.device))[0].to(dtype=node_tokens.dtype)
         return torch.where(non_text_mask.unsqueeze(-1), non_text_proj.unsqueeze(0), node_tokens)
-
-    def _build_topic_one_hot(self, *, batch: Any, num_nodes_total: int, device: torch.device) -> torch.Tensor:
-        if self.num_topics < 2:
-            raise ValueError(f"num_topics={self.num_topics} < 2; cannot build SubgraphRAG-parity topic_one_hot.")
-        topic_entity_mask = torch.zeros((num_nodes_total,), device=device, dtype=torch.long)
-        start_node_locals = getattr(batch, "start_node_locals", None)
-        if start_node_locals is None or start_node_locals.numel() == 0:
-            raise ValueError("g_agent batch missing non-empty start_node_locals; cannot build topic_one_hot.")
-        topic_entity_mask[start_node_locals.to(device).long()] = 1
-        return torch.nn.functional.one_hot(topic_entity_mask, num_classes=self.num_topics).to(dtype=torch.float32)
-
-    def _build_structure_features(
-        self,
-        *,
-        topic_one_hot: torch.Tensor,
-        edge_index: torch.Tensor,
-        head_idx: torch.Tensor,
-        tail_idx: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if self.dde is None:
-            raise RuntimeError("DDE is not initialized but structure features were requested.")
-        feats = [topic_one_hot]
-        feats.extend(self.dde(topic_one_hot, edge_index, edge_index.flip(0)))
-        stacked = torch.stack(feats, dim=-1)
-        node_struct = stacked.reshape(stacked.size(0), -1)
-        head_struct = node_struct[head_idx]
-        tail_struct = node_struct[tail_idx]
-        return torch.cat([head_struct, tail_struct], dim=-1)
 
     @staticmethod
     def _prepare_question_embeddings(question_emb: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -404,11 +499,27 @@ class GraphEmbedder(nn.Module):
     def _compute_edge_batch(
         edge_index: torch.Tensor,
         *,
-        batch: Any,
+        node_ptr: torch.Tensor,
         num_graphs: int,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        edge_batch = batch.batch[edge_index[0]].to(device)
+        if node_ptr.numel() != num_graphs + 1:
+            raise ValueError(f"node_ptr length mismatch: got {node_ptr.numel()} expected {num_graphs + 1}")
+        # Map each edge to its graph id via head node global index and node_ptr boundaries.
+        # NOTE: `right=True` is required to assign boundary nodes correctly:
+        # for a prefix-sum ptr, node indices in graph g satisfy ptr[g] <= i < ptr[g+1].
+        # If we used `right=False`, a head index exactly equal to ptr[g] (the first node of graph g)
+        # would be bucketized into graph g-1, breaking the edge_ptr segmentation invariant.
+        edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
+        if edge_batch.numel() > 1 and not bool((edge_batch[:-1] <= edge_batch[1:]).all().item()):
+            inv = torch.nonzero(edge_batch[:-1] > edge_batch[1:], as_tuple=False).view(-1)
+            preview = inv[:5].detach().cpu().tolist()
+            raise ValueError(
+                "edge_batch is not non-decreasing along the flattened edge list, which breaks the per-graph "
+                "edge_ptr slice semantics required by GraphEnv; "
+                f"first_inversions={preview}. "
+                "Ensure edges are concatenated per-graph (PyG Batch) or sort edges by graph before building edge_ptr."
+            )
         edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
         edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
         edge_ptr[1:] = edge_counts.cumsum(0)
@@ -423,7 +534,7 @@ class GraphEmbedder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         path_mask = torch.zeros(edge_index.size(1), dtype=torch.bool, device=device)
         path_mask[batch.gt_path_edge_local_ids.to(device)] = True
-        path_exists = batch.gt_path_exists.view(-1)
+        path_exists = batch.gt_path_exists.view(-1).to(device)
         return path_mask, path_exists
 
     @staticmethod
@@ -470,6 +581,11 @@ class EmbedOutputs:
     question_tokens: torch.Tensor
     start_entity_ids: torch.Tensor
     start_entity_mask: torch.Tensor
+
+    def validate_device(self, device: torch.device) -> None:
+        for name, value in self.__dict__.items():
+            if isinstance(value, torch.Tensor) and value.device != device:
+                raise RuntimeError(f"EmbedOutputs device mismatch: {name}.device={value.device}, expected={device}")
 
 
 __all__ = ["GraphEmbedder", "EmbedOutputs"]

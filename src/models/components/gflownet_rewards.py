@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Optional
 
 import torch
@@ -62,31 +63,15 @@ def _compute_pos_metrics(
 class RewardOutput:
     reward: torch.Tensor
     log_reward: torch.Tensor
-    log_reward_struct: torch.Tensor
-    recall: torch.Tensor
     success: torch.Tensor
-    semantic_only_success: torch.Tensor
-    fallback_to_system1: torch.Tensor
+    answer_reach_frac: torch.Tensor
     pos_precision: torch.Tensor
     pos_recall: torch.Tensor
     pos_f1: torch.Tensor
     answer_precision: torch.Tensor
     answer_recall: torch.Tensor
     answer_f1: torch.Tensor
-    gt_path_precision: torch.Tensor
-    gt_path_recall: torch.Tensor
-    gt_path_f1: torch.Tensor
-    gt_path_exists: torch.Tensor
-    gt_path_full_hit: torch.Tensor
-    answer_reach_frac: torch.Tensor
     path_exists: torch.Tensor
-    reward_connectivity: torch.Tensor
-    reward_path_term: torch.Tensor
-    semantic_score: torch.Tensor
-    struct_phi_len: torch.Tensor
-    struct_phi_score: torch.Tensor
-    struct_phi_gt: torch.Tensor
-    struct_phi_answer_div: torch.Tensor
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return self.__dict__
@@ -104,31 +89,19 @@ class _AnswerStats:
 
 
 class AnswerOnlyReward(nn.Module):
-    """最小化的奖励：命中答案 vs 未命中，shaping 仅通过 log-domain 可控项注入。"""
+    """二元结果奖励：命中答案 vs 未命中（无 shaping）。"""
 
     def __init__(
         self,
         *,
-        success_reward: float = 1.0,
-        failure_reward: float = 0.1,
-        lambda_reach: float = 0.0,
-        gamma_len: float = 0.0,
-        gamma_score: float = 0.0,
-        gamma_gt: float = 0.0,
-        gamma_answer_div: float = 0.0,
-        score_clip_max: float = 1.0,
-        score_eps: float = 1e-8,
+        success_reward: float,
+        failure_reward: float,
     ) -> None:
         super().__init__()
         self.success_reward = float(success_reward)
         self.failure_reward = float(failure_reward)
-        self.lambda_reach = float(lambda_reach)
-        self.gamma_len = float(gamma_len)
-        self.gamma_score = float(gamma_score)
-        self.gamma_gt = float(gamma_gt)
-        self.gamma_answer_div = float(gamma_answer_div)
-        self.score_clip_max = float(score_clip_max)
-        self.score_eps = float(score_eps)
+        if self.success_reward <= 0.0 or self.failure_reward <= 0.0:
+            raise ValueError(f"Rewards must be positive; got success_reward={self.success_reward}, failure_reward={self.failure_reward}.")
 
     def forward(
         self,
@@ -136,23 +109,17 @@ class AnswerOnlyReward(nn.Module):
         selected_mask: torch.Tensor,  # [E_total]
         edge_labels: torch.Tensor,  # [E_total]
         edge_batch: torch.Tensor,  # [E_total]
-        edge_heads: torch.Tensor,  # [E_total]
-        edge_tails: torch.Tensor,  # [E_total]
         edge_index: torch.Tensor,  # [2, E_total] local node indices (collated)
         node_ptr: torch.Tensor,  # [B+1]
-        answer_entity_ids: torch.Tensor,  # [A_total]
-        answer_ptr: torch.Tensor,  # [B+1]
         answer_node_locals: torch.Tensor,  # [A_total] local node indices (collated)
         answer_node_ptr: torch.Tensor,  # [B+1]
-        path_mask: Optional[torch.Tensor],
         path_exists: Optional[torch.Tensor],
         reach_success: torch.Tensor,  # [B]
         reach_fraction: torch.Tensor,  # [B]
-        edge_scores: Optional[torch.Tensor] = None,  # [E_total], retriever/confidence scores
         **_: Any,
     ) -> RewardOutput:
         device = selected_mask.device
-        num_graphs = int(answer_ptr.numel() - 1)
+        num_graphs = int(node_ptr.numel() - 1)
         stats = self._answer_metrics_vectorized(
             selected_mask=selected_mask,
             edge_index=edge_index,
@@ -169,96 +136,30 @@ class AnswerOnlyReward(nn.Module):
         )
 
         success_mask = reach_success.bool()
-        base_log_reward = torch.where(
+        log_reward = torch.where(
             success_mask,
-            torch.log(torch.full_like(reach_fraction, self.success_reward)),
-            torch.log(torch.full_like(reach_fraction, self.failure_reward)),
+            torch.full_like(reach_fraction, float(math.log(self.success_reward))),
+            torch.full_like(reach_fraction, float(math.log(self.failure_reward))),
         )
+        reward = log_reward.exp()
 
-        log_reward = base_log_reward
-        if self.lambda_reach != 0.0:
-            reach_bonus = self.lambda_reach * reach_fraction * success_mask.float()
-            log_reward = log_reward + reach_bonus
-        else:
-            reach_bonus = torch.zeros_like(log_reward)
-
-        # 结构项：长度惩罚 / 置信度 / GT 覆盖
-        zeros_struct = torch.zeros(num_graphs, dtype=log_reward.dtype, device=device)
-        phi_len = zeros_struct
-        if self.gamma_len != 0.0:
-            length = torch.bincount(edge_batch, weights=selected_mask.float(), minlength=num_graphs)
-            phi_len = -length
-
-        phi_score = zeros_struct
-        if self.gamma_score != 0.0 and edge_scores is not None:
-            scores = torch.clamp(edge_scores.to(device), min=self.score_eps, max=self.score_clip_max)
-            log_scores = scores.log()
-            sel = selected_mask.float()
-            sum_scores = torch.bincount(edge_batch, weights=log_scores * sel, minlength=num_graphs)
-            counts = torch.bincount(edge_batch, weights=sel, minlength=num_graphs)
-            phi_score = torch.where(counts > 0, sum_scores / counts.clamp(min=1.0), zeros_struct)
-
-        gt_prec, gt_rec, gt_f1, gt_full_hit = _compute_path_metrics(
-            selected_mask=selected_mask.bool(),
-            path_mask=path_mask.bool() if path_mask is not None else None,
-            edge_batch=edge_batch,
-            path_exists=(path_exists.to(device) if path_exists is not None else stats.contains_answer).bool(),
+        path_exists_tensor = (
+            path_exists.to(device).bool()
+            if path_exists is not None
+            else torch.zeros(num_graphs, dtype=torch.bool, device=device)
         )
-        phi_gt = gt_f1
-        phi_answer_div = stats.hits
-
-        struct_bonus = (
-            self.gamma_len * phi_len
-            + self.gamma_score * phi_score
-            + self.gamma_gt * phi_gt
-            + self.gamma_answer_div * phi_answer_div
-        )
-        log_reward_struct = log_reward + struct_bonus
-        log_reward = log_reward_struct
-
-        # 归一化：对齐最大可能奖励到 1，减少对 logZ 初值依赖。
-        log_max_reward = torch.log(torch.tensor(self.success_reward, device=log_reward.device, dtype=log_reward.dtype))
-        if self.lambda_reach > 0.0:
-            log_max_reward = log_max_reward + self.lambda_reach
-        if self.gamma_gt > 0.0:
-            log_max_reward = log_max_reward + self.gamma_gt
-        if self.gamma_answer_div > 0.0 and stats.totals is not None:
-            log_max_reward = log_max_reward + self.gamma_answer_div * stats.totals
-        log_reward = log_reward - log_max_reward
-        reward = log_reward.exp().clamp(min=1e-8)
-
-        zeros = torch.zeros_like(reach_fraction)
-        ones = torch.ones_like(reach_fraction)
-        path_exists_tensor = path_exists.to(reach_fraction.device) if path_exists is not None else stats.contains_answer
-        selected_per_graph = torch.bincount(edge_batch, weights=selected_mask.float(), minlength=num_graphs)
         return RewardOutput(
             reward=reward,
             log_reward=log_reward,
-            log_reward_struct=log_reward_struct,
-            recall=stats.recall,
             success=success_mask.float(),
-            semantic_only_success=zeros,
-            fallback_to_system1=(selected_per_graph == 0).float(),
+            answer_reach_frac=reach_fraction.float(),
             pos_precision=pos_prec,
             pos_recall=pos_rec,
             pos_f1=pos_f1,
             answer_precision=stats.precision,
             answer_recall=stats.recall,
             answer_f1=stats.f1,
-            gt_path_precision=gt_prec,
-            gt_path_recall=gt_rec,
-            gt_path_f1=gt_f1,
-            gt_path_exists=path_exists_tensor.bool(),
-            gt_path_full_hit=gt_full_hit,
-            answer_reach_frac=reach_fraction.float(),
             path_exists=path_exists_tensor,
-            reward_connectivity=reach_fraction.float(),
-            reward_path_term=ones,
-            semantic_score=ones,
-            struct_phi_len=phi_len,
-            struct_phi_score=phi_score,
-            struct_phi_gt=phi_gt,
-            struct_phi_answer_div=phi_answer_div,
         )
 
     @staticmethod

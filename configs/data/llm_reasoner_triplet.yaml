@@ -12,7 +12,7 @@ entity_vocab_path: ${dataset.paths.vocabulary}
 relation_vocab_path: ${dataset.paths.vocabulary}
 
 # Prompt construction
-triplet_limit: 50
+triplet_limits: [1, 5, 10, 25, 50, 100, 200, 300, 400]
 system_prompt: "You are a concise QA agent. Use the given triplets to answer with `Ans: <entity>`."
 
 # Loader

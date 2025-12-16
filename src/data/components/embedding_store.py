@@ -21,6 +21,8 @@ class GlobalEmbeddingStore:
         # 2. Pre-load Embeddings (CPU Pinned Memory for speed)
         self.entity_embeddings = self._load_tensor(self.embeddings_dir / "entity_embeddings.pt")
         self.relation_embeddings = self._load_tensor(self.embeddings_dir / "relation_embeddings.pt")
+        self._pinned_entity_buffer: Optional[torch.Tensor] = None
+        self._pinned_relation_buffer: Optional[torch.Tensor] = None
 
         # Dimension note: embedding rows correspond to textual entities only;
         # non-text entities map to embedding_id=0. So rows are expected to be
@@ -39,6 +41,11 @@ class GlobalEmbeddingStore:
                 rows,
                 self.num_total_entities,
             )
+
+    def clear_device_cache(self) -> None:
+        """Release transient pinned buffers used for async H2D transfers."""
+        self._pinned_entity_buffer = None
+        self._pinned_relation_buffer = None
 
     def _load_vocab_size(self, path: Path) -> int:
         if not path.exists():
@@ -65,18 +72,77 @@ class GlobalEmbeddingStore:
         # map_location='cpu' is crucial to avoid VRAM OOM
         return torch.load(path, map_location="cpu")
 
-    def get_entity_embeddings(self, entity_ids: torch.Tensor) -> torch.Tensor:
-        """Fetch embeddings. entity_ids can be on GPU."""
-        # Optimized: Indexing CPU tensor with CPU indices, then move to GPU.
-        # Moving huge Embedding table to GPU is usually impossible.
-        device = entity_ids.device
-        cpu_ids = entity_ids.cpu()
-        return self.entity_embeddings.index_select(0, cpu_ids).to(device)
+    @staticmethod
+    def _ensure_pinned_buffer(
+        *,
+        buffer: Optional[torch.Tensor],
+        num: int,
+        dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        needs_alloc = (
+            buffer is None
+            or buffer.device.type != "cpu"
+            or not buffer.is_pinned()
+            or buffer.dtype != dtype
+            or buffer.dim() != 2
+            or int(buffer.size(1)) != dim
+            or int(buffer.size(0)) < num
+        )
+        if needs_alloc:
+            return torch.empty((num, dim), dtype=dtype, device="cpu", pin_memory=True)
+        return buffer
 
-    def get_relation_embeddings(self, relation_ids: torch.Tensor) -> torch.Tensor:
-        device = relation_ids.device
-        cpu_ids = relation_ids.cpu()
-        return self.relation_embeddings.index_select(0, cpu_ids).to(device)
+    def get_entity_embeddings(self, entity_ids: torch.Tensor, *, device: Optional[torch.device] = None) -> torch.Tensor:
+        """Fetch entity embeddings.
+
+        The embedding tables live on CPU. `entity_ids` may be on CPU/GPU, while `device`
+        controls the desired output device. Avoid moving ids to GPU when unnecessary.
+        """
+        target_device = device if device is not None else entity_ids.device
+        cpu_ids = entity_ids if entity_ids.device.type == "cpu" else entity_ids.detach().to("cpu", non_blocking=True)
+        if cpu_ids.dtype != torch.long:
+            cpu_ids = cpu_ids.to(dtype=torch.long)
+        if cpu_ids.numel() == 0:
+            return torch.empty((0, int(self.entity_embeddings.size(1))), dtype=self.entity_embeddings.dtype, device=target_device)
+        if target_device.type == "cpu":
+            return self.entity_embeddings.index_select(0, cpu_ids)
+        if target_device.type == "cuda":
+            num = int(cpu_ids.numel())
+            dim = int(self.entity_embeddings.size(1))
+            self._pinned_entity_buffer = self._ensure_pinned_buffer(
+                buffer=self._pinned_entity_buffer,
+                num=num,
+                dim=dim,
+                dtype=self.entity_embeddings.dtype,
+            )
+            out_cpu = self._pinned_entity_buffer[:num]
+            torch.index_select(self.entity_embeddings, 0, cpu_ids, out=out_cpu)
+            return out_cpu.to(target_device, non_blocking=True)
+        return self.entity_embeddings.index_select(0, cpu_ids).to(target_device)
+
+    def get_relation_embeddings(self, relation_ids: torch.Tensor, *, device: Optional[torch.device] = None) -> torch.Tensor:
+        target_device = device if device is not None else relation_ids.device
+        cpu_ids = relation_ids if relation_ids.device.type == "cpu" else relation_ids.detach().to("cpu", non_blocking=True)
+        if cpu_ids.dtype != torch.long:
+            cpu_ids = cpu_ids.to(dtype=torch.long)
+        if cpu_ids.numel() == 0:
+            return torch.empty((0, int(self.relation_embeddings.size(1))), dtype=self.relation_embeddings.dtype, device=target_device)
+        if target_device.type == "cpu":
+            return self.relation_embeddings.index_select(0, cpu_ids)
+        if target_device.type == "cuda":
+            num = int(cpu_ids.numel())
+            dim = int(self.relation_embeddings.size(1))
+            self._pinned_relation_buffer = self._ensure_pinned_buffer(
+                buffer=self._pinned_relation_buffer,
+                num=num,
+                dim=dim,
+                dtype=self.relation_embeddings.dtype,
+            )
+            out_cpu = self._pinned_relation_buffer[:num]
+            torch.index_select(self.relation_embeddings, 0, cpu_ids, out=out_cpu)
+            return out_cpu.to(target_device, non_blocking=True)
+        return self.relation_embeddings.index_select(0, cpu_ids).to(target_device)
     
     @property
     def entity_dim(self) -> int:

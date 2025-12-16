@@ -10,7 +10,7 @@ accelerator: auto
 devices: auto
 
 # mixed precision for extra speed-up
-# precision: 16
+precision: 16-mixed
 
 # gradient clipping to stabilize TB under rare large residuals
 gradient_clip_val: 1.0

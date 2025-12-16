@@ -3,6 +3,3 @@ _target_: src.models.components.gflownet_rewards.AnswerDiffusionReward
 # 兼容旧实验的别名配置；AnswerDiffusionReward 现已等价于 AnswerOnlyReward。
 success_reward: 10.0
 failure_reward: 0.01
-
-# 可选覆盖率 shaping（log_reward += lambda_reach * reach_fraction）
-lambda_reach: 0.0

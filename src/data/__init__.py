@@ -23,6 +23,7 @@ __all__ = [
     "LLMReasonerPathDataset",
     "LLMReasonerPathDataModule",
     "LLMReasonerTripletDataModule",
+    "LLMReasonerTruthDataModule",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -35,6 +36,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .llm_reasoner_path_datamodule import LLMReasonerPathDataModule
     from .llm_reasoner_path_dataset import LLMReasonerPathDataset
     from .llm_reasoner_triplet_datamodule import LLMReasonerTripletDataModule
+    from .llm_reasoner_truth_datamodule import LLMReasonerTruthDataModule
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
@@ -88,9 +90,13 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
 
         return LLMReasonerTripletDataModule
 
+    if name == "LLMReasonerTruthDataModule":
+        from .llm_reasoner_truth_datamodule import LLMReasonerTruthDataModule
+
+        return LLMReasonerTruthDataModule
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:  # pragma: no cover
     return sorted(list(globals().keys()) + __all__)
-

@@ -9,6 +9,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
 from src.utils.llm_client import init_llm, run_chat
 from src.utils.llm_metrics import evaluate_predictions
+from src.utils.text_utils import count_tokens
 
 
 class LLMReasonerModule(LightningModule):
@@ -38,6 +39,7 @@ class LLMReasonerModule(LightningModule):
         self.dataset = dataset
         self.split = split
         self.prompt_tag = prompt_tag
+        self.token_budget = max_seq_len
 
         self.llm, self._is_openai = init_llm(
             model_name=model_name,
@@ -60,6 +62,17 @@ class LLMReasonerModule(LightningModule):
                 {"role": "user", "content": sample["user_prompt"]},
             ]
             prediction = run_chat(self.llm, messages, is_openai=self._is_openai)
+            prompt_token_count = sample.get("prompt_token_count")
+            if prompt_token_count is None:
+                prompt_token_count = count_tokens(f"{sample['system_prompt']}\n{sample['user_prompt']}")
+            evidence_token_count = sample.get("evidence_token_count")
+            token_budget = sample.get("token_budget", self.token_budget)
+            evidence_truncated = bool(sample.get("evidence_truncated", False))
+            if token_budget is not None and not evidence_truncated:
+                try:
+                    evidence_truncated = bool(prompt_token_count > int(token_budget))
+                except Exception:
+                    pass
             outputs.append(
                 {
                     "id": sample["id"],
@@ -68,6 +81,15 @@ class LLMReasonerModule(LightningModule):
                     "prediction": prediction,
                     "triplets": sample.get("triplets", []),
                     "paths": sample.get("paths", []),
+                    "window_k": sample.get("window_k"),
+                    "k_effective": sample.get("k_effective"),
+                    "retrieved_edge_ids": sample.get("retrieved_edge_ids", []),
+                    "visible_edge_ids": sample.get("visible_edge_ids", []),
+                    "gt_path_edge_local_ids": sample.get("gt_path_edge_local_ids", []),
+                    "evidence_token_count": evidence_token_count,
+                    "prompt_token_count": prompt_token_count,
+                    "token_budget": token_budget,
+                    "evidence_truncated": evidence_truncated,
                 }
             )
         return outputs
@@ -97,6 +119,7 @@ class LLMReasonerModule(LightningModule):
                 f.write(json.dumps(row) + "\n")
 
         metrics = evaluate_predictions(flat)
+
         metrics_path = pred_path.with_suffix(".metrics.json")
         metrics_path.write_text(json.dumps(metrics, indent=2))
 

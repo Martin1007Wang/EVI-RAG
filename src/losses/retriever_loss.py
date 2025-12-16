@@ -141,7 +141,9 @@ class RetrieverListwiseHardNegLoss(nn.Module):
         max_b = max_per[index]
 
         exp_sum = values.new_zeros(num_segments)
-        exp_sum.scatter_add_(0, index, torch.exp(values - max_b))
+        # Under autocast, torch.exp may promote to float32; force dtype alignment before scatter.
+        exp_term = torch.exp(values - max_b).to(dtype=exp_sum.dtype)
+        exp_sum.scatter_add_(0, index, exp_term)
 
         tiny = torch.finfo(values.dtype).tiny
         return max_per + torch.log(exp_sum.clamp_min(tiny))

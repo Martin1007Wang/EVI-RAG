@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 import logging
 
 import torch
@@ -13,6 +13,8 @@ class GraphBatch:
     edge_index: torch.Tensor          # [2, E_total], local node idx already offset by PyG Batch
     edge_batch: torch.Tensor          # [E_total], graph id per edge
     node_global_ids: torch.Tensor     # [N_total]
+    heads_global: torch.Tensor        # [E_total], cached global head ids
+    tails_global: torch.Tensor        # [E_total], cached global tail ids
     node_ptr: torch.Tensor            # [B+1], prefix sum of nodes per graph
     edge_ptr: torch.Tensor            # [B+1], prefix sum of edges per graph
     start_node_locals: torch.Tensor   # [S_total] local node idx (offset per graph)
@@ -26,13 +28,8 @@ class GraphBatch:
     node_is_answer: torch.Tensor      # [N_total] bool
     edge_relations: torch.Tensor      # [E_total]
     edge_labels: torch.Tensor         # [E_total]
-    top_edge_mask: torch.Tensor       # [E_total] bool
-    gt_path_edge_local_ids: torch.Tensor  # [P_total] local edge idx (offset per graph)
-    gt_edge_ptr: torch.Tensor             # [B+1]
-    gt_path_exists: torch.Tensor          # [B] bool
     is_answer_reachable: torch.Tensor     # [B] bool
     edge_starts_mask: torch.Tensor        # [E_total] bool, edges touching any start node
-    bypass_action_mask: torch.Tensor      # [B] bool, allow GT replay to skip mask checks
 
 
 @dataclass
@@ -43,10 +40,11 @@ class GraphState:
     selection_order: torch.Tensor     # [E_total] long
     current_tail: torch.Tensor        # [B] global entity id
     prev_tail: torch.Tensor           # [B] global entity id
+    current_tail_local: torch.Tensor  # [B] batch-global node index (edge_index space)
+    prev_tail_local: torch.Tensor     # [B] batch-global node index (edge_index space)
     done: torch.Tensor                # [B] bool
     step_counts: torch.Tensor         # [B] long
     actions: torch.Tensor             # [B, max_steps + 1] long (edge idx within slice or stop idx)
-    direction: Optional[torch.Tensor] # unused in current policies
     answer_hits: torch.Tensor         # [B] bool
     debug_logged: torch.Tensor        # [B] bool, used only when debug=True to throttle logs
     debug_enabled: bool               # whether this state should emit debug logs
@@ -61,7 +59,6 @@ class GraphEnv(nn.Module):
         mode: str = "path",
         forbid_backtrack: bool = True,
         forbid_revisit: bool = True,
-        bidir_token: bool = False,
         debug: bool = False,
         debug_max_resets: int = 0,
         debug_max_graphs: int = 1,
@@ -70,12 +67,11 @@ class GraphEnv(nn.Module):
         super().__init__()
         self.max_steps = int(max_steps)
         mode = str(mode).lower()
-        if mode not in ("path", "subgraph"):
-            raise ValueError(f"GraphEnv.mode must be 'path' or 'subgraph', got {mode}")
-        self.mode = mode
+        if mode != "path":
+            raise ValueError(f"GraphEnv supports only mode='path' in the final model, got {mode!r}.")
+        self.mode = "path"
         self.forbid_backtrack = bool(forbid_backtrack)
         self.forbid_revisit = bool(forbid_revisit)
-        self.bidir_token = bool(bidir_token)
         self.debug = bool(debug)
         self.debug_max_resets = max(int(debug_max_resets), 0)
         self.debug_max_graphs = max(int(debug_max_graphs), 1)
@@ -98,23 +94,10 @@ class GraphEnv(nn.Module):
         answer_entity_ids = batch["answer_entity_ids"].to(device)
         edge_relations = batch["edge_relations"].to(device)
         edge_labels = batch["edge_labels"].to(device)
-        top_edge_mask = batch["top_edge_mask"].to(device).bool()
-        gt_path_edge_local_ids = batch["gt_path_edge_local_ids"].to(device)
-        gt_edge_ptr = batch["gt_edge_ptr"].to(device)
-        gt_path_exists = batch["gt_path_exists"].to(device).bool()
         is_answer_reachable = batch["is_answer_reachable"].to(device).bool()
-        bypass_action_mask = batch.get("bypass_action_mask", torch.zeros_like(gt_path_exists)).to(device).bool()
 
         num_edges = edge_index.size(1)
         num_graphs = int(node_ptr.numel() - 1)
-
-        if getattr(self, "debug", False):
-            try:
-                logging.getLogger("gflownet.debug").info(
-                    "[ENV_DEBUG] debug=True num_graphs=%d num_edges=%d", num_graphs, num_edges
-                )
-            except Exception:
-                pass
 
         start_counts = start_ptr[1:] - start_ptr[:-1]
         if start_counts.numel() != num_graphs:
@@ -126,14 +109,17 @@ class GraphEnv(nn.Module):
                 "g_agent cache must materialize non-empty start anchors per graph instead of relying on runtime inference."
             )
 
+        heads_global = node_global_ids[edge_index[0]]
+        tails_global = node_global_ids[edge_index[1]]
         selected_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
         selection_order = torch.full((num_edges,), -1, dtype=torch.long, device=device)
         current_tail = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
         prev_tail = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
+        current_tail_local = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
+        prev_tail_local = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
         done = torch.zeros(num_graphs, dtype=torch.bool, device=device)
         step_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
         actions = torch.full((num_graphs, self.max_steps + 1), -1, dtype=torch.long, device=device)
-        direction = torch.zeros(num_edges, 1, device=device) if self.bidir_token else None
         answer_hits = torch.zeros(num_graphs, dtype=torch.bool, device=device)
         # Debug 控制：仅首图打印一次 ENV_HIT_DEBUG
         debug_logged = torch.zeros(num_graphs, dtype=torch.bool, device=device)
@@ -152,7 +138,8 @@ class GraphEnv(nn.Module):
         node_is_answer = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
         if answer_node_locals.numel() > 0:
             node_is_answer[answer_node_locals.long()] = True
-        edge_starts_mask = node_is_start[edge_index[0]] | node_is_start[edge_index[1]]
+        # 有向模式：仅允许从 start 节点出发的正向边
+        edge_starts_mask = node_is_start[edge_index[0]]
 
         should_debug = bool(self.debug) and (self._debug_resets_logged < self.debug_max_resets)
         if should_debug:
@@ -168,6 +155,8 @@ class GraphEnv(nn.Module):
             edge_index=edge_index,
             edge_batch=edge_batch,
             node_global_ids=node_global_ids,
+            heads_global=heads_global,
+            tails_global=tails_global,
             node_ptr=node_ptr,
             edge_ptr=edge_ptr,
             start_node_locals=start_node_locals,
@@ -181,13 +170,8 @@ class GraphEnv(nn.Module):
             node_is_answer=node_is_answer,
             edge_relations=edge_relations,
             edge_labels=edge_labels,
-            top_edge_mask=top_edge_mask,
-            gt_path_edge_local_ids=gt_path_edge_local_ids,
-            gt_edge_ptr=gt_edge_ptr,
-            gt_path_exists=gt_path_exists,
             is_answer_reachable=is_answer_reachable,
             edge_starts_mask=edge_starts_mask,
-            bypass_action_mask=bypass_action_mask,
         )
         return GraphState(
             graph=graph,
@@ -196,10 +180,11 @@ class GraphEnv(nn.Module):
             selection_order=selection_order,
             current_tail=current_tail,
             prev_tail=prev_tail,
+            current_tail_local=current_tail_local,
+            prev_tail_local=prev_tail_local,
             done=done,
             step_counts=step_counts,
             actions=actions,
-            direction=direction,
             answer_hits=answer_hits,
             debug_logged=debug_logged,
             debug_enabled=should_debug,
@@ -210,69 +195,41 @@ class GraphEnv(nn.Module):
         if not hasattr(state.graph, "edge_starts_mask"):
             raise ValueError("edge_starts_mask missing in GraphBatch; ensure GraphEnv.reset precomputes it.")
 
-        heads_global = state.graph.node_global_ids[state.graph.edge_index[0]]
-        tails_global = state.graph.node_global_ids[state.graph.edge_index[1]]
+        # Hard horizon: once a graph has selected >= max_steps edges, only stop is legal.
+        horizon_exhausted = state.step_counts[edge_batch] >= self.max_steps
+
+        heads_global = state.graph.heads_global
+        tails_global = state.graph.tails_global
         is_step0 = state.step_counts[edge_batch] == 0
+        current_tail = state.current_tail[edge_batch]
+        # 有向：仅允许从当前尾节点作为 head 出发
+        valid_next = heads_global == current_tail
+        next_local = state.graph.edge_index[1]
 
-        if self.mode == "path":
-            current_tail = state.current_tail[edge_batch]
-            valid_next = (heads_global == current_tail) | (tails_global == current_tail)
-
-            next_local = torch.where(
-                heads_global == current_tail,
-                state.graph.edge_index[1],
-                state.graph.edge_index[0],
-            )
-
-            if self.forbid_revisit:
-                visited = state.visited_nodes[next_local]
-                valid_next = valid_next & (~visited)
-
-            if self.forbid_backtrack:
-                prev_tail = state.prev_tail[edge_batch]
-                is_backtrack = (
-                    ((heads_global == current_tail) & (tails_global == prev_tail))
-                    | ((tails_global == current_tail) & (heads_global == prev_tail))
-                )
-                valid_next = valid_next & (~is_backtrack)
-
-            edge_mask = torch.where(is_step0, state.graph.edge_starts_mask, valid_next)
-            return edge_mask
-
-        # subgraph frontier：允许从已访问节点集的任意边扩张
-        frontier_nodes = state.visited_nodes
-        heads_frontier = frontier_nodes[state.graph.edge_index[0]]
-        tails_frontier = frontier_nodes[state.graph.edge_index[1]]
-        candidate = heads_frontier | tails_frontier
-        # 不允许重复选择同一条边
-        candidate = candidate & (~state.selected_mask)
         if self.forbid_revisit:
-            # 至少有一个新节点被引入，避免无意义的封闭环
-            heads_visited = state.visited_nodes[state.graph.edge_index[0]]
-            tails_visited = state.visited_nodes[state.graph.edge_index[1]]
-            introduces_new = ~(heads_visited & tails_visited)
-            candidate = candidate & introduces_new
-        return candidate
+            visited = state.visited_nodes[next_local]
+            valid_next = valid_next & (~visited)
+
+        if self.forbid_backtrack:
+            prev_tail = state.prev_tail[edge_batch]
+            is_backtrack = tails_global == prev_tail
+            valid_next = valid_next & (~is_backtrack)
+
+        edge_mask = torch.where(is_step0, state.graph.edge_starts_mask, valid_next)
+        return edge_mask & (~horizon_exhausted)
 
     def frontier_mask_edges(self, state: GraphState) -> torch.Tensor:
         """返回策略前沿边掩码（不含重复边），用于边级 bonus。"""
         edge_batch = state.graph.edge_batch
+        horizon_exhausted = state.step_counts[edge_batch] >= self.max_steps
         is_step0 = state.step_counts[edge_batch] == 0
-        if self.mode == "path":
-            heads = state.graph.node_global_ids[state.graph.edge_index[0]]
-            tails = state.graph.node_global_ids[state.graph.edge_index[1]]
-            current_tail = state.current_tail[edge_batch]
-            frontier = (heads == current_tail) | (tails == current_tail)
-            frontier = torch.where(is_step0, state.graph.edge_starts_mask, frontier)
-            frontier = frontier & (~state.selected_mask)
-            return frontier
-
-        frontier_nodes = state.visited_nodes
-        heads_frontier = frontier_nodes[state.graph.edge_index[0]]
-        tails_frontier = frontier_nodes[state.graph.edge_index[1]]
-        frontier = heads_frontier | tails_frontier
+        heads = state.graph.heads_global
+        tails = state.graph.tails_global
+        current_tail = state.current_tail[edge_batch]
+        frontier = heads == current_tail
+        frontier = torch.where(is_step0, state.graph.edge_starts_mask, frontier)
         frontier = frontier & (~state.selected_mask)
-        return frontier
+        return frontier & (~horizon_exhausted)
 
     def step(self, state: GraphState, actions: torch.Tensor, *, step_index: int) -> GraphState:
         device = state.graph.edge_index.device
@@ -288,9 +245,18 @@ class GraphEnv(nn.Module):
         invalid_low = actions < es
         invalid_high = actions > ee
         if invalid_low.any() or invalid_high.any():
+            bad = torch.nonzero(invalid_low | invalid_high, as_tuple=False).view(-1)
+            # Provide the first few offending graphs for deterministic debugging.
+            preview = []
+            for idx in bad[:5].tolist():
+                preview.append(
+                    f"(g={idx} action={int(actions[idx].item())} es={int(es[idx].item())} ee={int(ee[idx].item())})"
+                )
             raise ValueError(
-                f"Actions contain out-of-range indices; min_diff={int((actions - es).min().item())} "
-                f"max_diff={int((actions - ee).max().item())}"
+                "Actions contain out-of-range indices for per-graph edge slices; "
+                f"min_diff={int((actions - es).min().item())} "
+                f"max_diff={int((actions - ee).max().item())} "
+                f"bad_examples={', '.join(preview)}"
             )
 
         is_stop = (actions == stop_idx) | state.done
@@ -301,27 +267,19 @@ class GraphEnv(nn.Module):
         if edge_indices.numel() > 0:
             if (edge_indices < 0).any() or (edge_indices >= state.graph.edge_index.size(1)).any():
                 raise ValueError("Edge actions contain out-of-range indices for current batch.")
-            # 允许指定图跳过 mask 校验（用于 GT replay 的对拍）
-            if not state.graph.bypass_action_mask.any():
-                if not edge_mask_valid[edge_indices].all():
-                    raise ValueError("Edge actions violate action mask; check actor sampling or environment constraints.")
-            else:
-                violating = ~edge_mask_valid[edge_indices]
-                if violating.any():
-                    viol_graphs = state.graph.edge_batch[edge_indices[violating]].unique().tolist()
-                    logging.getLogger("gflownet.debug").info(
-                        "[ENV_BYPASS] step=%d graphs=%s bypassed action mask for GT replay.",
-                        step_index,
-                        viol_graphs,
-                    )
+            if not edge_mask_valid[edge_indices].all():
+                raise ValueError("Edge actions violate action mask; check actor sampling or environment constraints.")
 
-        selected_mask = state.selected_mask.clone()
-        selection_order = state.selection_order.clone()
-        current_tail = state.current_tail.clone()
-        prev_tail = state.prev_tail.clone()
-        actions_record = state.actions.clone()
-        answer_hits = state.answer_hits.clone()
-        visited_nodes = state.visited_nodes.clone()
+        # State tensors are non-differentiable (bool/long); mutate in-place to avoid per-step clones.
+        selected_mask = state.selected_mask
+        selection_order = state.selection_order
+        current_tail = state.current_tail
+        prev_tail = state.prev_tail
+        current_tail_local = state.current_tail_local
+        prev_tail_local = state.prev_tail_local
+        actions_record = state.actions
+        answer_hits = state.answer_hits
+        visited_nodes = state.visited_nodes
 
         if edge_indices.numel() > 0:
             selected_mask[edge_indices] = True
@@ -330,30 +288,18 @@ class GraphEnv(nn.Module):
             graph_ids = state.graph.edge_batch[edge_indices]
             heads_idx = state.graph.edge_index[0, edge_indices]
             tails_idx = state.graph.edge_index[1, edge_indices]
-            heads = state.graph.node_global_ids[heads_idx]
-            tails = state.graph.node_global_ids[tails_idx]
+            heads = state.graph.heads_global[edge_indices]
+            tails = state.graph.tails_global[edge_indices]
+            next_local = tails_idx
+            next_global = state.graph.node_global_ids[next_local]
 
-            if self.mode == "path":
-                is_step0 = state.step_counts[graph_ids] == 0
-                source_is_head = torch.where(
-                    is_step0,
-                    state.graph.node_is_start[heads_idx],
-                    heads == state.current_tail[graph_ids],
-                )
-                next_local = torch.where(source_is_head, tails_idx, heads_idx)
-                next_global = state.graph.node_global_ids[next_local]
-
-                prev_tail[graph_ids] = state.current_tail[graph_ids]
-                current_tail[graph_ids] = next_global
-                visited_nodes[next_local] = True
-                hit = state.graph.node_is_answer[next_local]
-            else:
-                # 子图模式：将边两端节点都纳入已访问集合
-                prev_tail[graph_ids] = state.current_tail[graph_ids]
-                visited_nodes[heads_idx] = True
-                visited_nodes[tails_idx] = True
-                # 维持 current_tail 的形状以兼容旧策略；此处不再驱动 mask
-                hit = state.graph.node_is_answer[heads_idx] | state.graph.node_is_answer[tails_idx]
+            is_step0 = state.step_counts[graph_ids] == 0
+            prev_tail[graph_ids] = torch.where(is_step0, heads, state.current_tail[graph_ids])
+            current_tail[graph_ids] = next_global
+            prev_tail_local[graph_ids] = torch.where(is_step0, heads_idx, current_tail_local[graph_ids])
+            current_tail_local[graph_ids] = next_local
+            visited_nodes[next_local] = True
+            hit = state.graph.node_is_answer[next_local]
 
             write_pos = state.step_counts[graph_ids].clamp(max=actions_record.size(1) - 1)
             actions_record[graph_ids, write_pos] = edge_indices
@@ -368,14 +314,8 @@ class GraphEnv(nn.Module):
                     if self._debug_hits_logged >= self.debug_max_hits:
                         continue
                     mask_gid = graph_ids == gid
-                    if self.mode == "path":
-                        sel_next = next_local[mask_gid]
-                        sel_next_global = state.graph.node_global_ids[sel_next]
-                    else:
-                        sel_heads = heads_idx[mask_gid]
-                        sel_tails = tails_idx[mask_gid]
-                        sel_nodes = torch.unique(torch.cat([sel_heads, sel_tails], dim=0))
-                        sel_next_global = state.graph.node_global_ids[sel_nodes]
+                    sel_next = next_local[mask_gid]
+                    sel_next_global = state.graph.node_global_ids[sel_next]
                     answers_start = int(state.graph.answer_ptr[gid].item())
                     answers_end = int(state.graph.answer_ptr[gid + 1].item())
                     answers = state.graph.answer_entity_ids[answers_start:answers_end]
@@ -393,23 +333,9 @@ class GraphEnv(nn.Module):
                         pass
 
         done = state.done | is_stop
-        step_counts = torch.where(done, state.step_counts, state.step_counts + 1)
-
-        return GraphState(
-            graph=state.graph,
-            selected_mask=selected_mask,
-            visited_nodes=visited_nodes,
-            selection_order=selection_order,
-            current_tail=current_tail,
-            prev_tail=prev_tail,
-            done=done,
-            step_counts=step_counts,
-            actions=actions_record,
-            direction=state.direction,
-            answer_hits=answer_hits,
-            debug_logged=state.debug_logged,
-            debug_enabled=state.debug_enabled,
-        )
+        state.done = done
+        state.step_counts.add_((~done).to(dtype=state.step_counts.dtype))
+        return state
 
 
 __all__ = ["GraphEnv", "GraphBatch", "GraphState"]

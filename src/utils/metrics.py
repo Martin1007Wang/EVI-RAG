@@ -203,6 +203,41 @@ def compute_answer_recall(samples: Iterable[Dict[str, torch.Tensor]], k_values: 
     return {f"answer_recall@{k}": float(sum(values) / len(values)) if values else 0.0 for k, values in recalls.items()}
 
 
+def compute_answer_hit(samples: Iterable[Dict[str, torch.Tensor]], k_values: Sequence[int]) -> Dict[str, float]:
+    """Compute answer hit@k (any answer entity appears in top-k edges)."""
+    ks = normalize_k_values(k_values)
+    if not ks:
+        return {}
+    max_k = max(ks)
+    hits: Dict[int, List[float]] = {k: [] for k in ks}
+    for sample in samples:
+        answer_ids = sample.get("answer_ids")
+        if answer_ids is None or answer_ids.numel() == 0:
+            continue
+        answers = set(int(x) for x in answer_ids.tolist())
+        if not answers:
+            continue
+        scores = sample["scores"]
+        order = torch.argsort(scores, descending=True)
+        head_ids = sample["head_ids"].tolist()
+        tail_ids = sample["tail_ids"].tolist()
+        found_any = False
+        k_pointer = 0
+        for rank_idx, edge_idx in enumerate(order.tolist()[:max_k], start=1):
+            if edge_idx < len(head_ids) and head_ids[edge_idx] in answers:
+                found_any = True
+            if edge_idx < len(tail_ids) and tail_ids[edge_idx] in answers:
+                found_any = True
+            while k_pointer < len(ks) and rank_idx == ks[k_pointer]:
+                hits[ks[k_pointer]].append(1.0 if found_any else 0.0)
+                k_pointer += 1
+        last_val = 1.0 if found_any else 0.0
+        while k_pointer < len(ks):
+            hits[ks[k_pointer]].append(last_val)
+            k_pointer += 1
+    return {f"answer_hit@{k}": float(sum(values) / len(values)) if values else 0.0 for k, values in hits.items()}
+
+
 # --------------------------------------------------------------------------- #
 # Uncertainty summaries
 # --------------------------------------------------------------------------- #
@@ -223,5 +258,6 @@ __all__ = [
     "RankingStats",
     "compute_ranking_metrics",
     "compute_answer_recall",
+    "compute_answer_hit",
     "summarize_uncertainty",
 ]

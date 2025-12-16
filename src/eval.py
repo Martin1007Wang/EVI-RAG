@@ -18,6 +18,7 @@ from src.utils import instantiate_callbacks, instantiate_loggers, log_hyperparam
 from src.models.retriever_module import RetrieverModule
 from src.models.gflownet_module import GFlowNetModule
 from src.models.llm_reasoner_module import LLMReasonerModule
+from src.models.llm_reasoner_truth_module import LLMReasonerTruthModule
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +186,7 @@ def _run_llm_reasoner_predict(
     model: LightningModule,
     datamodule: LightningDataModule,
 ) -> None:
-    if not isinstance(model, LLMReasonerModule):
+    if not isinstance(model, (LLMReasonerModule, LLMReasonerTruthModule)):
         return
     logger.info("Running LLM reasoner predict()...")
     # Force return_predictions=True to ensure outputs are available in on_predict_epoch_end.

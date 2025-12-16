@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
@@ -11,7 +10,7 @@ from omegaconf import ListConfig
 import torch
 import torch.distributed as dist
 from lightning import LightningModule
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch import nn
 
 from src.models.components import GFlowNetActor, GFlowNetEstimator, GraphEmbedder, GraphEnv, RewardOutput
@@ -54,10 +53,6 @@ class GFlowNetModule(LightningModule):
         self.optimizer_cfg = optimizer_cfg or {}
         self.scheduler_cfg = scheduler_cfg or {}
         self.logging_cfg = logging_cfg or {}
-        self.retriever_prior_alpha = float(self._cfg_get(self.training_cfg, "retriever_prior_alpha", 0.0))
-        self.retriever_prior_anneal = self._cfg_get(self.training_cfg, "retriever_prior_anneal", None)
-        self.pb_loss_weight = float(self._cfg_get(self.training_cfg, "pb_loss_weight", 1.0))
-        self.pb_loss_anneal = self._cfg_get(self.training_cfg, "pb_loss_anneal", None)
         eval_rollouts_cfg = self._cfg_get(self.evaluation_cfg, "num_eval_rollouts", 1)
         if isinstance(eval_rollouts_cfg, (list, tuple, ListConfig)):
             self._eval_rollout_prefixes = sorted({int(max(1, v)) for v in eval_rollouts_cfg})
@@ -66,10 +61,6 @@ class GFlowNetModule(LightningModule):
             self._eval_rollouts = int(max(1, self._cfg_get_int(self.evaluation_cfg, "num_eval_rollouts", 1)))
             self._eval_rollout_prefixes = [self._eval_rollouts]
         self._path_hit_k = self._parse_int_list(self._cfg_get(self.evaluation_cfg, "path_hit_k", [5]))
-        self.normalize_log_reward = bool(self._cfg_get(self.training_cfg, "normalize_log_reward", True))
-        self._log_reward_offset = self._infer_log_reward_offset(self.reward_cfg) if self.normalize_log_reward else 0.0
-        self.gt_replay_ratio = float(self._cfg_get(self.training_cfg, "gt_replay_ratio", 0.1))
-        self.learn_pb = bool(self._cfg_get(self.training_cfg, "learn_pb", True))
         self._debug_batches_to_log = max(int(self._cfg_get(self.training_cfg, "debug_batches_to_log", 0)), 0)
         self._debug_graphs_to_log = max(int(self._cfg_get(self.training_cfg, "debug_graphs_to_log", 1)), 1)
         self._debug_batches_logged = 0
@@ -89,15 +80,6 @@ class GFlowNetModule(LightningModule):
         self.max_steps = int(self.env.max_steps)
         self.embedder = hydra.utils.instantiate(embedder_cfg)
         self.estimator = hydra.utils.instantiate(estimator_cfg)
-        # 反向策略配置：禁用 tree，默认 uniform/learned
-        self.estimator.learn_pb = self.learn_pb  # type: ignore[attr-defined]
-        if self.estimator.log_pb_mode == "tree":
-            raise ValueError("log_pb_mode 'tree' is invalid for hub-heavy graphs; use 'uniform' or 'learned'.")
-        if not self.learn_pb:
-            self.estimator.log_pb_mode = "uniform"
-            if getattr(self.estimator, "backward_head", None) is not None:
-                for param in self.estimator.backward_head.parameters():
-                    param.requires_grad_(False)
         self.actor = hydra.utils.instantiate(
             actor_cfg,
             policy=self.policy,
@@ -172,68 +154,6 @@ class GFlowNetModule(LightningModule):
         except Exception:
             return [1]
 
-    @staticmethod
-    def _infer_log_reward_offset(cfg: Any) -> float:
-        """Infer a log-scale offset so that success reward is normalized near zero."""
-        success_reward = 1.0
-        if cfg is not None:
-            try:
-                success_reward = float(GFlowNetModule._cfg_get(cfg, "success_reward", 1.0))
-            except Exception:
-                success_reward = 1.0
-        safe_reward = max(success_reward, 1e-8)
-        return float(math.log(safe_reward))
-
-    def _reward_offset_tensor(self, ref: torch.Tensor) -> torch.Tensor:
-        return torch.as_tensor(self._log_reward_offset, device=ref.device, dtype=ref.dtype)
-
-    def _sample_path_exists_for_gt(self, path_exists: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if path_exists is None or not self.training or self.gt_replay_ratio <= 0:
-            return None
-        mask = path_exists.bool()
-        if not mask.any():
-            return None
-        if self.gt_replay_ratio >= 1.0:
-            return mask
-        rand = torch.rand_like(mask.float())
-        return mask & (rand < self.gt_replay_ratio)
-
-    def _current_prior_alpha(self) -> float:
-        """Compute retriever soft-prior weight with optional linear annealing."""
-        alpha = float(self.retriever_prior_alpha)
-        cfg = self.retriever_prior_anneal
-        if cfg is None:
-            return alpha
-        try:
-            alpha_start = float(cfg.get("start", alpha))
-            alpha_end = float(cfg.get("end", 0.0))
-            steps = float(cfg.get("steps", 0.0))
-        except Exception:
-            return alpha
-        if steps <= 0:
-            return alpha_end
-        gstep = float(getattr(getattr(self, "trainer", None), "global_step", 0.0) or 0.0)
-        frac = min(max(gstep / steps, 0.0), 1.0)
-        return alpha_start + (alpha_end - alpha_start) * frac
-
-    def _current_pb_loss_weight(self) -> float:
-        """Weight for PB auxiliary losses; supports linear anneal."""
-        weight = float(self.pb_loss_weight)
-        cfg = self.pb_loss_anneal
-        if cfg is None:
-            return weight
-        try:
-            w_start = float(cfg.get("start", weight))
-            w_end = float(cfg.get("end", 0.0))
-            steps = float(cfg.get("steps", 0.0))
-        except Exception:
-            return weight
-        if steps <= 0:
-            return w_end
-        gstep = float(getattr(getattr(self, "trainer", None), "global_step", 0.0) or 0.0)
-        frac = min(max(gstep / steps, 0.0), 1.0)
-        return w_start + (w_end - w_start) * frac
-
     def setup(self, stage: str | None = None) -> None:
         trainer = getattr(self, "trainer", None)
         if trainer is None or getattr(trainer, "datamodule", None) is None:
@@ -242,6 +162,11 @@ class GFlowNetModule(LightningModule):
         if resources is None:
             raise ValueError("Shared resources not found on datamodule; ensure GAgentDataModule constructs SharedDataResources.")
         self.embedder.setup(resources, device=self.device)
+
+    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
+        # Keep the PyG Batch on CPU to avoid unnecessary GPU residency/copies for large integer ID tensors.
+        # The model explicitly moves only the tensors it needs to `self.device` inside embedder/actor/env.
+        return batch
 
     def training_step(self, batch, batch_idx: int):
         # 强制开启梯度，防止上游误用了 no_grad/inference_mode 使图被剥离。
@@ -331,21 +256,27 @@ class GFlowNetModule(LightningModule):
         node_tokens = embed.node_tokens
         question_tokens = embed.question_tokens
         answer_ptr = batch._slice_dict["answer_entity_ids"].to(device)
-        start_node_ptr = batch._slice_dict.get("start_node_locals")
-        if start_node_ptr is None:
-            raise ValueError("Batch missing start_node_locals slice info; g_agent cache may be corrupt.")
-        start_summary = self.estimator.aggregate_start(
-            node_tokens=node_tokens,
-            start_node_locals=batch.start_node_locals.to(device),
-            start_node_ptr=start_node_ptr.to(device),
-            num_graphs=num_graphs,
-            question_tokens=question_tokens,
-            device=device,
-        )
+        # SubTB：logF(s_t) 在每一步状态上预测；不再使用单独的 start_summary/logZ 常数项。
 
-        path_exists_tf = self._sample_path_exists_for_gt(path_exists)
-        log_z_context = self.estimator.build_context(start_summary, question_tokens)
-        log_z = self.estimator.log_z(log_z_context)
+        graph_cache: Dict[str, torch.Tensor] = {
+            "edge_index": edge_index,
+            "edge_batch": edge_batch,
+            "node_global_ids": batch.node_global_ids.to(device),
+            "heads_global": heads_global,
+            "tails_global": tails_global,
+            "node_ptr": node_ptr,
+            "edge_ptr": edge_ptr,
+            "start_node_locals": batch.start_node_locals.to(device),
+            "start_ptr": batch._slice_dict["start_node_locals"].to(device),
+            "start_entity_ids": batch.start_entity_ids.to(device),
+            "start_entity_ptr": batch._slice_dict["start_entity_ids"].to(device),
+            "answer_node_locals": batch.answer_node_locals.to(device),
+            "answer_ptr": batch._slice_dict["answer_entity_ids"].to(device),
+            "answer_entity_ids": batch.answer_entity_ids.to(device),
+            "edge_relations": batch.edge_attr.to(device),
+            "edge_labels": edge_labels,
+            "is_answer_reachable": batch.is_answer_reachable.to(device),
+        }
 
         if self.training:
             num_rollouts = 1
@@ -362,7 +293,6 @@ class GFlowNetModule(LightningModule):
                 )
         loss_list = []
         metrics_list: list[Dict[str, torch.Tensor]] = []
-        use_gt_replay = self.training and path_exists_tf is not None and bool(path_exists_tf.any().item())
         diversity_answers: list[set[int]] = [set() for _ in range(num_graphs)] if not self.training else []
         diversity_paths: list[set[tuple[int, ...]]] = [set() for _ in range(num_graphs)] if not self.training else []
         answers_hits_per_rollout: list[list[set[int]]] = [] if not self.training else []
@@ -382,14 +312,12 @@ class GFlowNetModule(LightningModule):
                 edge_ptr=edge_ptr,
                 node_ptr=node_ptr,
                 edge_scores=edge_scores,
-                path_mask=path_mask if path_mask is not None and path_mask.any() else None,
-                path_exists=path_exists_tf,
                 training=self.training,
-                gt_replay=use_gt_replay,
-                prior_alpha=self._current_prior_alpha(),
                 batch_idx=batch_idx,
+                graph_cache=graph_cache,
+                node_tokens=node_tokens,
             )
-            gt_log_pf = rollout.get("log_pf_gt") if isinstance(rollout, dict) else None
+            # Residual PF: rollout 已返回 clean log_pf/log_pf_steps/state_emb_seq/actions_seq 等用于 SubTB。
 
             reward_out: RewardOutput = self.reward_fn(
                 selected_mask=rollout["selected_mask"],
@@ -403,14 +331,7 @@ class GFlowNetModule(LightningModule):
                 path_mask=path_mask,
                 path_exists=path_exists,
                 reach_success=rollout["reach_success"],
-                reach_fraction=self._compute_answer_reach_fraction(
-                    selected_mask=rollout["selected_mask"],
-                    edge_batch=edge_batch,
-                    edge_heads=heads_global,
-                    edge_tails=tails_global,
-                    answer_entity_ids=batch.answer_entity_ids.to(device),
-                    answer_ptr=batch._slice_dict["answer_entity_ids"].to(device),
-                ),
+                reach_fraction=rollout["reach_fraction"],
                 edge_index=edge_index,
                 node_ptr=node_ptr,
                 edge_ptr=edge_ptr,
@@ -419,24 +340,31 @@ class GFlowNetModule(LightningModule):
                 is_answer_reachable=batch.is_answer_reachable.view(-1).to(device),
             )
 
-            # reward_out.log_reward 已经在 Reward 内部完成归一化，不再做二次偏移
             log_reward = reward_out.log_reward
-            length_int = rollout["length"].detach().clamp(min=0)
-            log_pb, pb_losses = self.estimator.log_pb(
-                edge_tokens=edge_tokens,
-                node_tokens=node_tokens,
-                edge_batch=edge_batch,
-                selected_mask=rollout["selected_mask"],
-                question_tokens=question_tokens,
-                edge_index=edge_index,
-            )
             self._assert_finite(log_reward, "log_reward")
-            self._assert_finite(log_z, "log_z")
             self._assert_finite(rollout["log_pf"], "log_pf")
-            tb_loss = torch.mean((log_z + rollout["log_pf"] - log_pb - log_reward) ** 2)
-            pb_weight = self._current_pb_loss_weight() if self.learn_pb else 0.0
-            pb_loss_total = sum(pb_losses.values()) if pb_losses else torch.zeros((), device=device, dtype=log_z.dtype)
-            loss = tb_loss + pb_weight * pb_loss_total
+            log_flow_states = self._compute_log_flow_states(
+                state_emb_seq=rollout["state_emb_seq"],
+                question_tokens=question_tokens,
+                log_reward=log_reward,
+                edge_lengths=rollout["length"].long(),
+            )
+            # Backward policy P_B is deterministic under this state definition:
+            # given the full trajectory state (selected edges + order), the predecessor is uniquely
+            # obtained by removing the last selected edge. Hence log P_B = 0 for every realized step.
+            log_pb_steps = self._compute_deterministic_log_pb_steps(
+                actions_seq=rollout["actions_seq"],
+                stop_indices=edge_ptr[1:],
+                dtype=rollout["log_pf_steps"].dtype,
+                device=device,
+            )
+            subtb_loss = self._compute_subtb_loss(
+                log_flow_states=log_flow_states,
+                log_pf_steps=rollout["log_pf_steps"],
+                log_pb_steps=log_pb_steps,
+                edge_lengths=rollout["length"].long(),
+            )
+            loss = subtb_loss
 
             if should_debug:
                 self._log_reward_prior_debug(
@@ -448,17 +376,9 @@ class GFlowNetModule(LightningModule):
                     batch_idx=batch_idx,
                 )
 
-            gt_loss_value = None
-            gt_ce_weight = float(self._cfg_get(self.training_cfg, "gt_loss_weight", 0.0))
-            if gt_ce_weight > 0.0 and use_gt_replay and gt_log_pf is not None and path_exists_tf is not None:
-                mask_gt = path_exists_tf.bool()
-                if mask_gt.any():
-                    self._assert_finite(gt_log_pf, "log_pf_gt")
-                    gt_loss_value = -gt_log_pf[mask_gt].mean() * gt_ce_weight
-                    loss = loss + gt_loss_value
-
-            length_safe = rollout["length"].detach().clamp(min=1.0)
-            avg_step_entropy = (-rollout["log_pf"].detach() / length_safe).mean()
+            # 监控项：每步平均 NLL（包含 stop 这一步）。
+            steps_safe = (rollout["length"].detach() + 1.0).clamp(min=1.0)
+            avg_step_nll = (-rollout["log_pf"].detach() / steps_safe).mean()
 
             reward_metrics = reward_out.as_dict()
             rollout_reward = reward_metrics.pop("reward")
@@ -475,7 +395,7 @@ class GFlowNetModule(LightningModule):
                 path_exists.bool() if path_exists is not None else torch.ones(num_graphs, device=device, dtype=torch.bool)
             )
 
-            # Top-K 边回溯命中率（按选择顺序前 K 条边）
+            # Top-K 边回溯命中率（按选择顺序前 K 条边）；仅在存在 GT 边的图上聚合。
             if not self.training and self._path_hit_k:
                 sel_order = rollout["selection_order"]
                 for k_val in self._path_hit_k:
@@ -485,44 +405,34 @@ class GFlowNetModule(LightningModule):
                         edge_valid = path_mask.bool() & topk_mask & valid_graphs[edge_batch]
                     else:
                         edge_valid = torch.zeros_like(topk_mask, dtype=torch.bool)
-                    hits_topk = torch.bincount(
-                        edge_batch,
-                        weights=edge_valid.float(),
-                        minlength=num_graphs,
-                    )
+                    hits_topk = torch.bincount(edge_batch, weights=edge_valid.float(), minlength=num_graphs)
                     if path_mask is not None and path_mask.numel() == topk_mask.numel():
                         gt_edge_mask = path_mask.bool() & valid_graphs[edge_batch]
-                        gt_counts = torch.bincount(
-                            edge_batch,
-                            weights=gt_edge_mask.float(),
-                            minlength=num_graphs,
-                        )
+                        gt_counts = torch.bincount(edge_batch, weights=gt_edge_mask.float(), minlength=num_graphs)
                     else:
                         gt_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-                    selected_counts = torch.bincount(
-                        edge_batch,
-                        weights=(rollout["selected_mask"].bool() & valid_graphs[edge_batch]).float(),
-                        minlength=num_graphs,
-                    )
+                    selected_counts = torch.bincount(edge_batch, weights=(rollout["selected_mask"].bool() & valid_graphs[edge_batch]).float(), minlength=num_graphs)
                     denom = torch.minimum(torch.full_like(selected_counts, float(k_int)), selected_counts)
-                    precision_topk = torch.where(
-                        valid_graphs & (denom > 0),
-                        hits_topk / denom.clamp(min=1.0),
-                        torch.zeros_like(hits_topk),
-                    )
-                    recall_topk = torch.where(
-                        valid_graphs & (gt_counts > 0),
-                        hits_topk / gt_counts.clamp(min=1.0),
-                        torch.zeros_like(hits_topk),
-                    )
-                    f1_topk = torch.where(
-                        (precision_topk + recall_topk) > 0,
-                        2 * precision_topk * recall_topk / (precision_topk + recall_topk),
-                        torch.zeros_like(precision_topk),
-                    )
-                    reward_metrics[f"path_hit_precision@{k_int}"] = precision_topk.mean()
-                    reward_metrics[f"path_hit_recall@{k_int}"] = recall_topk.mean()
-                    reward_metrics[f"path_hit_f1@{k_int}"] = f1_topk.mean()
+                    has_gt = valid_graphs & (gt_counts > 0)
+                    valid_mask = has_gt & (denom > 0)
+                    precision_topk = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+                    recall_topk = torch.zeros_like(precision_topk)
+                    f1_topk = torch.zeros_like(precision_topk)
+                    precision_topk[valid_mask] = hits_topk[valid_mask] / denom[valid_mask].clamp(min=1.0)
+                    recall_topk[has_gt] = hits_topk[has_gt] / gt_counts[has_gt].clamp(min=1.0)
+                    with torch.no_grad():
+                        denom_f1 = precision_topk + recall_topk
+                        mask_f1 = denom_f1 > 0
+                        f1_topk[mask_f1] = 2 * precision_topk[mask_f1] * recall_topk[mask_f1] / denom_f1[mask_f1]
+                    # 仅在存在 GT 的图上取均值，避免把“无 GT”混入 0 噪声
+                    def _masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                        if not mask.any():
+                            return torch.tensor(0.0, device=device)
+                        return (t * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+
+                    reward_metrics[f"path_hit_precision@{k_int}"] = _masked_mean(precision_topk, valid_mask)
+                    reward_metrics[f"path_hit_recall@{k_int}"] = _masked_mean(recall_topk, has_gt)
+                    reward_metrics[f"path_hit_f1@{k_int}"] = _masked_mean(f1_topk, has_gt & mask_f1)
             # 确保所有配置的 K 都有键（即便 path_mask 为空）
             if not self.training and self._path_hit_k:
                 zero = torch.tensor(0.0, device=device)
@@ -538,22 +448,9 @@ class GFlowNetModule(LightningModule):
                 "success_mean": success_mean,
                 "answer_coverage": answer_coverage,
                 "length_mean": rollout["length"].detach(),
-                "path_exists_ratio": (
-                    reward_out.path_exists.detach().float().mean()
-                    if hasattr(reward_out, "path_exists")
-                    else torch.tensor(0.0, device=device)
-                ),
-                "tb_loss": tb_loss.detach(),
-                "avg_step_entropy": avg_step_entropy,
-                "pb_nll": pb_losses.get("pb_nll", torch.tensor(0.0, device=device)).detach(),
+                "subtb_loss": subtb_loss.detach(),
+                "avg_step_nll": avg_step_nll.detach(),
             }
-            for key in ("pb_entropy", "pb_l2", "pb_avg_entropy"):
-                if key in pb_losses:
-                    metrics[key] = pb_losses[key].detach()
-            if gt_loss_value is not None:
-                metrics["gt_loss"] = gt_loss_value.detach()
-            if gt_log_pf is not None:
-                metrics["gt_log_pf"] = gt_log_pf.detach()
 
             loss_list.append(loss)
             metrics_list.append(metrics)
@@ -634,20 +531,16 @@ class GFlowNetModule(LightningModule):
                 return f"{name}: req={t.requires_grad} grad_fn={t.grad_fn is not None} shape={tuple(t.shape)}"
 
             debug_logger.error(
-                "[LOSS_STATUS] grad_enabled=%s loss_is_leaf=%s len_loss_list=%d loss_list_req=%s | %s | %s | %s | %s | pb_loss_total req=%s grad_fn=%s pb_losses_keys=%s",
+                "[LOSS_STATUS] grad_enabled=%s loss_is_leaf=%s len_loss_list=%d loss_list_req=%s | %s | %s | %s",
                 torch.is_grad_enabled(),
                 loss.is_leaf,
                 len(loss_list),
                 [t.requires_grad for t in loss_list],
                 _flag(loss, "loss"),
-                _flag(tb_loss, "tb_loss"),
-                _flag(log_z, "log_z"),
+                _flag(subtb_loss, "subtb_loss"),
                 _flag(rollout["log_pf"], "log_pf"),
-                pb_loss_total.requires_grad,
-                pb_loss_total.grad_fn is not None,
-                list(pb_losses.keys()) if pb_losses else [],
             )
-            raise RuntimeError("Training loss has no grad; check LOSS_STATUS log for detached tensors.")
+            raise RuntimeError("Training loss has no grad; check LOSS_STATUS log for detached SubTB tensors.")
 
         if not self.training:
             if not log_pf_all:
@@ -1004,15 +897,12 @@ class GFlowNetModule(LightningModule):
             es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
             answer_start, answer_end = int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())
             answer_ids = answers_all[answer_start:answer_end].tolist()
-            node_offset = int(node_ptr[g].item())
-            start_local_slice = start_node_locals[start_node_ptr[g] : start_node_ptr[g + 1]]
-            start_nodes_batch = {int(node_offset + s.item()) for s in start_local_slice}
 
+            edge_range = torch.arange(es, ee)
             rollouts: list[Dict[str, Any]] = []
             for ridx, log in enumerate(rollout_logs):
                 sel_mask = log["selected_mask"][es:ee].bool()
                 sel_order = log["selection_order"][es:ee]
-                edge_range = torch.arange(es, ee)
                 selected_global = edge_range[sel_mask]
                 order_selected = sel_order[sel_mask]
                 if order_selected.numel() > 0:
@@ -1022,30 +912,9 @@ class GFlowNetModule(LightningModule):
                     ordered_global = torch.empty(0, dtype=torch.long)
 
                 edges: list[Dict[str, Any]] = []
-                current_tail_gid: Optional[int] = None
                 for edge_idx in ordered_global.tolist():
-                    h_idx = int(batch.edge_index[0, edge_idx].item())
-                    t_idx = int(batch.edge_index[1, edge_idx].item())
                     h_gid = int(heads_global[edge_idx].item())
                     t_gid = int(tails_global[edge_idx].item())
-                    # 定向：优先保持路径连通性；step0 以 start_node 判断方向
-                    if current_tail_gid is None:
-                        h_is_start = h_idx in start_nodes_batch
-                        t_is_start = t_idx in start_nodes_batch
-                        if h_is_start and not t_is_start:
-                            src_gid, dst_gid = h_gid, t_gid
-                        elif t_is_start and not h_is_start:
-                            src_gid, dst_gid = t_gid, h_gid
-                        else:
-                            src_gid, dst_gid = h_gid, t_gid
-                    else:
-                        if h_gid == current_tail_gid:
-                            src_gid, dst_gid = h_gid, t_gid
-                        elif t_gid == current_tail_gid:
-                            src_gid, dst_gid = t_gid, h_gid
-                        else:
-                            src_gid, dst_gid = h_gid, t_gid
-                    current_tail_gid = dst_gid
                     edges.append(
                         {
                             "head_entity_id": h_gid,
@@ -1054,8 +923,8 @@ class GFlowNetModule(LightningModule):
                             "edge_score": float(edge_scores[edge_idx].item()),
                             "edge_label": float(edge_labels[edge_idx].item()),
                             "edge_local_index": int(edge_idx - es),
-                            "src_entity_id": src_gid,
-                            "dst_entity_id": dst_gid,
+                            "src_entity_id": h_gid,
+                            "dst_entity_id": t_gid,
                         }
                     )
 
@@ -1119,40 +988,94 @@ class GFlowNetModule(LightningModule):
         torch.save(payload, output_path)
         logger.info("Persisted gflownet eval outputs to %s (samples=%d)", output_path, len(merged))
 
-    def _compute_answer_reach_fraction(
+    def _compute_log_flow_states(
         self,
         *,
-        selected_mask: torch.Tensor,
-        edge_batch: torch.Tensor,
-        edge_heads: torch.Tensor,
-        edge_tails: torch.Tensor,
-        answer_entity_ids: torch.Tensor,
-        answer_ptr: torch.Tensor,
+        state_emb_seq: torch.Tensor,  # [B, T_action, H]
+        question_tokens: torch.Tensor,  # [B, H]
+        log_reward: torch.Tensor,  # [B]
+        edge_lengths: torch.Tensor,  # [B] number of selected edges
     ) -> torch.Tensor:
-        num_graphs = int(answer_ptr.numel() - 1)
-        if num_graphs == 0:
-            return torch.zeros(0, device=selected_mask.device)
-        edge_nodes = torch.cat([edge_heads, edge_tails], dim=0)
-        selected_twice = torch.cat([selected_mask, selected_mask], dim=0)
-        selected_nodes = torch.where(
-            selected_twice,
-            edge_nodes,
-            torch.full_like(edge_nodes, -1),
-        )
-        edge_batch_twice = torch.cat([edge_batch, edge_batch], dim=0)
-        frac = torch.zeros(num_graphs, device=selected_mask.device)
-        for g in range(num_graphs):
-            a_start, a_end = int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())
-            if a_start == a_end:
-                continue
-            answers = answer_entity_ids[a_start:a_end]
-            mask_g = edge_batch_twice == g
-            selected_g = selected_nodes[mask_g]
-            if selected_g.numel() == 0:
-                continue
-            hits = (selected_g.unsqueeze(1) == answers).any(dim=0).float().sum()
-            frac[g] = hits / float(answers.numel())
-        return frac
+        """Compute logF(s_t) for SubTB, with terminal logF(s_T)=logR."""
+        if state_emb_seq.dim() != 3:
+            raise ValueError(f"state_emb_seq must be [B, T, H], got shape={tuple(state_emb_seq.shape)}")
+        num_graphs, num_steps, hidden_dim = state_emb_seq.shape
+        if question_tokens.size(0) != num_graphs:
+            raise ValueError("question_tokens batch size mismatch with state_emb_seq.")
+        if question_tokens.size(-1) != hidden_dim:
+            raise ValueError("question_tokens hidden_dim mismatch with state_emb_seq.")
+        if log_reward.numel() != num_graphs:
+            raise ValueError("log_reward batch size mismatch with state_emb_seq.")
+
+        state_flat = state_emb_seq.reshape(num_graphs * num_steps, hidden_dim)
+        q_flat = question_tokens.unsqueeze(1).expand(num_graphs, num_steps, hidden_dim).reshape(num_graphs * num_steps, hidden_dim)
+        context = self.estimator.build_context(state_flat, q_flat)
+        log_flow_flat = self.estimator.log_z(context)
+        log_flow_pred = log_flow_flat.view(num_graphs, num_steps)
+
+        # Pad one extra terminal state; fill it with log_reward for the max-length case.
+        log_flow_states = torch.zeros(num_graphs, num_steps + 1, device=state_emb_seq.device, dtype=log_flow_pred.dtype)
+        log_flow_states[:, :num_steps] = log_flow_pred
+        log_flow_states[:, num_steps] = log_reward.to(dtype=log_flow_pred.dtype)
+
+        # Terminal state index is (stop_step + 1) where stop_step == #selected_edges.
+        terminal_state = edge_lengths.clamp(min=0, max=num_steps - 1) + 1
+        log_flow_states.scatter_(1, terminal_state.view(-1, 1), log_reward.view(-1, 1).to(dtype=log_flow_pred.dtype))
+        return log_flow_states
+
+    @staticmethod
+    def _compute_deterministic_log_pb_steps(
+        *,
+        actions_seq: torch.Tensor,  # [B, T_action]
+        stop_indices: torch.Tensor,  # [B]
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Deterministic P_B: each non-terminal state has a unique predecessor, so log P_B = 0."""
+        if actions_seq.dim() != 2:
+            raise ValueError(f"actions_seq must be 2D [B,T], got shape={tuple(actions_seq.shape)}")
+        if stop_indices.dim() != 1 or stop_indices.numel() != actions_seq.size(0):
+            raise ValueError("stop_indices must be [B] and aligned with actions_seq batch size.")
+        return torch.zeros_like(actions_seq, dtype=dtype, device=device)
+
+    def _compute_subtb_loss(
+        self,
+        *,
+        log_flow_states: torch.Tensor,  # [B, T_state]
+        log_pf_steps: torch.Tensor,  # [B, T_action]
+        log_pb_steps: torch.Tensor,  # [B, T_action]
+        edge_lengths: torch.Tensor,  # [B] number of selected edges
+    ) -> torch.Tensor:
+        """Sub-Trajectory Balance with λ=1 (uniform weights over all sub-trajectories)."""
+        device = log_pf_steps.device
+        num_graphs, num_actions = log_pf_steps.shape
+        if log_flow_states.shape != (num_graphs, num_actions + 1):
+            raise ValueError(
+                f"log_flow_states shape {tuple(log_flow_states.shape)} != (B, T_action+1)=({num_graphs},{num_actions + 1})"
+            )
+        if log_pb_steps.shape != log_pf_steps.shape:
+            raise ValueError("log_pb_steps must have the same shape as log_pf_steps.")
+        if log_pb_steps.numel() > 0 and bool((log_pb_steps != 0).any().item()):
+            raise ValueError("Deterministic P_B expects log_pb_steps to be all zeros.")
+
+        log_pf_prefix = torch.zeros(num_graphs, num_actions + 1, device=device, dtype=log_pf_steps.dtype)
+        log_pf_prefix[:, 1:] = log_pf_steps.cumsum(dim=1)
+
+        pf_seg = log_pf_prefix.unsqueeze(1) - log_pf_prefix.unsqueeze(2)
+        residual = log_flow_states.unsqueeze(2) + pf_seg - log_flow_states.unsqueeze(1)
+
+        t_state = num_actions + 1
+        idx = torch.arange(t_state, device=device)
+        i_idx = idx.view(1, t_state, 1)
+        j_idx = idx.view(1, 1, t_state)
+        term_state = edge_lengths.clamp(min=0, max=num_actions - 1) + 1
+        term_state = term_state.view(num_graphs, 1, 1)
+        valid = (i_idx < j_idx) & (i_idx <= term_state) & (j_idx <= term_state)
+        valid_f = valid.to(dtype=residual.dtype)
+        sq = residual.pow(2) * valid_f
+        denom = valid_f.sum(dim=(1, 2)).clamp(min=1.0)
+        per_graph = sq.sum(dim=(1, 2)) / denom
+        return per_graph.mean()
 
     def _assert_finite(self, tensor: torch.Tensor, name: str) -> None:
         if not torch.isfinite(tensor).all():

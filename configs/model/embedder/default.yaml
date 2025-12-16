@@ -4,7 +4,6 @@ hidden_dim: ${model.hidden_dim}
 # 默认复用 retriever checkpoint 权重做特征提取初始化；dropout 可用于训练期正则。
 proj_dropout: 0.0
 projector_checkpoint: ???
-freeze_retriever: true
 projector_key_prefixes:
   - retriever.model._orig_mod
   - retriever.model

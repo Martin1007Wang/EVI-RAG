@@ -328,24 +328,33 @@ class GAgentBuilder:
             dtype=torch.long,
         )
 
-        # 答案只保留子图中存在的实体，并与局部索引一一对齐，去重后保持输入顺序。
-        answer_pairs: List[Tuple[int, int]] = []
-        seen_a = set()
+        # 答案实体的全局 ID 必须保留（审计字段），不可因为“不在子图中”就丢样本；
+        # 否则训练/评估只在“已知可达”子集上成立，drop_unreachable 也会失效。
+        #
+        # 语义约束：
+        # - answer_entity_ids：原始答案集合（去重、保序），与子图是否包含答案无关
+        # - answer_node_locals：子图内的答案节点局部索引（可空，shape [0]）
+        seen_a: set[int] = set()
+        ordered_answers: List[int] = []
         for a_id in answer_entity_ids.tolist():
             a_int = int(a_id)
             if a_int in seen_a:
                 continue
-            mapped = node_map.get(a_int)
+            seen_a.add(a_int)
+            ordered_answers.append(a_int)
+        answer_entity_ids = torch.tensor(ordered_answers, dtype=torch.long)
+
+        answer_node_locals_list: List[int] = []
+        for a_int in ordered_answers:
+            mapped = node_map.get(int(a_int))
             if mapped is None:
                 continue
-            seen_a.add(a_int)
-            answer_pairs.append((a_int, int(mapped)))
-        if not answer_pairs:
-            self.stats["retrieval_failed"] += 1
-            # 严格模式：答案不在子图直接丢弃样本，避免产出不可达样本
-            return
-        answer_entity_ids = torch.tensor([p[0] for p in answer_pairs], dtype=torch.long)
-        answer_node_locals = torch.tensor([p[1] for p in answer_pairs], dtype=torch.long)
+            answer_node_locals_list.append(int(mapped))
+        answer_node_locals = (
+            torch.tensor(answer_node_locals_list, dtype=torch.long)
+            if answer_node_locals_list
+            else torch.empty(0, dtype=torch.long)
+        )
 
         # === E. Ground Truth Path Mapping (by triple, after dedup) ===
         triple_to_agent = {triple: idx for idx, triple in enumerate(triples)}
@@ -406,9 +415,14 @@ class GAgentBuilder:
             gt_path_exists=gt_path_exists,
             is_answer_reachable=is_answer_reachable,
         )
-        # Invariance: GT path implies reachability, but not vice versa.
-        if sample.gt_path_exists:
-            assert sample.is_answer_reachable, f"Sample {sample_id} has GT path but is_answer_reachable=False."
+        # 记录但不跳过：eval 阶段允许 GT 路径被截断后不可达（train 有 force_include_gt 时仍应可达）。
+        if sample.gt_path_exists and not sample.is_answer_reachable:
+            self.stats["gt_broken"] += 1
+            log.warning(
+                "GT path exists but answer not reachable after selection (top_k=%d). sample_id=%s",
+                int(self.cfg.anchor_top_k),
+                sample_id,
+            )
 
         self.samples.append(sample)
         self.stats["num_samples"] += 1

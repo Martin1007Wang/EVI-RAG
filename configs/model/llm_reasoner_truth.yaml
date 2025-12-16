@@ -1,0 +1,9 @@
+_target_: src.models.llm_reasoner_truth_module.LLMReasonerTruthModule
+
+dataset: ${data.dataset}
+split: ${data.split}
+prompt_tag: ${data.prompt_tag}
+k_values: ${data.k_values}
+
+output_dir: ${paths.output_dir}
+

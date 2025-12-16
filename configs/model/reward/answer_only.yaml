@@ -1,20 +1,5 @@
 _target_: src.models.components.gflownet_rewards.AnswerOnlyReward
 
-# 纯命中目标：成功与失败的 reward 基线（正数，进入 log-domain 叠加）。
+# 纯二元结果：命中答案 vs 未命中（正数，进入 log-domain）。
 success_reward: 10.0
 failure_reward: 0.01
-
-# 可选 shaping：log_reward += lambda_reach * reach_fraction
-lambda_reach: 0.0
-
-# 结构 shaping（默认 0 保持旧行为）
-# log_reward += gamma_len * (-num_selected_edges)
-gamma_len: 0.0
-# log_reward += gamma_score * mean(log(edge_scores))
-gamma_score: 0.0
-score_clip_max: 1.0   # 限定 edge_scores<=1, log<=0，避免归一化溢出
-score_eps: 1.0e-8
-# log_reward += gamma_gt * gt_path_f1（与 path_mask 联动）
-gamma_gt: 0.0
-# log_reward += gamma_answer_div * (#answers hit)，用于多答案覆盖（单答案时可保持 0）
-gamma_answer_div: 0.0

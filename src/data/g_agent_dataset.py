@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GAgentSample:
-    """标准 g_agent 训练单元（确定性字段，不允许缺省/回退）。"""
+    """标准 g_agent 训练单元（核心字段确定性；可选审计字段允许缺省）。"""
 
     # 元数据
     sample_id: str
@@ -29,7 +29,9 @@ class GAgentSample:
     edge_relations: torch.LongTensor  # [E]
     edge_scores: torch.FloatTensor  # [E]
     edge_labels: torch.FloatTensor  # [E]
-    top_edge_mask: torch.BoolTensor  # [E] true 表示保留边
+    # 可选审计字段：标记该边是否来自 retriever Top-K（或其它“保留规则”）。
+    # 最终 GFlowNet 训练不依赖此字段；若缓存缺失，将在加载时确定性地补全为全 True。
+    top_edge_mask: torch.BoolTensor  # [E]
     # 关键节点（全局/局部）
     start_entity_ids: torch.LongTensor  # [Ks]
     answer_entity_ids: torch.LongTensor  # [Ka]
@@ -124,7 +126,6 @@ def _parse_sample(record: Dict) -> GAgentSample:
         "edge_tail_locals",
         "node_entity_ids",
         "node_embedding_ids",
-        "top_edge_mask",
         "start_entity_ids",
         "start_node_locals",
         "answer_entity_ids",
@@ -148,7 +149,6 @@ def _parse_sample(record: Dict) -> GAgentSample:
     edge_relations = as_long("edge_relations")
     edge_scores = as_float("edge_scores")
     edge_labels = as_float("edge_labels")
-    top_edge_mask = as_bool("top_edge_mask")
     node_embedding_ids = as_long("node_embedding_ids")
 
     num_edges = edge_head_locals.numel()
@@ -160,11 +160,27 @@ def _parse_sample(record: Dict) -> GAgentSample:
         "edge_relations": edge_relations,
         "edge_scores": edge_scores,
         "edge_labels": edge_labels,
-        "top_edge_mask": top_edge_mask,
     }
     for name, tensor in tensors_with_expected_edges.items():
         if tensor.numel() != num_edges:
             raise ValueError(f"{name} length {tensor.numel()} != num_edges {num_edges} for {record.get('sample_id')}")
+
+    top_edge_mask: torch.Tensor
+    if "top_edge_mask" in record:
+        top_edge_mask = as_bool("top_edge_mask")
+        if top_edge_mask.numel() != num_edges:
+            raise ValueError(
+                f"top_edge_mask length {top_edge_mask.numel()} != num_edges {num_edges} for {record.get('sample_id')}"
+            )
+    elif "top_edge_local_indices" in record:
+        top_edge_mask = torch.zeros(num_edges, dtype=torch.bool)
+        idx = torch.as_tensor(record["top_edge_local_indices"], dtype=torch.long).view(-1)
+        if idx.numel() > 0:
+            if (idx < 0).any() or (idx >= num_edges).any():
+                raise ValueError(f"top_edge_local_indices out of range for {record.get('sample_id')}")
+            top_edge_mask[idx] = True
+    else:
+        top_edge_mask = torch.ones(num_edges, dtype=torch.bool)
 
     if node_embedding_ids.numel() != num_nodes:
         raise ValueError(
@@ -201,12 +217,6 @@ def _parse_sample(record: Dict) -> GAgentSample:
     answer_entity_ids = as_long("answer_entity_ids")
     start_node_locals = as_long("start_node_locals")
     answer_node_locals = as_long("answer_node_locals")
-    if answer_entity_ids.numel() != answer_node_locals.numel():
-        raise ValueError(
-            f"answer_entity_ids length {answer_entity_ids.numel()} "
-            f"!= answer_node_locals length {answer_node_locals.numel()} for {record.get('sample_id')}; "
-            "builder must drop unreachable/duplicate answers to keep pointers aligned."
-        )
 
     for name, locals_tensor in (("start_node_locals", start_node_locals), ("answer_node_locals", answer_node_locals)):
         if locals_tensor.numel() > 0 and ((locals_tensor < 0).any() or (locals_tensor >= num_nodes).any()):
@@ -254,8 +264,6 @@ def _parse_sample(record: Dict) -> GAgentSample:
         sample.question_emb = sample.question_emb.unsqueeze(0)
     if sample.start_entity_ids.numel() == 0:
         raise ValueError(f"g_agent record missing non-empty start_entity_ids: {record.get('sample_id')}")
-    if sample.answer_entity_ids.numel() == 0:
-        raise ValueError(f"g_agent record missing non-empty answer_entity_ids: {record.get('sample_id')}")
     if sample.start_node_locals.numel() == 0:
         raise ValueError(
             f"g_agent record missing start_node_locals for {record.get('sample_id')}; "
@@ -322,7 +330,6 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
         edge_attr=sample.edge_relations,
         edge_scores=sample.edge_scores,
         edge_labels=sample.edge_labels,
-        top_edge_mask=sample.top_edge_mask,
         node_global_ids=sample.node_entity_ids,
         node_embedding_ids=sample.node_embedding_ids,
         question_emb=question_emb,
@@ -393,7 +400,11 @@ def pyg_batch_to_dense(batch: PyGData) -> Dict[str, torch.Tensor | List[str | No
         edge_labels[g, :e_count] = batch.edge_labels[edge_slice]
         edge_local_ids[g, :e_count] = torch.arange(e_count, device=device)
         edge_mask[g, :e_count] = True
-        top_edge_mask[g, :e_count] = batch.top_edge_mask[edge_slice]
+        top_mask_src = getattr(batch, "top_edge_mask", None)
+        if top_mask_src is None:
+            top_edge_mask[g, :e_count] = True
+        else:
+            top_edge_mask[g, :e_count] = top_mask_src[edge_slice].to(device=device, dtype=torch.bool)
 
         node_entity_ids[g, :n_count] = batch.node_global_ids[node_slice]
         node_local_ids[g, :n_count] = torch.arange(n_count, device=device)

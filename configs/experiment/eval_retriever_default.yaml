@@ -26,7 +26,7 @@ g_agent:
   enabled: true
   splits: ["train", "validation", "test"]
   output_dir: ${dataset.materialized_dir}/g_agent
-  anchor_top_k: 400
+  anchor_top_k: 200
   force_include_gt:
     train: true
     validation: false

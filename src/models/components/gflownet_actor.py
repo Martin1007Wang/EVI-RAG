@@ -28,6 +28,7 @@ class GFlowNetActor(nn.Module):
         eval_policy_temperature: Optional[float],
         stop_logit_bias: float,
         random_action_prob: float,
+        score_eps: float,
         debug_actions: bool,
         debug_actions_steps: int,
     ) -> None:
@@ -41,6 +42,7 @@ class GFlowNetActor(nn.Module):
         )
         self.stop_logit_bias = float(stop_logit_bias)
         self.random_action_prob = float(random_action_prob)
+        self.score_eps = float(score_eps)
         self.debug_actions = bool(debug_actions)
         self.debug_actions_steps = max(int(debug_actions_steps), 0)
 
@@ -54,13 +56,10 @@ class GFlowNetActor(nn.Module):
         edge_ptr: torch.Tensor,
         node_ptr: torch.Tensor,
         edge_scores: torch.Tensor,
-        path_mask: Optional[torch.Tensor],
-        path_exists: Optional[torch.Tensor],
         training: bool,
-        gt_replay: bool,
-        prior_alpha: float = 0.0,
-        prior_score_eps: float = 1e-4,
         batch_idx: Optional[int] = None,
+        graph_cache: Optional[Dict[str, torch.Tensor]] = None,
+        node_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         # 选择分布温度：训练/评估可分离，用于 ablation。
         base_temperature = self.policy_temperature if training else self.eval_policy_temperature
@@ -73,66 +72,135 @@ class GFlowNetActor(nn.Module):
 
         device = edge_tokens.device
         num_graphs = int(node_ptr.numel() - 1)
-        assert (
-            batch._slice_dict["answer_entity_ids"].shape == batch._slice_dict["answer_node_locals"].shape
-        ), "answer_entity_ids ptr must align with answer_node_locals ptr"
-        if batch.gt_path_edge_local_ids.numel() > 0:
-            max_gt = int(batch.gt_path_edge_local_ids.max().item())
-            assert max_gt < batch.edge_index.size(1), "gt_path_edge_local_ids exceeds edge_index size"
+        score_eps = self.score_eps
+        if score_eps <= 0.0:
+            raise ValueError(f"score_eps must be > 0, got {score_eps}")
 
-        graph_dict = {
-            "edge_index": batch.edge_index.to(device),
-            "edge_batch": edge_batch,
-            "node_global_ids": batch.node_global_ids.to(device),
-            "node_ptr": node_ptr,
-            "edge_ptr": edge_ptr,
-            "start_node_locals": batch.start_node_locals.to(device),
-            "start_ptr": batch._slice_dict["start_node_locals"].to(device),
-            "start_entity_ids": batch.start_entity_ids.to(device),
-            "start_entity_ptr": batch._slice_dict["start_entity_ids"].to(device),
-            "answer_node_locals": batch.answer_node_locals.to(device),
-            "answer_ptr": batch._slice_dict["answer_entity_ids"].to(device),
-            "answer_entity_ids": batch.answer_entity_ids.to(device),
-            "edge_relations": batch.edge_attr.to(device),
-            "edge_labels": batch.edge_labels.to(device),
-            "top_edge_mask": batch.top_edge_mask.to(device),
-            "gt_path_edge_local_ids": batch.gt_path_edge_local_ids.to(device),
-            "gt_edge_ptr": batch._slice_dict["gt_path_edge_local_ids"].to(device),
-            "gt_path_exists": batch.gt_path_exists.to(device),
-            "is_answer_reachable": batch.is_answer_reachable.to(device),
-        }
+        if graph_cache is not None:
+            graph_dict = graph_cache
+            node_global_ids = graph_cache["node_global_ids"]
+            edge_index = graph_cache["edge_index"]
+            heads_global = graph_cache["heads_global"]
+            tails_global = graph_cache["tails_global"]
+            edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
+            base_edge_logits = torch.log(edge_scores.clamp(min=score_eps))
+        else:
+            # 预计算静态张量，避免循环内重复搬运/索引
+            node_global_ids = batch.node_global_ids.to(device)
+            edge_index = batch.edge_index.to(device)
+            heads_global = node_global_ids[edge_index[0]]
+            tails_global = node_global_ids[edge_index[1]]
+            base_edge_logits = torch.log(edge_scores.clamp(min=score_eps))
+            edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
+
+            graph_dict = {
+                "edge_index": edge_index,
+                "edge_batch": edge_batch,
+                "node_global_ids": node_global_ids,
+                "heads_global": heads_global,
+                "tails_global": tails_global,
+                "node_ptr": node_ptr,
+                "edge_ptr": edge_ptr,
+                "start_node_locals": batch.start_node_locals.to(device),
+                "start_ptr": batch._slice_dict["start_node_locals"].to(device),
+                "start_entity_ids": batch.start_entity_ids.to(device),
+                "start_entity_ptr": batch._slice_dict["start_entity_ids"].to(device),
+                "answer_node_locals": batch.answer_node_locals.to(device),
+                "answer_ptr": batch._slice_dict["answer_entity_ids"].to(device),
+                "answer_entity_ids": batch.answer_entity_ids.to(device),
+                "edge_relations": batch.edge_attr.to(device),
+                "edge_labels": batch.edge_labels.to(device),
+                "is_answer_reachable": batch.is_answer_reachable.to(device),
+            }
         state = self.env.reset(graph_dict, device=device)
 
+        start_state_emb: Optional[torch.Tensor] = None
+        if node_tokens is not None:
+            if node_tokens.dim() != 2:
+                raise ValueError(f"node_tokens must be [N_total,H], got shape={tuple(node_tokens.shape)}")
+            if node_tokens.size(0) != int(state.graph.node_ptr[-1].item()):
+                raise ValueError(
+                    "node_tokens size mismatch with batch nodes: "
+                    f"node_tokens.size(0)={int(node_tokens.size(0))} vs node_ptr[-1]={int(state.graph.node_ptr[-1].item())}"
+                )
+            counts = (state.graph.start_ptr[1:] - state.graph.start_ptr[:-1]).to(device=device)
+            start_nodes = state.graph.start_node_locals.to(device=device, dtype=torch.long).view(-1)
+            start_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), counts)
+            start_sum = scatter_add(node_tokens[start_nodes], start_batch, dim=0, dim_size=num_graphs)
+            denom = counts.clamp(min=1).to(dtype=start_sum.dtype).unsqueeze(-1)
+            start_state_emb = start_sum / denom
+
         log_pf = torch.zeros(num_graphs, dtype=torch.float32, device=device)
-        use_gt_replay = gt_replay and path_exists is not None and bool(path_exists.any())
-        log_pf_gt = torch.zeros(num_graphs, dtype=torch.float32, device=device) if use_gt_replay else None
-        gt_positions = torch.zeros(num_graphs, dtype=torch.long, device=device) if use_gt_replay else None
-        gt_edges = batch.gt_path_edge_local_ids.to(device) if use_gt_replay else None
-        gt_ptr = batch._slice_dict["gt_path_edge_local_ids"].to(device) if use_gt_replay else None
+        num_steps = self.max_steps + 1  # max_edges + 1 stop step
+        log_pf_steps = torch.zeros(num_graphs, num_steps, dtype=torch.float32, device=device)
+        actions_seq = torch.full((num_graphs, num_steps), -1, dtype=torch.long, device=device)
+        state_emb_seq = torch.zeros(
+            num_graphs,
+            num_steps,
+            int(question_tokens.size(-1)),
+            dtype=edge_tokens.dtype,
+            device=device,
+        )
 
         debug_logged: bool = not self.debug_actions or self.debug_actions_steps <= 0 or (batch_idx is not None and batch_idx != 0)
 
-        actions = edge_ptr[1:].clone()
+        stop_indices = edge_ptr[1:]
+        actions = stop_indices.clone()
 
-        for step in range(self.max_steps + 1):
+        def _log_probs_from_logits(
+            *,
+            edge_logits: torch.Tensor,
+            stop_logits: torch.Tensor,
+            valid_edges: torch.Tensor,
+            temp: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            masked_edge_logits = edge_logits.masked_fill(~valid_edges, LARGE_NEG)
+            scaled_edge_logits = masked_edge_logits / temp
+            scaled_stop_logits = stop_logits / temp
+
+            # Segment-wise logsumexp(edge logits, stop logit) for normalization.
+            max_edge, _ = scatter_max(scaled_edge_logits, edge_batch, dim=0, dim_size=num_graphs)
+            has_edge = torch.bincount(edge_batch, minlength=num_graphs) > 0
+            max_edge = torch.where(has_edge, max_edge, torch.full_like(max_edge, LARGE_NEG))
+            max_joint = torch.maximum(max_edge, scaled_stop_logits)
+
+            exp_edges = scatter_add(
+                torch.exp(scaled_edge_logits - max_joint[edge_batch]),
+                edge_batch,
+                dim=0,
+                dim_size=num_graphs,
+            )
+            exp_stop = torch.exp(scaled_stop_logits - max_joint)
+            log_denom = max_joint + torch.log(exp_edges + exp_stop + eps)
+
+            log_edge = scaled_edge_logits - log_denom[edge_batch]
+            log_stop = scaled_stop_logits - log_denom
+            log_edge = log_edge.masked_fill(~valid_edges, LARGE_NEG)
+            return log_edge, log_stop
+
+        for step in range(num_steps):
             if state.done.all():
                 break
 
             action_mask_edges = self.env.action_mask_edges(state)
             frontier_mask_edges = self.env.frontier_mask_edges(state)
-            edge_logits, stop_logits, _ = self.policy(
+            edge_residual, stop_residual, state_emb = self.policy(
                 edge_tokens,
                 question_tokens,
                 edge_batch,
                 state.selected_mask,
-                edge_heads=batch.node_global_ids[batch.edge_index[0]].to(device),
-                edge_tails=batch.node_global_ids[batch.edge_index[1]].to(device),
+                edge_heads=heads_global,
+                edge_tails=tails_global,
                 current_tail=state.current_tail,
                 frontier_mask=frontier_mask_edges,
             )
-            if prior_alpha > 0.0:
-                safe_scores = torch.clamp(edge_scores, min=prior_score_eps)
-                edge_logits = edge_logits + prior_alpha * safe_scores.log()
+            if node_tokens is not None and start_state_emb is not None:
+                is_step0_graph = state.step_counts == 0
+                tail_local = state.current_tail_local.clamp(min=0)
+                tail_emb = node_tokens[tail_local].to(dtype=state_emb.dtype)
+                start_emb = start_state_emb.to(dtype=state_emb.dtype)
+                state_emb = state_emb + torch.where(is_step0_graph.view(-1, 1), start_emb, tail_emb)
+            state_emb_seq[:, step] = state_emb
 
             if not debug_logged:
                 debug_logged = self._log_debug_actions(
@@ -141,7 +209,7 @@ class GFlowNetActor(nn.Module):
                     edge_ptr=edge_ptr,
                     graph_dict=graph_dict,
                     action_mask_edges=action_mask_edges,
-                    edge_logits=edge_logits,
+                    edge_logits=edge_residual,
                     state=state,
                     batch=batch,
                 )
@@ -149,14 +217,9 @@ class GFlowNetActor(nn.Module):
             # 有效 mask：屏蔽已完成图与非法边，避免 per-graph Python 循环。
             graph_done = state.done
             # stop 索引定义为该图片段结束位置（合法范围内的虚拟停止），env.step 必须识别为 stop。
-            stop_indices = edge_ptr[1:]
             valid_edges = action_mask_edges & (~graph_done[edge_batch])
 
-            # Stop logits 仅使用静态偏置，避免随 edge score 漂移导致策略失真。
-            scaled_stop_logits = (stop_logits.squeeze(-1) + self.stop_logit_bias) / temperature
-
             # 归一化常数：segment-wise logsumexp
-            edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
             valid_counts = (
                 torch.bincount(edge_batch[valid_edges], minlength=num_graphs)
                 if valid_edges.any()
@@ -165,115 +228,73 @@ class GFlowNetActor(nn.Module):
             has_edge = edge_counts > 0
             has_valid_edge = valid_counts > 0
             total_actions = valid_counts.float() + 1.0  # +1 for stop
-            uniform_edge_prob = torch.zeros_like(edge_logits).float()
+            uniform_edge_prob = torch.zeros_like(edge_residual, dtype=torch.float32)
             if valid_edges.any():
                 uniform_edge_prob[valid_edges] = 1.0 / total_actions[edge_batch[valid_edges]].clamp(min=1.0)
             uniform_stop_prob = 1.0 / total_actions.clamp(min=1.0)
 
-            def _log_probs(masked_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-                scaled_edge_logits = masked_logits / temperature
-                max_edge, _ = scatter_max(scaled_edge_logits, edge_batch, dim=0, dim_size=num_graphs)
-                max_edge = torch.where(has_edge, max_edge, torch.full_like(max_edge, LARGE_NEG))
-                max_joint = torch.maximum(max_edge, scaled_stop_logits)
-                exp_edges = scatter_add(
-                    torch.exp(scaled_edge_logits - max_joint[edge_batch]),
-                    edge_batch,
-                    dim=0,
-                    dim_size=num_graphs,
-                )
-                exp_stop = torch.exp(scaled_stop_logits - max_joint)
-                log_denom = max_joint + torch.log(exp_edges + exp_stop + eps)
+            # --- Base distribution P_retriever(a|s): normalize retriever scores under the current action mask. ---
+            base_stop_logits = torch.full((num_graphs,), self.stop_logit_bias, device=device, dtype=edge_tokens.dtype)
+            base_log_edge, base_log_stop = _log_probs_from_logits(
+                edge_logits=base_edge_logits,
+                stop_logits=base_stop_logits,
+                valid_edges=valid_edges,
+                temp=1.0,
+            )
 
-                log_edge_prob = scaled_edge_logits - log_denom[edge_batch]
-                log_stop_prob = scaled_stop_logits - log_denom
-                edge_prob = torch.exp(log_edge_prob)
-                stop_prob = torch.exp(log_stop_prob)
-                final_edge_prob = (1.0 - random_action_prob) * edge_prob + random_action_prob * uniform_edge_prob
-                final_stop_prob = (1.0 - random_action_prob) * stop_prob + random_action_prob * uniform_stop_prob
-                log_final_edge = torch.log(final_edge_prob.clamp(min=prob_eps))
-                log_final_stop = torch.log(final_stop_prob.clamp(min=prob_eps))
-                log_final_edge = log_final_edge.masked_fill(~valid_edges, LARGE_NEG)
-                return log_final_edge, log_final_stop
+            # --- Residual policy: logit = log P_base + residual, then renormalize. ---
+            combined_edge_logits = base_log_edge + edge_residual
+            combined_stop_logits = base_log_stop + stop_residual
+            clean_log_edge, clean_log_stop = _log_probs_from_logits(
+                edge_logits=combined_edge_logits,
+                stop_logits=combined_stop_logits,
+                valid_edges=valid_edges,
+                temp=temperature,
+            )
 
-            masked_logits = edge_logits.masked_fill(~valid_edges, LARGE_NEG)
-            log_final_edge, log_final_stop = _log_probs(masked_logits)
+            # --- Sampling distribution: epsilon-greedy mixture (NO gradient through noise; log_pf uses clean probs). ---
+            clean_edge_prob = torch.exp(clean_log_edge)
+            clean_stop_prob = torch.exp(clean_log_stop)
+            sample_edge_prob = clean_edge_prob
+            sample_stop_prob = clean_stop_prob
+            if random_action_prob > 0.0:
+                sample_edge_prob = (1.0 - random_action_prob) * clean_edge_prob + random_action_prob * uniform_edge_prob
+                sample_stop_prob = (1.0 - random_action_prob) * clean_stop_prob + random_action_prob * uniform_stop_prob
+            log_sample_edge = torch.log(sample_edge_prob.clamp(min=prob_eps)).masked_fill(~valid_edges, LARGE_NEG)
+            log_sample_stop = torch.log(sample_stop_prob.clamp(min=prob_eps))
 
             # 采样：温度极低时走贪心，否则走 Gumbel-Max，基于混合后的分布。
             if is_greedy:
-                score_edges = log_final_edge
-                score_stop = log_final_stop
+                score_edges = log_sample_edge
+                score_stop = log_sample_stop
             else:
-                score_edges = log_final_edge + self._gumbel_like(log_final_edge)
-                score_stop = log_final_stop + self._gumbel_like(log_final_stop)
+                score_edges = log_sample_edge + self._gumbel_like(log_sample_edge)
+                score_stop = log_sample_stop + self._gumbel_like(log_sample_stop)
             score_edges_max, edge_argmax = scatter_max(score_edges, edge_batch, dim=0, dim_size=num_graphs)
             score_edges_max = torch.where(has_valid_edge, score_edges_max, torch.full_like(score_edges_max, LARGE_NEG))
             edge_argmax = torch.where(has_valid_edge, edge_argmax, torch.zeros_like(edge_argmax))
 
             choose_edge = has_valid_edge & (score_edges_max > score_stop)
             sampled_actions = torch.where(choose_edge, edge_argmax, stop_indices)
-            log_pf_sampled = torch.where(choose_edge, log_final_edge[edge_argmax], log_final_stop)
-
-            # GT replay（teacher forcing）：仅对 path_exists 图替换动作/对数概率。
-            use_gt = torch.zeros(num_graphs, dtype=torch.bool, device=device)
-            if use_gt_replay and path_exists is not None:
-                use_gt = path_exists.bool()
-                # 对使用 GT 的图启用环境绕过动作 mask（允许重复/回退），仅限 GT teacher forcing。
-                state.graph.bypass_action_mask = use_gt
+            # 行为策略对应该采样分布（含 epsilon），保持 TB 自洽
+            log_pf_behavior = torch.where(choose_edge, log_sample_edge[edge_argmax], log_sample_stop)
 
             # Step 0: 强制至少走一条边（若存在），避免起点即 stop。
             if step == 0:
                 choose_edge = has_valid_edge
                 sampled_actions = torch.where(choose_edge, edge_argmax, stop_indices)
-                log_pf_sampled = torch.where(choose_edge, log_final_edge[edge_argmax], log_final_stop)
+                log_pf_behavior = torch.where(choose_edge, log_sample_edge[edge_argmax], log_sample_stop)
 
-            gt_continue = torch.zeros(num_graphs, dtype=torch.bool, device=device)
-            gt_stop = torch.zeros_like(gt_continue)
-            gt_edge_choices = torch.full_like(sampled_actions, fill_value=-1)
-            if use_gt.any():
-                if gt_ptr is None or gt_edges is None or gt_positions is None or log_pf_gt is None:
-                    raise RuntimeError("GT replay structures are missing despite use_gt_replay=True.")
-                gt_lengths = gt_ptr[1:] - gt_ptr[:-1]
-                gt_continue = use_gt & (gt_lengths > 0) & (gt_positions < gt_lengths)
-                gt_stop = use_gt & (~gt_continue)
-
-                # 将本地 gt 边索引转为全局边索引：仅对活跃图计算 offset，避免 repeat_interleave。
-                if gt_continue.any():
-                    active_gt = torch.nonzero(gt_continue).view(-1)
-                    local_pos = gt_ptr[active_gt] + gt_positions[active_gt]
-                    local_pos = torch.clamp(local_pos, max=gt_edges.numel() - 1)
-                    # 注意：gt_path_edge_local_ids 在 PyG collate 后已累加成 batch 级绝对边索引
-                    global_edges = gt_edges[local_pos]
-                    # 额外校验：确保 gt 边落在所属图的边段内
-                    span_start = edge_ptr[active_gt]
-                    span_end = edge_ptr[active_gt + 1]
-                    out_of_span = (global_edges < span_start) | (global_edges >= span_end)
-                    if out_of_span.any():
-                        bad = torch.nonzero(out_of_span, as_tuple=False).view(-1)
-                        raise ValueError(
-                            f"gt_path_edge_local_ids out of range for graphs {active_gt[bad].tolist()} "
-                            f"global_edges={global_edges[bad].tolist()} "
-                            f"edge_span={[(int(span_start[i].item()), int(span_end[i].item())) for i in bad.tolist()]}"
-                        )
-                gt_edge_choices[active_gt] = global_edges
-
-            gt_log_p = torch.zeros_like(log_pf_sampled)
-            if gt_continue.any():
-                chosen_edges = gt_edge_choices[gt_continue]
-                gt_log_p[gt_continue] = log_final_edge[chosen_edges]
-            if gt_stop.any():
-                gt_log_p[gt_stop] = log_final_stop[gt_stop]
-
-            actions = torch.where(gt_continue, gt_edge_choices, torch.where(gt_stop, stop_indices, sampled_actions))
-            log_pf_vec = torch.where(use_gt, gt_log_p, log_pf_sampled)
-            if log_pf_gt is not None:
-                log_pf_gt = log_pf_gt + torch.where(use_gt, gt_log_p, torch.zeros_like(log_pf_gt))
-                gt_positions = torch.where(gt_continue, gt_positions + 1, gt_positions)
+            actions = sampled_actions
+            log_pf_vec = log_pf_behavior
 
             # 已完成图强制停留，log_pf 增量为 0。
             actions = torch.where(graph_done, stop_indices, actions)
             log_pf_vec = torch.where(graph_done, torch.zeros_like(log_pf_vec), log_pf_vec)
 
             log_pf = log_pf + log_pf_vec
+            log_pf_steps[:, step] = log_pf_vec
+            actions_seq[:, step] = actions
             state = self.env.step(state, actions, step_index=step)
 
         reach_success = state.answer_hits.float()
@@ -287,6 +308,9 @@ class GFlowNetActor(nn.Module):
 
         result = {
             "log_pf": log_pf,
+            "log_pf_steps": log_pf_steps,
+            "actions_seq": actions_seq,
+            "state_emb_seq": state_emb_seq,
             "selected_mask": state.selected_mask,
             "selection_order": state.selection_order,
             "actions": actions,
@@ -294,8 +318,6 @@ class GFlowNetActor(nn.Module):
             "reach_success": reach_success.float(),
             "length": length,
         }
-        if log_pf_gt is not None:
-            result["log_pf_gt"] = log_pf_gt
         return result
 
     def _log_debug_actions(

@@ -1,0 +1,38 @@
+{
+  "settings": {
+    "split": "test",
+    "ranking_k": [1, 5],
+    "answer_k": [1, 5]
+  },
+  "samples": [
+    {
+      "sample_id": "q1",
+      "question": "mock question 1",
+      "answer_entity_ids": [42],
+      "triplets_by_k": {
+        "5": [
+          {"head_entity_id": 1, "relation_id": 0, "tail_entity_id": 2, "score": 0.9, "label": 0.0, "rank": 1},
+          {"head_entity_id": 3, "relation_id": 0, "tail_entity_id": 42, "score": 0.8, "label": 0.0, "rank": 2},
+          {"head_entity_id": 4, "relation_id": 0, "tail_entity_id": 5, "score": 0.7, "label": 0.0, "rank": 3},
+          {"head_entity_id": 6, "relation_id": 0, "tail_entity_id": 7, "score": 0.6, "label": 0.0, "rank": 4},
+          {"head_entity_id": 8, "relation_id": 0, "tail_entity_id": 9, "score": 0.5, "label": 0.0, "rank": 5}
+        ]
+      }
+    },
+    {
+      "sample_id": "q2",
+      "question": "mock question 2",
+      "answer_entity_ids": [7, 8],
+      "triplets_by_k": {
+        "5": [
+          {"head_entity_id": 7, "relation_id": 0, "tail_entity_id": 100, "score": 0.9, "label": 0.0, "rank": 1},
+          {"head_entity_id": 1, "relation_id": 0, "tail_entity_id": 2, "score": 0.8, "label": 0.0, "rank": 2},
+          {"head_entity_id": 3, "relation_id": 0, "tail_entity_id": 4, "score": 0.7, "label": 0.0, "rank": 3},
+          {"head_entity_id": 5, "relation_id": 0, "tail_entity_id": 6, "score": 0.6, "label": 0.0, "rank": 4},
+          {"head_entity_id": 9, "relation_id": 0, "tail_entity_id": 10, "score": 0.5, "label": 0.0, "rank": 5}
+        ]
+      }
+    }
+  ]
+}
+

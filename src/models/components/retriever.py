@@ -181,7 +181,8 @@ class Retriever(nn.Module):
             return node_batch[head_idx]
         ptr = getattr(batch, "ptr", None)
         if ptr is not None:
-            return torch.bucketize(head_idx, ptr[1:], right=False)
+            # Use `right=True` to assign boundary nodes (idx == ptr[g]) to graph g.
+            return torch.bucketize(head_idx, ptr[1:], right=True)
         return head_idx.new_zeros(head_idx.numel(), dtype=head_idx.dtype)
 
 

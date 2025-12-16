@@ -24,6 +24,7 @@ class GAgentDataModule(LightningDataModule):
         pin_memory: bool = True,
         drop_last: bool = False,
         persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
         shuffle_train: bool = True,
         drop_unreachable: bool = False,
         resources: Optional[Dict[str, str]] = None,
@@ -35,6 +36,7 @@ class GAgentDataModule(LightningDataModule):
         self.pin_memory = bool(pin_memory)
         self.drop_last = bool(drop_last)
         self.persistent_workers = bool(persistent_workers)
+        self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
         self.shuffle_train = bool(shuffle_train)
         self.drop_unreachable = bool(drop_unreachable)
         self.resources_cfg = resources
@@ -67,6 +69,7 @@ class GAgentDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=self.drop_last,
             persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
         )
 
     def val_dataloader(self) -> PyGDataLoader:
@@ -80,6 +83,7 @@ class GAgentDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=False,
             persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
         )
 
     def test_dataloader(self) -> PyGDataLoader:
@@ -93,6 +97,7 @@ class GAgentDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=False,
             persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
         )
 
     def _build_dataset(self, split: str) -> Optional[GAgentPyGDataset]:

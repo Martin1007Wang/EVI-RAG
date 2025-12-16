@@ -17,9 +17,10 @@ seed: 42
 optimized_metric: "val/rollout_reward"
 
 # 打开 GFlowNet 专用 debug 日志（独立文件 logs/gflownet_debug.log）。
-gflownet_debug: true
-# 若需环境内对拍 success/hit（首图详细命中日志），打开 env_debug
-env_debug: true
+# 训练提速默认关闭，如需对拍再显式打开。
+gflownet_debug: false
+# 若需环境内对拍 success/hit（首图详细命中日志），打开 env_debug；默认关闭以减少日志开销。
+env_debug: false
 
 # Ensure validation runs every epoch for early stopping/monitoring.
 trainer:
@@ -37,12 +38,4 @@ callbacks:
     mode: max
     patience: 50
 
-# Soft prior 默认偏弱并可调；如需关闭先验，将 retriever_prior_alpha 设为 0。
-model:
-  training_cfg:
-    retriever_prior_alpha: 2.0
-    retriever_prior_anneal:
-      start: 2.0
-      end: 0.5
-      steps: 10000
-    gt_loss_weight: 0.15
+# Residual GFlowNet：PF 以 retriever 分数为 base；在该“显式轨迹状态”定义下 P_B 为确定性回退（log P_B=0），使用 SubTB（无辅助项）。

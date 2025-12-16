@@ -9,11 +9,8 @@ retriever:
   _target_: src.models.components.retriever.Retriever
   emb_dim: 1024
   hidden_dim: 1024
+  # Checkpoints（如 webqsp retriever 021）是在结构特征打开的情况下训练的，需保持一致维度。
   topic_pe: true
-  num_topics: 2
-  dde_cfg:
-    num_rounds: 2
-    num_reverse_rounds: 2
   dropout_p: 0.1
 
 loss:

@@ -109,6 +109,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Hydra config groups (do not ignore)
+!configs/model/env/
+!configs/model/env/**
+
 # Spyder project settings
 .spyderproject
 .spyproject

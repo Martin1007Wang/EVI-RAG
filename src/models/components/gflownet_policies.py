@@ -8,6 +8,20 @@ from torch import nn
 TYPE_SELECTED = 2
 
 
+def _zero_init_last_linear(module: nn.Module) -> None:
+    """Zero-init the last Linear layer so the policy starts as a pure residual (all-zeros)."""
+    last_linear = None
+    for sub in reversed(list(module.modules())):
+        if isinstance(sub, nn.Linear):
+            last_linear = sub
+            break
+    if last_linear is None:
+        raise ValueError("Expected nn.Linear in module for zero-init, but found none.")
+    nn.init.constant_(last_linear.weight, 0.0)
+    if last_linear.bias is not None:
+        nn.init.constant_(last_linear.bias, 0.0)
+
+
 def _compute_lookahead_states(
     edge_repr_selected: torch.Tensor,
     edge_batch: torch.Tensor,
@@ -79,6 +93,8 @@ class EdgeMLPMixerPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
+        _zero_init_last_linear(self.lookahead_head)
+        _zero_init_last_linear(self.stop_proj)
 
     def forward(
         self,
@@ -149,6 +165,8 @@ class EdgeFrontierPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
+        _zero_init_last_linear(self.lookahead_head)
+        _zero_init_last_linear(self.stop_head)
 
     def forward(
         self,
@@ -238,6 +256,8 @@ class EdgeGATPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
+        _zero_init_last_linear(self.lookahead_head)
+        _zero_init_last_linear(self.stop_head)
 
     def forward(
         self,

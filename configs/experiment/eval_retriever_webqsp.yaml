@@ -2,8 +2,7 @@
 
 defaults:
   - eval_retriever_default
-  # Use the same filtered dataset used for retriever training.
-  - override /dataset: webqsp-sub
+  - override /dataset: webqsp
 
 tags: ["eval", "retriever", "webqsp"]
 

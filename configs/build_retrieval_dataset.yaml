@@ -11,7 +11,7 @@ output_dir: ${dataset.materialized_dir}
 
 # Optional: also materialize a `${dataset.name}-${sub.suffix}` dataset if its normalized parquet exists.
 sub:
-  enabled: true
+  enabled: false
   suffix: sub
   parquet_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/normalized
   output_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/materialized

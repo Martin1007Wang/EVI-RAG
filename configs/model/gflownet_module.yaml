@@ -13,44 +13,23 @@ _recursive_: false
 hidden_dim: 1024
 
 training_cfg:
-  normalize_log_reward: true
-  gt_replay_ratio: 0.3
-  learn_pb: true
   debug_batches_to_log: 1
   debug_graphs_to_log: 2
-  retriever_prior_alpha: 2.0        # retriever 分数的对数软先验系数（0 保持现有行为）
-  retriever_prior_anneal:
-    start: 2.0
-    end: 0.5
-    steps: 10000
-  # PB 辅助损失权重，可退火到 0，避免长期行为克隆约束 TB
-  pb_loss_weight: 1.0
-  pb_loss_anneal:
-    start: 1.0
-    end: 0.0
-    steps: 5000
-  gt_loss_weight: 0.15              # teacher forcing CE 权重，默认关闭，仅 TB 驱动
 
 evaluation_cfg:
   num_eval_rollouts: [10, 20]       # 采样窗口 K_s（Best-of-K_s）
-  path_hit_k: [1, 5, 10, 20]         # 路径窗口 K_p（单条轨迹前 K_p 条边评估）
 
 optimizer_cfg:
   type: adamw
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  param_groups:
-    - params:
-        - estimator.log_z_head
-        - estimator.log_z_condition
-      lr: 1.0e-3
 
 scheduler_cfg:
   type: cosine
   t_max: 200
   eta_min: 1.0e-6
   interval: epoch
-  monitor: val/reward
+  monitor: val/rollout_reward
 
 logging_cfg:
   # 指标进度条：训练阶段
@@ -58,5 +37,5 @@ logging_cfg:
   # 指标进度条：验证/测试阶段（会自动追加 success@K / path_hit_f1@K，如果配置中存在）
   eval_prog_bar: ["success_mean", "answer_f1"]
   auto_add_success_at_k: true
-  auto_add_path_hit_f1: true
+  auto_add_path_hit_f1: false
   log_on_step_train: false
