@@ -2,6 +2,8 @@
 
 defaults:
   - eval_retriever_default
+  # Use the filtered dataset to match retriever training and avoid empty-graph samples.
   - override /dataset: cwq-sub
 
-tags: ["retriever", "eval", "cwq"]
+tags: ["cwq", "eval_retriever"]
+

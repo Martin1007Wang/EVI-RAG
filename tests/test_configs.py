@@ -2,6 +2,8 @@ import pytest
 
 hydra = pytest.importorskip("hydra")
 pytest.importorskip("omegaconf")
+from pathlib import Path
+
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
@@ -38,3 +40,25 @@ def test_eval_config(cfg_eval: DictConfig) -> None:
     hydra.utils.instantiate(cfg_eval.data)
     hydra.utils.instantiate(cfg_eval.model)
     hydra.utils.instantiate(cfg_eval.trainer)
+
+
+def test_llm_reasoner_truth_experiment_wiring() -> None:
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="eval.yaml",
+            return_hydra_config=True,
+            overrides=[
+                "experiment=llm_reasoner_truth_webqsp",
+                "trainer=cpu",
+                "logger=none",
+                "callbacks=none",
+            ],
+        )
+
+    assert cfg.data._target_ == "src.data.llm_reasoner_truth_datamodule.LLMReasonerTruthDataModule"
+    assert cfg.model._target_ == "src.models.llm_reasoner_truth_module.LLMReasonerTruthModule"

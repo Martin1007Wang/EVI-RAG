@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - eval_gflownet_default
+  - override /dataset: cwq
+
+tags: ["cwq", "eval_gflownet"]
+

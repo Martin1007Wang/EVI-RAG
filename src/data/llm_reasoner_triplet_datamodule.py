@@ -10,6 +10,7 @@ import torch
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader, Dataset
 
+from src.data.components.embedding_store import EmbeddingStore
 from src.data.components.graph_store import GraphStore
 from src.utils.llm_prompting import build_triplet_prompt
 from src.utils.metrics import normalize_k_values
@@ -42,6 +43,9 @@ class LLMReasonerTripletDataModule(LightningDataModule):
         entity_vocab_path: str,
         relation_vocab_path: str,
         triplet_limits: Sequence[int],
+        retrieval_lmdb_dir: Optional[str] = None,
+        token_budget: Optional[int] = None,
+        token_budget_encoding: Optional[str] = "cl100k_base",
         system_prompt: str = "You are a concise QA agent. Use the given triplets to answer with `Ans: <entity>`.",
         num_workers: int = 0,
         prompt_tag: str = "triplets",
@@ -56,13 +60,23 @@ class LLMReasonerTripletDataModule(LightningDataModule):
         self.triplet_limits = normalize_k_values(triplet_limits)
         if not self.triplet_limits:
             raise ValueError("triplet_limits must be a non-empty list of positive integers.")
+        self.retrieval_lmdb_dir = Path(retrieval_lmdb_dir).expanduser().resolve() if retrieval_lmdb_dir else None
+        if token_budget is not None and int(token_budget) <= 0:
+            raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
+        self.token_budget = int(token_budget) if token_budget is not None else None
+        self.token_budget_encoding = token_budget_encoding
         self.system_prompt = system_prompt
         self.num_workers = int(num_workers)
         self.prompt_tag = prompt_tag
         self.data: List[Dict[str, Any]] = []
         self._graph_store: Optional[GraphStore] = None
+        self._embedding_store: Optional[EmbeddingStore] = None
 
     def setup(self, stage: Optional[str] = None) -> None:
+        self._embedding_store = None
+        if self.retrieval_lmdb_dir is not None:
+            lmdb_path = self._resolve_retrieval_lmdb_path(self.retrieval_lmdb_dir, split=self.split)
+            self._embedding_store = EmbeddingStore(lmdb_path)
         self.data = self._build_samples()
 
     def predict_dataloader(self) -> DataLoader:
@@ -100,6 +114,128 @@ class LLMReasonerTripletDataModule(LightningDataModule):
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to load vocab maps: %s", exc)
         return ent_map, rel_map
+
+    @staticmethod
+    def _resolve_retrieval_lmdb_path(embeddings_dir: Path, *, split: str) -> str:
+        candidate = embeddings_dir / f"{split}.lmdb"
+        if candidate.exists():
+            return str(candidate)
+        if str(split).lower() in {"val", "valid", "validation"}:
+            fallback = embeddings_dir / "val.lmdb"
+            if fallback.exists():
+                return str(fallback)
+        return str(candidate)
+
+    @staticmethod
+    def _select_visible_prefix_by_budget(
+        lines: Sequence[str],
+        *,
+        token_budget: int,
+        encoding: Optional[str],
+    ) -> Tuple[int, int, bool]:
+        """
+        Select the longest prefix of `lines` such that token_count(join(prefix)) <= token_budget.
+
+        Returns:
+            - visible_count: number of lines kept
+            - visible_tokens: token count of the kept evidence text
+            - truncated: whether any line was dropped due to budget
+        """
+        if not lines:
+            return 0, 0, False
+        if token_budget <= 0:
+            return 0, 0, True
+
+        lo, hi = 0, len(lines)
+        best = 0
+        best_tokens = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            text = "\n".join(lines[:mid])
+            tokens = count_tokens(text, encoding=encoding)
+            if tokens <= token_budget:
+                best = mid
+                best_tokens = tokens
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best, best_tokens, best < len(lines)
+
+    def _load_gt_paths_triples(self, sample_id: str) -> List[List[Tuple[int, int, int]]]:
+        """
+        Load GT paths as global-id triples from the retrieval LMDB (if available).
+
+        Returns:
+            List of paths, each path is a list of (head_gid, rel_gid, tail_gid).
+            Empty list means GT is unavailable for this sample (or LMDB not configured).
+        """
+        if self._embedding_store is None:
+            return []
+        try:
+            raw = self._embedding_store.load_sample(str(sample_id))
+        except Exception as exc:  # pragma: no cover - dataset dependent
+            logger.warning("Failed to load GT paths for sample_id=%s: %s", sample_id, exc)
+            return []
+
+        gt_paths = raw.get("gt_paths_triples") or []
+        normalized: List[List[Tuple[int, int, int]]] = []
+        if isinstance(gt_paths, (list, tuple)) and gt_paths:
+            for path in gt_paths:
+                if not isinstance(path, (list, tuple)) or not path:
+                    continue
+                triples: List[Tuple[int, int, int]] = []
+                for triple in path:
+                    if not isinstance(triple, (list, tuple)) or len(triple) != 3:
+                        continue
+                    try:
+                        h, r, t = triple
+                        triples.append((int(h), int(r), int(t)))
+                    except Exception:
+                        continue
+                if triples:
+                    normalized.append(triples)
+        if normalized:
+            return normalized
+
+        raw_gt_indices = raw.get("gt_path_edge_indices") or []
+        if not raw_gt_indices:
+            return []
+
+        try:
+            edge_index = torch.as_tensor(raw.get("edge_index"), dtype=torch.long)
+            edge_attr = torch.as_tensor(raw.get("edge_attr"), dtype=torch.long).view(-1)
+            node_global_ids = torch.as_tensor(raw.get("node_global_ids"), dtype=torch.long).view(-1)
+            gt_indices = torch.as_tensor(raw_gt_indices, dtype=torch.long).view(-1)
+        except Exception:  # pragma: no cover - defensive
+            return []
+
+        if edge_index.dim() != 2 or edge_index.size(0) != 2:
+            return []
+        num_edges = int(edge_index.size(1))
+        if edge_attr.numel() != num_edges:
+            return []
+        if node_global_ids.numel() == 0:
+            return []
+
+        valid = (gt_indices >= 0) & (gt_indices < num_edges)
+        gt_indices = gt_indices[valid]
+        if gt_indices.numel() == 0:
+            return []
+
+        triples: List[Tuple[int, int, int]] = []
+        for e_idx in gt_indices.tolist():
+            h_local = int(edge_index[0, e_idx].item())
+            t_local = int(edge_index[1, e_idx].item())
+            if h_local < 0 or t_local < 0 or h_local >= int(node_global_ids.numel()) or t_local >= int(node_global_ids.numel()):
+                continue
+            triples.append(
+                (
+                    int(node_global_ids[h_local].item()),
+                    int(edge_attr[e_idx].item()),
+                    int(node_global_ids[t_local].item()),
+                )
+            )
+        return [triples] if triples else []
 
     @staticmethod
     def _extract_edges(record: Dict[str, Any], id2entity: Dict[int, str], id2relation: Dict[int, str]) -> List[Dict[str, Any]]:
@@ -173,7 +309,9 @@ class LLMReasonerTripletDataModule(LightningDataModule):
 
             edges = self._extract_edges(record, id2entity, id2relation)
             gt_path_edges = [int(x) for x in record.get("gt_path_edge_local_ids", [])]
-            triplets_all: List[Tuple[str, str, str, float]] = []
+            gt_paths_triples = self._load_gt_paths_triples(str(sample_id))
+            edge_by_local_id = {int(edge["edge_idx"]): edge for edge in edges}
+            triplets_all: List[Tuple[str, str, str, float, int]] = []
             for edge in edges:
                 head_name = edge.get("head_text") or str(edge["head_entity_id"])
                 tail_name = edge.get("tail_text") or str(edge["tail_entity_id"])
@@ -184,12 +322,50 @@ class LLMReasonerTripletDataModule(LightningDataModule):
                 triplets = triplets_all[: int(k)]
                 k_effective = len(triplets)
                 retrieved_edge_ids = [edge_idx for (_, _, _, _, edge_idx) in triplets]
-                evidence_lines = [f"({h}, {r}, {t})" for (h, r, t, _, _) in triplets]
-                evidence_text = "\n".join(evidence_lines)
+                retrieved_triples = {
+                    (
+                        int(edge_dict["head_entity_id"]),
+                        int(edge_dict["relation_id"]),
+                        int(edge_dict["tail_entity_id"]),
+                    )
+                    for edge_dict in (edge_by_local_id.get(int(edge_idx)) for edge_idx in retrieved_edge_ids)
+                    if edge_dict is not None
+                }
+                hit_set: Optional[bool] = None
+                hit_vis: Optional[bool] = None
+                if gt_paths_triples:
+                    hit_set = any(set(path).issubset(retrieved_triples) for path in gt_paths_triples)
+
+                evidence_lines_all = [f"({h}, {r}, {t})" for (h, r, t, _, _) in triplets]
+                if self.token_budget is None:
+                    visible_count = len(evidence_lines_all)
+                    visible_tokens = count_tokens("\n".join(evidence_lines_all), encoding=self.token_budget_encoding)
+                    evidence_truncated = False
+                else:
+                    visible_count, visible_tokens, evidence_truncated = self._select_visible_prefix_by_budget(
+                        evidence_lines_all,
+                        token_budget=int(self.token_budget),
+                        encoding=self.token_budget_encoding,
+                    )
+
+                visible_edge_ids = retrieved_edge_ids[:visible_count]
+                visible_triples = {
+                    (
+                        int(edge_dict["head_entity_id"]),
+                        int(edge_dict["relation_id"]),
+                        int(edge_dict["tail_entity_id"]),
+                    )
+                    for edge_dict in (edge_by_local_id.get(int(edge_idx)) for edge_idx in visible_edge_ids)
+                    if edge_dict is not None
+                }
+                if gt_paths_triples:
+                    hit_vis = any(set(path).issubset(visible_triples) for path in gt_paths_triples)
+
+                evidence_text = "\n".join(evidence_lines_all[:visible_count])
                 user_prompt = build_triplet_prompt(
                     question=question_text,
-                    triplets=[(head, rel, tail) for (head, rel, tail, _, _) in triplets],
-                    limit=int(k),
+                    triplets=[(head, rel, tail) for (head, rel, tail, _, _) in triplets[:visible_count]],
+                    limit=int(visible_count),
                 )
                 samples.append(
                     {
@@ -203,12 +379,14 @@ class LLMReasonerTripletDataModule(LightningDataModule):
                         "window_k": int(k),
                         "k_effective": int(k_effective),
                         "retrieved_edge_ids": retrieved_edge_ids,
-                        "visible_edge_ids": retrieved_edge_ids,  # no further truncation beyond K here
+                        "visible_edge_ids": visible_edge_ids,
                         "gt_path_edge_local_ids": gt_path_edges,
-                        "evidence_token_count": count_tokens(evidence_text),
+                        "hit_set": hit_set,
+                        "hit_vis": hit_vis,
+                        "evidence_token_count": int(visible_tokens),
                         "prompt_token_count": count_tokens(f"{self.system_prompt}\n{user_prompt}"),
-                        "token_budget": None,
-                        "evidence_truncated": False,
+                        "token_budget": self.token_budget,
+                        "evidence_truncated": bool(evidence_truncated),
                     }
                 )
 

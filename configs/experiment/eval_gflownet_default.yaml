@@ -1,41 +1,23 @@
 # @package _global_
+#
+# Default experiment wiring for GFlowNet evaluation.
+# Dataset should be overridden per experiment (or via CLI).
 
 defaults:
-  - override /data: gflownet            # 使用 gflownet 数据模块
-  - override /model: gflownet_module    # 使用 GFlowNet 模型
-  - override /callbacks: default
-  - override /logger: wandb
-  - override /trainer: gpu
+  - override /stage: gflownet_eval
+  - override /logger: none
 
-tags: ["eval", "gflownet"]
-task_name: "eval_gflownet"
-train: false
-test: true
-ckpt_path: null   # 评估时可通过 CLI 传入 ckpt_path
+# Checkpoints are run-dependent (not dataset-dependent).
+# Keep repo configs environment-agnostic; provide paths via CLI overrides or environment variables.
+#
+# Recommended:
+#   source logs/full_pipeline/<dataset>/<ts>/artifacts.env
+# which sets RETRIEVER_CKPT / GFLOWNET_CKPT for you.
+ckpt:
+  retriever: ${oc.env:RETRIEVER_CKPT,null}
+  gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
-seed: 42
-gflownet_debug: false
+# Used by `configs/model/env/graph.yaml` (`debug: ${env_debug}`).
 env_debug: false
 
-data:
-  # 统一过滤策略：不做 split-specific drop；GT 注入由 g_agent 生成阶段按 split 决定（通常仅 train）。
-  drop_unreachable: false
-
-model:
-  evaluation_cfg:
-    num_eval_rollouts: [1, 5, 10, 20]   # Best-of-K 候选
-    path_hit_k: [1, 5, 10, 20]          # 单路径前 K 条边诊断
-
-eval_persist:
-  gflownet:
-    enabled: true
-    output_dir: ${dataset.materialized_dir}/eval_gflownet
-    splits: ["test"]
-    textualize: true
-
-logging_cfg:
-  train_prog_bar: ["rollout_reward", "success_mean", "answer_coverage", "length_mean"]
-  eval_prog_bar: ["success_mean", "answer_f1"]
-  auto_add_success_at_k: true
-  auto_add_path_hit_f1: true
-  log_on_step_train: false
+tags: ["eval", "gflownet"]

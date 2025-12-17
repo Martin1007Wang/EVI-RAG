@@ -28,6 +28,12 @@ class GAgentSettings:
     output_path: Path = Path("g_agent/g_agent_samples.pt")
     force_include_gt: bool = False
 
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.anchor_top_k = int(self.anchor_top_k)
+        self.output_path = Path(self.output_path).expanduser()
+        self.force_include_gt = bool(self.force_include_gt)
+
     def to_metadata(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["output_path"] = str(payload.get("output_path"))

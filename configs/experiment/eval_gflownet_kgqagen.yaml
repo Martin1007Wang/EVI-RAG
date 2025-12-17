@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - eval_gflownet_default
+  - override /dataset: kgqagen
+
+tags: ["kgqagen", "eval_gflownet"]
+

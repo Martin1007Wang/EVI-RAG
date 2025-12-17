@@ -1,0 +1,11 @@
+# Shared window settings for (K, B, φ) analysis.
+#
+# Keep this file as the single source of truth for all "window k" lists used by:
+# - retriever ranking metrics
+# - g_agent materialization anchor_top_k (must cover max k)
+# - oracle/truth upper bound evaluation
+# - LLM triplet-window evaluation
+
+k_values: [1, 5, 10, 25, 50, 100, 200, 300, 400]
+anchor_top_k: 400
+

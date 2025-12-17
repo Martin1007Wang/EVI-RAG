@@ -26,8 +26,8 @@ def cfg_train():
             overrides=[
                 "experiment=train_retriever_webqsp",
                 "trainer=cpu",
-                "logger=null",
-                "callbacks=null",
+                "logger=none",
+                "callbacks=none",
             ],
         )
 
@@ -47,9 +47,10 @@ def cfg_eval():
             config_name="eval.yaml",
             return_hydra_config=True,
             overrides=[
-                "experiment=eval_retriever_webqsp",
+                "stage=retriever_eval",
+                "dataset=webqsp",
                 "trainer=cpu",
-                "logger=null",
-                "callbacks=null",
+                "logger=none",
+                "callbacks=none",
             ],
         )

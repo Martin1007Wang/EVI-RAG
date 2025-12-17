@@ -1,0 +1,17 @@
+# @package _global_
+#
+# Predict-only trainer pinned to a single GPU with DDP explicitly disabled.
+
+_target_: lightning.pytorch.trainer.Trainer
+
+accelerator: gpu
+devices: 1
+strategy: auto  # Force non-DDP for prediction-only stages.
+max_epochs: 1
+logger: null
+enable_checkpointing: False
+enable_progress_bar: True
+deterministic: False
+default_root_dir: ${paths.output_dir}
+# Avoid Lightning auto-inserting distributed samplers in case strategy is misconfigured.
+replace_sampler_ddp: False

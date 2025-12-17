@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from lightning import LightningModule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
+import torch.distributed as dist
 
 from src.utils.llm_client import init_llm, run_chat
 from src.utils.llm_metrics import evaluate_predictions
@@ -66,13 +67,8 @@ class LLMReasonerModule(LightningModule):
             if prompt_token_count is None:
                 prompt_token_count = count_tokens(f"{sample['system_prompt']}\n{sample['user_prompt']}")
             evidence_token_count = sample.get("evidence_token_count")
-            token_budget = sample.get("token_budget", self.token_budget)
+            token_budget = sample.get("token_budget")
             evidence_truncated = bool(sample.get("evidence_truncated", False))
-            if token_budget is not None and not evidence_truncated:
-                try:
-                    evidence_truncated = bool(prompt_token_count > int(token_budget))
-                except Exception:
-                    pass
             outputs.append(
                 {
                     "id": sample["id"],
@@ -86,6 +82,8 @@ class LLMReasonerModule(LightningModule):
                     "retrieved_edge_ids": sample.get("retrieved_edge_ids", []),
                     "visible_edge_ids": sample.get("visible_edge_ids", []),
                     "gt_path_edge_local_ids": sample.get("gt_path_edge_local_ids", []),
+                    "hit_set": sample.get("hit_set"),
+                    "hit_vis": sample.get("hit_vis"),
                     "evidence_token_count": evidence_token_count,
                     "prompt_token_count": prompt_token_count,
                     "token_budget": token_budget,
@@ -112,13 +110,36 @@ class LLMReasonerModule(LightningModule):
                 elif batch is not None:
                     flat.append(batch)  # pragma: no cover - defensive branch
 
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        merged = flat
+        if world_size > 1:
+            gathered: List[Optional[List[Dict[str, Any]]]] = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered, flat)
+            if rank != 0:
+                return
+            merged = []
+            for part in gathered:
+                if part:
+                    merged.extend(part)
+
+        # Deduplicate by sample id to guard against misconfigured samplers/strategies.
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for row in merged:
+            row_id = str(row.get("id", len(dedup)))
+            if row_id not in dedup:
+                dedup[row_id] = row
+        if len(dedup) != len(merged):
+            rank_zero_info(f"Deduplicated predictions: kept {len(dedup)} unique ids from {len(merged)} rows.")
+        merged = list(dedup.values())
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         pred_path = self._prediction_path()
         with pred_path.open("w") as f:
-            for row in flat:
+            for row in merged:
                 f.write(json.dumps(row) + "\n")
 
-        metrics = evaluate_predictions(flat)
+        metrics = evaluate_predictions(merged)
 
         metrics_path = pred_path.with_suffix(".metrics.json")
         metrics_path.write_text(json.dumps(metrics, indent=2))

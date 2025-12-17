@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
+import torch.distributed as dist
 from lightning import LightningModule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
@@ -149,13 +150,26 @@ class LLMReasonerTruthModule(LightningModule):
                 elif batch is not None:
                     flat.append(batch)  # pragma: no cover
 
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        merged = flat
+        if world_size > 1:
+            gathered: List[Optional[List[Dict[str, Any]]]] = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered, flat)
+            if rank != 0:
+                return
+            merged = []
+            for part in gathered:
+                if part:
+                    merged.extend(part)
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         pred_path = self._prediction_path()
         with pred_path.open("w") as f:
-            for row in flat:
+            for row in merged:
                 f.write(json.dumps(row) + "\n")
 
-        metrics = self._aggregate_metrics(flat, k_values=self.k_values)
+        metrics = self._aggregate_metrics(merged, k_values=self.k_values)
         metrics_path = pred_path.with_suffix(".metrics.json")
         metrics_path.write_text(json.dumps(metrics, indent=2))
 

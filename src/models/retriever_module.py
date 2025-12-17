@@ -28,6 +28,7 @@ class RetrieverModule(LightningModule):
         optimizer: Any,
         scheduler: Any = None,
         evaluation_cfg: Optional[DictConfig | Dict] = None,
+        eval_persist_cfg: Optional[DictConfig | Dict[str, Any]] = None,
         compile_model: bool = False,
         compile_dynamic: bool = True,
     ) -> None:
@@ -48,7 +49,7 @@ class RetrieverModule(LightningModule):
         self._answer_k = normalize_k_values(eval_cfg.get("answer_recall_k", [5, 10]), default=[5, 10])
 
         self._streaming_state: Dict[str, Dict[str, Any]] = {}
-        self.eval_persist_cfg: Optional[Dict[str, Any]] = None
+        self.eval_persist_cfg: Dict[str, Any] = self._to_dict(eval_persist_cfg or {})
 
     @staticmethod
     def _to_dict(cfg: Union[DictConfig, Dict]) -> Dict[str, Any]:
@@ -114,12 +115,37 @@ class RetrieverModule(LightningModule):
             edge_batch=output.query_ids,
             num_graphs=num_graphs,
         )
-        log_metric(self, "train/loss", loss_output.loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=num_graphs)
+        log_metric(
+            self,
+            "train/loss",
+            loss_output.loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=num_graphs,
+            sync_dist=True,
+        )
 
         for k, v in getattr(loss_output, "components", {}).items():
-            log_metric(self, f"train/loss/{k}", v, on_step=False, on_epoch=True, batch_size=num_graphs)
+            log_metric(
+                self,
+                f"train/loss/{k}",
+                v,
+                on_step=False,
+                on_epoch=True,
+                batch_size=num_graphs,
+                sync_dist=True,
+            )
         for k, v in getattr(loss_output, "metrics", {}).items():
-            log_metric(self, f"train/metric/{k}", v, on_step=False, on_epoch=True, batch_size=num_graphs)
+            log_metric(
+                self,
+                f"train/metric/{k}",
+                v,
+                on_step=False,
+                on_epoch=True,
+                batch_size=num_graphs,
+                sync_dist=True,
+            )
 
         return loss_output.loss
 
@@ -238,7 +264,7 @@ class RetrieverModule(LightningModule):
             f"{split}/ranking/mrr",
             state["mrr_sum"] / denom,
             batch_size=batch_size,
-            sync_dist=False,
+            sync_dist=True,
             on_step=False,
             on_epoch=True,
         )
@@ -248,7 +274,7 @@ class RetrieverModule(LightningModule):
                 f"{split}/ranking/recall@{k}",
                 state["recall_sum"][k] / denom,
                 batch_size=batch_size,
-                sync_dist=False,
+                sync_dist=True,
                 on_step=False,
                 on_epoch=True,
             )
@@ -258,7 +284,7 @@ class RetrieverModule(LightningModule):
                 f"{split}/ranking/precision@{k}",
                 state["precision_sum"][k] / denom,
                 batch_size=batch_size,
-                sync_dist=False,
+                sync_dist=True,
                 on_step=False,
                 on_epoch=True,
             )
@@ -268,7 +294,7 @@ class RetrieverModule(LightningModule):
                 f"{split}/ranking/f1@{k}",
                 state["f1_sum"][k] / denom,
                 batch_size=batch_size,
-                sync_dist=False,
+                sync_dist=True,
                 on_step=False,
                 on_epoch=True,
             )
@@ -278,7 +304,7 @@ class RetrieverModule(LightningModule):
                 f"{split}/ranking/ndcg@{k}",
                 state["ndcg_sum"][k] / denom,
                 batch_size=batch_size,
-                sync_dist=False,
+                sync_dist=True,
                 on_step=False,
                 on_epoch=True,
             )
@@ -293,7 +319,7 @@ class RetrieverModule(LightningModule):
                 f"{split}/answer/answer_recall@{k}",
                 state["answer_sum"][k] / answer_denom,
                 batch_size=answer_batch_size,
-                sync_dist=False,
+                sync_dist=True,
                 on_step=False,
                 on_epoch=True,
             )
@@ -597,14 +623,11 @@ class RetrieverModule(LightningModule):
         entity_path = cfg.get("entity_vocab_path")
         relation_path = cfg.get("relation_vocab_path")
         if not entity_path or not relation_path:
-            ds = cfg.get("dataset_cfg") or {}
-            out_dir = ds.get("out_dir")
-            if out_dir:
-                base = Path(out_dir)
-                if not entity_path:
-                    entity_path = base / "entity_vocab.parquet"
-                if not relation_path:
-                    relation_path = base / "relation_vocab.parquet"
+            raise ValueError("eval_persist_cfg.textualize=true requires both entity_vocab_path and relation_vocab_path.")
+        if not Path(entity_path).exists():
+            raise FileNotFoundError(f"entity_vocab_path not found: {entity_path}")
+        if not Path(relation_path).exists():
+            raise FileNotFoundError(f"relation_vocab_path not found: {relation_path}")
 
         ent_map: Optional[Dict[int, str]] = None
         rel_map: Optional[Dict[int, str]] = None

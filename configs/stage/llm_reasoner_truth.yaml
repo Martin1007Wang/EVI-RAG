@@ -1,0 +1,20 @@
+# @package _global_
+#
+# Stage: Retriever oracle upper bound (no LLM). Consumes persisted retriever eval cache.
+
+defaults:
+  - override /data: llm_reasoner_truth
+  - override /model: llm_reasoner/truth
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict
+
+stage:
+  name: llm_reasoner_truth
+  task_name: "llm_reasoner/truth"
+  tags: ["eval", "llm_reasoner", "truth"]
+  run:
+    loop: predict
+    return_predictions: true
+
+ckpt_path: null

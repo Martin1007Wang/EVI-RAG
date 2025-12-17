@@ -1,0 +1,4 @@
+defaults:
+  - gflownet_module
+  - override reward@reward_cfg: answer_fraction
+

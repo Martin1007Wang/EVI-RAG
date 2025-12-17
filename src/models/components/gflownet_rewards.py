@@ -135,7 +135,10 @@ class AnswerOnlyReward(nn.Module):
             num_graphs=num_graphs,
         )
 
-        success_mask = reach_success.bool()
+        # Keep reward self-contained: success/coverage are determined by (selected edges, answer nodes),
+        # not by external flags that may drift across refactors.
+        reach_fraction = stats.recall.clamp(min=0.0, max=1.0)
+        success_mask = stats.hits > 0
         log_reward = torch.where(
             success_mask,
             torch.full_like(reach_fraction, float(math.log(self.success_reward))),
@@ -232,8 +235,87 @@ class AnswerDiffusionReward(AnswerOnlyReward):
     pass
 
 
+class AnswerFractionReward(nn.Module):
+    """
+    Coverage-shaped reward based on answer recall fraction.
+
+    Let f in [0,1] be the fraction of answer entities visited by the trajectory.
+    We interpolate rewards geometrically:
+      log R = log(failure_reward) + f * log(success_reward / failure_reward)
+    so that f=0 -> failure_reward and f=1 -> success_reward.
+    """
+
+    def __init__(
+        self,
+        *,
+        success_reward: float,
+        failure_reward: float,
+    ) -> None:
+        super().__init__()
+        self.success_reward = float(success_reward)
+        self.failure_reward = float(failure_reward)
+        if self.success_reward <= 0.0 or self.failure_reward <= 0.0:
+            raise ValueError(f"Rewards must be positive; got success_reward={self.success_reward}, failure_reward={self.failure_reward}.")
+
+    def forward(
+        self,
+        *,
+        selected_mask: torch.Tensor,  # [E_total]
+        edge_labels: torch.Tensor,  # [E_total]
+        edge_batch: torch.Tensor,  # [E_total]
+        edge_index: torch.Tensor,  # [2, E_total] local node indices (collated)
+        node_ptr: torch.Tensor,  # [B+1]
+        answer_node_locals: torch.Tensor,  # [A_total] local node indices (collated)
+        answer_node_ptr: torch.Tensor,  # [B+1]
+        path_exists: Optional[torch.Tensor],
+        **_: Any,
+    ) -> RewardOutput:
+        device = selected_mask.device
+        num_graphs = int(node_ptr.numel() - 1)
+        stats = AnswerOnlyReward._answer_metrics_vectorized(
+            selected_mask=selected_mask,
+            edge_index=edge_index,
+            edge_batch=edge_batch,
+            node_ptr=node_ptr,
+            answer_node_locals=answer_node_locals,
+            answer_node_ptr=answer_node_ptr,
+        )
+        pos_prec, pos_rec, pos_f1 = _compute_pos_metrics(
+            selected_mask=selected_mask.bool(),
+            positive_mask=edge_labels > 0.5,
+            edge_batch=edge_batch,
+            num_graphs=num_graphs,
+        )
+
+        reach_fraction = stats.recall.clamp(min=0.0, max=1.0)
+        success_mask = stats.hits > 0
+        log_ratio = float(math.log(self.success_reward / self.failure_reward))
+        log_reward = torch.full_like(reach_fraction, float(math.log(self.failure_reward))) + reach_fraction * log_ratio
+        reward = log_reward.exp()
+
+        path_exists_tensor = (
+            path_exists.to(device).bool()
+            if path_exists is not None
+            else torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        )
+        return RewardOutput(
+            reward=reward,
+            log_reward=log_reward,
+            success=success_mask.float(),
+            answer_reach_frac=reach_fraction.float(),
+            pos_precision=pos_prec,
+            pos_recall=pos_rec,
+            pos_f1=pos_f1,
+            answer_precision=stats.precision,
+            answer_recall=stats.recall,
+            answer_f1=stats.f1,
+            path_exists=path_exists_tensor,
+        )
+
+
 __all__ = [
     "RewardOutput",
     "AnswerOnlyReward",
+    "AnswerFractionReward",
     "AnswerDiffusionReward",
 ]

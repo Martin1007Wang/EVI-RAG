@@ -1,0 +1,20 @@
+# @package _global_
+#
+# Default wiring for g_agent materialization from a trained retriever checkpoint.
+# By default, run all three splits (train/validation/test) via Hydra multirun.
+
+defaults:
+  - override /stage: materialize_g_agent
+  - override /logger: none
+
+tags: ["materialize", "g_agent"]
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      stage.split: train,validation,test
+
+# Prefer env var to avoid long CLI paths; CLI override still works.
+ckpt:
+  retriever: ${oc.env:RETRIEVER_CKPT,null}

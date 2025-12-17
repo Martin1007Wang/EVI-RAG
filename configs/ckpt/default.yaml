@@ -1,0 +1,8 @@
+# Placeholder checkpoint paths.
+#
+# This file must stay environment-agnostic: do NOT hardcode absolute paths here.
+# Override via CLI (recommended) or create `configs/local/default.yaml` (optional) to set your local defaults.
+
+retriever: null
+gflownet: null
+

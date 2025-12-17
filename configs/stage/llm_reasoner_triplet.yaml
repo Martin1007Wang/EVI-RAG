@@ -1,0 +1,20 @@
+# @package _global_
+#
+# Stage: Run an LLM over g_agent top-k triplet windows and compute answer metrics.
+
+defaults:
+  - override /data: llm_reasoner_triplet
+  - override /model: llm_reasoner/ollama
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict_single_gpu
+
+stage:
+  name: llm_reasoner_triplet
+  task_name: "llm_reasoner/triplet"
+  tags: ["eval", "llm_reasoner", "triplet"]
+  run:
+    loop: predict
+    return_predictions: true
+
+ckpt_path: null

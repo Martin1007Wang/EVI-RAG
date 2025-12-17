@@ -1,0 +1,7 @@
+# @package _global_
+
+defaults:
+  - llm_reasoner_paths_default
+  - override /dataset: cwq
+
+tags: ["cwq", "llm_reasoner", "paths"]

@@ -4,7 +4,5 @@ defaults:
   - eval_retriever_default
   - override /dataset: webqsp
 
-tags: ["eval", "retriever", "webqsp"]
+tags: ["webqsp", "eval_retriever"]
 
-ckpt_path: "logs/train_retriever_webqsp/runs/2025-12-15_17-40-20/checkpoints/epoch_021.ckpt"
-task_name: "eval_retriever_webqsp"

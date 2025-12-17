@@ -41,6 +41,7 @@ class GFlowNetModule(LightningModule):
         optimizer_cfg: Optional[Dict[str, Any]] = None,
         scheduler_cfg: Optional[Dict[str, Any]] = None,
         logging_cfg: Optional[Dict[str, Any]] = None,
+        eval_persist_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -69,8 +70,8 @@ class GFlowNetModule(LightningModule):
         self._auto_success_k = bool(self._cfg_get(self.logging_cfg, "auto_add_success_at_k", True))
         self._auto_path_hit_f1 = bool(self._cfg_get(self.logging_cfg, "auto_add_path_hit_f1", True))
         self._log_on_step_train = bool(self._cfg_get(self.logging_cfg, "log_on_step_train", False))
-        # Eval 持久化配置（由 eval.py 注入），仅在 eval 阶段使用
-        self.eval_persist_cfg: Optional[Dict[str, Any]] = None
+        # Eval 持久化配置（由 Hydra 注入），仅在 eval 阶段使用
+        self.eval_persist_cfg: Dict[str, Any] = dict(eval_persist_cfg or {})
         self._eval_rollout_storage: Dict[str, list] = {"val": [], "test": []}
         self._active_eval_split: Optional[str] = None
 
@@ -1207,16 +1208,11 @@ class _EvalPersistProcessor:
         entity_path = cfg.get("entity_vocab_path")
         relation_path = cfg.get("relation_vocab_path")
         if not entity_path or not relation_path:
-            ds = cfg.get("dataset_cfg") or {}
-            out_dir = ds.get("out_dir")
-            if out_dir:
-                base = Path(out_dir)
-                if not entity_path:
-                    if (base / "entity_vocab.parquet").exists():
-                        entity_path = base / "entity_vocab.parquet"
-                    else:
-                        entity_path = base / "embedding_vocab.parquet"
-                relation_path = relation_path or (base / "relation_vocab.parquet")
+            raise ValueError("eval_persist_cfg.textualize=true requires both entity_vocab_path and relation_vocab_path.")
+        if not Path(entity_path).exists():
+            raise FileNotFoundError(f"entity_vocab_path not found: {entity_path}")
+        if not Path(relation_path).exists():
+            raise FileNotFoundError(f"relation_vocab_path not found: {relation_path}")
         ent_map: Optional[Dict[int, str]] = None
         rel_map: Optional[Dict[int, str]] = None
         try:

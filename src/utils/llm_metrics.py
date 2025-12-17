@@ -197,21 +197,34 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
             recalls.append(score["recall"])
             f1s.append(score["f1"])
 
+        hit_set: Optional[bool] = item.get("hit_set")
+        hit_vis: Optional[bool] = item.get("hit_vis")
+
         gt_edges = _as_int_list(item.get("gt_path_edge_local_ids") or item.get("gt_path_edges"))
         retrieved_edges = _as_int_list(item.get("retrieved_edge_ids"))
-        visible_edges = _as_int_list(item.get("visible_edge_ids")) or retrieved_edges
 
-        hit_set = None
-        hit_vis = None
-        if gt_edges:
-            gt_set = set(gt_edges)
-            hit_set = gt_set.issubset(set(retrieved_edges)) if retrieved_edges else False
-            hit_vis = gt_set.issubset(set(visible_edges)) if visible_edges else False
+        has_visible_key = "visible_edge_ids" in item
+        visible_edges = _as_int_list(item.get("visible_edge_ids")) if has_visible_key else []
+        if not has_visible_key:
+            visible_edges = retrieved_edges
+
+        if hit_set is None or hit_vis is None:
+            # Only derive hit events if the item explicitly represents a (K,B,phi) retrieval window.
+            # Guard against non-retrieval prompts (e.g., path rollouts) that do not provide edge IDs.
+            if gt_edges and retrieved_edges:
+                gt_set = set(gt_edges)
+                if hit_set is None:
+                    hit_set = gt_set.issubset(set(retrieved_edges))
+                if hit_vis is None:
+                    hit_vis = gt_set.issubset(set(visible_edges))
 
         evidence_tokens = item.get("evidence_token_count")
         prompt_tokens = item.get("prompt_token_count")
         token_budget = item.get("token_budget")
-        k_visible = len(visible_edges) if visible_edges else item.get("k_effective")
+        if has_visible_key:
+            k_visible = len(visible_edges)
+        else:
+            k_visible = item.get("k_effective")
         truncated = bool(item.get("evidence_truncated", False))
         semantic_global.update(
             score=score["f1"] if score is not None else None,

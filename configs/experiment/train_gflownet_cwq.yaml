@@ -8,6 +8,6 @@ model:
   env_cfg:
     max_steps: 6
   embedder_cfg:
-    projector_checkpoint: "logs/train_retriever_cwq/runs/2025-12-02_22-43-12/checkpoints/epoch_194.ckpt"
+    projector_checkpoint: "logs/full_pipeline/cwq/2025-12-17_09-52-16/hydra/03_train_retriever/checkpoints/epoch_021.ckpt"
   
 tags: ["cwq", "gflownet"]

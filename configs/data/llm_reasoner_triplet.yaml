@@ -10,9 +10,12 @@ score_dict_path: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
 questions_path: ${dataset.out_dir}/questions.parquet
 entity_vocab_path: ${dataset.paths.vocabulary}
 relation_vocab_path: ${dataset.paths.vocabulary}
+retrieval_lmdb_dir: ${dataset.paths.embeddings}
 
 # Prompt construction
-triplet_limits: [1, 5, 10, 25, 50, 100, 200, 300, 400]
+triplet_limits: ${window.k_values}
+token_budget: null  # Evidence-only token budget B (null disables truncation)
+token_budget_encoding: "cl100k_base"
 system_prompt: "You are a concise QA agent. Use the given triplets to answer with `Ans: <entity>`."
 
 # Loader

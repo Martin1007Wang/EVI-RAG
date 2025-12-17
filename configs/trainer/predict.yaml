@@ -1,7 +1,9 @@
 _target_: lightning.pytorch.trainer.Trainer
 
-accelerator: auto
-devices: auto
+# Eval/predict must run on exactly one GPU to avoid DDP sharding and non-deterministic
+# metric aggregation across ranks. Select a specific GPU via CUDA_VISIBLE_DEVICES.
+accelerator: gpu
+devices: 1
 max_epochs: 1
 logger: null
 enable_checkpointing: False

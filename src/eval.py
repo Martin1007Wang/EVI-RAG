@@ -1,248 +1,192 @@
-import logging
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, List, Optional
+from __future__ import annotations
+
+import inspect
+from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
+import lightning as L
 import rootutils
 import torch
-from omegaconf import DictConfig, OmegaConf
-from lightning import LightningDataModule, LightningModule, Trainer, Callback
+from lightning import Callback, LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.loggers import Logger
+from omegaconf import DictConfig
 
-# 1. Setup Root (只做一次)
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.data.components.g_agent_builder import GAgentSettings
-from src.callbacks.g_agent_callback import GAgentGenerationCallback
-from src.utils import instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
-from src.models.retriever_module import RetrieverModule
-from src.models.gflownet_module import GFlowNetModule
-from src.models.llm_reasoner_module import LLMReasonerModule
-from src.models.llm_reasoner_truth_module import LLMReasonerTruthModule
+from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
 
-logger = logging.getLogger(__name__)
+log = RankedLogger(__name__, rank_zero_only=True)
 
-# ==============================================================================
-# Helper Functions (Utility Layer)
-# ==============================================================================
+
+def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
+    accelerator = str(trainer_cfg.get("accelerator", "")).lower()
+    if accelerator not in {"gpu", "cuda"}:
+        raise ValueError(
+            "Eval 禁止使用非 GPU accelerator。"
+            f"Got trainer.accelerator={trainer_cfg.get('accelerator')!r}. "
+            "Fix: set `trainer.accelerator=gpu` (and keep `trainer.devices=1`)."
+        )
+
+    devices = trainer_cfg.get("devices", None)
+    num_devices: Optional[int]
+    if devices is None:
+        num_devices = None
+    elif isinstance(devices, int):
+        num_devices = int(devices)
+    elif isinstance(devices, (list, tuple)):
+        num_devices = len(devices)
+    elif isinstance(devices, str):
+        raw = devices.strip().lower()
+        if raw == "auto":
+            num_devices = None
+        elif raw.isdigit():
+            num_devices = int(raw)
+        elif "," in raw:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            num_devices = len(parts)
+        else:
+            num_devices = None
+    else:
+        num_devices = None
+
+    if num_devices != 1:
+        raise ValueError(
+            "Eval 严禁多卡/自动多卡（DDP）以保证样本数与指标聚合不被分片。"
+            f"Got trainer.devices={devices!r} (parsed_num_devices={num_devices!r}). "
+            "Fix: set `trainer.devices=1` (optionally select GPU via CUDA_VISIBLE_DEVICES)."
+        )
+
+    strategy = trainer_cfg.get("strategy", "auto")
+    strategy_name = str(strategy).lower()
+    if any(tag in strategy_name for tag in ("ddp", "fsdp", "deepspeed")):
+        raise ValueError(
+            "Eval 禁止分布式 strategy。"
+            f"Got trainer.strategy={strategy!r}. "
+            "Fix: remove the override or set `trainer.strategy=auto`."
+        )
 
 
 def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) -> None:
-    if not ckpt_path:
+    if ckpt_path in (None, ""):
         return
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = False
+    checkpoint = torch.load(str(ckpt_path), **load_kwargs)
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Checkpoint at {ckpt_path} must be a state_dict mapping, got {type(state_dict)!r}")
     model.load_state_dict(state_dict, strict=True)
-    model.eval()
 
 
-def _extract_shared_resources(datamodule: LightningDataModule) -> Optional[Any]:
-    if hasattr(datamodule, "shared_resources"):
-        return getattr(datamodule, "shared_resources")
-    if hasattr(datamodule, "_shared_resources"):
-        return getattr(datamodule, "_shared_resources")
-    return None
+def _maybe_initialize_model_for_strict_load(
+    *,
+    model: LightningModule,
+    datamodule: LightningDataModule,
+    loop: str,
+) -> None:
+    """Ensure lazily constructed submodules exist before strict state_dict loading.
 
+    Some modules (e.g. GFlowNet) materialize parts of the network inside `setup()` after accessing
+    shared resources from the DataModule. When we do a strict manual state_dict load, we must
+    instantiate those parts first, otherwise keys will be reported as "unexpected".
+    """
 
-def _bootstrap_embedder(model: LightningModule, datamodule: LightningDataModule) -> None:
-    resources = _extract_shared_resources(datamodule)
-    if resources is None or not hasattr(model, "embedder"):
+    embedder = getattr(model, "embedder", None)
+    embedder_setup = getattr(embedder, "setup", None) if embedder is not None else None
+    if not callable(embedder_setup):
         return
-    model.embedder.setup(resources, device=model.device)  # type: ignore[attr-defined]
-    if hasattr(model.embedder, "_init_query_projection"):  # type: ignore[attr-defined]
-        model.embedder._init_query_projection(question_dim=model.embedder.entity_dim)  # type: ignore[attr-defined]
 
+    # DataModules typically populate shared resources inside `setup()`.
+    stage = "test" if loop == "test" else "predict"
+    datamodule_setup = getattr(datamodule, "setup", None)
+    if callable(datamodule_setup):
+        datamodule_setup(stage=stage)  # type: ignore[call-arg]
 
-def _get_split_loader(datamodule: LightningDataModule, split_name: str) -> Any:
-    """
-    根据 split 名称安全地从 DataModule 获取 DataLoader。
-    """
-    resolver = getattr(datamodule, "get_split_dataloader", None)
-    if callable(resolver):
-        return resolver(split_name)
-    if split_name == "train":
-        if hasattr(datamodule, "train_eval_dataloader"):
-            return datamodule.train_eval_dataloader()  # type: ignore[attr-defined]
-        # 退回到标准 train_dataloader，但可能包含 shuffle
-        return datamodule.train_dataloader()
-    if split_name in ["val", "validation"]:
-        return datamodule.val_dataloader()
-    if split_name == "test":
-        return datamodule.test_dataloader()
-    raise ValueError(f"Unknown split name: {split_name}. Supported: train, val, test")
-
-
-def _resolve_lmdb_path(cfg: DictConfig, split_name: str) -> Path:
-    """
-    Strict Path Resolution. No guessing based on private attributes.
-    """
-    # 1. Extract Root
-    paths = cfg.get("dataset", {}).get("paths", {})
-    if not paths:
-        # Fallback to flattened structure if dataset is not nested
-        paths = cfg.get("paths", {})
-
-    emb_root_str = paths.get("embeddings")
-    if not emb_root_str:
+    resources = getattr(datamodule, "shared_resources", None)
+    if resources is None:
         raise ValueError(
-            "Critical Config Error: Could not find 'embeddings' path in config. "
-            "Ensure 'dataset.paths.embeddings' or 'paths.embeddings' is set."
+            "Model requires datamodule.shared_resources for initialization before checkpoint loading, "
+            "but `shared_resources` is missing. Ensure the DataModule constructs SharedDataResources in `setup()`."
         )
 
-    emb_root = Path(emb_root_str)
-    if not emb_root.exists():
-        raise FileNotFoundError(f"Embeddings root directory does not exist: {emb_root}")
-
-    # 2. Map Split to Filename (Deterministic)
-    filename_map = {
-        "train": "train.lmdb",
-        "test": "test.lmdb",
-        "validation": "validation.lmdb",
-        "val": "validation.lmdb",
-    }
-
-    filename = filename_map.get(split_name, f"{split_name}.lmdb")
-    target_path = emb_root / filename
-
-    # 3. Fail Fast
-    if not target_path.exists():
-        # List available files for helpful error message
-        available = [p.name for p in emb_root.glob("*.lmdb")]
-        raise FileNotFoundError(
-            f"LMDB file for split '{split_name}' not found at {target_path}.\n" f"Available LMDBs in {emb_root}: {available}"
-        )
-
-    return target_path
-
-
-@contextmanager
-def _temporary_callback(trainer: Trainer, callback: Callback):
-    """
-    Context Manager to safely inject and remove a callback.
-    Guarantees cleanup even if predict fails.
-    """
-    trainer.callbacks.append(callback)
-    try:
-        yield
-    finally:
-        if callback in trainer.callbacks:
-            trainer.callbacks.remove(callback)
-
-
-def _run_standard_metrics(
-    trainer: Trainer,
-    model: LightningModule,
-    datamodule: LightningDataModule,
-    skip_metrics: bool,
-) -> None:
-    if skip_metrics:
-        logger.info("Skipping standard metrics evaluation as requested.")
-        return
-    logger.info("Starting Standard Retrieval Metrics Evaluation...")
-    trainer.test(model=model, datamodule=datamodule, ckpt_path=None)
-
-
-def _run_g_agent_generation(
-    trainer: Trainer,
-    model: LightningModule,
-    datamodule: LightningDataModule,
-    cfg: DictConfig,
-) -> None:
-    g_agent_cfg = cfg.get("g_agent")
-    if not g_agent_cfg or not g_agent_cfg.get("enabled"):
-        return
-
-    logger.info("Starting GAgent Trajectory Generation...")
-    splits: List[str] = g_agent_cfg.get("splits", [])
-    output_dir = Path(g_agent_cfg.get("output_dir", "g_agent_outputs"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 预加载权重：evaluate 已经加载过 checkpoint；若跳过 metrics，权重同样已就绪。
-    for split in splits:
-        logger.info(f"\n[GAgent] Processing split: {split}")
-        loader = _get_split_loader(datamodule, split)
-        lmdb_path = _resolve_lmdb_path(cfg, split)
-
-        anchor_top_k = int(g_agent_cfg.get("anchor_top_k", GAgentSettings.anchor_top_k))
-        include_cfg = g_agent_cfg.get("force_include_gt", g_agent_cfg.get("include_gt", GAgentSettings.force_include_gt))
-        if isinstance(include_cfg, (dict, DictConfig)):
-            force_gt = bool(include_cfg.get(split, False))
-        else:
-            force_gt = bool(include_cfg)
-        settings = GAgentSettings(
-            enabled=True,
-            anchor_top_k=anchor_top_k,
-            output_path=output_dir / f"{split}_g_agent.pt",
-            force_include_gt=force_gt,
-        )
-
-        g_callback = GAgentGenerationCallback(settings, lmdb_path)
-        with _temporary_callback(trainer, g_callback):
-            trainer.predict(model=model, dataloaders=loader, ckpt_path=None)
-
-
-def _run_llm_reasoner_predict(
-    trainer: Trainer,
-    model: LightningModule,
-    datamodule: LightningDataModule,
-) -> None:
-    if not isinstance(model, (LLMReasonerModule, LLMReasonerTruthModule)):
-        return
-    logger.info("Running LLM reasoner predict()...")
-    # Force return_predictions=True to ensure outputs are available in on_predict_epoch_end.
-    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
-
-
-# ==============================================================================
-# Main Task (Logic Layer)
-# ==============================================================================
+    embedder_setup(resources)
 
 
 @task_wrapper
-def evaluate(cfg: DictConfig) -> tuple[dict, dict]:
+def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if cfg.get("seed") is not None:
+        L.seed_everything(int(cfg.seed), workers=True)
+
+    stage = cfg.get("stage")
+    if stage is None:
+        raise ValueError("Missing required config group: `stage`. Example: `python src/eval.py stage=retriever_eval dataset=webqsp`.")
+    # Leakage guard: GT injection is an oracle and must never be enabled for non-train splits.
+    # We validate here (before instantiating callbacks) to fail-fast and keep the rule global.
+    stage_split = stage.get("split")
+    if bool(stage.get("force_include_gt", False)) and str(stage_split).lower() != "train":
+        raise ValueError(
+            "Data leakage detected: `stage.force_include_gt=true` is only allowed when `stage.split=train`. "
+            f"Got stage.split={stage_split!r}. "
+            "Fix: set `stage.force_include_gt=false` for validation/test (and only enable it for train materialization)."
+        )
+    loop = str(stage.get("run", {}).get("loop", "")).lower()
+    return_predictions = bool(stage.get("run", {}).get("return_predictions", False))
+
+    log.info(f"Stage: {stage.get('name')} (loop={loop}, return_predictions={return_predictions})")
+
+    _enforce_single_gpu_eval(cfg.trainer)
+
+    log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+
+    log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
-    logger_obj = instantiate_loggers(cfg.get("logger"))
-    base_callbacks = instantiate_callbacks(cfg.get("callbacks"))
-    # 评估持久化配置：仅在 eval 场景下传递，训练不受影响
-    persist_cfg = cfg.get("eval_persist", {})
-    if isinstance(persist_cfg, DictConfig):
-        persist_cfg = OmegaConf.to_container(persist_cfg, resolve=True)
-    dataset_cfg = cfg.get("dataset")
-    if dataset_cfg is not None:
-        try:
-            ds_cfg = OmegaConf.to_container(dataset_cfg, resolve=True)
-        except Exception:
-            ds_cfg = dataset_cfg
-        for key in ("retriever", "gflownet"):
-            if isinstance(persist_cfg.get(key), dict):
-                persist_cfg[key].setdefault("dataset_cfg", ds_cfg)
-    if isinstance(model, RetrieverModule):
-        model.eval_persist_cfg = persist_cfg.get("retriever")
-    elif isinstance(model, GFlowNetModule):
-        model.eval_persist_cfg = persist_cfg.get("gflownet")
 
-    logger.info("Setting up DataModule...")
-    datamodule.setup()  # 显式 setup，确保 dataset 可用
-    _bootstrap_embedder(model, datamodule)
-    _load_checkpoint_strict(model, cfg.ckpt_path)
+    log.info("Instantiating callbacks...")
+    callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 
-    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=base_callbacks, logger=logger_obj)
+    log.info("Instantiating loggers...")
+    logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
-    if logger_obj:
-        log_hyperparameters({"cfg": cfg, "model": model, "trainer": trainer})
+    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
+    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
 
-    skip_metrics = cfg.get("g_agent", {}).get("skip_retriever_metrics", False)
-    _run_standard_metrics(trainer, model, datamodule, skip_metrics)
-    _run_g_agent_generation(trainer, model, datamodule, cfg)
-    _run_llm_reasoner_predict(trainer, model, datamodule)
+    # Some models (notably GFlowNet) lazily build submodules in `setup()` using datamodule resources.
+    # Since we do a strict manual checkpoint load, we must materialize those modules first.
+    _maybe_initialize_model_for_strict_load(model=model, datamodule=datamodule, loop=loop)
 
-    object_dict = {"cfg": cfg, "datamodule": datamodule, "model": model, "trainer": trainer}
-    return trainer.callback_metrics, object_dict
+    _load_checkpoint_strict(model, cfg.get("ckpt_path"))
+
+    object_dict = {
+        "cfg": cfg,
+        "datamodule": datamodule,
+        "model": model,
+        "callbacks": callbacks,
+        "logger": logger,
+        "trainer": trainer,
+    }
+
+    if logger:
+        log.info("Logging hyperparameters...")
+        log_hyperparameters(object_dict)
+
+    if loop == "test":
+        log.info("Running trainer.test()...")
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=None)
+    elif loop == "predict":
+        log.info("Running trainer.predict()...")
+        trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=return_predictions)
+    else:
+        raise ValueError(f"Unsupported stage.run.loop={loop!r}. Supported: 'test', 'predict'.")
+
+    metric_dict = trainer.callback_metrics
+    return metric_dict, object_dict
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="eval.yaml")
 def main(cfg: DictConfig) -> None:
+    extras(cfg)
     evaluate(cfg)
 
 

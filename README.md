@@ -655,7 +655,27 @@ logger:
     group: "retrieval"
 ```
 
-预置 alias 速查（可再用 CLI 覆盖 dataset）：`train_retriever[_cwq|_gtsqa|_kgqagen]`, `eval_retriever[_cwq|_gtsqa|_kgqagen]`, `train_gflownet`, `train_gflownet_quick`, `eval_gflownet`, `llm_reasoner`.
+预置 alias 速查：
+- 训练（`experiment=`）：`train_retriever[_cwq|_gtsqa|_kgqagen|_webqsp]`, `train_gflownet[_cwq|_gtsqa|_kgqagen|_webqsp]`
+- 评估（`stage=`，统一入口 `python src/eval.py`）：`retriever_eval`, `materialize_g_agent`, `gflownet_eval`, `llm_reasoner_truth`, `llm_reasoner_paths`, `llm_reasoner_triplet`（可用 CLI 覆盖 `dataset=<name>`）
+
+评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：
+
+```bash
+# 1) Retriever metrics + eval cache（供 truth）
+python src/eval.py stage=retriever_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt
+
+# 2) g_agent（供 GFlowNet）
+python src/eval.py stage=materialize_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt stage.split=test
+
+# 3) GFlowNet metrics + rollout cache（供 paths reasoner）
+python src/eval.py stage=gflownet_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt ckpt.gflownet=/path/to/gflownet.ckpt
+
+# 4) Oracle upper bound / LLM reasoner
+python src/eval.py stage=llm_reasoner_truth dataset=webqsp
+python src/eval.py stage=llm_reasoner_paths dataset=webqsp model=llm_reasoner/ollama
+python src/eval.py stage=llm_reasoner_triplet dataset=webqsp model=llm_reasoner/ollama
+```
 
 </details>
 

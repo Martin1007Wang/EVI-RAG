@@ -9,6 +9,6 @@ prompt_tag: truth
 retriever_eval_path: ${dataset.materialized_dir}/eval_retriever/${data.split}_retriever_eval.pt
 
 # Window sizes (must be <= max ranking_k used when generating retriever eval cache).
-k_values: [1, 5, 10, 25, 50, 100, 200, 300, 400]
+k_values: ${window.k_values}
 
 num_workers: 0
