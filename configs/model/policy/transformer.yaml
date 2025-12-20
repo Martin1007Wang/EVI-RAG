@@ -1,5 +1,6 @@
 _target_: src.models.components.gflownet_policies.EdgeMLPMixerPolicy
 # TransformerPolicy 已移除；保留配置以保证现有引用不崩溃，退回 Mixer。
 hidden_dim: ${model.hidden_dim}
+max_steps: ${model.env_cfg.max_steps}
 dropout: 0.1
 num_layers: 2

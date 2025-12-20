@@ -1,13 +1,6 @@
 _target_: src.models.components.gflownet_embedder.GraphEmbedder
 
 hidden_dim: ${model.hidden_dim}
-# 默认复用 retriever checkpoint 权重做特征提取初始化；dropout 可用于训练期正则。
+# 默认直接使用模型 checkpoint 内嵌权重；可选 warmstart 时再显式传入。
 proj_dropout: 0.0
-projector_checkpoint: ???
-projector_key_prefixes:
-  - retriever.model._orig_mod
-  - retriever.model
-  - retriever
-  - model._orig_mod
-  - model
-  - ""
+projector_checkpoint: null

@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - materialize_g_agent_default
-  - override /dataset: kgqagen
-
-tags: ["kgqagen", "materialize", "g_agent"]

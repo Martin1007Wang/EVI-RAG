@@ -28,6 +28,8 @@ class GAgentDataModule(LightningDataModule):
         shuffle_train: bool = True,
         drop_unreachable: bool = False,
         resources: Optional[Dict[str, str]] = None,
+        prefer_jsonl: bool = True,
+        convert_pt_to_jsonl: bool = True,
     ) -> None:
         super().__init__()
         self.cache_paths = {split: Path(path).expanduser().resolve() for split, path in cache_paths.items()}
@@ -40,6 +42,8 @@ class GAgentDataModule(LightningDataModule):
         self.shuffle_train = bool(shuffle_train)
         self.drop_unreachable = bool(drop_unreachable)
         self.resources_cfg = resources
+        self.prefer_jsonl = bool(prefer_jsonl)
+        self.convert_pt_to_jsonl = bool(convert_pt_to_jsonl)
 
         self.train_dataset: Optional[GAgentPyGDataset] = None
         self.val_dataset: Optional[GAgentPyGDataset] = None
@@ -106,7 +110,12 @@ class GAgentDataModule(LightningDataModule):
             raise FileNotFoundError(f"g_agent cache path not configured for split={split}")
         if not path.exists():
             raise FileNotFoundError(f"g_agent cache not found for split={split}: {path}")
-        return GAgentPyGDataset(path, drop_unreachable=self.drop_unreachable)
+        return GAgentPyGDataset(
+            path,
+            drop_unreachable=self.drop_unreachable,
+            prefer_jsonl=self.prefer_jsonl,
+            convert_pt_to_jsonl=self.convert_pt_to_jsonl,
+        )
 
 
 __all__ = ["GAgentDataModule"]

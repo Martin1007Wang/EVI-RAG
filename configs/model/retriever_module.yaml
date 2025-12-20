@@ -34,3 +34,10 @@ scheduler: null
 evaluation_cfg:
   ranking_k: ${window.k_values}
   answer_recall_k: ${window.k_values}
+  emit_predict_outputs: false
+
+# Start-edge ranking loss: auxiliary term on edges incident to seed entities (added to full-graph loss).
+start_edge_loss_cfg:
+  enabled: true
+  weight: 1.0  # auxiliary coefficient; full-graph loss always included
+  apply_to_eval: false

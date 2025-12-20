@@ -38,16 +38,32 @@ def _compute_lookahead_states(
     selected_mask_f = selected_mask.float().unsqueeze(-1)
     selected_sum = torch.zeros(num_graphs, hidden_dim, device=device)
     selected_sum.index_add_(0, edge_batch, edge_repr_selected * selected_mask_f)
-    selected_count = torch.bincount(edge_batch, weights=selected_mask.float(), minlength=num_graphs)
-    selected_count = selected_count.clamp(min=1.0).unsqueeze(-1)
+    selected_count_raw = torch.bincount(edge_batch, weights=selected_mask.float(), minlength=num_graphs)
+    # Clamp only for division stability; keep the raw count for next_state to avoid double-counting at step0.
+    selected_count = selected_count_raw.clamp(min=1.0).unsqueeze(-1)
     current_state = selected_sum / selected_count
     current_state = graph_norm(current_state + question_tokens)
 
     next_sum = selected_sum[edge_batch] + edge_repr_selected
-    next_count = selected_count[edge_batch] + 1.0
+    next_count = selected_count_raw[edge_batch].unsqueeze(-1) + 1.0
     next_state = next_sum / next_count
     next_state = graph_norm(next_state + question_tokens[edge_batch])
     return current_state, next_state
+
+
+def _apply_order_embedding(
+    edge_tokens: torch.Tensor,
+    selection_order: Optional[torch.Tensor],
+    *,
+    max_steps: int,
+    order_embeddings: nn.Embedding,
+) -> torch.Tensor:
+    if selection_order is None:
+        return edge_tokens
+    if selection_order.shape != edge_tokens.shape[:1]:
+        raise ValueError("selection_order shape must match edge_tokens first dimension.")
+    order_idx = selection_order.to(device=edge_tokens.device, dtype=torch.long).clamp(min=-1, max=max_steps) + 1
+    return edge_tokens + order_embeddings(order_idx)
 
 
 class EdgeMLPMixerPolicy(nn.Module):
@@ -56,12 +72,16 @@ class EdgeMLPMixerPolicy(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
+        max_steps: int,
         dropout: float = 0.1,
         num_layers: int = 2,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
+        self.max_steps = int(max_steps)
         self.type_embeddings = nn.Embedding(5, self.hidden_dim)
+        self.order_embeddings = nn.Embedding(self.max_steps + 2, self.hidden_dim)
+        nn.init.constant_(self.order_embeddings.weight, 0.0)
         self.graph_norm = nn.LayerNorm(self.hidden_dim)
         # FiLM-style调制：让 question_tokens 直接作用到每条边的表示上，避免“只靠结构”忽略语义。
         self.q_film = nn.Sequential(
@@ -102,10 +122,17 @@ class EdgeMLPMixerPolicy(nn.Module):
         question_tokens: torch.Tensor,     # [B, H]
         edge_batch: torch.Tensor,          # [E_total]
         selected_mask: torch.Tensor,       # [E_total]
+        selection_order: Optional[torch.Tensor] = None,  # [E_total]
         **_: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
 
+        edge_tokens = _apply_order_embedding(
+            edge_tokens,
+            selection_order,
+            max_steps=self.max_steps,
+            order_embeddings=self.order_embeddings,
+        )
         edge_tokens = edge_tokens + self.q_film(question_tokens[edge_batch])
         selected_types = torch.full_like(selected_mask, TYPE_SELECTED, dtype=torch.long, device=device)
         type_embed_selected = self.type_embeddings(selected_types)
@@ -132,11 +159,13 @@ class EdgeFrontierPolicy(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
+        max_steps: int,
         dropout: float = 0.1,
         frontier_bonus: float = 0.5,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
+        self.max_steps = int(max_steps)
         self.frontier_bonus = float(frontier_bonus)
         self.graph_norm = nn.LayerNorm(self.hidden_dim)
         self.q_film = nn.Sequential(
@@ -165,6 +194,8 @@ class EdgeFrontierPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
+        self.order_embeddings = nn.Embedding(self.max_steps + 2, self.hidden_dim)
+        nn.init.constant_(self.order_embeddings.weight, 0.0)
         _zero_init_last_linear(self.lookahead_head)
         _zero_init_last_linear(self.stop_head)
 
@@ -175,6 +206,7 @@ class EdgeFrontierPolicy(nn.Module):
         edge_batch: torch.Tensor,          # [E_total]
         selected_mask: torch.Tensor,       # [E_total]
         *,
+        selection_order: Optional[torch.Tensor] = None,  # [E_total]
         edge_heads: Optional[torch.Tensor] = None,  # [E_total]
         edge_tails: Optional[torch.Tensor] = None,  # [E_total]
         current_tail: Optional[torch.Tensor] = None,  # [B]
@@ -183,6 +215,12 @@ class EdgeFrontierPolicy(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
 
+        edge_tokens = _apply_order_embedding(
+            edge_tokens,
+            selection_order,
+            max_steps=self.max_steps,
+            order_embeddings=self.order_embeddings,
+        )
         edge_tokens = edge_tokens + self.q_film(question_tokens[edge_batch])
         candidate_mask = ~selected_mask
         if frontier_mask is None:
@@ -230,11 +268,13 @@ class EdgeGATPolicy(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
+        max_steps: int,
         dropout: float = 0.1,
         frontier_bonus: float = 0.5,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
+        self.max_steps = int(max_steps)
         self.frontier_bonus = float(frontier_bonus)
         self.edge_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.graph_norm = nn.LayerNorm(self.hidden_dim)
@@ -256,6 +296,8 @@ class EdgeGATPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
+        self.order_embeddings = nn.Embedding(self.max_steps + 2, self.hidden_dim)
+        nn.init.constant_(self.order_embeddings.weight, 0.0)
         _zero_init_last_linear(self.lookahead_head)
         _zero_init_last_linear(self.stop_head)
 
@@ -266,6 +308,7 @@ class EdgeGATPolicy(nn.Module):
         edge_batch: torch.Tensor,          # [E_total]
         selected_mask: torch.Tensor,       # [E_total]
         *,
+        selection_order: Optional[torch.Tensor] = None,  # [E_total]
         edge_heads: Optional[torch.Tensor] = None,  # [E_total]
         edge_tails: Optional[torch.Tensor] = None,  # [E_total]
         current_tail: Optional[torch.Tensor] = None,  # [B]
@@ -274,6 +317,12 @@ class EdgeGATPolicy(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
 
+        edge_tokens = _apply_order_embedding(
+            edge_tokens,
+            selection_order,
+            max_steps=self.max_steps,
+            order_embeddings=self.order_embeddings,
+        )
         edge_tokens = edge_tokens + self.q_film(question_tokens[edge_batch])
         candidate_mask = ~selected_mask
         if frontier_mask is None:

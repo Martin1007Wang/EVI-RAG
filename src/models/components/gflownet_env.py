@@ -102,12 +102,9 @@ class GraphEnv(nn.Module):
         start_counts = start_ptr[1:] - start_ptr[:-1]
         if start_counts.numel() != num_graphs:
             raise ValueError("start_ptr has inconsistent length; ensure g_agent cache uses PyG slicing.")
-        if (start_counts <= 0).any():
-            missing = torch.nonzero(start_counts <= 0, as_tuple=False).view(-1).cpu().tolist()
-            raise ValueError(
-                f"GraphEnv.reset received graphs without start_node_locals at indices {missing}; "
-                "g_agent cache must materialize non-empty start anchors per graph instead of relying on runtime inference."
-            )
+        if (start_counts < 0).any():
+            raise ValueError("start_ptr must be non-decreasing.")
+        missing_start = start_counts == 0
 
         heads_global = node_global_ids[edge_index[0]]
         tails_global = node_global_ids[edge_index[1]]
@@ -117,10 +114,9 @@ class GraphEnv(nn.Module):
         prev_tail = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
         current_tail_local = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
         prev_tail_local = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
-        done = torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        done = missing_start.to(device=device)
         step_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
         actions = torch.full((num_graphs, self.max_steps + 1), -1, dtype=torch.long, device=device)
-        answer_hits = torch.zeros(num_graphs, dtype=torch.bool, device=device)
         # Debug 控制：仅首图打印一次 ENV_HIT_DEBUG
         debug_logged = torch.zeros(num_graphs, dtype=torch.bool, device=device)
 
@@ -131,6 +127,10 @@ class GraphEnv(nn.Module):
             raise ValueError("start_node_locals contains negative indices; g_agent cache must store valid node indices.")
         if start_node_locals.numel() > 0 and int(start_node_locals.max().item()) >= num_nodes_total:
             raise ValueError("start_node_locals contains out-of-range indices relative to node_ptr.")
+        if answer_node_locals.numel() > 0 and (answer_node_locals < 0).any():
+            raise ValueError("answer_node_locals contains negative indices; g_agent cache must store valid node indices.")
+        if answer_node_locals.numel() > 0 and int(answer_node_locals.max().item()) >= num_nodes_total:
+            raise ValueError("answer_node_locals contains out-of-range indices relative to node_ptr.")
 
         node_is_start = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
         if start_node_locals.numel() > 0:
@@ -138,8 +138,14 @@ class GraphEnv(nn.Module):
         node_is_answer = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
         if answer_node_locals.numel() > 0:
             node_is_answer[answer_node_locals.long()] = True
-        # 有向模式：仅允许从 start 节点出发的正向边
-        edge_starts_mask = node_is_start[edge_index[0]]
+        answer_hits = torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        if start_node_locals.numel() > 0:
+            start_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), start_counts.clamp(min=0))
+            start_is_answer = node_is_answer[start_node_locals.long()].float()
+            answer_hits = torch.bincount(start_batch, weights=start_is_answer, minlength=num_graphs) > 0
+        # GT 路径按无向遍历定义，因此 step0 必须允许触达 start 的任意 incident edge，
+        # 而非仅 head==start 的正向边。
+        edge_starts_mask = node_is_start[edge_index[0]] | node_is_start[edge_index[1]]
 
         should_debug = bool(self.debug) and (self._debug_resets_logged < self.debug_max_resets)
         if should_debug:
@@ -202,9 +208,15 @@ class GraphEnv(nn.Module):
         tails_global = state.graph.tails_global
         is_step0 = state.step_counts[edge_batch] == 0
         current_tail = state.current_tail[edge_batch]
-        # 有向：仅允许从当前尾节点作为 head 出发
-        valid_next = heads_global == current_tail
-        next_local = state.graph.edge_index[1]
+
+        # 允许沿边双向移动：当前节点可匹配 head 或 tail。
+        head_match = heads_global == current_tail
+        tail_match = tails_global == current_tail
+        valid_next = head_match | tail_match
+
+        # 下一节点（局部索引）由匹配端点确定：head_match -> tail，否则 tail_match -> head。
+        # 对非 incident 边该值无意义（会被 valid_next 屏蔽）。
+        next_local = torch.where(head_match, state.graph.edge_index[1], state.graph.edge_index[0])
 
         if self.forbid_revisit:
             visited = state.visited_nodes[next_local]
@@ -212,7 +224,8 @@ class GraphEnv(nn.Module):
 
         if self.forbid_backtrack:
             prev_tail = state.prev_tail[edge_batch]
-            is_backtrack = tails_global == prev_tail
+            next_global = torch.where(head_match, tails_global, heads_global)
+            is_backtrack = next_global == prev_tail
             valid_next = valid_next & (~is_backtrack)
 
         edge_mask = torch.where(is_step0, state.graph.edge_starts_mask, valid_next)
@@ -226,7 +239,7 @@ class GraphEnv(nn.Module):
         heads = state.graph.heads_global
         tails = state.graph.tails_global
         current_tail = state.current_tail[edge_batch]
-        frontier = heads == current_tail
+        frontier = (heads == current_tail) | (tails == current_tail)
         frontier = torch.where(is_step0, state.graph.edge_starts_mask, frontier)
         frontier = frontier & (~state.selected_mask)
         return frontier & (~horizon_exhausted)
@@ -288,18 +301,33 @@ class GraphEnv(nn.Module):
             graph_ids = state.graph.edge_batch[edge_indices]
             heads_idx = state.graph.edge_index[0, edge_indices]
             tails_idx = state.graph.edge_index[1, edge_indices]
-            heads = state.graph.heads_global[edge_indices]
-            tails = state.graph.tails_global[edge_indices]
-            next_local = tails_idx
-            next_global = state.graph.node_global_ids[next_local]
 
             is_step0 = state.step_counts[graph_ids] == 0
-            prev_tail[graph_ids] = torch.where(is_step0, heads, state.current_tail[graph_ids])
-            current_tail[graph_ids] = next_global
-            prev_tail_local[graph_ids] = torch.where(is_step0, heads_idx, current_tail_local[graph_ids])
-            current_tail_local[graph_ids] = next_local
-            visited_nodes[next_local] = True
-            hit = state.graph.node_is_answer[next_local]
+
+            # Step0：从 start 节点出发（可能在 head 或 tail）；非 step0：从 current_tail 出发。
+            head_is_start = state.graph.node_is_start[heads_idx]
+            tail_is_start = state.graph.node_is_start[tails_idx]
+            src_local_step0 = torch.where(head_is_start, heads_idx, tails_idx)
+            src_is_head_step0 = src_local_step0 == heads_idx
+            dst_local_step0 = torch.where(src_is_head_step0, tails_idx, heads_idx)
+
+            src_local = torch.where(is_step0, src_local_step0, current_tail_local[graph_ids])
+            src_is_head = heads_idx == src_local
+            src_is_tail = tails_idx == src_local
+            if bool((~is_step0 & ~(src_is_head | src_is_tail)).any().item()):
+                raise ValueError("Edge action is not incident to current tail; action_mask_edges must prevent this.")
+            dst_local_non0 = torch.where(src_is_head, tails_idx, heads_idx)
+            dst_local = torch.where(is_step0, dst_local_step0, dst_local_non0)
+
+            src_global = state.graph.node_global_ids[src_local]
+            dst_global = state.graph.node_global_ids[dst_local]
+
+            prev_tail[graph_ids] = src_global
+            current_tail[graph_ids] = dst_global
+            prev_tail_local[graph_ids] = src_local
+            current_tail_local[graph_ids] = dst_local
+            visited_nodes[dst_local] = True
+            hit = state.graph.node_is_answer[dst_local]
 
             write_pos = state.step_counts[graph_ids].clamp(max=actions_record.size(1) - 1)
             actions_record[graph_ids, write_pos] = edge_indices
@@ -314,7 +342,7 @@ class GraphEnv(nn.Module):
                     if self._debug_hits_logged >= self.debug_max_hits:
                         continue
                     mask_gid = graph_ids == gid
-                    sel_next = next_local[mask_gid]
+                    sel_next = dst_local[mask_gid]
                     sel_next_global = state.graph.node_global_ids[sel_next]
                     answers_start = int(state.graph.answer_ptr[gid].item())
                     answers_end = int(state.graph.answer_ptr[gid + 1].item())

@@ -5,7 +5,11 @@ cache_paths:
   validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt
   test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
 
-batch_size: 8
+# 流式优先，若存在 jsonl 则直接使用；若仅有 pt，可选择自动转换为 jsonl 以便后续流式读取。
+prefer_jsonl: true
+convert_pt_to_jsonl: true
+
+batch_size: 128
 num_workers: 8
 pin_memory: true
 drop_last: false

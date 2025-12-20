@@ -3,14 +3,16 @@ _target_: src.models.components.gflownet_actor.GFlowNetActor
 # policy_temperature: train-time sampling temperature; <1e-5 degenerates to greedy
 # eval_policy_temperature: eval-time temperature; null -> reuse train temperature; set 0 for argmax eval
 # stop_logit_bias: bias on stop action; negative discourages early stop
-# random_action_prob: epsilon-greedy mixing weight during training; set 0 for eval
 # debug_actions: emit per-step action debug logs for first batch
 # debug_actions_steps: how many steps to log when debug_actions is true
-policy_temperature: 1.0
-eval_policy_temperature: 0.7
-stop_logit_bias: -1.0
-random_action_prob: 0.1
+policy_temperature: 1.2
+eval_policy_temperature: 0.3  # 稳定优先：低温采样，仍保留 Top-K 差异
+stop_logit_bias: -2.0  # 强力抑制早停，首步已禁用 stop
+# Base retriever score sharpening; <1.0 makes the base distribution peakier.
+score_temperature: 1.0
 # retriever score clamp for log() in residual base distribution
 score_eps: 1.0e-8
-debug_actions: false
+# whether to log policy shift/residual stats for debugging
+log_policy_stats: true
+debug_actions: true
 debug_actions_steps: 0

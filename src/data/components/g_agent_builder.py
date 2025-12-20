@@ -25,12 +25,15 @@ class GAgentSettings:
     # Top-K edges kept from retriever scores (per-sample, retrieval graph space).
     # Final g_agent edges = Top-K ∪ GT-path edges, then deduplicated by (h,r,t) triple.
     anchor_top_k: int = 50
+    # Top-K edges incident to start entities (per-sample, retrieval graph space).
+    anchor_start_k: int = 50
     output_path: Path = Path("g_agent/g_agent_samples.pt")
     force_include_gt: bool = False
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
         self.anchor_top_k = int(self.anchor_top_k)
+        self.anchor_start_k = int(self.anchor_start_k)
         self.output_path = Path(self.output_path).expanduser()
         self.force_include_gt = bool(self.force_include_gt)
 
@@ -207,6 +210,23 @@ class GAgentBuilder:
         if answer_entity_ids.numel() == 0:
             raise ValueError(f"Sample {sample_id} missing answer_entity_ids.")
 
+        # === B.0 Start-edge Top-K (retrieval space) ===
+        start_top_k = int(self.cfg.anchor_start_k)
+        if start_top_k <= 0:
+            raise ValueError(f"anchor_start_k must be > 0, got {start_top_k} (sample_id={sample_id}).")
+        start_mask = torch.isin(graph.node_global_ids, start_entity_ids.view(-1))
+        if not bool(start_mask.any().item()):
+            raise ValueError(f"Start entities missing from retrieval graph (sample_id={sample_id}).")
+        start_edge_mask = start_mask[graph.heads] | start_mask[graph.tails]
+        start_edge_indices = torch.nonzero(start_edge_mask, as_tuple=False).view(-1)
+        if start_edge_indices.numel() == 0:
+            raise ValueError(f"No edges incident to start entities (sample_id={sample_id}).")
+        k_start = min(start_top_k, int(start_edge_indices.numel()))
+        start_scores = scores_full[start_edge_indices]
+        _, start_rank = torch.topk(start_scores, k=k_start, largest=True, sorted=True)
+        start_top_idx = start_edge_indices[start_rank]
+        start_top_locals: Set[int] = {int(i) for i in start_top_idx.tolist()}
+
         # === B.1 Resolve GT edge ids (retrieval space) ===
         # Note: some splits/samples may not have GT paths materialized. GT is required only when we
         # explicitly force-include it (training/oracle graph); otherwise we treat it as absent.
@@ -237,7 +257,8 @@ class GAgentBuilder:
                 return
             raw_gt_indices = []
 
-        gt_locals: Set[int] = set()
+        gt_locals: List[int] = []
+        gt_locals_set: Set[int] = set()
         if raw_gt_indices:
             # Defensive: accept "batch-global" edge indices by mapping them back to local indices.
             global_to_local = {
@@ -248,11 +269,15 @@ class GAgentBuilder:
             for ridx in raw_gt_indices:
                 r_val = int(ridx) if isinstance(ridx, int) else int(ridx.item())
                 if 0 <= r_val < graph.num_edges:
-                    gt_locals.add(r_val)
+                    if r_val not in gt_locals_set:
+                        gt_locals.append(r_val)
+                        gt_locals_set.add(r_val)
                     continue
                 local_idx = global_to_local.get(r_val)
                 if local_idx is not None:
-                    gt_locals.add(local_idx)
+                    if local_idx not in gt_locals_set:
+                        gt_locals.append(local_idx)
+                        gt_locals_set.add(local_idx)
 
             if not gt_locals:
                 if self.cfg.force_include_gt:
@@ -260,9 +285,10 @@ class GAgentBuilder:
                     return
         # === C. Union (Top-K ∪ GT) + Deduplicate by (h,r,t) ===
         # Order matters for determinism: first Top-K (sorted by score desc), then GT-only edges (sorted by score desc).
-        selected_locals: List[int] = [int(i) for i in top_idx.tolist()]
+        selected_locals: List[int] = [int(i) for i in start_top_idx.tolist()]
+        selected_locals.extend([int(i) for i in top_idx.tolist() if int(i) not in start_top_locals])
         if self.cfg.force_include_gt:
-            gt_only = [int(i) for i in gt_locals if int(i) not in top_locals]
+            gt_only = [int(i) for i in gt_locals if int(i) not in top_locals and int(i) not in start_top_locals]
             gt_only.sort(key=lambda idx: (-float(scores_full[idx].item()), int(idx)))
             selected_locals.extend(gt_only)
 
@@ -278,7 +304,7 @@ class GAgentBuilder:
             triple = (h_global, r_global, t_global)
             score = float(graph.scores[eidx].item())
             label = float(graph.labels[eidx].item())
-            in_top = eidx in top_locals
+            in_top = (eidx in top_locals) or (eidx in start_top_locals)
             agg = triple_to_agg.get(triple)
             if agg is None:
                 triple_to_agg[triple] = {"score": score, "label": label, "in_top": in_top}
@@ -326,8 +352,7 @@ class GAgentBuilder:
             if mapped is not None:
                 start_node_locals_list.append(mapped)
         if not start_node_locals_list:
-            self.stats["retrieval_failed"] += 1
-            return
+            raise ValueError(f"Start entities missing from selected subgraph (sample_id={sample_id}).")
         seen_q = set()
         start_node_locals = torch.tensor(
             [x for x in start_node_locals_list if not (x in seen_q or seen_q.add(x))],
@@ -364,21 +389,26 @@ class GAgentBuilder:
 
         # === E. Ground Truth Path Mapping (by triple, after dedup) ===
         triple_to_agent = {triple: idx for idx, triple in enumerate(triples)}
-        gt_triples_set: Set[Tuple[int, int, int]] = set()
+        gt_triples_ordered: List[Tuple[int, int, int]] = []
+        gt_triples_seen: Set[Tuple[int, int, int]] = set()
         for ridx in gt_locals:
             h_local = int(graph.heads[int(ridx)].item())
             t_local = int(graph.tails[int(ridx)].item())
             h_global = int(graph.node_global_ids[h_local].item())
             t_global = int(graph.node_global_ids[t_local].item())
             r_global = int(graph.relations[int(ridx)].item())
-            gt_triples_set.add((h_global, r_global, t_global))
+            triple = (h_global, r_global, t_global)
+            if triple not in gt_triples_seen:
+                gt_triples_ordered.append(triple)
+                gt_triples_seen.add(triple)
 
-        gt_set: Set[int] = set()
-        for triple in gt_triples_set:
+        gt_path_indices: List[int] = []
+        gt_path_seen: Set[int] = set()
+        for triple in gt_triples_ordered:
             agent_idx = triple_to_agent.get(triple)
-            if agent_idx is not None:
-                gt_set.add(int(agent_idx))
-        gt_path_indices = sorted(gt_set)
+            if agent_idx is not None and agent_idx not in gt_path_seen:
+                gt_path_indices.append(int(agent_idx))
+                gt_path_seen.add(int(agent_idx))
         gt_path_exists = len(gt_path_indices) > 0
         if self.cfg.force_include_gt and not gt_path_exists:
             raise ValueError(f"Sample {sample_id} GT triples missing in selected subgraph after union/dedup.")

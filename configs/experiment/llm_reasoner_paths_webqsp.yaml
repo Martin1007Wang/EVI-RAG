@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - llm_reasoner_paths_default
-  - override /dataset: webqsp
-
-tags: ["webqsp", "llm_reasoner", "paths"]

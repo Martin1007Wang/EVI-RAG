@@ -1,8 +1,0 @@
-# @package _global_
-
-defaults:
-  - train_retriever_default
-  # Train on the filtered dataset to avoid empty-graph samples in raw CWQ.
-  - override /dataset: cwq-sub
-
-tags: ["cwq", "train_retriever"]

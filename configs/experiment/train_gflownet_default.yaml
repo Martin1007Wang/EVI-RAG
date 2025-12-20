@@ -14,13 +14,11 @@ train: true
 test: true
 ckpt_path: null
 seed: 42
-optimized_metric: "val/rollout_reward"
+optimized_metric: "val/path_prefix@5"
 
 # 打开 GFlowNet 专用 debug 日志（独立文件 logs/gflownet_debug.log）。
-# 训练提速默认关闭，如需对拍再显式打开。
-gflownet_debug: false
-# 若需环境内对拍 success/hit（首图详细命中日志），打开 env_debug；默认关闭以减少日志开销。
-env_debug: false
+# 统一 debug 开关：控制 gflownet.debug 和 env.debug。
+debug: true
 
 # Ensure validation runs every epoch for early stopping/monitoring.
 trainer:
@@ -29,13 +27,23 @@ trainer:
 # Override callback monitors for GFlowNet (no ranking/mrr available)
 callbacks:
   model_checkpoint:
-    monitor: val/rollout_reward
+    monitor: val/path_exact@5
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
-  early_stopping:
-    monitor: val/rollout_reward
+    save_weights_only: True
+  answer_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints/answer
+    monitor: val/answer_hit@5
     mode: max
-    patience: 50
+    filename: "answer_epoch_{epoch:03d}"
+    save_top_k: 1
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: val/path_prefix@5
+    mode: max
+    patience: 20
 
 # Residual GFlowNet：PF 以 retriever 分数为 base；在该“显式轨迹状态”定义下 P_B 为确定性回退（log P_B=0），使用 SubTB（无辅助项）。

@@ -38,7 +38,6 @@ class SplitFilter:
     skip_no_topic: bool
     skip_no_ans: bool
     skip_no_path: bool
-    use_shortest_path_positive: bool
 
 
 @dataclass(frozen=True)
@@ -67,16 +66,13 @@ class GraphRecord:
     edge_src: List[int]
     edge_dst: List[int]
     edge_relation_ids: List[int]
-    # Transition-level positives: supervision defined on node transitions (u->v),
-    # then lifted to all parallel edges between the same endpoints.
-    positive_edge_mask: List[bool]
     # Triple-level positives: supervision defined on a specific edge id in the
     # preserved multi-edge list (h,r,t). For shortest-path supervision this is
-    # the canonical edge id induced by SubgraphRAG-parity collapsing.
+    # a deterministic single shortest path (not a union).
     positive_triple_mask: List[bool]
     gt_path_edge_indices: List[int]
     gt_path_node_indices: List[int]
-    # Provenance of gt_path_* (used for downstream label selection).
+    # Provenance of gt_path_* (diagnostics only).
     gt_source: str
 
 
@@ -209,9 +205,6 @@ class ParquetDatasetWriter:
                     "edge_relation_ids": pa.array(
                         [g.edge_relation_ids for g in self.graphs], type=pa.list_(pa.int64())
                     ),
-                    "positive_edge_mask": pa.array(
-                        [g.positive_edge_mask for g in self.graphs], type=pa.list_(pa.bool_())
-                    ),
                     "positive_triple_mask": pa.array(
                         [g.positive_triple_mask for g in self.graphs], type=pa.list_(pa.bool_())
                     ),
@@ -291,22 +284,19 @@ def shortest_path_edge_indices_directed(
     answers: Sequence[int],
     undirected: bool,
 ) -> Tuple[List[int], List[int]]:
-    """Bidirectional shortest-path union (SubgraphRAG parity), preserving multi-edges.
+    """Deterministic single shortest path (seed -> answer), preserving multi-edges.
 
-    - Compute all shortest paths seed->answer (forward) and answer->seed (backward).
-    - If only one direction exists, use that direction.
-    - If both exist, keep only the direction(s) with minimal hop length (could be one side or both).
-    - Return the union of edge indices that appear in these shortest paths, plus incident nodes.
+    - Build adjacency from the collapsed (u,v) pairs; parallel edges map to the last edge id.
+    - Run multi-source BFS from all seeds with stable ordering.
+    - Pick the closest reachable answer (tie-break by answer id).
+    - Return the edge indices along that single path plus its node indices.
     """
     if not seeds or not answers or num_nodes <= 0:
         return [], []
 
     from collections import deque
 
-    # SubgraphRAG uses `nx.DiGraph()` which collapses parallel edges by (u,v) with last-write-wins
-    # on edge attributes. We mirror that behavior by:
-    #   - storing a canonical `pair_to_edge_idx[(u,v)] = last_edge_idx`
-    #   - building adjacency over unique (u,v) pairs (in first-seen order)
+    # Collapse parallel edges by (u,v) with last-write-wins to mirror DiGraph semantics.
     pair_to_edge_idx: Dict[Tuple[int, int], int] = {}
     adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
     for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
@@ -320,79 +310,54 @@ def shortest_path_edge_indices_directed(
                 if (v, u) not in pair_to_edge_idx:
                     adjacency[v].append(u)
                 pair_to_edge_idx[(v, u)] = idx
+    # Sort adjacency for deterministic BFS ordering.
+    for nbrs in adjacency:
+        nbrs.sort()
 
-    def _all_shortest_paths(src: int, dst: int) -> List[List[int]]:
-        """Return all shortest node paths (inclusive) from src->dst on the collapsed adjacency."""
-        if src == dst:
-            return []
-
-        dist = [-1] * num_nodes
-        parents: List[List[int]] = [[] for _ in range(num_nodes)]
-        dist[src] = 0
-        q: deque[int] = deque([src])
-        while q:
-            cur = q.popleft()
-            next_dist = dist[cur] + 1
-            for nb in adjacency[cur]:
-                if dist[nb] == -1:
-                    dist[nb] = next_dist
-                    q.append(nb)
-                if dist[nb] == next_dist:
-                    parents[nb].append(cur)
-
-        if dist[dst] == -1:
-            return []
-
-        paths: List[List[int]] = []
-
-        def _dfs(node: int, suffix: List[int]) -> None:
-            if node == src:
-                paths.append([src] + list(reversed(suffix)))
-                return
-            for p in parents[node]:
-                _dfs(p, suffix + [node])
-
-        _dfs(dst, [])
-        return paths
-
-    seeds_unique = [int(s) for s in seeds if 0 <= int(s) < num_nodes]
-    answers_unique = [int(a) for a in answers if 0 <= int(a) < num_nodes]
+    seeds_unique = sorted({int(s) for s in seeds if 0 <= int(s) < num_nodes})
+    answers_unique = sorted({int(a) for a in answers if 0 <= int(a) < num_nodes})
     if not seeds_unique or not answers_unique:
         return [], []
 
-    # SubgraphRAG parity: refine per (seed, answer) pair.
-    selected_paths: List[List[int]] = []
+    dist = [-1] * num_nodes
+    parent = [-1] * num_nodes
+    parent_edge = [-1] * num_nodes
+    q: deque[int] = deque()
     for s in seeds_unique:
-        for a in answers_unique:
-            forward_paths = _all_shortest_paths(s, a)
-            backward_paths = _all_shortest_paths(a, s)
-            full_paths = forward_paths + backward_paths
-            if not full_paths:
+        dist[s] = 0
+        q.append(s)
+
+    while q:
+        cur = q.popleft()
+        next_dist = dist[cur] + 1
+        for nb in adjacency[cur]:
+            if dist[nb] != -1:
                 continue
+            dist[nb] = next_dist
+            parent[nb] = cur
+            parent_edge[nb] = pair_to_edge_idx.get((cur, nb), -1)
+            q.append(nb)
 
-            # If either direction is missing, keep the existing one(s).
-            if (len(forward_paths) == 0) or (len(backward_paths) == 0):
-                selected_paths.extend(full_paths)
-                continue
-
-            # Both directions exist: keep only shortest-length paths.
-            min_len = min(len(p) for p in full_paths)
-            selected_paths.extend([p for p in full_paths if len(p) == min_len])
-
-    if not selected_paths:
+    candidates = [a for a in answers_unique if dist[a] >= 0]
+    if not candidates:
         return [], []
 
-    edge_set: Set[int] = set()
-    node_set: Set[int] = set()
-    for path in selected_paths:
-        for u, v in zip(path[:-1], path[1:]):
-            node_set.add(u)
-            node_set.add(v)
-            e_idx = pair_to_edge_idx.get((u, v))
-            if e_idx is not None:
-                edge_set.add(int(e_idx))
+    best_dist = min(dist[a] for a in candidates)
+    best_answer = min(a for a in candidates if dist[a] == best_dist)
 
-    return sorted(edge_set), sorted(node_set)
+    path_nodes: List[int] = []
+    path_edges: List[int] = []
+    cur = best_answer
+    while cur != -1 and dist[cur] >= 0:
+        path_nodes.append(cur)
+        e_idx = parent_edge[cur]
+        if e_idx != -1:
+            path_edges.append(int(e_idx))
+        cur = parent[cur]
+
+    path_nodes.reverse()
+    path_edges.reverse()
+    return path_edges, path_nodes
 
 
 def has_connectivity(
@@ -666,9 +631,8 @@ def preprocess(
         split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
         keep_for_sub = _should_keep_sample(sample, split_filter, undirected_traversal, connectivity_cache) if write_sub else False
 
-        use_sp = split_filter.use_shortest_path_positive
-        graph = build_graph(sample, entity_vocab, relation_vocab, graph_id, use_sp, undirected_traversal)
-        question = build_question_record(sample, entity_vocab, graph_id, use_sp)
+        graph = build_graph(sample, entity_vocab, relation_vocab, graph_id, undirected_traversal)
+        question = build_question_record(sample, entity_vocab, graph_id)
         base_writer.append(graph, question)
         if sub_writer is not None and keep_for_sub:
             sub_writer.append(graph, question)
@@ -696,7 +660,6 @@ def build_graph(
     entity_vocab: EntityVocab,
     relation_vocab: RelationVocab,
     graph_id: str,
-    use_shortest_path_positive: bool,
     undirected_traversal: bool,
 ) -> GraphRecord:
     node_index: Dict[str, int] = {}
@@ -771,13 +734,6 @@ def build_graph(
     positive_triple_set = {int(idx) for idx in path_edge_indices if 0 <= int(idx) < num_edges}
     positive_triple_mask = [i in positive_triple_set for i in range(num_edges)]
 
-    if use_shortest_path_positive:
-        # Transition-level supervision: lift GT transitions (u->v) to all parallel edges.
-        positive_pairs = {(edge_src[idx], edge_dst[idx]) for idx in positive_triple_set}
-        positive_edge_mask = [(u, v) in positive_pairs for u, v in zip(edge_src, edge_dst)]
-    else:
-        positive_edge_mask = [True] * num_edges
-
     return GraphRecord(
         graph_id=graph_id,
         node_entity_ids=node_entity_ids,
@@ -786,7 +742,6 @@ def build_graph(
         edge_src=edge_src,
         edge_dst=edge_dst,
         edge_relation_ids=edge_relation_ids,
-        positive_edge_mask=positive_edge_mask,
         positive_triple_mask=positive_triple_mask,
         gt_path_edge_indices=path_edge_indices,
         gt_path_node_indices=path_node_indices,
@@ -798,13 +753,12 @@ def build_question_record(
     sample: Sample,
     entity_vocab: EntityVocab,
     graph_id: str,
-    use_shortest_path_positive: bool,
 ) -> Dict[str, object]:
     seed_entity_ids = [entity_vocab.entity_id(ent) for ent in sample.q_entity]
     answer_entity_ids = [entity_vocab.entity_id(ent) for ent in sample.a_entity]
     seed_embedding_ids = [entity_vocab.embedding_id(ent) for ent in sample.q_entity]
     answer_embedding_ids = [entity_vocab.embedding_id(ent) for ent in sample.a_entity]
-    metadata: Dict[str, Any] = {"use_shortest_path_positive": use_shortest_path_positive}
+    metadata: Dict[str, Any] = {}
     if sample.graph_iso_type is not None:
         metadata["graph_isomorphism"] = sample.graph_iso_type
     if sample.redundant is not None:
@@ -843,7 +797,6 @@ def write_graphs(graphs: List[GraphRecord], output_path: Path) -> None:
             "edge_src": pa.array([g.edge_src for g in graphs], type=pa.list_(pa.int64())),
             "edge_dst": pa.array([g.edge_dst for g in graphs], type=pa.list_(pa.int64())),
             "edge_relation_ids": pa.array([g.edge_relation_ids for g in graphs], type=pa.list_(pa.int64())),
-            "positive_edge_mask": pa.array([g.positive_edge_mask for g in graphs], type=pa.list_(pa.bool_())),
             "positive_triple_mask": pa.array([g.positive_triple_mask for g in graphs], type=pa.list_(pa.bool_())),
             "gt_path_edge_indices": pa.array([g.gt_path_edge_indices for g in graphs], type=pa.list_(pa.int64())),
             "gt_path_node_indices": pa.array([g.gt_path_node_indices for g in graphs], type=pa.list_(pa.int64())),
@@ -928,7 +881,6 @@ if hydra is not None:
                 skip_no_topic=bool(section.get("skip_no_topic", False)),
                 skip_no_ans=bool(section.get("skip_no_ans", False)),
                 skip_no_path=bool(section.get("skip_no_path", False)),
-                use_shortest_path_positive=bool(section.get("use_shortest_path_positive", False)),
             )
 
         train_filter = _as_filter(cfg.filter.train)

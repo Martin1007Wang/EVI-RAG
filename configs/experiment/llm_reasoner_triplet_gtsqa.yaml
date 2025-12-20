@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - llm_reasoner_triplet_default
-  - override /dataset: gtsqa
-
-tags: ["gtsqa", "llm_reasoner", "triplet"]

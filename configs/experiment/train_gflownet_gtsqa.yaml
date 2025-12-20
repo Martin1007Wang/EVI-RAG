@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - train_gflownet_default
-  - override /dataset: gtsqa
-
-tags: ["gtsqa", "gflownet"]

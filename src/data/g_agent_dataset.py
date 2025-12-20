@@ -3,8 +3,9 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -55,61 +56,30 @@ def _load_g_agent_cache(cache_path: Path):
 
 
 def _builder_sample_to_record(sample: GAgentSample) -> Dict:
-    """Normalize legacy builder-style dataclass into dict format consumed by parser."""
-    num_edges = int(sample.edge_head_locals.numel())
-    num_nodes = int(sample.node_entity_ids.numel())
-    edge_local_ids = list(range(num_edges))
-    nodes = [
-        {
-            "local_index": i,
-            "entity_id": int(sample.node_entity_ids[i].item()),
-            "id": int(sample.node_entity_ids[i].item()),
-            "embedding_id": int(sample.node_embedding_ids[i].item()),
-        }
-        for i in range(num_nodes)
-    ]
-    edges = []
-    for i in range(num_edges):
-        edges.append(
-            {
-                "local_index": i,
-                "head_local": int(sample.edge_head_locals[i].item()),
-                "tail_local": int(sample.edge_tail_locals[i].item()),
-                "relation": int(sample.edge_relations[i].item()),
-                "label": float(sample.edge_labels[i].item()) if sample.edge_labels.numel() > i else 0.0,
-                "score": float(sample.edge_scores[i].item()) if sample.edge_scores.numel() > i else 0.0,
-            }
-        )
-    if hasattr(sample, "gt_path_edge_local_ids"):
-        gt_edges = sample.gt_path_edge_local_ids.tolist()
-    else:
-        gt_edges = []
-    if hasattr(sample, "gt_path_node_local_ids") and sample.gt_path_node_local_ids.numel() > 0:
-        gt_nodes = sample.gt_path_node_local_ids.tolist()
-    else:
-        gt_nodes_set = set()
-        for e_idx in gt_edges:
-            if 0 <= e_idx < num_edges:
-                h_local = int(sample.edge_head_locals[e_idx].item())
-                t_local = int(sample.edge_tail_locals[e_idx].item())
-                gt_nodes_set.add(h_local)
-                gt_nodes_set.add(t_local)
-        gt_nodes = sorted(gt_nodes_set)
+    """Normalize GAgentSample into flat dict schema consumed by parser."""
+
+    def _tolist(t):
+        return t.tolist() if hasattr(t, "tolist") else t
+
     return {
         "sample_id": sample.sample_id,
         "question": sample.question,
-        "question_emb": sample.question_emb,
-        "selected_edges": edges,
-        "selected_nodes": nodes,
-        "node_embedding_ids": sample.node_embedding_ids.tolist(),
-        "top_edge_local_indices": edge_local_ids,
-        "gt_path_edge_local_indices": gt_edges,
-        "gt_path_node_local_indices": gt_nodes,
+        "question_emb": _tolist(sample.question_emb),
+        "edge_relations": _tolist(sample.edge_relations),
+        "edge_scores": _tolist(sample.edge_scores),
+        "edge_labels": _tolist(sample.edge_labels),
+        "edge_head_locals": _tolist(sample.edge_head_locals),
+        "edge_tail_locals": _tolist(sample.edge_tail_locals),
+        "node_entity_ids": _tolist(sample.node_entity_ids),
+        "node_embedding_ids": _tolist(sample.node_embedding_ids),
+        "top_edge_mask": _tolist(sample.top_edge_mask),
+        "start_entity_ids": _tolist(sample.start_entity_ids),
+        "answer_entity_ids": _tolist(sample.answer_entity_ids),
+        "gt_path_edge_local_ids": _tolist(sample.gt_path_edge_local_ids),
+        "gt_path_node_local_ids": _tolist(sample.gt_path_node_local_ids),
         "gt_path_exists": bool(sample.gt_path_exists),
-        "start_entity_ids": sample.start_entity_ids.tolist(),
-        "start_node_locals": sample.start_node_locals.tolist(),
-        "answer_entity_ids": sample.answer_entity_ids.tolist(),
-        "answer_node_locals": sample.answer_node_locals.tolist(),
+        "start_node_locals": _tolist(sample.start_node_locals),
+        "answer_node_locals": _tolist(sample.answer_node_locals),
         "is_answer_reachable": bool(sample.is_answer_reachable),
     }
 
@@ -230,6 +200,12 @@ def _parse_sample(record: Dict) -> GAgentSample:
     if gt_path_node_local_ids.numel() > 0:
         if ((gt_path_node_local_ids < 0) | (gt_path_node_local_ids >= num_nodes)).any():
             raise ValueError(f"gt_path_node_local_ids out of range for {record.get('sample_id')}")
+    gt_path_exists = bool(record["gt_path_exists"])
+    if gt_path_exists:
+        if gt_path_edge_local_ids.numel() == 0 or gt_path_node_local_ids.numel() == 0:
+            raise ValueError(f"gt_path_exists=True but gt_path_* is empty for {record.get('sample_id')}")
+    elif gt_path_edge_local_ids.numel() > 0 or gt_path_node_local_ids.numel() > 0:
+        raise ValueError(f"gt_path_exists=False but gt_path_* is non-empty for {record.get('sample_id')}")
 
     computed_reachable = answer_node_locals.numel() > 0
     declared_reachable = bool(record["is_answer_reachable"])
@@ -257,18 +233,13 @@ def _parse_sample(record: Dict) -> GAgentSample:
         answer_node_locals=answer_node_locals,
         gt_path_edge_local_ids=gt_path_edge_local_ids,
         gt_path_node_local_ids=gt_path_node_local_ids,
-        gt_path_exists=bool(record["gt_path_exists"]),
+        gt_path_exists=gt_path_exists,
         is_answer_reachable=declared_reachable,
     )
     if sample.question_emb.dim() == 1:
         sample.question_emb = sample.question_emb.unsqueeze(0)
     if sample.start_entity_ids.numel() == 0:
         raise ValueError(f"g_agent record missing non-empty start_entity_ids: {record.get('sample_id')}")
-    if sample.start_node_locals.numel() == 0:
-        raise ValueError(
-            f"g_agent record missing start_node_locals for {record.get('sample_id')}; "
-            "builder must emit per-graph start_node_locals aligned to start_entity_ids instead of relying on inference."
-        )
     return sample
 
 
@@ -281,14 +252,22 @@ def load_g_agent_samples(
     if not cache_path.exists():
         raise FileNotFoundError(f"g_agent cache not found: {cache_path}")
     payload = _load_g_agent_cache(cache_path)
-    raw_samples: Sequence[Dict] = payload.get("samples") or []
+    if isinstance(payload, dict):
+        raw_samples: Sequence[Dict] = payload.get("samples") or []
+    elif isinstance(payload, list):
+        raw_samples = payload
+    else:
+        raise TypeError(f"Unsupported g_agent cache format at {cache_path}: {type(payload)}")
     if not raw_samples:
         raise ValueError(f"No samples found in {cache_path}")
 
     samples: List[GAgentSample] = []
     dropped = 0
     for record in raw_samples:
-        sample = _parse_sample(record)
+        if isinstance(record, GAgentSample):
+            sample = record
+        else:
+            sample = _parse_sample(record)
         if drop_unreachable and not sample.is_answer_reachable:
             dropped += 1
             continue
@@ -320,11 +299,6 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
     if question_emb.dim() == 1:
         question_emb = question_emb.unsqueeze(0)
     start_node_locals = sample.start_node_locals
-    if start_node_locals.numel() == 0:
-        raise ValueError(
-            f"GAgentSample {sample.sample_id} missing start_node_locals; "
-            "dataset must materialize start anchors instead of inferring from start_entity_ids."
-    )
     data = GAgentData(
         edge_index=edge_index,
         edge_attr=sample.edge_relations,
@@ -537,15 +511,80 @@ class GAgentPyGDataset(Dataset):
         cache_path: str | Path,
         *,
         drop_unreachable: bool = False,
+        prefer_jsonl: bool = True,
+        convert_pt_to_jsonl: bool = False,
     ) -> None:
         super().__init__()
-        self.samples = load_g_agent_samples(cache_path, drop_unreachable=drop_unreachable)
+        path = Path(cache_path)
+        self.drop_unreachable = drop_unreachable
+        target = path
+        if path.suffix.lower() == ".pt" and convert_pt_to_jsonl:
+            target = self._convert_pt_to_jsonl(path)
+        elif prefer_jsonl:
+            candidate = path.with_suffix(".jsonl")
+            if candidate.exists():
+                target = candidate
+        self._is_jsonl = target.suffix.lower() == ".jsonl"
+        self.cache_path = target
+        if self._is_jsonl:
+            self._offsets = self._build_index(self.cache_path)
+            self.samples = None
+        else:
+            if convert_pt_to_jsonl:
+                converted = self._convert_pt_to_jsonl(path)
+                self.cache_path = converted
+                self._is_jsonl = True
+                self._offsets = self._build_index(converted)
+                self.samples = None
+            else:
+                self.samples = load_g_agent_samples(path, drop_unreachable=drop_unreachable)
+            self._offsets = []
 
     def __len__(self) -> int:
-        return len(self.samples)
+        if self.samples is not None:
+            return len(self.samples)
+        return len(self._offsets)
 
     def __getitem__(self, idx: int) -> GAgentData:
-        return _sample_to_pyg_data(self.samples[idx])
+        if self.samples is not None:
+            return _sample_to_pyg_data(self.samples[idx])
+        record = self._read_jsonl_record(idx)
+        sample = _parse_sample(record)
+        if self.drop_unreachable and not sample.is_answer_reachable:
+            # 线性探测下一个样本，确保 DataLoader 不返回空
+            return self.__getitem__((idx + 1) % len(self))
+        return _sample_to_pyg_data(sample)
+
+    def _build_index(self, path: Path) -> List[int]:
+        offsets: List[int] = []
+        with path.open("rb") as f:
+            offset = 0
+            for line in f:
+                offsets.append(offset)
+                offset += len(line)
+        return offsets
+
+    def _read_jsonl_record(self, idx: int) -> Dict:
+        if idx < 0 or idx >= len(self._offsets):
+            raise IndexError(idx)
+        with self.cache_path.open("rb") as f:
+            f.seek(self._offsets[idx])
+            line = f.readline()
+        if not line:
+            raise ValueError(f"Empty line at idx={idx}")
+        return json.loads(line)
+
+    def _convert_pt_to_jsonl(self, path: Path) -> Path:
+        samples = load_g_agent_samples(path, drop_unreachable=self.drop_unreachable)
+        out = path.with_suffix(".jsonl")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as f:
+            for sample in samples:
+                rec = _builder_sample_to_record(sample) if isinstance(sample, GAgentSample) else sample
+                f.write(json.dumps(rec) + "\n")
+        # 释放内存
+        del samples
+        return out
 
 
 __all__ = [

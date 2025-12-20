@@ -1,8 +1,8 @@
 # DataModule for LLM reasoning over persisted GFlowNet eval rollouts (path-based).
 _target_: src.data.llm_reasoner_path_datamodule.LLMReasonerPathDataModule
 
-# Required paths
-eval_cache_path: ${dataset.materialized_dir}/eval_gflownet/test_gflownet_eval.pt
+# Required paths (split-aware)
+eval_cache_path: ${dataset.materialized_dir}/eval_gflownet/${.split}_gflownet_eval.pt
 entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
 relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
 

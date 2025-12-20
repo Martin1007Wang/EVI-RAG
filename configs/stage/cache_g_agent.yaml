@@ -1,0 +1,54 @@
+# @package _global_
+#
+# Stage: 单次 Retriever 前向同时做指标 + 物化 g_agent 缓存。
+
+defaults:
+  - _self_
+  - dataset: null
+  - experiment: null
+  - optional local: default
+  - override /data: retriever
+  - override /model: retriever_module
+  - override /callbacks: g_agent_generation
+  - override /logger: none
+  - override /trainer: single_gpu_eval
+  - override /window: default
+  - override /ckpt: default
+  - override /paths: default
+  - override /extras: default
+  - override /hydra: default
+
+stage:
+  name: cache_g_agent
+  task_name: "cache/g_agent"
+  tags: ["cache", "g_agent", "retriever"]
+  # Default behavior: materialize all splits deterministically in a single invocation.
+  # Override via CLI if you want a single split run:
+  #   stage.run_all_splits=false stage.split=test stage.force_include_gt=false
+  run_all_splits: true
+  splits: [train, validation, test]
+  split: test
+  anchor_top_k: ${window.anchor_top_k}
+  anchor_start_k: ${window.anchor_start_k}
+  force_include_gt: false
+  run:
+    return_predictions: false
+
+ckpt_path: ${ckpt.retriever}
+
+# 仅跑目标 split 的 loader，避免不必要的 train/val 迭代。
+data:
+  splits:
+    test: ${stage.split}
+
+model:
+  evaluation_cfg:
+    split: ${stage.split}
+    emit_predict_outputs: true
+  eval_persist_cfg:
+    enabled: true
+    output_dir: ${dataset.materialized_dir}/eval_retriever
+    splits: ["${stage.split}"]
+    textualize: true
+    entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+    relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet

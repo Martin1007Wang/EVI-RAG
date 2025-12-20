@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - materialize_g_agent_default
-  - override /dataset: webqsp
-
-tags: ["webqsp", "materialize", "g_agent"]

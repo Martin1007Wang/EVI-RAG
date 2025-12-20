@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Mapping
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,38 @@ class LossOutput:
     loss: torch.Tensor
     components: Dict[str, float]
     metrics: Dict[str, float]
+
+
+def _apply_edge_mask(
+    *,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    edge_batch: Optional[torch.Tensor],
+    edge_mask: Optional[torch.Tensor],
+    name: str,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
+    metrics: Dict[str, float] = {}
+    if edge_mask is None:
+        return logits, targets, edge_batch, metrics
+
+    mask = edge_mask.view(-1).to(dtype=torch.bool, device=logits.device)
+    if mask.numel() != logits.numel():
+        raise ValueError(f"{name} edge_mask shape mismatch: {mask.shape} vs logits {logits.shape}")
+    if not bool(mask.any().item()):
+        raise ValueError(f"{name} edge_mask has no True entries.")
+
+    metrics[f"{name}_mask_frac"] = float(mask.float().mean().item())
+    pos_mask_all = targets > 0.5
+    if bool(pos_mask_all.any().item()):
+        pos_in_mask = (mask & pos_mask_all).float().sum().item()
+        pos_total = pos_mask_all.float().sum().item()
+        metrics[f"{name}_mask_pos_frac"] = float(pos_in_mask / pos_total)
+
+    logits = logits[mask]
+    targets = targets[mask]
+    if edge_batch is not None:
+        edge_batch = edge_batch[mask]
+    return logits, targets, edge_batch, metrics
 
 
 class RetrieverBCELoss(nn.Module):
@@ -38,6 +70,7 @@ class RetrieverBCELoss(nn.Module):
         *,
         edge_batch: Optional[torch.Tensor] = None,
         num_graphs: Optional[int] = None,
+        edge_mask: Optional[torch.Tensor] = None,
     ) -> LossOutput:
         logits = output.logits
         if logits is None:
@@ -47,6 +80,14 @@ class RetrieverBCELoss(nn.Module):
         targets = targets.view(-1).float()
         if logits.numel() != targets.numel():
             raise ValueError(f"logits/targets shape mismatch: {logits.shape} vs {targets.shape}")
+
+        logits, targets, edge_batch, mask_metrics = _apply_edge_mask(
+            logits=logits,
+            targets=targets,
+            edge_batch=edge_batch,
+            edge_mask=edge_mask,
+            name="edge",
+        )
 
         pos_weight = self.pos_weight.to(dtype=logits.dtype) if self._use_pos_weight else None
         edge_loss = F.binary_cross_entropy_with_logits(
@@ -86,6 +127,7 @@ class RetrieverBCELoss(nn.Module):
                 "pos_prob": float(pos_avg.item()),
                 "neg_prob": float(neg_avg.item()),
                 "separation": float((pos_avg - neg_avg).item()),
+                **mask_metrics,
             },
         )
 
@@ -156,6 +198,7 @@ class RetrieverListwiseHardNegLoss(nn.Module):
         *,
         edge_batch: Optional[torch.Tensor] = None,
         num_graphs: Optional[int] = None,
+        edge_mask: Optional[torch.Tensor] = None,
     ) -> LossOutput:
         del training_step
         logits = output.logits
@@ -171,6 +214,14 @@ class RetrieverListwiseHardNegLoss(nn.Module):
             raise ValueError(
                 f"logits/targets/edge_batch shape mismatch: {logits.shape} vs {targets.shape} vs {edge_batch.shape}"
             )
+
+        logits, targets, edge_batch, mask_metrics = _apply_edge_mask(
+            logits=logits,
+            targets=targets,
+            edge_batch=edge_batch,
+            edge_mask=edge_mask,
+            name="edge",
+        )
         if num_graphs is None:
             num_graphs = int(edge_batch.max().item()) + 1 if edge_batch.numel() > 0 else 0
         num_graphs = int(num_graphs)
@@ -252,6 +303,7 @@ class RetrieverListwiseHardNegLoss(nn.Module):
                 "separation": float((pos_avg - neg_avg).item()),
                 "num_pos_graphs": float(has_pos.to(torch.float32).sum().item()),
                 "num_pairwise_graphs": float(pairwise_graphs.detach().cpu().item()),
+                **mask_metrics,
             },
         )
 

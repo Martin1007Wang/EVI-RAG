@@ -101,7 +101,6 @@ def test_gflownet_actor_rollout_smoke_no_name_error() -> None:
         policy_temperature=1.0,
         eval_policy_temperature=None,
         stop_logit_bias=0.0,
-        random_action_prob=0.1,
         score_eps=1e-6,
         debug_actions=False,
         debug_actions_steps=0,
@@ -121,7 +120,7 @@ def test_gflownet_actor_rollout_smoke_no_name_error() -> None:
     assert out["log_pf"].shape == (1,)
 
 
-def test_gflownet_actor_log_pf_matches_behavior_distribution_under_epsilon_greedy() -> None:
+def test_gflownet_actor_log_pf_matches_policy_distribution() -> None:
     graph = Data(
         num_nodes=3,
         edge_index=torch.tensor([[0, 0], [1, 2]], dtype=torch.long),
@@ -147,7 +146,6 @@ def test_gflownet_actor_log_pf_matches_behavior_distribution_under_epsilon_greed
     question_tokens = torch.zeros((1, 4), dtype=torch.float32, device=device)
     edge_scores = batch.edge_scores.to(device)
 
-    epsilon = 0.25
     stop_bias = -1.0
     actor = GFlowNetActor(
         policy=_DummyPolicy(),
@@ -156,7 +154,6 @@ def test_gflownet_actor_log_pf_matches_behavior_distribution_under_epsilon_greed
         policy_temperature=1.0,
         eval_policy_temperature=None,
         stop_logit_bias=stop_bias,
-        random_action_prob=epsilon,
         score_eps=1e-6,
         debug_actions=False,
         debug_actions_steps=0,
@@ -175,12 +172,11 @@ def test_gflownet_actor_log_pf_matches_behavior_distribution_under_epsilon_greed
         batch_idx=0,
     )
     chosen = int(out["actions_seq"][0, 0].item())
-    assert 0 <= chosen < int(edge_scores.numel())
-
+    stop_idx = int(edge_scores.numel())
     stop_weight = math.exp(stop_bias)
     denom = float(edge_scores.sum().item() + stop_weight)
-    clean_edge_prob = edge_scores / denom
-    uniform = 1.0 / float(edge_scores.numel() + 1)
-    behavior_edge_prob = (1.0 - epsilon) * clean_edge_prob + epsilon * uniform
-    expected_log_pf = torch.log(behavior_edge_prob[chosen])
+    if chosen == stop_idx:
+        expected_log_pf = torch.log(torch.tensor(stop_weight / denom))
+    else:
+        expected_log_pf = torch.log(edge_scores[chosen] / denom)
     assert_close(out["log_pf"][0], expected_log_pf, rtol=1e-5, atol=1e-6)

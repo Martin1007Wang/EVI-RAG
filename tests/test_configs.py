@@ -53,7 +53,8 @@ def test_llm_reasoner_truth_experiment_wiring() -> None:
             config_name="eval.yaml",
             return_hydra_config=True,
             overrides=[
-                "experiment=llm_reasoner_truth_webqsp",
+                "stage=llm_reasoner_truth",
+                "dataset=webqsp",
                 "trainer=cpu",
                 "logger=none",
                 "callbacks=none",

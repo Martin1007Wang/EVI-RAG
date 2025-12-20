@@ -655,9 +655,19 @@ logger:
     group: "retrieval"
 ```
 
-预置 alias 速查：
-- 训练（`experiment=`）：`train_retriever[_cwq|_gtsqa|_kgqagen|_webqsp]`, `train_gflownet[_cwq|_gtsqa|_kgqagen|_webqsp]`
-- 评估（`stage=`，统一入口 `python src/eval.py`）：`retriever_eval`, `materialize_g_agent`, `gflownet_eval`, `llm_reasoner_truth`, `llm_reasoner_paths`, `llm_reasoner_triplet`（可用 CLI 覆盖 `dataset=<name>`）
+预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
+- 训练（`experiment=`）：`train_retriever_default`（或 `train_retriever_perf_default`）、`train_gflownet_default`
+- 评估（`stage=`，统一入口 `python src/eval.py`）：`retriever_eval`, `cache_g_agent`, `gflownet_eval`, `llm_reasoner_truth`, `llm_reasoner_paths`, `llm_reasoner_triplet`
+
+数据构建（Retriever，triple-only 监督，不提供任何回退）：
+- `scripts/build_retrieval_parquet.py` 生成 normalized parquet；其中 `graphs.parquet` 必含 `positive_triple_mask`（GT 路径上的 canonical `(h,r,t)` 边）。
+- `scripts/build_retrieval_dataset.py` 物化 LMDB/embeddings；LMDB 中的 `labels` 恒等于 `positive_triple_mask`，不再支持 transition/hybrid 等旧语义。
+- 若已有旧缓存/旧 parquet，必须完整重建这两步，否则会 fail-fast。
+
+```bash
+python scripts/build_retrieval_parquet.py dataset=webqsp
+python scripts/build_retrieval_dataset.py dataset=webqsp
+```
 
 评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：
 
@@ -666,7 +676,7 @@ logger:
 python src/eval.py stage=retriever_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt
 
 # 2) g_agent（供 GFlowNet）
-python src/eval.py stage=materialize_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt stage.split=test
+python src/eval.py stage=cache_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt stage.split=test
 
 # 3) GFlowNet metrics + rollout cache（供 paths reasoner）
 python src/eval.py stage=gflownet_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt ckpt.gflownet=/path/to/gflownet.ckpt

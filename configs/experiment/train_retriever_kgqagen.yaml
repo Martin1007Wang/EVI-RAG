@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - train_retriever_default
-  - override /dataset: kgqagen
-
-tags: ["kgqagen", "train_retriever"]

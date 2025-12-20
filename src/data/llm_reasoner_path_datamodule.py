@@ -59,7 +59,7 @@ class LLMReasonerPathDataModule(LightningDataModule):
         self.min_chain_length = min_chain_length
         self.max_chain_length = max_chain_length
         self.include_meta = include_meta
-        self.sort_by = sort_by or ["-frequency", "-success_hits", "-length"]
+        self.sort_by = sort_by or ["-frequency", "-length"]
         self.system_prompt = system_prompt
         self.user_instruction = user_instruction
         self.num_workers = int(num_workers)

@@ -5,10 +5,10 @@ mode: path
 forbid_backtrack: true
 forbid_revisit: true
 
-# 最大 roll-out 步数，建议由数据集最短路径上界 + 容错 1 控制；可在实验文件中覆盖。
-max_steps: 6
+# 最大 roll-out 步数，GT 90% 为 1 跳、10% 为 2 跳，直接约束为 2。
+max_steps: 2
 # 环境层 debug hook，仅在需要对拍 success/hit 时临时打开
-debug: ${env_debug}
+debug: ${debug}
 debug_max_resets: 2
 debug_max_graphs: 2
 debug_max_hits: 4

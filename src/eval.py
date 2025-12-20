@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -9,13 +11,21 @@ import rootutils
 import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+_STAGE_REQUIRES_CKPT_KIND = {
+    "cache_g_agent": "retriever",
+    "materialize_g_agent": "retriever",
+    "retriever_eval": "retriever",
+    "gflownet_eval": "gflownet",
+    "gflownet_export": "gflownet",
+}
 
 
 def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
@@ -70,6 +80,8 @@ def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) ->
     if ckpt_path in (None, ""):
         return
     load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
+    # NOTE: Lightning `.ckpt` is not guaranteed to be `weights_only`-safe under torch>=2.6.
+    # We explicitly load with `weights_only=False` for compatibility (assumes checkpoint is trusted).
     if "weights_only" in inspect.signature(torch.load).parameters:
         load_kwargs["weights_only"] = False
     checkpoint = torch.load(str(ckpt_path), **load_kwargs)
@@ -79,38 +91,62 @@ def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) ->
     model.load_state_dict(state_dict, strict=True)
 
 
-def _maybe_initialize_model_for_strict_load(
-    *,
-    model: LightningModule,
-    datamodule: LightningDataModule,
-    loop: str,
-) -> None:
-    """Ensure lazily constructed submodules exist before strict state_dict loading.
+def _save_metrics(cfg: DictConfig, metrics: Dict[str, Any], *, filename: str = "metrics.json") -> Path:
+    """Persist metrics to ${paths.output_dir}/<filename> (rank0-only logic handled upstream)."""
 
-    Some modules (e.g. GFlowNet) materialize parts of the network inside `setup()` after accessing
-    shared resources from the DataModule. When we do a strict manual state_dict load, we must
-    instantiate those parts first, otherwise keys will be reported as "unexpected".
-    """
+    def _to_python(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        return value
 
-    embedder = getattr(model, "embedder", None)
-    embedder_setup = getattr(embedder, "setup", None) if embedder is not None else None
-    if not callable(embedder_setup):
-        return
+    output_dir = Path(cfg.paths.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / str(filename)
+    payload = {k: _to_python(v) for k, v in metrics.items()}
+    path.write_text(json.dumps(payload, indent=2))
+    return path
 
-    # DataModules typically populate shared resources inside `setup()`.
-    stage = "test" if loop == "test" else "predict"
-    datamodule_setup = getattr(datamodule, "setup", None)
-    if callable(datamodule_setup):
-        datamodule_setup(stage=stage)  # type: ignore[call-arg]
 
-    resources = getattr(datamodule, "shared_resources", None)
-    if resources is None:
+def _preflight_validate(cfg: DictConfig) -> None:
+    """Fail-fast on missing Hydra groups to avoid confusing OmegaConf interpolation errors."""
+
+    if cfg.get("dataset") is None:
         raise ValueError(
-            "Model requires datamodule.shared_resources for initialization before checkpoint loading, "
-            "but `shared_resources` is missing. Ensure the DataModule constructs SharedDataResources in `setup()`."
+            "Missing required config group: `dataset`.\n"
+            "Fix:\n"
+            "  python src/eval.py stage=cache_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
+            "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
+            "  defaults:\n"
+            "    - override /dataset: webqsp"
         )
 
-    embedder_setup(resources)
+    stage = cfg.get("stage") or {}
+    stage_name = str(stage.get("name", "")).strip()
+    required_kind = _STAGE_REQUIRES_CKPT_KIND.get(stage_name)
+    if required_kind and cfg.get("ckpt_path") in (None, ""):
+        raise ValueError(
+            f"Stage `{stage_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
+            f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
+        )
+
+
+def _run_cache_g_agent_all_splits(cfg: DictConfig) -> None:
+    stage_cfg = cfg.get("stage") or {}
+    splits = stage_cfg.get("splits") or ["train", "validation", "test"]
+    split_list = [str(s) for s in splits]
+    if not split_list:
+        raise ValueError("stage.splits must be a non-empty list when stage.run_all_splits=true.")
+
+    for split in split_list:
+        force_gt = split == "train"
+        log.info("cache_g_agent: split=%s force_include_gt=%s", split, force_gt)
+
+        with open_dict(cfg):
+            cfg.stage.split = split
+            cfg.stage.force_include_gt = force_gt
+        evaluate(cfg)
 
 
 @task_wrapper
@@ -130,10 +166,9 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             f"Got stage.split={stage_split!r}. "
             "Fix: set `stage.force_include_gt=false` for validation/test (and only enable it for train materialization)."
         )
-    loop = str(stage.get("run", {}).get("loop", "")).lower()
     return_predictions = bool(stage.get("run", {}).get("return_predictions", False))
 
-    log.info(f"Stage: {stage.get('name')} (loop={loop}, return_predictions={return_predictions})")
+    log.info(f"Stage: {stage.get('name')} (return_predictions={return_predictions})")
 
     _enforce_single_gpu_eval(cfg.trainer)
 
@@ -152,10 +187,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
     trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
 
-    # Some models (notably GFlowNet) lazily build submodules in `setup()` using datamodule resources.
-    # Since we do a strict manual checkpoint load, we must materialize those modules first.
-    _maybe_initialize_model_for_strict_load(model=model, datamodule=datamodule, loop=loop)
-
     _load_checkpoint_strict(model, cfg.get("ckpt_path"))
 
     object_dict = {
@@ -171,22 +202,38 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Logging hyperparameters...")
         log_hyperparameters(object_dict)
 
-    if loop == "test":
-        log.info("Running trainer.test()...")
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=None)
-    elif loop == "predict":
-        log.info("Running trainer.predict()...")
-        trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=return_predictions)
-    else:
-        raise ValueError(f"Unsupported stage.run.loop={loop!r}. Supported: 'test', 'predict'.")
+    log.info("Running trainer.predict()...")
+    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=return_predictions)
 
     metric_dict = trainer.callback_metrics
+    if not metric_dict and hasattr(model, "predict_metrics"):
+        try:
+            metrics_from_model = getattr(model, "predict_metrics")
+            if isinstance(metrics_from_model, dict):
+                metric_dict = metrics_from_model
+        except Exception:
+            pass
+    try:
+        metrics_filename = "metrics.json"
+        stage_cfg = cfg.get("stage") or {}
+        split = stage_cfg.get("split")
+        if bool(stage_cfg.get("run_all_splits", False)) and split not in (None, ""):
+            metrics_filename = f"metrics_{split}.json"
+        metrics_path = _save_metrics(cfg, metric_dict, filename=metrics_filename)
+        log.info("Metrics saved to %s", metrics_path)
+    except Exception as exc:  # pragma: no cover
+        log.warning("Failed to save metrics.json: %s", exc)
     return metric_dict, object_dict
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="eval.yaml")
 def main(cfg: DictConfig) -> None:
+    _preflight_validate(cfg)
     extras(cfg)
+    stage_cfg = cfg.get("stage") or {}
+    if str(stage_cfg.get("name", "")).strip() == "cache_g_agent" and bool(stage_cfg.get("run_all_splits", False)):
+        _run_cache_g_agent_all_splits(cfg)
+        return
     evaluate(cfg)
 
 

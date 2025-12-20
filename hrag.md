@@ -3,14 +3,15 @@
 **Problem Formulation**
 
 我们将知识图谱问答（KGQA）形式化为在全图 $\mathcal{G} = (\mathcal{V}, \mathcal{E})$ 上的子图推理问题。给定自然语言问题 $q$，任务旨在检索并构建一个包含完整推理链的证据子图 $G_{sub} \subset \mathcal{G}$，从而最大化生成正确答案 $a$ 的后验概率 $P(a | q, G_{sub})$。通常，训练数据通过标注问题实体 $e_q$ 与答案实体 $e_a$ 之间的**最短路径（Shortest Paths）**作为弱监督信号（Weak Supervision）。
+我们在实现中把监督信号固定为 **triple-level**：GT 路径上的 canonical `(h,r,t)` 边被标为正例（`positive_triple_mask`），不做 `(u->v)` transition 的“平行边提升”。
 
 **Graph Hierarchy（三级漏斗）**
 
 1. $G_{global}$（全图）：完整 KG（如 Freebase），静态，上帝视角。代码：`SharedDataResources` / `graph_store`。
 2. $G_{retrieval}$（检索上下文）：PPR / Query-Center 召回的大子图，作为 retriever 打分的搜索空间；batch 中 scores/heads/tails 全量对应此层。
-3. $G_{agent}$（Agent 视图，g_agent 缓存）：在 $G_{retrieval}$ 上按 retriever 分数截断/扩展形成的可见图，分两种模式：
-   - $G_{oracle}$（train/val）：Top-K ∪ 注入 GT，GT 覆盖高，用于模仿/监督。
-   - $G_{pruned}$（test/部署）：仅 Top-K + 启发式扩展，不注入 GT，GT 覆盖低，在不确定下推理。
+3. $G_{agent}$（Agent 视图，g_agent 缓存）：在 $G_{retrieval}$ 上按 retriever 分数截断形成的可见图，分两种模式：
+   - $G_{oracle}$（train）：Top-K ∪ 注入 GT（oracle 上界/训练用），GT 覆盖高，用于模仿/监督。
+   - $G_{pruned}$（validation/test/部署）：仅 Top-K（不注入 GT），在不确定下推理。
 
 **The Challenge: Topological Fragmentation in Pointwise Retrieval**
 
@@ -114,40 +115,47 @@ $R(S_T) = \alpha \cdot \text{Recall}(S_T, G^*) + \beta \cdot \mathbb{I}(\text{LL
 
 ---
 
-## 4.4 Handoff：Top-K 图补全
+## 4.4 Handoff：Top-K 物化为 g_agent（SSOT）
 
-Anchor 阶段输出的 Top-$K$ 三元组在语义上已经高度相关，但结构上仍可能存在缺失。为了承上启下，把 retriever 的候选集变成 GFlowNet 可直接消费的图结构，我们在 `eval.py` 中实现了 **Handoff** 管线：
+Anchor 阶段输出的是 retriever 在 $G_{retrieval}$ 上的逐边分数 $s(e)$。为了承上启下，把这一层的“平铺边集合”变成 GFlowNet 可直接消费的 SSOT 图缓存（`g_agent`），我们实现了一个严格、确定性的 materialize：
 
-1.  **Top-K 采样**：对 retriever 的评分 $s(e)$ 按样本排序，保留 $\mathcal{E}_K = \{e_1, \dots, e_K\}$，默认 $K=50$，可通过 `g_agent.top_k` 调节。
-2.  **邻域扩展**：对 $\mathcal{V}_K = \{v | v \text{ 是 } \mathcal{E}_K \text{ 的端点}\}$，添加 $h$-hop 邻居（默认 1-hop）及其 incident edges，得到扩展集合 $\hat{\mathcal{E}} = \mathcal{E}_K \cup \bigcup_{v \in \mathcal{V}_K} \mathcal{E}(v)$。
-3.  **短路径挖掘**：在候选图上执行 BFS，若存在两两核心节点间的路径 $\pi_{u \rightarrow v}$ 满足 $|\pi| \leq 3$，则提取路径中所有节点/边加入 $\hat{\mathcal{E}}$，让被 Top-K 误删的“隐式”链路被自动补齐。
+1.  **Top-K 截断**：对每个样本按 $s(e)$ 排序，保留前 $K$ 条边（`stage.anchor_top_k`，默认来自 `configs/window/default.yaml` 的 `anchor_top_k`）。该集合对应 `top_edge_mask=True`。
+2.  **Oracle 注入（仅 train 可开）**：若 `stage.force_include_gt=true`，则把 LMDB 中的 `gt_path_edge_indices` 对应的 GT 边加入候选（Top-K ∪ GT），用于构造 $G_{oracle}$。为避免数据泄漏，`src/eval.py` 会强制 `stage.split=train` 才允许开启。
+3.  **Triple 去重**：最终按三元组键 `(head_entity_id, relation_id, tail_entity_id)` 去重；`edge_scores` 用 max 聚合、`edge_labels` 用 max 聚合、`top_edge_mask` 用 OR 聚合（实现见 `src/data/components/g_agent_builder.py`）。
 
-g_agent 阶段会输出 `g_agent_samples.pt`，包含每个样本的 Top-$K$ 边、扩展后的节点集合以及检索分数，形成 $G_{agent}$：train/val 为 $G_{oracle}$（注入 GT），test 为 $G_{pruned}$（不注入 GT）。运行方式示例：
+g_agent 阶段会输出 `<split>_g_agent.pt`，包含每个样本的 Top-$K$ 边、由这些边诱导出的节点集合以及检索分数，形成 $G_{agent}$：train 可选为 $G_{oracle}$（注入 GT），validation/test 为 $G_{pruned}$（不注入 GT）。运行方式示例：
 
 ```bash
-python src/eval.py g_agent.enabled=true g_agent.top_k=75 g_agent.max_path_length=3
+# 单 split 物化（默认写到 ${dataset.materialized_dir}/g_agent/<split>_g_agent.pt）
+python src/eval.py stage=materialize_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt stage.split=test
+
+# 扫多个 split（Hydra multirun）
+python src/eval.py -m stage=materialize_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt stage.split=train,validation,test
+
+# 仅 train 开 oracle 注入（用于训练 gflownet；val/test 禁止开启）
+python src/eval.py stage=materialize_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt stage.split=train stage.force_include_gt=true
 ```
 
-默认情况下，g_agent 会根据 `data.dataset_cfg.data_dir` 自动将 `train/validation/test` 三个 split 的缓存分别写到 `${data_dir}/g_agent/{split}_g_agent.pt`。也可以通过 `g_agent.output_dir` 或 `g_agent.output_paths.split=` 手动指定路径。
+默认情况下输出路径由 stage config 决定（见 `configs/stage/materialize_g_agent.yaml` / `configs/callbacks/g_agent_generation.yaml`），无需在代码里启用/禁用开关。
 
 ## 5. 实践指南：g_agent 数据 & GFlowNet 训练
 
-g_agent 管线会将 `eval.py g_agent.enabled=true ...` 的输出序列化成 `g_agent_samples.pt`。为了直接用于 GFlowNet 训练，我们提供了：
+g_agent 管线会将 `stage=materialize_g_agent`（或 `stage=cache_g_agent`）的输出序列化成 `<split>_g_agent.pt`。为了直接用于 GFlowNet 训练，我们提供了：
 
 *   **数据模块**：`configs/data/gflownet.yaml` 读取 `{split}_g_agent.pt`，自动 padding 出批次级别的实体/关系 ID、Top-K 掩码与图结构。
-*   **策略模块**：`src/models/gflow_net.py` 实现 Role-Aware Transformer + Trajectory Balance 损失，依赖全局实体/关系嵌入 (`resources.{vocabulary_path, embeddings_dir}`) 进行 ID→语义映射。
+*   **策略模块**：`src/models/gflownet_module.py`（及 `src/models/components/`）实现策略网络与 SubTB 损失，依赖全局实体/关系嵌入 (`resources.{vocabulary_path, embeddings_dir}`) 进行 ID→语义映射。
 *   **训练入口**：使用 `python src/train.py experiment=train_gflownet data.cache_paths.train=/path/to/train_g_agent.pt ...` 启动。Reward 目前默认使用正例召回 + $\epsilon$ 平滑，可替换为任意 LLM 判别信号。
 
-**如何批量生成 train/validation/test g_agent 缓存**
+**如何批量生成 train/validation/test g_agent 缓存（推荐）**
 
 ```bash
-python src/eval.py \
-  ckpt_path=/path/to/retriever.ckpt \
-  g_agent.enabled=true \
-  g_agent.splits=[train,validation,test] \
-  data.drop_last=false
+python src/eval.py -m \
+  stage=cache_g_agent \
+  dataset=webqsp \
+  ckpt.retriever=/path/to/retriever.ckpt \
+  stage.split=train,validation,test
 ```
 
-命令会依次遍历 datamodule 的三种 split，并把结果写到 `${data.dataset_cfg.data_dir}/g_agent/{split}_g_agent.pt`。若想自定义路径，可通过 `g_agent.output_dir=/foo` 或 `g_agent.output_paths.train=/foo/train.pt` 这类 override 精细控制。随后将这些 `.pt` 文件填入 GFlowNet 训练命令中的 `data.cache_paths.*` 参数即可。
+命令会分别跑三个 split，并把结果写到 `${dataset.materialized_dir}/g_agent/<split>_g_agent.pt`。随后将这些 `.pt` 文件填入 GFlowNet 训练命令中的 `data.cache_paths.*` 参数即可。
 
 这条流水线把“承上启下 g_agent → 结构化候选集 → 无过程标注 GFlowNet”闭环串起来，后续只需替换 Reward 或策略超参即可快速迭代 System 2。

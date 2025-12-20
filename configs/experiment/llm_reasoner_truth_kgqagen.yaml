@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - llm_reasoner_truth_default
-  - override /dataset: kgqagen
-
-tags: ["kgqagen", "llm_reasoner", "truth"]

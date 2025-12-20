@@ -1,0 +1,5 @@
+_target_: src.models.components.gflownet_state_encoder.TrajectoryStateEncoder
+
+hidden_dim: ${model.hidden_dim}
+dropout: 0.0
+use_start_state: true

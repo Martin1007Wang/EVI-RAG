@@ -10,6 +10,7 @@ __all__ = [
     "GraphEmbedder",
     "GFlowNetEstimator",
     "GFlowNetActor",
+    "TrajectoryStateEncoder",
     "EdgeFrontierPolicy",
     "EdgeGATPolicy",
     "EdgeMLPMixerPolicy",
@@ -32,12 +33,13 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "GraphEnv": (".gflownet_env", "GraphEnv"),
     "GraphState": (".gflownet_env", "GraphState"),
     "GFlowNetActor": (".gflownet_actor", "GFlowNetActor"),
+    "TrajectoryStateEncoder": (".gflownet_state_encoder", "TrajectoryStateEncoder"),
     "GraphEmbedder": (".gflownet_embedder", "GraphEmbedder"),
     "GFlowNetEstimator": (".gflownet_estimator", "GFlowNetEstimator"),
     "EdgeFrontierPolicy": (".gflownet_policies", "EdgeFrontierPolicy"),
     "EdgeGATPolicy": (".gflownet_policies", "EdgeGATPolicy"),
     "EdgeMLPMixerPolicy": (".gflownet_policies", "EdgeMLPMixerPolicy"),
-    "AnswerOnlyReward": (".gflownet_rewards", "AnswerOnlyReward"),
+    "GTPathAlignedReward": (".gflownet_rewards", "GTPathAlignedReward"),
     "RewardOutput": (".gflownet_rewards", "RewardOutput"),
     "DDE": (".graph", "DDE"),
     "PEConv": (".graph", "PEConv"),
@@ -53,8 +55,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from .gflownet_embedder import GraphEmbedder
     from .gflownet_env import GraphBatch, GraphEnv, GraphState
     from .gflownet_estimator import GFlowNetEstimator
+    from .gflownet_state_encoder import TrajectoryStateEncoder
     from .gflownet_policies import EdgeFrontierPolicy, EdgeGATPolicy, EdgeMLPMixerPolicy
-    from .gflownet_rewards import AnswerOnlyReward, RewardOutput
+    from .gflownet_rewards import GTPathAlignedReward, RewardOutput
     from .graph import DDE, PEConv
     from .heads import DenseFeatureExtractor, DeterministicHead
     from .projections import EmbeddingProjector

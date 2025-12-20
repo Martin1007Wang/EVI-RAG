@@ -15,6 +15,7 @@ from src.data.components.graph_store import GraphStore
 from src.utils.llm_prompting import build_triplet_prompt
 from src.utils.metrics import normalize_k_values
 from src.utils.text_utils import count_tokens
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,14 @@ class LLMReasonerTripletDataModule(LightningDataModule):
     def _build_samples(self) -> List[Dict[str, Any]]:
         if not self.score_dict_path.exists():
             raise FileNotFoundError(f"score_dict_path not found: {self.score_dict_path}")
+        stat = self.score_dict_path.stat()
+        logger.info(
+            "Loading g_agent cache from %s (size=%.2f MB, ctime=%s, mtime=%s)",
+            self.score_dict_path,
+            stat.st_size / (1024 * 1024),
+            datetime.fromtimestamp(stat.st_ctime),
+            datetime.fromtimestamp(stat.st_mtime),
+        )
         load_kwargs = {"map_location": "cpu"}
         if "weights_only" in inspect.signature(torch.load).parameters:
             load_kwargs["weights_only"] = False

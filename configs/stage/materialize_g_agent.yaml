@@ -16,9 +16,9 @@ stage:
   tags: ["materialize", "g_agent"]
   split: test
   anchor_top_k: ${window.anchor_top_k}
+  anchor_start_k: ${window.anchor_start_k}
   force_include_gt: false
   run:
-    loop: predict
     return_predictions: false
 
 data:

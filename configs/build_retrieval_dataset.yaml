@@ -36,13 +36,8 @@ fp16: True
 # SubgraphRAG parity: 2-class one-hot {non-topic, topic} built from query entities only.
 num_topics: 2
 
-# Which supervision mask to write into LMDB as `labels` (consumed by GRetrievalDataset/Retriever).
-# - transition: (u->v) transitions on GT paths, lifted to all parallel edges (legacy behavior)
-# - triple: exact (h,r,t) edges on GT paths (canonical edge ids / answer_subgraph edges)
-# - hybrid: use `triple` when GT comes from answer_subgraph, else `transition`
-labels:
-  source: hybrid
-  store_aux: true
+# Supervision invariant: retriever labels are ALWAYS triple-level (positive_triple_mask).
+# This removes ambiguous transition-lifting and enforces relation-sensitive training.
 
 # LMDB map size in GB.
 map_size_gb: 32

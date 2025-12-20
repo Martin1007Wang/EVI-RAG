@@ -45,7 +45,7 @@ from pathlib import Path
 
 
 def _setup_gflownet_debug_logging(cfg) -> None:
-    enable = cfg.get("gflownet_debug", False)
+    enable = cfg.get("debug", False)
     if not enable:
         return
 

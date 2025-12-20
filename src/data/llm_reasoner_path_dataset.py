@@ -37,7 +37,7 @@ class LLMReasonerPathDataset(Dataset):
     Dataset to serve GFlowNet eval rollouts (test_gflownet_eval.pt) to an LLM-friendly prompt format.
 
     Produces dict with:
-      - id, question, answers (mapped to text), answer_entity_ids
+      - id, question
       - paths (filtered candidate_chains)
       - system_prompt, user_prompt (built via build_path_prompt)
     """
@@ -65,7 +65,7 @@ class LLMReasonerPathDataset(Dataset):
         self.min_chain_length = int(min_chain_length)
         self.max_chain_length = int(max_chain_length) if max_chain_length is not None else None
         self.include_meta = bool(include_meta)
-        self.sort_by = list(sort_by)
+        self.sort_by = self._validate_sort_by(list(sort_by))
         self.system_prompt = system_prompt
         self.user_instruction = user_instruction
         self.prompt_tag = prompt_tag
@@ -94,8 +94,8 @@ class LLMReasonerPathDataset(Dataset):
         raw = self.samples[idx]
         sample_id = raw.get("sample_id", f"sample-{idx}")
         question = raw.get("question", "")
-        answer_ids = [int(a) for a in raw.get("answer_entity_ids", [])]
-        answers = [self._ent_map.get(a, str(a)) for a in answer_ids]
+        answer_ids: List[int] = []
+        answers: List[str] = []
 
         chains = self._prepare_chains(raw.get("candidate_chains") or [])
         user_prompt = build_path_prompt(
@@ -155,6 +155,22 @@ class LLMReasonerPathDataset(Dataset):
 
         filtered.sort(key=_key)
         return filtered[: self.max_chains_per_sample]
+
+    @staticmethod
+    def _validate_sort_by(sort_by: List[str]) -> List[str]:
+        allowed = {"frequency", "length"}
+        normalized: List[str] = []
+        for field in sort_by:
+            if not field:
+                continue
+            desc = field.startswith("-")
+            name = field[1:] if desc else field
+            if name not in allowed:
+                raise ValueError(f"sort_by contains disallowed field '{name}'. Allowed: {sorted(allowed)}")
+            normalized.append(f"-{name}" if desc else name)
+        if not normalized:
+            raise ValueError(f"sort_by must include at least one of {sorted(allowed)}.")
+        return normalized
 
     def _fmt_edge(self, e: Dict[str, Any]) -> str:
         def _txt(val_text: Any, val_id: Any) -> str:

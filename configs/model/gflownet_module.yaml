@@ -2,9 +2,10 @@ defaults:
   - _self_
   - env@env_cfg: graph
   - policy@policy_cfg: mixer
-  - reward@reward_cfg: answer_fraction
+  - reward@reward_cfg: answer_only
   - actor@actor_cfg: gflownet_actor
   - embedder@embedder_cfg: default
+  - state_encoder@state_encoder_cfg: gru
   - estimator@estimator_cfg: gflownet_estimator
 
 _target_: src.models.gflownet_module.GFlowNetModule
@@ -15,9 +16,11 @@ hidden_dim: 1024
 training_cfg:
   debug_batches_to_log: 1
   debug_graphs_to_log: 2
+  step0_supervision_weight: 0.0      # 纯 reward 训练不使用 GT step0 监督
+  mask_subtb_by_path_exists: false
 
 evaluation_cfg:
-  num_eval_rollouts: [10, 20]       # 采样窗口 K_s（Best-of-K_s）
+  num_eval_rollouts: [1, 5]         # 同时展示单次与 best-of-5（路径/答案）
 
 optimizer_cfg:
   type: adamw
@@ -29,13 +32,13 @@ scheduler_cfg:
   t_max: 200
   eta_min: 1.0e-6
   interval: epoch
-  monitor: val/rollout_reward
+  monitor: val/path_prefix@5
 
 logging_cfg:
   # 指标进度条：训练阶段
-  train_prog_bar: ["rollout_reward", "success_mean", "answer_coverage", "length_mean"]
-  # 指标进度条：验证/测试阶段（会自动追加 success@K / path_hit_f1@K，如果配置中存在）
-  eval_prog_bar: ["success_mean", "answer_f1"]
-  auto_add_success_at_k: true
+  train_prog_bar: ["log_reward", "path_prefix_ratio", "answer_hit"]
+  # 指标进度条：验证/测试阶段（会自动追加 path_hit_f1@K，如果配置中存在）
+  eval_prog_bar: ["path_prefix@1", "path_exact@1", "answer_hit@1", "path_prefix@5", "path_exact@5", "answer_hit@5"]
+  auto_add_success_at_k: false
   auto_add_path_hit_f1: false
   log_on_step_train: false

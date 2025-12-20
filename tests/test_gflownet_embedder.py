@@ -5,7 +5,6 @@ from pathlib import Path
 
 import lmdb
 import torch
-import torch.nn.functional as F
 from torch.testing import assert_close
 from torch_geometric.data import Batch, Data
 
@@ -27,34 +26,7 @@ def _write_vocab_lmdb(path: Path) -> None:
         env.close()
 
 
-def _write_mock_checkpoint(path: Path, *, hidden_dim: int) -> None:
-    torch.manual_seed(0)
-    emb_dim = hidden_dim
-    semantic_dim = 4 * hidden_dim
-    num_topics = 2
-    num_rounds = 2
-    num_rev = 2
-    struct_dim = 2 * num_topics * (1 + num_rounds + num_rev)
-    input_dim = semantic_dim + struct_dim
-
-    state_dict = {
-        "entity_proj.network.0.weight": torch.eye(hidden_dim),
-        "entity_proj.network.0.bias": torch.zeros(hidden_dim),
-        "relation_proj.network.0.weight": torch.eye(hidden_dim),
-        "relation_proj.network.0.bias": torch.zeros(hidden_dim),
-        "query_proj.network.0.weight": torch.eye(hidden_dim),
-        "query_proj.network.0.bias": torch.zeros(hidden_dim),
-        "non_text_entity_emb.weight": torch.zeros(1, hidden_dim),
-        "feature_extractor.network.0.weight": torch.randn(emb_dim, input_dim),
-        "feature_extractor.network.0.bias": torch.randn(emb_dim),
-        "feature_extractor.network.3.weight": torch.randn(hidden_dim, emb_dim),
-        "feature_extractor.network.3.bias": torch.randn(hidden_dim),
-        "parity_meta": torch.tensor([1, num_topics, num_rounds, num_rev], dtype=torch.long),
-    }
-    torch.save({"state_dict": state_dict}, path)
-
-
-def test_graph_embedder_aligns_retriever_structure_features(tmp_path: Path) -> None:
+def test_graph_embedder_semantic_only_forward(tmp_path: Path) -> None:
     root = tmp_path / "mock_resources"
     vocab_dir = root / "vocabulary"
     vocab_dir.mkdir(parents=True)
@@ -68,16 +40,8 @@ def test_graph_embedder_aligns_retriever_structure_features(tmp_path: Path) -> N
     torch.save(entity_embeddings, embeddings_dir / "entity_embeddings.pt")
     torch.save(relation_embeddings, embeddings_dir / "relation_embeddings.pt")
 
-    ckpt_path = tmp_path / "mock_retriever.ckpt"
-    _write_mock_checkpoint(ckpt_path, hidden_dim=4)
-
     resources = SharedDataResources(vocabulary_path=vocab_path, embeddings_dir=embeddings_dir)
-    embedder = GraphEmbedder(
-        hidden_dim=4,
-        proj_dropout=0.0,
-        projector_checkpoint=str(ckpt_path),
-        projector_key_prefixes=[""],
-    ).eval()
+    embedder = GraphEmbedder(hidden_dim=4, proj_dropout=0.0, projector_checkpoint=None).eval()
     embedder.setup(resources, device=torch.device("cpu"))
 
     graph = Data(
@@ -113,17 +77,7 @@ def test_graph_embedder_aligns_retriever_structure_features(tmp_path: Path) -> N
         ],
         dim=-1,
     )
-
-    topic_mask = torch.zeros(out.node_tokens.size(0), dtype=torch.long)
-    topic_mask[batch.start_node_locals.view(-1)] = 1
-    topic_one_hot = F.one_hot(topic_mask, num_classes=embedder._num_topics).to(dtype=semantic.dtype)
-    feats = [topic_one_hot]
-    feats.extend(embedder._dde(topic_one_hot, out.edge_index, None))
-    node_struct = torch.stack(feats, dim=-1).reshape(out.node_tokens.size(0), -1)
-    struct = torch.cat([node_struct[out.edge_index[0]], node_struct[out.edge_index[1]]], dim=-1)
-
-    fused = torch.cat([semantic, struct], dim=-1)
-    expected = embedder.edge_adapter(fused)
+    expected = embedder.edge_adapter(semantic)
     assert_close(out.edge_tokens, expected)
 
 

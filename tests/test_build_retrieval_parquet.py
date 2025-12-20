@@ -127,20 +127,17 @@ def test_preprocess_writes_base_and_sub_only_when_filtered(tmp_path):
         skip_no_topic=False,
         skip_no_ans=True,
         skip_no_path=False,
-        use_shortest_path_positive=True,
     )
     eval_filter = brp.SplitFilter(
         skip_no_topic=False,
         skip_no_ans=True,
         skip_no_path=False,
-        use_shortest_path_positive=True,
     )
     override_filters = {
         "test": brp.SplitFilter(
             skip_no_topic=False,
             skip_no_ans=False,
             skip_no_path=False,
-            use_shortest_path_positive=True,
         )
     }
 
@@ -213,13 +210,11 @@ def test_preprocess_skips_sub_when_no_rows_filtered(tmp_path):
         skip_no_topic=False,
         skip_no_ans=True,
         skip_no_path=False,
-        use_shortest_path_positive=True,
     )
     eval_filter = brp.SplitFilter(
         skip_no_topic=False,
         skip_no_ans=True,
         skip_no_path=False,
-        use_shortest_path_positive=True,
     )
 
     brp.preprocess(
@@ -278,7 +273,6 @@ def test_preprocess_drops_empty_graph_samples(tmp_path):
         skip_no_topic=False,
         skip_no_ans=False,
         skip_no_path=False,
-        use_shortest_path_positive=True,
     )
 
     brp.preprocess(
@@ -349,14 +343,11 @@ def test_build_graph_emits_triple_mask_and_gt_source_answer_subgraph():
         entity_vocab,
         relation_vocab,
         graph_id="ds/train/0",
-        use_shortest_path_positive=True,
         undirected_traversal=False,
     )
     assert graph.gt_source == "answer_subgraph"
     assert graph.gt_path_edge_indices == [0]
     assert graph.positive_triple_mask == [True, False]
-    # Transition-level supervision is lifted to all parallel edges between the same endpoints.
-    assert graph.positive_edge_mask == [True, True]
 
 
 def test_build_graph_emits_gt_source_shortest_path():
@@ -378,7 +369,6 @@ def test_build_graph_emits_gt_source_shortest_path():
         entity_vocab,
         relation_vocab,
         graph_id="ds/train/1",
-        use_shortest_path_positive=True,
         undirected_traversal=False,
     )
     assert graph.gt_source == "shortest_path"

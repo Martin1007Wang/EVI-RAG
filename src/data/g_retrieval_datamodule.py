@@ -70,7 +70,8 @@ class GRetrievalDataModule(LightningDataModule):
         splits: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(logger=False)
+        # dataset_cfg 可能包含 OmegaConf 对象；避免写入 checkpoint 元数据。
+        self.save_hyperparameters(logger=False, ignore=["dataset_cfg"])
 
         # 1. Store Configuration (The Source of Truth)
         # Convert DictConfig to primitive dict if necessary, or keep it wrapper

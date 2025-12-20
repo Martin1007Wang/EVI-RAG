@@ -14,18 +14,12 @@ stage:
   task_name: "eval/gflownet"
   tags: ["eval", "gflownet"]
   run:
-    loop: test
     return_predictions: false
 
 ckpt_path: ${ckpt.gflownet}
 
+debug: true
+
 model:
-  embedder_cfg:
-    projector_checkpoint: ${ckpt.retriever}
   eval_persist_cfg:
-    enabled: true
-    output_dir: ${dataset.materialized_dir}/eval_gflownet
-    splits: ["test"]
-    textualize: true
-    entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
-    relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+    enabled: false  # 评估默认不导出 rollouts；使用 gflownet_export stage。

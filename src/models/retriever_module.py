@@ -10,6 +10,7 @@ from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 
 from src.models.components.retriever import RetrieverOutput
+from src.losses import LossOutput
 from src.utils import (
     extract_sample_ids,
     infer_batch_size,
@@ -29,11 +30,24 @@ class RetrieverModule(LightningModule):
         scheduler: Any = None,
         evaluation_cfg: Optional[DictConfig | Dict] = None,
         eval_persist_cfg: Optional[DictConfig | Dict[str, Any]] = None,
+        start_edge_loss_cfg: Optional[DictConfig | Dict[str, Any]] = None,
         compile_model: bool = False,
         compile_dynamic: bool = True,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(logger=False, ignore=["retriever"])
+        # 仅保存可序列化的原始标量；避免将 Hydra/nn.Module/partial 写入 checkpoint。
+        self.save_hyperparameters(
+            logger=False,
+            ignore=[
+                "retriever",
+                "loss",
+                "optimizer",
+                "scheduler",
+                "evaluation_cfg",
+                "eval_persist_cfg",
+                "start_edge_loss_cfg",
+            ],
+        )
 
         self.model = retriever
         if compile_model and hasattr(torch, "compile"):
@@ -47,9 +61,27 @@ class RetrieverModule(LightningModule):
         eval_cfg = self._to_dict(evaluation_cfg or {})
         self._ranking_k = normalize_k_values(eval_cfg.get("ranking_k", [1, 5, 10]), default=[1, 5, 10])
         self._answer_k = normalize_k_values(eval_cfg.get("answer_recall_k", [5, 10]), default=[5, 10])
+        self._emit_predict_outputs = bool(eval_cfg.get("emit_predict_outputs", False))
+        self._predict_metrics: Dict[str, Any] = {}
+        self._predict_split = str(eval_cfg.get("split", "test"))
 
         self._streaming_state: Dict[str, Dict[str, Any]] = {}
         self.eval_persist_cfg: Dict[str, Any] = self._to_dict(eval_persist_cfg or {})
+
+        start_cfg = self._to_dict(start_edge_loss_cfg or {})
+        self._start_edge_loss_enabled = bool(start_cfg.get("enabled", False))
+        self._start_edge_loss_weight: Optional[float] = None
+        self._start_edge_apply_to_eval = False
+        if self._start_edge_loss_enabled:
+            if "weight" not in start_cfg:
+                raise ValueError("start_edge_loss_cfg.weight must be set when start_edge_loss is enabled.")
+            if "apply_to_eval" not in start_cfg:
+                raise ValueError("start_edge_loss_cfg.apply_to_eval must be set when start_edge_loss is enabled.")
+            weight = float(start_cfg["weight"])
+            if not (0.0 < weight <= 1.0):
+                raise ValueError(f"start_edge_loss_cfg.weight must be in (0,1], got {weight}")
+            self._start_edge_loss_weight = weight
+            self._start_edge_apply_to_eval = bool(start_cfg["apply_to_eval"])
 
     @staticmethod
     def _to_dict(cfg: Union[DictConfig, Dict]) -> Dict[str, Any]:
@@ -63,12 +95,8 @@ class RetrieverModule(LightningModule):
     def forward(self, batch: Any) -> RetrieverOutput:
         return self.model(batch)
 
-    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Dict[str, Any]:
-        """
-        Interface for g_agent / inference.
-        Returns a lightweight dict on CPU (mostly) to avoid VRAM retention in downstream graph ops.
-        """
-        output = self(batch)
+    def _build_predict_payload(self, batch: Any, output: RetrieverOutput) -> Dict[str, Any]:
+        """统一的推理输出，供 predict/test 两个 loop 共享。"""
         scores = output.scores.detach().cpu()
         logits = output.logits.detach().cpu()
         query_ids = output.query_ids.detach().cpu()
@@ -102,18 +130,103 @@ class RetrieverModule(LightningModule):
             "q_local_indices_ptr": q_ptr,
         }
 
+    def _compute_start_edge_mask(self, *, batch: Any, device: torch.device) -> torch.Tensor:
+        edge_index = getattr(batch, "edge_index", None)
+        if edge_index is None:
+            raise ValueError("Batch missing edge_index required for start-edge loss.")
+        q_local_indices = getattr(batch, "q_local_indices", None)
+        if q_local_indices is None:
+            raise ValueError("Batch missing q_local_indices required for start-edge loss.")
+        q_local_indices = q_local_indices.to(device=device, dtype=torch.long).view(-1)
+        if q_local_indices.numel() == 0:
+            raise ValueError("q_local_indices is empty; start-edge loss requires non-empty start entities.")
+
+        num_nodes = getattr(batch, "num_nodes", None)
+        if num_nodes is None:
+            ptr = getattr(batch, "ptr", None)
+            if ptr is not None:
+                num_nodes = int(ptr[-1].item())
+        if num_nodes is None or int(num_nodes) <= 0:
+            raise ValueError("Unable to infer num_nodes for start-edge loss.")
+        num_nodes = int(num_nodes)
+
+        node_is_start = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        valid = (q_local_indices >= 0) & (q_local_indices < num_nodes)
+        if not bool(valid.any().item()):
+            raise ValueError("q_local_indices are out of range for start-edge loss.")
+        node_is_start[q_local_indices[valid]] = True
+
+        edge_index = edge_index.to(device=device)
+        return node_is_start[edge_index[0]] | node_is_start[edge_index[1]]
+
+    def _compute_loss_output(
+        self,
+        *,
+        batch: Any,
+        output: RetrieverOutput,
+        num_graphs: int,
+        training_step: int,
+    ) -> LossOutput:
+        def _call_loss(edge_mask: Optional[torch.Tensor] = None) -> LossOutput:
+            return self.loss(
+                output,
+                batch.labels,
+                training_step=training_step,
+                edge_batch=output.query_ids,
+                num_graphs=num_graphs,
+                edge_mask=edge_mask,
+            )
+
+        base = _call_loss(edge_mask=None)
+        apply_mask = self._start_edge_loss_enabled and (self.training or self._start_edge_apply_to_eval)
+        if not apply_mask:
+            return base
+
+        device = output.logits.device if output.logits is not None else output.scores.device
+        edge_mask = self._compute_start_edge_mask(batch=batch, device=device)
+        masked = _call_loss(edge_mask=edge_mask)
+        weight = float(self._start_edge_loss_weight) if self._start_edge_loss_weight is not None else 1.0
+        total = base.loss + masked.loss * weight
+        components = {f"start_edge_{k}": v for k, v in masked.components.items()}
+        components.update({f"full_{k}": v for k, v in base.components.items()})
+        components["start_edge"] = float(masked.loss.detach().cpu().item())
+        components["full"] = float(base.loss.detach().cpu().item())
+        metrics = {f"start_edge_{k}": v for k, v in masked.metrics.items()}
+        metrics.update({f"full_{k}": v for k, v in base.metrics.items()})
+        return LossOutput(loss=total, components=components, metrics=metrics)
+
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Optional[Dict[str, Any]]:
+        """
+        Unified eval/export path (predict loop).
+        - 更新 streaming metrics（predict split）。
+        - 按需返回轻量 payload（仅当 emit_predict_outputs=true）。
+        """
+        split = self._predict_split
+        num_graphs = infer_batch_size(batch)
+        output = self(batch)
+        loss_out = self._compute_loss_output(
+            batch=batch,
+            output=output,
+            num_graphs=num_graphs,
+            training_step=self.global_step,
+        )
+        # predict loop不依赖 log_metric，避免 Lightning 忽略；仅更新 streaming 状态。
+        self._update_streaming_state(split=split, batch=batch, output=output, num_graphs=num_graphs)
+        if self._emit_predict_outputs:
+            return self._build_predict_payload(batch, output)
+        return None
+
     # ------------------------------------------------------------------ #
     # Training Loop
     # ------------------------------------------------------------------ #
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         num_graphs = infer_batch_size(batch)
         output = self(batch)
-        loss_output = self.loss(
-            output,
-            batch.labels,
-            training_step=self.global_step,
-            edge_batch=output.query_ids,
+        loss_output = self._compute_loss_output(
+            batch=batch,
+            output=output,
             num_graphs=num_graphs,
+            training_step=self.global_step,
         )
         log_metric(
             self,
@@ -168,11 +281,19 @@ class RetrieverModule(LightningModule):
     def on_test_epoch_start(self) -> None:
         self._reset_streaming_state(split="test")
 
+    def on_predict_epoch_start(self) -> None:
+        self._reset_streaming_state(split=self._predict_split)
+
     def validation_step(self, batch: Any, batch_idx: int) -> None:
         self._shared_eval_step(batch, batch_idx, split="val")
 
-    def test_step(self, batch: Any, batch_idx: int) -> None:
-        self._shared_eval_step(batch, batch_idx, split="test")
+    def test_step(self, batch: Any, batch_idx: int) -> Dict[str, Any] | None:
+        return self._shared_eval_step(
+            batch,
+            batch_idx,
+            split="test",
+            collect_predict_payload=self._emit_predict_outputs,
+        )
 
     def on_validation_epoch_end(self) -> None:
         self._finalize_streaming_state(split="val")
@@ -180,15 +301,27 @@ class RetrieverModule(LightningModule):
     def on_test_epoch_end(self) -> None:
         self._finalize_streaming_state(split="test")
 
-    def _shared_eval_step(self, batch: Any, batch_idx: int, *, split: str) -> None:
+    def on_predict_epoch_end(self, results: Optional[List[Any]] = None) -> None:
+        metrics = self._finalize_streaming_state(split=self._predict_split, log_metrics=False)
+        self._predict_metrics = metrics
+        logger.info("Predict metrics: %s", {k: float(v) if hasattr(v, 'item') else v for k, v in metrics.items()})
+        if self.trainer is not None and self.trainer.logger is not None:
+            # 手动落日志，predict loop默认不会处理 self.log
+            self.trainer.logger.log_metrics(metrics, step=0)
+        if self.trainer is not None:
+            try:
+                self.trainer.callback_metrics.update(metrics)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+    def _shared_eval_step(self, batch: Any, batch_idx: int, *, split: str, collect_predict_payload: bool = False) -> Optional[Dict[str, Any]]:
         num_graphs = infer_batch_size(batch)
         output = self(batch)
-        loss_out = self.loss(
-            output,
-            batch.labels,
-            training_step=self.global_step,
-            edge_batch=output.query_ids,
+        loss_out = self._compute_loss_output(
+            batch=batch,
+            output=output,
             num_graphs=num_graphs,
+            training_step=self.global_step,
         )
 
         log_metric(
@@ -202,6 +335,10 @@ class RetrieverModule(LightningModule):
             on_epoch=True,
         )
         self._update_streaming_state(split=split, batch=batch, output=output, num_graphs=num_graphs)
+
+        if collect_predict_payload:
+            return self._build_predict_payload(batch, output)
+        return None
 
     # ------------------------------------------------------------------ #
     # Streaming Metrics (no epoch-sized buffering)
@@ -240,10 +377,10 @@ class RetrieverModule(LightningModule):
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(value, op=dist.ReduceOp.SUM)
 
-    def _finalize_streaming_state(self, *, split: str) -> None:
+    def _finalize_streaming_state(self, *, split: str, log_metrics: bool = True) -> Dict[str, torch.Tensor]:
         state = self._streaming_state.get(split)
         if not state:
-            return
+            return {}
 
         self._all_reduce_inplace(state["ranking_count"])
         self._all_reduce_inplace(state["mrr_sum"])
@@ -259,73 +396,40 @@ class RetrieverModule(LightningModule):
         effective_ranking_count = int(ranking_count.detach().cpu().item())
         batch_size = max(effective_ranking_count, 1)
 
-        log_metric(
-            self,
-            f"{split}/ranking/mrr",
-            state["mrr_sum"] / denom,
-            batch_size=batch_size,
-            sync_dist=True,
-            on_step=False,
-            on_epoch=True,
-        )
+        metrics: Dict[str, torch.Tensor] = {
+            f"{split}/ranking/mrr": state["mrr_sum"] / denom,
+        }
         for k in sorted(state["recall_sum"].keys()):
-            log_metric(
-                self,
-                f"{split}/ranking/recall@{k}",
-                state["recall_sum"][k] / denom,
-                batch_size=batch_size,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-            )
+            metrics[f"{split}/ranking/recall@{k}"] = state["recall_sum"][k] / denom
         for k in sorted(state["precision_sum"].keys()):
-            log_metric(
-                self,
-                f"{split}/ranking/precision@{k}",
-                state["precision_sum"][k] / denom,
-                batch_size=batch_size,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-            )
+            metrics[f"{split}/ranking/precision@{k}"] = state["precision_sum"][k] / denom
         for k in sorted(state["f1_sum"].keys()):
-            log_metric(
-                self,
-                f"{split}/ranking/f1@{k}",
-                state["f1_sum"][k] / denom,
-                batch_size=batch_size,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-            )
+            metrics[f"{split}/ranking/f1@{k}"] = state["f1_sum"][k] / denom
         for k in sorted(state["ndcg_sum"].keys()):
-            log_metric(
-                self,
-                f"{split}/ranking/ndcg@{k}",
-                state["ndcg_sum"][k] / denom,
-                batch_size=batch_size,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-            )
+            metrics[f"{split}/ranking/ndcg@{k}"] = state["ndcg_sum"][k] / denom
 
         answer_count = state["answer_count"]
         answer_denom = answer_count.clamp_min(1.0)
         effective_answer_count = int(answer_count.detach().cpu().item())
         answer_batch_size = max(effective_answer_count, 1)
         for k in sorted(state["answer_sum"].keys()):
-            log_metric(
-                self,
-                f"{split}/answer/answer_recall@{k}",
-                state["answer_sum"][k] / answer_denom,
-                batch_size=answer_batch_size,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-            )
+            metrics[f"{split}/answer/answer_recall@{k}"] = state["answer_sum"][k] / answer_denom
+
+        if log_metrics:
+            for name, value in metrics.items():
+                log_metric(
+                    self,
+                    name,
+                    value,
+                    batch_size=batch_size if "ranking" in name else answer_batch_size,
+                    sync_dist=True,
+                    on_step=False,
+                    on_epoch=True,
+                )
 
         self._maybe_persist_retriever_outputs(split, state["persist_samples"])
         state["persist_samples"] = []
+        return metrics
 
     def _update_streaming_state(
         self,

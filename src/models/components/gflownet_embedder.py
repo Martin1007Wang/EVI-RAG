@@ -19,11 +19,10 @@ logger = logging.getLogger(__name__)
 
 class GraphEmbedder(nn.Module):
     """
-    GFlowNet 图嵌入器：复用 Retriever checkpoint 中的投影器 + DenseFeatureExtractor 权重，
-    作为 trainable warm-start（可微调热启动），并严格保持 g_agent 的 SSOT 字段不引入额外结构特征。
+    GFlowNet 图嵌入器：默认自包含（不依赖 retriever ckpt），可选 warm-start 时再显式传入 projector_checkpoint。
 
-    结构特征（topic/DDE）仅在 retriever checkpoint 明确启用时计算，且完全由 g_agent SSOT 字段
-    （start_node_locals + edge_index）确定性派生，不要求缓存额外字段。
+    结构特征（topic/DDE）只有在 warm-start ckpt 中显式存在时才会启用；否则只使用语义特征。
+    严格保持 g_agent 的 SSOT 字段，不引入额外缓存字段。
     """
 
     def __init__(
@@ -31,13 +30,13 @@ class GraphEmbedder(nn.Module):
         *,
         hidden_dim: int,
         proj_dropout: float,
-        projector_checkpoint: str,
+        projector_checkpoint: str | None = None,
         projector_key_prefixes: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.proj_dropout = float(proj_dropout)
-        self.projector_checkpoint = str(projector_checkpoint)
+        self.projector_checkpoint = str(projector_checkpoint) if projector_checkpoint else ""
 
         self.projector_key_prefixes = self._normalize_prefixes(projector_key_prefixes or ["model._orig_mod", "model", ""])
 
@@ -59,6 +58,13 @@ class GraphEmbedder(nn.Module):
         self.query_proj: Optional[EmbeddingProjector] = None
         self.non_text_entity_emb: Optional[nn.Embedding] = None
         self.edge_adapter: Optional[nn.Module] = None
+
+        # 构造所有可训练子模块，确保 strict load 不依赖外部 datamodule/setup。
+        if self.projector_checkpoint:
+            state_dict = self._load_checkpoint_state()
+            self._load_retriever_components(state_dict)
+        else:
+            self._init_fresh_components()
 
     @staticmethod
     def _normalize_prefixes(prefixes: Sequence[str]) -> list[str]:
@@ -99,8 +105,6 @@ class GraphEmbedder(nn.Module):
                 f"entity_dim={self._entity_dim}, relation_dim={self._relation_dim}."
             )
 
-        state_dict = self._load_checkpoint_state()
-        self._load_retriever_components(state_dict)
         if device is not None:
             self.to(device)
 
@@ -109,6 +113,11 @@ class GraphEmbedder(nn.Module):
             raise RuntimeError("GraphEmbedder.setup() must be called before embed_batch.")
         if self.edge_adapter is None or self.entity_proj is None or self.relation_proj is None or self.query_proj is None:
             raise RuntimeError("GraphEmbedder not initialized; call setup() first.")
+        if self.hidden_dim != self._entity_dim or self.hidden_dim != self._relation_dim:
+            raise ValueError(
+                f"GraphEmbedder hidden_dim mismatch with resources (hidden_dim={self.hidden_dim}, "
+                f"entity_dim={self._entity_dim}, relation_dim={self._relation_dim})."
+            )
 
         edge_index = batch.edge_index.to(device)
         node_ptr = batch.ptr.to(device)
@@ -121,7 +130,15 @@ class GraphEmbedder(nn.Module):
         edge_relations = edge_relations_raw.to(device)
         edge_labels = batch.edge_labels.to(device)
         edge_scores = batch.edge_scores.to(device)
-        path_mask, path_exists = self._build_path_mask(batch=batch, edge_index=edge_index, device=device)
+        gt_path_ptr = batch._slice_dict.get("gt_path_edge_local_ids")
+        if gt_path_ptr is None:
+            raise ValueError("Batch missing gt_path_edge_local_ids slice; g_agent cache must include GT path ptrs.")
+        path_mask, path_exists = self._build_path_mask(
+            batch=batch,
+            edge_ptr=edge_ptr,
+            gt_path_ptr=gt_path_ptr.to(device),
+            device=device,
+        )
 
         question_raw = self._prepare_question_embeddings(batch.question_emb, batch_size=num_graphs, device=device)
         question_tokens = self.query_proj(question_raw)
@@ -304,6 +321,27 @@ class GraphEmbedder(nn.Module):
             self.edge_adapter[0].bias.copy_(b0)
             self.edge_adapter[3].weight.copy_(w1)
             self.edge_adapter[3].bias.copy_(b1)
+
+    def _init_fresh_components(self) -> None:
+        """Initialize projector/adapter from scratch when no retriever checkpoint is provided."""
+        self._edge_in_dim = 4 * self.hidden_dim
+        self._use_topic_pe = False
+        self._num_topics = 0
+        self._struct_dim = 0
+        self._dde = None
+
+        self.entity_proj = EmbeddingProjector(output_dim=self.hidden_dim, input_dim=self.hidden_dim, finetune=True)
+        self.relation_proj = EmbeddingProjector(output_dim=self.hidden_dim, input_dim=self.hidden_dim, finetune=True)
+        self.query_proj = EmbeddingProjector(output_dim=self.hidden_dim, input_dim=self.hidden_dim, finetune=True)
+        self.non_text_entity_emb = nn.Embedding(1, self.hidden_dim)
+        nn.init.zeros_(self.non_text_entity_emb.weight)
+
+        self.edge_adapter = nn.Sequential(
+            nn.Linear(self._edge_in_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
 
     def _load_retriever_parity_meta(
         self,
@@ -529,11 +567,35 @@ class GraphEmbedder(nn.Module):
     def _build_path_mask(
         *,
         batch: Any,
-        edge_index: torch.Tensor,
+        edge_ptr: torch.Tensor,
+        gt_path_ptr: torch.Tensor,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        path_mask = torch.zeros(edge_index.size(1), dtype=torch.bool, device=device)
-        path_mask[batch.gt_path_edge_local_ids.to(device)] = True
+        if gt_path_ptr.dim() != 1:
+            raise ValueError("gt_path_ptr must be 1D [B+1].")
+        num_graphs = int(gt_path_ptr.numel() - 1)
+        if num_graphs <= 0:
+            raise ValueError("gt_path_ptr implies no graphs in batch.")
+        if edge_ptr.numel() != num_graphs + 1:
+            raise ValueError("edge_ptr length mismatch with gt_path_ptr.")
+        path_mask = torch.zeros(int(edge_ptr[-1].item()), dtype=torch.bool, device=device)
+        gt_edges = batch.gt_path_edge_local_ids.to(device=device, dtype=torch.long)
+        if gt_edges.numel() > 0:
+            gt_counts = gt_path_ptr[1:] - gt_path_ptr[:-1]
+            if gt_counts.numel() != num_graphs:
+                raise ValueError("gt_path_ptr length mismatch; expected one count per graph.")
+            gt_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), gt_counts)
+            edge_start = edge_ptr[:-1].to(device=device)
+            edge_end = edge_ptr[1:].to(device=device)
+            in_range = (gt_edges >= edge_start[gt_batch]) & (gt_edges < edge_end[gt_batch])
+            if not bool(in_range.all().item()):
+                bad = torch.nonzero(~in_range, as_tuple=False).view(-1)
+                preview = bad[:5].detach().cpu().tolist()
+                raise ValueError(
+                    "gt_path_edge_local_ids must be batch-global edge indices; "
+                    f"found out-of-range entries at positions={preview}."
+                )
+            path_mask[gt_edges] = True
         path_exists = batch.gt_path_exists.view(-1).to(device)
         return path_mask, path_exists
 

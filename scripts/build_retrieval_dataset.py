@@ -317,40 +317,23 @@ def build_dataset(cfg: DictConfig) -> None:
 
     graph_id_list = graph_ids_all.to_pylist()
     graph_id_to_row: Dict[str, int] = {gid: idx for idx, gid in enumerate(graph_id_list)}
+    if "positive_triple_mask" not in graphs_table.schema.names:
+        raise RuntimeError(
+            "graphs.parquet is missing required column `positive_triple_mask`. "
+            "Re-run scripts/build_retrieval_parquet.py to regenerate normalized parquet with triple-level supervision."
+        )
+
     graph_cols: Dict[str, List] = {
         "node_entity_ids": graphs_table.column("node_entity_ids").to_pylist(),
         "node_embedding_ids": graphs_table.column("node_embedding_ids").to_pylist(),
         "edge_src": graphs_table.column("edge_src").to_pylist(),
         "edge_dst": graphs_table.column("edge_dst").to_pylist(),
         "edge_relation_ids": graphs_table.column("edge_relation_ids").to_pylist(),
-        "positive_edge_mask": graphs_table.column("positive_edge_mask").to_pylist(),
-        # Optional newer schema fields (produced by scripts/build_retrieval_parquet.py).
-        # - positive_triple_mask: edge-level mask (canonical edge ids on GT paths)
-        # - gt_source: provenance of GT (answer_subgraph vs shortest_path)
-        "positive_triple_mask": graphs_table.column("positive_triple_mask").to_pylist()
-        if "positive_triple_mask" in graphs_table.schema.names
-        else [],
+        # Fixed invariant: retriever supervision is ALWAYS triple-level.
+        "positive_triple_mask": graphs_table.column("positive_triple_mask").to_pylist(),
         "gt_path_edge_indices": graphs_table.column("gt_path_edge_indices").to_pylist(),
         "gt_path_node_indices": graphs_table.column("gt_path_node_indices").to_pylist(),
-        "gt_source": graphs_table.column("gt_source").to_pylist() if "gt_source" in graphs_table.schema.names else [],
     }
-
-    labels_cfg: Dict[str, Any] = cfg.get("labels", {}) or {}
-    label_source: str = str(labels_cfg.get("source", "transition"))
-    store_aux_labels: bool = bool(labels_cfg.get("store_aux", True))
-    valid_sources = {"transition", "triple", "hybrid"}
-    if label_source not in valid_sources:
-        raise ValueError(f"labels.source must be one of {sorted(valid_sources)}, got {label_source!r}")
-    if label_source in {"triple", "hybrid"} and not graph_cols["positive_triple_mask"]:
-        raise RuntimeError(
-            "graphs.parquet is missing `positive_triple_mask` required by labels.source="
-            f"{label_source!r}. Re-run scripts/build_retrieval_parquet.py with the updated code."
-        )
-    if label_source == "hybrid" and not graph_cols["gt_source"]:
-        raise RuntimeError(
-            "graphs.parquet is missing `gt_source` required by labels.source='hybrid'. "
-            "Re-run scripts/build_retrieval_parquet.py with the updated code."
-        )
 
     questions_rows = questions_table.num_rows
     print(f"Preparing {questions_rows} samples...")
@@ -433,23 +416,7 @@ def build_dataset(cfg: DictConfig) -> None:
                 edge_src = graph_cols["edge_src"][g_idx]
                 edge_dst = graph_cols["edge_dst"][g_idx]
                 edge_rel = graph_cols["edge_relation_ids"][g_idx]
-                labels_transition = graph_cols["positive_edge_mask"][g_idx]
-                labels_triple = (
-                    graph_cols["positive_triple_mask"][g_idx] if graph_cols["positive_triple_mask"] else None
-                )
-                gt_source = graph_cols["gt_source"][g_idx] if graph_cols["gt_source"] else "unknown"
-
-                if label_source == "transition":
-                    labels = labels_transition
-                elif label_source == "triple":
-                    labels = labels_triple
-                elif label_source == "hybrid":
-                    if gt_source == "answer_subgraph":
-                        labels = labels_triple
-                    else:
-                        labels = labels_transition
-                else:
-                    raise RuntimeError("unreachable label_source")
+                labels = graph_cols["positive_triple_mask"][g_idx]
 
                 num_nodes = len(node_entity_ids)
                 num_edges = len(edge_src)
@@ -462,8 +429,6 @@ def build_dataset(cfg: DictConfig) -> None:
                 node_emb_ids = torch.tensor(node_embedding_ids, dtype=torch.long)
                 edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
                 edge_attr = torch.tensor(edge_rel, dtype=torch.long)
-                if labels is None:
-                    raise RuntimeError(f"labels resolved to None for {graph_id}; check labels.source={label_source!r}")
                 label_tensor = torch.tensor(labels, dtype=torch.float32)
                 if label_tensor.numel() != num_edges:
                     raise ValueError(
@@ -519,17 +484,10 @@ def build_dataset(cfg: DictConfig) -> None:
                     "gt_path_edge_indices": path_edge_indices if path_edge_indices else [],
                     # 兼容性：存原始节点索引列表（非必需）
                     "gt_path_node_indices": path_node_indices if path_node_indices else [],
-                    # Debug-only provenance (safe to ignore downstream)
-                    "gt_source": str(gt_source),
-                    "labels_source": str(label_source),
                     "sample_id": graph_id,
                     "idx": processed + i,
                     "metadata": meta_val,
                 }
-                if store_aux_labels:
-                    sample["labels_transition"] = torch.tensor(labels_transition, dtype=torch.float32)
-                    if labels_triple is not None:
-                        sample["labels_triple"] = torch.tensor(labels_triple, dtype=torch.float32)
 
                 txn = txn_cache[split]
                 _write_sample(txn, graph_id, sample)

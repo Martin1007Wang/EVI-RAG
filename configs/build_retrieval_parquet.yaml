@@ -18,23 +18,19 @@ filter:
     skip_no_topic: true
     skip_no_ans: true
     skip_no_path: true
-    use_shortest_path_positive: true
   # Optional per-split overrides (e.g., to match SubgraphRAG: train/validation filtered, test unfiltered).
   validation:
     skip_no_topic: false
     skip_no_ans: false
     skip_no_path: false
-    use_shortest_path_positive: true
   test:
     skip_no_topic: false
     skip_no_ans: false
     skip_no_path: false
-    use_shortest_path_positive: true
   eval:
     skip_no_topic: false
     skip_no_ans: false
     skip_no_path: false
-    use_shortest_path_positive: true
 
 # When the filter actually removes samples, also write a `${dataset.name}-${sub.suffix}` normalized dataset.
 sub:

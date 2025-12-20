@@ -15,6 +15,7 @@ callbacks:
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
+    save_weights_only: True
   early_stopping:
     monitor: val/ranking/recall@100
     mode: max

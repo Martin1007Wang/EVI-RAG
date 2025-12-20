@@ -1,0 +1,13 @@
+# Single-GPU eval/test trainer (no DDP, no checkpointing).
+_target_: lightning.pytorch.trainer.Trainer
+
+accelerator: gpu
+devices: 1
+strategy: auto
+precision: 16-mixed
+max_epochs: 1
+logger: null
+enable_checkpointing: false
+enable_progress_bar: true
+deterministic: false
+default_root_dir: ${paths.output_dir}

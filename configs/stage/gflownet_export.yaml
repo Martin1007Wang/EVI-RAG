@@ -1,0 +1,31 @@
+# @package _global_
+#
+# Stage: 导出 GFlowNet rollouts（流式 JSONL），仅用于下游路径提示/审计，不计算指标。
+
+defaults:
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict
+
+stage:
+  name: gflownet_export
+  task_name: "export/gflownet"
+  tags: ["export", "gflownet"]
+  run:
+    return_predictions: false
+
+ckpt_path: ${ckpt.gflownet}
+
+debug: true
+
+model:
+  eval_persist_cfg:
+    enabled: true
+    stream: true
+    output_dir: ${dataset.materialized_dir}/export_gflownet
+    splits: ["predict"]
+    textualize: true
+    entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+    relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet

@@ -53,6 +53,7 @@ def test_g_agent_builder_roundtrip(tmp_path: Path) -> None:
         settings = GAgentSettings(
             enabled=True,
             anchor_top_k=1,
+            anchor_start_k=1,
             output_path=tmp_path / "g_agent_samples.pt",
             force_include_gt=False,
         )
@@ -107,6 +108,7 @@ def test_g_agent_builder_keeps_unreachable_answers(tmp_path: Path) -> None:
         settings = GAgentSettings(
             enabled=True,
             anchor_top_k=1,
+            anchor_start_k=1,
             output_path=tmp_path / "g_agent_samples_unreachable.pt",
             force_include_gt=False,
         )

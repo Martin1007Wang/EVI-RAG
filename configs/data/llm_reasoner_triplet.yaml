@@ -5,8 +5,8 @@ dataset: ${dataset.name}
 split: test
 prompt_tag: triplets
 
-# Required paths
-score_dict_path: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
+# Required paths (split-aware)
+score_dict_path: ${dataset.materialized_dir}/g_agent/${.split}_g_agent.pt
 questions_path: ${dataset.out_dir}/questions.parquet
 entity_vocab_path: ${dataset.paths.vocabulary}
 relation_vocab_path: ${dataset.paths.vocabulary}

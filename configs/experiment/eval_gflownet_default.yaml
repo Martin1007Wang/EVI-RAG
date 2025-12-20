@@ -17,7 +17,6 @@ ckpt:
   retriever: ${oc.env:RETRIEVER_CKPT,null}
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
-# Used by `configs/model/env/graph.yaml` (`debug: ${env_debug}`).
-env_debug: false
+debug: true  # Used by train/eval/export统一控制 gflownet.debug 和 env.debug。
 
 tags: ["eval", "gflownet"]

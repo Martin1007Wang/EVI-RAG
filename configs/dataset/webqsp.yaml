@@ -13,7 +13,7 @@ paths:
   processed: ${dataset.materialized_dir}/processed
 
 entity_normalization: none
-undirected_traversal: false
+undirected_traversal: true
 
 column_map:
   question_id_field: id

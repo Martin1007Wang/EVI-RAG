@@ -18,6 +18,13 @@ from .components import (
 logger = logging.getLogger(__name__)
 
 
+class GRetrievalData(GraphData):
+    def __inc__(self, key: str, value: Any, *args, **kwargs) -> int:
+        if key in {"q_local_indices", "a_local_indices"}:
+            return int(self.num_nodes)
+        return super().__inc__(key, value, *args, **kwargs)
+
+
 class GRetrievalDataset(Dataset):
 
     def __init__(
@@ -86,7 +93,7 @@ class GRetrievalDataset(Dataset):
     def len(self) -> int:
         return len(self.sample_ids)
 
-    def get(self, idx: int) -> GraphData:
+    def get(self, idx: int) -> GRetrievalData:
         """Load single sample from LMDB with strict PyG validation."""
         sample_id = self.sample_ids[idx]
         raw = self._get_sample_store().load_sample(sample_id)
@@ -111,7 +118,7 @@ class GRetrievalDataset(Dataset):
         q_local_indices = torch.as_tensor(raw.get("q_local_indices", []), dtype=torch.long).view(-1)
         a_local_indices = torch.as_tensor(raw.get("a_local_indices", []), dtype=torch.long).view(-1)
 
-        data = GraphData(
+        data = GRetrievalData(
             num_nodes=num_nodes,
             edge_index=edge_index,
             edge_attr=torch.as_tensor(raw["edge_attr"], dtype=torch.long), # Global relation IDs

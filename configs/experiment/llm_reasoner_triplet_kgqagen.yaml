@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - llm_reasoner_triplet_default
-  - override /dataset: kgqagen
-
-tags: ["kgqagen", "llm_reasoner", "triplet"]

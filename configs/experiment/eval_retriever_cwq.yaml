@@ -1,9 +1,0 @@
-# @package _global_
-
-defaults:
-  - eval_retriever_default
-  # Use the filtered dataset to match retriever training and avoid empty-graph samples.
-  - override /dataset: cwq-sub
-
-tags: ["cwq", "eval_retriever"]
-
