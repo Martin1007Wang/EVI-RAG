@@ -26,9 +26,7 @@ class RewardProbeCallback(Callback):
             return
         log_reward = debug.get("log_reward")
         answer_hit = debug.get("answer_hit")
-        prefix_ratio = debug.get("path_prefix_ratio")
-        full_hit = debug.get("path_full_hit")
-        gt_exists = debug.get("gt_path_exists_ratio")
+        answer_reach_frac = debug.get("answer_reach_frac")
         if log_reward is None or answer_hit is None:
             return
         # Only inspect samples that reached answers (success=True).
@@ -36,9 +34,6 @@ class RewardProbeCallback(Callback):
         if mask.numel() == 0 or not mask.any():
             return
         log_reward_hit = log_reward[mask]
-        prefix_hit = prefix_ratio[mask] if prefix_ratio is not None else None
-        full_hit_mask = full_hit[mask] if full_hit is not None else None
-        gt_hit = gt_exists[mask] if isinstance(gt_exists, torch.Tensor) and gt_exists.numel() == mask.numel() else None
         batch_size = infer_batch_size(batch)
         log_metric(
             pl_module,
@@ -49,31 +44,11 @@ class RewardProbeCallback(Callback):
             on_epoch=False,
             batch_size=batch_size,
         )
-        if prefix_hit is not None and prefix_hit.numel() > 0:
+        if isinstance(answer_reach_frac, torch.Tensor) and answer_reach_frac.numel() == mask.numel():
             log_metric(
                 pl_module,
-                "debug/path_prefix_ratio_success_mean",
-                prefix_hit.mean(),
-                prog_bar=False,
-                on_step=True,
-                on_epoch=False,
-                batch_size=batch_size,
-            )
-        if full_hit_mask is not None and full_hit_mask.numel() > 0:
-            log_metric(
-                pl_module,
-                "debug/path_full_hit_success_mean",
-                full_hit_mask.float().mean(),
-                prog_bar=False,
-                on_step=True,
-                on_epoch=False,
-                batch_size=batch_size,
-            )
-        if gt_hit is not None and gt_hit.numel() > 0:
-            log_metric(
-                pl_module,
-                "debug/gt_path_exists_success_mean",
-                gt_hit.float().mean(),
+                "debug/answer_reach_frac_success_mean",
+                answer_reach_frac[mask].mean(),
                 prog_bar=False,
                 on_step=True,
                 on_epoch=False,

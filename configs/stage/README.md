@@ -4,7 +4,7 @@
 
 ## 标准流水（单 GPU，逐步产物单一）
 
-1. `cache_g_agent`：单次 Retriever 前向，产出指标 + `g_agent/{split}_g_agent.pt`（并可选 `eval_retriever/{split}_retriever_eval.pt`）。
+1. `retriever_eval`：Retriever 前向评估 + 物化 `g_agent/{split}_g_agent.pt`（默认一次跑 train/validation/test；并持久化 `eval_retriever/{split}_retriever_eval.pt` 供 truth/LLM 阶段消费）。
 2. `gflownet_eval`：评估 GFlowNet（统一走 `trainer.predict`），产出指标 + `eval_gflownet/{split}_gflownet_eval.pt`。
 3. `llm_reasoner_*`：
    - `llm_reasoner_triplet`：LLM over triplets（消费 `g_agent`）。

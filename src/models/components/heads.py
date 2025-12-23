@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
+
 from torch import nn
 
 
 class DenseFeatureExtractor(nn.Module):
-    """Two-layer MLP with dropout and ReLU activations."""
+    """Two-layer MLP with dropout and configurable activations."""
 
     def __init__(
         self,
@@ -12,14 +14,19 @@ class DenseFeatureExtractor(nn.Module):
         emb_dim: int,
         hidden_dim: int,
         dropout_p: float,
+        activation: nn.Module,
     ) -> None:
         super().__init__()
+        if activation is None:
+            raise ValueError("DenseFeatureExtractor requires a non-null activation module.")
+        activation_0 = copy.deepcopy(activation)
+        activation_1 = copy.deepcopy(activation)
         self.network = nn.Sequential(
             nn.Linear(input_dim, emb_dim),
-            nn.ReLU(),
+            activation_0,
             nn.Dropout(dropout_p),
             nn.Linear(emb_dim, hidden_dim),
-            nn.ReLU(),
+            activation_1,
             nn.Dropout(dropout_p),
         )
 

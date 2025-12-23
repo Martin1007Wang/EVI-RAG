@@ -66,9 +66,8 @@ class GraphRecord:
     edge_src: List[int]
     edge_dst: List[int]
     edge_relation_ids: List[int]
-    # Triple-level positives: supervision defined on a specific edge id in the
-    # preserved multi-edge list (h,r,t). For shortest-path supervision this is
-    # a deterministic single shortest path (not a union).
+    # Triple-level positives: union of all shortest-path edges (shortest-path DAG)
+    # between any seed and any answer (multi-source, multi-target).
     positive_triple_mask: List[bool]
     gt_path_edge_indices: List[int]
     gt_path_node_indices: List[int]
@@ -276,6 +275,178 @@ def is_text_entity(entity: str) -> bool:
     return not (entity.startswith("m.") or entity.startswith("g."))
 
 
+def _shortest_path_single(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    sources: Sequence[int],
+    targets: Sequence[int],
+    undirected: bool,
+) -> Tuple[List[int], List[int]]:
+    if not sources or not targets or num_nodes <= 0:
+        return [], []
+
+    from collections import deque
+
+    adjacency: List[List[Tuple[int, int]]] = [[] for _ in range(num_nodes)]
+    for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
+        u = int(u_raw)
+        v = int(v_raw)
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            adjacency[u].append((v, idx))
+            if undirected:
+                adjacency[v].append((u, idx))
+
+    for nbrs in adjacency:
+        nbrs.sort(key=lambda item: (item[0], item[1]))
+
+    sources_unique = sorted({int(s) for s in sources if 0 <= int(s) < num_nodes})
+    targets_unique = sorted({int(t) for t in targets if 0 <= int(t) < num_nodes})
+    if not sources_unique or not targets_unique:
+        return [], []
+
+    dist = [-1] * num_nodes
+    parent = [-1] * num_nodes
+    parent_edge = [-1] * num_nodes
+    q: deque[int] = deque()
+    for s in sources_unique:
+        dist[s] = 0
+        q.append(s)
+
+    while q:
+        cur = q.popleft()
+        next_dist = dist[cur] + 1
+        for nb, e_idx in adjacency[cur]:
+            if dist[nb] != -1:
+                continue
+            dist[nb] = next_dist
+            parent[nb] = cur
+            parent_edge[nb] = int(e_idx)
+            q.append(nb)
+
+    best_target = None
+    best_dist = None
+    for tgt in targets_unique:
+        if dist[tgt] < 0:
+            continue
+        if best_dist is None or dist[tgt] < best_dist or (dist[tgt] == best_dist and tgt < best_target):
+            best_target = tgt
+            best_dist = dist[tgt]
+
+    if best_target is None:
+        return [], []
+
+    nodes_rev: List[int] = [int(best_target)]
+    edges_rev: List[int] = []
+    cur = int(best_target)
+    sources_set = set(sources_unique)
+    while cur not in sources_set:
+        prev = int(parent[cur])
+        edge = int(parent_edge[cur])
+        if prev < 0 or edge < 0:
+            return [], []
+        edges_rev.append(edge)
+        nodes_rev.append(prev)
+        cur = prev
+
+    edges = list(reversed(edges_rev))
+    if not edges:
+        return [], []
+    nodes = list(reversed(nodes_rev))
+    return edges, nodes
+
+
+def _build_adjacency(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    undirected: bool,
+) -> Tuple[List[List[int]], List[List[int]]]:
+    adj_fwd: List[List[int]] = [[] for _ in range(num_nodes)]
+    adj_rev: List[List[int]] = [[] for _ in range(num_nodes)]
+    for u_raw, v_raw in zip(edge_src, edge_dst):
+        u = int(u_raw)
+        v = int(v_raw)
+        if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
+            continue
+        adj_fwd[u].append(v)
+        adj_rev[v].append(u)
+        if undirected and u != v:
+            adj_fwd[v].append(u)
+            adj_rev[u].append(v)
+    for nbrs in adj_fwd:
+        nbrs.sort()
+    for nbrs in adj_rev:
+        nbrs.sort()
+    return adj_fwd, adj_rev
+
+
+def _bfs_dist(num_nodes: int, adjacency: Sequence[Sequence[int]], sources: Sequence[int]) -> List[int]:
+    dist = [-1] * num_nodes
+    if num_nodes <= 0:
+        return dist
+    from collections import deque
+
+    q: deque[int] = deque()
+    for s_raw in sources:
+        s = int(s_raw)
+        if 0 <= s < num_nodes and dist[s] < 0:
+            dist[s] = 0
+            q.append(s)
+
+    while q:
+        u = q.popleft()
+        du = dist[u] + 1
+        for v in adjacency[u]:
+            if dist[v] >= 0:
+                continue
+            dist[v] = du
+            q.append(v)
+    return dist
+
+
+def _shortest_path_union_mask(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    sources: Sequence[int],
+    targets: Sequence[int],
+    undirected: bool,
+) -> List[bool]:
+    num_edges = len(edge_src)
+    if num_nodes <= 0 or num_edges == 0 or not sources or not targets:
+        return [False] * num_edges
+
+    adj_fwd, adj_rev = _build_adjacency(
+        num_nodes=num_nodes,
+        edge_src=edge_src,
+        edge_dst=edge_dst,
+        undirected=undirected,
+    )
+    dist_start = _bfs_dist(num_nodes, adj_fwd, sources)
+    reachable_targets = sorted({int(t) for t in targets if 0 <= int(t) < num_nodes and dist_start[int(t)] >= 0})
+    if not reachable_targets:
+        return [False] * num_edges
+
+    mask = [False] * num_edges
+    for tgt in reachable_targets:
+        dist_to_t = _bfs_dist(num_nodes, adj_rev, [tgt])
+        target_dist = dist_start[tgt]
+        if target_dist <= 0:
+            continue
+        for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
+            u = int(u_raw)
+            v = int(v_raw)
+            if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
+                continue
+            if dist_start[u] >= 0 and dist_to_t[v] >= 0 and dist_start[u] + 1 + dist_to_t[v] == target_dist:
+                mask[idx] = True
+                continue
+            if undirected and dist_start[v] >= 0 and dist_to_t[u] >= 0 and dist_start[v] + 1 + dist_to_t[u] == target_dist:
+                mask[idx] = True
+    return mask
+
+
 def shortest_path_edge_indices_directed(
     num_nodes: int,
     edge_src: Sequence[int],
@@ -284,80 +455,11 @@ def shortest_path_edge_indices_directed(
     answers: Sequence[int],
     undirected: bool,
 ) -> Tuple[List[int], List[int]]:
-    """Deterministic single shortest path (seed -> answer), preserving multi-edges.
+    """Deterministic single shortest path between seeds and answers (optionally undirected)."""
+    if undirected:
+        return _shortest_path_single(num_nodes, edge_src, edge_dst, seeds, answers, undirected=True)
 
-    - Build adjacency from the collapsed (u,v) pairs; parallel edges map to the last edge id.
-    - Run multi-source BFS from all seeds with stable ordering.
-    - Pick the closest reachable answer (tie-break by answer id).
-    - Return the edge indices along that single path plus its node indices.
-    """
-    if not seeds or not answers or num_nodes <= 0:
-        return [], []
-
-    from collections import deque
-
-    # Collapse parallel edges by (u,v) with last-write-wins to mirror DiGraph semantics.
-    pair_to_edge_idx: Dict[Tuple[int, int], int] = {}
-    adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
-    for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
-        u = int(u_raw)
-        v = int(v_raw)
-        if 0 <= u < num_nodes and 0 <= v < num_nodes:
-            if (u, v) not in pair_to_edge_idx:
-                adjacency[u].append(v)
-            pair_to_edge_idx[(u, v)] = idx
-            if undirected:
-                if (v, u) not in pair_to_edge_idx:
-                    adjacency[v].append(u)
-                pair_to_edge_idx[(v, u)] = idx
-    # Sort adjacency for deterministic BFS ordering.
-    for nbrs in adjacency:
-        nbrs.sort()
-
-    seeds_unique = sorted({int(s) for s in seeds if 0 <= int(s) < num_nodes})
-    answers_unique = sorted({int(a) for a in answers if 0 <= int(a) < num_nodes})
-    if not seeds_unique or not answers_unique:
-        return [], []
-
-    dist = [-1] * num_nodes
-    parent = [-1] * num_nodes
-    parent_edge = [-1] * num_nodes
-    q: deque[int] = deque()
-    for s in seeds_unique:
-        dist[s] = 0
-        q.append(s)
-
-    while q:
-        cur = q.popleft()
-        next_dist = dist[cur] + 1
-        for nb in adjacency[cur]:
-            if dist[nb] != -1:
-                continue
-            dist[nb] = next_dist
-            parent[nb] = cur
-            parent_edge[nb] = pair_to_edge_idx.get((cur, nb), -1)
-            q.append(nb)
-
-    candidates = [a for a in answers_unique if dist[a] >= 0]
-    if not candidates:
-        return [], []
-
-    best_dist = min(dist[a] for a in candidates)
-    best_answer = min(a for a in candidates if dist[a] == best_dist)
-
-    path_nodes: List[int] = []
-    path_edges: List[int] = []
-    cur = best_answer
-    while cur != -1 and dist[cur] >= 0:
-        path_nodes.append(cur)
-        e_idx = parent_edge[cur]
-        if e_idx != -1:
-            path_edges.append(int(e_idx))
-        cur = parent[cur]
-
-    path_nodes.reverse()
-    path_edges.reverse()
-    return path_edges, path_nodes
+    return _shortest_path_single(num_nodes, edge_src, edge_dst, seeds, answers, undirected=False)
 
 
 def has_connectivity(
@@ -703,23 +805,75 @@ def build_graph(
             if idxs:
                 answer_edge_indices.extend(idxs)
 
+    num_edges = len(edge_src)
+    positive_triple_mask = [False] * num_edges
+    path_edge_indices: List[int] = []
+    path_node_indices: List[int] = []
+    gt_source = "none"
+
     if answer_edge_indices:
-        # Deduplicate while preserving order for determinism
+        # Deduplicate while preserving order for determinism.
         seen = set()
         dedup_answer_edges = []
         for idx in answer_edge_indices:
             if idx not in seen:
                 seen.add(idx)
                 dedup_answer_edges.append(idx)
-        path_edge_indices = dedup_answer_edges
-        gt_source = "answer_subgraph"
-        node_set = set()
-        for idx in path_edge_indices:
-            node_set.add(edge_src[idx])
-            node_set.add(edge_dst[idx])
-        path_node_indices = sorted(node_set)
+
+        sub_edge_src = [edge_src[idx] for idx in dedup_answer_edges]
+        sub_edge_dst = [edge_dst[idx] for idx in dedup_answer_edges]
+        sub_mask = _shortest_path_union_mask(
+            num_nodes=len(node_entity_ids),
+            edge_src=sub_edge_src,
+            edge_dst=sub_edge_dst,
+            sources=q_local,
+            targets=a_local,
+            undirected=undirected_traversal,
+        )
+        if any(sub_mask):
+            positive_triple_mask = [False] * num_edges
+            for sub_idx, keep in enumerate(sub_mask):
+                if keep:
+                    positive_triple_mask[dedup_answer_edges[sub_idx]] = True
+            sub_path_edges, sub_path_nodes = shortest_path_edge_indices_directed(
+                num_nodes=len(node_entity_ids),
+                edge_src=sub_edge_src,
+                edge_dst=sub_edge_dst,
+                seeds=q_local,
+                answers=a_local,
+                undirected=undirected_traversal,
+            )
+            if sub_path_edges:
+                path_edge_indices = [dedup_answer_edges[idx] for idx in sub_path_edges]
+                path_node_indices = sub_path_nodes
+            gt_source = "answer_subgraph_dag" if path_edge_indices else "none"
+        else:
+            positive_triple_mask = _shortest_path_union_mask(
+                num_nodes=len(node_entity_ids),
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+                sources=q_local,
+                targets=a_local,
+                undirected=undirected_traversal,
+            )
+            path_edge_indices, path_node_indices = shortest_path_edge_indices_directed(
+                num_nodes=len(node_entity_ids),
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+                seeds=q_local,
+                answers=a_local,
+                undirected=undirected_traversal,
+            )
+            gt_source = "shortest_path_dag" if path_edge_indices else "none"
     else:
-        # Fallback: shortest-path labelling or dense positives.
+        positive_triple_mask = _shortest_path_union_mask(
+            num_nodes=len(node_entity_ids),
+            edge_src=edge_src,
+            edge_dst=edge_dst,
+            sources=q_local,
+            targets=a_local,
+            undirected=undirected_traversal,
+        )
         path_edge_indices, path_node_indices = shortest_path_edge_indices_directed(
             num_nodes=len(node_entity_ids),
             edge_src=edge_src,
@@ -728,11 +882,7 @@ def build_graph(
             answers=a_local,
             undirected=undirected_traversal,
         )
-        gt_source = "shortest_path" if path_edge_indices else "none"
-
-    num_edges = len(edge_src)
-    positive_triple_set = {int(idx) for idx in path_edge_indices if 0 <= int(idx) < num_edges}
-    positive_triple_mask = [i in positive_triple_set for i in range(num_edges)]
+        gt_source = "shortest_path_dag" if path_edge_indices else "none"
 
     return GraphRecord(
         graph_id=graph_id,

@@ -4,7 +4,7 @@
 
 defaults:
   - override /data: gflownet
-  - override /model: gflownet_module
+  - override /model: gflownet_local_gat
   - override /callbacks: none
   - override /logger: none
   - override /trainer: predict
@@ -29,3 +29,5 @@ model:
     textualize: true
     entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
     relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+  embedder_cfg:
+    allow_deferred_init: true

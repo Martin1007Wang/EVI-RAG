@@ -26,20 +26,3 @@ def test_subtb_loss_zero_for_consistent_single_step_trajectory() -> None:
     )
     assert_close(loss, torch.tensor(0.0), atol=1e-6, rtol=0.0)
 
-
-def test_mask_subtb_loss_by_path_exists_uses_only_valid_graphs() -> None:
-    subtb_per_graph = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
-    path_exists = torch.tensor([True, False, True, False], dtype=torch.bool)
-
-    masked = GFlowNetModule._mask_subtb_loss_by_path_exists(subtb_per_graph=subtb_per_graph, path_exists=path_exists)
-    assert masked.shape == torch.Size([])
-    assert_close(masked, torch.tensor(2.0), atol=1e-6, rtol=0.0)
-
-
-def test_mask_subtb_loss_by_path_exists_all_missing_returns_zero_scalar() -> None:
-    subtb_per_graph = torch.tensor([1.0, 2.0], dtype=torch.float32)
-    path_exists = torch.tensor([False, False], dtype=torch.bool)
-
-    masked = GFlowNetModule._mask_subtb_loss_by_path_exists(subtb_per_graph=subtb_per_graph, path_exists=path_exists)
-    assert masked.shape == torch.Size([])
-    assert_close(masked, torch.tensor(0.0), atol=1e-6, rtol=0.0)

@@ -22,6 +22,8 @@ class GRetrievalData(GraphData):
     def __inc__(self, key: str, value: Any, *args, **kwargs) -> int:
         if key in {"q_local_indices", "a_local_indices"}:
             return int(self.num_nodes)
+        if key == "gt_path_edge_indices":
+            return 0
         return super().__inc__(key, value, *args, **kwargs)
 
 
@@ -39,8 +41,8 @@ class GRetrievalDataset(Dataset):
         sample_limit: Optional[int] = None,
         sample_filter_path: Optional[Path] = None,
         random_seed: Optional[int] = None,
-        gpt_triples_path: Optional[Path] = None,
         validate_on_init: bool = False,
+        include_topic_one_hot: bool = True,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -78,6 +80,7 @@ class GRetrievalDataset(Dataset):
         if sample_limit:
             self._apply_sample_limit(sample_limit, random_seed)
 
+        self.include_topic_one_hot = bool(include_topic_one_hot)
         if validate_on_init:
             self._assert_all_samples_valid()
 
@@ -85,10 +88,6 @@ class GRetrievalDataset(Dataset):
             f"GRetrievalDataset[{self.split}] initialized: {len(self.sample_ids)} samples."
         )
 
-        # 5. GPT Triples (Lazy Load)
-        self.gpt_triples_path = gpt_triples_path
-        self.gpt_triples_ids: Dict[str, Any] = {}
-        self._gpt_triples_loaded = False
 
     def len(self) -> int:
         return len(self.sample_ids)
@@ -97,7 +96,7 @@ class GRetrievalDataset(Dataset):
         """Load single sample from LMDB with strict PyG validation."""
         sample_id = self.sample_ids[idx]
         raw = self._get_sample_store().load_sample(sample_id)
-        _validate_raw_sample(raw, sample_id)
+        _validate_raw_sample(raw, sample_id, require_topic_one_hot=self.include_topic_one_hot)
 
         edge_index = torch.as_tensor(raw["edge_index"], dtype=torch.long)
         num_nodes = int(raw["num_nodes"])
@@ -117,24 +116,33 @@ class GRetrievalDataset(Dataset):
 
         q_local_indices = torch.as_tensor(raw.get("q_local_indices", []), dtype=torch.long).view(-1)
         a_local_indices = torch.as_tensor(raw.get("a_local_indices", []), dtype=torch.long).view(-1)
+        gt_path_edge_indices = torch.as_tensor(raw.get("gt_path_edge_indices", []), dtype=torch.long).view(-1)
+        topic_pe_raw = raw.get("topic_pe")
+        topic_pe = torch.as_tensor(topic_pe_raw, dtype=torch.float32) if topic_pe_raw is not None else None
 
-        data = GRetrievalData(
-            num_nodes=num_nodes,
-            edge_index=edge_index,
-            edge_attr=torch.as_tensor(raw["edge_attr"], dtype=torch.long), # Global relation IDs
-            labels=torch.as_tensor(raw["labels"], dtype=torch.float32),
-            node_global_ids=node_global_ids,
-            node_embedding_ids=node_embedding_ids,
-            topic_one_hot=torch.as_tensor(raw["topic_one_hot"], dtype=torch.float32),
-            question_emb=question_emb,
-            question=raw.get("question", ""),
-            q_local_indices=q_local_indices,
-            a_local_indices=a_local_indices,
-            answer_entity_ids=answer_ids,
-            answer_entity_ids_len=answer_ids_len,
-            sample_id=sample_id,
-            idx=idx,
-        )
+        data_kwargs: Dict[str, Any] = {
+            "num_nodes": num_nodes,
+            "edge_index": edge_index,
+            "edge_attr": torch.as_tensor(raw["edge_attr"], dtype=torch.long),  # Global relation IDs
+            "labels": torch.as_tensor(raw["labels"], dtype=torch.float32),
+            "soft_labels": torch.as_tensor(raw["soft_labels"], dtype=torch.float32),
+            "node_global_ids": node_global_ids,
+            "node_embedding_ids": node_embedding_ids,
+            "question_emb": question_emb,
+            "question": raw.get("question", ""),
+            "q_local_indices": q_local_indices,
+            "a_local_indices": a_local_indices,
+            "gt_path_edge_indices": gt_path_edge_indices,
+            "answer_entity_ids": answer_ids,
+            "answer_entity_ids_len": answer_ids_len,
+            "sample_id": sample_id,
+            "idx": idx,
+        }
+        if self.include_topic_one_hot:
+            data_kwargs["topic_one_hot"] = torch.as_tensor(raw["topic_one_hot"], dtype=torch.float32)
+        if topic_pe is not None:
+            data_kwargs["topic_pe"] = topic_pe
+        data = GRetrievalData(**data_kwargs)
         return data
 
     def close(self) -> None:
@@ -180,7 +188,7 @@ class GRetrievalDataset(Dataset):
         try:
             for sid in self.sample_ids:
                 raw = temp_store.load_sample(sid)
-                _validate_raw_sample(raw, sid)
+                _validate_raw_sample(raw, sid, require_topic_one_hot=self.include_topic_one_hot)
         finally:
             temp_store.close()
 
@@ -212,52 +220,6 @@ class GRetrievalDataset(Dataset):
         # Line-based fallback
         return {line.strip() for line in text.splitlines() if line.strip()}
 
-    # ------------------------------------------------------------------ #
-    # GPT Triples Logic
-    # ------------------------------------------------------------------ #
-    def _ensure_gpt_triples_loaded(self) -> None:
-        if self._gpt_triples_loaded:
-            return
-        
-        if not self.gpt_triples_path or not self.gpt_triples_path.exists():
-            self._gpt_triples_loaded = True # Mark as done to avoid retrying
-            return
-
-        try:
-            logger.info(f"Loading GPT triples from {self.gpt_triples_path}...")
-            # Use torch.load for .pth files, safer and faster than json for huge dicts
-            data = torch.load(self.gpt_triples_path, map_location="cpu")
-            if isinstance(data, dict):
-                self._map_gpt_triples(data)
-            logger.info(f"Loaded GPT triples for {len(self.gpt_triples_ids)} samples.")
-        except Exception as e:
-            logger.error(f"Failed to load GPT triples: {e}")
-        finally:
-            self._gpt_triples_loaded = True
-
-    def _map_gpt_triples(self, raw_data: Dict[str, list]) -> None:
-        """Convert raw strings to global IDs."""
-        e2i = self.graph_store.entity2id
-        r2i = self.graph_store.relation2id
-        
-        for sid, triples in raw_data.items():
-            mapped_set = set()
-            for t in triples:
-                if len(t) != 3: continue
-                try:
-                    h, r, v = e2i[str(t[0])], r2i[str(t[1])], e2i[str(t[2])]
-                    mapped_set.add((h, r, v))
-                except KeyError:
-                    continue # Skip triples with unknown entities
-            
-            if mapped_set:
-                self.gpt_triples_ids[str(sid)] = mapped_set
-
-    def get_gpt_triples_ids(self, sample_id: str) -> Optional[set]:
-        self._ensure_gpt_triples_loaded()
-        return self.gpt_triples_ids.get(sample_id)
-
-
 # ------------------------------------------------------------------ #
 # Factory Function (The Adapter)
 # ------------------------------------------------------------------ #
@@ -276,8 +238,7 @@ def create_g_retrieval_dataset(
        "name": "webqsp",
        "paths": {
            "vocabulary": "...",
-           "embeddings": "...",
-           "gpt_triples": "..." (Optional)
+           "embeddings": "..."
        },
        "sample_limit": { "train": 1000 } (Optional)
        "random_seed": 42
@@ -306,10 +267,10 @@ def create_g_retrieval_dataset(
         else:
             sample_limit = int(sl_cfg)
 
-    # 3. GPT Path
-    gpt_path = None
-    if "gpt_triples" in cfg["paths"]:
-        gpt_path = Path(cfg["paths"]["gpt_triples"])
+    topic_pe_cfg = cfg.get("topic_pe") or {}
+    if bool(topic_pe_cfg.get("enabled", False)) and not bool(topic_pe_cfg.get("precompute", False)):
+        raise ValueError("topic_pe.enabled=true requires topic_pe.precompute=true (runtime DDE removed).")
+    include_topic_one_hot = not bool(topic_pe_cfg.get("precompute", False))
 
     return GRetrievalDataset(
         split_path=split_path,
@@ -321,8 +282,8 @@ def create_g_retrieval_dataset(
         sample_limit=sample_limit,
         sample_filter_path=Path(cfg.get("sample_filter_path")) if cfg.get("sample_filter_path") else None,
         random_seed=cfg.get("random_seed"),
-        gpt_triples_path=gpt_path,
         validate_on_init=bool(cfg.get("validate_on_init", False)),
+        include_topic_one_hot=include_topic_one_hot,
     )
 
 
@@ -354,18 +315,20 @@ def _validate_answer_ids(answer_ids: torch.Tensor, sample_id: str) -> None:
         raise ValueError(f"answer_entity_ids for {sample_id} must be 1D.")
 
 
-def _validate_raw_sample(raw: Dict[str, Any], sample_id: str) -> None:
+def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_one_hot: bool = True) -> None:
     """Shared raw-schema validation to guarantee PyG Data integrity."""
     required_keys = [
         "edge_index",
         "edge_attr",
         "labels",
+        "soft_labels",
         "num_nodes",
         "node_global_ids",
         "node_embedding_ids",
         "question_emb",
-        "topic_one_hot",
     ]
+    if require_topic_one_hot:
+        required_keys.append("topic_one_hot")
     missing = [k for k in required_keys if k not in raw]
     if missing:
         raise KeyError(f"Sample {sample_id} missing keys: {missing}")
@@ -401,13 +364,23 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str) -> None:
 
     edge_attr = _ensure_tensor(raw["edge_attr"], torch.long, "edge_attr", sample_id).view(-1)
     labels = _ensure_tensor(raw["labels"], torch.float32, "labels", sample_id).view(-1)
+    soft_labels = _ensure_tensor(raw["soft_labels"], torch.float32, "soft_labels", sample_id).view(-1)
     if edge_attr.numel() != num_edges:
         raise ValueError(f"edge_attr length {edge_attr.numel()} != num_edges {num_edges} for {sample_id}")
     if labels.numel() != num_edges:
         raise ValueError(f"labels length {labels.numel()} != num_edges {num_edges} for {sample_id}")
+    if soft_labels.numel() != num_edges:
+        raise ValueError(f"soft_labels length {soft_labels.numel()} != num_edges {num_edges} for {sample_id}")
+    if soft_labels.numel() > 0:
+        if soft_labels.min().item() < 0.0 or soft_labels.max().item() > 1.0:
+            raise ValueError(
+                f"soft_labels out of range for {sample_id}: min={float(soft_labels.min().item())} "
+                f"max={float(soft_labels.max().item())}"
+            )
 
-    topic_one_hot = _ensure_tensor(raw["topic_one_hot"], torch.float32, "topic_one_hot", sample_id)
-    _validate_topic_one_hot(topic_one_hot, num_nodes, sample_id)
+    if require_topic_one_hot:
+        topic_one_hot = _ensure_tensor(raw["topic_one_hot"], torch.float32, "topic_one_hot", sample_id)
+        _validate_topic_one_hot(topic_one_hot, num_nodes, sample_id)
 
     q_local_indices = _ensure_tensor(raw.get("q_local_indices", []), torch.long, "q_local_indices", sample_id).view(-1)
     a_local_indices = _ensure_tensor(raw.get("a_local_indices", []), torch.long, "a_local_indices", sample_id).view(-1)
@@ -427,3 +400,12 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str) -> None:
             raise ValueError(
                 f"answer_entity_ids_len mismatch for {sample_id}: declared {answer_len_tensor.tolist()} vs actual {answer_ids.numel()}"
             )
+    gt_edges = raw.get("gt_path_edge_indices")
+    if gt_edges is not None:
+        gt_edges_tensor = _ensure_tensor(gt_edges, torch.long, "gt_path_edge_indices", sample_id).view(-1)
+        if gt_edges_tensor.numel() > 0:
+            if gt_edges_tensor.min().item() < 0 or gt_edges_tensor.max().item() >= num_edges:
+                raise ValueError(
+                    f"gt_path_edge_indices out of range for {sample_id}: "
+                    f"min={int(gt_edges_tensor.min().item())} max={int(gt_edges_tensor.max().item())} num_edges={num_edges}"
+                )

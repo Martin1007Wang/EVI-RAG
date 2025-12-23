@@ -1,0 +1,61 @@
+paths:
+  root_dir: ${oc.env:PROJECT_ROOT,${oc.env:PWD}}
+  data_dir: /mnt/data/retrieval_dataset
+  log_dir: ${paths.root_dir}/logs/
+  debug_log_path: ${paths.log_dir}/debug.log
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+dataset:
+  name: webqsp
+  kb: freebase
+  raw_root: ${paths.data_dir}/webqsp/raw/data
+  out_dir: ${paths.data_dir}/webqsp/normalized
+  materialized_dir: ${paths.data_dir}/webqsp/materialized
+  paths:
+    vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
+    embeddings: ${dataset.materialized_dir}/embeddings
+    processed: ${dataset.materialized_dir}/processed
+  entity_normalization: none
+  undirected_traversal: false
+  num_topics: 2
+  topic_pe:
+    enabled: true
+    precompute: true
+    num_rounds: 2
+    num_reverse_rounds: 2
+  column_map:
+    question_id_field: id
+    question_field: question
+    answer_text_field: answer
+    q_entity_field: q_entity
+    a_entity_field: a_entity
+    graph_field: graph
+parquet_dir: ${dataset.out_dir}
+output_dir: ${dataset.materialized_dir}
+sub:
+  enabled: false
+  suffix: sub
+  parquet_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/normalized
+  output_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/materialized
+  share_vocab_and_embeddings: true
+encoder: Alibaba-NLP/gte-large-en-v1.5
+device: cuda
+batch_size: 64
+progress_bar: true
+fp16: true
+num_topics: ${dataset.num_topics}
+topic_pe:
+  precompute: ${dataset.topic_pe.precompute}
+  num_rounds: ${dataset.topic_pe.num_rounds}
+  num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
+soft_label:
+  enabled: false
+  decay: 1.0
+  max_extra_hops: 2
+  undirected: ${dataset.undirected_traversal}
+map_size_gb: 32
+vocab_map_size_gb: 4
+overwrite_lmdb: true
+txn_size: 512
+seed: 42
+deterministic: false

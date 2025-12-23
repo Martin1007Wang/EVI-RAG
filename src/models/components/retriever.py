@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
-from .graph import DDE
 from .heads import DenseFeatureExtractor, DeterministicHead
 from .projections import EmbeddingProjector
 
@@ -14,14 +13,12 @@ from .projections import EmbeddingProjector
 @dataclass
 class RetrieverOutput:
     """Minimal container for retriever outputs."""
-    scores: torch.Tensor
     logits: torch.Tensor
     query_ids: torch.Tensor
     relation_ids: torch.Tensor | None = None
 
     def detach(self) -> "RetrieverOutput":
         return RetrieverOutput(
-            scores=self.scores.detach(),
             logits=self.logits.detach(),
             query_ids=self.query_ids.detach(),
             relation_ids=self.relation_ids.detach() if self.relation_ids is not None else None,
@@ -39,6 +36,7 @@ class Retriever(nn.Module):
         num_topics: int = 2,
         dde_cfg: Optional[Dict[str, int]] = None,
         dropout_p: float = 0.0,
+        feature_extractor_activation: nn.Module | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -54,17 +52,19 @@ class Retriever(nn.Module):
         # SubgraphRAG parity: trainable non-text entity representation for embedding_id=0.
         self.non_text_entity_emb = nn.Embedding(1, self.emb_dim)
 
-        self.dde = DDE(**(dde_cfg or {})) if self.use_topic_pe else None
+        dde_cfg = dde_cfg or {}
 
         semantic_dim = self.emb_dim * 4  # concat [q,h,r,t]
         struct_dim = 0
         if self.use_topic_pe:
-            num_rounds = int(self.dde.num_rounds) if self.dde is not None else 0
-            num_rev = int(self.dde.num_reverse_rounds) if self.dde is not None else 0
-            struct_dim = 2 * self.num_topics * (1 + num_rounds + num_rev)  # head+tail concatenation
+            num_rounds = int(dde_cfg.get("num_rounds", 0))
+            num_rev = int(dde_cfg.get("num_reverse_rounds", 0))
+            self._topic_struct_dim = self.num_topics * (1 + num_rounds + num_rev)
+            struct_dim = 2 * self._topic_struct_dim  # head+tail concatenation
         else:
             num_rounds = 0
             num_rev = 0
+            self._topic_struct_dim = 0
         fusion_dim = semantic_dim + struct_dim
 
         # Minimal metadata persisted in checkpoints for downstream consumers (e.g., GFlowNet embedder).
@@ -82,6 +82,7 @@ class Retriever(nn.Module):
             emb_dim=self.emb_dim,
             hidden_dim=self.hidden_dim,
             dropout_p=dropout_p,
+            activation=feature_extractor_activation,
         )
         self.head = DeterministicHead(hidden_dim=self.hidden_dim)
         self.dropout = nn.Dropout(dropout_p)
@@ -106,9 +107,9 @@ class Retriever(nn.Module):
             param = next(self.parameters(), None)
             dtype = param.dtype if param is not None else torch.float32
             device = head_idx.device
-            empty_scores = torch.empty(0, device=device, dtype=dtype)
+            empty_logits = torch.empty(0, device=device, dtype=dtype)
             empty_ids = head_idx.new_empty(0)
-            output = RetrieverOutput(scores=empty_scores, logits=empty_scores, query_ids=empty_ids, relation_ids=None)
+            output = RetrieverOutput(logits=empty_logits, query_ids=empty_ids, relation_ids=None)
             if return_features:
                 features = torch.empty((0, self.hidden_dim), device=device, dtype=dtype)
                 return output, features
@@ -143,9 +144,8 @@ class Retriever(nn.Module):
 
         features = self.feature_extractor(self.dropout(fused))
         logits = self.head(features)
-        scores = torch.sigmoid(logits)
         relation_ids = getattr(batch, "edge_attr", None)
-        output = RetrieverOutput(scores=scores, logits=logits, query_ids=query_ids, relation_ids=relation_ids)
+        output = RetrieverOutput(logits=logits, query_ids=query_ids, relation_ids=relation_ids)
         return (output, features) if return_features else (output, None)
 
     def _build_structure_features(
@@ -154,25 +154,21 @@ class Retriever(nn.Module):
         head_idx: torch.Tensor,
         tail_idx: torch.Tensor,
     ) -> torch.Tensor:
-        topic = getattr(batch, "topic_one_hot", None)
-        if topic is None:
-            raise ValueError("topic_pe is enabled but batch.topic_one_hot is missing.")
-        if topic.dim() == 1:
-            topic = topic.unsqueeze(-1)
-        if topic.size(-1) < self.num_topics:
+        topic_pe = getattr(batch, "topic_pe", None)
+        if topic_pe is None:
+            raise ValueError("topic_pe is enabled but batch.topic_pe is missing.")
+        if topic_pe.dim() == 3:
+            topic_pe = topic_pe.reshape(topic_pe.size(0), -1)
+        if topic_pe.dim() != 2:
+            raise ValueError(f"topic_pe must be 2D (N, D), got shape {tuple(topic_pe.shape)}")
+        expected_dim = int(self._topic_struct_dim)
+        if topic_pe.size(-1) != expected_dim:
             raise ValueError(
-                f"topic_one_hot feature dim {topic.size(-1)} < num_topics={self.num_topics}; "
+                f"topic_pe feature dim {topic_pe.size(-1)} != expected {expected_dim}; "
                 "rebuild g_retrieval caches or update configs/build_retrieval_dataset.yaml."
             )
-        if topic.size(-1) != self.num_topics:
-            topic = topic[..., : self.num_topics]
-        features = [topic]  # [N, num_topics]
-        if self.dde is not None:
-            features.extend(self.dde(topic, batch.edge_index, getattr(batch, "reverse_edge_index", None)))
-        stacked = torch.stack(features, dim=-1)
-        node_struct = stacked.reshape(stacked.size(0), -1)
-        head_struct = node_struct[head_idx]
-        tail_struct = node_struct[tail_idx]
+        head_struct = topic_pe[head_idx]
+        tail_struct = topic_pe[tail_idx]
         return torch.cat([head_struct, tail_struct], dim=-1)
 
     def _compute_query_ids(self, batch, head_idx: torch.Tensor) -> torch.Tensor:

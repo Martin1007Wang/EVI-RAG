@@ -5,14 +5,52 @@ set -euo pipefail
 # 仅依赖默认的 config/experiment，必须显式传入 dataset。
 #
 # 用法：
-#   bash scripts/run_full_pipeline.sh <dataset>
+#   bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]
 #
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-DATASET="${1:-}"
+DATASET=""
+SKIP_PREPROCESS="false"
+RETRIEVER_CKPT_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-preprocess)
+      SKIP_PREPROCESS="true"
+      shift
+      ;;
+    --retriever-ckpt)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --retriever-ckpt" >&2
+        exit 2
+      fi
+      RETRIEVER_CKPT_OVERRIDE="${2}"
+      shift 2
+      ;;
+    --retriever-ckpt=*)
+      RETRIEVER_CKPT_OVERRIDE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]" >&2
+      exit 0
+      ;;
+    *)
+      if [[ -z "${DATASET}" ]]; then
+        DATASET="${1}"
+        shift
+      else
+        echo "Unknown argument: $1" >&2
+        echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 if [[ -z "${DATASET}" ]]; then
-  echo "Usage: bash scripts/run_full_pipeline.sh <dataset>" >&2
+  echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]" >&2
   ls -1 configs/dataset/*.yaml | xargs -n1 basename | sed 's/\\.yaml$//' >&2
   exit 2
 fi
@@ -59,41 +97,48 @@ pick_best_ckpt() {
   echo ""
 }
 
-echo "==> [1/8] build_retrieval_parquet (${DATASET})"
-python scripts/build_retrieval_parquet.py "${COMMON_OVERRIDES[@]}"
+if [[ "${SKIP_PREPROCESS}" != "true" ]]; then
+  echo "==> [1/8] build_retrieval_parquet (${DATASET})"
+  python scripts/build_retrieval_parquet.py "${COMMON_OVERRIDES[@]}"
 
-echo "==> [2/8] build_retrieval_dataset (${DATASET})"
-python scripts/build_retrieval_dataset.py "${COMMON_OVERRIDES[@]}"
+  echo "==> [2/8] build_retrieval_dataset (${DATASET})"
+  python scripts/build_retrieval_dataset.py "${COMMON_OVERRIDES[@]}"
+else
+  echo "==> [1/8] build_retrieval_parquet (${DATASET}) [skipped]"
+  echo "==> [2/8] build_retrieval_dataset (${DATASET}) [skipped]"
+fi
 
-echo "==> [3/8] train_retriever (experiment=train_retriever_default)"
-RETR_EXP="train_retriever_default"
-RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${RETR_EXP}")
-python src/train.py "${RETR_TRAIN_OVERRIDES[@]}"
-RETR_RUN_DIR="$(latest_run_dir "${RETR_EXP}")"
-RETR_CKPT="$(pick_best_ckpt "${RETR_RUN_DIR}")"
-if [[ -z "${RETR_CKPT}" ]]; then
-  echo "Retriever checkpoint not found under run dir: ${RETR_RUN_DIR:-<missing>}" >&2
-  exit 1
+if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
+  if [[ ! -f "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
+    echo "Retriever checkpoint override not found: ${RETRIEVER_CKPT_OVERRIDE}" >&2
+    exit 1
+  fi
+  RETR_CKPT="${RETRIEVER_CKPT_OVERRIDE}"
+  echo "==> [3/8] train_retriever (skipped, using retriever ckpt override)"
+else
+  echo "==> [3/8] train_retriever (experiment=train_retriever_default)"
+  RETR_EXP="train_retriever_default"
+  RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${RETR_EXP}")
+  python src/train.py "${RETR_TRAIN_OVERRIDES[@]}"
+  RETR_RUN_DIR="$(latest_run_dir "${RETR_EXP}")"
+  RETR_CKPT="$(pick_best_ckpt "${RETR_RUN_DIR}")"
+  if [[ -z "${RETR_CKPT}" ]]; then
+    echo "Retriever checkpoint not found under run dir: ${RETR_RUN_DIR:-<missing>}" >&2
+    exit 1
+  fi
 fi
 echo "Retriever checkpoint: ${RETR_CKPT}"
 
-echo "==> [4/8] cache_g_agent (train/val/test)"
-for SPLIT in train validation test; do
-  FORCE_GT="false"
-  if [[ "${SPLIT}" == "train" ]]; then
-    FORCE_GT="true"
-  fi
-  python src/eval.py \
-    "${COMMON_OVERRIDES[@]}" \
-    "stage=cache_g_agent" \
-    "ckpt.retriever=${RETR_CKPT}" \
-    "stage.split=${SPLIT}" \
-    "stage.force_include_gt=${FORCE_GT}"
-done
+echo "==> [4/8] retriever_eval (train/val/test + g_agent)"
+python src/eval.py \
+  "${COMMON_OVERRIDES[@]}" \
+  "stage=retriever_eval" \
+  "ckpt.retriever=${RETR_CKPT}" \
+  "stage.run_all_splits=true"
 
 echo "==> [5/8] train_gflownet (experiment=train_gflownet_default)"
 GFLOW_EXP="train_gflownet_default"
-GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${GFLOW_EXP}")
+GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${GFLOW_EXP}" "ckpt.retriever=${RETR_CKPT}")
 python src/train.py "${GFLOW_TRAIN_OVERRIDES[@]}"
 GFLOW_RUN_DIR="$(latest_run_dir "${GFLOW_EXP}")"
 GFLOW_CKPT="$(pick_best_ckpt "${GFLOW_RUN_DIR}")"

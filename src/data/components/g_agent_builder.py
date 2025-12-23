@@ -4,6 +4,7 @@ import logging
 import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from collections import deque
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -23,19 +24,25 @@ class GAgentSettings:
 
     enabled: bool = True
     # Top-K edges kept from retriever scores (per-sample, retrieval graph space).
-    # Final g_agent edges = Top-K ∪ GT-path edges, then deduplicated by (h,r,t) triple.
     anchor_top_k: int = 50
-    # Top-K edges incident to start entities (per-sample, retrieval graph space).
-    anchor_start_k: int = 50
+    # Only keep nodes/edges reachable from start within this hop radius (computed on the Top-K edge space).
+    max_hops: int = 2
+    # Logit calibration applied to retriever scores before caching.
+    score_temperature: float = 1.0
+    score_bias: float = 0.0
     output_path: Path = Path("g_agent/g_agent_samples.pt")
-    force_include_gt: bool = False
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
         self.anchor_top_k = int(self.anchor_top_k)
-        self.anchor_start_k = int(self.anchor_start_k)
+        self.max_hops = int(self.max_hops)
+        self.score_temperature = float(self.score_temperature)
+        self.score_bias = float(self.score_bias)
+        if self.max_hops < 0:
+            raise ValueError(f"max_hops must be >= 0, got {self.max_hops}")
+        if not (self.score_temperature > 0.0):
+            raise ValueError(f"score_temperature must be positive, got {self.score_temperature}")
         self.output_path = Path(self.output_path).expanduser()
-        self.force_include_gt = bool(self.force_include_gt)
 
     def to_metadata(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -82,14 +89,13 @@ class GAgentBuilder:
             "num_samples": 0,
             "path_exists": 0,
             "retrieval_failed": 0,
-            "gt_broken": 0,
             "edge_counts": [],
             "path_lengths": [],
         }
 
     def reset(self):
         self.samples = []
-        for k in ["num_samples", "path_exists", "retrieval_failed", "gt_broken"]:
+        for k in ["num_samples", "path_exists", "retrieval_failed"]:
             self.stats[k] = 0
         self.stats["edge_counts"] = []
         self.stats["path_lengths"] = []
@@ -103,67 +109,80 @@ class GAgentBuilder:
             raise ValueError("Batch must have 'ptr' for slicing.")
 
         ptr = batch.ptr
-        batch_size = ptr.numel() - 1
+        batch_size = int(ptr.numel() - 1)
 
-        # Detach tensors to CPU to avoid CUDA OOM during graph algo
-        scores = model_output.scores.detach().cpu()
-        edge_index = batch.edge_index.detach().cpu()
-        relations = batch.edge_attr.detach().cpu()
-        labels = batch.labels.detach().cpu()
-        node_global_ids = batch.node_global_ids.detach().cpu()
+        logits = getattr(model_output, "logits", None)
+        if logits is None:
+            raise ValueError("Retriever output missing logits; g_agent requires logit scores.")
+        scores = logits.detach().view(-1)
+        if scores.numel() == 0:
+            return
+        if self.cfg.score_temperature != 1.0 or self.cfg.score_bias != 0.0:
+            scores = scores / float(self.cfg.score_temperature) + float(self.cfg.score_bias)
+
+        device = scores.device
+        edge_index = batch.edge_index.to(device=device)
+        relations = batch.edge_attr.to(device=device)
+        labels = batch.labels.to(device=device)
+        node_global_ids = batch.node_global_ids.to(device=device)
+
+        if not hasattr(batch, "node_embedding_ids"):
+            raise AttributeError("Batch missing node_embedding_ids; retriever dataset must provide embedding ids per node.")
+        node_embedding_ids = batch.node_embedding_ids.to(device=device)
+
+        query_ids = getattr(model_output, "query_ids", None)
+        if query_ids is None:
+            raise ValueError("Retriever output missing query_ids; g_agent requires per-edge graph mapping.")
+        if not torch.is_tensor(query_ids):
+            query_ids = torch.as_tensor(query_ids, dtype=torch.long, device=device)
+        else:
+            query_ids = query_ids.to(device=device, dtype=torch.long)
+        query_ids = query_ids.view(-1)
+        if query_ids.numel() != scores.numel():
+            raise ValueError(f"query_ids/logits shape mismatch: {query_ids.shape} vs {scores.shape}")
+
+        num_edges = int(query_ids.numel())
+        edge_order = torch.arange(num_edges, device=device, dtype=query_ids.dtype)
+        sort_key = query_ids * num_edges + edge_order
+        sort_idx = torch.argsort(sort_key)
+        sorted_q = query_ids.index_select(0, sort_idx)
+
+        counts = torch.zeros(batch_size, device=device, dtype=torch.long)
+        counts.scatter_add_(0, sorted_q, torch.ones_like(sorted_q, dtype=torch.long))
+        if int(counts.sum().item()) != num_edges:
+            raise ValueError("Invalid query_ids: edge assignments exceed batch_size.")
+        starts = torch.cumsum(counts, dim=0) - counts
 
         # Sample IDs list
         sample_ids = getattr(batch, "sample_id", [])
 
-        # Group edges by sample index (using model_output.query_ids or ptr logic)
-        # Here we use query_ids for robustness if available, otherwise infer from ptr?
-        # Usually retriever output aligns with edge_index.
-        # But edge_index is sparse. We need to know which edges belong to which sample.
-        # 'query_ids' from RetrieverOutput maps each edge to a sample index [0, B-1]
-        query_ids = model_output.query_ids.detach().cpu()
-
-        # Pre-calculate edge ranges for each sample
-        # Assumes edges are sorted by query_id (which they usually are in PyG batch)
-        # But let's be safe and use a grouping map
-        edge_indices_by_sample = [[] for _ in range(batch_size)]
-        for edge_idx, sample_idx in enumerate(query_ids.tolist()):
-            if 0 <= int(sample_idx) < batch_size:
-                edge_indices_by_sample[int(sample_idx)].append(edge_idx)
-
         for i in range(batch_size):
-            # 2. Construct GraphSlice
-            edge_indices = edge_indices_by_sample[i]
-            if not edge_indices:
+            count = int(counts[i].item())
+            if count == 0:
                 continue
-
-            edge_indices_tensor = torch.tensor(edge_indices, dtype=torch.long)
+            start = int(starts[i].item())
+            edge_indices = sort_idx[start : start + count]
 
             node_start = int(ptr[i].item())
             node_end = int(ptr[i + 1].item())
             node_slice = node_global_ids[node_start:node_end]
-            if not hasattr(batch, "node_embedding_ids"):
-                raise AttributeError("Batch missing node_embedding_ids; retriever dataset must provide embedding ids per node.")
-            node_embedding_slice = batch.node_embedding_ids.detach().cpu()[node_start:node_end]
+            node_embedding_slice = node_embedding_ids[node_start:node_end]
 
             # Convert global edge_index to local (0~N_retrieval)
-            # Note: edge_index in batch is already offset-adjusted if using PyG Batch?
-            # Usually PyG Batch stacks node indices (0~N1, N1~N2...).
-            # So we subtract node_start.
-            heads = edge_index[0, edge_indices_tensor] - node_start
-            tails = edge_index[1, edge_indices_tensor] - node_start
+            heads = edge_index[0, edge_indices] - node_start
+            tails = edge_index[1, edge_indices] - node_start
 
             graph_slice = _GraphSlice(
                 heads=heads,
                 tails=tails,
-                relations=relations[edge_indices_tensor],
-                labels=labels[edge_indices_tensor],
-                scores=scores[edge_indices_tensor],
+                relations=relations.index_select(0, edge_indices),
+                labels=labels.index_select(0, edge_indices),
+                scores=scores.index_select(0, edge_indices),
                 node_global_ids=node_slice,
                 node_embedding_ids=node_embedding_slice,
-                retrieval_edge_indices=edge_indices_tensor,
+                retrieval_edge_indices=edge_indices,
             )
 
-            # 3. Process Single Sample
             try:
                 sid = str(sample_ids[i])
             except IndexError:
@@ -173,24 +192,25 @@ class GAgentBuilder:
 
     def _build_and_add_sample(self, sample_id: str, graph: _GraphSlice) -> None:
         """
-        Core Logic: Top-K by score -> Union GT -> Dedup by triple -> Re-index -> Create Object
+        Core Logic: Top-K by score -> Dedup by triple -> Re-index -> Create Object
         """
         # === A. Top-K Filter (retriever space) ===
         num_edges_full = graph.num_edges
         if num_edges_full <= 0:
             return
+        device = graph.scores.device
+        node_global_ids_cpu = graph.node_global_ids.detach().cpu()
         top_k = int(self.cfg.anchor_top_k)
         if top_k <= 0:
             raise ValueError(f"anchor_top_k must be > 0, got {top_k} (sample_id={sample_id}).")
         k = min(top_k, num_edges_full)
         scores_full = graph.scores.float()
         _, top_idx = torch.topk(scores_full, k=k, largest=True, sorted=True)
-        top_locals: Set[int] = {int(i) for i in top_idx.tolist()}
 
         # === B. Fetch Metadata from LMDB ===
         # This is crucial for "One Source of Truth"
         if self.embedding_store is None:
-            raise ValueError("EmbeddingStore must be provided; builder cannot proceed without GT metadata.")
+            raise ValueError("EmbeddingStore must be provided; builder cannot proceed without per-sample metadata.")
 
         try:
             raw_data = self.embedding_store.load_sample(sample_id)
@@ -210,101 +230,32 @@ class GAgentBuilder:
         if answer_entity_ids.numel() == 0:
             raise ValueError(f"Sample {sample_id} missing answer_entity_ids.")
 
-        # === B.0 Start-edge Top-K (retrieval space) ===
-        start_top_k = int(self.cfg.anchor_start_k)
-        if start_top_k <= 0:
-            raise ValueError(f"anchor_start_k must be > 0, got {start_top_k} (sample_id={sample_id}).")
-        start_mask = torch.isin(graph.node_global_ids, start_entity_ids.view(-1))
+        start_entity_ids_device = start_entity_ids.to(device=device)
+        start_mask = torch.isin(graph.node_global_ids, start_entity_ids_device.view(-1))
         if not bool(start_mask.any().item()):
             raise ValueError(f"Start entities missing from retrieval graph (sample_id={sample_id}).")
-        start_edge_mask = start_mask[graph.heads] | start_mask[graph.tails]
-        start_edge_indices = torch.nonzero(start_edge_mask, as_tuple=False).view(-1)
-        if start_edge_indices.numel() == 0:
-            raise ValueError(f"No edges incident to start entities (sample_id={sample_id}).")
-        k_start = min(start_top_k, int(start_edge_indices.numel()))
-        start_scores = scores_full[start_edge_indices]
-        _, start_rank = torch.topk(start_scores, k=k_start, largest=True, sorted=True)
-        start_top_idx = start_edge_indices[start_rank]
-        start_top_locals: Set[int] = {int(i) for i in start_top_idx.tolist()}
 
-        # === B.1 Resolve GT edge ids (retrieval space) ===
-        # Note: some splits/samples may not have GT paths materialized. GT is required only when we
-        # explicitly force-include it (training/oracle graph); otherwise we treat it as absent.
-        raw_gt_indices = raw_data.get("gt_path_edge_indices", [])  # retrieval-local or batch-global ids
-        if not raw_gt_indices:
-            gt_triples = raw_data.get("gt_paths_triples", [])
-            if gt_triples:
-                # Map (h,r,t) triples to retrieval-local edge ids using the full retrieval graph.
-                edge_triples_full = []
-                for e_idx in range(graph.num_edges):
-                    h_global = int(graph.node_global_ids[int(graph.heads[e_idx])].item())
-                    t_global = int(graph.node_global_ids[int(graph.tails[e_idx])].item())
-                    r_global = int(graph.relations[e_idx].item())
-                    edge_triples_full.append((h_global, r_global, t_global))
-                triple_to_edge_idx_full: Dict[Tuple[int, int, int], List[int]] = {}
-                for idx, triple in enumerate(edge_triples_full):
-                    triple_to_edge_idx_full.setdefault(triple, []).append(idx)
-                raw_gt_indices = []
-                for path in gt_triples:
-                    for triple in path:
-                        triple_tuple = tuple(int(x) for x in triple)
-                        cand = triple_to_edge_idx_full.get(triple_tuple)
-                        if cand:
-                            raw_gt_indices.append(cand[0])  # 取首个匹配
-        if not raw_gt_indices:
-            if self.cfg.force_include_gt:
-                self.stats["gt_broken"] += 1
-                return
-            raw_gt_indices = []
-
-        gt_locals: List[int] = []
-        gt_locals_set: Set[int] = set()
-        if raw_gt_indices:
-            # Defensive: accept "batch-global" edge indices by mapping them back to local indices.
-            global_to_local = {
-                int(val.item()): i for i, val in enumerate(graph.retrieval_edge_indices.view(-1))
-            }
-
-            # Map GT edges to retrieval-local indices (0..E_retr-1 of this sample graph slice).
-            for ridx in raw_gt_indices:
-                r_val = int(ridx) if isinstance(ridx, int) else int(ridx.item())
-                if 0 <= r_val < graph.num_edges:
-                    if r_val not in gt_locals_set:
-                        gt_locals.append(r_val)
-                        gt_locals_set.add(r_val)
-                    continue
-                local_idx = global_to_local.get(r_val)
-                if local_idx is not None:
-                    if local_idx not in gt_locals_set:
-                        gt_locals.append(local_idx)
-                        gt_locals_set.add(local_idx)
-
-            if not gt_locals:
-                if self.cfg.force_include_gt:
-                    self.stats["gt_broken"] += 1
-                    return
-        # === C. Union (Top-K ∪ GT) + Deduplicate by (h,r,t) ===
-        # Order matters for determinism: first Top-K (sorted by score desc), then GT-only edges (sorted by score desc).
-        selected_locals: List[int] = [int(i) for i in start_top_idx.tolist()]
-        selected_locals.extend([int(i) for i in top_idx.tolist() if int(i) not in start_top_locals])
-        if self.cfg.force_include_gt:
-            gt_only = [int(i) for i in gt_locals if int(i) not in top_locals and int(i) not in start_top_locals]
-            gt_only.sort(key=lambda idx: (-float(scores_full[idx].item()), int(idx)))
-            selected_locals.extend(gt_only)
+        # === C. Top-K edge space + deduplicate by (h,r,t) ===
+        selected_idx = top_idx.to(device=device, dtype=torch.long)
+        selected_heads = graph.heads.index_select(0, selected_idx).detach().cpu()
+        selected_tails = graph.tails.index_select(0, selected_idx).detach().cpu()
+        selected_relations = graph.relations.index_select(0, selected_idx).detach().cpu()
+        selected_scores = graph.scores.index_select(0, selected_idx).detach().cpu()
+        selected_labels = graph.labels.index_select(0, selected_idx).detach().cpu()
 
         # Dedup dictionary: triple -> aggregated attributes.
         # We aggregate score by max, label by max, and top_edge_mask as OR over Top-K membership.
         triple_to_agg: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-        for eidx in selected_locals:
-            h_local = int(graph.heads[eidx].item())
-            t_local = int(graph.tails[eidx].item())
-            h_global = int(graph.node_global_ids[h_local].item())
-            t_global = int(graph.node_global_ids[t_local].item())
-            r_global = int(graph.relations[eidx].item())
+        for offset in range(int(selected_heads.numel())):
+            h_local = int(selected_heads[offset].item())
+            t_local = int(selected_tails[offset].item())
+            h_global = int(node_global_ids_cpu[h_local].item())
+            t_global = int(node_global_ids_cpu[t_local].item())
+            r_global = int(selected_relations[offset].item())
             triple = (h_global, r_global, t_global)
-            score = float(graph.scores[eidx].item())
-            label = float(graph.labels[eidx].item())
-            in_top = (eidx in top_locals) or (eidx in start_top_locals)
+            score = float(selected_scores[offset].item())
+            label = float(selected_labels[offset].item())
+            in_top = True
             agg = triple_to_agg.get(triple)
             if agg is None:
                 triple_to_agg[triple] = {"score": score, "label": label, "in_top": in_top}
@@ -317,7 +268,6 @@ class GAgentBuilder:
         triples = list(triple_to_agg.keys())
         if not triples:
             return
-        num_edges = len(triples)
 
         edge_heads_global = torch.tensor([t[0] for t in triples], dtype=torch.long)
         edge_relations = torch.tensor([t[1] for t in triples], dtype=torch.long)
@@ -332,7 +282,8 @@ class GAgentBuilder:
 
         # Map Global ID -> Subgraph Index / Embedding Row
         node_map = {gid.item(): i for i, gid in enumerate(unique_nodes)}
-        embedding_lookup = {int(g.item()): int(e.item()) for g, e in zip(graph.node_global_ids, graph.node_embedding_ids)}
+        node_embedding_ids_cpu = graph.node_embedding_ids.detach().cpu()
+        embedding_lookup = {int(g.item()): int(e.item()) for g, e in zip(node_global_ids_cpu, node_embedding_ids_cpu)}
         unique_embedding_ids = []
         for gid in unique_nodes.tolist():
             if gid not in embedding_lookup:
@@ -352,7 +303,8 @@ class GAgentBuilder:
             if mapped is not None:
                 start_node_locals_list.append(mapped)
         if not start_node_locals_list:
-            raise ValueError(f"Start entities missing from selected subgraph (sample_id={sample_id}).")
+            self.stats["retrieval_failed"] += 1
+            return
         seen_q = set()
         start_node_locals = torch.tensor(
             [x for x in start_node_locals_list if not (x in seen_q or seen_q.add(x))],
@@ -387,46 +339,78 @@ class GAgentBuilder:
             else torch.empty(0, dtype=torch.long)
         )
 
-        # === E. Ground Truth Path Mapping (by triple, after dedup) ===
-        triple_to_agent = {triple: idx for idx, triple in enumerate(triples)}
-        gt_triples_ordered: List[Tuple[int, int, int]] = []
-        gt_triples_seen: Set[Tuple[int, int, int]] = set()
-        for ridx in gt_locals:
-            h_local = int(graph.heads[int(ridx)].item())
-            t_local = int(graph.tails[int(ridx)].item())
-            h_global = int(graph.node_global_ids[h_local].item())
-            t_global = int(graph.node_global_ids[t_local].item())
-            r_global = int(graph.relations[int(ridx)].item())
-            triple = (h_global, r_global, t_global)
-            if triple not in gt_triples_seen:
-                gt_triples_ordered.append(triple)
-                gt_triples_seen.add(triple)
+        # === E. Hop pruning: keep only nodes/edges reachable from start within max_hops ===
+        max_hops = int(self.cfg.max_hops)
+        (
+            unique_nodes,
+            node_embedding_ids,
+            edge_head_locals,
+            edge_tail_locals,
+            edge_relations,
+            edge_scores,
+            edge_labels,
+            top_edge_mask,
+            start_node_locals,
+            answer_node_locals,
+        ) = self._prune_to_hops(
+            node_entity_ids=unique_nodes,
+            node_embedding_ids=node_embedding_ids,
+            edge_head_locals=edge_head_locals,
+            edge_tail_locals=edge_tail_locals,
+            edge_relations=edge_relations,
+            edge_scores=edge_scores,
+            edge_labels=edge_labels,
+            top_edge_mask=top_edge_mask,
+            start_node_locals=start_node_locals,
+            answer_node_locals=answer_node_locals,
+            max_hops=max_hops,
+        )
+        if int(edge_head_locals.numel()) == 0 or int(edge_relations.numel()) == 0:
+            self.stats["retrieval_failed"] += 1
+            return
+        if int(start_node_locals.numel()) == 0:
+            self.stats["retrieval_failed"] += 1
+            return
 
-        gt_path_indices: List[int] = []
-        gt_path_seen: Set[int] = set()
-        for triple in gt_triples_ordered:
-            agent_idx = triple_to_agent.get(triple)
-            if agent_idx is not None and agent_idx not in gt_path_seen:
-                gt_path_indices.append(int(agent_idx))
-                gt_path_seen.add(int(agent_idx))
-        gt_path_exists = len(gt_path_indices) > 0
-        if self.cfg.force_include_gt and not gt_path_exists:
-            raise ValueError(f"Sample {sample_id} GT triples missing in selected subgraph after union/dedup.")
+        # === F. Path-valued supervision: deterministic shortest path in pruned agent space ===
+        edge_pos_mask = edge_labels > 0.5
+        gt_path_edge_local_ids = self._shortest_path_edge_locals(
+            num_nodes=int(node_embedding_ids.numel()),
+            edge_head_locals=edge_head_locals,
+            edge_tail_locals=edge_tail_locals,
+            edge_scores=edge_scores,
+            edge_mask=edge_pos_mask,
+            start_node_locals=start_node_locals,
+            answer_node_locals=answer_node_locals,
+        )
+        gt_path_exists = bool(gt_path_edge_local_ids.numel() > 0)
+        gt_path_node_local_ids = (
+            self._build_gt_path_node_locals(
+                gt_path_edge_local_ids=gt_path_edge_local_ids,
+                edge_head_locals=edge_head_locals,
+                edge_tail_locals=edge_tail_locals,
+                start_node_locals=start_node_locals,
+            )
+            if gt_path_exists
+            else torch.empty(0, dtype=torch.long)
+        )
+
+        if gt_path_exists and gt_path_node_local_ids.numel() == 0:
+            gt_path_exists = False
+            gt_path_edge_local_ids = torch.empty(0, dtype=torch.long)
+            gt_path_node_local_ids = torch.empty(0, dtype=torch.long)
+
+        if gt_path_exists and answer_node_locals.numel() > 0:
+            terminal = int(gt_path_node_local_ids[-1].item())
+            if not bool((answer_node_locals == terminal).any().item()):
+                gt_path_exists = False
+                gt_path_edge_local_ids = torch.empty(0, dtype=torch.long)
+                gt_path_node_local_ids = torch.empty(0, dtype=torch.long)
 
         if gt_path_exists:
             self.stats["path_exists"] += 1
-            self.stats["path_lengths"].append(len(gt_path_indices))
-        self.stats["edge_counts"].append(num_edges)
-
-        # === F. Create the Object (fully specified schema) ===
-        gt_path_edge_local_ids = torch.tensor(gt_path_indices, dtype=torch.long)
-        gt_path_node_local_ids = torch.tensor(
-            sorted(
-                {int(edge_head_locals[i].item()) for i in gt_path_indices}
-                | {int(edge_tail_locals[i].item()) for i in gt_path_indices}
-            ),
-            dtype=torch.long,
-        )
+            self.stats["path_lengths"].append(int(gt_path_edge_local_ids.numel()))
+        self.stats["edge_counts"].append(int(edge_relations.numel()))
 
         is_answer_reachable = bool(answer_node_locals.numel() > 0)
 
@@ -451,14 +435,6 @@ class GAgentBuilder:
             gt_path_exists=gt_path_exists,
             is_answer_reachable=is_answer_reachable,
         )
-        # 记录但不跳过：eval 阶段允许 GT 路径被截断后不可达（train 有 force_include_gt 时仍应可达）。
-        if sample.gt_path_exists and not sample.is_answer_reachable:
-            self.stats["gt_broken"] += 1
-            log.warning(
-                "GT path exists but answer not reachable after selection (top_k=%d). sample_id=%s",
-                int(self.cfg.anchor_top_k),
-                sample_id,
-            )
 
         self.samples.append(sample)
         self.stats["num_samples"] += 1
@@ -471,10 +447,11 @@ class GAgentBuilder:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Compute final stats
+        attempted = int(self.stats["num_samples"]) + int(self.stats["retrieval_failed"])
         final_stats = {
             "num_samples": self.stats["num_samples"],
             "path_exists_ratio": self.stats["path_exists"] / max(1, self.stats["num_samples"]),
-            "retrieval_failed_ratio": self.stats["retrieval_failed"] / max(1, self.stats["num_samples"]),
+            "retrieval_failed_ratio": self.stats["retrieval_failed"] / max(1, attempted),
             "avg_edges": statistics.mean(self.stats["edge_counts"]) if self.stats["edge_counts"] else 0,
             "avg_gt_len": statistics.mean(self.stats["path_lengths"]) if self.stats["path_lengths"] else 0,
         }
@@ -518,5 +495,360 @@ class GAgentBuilder:
     def _log_stats(self, stats):
         for k, v in stats.items():
             log.info(f"  {k}: {v}")
+
+    @staticmethod
+    def _prune_to_hops(
+        *,
+        node_entity_ids: torch.Tensor,
+        node_embedding_ids: torch.Tensor,
+        edge_head_locals: torch.Tensor,
+        edge_tail_locals: torch.Tensor,
+        edge_relations: torch.Tensor,
+        edge_scores: torch.Tensor,
+        edge_labels: torch.Tensor,
+        top_edge_mask: torch.Tensor,
+        start_node_locals: torch.Tensor,
+        answer_node_locals: torch.Tensor,
+        max_hops: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Prune graph to the radius-`max_hops` ball around start nodes (undirected reachability)."""
+        max_hops = int(max_hops)
+        if max_hops < 0:
+            raise ValueError(f"max_hops must be >= 0, got {max_hops}")
+
+        num_nodes = int(node_entity_ids.numel())
+        if num_nodes <= 0:
+            return (
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.bool),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            )
+
+        if node_embedding_ids.numel() != num_nodes:
+            raise ValueError(f"node_embedding_ids length {int(node_embedding_ids.numel())} != num_nodes {num_nodes}")
+
+        starts = [int(x) for x in start_node_locals.view(-1).tolist()]
+        if not starts:
+            return (
+                node_entity_ids,
+                node_embedding_ids,
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.bool),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            )
+        for s in starts:
+            if s < 0 or s >= num_nodes:
+                raise ValueError(f"start_node_locals out of range: {s} (num_nodes={num_nodes})")
+
+        heads = [int(x) for x in edge_head_locals.view(-1).tolist()]
+        tails = [int(x) for x in edge_tail_locals.view(-1).tolist()]
+        num_edges = len(heads)
+        if len(tails) != num_edges:
+            raise ValueError("edge_head_locals/edge_tail_locals length mismatch.")
+        if int(edge_relations.numel()) != num_edges:
+            raise ValueError("edge_relations length mismatch with edge_head_locals.")
+        if int(edge_scores.numel()) != num_edges:
+            raise ValueError("edge_scores length mismatch with edge_head_locals.")
+        if int(edge_labels.numel()) != num_edges:
+            raise ValueError("edge_labels length mismatch with edge_head_locals.")
+        if int(top_edge_mask.numel()) != num_edges:
+            raise ValueError("top_edge_mask length mismatch with edge_head_locals.")
+
+        adj: list[list[int]] = [[] for _ in range(num_nodes)]
+        for h, t in zip(heads, tails):
+            if h < 0 or h >= num_nodes or t < 0 or t >= num_nodes:
+                raise ValueError(f"Edge locals out of range: h={h} t={t} num_nodes={num_nodes}")
+            adj[h].append(t)
+
+        dist = [-1] * num_nodes
+        q: deque[int] = deque()
+        for s in starts:
+            if dist[s] != 0:
+                dist[s] = 0
+                q.append(s)
+        while q:
+            u = q.popleft()
+            du = dist[u]
+            if du >= max_hops:
+                continue
+            for v in adj[u]:
+                if dist[v] >= 0:
+                    continue
+                dist[v] = du + 1
+                q.append(v)
+
+        kept_nodes = [i for i, d in enumerate(dist) if d >= 0]
+        if not kept_nodes:
+            return (
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.bool),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            )
+
+        old_to_new = [-1] * num_nodes
+        for new_i, old_i in enumerate(kept_nodes):
+            old_to_new[old_i] = new_i
+
+        kept_edges: List[int] = []
+        for eid, (h, t) in enumerate(zip(heads, tails)):
+            dh = dist[h]
+            dt = dist[t]
+            if dh < 0 or dt < 0:
+                continue
+            if dh >= max_hops:
+                continue
+            kept_edges.append(eid)
+
+        node_entity_ids = node_entity_ids.index_select(0, torch.tensor(kept_nodes, dtype=torch.long))
+        node_embedding_ids = node_embedding_ids.index_select(0, torch.tensor(kept_nodes, dtype=torch.long))
+
+        if not kept_edges:
+            return (
+                node_entity_ids,
+                node_embedding_ids,
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.bool),
+                torch.tensor([old_to_new[s] for s in starts if old_to_new[s] >= 0], dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            )
+
+        head_new = [old_to_new[heads[eid]] for eid in kept_edges]
+        tail_new = [old_to_new[tails[eid]] for eid in kept_edges]
+
+        kept_edges_t = torch.tensor(kept_edges, dtype=torch.long)
+        edge_head_locals = torch.tensor(head_new, dtype=torch.long)
+        edge_tail_locals = torch.tensor(tail_new, dtype=torch.long)
+        edge_relations = edge_relations.index_select(0, kept_edges_t)
+        edge_scores = edge_scores.index_select(0, kept_edges_t)
+        edge_labels = edge_labels.index_select(0, kept_edges_t)
+        top_edge_mask = top_edge_mask.index_select(0, kept_edges_t)
+
+        start_new = [old_to_new[s] for s in starts if old_to_new[s] >= 0]
+        start_node_locals = torch.tensor(start_new, dtype=torch.long) if start_new else torch.empty(0, dtype=torch.long)
+
+        answers = [int(x) for x in answer_node_locals.view(-1).tolist()]
+        ans_new = [old_to_new[a] for a in answers if 0 <= a < num_nodes and old_to_new[a] >= 0]
+        answer_node_locals = torch.tensor(ans_new, dtype=torch.long) if ans_new else torch.empty(0, dtype=torch.long)
+
+        return (
+            node_entity_ids,
+            node_embedding_ids,
+            edge_head_locals,
+            edge_tail_locals,
+            edge_relations,
+            edge_scores,
+            edge_labels,
+            top_edge_mask,
+            start_node_locals,
+            answer_node_locals,
+        )
+
+    @staticmethod
+    def _build_gt_path_node_locals(
+        *,
+        gt_path_edge_local_ids: torch.Tensor,
+        edge_head_locals: torch.Tensor,
+        edge_tail_locals: torch.Tensor,
+        start_node_locals: torch.Tensor,
+    ) -> torch.Tensor:
+        if gt_path_edge_local_ids.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        start_set = set(start_node_locals.view(-1).tolist())
+        nodes: List[int] = []
+        first_edge = int(gt_path_edge_local_ids[0].item())
+        h0 = int(edge_head_locals[first_edge].item())
+        t0 = int(edge_tail_locals[first_edge].item())
+        if h0 in start_set:
+            src, dst = h0, t0
+        else:
+            return torch.empty(0, dtype=torch.long)
+        nodes.extend([src, dst])
+
+        for edge_idx in gt_path_edge_local_ids[1:]:
+            e = int(edge_idx.item())
+            h = int(edge_head_locals[e].item())
+            t = int(edge_tail_locals[e].item())
+            prev = nodes[-1]
+            if prev == h:
+                nodes.append(t)
+            else:
+                return torch.empty(0, dtype=torch.long)
+        return torch.tensor(nodes, dtype=torch.long)
+
+    @staticmethod
+    def _shortest_path_edge_locals(
+        *,
+        num_nodes: int,
+        edge_head_locals: torch.Tensor,
+        edge_tail_locals: torch.Tensor,
+        edge_scores: torch.Tensor,
+        edge_mask: torch.Tensor | None = None,
+        start_node_locals: torch.Tensor,
+        answer_node_locals: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a single deterministic shortest path (edge-local ids) from any start to any answer.
+
+        Tie-break: among all shortest paths, choose the one maximizing sum of edge scores;
+        break remaining ties by smaller edge id, then smaller predecessor node id (deterministic).
+        """
+        num_nodes = int(num_nodes)
+        if num_nodes <= 0:
+            return torch.empty(0, dtype=torch.long)
+
+        starts = [int(x) for x in start_node_locals.view(-1).tolist()]
+        answers = [int(x) for x in answer_node_locals.view(-1).tolist()]
+        if not starts or not answers:
+            return torch.empty(0, dtype=torch.long)
+
+        starts_set = set(starts)
+        if starts_set.intersection(answers):
+            # Start node already contains an answer: the optimal teacher is "stop" (empty edge path).
+            return torch.empty(0, dtype=torch.long)
+
+        heads = [int(x) for x in edge_head_locals.view(-1).tolist()]
+        tails = [int(x) for x in edge_tail_locals.view(-1).tolist()]
+        scores = [float(x) for x in edge_scores.view(-1).tolist()]
+        num_edges = len(heads)
+        if num_edges == 0:
+            return torch.empty(0, dtype=torch.long)
+        if len(tails) != num_edges or len(scores) != num_edges:
+            raise ValueError("edge_head_locals/edge_tail_locals/edge_scores length mismatch when building shortest path.")
+
+        edge_ids = list(range(num_edges))
+        if edge_mask is not None:
+            mask = edge_mask.view(-1).to(dtype=torch.bool)
+            if int(mask.numel()) != num_edges:
+                raise ValueError(
+                    f"edge_mask length {int(mask.numel())} != num_edges {num_edges} when building shortest path."
+                )
+            edge_ids = [idx for idx, keep in enumerate(mask.tolist()) if keep]
+            if not edge_ids:
+                return torch.empty(0, dtype=torch.long)
+
+        adj_fwd: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+        adj_rev: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+        for eid in edge_ids:
+            h = heads[eid]
+            t = tails[eid]
+            if h < 0 or h >= num_nodes or t < 0 or t >= num_nodes:
+                raise ValueError(f"Edge locals out of range: eid={eid} h={h} t={t} num_nodes={num_nodes}")
+            adj_fwd[h].append((t, eid))
+            adj_rev[t].append((h, eid))
+
+        # 1) Multi-source BFS for hop distance.
+        dist = [-1] * num_nodes
+        q: deque[int] = deque()
+        for s in starts:
+            if s < 0 or s >= num_nodes:
+                raise ValueError(f"start_node_locals out of range: {s} (num_nodes={num_nodes})")
+            if dist[s] == 0:
+                continue
+            dist[s] = 0
+            q.append(s)
+        while q:
+            u = q.popleft()
+            du = dist[u]
+            for v, _eid in adj_fwd[u]:
+                if dist[v] >= 0:
+                    continue
+                dist[v] = du + 1
+                q.append(v)
+
+        reachable_answers = [a for a in answers if 0 <= a < num_nodes and dist[a] >= 0]
+        if not reachable_answers:
+            return torch.empty(0, dtype=torch.long)
+        best_dist = min(dist[a] for a in reachable_answers)
+        if best_dist <= 0:
+            return torch.empty(0, dtype=torch.long)
+
+        # 2) DP over BFS layers: best_score[v] = max_{u: dist[u]=dist[v]-1} best_score[u] + score(u,v).
+        best_score = [float("-inf")] * num_nodes
+        parent_node = [-1] * num_nodes
+        parent_edge = [-1] * num_nodes
+        for s in starts:
+            best_score[s] = 0.0
+
+        nodes_order = [i for i, d in enumerate(dist) if d >= 0]
+        nodes_order.sort(key=lambda i: dist[i])
+        for v in nodes_order:
+            dv = dist[v]
+            if dv <= 0:
+                continue
+            best_key = (float("-inf"), 0, 0)  # (score, -edge_id, -pred_node)
+            best_u = -1
+            best_eid = -1
+            for u, eid in adj_rev[v]:
+                if dist[u] != dv - 1:
+                    continue
+                cand = best_score[u] + scores[eid]
+                key = (cand, -eid, -u)
+                if key > best_key:
+                    best_key = key
+                    best_u = u
+                    best_eid = eid
+            if best_eid >= 0:
+                best_score[v] = best_key[0]
+                parent_node[v] = best_u
+                parent_edge[v] = best_eid
+
+        candidate_answers = [a for a in reachable_answers if dist[a] == best_dist]
+        best_answer_key = (float("-inf"), 0)  # (score, -node_id)
+        best_answer = -1
+        for a in candidate_answers:
+            key = (best_score[a], -a)
+            if key > best_answer_key:
+                best_answer_key = key
+                best_answer = a
+        if best_answer < 0:
+            return torch.empty(0, dtype=torch.long)
+
+        # 3) Reconstruct edge path.
+        edges_rev: List[int] = []
+        cur = best_answer
+        while dist[cur] > 0:
+            eid = parent_edge[cur]
+            prev = parent_node[cur]
+            if eid < 0 or prev < 0:
+                return torch.empty(0, dtype=torch.long)
+            edges_rev.append(eid)
+            cur = prev
+        edges_rev.reverse()
+        if not edges_rev:
+            return torch.empty(0, dtype=torch.long)
+        return torch.tensor(edges_rev, dtype=torch.long)
 
 __all__ = ["GAgentBuilder", "GAgentSettings"]

@@ -20,8 +20,6 @@ from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_l
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _STAGE_REQUIRES_CKPT_KIND = {
-    "cache_g_agent": "retriever",
-    "materialize_g_agent": "retriever",
     "retriever_eval": "retriever",
     "gflownet_eval": "gflownet",
     "gflownet_export": "gflownet",
@@ -85,6 +83,11 @@ def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) ->
     if "weights_only" in inspect.signature(torch.load).parameters:
         load_kwargs["weights_only"] = False
     checkpoint = torch.load(str(ckpt_path), **load_kwargs)
+    if isinstance(checkpoint, dict):
+        try:
+            model.on_load_checkpoint(checkpoint)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply checkpoint metadata before strict load: {exc}") from exc
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
     if not isinstance(state_dict, dict):
         raise TypeError(f"Checkpoint at {ckpt_path} must be a state_dict mapping, got {type(state_dict)!r}")
@@ -116,7 +119,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py stage=cache_g_agent dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
+            "  python src/eval.py stage=retriever_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
@@ -132,7 +135,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         )
 
 
-def _run_cache_g_agent_all_splits(cfg: DictConfig) -> None:
+def _run_retriever_eval_all_splits(cfg: DictConfig) -> None:
     stage_cfg = cfg.get("stage") or {}
     splits = stage_cfg.get("splits") or ["train", "validation", "test"]
     split_list = [str(s) for s in splits]
@@ -140,12 +143,10 @@ def _run_cache_g_agent_all_splits(cfg: DictConfig) -> None:
         raise ValueError("stage.splits must be a non-empty list when stage.run_all_splits=true.")
 
     for split in split_list:
-        force_gt = split == "train"
-        log.info("cache_g_agent: split=%s force_include_gt=%s", split, force_gt)
+        log.info("retriever_eval: split=%s", split)
 
         with open_dict(cfg):
             cfg.stage.split = split
-            cfg.stage.force_include_gt = force_gt
         evaluate(cfg)
 
 
@@ -157,15 +158,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     stage = cfg.get("stage")
     if stage is None:
         raise ValueError("Missing required config group: `stage`. Example: `python src/eval.py stage=retriever_eval dataset=webqsp`.")
-    # Leakage guard: GT injection is an oracle and must never be enabled for non-train splits.
-    # We validate here (before instantiating callbacks) to fail-fast and keep the rule global.
-    stage_split = stage.get("split")
-    if bool(stage.get("force_include_gt", False)) and str(stage_split).lower() != "train":
-        raise ValueError(
-            "Data leakage detected: `stage.force_include_gt=true` is only allowed when `stage.split=train`. "
-            f"Got stage.split={stage_split!r}. "
-            "Fix: set `stage.force_include_gt=false` for validation/test (and only enable it for train materialization)."
-        )
     return_predictions = bool(stage.get("run", {}).get("return_predictions", False))
 
     log.info(f"Stage: {stage.get('name')} (return_predictions={return_predictions})")
@@ -231,8 +223,8 @@ def main(cfg: DictConfig) -> None:
     _preflight_validate(cfg)
     extras(cfg)
     stage_cfg = cfg.get("stage") or {}
-    if str(stage_cfg.get("name", "")).strip() == "cache_g_agent" and bool(stage_cfg.get("run_all_splits", False)):
-        _run_cache_g_agent_all_splits(cfg)
+    if str(stage_cfg.get("name", "")).strip() == "retriever_eval" and bool(stage_cfg.get("run_all_splits", False)):
+        _run_retriever_eval_all_splits(cfg)
         return
     evaluate(cfg)
 

@@ -59,7 +59,7 @@ class GAgentDataModule(LightningDataModule):
         if stage in (None, "fit"):
             self.train_dataset = self._build_dataset("train")
             self.val_dataset = self._build_dataset("validation")
-        if stage in (None, "test"):
+        if stage in (None, "test", "predict"):
             self.test_dataset = self._build_dataset("test")
 
     def train_dataloader(self) -> PyGDataLoader:
@@ -93,6 +93,20 @@ class GAgentDataModule(LightningDataModule):
     def test_dataloader(self) -> PyGDataLoader:
         if self.test_dataset is None:
             raise RuntimeError("Call setup() before requesting test dataloader.")
+        return PyGDataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
+        )
+
+    def predict_dataloader(self) -> PyGDataLoader:
+        if self.test_dataset is None:
+            raise RuntimeError("Call setup() before requesting predict dataloader.")
         return PyGDataLoader(
             self.test_dataset,
             batch_size=self.batch_size,

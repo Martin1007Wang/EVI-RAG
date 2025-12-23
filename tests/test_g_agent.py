@@ -53,13 +53,11 @@ def test_g_agent_builder_roundtrip(tmp_path: Path) -> None:
         settings = GAgentSettings(
             enabled=True,
             anchor_top_k=1,
-            anchor_start_k=1,
+            max_hops=2,
             output_path=tmp_path / "g_agent_samples.pt",
-            force_include_gt=False,
         )
         builder = GAgentBuilder(settings, embedding_store=store)
         output = RetrieverOutput(
-            scores=torch.tensor([0.9], dtype=torch.float32),
             logits=torch.tensor([2.0], dtype=torch.float32),
             query_ids=torch.zeros(1, dtype=torch.long),
         )
@@ -108,13 +106,11 @@ def test_g_agent_builder_keeps_unreachable_answers(tmp_path: Path) -> None:
         settings = GAgentSettings(
             enabled=True,
             anchor_top_k=1,
-            anchor_start_k=1,
+            max_hops=2,
             output_path=tmp_path / "g_agent_samples_unreachable.pt",
-            force_include_gt=False,
         )
         builder = GAgentBuilder(settings, embedding_store=store)
         output = RetrieverOutput(
-            scores=torch.tensor([0.9], dtype=torch.float32),
             logits=torch.tensor([2.0], dtype=torch.float32),
             query_ids=torch.zeros(1, dtype=torch.long),
         )
@@ -131,5 +127,63 @@ def test_g_agent_builder_keeps_unreachable_answers(tmp_path: Path) -> None:
 
         with pytest.raises(ValueError):
             load_g_agent_samples(settings.output_path, drop_unreachable=True)
+    finally:
+        store.close()
+
+
+def test_g_agent_builder_fills_missing_gt_with_shortest_path(tmp_path: Path) -> None:
+    sample_id = "sample-missing-gt"
+    node_global_ids = torch.tensor([10, 12, 11], dtype=torch.long)
+
+    # Retrieval graph: 10 -> 12 -> 11
+    data = Data(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        edge_attr=torch.tensor([0, 0], dtype=torch.long),
+        labels=torch.tensor([1.0, 1.0], dtype=torch.float32),
+        node_global_ids=node_global_ids,
+        node_embedding_ids=torch.tensor([10, 12, 11], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        sample_id=sample_id,
+    )
+    batch = Batch.from_data_list([data])
+
+    lmdb_path = tmp_path / "train.lmdb"
+    raw = {
+        "question_emb": torch.tensor([0.25, 0.5, 0.75, 1.0], dtype=torch.float32),
+        "question": "mock question missing gt",
+        "seed_entity_ids": torch.tensor([10], dtype=torch.long),
+        "answer_entity_ids": torch.tensor([11], dtype=torch.long),
+        # No gt_path_edge_indices / gt_paths_triples provided.
+        "gt_path_edge_indices": [],
+    }
+    _write_lmdb(lmdb_path, {sample_id: raw})
+
+    store = EmbeddingStore(lmdb_path)
+    try:
+        settings = GAgentSettings(
+            enabled=True,
+            anchor_top_k=2,
+            max_hops=2,
+            output_path=tmp_path / "g_agent_samples_missing_gt.pt",
+        )
+        builder = GAgentBuilder(settings, embedding_store=store)
+        output = RetrieverOutput(
+            logits=torch.tensor([2.0, 1.0], dtype=torch.float32),
+            query_ids=torch.zeros(2, dtype=torch.long),
+        )
+        builder.process_batch(batch, output)
+        assert len(builder.samples) == 1
+
+        builder.save(settings.output_path)
+        loaded = load_g_agent_samples(settings.output_path, drop_unreachable=False)
+        assert len(loaded) == 1
+        sample = loaded[0]
+
+        assert sample.gt_path_exists is True
+        assert sample.gt_path_edge_local_ids.numel() == 2
+        assert sample.gt_path_node_local_ids.numel() == sample.gt_path_edge_local_ids.numel() + 1
+        assert int(sample.gt_path_node_local_ids[0].item()) in set(sample.start_node_locals.tolist())
+        assert int(sample.gt_path_node_local_ids[-1].item()) in set(sample.answer_node_locals.tolist())
     finally:
         store.close()

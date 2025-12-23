@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import math
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -13,17 +15,15 @@ import torch.distributed as dist
 from lightning import LightningModule
 from omegaconf import DictConfig
 from torch import nn
-from torch_scatter import scatter_max
 
 from src.models.components import (
     GFlowNetActor,
     GFlowNetEstimator,
     GraphEmbedder,
     GraphEnv,
+    GNNStateEncoder,
     RewardOutput,
-    TrajectoryStateEncoder,
 )
-from src.models.components import GTPathAlignedReward
 from src.utils import setup_optimizer
 from src.utils.logging_utils import log_metric
 from src.utils.pylogger import RankedLogger
@@ -73,15 +73,18 @@ class GFlowNetModule(LightningModule):
         else:
             self._eval_rollouts = int(max(1, self._cfg_get_int(self.evaluation_cfg, "num_eval_rollouts", 1)))
             self._eval_rollout_prefixes = [self._eval_rollouts]
-        self._path_hit_k = self._parse_int_list(self._cfg_get(self.evaluation_cfg, "path_hit_k", [5]))
+        eval_temp_cfg = self._cfg_get_float(self.evaluation_cfg, "rollout_temperature", None)
+        if eval_temp_cfg is None:
+            raise ValueError("evaluation_cfg.rollout_temperature must be set explicitly (no implicit eval temperature).")
+        if eval_temp_cfg < 0.0:
+            raise ValueError(f"evaluation_cfg.rollout_temperature must be >= 0, got {eval_temp_cfg}.")
+        self._eval_rollout_temperature = float(eval_temp_cfg)
         self._debug_batches_to_log = max(int(self._cfg_get(self.training_cfg, "debug_batches_to_log", 0)), 0)
         self._debug_graphs_to_log = max(int(self._cfg_get(self.training_cfg, "debug_graphs_to_log", 1)), 1)
         self._debug_batches_logged = 0
         self._subtb_shapes_logged = False
         self._train_prog_bar = set(self._cfg_get(self.logging_cfg, "train_prog_bar", []))
         self._eval_prog_bar = set(self._cfg_get(self.logging_cfg, "eval_prog_bar", []))
-        self._auto_success_k = bool(self._cfg_get(self.logging_cfg, "auto_add_success_at_k", True))
-        self._auto_path_hit_f1 = bool(self._cfg_get(self.logging_cfg, "auto_add_path_hit_f1", True))
         self._log_on_step_train = bool(self._cfg_get(self.logging_cfg, "log_on_step_train", False))
         # Eval 持久化配置（由 Hydra 注入），仅在 eval 阶段使用
         self.eval_persist_cfg: Dict[str, Any] = dict(eval_persist_cfg or {})
@@ -93,19 +96,22 @@ class GFlowNetModule(LightningModule):
         self._predict_metric_sums: Dict[str, torch.Tensor] = {}
         self._predict_metric_counts: Dict[str, torch.Tensor] = {}
         self._predict_metrics: Dict[str, torch.Tensor] = {}
+        self.predict_metrics: Dict[str, torch.Tensor] = {}
         self._last_debug_epoch: int = -1
+        self._estimated_stepping_batches: Optional[int] = None
 
         self.policy: nn.Module = hydra.utils.instantiate(policy_cfg)
         self.reward_fn: nn.Module = hydra.utils.instantiate(reward_cfg)
         self.env: GraphEnv = hydra.utils.instantiate(env_cfg)
         self.max_steps = int(self.env.max_steps)
         self.embedder = hydra.utils.instantiate(embedder_cfg)
-        self.state_encoder: TrajectoryStateEncoder = hydra.utils.instantiate(state_encoder_cfg)
         self.estimator = hydra.utils.instantiate(estimator_cfg)
+        state_encoder: GNNStateEncoder = hydra.utils.instantiate(state_encoder_cfg)
         self.actor = hydra.utils.instantiate(
             actor_cfg,
             policy=self.policy,
             env=self.env,
+            state_encoder=state_encoder,
             max_steps=self.max_steps,
         )
         # 仅保存可序列化的标量，避免将 Hydra 配置对象写入 checkpoint。
@@ -127,6 +133,74 @@ class GFlowNetModule(LightningModule):
                 "eval_persist_cfg",
             ],
         )
+
+    def on_fit_start(self) -> None:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        est = getattr(trainer, "estimated_stepping_batches", None)
+        if est is None:
+            return
+        try:
+            est_int = int(est)
+        except Exception:
+            return
+        self._estimated_stepping_batches = est_int if est_int > 0 else None
+
+    def _train_progress(self) -> Optional[float]:
+        total = self._estimated_stepping_batches
+        if total is None:
+            trainer = getattr(self, "trainer", None)
+            est = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
+            try:
+                total = int(est) if est is not None else None
+            except Exception:
+                total = None
+        if total is None or total <= 0:
+            return None
+        return min(1.0, max(0.0, float(self.global_step) / float(max(1, total))))
+
+    def _scheduled_coef(self, base_coef: float, schedule_cfg: Any) -> float:
+        if not schedule_cfg:
+            return float(base_coef)
+        schedule_type = str(self._cfg_get(schedule_cfg, "type", "cosine")).strip().lower()
+        if schedule_type in {"none", "null", "constant", "const", "identity", "id"}:
+            return float(base_coef)
+        progress = self._train_progress()
+        if progress is None:
+            return float(base_coef)
+        final_coef = float(self._cfg_get_float(schedule_cfg, "final_coef", 0.0) or 0.0)
+        start_frac = float(self._cfg_get_float(schedule_cfg, "start_frac", 0.0) or 0.0)
+        duration_frac = float(self._cfg_get_float(schedule_cfg, "duration_frac", 1.0) or 1.0)
+        denom = max(duration_frac, 1e-12)
+        phase = (progress - start_frac) / denom
+        phase = min(1.0, max(0.0, float(phase)))
+        if schedule_type in {"linear", "lin"}:
+            coef = float(base_coef) + (final_coef - float(base_coef)) * phase
+        elif schedule_type in {"cosine", "cos"}:
+            coef = final_coef + 0.5 * (float(base_coef) - final_coef) * (1.0 + math.cos(math.pi * phase))
+        else:
+            raise ValueError(
+                f"Unsupported schedule.type={schedule_type!r} (expected 'none'|'linear'|'cosine')."
+            )
+        return max(0.0, float(coef))
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        try:
+            checkpoint["retriever_meta"] = self.embedder.export_retriever_meta()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to export retriever_meta for checkpoint: {exc}") from exc
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        meta = checkpoint.get("retriever_meta")
+        if meta is None:
+            if getattr(self.embedder, "allow_deferred_init", False):
+                raise RuntimeError("Missing retriever_meta in gflownet checkpoint; cannot init embedder for eval.")
+            return
+        try:
+            self.embedder.init_from_retriever_meta(meta)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply retriever_meta from checkpoint: {exc}") from exc
 
     def configure_optimizers(self):
         optimizer = setup_optimizer(self, self.optimizer_cfg)
@@ -175,24 +249,19 @@ class GFlowNetModule(LightningModule):
             return int(default)
 
     @staticmethod
-    def _parse_int_list(value: Any) -> list[int]:
+    def _cfg_get_float(cfg: Any, key: str, default: Optional[float]) -> Optional[float]:
+        value = GFlowNetModule._cfg_get(cfg, key, default)
         if value is None:
-            return []
-        if isinstance(value, int):
-            return [int(value)]
-        if isinstance(value, (list, tuple, ListConfig)):
-            result: list[int] = []
-            for v in value:
-                iv = int(v)
-                if iv <= 0:
-                    continue
-                result.append(iv)
-            return result or [1]
+            return default
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            try:
+                return float(value[0]) if len(value) > 0 else default
+            except Exception:
+                return default
         try:
-            iv = int(value)
-            return [iv] if iv > 0 else [1]
+            return float(value)
         except Exception:
-            return [1]
+            return default
 
     def setup(self, stage: str | None = None) -> None:
         trainer = getattr(self, "trainer", None)
@@ -218,9 +287,7 @@ class GFlowNetModule(LightningModule):
         self._last_debug = {
             "log_reward": metrics.get("log_reward"),
             "answer_hit": metrics.get("answer_hit"),
-            "path_prefix_ratio": metrics.get("path_prefix_ratio"),
-            "path_full_hit": metrics.get("path_full_hit"),
-            "gt_path_exists_ratio": metrics.get("gt_path_exists_ratio"),
+            "answer_reach_frac": metrics.get("answer_reach_frac"),
         }
         return loss
 
@@ -245,7 +312,6 @@ class GFlowNetModule(LightningModule):
         loss, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
         metrics = dict(metrics)
         metrics["loss"] = loss.detach()
-        self._log_metrics(metrics, prefix="predict", batch_size=int(batch.num_graphs))
         self._accumulate_predict_metrics(metrics, batch_size=int(batch.num_graphs))
         self._active_eval_split = None
         return None
@@ -260,19 +326,14 @@ class GFlowNetModule(LightningModule):
         self._persist_eval_rollouts("predict")
         metrics = self._finalize_predict_metrics()
         self._predict_metrics = metrics
-        if metrics:
-            for name, value in metrics.items():
-                log_metric(self, f"predict/{name}", value, batch_size=1, on_step=False, on_epoch=True)
+        self.predict_metrics = metrics
 
     def _log_metrics(self, metrics: Dict[str, torch.Tensor], prefix: str, batch_size: int) -> None:
+        if prefix == "predict":
+            return
         sync_dist = bool(self.trainer and getattr(self.trainer, "num_devices", 1) > 1)
         is_train = prefix == "train"
-        max_eval_prefix = max(self._eval_rollout_prefixes) if hasattr(self, "_eval_rollout_prefixes") else self._eval_rollouts
         prog_bar_set = set(self._train_prog_bar if is_train else self._eval_prog_bar)
-        if not is_train and self._auto_success_k and max_eval_prefix > 1:
-            prog_bar_set.add(f"success@{max_eval_prefix}")
-        if not is_train and self._auto_path_hit_f1 and self._path_hit_k:
-            prog_bar_set.add(f"path_hit_f1@{max(self._path_hit_k)}")
         for name, value in metrics.items():
             if not torch.is_floating_point(value):
                 value = value.float()
@@ -323,27 +384,22 @@ class GFlowNetModule(LightningModule):
         embed = self.embedder.embed_batch(batch, device=device)
         if should_debug:
             self._log_batch_debug(batch=batch, embed=embed, batch_idx=batch_idx)
-            self._log_gt_path_feasibility_debug(batch=batch, embed=embed, device=device, batch_idx=batch_idx)
             self._debug_batches_logged += 1
-        edge_tokens = embed.edge_tokens
+        edge_tokens = embed.edge_tokens.to(dtype=torch.float32)
         edge_batch = embed.edge_batch
         edge_ptr = embed.edge_ptr
         node_ptr = embed.node_ptr
         num_graphs = int(node_ptr.numel() - 1)
-        edge_scores = embed.edge_scores
         edge_index = embed.edge_index
         edge_relations = embed.edge_relations
-        edge_labels = embed.edge_labels
-        path_mask = embed.path_mask
-        path_exists = embed.path_exists
+        edge_labels = batch.edge_labels.to(device)
         heads_global = embed.heads_global
         tails_global = embed.tails_global
-        node_tokens = embed.node_tokens
-        question_tokens = embed.question_tokens
-        answer_ptr = batch._slice_dict["answer_entity_ids"].to(device)
+        node_tokens = embed.node_tokens.to(dtype=torch.float32)
+        question_tokens = embed.question_tokens.to(dtype=torch.float32)
         answer_node_ptr = batch._slice_dict["answer_node_locals"].to(device)
-        gt_path_ptr = batch._slice_dict["gt_path_edge_local_ids"].to(device)
         # SubTB：logF(s_t) 在每一步状态上预测；不再使用单独的 start_summary/logZ 常数项。
+        subtb_penalty = str(self._cfg_get(self.training_cfg, "subtb_penalty", "l2")).strip().lower()
 
         graph_cache: Dict[str, torch.Tensor] = {
             "edge_index": edge_index,
@@ -351,67 +407,172 @@ class GFlowNetModule(LightningModule):
             "node_global_ids": batch.node_global_ids.to(device),
             "heads_global": heads_global,
             "tails_global": tails_global,
+            "edge_scores": batch.edge_scores.to(device=device, dtype=torch.float32).view(-1),
             "node_ptr": node_ptr,
             "edge_ptr": edge_ptr,
+            "node_tokens": node_tokens,
             "start_node_locals": batch.start_node_locals.to(device),
             "start_ptr": batch._slice_dict["start_node_locals"].to(device),
-            "start_entity_ids": batch.start_entity_ids.to(device),
-            "start_entity_ptr": batch._slice_dict["start_entity_ids"].to(device),
             "answer_node_locals": batch.answer_node_locals.to(device),
-            "answer_ptr": batch._slice_dict["answer_entity_ids"].to(device),
-            "answer_entity_ids": batch.answer_entity_ids.to(device),
-            "edge_relations": batch.edge_attr.to(device),
-            "edge_labels": edge_labels,
-            "is_answer_reachable": batch.is_answer_reachable.to(device),
+            "answer_ptr": batch._slice_dict["answer_node_locals"].to(device),
         }
 
-        gt_counts = gt_path_ptr[1:] - gt_path_ptr[:-1]
-
-        step0_weight = float(self._cfg_get(self.training_cfg, "step0_supervision_weight", 0.0))
-        step0_loss: Optional[torch.Tensor] = None
-        step0_acc: Optional[torch.Tensor] = None
-        if self.training and step0_weight > 0.0:
-            step0_loss, step0_acc = self._compute_step0_supervision(
+        autocast_ctx = (
+            torch.autocast(device_type=device.type, enabled=False)
+            if device.type != "cpu"
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            state_encoder_cache = self.actor.state_encoder.precompute(
+                edge_index=edge_index,
+                edge_batch=edge_batch,
+                node_ptr=node_ptr,
+                start_node_locals=graph_cache["start_node_locals"],
+                start_ptr=graph_cache["start_ptr"],
+                node_tokens=node_tokens,
                 edge_tokens=edge_tokens,
+                question_tokens=question_tokens,
+            )
+
+        bc_coef_base = float(self._cfg_get_float(self.training_cfg, "bc_coef", 0.0) or 0.0)
+        bc_schedule_cfg = self._cfg_get(self.training_cfg, "bc_schedule", None)
+        bc_coef = self._scheduled_coef(bc_coef_base, bc_schedule_cfg) if (self.training and bc_schedule_cfg) else bc_coef_base
+        bc_include_stop = bool(self._cfg_get(self.training_cfg, "bc_include_stop", False))
+
+        gt_flow_coef_base = float(self._cfg_get_float(self.training_cfg, "gt_flow_coef", 0.0) or 0.0)
+        gt_flow_schedule_cfg = self._cfg_get(self.training_cfg, "gt_flow_schedule", None)
+        gt_flow_coef = (
+            self._scheduled_coef(gt_flow_coef_base, gt_flow_schedule_cfg)
+            if (self.training and gt_flow_schedule_cfg)
+            else gt_flow_coef_base
+        )
+
+        bc_loss: Optional[torch.Tensor] = None
+        bc_metrics: Dict[str, torch.Tensor] = {}
+        gt_subtb_loss: Optional[torch.Tensor] = None
+        gt_flow_metrics: Dict[str, torch.Tensor] = {}
+
+        if self.training and (bc_coef > 0.0 or gt_flow_coef > 0.0):
+            gt_actions_seq, gt_lens, usable = self._sample_gt_actions_from_dag(
+                edge_index=edge_index,
+                edge_labels=edge_labels,
+                edge_ptr=edge_ptr,
+                node_ptr=node_ptr,
+                start_node_locals=graph_cache["start_node_locals"],
+                start_ptr=graph_cache["start_ptr"],
+                answer_node_locals=graph_cache["answer_node_locals"],
+                answer_ptr=graph_cache["answer_ptr"],
+                max_steps=self.max_steps,
+            )
+            usable_frac = usable.float().mean() if num_graphs > 0 else torch.zeros((), device=device)
+
+            stop_indices = edge_ptr[1:].to(device=device, dtype=torch.long)
+            num_steps_bc = self.max_steps + 1
+            if gt_actions_seq.shape != (num_graphs, num_steps_bc):
+                raise ValueError(
+                    f"gt_actions_seq shape {tuple(gt_actions_seq.shape)} != ({num_graphs},{num_steps_bc})"
+                )
+
+            rollout_gt = self.actor.rollout(
+                batch=batch,
+                edge_tokens=edge_tokens,
+                node_tokens=node_tokens,
                 question_tokens=question_tokens,
                 edge_batch=edge_batch,
                 edge_ptr=edge_ptr,
-                edge_scores=edge_scores,
-                edge_index=edge_index,
                 node_ptr=node_ptr,
-                heads_global=heads_global,
-                tails_global=tails_global,
-                start_node_locals=batch.start_node_locals.to(device),
-                gt_path_edge_local_ids=batch.gt_path_edge_local_ids.to(device),
-                gt_path_ptr=gt_path_ptr,
-                training=self.training,
+                temperature=None,
+                batch_idx=batch_idx,
+                graph_cache=graph_cache,
+                forced_actions_seq=gt_actions_seq,
+                state_encoder_cache=state_encoder_cache,
             )
+            log_pf_steps_gt = rollout_gt["log_pf_steps"]
+            if log_pf_steps_gt.shape != (num_graphs, num_steps_bc):
+                raise ValueError(
+                    f"GT log_pf_steps shape {tuple(log_pf_steps_gt.shape)} != ({num_graphs},{num_steps_bc})"
+                )
 
-        gt_stats: Dict[str, torch.Tensor] = {}
-        if path_mask is not None and path_mask.numel() == edge_batch.numel():
-            gt_edge_counts = torch.bincount(edge_batch, weights=path_mask.float(), minlength=num_graphs)
-            valid_gt = path_exists.bool() if path_exists is not None else torch.ones(num_graphs, device=device, dtype=torch.bool)
-            if valid_gt.any():
-                gt_counts_valid = gt_edge_counts[valid_gt]
-                gt_stats["gt_path_edges_mean"] = gt_counts_valid.mean()
-                gt_stats["gt_path_edges_p90"] = torch.quantile(gt_counts_valid, 0.9)
-                gt_stats["gt_path_edges_max"] = gt_counts_valid.max()
-                if self._path_hit_k:
-                    for k_val in self._path_hit_k:
-                        k_int = int(k_val)
-                        gt_stats[f"gt_path_edges_gt@{k_int}"] = (gt_counts_valid > k_int).float().mean()
-            else:
-                zero = torch.tensor(0.0, device=device)
-                gt_stats["gt_path_edges_mean"] = zero
-                gt_stats["gt_path_edges_p90"] = zero
-                gt_stats["gt_path_edges_max"] = zero
-                if self._path_hit_k:
-                    for k_val in self._path_hit_k:
-                        k_int = int(k_val)
-                        gt_stats[f"gt_path_edges_gt@{k_int}"] = zero
+            if bc_coef > 0.0:
+                target_len = gt_lens + (1 if bc_include_stop else 0)
+                target_len = torch.clamp(target_len, min=0, max=num_steps_bc)
+                steps = torch.arange(num_steps_bc, device=device).view(1, -1)
+                step_mask = steps < target_len.view(-1, 1)
+                step_mask = step_mask & usable.view(-1, 1)
+                denom = step_mask.sum().to(dtype=log_pf_steps_gt.dtype)
+                if float(denom.item()) > 0.0:
+                    bc_loss = -(log_pf_steps_gt * step_mask.to(dtype=log_pf_steps_gt.dtype)).sum() / denom
+                else:
+                    bc_loss = torch.zeros((), device=device, dtype=log_pf_steps_gt.dtype)
+                bc_metrics = {
+                    "bc_loss": bc_loss.detach(),
+                    "bc_coef": torch.tensor(bc_coef, device=device, dtype=bc_loss.dtype),
+                    "bc_usable_frac": usable_frac.detach(),
+                    "bc_steps_mean": (target_len.to(dtype=log_pf_steps_gt.dtype)[usable].mean().detach() if usable.any() else torch.zeros((), device=device)),
+                }
+
+            if gt_flow_coef > 0.0:
+                reward_out_gt: RewardOutput = self.reward_fn(
+                    selected_mask=rollout_gt["selected_mask"],
+                    edge_labels=edge_labels,
+                    edge_batch=edge_batch,
+                    edge_index=edge_index,
+                    node_ptr=node_ptr,
+                    start_node_locals=batch.start_node_locals.to(device),
+                    answer_node_locals=batch.answer_node_locals.to(device),
+                    answer_node_ptr=answer_node_ptr,
+                )
+                log_reward_gt = reward_out_gt.log_reward
+                self._assert_finite(log_reward_gt, "log_reward_gt")
+
+                state_emb_seq_gt = rollout_gt.get("state_emb_seq")
+                if state_emb_seq_gt is None:
+                    raise ValueError("state_emb_seq missing in GT rollout; actor/state_encoder must return per-step embeddings.")
+
+                log_flow_states_gt = self._compute_log_flow_states(
+                    state_emb_seq=state_emb_seq_gt,
+                    question_tokens=question_tokens,
+                    log_reward=log_reward_gt,
+                    edge_lengths=rollout_gt["length"].long(),
+                )
+                phi_states_gt = rollout_gt.get("phi_states", None)
+                if phi_states_gt is None:
+                    raise ValueError("phi_states missing in GT rollout; GraphEnv.potential must be enabled.")
+                if phi_states_gt.shape != log_flow_states_gt.shape:
+                    raise ValueError(
+                        f"phi_states_gt shape {tuple(phi_states_gt.shape)} != log_flow_states_gt {tuple(log_flow_states_gt.shape)}"
+                    )
+                phi_states_gt = phi_states_gt.to(device=device, dtype=log_flow_states_gt.dtype).detach()
+                term_state_gt = rollout_gt["length"].long().clamp(min=0, max=rollout_gt["log_pf_steps"].size(1) - 1) + 1
+                phi_states_gt.scatter_(
+                    1,
+                    term_state_gt.view(-1, 1),
+                    torch.zeros_like(term_state_gt, dtype=phi_states_gt.dtype).view(-1, 1),
+                )
+                log_flow_states_gt = log_flow_states_gt + phi_states_gt
+
+                log_pb_steps_gt = self._compute_deterministic_log_pb_steps(
+                    actions_seq=rollout_gt["actions_seq"],
+                    stop_indices=edge_ptr[1:],
+                    dtype=rollout_gt["log_pf_steps"].dtype,
+                    device=device,
+                )
+                gt_subtb_loss = self._compute_subtb_loss(
+                    log_flow_states=log_flow_states_gt,
+                    log_pf_steps=rollout_gt["log_pf_steps"],
+                    log_pb_steps=log_pb_steps_gt,
+                    edge_lengths=rollout_gt["length"].long(),
+                    graph_mask=usable,
+                    penalty=subtb_penalty,
+                )
+                gt_flow_metrics = {
+                    "gt_subtb_loss": gt_subtb_loss.detach(),
+                    "gt_flow_coef": torch.tensor(gt_flow_coef, device=device, dtype=gt_subtb_loss.dtype),
+                    "gt_usable_frac": usable_frac.detach(),
+                }
 
         if self.training:
-            num_rollouts = 1
+            num_rollouts = max(int(self._cfg_get_int(self.training_cfg, "num_train_rollouts", 1)), 1)
         else:
             try:
                 num_rollouts = int(self._eval_rollouts)
@@ -425,11 +586,7 @@ class GFlowNetModule(LightningModule):
                 )
         loss_list = []
         metrics_list: list[Dict[str, torch.Tensor]] = []
-        path_hits: list[torch.Tensor] = []
         rollout_logs: list[Dict[str, torch.Tensor]] = []
-        rollout_selected_masks: list[torch.Tensor] = []
-        rollout_prefix_ratios: list[torch.Tensor] = []
-        rollout_full_hits: list[torch.Tensor] = []
         rollout_answer_hits: list[torch.Tensor] = []
         rollout_lengths: list[torch.Tensor] = []
 
@@ -437,51 +594,30 @@ class GFlowNetModule(LightningModule):
             rollout = self.actor.rollout(
                 batch=batch,
                 edge_tokens=edge_tokens,
+                node_tokens=node_tokens,
                 question_tokens=question_tokens,
                 edge_batch=edge_batch,
                 edge_ptr=edge_ptr,
                 node_ptr=node_ptr,
-                edge_scores=edge_scores,
-                training=self.training,
+                temperature=None if self.training else self._eval_rollout_temperature,
                 batch_idx=batch_idx,
                 graph_cache=graph_cache,
+                state_encoder_cache=state_encoder_cache,
             )
-            # Residual PF: rollout 已返回 clean log_pf/log_pf_steps/actions_seq 等用于 SubTB。
-            state_emb_seq = self.state_encoder(
-                actions_seq=rollout["actions_seq"],
-                edge_tokens=edge_tokens,
-                stop_indices=edge_ptr[1:],
-                question_tokens=question_tokens,
-                node_tokens=node_tokens,
-                start_node_locals=batch.start_node_locals.to(device),
-                start_ptr=batch._slice_dict["start_node_locals"].to(device),
-            )
+            # Rollout returns log_pf/log_pf_steps/actions_seq for SubTB.
+            state_emb_seq = rollout.get("state_emb_seq")
+            if state_emb_seq is None:
+                raise ValueError("state_emb_seq missing in rollout; actor/state_encoder must return per-step embeddings.")
 
             reward_out: RewardOutput = self.reward_fn(
-                actions_seq=rollout["actions_seq"],
                 selected_mask=rollout["selected_mask"],
-                selection_order=rollout["selection_order"],
-                length=rollout["length"],
                 edge_labels=edge_labels,
                 edge_batch=edge_batch,
-                edge_heads=heads_global,
-                edge_tails=tails_global,
-                edge_scores=edge_scores,
-                answer_entity_ids=batch.answer_entity_ids.to(device),
-                answer_ptr=batch._slice_dict["answer_entity_ids"].to(device),
-                path_mask=path_mask,
-                path_exists=path_exists,
-                reach_success=rollout["reach_success"],
-                reach_fraction=rollout["reach_fraction"],
                 edge_index=edge_index,
                 node_ptr=node_ptr,
-                edge_ptr=edge_ptr,
-                gt_path_edge_local_ids=batch.gt_path_edge_local_ids.to(device),
-                gt_path_ptr=gt_path_ptr,
-                max_steps=torch.tensor(self.max_steps, device=device),
+                start_node_locals=batch.start_node_locals.to(device),
                 answer_node_locals=batch.answer_node_locals.to(device),
                 answer_node_ptr=answer_node_ptr,
-                is_answer_reachable=batch.is_answer_reachable.view(-1).to(device),
             )
 
             log_reward = reward_out.log_reward
@@ -493,6 +629,21 @@ class GFlowNetModule(LightningModule):
                 log_reward=log_reward,
                 edge_lengths=rollout["length"].long(),
             )
+            phi_states = rollout.get("phi_states", None)
+            if phi_states is None:
+                raise ValueError("phi_states missing in rollout; GraphEnv.potential must be enabled.")
+            if phi_states.shape != log_flow_states.shape:
+                raise ValueError(
+                    f"phi_states shape {tuple(phi_states.shape)} != log_flow_states {tuple(log_flow_states.shape)}"
+                )
+            phi_states = phi_states.to(device=device, dtype=log_flow_states.dtype).detach()
+            term_state = rollout["length"].long().clamp(min=0, max=rollout["log_pf_steps"].size(1) - 1) + 1
+            phi_states.scatter_(
+                1,
+                term_state.view(-1, 1),
+                torch.zeros_like(term_state, dtype=phi_states.dtype).view(-1, 1),
+            )
+            log_flow_states = log_flow_states + phi_states
             # Backward policy P_B is deterministic under this state definition:
             # given the full trajectory state (selected edges + order), the predecessor is uniquely
             # obtained by removing the last selected edge. Hence log P_B = 0 for every realized step.
@@ -502,200 +653,61 @@ class GFlowNetModule(LightningModule):
                 dtype=rollout["log_pf_steps"].dtype,
                 device=device,
             )
-            subtb_loss_raw, subtb_per_graph = self._compute_subtb_loss(
+            subtb_loss = self._compute_subtb_loss(
                 log_flow_states=log_flow_states,
                 log_pf_steps=rollout["log_pf_steps"],
                 log_pb_steps=log_pb_steps,
                 edge_lengths=rollout["length"].long(),
-                return_per_graph=True,
+                penalty=subtb_penalty,
             )
-            subtb_loss = subtb_loss_raw
-            mask_subtb_by_path_exists = bool(self._cfg_get(self.training_cfg, "mask_subtb_by_path_exists", False))
-            if mask_subtb_by_path_exists and isinstance(self.reward_fn, GTPathAlignedReward):
-                subtb_loss = self._mask_subtb_loss_by_path_exists(
-                    subtb_per_graph=subtb_per_graph,
-                    path_exists=path_exists,
-                )
-
             loss = subtb_loss
-            if step0_loss is not None:
-                loss = loss + step0_weight * step0_loss
+            if bc_loss is not None and bc_coef > 0.0:
+                loss = loss + bc_coef * bc_loss
+            if gt_subtb_loss is not None and gt_flow_coef > 0.0:
+                loss = loss + gt_flow_coef * gt_subtb_loss
 
             if should_debug:
-                self._log_reward_prior_debug(
-                    rollout=rollout,
-                    reward_out=reward_out,
-                    edge_scores=edge_scores,
-                    edge_batch=edge_batch,
-                    log_reward=log_reward,
-                    batch_idx=batch_idx,
-                )
                 self._log_rollout_sanity_debug(
                     rollout=rollout,
-                    reward_out=reward_out,
                     log_reward=log_reward,
                     log_flow_states=log_flow_states,
-                    edge_batch=edge_batch,
                     edge_ptr=edge_ptr,
-                    path_mask=path_mask,
-                    gt_path_edge_local_ids=batch.gt_path_edge_local_ids.to(device),
-                    gt_path_ptr=gt_path_ptr,
                     batch_idx=batch_idx,
                 )
 
             reward_metrics = reward_out.as_dict()
             log_reward_metric = reward_metrics.pop("log_reward")
             answer_hit = reward_metrics.pop("answer_hit", None)
-            success = reward_metrics.pop("success", None)
-            path_prefix_len = reward_metrics.pop("path_prefix_len", None)
-            path_prefix_ratio = reward_metrics.pop("path_prefix_ratio", None)
-            path_full_hit = reward_metrics.pop("path_full_hit", None)
             answer_reach_frac = reward_metrics.pop("answer_reach_frac", None)
             reward_metrics.pop("reward", None)
-            reward_metrics.pop("pos_precision", None)
-            reward_metrics.pop("pos_recall", None)
-            reward_metrics.pop("pos_f1", None)
-            reward_metrics.pop("answer_precision", None)
-            reward_metrics.pop("answer_recall", None)
-            reward_metrics.pop("answer_f1", None)
-            reward_metrics.pop("path_exists", None)
-
-            valid_graphs = (
-                path_exists.bool()
-                if path_exists is not None
-                else torch.ones(num_graphs, device=device, dtype=torch.bool)
-            )
-
-            # Top-K 边回溯命中率（按选择顺序前 K 条边）；仅在存在 GT 边的图上聚合。
-            if not self.training and self._path_hit_k:
-                sel_order = rollout["selection_order"]
-                for k_val in self._path_hit_k:
-                    k_int = int(k_val)
-                    topk_mask = (sel_order >= 0) & (sel_order < k_int)
-                    if path_mask is not None and path_mask.numel() == topk_mask.numel():
-                        edge_valid = path_mask.bool() & topk_mask & valid_graphs[edge_batch]
-                    else:
-                        edge_valid = torch.zeros_like(topk_mask, dtype=torch.bool)
-                    hits_topk = torch.bincount(edge_batch, weights=edge_valid.float(), minlength=num_graphs)
-                    if path_mask is not None and path_mask.numel() == topk_mask.numel():
-                        gt_edge_mask = path_mask.bool() & valid_graphs[edge_batch]
-                        gt_counts = torch.bincount(edge_batch, weights=gt_edge_mask.float(), minlength=num_graphs)
-                    else:
-                        gt_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-                    selected_counts = torch.bincount(
-                        edge_batch,
-                        weights=(rollout["selected_mask"].bool() & valid_graphs[edge_batch]).float(),
-                        minlength=num_graphs,
-                    )
-                    denom = torch.minimum(torch.full_like(selected_counts, float(k_int)), selected_counts)
-                    has_gt = valid_graphs & (gt_counts > 0)
-                    valid_mask = has_gt & (denom > 0)
-                    precision_topk = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-                    recall_topk = torch.zeros_like(precision_topk)
-                    f1_topk = torch.zeros_like(precision_topk)
-                    precision_topk[valid_mask] = hits_topk[valid_mask] / denom[valid_mask].clamp(min=1.0)
-                    recall_topk[has_gt] = hits_topk[has_gt] / gt_counts[has_gt].clamp(min=1.0)
-                with torch.no_grad():
-                    denom_f1 = precision_topk + recall_topk
-                    mask_f1 = denom_f1 > 0
-                    f1_topk[mask_f1] = (
-                        2 * precision_topk[mask_f1] * recall_topk[mask_f1] / denom_f1[mask_f1]
-                    )
-
-                    # 仅在存在 GT 的图上取均值，避免把“无 GT”混入 0 噪声
-                    def _masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-                        if not mask.any():
-                            return torch.tensor(0.0, device=device)
-                        return (t * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
-
-                    reward_metrics[f"path_hit_precision@{k_int}"] = _masked_mean(precision_topk, valid_mask)
-                    reward_metrics[f"path_hit_recall@{k_int}"] = _masked_mean(recall_topk, has_gt)
-                reward_metrics[f"path_hit_f1@{k_int}"] = _masked_mean(f1_topk, has_gt)
-            # 确保所有配置的 K 都有键（即便 path_mask 为空）
-            if not self.training and self._path_hit_k:
-                zero = torch.tensor(0.0, device=device)
-                for k_val in self._path_hit_k:
-                    k_int = int(k_val)
-                    reward_metrics.setdefault(f"path_hit_precision@{k_int}", zero)
-                    reward_metrics.setdefault(f"path_hit_recall@{k_int}", zero)
-                    reward_metrics.setdefault(f"path_hit_f1@{k_int}", zero)
+            reward_metrics.pop("success", None)
 
             metrics: Dict[str, torch.Tensor] = {
                 "log_reward": log_reward_metric,
-                "path_prefix_len": (
-                    path_prefix_len.detach()
-                    if isinstance(path_prefix_len, torch.Tensor)
-                    else torch.tensor(0.0, device=device)
-                ),
-                "path_prefix_ratio": (
-                    path_prefix_ratio.detach()
-                    if isinstance(path_prefix_ratio, torch.Tensor)
-                    else torch.tensor(0.0, device=device)
-                ),
-                "path_full_hit": (
-                    path_full_hit.detach()
-                    if isinstance(path_full_hit, torch.Tensor)
-                    else torch.tensor(0.0, device=device)
-                ),
                 "answer_hit": (
                     answer_hit.detach()
                     if isinstance(answer_hit, torch.Tensor)
-                    else (success.detach() if isinstance(success, torch.Tensor) else rollout["reach_success"].detach())
+                    else rollout["reach_success"].detach()
+                ),
+                "answer_reach_frac": (
+                    answer_reach_frac.detach()
+                    if isinstance(answer_reach_frac, torch.Tensor)
+                    else torch.zeros(num_graphs, device=device, dtype=log_reward_metric.dtype)
                 ),
                 "length_mean": rollout["length"].detach(),
                 "subtb_loss": subtb_loss.detach(),
-                "subtb_loss_unmasked": subtb_loss_raw.detach(),
-                "subtb_loss_gt_exists": (
-                    subtb_per_graph[path_exists.bool()].mean().detach()
-                    if path_exists is not None and bool(path_exists.any().item())
-                    else torch.tensor(0.0, device=device)
-                ),
-                "subtb_loss_gt_missing": (
-                    subtb_per_graph[(~path_exists.bool())].mean().detach()
-                    if path_exists is not None and bool((~path_exists.bool()).any().item())
-                    else torch.tensor(0.0, device=device)
-                ),
-                "gt_path_exists_ratio": path_exists.float().mean().detach()
-                if path_exists is not None
-                else torch.tensor(0.0, device=device),
+                **{k: v.detach() for k, v in reward_metrics.items()},
+                **bc_metrics,
+                **gt_flow_metrics,
             }
-            if isinstance(answer_reach_frac, torch.Tensor) and not isinstance(self.reward_fn, GTPathAlignedReward):
-                metrics["answer_reach_frac"] = answer_reach_frac.detach()
-            if "policy_shift_rate" in rollout:
-                metrics["policy_shift_rate"] = rollout["policy_shift_rate"].detach()
-            if "policy_residual_l1" in rollout:
-                metrics["policy_residual_l1"] = rollout["policy_residual_l1"].detach()
-            metrics.update(reward_metrics)
-            if gt_stats:
-                metrics.update(gt_stats)
-            if step0_loss is not None:
-                metrics["step0_loss"] = step0_loss.detach()
-                if step0_acc is not None:
-                    metrics["step0_acc@1"] = step0_acc.detach()
 
             if not self.training:
-                zeros_f = torch.zeros(num_graphs, device=device, dtype=log_reward_metric.dtype)
-                prefix_val = (
-                    path_prefix_ratio.detach().to(dtype=zeros_f.dtype)
-                    if isinstance(path_prefix_ratio, torch.Tensor)
-                    else zeros_f
-                )
-                full_val = (
-                    path_full_hit.detach().to(dtype=torch.bool)
-                    if isinstance(path_full_hit, torch.Tensor)
-                    else torch.zeros(num_graphs, device=device, dtype=torch.bool)
-                )
                 if isinstance(answer_hit, torch.Tensor):
                     answer_val = answer_hit.detach().to(dtype=torch.bool)
-                elif isinstance(success, torch.Tensor):
-                    answer_val = success.detach().to(dtype=torch.bool)
                 else:
                     answer_val = rollout["reach_success"].detach().to(dtype=torch.bool)
-                rollout_prefix_ratios.append(prefix_val)
-                rollout_full_hits.append(full_val)
                 rollout_answer_hits.append(answer_val)
-                rollout_lengths.append(rollout["length"].detach().to(dtype=zeros_f.dtype))
-                rollout_selected_masks.append(rollout["selected_mask"].detach())
+                rollout_lengths.append(rollout["length"].detach().to(dtype=log_reward_metric.dtype))
 
             loss_list.append(loss)
             metrics_list.append(metrics)
@@ -706,20 +718,8 @@ class GFlowNetModule(LightningModule):
                         "selection_order": rollout["selection_order"].detach().cpu(),
                         "log_pf": rollout["log_pf"].detach().cpu(),
                         "log_reward": log_reward.detach().cpu(),
-                        "reach_success": rollout["reach_success"].detach().cpu(),
                     }
                 )
-
-            if not self.training:
-                if path_mask is not None and path_mask.numel() == rollout["selected_mask"].numel():
-                    hit_edge = rollout["selected_mask"].bool() & path_mask.bool() & valid_graphs[edge_batch]
-                else:
-                    hit_edge = torch.zeros_like(rollout["selected_mask"], dtype=torch.bool)
-                per_graph_hit = torch.zeros(num_graphs, device=device, dtype=torch.bool)
-                if hit_edge.any():
-                    per_graph_hit = torch.bincount(edge_batch, weights=hit_edge.float(), minlength=num_graphs) > 0
-                per_graph_hit = per_graph_hit & valid_graphs
-                path_hits.append(per_graph_hit)
 
         if not loss_list:
             # Defensive: avoid empty TensorList when eval rollouts unexpectedly skipped.
@@ -758,42 +758,15 @@ class GFlowNetModule(LightningModule):
         if not self.training:
             if self._eval_rollout_prefixes:
                 k_values = [int(k) for k in self._eval_rollout_prefixes]
-                valid_graphs = (
-                    path_exists.bool() if path_exists is not None else torch.ones(num_graphs, device=device, dtype=torch.bool)
-                )
-                path_stack = (
-                    torch.stack(path_hits, dim=0) if path_hits else torch.zeros(1, num_graphs, device=device, dtype=torch.bool)
-                )
-                rollouts_avail = path_stack.size(0)
-                answer_counts = (answer_ptr[1:] - answer_ptr[:-1]).to(device)
-                valid_answers = (answer_counts > 0) & valid_graphs
+                if rollout_answer_hits:
+                    answer_stack = torch.stack(rollout_answer_hits, dim=0).bool()
+                else:
+                    answer_stack = torch.zeros(1, num_graphs, device=device, dtype=torch.bool)
+                rollouts_avail = answer_stack.size(0)
                 for k_int in k_values:
                     k_clamped = min(max(k_int, 1), rollouts_avail)
-                    hit_any = path_stack[:k_clamped].any(dim=0)
-                    if valid_graphs.any():
-                        denom = valid_graphs.float().sum().clamp(min=1.0)
-                        hit_k = (hit_any & valid_graphs).float().sum() / denom
-                    else:
-                        hit_k = torch.tensor(0.0, device=device)
-                    metrics[f"path_hit_any@{k_int}"] = hit_k
-            metrics.update(
-                self._compute_rollout_eval_metrics(
-                    path_exists=path_exists,
-                    path_mask=path_mask,
-                    edge_batch=edge_batch,
-                    edge_index=edge_index,
-                    node_ptr=node_ptr,
-                    gt_counts=gt_counts.to(device=device),
-                    answer_node_locals=batch.answer_node_locals.to(device),
-                    answer_node_ptr=answer_node_ptr,
-                    is_answer_reachable=batch.is_answer_reachable.to(device),
-                    rollout_selected_masks=rollout_selected_masks,
-                    rollout_prefix_ratios=rollout_prefix_ratios,
-                    rollout_full_hits=rollout_full_hits,
-                    rollout_answer_hits=rollout_answer_hits,
-                    rollout_lengths=rollout_lengths,
-                )
-            )
+                    hit_any = answer_stack[:k_clamped].any(dim=0)
+                    metrics[f"answer_hit@{k_int}"] = hit_any.float().mean()
         if collect_rollouts and rollout_logs:
             self._buffer_rollout_records(
                 split=split or "test",
@@ -802,8 +775,6 @@ class GFlowNetModule(LightningModule):
                 heads_global=heads_global.detach().cpu(),
                 tails_global=tails_global.detach().cpu(),
                 edge_relations=edge_relations.detach().cpu(),
-                edge_scores=edge_scores.detach().cpu(),
-                edge_labels=edge_labels.detach().cpu(),
                 edge_index=edge_index.detach().cpu(),
                 edge_ptr=edge_ptr.detach().cpu(),
                 node_ptr=node_ptr.detach().cpu(),
@@ -811,30 +782,6 @@ class GFlowNetModule(LightningModule):
                 start_node_locals=batch.start_node_locals.detach().cpu(),
             )
         return loss, metrics
-
-    @staticmethod
-    def _sort_edges_by_graph(batch: Any) -> Any:
-        edge_index = batch.edge_index
-        edge_batch = batch.batch[edge_index[0]]
-        perm = torch.argsort(edge_batch)
-        if perm.numel() == 0:
-            return batch
-        # 重排所有按边对齐的字段，确保同图边连续，edge_ptr 合法。
-        batch.edge_index = edge_index[:, perm]
-        if hasattr(batch, "edge_attr"):
-            batch.edge_attr = batch.edge_attr[perm]
-        if hasattr(batch, "edge_labels"):
-            batch.edge_labels = batch.edge_labels[perm]
-        if hasattr(batch, "top_edge_mask"):
-            batch.top_edge_mask = batch.top_edge_mask[perm]
-        if hasattr(batch, "edge_relations"):
-            batch.edge_relations = batch.edge_relations[perm]
-
-        inv_perm = torch.empty_like(perm)
-        inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
-        if hasattr(batch, "gt_path_edge_local_ids") and batch.gt_path_edge_local_ids.numel() > 0:
-            batch.gt_path_edge_local_ids = inv_perm[batch.gt_path_edge_local_ids]
-        return batch
 
     def _should_log_debug(self, batch_idx: int | None) -> bool:
         if self._debug_batches_to_log <= 0:
@@ -850,160 +797,20 @@ class GFlowNetModule(LightningModule):
             return False
         return self._debug_batches_logged < self._debug_batches_to_log
 
-    def _compute_step0_supervision(
-        self,
-        *,
-        edge_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        edge_batch: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        edge_scores: torch.Tensor,
-        edge_index: torch.Tensor,
-        node_ptr: torch.Tensor,
-        heads_global: torch.Tensor,
-        tails_global: torch.Tensor,
-        start_node_locals: torch.Tensor,
-        gt_path_edge_local_ids: torch.Tensor,
-        gt_path_ptr: torch.Tensor,
-        training: bool,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        device = edge_tokens.device
-        num_graphs = int(edge_ptr.numel() - 1)
-        if num_graphs <= 0:
-            raise ValueError("edge_ptr implies no graphs for step0 supervision.")
-        if gt_path_ptr.numel() != num_graphs + 1:
-            raise ValueError("gt_path_ptr length mismatch with edge_ptr.")
-        if edge_index.size(1) != edge_batch.numel():
-            raise ValueError("edge_index must align with edge_batch for step0 supervision.")
-
-        gt_counts = gt_path_ptr[1:] - gt_path_ptr[:-1]
-        has_gt = gt_counts > 0
-        if not bool(has_gt.any().item()):
-            return torch.zeros((), device=device), None
-
-        gt_edges = gt_path_edge_local_ids.to(device=device, dtype=torch.long)
-        first_idx = gt_path_ptr[:-1][has_gt]
-        gt_first = torch.full((num_graphs,), -1, device=device, dtype=torch.long)
-        gt_first[has_gt] = gt_edges[first_idx]
-        gt_first_sel = gt_first[has_gt]
-        if (gt_first_sel < 0).any() or (gt_first_sel >= edge_batch.numel()).any():
-            raise ValueError("GT step0 edge indices out of batch edge range.")
-
-        num_nodes_total = int(node_ptr[-1].item())
-        if num_nodes_total <= 0:
-            raise ValueError("node_ptr implies empty batch for step0 supervision.")
-        start_nodes = start_node_locals.to(device=device, dtype=torch.long)
-        if start_nodes.numel() == 0:
-            raise ValueError("start_node_locals empty; cannot compute step0 supervision.")
-        if (start_nodes < 0).any() or int(start_nodes.max().item()) >= num_nodes_total:
-            raise ValueError("start_node_locals out of range for step0 supervision.")
-        node_is_start = torch.zeros(num_nodes_total, device=device, dtype=torch.bool)
-        node_is_start[start_nodes] = True
-        edge_starts_mask = node_is_start[edge_index[0]] | node_is_start[edge_index[1]]
-        if edge_starts_mask.numel() != edge_batch.numel():
-            raise ValueError("edge_starts_mask shape mismatch for step0 supervision.")
-
-        valid_counts = torch.bincount(edge_batch[edge_starts_mask], minlength=num_graphs)
-        if bool((valid_counts[has_gt] <= 0).any().item()):
-            raise ValueError("Graphs with GT path have no valid step0 edges.")
-        invalid_gt = ~edge_starts_mask[gt_first_sel]
-        if bool(invalid_gt.any().item()):
-            raise ValueError("GT step0 edge is not in the step0 action mask.")
-
-        selected_mask = torch.zeros_like(edge_batch, dtype=torch.bool, device=device)
-        selection_order = torch.full_like(edge_batch, -1, dtype=torch.long, device=device)
-        edge_residual, stop_residual, _ = self.policy(
-            edge_tokens,
-            question_tokens,
-            edge_batch,
-            selected_mask,
-            selection_order=selection_order,
-            edge_heads=heads_global,
-            edge_tails=tails_global,
-            frontier_mask=edge_starts_mask,
-        )
-        log_edge, _ = self.actor.compute_step0_log_probs(
-            edge_scores=edge_scores,
-            edge_residual=edge_residual,
-            stop_residual=stop_residual,
-            edge_batch=edge_batch,
-            valid_edges=edge_starts_mask,
-            training=training,
-        )
-        logp = log_edge[gt_first[has_gt]]
-        loss = -logp.mean()
-
-        masked_log_edge = log_edge.masked_fill(~edge_starts_mask, float("-inf"))
-        _, edge_argmax = scatter_max(masked_log_edge, edge_batch, dim=0, dim_size=num_graphs)
-        acc = (edge_argmax[has_gt] == gt_first[has_gt]).float().mean()
-        return loss, acc
-
-    def _log_reward_prior_debug(
-        self,
-        *,
-        rollout: Dict[str, torch.Tensor],
-        reward_out: RewardOutput,
-        edge_scores: torch.Tensor,
-        edge_batch: torch.Tensor,
-        log_reward: torch.Tensor,
-        batch_idx: int | None,
-        top_pct: float = 0.1,
-    ) -> None:
-        """粗粒度打印 reward vs retriever score，用于 overfit / 逸出先验的对拍。"""
-        try:
-            sel = rollout["selected_mask"].detach().cpu()
-            scores = edge_scores.detach().cpu()
-            e_batch = edge_batch.detach().cpu()
-            reward = reward_out.reward.detach().cpu()
-            log_r = log_reward.detach().cpu()
-            success = reward_out.success.detach().cpu()
-        except Exception as exc:  # pragma: no cover - debug only
-            debug_logger.error("Failed to collect reward/prior debug tensors (batch_idx=%s): %s", str(batch_idx), exc)
-            return
-
-        num_graphs = int(reward.numel())
-        graphs_to_log = min(num_graphs, self._debug_graphs_to_log)
-        for g in range(graphs_to_log):
-            mask_g = e_batch == g
-            sel_g = sel[mask_g]
-            scores_g = scores[mask_g]
-            if scores_g.numel() == 0:
-                continue
-            sel_any = sel_g.any().item()
-            mean_all = float(scores_g.mean().item())
-            mean_sel = float(scores_g[sel_g].mean().item()) if sel_any else 0.0
-            max_sel = float(scores_g[sel_g].max().item()) if sel_any else 0.0
-            try:
-                # torch.quantile 不可用时回退 numpy
-                q_thr = float(torch.quantile(scores_g, 1.0 - top_pct).item())
-            except Exception:
-                import numpy as np  # lazy import
-
-                q_thr = float(np.quantile(scores_g.numpy(), 1.0 - top_pct))
-            sel_frac_top = (
-                float(((sel_g) & (scores_g >= q_thr)).float().sum().item()) / float(max(sel_g.float().sum().item(), 1.0))
-                if sel_any
-                else 0.0
-            )
-
     def _log_rollout_sanity_debug(
         self,
         *,
         rollout: Dict[str, torch.Tensor],
-        reward_out: RewardOutput,
         log_reward: torch.Tensor,
         log_flow_states: torch.Tensor,
-        edge_batch: torch.Tensor,
         edge_ptr: torch.Tensor,
-        path_mask: Optional[torch.Tensor],
-        gt_path_edge_local_ids: Optional[torch.Tensor],
-        gt_path_ptr: Optional[torch.Tensor],
         batch_idx: int | None,
     ) -> None:
         """打印 SubTB 关键量的确定性一致性检查（可直接粘贴日志定位问题）。"""
         try:
             log_pf_steps = rollout["log_pf_steps"].detach()
             log_pf = rollout["log_pf"].detach()
+            actions_seq = rollout["actions_seq"].detach()
             length = rollout["length"].detach().long()
             success = rollout["reach_success"].detach().float()
         except Exception as exc:  # pragma: no cover - debug only
@@ -1020,15 +827,8 @@ class GFlowNetModule(LightningModule):
                     float(length.float().mean().item()),
                     float(success.mean().item()),
                 )
-                if "policy_shift_rate" in rollout and "policy_residual_l1" in rollout:
-                    debug_logger.info(
-                        "[POLICY_STATS] batch_idx=%s shift_rate=%.6g residual_l1=%.6g",
-                        str(batch_idx),
-                        float(rollout["policy_shift_rate"].detach().item()),
-                        float(rollout["policy_residual_l1"].detach().item()),
-                    )
                 stop_idx = edge_ptr[1:].view(-1, 1)  # [B,1] for broadcast with actions[B,T]
-                stop_counts = (rollout["actions"] == stop_idx).sum(dim=1).float()
+                stop_counts = (actions_seq == stop_idx).sum(dim=1).float()
                 debug_logger.info(
                     "[ROLL_DISTR] batch_idx=%s len(min/med/max)=%.1f/%.1f/%.1f stop_cnt(min/med/max)=%.1f/%.1f/%.1f",
                     str(batch_idx),
@@ -1067,192 +867,6 @@ class GFlowNetModule(LightningModule):
                 float(tb_residual.max().item()),
             )
 
-            # 3) Reward 定义与 rollout 前缀匹配的自洽性检查（仅路径奖励）
-            if isinstance(self.reward_fn, GTPathAlignedReward):
-                reward_prefix = reward_out.path_prefix_ratio.detach()
-                if (
-                    gt_path_edge_local_ids is not None
-                    and gt_path_ptr is not None
-                    and reward_prefix.numel() == num_graphs
-                    and gt_path_ptr.numel() == num_graphs + 1
-                ):
-                    gt_ptr = gt_path_ptr.to(device=log_pf_steps.device)
-                    gt_edges = gt_path_edge_local_ids.to(device=log_pf_steps.device, dtype=torch.long)
-                    gt_counts = gt_ptr[1:] - gt_ptr[:-1]
-                    max_gt = int(gt_counts.max().item()) if gt_counts.numel() > 0 else 0
-                    if max_gt > 0:
-                        gt_path = torch.full((num_graphs, max_gt), -1, dtype=torch.long, device=log_pf_steps.device)
-                        if gt_edges.numel() > 0:
-                            gt_batch = torch.repeat_interleave(torch.arange(num_graphs, device=log_pf_steps.device), gt_counts)
-                            gt_pos = torch.arange(gt_edges.numel(), device=log_pf_steps.device) - gt_ptr[gt_batch]
-                            edge_start = edge_ptr[:-1].to(device=log_pf_steps.device)
-                            edge_end = edge_ptr[1:].to(device=log_pf_steps.device)
-                            in_range = (gt_edges >= edge_start[gt_batch]) & (gt_edges < edge_end[gt_batch])
-                            if not bool(in_range.all().item()):
-                                bad = torch.nonzero(~in_range, as_tuple=False).view(-1)
-                                preview = bad[:5].detach().cpu().tolist()
-                                raise ValueError(
-                                    "gt_path_edge_local_ids must be batch-global edge indices; "
-                                    f"found out-of-range entries at positions={preview}."
-                                )
-                            local_edges = gt_edges - edge_start[gt_batch]
-                            gt_path[gt_batch, gt_pos] = local_edges
-                    else:
-                        gt_path = torch.empty(num_graphs, 0, dtype=torch.long, device=log_pf_steps.device)
-
-                    actions = rollout["actions_seq"].to(device=log_pf_steps.device, dtype=torch.long)
-                    stop_idx = edge_ptr[1:].view(-1, 1).to(device=log_pf_steps.device)
-                    is_stop = actions == stop_idx
-                    actions_local = actions - edge_ptr[:-1].view(-1, 1).to(device=log_pf_steps.device)
-                    actions_local = torch.where(is_stop, torch.full_like(actions_local, -1), actions_local)
-
-                    max_compare = min(actions_local.size(1), gt_path.size(1))
-                    if max_compare > 0:
-                        actions_cmp = actions_local[:, :max_compare]
-                        gt_cmp = gt_path[:, :max_compare]
-                        valid = gt_cmp >= 0
-                        match = (actions_cmp == gt_cmp) & valid & (actions_cmp >= 0)
-                        prefix_mask = match.float().cumprod(dim=1)
-                        prefix_len = prefix_mask.sum(dim=1)
-                    else:
-                        prefix_len = torch.zeros(num_graphs, device=log_pf_steps.device, dtype=torch.float32)
-
-                    prefix_ratio = torch.zeros_like(prefix_len)
-                    has_gt = gt_counts > 0
-                    if has_gt.any():
-                        prefix_ratio[has_gt] = prefix_len[has_gt] / gt_counts[has_gt].to(prefix_len.dtype).clamp(min=1.0)
-                    diff = (prefix_ratio - reward_prefix.to(dtype=prefix_ratio.dtype)).abs()
-                    debug_logger.info(
-                        "[PREFIX_ALIGN] batch_idx=%s max_abs_diff=%.6g",
-                        str(batch_idx),
-                        float(diff.max().item()),
-                    )
-                return
-
-            # 3) Reward 内部的 Top-K recall 与 path_mask 计算是否一致（非路径奖励）
-            reward_recall = reward_out.answer_reach_frac.detach()
-            if (
-                path_mask is not None
-                and path_mask.numel() == rollout["selection_order"].numel()
-                and reward_recall.numel() == num_graphs
-            ):
-                k = max(self._path_hit_k) if self._path_hit_k else 5
-                sel_order = rollout["selection_order"]
-                topk_mask = (sel_order >= 0) & (sel_order < int(k))
-                hit_topk = path_mask.bool() & topk_mask
-                hits = torch.bincount(edge_batch, weights=hit_topk.float(), minlength=num_graphs)
-                gt_counts = torch.bincount(edge_batch, weights=path_mask.bool().float(), minlength=num_graphs)
-                recall = torch.zeros(num_graphs, device=log_pf_steps.device, dtype=torch.float32)
-                has_gt = gt_counts > 0
-                recall[has_gt] = hits[has_gt] / gt_counts[has_gt].clamp(min=1.0)
-                diff = (recall - reward_recall.to(dtype=recall.dtype)).abs()
-                debug_logger.info(
-                    "[REWARD_ALIGN] batch_idx=%s k=%d max_abs_diff=%.6g",
-                    str(batch_idx),
-                    int(k),
-                    float(diff.max().item()),
-                )
-
-    def _log_gt_path_feasibility_debug(self, *, batch: Any, embed: Any, device: torch.device, batch_idx: int | None) -> None:
-        """验证 GT 路径是否在 GraphEnv 约束下可执行；不可执行则训练目标本身不成立。"""
-        try:
-            node_ptr = embed.node_ptr.to(device)
-            edge_ptr = embed.edge_ptr.to(device)
-            edge_batch = embed.edge_batch.to(device)
-            edge_index = embed.edge_index.to(device)
-            heads_global = embed.heads_global.to(device)
-            tails_global = embed.tails_global.to(device)
-            edge_labels = embed.edge_labels.to(device)
-
-            graph_dict: Dict[str, torch.Tensor] = {
-                "edge_index": edge_index,
-                "edge_batch": edge_batch,
-                "node_global_ids": batch.node_global_ids.to(device),
-                "heads_global": heads_global,
-                "tails_global": tails_global,
-                "node_ptr": node_ptr,
-                "edge_ptr": edge_ptr,
-                "start_node_locals": batch.start_node_locals.to(device),
-                "start_ptr": batch._slice_dict["start_node_locals"].to(device),
-                "start_entity_ids": batch.start_entity_ids.to(device),
-                "start_entity_ptr": batch._slice_dict["start_entity_ids"].to(device),
-                "answer_node_locals": batch.answer_node_locals.to(device),
-                "answer_ptr": batch._slice_dict["answer_entity_ids"].to(device),
-                "answer_entity_ids": batch.answer_entity_ids.to(device),
-                "edge_relations": batch.edge_attr.to(device),
-                "edge_labels": edge_labels,
-                "is_answer_reachable": batch.is_answer_reachable.to(device),
-            }
-
-            gt_edges_all = batch.gt_path_edge_local_ids.to(device)
-            gt_ptr = batch._slice_dict["gt_path_edge_local_ids"].to(device)
-        except Exception as exc:  # pragma: no cover - debug only
-            debug_logger.error("Failed to collect GT feasibility tensors (batch_idx=%s): %s", str(batch_idx), exc)
-            return
-
-        num_graphs = int(node_ptr.numel() - 1)
-        graphs_to_check = min(num_graphs, self._debug_graphs_to_log)
-        if graphs_to_check <= 0:
-            return
-        if gt_ptr.numel() != num_graphs + 1:
-            debug_logger.error(
-                "[GT_FEASIBILITY] batch_idx=%s gt_ptr has wrong shape: %s (expected B+1=%d)",
-                str(batch_idx),
-                tuple(gt_ptr.shape),
-                num_graphs + 1,
-            )
-            return
-
-        # NOTE: gt_path_edge_local_ids 已保序；验证 GT 路径在环境约束下是否可执行。
-        stop_indices = edge_ptr[1:].to(device=device)
-
-        for g in range(graphs_to_check):
-            es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
-            ns, ne = int(node_ptr[g].item()), int(node_ptr[g + 1].item())
-            if ne <= ns or ee <= es:
-                continue
-
-            gt_s, gt_e = int(gt_ptr[g].item()), int(gt_ptr[g + 1].item())
-            gt_edges = gt_edges_all[gt_s:gt_e]
-            if gt_edges.numel() == 0:
-                continue
-
-            # 按 GT 顺序逐步检查可行性（step0/前缀/全路径）
-            state = self.env.reset(graph_dict, device=device)
-            actions = stop_indices.clone()
-            prefix_ok = 0
-            for step_idx, edge_id in enumerate(gt_edges.tolist()):
-                if edge_id < es or edge_id >= ee:
-                    debug_logger.error(
-                        "[GT_FEASIBILITY] batch_idx=%s graph=%d edge_id=%d out_of_range=[%d,%d)",
-                        str(batch_idx),
-                        g,
-                        int(edge_id),
-                        es,
-                        ee,
-                    )
-                    break
-                action_mask = self.env.action_mask_edges(state)
-                if not bool(action_mask[edge_id].item()):
-                    break
-                actions[:] = stop_indices
-                actions[g] = int(edge_id)
-                state = self.env.step(state, actions, step_index=step_idx)
-                prefix_ok += 1
-
-            full_ok = prefix_ok == int(gt_edges.numel())
-            step0_ok = prefix_ok >= 1
-            debug_logger.info(
-                "[GT_FEASIBILITY] batch_idx=%s graph=%d gt_edges=%d step0_ok=%s prefix_len=%d full_ok=%s answer_hit=%s",
-                str(batch_idx),
-                g,
-                int(gt_edges.numel()),
-                str(bool(step0_ok)),
-                int(prefix_ok),
-                str(bool(full_ok)),
-                str(bool(state.answer_hits[g].item())),
-            )
-
     def _log_batch_debug(self, *, batch: Any, embed, batch_idx: int | None) -> None:
         try:
             node_ptr = batch.ptr.detach().cpu()
@@ -1262,12 +876,8 @@ class GFlowNetModule(LightningModule):
             node_global_ids = batch.node_global_ids.detach().cpu()
             start_node_locals = batch.start_node_locals.detach().cpu()
             answer_node_locals = batch.answer_node_locals.detach().cpu()
-            gt_edges = batch.gt_path_edge_local_ids.detach().cpu()
             start_ptr = batch._slice_dict.get("start_node_locals")
             answer_ptr = batch._slice_dict.get("answer_node_locals")
-            start_entity_ptr = batch._slice_dict.get("start_entity_ids")
-            answer_entity_ptr = batch._slice_dict.get("answer_entity_ids")
-            path_ptr = batch._slice_dict.get("gt_path_edge_local_ids")
         except Exception as exc:  # pragma: no cover - defensive
             debug_logger.error("Failed to collect debug tensors (batch_idx=%s): %s", str(batch_idx), exc)
             return
@@ -1294,26 +904,19 @@ class GFlowNetModule(LightningModule):
             answer_slice = (
                 slice(int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())) if answer_ptr is not None else slice(0, 0)
             )
-            path_slice = slice(int(path_ptr[g].item()), int(path_ptr[g + 1].item())) if path_ptr is not None else slice(0, 0)
 
             start_nodes = start_node_locals[start_slice]
             answer_nodes = answer_node_locals[answer_slice]
-            path_edges = gt_edges[path_slice]
 
             start_oob = start_nodes.numel() > 0 and ((start_nodes < ns) | (start_nodes >= ne)).any().item()
             answer_oob = answer_nodes.numel() > 0 and ((answer_nodes < ns) | (answer_nodes >= ne)).any().item()
-            path_oob = path_edges.numel() > 0 and ((path_edges < es) | (path_edges >= ee)).any().item()
 
             edge_batch_slice = edge_batch[es:ee]
             edge_batch_mismatch = bool(edge_batch_slice.numel() > 0 and torch.unique(edge_batch_slice).numel() != 1)
             node_dup = max(int(nodes.numel() - torch.unique(nodes).numel()), 0)
 
-            start_entities = (
-                int(start_entity_ptr[g + 1].item() - start_entity_ptr[g].item()) if start_entity_ptr is not None else 0
-            )
-            answer_entities = (
-                int(answer_entity_ptr[g + 1].item() - answer_entity_ptr[g].item()) if answer_entity_ptr is not None else 0
-            )
+            start_count = int(start_nodes.numel())
+            answer_count = int(answer_nodes.numel())
 
             summary: Dict[str, Any] = {
                 "graph": g,
@@ -1322,19 +925,16 @@ class GFlowNetModule(LightningModule):
                 "node_dup": node_dup,
                 "edge_batch_ok": not edge_batch_mismatch,
                 "start_locals": (start_nodes - ns).tolist(),
-                "start_entities": start_entities,
+                "start_count": start_count,
                 "answer_locals": (answer_nodes - ns).tolist(),
-                "answer_entities": answer_entities,
-                "path_edges_local": (path_edges - es).tolist(),
+                "answer_count": answer_count,
                 "flags": {
                     "start_oob": bool(start_oob),
                     "answer_oob": bool(answer_oob),
-                    "path_oob": bool(path_oob),
                 },
             }
             debug_logger.info("[GRAPH_DEBUG] %s", summary)
 
-    @staticmethod
     @staticmethod
     def _aggregate_metrics(metrics_list: list[Dict[str, torch.Tensor]], *, best_of: bool = False) -> Dict[str, torch.Tensor]:
         """Aggregate metrics across eval rollouts.
@@ -1360,106 +960,8 @@ class GFlowNetModule(LightningModule):
                 aggregated[key] = stack.mean(dim=0)
         return aggregated
 
-    def _compute_rollout_eval_metrics(
-        self,
-        *,
-        path_exists: Optional[torch.Tensor],
-        path_mask: Optional[torch.Tensor],
-        edge_batch: torch.Tensor,
-        edge_index: torch.Tensor,
-        node_ptr: torch.Tensor,
-        gt_counts: torch.Tensor,
-        answer_node_locals: torch.Tensor,
-        answer_node_ptr: torch.Tensor,
-        is_answer_reachable: torch.Tensor,
-        rollout_selected_masks: list[torch.Tensor],
-        rollout_prefix_ratios: list[torch.Tensor],
-        rollout_full_hits: list[torch.Tensor],
-        rollout_answer_hits: list[torch.Tensor],
-        rollout_lengths: list[torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        if not rollout_selected_masks:
-            return {}
-        device = rollout_selected_masks[0].device
-        num_graphs = int(node_ptr.numel() - 1)
-        if num_graphs <= 0:
-            return {}
-
-        path_valid = (
-            path_exists.bool()
-            if isinstance(path_exists, torch.Tensor)
-            else (gt_counts.to(device=device) > 0)
-        )
-        answer_counts = answer_node_ptr[1:] - answer_node_ptr[:-1]
-        answer_valid = (
-            is_answer_reachable.view(-1).bool()
-            if isinstance(is_answer_reachable, torch.Tensor) and is_answer_reachable.numel() == num_graphs
-            else (answer_counts > 0)
-        )
-
-        def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-            if not mask.any():
-                return torch.tensor(0.0, device=device)
-            return (value * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
-
-        rollout_count = len(rollout_selected_masks)
-        selected_stack = torch.stack(rollout_selected_masks, dim=0).bool()
-        prefix_stack = torch.stack(rollout_prefix_ratios, dim=0)
-        full_stack = torch.stack(rollout_full_hits, dim=0).bool()
-        answer_stack = torch.stack(rollout_answer_hits, dim=0).bool()
-        length_stack = torch.stack(rollout_lengths, dim=0)
-        gt_len = gt_counts.to(device=device, dtype=length_stack.dtype)
-
-        k_values = [int(k) for k in self._eval_rollout_prefixes] if self._eval_rollout_prefixes else [rollout_count]
-        metrics: Dict[str, torch.Tensor] = {}
-        for k_int in k_values:
-            k_clamped = min(max(k_int, 1), rollout_count)
-            prefix_best = prefix_stack[:k_clamped].max(dim=0).values
-            metrics[f"path_prefix@{k_int}"] = _masked_mean(prefix_best, path_valid)
-
-            exact_any = full_stack[:k_clamped].any(dim=0)
-            metrics[f"path_exact@{k_int}"] = _masked_mean(exact_any.float(), path_valid)
-
-            len_err = (length_stack[:k_clamped] - gt_len).abs()
-            min_err = len_err.min(dim=0).values
-            metrics[f"path_len_err@{k_int}"] = _masked_mean(min_err, path_valid)
-
-            answer_any = answer_stack[:k_clamped].any(dim=0)
-            metrics[f"answer_hit@{k_int}"] = _masked_mean(answer_any.float(), answer_valid)
-
-            union_mask = selected_stack[:k_clamped].any(dim=0)
-            if path_mask is not None and path_mask.numel() == edge_batch.numel():
-                path_mask_bool = path_mask.bool()
-                hit_mask = union_mask & path_mask_bool
-                hits = torch.bincount(edge_batch, weights=hit_mask.float(), minlength=num_graphs)
-                selected = torch.bincount(edge_batch, weights=union_mask.float(), minlength=num_graphs)
-                precision = torch.zeros(num_graphs, device=device, dtype=hits.dtype)
-                mask_sel = selected > 0
-                precision[mask_sel] = hits[mask_sel] / selected[mask_sel].clamp(min=1.0)
-                recall = torch.zeros_like(precision)
-                mask_gt = gt_counts > 0
-                recall[mask_gt] = hits[mask_gt] / gt_counts[mask_gt].to(dtype=hits.dtype).clamp(min=1.0)
-                metrics[f"path_edge_precision@{k_int}"] = _masked_mean(precision, path_valid & mask_sel)
-                metrics[f"path_edge_recall@{k_int}"] = _masked_mean(recall, path_valid)
-
-            if answer_node_locals.numel() > 0 and answer_counts.numel() == num_graphs:
-                total_nodes = int(node_ptr[-1].item())
-                visited = torch.zeros(total_nodes, device=device, dtype=torch.bool)
-                if union_mask.any():
-                    visited[edge_index[0, union_mask]] = True
-                    visited[edge_index[1, union_mask]] = True
-                answer_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), answer_counts)
-                hit_answers = visited[answer_node_locals.to(device=device, dtype=torch.long)]
-                hits = torch.bincount(answer_batch, weights=hit_answers.float(), minlength=num_graphs)
-                recall = torch.zeros(num_graphs, device=device, dtype=hits.dtype)
-                valid_answers = answer_counts > 0
-                recall[valid_answers] = hits[valid_answers] / answer_counts[valid_answers].to(dtype=hits.dtype).clamp(min=1.0)
-                metrics[f"answer_recall@{k_int}"] = _masked_mean(recall, answer_valid)
-
-        return metrics
-
     def _refresh_eval_settings(self) -> None:
-        """Ensure eval rollouts and path_hit_k reflect current config (even when loading old checkpoints)."""
+        """Ensure eval rollouts reflect current config (even when loading old checkpoints)."""
         eval_cfg = self.evaluation_cfg or {}
         rollouts_cfg = self._cfg_get(eval_cfg, "num_eval_rollouts", self._eval_rollouts if hasattr(self, "_eval_rollouts") else 1)
         if isinstance(rollouts_cfg, (list, tuple, ListConfig)):
@@ -1469,7 +971,12 @@ class GFlowNetModule(LightningModule):
         else:
             self._eval_rollouts = int(max(1, self._cfg_get_int(eval_cfg, "num_eval_rollouts", 1)))
             self._eval_rollout_prefixes = [self._eval_rollouts]
-        self._path_hit_k = self._parse_int_list(self._cfg_get(eval_cfg, "path_hit_k", getattr(self, "_path_hit_k", [5])))
+        eval_temp_cfg = self._cfg_get_float(eval_cfg, "rollout_temperature", self._eval_rollout_temperature)
+        if eval_temp_cfg is None:
+            raise ValueError("evaluation_cfg.rollout_temperature must be set explicitly (no implicit eval temperature).")
+        if eval_temp_cfg < 0.0:
+            raise ValueError(f"evaluation_cfg.rollout_temperature must be >= 0, got {eval_temp_cfg}.")
+        self._eval_rollout_temperature = float(eval_temp_cfg)
 
     def _should_persist(self, split: Optional[str]) -> bool:
         cfg = getattr(self, "eval_persist_cfg", None) or {}
@@ -1522,8 +1029,6 @@ class GFlowNetModule(LightningModule):
         heads_global: torch.Tensor,
         tails_global: torch.Tensor,
         edge_relations: torch.Tensor,
-        edge_scores: torch.Tensor,
-        edge_labels: torch.Tensor,
         edge_index: torch.Tensor,
         edge_ptr: torch.Tensor,
         node_ptr: torch.Tensor,
@@ -1594,8 +1099,6 @@ class GFlowNetModule(LightningModule):
                             "head_entity_id": h_gid,
                             "relation_id": int(edge_relations[edge_idx].item()),
                             "tail_entity_id": t_gid,
-                            "edge_score": float(edge_scores[edge_idx].item()),
-                            "edge_label": float(edge_labels[edge_idx].item()),
                             "edge_local_index": int(edge_idx - es),
                             "src_entity_id": src_global,
                             "dst_entity_id": dst_global,
@@ -1605,7 +1108,6 @@ class GFlowNetModule(LightningModule):
                 rollouts.append(
                     {
                         "rollout_index": ridx,
-                        "success": bool(self._value_at(log["reach_success"], g).item()),
                         "log_pf": float(self._value_at(log["log_pf"], g).item()),
                         "log_reward": float(self._value_at(log["log_reward"], g).item()),
                         "edges": edges,
@@ -1660,7 +1162,6 @@ class GFlowNetModule(LightningModule):
             "settings": {
                 "split": split,
                 "num_eval_rollouts": k_values,
-                "path_hit_k": [int(k) for k in getattr(self, "_path_hit_k", [])],
             },
             "samples": merged,
         }
@@ -1733,6 +1234,204 @@ class GFlowNetModule(LightningModule):
         return log_flow_states
 
     @staticmethod
+    def _sample_gt_actions_from_dag(
+        *,
+        edge_index: torch.Tensor,
+        edge_labels: torch.Tensor,
+        edge_ptr: torch.Tensor,
+        node_ptr: torch.Tensor,
+        start_node_locals: torch.Tensor,
+        start_ptr: torch.Tensor,
+        answer_node_locals: torch.Tensor,
+        answer_ptr: torch.Tensor,
+        max_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = edge_index.device
+        num_graphs = int(node_ptr.numel() - 1)
+        num_steps = int(max_steps) + 1
+        if num_graphs <= 0:
+            empty_actions = torch.empty((0, num_steps), dtype=torch.long, device=device)
+            empty_lens = torch.empty((0,), dtype=torch.long, device=device)
+            empty_mask = torch.empty((0,), dtype=torch.bool, device=device)
+            return empty_actions, empty_lens, empty_mask
+
+        edge_index_cpu = edge_index.detach().cpu()
+        edge_labels_cpu = edge_labels.detach().cpu().view(-1)
+        edge_ptr_cpu = edge_ptr.detach().cpu().view(-1)
+        node_ptr_cpu = node_ptr.detach().cpu().view(-1)
+        start_node_locals_cpu = start_node_locals.detach().cpu().view(-1)
+        start_ptr_cpu = start_ptr.detach().cpu().view(-1)
+        answer_node_locals_cpu = answer_node_locals.detach().cpu().view(-1)
+        answer_ptr_cpu = answer_ptr.detach().cpu().view(-1)
+
+        actions_buf: list[list[int]] = []
+        lens_buf: list[int] = []
+        usable_buf: list[bool] = []
+
+        from collections import deque
+
+        for g in range(num_graphs):
+            stop_idx = int(edge_ptr_cpu[g + 1].item())
+            actions = [stop_idx] * num_steps
+            lens = 0
+            usable = False
+
+            e0 = int(edge_ptr_cpu[g].item())
+            e1 = int(edge_ptr_cpu[g + 1].item())
+            n0 = int(node_ptr_cpu[g].item())
+            n1 = int(node_ptr_cpu[g + 1].item())
+            if e1 <= e0 or n1 <= n0:
+                actions_buf.append(actions)
+                lens_buf.append(lens)
+                usable_buf.append(usable)
+                continue
+
+            pos_mask = edge_labels_cpu[e0:e1] > 0.5
+            if not bool(pos_mask.any()):
+                actions_buf.append(actions)
+                lens_buf.append(lens)
+                usable_buf.append(usable)
+                continue
+
+            num_nodes = n1 - n0
+            heads = (edge_index_cpu[0, e0:e1] - n0).tolist()
+            tails = (edge_index_cpu[1, e0:e1] - n0).tolist()
+            pos_mask_list = pos_mask.tolist()
+
+            s0 = int(start_ptr_cpu[g].item())
+            s1 = int(start_ptr_cpu[g + 1].item())
+            starts = [
+                int(x) - n0
+                for x in start_node_locals_cpu[s0:s1].tolist()
+                if 0 <= int(x) - n0 < num_nodes
+            ]
+            a0 = int(answer_ptr_cpu[g].item())
+            a1 = int(answer_ptr_cpu[g + 1].item())
+            answers = [
+                int(x) - n0
+                for x in answer_node_locals_cpu[a0:a1].tolist()
+                if 0 <= int(x) - n0 < num_nodes
+            ]
+            if not starts or not answers:
+                actions_buf.append(actions)
+                lens_buf.append(lens)
+                usable_buf.append(usable)
+                continue
+
+            adj_fwd: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+            adj_rev: list[list[int]] = [[] for _ in range(num_nodes)]
+            for local_eid, keep in enumerate(pos_mask_list):
+                if not keep:
+                    continue
+                h = heads[local_eid]
+                t = tails[local_eid]
+                if h < 0 or t < 0 or h >= num_nodes or t >= num_nodes:
+                    continue
+                global_eid = e0 + local_eid
+                adj_fwd[h].append((t, global_eid))
+                adj_rev[t].append(h)
+            for nbrs in adj_fwd:
+                nbrs.sort(key=lambda item: (item[0], item[1]))
+            for nbrs in adj_rev:
+                nbrs.sort()
+
+            def bfs_dist(neighbors: list[list[int]], src_nodes: list[int]) -> list[int]:
+                dist = [-1] * num_nodes
+                q: deque[int] = deque()
+                for s in src_nodes:
+                    if 0 <= s < num_nodes and dist[s] < 0:
+                        dist[s] = 0
+                        q.append(s)
+                while q:
+                    u = q.popleft()
+                    du = dist[u] + 1
+                    for v in neighbors[u]:
+                        if dist[v] >= 0:
+                            continue
+                        dist[v] = du
+                        q.append(v)
+                return dist
+
+            adj_fwd_neighbors = [[nb for nb, _ in nbrs] for nbrs in adj_fwd]
+            dist_start = bfs_dist(adj_fwd_neighbors, starts)
+            reachable_answers = [a for a in answers if dist_start[a] >= 0]
+            if not reachable_answers:
+                actions_buf.append(actions)
+                lens_buf.append(lens)
+                usable_buf.append(usable)
+                continue
+
+            start_set = set(starts)
+            perm = torch.randperm(len(reachable_answers)).tolist()
+            for idx in perm:
+                target = reachable_answers[idx]
+                dist_to_t = bfs_dist(adj_rev, [target])
+                if dist_to_t[target] != 0:
+                    continue
+                candidates: list[tuple[int, int, int]] = []
+                for local_eid, keep in enumerate(pos_mask_list):
+                    if not keep:
+                        continue
+                    h = heads[local_eid]
+                    t = tails[local_eid]
+                    if h not in start_set:
+                        continue
+                    src = h
+                    dst = t
+                    if dst in start_set:
+                        continue
+                    if dist_to_t[src] <= 0 or dist_to_t[dst] < 0:
+                        continue
+                    if dist_to_t[src] > max_steps:
+                        continue
+                    if dist_to_t[dst] != dist_to_t[src] - 1:
+                        continue
+                    candidates.append((src, dst, e0 + local_eid))
+                if not candidates:
+                    continue
+
+                first_idx = int(torch.randint(len(candidates), (1,)).item())
+                _, cur, first_edge = candidates[first_idx]
+                path_edges = [int(first_edge)]
+                steps = 1
+                visited = set(start_set)
+                visited.add(cur)
+                while cur != target:
+                    if steps >= max_steps:
+                        path_edges = []
+                        break
+                    options = [
+                        (nb, eid)
+                        for nb, eid in adj_fwd[cur]
+                        if dist_to_t[nb] == dist_to_t[cur] - 1 and nb not in visited
+                    ]
+                    if not options:
+                        path_edges = []
+                        break
+                    opt_idx = int(torch.randint(len(options), (1,)).item())
+                    cur, eid = options[opt_idx]
+                    visited.add(cur)
+                    path_edges.append(int(eid))
+                    steps += 1
+                if path_edges and cur == target and len(path_edges) <= max_steps:
+                    for step_idx, eid in enumerate(path_edges):
+                        if step_idx >= max_steps:
+                            break
+                        actions[step_idx] = int(eid)
+                    lens = len(path_edges)
+                    usable = lens > 0
+                    break
+
+            actions_buf.append(actions)
+            lens_buf.append(lens)
+            usable_buf.append(usable)
+
+        gt_actions = torch.tensor(actions_buf, dtype=torch.long, device=device)
+        gt_lens = torch.tensor(lens_buf, dtype=torch.long, device=device)
+        usable_mask = torch.tensor(usable_buf, dtype=torch.bool, device=device)
+        return gt_actions, gt_lens, usable_mask
+
+    @staticmethod
     def _compute_deterministic_log_pb_steps(
         *,
         actions_seq: torch.Tensor,  # [B, T_action]
@@ -1754,9 +1453,15 @@ class GFlowNetModule(LightningModule):
         log_pf_steps: torch.Tensor,  # [B, T_action]
         log_pb_steps: torch.Tensor,  # [B, T_action]
         edge_lengths: torch.Tensor,  # [B] number of selected edges
-        return_per_graph: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Sub-Trajectory Balance with λ=1 (uniform weights over all sub-trajectories)."""
+        graph_mask: torch.Tensor | None = None,  # [B] optional bool mask for averaging
+        penalty: str = "l2",
+    ) -> torch.Tensor:
+        """Sub-Trajectory Balance with λ=1 (uniform weights over all sub-trajectories).
+
+        `penalty` controls the element-wise residual penalty:
+          - "l2": residual^2 (default, classic SubTB)
+          - "log1p_l2": log(1 + residual^2) (robust, reduces rare explosion without extra hyperparams)
+        """
         device = log_pf_steps.device
         num_graphs, num_actions = log_pf_steps.shape
         if debug_logger.isEnabledFor(logging.INFO) and not self._subtb_shapes_logged:
@@ -1795,20 +1500,24 @@ class GFlowNetModule(LightningModule):
         term_state = term_state.view(num_graphs, 1, 1)
         valid = (i_idx < j_idx) & (i_idx <= term_state) & (j_idx <= term_state)
         valid_f = valid.to(dtype=residual.dtype)
-        sq = residual.pow(2) * valid_f
+        penalty_key = str(penalty).strip().lower()
+        if penalty_key in {"l2", "mse"}:
+            elem = residual.pow(2)
+        elif penalty_key in {"log1p_l2", "log1p"}:
+            elem = torch.log1p(residual.pow(2))
+        else:
+            raise ValueError(f"Unsupported SubTB penalty={penalty!r}. Use 'l2' or 'log1p_l2'.")
+        sq = elem * valid_f
         denom = valid_f.sum(dim=(1, 2)).clamp(min=1.0)
         per_graph = sq.sum(dim=(1, 2)) / denom
-        mean_loss = per_graph.mean()
-        if return_per_graph:
-            return mean_loss, per_graph
-        return mean_loss
-
-    @staticmethod
-    def _mask_subtb_loss_by_path_exists(*, subtb_per_graph: torch.Tensor, path_exists: torch.Tensor) -> torch.Tensor:
-        valid_graphs_for_loss = path_exists.bool()
-        if valid_graphs_for_loss.any():
-            return subtb_per_graph[valid_graphs_for_loss].mean()
-        return torch.zeros((), device=subtb_per_graph.device, dtype=subtb_per_graph.dtype)
+        if graph_mask is not None:
+            graph_mask = graph_mask.to(device=device, dtype=torch.bool).view(-1)
+            if graph_mask.numel() != num_graphs:
+                raise ValueError(f"graph_mask length {graph_mask.numel()} != num_graphs {num_graphs}")
+            weights = graph_mask.to(dtype=per_graph.dtype)
+            denom_g = weights.sum().clamp(min=1.0)
+            return (per_graph * weights).sum() / denom_g
+        return per_graph.mean()
 
     def _assert_finite(self, tensor: torch.Tensor, name: str) -> None:
         if not torch.isfinite(tensor).all():
@@ -1898,7 +1607,6 @@ class _EvalPersistProcessor:
                             "head_text": e.get("head_text"),
                             "relation_text": e.get("relation_text"),
                             "tail_text": e.get("tail_text"),
-                            "edge_score": e.get("edge_score"),
                             # 保留实际行走方向，便于文本化时使用 src->dst 而非图定义的 head->tail
                             "src_entity_id": e.get("src_entity_id"),
                             "dst_entity_id": e.get("dst_entity_id"),

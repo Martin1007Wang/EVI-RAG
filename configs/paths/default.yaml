@@ -1,5 +1,7 @@
-# path to root directory (defaults to the directory where the entry script was launched)
-root_dir: ${hydra:runtime.cwd}
+# path to root directory.
+# Prefer PROJECT_ROOT exported by rootutils (entrypoints call rootutils.setup_root before Hydra composes configs).
+# Fall back to PWD for compose-only contexts (e.g., pytest that loads configs without running entrypoints).
+root_dir: ${oc.env:PROJECT_ROOT,${oc.env:PWD}}
 
 # path to data directory (absolute to avoid ambiguity)
 data_dir: /mnt/data/retrieval_dataset

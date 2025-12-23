@@ -27,9 +27,11 @@ class UnifiedDataLoader(DataLoader):
         shuffle: bool = True,
         num_workers: int = 0,
         random_seed: Optional[int] = None,
+        build_reverse_edge_index: bool = True,
         **kwargs: Any,
     ) -> None:
         self.random_seed = random_seed
+        self.build_reverse_edge_index = bool(build_reverse_edge_index)
 
         worker_init_fn: Optional[Callable[[int], None]] = kwargs.pop("worker_init_fn", None)
         if random_seed is not None:
@@ -76,7 +78,7 @@ class UnifiedDataLoader(DataLoader):
             node_embedding_ids = torch.as_tensor(batch.node_embedding_ids, dtype=torch.long, device="cpu")
             relation_ids = torch.as_tensor(batch.edge_attr, dtype=torch.long, device="cpu")
 
-            if hasattr(batch, "edge_index") and batch.edge_index is not None:
+            if self.build_reverse_edge_index and hasattr(batch, "edge_index") and batch.edge_index is not None:
                 batch.reverse_edge_index = batch.edge_index.flip(0)
 
             batch.node_embeddings = self.global_embeddings.get_entity_embeddings(node_embedding_ids)

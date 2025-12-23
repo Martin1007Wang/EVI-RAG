@@ -5,7 +5,13 @@ out_dir: ${paths.data_dir}/KGQAGen-10k/normalized
 materialized_dir: ${paths.data_dir}/KGQAGen-10k/materialized
 # graph/seed/answers混用 label+Qid，需要归一化到 Qid
 entity_normalization: qid_in_parentheses
-undirected_traversal: true
+undirected_traversal: false
+num_topics: 2
+topic_pe:
+  enabled: true
+  precompute: true
+  num_rounds: 2
+  num_reverse_rounds: 2
 column_map:
   question_id_field: id
   question_field: question

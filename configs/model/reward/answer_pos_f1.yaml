@@ -1,0 +1,16 @@
+_target_: src.models.components.gflownet_rewards.AnswerAndPositiveEdgeF1Reward
+
+# Base sparse reward (must be positive; used in log-domain).
+success_reward: 1.0
+
+# Failure scale (log-domain):
+#   log R_failure = -log|V_g| - L * log K_eff + log_failure_bias
+#   K_eff = min(action_topk, avg_out_degree) per graph.
+failure_action_topk: ${model.actor_cfg.action_topk}
+failure_path_length: ${model.env_cfg.max_steps}
+log_failure_bias: 0.0
+
+# Dense shaping strength on edge-set F1 in log-domain:
+#   logR = logR_base + pos_f1_coef * pos_f1
+# Keep this smaller than the typical log-gap between success and failure to avoid mode collapse.
+pos_f1_coef: 2.0

@@ -19,15 +19,13 @@ def test_stream_rollouts_writes_jsonl(tmp_path: Path) -> None:
         {
             "sample_id": "s1",
             "question": "q1",
-            "answer_entity_ids": [1],
             "rollouts": [
                 {
                     "rollout_index": 0,
-                    "success": True,
                     "log_pf": 0.0,
                     "log_reward": 0.0,
                     "edges": [
-                        {"head_entity_id": 10, "relation_id": 0, "tail_entity_id": 20, "edge_score": 0.1, "edge_label": 1.0}
+                        {"head_entity_id": 10, "relation_id": 0, "tail_entity_id": 20}
                     ],
                 }
             ],
@@ -35,7 +33,6 @@ def test_stream_rollouts_writes_jsonl(tmp_path: Path) -> None:
         {
             "sample_id": "s2",
             "question": "q2",
-            "answer_entity_ids": [2],
             "rollouts": [],
         },
     ]

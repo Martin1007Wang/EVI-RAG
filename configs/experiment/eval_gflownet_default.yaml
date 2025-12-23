@@ -5,18 +5,15 @@
 
 defaults:
   - override /stage: gflownet_eval
-  - override /logger: none
 
 # Checkpoints are run-dependent (not dataset-dependent).
 # Keep repo configs environment-agnostic; provide paths via CLI overrides or environment variables.
 #
 # Recommended:
 #   source logs/full_pipeline/<dataset>/<ts>/artifacts.env
-# which sets RETRIEVER_CKPT / GFLOWNET_CKPT for you.
+# which sets GFLOWNET_CKPT for you. Eval only depends on gflownet ckpt.
 ckpt:
-  retriever: ${oc.env:RETRIEVER_CKPT,null}
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
-debug: true  # Used by train/eval/export统一控制 gflownet.debug 和 env.debug。
-
-tags: ["eval", "gflownet"]
+#
+# Debug/tags are controlled by the stage config to avoid duplication.

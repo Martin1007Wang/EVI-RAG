@@ -6,7 +6,8 @@ g_agent_generation:
     _target_: src.data.components.g_agent_builder.GAgentSettings
     enabled: true
     anchor_top_k: ${stage.anchor_top_k}
-    anchor_start_k: ${stage.anchor_start_k}
+    max_hops: ${stage.max_hops}
+    score_temperature: ${stage.score_temperature}
+    score_bias: ${stage.score_bias}
     output_path: ${dataset.materialized_dir}/g_agent/${stage.split}_g_agent.pt
-    force_include_gt: ${stage.force_include_gt}
   lmdb_path: ${dataset.paths.embeddings}/${stage.split}.lmdb

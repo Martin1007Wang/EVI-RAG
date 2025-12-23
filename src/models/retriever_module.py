@@ -61,6 +61,8 @@ class RetrieverModule(LightningModule):
         eval_cfg = self._to_dict(evaluation_cfg or {})
         self._ranking_k = normalize_k_values(eval_cfg.get("ranking_k", [1, 5, 10]), default=[1, 5, 10])
         self._answer_k = normalize_k_values(eval_cfg.get("answer_recall_k", [5, 10]), default=[5, 10])
+        self._reachability_k = normalize_k_values(eval_cfg.get("reachability_k", self._ranking_k), default=self._ranking_k)
+        self._path_k = normalize_k_values(eval_cfg.get("path_inclusion_k", self._ranking_k), default=self._ranking_k)
         self._emit_predict_outputs = bool(eval_cfg.get("emit_predict_outputs", False))
         self._predict_metrics: Dict[str, Any] = {}
         self._predict_split = str(eval_cfg.get("split", "test"))
@@ -97,8 +99,8 @@ class RetrieverModule(LightningModule):
 
     def _build_predict_payload(self, batch: Any, output: RetrieverOutput) -> Dict[str, Any]:
         """统一的推理输出，供 predict/test 两个 loop 共享。"""
-        scores = output.scores.detach().cpu()
         logits = output.logits.detach().cpu()
+        scores = torch.sigmoid(output.logits).detach().cpu()
         query_ids = output.query_ids.detach().cpu()
         relation_ids = output.relation_ids.detach().cpu() if output.relation_ids is not None else None
 
@@ -168,9 +170,12 @@ class RetrieverModule(LightningModule):
         training_step: int,
     ) -> LossOutput:
         def _call_loss(edge_mask: Optional[torch.Tensor] = None) -> LossOutput:
+            targets = getattr(batch, "soft_labels", None)
+            if targets is None:
+                raise ValueError("Batch missing soft_labels required for retriever loss.")
             return self.loss(
                 output,
-                batch.labels,
+                targets,
                 training_step=training_step,
                 edge_batch=output.query_ids,
                 num_graphs=num_graphs,
@@ -182,7 +187,7 @@ class RetrieverModule(LightningModule):
         if not apply_mask:
             return base
 
-        device = output.logits.device if output.logits is not None else output.scores.device
+        device = output.logits.device
         edge_mask = self._compute_start_edge_mask(batch=batch, device=device)
         masked = _call_loss(edge_mask=edge_mask)
         weight = float(self._start_edge_loss_weight) if self._start_edge_loss_weight is not None else 1.0
@@ -349,7 +354,11 @@ class RetrieverModule(LightningModule):
         max_ranking_k = max(ranking_k) if ranking_k else 1
         answer_k = [int(k) for k in self._answer_k]
         max_answer_k = max(answer_k) if answer_k else 0
-        max_top_k = max(max_ranking_k, max_answer_k)
+        reachability_k = [int(k) for k in self._reachability_k]
+        max_reach_k = max(reachability_k) if reachability_k else 0
+        path_k = [int(k) for k in self._path_k]
+        max_path_k = max(path_k) if path_k else 0
+        max_top_k = max(max_ranking_k, max_answer_k, max_reach_k, max_path_k)
 
         positions = torch.arange(1, max_ranking_k + 1, device=device, dtype=torch.float32)
         discounts = 1.0 / torch.log2(positions + 1.0)
@@ -358,6 +367,8 @@ class RetrieverModule(LightningModule):
             "device": device,
             "max_ranking_k": int(max_ranking_k),
             "max_answer_k": int(max_answer_k),
+            "max_reach_k": int(max_reach_k),
+            "max_path_k": int(max_path_k),
             "max_top_k": int(max_top_k),
             "discounts": discounts,
             "discounts_cumsum": discounts.cumsum(0),
@@ -369,6 +380,10 @@ class RetrieverModule(LightningModule):
             "ndcg_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in ranking_k},
             "answer_count": torch.zeros((), device=device, dtype=torch.float32),
             "answer_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in answer_k},
+            "reachability_count": torch.zeros((), device=device, dtype=torch.float32),
+            "reachability_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in reachability_k},
+            "path_inclusion_count": torch.zeros((), device=device, dtype=torch.float32),
+            "path_inclusion_sum": {k: torch.zeros((), device=device, dtype=torch.float32) for k in path_k},
             "persist_samples": [],
         }
 
@@ -389,6 +404,12 @@ class RetrieverModule(LightningModule):
                 self._all_reduce_inplace(tensor)
         self._all_reduce_inplace(state["answer_count"])
         for tensor in state["answer_sum"].values():
+            self._all_reduce_inplace(tensor)
+        self._all_reduce_inplace(state["reachability_count"])
+        for tensor in state["reachability_sum"].values():
+            self._all_reduce_inplace(tensor)
+        self._all_reduce_inplace(state["path_inclusion_count"])
+        for tensor in state["path_inclusion_sum"].values():
             self._all_reduce_inplace(tensor)
 
         ranking_count = state["ranking_count"]
@@ -415,13 +436,35 @@ class RetrieverModule(LightningModule):
         for k in sorted(state["answer_sum"].keys()):
             metrics[f"{split}/answer/answer_recall@{k}"] = state["answer_sum"][k] / answer_denom
 
+        reach_count = state["reachability_count"]
+        reach_denom = reach_count.clamp_min(1.0)
+        effective_reach_count = int(reach_count.detach().cpu().item())
+        reach_batch_size = max(effective_reach_count, 1)
+        for k in sorted(state["reachability_sum"].keys()):
+            metrics[f"{split}/reachability/answer_reachable@{k}"] = state["reachability_sum"][k] / reach_denom
+
+        path_count = state["path_inclusion_count"]
+        path_denom = path_count.clamp_min(1.0)
+        effective_path_count = int(path_count.detach().cpu().item())
+        path_batch_size = max(effective_path_count, 1)
+        for k in sorted(state["path_inclusion_sum"].keys()):
+            metrics[f"{split}/path_inclusion@{k}"] = state["path_inclusion_sum"][k] / path_denom
+
         if log_metrics:
             for name, value in metrics.items():
                 log_metric(
                     self,
                     name,
                     value,
-                    batch_size=batch_size if "ranking" in name else answer_batch_size,
+                    batch_size=(
+                        batch_size
+                        if "ranking" in name
+                        else reach_batch_size
+                        if "reachability" in name
+                        else path_batch_size
+                        if "path_inclusion" in name
+                        else answer_batch_size
+                    ),
                     sync_dist=True,
                     on_step=False,
                     on_epoch=True,
@@ -440,11 +483,11 @@ class RetrieverModule(LightningModule):
         num_graphs: int,
     ) -> None:
         state = self._streaming_state.get(split)
-        if state is None or state.get("device") != output.scores.device:
+        if state is None or state.get("device") != output.logits.device:
             self._reset_streaming_state(split=split)
             state = self._streaming_state[split]
 
-        scores_all = output.scores.detach().view(-1)
+        scores_all = torch.sigmoid(output.logits).detach().view(-1)
         labels_all = batch.labels.detach().view(-1).to(dtype=torch.float32)
         if scores_all.numel() != labels_all.numel():
             raise ValueError(f"scores/labels shape mismatch: {scores_all.shape} vs {labels_all.shape}")
@@ -479,9 +522,54 @@ class RetrieverModule(LightningModule):
 
         max_ranking_k = int(state["max_ranking_k"])
         max_answer_k = int(state["max_answer_k"])
+        max_reach_k = int(state["max_reach_k"])
+        max_path_k = int(state["max_path_k"])
         max_top_k = int(state["max_top_k"])
         discounts = state["discounts"]
         discounts_cumsum = state["discounts_cumsum"]
+        need_edge_index = max_answer_k > 0 or persist_enabled or max_reach_k > 0 or max_path_k > 0
+
+        node_ptr = getattr(batch, "ptr", None)
+        if max_reach_k > 0 and node_ptr is None:
+            raise ValueError("Batch missing ptr required for reachability metrics.")
+
+        q_local_indices_all = getattr(batch, "q_local_indices", None)
+        q_ptr_raw = getattr(batch, "q_local_indices_ptr", None)
+        if q_ptr_raw is None and isinstance(slice_dict, dict):
+            q_ptr_raw = slice_dict.get("q_local_indices")
+        a_local_indices_all = getattr(batch, "a_local_indices", None)
+        a_ptr_raw = getattr(batch, "a_local_indices_ptr", None)
+        if a_ptr_raw is None and isinstance(slice_dict, dict):
+            a_ptr_raw = slice_dict.get("a_local_indices")
+        q_ptr = None
+        a_ptr = None
+        q_local_indices = None
+        a_local_indices = None
+        if max_reach_k > 0:
+            if q_local_indices_all is None or a_local_indices_all is None or q_ptr_raw is None or a_ptr_raw is None:
+                raise ValueError("Batch missing q_local_indices/a_local_indices required for reachability metrics.")
+            q_ptr = torch.as_tensor(q_ptr_raw, dtype=torch.long, device=scores_all.device).view(-1)
+            a_ptr = torch.as_tensor(a_ptr_raw, dtype=torch.long, device=scores_all.device).view(-1)
+            q_local_indices = torch.as_tensor(q_local_indices_all, dtype=torch.long, device=scores_all.device).view(-1)
+            a_local_indices = torch.as_tensor(a_local_indices_all, dtype=torch.long, device=scores_all.device).view(-1)
+            if q_ptr.numel() != num_graphs + 1:
+                raise ValueError(f"q_local_indices_ptr length mismatch: {q_ptr.numel()} vs expected {num_graphs + 1}")
+            if a_ptr.numel() != num_graphs + 1:
+                raise ValueError(f"a_local_indices_ptr length mismatch: {a_ptr.numel()} vs expected {num_graphs + 1}")
+
+        gt_edge_indices_all = getattr(batch, "gt_path_edge_indices", None)
+        gt_ptr_raw = getattr(batch, "gt_path_edge_indices_ptr", None)
+        if gt_ptr_raw is None and isinstance(slice_dict, dict):
+            gt_ptr_raw = slice_dict.get("gt_path_edge_indices")
+        gt_ptr = None
+        gt_edge_indices = None
+        if max_path_k > 0:
+            if gt_edge_indices_all is None or gt_ptr_raw is None:
+                raise ValueError("Batch missing gt_path_edge_indices required for path_inclusion metrics.")
+            gt_ptr = torch.as_tensor(gt_ptr_raw, dtype=torch.long, device=scores_all.device).view(-1)
+            gt_edge_indices = torch.as_tensor(gt_edge_indices_all, dtype=torch.long, device=scores_all.device).view(-1)
+            if gt_ptr.numel() != num_graphs + 1:
+                raise ValueError(f"gt_path_edge_indices_ptr length mismatch: {gt_ptr.numel()} vs expected {num_graphs + 1}")
 
         for gid in range(int(num_graphs)):
             if edge_ptr is not None:
@@ -491,7 +579,7 @@ class RetrieverModule(LightningModule):
                     continue
                 scores = scores_all[start:end]
                 labels = labels_all[start:end]
-                edge_index_g = batch.edge_index[:, start:end] if (max_answer_k > 0 or persist_enabled) else None
+                edge_index_g = batch.edge_index[:, start:end] if need_edge_index else None
                 edge_attr_g = batch.edge_attr[start:end] if persist_enabled else None
             else:
                 mask = query_ids == gid
@@ -499,7 +587,7 @@ class RetrieverModule(LightningModule):
                     continue
                 scores = scores_all[mask]
                 labels = labels_all[mask]
-                edge_index_g = batch.edge_index[:, mask] if (max_answer_k > 0 or persist_enabled) else None
+                edge_index_g = batch.edge_index[:, mask] if need_edge_index else None
                 edge_attr_g = batch.edge_attr[mask] if persist_enabled else None
 
             num_edges = int(scores.numel())
@@ -590,6 +678,54 @@ class RetrieverModule(LightningModule):
                         for k in state["answer_sum"].keys():
                             k_used = min(int(k), k_ans)
                             state["answer_sum"][k].add_((first_rank <= k_used).to(dtype=torch.float32).mean())
+
+            # --- Answer reachability (undirected connectivity from start nodes) ---
+            if state["reachability_sum"]:
+                q_start = int(q_ptr[gid])
+                q_end = int(q_ptr[gid + 1])
+                a_start = int(a_ptr[gid])
+                a_end = int(a_ptr[gid + 1])
+                q_nodes = q_local_indices[q_start:q_end]
+                a_nodes = a_local_indices[a_start:a_end]
+                if q_nodes.numel() > 0 and a_nodes.numel() > 0 and edge_index_g is not None:
+                    node_start = int(node_ptr[gid].item())
+                    node_end = int(node_ptr[gid + 1].item())
+                    num_nodes = max(0, node_end - node_start)
+                    q_local = q_nodes[(q_nodes >= node_start) & (q_nodes < node_end)] - node_start
+                    a_local = a_nodes[(a_nodes >= node_start) & (a_nodes < node_end)] - node_start
+                    if num_nodes > 0 and q_local.numel() > 0 and a_local.numel() > 0:
+                        edge_index_local = edge_index_g - node_start
+                        reach_map = self._compute_reachability_at_k(
+                            edge_index=edge_index_local,
+                            top_idx=top_idx,
+                            start_nodes=q_local,
+                            answer_nodes=a_local,
+                            num_nodes=num_nodes,
+                            k_values=sorted(state["reachability_sum"].keys()),
+                        )
+                        if reach_map:
+                            state["reachability_count"].add_(1.0)
+                            for k, reachable in reach_map.items():
+                                state["reachability_sum"][k].add_(1.0 if reachable else 0.0)
+
+            # --- GT path inclusion (coverage of GT edges in Top-K) ---
+            if state["path_inclusion_sum"]:
+                gt_start = int(gt_ptr[gid])
+                gt_end = int(gt_ptr[gid + 1])
+                gt_edges = gt_edge_indices[gt_start:gt_end]
+                if gt_edges.numel() > 0:
+                    gt_edges = gt_edges[(gt_edges >= 0) & (gt_edges < num_edges)]
+                if gt_edges.numel() > 0:
+                    gt_unique = torch.unique(gt_edges)
+                    gt_denom = float(gt_unique.numel())
+                    if gt_denom > 0 and k_top > 0:
+                        state["path_inclusion_count"].add_(1.0)
+                        top_mask = torch.isin(top_idx[:k_top], gt_unique)
+                        hits_prefix = top_mask.to(dtype=torch.float32).cumsum(0)
+                        for k in state["path_inclusion_sum"].keys():
+                            k_used = min(int(k), k_top)
+                            hits = hits_prefix[k_used - 1] if k_used > 0 else hits_prefix.new_zeros(())
+                            state["path_inclusion_sum"][k].add_(hits / gt_denom)
 
             # --- Optional persistence (store only top max_ranking_k edges) ---
             if persist_enabled:
@@ -751,3 +887,77 @@ class RetrieverModule(LightningModule):
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to load vocab for textualize: %s", exc)
         return ent_map, rel_map
+
+    @staticmethod
+    def _compute_reachability_at_k(
+        *,
+        edge_index: torch.Tensor,
+        top_idx: torch.Tensor,
+        start_nodes: torch.Tensor,
+        answer_nodes: torch.Tensor,
+        num_nodes: int,
+        k_values: List[int],
+    ) -> Dict[int, bool]:
+        if num_nodes <= 0:
+            return {}
+        k_values = [int(k) for k in k_values if int(k) > 0]
+        if not k_values:
+            return {}
+        start_nodes = start_nodes.view(-1)
+        answer_nodes = answer_nodes.view(-1)
+        if start_nodes.numel() == 0 or answer_nodes.numel() == 0:
+            return {int(k): False for k in k_values}
+
+        k_top = min(int(top_idx.numel()), max(k_values))
+        if k_top <= 0:
+            return {int(k): False for k in k_values}
+
+        edge_index_top = edge_index[:, top_idx[:k_top]].detach().cpu()
+        start_nodes_cpu = start_nodes.detach().cpu().view(-1).tolist()
+        answer_nodes_cpu = answer_nodes.detach().cpu().view(-1).tolist()
+
+        parent = list(range(num_nodes))
+        rank = [0] * num_nodes
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            pa = _find(a)
+            pb = _find(b)
+            if pa == pb:
+                return
+            if rank[pa] < rank[pb]:
+                parent[pa] = pb
+            elif rank[pa] > rank[pb]:
+                parent[pb] = pa
+            else:
+                parent[pb] = pa
+                rank[pa] += 1
+
+        def _reachable() -> bool:
+            roots = {_find(s) for s in start_nodes_cpu}
+            for a in answer_nodes_cpu:
+                if _find(a) in roots:
+                    return True
+            return False
+
+        k_check = sorted({min(int(k), k_top) for k in k_values})
+        reach_map: Dict[int, bool] = {}
+        next_idx = 0
+        for idx in range(k_top):
+            u = int(edge_index_top[0, idx].item())
+            v = int(edge_index_top[1, idx].item())
+            if 0 <= u < num_nodes and 0 <= v < num_nodes:
+                _union(u, v)
+            while next_idx < len(k_check) and idx + 1 >= k_check[next_idx]:
+                reach_map[k_check[next_idx]] = _reachable()
+                next_idx += 1
+        while next_idx < len(k_check):
+            reach_map[k_check[next_idx]] = _reachable()
+            next_idx += 1
+
+        return {int(k): reach_map[min(int(k), k_top)] for k in k_values}

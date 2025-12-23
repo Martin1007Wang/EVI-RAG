@@ -1,10 +1,10 @@
 # @package _global_
 #
-# Stage: Evaluate GFlowNet on g_agent caches (metrics + optional persisted rollouts for LLM path prompting).
+# Stage: Evaluate GFlowNet on g_agent caches (metrics + persisted rollouts).
 
 defaults:
   - override /data: gflownet
-  - override /model: gflownet_module
+  - override /model: gflownet_local_gat
   - override /callbacks: none
   - override /logger: none
   - override /trainer: predict
@@ -18,8 +18,17 @@ stage:
 
 ckpt_path: ${ckpt.gflownet}
 
-debug: true
+debug: false
 
 model:
+  evaluation_cfg:
+    # Evaluation windows (K rollouts) for answer_hit@K.
+    num_eval_rollouts: [1, 5, 10, 25, 50]
+    rollout_temperature: 1.0
   eval_persist_cfg:
-    enabled: false  # 评估默认不导出 rollouts；使用 gflownet_export stage。
+    enabled: true
+    stream: false
+    splits: ["predict"]
+    output_dir: ${dataset.materialized_dir}/eval_gflownet
+  embedder_cfg:
+    allow_deferred_init: true

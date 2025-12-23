@@ -205,6 +205,9 @@ class GRetrievalDataModule(LightningDataModule):
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Did you run setup()?")
         
+        topic_pe_cfg = self.dataset_cfg.get("topic_pe") or {}
+        build_reverse_edge_index = bool(topic_pe_cfg.get("enabled", False)) and not bool(topic_pe_cfg.get("precompute", False))
+
         return UnifiedDataLoader(
             dataset,
             batch_size=self.batch_size_per_device,
@@ -213,6 +216,7 @@ class GRetrievalDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
+            build_reverse_edge_index=build_reverse_edge_index,
 
             # Reproducibility
             random_seed=self.dataset_cfg.get("random_seed"),

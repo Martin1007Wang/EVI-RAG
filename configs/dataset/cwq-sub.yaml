@@ -16,6 +16,12 @@ paths:
 
 entity_normalization: none
 undirected_traversal: false
+num_topics: 2
+topic_pe:
+  enabled: true
+  precompute: true
+  num_rounds: 2
+  num_reverse_rounds: 2
 
 column_map:
   question_id_field: id
@@ -24,4 +30,3 @@ column_map:
   q_entity_field: q_entity
   a_entity_field: a_entity
   graph_field: graph
-

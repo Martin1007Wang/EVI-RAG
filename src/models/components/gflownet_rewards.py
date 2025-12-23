@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import torch
 from torch import nn
@@ -12,28 +12,37 @@ def _safe_f1(precision: torch.Tensor, recall: torch.Tensor, *, eps: float = 1e-8
     return 2 * precision * recall / (precision + recall + eps)
 
 
-def _compute_path_metrics(
+def _log_failure_from_graph(
     *,
-    selected_mask: torch.Tensor,
-    path_mask: Optional[torch.Tensor],
+    node_ptr: torch.Tensor,
     edge_batch: torch.Tensor,
-    path_exists: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = selected_mask.device
-    if path_mask is None or not path_mask.any():
-        zeros = torch.zeros_like(path_exists, dtype=torch.float32, device=device)
-        return zeros, zeros, zeros, zeros
+    failure_action_topk: Optional[int],
+    failure_path_length: float,
+    log_failure_bias: float,
+) -> torch.Tensor:
+    """Compute log R_failure(g) = -log|V_g| - L*log K_eff + bias (per graph)."""
+    device = node_ptr.device
+    num_graphs = int(node_ptr.numel() - 1)
+    if num_graphs <= 0:
+        return torch.zeros(0, device=device, dtype=torch.float32)
 
-    num_graphs = int(path_exists.numel())
-    tp = torch.bincount(edge_batch, weights=(selected_mask & path_mask).float(), minlength=num_graphs)
-    pred = torch.bincount(edge_batch, weights=selected_mask.float(), minlength=num_graphs).clamp(min=1.0)
-    pos = torch.bincount(edge_batch, weights=path_mask.float(), minlength=num_graphs)
+    node_counts = (node_ptr[1:] - node_ptr[:-1]).to(dtype=torch.float32).clamp(min=1.0)
+    if edge_batch.numel() == 0:
+        edge_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+    else:
+        edge_counts = torch.bincount(edge_batch, minlength=num_graphs).to(dtype=torch.float32)
 
-    precision = torch.where(pos > 0, tp / pred, torch.zeros_like(tp))
-    recall = torch.where(pos > 0, tp / pos.clamp(min=1.0), torch.zeros_like(tp))
-    f1 = _safe_f1(precision, recall)
-    full_hit = (tp == pos) & (pos > 0)
-    return precision, recall, f1, full_hit.float()
+    avg_out_degree = edge_counts / node_counts
+    k_eff = avg_out_degree
+    if failure_action_topk is not None:
+        k_eff = torch.minimum(k_eff, torch.full_like(k_eff, float(failure_action_topk)))
+    k_eff = k_eff.clamp(min=1.0)
+
+    log_failure = -torch.log(node_counts) - float(failure_path_length) * torch.log(k_eff)
+    if log_failure_bias != 0.0:
+        log_failure = log_failure + float(log_failure_bias)
+    return log_failure
+
 
 
 def _compute_pos_metrics(
@@ -71,10 +80,6 @@ class RewardOutput:
     answer_precision: torch.Tensor
     answer_recall: torch.Tensor
     answer_f1: torch.Tensor
-    path_exists: torch.Tensor
-    path_prefix_len: torch.Tensor
-    path_prefix_ratio: torch.Tensor
-    path_full_hit: torch.Tensor
     answer_hit: torch.Tensor
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
@@ -93,19 +98,27 @@ class _AnswerStats:
 
 
 class AnswerOnlyReward(nn.Module):
-    """二元结果奖励：命中答案 vs 未命中（无 shaping）。"""
+    """Binary answer-hit reward with graph-scaled failure in log-domain."""
 
     def __init__(
         self,
         *,
         success_reward: float,
-        failure_reward: float,
+        failure_action_topk: Optional[int],
+        failure_path_length: float,
+        log_failure_bias: float,
     ) -> None:
         super().__init__()
         self.success_reward = float(success_reward)
-        self.failure_reward = float(failure_reward)
-        if self.success_reward <= 0.0 or self.failure_reward <= 0.0:
-            raise ValueError(f"Rewards must be positive; got success_reward={self.success_reward}, failure_reward={self.failure_reward}.")
+        self.failure_action_topk = None if failure_action_topk is None else int(failure_action_topk)
+        self.failure_path_length = float(failure_path_length)
+        self.log_failure_bias = float(log_failure_bias)
+        if self.success_reward <= 0.0:
+            raise ValueError(f"success_reward must be positive; got {self.success_reward}.")
+        if self.failure_action_topk is not None and self.failure_action_topk <= 0:
+            raise ValueError(f"failure_action_topk must be positive when set; got {self.failure_action_topk}.")
+        if self.failure_path_length <= 0.0:
+            raise ValueError(f"failure_path_length must be positive; got {self.failure_path_length}.")
 
     def forward(
         self,
@@ -115,12 +128,9 @@ class AnswerOnlyReward(nn.Module):
         edge_batch: torch.Tensor,  # [E_total]
         edge_index: torch.Tensor,  # [2, E_total] local node indices (collated)
         node_ptr: torch.Tensor,  # [B+1]
+        start_node_locals: torch.Tensor,  # [S_total] local node indices (collated)
         answer_node_locals: torch.Tensor,  # [A_total] local node indices (collated)
         answer_node_ptr: torch.Tensor,  # [B+1]
-        path_exists: Optional[torch.Tensor],
-        reach_success: torch.Tensor,  # [B]
-        reach_fraction: torch.Tensor,  # [B]
-        **_: Any,
     ) -> RewardOutput:
         device = selected_mask.device
         num_graphs = int(node_ptr.numel() - 1)
@@ -129,6 +139,7 @@ class AnswerOnlyReward(nn.Module):
             edge_index=edge_index,
             edge_batch=edge_batch,
             node_ptr=node_ptr,
+            start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
             answer_node_ptr=answer_node_ptr,
         )
@@ -139,23 +150,23 @@ class AnswerOnlyReward(nn.Module):
             num_graphs=num_graphs,
         )
 
-        # Keep reward self-contained: success/coverage are determined by (selected edges, answer nodes),
-        # not by external flags that may drift across refactors.
+        # Keep reward self-contained: success/coverage are determined by (selected edges, answer nodes).
         reach_fraction = stats.recall.clamp(min=0.0, max=1.0)
         success_mask = stats.hits > 0
+        log_failure = _log_failure_from_graph(
+            node_ptr=node_ptr,
+            edge_batch=edge_batch,
+            failure_action_topk=self.failure_action_topk,
+            failure_path_length=self.failure_path_length,
+            log_failure_bias=self.log_failure_bias,
+        ).to(dtype=reach_fraction.dtype)
         log_reward = torch.where(
             success_mask,
             torch.full_like(reach_fraction, float(math.log(self.success_reward))),
-            torch.full_like(reach_fraction, float(math.log(self.failure_reward))),
+            log_failure,
         )
         reward = log_reward.exp()
 
-        path_exists_tensor = (
-            path_exists.to(device).bool()
-            if path_exists is not None
-            else torch.zeros(num_graphs, dtype=torch.bool, device=device)
-        )
-        zeros = torch.zeros_like(reach_fraction, dtype=torch.float32)
         return RewardOutput(
             reward=reward,
             log_reward=log_reward,
@@ -167,10 +178,6 @@ class AnswerOnlyReward(nn.Module):
             answer_precision=stats.precision,
             answer_recall=stats.recall,
             answer_f1=stats.f1,
-            path_exists=path_exists_tensor,
-            path_prefix_len=zeros,
-            path_prefix_ratio=zeros,
-            path_full_hit=zeros,
             answer_hit=success_mask.float(),
         )
 
@@ -181,6 +188,7 @@ class AnswerOnlyReward(nn.Module):
         edge_index: torch.Tensor,
         edge_batch: torch.Tensor,
         node_ptr: torch.Tensor,
+        start_node_locals: torch.Tensor,
         answer_node_locals: torch.Tensor,
         answer_node_ptr: torch.Tensor,
     ) -> _AnswerStats:
@@ -204,6 +212,8 @@ class AnswerOnlyReward(nn.Module):
             tails_local = edge_index[1][sel_mask]
             hit_nodes[heads_local] = True
             hit_nodes[tails_local] = True
+        if start_node_locals.numel() > 0:
+            hit_nodes[start_node_locals.long()] = True
 
         answer_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), answer_node_ptr[1:] - answer_node_ptr[:-1])
         hit_answers = hit_nodes[answer_node_locals].float()
@@ -239,32 +249,41 @@ class AnswerOnlyReward(nn.Module):
         return precision, recall, f1
 
 
-class AnswerDiffusionReward(AnswerOnlyReward):
-    """别名保留：AnswerDiffusionReward 已去掉 answer_gravity，等价于 AnswerOnlyReward。"""
-    pass
+class AnswerAndPositiveEdgeF1Reward(nn.Module):
+    """结果奖励 + 集合监督稠密 shaping（基于 positive edge set 的 F1）。
 
+    记轨迹选择的边集合为 S(τ)，正边集合为 P（由 edge_labels>0.5 给出）。
+    令 f1(S,P) 为边级 F1，则本奖励在 log-domain 中定义为：
 
-class AnswerFractionReward(nn.Module):
-    """
-    Coverage-shaped reward based on answer recall fraction.
+        log R(τ) = log R_base(τ) + α · f1(S(τ), P)
 
-    Let f in [0,1] be the fraction of answer entities visited by the trajectory.
-    We interpolate rewards geometrically:
-      log R = log(failure_reward) + f * log(success_reward / failure_reward)
-    so that f=0 -> failure_reward and f=1 -> success_reward.
+    其中 R_base 是二元的 answer-hit 奖励（success_reward / scaled failure），α>=0 控制稠密项强度。
+    该设计保持“集合监督”不变性：不同但等价的最短路径并集成员不会因 tie-break 被惩罚。
     """
 
     def __init__(
         self,
         *,
         success_reward: float,
-        failure_reward: float,
+        failure_action_topk: Optional[int],
+        failure_path_length: float,
+        log_failure_bias: float,
+        pos_f1_coef: float,
     ) -> None:
         super().__init__()
         self.success_reward = float(success_reward)
-        self.failure_reward = float(failure_reward)
-        if self.success_reward <= 0.0 or self.failure_reward <= 0.0:
-            raise ValueError(f"Rewards must be positive; got success_reward={self.success_reward}, failure_reward={self.failure_reward}.")
+        self.failure_action_topk = None if failure_action_topk is None else int(failure_action_topk)
+        self.failure_path_length = float(failure_path_length)
+        self.log_failure_bias = float(log_failure_bias)
+        self.pos_f1_coef = float(pos_f1_coef)
+        if self.success_reward <= 0.0:
+            raise ValueError(f"success_reward must be positive; got {self.success_reward}.")
+        if self.failure_action_topk is not None and self.failure_action_topk <= 0:
+            raise ValueError(f"failure_action_topk must be positive when set; got {self.failure_action_topk}.")
+        if self.failure_path_length <= 0.0:
+            raise ValueError(f"failure_path_length must be positive; got {self.failure_path_length}.")
+        if self.pos_f1_coef < 0.0:
+            raise ValueError(f"pos_f1_coef must be >= 0, got {self.pos_f1_coef}.")
 
     def forward(
         self,
@@ -274,10 +293,9 @@ class AnswerFractionReward(nn.Module):
         edge_batch: torch.Tensor,  # [E_total]
         edge_index: torch.Tensor,  # [2, E_total] local node indices (collated)
         node_ptr: torch.Tensor,  # [B+1]
+        start_node_locals: torch.Tensor,  # [S_total] local node indices (collated)
         answer_node_locals: torch.Tensor,  # [A_total] local node indices (collated)
         answer_node_ptr: torch.Tensor,  # [B+1]
-        path_exists: Optional[torch.Tensor],
-        **_: Any,
     ) -> RewardOutput:
         device = selected_mask.device
         num_graphs = int(node_ptr.numel() - 1)
@@ -286,6 +304,7 @@ class AnswerFractionReward(nn.Module):
             edge_index=edge_index,
             edge_batch=edge_batch,
             node_ptr=node_ptr,
+            start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
             answer_node_ptr=answer_node_ptr,
         )
@@ -296,18 +315,23 @@ class AnswerFractionReward(nn.Module):
             num_graphs=num_graphs,
         )
 
-        reach_fraction = stats.recall.clamp(min=0.0, max=1.0)
         success_mask = stats.hits > 0
-        log_ratio = float(math.log(self.success_reward / self.failure_reward))
-        log_reward = torch.full_like(reach_fraction, float(math.log(self.failure_reward))) + reach_fraction * log_ratio
-        reward = log_reward.exp()
-
-        path_exists_tensor = (
-            path_exists.to(device).bool()
-            if path_exists is not None
-            else torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        log_failure = _log_failure_from_graph(
+            node_ptr=node_ptr,
+            edge_batch=edge_batch,
+            failure_action_topk=self.failure_action_topk,
+            failure_path_length=self.failure_path_length,
+            log_failure_bias=self.log_failure_bias,
         )
-        zeros = torch.zeros_like(reach_fraction, dtype=torch.float32)
+        base_log_reward = torch.where(
+            success_mask,
+            torch.full((num_graphs,), float(math.log(self.success_reward)), device=device, dtype=torch.float32),
+            log_failure.to(dtype=torch.float32),
+        )
+        log_reward = base_log_reward + (pos_f1.to(dtype=base_log_reward.dtype) * self.pos_f1_coef)
+        reward = torch.exp(log_reward)
+        reach_fraction = stats.recall.clamp(min=0.0, max=1.0)
+
         return RewardOutput(
             reward=reward,
             log_reward=log_reward,
@@ -319,185 +343,12 @@ class AnswerFractionReward(nn.Module):
             answer_precision=stats.precision,
             answer_recall=stats.recall,
             answer_f1=stats.f1,
-            path_exists=path_exists_tensor,
-            path_prefix_len=zeros,
-            path_prefix_ratio=zeros,
-            path_full_hit=zeros,
             answer_hit=success_mask.float(),
-        )
-
-
-class GTPathAlignedReward(nn.Module):
-    """
-    奖励对齐 GT 路径：前缀一致性 + 命中答案 − 长度惩罚（log 域）。
-
-    log R = log(failure_reward) + s * log(success_reward / failure_reward) - lambda_len * norm_len
-    s = (alpha_prefix * prefix_ratio + beta_answer * answer_hit) / (alpha_prefix + beta_answer)
-    - prefix_ratio: 动作序列与 GT 路径的最长前缀匹配比例
-    - answer_hit: 轨迹是否访问到任一答案节点
-    - norm_len: 轨迹长度 / max_steps
-    """
-
-    def __init__(
-        self,
-        *,
-        alpha_prefix: float,
-        beta_answer: float,
-        answer_gate_full_path: bool,
-        lambda_len: float,
-        success_reward: float,
-        failure_reward: float,
-    ) -> None:
-        super().__init__()
-        if alpha_prefix < 0 or beta_answer < 0:
-            raise ValueError("alpha_prefix and beta_answer must be non-negative.")
-        if alpha_prefix + beta_answer <= 0:
-            raise ValueError("alpha_prefix + beta_answer must be positive.")
-        if lambda_len < 0:
-            raise ValueError("lambda_len must be >= 0.")
-        if success_reward <= 0.0 or failure_reward <= 0.0:
-            raise ValueError(
-                f"Rewards must be positive; got success_reward={success_reward}, failure_reward={failure_reward}."
-            )
-        if success_reward <= failure_reward:
-            raise ValueError("success_reward must be larger than failure_reward.")
-        self.alpha_prefix = float(alpha_prefix)
-        self.beta_answer = float(beta_answer)
-        self.answer_gate_full_path = bool(answer_gate_full_path)
-        self.lambda_len = float(lambda_len)
-        self.success_reward = float(success_reward)
-        self.failure_reward = float(failure_reward)
-
-    def forward(
-        self,
-        *,
-        actions_seq: torch.Tensor,           # [B, T_action]
-        edge_ptr: torch.Tensor,              # [B+1]
-        selected_mask: torch.Tensor,          # [E_total] bool
-        selection_order: torch.Tensor,        # [E_total] long (-1 for unselected)
-        edge_batch: torch.Tensor,             # [E_total] graph ids
-        path_mask: Optional[torch.Tensor],    # [E_total] bool (unused; kept for signature parity)
-        path_exists: torch.Tensor,            # [B] bool
-        length: torch.Tensor,                 # [B] number of selected edges
-        max_steps: torch.Tensor,              # scalar tensor (same device)
-        gt_path_edge_local_ids: torch.Tensor, # [P_total]
-        gt_path_ptr: torch.Tensor,            # [B+1]
-        reach_success: torch.Tensor,          # [B]
-        **_: Any,
-    ) -> RewardOutput:
-        device = selected_mask.device
-        if selection_order.shape != selected_mask.shape:
-            raise ValueError("selection_order shape must match selected_mask.")
-        if edge_batch.shape != selected_mask.shape:
-            raise ValueError("edge_batch shape must match selected_mask.")
-        num_graphs = int(path_exists.numel())
-        if length.numel() != num_graphs:
-            raise ValueError("length must align with batch graphs.")
-
-        if gt_path_ptr.numel() != num_graphs + 1:
-            raise ValueError("gt_path_ptr length mismatch; expected one offset per graph.")
-        if actions_seq.dim() != 2 or actions_seq.size(0) != num_graphs:
-            raise ValueError("actions_seq must be [B,T_action] and aligned to batch size.")
-
-        max_steps_scalar = float(max_steps.item()) if max_steps.numel() > 0 else 1.0
-        norm_len = length.float() / max(max_steps_scalar, 1.0)
-
-        gt_counts = gt_path_ptr[1:] - gt_path_ptr[:-1]
-        max_gt = int(gt_counts.max().item()) if gt_counts.numel() > 0 else 0
-        if max_gt > 0:
-            gt_path = torch.full((num_graphs, max_gt), -1, dtype=torch.long, device=device)
-            if gt_path_edge_local_ids.numel() > 0:
-                if edge_ptr.numel() != num_graphs + 1:
-                    raise ValueError("edge_ptr length mismatch; expected one offset per graph.")
-                gt_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), gt_counts)
-                gt_pos = torch.arange(gt_path_edge_local_ids.numel(), device=device) - gt_path_ptr[gt_batch]
-                gt_edges = gt_path_edge_local_ids.to(device=device, dtype=torch.long)
-                edge_start = edge_ptr[:-1].to(device=device)
-                edge_end = edge_ptr[1:].to(device=device)
-                in_range = (gt_edges >= edge_start[gt_batch]) & (gt_edges < edge_end[gt_batch])
-                if not bool(in_range.all().item()):
-                    bad = torch.nonzero(~in_range, as_tuple=False).view(-1)
-                    preview = bad[:5].detach().cpu().tolist()
-                    raise ValueError(
-                        "gt_path_edge_local_ids must be batch-global edge indices; "
-                        f"found out-of-range entries at positions={preview}."
-                    )
-                local_edges = gt_edges - edge_start[gt_batch]
-                gt_path[gt_batch, gt_pos] = local_edges
-        else:
-            gt_path = torch.empty(num_graphs, 0, dtype=torch.long, device=device)
-
-        stop_indices = edge_ptr[1:].view(-1, 1).to(device=device)
-        actions = actions_seq.to(device=device, dtype=torch.long)
-        is_stop = actions == stop_indices
-        actions_local = actions - edge_ptr[:-1].view(-1, 1).to(device=device)
-        actions_local = torch.where(is_stop, torch.full_like(actions_local, -1), actions_local)
-
-        max_compare = min(actions_local.size(1), gt_path.size(1))
-        if max_compare > 0:
-            actions_cmp = actions_local[:, :max_compare]
-            gt_cmp = gt_path[:, :max_compare]
-            valid = gt_cmp >= 0
-            match = (actions_cmp == gt_cmp) & valid & (actions_cmp >= 0)
-            prefix_mask = match.float().cumprod(dim=1)
-            prefix_len = prefix_mask.sum(dim=1)
-        else:
-            prefix_len = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-
-        gt_len = gt_counts.to(dtype=prefix_len.dtype)
-        prefix_ratio = torch.zeros_like(prefix_len)
-        has_gt = gt_counts > 0
-        if has_gt.any():
-            prefix_ratio[has_gt] = prefix_len[has_gt] / gt_len[has_gt].clamp(min=1.0)
-
-        prefix_len_long = prefix_len.to(dtype=torch.long)
-        full_hit = (gt_counts > 0) & (prefix_len_long == gt_counts)
-        if full_hit.any():
-            next_idx = gt_counts.clamp(min=0)
-            has_next = next_idx < actions_local.size(1)
-            stop_after = torch.zeros_like(full_hit, dtype=torch.bool)
-            if has_next.any():
-                next_actions = actions_local[has_next].gather(1, next_idx[has_next].view(-1, 1)).view(-1)
-                stop_after[has_next] = next_actions < 0
-            stop_after[~has_next] = True
-            full_hit = full_hit & stop_after
-
-        answer_hit = reach_success.to(device=device, dtype=torch.float32).clamp(min=0.0, max=1.0)
-        if self.answer_gate_full_path:
-            answer_hit = answer_hit * full_hit.to(dtype=answer_hit.dtype)
-        denom = self.alpha_prefix + self.beta_answer
-        score = (self.alpha_prefix * prefix_ratio + self.beta_answer * answer_hit) / denom
-        score = score.clamp(min=0.0, max=1.0)
-        log_ratio = float(math.log(self.success_reward / self.failure_reward))
-        log_reward = torch.full_like(score, float(math.log(self.failure_reward))) + score * log_ratio
-        if self.lambda_len > 0:
-            log_reward = log_reward - self.lambda_len * norm_len
-        reward = log_reward.exp()
-        success = answer_hit
-
-        path_exists_tensor = path_exists.to(device).bool()
-        zeros = torch.zeros_like(reward)
-
-        return RewardOutput(
-            reward=reward,
-            log_reward=log_reward,
-            success=success,
-            answer_reach_frac=answer_hit,
-            pos_precision=zeros,
-            pos_recall=zeros,
-            pos_f1=zeros,
-            answer_precision=zeros,
-            answer_recall=zeros,
-            answer_f1=zeros,
-            path_exists=path_exists_tensor,
-            path_prefix_len=prefix_len.to(dtype=reward.dtype),
-            path_prefix_ratio=prefix_ratio.to(dtype=reward.dtype),
-            path_full_hit=full_hit.float(),
-            answer_hit=answer_hit,
         )
 
 
 __all__ = [
     "RewardOutput",
-    "GTPathAlignedReward",
+    "AnswerOnlyReward",
+    "AnswerAndPositiveEdgeF1Reward",
 ]

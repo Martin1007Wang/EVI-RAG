@@ -204,6 +204,24 @@ def _parse_sample(record: Dict) -> GAgentSample:
     if gt_path_exists:
         if gt_path_edge_local_ids.numel() == 0 or gt_path_node_local_ids.numel() == 0:
             raise ValueError(f"gt_path_exists=True but gt_path_* is empty for {record.get('sample_id')}")
+        if gt_path_node_local_ids.numel() != gt_path_edge_local_ids.numel() + 1:
+            raise ValueError(
+                f"gt_path_node_local_ids length {gt_path_node_local_ids.numel()} != "
+                f"gt_path_edge_local_ids+1 ({gt_path_edge_local_ids.numel() + 1}) for {record.get('sample_id')}"
+            )
+        if start_node_locals.numel() > 0:
+            if not bool((start_node_locals == gt_path_node_local_ids[0]).any().item()):
+                raise ValueError(f"gt_path does not start from start_node_locals for {record.get('sample_id')}")
+        if answer_node_locals.numel() > 0:
+            if not bool((answer_node_locals == gt_path_node_local_ids[-1]).any().item()):
+                raise ValueError(f"gt_path terminal not in answer_node_locals for {record.get('sample_id')}")
+        for idx, edge_id in enumerate(gt_path_edge_local_ids.tolist()):
+            h = int(edge_head_locals[edge_id].item())
+            t = int(edge_tail_locals[edge_id].item())
+            a = int(gt_path_node_local_ids[idx].item())
+            b = int(gt_path_node_local_ids[idx + 1].item())
+            if not (a == h and b == t):
+                raise ValueError(f"gt_path edge/node mismatch at step {idx} for {record.get('sample_id')}")
     elif gt_path_edge_local_ids.numel() > 0 or gt_path_node_local_ids.numel() > 0:
         raise ValueError(f"gt_path_exists=False but gt_path_* is non-empty for {record.get('sample_id')}")
 

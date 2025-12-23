@@ -5,6 +5,7 @@
 defaults:
   - _self_
   - window: default
+  - ckpt: default
   - dataset: null
   - data: null
   - model: null

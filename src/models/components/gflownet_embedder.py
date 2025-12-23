@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 import inspect
@@ -16,12 +17,14 @@ from src.models.components.projections import EmbeddingProjector
 
 logger = logging.getLogger(__name__)
 
+HASH_CHUNK_SIZE = 4 * 1024 * 1024
+
 
 class GraphEmbedder(nn.Module):
     """
-    GFlowNet 图嵌入器：默认自包含（不依赖 retriever ckpt），可选 warm-start 时再显式传入 projector_checkpoint。
+    GFlowNet 图嵌入器：训练要求 retriever ckpt，评估可从 gflownet ckpt 元数据恢复结构信息。
 
-    结构特征（topic/DDE）只有在 warm-start ckpt 中显式存在时才会启用；否则只使用语义特征。
+    结构特征（topic/DDE）由 retriever ckpt 或 gflownet ckpt 中的 parity_meta 决定。
     严格保持 g_agent 的 SSOT 字段，不引入额外缓存字段。
     """
 
@@ -32,11 +35,21 @@ class GraphEmbedder(nn.Module):
         proj_dropout: float,
         projector_checkpoint: str | None = None,
         projector_key_prefixes: Optional[Sequence[str]] = None,
+        allow_deferred_init: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.proj_dropout = float(proj_dropout)
-        self.projector_checkpoint = str(projector_checkpoint) if projector_checkpoint else ""
+        ckpt_raw = "" if projector_checkpoint is None else str(projector_checkpoint).strip()
+        if ckpt_raw.lower() in {"null", "none"}:
+            ckpt_raw = ""
+        self.projector_checkpoint = ckpt_raw
+        self.allow_deferred_init = bool(allow_deferred_init)
+        if not self.projector_checkpoint and not self.allow_deferred_init:
+            raise ValueError(
+                "GraphEmbedder requires retriever ckpt. "
+                "Provide `ckpt.retriever` or enable deferred init for gflownet-eval."
+            )
 
         self.projector_key_prefixes = self._normalize_prefixes(projector_key_prefixes or ["model._orig_mod", "model", ""])
 
@@ -58,13 +71,21 @@ class GraphEmbedder(nn.Module):
         self.query_proj: Optional[EmbeddingProjector] = None
         self.non_text_entity_emb: Optional[nn.Embedding] = None
         self.edge_adapter: Optional[nn.Module] = None
+        self.edge_score_proj: Optional[nn.Linear] = None
+        self._components_initialized = False
+        self._retriever_meta_source: Optional[str] = None
+        self._retriever_ckpt_hash: Optional[str] = None
+        self._retriever_ckpt_basename: Optional[str] = None
 
         # 构造所有可训练子模块，确保 strict load 不依赖外部 datamodule/setup。
         if self.projector_checkpoint:
-            state_dict = self._load_checkpoint_state()
+            state_dict = self._load_checkpoint_state(self.projector_checkpoint)
             self._load_retriever_components(state_dict)
-        else:
-            self._init_fresh_components()
+            self._components_initialized = True
+            self._retriever_meta_source = "retriever_ckpt"
+            self._retriever_ckpt_basename = Path(self.projector_checkpoint).name
+        elif self.allow_deferred_init:
+            self._retriever_meta_source = "deferred"
 
     @staticmethod
     def _normalize_prefixes(prefixes: Sequence[str]) -> list[str]:
@@ -109,6 +130,8 @@ class GraphEmbedder(nn.Module):
             self.to(device)
 
     def embed_batch(self, batch: Any, *, device: torch.device) -> "EmbedOutputs":
+        if not self._components_initialized:
+            raise RuntimeError("GraphEmbedder is not initialized; load a gflownet ckpt with retriever_meta first.")
         if self._shared_resources is None:
             raise RuntimeError("GraphEmbedder.setup() must be called before embed_batch.")
         if self.edge_adapter is None or self.entity_proj is None or self.relation_proj is None or self.query_proj is None:
@@ -128,17 +151,6 @@ class GraphEmbedder(nn.Module):
         edge_batch, edge_ptr = self._compute_edge_batch(edge_index, node_ptr=node_ptr, num_graphs=num_graphs, device=device)
         edge_relations_raw = batch.edge_attr
         edge_relations = edge_relations_raw.to(device)
-        edge_labels = batch.edge_labels.to(device)
-        edge_scores = batch.edge_scores.to(device)
-        gt_path_ptr = batch._slice_dict.get("gt_path_edge_local_ids")
-        if gt_path_ptr is None:
-            raise ValueError("Batch missing gt_path_edge_local_ids slice; g_agent cache must include GT path ptrs.")
-        path_mask, path_exists = self._build_path_mask(
-            batch=batch,
-            edge_ptr=edge_ptr,
-            gt_path_ptr=gt_path_ptr.to(device),
-            device=device,
-        )
 
         question_raw = self._prepare_question_embeddings(batch.question_emb, batch_size=num_graphs, device=device)
         question_tokens = self.query_proj(question_raw)
@@ -182,6 +194,15 @@ class GraphEmbedder(nn.Module):
             tail_edge=tail_edge,
             struct_edge=struct,
         )
+        edge_scores = getattr(batch, "edge_scores", None)
+        if edge_scores is None:
+            raise ValueError("Batch missing edge_scores; g_agent cache must include per-edge retriever scores.")
+        edge_scores = edge_scores.to(device=device, dtype=edge_tokens.dtype).view(-1, 1)
+        if edge_scores.size(0) != edge_tokens.size(0):
+            raise ValueError(f"edge_scores length {edge_scores.size(0)} != num_edges {edge_tokens.size(0)}")
+        if self.edge_score_proj is None:
+            raise RuntimeError("edge_score_proj is not initialized; call setup() first.")
+        edge_tokens = edge_tokens + self.edge_score_proj(edge_scores)
 
         start_entity_ids, start_entity_mask = self._pad_start_entities(
             batch.start_entity_ids.to(device),
@@ -196,10 +217,6 @@ class GraphEmbedder(nn.Module):
             node_ptr=node_ptr,
             edge_index=edge_index,
             edge_relations=edge_relations,
-            edge_labels=edge_labels,
-            edge_scores=edge_scores,
-            path_mask=path_mask,
-            path_exists=path_exists,
             heads_global=heads_global,
             tails_global=tails_global,
             node_tokens=node_tokens,
@@ -213,8 +230,8 @@ class GraphEmbedder(nn.Module):
     # ------------------------------------------------------------------ #
     # Checkpoint loading
     # ------------------------------------------------------------------ #
-    def _load_checkpoint_state(self) -> Dict[str, torch.Tensor]:
-        ckpt_path = Path(self.projector_checkpoint).expanduser()
+    def _load_checkpoint_state(self, ckpt_path: str) -> Dict[str, torch.Tensor]:
+        ckpt_path = Path(ckpt_path).expanduser()
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"projector_checkpoint not found: {ckpt_path}")
         load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
@@ -321,15 +338,33 @@ class GraphEmbedder(nn.Module):
             self.edge_adapter[0].bias.copy_(b0)
             self.edge_adapter[3].weight.copy_(w1)
             self.edge_adapter[3].bias.copy_(b1)
+        self.edge_score_proj = nn.Linear(1, self.hidden_dim, bias=False)
+        nn.init.zeros_(self.edge_score_proj.weight)
+        self._components_initialized = True
+
+    def _configure_struct_features(
+        self,
+        *,
+        use_topic_pe: bool,
+        num_topics: int,
+        num_rounds: int,
+        num_reverse_rounds: int,
+    ) -> None:
+        struct_dim = 0
+        if use_topic_pe:
+            if num_topics <= 1:
+                raise ValueError(f"Invalid retriever_meta: num_topics must be >= 2 when topic_pe=1, got {num_topics}")
+            struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_reverse_rounds))
+        self._edge_in_dim = 4 * self.hidden_dim + struct_dim
+        self._use_topic_pe = bool(use_topic_pe)
+        self._num_topics = int(num_topics) if use_topic_pe else 0
+        self._struct_dim = int(struct_dim)
+        self._dde = DDE(num_rounds=int(num_rounds), num_reverse_rounds=int(num_reverse_rounds)) if use_topic_pe else None
 
     def _init_fresh_components(self) -> None:
-        """Initialize projector/adapter from scratch when no retriever checkpoint is provided."""
-        self._edge_in_dim = 4 * self.hidden_dim
-        self._use_topic_pe = False
-        self._num_topics = 0
-        self._struct_dim = 0
-        self._dde = None
-
+        """Initialize projector/adapter from scratch after struct configuration."""
+        if self._edge_in_dim is None:
+            raise RuntimeError("edge_in_dim is not initialized; configure struct features first.")
         self.entity_proj = EmbeddingProjector(output_dim=self.hidden_dim, input_dim=self.hidden_dim, finetune=True)
         self.relation_proj = EmbeddingProjector(output_dim=self.hidden_dim, input_dim=self.hidden_dim, finetune=True)
         self.query_proj = EmbeddingProjector(output_dim=self.hidden_dim, input_dim=self.hidden_dim, finetune=True)
@@ -342,6 +377,9 @@ class GraphEmbedder(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
+        self.edge_score_proj = nn.Linear(1, self.hidden_dim, bias=False)
+        nn.init.zeros_(self.edge_score_proj.weight)
+        self._components_initialized = True
 
     def _load_retriever_parity_meta(
         self,
@@ -375,6 +413,121 @@ class GraphEmbedder(nn.Module):
         num_rounds = int(meta[2].item())
         num_rev = int(meta[3].item())
         return use_topic_pe, num_topics, num_rounds, num_rev
+
+    def init_from_retriever_meta(self, meta: Dict[str, Any]) -> None:
+        """Initialize missing components from retriever meta stored in gflownet checkpoints."""
+        use_topic_pe, num_topics, num_rounds, num_rev = self._parse_retriever_meta(meta)
+        if self._components_initialized:
+            self._validate_retriever_meta(use_topic_pe, num_topics, num_rounds, num_rev, meta)
+            self._record_retriever_meta(meta, source="gflownet_ckpt", allow_override=False)
+            return
+        self._configure_struct_features(
+            use_topic_pe=use_topic_pe,
+            num_topics=num_topics,
+            num_rounds=num_rounds,
+            num_reverse_rounds=num_rev,
+        )
+        self._init_fresh_components()
+        self._record_retriever_meta(meta, source="gflownet_ckpt", allow_override=True)
+
+    def export_retriever_meta(self) -> Dict[str, Any]:
+        if not self._components_initialized:
+            raise RuntimeError("GraphEmbedder is not initialized; cannot export retriever meta.")
+        use_topic_pe = bool(self._use_topic_pe)
+        num_topics = int(self._num_topics) if use_topic_pe else 0
+        num_rounds = int(self._dde.num_rounds) if self._dde is not None else 0
+        num_rev = int(self._dde.num_reverse_rounds) if self._dde is not None else 0
+        parity_meta = [int(use_topic_pe), int(num_topics), int(num_rounds), int(num_rev)]
+        meta: Dict[str, Any] = {
+            "parity_meta": parity_meta,
+            "use_topic_pe": bool(use_topic_pe),
+            "num_topics": int(num_topics),
+            "num_rounds": int(num_rounds),
+            "num_reverse_rounds": int(num_rev),
+            "struct_dim": int(self._struct_dim or 0),
+            "edge_in_dim": int(self._edge_in_dim or 0),
+            "hidden_dim": int(self.hidden_dim),
+        }
+        if self.projector_checkpoint and self._retriever_ckpt_hash is None:
+            self._retriever_ckpt_hash = self._compute_ckpt_hash(self.projector_checkpoint)
+            self._retriever_ckpt_basename = Path(self.projector_checkpoint).name
+        if self._retriever_ckpt_hash:
+            meta["retriever_ckpt_hash"] = self._retriever_ckpt_hash
+        if self._retriever_ckpt_basename:
+            meta["retriever_ckpt_basename"] = self._retriever_ckpt_basename
+        if self._retriever_meta_source:
+            meta["source"] = self._retriever_meta_source
+        return meta
+
+    def _compute_ckpt_hash(self, ckpt_path: str) -> Optional[str]:
+        path = Path(ckpt_path).expanduser()
+        if not path.is_file():
+            return None
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _record_retriever_meta(self, meta: Dict[str, Any], *, source: str, allow_override: bool) -> None:
+        if allow_override or self._retriever_meta_source is None or self._retriever_meta_source == "deferred":
+            self._retriever_meta_source = source
+        ckpt_hash = meta.get("retriever_ckpt_hash")
+        ckpt_name = meta.get("retriever_ckpt_basename")
+        if ckpt_hash and (allow_override or self._retriever_ckpt_hash is None):
+            self._retriever_ckpt_hash = str(ckpt_hash)
+        if ckpt_name and (allow_override or self._retriever_ckpt_basename is None):
+            self._retriever_ckpt_basename = str(ckpt_name)
+
+    def _parse_retriever_meta(self, meta: Dict[str, Any]) -> tuple[bool, int, int, int]:
+        if not isinstance(meta, dict):
+            raise TypeError("retriever_meta must be a dict.")
+        parity_meta = meta.get("parity_meta")
+        if parity_meta is not None:
+            if isinstance(parity_meta, torch.Tensor):
+                parity_meta = parity_meta.detach().cpu().tolist()
+            if len(parity_meta) != 4:
+                raise ValueError(f"parity_meta must have 4 values; got {parity_meta}")
+            use_topic_pe, num_topics, num_rounds, num_rev = [int(v) for v in parity_meta]
+        else:
+            use_topic_pe = int(meta.get("use_topic_pe", 0))
+            num_topics = int(meta.get("num_topics", 0))
+            num_rounds = int(meta.get("num_rounds", 0))
+            num_rev = int(meta.get("num_reverse_rounds", 0))
+        if use_topic_pe and num_topics <= 1:
+            raise ValueError(f"Invalid retriever_meta: num_topics must be >= 2 when topic_pe=1, got {num_topics}")
+        struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_rev)) if use_topic_pe else 0
+        edge_in_dim = 4 * self.hidden_dim + struct_dim
+        if "edge_in_dim" in meta and int(meta["edge_in_dim"]) != edge_in_dim:
+            raise ValueError(f"retriever_meta edge_in_dim mismatch: meta={meta['edge_in_dim']} expected={edge_in_dim}")
+        if "struct_dim" in meta and int(meta["struct_dim"]) != struct_dim:
+            raise ValueError(f"retriever_meta struct_dim mismatch: meta={meta['struct_dim']} expected={struct_dim}")
+        return bool(use_topic_pe), int(num_topics), int(num_rounds), int(num_rev)
+
+    def _validate_retriever_meta(
+        self,
+        use_topic_pe: bool,
+        num_topics: int,
+        num_rounds: int,
+        num_rev: int,
+        meta: Dict[str, Any],
+    ) -> None:
+        current_use = bool(self._use_topic_pe)
+        current_topics = int(self._num_topics) if self._use_topic_pe else 0
+        current_rounds = int(self._dde.num_rounds) if self._dde is not None else 0
+        current_rev = int(self._dde.num_reverse_rounds) if self._dde is not None else 0
+        if (current_use, current_topics, current_rounds, current_rev) != (
+            bool(use_topic_pe),
+            int(num_topics),
+            int(num_rounds),
+            int(num_rev),
+        ):
+            raise ValueError(
+                "retriever_meta mismatch with existing embedder configuration: "
+                f"meta=({use_topic_pe},{num_topics},{num_rounds},{num_rev}) "
+                f"current=({current_use},{current_topics},{current_rounds},{current_rev})"
+            )
+        _ = self._parse_retriever_meta(meta)
 
     def _build_structure_features(
         self,
@@ -564,42 +717,6 @@ class GraphEmbedder(nn.Module):
         return edge_batch, edge_ptr
 
     @staticmethod
-    def _build_path_mask(
-        *,
-        batch: Any,
-        edge_ptr: torch.Tensor,
-        gt_path_ptr: torch.Tensor,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if gt_path_ptr.dim() != 1:
-            raise ValueError("gt_path_ptr must be 1D [B+1].")
-        num_graphs = int(gt_path_ptr.numel() - 1)
-        if num_graphs <= 0:
-            raise ValueError("gt_path_ptr implies no graphs in batch.")
-        if edge_ptr.numel() != num_graphs + 1:
-            raise ValueError("edge_ptr length mismatch with gt_path_ptr.")
-        path_mask = torch.zeros(int(edge_ptr[-1].item()), dtype=torch.bool, device=device)
-        gt_edges = batch.gt_path_edge_local_ids.to(device=device, dtype=torch.long)
-        if gt_edges.numel() > 0:
-            gt_counts = gt_path_ptr[1:] - gt_path_ptr[:-1]
-            if gt_counts.numel() != num_graphs:
-                raise ValueError("gt_path_ptr length mismatch; expected one count per graph.")
-            gt_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), gt_counts)
-            edge_start = edge_ptr[:-1].to(device=device)
-            edge_end = edge_ptr[1:].to(device=device)
-            in_range = (gt_edges >= edge_start[gt_batch]) & (gt_edges < edge_end[gt_batch])
-            if not bool(in_range.all().item()):
-                bad = torch.nonzero(~in_range, as_tuple=False).view(-1)
-                preview = bad[:5].detach().cpu().tolist()
-                raise ValueError(
-                    "gt_path_edge_local_ids must be batch-global edge indices; "
-                    f"found out-of-range entries at positions={preview}."
-                )
-            path_mask[gt_edges] = True
-        path_exists = batch.gt_path_exists.view(-1).to(device)
-        return path_mask, path_exists
-
-    @staticmethod
     def _pad_start_entities(
         start_entity_ids: torch.Tensor,
         start_ptr: torch.Tensor,
@@ -633,10 +750,6 @@ class EmbedOutputs:
     node_ptr: torch.Tensor
     edge_index: torch.Tensor
     edge_relations: torch.Tensor
-    edge_labels: torch.Tensor
-    edge_scores: torch.Tensor
-    path_mask: torch.Tensor
-    path_exists: torch.Tensor
     heads_global: torch.Tensor
     tails_global: torch.Tensor
     node_tokens: torch.Tensor

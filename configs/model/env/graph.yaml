@@ -4,9 +4,10 @@ _target_: src.models.components.gflownet_env.GraphEnv
 mode: path
 forbid_backtrack: true
 forbid_revisit: true
+directed: true
 
-# 最大 roll-out 步数，GT 90% 为 1 跳、10% 为 2 跳，直接约束为 2。
-max_steps: 2
+# 最大 roll-out 步数（与 g_agent 构图 hop pruning 共享）。
+max_steps: ${window.max_hops}
 # 环境层 debug hook，仅在需要对拍 success/hit 时临时打开
 debug: ${debug}
 debug_max_resets: 2

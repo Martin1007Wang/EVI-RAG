@@ -1,7 +1,0 @@
-_target_: src.models.components.gflownet_rewards.AnswerFractionReward
-
-# Coverage-shaped reward (log-domain geometric interpolation).
-# f = fraction of answer entities visited along the trajectory (0..1).
-# f=0 -> failure_reward, f=1 -> success_reward.
-success_reward: 5.0
-failure_reward: 0.5

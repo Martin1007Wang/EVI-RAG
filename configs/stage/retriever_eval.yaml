@@ -1,11 +1,11 @@
 # @package _global_
 #
-# Stage: Evaluate retriever (metrics + optional persisted cache for downstream oracle/LLM stages).
+# Stage: Evaluate retriever + materialize g_agent (train/validation/test).
 
 defaults:
   - override /data: retriever
   - override /model: retriever_module
-  - override /callbacks: none
+  - override /callbacks: g_agent_generation
   - override /logger: none
   - override /trainer: predict
 
@@ -13,16 +13,34 @@ stage:
   name: retriever_eval
   task_name: "eval/retriever"
   tags: ["eval", "retriever"]
+  # Default behavior: evaluate + materialize all splits deterministically in one invocation.
+  # Override via CLI if you want a single split run:
+  #   stage.run_all_splits=false stage.split=test
+  run_all_splits: true
+  splits: [train, validation, test]
+  split: test
+  anchor_top_k: ${window.anchor_top_k}
+  max_hops: ${window.max_hops}
+  # Logit calibration for retriever scores cached into g_agent.
+  score_temperature: 1.0
+  score_bias: 0.0
   run:
     return_predictions: false
 
 ckpt_path: ${ckpt.retriever}
 
+data:
+  splits:
+    test: ${stage.split}
+
 model:
+  evaluation_cfg:
+    split: ${stage.split}
+    emit_predict_outputs: true
   eval_persist_cfg:
     enabled: true
     output_dir: ${dataset.materialized_dir}/eval_retriever
-    splits: ["test"]
+    splits: ["${stage.split}"]
     textualize: true
     entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
     relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet

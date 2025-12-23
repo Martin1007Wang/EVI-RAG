@@ -11,13 +11,13 @@ tags: ["train_retriever"]
 
 callbacks:
   model_checkpoint:
-    monitor: val/ranking/recall@100
+    monitor: val/reachability/answer_reachable@100
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/ranking/recall@100
+    monitor: val/reachability/answer_reachable@100
     mode: max
     patience: 10
 

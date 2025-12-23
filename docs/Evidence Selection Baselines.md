@@ -109,7 +109,7 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 
 ### 5. 在本仓库中的落点（数据/产物）
 本项目中，GFlowNet 训练与评测消费的是 `g_agent` 缓存（唯一持久化 schema）：
-- 生成：`stage=materialize_g_agent` → `${dataset.materialized_dir}/g_agent/<split>_g_agent.pt`
+- 生成：`stage=retriever_eval` → `${dataset.materialized_dir}/g_agent/<split>_g_agent.pt`
 - GFlowNet 评测：`stage=gflownet_eval` → `${dataset.materialized_dir}/eval_gflownet/test_gflownet_eval.pt`
 - Retriever 评测缓存：`stage=retriever_eval` → `${dataset.materialized_dir}/eval_retriever/test_retriever_eval.pt`
 
@@ -129,4 +129,3 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 
 3) **表：可部署性与代价**：  
 列出是否 oracle、是否使用答案、平均展开边数/耗时、最终证据边数、关键指标。
-

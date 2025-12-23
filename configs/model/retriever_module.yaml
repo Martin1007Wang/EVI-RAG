@@ -9,17 +9,22 @@ retriever:
   _target_: src.models.components.retriever.Retriever
   emb_dim: 1024
   hidden_dim: 1024
+  feature_extractor_activation:
+    _target_: torch.nn.ReLU
+  num_topics: ${dataset.num_topics}
   # Checkpoints（如 webqsp retriever 021）是在结构特征打开的情况下训练的，需保持一致维度。
-  topic_pe: true
+  topic_pe: ${dataset.topic_pe.enabled}
+  dde_cfg:
+    num_rounds: ${dataset.topic_pe.num_rounds}
+    num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
   dropout_p: 0.1
 
 loss:
-  _target_: src.losses.retriever_loss.RetrieverListwiseHardNegLoss
+  _target_: src.losses.retriever_loss.RetrieverReachabilityLoss
   temperature: 1.0
   listwise_weight: 1.0
-  hard_neg_k: 64
-  pairwise_margin: 1.0
-  pairwise_weight: 1.0
+  bce_weight: 0.5
+  soft_label_power: 1.0
 
 optimizer:
   _target_: torch.optim.Adam
@@ -34,10 +39,12 @@ scheduler: null
 evaluation_cfg:
   ranking_k: ${window.k_values}
   answer_recall_k: ${window.k_values}
+  reachability_k: ${window.k_values}
+  path_inclusion_k: ${window.k_values}
   emit_predict_outputs: false
 
 # Start-edge ranking loss: auxiliary term on edges incident to seed entities (added to full-graph loss).
 start_edge_loss_cfg:
-  enabled: true
+  enabled: false
   weight: 1.0  # auxiliary coefficient; full-graph loss always included
   apply_to_eval: false

@@ -4,3 +4,4 @@ hidden_dim: ${model.hidden_dim}
 max_steps: ${model.env_cfg.max_steps}
 dropout: 0.1
 frontier_bonus: 0.5
+direction_vocab_size: 3

@@ -51,7 +51,7 @@ def test_shortest_path_includes_backward_when_forward_missing():
 
 
 def test_shortest_path_preserves_parallel_edges():
-    # SubgraphRAG parity (nx.DiGraph): parallel edges collapse and keep the LAST edge id for (u,v).
+    # Deterministic single path prefers the smallest edge index.
     edges_src = [0, 0, 1]
     edges_dst = [1, 1, 2]
     path_edges, path_nodes = brp.shortest_path_edge_indices_directed(
@@ -62,7 +62,7 @@ def test_shortest_path_preserves_parallel_edges():
         answers=[2],
         undirected=False,
     )
-    assert path_edges == [1, 2]  # last edge id for (0,1) is 1
+    assert path_edges == [0, 2]
     assert path_nodes == [0, 1, 2]
 
 

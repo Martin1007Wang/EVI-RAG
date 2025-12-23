@@ -29,6 +29,7 @@ def _mock_sample() -> dict:
         "edge_index": torch.tensor([[0, 2], [1, 0]], dtype=torch.long),
         "edge_attr": torch.zeros(2, dtype=torch.long),
         "labels": torch.tensor([1, 0], dtype=torch.long),
+        "soft_labels": torch.tensor([1.0, 0.0], dtype=torch.float32),
         "num_nodes": node_ids.numel(),
         "node_global_ids": node_ids,
         "node_embedding_ids": node_ids,
@@ -161,12 +162,14 @@ def test_retriever_forward_smoke(tmp_path) -> None:
         num_topics=2,
         dde_cfg={"num_rounds": 0, "num_reverse_rounds": 0},
         dropout_p=0.0,
+        feature_extractor_activation=torch.nn.ReLU(),
     ).eval()
     with torch.no_grad():
         output = model(batch)
-    assert output.scores.numel() == batch.edge_attr.numel()
-    assert output.logits.shape == output.scores.shape
-    assert output.query_ids.numel() == output.scores.numel()
+    scores = torch.sigmoid(output.logits)
+    assert scores.numel() == batch.edge_attr.numel()
+    assert output.logits.shape == scores.shape
+    assert output.query_ids.numel() == scores.numel()
 
 
 def test_retrieval_datamodule_requires_paths_or_data_dir() -> None:

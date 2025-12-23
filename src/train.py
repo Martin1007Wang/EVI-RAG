@@ -9,6 +9,7 @@ from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
 
+
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
 # the setup_root above is equivalent to:
@@ -43,6 +44,11 @@ from src.utils import (
 import logging
 from pathlib import Path
 
+import inspect
+from src.models.components.gflownet_actor import GFlowNetActor
+from src.models.gflownet_module import GFlowNetModule
+print("actor:", GFlowNetActor.rollout.__code__.co_filename)
+print("module:", GFlowNetModule._compute_log_flow_states.__code__.co_filename)
 
 def _setup_gflownet_debug_logging(cfg) -> None:
     enable = cfg.get("debug", False)

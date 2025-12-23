@@ -1,3 +1,3 @@
-from .retriever_loss import create_loss_function, LossOutput
+from .retriever_loss import LossOutput, RetrieverReachabilityLoss
 
-__all__ = ["create_loss_function", "LossOutput"]
+__all__ = ["LossOutput", "RetrieverReachabilityLoss"]

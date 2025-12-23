@@ -19,9 +19,11 @@ path materialization (avoid recomputing shortest paths later).
 
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import shutil
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -217,6 +219,135 @@ def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> 
     tmp_path.rename(final_path)
 
 
+def _build_adjacency(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    *,
+    undirected: bool,
+) -> List[List[int]]:
+    adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
+    for u_raw, v_raw in zip(edge_src, edge_dst):
+        u = int(u_raw)
+        v = int(v_raw)
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            adjacency[u].append(v)
+            if undirected:
+                adjacency[v].append(u)
+    for nbrs in adjacency:
+        nbrs.sort()
+    return adjacency
+
+
+def _multi_source_bfs(adjacency: List[List[int]], sources: Sequence[int]) -> List[int]:
+    num_nodes = len(adjacency)
+    dist = [-1] * num_nodes
+    q: deque[int] = deque()
+    for s_raw in sources:
+        s = int(s_raw)
+        if 0 <= s < num_nodes and dist[s] == -1:
+            dist[s] = 0
+            q.append(s)
+    while q:
+        cur = q.popleft()
+        next_dist = dist[cur] + 1
+        for nb in adjacency[cur]:
+            if dist[nb] != -1:
+                continue
+            dist[nb] = next_dist
+            q.append(nb)
+    return dist
+
+
+def _compute_soft_labels(
+    *,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    num_nodes: int,
+    start_nodes: Sequence[int],
+    answer_nodes: Sequence[int],
+    decay: float,
+    max_extra_hops: Optional[int],
+    undirected: bool,
+) -> List[float]:
+    num_edges = len(edge_src)
+    if num_nodes <= 0 or num_edges == 0:
+        return [0.0 for _ in range(num_edges)]
+    if not start_nodes or not answer_nodes:
+        return [0.0 for _ in range(num_edges)]
+
+    adjacency = _build_adjacency(num_nodes, edge_src, edge_dst, undirected=undirected)
+    dist_start = _multi_source_bfs(adjacency, start_nodes)
+    dist_answer = _multi_source_bfs(adjacency, answer_nodes)
+
+    reachable = [dist_start[a] for a in answer_nodes if 0 <= int(a) < num_nodes and dist_start[int(a)] >= 0]
+    if not reachable:
+        return [0.0 for _ in range(num_edges)]
+    min_len = min(reachable)
+
+    decay = float(decay)
+    max_extra = int(max_extra_hops) if max_extra_hops is not None else None
+    labels: List[float] = []
+    for u_raw, v_raw in zip(edge_src, edge_dst):
+        u = int(u_raw)
+        v = int(v_raw)
+        best = math.inf
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            du = dist_start[u]
+            dv = dist_start[v]
+            au = dist_answer[u]
+            av = dist_answer[v]
+            if du >= 0 and av >= 0:
+                best = min(best, du + 1 + av)
+            if dv >= 0 and au >= 0:
+                best = min(best, dv + 1 + au)
+        if best is math.inf:
+            labels.append(0.0)
+            continue
+        gap = int(best - min_len)
+        if max_extra is not None and gap > max_extra:
+            labels.append(0.0)
+            continue
+        labels.append(math.exp(-decay * float(gap)))
+    return labels
+
+
+def _mean_aggregate(edge_index: torch.Tensor, x: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    if edge_index.numel() == 0:
+        return x.new_zeros((num_nodes, x.size(1)))
+    src = edge_index[0].to(dtype=torch.long)
+    dst = edge_index[1].to(dtype=torch.long)
+    out = x.new_zeros((num_nodes, x.size(1)))
+    out.index_add_(0, dst, x[src])
+    deg = x.new_zeros((num_nodes,), dtype=x.dtype)
+    deg.index_add_(0, dst, torch.ones_like(dst, dtype=x.dtype))
+    return out / deg.clamp_min(1.0).unsqueeze(-1)
+
+
+def _build_topic_pe(
+    *,
+    topic_one_hot: torch.Tensor,
+    edge_index: torch.Tensor,
+    num_rounds: int,
+    num_reverse_rounds: int,
+) -> torch.Tensor:
+    num_nodes = int(topic_one_hot.size(0))
+    if num_nodes == 0:
+        return topic_one_hot.new_empty((0, topic_one_hot.size(1) * (1 + num_rounds + num_reverse_rounds)))
+    features = [topic_one_hot]
+    h = topic_one_hot
+    for _ in range(num_rounds):
+        h = _mean_aggregate(edge_index, h, num_nodes)
+        features.append(h)
+    rev_edge_index = edge_index.flip(0)
+    h_rev = topic_one_hot
+    for _ in range(num_reverse_rounds):
+        h_rev = _mean_aggregate(rev_edge_index, h_rev, num_nodes)
+        features.append(h_rev)
+    stacked = torch.stack(features, dim=-1)
+    return stacked.reshape(num_nodes, -1)
+
+
 def build_dataset(cfg: DictConfig) -> None:
     if cfg.get("seed") is not None:
         torch.manual_seed(int(cfg.seed))
@@ -230,6 +361,24 @@ def build_dataset(cfg: DictConfig) -> None:
     num_topics = int(cfg.get("num_topics", 2))
     if num_topics < 2:
         raise ValueError("num_topics must be >= 2 to build SubgraphRAG-parity topic features.")
+
+    soft_cfg = cfg.get("soft_label") or {}
+    soft_enabled = bool(soft_cfg.get("enabled", False))
+    soft_decay = float(soft_cfg.get("decay", 1.0))
+    if soft_decay <= 0.0:
+        raise ValueError(f"soft_label.decay must be > 0, got {soft_decay}")
+    max_extra_hops_raw = soft_cfg.get("max_extra_hops")
+    max_extra_hops = int(max_extra_hops_raw) if max_extra_hops_raw is not None else None
+    soft_undirected = bool(soft_cfg.get("undirected", False))
+
+    topic_pe_cfg = cfg.get("topic_pe") or {}
+    topic_pe_precompute = bool(topic_pe_cfg.get("precompute", False))
+    if topic_pe_precompute and ("num_rounds" not in topic_pe_cfg or "num_reverse_rounds" not in topic_pe_cfg):
+        raise ValueError("topic_pe.precompute=true requires explicit num_rounds and num_reverse_rounds.")
+    topic_pe_rounds = int(topic_pe_cfg.get("num_rounds", 0))
+    topic_pe_rev_rounds = int(topic_pe_cfg.get("num_reverse_rounds", 0))
+    if topic_pe_rounds < 0 or topic_pe_rev_rounds < 0:
+        raise ValueError("topic_pe.num_rounds and num_reverse_rounds must be >= 0.")
 
     # Load vocabulary tables (small) and convert to Python dicts
     entity_vocab = _load_parquet(Path(cfg.parquet_dir) / "entity_vocab.parquet").to_pydict()
@@ -435,6 +584,25 @@ def build_dataset(cfg: DictConfig) -> None:
                         f"Label length mismatch for {graph_id}: labels={label_tensor.numel()} vs num_edges={num_edges}. "
                         "Rebuild normalized parquet caches to match the updated schema."
                     )
+                if soft_enabled:
+                    soft_labels = _compute_soft_labels(
+                        edge_src=edge_src,
+                        edge_dst=edge_dst,
+                        num_nodes=num_nodes,
+                        start_nodes=q_local,
+                        answer_nodes=a_local,
+                        decay=soft_decay,
+                        max_extra_hops=max_extra_hops,
+                        undirected=soft_undirected,
+                    )
+                    soft_label_tensor = torch.tensor(soft_labels, dtype=torch.float32)
+                    if soft_label_tensor.numel() != num_edges:
+                        raise ValueError(
+                            f"soft_labels length mismatch for {graph_id}: soft_labels={soft_label_tensor.numel()} "
+                            f"vs num_edges={num_edges}."
+                        )
+                else:
+                    soft_label_tensor = label_tensor.float()
                 topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long)
 
                 q_entities = q_batch_dict["seed_entity_ids"][i] or []
@@ -444,6 +612,14 @@ def build_dataset(cfg: DictConfig) -> None:
                 if q_local:
                     topic_entity_mask[torch.as_tensor(q_local, dtype=torch.long)] = 1
                 topic_one_hot = torch.nn.functional.one_hot(topic_entity_mask, num_classes=num_topics).float()
+                topic_pe = None
+                if topic_pe_precompute:
+                    topic_pe = _build_topic_pe(
+                        topic_one_hot=topic_one_hot,
+                        edge_index=edge_index,
+                        num_rounds=topic_pe_rounds,
+                        num_reverse_rounds=topic_pe_rev_rounds,
+                    )
                 q_emb_ids = (q_batch_dict.get("seed_embedding_ids", [[]] * (i + 1)) or [[]])[i] or []
                 a_emb_ids = (q_batch_dict.get("answer_embedding_ids", [[]] * (i + 1)) or [[]])[i] or []
 
@@ -464,10 +640,10 @@ def build_dataset(cfg: DictConfig) -> None:
                     "edge_index": edge_index,
                     "edge_attr": edge_attr,
                     "labels": label_tensor,
+                    "soft_labels": soft_label_tensor,
                     "num_nodes": num_nodes,
                     "node_global_ids": node_global_ids,
                     "node_embedding_ids": node_emb_ids,
-                    "topic_one_hot": topic_one_hot,
                     "question_emb": q_batch_emb[i],
                     "question": q_batch_dict["question"][i],
                     # 全局种子实体（用于下游 start_entity_ids）
@@ -488,6 +664,10 @@ def build_dataset(cfg: DictConfig) -> None:
                     "idx": processed + i,
                     "metadata": meta_val,
                 }
+                if not topic_pe_precompute:
+                    sample["topic_one_hot"] = topic_one_hot
+                if topic_pe is not None:
+                    sample["topic_pe"] = topic_pe
 
                 txn = txn_cache[split]
                 _write_sample(txn, graph_id, sample)
