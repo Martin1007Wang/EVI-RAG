@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -66,6 +68,7 @@ class RetrieverModule(LightningModule):
         self._emit_predict_outputs = bool(eval_cfg.get("emit_predict_outputs", False))
         self._predict_metrics: Dict[str, Any] = {}
         self._predict_split = str(eval_cfg.get("split", "test"))
+        self._metrics_enabled = bool(eval_cfg.get("metrics_enabled", True))
 
         self._streaming_state: Dict[str, Dict[str, Any]] = {}
         self.eval_persist_cfg: Dict[str, Any] = self._to_dict(eval_persist_cfg or {})
@@ -101,6 +104,10 @@ class RetrieverModule(LightningModule):
         """统一的推理输出，供 predict/test 两个 loop 共享。"""
         logits = output.logits.detach().cpu()
         scores = torch.sigmoid(output.logits).detach().cpu()
+        logits_fwd = output.logits_fwd.detach().cpu() if output.logits_fwd is not None else None
+        logits_bwd = output.logits_bwd.detach().cpu() if output.logits_bwd is not None else None
+        scores_fwd = torch.sigmoid(logits_fwd) if logits_fwd is not None else None
+        scores_bwd = torch.sigmoid(logits_bwd) if logits_bwd is not None else None
         query_ids = output.query_ids.detach().cpu()
         relation_ids = output.relation_ids.detach().cpu() if output.relation_ids is not None else None
 
@@ -120,6 +127,10 @@ class RetrieverModule(LightningModule):
             "query_ids": query_ids,
             "scores": scores,
             "logits": logits,
+            "scores_fwd": scores_fwd,
+            "scores_bwd": scores_bwd,
+            "logits_fwd": logits_fwd,
+            "logits_bwd": logits_bwd,
             "relation_ids": relation_ids,
             "edge_index": _maybe_cpu("edge_index"),
             "edge_attr": _maybe_cpu("edge_attr"),
@@ -170,9 +181,9 @@ class RetrieverModule(LightningModule):
         training_step: int,
     ) -> LossOutput:
         def _call_loss(edge_mask: Optional[torch.Tensor] = None) -> LossOutput:
-            targets = getattr(batch, "soft_labels", None)
+            targets = getattr(batch, "labels", None)
             if targets is None:
-                raise ValueError("Batch missing soft_labels required for retriever loss.")
+                raise ValueError("Batch missing labels required for retriever loss.")
             return self.loss(
                 output,
                 targets,
@@ -309,6 +320,8 @@ class RetrieverModule(LightningModule):
     def on_predict_epoch_end(self, results: Optional[List[Any]] = None) -> None:
         metrics = self._finalize_streaming_state(split=self._predict_split, log_metrics=False)
         self._predict_metrics = metrics
+        if not metrics:
+            return
         logger.info("Predict metrics: %s", {k: float(v) if hasattr(v, 'item') else v for k, v in metrics.items()})
         if self.trainer is not None and self.trainer.logger is not None:
             # 手动落日志，predict loop默认不会处理 self.log
@@ -352,11 +365,12 @@ class RetrieverModule(LightningModule):
         device = self.device
         ranking_k = [int(k) for k in self._ranking_k]
         max_ranking_k = max(ranking_k) if ranking_k else 1
-        answer_k = [int(k) for k in self._answer_k]
+        metrics_enabled = bool(self._metrics_enabled)
+        answer_k = [int(k) for k in self._answer_k] if metrics_enabled else []
         max_answer_k = max(answer_k) if answer_k else 0
-        reachability_k = [int(k) for k in self._reachability_k]
+        reachability_k = [int(k) for k in self._reachability_k] if metrics_enabled else []
         max_reach_k = max(reachability_k) if reachability_k else 0
-        path_k = [int(k) for k in self._path_k]
+        path_k = [int(k) for k in self._path_k] if metrics_enabled else []
         max_path_k = max(path_k) if path_k else 0
         max_top_k = max(max_ranking_k, max_answer_k, max_reach_k, max_path_k)
 
@@ -370,6 +384,7 @@ class RetrieverModule(LightningModule):
             "max_reach_k": int(max_reach_k),
             "max_path_k": int(max_path_k),
             "max_top_k": int(max_top_k),
+            "metrics_enabled": metrics_enabled,
             "discounts": discounts,
             "discounts_cumsum": discounts.cumsum(0),
             "ranking_count": torch.zeros((), device=device, dtype=torch.float32),
@@ -395,6 +410,10 @@ class RetrieverModule(LightningModule):
     def _finalize_streaming_state(self, *, split: str, log_metrics: bool = True) -> Dict[str, torch.Tensor]:
         state = self._streaming_state.get(split)
         if not state:
+            return {}
+        if not bool(state.get("metrics_enabled", True)):
+            self._maybe_persist_retriever_outputs(split, state["persist_samples"])
+            state["persist_samples"] = []
             return {}
 
         self._all_reduce_inplace(state["ranking_count"])
@@ -486,8 +505,11 @@ class RetrieverModule(LightningModule):
         if state is None or state.get("device") != output.logits.device:
             self._reset_streaming_state(split=split)
             state = self._streaming_state[split]
+        metrics_enabled = bool(state.get("metrics_enabled", True))
 
         scores_all = torch.sigmoid(output.logits).detach().view(-1)
+        logits_fwd_all = output.logits_fwd.detach().view(-1) if output.logits_fwd is not None else None
+        logits_bwd_all = output.logits_bwd.detach().view(-1) if output.logits_bwd is not None else None
         labels_all = batch.labels.detach().view(-1).to(dtype=torch.float32)
         if scores_all.numel() != labels_all.numel():
             raise ValueError(f"scores/labels shape mismatch: {scores_all.shape} vs {labels_all.shape}")
@@ -598,42 +620,43 @@ class RetrieverModule(LightningModule):
             top_scores, top_idx = torch.topk(scores, k=k_top, largest=True, sorted=True)
 
             # --- Ranking metrics (only defined when positives exist) ---
-            pos_mask = labels > 0.5
-            pos_count = int(pos_mask.sum().item())
-            if pos_count > 0:
-                best_pos = scores[pos_mask].max()
-                rank = (scores > best_pos).sum() + 1
-                state["mrr_sum"].add_(1.0 / rank.to(dtype=torch.float32))
-                state["ranking_count"].add_(1.0)
+            if metrics_enabled:
+                pos_mask = labels > 0.5
+                pos_count = int(pos_mask.sum().item())
+                if pos_count > 0:
+                    best_pos = scores[pos_mask].max()
+                    rank = (scores > best_pos).sum() + 1
+                    state["mrr_sum"].add_(1.0 / rank.to(dtype=torch.float32))
+                    state["ranking_count"].add_(1.0)
 
-                k_rank = min(k_top, max_ranking_k)
-                ranked_labels = labels[top_idx[:k_rank]].to(dtype=torch.float32)
-                hits_prefix = ranked_labels.cumsum(0)
-                dcg_prefix = (ranked_labels * discounts[:k_rank]).cumsum(0)
-                pos_denom = ranked_labels.new_tensor(float(pos_count))
+                    k_rank = min(k_top, max_ranking_k)
+                    ranked_labels = labels[top_idx[:k_rank]].to(dtype=torch.float32)
+                    hits_prefix = ranked_labels.cumsum(0)
+                    dcg_prefix = (ranked_labels * discounts[:k_rank]).cumsum(0)
+                    pos_denom = ranked_labels.new_tensor(float(pos_count))
 
-                for k in state["recall_sum"].keys():
-                    k_int = int(k)
-                    k_used = min(k_int, k_rank)
-                    hits = hits_prefix[k_used - 1] if k_used > 0 else ranked_labels.new_zeros(())
-                    recall = hits / pos_denom
-                    precision = hits / ranked_labels.new_tensor(float(k_int))
-                    denom_f1 = (precision + recall).clamp_min(1e-12)
-                    f1 = (2 * precision * recall) / denom_f1
+                    for k in state["recall_sum"].keys():
+                        k_int = int(k)
+                        k_used = min(k_int, k_rank)
+                        hits = hits_prefix[k_used - 1] if k_used > 0 else ranked_labels.new_zeros(())
+                        recall = hits / pos_denom
+                        precision = hits / ranked_labels.new_tensor(float(k_int))
+                        denom_f1 = (precision + recall).clamp_min(1e-12)
+                        f1 = (2 * precision * recall) / denom_f1
 
-                    state["precision_sum"][k].add_(precision)
-                    state["recall_sum"][k].add_(recall)
-                    state["f1_sum"][k].add_(f1)
+                        state["precision_sum"][k].add_(precision)
+                        state["recall_sum"][k].add_(recall)
+                        state["f1_sum"][k].add_(f1)
 
-                    ideal_k = min(pos_count, k_used)
-                    if ideal_k <= 0:
-                        state["ndcg_sum"][k].add_(ranked_labels.new_zeros(()))
-                    else:
-                        ideal_dcg = discounts_cumsum[ideal_k - 1]
-                        state["ndcg_sum"][k].add_(dcg_prefix[k_used - 1] / ideal_dcg)
+                        ideal_k = min(pos_count, k_used)
+                        if ideal_k <= 0:
+                            state["ndcg_sum"][k].add_(ranked_labels.new_zeros(()))
+                        else:
+                            ideal_dcg = discounts_cumsum[ideal_k - 1]
+                            state["ndcg_sum"][k].add_(dcg_prefix[k_used - 1] / ideal_dcg)
 
             # --- Answer recall (depends on top-k endpoints, independent of positives) ---
-            if state["answer_sum"]:
+            if metrics_enabled and state["answer_sum"]:
                 a_start = int(answer_ptr[gid])
                 a_end = int(answer_ptr[gid + 1])
                 answer_ids = answer_ids_all[a_start:a_end]
@@ -680,7 +703,7 @@ class RetrieverModule(LightningModule):
                             state["answer_sum"][k].add_((first_rank <= k_used).to(dtype=torch.float32).mean())
 
             # --- Answer reachability (undirected connectivity from start nodes) ---
-            if state["reachability_sum"]:
+            if metrics_enabled and state["reachability_sum"]:
                 q_start = int(q_ptr[gid])
                 q_end = int(q_ptr[gid + 1])
                 a_start = int(a_ptr[gid])
@@ -709,7 +732,7 @@ class RetrieverModule(LightningModule):
                                 state["reachability_sum"][k].add_(1.0 if reachable else 0.0)
 
             # --- GT path inclusion (coverage of GT edges in Top-K) ---
-            if state["path_inclusion_sum"]:
+            if metrics_enabled and state["path_inclusion_sum"]:
                 gt_start = int(gt_ptr[gid])
                 gt_end = int(gt_ptr[gid + 1])
                 gt_edges = gt_edge_indices[gt_start:gt_end]
@@ -746,18 +769,21 @@ class RetrieverModule(LightningModule):
                 a_end = int(answer_ptr[gid + 1])
                 answer_ids = answer_ids_all[a_start:a_end].detach().cpu()
 
-                state["persist_samples"].append(
-                    {
-                        "scores": top_scores[:k_persist].detach().cpu(),
-                        "labels": labels[top_edges].detach().cpu(),
-                        "head_ids": head_ids,
-                        "tail_ids": tail_ids,
-                        "relation_ids": relation_ids,
-                        "sample_id": sample_id,
-                        "question": question,
-                        "answer_ids": answer_ids,
-                    }
-                )
+                payload = {
+                    "scores": top_scores[:k_persist].detach().cpu(),
+                    "labels": labels[top_edges].detach().cpu(),
+                    "head_ids": head_ids,
+                    "tail_ids": tail_ids,
+                    "relation_ids": relation_ids,
+                    "sample_id": sample_id,
+                    "question": question,
+                    "answer_ids": answer_ids,
+                }
+                if logits_fwd_all is not None:
+                    payload["logits_fwd"] = logits_fwd_all[top_edges].detach().cpu()
+                if logits_bwd_all is not None:
+                    payload["logits_bwd"] = logits_bwd_all[top_edges].detach().cpu()
+                state["persist_samples"].append(payload)
 
     @staticmethod
     def _extract_questions(batch: Any, num_graphs: int) -> List[str]:
@@ -798,7 +824,14 @@ class RetrieverModule(LightningModule):
 
         output_dir = Path(cfg.get("output_dir", "eval_retriever"))
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{split}_retriever_eval.pt"
+        output_path = output_dir / f"{split}.pt"
+        manifest_path = output_dir / f"{split}.manifest.json"
+        artifact_name = str(cfg.get("artifact_name", "eval_retriever")).strip()
+        if not artifact_name:
+            raise ValueError("eval_persist_cfg.artifact_name must be a non-empty string.")
+        schema_version = int(cfg.get("schema_version", 1))
+        if schema_version <= 0:
+            raise ValueError("eval_persist_cfg.schema_version must be a positive integer.")
         entity_map, relation_map = self._resolve_vocab_maps(cfg)
 
         ranking_k = [int(k) for k in self._ranking_k]
@@ -806,6 +839,8 @@ class RetrieverModule(LightningModule):
         for sample in merged_samples:
             scores = sample["scores"]
             labels = sample["labels"]
+            logits_fwd = sample.get("logits_fwd")
+            logits_bwd = sample.get("logits_bwd")
             head_ids = sample.get("head_ids")
             tail_ids = sample.get("tail_ids")
             relation_ids = sample.get("relation_ids")
@@ -834,6 +869,10 @@ class RetrieverModule(LightningModule):
                             "rank": int(rank_idx + 1),
                         }
                     )
+                    if logits_fwd is not None:
+                        edges[-1]["logit_fwd"] = float(logits_fwd[rank_idx].item())
+                    if logits_bwd is not None:
+                        edges[-1]["logit_bwd"] = float(logits_bwd[rank_idx].item())
                 triplets_by_k[int(k)] = edges
 
             record: Dict[str, Any] = {
@@ -854,7 +893,20 @@ class RetrieverModule(LightningModule):
             "samples": records,
         }
         torch.save(payload, output_path)
-        logger.info("Persisted retriever eval outputs to %s (samples=%d)", output_path, len(records))
+        manifest = {
+            "artifact": artifact_name,
+            "schema_version": schema_version,
+            "file": output_path.name,
+            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "producer": "retriever_module",
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        logger.info(
+            "Persisted retriever eval outputs to %s (samples=%d, manifest=%s)",
+            output_path,
+            len(records),
+            manifest_path,
+        )
 
     @staticmethod
     def _resolve_vocab_maps(cfg: Dict[str, Any]) -> tuple[Optional[Dict[int, str]], Optional[Dict[int, str]]]:

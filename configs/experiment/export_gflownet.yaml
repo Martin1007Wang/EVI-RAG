@@ -1,0 +1,40 @@
+# @package _global_
+#
+# Experiment: export GFlowNet rollouts (stream JSONL, no metrics).
+
+defaults:
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: gflownet_rollout_writer
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: export_gflownet
+  task_name: "export/gflownet"
+  tags: ["export", "gflownet"]
+  split: test
+  return_predictions: false
+  save_metrics: false
+  ckpt_path: ${ckpt.gflownet}
+
+ckpt:
+  gflownet: ${oc.env:GFLOWNET_CKPT,null}
+
+data:
+  cache_paths:
+    test: ${dataset.materialized_dir}/g_agent/${run.split}_g_agent.pt
+
+model:
+  embedder_cfg:
+    allow_deferred_init: true
+
+callbacks:
+  gflownet_rollout_writer:
+    output_dir: ${dataset.materialized_dir}/export_gflownet
+    split: ${run.split}
+    artifact_name: export_gflownet
+    schema_version: 1
+    textualize: true
+    entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+    relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet

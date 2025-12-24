@@ -19,10 +19,10 @@ from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_l
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
-_STAGE_REQUIRES_CKPT_KIND = {
-    "retriever_eval": "retriever",
-    "gflownet_eval": "gflownet",
-    "gflownet_export": "gflownet",
+_RUN_REQUIRES_CKPT_KIND = {
+    "eval_retriever": "retriever",
+    "eval_gflownet": "gflownet",
+    "export_gflownet": "gflownet",
 }
 
 
@@ -119,34 +119,40 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py stage=retriever_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
+            "  python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
         )
 
-    stage = cfg.get("stage") or {}
-    stage_name = str(stage.get("name", "")).strip()
-    required_kind = _STAGE_REQUIRES_CKPT_KIND.get(stage_name)
+    run_cfg = cfg.get("run") or {}
+    run_name = str(run_cfg.get("name", "")).strip()
+    if run_name in ("", "null", "None"):
+        raise ValueError(
+            "Missing required config group: `run`.\n"
+            "Fix:\n"
+            "  python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
+        )
+    required_kind = _RUN_REQUIRES_CKPT_KIND.get(run_name)
     if required_kind and cfg.get("ckpt_path") in (None, ""):
         raise ValueError(
-            f"Stage `{stage_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
+            f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
 
 
-def _run_retriever_eval_all_splits(cfg: DictConfig) -> None:
-    stage_cfg = cfg.get("stage") or {}
-    splits = stage_cfg.get("splits") or ["train", "validation", "test"]
+def _run_eval_all_splits(cfg: DictConfig) -> None:
+    run_cfg = cfg.get("run") or {}
+    splits = run_cfg.get("splits") or ["train", "validation", "test"]
     split_list = [str(s) for s in splits]
     if not split_list:
-        raise ValueError("stage.splits must be a non-empty list when stage.run_all_splits=true.")
+        raise ValueError("run.splits must be a non-empty list when run.run_all_splits=true.")
 
     for split in split_list:
-        log.info("retriever_eval: split=%s", split)
+        log.info("eval: split=%s", split)
 
         with open_dict(cfg):
-            cfg.stage.split = split
+            cfg.run.split = split
         evaluate(cfg)
 
 
@@ -155,12 +161,15 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed") is not None:
         L.seed_everything(int(cfg.seed), workers=True)
 
-    stage = cfg.get("stage")
-    if stage is None:
-        raise ValueError("Missing required config group: `stage`. Example: `python src/eval.py stage=retriever_eval dataset=webqsp`.")
-    return_predictions = bool(stage.get("run", {}).get("return_predictions", False))
+    run_cfg = cfg.get("run")
+    if run_cfg is None:
+        raise ValueError(
+            "Missing required config group: `run`. Example: "
+            "`python src/eval.py experiment=eval_retriever dataset=webqsp`."
+        )
+    return_predictions = bool(run_cfg.get("return_predictions", False))
 
-    log.info(f"Stage: {stage.get('name')} (return_predictions={return_predictions})")
+    log.info(f"Run: {run_cfg.get('name')} (return_predictions={return_predictions})")
 
     _enforce_single_gpu_eval(cfg.trainer)
 
@@ -205,16 +214,17 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 metric_dict = metrics_from_model
         except Exception:
             pass
-    try:
+    run_cfg = cfg.get("run") or {}
+    save_metrics = bool(run_cfg.get("save_metrics", True))
+    if save_metrics:
+        if not metric_dict:
+            raise ValueError("No metrics were produced; check model.predict/test hooks or run.save_metrics.")
         metrics_filename = "metrics.json"
-        stage_cfg = cfg.get("stage") or {}
-        split = stage_cfg.get("split")
-        if bool(stage_cfg.get("run_all_splits", False)) and split not in (None, ""):
+        split = run_cfg.get("split")
+        if bool(run_cfg.get("run_all_splits", False)) and split not in (None, ""):
             metrics_filename = f"metrics_{split}.json"
         metrics_path = _save_metrics(cfg, metric_dict, filename=metrics_filename)
         log.info("Metrics saved to %s", metrics_path)
-    except Exception as exc:  # pragma: no cover
-        log.warning("Failed to save metrics.json: %s", exc)
     return metric_dict, object_dict
 
 
@@ -222,9 +232,9 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 def main(cfg: DictConfig) -> None:
     _preflight_validate(cfg)
     extras(cfg)
-    stage_cfg = cfg.get("stage") or {}
-    if str(stage_cfg.get("name", "")).strip() == "retriever_eval" and bool(stage_cfg.get("run_all_splits", False)):
-        _run_retriever_eval_all_splits(cfg)
+    run_cfg = cfg.get("run") or {}
+    if bool(run_cfg.get("run_all_splits", False)):
+        _run_eval_all_splits(cfg)
         return
     evaluate(cfg)
 

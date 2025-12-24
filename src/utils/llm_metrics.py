@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import string
 from dataclasses import dataclass
@@ -15,30 +16,49 @@ def _normalize(text: str) -> str:
     return text
 
 
-def _extract_predictions(raw: str) -> List[str]:
+class PredictionParseError(ValueError):
+    pass
+
+
+def _extract_predictions(raw: Any) -> List[str]:
     if raw is None:
-        return []
-    lines = [line.strip() for line in str(raw).split("\n") if line.strip()]
-    ans_lines = [ln for ln in lines if ln.lower().startswith("ans:")]
-    if ans_lines:
-        return ans_lines
-    return lines[:1] if lines else []
+        raise PredictionParseError("prediction is None")
+    text = str(raw).strip()
+    if not text:
+        raise PredictionParseError("prediction is empty")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PredictionParseError(
+            f"invalid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise PredictionParseError(f"JSON root must be an object with 'answers', got {type(parsed).__name__}")
+    if "answers" not in parsed:
+        raise PredictionParseError("missing required key 'answers'")
+    answers = parsed["answers"]
+    if not isinstance(answers, list):
+        raise PredictionParseError(f"'answers' must be a list, got {type(answers).__name__}")
+
+    normalized: List[str] = []
+    for idx, ans in enumerate(answers):
+        if not isinstance(ans, str):
+            raise PredictionParseError(f"'answers[{idx}]' must be a string, got {type(ans).__name__}")
+        text_ans = ans.strip()
+        if not text_ans:
+            raise PredictionParseError(f"'answers[{idx}]' is empty")
+        normalized.append(text_ans)
+    return normalized
 
 
 def _match(pred: str, answer: str) -> bool:
     return _normalize(pred) == _normalize(answer) or _normalize(answer) in _normalize(pred)
 
 
-def _score_answers(preds: List[str], gold_answers: List[str]) -> Dict[str, float]:
+def _score_match(preds: List[str], gold_answers: List[str]) -> Dict[str, float]:
     if not gold_answers:
-        return {"hit@1": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
-
-    # Hit@1
-    if preds:
-        hit = 1.0 if any(_match(preds[0], ans) for ans in gold_answers) else 0.0
-    else:
-        hit = 0.0
-
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
     matched = 0
     remaining_preds = preds.copy()
     for gold in gold_answers:
@@ -50,7 +70,58 @@ def _score_answers(preds: List[str], gold_answers: List[str]) -> Dict[str, float
     precision = matched / max(len(preds), 1)
     recall = matched / len(gold_answers)
     f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
-    return {"hit@1": float(hit), "precision": float(precision), "recall": float(recall), "f1": float(f1)}
+    return {"precision": float(precision), "recall": float(recall), "f1": float(f1)}
+
+
+def _dedupe_answers(values: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for val in values:
+        norm = _normalize(val)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(val)
+    return out
+
+
+def _score_answers(preds: List[str], gold_answers: List[str]) -> Dict[str, float]:
+    if not gold_answers:
+        return {
+            "hit@1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "set_precision": 0.0,
+            "set_recall": 0.0,
+            "set_f1": 0.0,
+            "set_exact": 0.0,
+        }
+
+    if preds:
+        hit = 1.0 if any(_match(preds[0], ans) for ans in gold_answers) else 0.0
+    else:
+        hit = 0.0
+
+    list_scores = _score_match(preds, gold_answers)
+    pred_set = _dedupe_answers(preds)
+    gold_set = _dedupe_answers(gold_answers)
+    set_scores = _score_match(pred_set, gold_set)
+
+    pred_norm = {_normalize(p) for p in preds if _normalize(p)}
+    gold_norm = {_normalize(g) for g in gold_answers if _normalize(g)}
+    set_exact = 1.0 if pred_norm == gold_norm else 0.0
+
+    return {
+        "hit@1": float(hit),
+        "precision": list_scores["precision"],
+        "recall": list_scores["recall"],
+        "f1": list_scores["f1"],
+        "set_precision": set_scores["precision"],
+        "set_recall": set_scores["recall"],
+        "set_f1": set_scores["f1"],
+        "set_exact": float(set_exact),
+    }
 
 
 def _as_int_list(values: Any) -> List[int]:
@@ -62,6 +133,14 @@ def _as_int_list(values: Any) -> List[int]:
         return [int(values)]
     except (TypeError, ValueError):
         return []
+
+
+def _require_bool(value: Any, *, name: str, sample_id: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"{name} must be bool/0/1 for id={sample_id}, got {value!r}")
 
 
 def _mean(values: Iterable[float]) -> float:
@@ -178,6 +257,10 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
     precisions: List[float] = []
     recalls: List[float] = []
     f1s: List[float] = []
+    set_precisions: List[float] = []
+    set_recalls: List[float] = []
+    set_f1s: List[float] = []
+    set_exacts: List[float] = []
     total = 0
 
     semantic_global = _SemanticAccumulator()
@@ -185,10 +268,29 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
     base_by_window: Dict[int, Dict[str, List[float]]] = {}
 
     for item in predictions:
-        gold_answers: List[str] = item.get("answers") or []
-        pred_raw: str = item.get("prediction") or ""
-        preds = _extract_predictions(pred_raw)
-        score = _score_answers(preds, gold_answers) if gold_answers else None
+        sample_id = str(item.get("id", "unknown"))
+        gold_raw = item.get("answers")
+        if gold_raw is None:
+            raise ValueError(f"missing gold answers for id={sample_id}")
+        if not isinstance(gold_raw, list):
+            raise ValueError(f"gold answers must be a list for id={sample_id}, got {type(gold_raw).__name__}")
+        if not gold_raw:
+            raise ValueError(f"gold answers list is empty for id={sample_id}")
+        gold_answers: List[str] = []
+        for idx, ans in enumerate(gold_raw):
+            if not isinstance(ans, str):
+                raise ValueError(f"gold answers[{idx}] must be string for id={sample_id}, got {type(ans).__name__}")
+            text_ans = ans.strip()
+            if not text_ans:
+                raise ValueError(f"gold answers[{idx}] is empty for id={sample_id}")
+            gold_answers.append(text_ans)
+
+        pred_raw = item.get("prediction")
+        try:
+            preds = _extract_predictions(pred_raw)
+        except PredictionParseError as exc:
+            raise ValueError(f"prediction parse failed for id={sample_id}: {exc}") from exc
+        score = _score_answers(preds, gold_answers)
 
         if score is not None:
             total += 1
@@ -196,35 +298,24 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
             precisions.append(score["precision"])
             recalls.append(score["recall"])
             f1s.append(score["f1"])
+            set_precisions.append(score["set_precision"])
+            set_recalls.append(score["set_recall"])
+            set_f1s.append(score["set_f1"])
+            set_exacts.append(score["set_exact"])
 
-        hit_set: Optional[bool] = item.get("hit_set")
-        hit_vis: Optional[bool] = item.get("hit_vis")
+        if "hit_set" not in item or "hit_vis" not in item:
+            raise ValueError(f"missing hit_set/hit_vis for id={sample_id}")
+        hit_set = _require_bool(item.get("hit_set"), name="hit_set", sample_id=sample_id)
+        hit_vis = _require_bool(item.get("hit_vis"), name="hit_vis", sample_id=sample_id)
 
-        gt_edges = _as_int_list(item.get("gt_path_edge_local_ids") or item.get("gt_path_edges"))
-        retrieved_edges = _as_int_list(item.get("retrieved_edge_ids"))
-
-        has_visible_key = "visible_edge_ids" in item
-        visible_edges = _as_int_list(item.get("visible_edge_ids")) if has_visible_key else []
-        if not has_visible_key:
-            visible_edges = retrieved_edges
-
-        if hit_set is None or hit_vis is None:
-            # Only derive hit events if the item explicitly represents a (K,B,phi) retrieval window.
-            # Guard against non-retrieval prompts (e.g., path rollouts) that do not provide edge IDs.
-            if gt_edges and retrieved_edges:
-                gt_set = set(gt_edges)
-                if hit_set is None:
-                    hit_set = gt_set.issubset(set(retrieved_edges))
-                if hit_vis is None:
-                    hit_vis = gt_set.issubset(set(visible_edges))
+        if "visible_edge_ids" not in item:
+            raise ValueError(f"missing visible_edge_ids for id={sample_id}")
+        visible_edges = _as_int_list(item.get("visible_edge_ids"))
 
         evidence_tokens = item.get("evidence_token_count")
         prompt_tokens = item.get("prompt_token_count")
         token_budget = item.get("token_budget")
-        if has_visible_key:
-            k_visible = len(visible_edges)
-        else:
-            k_visible = item.get("k_effective")
+        k_visible = len(visible_edges)
         truncated = bool(item.get("evidence_truncated", False))
         semantic_global.update(
             score=score["f1"] if score is not None else None,
@@ -245,12 +336,29 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
             window_k = None
 
         if window_k is not None:
-            base_stats = base_by_window.setdefault(window_k, {"hits": [], "precisions": [], "recalls": [], "f1s": [], "total": 0})
+            base_stats = base_by_window.setdefault(
+                window_k,
+                {
+                    "hits": [],
+                    "precisions": [],
+                    "recalls": [],
+                    "f1s": [],
+                    "set_precisions": [],
+                    "set_recalls": [],
+                    "set_f1s": [],
+                    "set_exacts": [],
+                    "total": 0,
+                },
+            )
             if score is not None:
                 base_stats["hits"].append(score["hit@1"])
                 base_stats["precisions"].append(score["precision"])
                 base_stats["recalls"].append(score["recall"])
                 base_stats["f1s"].append(score["f1"])
+                base_stats["set_precisions"].append(score["set_precision"])
+                base_stats["set_recalls"].append(score["set_recall"])
+                base_stats["set_f1s"].append(score["set_f1"])
+                base_stats["set_exacts"].append(score["set_exact"])
                 base_stats["total"] += 1
 
             sem_acc = semantic_by_window.setdefault(window_k, _SemanticAccumulator())
@@ -270,6 +378,10 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
         "results/macro_precision": _mean(precisions),
         "results/macro_recall": _mean(recalls),
         "results/macro_f1": _mean(f1s),
+        "results/answer_set_precision": _mean(set_precisions),
+        "results/answer_set_recall": _mean(set_recalls),
+        "results/answer_set_f1": _mean(set_f1s),
+        "results/answer_set_exact": _mean(set_exacts),
         "results/total": float(total),
     }
 
@@ -280,6 +392,10 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
         metrics[f"results/window_{k_int}/macro_precision"] = _mean(stats["precisions"])
         metrics[f"results/window_{k_int}/macro_recall"] = _mean(stats["recalls"])
         metrics[f"results/window_{k_int}/macro_f1"] = _mean(stats["f1s"])
+        metrics[f"results/window_{k_int}/answer_set_precision"] = _mean(stats["set_precisions"])
+        metrics[f"results/window_{k_int}/answer_set_recall"] = _mean(stats["set_recalls"])
+        metrics[f"results/window_{k_int}/answer_set_f1"] = _mean(stats["set_f1s"])
+        metrics[f"results/window_{k_int}/answer_set_exact"] = _mean(stats["set_exacts"])
         metrics[f"results/window_{k_int}/total"] = float(stats["total"])
 
     for k_int, sem in sorted(semantic_by_window.items()):

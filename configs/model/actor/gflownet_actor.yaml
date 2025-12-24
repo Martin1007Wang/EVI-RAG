@@ -1,6 +1,0 @@
-_target_: src.models.components.gflownet_actor.GFlowNetActor
-
-policy_temperature: 1.0
-# Optional: prune legal edge actions per graph by retriever score (Top-K). Use null to disable.
-action_topk: 100
-debug: ${debug}

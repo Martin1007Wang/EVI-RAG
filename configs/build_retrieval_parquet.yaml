@@ -10,7 +10,7 @@ raw_root: ${dataset.raw_root}
 out_dir: ${dataset.out_dir}
 column_map: ${dataset.column_map}
 entity_normalization: ${dataset.entity_normalization}
-undirected_traversal: ${dataset.undirected_traversal}
+# Shortest-path supervision is computed with undirected BFS (fixed design choice).
 
 # filtering / labeling knobs (train vs eval can differ)
 filter:

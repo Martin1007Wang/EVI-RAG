@@ -1,0 +1,28 @@
+# DataModule for reasoning over persisted GFlowNet eval rollouts (path-based).
+_target_: src.data.reasoner_path_datamodule.ReasonerPathDataModule
+
+# Required paths (split-aware, eval_gflownet/<split>.jsonl + <split>.manifest.json)
+eval_cache_path: ${dataset.materialized_dir}/eval_gflownet/${.split}.jsonl
+entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+questions_path: ${dataset.out_dir}/questions.parquet
+answer_text_field: answer_texts
+
+# Metadata for downstream logging / naming
+dataset: ${dataset.name}
+split: ${run.split}
+prompt_tag: paths
+artifact_name: eval_gflownet
+schema_version: 1
+
+# Chain filtering / prompt construction
+max_chains_per_sample: 20
+min_chain_length: 1
+max_chain_length: null
+include_meta: true
+sort_by: ["-frequency", "-length"]
+system_prompt: "You are a concise QA agent. Use the provided paths as evidence and return JSON answers."
+user_instruction: "Copy all answer entities exactly as they appear in the paths (no paraphrase or alias). Return JSON only: {\"answers\": [\"<entity>\", ...]}. Use [] if the answer is absent."
+
+# Loader
+num_workers: 0

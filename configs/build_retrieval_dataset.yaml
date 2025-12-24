@@ -42,13 +42,6 @@ topic_pe:
   num_rounds: ${dataset.topic_pe.num_rounds}
   num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
 
-# Soft labels for reachability-aware retriever training.
-soft_label:
-  enabled: false
-  decay: 1.0
-  max_extra_hops: 2
-  undirected: ${dataset.undirected_traversal}
-
 # Supervision invariant: retriever labels are ALWAYS triple-level (positive_triple_mask).
 # This removes ambiguous transition-lifting and enforces relation-sensitive training.
 

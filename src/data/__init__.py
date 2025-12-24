@@ -1,6 +1,6 @@
 """Public data API exposed to Lightning & Hydra configs.
 
-Keep this module import-lightweight: heavy dependencies (LLM reasoner datasets,
+Keep this module import-lightweight: heavy dependencies (reasoner datasets,
 Hydra/OmegaConf, etc.) are imported lazily to avoid side effects during unit
 tests and simple utilities.
 """
@@ -20,10 +20,11 @@ __all__ = [
     "SharedDataResources",
     "GAgentPyGDataset",
     "GAgentDataModule",
-    "LLMReasonerPathDataset",
-    "LLMReasonerPathDataModule",
-    "LLMReasonerTripletDataModule",
-    "LLMReasonerTruthDataModule",
+    "SelectorEvalDataModule",
+    "ReasonerPathDataset",
+    "ReasonerPathDataModule",
+    "ReasonerTripletDataModule",
+    "ReasonerOracleDataModule",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -33,10 +34,11 @@ if TYPE_CHECKING:  # pragma: no cover
     from .g_agent_dataset import GAgentPyGDataset
     from .g_retrieval_datamodule import GRetrievalDataModule
     from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
-    from .llm_reasoner_path_datamodule import LLMReasonerPathDataModule
-    from .llm_reasoner_path_dataset import LLMReasonerPathDataset
-    from .llm_reasoner_triplet_datamodule import LLMReasonerTripletDataModule
-    from .llm_reasoner_truth_datamodule import LLMReasonerTruthDataModule
+    from .selector_eval_datamodule import SelectorEvalDataModule
+    from .reasoner_path_datamodule import ReasonerPathDataModule
+    from .reasoner_path_dataset import ReasonerPathDataset
+    from .reasoner_triplet_datamodule import ReasonerTripletDataModule
+    from .reasoner_oracle_datamodule import ReasonerOracleDataModule
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
@@ -75,25 +77,30 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
 
         return GAgentDataModule
 
-    if name == "LLMReasonerPathDataset":
-        from .llm_reasoner_path_dataset import LLMReasonerPathDataset
+    if name == "SelectorEvalDataModule":
+        from .selector_eval_datamodule import SelectorEvalDataModule
 
-        return LLMReasonerPathDataset
+        return SelectorEvalDataModule
 
-    if name == "LLMReasonerPathDataModule":
-        from .llm_reasoner_path_datamodule import LLMReasonerPathDataModule
+    if name == "ReasonerPathDataset":
+        from .reasoner_path_dataset import ReasonerPathDataset
 
-        return LLMReasonerPathDataModule
+        return ReasonerPathDataset
 
-    if name == "LLMReasonerTripletDataModule":
-        from .llm_reasoner_triplet_datamodule import LLMReasonerTripletDataModule
+    if name == "ReasonerPathDataModule":
+        from .reasoner_path_datamodule import ReasonerPathDataModule
 
-        return LLMReasonerTripletDataModule
+        return ReasonerPathDataModule
 
-    if name == "LLMReasonerTruthDataModule":
-        from .llm_reasoner_truth_datamodule import LLMReasonerTruthDataModule
+    if name == "ReasonerTripletDataModule":
+        from .reasoner_triplet_datamodule import ReasonerTripletDataModule
 
-        return LLMReasonerTruthDataModule
+        return ReasonerTripletDataModule
+
+    if name == "ReasonerOracleDataModule":
+        from .reasoner_oracle_datamodule import ReasonerOracleDataModule
+
+        return ReasonerOracleDataModule
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

@@ -1,0 +1,9 @@
+# Model for selector evaluation (prediction-only).
+_target_: src.models.selector_eval_module.SelectorEvalModule
+
+dataset: ${dataset.name}
+split: ${run.split}
+output_dir: ${paths.output_dir}
+selector: ${data.selector}
+k_values: ${data.k_values}
+allow_empty_dag: false

@@ -1,0 +1,34 @@
+# @package _global_
+#
+# Experiment: GFlowNet artifact generation (eval_gflownet rollouts).
+
+defaults:
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: gflownet_rollout_writer
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: eval_gflownet
+  task_name: "eval/gflownet"
+  tags: ["eval", "gflownet"]
+  split: test
+  return_predictions: false
+  save_metrics: false
+  ckpt_path: ${ckpt.gflownet}
+
+# Checkpoints are run-dependent (not dataset-dependent).
+ckpt:
+  gflownet: ${oc.env:GFLOWNET_CKPT,null}
+
+data:
+  cache_paths:
+    test: ${dataset.materialized_dir}/g_agent/${run.split}_g_agent.pt
+
+model:
+  evaluation_cfg:
+    num_eval_rollouts: ${window.rollout_k_values}
+    rollout_temperature: 1.0
+  embedder_cfg:
+    allow_deferred_init: true

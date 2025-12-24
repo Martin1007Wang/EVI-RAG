@@ -4,6 +4,7 @@
 
 *   **DAG (Edge Mask)** 是解空间的全集。它包含数学上所有的最短路。
 *   **Path** 只是在这个全集中采样出的一个实例。
+*   **Pair-level DAG (CSR)** 是新的 SSOT：对每个 `(start, answer)` 对保存其最短路 DAG（集合），避免显式路径枚举。
 
 为了消除歧义并保持数学上的纯粹性，我们需要重写这份 `agents.md`。核心变革在于：**废除“多条路径列表”的物理存储，确立“最短路 DAG 掩码”为唯一的真值（Ground Truth），路径仅为训练时的采样视口。**
 
@@ -68,15 +69,20 @@
 
 **这是最关键的定义。请仔细区分“全集”与“实例”。**
 
-1.  **The Solution Set (解的全集 - Set Supervision):**
+1.  **The Solution Set (解的全集 - Pair-aware Set Supervision):**
     *   **Field:** `edge_labels` (Float Tensor, shape $[E]$; in g_agent) / `labels` (Float Tensor, shape $[E]$; in g_retrieval).
-    *   **Definition:** 此掩码标记了**所有**连接 $S_{loc}$ 到 $A_{loc}$ 的**有向**最短路径的并集（Union of all Shortest Paths DAG）。
-    *   **Math:** $M_e = 1 \iff e \in \bigcup_{\tau \in \mathcal{P}_{min}} \tau$。
-    *   **Purpose:** 用于计算 F1 Reward、Flow Matching Loss 的边缘概率。它是**多解**的完备表示。**我们不存储多条路径的列表，因为 DAG Mask 已经隐含了所有路径。**
+    *   **Definition:** 此掩码标记了**所有** `(start, answer)` 对上 **无向**最短路径的并集（Union of pair-wise Shortest Paths DAG）。
+    *   **Math:** $M_e = 1 \iff e \in \bigcup_{(s,a)} \bigcup_{\tau \in \mathcal{P}_{min}(s,a)} \tau$。
+    *   **Purpose:** 用于计算 F1 Reward、Flow Matching Loss 的边缘概率。它是**多解**的完备表示。
 
-2.  **The Canonical Reference (参考实例 - Instance Supervision):**
+2.  **The Pair-level DAG (SSOT - CSR):**
+    *   **Fields:** `pair_start_node_locals`, `pair_answer_node_locals`, `pair_edge_local_ids`, `pair_edge_ptr`.
+    *   **Definition:** 对每个可达 `(start, answer)` 对，保存其**最短路 DAG 的边集合**（CSR 结构）。
+    *   **Purpose:** 为训练/采样提供更细粒度的监督视图；不枚举路径实例，仅存集合。
+
+3.  **The Canonical Reference (参考实例 - Instance Supervision):**
     *   **Field:** `gt_path_edge_local_ids` (Long Tensor, shape $[L]$) & `gt_path_node_local_ids` (Long Tensor, shape $[L+1]$).
-    *   **Definition:** **一条**确定性的、用于参考的最短路径（由 Tie-break 规则选出，且必须沿有向边）。
+    *   **Definition:** **一条**确定性的、用于参考的最短路径（由 Tie-break 规则选出；允许沿有向边的任一方向行走）。
     *   **Purpose:** 仅用于 (1) 冷启动阶段的 Behavior Cloning (2) 调试与连通性验证 (3) 作为 Anchor path。
     *   **Constraint:** 这条路径的边必须是 `edge_labels>0.5` 的子集。
 
@@ -84,7 +90,7 @@
 
 *   **SSOT (Single Source of Truth):** 
     *   不要存储 `edge_heads` / `edge_tails`。它们必须由 `node_entity_ids` 和 `edge_head_locals/edge_tail_locals` 实时推导。
-    *   不要存储 "List of GT Paths"。如果你需要多条路径进行训练，请在训练步（Training Step）中基于 `edge_gt_mask` 进行 **On-the-fly Sampling**。不要把采样结果写死在磁盘上。
+    *   不要存储 "List of GT Paths"。使用 `pair_*` 的 CSR 结构表达集合；若需要路径实例，请在训练步中 **On-the-fly Sampling**。
 *   **Validation:** 
     *   $L_{path} = L_{edges} + 1$。
     *   `gt_path` 的起点 $\in$ `start_node_locals`，终点 $\in$ `answer_node_locals`。

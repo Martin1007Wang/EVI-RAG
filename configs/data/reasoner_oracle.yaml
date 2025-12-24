@@ -1,0 +1,16 @@
+# DataModule for retriever-oracle evaluation (upper bound with perfect LLM).
+_target_: src.data.reasoner_oracle_datamodule.ReasonerOracleDataModule
+
+dataset: ${dataset.name}
+split: ${run.split}
+prompt_tag: oracle
+
+# Input: persisted retriever eval cache (eval_retriever/<split>.pt + <split>.manifest.json).
+eval_retriever_path: ${dataset.materialized_dir}/eval_retriever/${data.split}.pt
+artifact_name: eval_retriever
+schema_version: 1
+
+# Window sizes (must be <= max ranking_k used when generating retriever eval cache).
+k_values: ${window.k_values}
+
+num_workers: 0

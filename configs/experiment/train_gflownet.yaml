@@ -1,0 +1,57 @@
+# @package _global_
+#
+# GFlowNet training (single recommended config).
+
+defaults:
+  - override /data: gflownet
+  - override /model: gflownet_module
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /trainer: gpu
+
+task_name: "gflownet_train"
+tags: ["gflownet"]
+train: true
+test: true
+ckpt_path: null
+seed: 42
+optimized_metric: "val/answer_hit"
+
+ckpt:
+  retriever: ${oc.env:RETRIEVER_CKPT,null}
+
+window:
+  max_hops: 3
+
+trainer:
+  check_val_every_n_epoch: 1
+
+model:
+  training_cfg:
+    num_train_rollouts: 2
+
+  evaluation_cfg:
+    num_eval_rollouts: 10
+    rollout_temperature: 1.0
+
+  env_cfg:
+    max_steps: 3
+
+  actor_cfg:
+    policy_temperature: 1.0
+    action_topk: 100
+
+  reward_cfg:
+    shaping_coef: 5.0
+
+callbacks:
+  model_checkpoint:
+    monitor: val/answer_hit
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: val/answer_hit
+    mode: max
+    patience: 50

@@ -42,6 +42,11 @@ class GAgentSample:
     # 可空节点索引（为空时使用 shape [0] 的 long tensor）
     start_node_locals: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
     answer_node_locals: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    # Pair-level shortest-path supervision (CSR-style).
+    pair_start_node_locals: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    pair_answer_node_locals: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    pair_edge_local_ids: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    pair_edge_ptr: torch.LongTensor = field(default_factory=lambda: torch.tensor([0], dtype=torch.long))
     gt_path_exists: bool = False
     # 可达性标志
     is_answer_reachable: bool = False
@@ -80,6 +85,10 @@ def _builder_sample_to_record(sample: GAgentSample) -> Dict:
         "gt_path_exists": bool(sample.gt_path_exists),
         "start_node_locals": _tolist(sample.start_node_locals),
         "answer_node_locals": _tolist(sample.answer_node_locals),
+        "pair_start_node_locals": _tolist(sample.pair_start_node_locals),
+        "pair_answer_node_locals": _tolist(sample.pair_answer_node_locals),
+        "pair_edge_local_ids": _tolist(sample.pair_edge_local_ids),
+        "pair_edge_ptr": _tolist(sample.pair_edge_ptr),
         "is_answer_reachable": bool(sample.is_answer_reachable),
     }
 
@@ -100,6 +109,10 @@ def _parse_sample(record: Dict) -> GAgentSample:
         "start_node_locals",
         "answer_entity_ids",
         "answer_node_locals",
+        "pair_start_node_locals",
+        "pair_answer_node_locals",
+        "pair_edge_local_ids",
+        "pair_edge_ptr",
         "gt_path_edge_local_ids",
         "gt_path_node_local_ids",
         "gt_path_exists",
@@ -187,10 +200,47 @@ def _parse_sample(record: Dict) -> GAgentSample:
     answer_entity_ids = as_long("answer_entity_ids")
     start_node_locals = as_long("start_node_locals")
     answer_node_locals = as_long("answer_node_locals")
+    pair_start_node_locals = as_long("pair_start_node_locals")
+    pair_answer_node_locals = as_long("pair_answer_node_locals")
+    pair_edge_local_ids = as_long("pair_edge_local_ids")
+    pair_edge_ptr = as_long("pair_edge_ptr")
 
     for name, locals_tensor in (("start_node_locals", start_node_locals), ("answer_node_locals", answer_node_locals)):
         if locals_tensor.numel() > 0 and ((locals_tensor < 0).any() or (locals_tensor >= num_nodes).any()):
             raise ValueError(f"{name} out of range for {record.get('sample_id')}")
+
+    if pair_start_node_locals.numel() != pair_answer_node_locals.numel():
+        raise ValueError(
+            f"pair_start_node_locals length {pair_start_node_locals.numel()} != "
+            f"pair_answer_node_locals length {pair_answer_node_locals.numel()} for {record.get('sample_id')}"
+        )
+    for name, locals_tensor in (
+        ("pair_start_node_locals", pair_start_node_locals),
+        ("pair_answer_node_locals", pair_answer_node_locals),
+    ):
+        if locals_tensor.numel() > 0 and ((locals_tensor < 0).any() or (locals_tensor >= num_nodes).any()):
+            raise ValueError(f"{name} out of range for {record.get('sample_id')}")
+    if pair_edge_local_ids.numel() > 0:
+        if ((pair_edge_local_ids < 0) | (pair_edge_local_ids >= num_edges)).any():
+            raise ValueError(f"pair_edge_local_ids out of range for {record.get('sample_id')}")
+    if pair_edge_ptr.numel() == 0:
+        if pair_start_node_locals.numel() != 0:
+            raise ValueError(f"pair_edge_ptr empty but pairs exist for {record.get('sample_id')}")
+    else:
+        if pair_edge_ptr.numel() != pair_start_node_locals.numel() + 1:
+            raise ValueError(
+                f"pair_edge_ptr length {pair_edge_ptr.numel()} != pair_count+1 "
+                f"({pair_start_node_locals.numel() + 1}) for {record.get('sample_id')}"
+            )
+        if pair_edge_ptr[0].item() != 0:
+            raise ValueError(f"pair_edge_ptr must start at 0 for {record.get('sample_id')}")
+        if (pair_edge_ptr[1:] < pair_edge_ptr[:-1]).any():
+            raise ValueError(f"pair_edge_ptr must be non-decreasing for {record.get('sample_id')}")
+        if pair_edge_ptr[-1].item() != pair_edge_local_ids.numel():
+            raise ValueError(
+                f"pair_edge_ptr end {int(pair_edge_ptr[-1].item())} != "
+                f"pair_edge_local_ids length {pair_edge_local_ids.numel()} for {record.get('sample_id')}"
+            )
 
     gt_path_edge_local_ids = as_long("gt_path_edge_local_ids")
     gt_path_node_local_ids = as_long("gt_path_node_local_ids")
@@ -202,30 +252,43 @@ def _parse_sample(record: Dict) -> GAgentSample:
             raise ValueError(f"gt_path_node_local_ids out of range for {record.get('sample_id')}")
     gt_path_exists = bool(record["gt_path_exists"])
     if gt_path_exists:
-        if gt_path_edge_local_ids.numel() == 0 or gt_path_node_local_ids.numel() == 0:
-            raise ValueError(f"gt_path_exists=True but gt_path_* is empty for {record.get('sample_id')}")
-        if gt_path_node_local_ids.numel() != gt_path_edge_local_ids.numel() + 1:
-            raise ValueError(
-                f"gt_path_node_local_ids length {gt_path_node_local_ids.numel()} != "
-                f"gt_path_edge_local_ids+1 ({gt_path_edge_local_ids.numel() + 1}) for {record.get('sample_id')}"
-            )
-        if start_node_locals.numel() > 0:
-            if not bool((start_node_locals == gt_path_node_local_ids[0]).any().item()):
-                raise ValueError(f"gt_path does not start from start_node_locals for {record.get('sample_id')}")
-        if answer_node_locals.numel() > 0:
-            if not bool((answer_node_locals == gt_path_node_local_ids[-1]).any().item()):
-                raise ValueError(f"gt_path terminal not in answer_node_locals for {record.get('sample_id')}")
-        for idx, edge_id in enumerate(gt_path_edge_local_ids.tolist()):
-            h = int(edge_head_locals[edge_id].item())
-            t = int(edge_tail_locals[edge_id].item())
-            a = int(gt_path_node_local_ids[idx].item())
-            b = int(gt_path_node_local_ids[idx + 1].item())
-            if not (a == h and b == t):
-                raise ValueError(f"gt_path edge/node mismatch at step {idx} for {record.get('sample_id')}")
+        if gt_path_edge_local_ids.numel() == 0:
+            if gt_path_node_local_ids.numel() != 1:
+                raise ValueError(f"gt_path zero-length but node path size != 1 for {record.get('sample_id')}")
+            if start_node_locals.numel() > 0:
+                if not bool((start_node_locals == gt_path_node_local_ids[0]).any().item()):
+                    raise ValueError(f"gt_path does not start from start_node_locals for {record.get('sample_id')}")
+            if answer_node_locals.numel() > 0:
+                if not bool((answer_node_locals == gt_path_node_local_ids[-1]).any().item()):
+                    raise ValueError(f"gt_path terminal not in answer_node_locals for {record.get('sample_id')}")
+        else:
+            if gt_path_node_local_ids.numel() == 0:
+                raise ValueError(f"gt_path_exists=True but gt_path_node_local_ids is empty for {record.get('sample_id')}")
+            if gt_path_node_local_ids.numel() != gt_path_edge_local_ids.numel() + 1:
+                raise ValueError(
+                    f"gt_path_node_local_ids length {gt_path_node_local_ids.numel()} != "
+                    f"gt_path_edge_local_ids+1 ({gt_path_edge_local_ids.numel() + 1}) for {record.get('sample_id')}"
+                )
+            if start_node_locals.numel() > 0:
+                if not bool((start_node_locals == gt_path_node_local_ids[0]).any().item()):
+                    raise ValueError(f"gt_path does not start from start_node_locals for {record.get('sample_id')}")
+            if answer_node_locals.numel() > 0:
+                if not bool((answer_node_locals == gt_path_node_local_ids[-1]).any().item()):
+                    raise ValueError(f"gt_path terminal not in answer_node_locals for {record.get('sample_id')}")
+            for idx, edge_id in enumerate(gt_path_edge_local_ids.tolist()):
+                h = int(edge_head_locals[edge_id].item())
+                t = int(edge_tail_locals[edge_id].item())
+                a = int(gt_path_node_local_ids[idx].item())
+                b = int(gt_path_node_local_ids[idx + 1].item())
+                if not ((a == h and b == t) or (a == t and b == h)):
+                    raise ValueError(f"gt_path edge/node mismatch at step {idx} for {record.get('sample_id')}")
+            if gt_path_edge_local_ids.numel() > 0:
+                if not bool((edge_labels[gt_path_edge_local_ids] > 0.5).all().item()):
+                    raise ValueError(f"gt_path edges must be subset of edge_labels for {record.get('sample_id')}")
     elif gt_path_edge_local_ids.numel() > 0 or gt_path_node_local_ids.numel() > 0:
         raise ValueError(f"gt_path_exists=False but gt_path_* is non-empty for {record.get('sample_id')}")
 
-    computed_reachable = answer_node_locals.numel() > 0
+    computed_reachable = bool(pair_start_node_locals.numel() > 0)
     declared_reachable = bool(record["is_answer_reachable"])
     if computed_reachable != declared_reachable:
         raise ValueError(
@@ -249,6 +312,10 @@ def _parse_sample(record: Dict) -> GAgentSample:
         answer_entity_ids=answer_entity_ids,
         start_node_locals=start_node_locals,
         answer_node_locals=answer_node_locals,
+        pair_start_node_locals=pair_start_node_locals,
+        pair_answer_node_locals=pair_answer_node_locals,
+        pair_edge_local_ids=pair_edge_local_ids,
+        pair_edge_ptr=pair_edge_ptr,
         gt_path_edge_local_ids=gt_path_edge_local_ids,
         gt_path_node_local_ids=gt_path_node_local_ids,
         gt_path_exists=gt_path_exists,
@@ -304,10 +371,18 @@ class GAgentData(PyGData):
     def __inc__(self, key, value, *args, **kwargs):
         if key == "edge_index":
             return int(self.num_nodes)
-        if key in {"start_node_locals", "answer_node_locals", "gt_path_node_local_ids"}:
+        if key in {
+            "start_node_locals",
+            "answer_node_locals",
+            "gt_path_node_local_ids",
+            "pair_start_node_locals",
+            "pair_answer_node_locals",
+        }:
             return int(self.num_nodes)
-        if key == "gt_path_edge_local_ids":
+        if key in {"gt_path_edge_local_ids", "pair_edge_local_ids"}:
             return int(self.edge_index.size(1))
+        if key == "pair_edge_ptr":
+            return int(self.pair_edge_local_ids.numel())
         return super().__inc__(key, value, *args, **kwargs)
 
 
@@ -329,6 +404,10 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
         answer_node_locals=sample.answer_node_locals,
         start_entity_ids=sample.start_entity_ids,
         answer_entity_ids=sample.answer_entity_ids,
+        pair_start_node_locals=sample.pair_start_node_locals,
+        pair_answer_node_locals=sample.pair_answer_node_locals,
+        pair_edge_local_ids=sample.pair_edge_local_ids,
+        pair_edge_ptr=sample.pair_edge_ptr,
         gt_path_edge_local_ids=sample.gt_path_edge_local_ids,
         gt_path_node_local_ids=sample.gt_path_node_local_ids,
         gt_path_exists=torch.tensor([sample.gt_path_exists], dtype=torch.bool),

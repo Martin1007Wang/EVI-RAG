@@ -1,3 +1,0 @@
-_target_: src.models.components.gflownet_estimator.GFlowNetEstimator
-
-hidden_dim: ${model.hidden_dim}

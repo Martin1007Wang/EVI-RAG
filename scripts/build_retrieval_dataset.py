@@ -19,13 +19,11 @@ path materialization (avoid recomputing shortest paths later).
 
 from __future__ import annotations
 
-import math
 import os
 import pickle
 import shutil
-from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 try:
     import hydra
@@ -219,99 +217,6 @@ def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> 
     tmp_path.rename(final_path)
 
 
-def _build_adjacency(
-    num_nodes: int,
-    edge_src: Sequence[int],
-    edge_dst: Sequence[int],
-    *,
-    undirected: bool,
-) -> List[List[int]]:
-    adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
-    for u_raw, v_raw in zip(edge_src, edge_dst):
-        u = int(u_raw)
-        v = int(v_raw)
-        if 0 <= u < num_nodes and 0 <= v < num_nodes:
-            adjacency[u].append(v)
-            if undirected:
-                adjacency[v].append(u)
-    for nbrs in adjacency:
-        nbrs.sort()
-    return adjacency
-
-
-def _multi_source_bfs(adjacency: List[List[int]], sources: Sequence[int]) -> List[int]:
-    num_nodes = len(adjacency)
-    dist = [-1] * num_nodes
-    q: deque[int] = deque()
-    for s_raw in sources:
-        s = int(s_raw)
-        if 0 <= s < num_nodes and dist[s] == -1:
-            dist[s] = 0
-            q.append(s)
-    while q:
-        cur = q.popleft()
-        next_dist = dist[cur] + 1
-        for nb in adjacency[cur]:
-            if dist[nb] != -1:
-                continue
-            dist[nb] = next_dist
-            q.append(nb)
-    return dist
-
-
-def _compute_soft_labels(
-    *,
-    edge_src: Sequence[int],
-    edge_dst: Sequence[int],
-    num_nodes: int,
-    start_nodes: Sequence[int],
-    answer_nodes: Sequence[int],
-    decay: float,
-    max_extra_hops: Optional[int],
-    undirected: bool,
-) -> List[float]:
-    num_edges = len(edge_src)
-    if num_nodes <= 0 or num_edges == 0:
-        return [0.0 for _ in range(num_edges)]
-    if not start_nodes or not answer_nodes:
-        return [0.0 for _ in range(num_edges)]
-
-    adjacency = _build_adjacency(num_nodes, edge_src, edge_dst, undirected=undirected)
-    dist_start = _multi_source_bfs(adjacency, start_nodes)
-    dist_answer = _multi_source_bfs(adjacency, answer_nodes)
-
-    reachable = [dist_start[a] for a in answer_nodes if 0 <= int(a) < num_nodes and dist_start[int(a)] >= 0]
-    if not reachable:
-        return [0.0 for _ in range(num_edges)]
-    min_len = min(reachable)
-
-    decay = float(decay)
-    max_extra = int(max_extra_hops) if max_extra_hops is not None else None
-    labels: List[float] = []
-    for u_raw, v_raw in zip(edge_src, edge_dst):
-        u = int(u_raw)
-        v = int(v_raw)
-        best = math.inf
-        if 0 <= u < num_nodes and 0 <= v < num_nodes:
-            du = dist_start[u]
-            dv = dist_start[v]
-            au = dist_answer[u]
-            av = dist_answer[v]
-            if du >= 0 and av >= 0:
-                best = min(best, du + 1 + av)
-            if dv >= 0 and au >= 0:
-                best = min(best, dv + 1 + au)
-        if best is math.inf:
-            labels.append(0.0)
-            continue
-        gap = int(best - min_len)
-        if max_extra is not None and gap > max_extra:
-            labels.append(0.0)
-            continue
-        labels.append(math.exp(-decay * float(gap)))
-    return labels
-
-
 def _mean_aggregate(edge_index: torch.Tensor, x: torch.Tensor, num_nodes: int) -> torch.Tensor:
     if edge_index.numel() == 0:
         return x.new_zeros((num_nodes, x.size(1)))
@@ -361,15 +266,6 @@ def build_dataset(cfg: DictConfig) -> None:
     num_topics = int(cfg.get("num_topics", 2))
     if num_topics < 2:
         raise ValueError("num_topics must be >= 2 to build SubgraphRAG-parity topic features.")
-
-    soft_cfg = cfg.get("soft_label") or {}
-    soft_enabled = bool(soft_cfg.get("enabled", False))
-    soft_decay = float(soft_cfg.get("decay", 1.0))
-    if soft_decay <= 0.0:
-        raise ValueError(f"soft_label.decay must be > 0, got {soft_decay}")
-    max_extra_hops_raw = soft_cfg.get("max_extra_hops")
-    max_extra_hops = int(max_extra_hops_raw) if max_extra_hops_raw is not None else None
-    soft_undirected = bool(soft_cfg.get("undirected", False))
 
     topic_pe_cfg = cfg.get("topic_pe") or {}
     topic_pe_precompute = bool(topic_pe_cfg.get("precompute", False))
@@ -472,6 +368,11 @@ def build_dataset(cfg: DictConfig) -> None:
             "Re-run scripts/build_retrieval_parquet.py to regenerate normalized parquet with triple-level supervision."
         )
 
+    def _optional_graph_col(name: str, default: object) -> List:
+        if name in graphs_table.schema.names:
+            return graphs_table.column(name).to_pylist()
+        return [default for _ in range(graphs_table.num_rows)]
+
     graph_cols: Dict[str, List] = {
         "node_entity_ids": graphs_table.column("node_entity_ids").to_pylist(),
         "node_embedding_ids": graphs_table.column("node_embedding_ids").to_pylist(),
@@ -480,6 +381,10 @@ def build_dataset(cfg: DictConfig) -> None:
         "edge_relation_ids": graphs_table.column("edge_relation_ids").to_pylist(),
         # Fixed invariant: retriever supervision is ALWAYS triple-level.
         "positive_triple_mask": graphs_table.column("positive_triple_mask").to_pylist(),
+        "pair_start_node_locals": _optional_graph_col("pair_start_node_locals", []),
+        "pair_answer_node_locals": _optional_graph_col("pair_answer_node_locals", []),
+        "pair_edge_indices": _optional_graph_col("pair_edge_indices", []),
+        "pair_edge_ptr": _optional_graph_col("pair_edge_ptr", [0]),
         "gt_path_edge_indices": graphs_table.column("gt_path_edge_indices").to_pylist(),
         "gt_path_node_indices": graphs_table.column("gt_path_node_indices").to_pylist(),
     }
@@ -584,31 +489,14 @@ def build_dataset(cfg: DictConfig) -> None:
                         f"Label length mismatch for {graph_id}: labels={label_tensor.numel()} vs num_edges={num_edges}. "
                         "Rebuild normalized parquet caches to match the updated schema."
                     )
-                if soft_enabled:
-                    soft_labels = _compute_soft_labels(
-                        edge_src=edge_src,
-                        edge_dst=edge_dst,
-                        num_nodes=num_nodes,
-                        start_nodes=q_local,
-                        answer_nodes=a_local,
-                        decay=soft_decay,
-                        max_extra_hops=max_extra_hops,
-                        undirected=soft_undirected,
-                    )
-                    soft_label_tensor = torch.tensor(soft_labels, dtype=torch.float32)
-                    if soft_label_tensor.numel() != num_edges:
-                        raise ValueError(
-                            f"soft_labels length mismatch for {graph_id}: soft_labels={soft_label_tensor.numel()} "
-                            f"vs num_edges={num_edges}."
-                        )
-                else:
-                    soft_label_tensor = label_tensor.float()
-                topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long)
 
                 q_entities = q_batch_dict["seed_entity_ids"][i] or []
                 a_entities = q_batch_dict["answer_entity_ids"][i] or []
                 q_local = _local_indices(node_entity_ids, q_entities)
                 a_local = _local_indices(node_entity_ids, a_entities)
+
+                topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long)
+
                 if q_local:
                     topic_entity_mask[torch.as_tensor(q_local, dtype=torch.long)] = 1
                 topic_one_hot = torch.nn.functional.one_hot(topic_entity_mask, num_classes=num_topics).float()
@@ -625,22 +513,15 @@ def build_dataset(cfg: DictConfig) -> None:
 
                 path_edge_indices = graph_cols["gt_path_edge_indices"][g_idx] or []
                 path_node_indices = graph_cols["gt_path_node_indices"][g_idx] or []
-
-                def _edge_triples(edges: Iterable[int]) -> List[Tuple[int, int, int]]:
-                    triples: List[Tuple[int, int, int]] = []
-                    for e_idx in edges:
-                        if 0 <= e_idx < num_edges:
-                            h = node_entity_ids[edge_src[e_idx]]
-                            t = node_entity_ids[edge_dst[e_idx]]
-                            r = edge_rel[e_idx]
-                            triples.append((h, r, t))
-                    return triples
+                pair_start_node_locals = graph_cols["pair_start_node_locals"][g_idx] or []
+                pair_answer_node_locals = graph_cols["pair_answer_node_locals"][g_idx] or []
+                pair_edge_indices = graph_cols["pair_edge_indices"][g_idx] or []
+                pair_edge_ptr = graph_cols["pair_edge_ptr"][g_idx] or [0]
 
                 sample = {
                     "edge_index": edge_index,
                     "edge_attr": edge_attr,
                     "labels": label_tensor,
-                    "soft_labels": soft_label_tensor,
                     "num_nodes": num_nodes,
                     "node_global_ids": node_global_ids,
                     "node_embedding_ids": node_emb_ids,
@@ -654,8 +535,10 @@ def build_dataset(cfg: DictConfig) -> None:
                     "answer_entity_ids_len": torch.tensor([len(a_entities)], dtype=torch.long),
                     "q_embedding_ids": q_emb_ids,
                     "a_embedding_ids": a_emb_ids,
-                    "gt_paths_nodes": [path_node_indices] if path_node_indices else [],
-                    "gt_paths_triples": [_edge_triples(path_edge_indices)] if path_edge_indices else [],
+                    "pair_start_node_locals": pair_start_node_locals,
+                    "pair_answer_node_locals": pair_answer_node_locals,
+                    "pair_edge_indices": pair_edge_indices,
+                    "pair_edge_ptr": pair_edge_ptr,
                     # 直接存检索图中的 GT 边索引，便于下游无需反推
                     "gt_path_edge_indices": path_edge_indices if path_edge_indices else [],
                     # 兼容性：存原始节点索引列表（非必需）

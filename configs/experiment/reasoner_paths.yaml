@@ -1,0 +1,19 @@
+# @package _global_
+#
+# Experiment: reasoning over GFlowNet rollouts (path prompts).
+
+defaults:
+  - override /data: reasoner_paths
+  - override /model: reasoner/ollama
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: reasoner_paths
+  task_name: "reasoner/paths"
+  tags: ["eval", "reasoner", "paths"]
+  split: test
+  return_predictions: true
+  save_metrics: true
+  ckpt_path: null

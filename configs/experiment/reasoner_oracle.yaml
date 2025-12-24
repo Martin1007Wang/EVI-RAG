@@ -1,0 +1,19 @@
+# @package _global_
+#
+# Experiment: retriever-oracle upper bound (no LLM).
+
+defaults:
+  - override /data: reasoner_oracle
+  - override /model: reasoner/oracle
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: reasoner_oracle
+  task_name: "reasoner/oracle"
+  tags: ["eval", "reasoner", "oracle"]
+  split: test
+  return_predictions: true
+  save_metrics: true
+  ckpt_path: null

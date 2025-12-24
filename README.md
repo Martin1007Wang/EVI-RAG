@@ -89,7 +89,6 @@ The directory structure of new project looks like this:
 ├── configs                   <- Hydra configs
 │   ├── callbacks                <- Callbacks configs
 │   ├── data                     <- Data configs
-│   ├── debug                    <- Debugging configs
 │   ├── experiment               <- Experiment configs
 │   ├── extras                   <- Extra utilities configs
 │   ├── hparams_search           <- Hyperparameter search configs
@@ -297,37 +296,6 @@ python train.py +trainer.max_time="00:12:00:00"
 ```
 
 > **Note**: PyTorch Lightning provides about [40+ useful trainer flags](https://pytorch-lightning.readthedocs.io/en/latest/common/trainer.html#trainer-flags).
-
-</details>
-
-<details>
-<summary><b>Easily debug</b></summary>
-
-```bash
-# runs 1 epoch in default debugging mode
-# changes logging directory to `logs/debugs/...`
-# sets level of all command line loggers to 'DEBUG'
-# enforces debug-friendly configuration
-python train.py debug=default
-
-# run 1 train, val and test loop, using only 1 batch
-python train.py debug=fdr
-
-# print execution time profiling
-python train.py debug=profiler
-
-# try overfitting to 1 batch
-python train.py debug=overfit
-
-# raise exception if there are any numerical anomalies in tensors, like NaN or +/-inf
-python train.py +trainer.detect_anomaly=true
-
-# use only 20% of the data
-python train.py +trainer.limit_train_batches=0.2 \
-+trainer.limit_val_batches=0.2 +trainer.limit_test_batches=0.2
-```
-
-> **Note**: Visit [configs/debug/](configs/debug/) for different debugging configs.
 
 </details>
 
@@ -574,9 +542,6 @@ defaults:
   # it's optional since it doesn't need to exist and is excluded from version control
   - optional local: default.yaml
 
-  # debugging config (enable through command line, e.g. `python train.py debug=default)
-  - debug: null
-
 # task name, determines output directory path
 task_name: "train"
 
@@ -656,13 +621,18 @@ logger:
 ```
 
 预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
-- 训练（`experiment=`）：`train_retriever_default`（或 `train_retriever_perf_default`）、`train_gflownet_default`
-- 评估（`stage=`，统一入口 `python src/eval.py`）：`retriever_eval`, `gflownet_eval`, `llm_reasoner_truth`, `llm_reasoner_paths`, `llm_reasoner_triplet`
+- 训练（`experiment=`）：`train_retriever`, `train_gflownet`
+- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_retriever`, `eval_gflownet`, `export_gflownet`, `selector_eval_retriever`, `selector_eval_gflownet`, `reasoner_oracle`, `reasoner_paths`, `reasoner_triplet`
 
 数据构建（Retriever，triple-only 监督，不提供任何回退）：
 - `scripts/build_retrieval_parquet.py` 生成 normalized parquet；其中 `graphs.parquet` 必含 `positive_triple_mask`（GT 路径上的 canonical `(h,r,t)` 边）。
 - `scripts/build_retrieval_dataset.py` 物化 LMDB/embeddings；LMDB 中的 `labels` 恒等于 `positive_triple_mask`，不再支持 transition/hybrid 等旧语义。
 - 若已有旧缓存/旧 parquet，必须完整重建这两步，否则会 fail-fast。
+
+一致性设计要点：
+- 预处理阶段固定使用无向 BFS，并按 `(start, answer)` 对存储最短路 DAG（`pair_*` CSR 结构）。
+- Retriever 使用双视图打分 `max(fwd, bwd)`，GFlowNet 在有向图上通过 `backward_mask` + `direction` embedding 动态反向推理。
+- 详细说明见 `docs/undirected-bfs-supervision.md`。
 
 ```bash
 python scripts/build_retrieval_parquet.py dataset=webqsp
@@ -672,16 +642,18 @@ python scripts/build_retrieval_dataset.py dataset=webqsp
 评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：
 
 ```bash
-# 1) Retriever metrics + eval cache（供 truth）+ 物化 g_agent（train/validation/test）
-python src/eval.py stage=retriever_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt
+# 1) Retriever 产物：g_agent + eval_retriever cache（供 oracle/reasoner）
+python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt
 
-# 2) GFlowNet metrics + rollout cache（供 paths reasoner）
-python src/eval.py stage=gflownet_eval dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt ckpt.gflownet=/path/to/gflownet.ckpt
+# 2) GFlowNet 产物：eval_gflownet rollouts（供 paths reasoner）
+python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt
 
-# 3) Oracle upper bound / LLM reasoner
-python src/eval.py stage=llm_reasoner_truth dataset=webqsp
-python src/eval.py stage=llm_reasoner_paths dataset=webqsp model=llm_reasoner/ollama
-python src/eval.py stage=llm_reasoner_triplet dataset=webqsp model=llm_reasoner/ollama
+# 3) Selector metrics + oracle upper bound / reasoner
+python src/eval.py experiment=selector_eval_retriever dataset=webqsp
+python src/eval.py experiment=selector_eval_gflownet dataset=webqsp
+python src/eval.py experiment=reasoner_oracle dataset=webqsp
+python src/eval.py experiment=reasoner_paths dataset=webqsp model=reasoner/ollama
+python src/eval.py experiment=reasoner_triplet dataset=webqsp model=reasoner/ollama
 ```
 
 </details>
@@ -739,8 +711,6 @@ Default logging structure:
 │   │       │   └── ...
 │   │       └── ...
 │   │
-│   └── debugs                          # Logs generated when debugging config is attached
-│       └── ...
 ```
 
 </details>

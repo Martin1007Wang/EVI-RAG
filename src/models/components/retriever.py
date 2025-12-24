@@ -16,12 +16,16 @@ class RetrieverOutput:
     logits: torch.Tensor
     query_ids: torch.Tensor
     relation_ids: torch.Tensor | None = None
+    logits_fwd: torch.Tensor | None = None
+    logits_bwd: torch.Tensor | None = None
 
     def detach(self) -> "RetrieverOutput":
         return RetrieverOutput(
             logits=self.logits.detach(),
             query_ids=self.query_ids.detach(),
             relation_ids=self.relation_ids.detach() if self.relation_ids is not None else None,
+            logits_fwd=self.logits_fwd.detach() if self.logits_fwd is not None else None,
+            logits_bwd=self.logits_bwd.detach() if self.logits_bwd is not None else None,
         )
 
 
@@ -109,7 +113,13 @@ class Retriever(nn.Module):
             device = head_idx.device
             empty_logits = torch.empty(0, device=device, dtype=dtype)
             empty_ids = head_idx.new_empty(0)
-            output = RetrieverOutput(logits=empty_logits, query_ids=empty_ids, relation_ids=None)
+            output = RetrieverOutput(
+                logits=empty_logits,
+                query_ids=empty_ids,
+                relation_ids=None,
+                logits_fwd=empty_logits,
+                logits_bwd=empty_logits,
+            )
             if return_features:
                 features = torch.empty((0, self.hidden_dim), device=device, dtype=dtype)
                 return output, features
@@ -138,15 +148,33 @@ class Retriever(nn.Module):
         tail_repr = node_repr[tail_idx]
         relation_repr = self.relation_proj(edge_embeddings)
 
-        semantic = torch.cat([query_repr, head_repr, relation_repr, tail_repr], dim=-1)
-        structure = self._build_structure_features(batch, head_idx, tail_idx) if self.use_topic_pe else None
-        fused = torch.cat([semantic, structure], dim=-1) if structure is not None else semantic
+        semantic_fwd = torch.cat([query_repr, head_repr, relation_repr, tail_repr], dim=-1)
+        structure_fwd = self._build_structure_features(batch, head_idx, tail_idx) if self.use_topic_pe else None
+        fused_fwd = torch.cat([semantic_fwd, structure_fwd], dim=-1) if structure_fwd is not None else semantic_fwd
 
-        features = self.feature_extractor(self.dropout(fused))
-        logits = self.head(features)
+        semantic_bwd = torch.cat([query_repr, tail_repr, relation_repr, head_repr], dim=-1)
+        structure_bwd = self._build_structure_features(batch, tail_idx, head_idx) if self.use_topic_pe else None
+        fused_bwd = torch.cat([semantic_bwd, structure_bwd], dim=-1) if structure_bwd is not None else semantic_bwd
+
+        features_fwd = self.feature_extractor(self.dropout(fused_fwd))
+        features_bwd = self.feature_extractor(self.dropout(fused_bwd))
+        logits_fwd = self.head(features_fwd)
+        logits_bwd = self.head(features_bwd)
+        # Twin-view scoring: symmetric max over forward/backward logits.
+        logits = torch.max(logits_fwd, logits_bwd)
         relation_ids = getattr(batch, "edge_attr", None)
-        output = RetrieverOutput(logits=logits, query_ids=query_ids, relation_ids=relation_ids)
-        return (output, features) if return_features else (output, None)
+        output = RetrieverOutput(
+            logits=logits,
+            query_ids=query_ids,
+            relation_ids=relation_ids,
+            logits_fwd=logits_fwd,
+            logits_bwd=logits_bwd,
+        )
+        if return_features:
+            use_bwd = logits_bwd > logits_fwd
+            features = torch.where(use_bwd.unsqueeze(-1), features_bwd, features_fwd)
+            return output, features
+        return output, None
 
     def _build_structure_features(
         self,

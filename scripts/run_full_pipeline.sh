@@ -116,8 +116,8 @@ if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
   RETR_CKPT="${RETRIEVER_CKPT_OVERRIDE}"
   echo "==> [3/8] train_retriever (skipped, using retriever ckpt override)"
 else
-  echo "==> [3/8] train_retriever (experiment=train_retriever_default)"
-  RETR_EXP="train_retriever_default"
+echo "==> [3/8] train_retriever (experiment=train_retriever)"
+RETR_EXP="train_retriever"
   RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${RETR_EXP}")
   python src/train.py "${RETR_TRAIN_OVERRIDES[@]}"
   RETR_RUN_DIR="$(latest_run_dir "${RETR_EXP}")"
@@ -129,15 +129,15 @@ else
 fi
 echo "Retriever checkpoint: ${RETR_CKPT}"
 
-echo "==> [4/8] retriever_eval (train/val/test + g_agent)"
+echo "==> [4/8] eval_retriever (train/val/test + g_agent)"
 python src/eval.py \
   "${COMMON_OVERRIDES[@]}" \
-  "stage=retriever_eval" \
+  "experiment=eval_retriever" \
   "ckpt.retriever=${RETR_CKPT}" \
-  "stage.run_all_splits=true"
+  "run.run_all_splits=true"
 
-echo "==> [5/8] train_gflownet (experiment=train_gflownet_default)"
-GFLOW_EXP="train_gflownet_default"
+echo "==> [5/8] train_gflownet (experiment=train_gflownet)"
+GFLOW_EXP="train_gflownet"
 GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${GFLOW_EXP}" "ckpt.retriever=${RETR_CKPT}")
 python src/train.py "${GFLOW_TRAIN_OVERRIDES[@]}"
 GFLOW_RUN_DIR="$(latest_run_dir "${GFLOW_EXP}")"
@@ -151,12 +151,12 @@ echo "GFlowNet checkpoint: ${GFLOW_CKPT}"
 echo "==> [6/8] eval_gflownet"
 python src/eval.py \
   "${COMMON_OVERRIDES[@]}" \
-  "stage=gflownet_eval" \
+  "experiment=eval_gflownet" \
   "ckpt.gflownet=${GFLOW_CKPT}"
 
-echo "==> [7/8] oracle truth (retriever upper bound)"
+echo "==> [7/8] oracle (retriever upper bound)"
 python src/eval.py \
   "${COMMON_OVERRIDES[@]}" \
-  "stage=llm_reasoner_truth"
+  "experiment=reasoner_oracle"
 
 echo "Pipeline finished."

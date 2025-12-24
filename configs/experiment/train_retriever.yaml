@@ -1,0 +1,33 @@
+# @package _global_
+#
+# Retriever training (single recommended config).
+
+defaults:
+  - override /data: retriever
+  - override /model: retriever_module
+  - override /trainer: gpu
+  - override /logger: wandb
+
+task_name: "retriever_train"
+tags: ["retriever"]
+
+trainer:
+  min_epochs: 0
+  max_epochs: 10000
+  check_val_every_n_epoch: 1
+  precision: 16-mixed
+
+model:
+  compile_model: true
+
+callbacks:
+  model_checkpoint:
+    monitor: val/reachability/answer_reachable@100
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: val/reachability/answer_reachable@100
+    mode: max
+    patience: 10

@@ -9,7 +9,7 @@ from src.models.components.gflownet_embedder import GraphEmbedder
 
 def test_graph_embedder_requires_checkpoint() -> None:
     with pytest.raises(ValueError, match="requires retriever ckpt"):
-        GraphEmbedder(hidden_dim=4, proj_dropout=0.0, projector_checkpoint=None)
+        GraphEmbedder(hidden_dim=4, projector_checkpoint=None)
 
 
 def test_graph_embedder_edge_batch_bucketize_respects_ptr_boundaries() -> None:

@@ -28,7 +28,6 @@ def test_shortest_path_directed_forward_only():
         edge_dst=edges_dst,
         seeds=[0],
         answers=[2],
-        undirected=False,
     )
     assert path_edges == [0, 1]
     assert path_nodes == [0, 1, 2]
@@ -44,7 +43,6 @@ def test_shortest_path_includes_backward_when_forward_missing():
         edge_dst=edges_dst,
         seeds=[0],
         answers=[1],
-        undirected=False,
     )
     assert path_edges == [0]
     assert path_nodes == [0, 1]
@@ -60,7 +58,6 @@ def test_shortest_path_preserves_parallel_edges():
         edge_dst=edges_dst,
         seeds=[0],
         answers=[2],
-        undirected=False,
     )
     assert path_edges == [0, 2]
     assert path_nodes == [0, 1, 2]
@@ -156,7 +153,6 @@ def test_preprocess_writes_base_and_sub_only_when_filtered(tmp_path):
             "graph_field": "graph",
         },
         entity_normalization="none",
-        undirected_traversal=False,
         train_filter=train_filter,
         eval_filter=eval_filter,
         override_filters=override_filters,
@@ -232,7 +228,6 @@ def test_preprocess_skips_sub_when_no_rows_filtered(tmp_path):
             "graph_field": "graph",
         },
         entity_normalization="none",
-        undirected_traversal=False,
         train_filter=train_filter,
         eval_filter=eval_filter,
         override_filters={},
@@ -290,7 +285,6 @@ def test_preprocess_drops_empty_graph_samples(tmp_path):
             "graph_field": "graph",
         },
         entity_normalization="none",
-        undirected_traversal=False,
         train_filter=filter_all,
         eval_filter=filter_all,
         override_filters={},
@@ -343,9 +337,8 @@ def test_build_graph_emits_triple_mask_and_gt_source_answer_subgraph():
         entity_vocab,
         relation_vocab,
         graph_id="ds/train/0",
-        undirected_traversal=False,
     )
-    assert graph.gt_source == "answer_subgraph"
+    assert graph.gt_source == "answer_subgraph_dag"
     assert graph.gt_path_edge_indices == [0]
     assert graph.positive_triple_mask == [True, False]
 
@@ -369,6 +362,5 @@ def test_build_graph_emits_gt_source_shortest_path():
         entity_vocab,
         relation_vocab,
         graph_id="ds/train/1",
-        undirected_traversal=False,
     )
-    assert graph.gt_source == "shortest_path"
+    assert graph.gt_source == "shortest_path_dag"

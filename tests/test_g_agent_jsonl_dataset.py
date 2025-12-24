@@ -35,6 +35,10 @@ def test_g_agent_jsonl_dataset_stream_read(tmp_path: Path) -> None:
         gt_path_node_local_ids=torch.tensor([0, 1]),
         start_node_locals=torch.tensor([0]),
         answer_node_locals=torch.tensor([1]),
+        pair_start_node_locals=torch.tensor([0]),
+        pair_answer_node_locals=torch.tensor([1]),
+        pair_edge_local_ids=torch.tensor([0]),
+        pair_edge_ptr=torch.tensor([0, 1]),
         gt_path_exists=True,
         is_answer_reachable=True,
     )

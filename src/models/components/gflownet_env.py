@@ -2,98 +2,79 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict
-import logging
 
 import torch
 from torch import nn
-from torch_scatter import scatter_add, scatter_max
+
+STOP_RELATION = -1
+DIRECTION_FORWARD = 0
+DIRECTION_BACKWARD = 1
 
 
 @dataclass
 class GraphBatch:
-    edge_index: torch.Tensor          # [2, E_total], local node idx already offset by PyG Batch
-    edge_batch: torch.Tensor          # [E_total], graph id per edge
-    node_global_ids: torch.Tensor     # [N_total]
-    heads_global: torch.Tensor        # [E_total], cached global head ids
-    tails_global: torch.Tensor        # [E_total], cached global tail ids
-    edge_scores_z: torch.Tensor       # [E_total], per-graph z-scored edge scores
-    node_ptr: torch.Tensor            # [B+1], prefix sum of nodes per graph
-    edge_ptr: torch.Tensor            # [B+1], prefix sum of edges per graph
-    start_node_locals: torch.Tensor   # [S_total] local node idx (offset per graph)
-    start_ptr: torch.Tensor           # [B+1], prefix sum of start nodes
-    answer_node_locals: torch.Tensor  # [A_total] local node idx
-    answer_ptr: torch.Tensor          # [B+1], prefix sum of answer nodes
+    edge_index: torch.Tensor          # [2, E_total]
+    edge_batch: torch.Tensor          # [E_total]
+    edge_relations: torch.Tensor      # [E_total]
+    edge_scores_norm: torch.Tensor    # [E_total]
+    node_ptr: torch.Tensor            # [B+1]
+    edge_ptr: torch.Tensor            # [B+1]
+    start_node_locals: torch.Tensor   # [S_total]
+    start_ptr: torch.Tensor           # [B+1]
+    answer_node_locals: torch.Tensor  # [A_total]
+    answer_ptr: torch.Tensor          # [B+1]
     node_is_start: torch.Tensor       # [N_total] bool
     node_is_answer: torch.Tensor      # [N_total] bool
-    edge_starts_mask: torch.Tensor        # [E_total] bool, edges touching any start node
-    directed: bool                   # whether traversal is directed along edge_index
+    node_batch: torch.Tensor          # [N_total]
 
 
 @dataclass
 class GraphState:
     graph: GraphBatch
-    selected_mask: torch.Tensor       # [E_total] bool
+    active_nodes: torch.Tensor        # [N_total] bool
     visited_nodes: torch.Tensor       # [N_total] bool
-    selection_order: torch.Tensor     # [E_total] long
-    current_tail: torch.Tensor        # [B] global entity id
-    prev_tail: torch.Tensor           # [B] global entity id
-    current_tail_local: torch.Tensor  # [B] batch-global node index (edge_index space)
-    prev_tail_local: torch.Tensor     # [B] batch-global node index (edge_index space)
+    used_edge_mask: torch.Tensor      # [E_total] bool
+    actions: torch.Tensor             # [B, max_steps+1] long (edge id or STOP_RELATION)
+    directions: torch.Tensor          # [B, max_steps+1] long (DIRECTION_*)
+    action_embeddings: torch.Tensor   # [B, max_steps, H]
     done: torch.Tensor                # [B] bool
     step_counts: torch.Tensor         # [B] long
-    actions: torch.Tensor             # [B, max_steps + 1] long (edge idx within slice or stop idx)
     answer_hits: torch.Tensor         # [B] bool
-    debug_logged: torch.Tensor        # [B] bool, used only when debug=True to throttle logs
-    debug_enabled: bool               # whether this state should emit debug logs
+    selection_order: torch.Tensor     # [E_total] long (step index or -1)
 
 
 class GraphEnv(nn.Module):
-    """Graph environment on PyG flat batch (no dense padding)."""
+    """Set-based graph environment with edge-level actions."""
 
     def __init__(
         self,
         max_steps: int,
-        mode: str = "path",
-        forbid_backtrack: bool = True,
-        forbid_revisit: bool = True,
-        directed: bool = True,
-        debug: bool = False,
-        debug_max_resets: int = 0,
-        debug_max_graphs: int = 1,
-        debug_max_hits: int = 1,
     ) -> None:
         super().__init__()
         self.max_steps = int(max_steps)
-        mode = str(mode).lower()
-        if mode != "path":
-            raise ValueError(f"GraphEnv supports only mode='path' in the final model, got {mode!r}.")
-        self.mode = "path"
-        self.forbid_backtrack = bool(forbid_backtrack)
-        self.forbid_revisit = bool(forbid_revisit)
-        self.directed = bool(directed)
-        self.debug = bool(debug)
-        self.debug_max_resets = max(int(debug_max_resets), 0)
-        self.debug_max_graphs = max(int(debug_max_graphs), 1)
-        self.debug_max_hits = max(int(debug_max_hits), 1)
-        self._debug_resets_logged = 0
-        self._debug_hits_logged = 0
+        if self.max_steps <= 0:
+            raise ValueError(f"max_steps must be positive, got {self.max_steps}")
 
     def reset(self, batch: Dict[str, torch.Tensor], *, device: torch.device) -> GraphState:
         edge_index = batch["edge_index"].to(device)
         edge_batch = batch["edge_batch"].to(device)
-        node_global_ids = batch["node_global_ids"].to(device)
+        edge_relations = batch["edge_relations"].to(device=device, dtype=torch.long)
         node_ptr = batch["node_ptr"].to(device)
         edge_ptr = batch["edge_ptr"].to(device)
         if "edge_scores" not in batch:
             raise ValueError("edge_scores missing in graph batch; g_agent cache must provide per-edge scores.")
         edge_scores = batch["edge_scores"].to(device=device, dtype=torch.float32).view(-1)
-        start_node_locals = batch["start_node_locals"].to(device)
+        start_node_locals = batch["start_node_locals"].to(device=device, dtype=torch.long)
         start_ptr = batch["start_ptr"].to(device)
-        answer_node_locals = batch["answer_node_locals"].to(device)
+        answer_node_locals = batch["answer_node_locals"].to(device=device, dtype=torch.long)
         answer_ptr = batch["answer_ptr"].to(device)
+        if (start_node_locals < 0).any() or (answer_node_locals < 0).any():
+            raise ValueError("node locals contain negative values; packed batching forbids padding.")
 
         num_edges = edge_index.size(1)
         num_graphs = int(node_ptr.numel() - 1)
+        if num_graphs <= 0:
+            raise ValueError("Graph batch must have positive num_graphs.")
 
         start_counts = start_ptr[1:] - start_ptr[:-1]
         if start_counts.numel() != num_graphs:
@@ -102,85 +83,56 @@ class GraphEnv(nn.Module):
             raise ValueError("start_ptr must be non-decreasing.")
         missing_start = start_counts == 0
 
-        heads_global = node_global_ids[edge_index[0]]
-        tails_global = node_global_ids[edge_index[1]]
+        if edge_relations.numel() != num_edges:
+            raise ValueError(f"edge_relations length {edge_relations.numel()} != num_edges {num_edges}")
         if edge_scores.numel() != num_edges:
             raise ValueError(f"edge_scores length {edge_scores.numel()} != num_edges {num_edges}")
-        edge_scores_z = self._zscore_edges(edge_scores=edge_scores, edge_batch=edge_batch, num_graphs=num_graphs)
-        selected_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
-        selection_order = torch.full((num_edges,), -1, dtype=torch.long, device=device)
-        current_tail = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
-        prev_tail = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
-        current_tail_local = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
-        prev_tail_local = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
-        done = missing_start.to(device=device)
-        step_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
-        actions = torch.full((num_graphs, self.max_steps + 1), -1, dtype=torch.long, device=device)
-        # Debug 控制：仅首图打印一次 ENV_HIT_DEBUG
-        debug_logged = torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        edge_scores_norm = edge_scores
 
         num_nodes_total = int(node_ptr[-1].item())
         if num_nodes_total <= 0:
             raise ValueError("GraphEnv.reset received empty node_ptr; g_agent cache may be corrupt.")
-        if start_node_locals.numel() > 0 and (start_node_locals < 0).any():
-            raise ValueError("start_node_locals contains negative indices; g_agent cache must store valid node indices.")
-        if start_node_locals.numel() > 0 and int(start_node_locals.max().item()) >= num_nodes_total:
-            raise ValueError("start_node_locals contains out-of-range indices relative to node_ptr.")
-        if answer_node_locals.numel() > 0 and (answer_node_locals < 0).any():
-            raise ValueError("answer_node_locals contains negative indices; g_agent cache must store valid node indices.")
-        if answer_node_locals.numel() > 0 and int(answer_node_locals.max().item()) >= num_nodes_total:
-            raise ValueError("answer_node_locals contains out-of-range indices relative to node_ptr.")
 
-        self._validate_locals_per_graph(
-            locals_tensor=start_node_locals,
-            ptr=start_ptr,
-            node_ptr=node_ptr,
-            num_graphs=num_graphs,
-            name="start_node_locals",
-        )
-        self._validate_locals_per_graph(
-            locals_tensor=answer_node_locals,
-            ptr=answer_ptr,
-            node_ptr=node_ptr,
-            num_graphs=num_graphs,
-            name="answer_node_locals",
-        )
+        node_counts = (node_ptr[1:] - node_ptr[:-1]).clamp(min=0)
+        node_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), node_counts)
+        if node_batch.numel() != num_nodes_total:
+            raise ValueError("node_batch length mismatch with node_ptr.")
 
         node_is_start = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
         if start_node_locals.numel() > 0:
-            node_is_start[start_node_locals.long()] = True
+            node_is_start[start_node_locals] = True
         node_is_answer = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
         if answer_node_locals.numel() > 0:
-            node_is_answer[answer_node_locals.long()] = True
-        answer_hits = torch.zeros(num_graphs, dtype=torch.bool, device=device)
-        if start_node_locals.numel() > 0:
-            start_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), start_counts.clamp(min=0))
-            start_is_answer = node_is_answer[start_node_locals.long()].float()
-            answer_hits = torch.bincount(start_batch, weights=start_is_answer, minlength=num_graphs) > 0
-        # Directed traversal: step0 only allows outgoing edges from start nodes.
-        if self.directed:
-            edge_starts_mask = node_is_start[edge_index[0]]
-        else:
-            # Undirected traversal: step0 allows any incident edge.
-            edge_starts_mask = node_is_start[edge_index[0]] | node_is_start[edge_index[1]]
+            node_is_answer[answer_node_locals] = True
 
-        should_debug = bool(self.debug) and (self._debug_resets_logged < self.debug_max_resets)
-        if should_debug:
-            self._debug_resets_logged += 1
-            try:
-                logging.getLogger("gflownet.debug").info(
-                    "[ENV_DEBUG] debug=True num_graphs=%d num_edges=%d", num_graphs, num_edges
-                )
-            except Exception:
-                pass
+        active_nodes = node_is_start.clone()
+        visited_nodes = active_nodes.clone()
+
+        answer_hits = torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        if active_nodes.any():
+            hit_nodes = active_nodes & node_is_answer
+            if hit_nodes.any():
+                hit_batch = node_batch[hit_nodes]
+                answer_hits = torch.bincount(hit_batch, minlength=num_graphs) > 0
+
+        done = missing_start.to(device=device)
+        step_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
+        actions = torch.full((num_graphs, self.max_steps + 1), STOP_RELATION, dtype=torch.long, device=device)
+        directions = torch.full(
+            (num_graphs, self.max_steps + 1),
+            DIRECTION_FORWARD,
+            dtype=torch.long,
+            device=device,
+        )
+        used_edge_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
+        action_embeddings = torch.zeros(num_graphs, self.max_steps, 0, device=device)
+        selection_order = torch.full((num_edges,), -1, dtype=torch.long, device=device)
 
         graph = GraphBatch(
             edge_index=edge_index,
             edge_batch=edge_batch,
-            node_global_ids=node_global_ids,
-            heads_global=heads_global,
-            tails_global=tails_global,
-            edge_scores_z=edge_scores_z,
+            edge_relations=edge_relations,
+            edge_scores_norm=edge_scores_norm,
             node_ptr=node_ptr,
             edge_ptr=edge_ptr,
             start_node_locals=start_node_locals,
@@ -189,309 +141,155 @@ class GraphEnv(nn.Module):
             answer_ptr=answer_ptr,
             node_is_start=node_is_start,
             node_is_answer=node_is_answer,
-            edge_starts_mask=edge_starts_mask,
-            directed=self.directed,
+            node_batch=node_batch,
         )
         return GraphState(
             graph=graph,
-            selected_mask=selected_mask,
-            visited_nodes=node_is_start.clone(),
-            selection_order=selection_order,
-            current_tail=current_tail,
-            prev_tail=prev_tail,
-            current_tail_local=current_tail_local,
-            prev_tail_local=prev_tail_local,
+            active_nodes=active_nodes,
+            visited_nodes=visited_nodes,
+            used_edge_mask=used_edge_mask,
+            actions=actions,
+            directions=directions,
+            action_embeddings=action_embeddings,
             done=done,
             step_counts=step_counts,
-            actions=actions,
             answer_hits=answer_hits,
-            debug_logged=debug_logged,
-            debug_enabled=should_debug,
+            selection_order=selection_order,
         )
 
-    @staticmethod
-    def _zscore_edges(
-        *,
-        edge_scores: torch.Tensor,
-        edge_batch: torch.Tensor,
-        num_graphs: int,
-    ) -> torch.Tensor:
-        edge_scores = edge_scores.to(dtype=torch.float32)
-        counts = torch.bincount(edge_batch, minlength=num_graphs).to(dtype=edge_scores.dtype).clamp(min=1.0)
-        sum_scores = torch.zeros(num_graphs, device=edge_scores.device, dtype=edge_scores.dtype)
-        sum_scores.index_add_(0, edge_batch, edge_scores)
-        sum_sq = torch.zeros(num_graphs, device=edge_scores.device, dtype=edge_scores.dtype)
-        sum_sq.index_add_(0, edge_batch, edge_scores * edge_scores)
-        mean = sum_scores / counts
-        var = (sum_sq / counts) - mean * mean
-        std = torch.sqrt(var.clamp(min=0.0))
-        eps = torch.finfo(edge_scores.dtype).eps
-        std = torch.where(std > eps, std, torch.ones_like(std))
-        return (edge_scores - mean[edge_batch]) / std[edge_batch]
+    def candidate_edge_mask(self, state: GraphState) -> torch.Tensor:
+        forward_mask, backward_mask = self.candidate_edge_masks(state)
+        return forward_mask | backward_mask
+
+    def candidate_edge_masks(self, state: GraphState) -> tuple[torch.Tensor, torch.Tensor]:
+        edge_batch = state.graph.edge_batch
+        horizon_exhausted = state.step_counts[edge_batch] >= self.max_steps
+        base = (~state.done[edge_batch]) & (~horizon_exhausted)
+        heads = state.graph.edge_index[0]
+        tails = state.graph.edge_index[1]
+        forward_incident = state.active_nodes[heads]
+        backward_incident = state.active_nodes[tails]
+        forward_mask = base & forward_incident
+        backward_mask = base & backward_incident
+        return forward_mask, backward_mask
 
     def potential(self, state: GraphState, *, valid_edges_override: torch.Tensor | None = None) -> torch.Tensor:
-        """Potential based on global (per-graph) z-scored edge scores over legal actions.
-
-        Args:
-            valid_edges_override: Optional extra mask over edges (shape [E_total]) to further restrict
-                which actions are considered legal for the potential. This is useful when the actor
-                prunes the action set (e.g., Top-K) and we want φ(s) to reflect that same action set.
-        """
-        edge_scores_z = state.graph.edge_scores_z
-        edge_batch = state.graph.edge_batch
         num_graphs = int(state.graph.node_ptr.numel() - 1)
         if num_graphs <= 0:
-            return torch.zeros(0, device=edge_scores_z.device, dtype=edge_scores_z.dtype)
+            return torch.zeros(0, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
+        return torch.zeros(num_graphs, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
 
-        valid = self.action_mask_edges(state)
-        if valid_edges_override is not None:
-            valid_edges_override = valid_edges_override.to(device=edge_scores_z.device, dtype=torch.bool).view(-1)
-            if valid_edges_override.shape != valid.shape:
-                raise ValueError(
-                    f"valid_edges_override shape {tuple(valid_edges_override.shape)} != action_mask_edges {tuple(valid.shape)}"
-                )
-            valid = valid & valid_edges_override
-        valid = valid & (~state.selected_mask)
-        if state.done.any():
-            valid = valid & (~state.done[edge_batch])
-        if not bool(valid.any().item()):
-            return torch.zeros(num_graphs, device=edge_scores_z.device, dtype=edge_scores_z.dtype)
-
-        valid_counts = torch.bincount(edge_batch[valid], minlength=num_graphs).to(dtype=edge_scores_z.dtype)
-        scores = edge_scores_z.to(dtype=torch.float32)
-        neg_inf = torch.finfo(scores.dtype).min
-        masked = scores.masked_fill(~valid, neg_inf)
-        max_per_graph, _ = scatter_max(masked, edge_batch, dim=0, dim_size=num_graphs)
-        max_per_graph = torch.where(valid_counts > 0, max_per_graph, torch.zeros_like(max_per_graph))
-        exp_sum = scatter_add(
-            torch.exp(masked - max_per_graph[edge_batch]) * valid.to(dtype=scores.dtype),
-            edge_batch,
-            dim=0,
-            dim_size=num_graphs,
-        )
-        eps = torch.finfo(scores.dtype).tiny
-        logsumexp = max_per_graph + torch.log(exp_sum.clamp(min=eps))
-        logmeanexp = logsumexp - torch.log(valid_counts.clamp(min=1.0))
-        phi = torch.where(valid_counts > 0, logmeanexp, torch.zeros_like(logmeanexp))
-        return phi.to(dtype=edge_scores_z.dtype)
-
-    @staticmethod
-    def _validate_locals_per_graph(
+    def step(
+        self,
+        state: GraphState,
+        actions: torch.Tensor,
+        action_embeddings: torch.Tensor,
         *,
-        locals_tensor: torch.Tensor,
-        ptr: torch.Tensor,
-        node_ptr: torch.Tensor,
-        num_graphs: int,
-        name: str,
-    ) -> None:
-        counts = ptr.view(-1)[1:] - ptr.view(-1)[:-1]
-        total = int(counts.sum().item()) if counts.numel() > 0 else 0
-        if total != int(locals_tensor.numel()):
-            raise ValueError(
-                f"{name} count mismatch: ptr_sum={total} vs locals_numel={int(locals_tensor.numel())}"
-            )
-        if total == 0 or num_graphs <= 0:
-            return
-        batch_ids = torch.repeat_interleave(torch.arange(num_graphs, device=ptr.device), counts.clamp(min=0))
-        lower = node_ptr[batch_ids]
-        upper = node_ptr[batch_ids + 1]
-        invalid = (locals_tensor < lower) | (locals_tensor >= upper)
-        if not bool(invalid.any().item()):
-            return
-        bad_idx = torch.nonzero(invalid, as_tuple=False).view(-1)
-        preview = []
-        for i in bad_idx[:5].tolist():
-            preview.append(
-                f"(i={i} val={int(locals_tensor[i].item())} range=[{int(lower[i].item())},{int(upper[i].item())}))"
-            )
-        raise ValueError(f"{name} contains cross-graph indices: {', '.join(preview)}")
-
-    def action_mask_edges(self, state: GraphState) -> torch.Tensor:
-        edge_batch = state.graph.edge_batch
-        if not hasattr(state.graph, "edge_starts_mask"):
-            raise ValueError("edge_starts_mask missing in GraphBatch; ensure GraphEnv.reset precomputes it.")
-
-        # Hard horizon: once a graph has selected >= max_steps edges, only stop is legal.
-        horizon_exhausted = state.step_counts[edge_batch] >= self.max_steps
-
-        heads_global = state.graph.heads_global
-        tails_global = state.graph.tails_global
-        is_step0 = state.step_counts[edge_batch] == 0
-        current_tail = state.current_tail[edge_batch]
-
-        if state.graph.directed:
-            # Directed traversal: only follow head -> tail.
-            head_match = heads_global == current_tail
-            valid_next = head_match
-            next_local = state.graph.edge_index[1]
-        else:
-            # Undirected traversal: current node can match head or tail.
-            head_match = heads_global == current_tail
-            tail_match = tails_global == current_tail
-            valid_next = head_match | tail_match
-
-            # 下一节点（局部索引）由匹配端点确定：head_match -> tail，否则 tail_match -> head。
-            # 对非 incident 边该值无意义（会被 valid_next 屏蔽）。
-            next_local = torch.where(head_match, state.graph.edge_index[1], state.graph.edge_index[0])
-
-        if self.forbid_revisit:
-            visited = state.visited_nodes[next_local]
-            valid_next = valid_next & (~visited)
-
-        if self.forbid_backtrack:
-            prev_tail = state.prev_tail[edge_batch]
-            next_global = tails_global if state.graph.directed else torch.where(head_match, tails_global, heads_global)
-            is_backtrack = next_global == prev_tail
-            valid_next = valid_next & (~is_backtrack)
-
-        edge_mask = torch.where(is_step0, state.graph.edge_starts_mask, valid_next)
-        return edge_mask & (~horizon_exhausted)
-
-    def frontier_mask_edges(self, state: GraphState) -> torch.Tensor:
-        """返回策略前沿边掩码（不含重复边），用于边级 bonus。"""
-        edge_batch = state.graph.edge_batch
-        horizon_exhausted = state.step_counts[edge_batch] >= self.max_steps
-        is_step0 = state.step_counts[edge_batch] == 0
-        heads = state.graph.heads_global
-        tails = state.graph.tails_global
-        current_tail = state.current_tail[edge_batch]
-        if state.graph.directed:
-            frontier = heads == current_tail
-        else:
-            frontier = (heads == current_tail) | (tails == current_tail)
-        frontier = torch.where(is_step0, state.graph.edge_starts_mask, frontier)
-        frontier = frontier & (~state.selected_mask)
-        return frontier & (~horizon_exhausted)
-
-    def step(self, state: GraphState, actions: torch.Tensor, *, step_index: int) -> GraphState:
+        step_index: int,
+    ) -> GraphState:
         device = state.graph.edge_index.device
         num_graphs = int(state.graph.node_ptr.numel() - 1)
-        edge_ptr = state.graph.edge_ptr
-        es = edge_ptr[:-1]
-        ee = edge_ptr[1:]
-        stop_idx = ee  # virtual stop at end of slice
-
         if actions.numel() != num_graphs:
             raise ValueError(f"Actions length {actions.numel()} != num_graphs {num_graphs}")
+        if action_embeddings.shape[0] != num_graphs:
+            raise ValueError("action_embeddings batch mismatch with actions.")
 
-        invalid_low = actions < es
-        invalid_high = actions > ee
-        if invalid_low.any() or invalid_high.any():
-            bad = torch.nonzero(invalid_low | invalid_high, as_tuple=False).view(-1)
-            # Provide the first few offending graphs for deterministic debugging.
-            preview = []
-            for idx in bad[:5].tolist():
-                preview.append(
-                    f"(g={idx} action={int(actions[idx].item())} es={int(es[idx].item())} ee={int(ee[idx].item())})"
-                )
-            raise ValueError(
-                "Actions contain out-of-range indices for per-graph edge slices; "
-                f"min_diff={int((actions - es).min().item())} "
-                f"max_diff={int((actions - ee).max().item())} "
-                f"bad_examples={', '.join(preview)}"
+        actions = actions.to(device=device, dtype=torch.long)
+        is_stop = actions == STOP_RELATION
+        is_stop = is_stop | state.done
+
+        edge_batch = state.graph.edge_batch
+        edge_index = state.graph.edge_index
+        num_edges = int(edge_index.size(1))
+
+        valid_action = ~is_stop
+        if bool(valid_action.any().item()):
+            if ((actions[valid_action] < 0) | (actions[valid_action] >= num_edges)).any():
+                raise ValueError("Actions contain out-of-range edge ids.")
+            graph_ids = torch.arange(num_graphs, device=device, dtype=torch.long)
+            act_graph = graph_ids[valid_action]
+            act_edges = actions[valid_action]
+            if (edge_batch[act_edges] != act_graph).any():
+                raise ValueError("Actions must point to edges within their respective graphs.")
+
+        candidate_mask = self.candidate_edge_mask(state)
+        edge_selected = torch.zeros(num_edges, dtype=torch.bool, device=device)
+        if bool(valid_action.any().item()):
+            act_edges = actions[valid_action]
+            if (~candidate_mask[act_edges]).any():
+                raise ValueError("Actions contain edges that are not valid candidates for the current state.")
+            edge_selected[act_edges] = True
+
+        if edge_selected.any():
+            state.used_edge_mask[edge_selected] = True
+            state.selection_order[edge_selected] = int(step_index)
+
+        step_directions = torch.full(
+            (num_graphs,),
+            DIRECTION_FORWARD,
+            device=device,
+            dtype=torch.long,
+        )
+        next_active = torch.zeros_like(state.active_nodes)
+        if edge_selected.any():
+            heads = edge_index[0, edge_selected]
+            tails = edge_index[1, edge_selected]
+            head_active = state.active_nodes[heads]
+            tail_active = state.active_nodes[tails]
+            if not bool((head_active | tail_active).any().item()):
+                raise ValueError("Selected directed edge is not incident to any active node.")
+            is_backward = (~head_active) & tail_active
+            if is_backward.any():
+                backward_graphs = edge_batch[edge_selected][is_backward]
+                step_directions[backward_graphs] = DIRECTION_BACKWARD
+            if head_active.any():
+                next_active[tails[head_active]] = True
+            if tail_active.any():
+                next_active[heads[tail_active]] = True
+
+        node_batch = state.graph.node_batch
+        replace_graphs = (~is_stop) & (~state.done)
+        if replace_graphs.any():
+            replace_nodes = replace_graphs[node_batch]
+            state.active_nodes = torch.where(replace_nodes, next_active, state.active_nodes)
+
+        state.visited_nodes = state.visited_nodes | state.active_nodes
+
+        if state.active_nodes.any():
+            hit_nodes = state.active_nodes & state.graph.node_is_answer
+            if hit_nodes.any():
+                hit_batch = state.graph.node_batch[hit_nodes]
+                hits = torch.bincount(hit_batch, minlength=num_graphs) > 0
+                state.answer_hits = state.answer_hits | hits
+
+        state.actions[:, step_index] = actions
+        state.directions[:, step_index] = step_directions
+
+        if state.action_embeddings.numel() == 0:
+            state.action_embeddings = torch.zeros(
+                num_graphs,
+                self.max_steps,
+                action_embeddings.size(-1),
+                device=device,
+                dtype=action_embeddings.dtype,
             )
+        write_pos = state.step_counts.clamp(max=self.max_steps - 1)
+        if (~is_stop).any():
+            idx = torch.nonzero(~is_stop, as_tuple=False).view(-1)
+            state.action_embeddings[idx, write_pos[idx]] = action_embeddings[idx]
 
-        is_stop = (actions == stop_idx) | state.done
-        edge_mask_valid = self.action_mask_edges(state)
-        edge_actions_mask = ~is_stop
-        edge_indices = actions[edge_actions_mask]
-
-        if edge_indices.numel() > 0:
-            if (edge_indices < 0).any() or (edge_indices >= state.graph.edge_index.size(1)).any():
-                raise ValueError("Edge actions contain out-of-range indices for current batch.")
-            if not edge_mask_valid[edge_indices].all():
-                raise ValueError("Edge actions violate action mask; check actor sampling or environment constraints.")
-
-        # State tensors are non-differentiable (bool/long); mutate in-place to avoid per-step clones.
-        selected_mask = state.selected_mask
-        selection_order = state.selection_order
-        current_tail = state.current_tail
-        prev_tail = state.prev_tail
-        current_tail_local = state.current_tail_local
-        prev_tail_local = state.prev_tail_local
-        actions_record = state.actions
-        answer_hits = state.answer_hits
-        visited_nodes = state.visited_nodes
-
-        if edge_indices.numel() > 0:
-            selected_mask[edge_indices] = True
-            selection_order[edge_indices] = step_index
-
-            graph_ids = state.graph.edge_batch[edge_indices]
-            heads_idx = state.graph.edge_index[0, edge_indices]
-            tails_idx = state.graph.edge_index[1, edge_indices]
-
-            is_step0 = state.step_counts[graph_ids] == 0
-
-            # Step0：从 start 节点出发（有向时仅允许 head==start）；非 step0：从 current_tail 出发。
-            head_is_start = state.graph.node_is_start[heads_idx]
-            tail_is_start = state.graph.node_is_start[tails_idx]
-            if state.graph.directed:
-                src_local_step0 = heads_idx
-                dst_local_step0 = tails_idx
-            else:
-                src_local_step0 = torch.where(head_is_start, heads_idx, tails_idx)
-                src_is_head_step0 = src_local_step0 == heads_idx
-                dst_local_step0 = torch.where(src_is_head_step0, tails_idx, heads_idx)
-
-            src_local = torch.where(is_step0, src_local_step0, current_tail_local[graph_ids])
-            src_is_head = heads_idx == src_local
-            src_is_tail = tails_idx == src_local
-            if state.graph.directed:
-                if bool((~is_step0 & ~src_is_head).any().item()):
-                    raise ValueError("Directed action is not incident to current head; action_mask_edges must prevent this.")
-            else:
-                if bool((~is_step0 & ~(src_is_head | src_is_tail)).any().item()):
-                    raise ValueError("Edge action is not incident to current tail; action_mask_edges must prevent this.")
-            dst_local_non0 = torch.where(src_is_head, tails_idx, heads_idx)
-            dst_local = torch.where(is_step0, dst_local_step0, dst_local_non0)
-
-            src_global = state.graph.node_global_ids[src_local]
-            dst_global = state.graph.node_global_ids[dst_local]
-
-            prev_tail[graph_ids] = src_global
-            current_tail[graph_ids] = dst_global
-            prev_tail_local[graph_ids] = src_local
-            current_tail_local[graph_ids] = dst_local
-            visited_nodes[dst_local] = True
-            hit = state.graph.node_is_answer[dst_local]
-
-            write_pos = state.step_counts[graph_ids].clamp(max=actions_record.size(1) - 1)
-            actions_record[graph_ids, write_pos] = edge_indices
-
-            answer_hits[graph_ids] = answer_hits[graph_ids] | hit
-
-            if state.debug_enabled and getattr(self, "debug", False):
-                graphs_with_selection = graph_ids.unique()
-                for gid in graphs_with_selection.tolist():
-                    if gid >= self.debug_max_graphs or state.debug_logged[gid]:
-                        continue
-                    if self._debug_hits_logged >= self.debug_max_hits:
-                        continue
-                    mask_gid = graph_ids == gid
-                    sel_next = dst_local[mask_gid]
-                    sel_next_global = state.graph.node_global_ids[sel_next]
-                    answers_start = int(state.graph.answer_ptr[gid].item())
-                    answers_end = int(state.graph.answer_ptr[gid + 1].item())
-                    answers_local = state.graph.answer_node_locals[answers_start:answers_end]
-                    answers = state.graph.node_global_ids[answers_local]
-                    try:
-                        logging.getLogger("gflownet.debug").info(
-                            "[ENV_HIT_DEBUG] graph=%d hit=%s answers=%s selected_nodes=%s",
-                            gid,
-                            bool(hit[mask_gid].any().item()),
-                            answers.detach().cpu().tolist(),
-                            sel_next_global.detach().cpu().tolist(),
-                        )
-                        state.debug_logged[gid] = True
-                        self._debug_hits_logged += 1
-                    except Exception:
-                        pass
-
-        done = state.done | is_stop
-        state.done = done
-        state.step_counts.add_((~done).to(dtype=state.step_counts.dtype))
+        increment = (~is_stop).to(dtype=state.step_counts.dtype)
+        state.step_counts = state.step_counts + increment
+        horizon_exhausted = state.step_counts >= self.max_steps
+        state.done = state.done | is_stop | horizon_exhausted
         return state
 
 
-__all__ = ["GraphEnv", "GraphBatch", "GraphState"]
+__all__ = [
+    "GraphEnv",
+    "GraphBatch",
+    "GraphState",
+    "STOP_RELATION",
+    "DIRECTION_FORWARD",
+    "DIRECTION_BACKWARD",
+]

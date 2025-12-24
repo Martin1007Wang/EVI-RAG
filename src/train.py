@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import hydra
 import lightning as L
 import rootutils
-import torch
 
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
@@ -38,71 +37,50 @@ from src.utils import (
     task_wrapper,
 )
 
-# --------------------------------------------------------------------------
-# GFlowNet 专用 debug 日志：独立文件，避免和 tqdm/CLI 混杂。
-# --------------------------------------------------------------------------
-import logging
-from pathlib import Path
-
-import inspect
-from src.models.components.gflownet_actor import GFlowNetActor
-from src.models.gflownet_module import GFlowNetModule
-print("actor:", GFlowNetActor.rollout.__code__.co_filename)
-print("module:", GFlowNetModule._compute_log_flow_states.__code__.co_filename)
-
-def _setup_gflownet_debug_logging(cfg) -> None:
-    enable = cfg.get("debug", False)
-    if not enable:
-        return
-
-    log_paths = []
-    out_dir = Path(cfg.paths.output_dir)
-    run_log_dir = out_dir / "logs"
-    run_log_dir.mkdir(parents=True, exist_ok=True)
-    log_paths.append(run_log_dir / "gflownet_debug.log")
-
-    debug_log_path = getattr(cfg.paths, "debug_log_path", None)
-    if debug_log_path:
-        debug_log = Path(debug_log_path).expanduser()
-        debug_log.parent.mkdir(parents=True, exist_ok=True)
-        log_paths.append(debug_log)
-
-    base_logger = logging.getLogger("gflownet.debug")
-    base_logger.setLevel(logging.INFO)
-
-    # 防止重复添加 handler
-    for path in log_paths:
-        if not any(isinstance(h, logging.FileHandler) and Path(h.baseFilename) == Path(path) for h in base_logger.handlers):
-            handler = logging.FileHandler(path, mode="a", encoding="utf-8")
-            handler.setLevel(logging.INFO)
-            formatter = logging.Formatter(
-                fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-            handler.setFormatter(formatter)
-            base_logger.addHandler(handler)
-    base_logger.propagate = False
-
-
 from src.utils.run_context import apply_run_name
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return True
+    return False
 
-def _run_data_loading_preflight(cfg: DictConfig) -> None:
-    """Run a minimal fast_dev_run to surface dataloader/worker crashes early."""
-    log.info("Running data-loading preflight with fast_dev_run=1 batch...")
-    preflight_datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
-    preflight_model: LightningModule = hydra.utils.instantiate(cfg.model)
-    preflight_trainer: Trainer = hydra.utils.instantiate(
-        cfg.trainer,
-        callbacks=[],
-        logger=False,
-        enable_checkpointing=False,
-        fast_dev_run=True,
+
+def _validate_gflownet_required_args(cfg: DictConfig) -> None:
+    model_cfg = cfg.get("model")
+    data_cfg = cfg.get("data")
+    model_target = model_cfg.get("_target_") if model_cfg else ""
+    data_target = data_cfg.get("_target_") if data_cfg else ""
+    is_gflownet = (
+        model_target == "src.models.gflownet_module.GFlowNetModule"
+        or data_target == "src.data.g_agent_datamodule.GAgentDataModule"
     )
-    preflight_trainer.fit(model=preflight_model, datamodule=preflight_datamodule, ckpt_path=None)
-    log.info("Preflight passed; proceeding to full training run.")
+    if not is_gflownet:
+        return
+
+    missing = []
+    if cfg.get("dataset") is None:
+        missing.append("dataset")
+
+    embedder_cfg = model_cfg.get("embedder_cfg") if model_cfg else None
+    allow_deferred = bool(embedder_cfg.get("allow_deferred_init", False)) if embedder_cfg else False
+    ckpt_cfg = cfg.get("ckpt") or {}
+    retriever_ckpt = ckpt_cfg.get("retriever") if hasattr(ckpt_cfg, "get") else None
+    if not allow_deferred and _is_missing_value(retriever_ckpt):
+        missing.append("ckpt.retriever")
+
+    if missing:
+        missing_str = ", ".join(missing)
+        raise ValueError(
+            "Missing required GFlowNet inputs: "
+            f"{missing_str}. Please specify both `dataset=<name>` and "
+            "`ckpt.retriever=/path/to/retriever.ckpt` for GFlowNet training. "
+            "Example: python src/train.py experiment=train_gflownet "
+            "dataset=webqsp ckpt.retriever=/path/to/epoch_003.ckpt"
+        )
 
 
 @task_wrapper
@@ -119,12 +97,6 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
-
-    # GFlowNet 深度调试日志重定向（独立文件）。
-    _setup_gflownet_debug_logging(cfg)
-
-    if cfg.get("debug_data_loading"):
-        _run_data_loading_preflight(cfg)
 
     resolved_run_name = apply_run_name(cfg)
     log.info(f"Resolved run name: {resolved_run_name}")
@@ -205,6 +177,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     """
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
+    _validate_gflownet_required_args(cfg)
     extras(cfg)
 
     # train the model

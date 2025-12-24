@@ -1,9 +1,0 @@
-# @package _global_
-#
-# Default wiring for LLM triplet-window evaluation (Semantic Dissipation interface view).
-
-defaults:
-  - override /stage: llm_reasoner_triplet
-  - override /logger: none
-
-tags: ["llm_reasoner", "triplet"]

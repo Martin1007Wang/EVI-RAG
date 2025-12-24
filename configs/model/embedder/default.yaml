@@ -1,7 +1,0 @@
-_target_: src.models.components.gflownet_embedder.GraphEmbedder
-
-hidden_dim: ${model.hidden_dim}
-# 必须提供 retriever ckpt（ckpt.retriever），否则 GraphEmbedder 会报错。
-proj_dropout: 0.0
-projector_checkpoint: ${ckpt.retriever}
-allow_deferred_init: false

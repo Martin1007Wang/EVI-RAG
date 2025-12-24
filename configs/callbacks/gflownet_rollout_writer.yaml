@@ -1,0 +1,13 @@
+# Stream GFlowNet rollouts during predict().
+
+gflownet_rollout_writer:
+  _target_: src.callbacks.gflownet_rollout_writer.GFlowNetRolloutWriter
+  output_dir: ${dataset.materialized_dir}/eval_gflownet
+  split: ${run.split}
+  enabled: true
+  artifact_name: eval_gflownet
+  schema_version: 1
+  textualize: true
+  entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+  relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+  overwrite: true

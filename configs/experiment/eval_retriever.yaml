@@ -1,0 +1,46 @@
+# @package _global_
+#
+# Experiment: retriever artifact generation (g_agent + eval_retriever cache).
+
+defaults:
+  - override /data: retriever
+  - override /model: retriever_module
+  - override /callbacks: g_agent_generation
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: eval_retriever
+  task_name: "eval/retriever"
+  tags: ["eval", "retriever"]
+  run_all_splits: true
+  splits: [train, validation, test]
+  split: test
+  return_predictions: false
+  save_metrics: false
+  score_temperature: 1.0
+  score_bias: 0.0
+  ckpt_path: ${ckpt.retriever}
+
+# Keep repo configs environment-agnostic; provide checkpoint paths via env/CLI.
+ckpt:
+  retriever: ${oc.env:RETRIEVER_CKPT,null}
+
+data:
+  splits:
+    test: ${run.split}
+
+model:
+  evaluation_cfg:
+    split: ${run.split}
+    emit_predict_outputs: true
+    metrics_enabled: false
+  eval_persist_cfg:
+    enabled: true
+    output_dir: ${dataset.materialized_dir}/eval_retriever
+    artifact_name: eval_retriever
+    schema_version: 1
+    splits: ["${run.split}"]
+    textualize: true
+    entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+    relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet

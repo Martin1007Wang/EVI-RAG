@@ -32,14 +32,12 @@ class GraphEmbedder(nn.Module):
         self,
         *,
         hidden_dim: int,
-        proj_dropout: float,
         projector_checkpoint: str | None = None,
         projector_key_prefixes: Optional[Sequence[str]] = None,
         allow_deferred_init: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
-        self.proj_dropout = float(proj_dropout)
         ckpt_raw = "" if projector_checkpoint is None else str(projector_checkpoint).strip()
         if ckpt_raw.lower() in {"null", "none"}:
             ckpt_raw = ""

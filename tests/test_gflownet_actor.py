@@ -12,6 +12,7 @@ from torch_geometric.data import Batch, Data
 pytest.importorskip("torch_scatter")
 
 from src.models.components.gflownet_actor import GFlowNetActor
+from src.models.components.gflownet_env import STOP_RELATION
 
 
 class _DummyStateEncoder(nn.Module):
@@ -22,13 +23,8 @@ class _DummyStateEncoder(nn.Module):
     def precompute(
         self,
         *,
-        edge_index: torch.Tensor,
-        edge_batch: torch.Tensor,
         node_ptr: torch.Tensor,
-        start_node_locals: torch.Tensor,
-        start_ptr: torch.Tensor,
         node_tokens: torch.Tensor,
-        edge_tokens: torch.Tensor,
         question_tokens: torch.Tensor,
     ) -> torch.Tensor:
         if question_tokens.dim() != 2 or question_tokens.size(-1) != self.hidden_dim:
@@ -42,11 +38,12 @@ class _DummyStateEncoder(nn.Module):
 @dataclass
 class _DummyState:
     done: torch.Tensor
-    selected_mask: torch.Tensor
     selection_order: torch.Tensor
-    current_tail: torch.Tensor
-    answer_hits: torch.Tensor
     step_counts: torch.Tensor
+    answer_hits: torch.Tensor
+    used_edge_mask: torch.Tensor
+    actions: torch.Tensor
+    action_embeddings: torch.Tensor
     graph: Any
 
 
@@ -57,9 +54,13 @@ class _DummyGraph:
     node_is_start: torch.Tensor
     heads_global: torch.Tensor
     tails_global: torch.Tensor
+    edge_scores_norm: torch.Tensor
 
 
 class _DummyEnv:
+    def __init__(self, max_steps: int = 1) -> None:
+        self.max_steps = int(max_steps)
+
     def reset(self, batch: dict[str, torch.Tensor], *, device: torch.device) -> _DummyState:
         num_graphs = int(batch["node_ptr"].numel() - 1)
         num_edges = int(batch["edge_index"].size(1))
@@ -77,67 +78,73 @@ class _DummyEnv:
             node_is_start=node_is_start,
             heads_global=heads_global,
             tails_global=tails_global,
+            edge_scores_norm=torch.zeros(num_edges, dtype=torch.float32, device=device),
         )
         return _DummyState(
             done=torch.zeros(num_graphs, dtype=torch.bool, device=device),
-            selected_mask=torch.zeros(num_edges, dtype=torch.bool, device=device),
-            selection_order=torch.zeros(num_edges, dtype=torch.long, device=device),
-            current_tail=torch.zeros(num_graphs, dtype=torch.long, device=device),
-            answer_hits=torch.zeros(num_graphs, dtype=torch.bool, device=device),
+            selection_order=torch.full((num_edges,), -1, dtype=torch.long, device=device),
             step_counts=torch.zeros(num_graphs, dtype=torch.long, device=device),
+            answer_hits=torch.zeros(num_graphs, dtype=torch.bool, device=device),
+            used_edge_mask=torch.zeros(num_edges, dtype=torch.bool, device=device),
+            actions=torch.full((num_graphs, self.max_steps + 1), STOP_RELATION, dtype=torch.long, device=device),
+            action_embeddings=torch.zeros(num_graphs, self.max_steps, 0, dtype=torch.float32, device=device),
             graph=graph,
         )
 
-    def action_mask_edges(self, state: _DummyState) -> torch.Tensor:
-        return torch.ones_like(state.selected_mask, dtype=torch.bool)
+    def candidate_edge_masks(self, state: _DummyState) -> tuple[torch.Tensor, torch.Tensor]:
+        edge_batch = state.graph.edge_batch
+        valid = ~state.done[edge_batch]
+        forward = valid.clone()
+        backward = torch.zeros_like(forward, dtype=torch.bool)
+        return forward, backward
 
     def potential(self, state: _DummyState, *, valid_edges_override: torch.Tensor | None = None) -> torch.Tensor:
         return torch.zeros(int(state.done.numel()), device=state.done.device, dtype=torch.float32)
 
-    def frontier_mask_edges(self, state: _DummyState) -> torch.Tensor:
-        return torch.ones_like(state.selected_mask, dtype=torch.bool)
-
-    def step(self, state: _DummyState, actions: torch.Tensor, *, step_index: int) -> _DummyState:
-        num_edges = int(state.selected_mask.numel())
-        is_edge = actions < num_edges
+    def step(
+        self,
+        state: _DummyState,
+        actions: torch.Tensor,
+        action_embeddings: torch.Tensor,
+        *,
+        step_index: int,
+    ) -> _DummyState:
+        num_edges = int(state.used_edge_mask.numel())
+        is_edge = actions >= 0
         if bool(is_edge.any().item()):
-            selected = state.selected_mask.clone()
+            selected = state.used_edge_mask.clone()
+            order = state.selection_order.clone()
             selected[actions[is_edge]] = True
-            state.selected_mask = selected
-        state.done = torch.ones_like(state.done, dtype=torch.bool)
+            order[actions[is_edge]] = int(step_index)
+            state.used_edge_mask = selected
+            state.selection_order = order
+            state.step_counts = state.step_counts + is_edge.to(dtype=state.step_counts.dtype)
+            state.actions[is_edge, step_index] = actions[is_edge]
+            if state.action_embeddings.numel() != 0:
+                state.action_embeddings[is_edge, step_index] = action_embeddings[is_edge]
+        horizon = state.step_counts >= self.max_steps
+        state.done = state.done | (actions == STOP_RELATION) | horizon
         return state
 
 
 class _MultiStepEnv(_DummyEnv):
-    def step(self, state: _DummyState, actions: torch.Tensor, *, step_index: int) -> _DummyState:
-        num_edges = int(state.selected_mask.numel())
-        is_edge = actions < num_edges
-        if bool(is_edge.any().item()):
-            selected = state.selected_mask.clone()
-            order = state.selection_order.clone()
-            selected[actions[is_edge]] = True
-            order[actions[is_edge]] = int(step_index)
-            state.selected_mask = selected
-            state.selection_order = order
-            step_counts = state.step_counts.clone()
-            step_counts[is_edge] = step_counts[is_edge] + 1
-            state.step_counts = step_counts
-        state.done = actions >= num_edges
-        return state
+    pass
 
 
 class _DummyPolicy(nn.Module):
     def forward(
         self,
         edge_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
         state_tokens: torch.Tensor,
         edge_batch: torch.Tensor,
-        selected_mask: torch.Tensor,
+        valid_edges_mask: torch.Tensor,
+        edge_direction: torch.Tensor | None = None,
+        question_tokens: torch.Tensor | None = None,
         **_: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         edge_logits = torch.zeros(edge_tokens.size(0), device=edge_tokens.device, dtype=edge_tokens.dtype)
-        stop_logits = torch.zeros(question_tokens.size(0), device=edge_tokens.device, dtype=edge_tokens.dtype)
+        batch_size = int(state_tokens.size(0))
+        stop_logits = torch.zeros(batch_size, device=edge_tokens.device, dtype=edge_tokens.dtype)
         state_emb = state_tokens.to(dtype=edge_tokens.dtype)
         return edge_logits, stop_logits, state_emb
 
@@ -151,10 +158,11 @@ class _FixedLogitPolicy(nn.Module):
     def forward(
         self,
         edge_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
         state_tokens: torch.Tensor,
         edge_batch: torch.Tensor,
-        selected_mask: torch.Tensor,
+        valid_edges_mask: torch.Tensor,
+        edge_direction: torch.Tensor | None = None,
+        question_tokens: torch.Tensor | None = None,
         **_: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         edge_logits = self.edge_logits.to(device=edge_tokens.device, dtype=edge_tokens.dtype)
@@ -195,7 +203,6 @@ def test_gflownet_actor_rollout_smoke_no_name_error() -> None:
         state_encoder=state_encoder,
         max_steps=1,
         policy_temperature=1.0,
-        debug=False,
     ).eval()
 
     out = actor.rollout(
@@ -245,7 +252,6 @@ def test_gflownet_actor_log_pf_matches_policy_distribution() -> None:
         state_encoder=state_encoder,
         max_steps=1,
         policy_temperature=1.0,
-        debug=False,
     ).train()
 
     out = actor.rollout(
@@ -259,18 +265,16 @@ def test_gflownet_actor_log_pf_matches_policy_distribution() -> None:
         batch_idx=0,
     )
     chosen = int(out["actions_seq"][0, 0].item())
-    stop_idx = int(edge_logits.numel())
     valid_edges = torch.ones_like(edge_logits, dtype=torch.bool)
-    log_edge, log_stop = actor._log_probs_from_logits(
+    log_edge, log_stop, _, _ = actor._log_probs_edges(
         edge_logits=edge_logits,
         stop_logits=stop_logits,
-        valid_edges=valid_edges,
-        temp=1.0,
         edge_batch=edge_batch,
+        valid_edges=valid_edges,
         num_graphs=1,
-        suppress_stop=False,
+        temp=1.0,
     )
-    if chosen == stop_idx:
+    if chosen == STOP_RELATION:
         expected_log_pf = log_stop[0]
     else:
         expected_log_pf = log_edge[chosen]
@@ -307,15 +311,13 @@ def test_gflownet_actor_forced_actions_sequence_log_pf() -> None:
     state_encoder = _DummyStateEncoder(hidden_dim=4)
     actor = GFlowNetActor(
         policy=_FixedLogitPolicy(edge_logits=edge_logits, stop_logits=stop_logits),
-        env=_MultiStepEnv(),
+        env=_MultiStepEnv(max_steps=2),
         state_encoder=state_encoder,
         max_steps=2,
         policy_temperature=1.0,
-        debug=False,
     ).train()
 
-    stop_idx = int(edge_index.size(1))
-    forced_actions_seq = torch.tensor([[0, 1, stop_idx]], dtype=torch.long, device=device)
+    forced_actions_seq = torch.tensor([[0, 1, STOP_RELATION]], dtype=torch.long, device=device)
     out = actor.rollout(
         batch=batch,
         edge_tokens=edge_tokens,
@@ -331,36 +333,33 @@ def test_gflownet_actor_forced_actions_sequence_log_pf() -> None:
     # Actor excludes already-selected edges from the legal action set at each step.
     # Step 0: both edges are available.
     valid_edges0 = torch.ones_like(edge_logits, dtype=torch.bool)
-    log_edge0, _ = actor._log_probs_from_logits(
+    log_edge0, _, _, _ = actor._log_probs_edges(
         edge_logits=edge_logits,
         stop_logits=stop_logits,
-        valid_edges=valid_edges0,
-        temp=1.0,
         edge_batch=edge_batch,
+        valid_edges=valid_edges0,
         num_graphs=1,
-        suppress_stop=False,
+        temp=1.0,
     )
     # Step 1: edge 0 is selected, only edge 1 remains.
     valid_edges1 = torch.tensor([False, True], dtype=torch.bool, device=device)
-    log_edge1, _ = actor._log_probs_from_logits(
+    log_edge1, _, _, _ = actor._log_probs_edges(
         edge_logits=edge_logits,
         stop_logits=stop_logits,
-        valid_edges=valid_edges1,
-        temp=1.0,
         edge_batch=edge_batch,
+        valid_edges=valid_edges1,
         num_graphs=1,
-        suppress_stop=False,
+        temp=1.0,
     )
     # Step 2: both edges are selected, only stop remains (log prob = 0).
     valid_edges2 = torch.zeros_like(edge_logits, dtype=torch.bool)
-    _, log_stop2 = actor._log_probs_from_logits(
+    _, log_stop2, _, _ = actor._log_probs_edges(
         edge_logits=edge_logits,
         stop_logits=stop_logits,
-        valid_edges=valid_edges2,
-        temp=1.0,
         edge_batch=edge_batch,
+        valid_edges=valid_edges2,
         num_graphs=1,
-        suppress_stop=False,
+        temp=1.0,
     )
     expected_log_pf = log_edge0[0] + log_edge1[1] + log_stop2[0]
     assert_close(out["log_pf"][0], expected_log_pf, rtol=1e-5, atol=1e-6)

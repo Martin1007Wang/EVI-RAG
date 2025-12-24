@@ -1,9 +1,0 @@
-# @package _global_
-#
-# Default wiring for retriever-oracle upper bound (no LLM) to quantify S_ret^{vis} ceiling.
-
-defaults:
-  - override /stage: llm_reasoner_truth
-  - override /logger: none
-
-tags: ["llm_reasoner", "truth"]

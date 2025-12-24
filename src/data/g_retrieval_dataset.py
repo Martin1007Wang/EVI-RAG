@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 class GRetrievalData(GraphData):
     def __inc__(self, key: str, value: Any, *args, **kwargs) -> int:
-        if key in {"q_local_indices", "a_local_indices"}:
+        if key in {"q_local_indices", "a_local_indices", "pair_start_node_locals", "pair_answer_node_locals"}:
             return int(self.num_nodes)
-        if key == "gt_path_edge_indices":
+        if key in {"gt_path_edge_indices", "pair_edge_indices", "pair_edge_ptr"}:
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
@@ -117,6 +117,10 @@ class GRetrievalDataset(Dataset):
         q_local_indices = torch.as_tensor(raw.get("q_local_indices", []), dtype=torch.long).view(-1)
         a_local_indices = torch.as_tensor(raw.get("a_local_indices", []), dtype=torch.long).view(-1)
         gt_path_edge_indices = torch.as_tensor(raw.get("gt_path_edge_indices", []), dtype=torch.long).view(-1)
+        pair_start_node_locals = torch.as_tensor(raw.get("pair_start_node_locals", []), dtype=torch.long).view(-1)
+        pair_answer_node_locals = torch.as_tensor(raw.get("pair_answer_node_locals", []), dtype=torch.long).view(-1)
+        pair_edge_indices = torch.as_tensor(raw.get("pair_edge_indices", []), dtype=torch.long).view(-1)
+        pair_edge_ptr = torch.as_tensor(raw.get("pair_edge_ptr", [0]), dtype=torch.long).view(-1)
         topic_pe_raw = raw.get("topic_pe")
         topic_pe = torch.as_tensor(topic_pe_raw, dtype=torch.float32) if topic_pe_raw is not None else None
 
@@ -125,13 +129,16 @@ class GRetrievalDataset(Dataset):
             "edge_index": edge_index,
             "edge_attr": torch.as_tensor(raw["edge_attr"], dtype=torch.long),  # Global relation IDs
             "labels": torch.as_tensor(raw["labels"], dtype=torch.float32),
-            "soft_labels": torch.as_tensor(raw["soft_labels"], dtype=torch.float32),
             "node_global_ids": node_global_ids,
             "node_embedding_ids": node_embedding_ids,
             "question_emb": question_emb,
             "question": raw.get("question", ""),
             "q_local_indices": q_local_indices,
             "a_local_indices": a_local_indices,
+            "pair_start_node_locals": pair_start_node_locals,
+            "pair_answer_node_locals": pair_answer_node_locals,
+            "pair_edge_indices": pair_edge_indices,
+            "pair_edge_ptr": pair_edge_ptr,
             "gt_path_edge_indices": gt_path_edge_indices,
             "answer_entity_ids": answer_ids,
             "answer_entity_ids_len": answer_ids_len,
@@ -321,7 +328,6 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_o
         "edge_index",
         "edge_attr",
         "labels",
-        "soft_labels",
         "num_nodes",
         "node_global_ids",
         "node_embedding_ids",
@@ -364,18 +370,15 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_o
 
     edge_attr = _ensure_tensor(raw["edge_attr"], torch.long, "edge_attr", sample_id).view(-1)
     labels = _ensure_tensor(raw["labels"], torch.float32, "labels", sample_id).view(-1)
-    soft_labels = _ensure_tensor(raw["soft_labels"], torch.float32, "soft_labels", sample_id).view(-1)
     if edge_attr.numel() != num_edges:
         raise ValueError(f"edge_attr length {edge_attr.numel()} != num_edges {num_edges} for {sample_id}")
     if labels.numel() != num_edges:
         raise ValueError(f"labels length {labels.numel()} != num_edges {num_edges} for {sample_id}")
-    if soft_labels.numel() != num_edges:
-        raise ValueError(f"soft_labels length {soft_labels.numel()} != num_edges {num_edges} for {sample_id}")
-    if soft_labels.numel() > 0:
-        if soft_labels.min().item() < 0.0 or soft_labels.max().item() > 1.0:
+    if labels.numel() > 0:
+        if labels.min().item() < 0.0 or labels.max().item() > 1.0:
             raise ValueError(
-                f"soft_labels out of range for {sample_id}: min={float(soft_labels.min().item())} "
-                f"max={float(soft_labels.max().item())}"
+                f"labels out of range for {sample_id}: min={float(labels.min().item())} "
+                f"max={float(labels.max().item())}"
             )
 
     if require_topic_one_hot:
@@ -408,4 +411,49 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_o
                 raise ValueError(
                     f"gt_path_edge_indices out of range for {sample_id}: "
                     f"min={int(gt_edges_tensor.min().item())} max={int(gt_edges_tensor.max().item())} num_edges={num_edges}"
+                )
+
+    pair_keys = {"pair_start_node_locals", "pair_answer_node_locals", "pair_edge_indices", "pair_edge_ptr"}
+    has_pair = any(k in raw for k in pair_keys)
+    if has_pair:
+        missing_pair = [k for k in pair_keys if k not in raw]
+        if missing_pair:
+            raise ValueError(f"pair supervision missing keys for {sample_id}: {missing_pair}")
+
+        pair_start = _ensure_tensor(raw["pair_start_node_locals"], torch.long, "pair_start_node_locals", sample_id).view(-1)
+        pair_answer = _ensure_tensor(raw["pair_answer_node_locals"], torch.long, "pair_answer_node_locals", sample_id).view(-1)
+        if pair_start.numel() != pair_answer.numel():
+            raise ValueError(
+                f"pair_start_node_locals length {pair_start.numel()} != "
+                f"pair_answer_node_locals length {pair_answer.numel()} for {sample_id}"
+            )
+        _validate_local_indices(pair_start, num_nodes, "pair_start_node_locals", sample_id)
+        _validate_local_indices(pair_answer, num_nodes, "pair_answer_node_locals", sample_id)
+
+        pair_edge_indices = _ensure_tensor(raw["pair_edge_indices"], torch.long, "pair_edge_indices", sample_id).view(-1)
+        if pair_edge_indices.numel() > 0:
+            if pair_edge_indices.min().item() < 0 or pair_edge_indices.max().item() >= num_edges:
+                raise ValueError(
+                    f"pair_edge_indices out of range for {sample_id}: "
+                    f"min={int(pair_edge_indices.min().item())} max={int(pair_edge_indices.max().item())} num_edges={num_edges}"
+                )
+
+        pair_edge_ptr = _ensure_tensor(raw["pair_edge_ptr"], torch.long, "pair_edge_ptr", sample_id).view(-1)
+        if pair_edge_ptr.numel() == 0:
+            if pair_start.numel() != 0:
+                raise ValueError(f"pair_edge_ptr empty but pairs exist for {sample_id}")
+        else:
+            if pair_edge_ptr.numel() != pair_start.numel() + 1:
+                raise ValueError(
+                    f"pair_edge_ptr length {pair_edge_ptr.numel()} != pair_count+1 "
+                    f"({pair_start.numel() + 1}) for {sample_id}"
+                )
+            if pair_edge_ptr[0].item() != 0:
+                raise ValueError(f"pair_edge_ptr must start at 0 for {sample_id}")
+            if (pair_edge_ptr[1:] < pair_edge_ptr[:-1]).any():
+                raise ValueError(f"pair_edge_ptr must be non-decreasing for {sample_id}")
+            if pair_edge_ptr[-1].item() != pair_edge_indices.numel():
+                raise ValueError(
+                    f"pair_edge_ptr end {int(pair_edge_ptr[-1].item())} != "
+                    f"pair_edge_indices length {pair_edge_indices.numel()} for {sample_id}"
                 )

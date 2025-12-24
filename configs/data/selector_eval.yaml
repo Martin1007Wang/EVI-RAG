@@ -1,0 +1,13 @@
+# DataModule for selector evaluation over g_agent (retriever_topk or gflownet_rollouts).
+_target_: src.data.selector_eval_datamodule.SelectorEvalDataModule
+
+dataset: ${dataset.name}
+split: ${run.split}
+g_agent_path: ${dataset.materialized_dir}/g_agent/${.split}_g_agent.pt
+selector: retriever_topk
+k_values: ${window.k_values}
+eval_gflownet_path: null
+eval_gflownet_artifact_name: eval_gflownet
+eval_gflownet_schema_version: 1
+drop_unreachable: true
+num_workers: 0

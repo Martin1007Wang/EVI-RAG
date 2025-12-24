@@ -29,7 +29,6 @@ def _mock_sample() -> dict:
         "edge_index": torch.tensor([[0, 2], [1, 0]], dtype=torch.long),
         "edge_attr": torch.zeros(2, dtype=torch.long),
         "labels": torch.tensor([1, 0], dtype=torch.long),
-        "soft_labels": torch.tensor([1.0, 0.0], dtype=torch.float32),
         "num_nodes": node_ids.numel(),
         "node_global_ids": node_ids,
         "node_embedding_ids": node_ids,

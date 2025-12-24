@@ -12,7 +12,11 @@ def build_triplet_prompt(question: str, triplets: Sequence[Tuple[str, str, str]]
     lines = [triplet_to_str(t) for t in triplets[:limit]]
     triplet_block = "Triplets:\n" + "\n".join(lines) if lines else "Triplets:\n"
     question_block = f"Question:\n{question}"
-    instruction = "Answer with a concise entity string prefixed by 'Ans:' using only the provided triplets."
+    instruction = (
+        "Return JSON only with the full answer list: "
+        "{\"answers\": [\"<entity>\", ...]}. Use [] if no answer can be derived. "
+        "Use entity strings exactly as they appear in the triplets."
+    )
     return "\n\n".join([triplet_block, question_block, instruction])
 
 

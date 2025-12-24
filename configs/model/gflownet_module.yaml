@@ -1,0 +1,67 @@
+defaults:
+  - _self_
+
+_target_: src.models.gflownet_module.GFlowNetModule
+_recursive_: false
+
+hidden_dim: 1024
+env_cfg:
+  _target_: src.models.components.gflownet_env.GraphEnv
+  max_steps: ${window.max_hops}
+
+policy_cfg:
+  _target_: src.models.components.gflownet_policy.GFlowNetEdgePolicy
+  hidden_dim: ${model.hidden_dim}
+  dropout: 0.1
+  direction_vocab_size: 2
+
+reward_cfg:
+  _target_: src.models.components.gflownet_rewards.GFlowNetReward
+  success_reward: 1.0
+  failure_reward: 0.01
+  shaping_coef: 2.0
+
+actor_cfg:
+  _target_: src.models.components.gflownet_actor.GFlowNetActor
+  policy_temperature: 1.0
+  action_topk: 100
+
+embedder_cfg:
+  _target_: src.models.components.gflownet_embedder.GraphEmbedder
+  hidden_dim: ${model.hidden_dim}
+  projector_checkpoint: ${ckpt.retriever}
+  allow_deferred_init: false
+
+state_encoder_cfg:
+  _target_: src.models.components.state_encoder.StateEncoder
+  hidden_dim: ${model.hidden_dim}
+  max_steps: ${model.env_cfg.max_steps}
+
+estimator_cfg:
+  _target_: src.models.components.gflownet_estimator.GFlowNetEstimator
+  hidden_dim: ${model.hidden_dim}
+  zero_init_last: true
+
+training_cfg:
+  num_train_rollouts: 1
+
+evaluation_cfg:
+  num_eval_rollouts: 5
+  rollout_temperature: 1.0
+
+optimizer_cfg:
+  type: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+scheduler_cfg:
+  type: cosine
+  t_max: 200
+  eta_min: 1.0e-6
+  interval: epoch
+  monitor: val/answer_hit@1
+
+logging_cfg:
+  train_prog_bar: ["log_reward", "answer_hit"]
+  eval_prog_bar: ["answer_hit@1"]
+  log_on_step_train: false

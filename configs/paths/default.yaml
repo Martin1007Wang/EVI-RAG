@@ -8,7 +8,6 @@ data_dir: /mnt/data/retrieval_dataset
 
 # path to logging directory
 log_dir: ${paths.root_dir}/logs/
-debug_log_path: ${paths.log_dir}/debug.log
 
 # path to output directory, created dynamically by hydra
 # path generation pattern is specified in `configs/hydra/default.yaml`

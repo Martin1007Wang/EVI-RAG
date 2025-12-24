@@ -1,0 +1,19 @@
+# @package _global_
+#
+# Experiment: reasoning over g_agent triplets.
+
+defaults:
+  - override /data: reasoner_triplet
+  - override /model: reasoner/ollama
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: reasoner_triplet
+  task_name: "reasoner/triplet"
+  tags: ["eval", "reasoner", "triplet"]
+  split: test
+  return_predictions: true
+  save_metrics: true
+  ckpt_path: null

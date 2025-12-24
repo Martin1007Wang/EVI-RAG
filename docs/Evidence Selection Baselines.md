@@ -109,9 +109,9 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 
 ### 5. 在本仓库中的落点（数据/产物）
 本项目中，GFlowNet 训练与评测消费的是 `g_agent` 缓存（唯一持久化 schema）：
-- 生成：`stage=retriever_eval` → `${dataset.materialized_dir}/g_agent/<split>_g_agent.pt`
-- GFlowNet 评测：`stage=gflownet_eval` → `${dataset.materialized_dir}/eval_gflownet/test_gflownet_eval.pt`
-- Retriever 评测缓存：`stage=retriever_eval` → `${dataset.materialized_dir}/eval_retriever/test_retriever_eval.pt`
+- 生成：`experiment=eval_retriever` → `${dataset.materialized_dir}/g_agent/<split>_g_agent.pt`
+- GFlowNet 评测：`experiment=eval_gflownet` → `${dataset.materialized_dir}/eval_gflownet/<split>.jsonl`
+- Retriever 评测缓存：`experiment=eval_retriever` → `${dataset.materialized_dir}/eval_retriever/<split>.pt`
 
 建议把 BFS/Beam baselines 的产物也做成“可解析缓存”，并沿用相同的下游评测接口（truth/LLM stages 只看缓存，不关心生成器来自哪里）。这样才符合“算子/变量分离”的可组合性。
 

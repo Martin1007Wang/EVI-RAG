@@ -4,7 +4,6 @@ raw_root: ${paths.data_dir}/GTSQA/raw/gtsqa-with-graphs
 out_dir: ${paths.data_dir}/GTSQA/normalized
 materialized_dir: ${paths.data_dir}/GTSQA/materialized
 entity_normalization: none
-undirected_traversal: false
 num_topics: 2
 topic_pe:
   enabled: true

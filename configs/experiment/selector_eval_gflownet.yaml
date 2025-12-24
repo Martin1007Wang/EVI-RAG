@@ -1,0 +1,27 @@
+# @package _global_
+#
+# Experiment: selector evaluation using GFlowNet rollouts on g_agent DAG mask.
+
+defaults:
+  - override /data: selector_eval
+  - override /model: selector_eval_module
+  - override /callbacks: none
+  - override /logger: none
+  - override /trainer: predict
+
+run:
+  name: selector_eval_gflownet
+  task_name: "eval/selector_gflownet"
+  tags: ["eval", "selector", "gflownet"]
+  split: test
+  return_predictions: false
+  save_metrics: true
+  ckpt_path: null
+
+data:
+  selector: gflownet_rollouts
+  eval_gflownet_path: ${dataset.materialized_dir}/eval_gflownet/${run.split}.jsonl
+  k_values: ${window.rollout_k_values}
+
+model:
+  selector: gflownet_rollouts

@@ -372,7 +372,20 @@ class GAgentBuilder:
             self.stats["retrieval_failed"] += 1
             return
 
-        # === F. Path-valued supervision: deterministic shortest path in pruned agent space ===
+        # === F. Path-valued supervision: undirected shortest-path DAG per (start, answer) pair ===
+        (
+            edge_labels,
+            pair_start_node_locals,
+            pair_answer_node_locals,
+            pair_edge_local_ids,
+            pair_edge_ptr,
+        ) = self._shortest_path_union_mask_by_pair(
+            num_nodes=int(node_embedding_ids.numel()),
+            edge_head_locals=edge_head_locals,
+            edge_tail_locals=edge_tail_locals,
+            start_node_locals=start_node_locals,
+            answer_node_locals=answer_node_locals,
+        )
         edge_pos_mask = edge_labels > 0.5
         gt_path_edge_local_ids = self._shortest_path_edge_locals(
             num_nodes=int(node_embedding_ids.numel()),
@@ -383,22 +396,28 @@ class GAgentBuilder:
             start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
         )
-        gt_path_exists = bool(gt_path_edge_local_ids.numel() > 0)
-        gt_path_node_local_ids = (
-            self._build_gt_path_node_locals(
+        gt_path_node_local_ids = torch.empty(0, dtype=torch.long)
+        gt_path_exists = False
+        if gt_path_edge_local_ids.numel() > 0:
+            gt_path_node_local_ids = self._build_gt_path_node_locals(
                 gt_path_edge_local_ids=gt_path_edge_local_ids,
                 edge_head_locals=edge_head_locals,
                 edge_tail_locals=edge_tail_locals,
                 start_node_locals=start_node_locals,
             )
-            if gt_path_exists
-            else torch.empty(0, dtype=torch.long)
-        )
+            if gt_path_node_local_ids.numel() > 0:
+                gt_path_exists = True
+            else:
+                gt_path_edge_local_ids = torch.empty(0, dtype=torch.long)
 
-        if gt_path_exists and gt_path_node_local_ids.numel() == 0:
-            gt_path_exists = False
-            gt_path_edge_local_ids = torch.empty(0, dtype=torch.long)
-            gt_path_node_local_ids = torch.empty(0, dtype=torch.long)
+        if not gt_path_exists and start_node_locals.numel() > 0 and answer_node_locals.numel() > 0:
+            # Zero-length shortest path: start already contains an answer.
+            intersect = torch.isin(start_node_locals, answer_node_locals)
+            if bool(intersect.any().item()):
+                node_id = int(start_node_locals[intersect].min().item())
+                gt_path_exists = True
+                gt_path_edge_local_ids = torch.empty(0, dtype=torch.long)
+                gt_path_node_local_ids = torch.tensor([node_id], dtype=torch.long)
 
         if gt_path_exists and answer_node_locals.numel() > 0:
             terminal = int(gt_path_node_local_ids[-1].item())
@@ -412,7 +431,7 @@ class GAgentBuilder:
             self.stats["path_lengths"].append(int(gt_path_edge_local_ids.numel()))
         self.stats["edge_counts"].append(int(edge_relations.numel()))
 
-        is_answer_reachable = bool(answer_node_locals.numel() > 0)
+        is_answer_reachable = bool(pair_start_node_locals.numel() > 0)
 
         sample = GAgentSample(
             sample_id=sample_id,
@@ -430,6 +449,10 @@ class GAgentBuilder:
             answer_entity_ids=answer_entity_ids,
             start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
+            pair_start_node_locals=pair_start_node_locals,
+            pair_answer_node_locals=pair_answer_node_locals,
+            pair_edge_local_ids=pair_edge_local_ids,
+            pair_edge_ptr=pair_edge_ptr,
             gt_path_edge_local_ids=gt_path_edge_local_ids,
             gt_path_node_local_ids=gt_path_node_local_ids,
             gt_path_exists=gt_path_exists,
@@ -486,6 +509,10 @@ class GAgentBuilder:
             "start_node_locals": sample.start_node_locals,
             "answer_entity_ids": sample.answer_entity_ids,
             "answer_node_locals": sample.answer_node_locals,
+            "pair_start_node_locals": sample.pair_start_node_locals,
+            "pair_answer_node_locals": sample.pair_answer_node_locals,
+            "pair_edge_local_ids": sample.pair_edge_local_ids,
+            "pair_edge_ptr": sample.pair_edge_ptr,
             "gt_path_edge_local_ids": sample.gt_path_edge_local_ids,
             "gt_path_node_local_ids": sample.gt_path_node_local_ids,
             "gt_path_exists": bool(sample.gt_path_exists),
@@ -582,6 +609,8 @@ class GAgentBuilder:
             if h < 0 or h >= num_nodes or t < 0 or t >= num_nodes:
                 raise ValueError(f"Edge locals out of range: h={h} t={t} num_nodes={num_nodes}")
             adj[h].append(t)
+            if h != t:
+                adj[t].append(h)
 
         dist = [-1] * num_nodes
         q: deque[int] = deque()
@@ -624,8 +653,6 @@ class GAgentBuilder:
             dh = dist[h]
             dt = dist[t]
             if dh < 0 or dt < 0:
-                continue
-            if dh >= max_hops:
                 continue
             kept_edges.append(eid)
 
@@ -693,10 +720,11 @@ class GAgentBuilder:
         h0 = int(edge_head_locals[first_edge].item())
         t0 = int(edge_tail_locals[first_edge].item())
         if h0 in start_set:
-            src, dst = h0, t0
+            nodes.extend([h0, t0])
+        elif t0 in start_set:
+            nodes.extend([t0, h0])
         else:
             return torch.empty(0, dtype=torch.long)
-        nodes.extend([src, dst])
 
         for edge_idx in gt_path_edge_local_ids[1:]:
             e = int(edge_idx.item())
@@ -705,9 +733,117 @@ class GAgentBuilder:
             prev = nodes[-1]
             if prev == h:
                 nodes.append(t)
+            elif prev == t:
+                nodes.append(h)
             else:
                 return torch.empty(0, dtype=torch.long)
         return torch.tensor(nodes, dtype=torch.long)
+
+    @staticmethod
+    def _bfs_dist(num_nodes: int, adjacency: list[list[int]], sources: list[int]) -> list[int]:
+        dist = [-1] * num_nodes
+        q: deque[int] = deque()
+        for s in sources:
+            if s < 0 or s >= num_nodes:
+                continue
+            if dist[s] == 0:
+                continue
+            dist[s] = 0
+            q.append(s)
+        while q:
+            u = q.popleft()
+            du = dist[u]
+            for v in adjacency[u]:
+                if dist[v] >= 0:
+                    continue
+                dist[v] = du + 1
+                q.append(v)
+        return dist
+
+    @classmethod
+    def _shortest_path_union_mask_by_pair(
+        cls,
+        *,
+        num_nodes: int,
+        edge_head_locals: torch.Tensor,
+        edge_tail_locals: torch.Tensor,
+        start_node_locals: torch.Tensor,
+        answer_node_locals: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Union of all shortest undirected paths per (start, answer) pair."""
+        num_nodes = int(num_nodes)
+        heads = [int(x) for x in edge_head_locals.view(-1).tolist()]
+        tails = [int(x) for x in edge_tail_locals.view(-1).tolist()]
+        num_edges = len(heads)
+        if num_nodes <= 0 or num_edges == 0:
+            empty = torch.zeros(num_edges, dtype=torch.float32)
+            return empty, torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long), torch.tensor([0], dtype=torch.long)
+
+        starts = []
+        seen_s: set[int] = set()
+        for s_raw in start_node_locals.view(-1).tolist():
+            s = int(s_raw)
+            if s < 0 or s >= num_nodes or s in seen_s:
+                continue
+            seen_s.add(s)
+            starts.append(s)
+        answers = []
+        seen_a: set[int] = set()
+        for a_raw in answer_node_locals.view(-1).tolist():
+            a = int(a_raw)
+            if a < 0 or a >= num_nodes or a in seen_a:
+                continue
+            seen_a.add(a)
+            answers.append(a)
+        if not starts or not answers:
+            empty = torch.zeros(num_edges, dtype=torch.float32)
+            return empty, torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long), torch.tensor([0], dtype=torch.long)
+        if len(tails) != num_edges:
+            raise ValueError("edge_head_locals/edge_tail_locals length mismatch for DAG mask.")
+
+        adj: list[list[int]] = [[] for _ in range(num_nodes)]
+        for h, t in zip(heads, tails):
+            if h < 0 or h >= num_nodes or t < 0 or t >= num_nodes:
+                raise ValueError(f"Edge locals out of range: h={h} t={t} num_nodes={num_nodes}")
+            adj[h].append(t)
+            if h != t:
+                adj[t].append(h)
+
+        dist_from_start = {s: cls._bfs_dist(num_nodes, adj, [s]) for s in starts}
+        dist_to_answer = {a: cls._bfs_dist(num_nodes, adj, [a]) for a in answers}
+
+        mask = [False] * num_edges
+        pair_start_nodes: list[int] = []
+        pair_answer_nodes: list[int] = []
+        pair_edge_indices: list[int] = []
+        pair_edge_ptr: list[int] = [0]
+
+        for s in starts:
+            dist_s = dist_from_start[s]
+            for a in answers:
+                dist_a = dist_to_answer[a]
+                dist_sa = dist_s[a]
+                if dist_sa < 0:
+                    continue
+                pair_start_nodes.append(s)
+                pair_answer_nodes.append(a)
+                for idx, (u, v) in enumerate(zip(heads, tails)):
+                    if dist_s[u] >= 0 and dist_a[v] >= 0 and dist_s[u] + 1 + dist_a[v] == dist_sa:
+                        pair_edge_indices.append(idx)
+                        mask[idx] = True
+                        continue
+                    if dist_s[v] >= 0 and dist_a[u] >= 0 and dist_s[v] + 1 + dist_a[u] == dist_sa:
+                        pair_edge_indices.append(idx)
+                        mask[idx] = True
+                pair_edge_ptr.append(len(pair_edge_indices))
+
+        return (
+            torch.tensor(mask, dtype=torch.float32),
+            torch.tensor(pair_start_nodes, dtype=torch.long),
+            torch.tensor(pair_answer_nodes, dtype=torch.long),
+            torch.tensor(pair_edge_indices, dtype=torch.long),
+            torch.tensor(pair_edge_ptr, dtype=torch.long),
+        )
 
     @staticmethod
     def _shortest_path_edge_locals(
@@ -759,15 +895,15 @@ class GAgentBuilder:
             if not edge_ids:
                 return torch.empty(0, dtype=torch.long)
 
-        adj_fwd: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
-        adj_rev: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+        adj: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
         for eid in edge_ids:
             h = heads[eid]
             t = tails[eid]
             if h < 0 or h >= num_nodes or t < 0 or t >= num_nodes:
                 raise ValueError(f"Edge locals out of range: eid={eid} h={h} t={t} num_nodes={num_nodes}")
-            adj_fwd[h].append((t, eid))
-            adj_rev[t].append((h, eid))
+            adj[h].append((t, eid))
+            if h != t:
+                adj[t].append((h, eid))
 
         # 1) Multi-source BFS for hop distance.
         dist = [-1] * num_nodes
@@ -782,7 +918,7 @@ class GAgentBuilder:
         while q:
             u = q.popleft()
             du = dist[u]
-            for v, _eid in adj_fwd[u]:
+            for v, _eid in adj[u]:
                 if dist[v] >= 0:
                     continue
                 dist[v] = du + 1
@@ -811,7 +947,7 @@ class GAgentBuilder:
             best_key = (float("-inf"), 0, 0)  # (score, -edge_id, -pred_node)
             best_u = -1
             best_eid = -1
-            for u, eid in adj_rev[v]:
+            for u, eid in adj[v]:
                 if dist[u] != dv - 1:
                     continue
                 cand = best_score[u] + scores[eid]

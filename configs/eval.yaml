@@ -4,6 +4,7 @@ defaults:
   - _self_
   - window: default
   - ckpt: default
+  - run: default
   - dataset: null
   - data: null
   - model: null
@@ -13,15 +14,14 @@ defaults:
   - paths: default
   - extras: default
   - hydra: default
-  - stage: null
   - experiment: null
   - optional local: default
 
-task_name: ${stage.task_name}
-tags: ${stage.tags}
+task_name: ${run.task_name}
+tags: ${run.tags}
 
 # seed for reproducibility; keep configurable via CLI override
 seed: 42
 
-# Stage-driven checkpoint (stage configs should set this explicitly, e.g. `${ckpt.retriever}`).
-ckpt_path: ${stage.ckpt_path}
+# Run-driven checkpoint (set explicitly in experiment configs).
+ckpt_path: ${run.ckpt_path}

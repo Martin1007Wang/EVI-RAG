@@ -15,7 +15,6 @@ paths:
   processed: ${dataset.materialized_dir}/processed
 
 entity_normalization: none
-undirected_traversal: false
 num_topics: 2
 topic_pe:
   enabled: true

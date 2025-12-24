@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("hydra")
 
-from src.models.gflownet_module import GFlowNetModule
+from src.callbacks.gflownet_rollout_writer import GFlowNetRolloutWriter
 
 
 def test_stream_rollouts_writes_jsonl(tmp_path: Path) -> None:
-    # Construct a minimal module stub (bypass heavy __init__) to exercise stream writer.
-    module = GFlowNetModule.__new__(GFlowNetModule)
-    module.eval_persist_cfg = {"output_dir": str(tmp_path), "textualize": False}
-    module._stream_processor = None
-    module._stream_output_dir = None
+    writer = GFlowNetRolloutWriter(output_dir=tmp_path, split="predict", textualize=False)
     records = [
         {
             "sample_id": "s1",
@@ -37,8 +34,12 @@ def test_stream_rollouts_writes_jsonl(tmp_path: Path) -> None:
         },
     ]
 
-    module._stream_rollouts(records, split="predict")
-    out = tmp_path / "predict_gflownet_eval.jsonl"
+    trainer = SimpleNamespace(global_rank=0)
+    writer.on_predict_start(trainer, None)
+    writer.write_on_batch_end(trainer, None, records, None, None, 0, 0)
+    out = tmp_path / "predict.jsonl"
     assert out.exists()
     lines = out.read_text().strip().splitlines()
     assert len(lines) == len(records)
+    manifest = tmp_path / "predict.manifest.json"
+    assert manifest.exists()

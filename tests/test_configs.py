@@ -42,7 +42,7 @@ def test_eval_config(cfg_eval: DictConfig) -> None:
     hydra.utils.instantiate(cfg_eval.trainer)
 
 
-def test_llm_reasoner_truth_experiment_wiring() -> None:
+def test_reasoner_oracle_experiment_wiring() -> None:
     from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
 
@@ -53,7 +53,7 @@ def test_llm_reasoner_truth_experiment_wiring() -> None:
             config_name="eval.yaml",
             return_hydra_config=True,
             overrides=[
-                "stage=llm_reasoner_truth",
+                "experiment=reasoner_oracle",
                 "dataset=webqsp",
                 "trainer=cpu",
                 "logger=none",
@@ -61,5 +61,5 @@ def test_llm_reasoner_truth_experiment_wiring() -> None:
             ],
         )
 
-    assert cfg.data._target_ == "src.data.llm_reasoner_truth_datamodule.LLMReasonerTruthDataModule"
-    assert cfg.model._target_ == "src.models.llm_reasoner_truth_module.LLMReasonerTruthModule"
+    assert cfg.data._target_ == "src.data.reasoner_oracle_datamodule.ReasonerOracleDataModule"
+    assert cfg.model._target_ == "src.models.reasoner_module.ReasonerModule"
