@@ -11,10 +11,13 @@ import rootutils
 import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+from src.data.components.bfs_chain_builder import BFSChainSettings, export_bfs_chain_cache
+from src.data.selector_eval_datamodule import SelectorEvalDataModule
+from src.models.selector_eval_module import SelectorEvalModule
 from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -24,6 +27,8 @@ _RUN_REQUIRES_CKPT_KIND = {
     "eval_gflownet": "gflownet",
     "export_gflownet": "gflownet",
 }
+
+_DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"
 
 
 def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
@@ -77,6 +82,19 @@ def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
 def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) -> None:
     if ckpt_path in (None, ""):
         return
+    def _strip_torch_compile_prefix(state: Dict[str, Any]) -> Dict[str, Any]:
+        if not state:
+            return state
+        if not any("._orig_mod." in key or key.startswith("_orig_mod.") for key in state):
+            return state
+        stripped: Dict[str, Any] = {}
+        for key, value in state.items():
+            if key.startswith("_orig_mod."):
+                new_key = key.replace("_orig_mod.", "", 1)
+            else:
+                new_key = key.replace("._orig_mod.", ".", 1)
+            stripped[new_key] = value
+        return stripped
     load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
     # NOTE: Lightning `.ckpt` is not guaranteed to be `weights_only`-safe under torch>=2.6.
     # We explicitly load with `weights_only=False` for compatibility (assumes checkpoint is trusted).
@@ -91,6 +109,7 @@ def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) ->
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
     if not isinstance(state_dict, dict):
         raise TypeError(f"Checkpoint at {ckpt_path} must be a state_dict mapping, got {type(state_dict)!r}")
+    state_dict = _strip_torch_compile_prefix(state_dict)
     model.load_state_dict(state_dict, strict=True)
 
 
@@ -110,6 +129,172 @@ def _save_metrics(cfg: DictConfig, metrics: Dict[str, Any], *, filename: str = "
     payload = {k: _to_python(v) for k, v in metrics.items()}
     path.write_text(json.dumps(payload, indent=2))
     return path
+
+
+def _normalize_dataset_scope(dataset_cfg: DictConfig | Dict[str, Any]) -> str:
+    scope_raw = dataset_cfg.get("dataset_scope") if hasattr(dataset_cfg, "get") else None
+    scope = str(scope_raw or "").strip().lower()
+    if scope in {"full", "sub"}:
+        return scope
+    name_raw = dataset_cfg.get("name") if hasattr(dataset_cfg, "get") else ""
+    name = str(name_raw or "")
+    return "sub" if name.endswith("-sub") else "full"
+
+
+def _load_dataset_config_by_name(name: str, paths_cfg: DictConfig) -> DictConfig:
+    path = _DATASET_CONFIG_DIR / f"{name}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset config not found: {path}")
+    raw_cfg = OmegaConf.load(path)
+    container = OmegaConf.create({"paths": paths_cfg, "dataset": raw_cfg})
+    OmegaConf.resolve(container)
+    return container["dataset"]
+
+
+def _resolve_dataset_variants(cfg: DictConfig) -> List[Tuple[str, DictConfig]]:
+    run_cfg = cfg.get("run") or {}
+    raw_variants = run_cfg.get("dataset_variants")
+    if not raw_variants:
+        return []
+    variants: List[Tuple[str, DictConfig]] = []
+    if OmegaConf.is_list(raw_variants) or isinstance(raw_variants, (list, tuple)):
+        items = list(raw_variants)
+    else:
+        items = [raw_variants]
+    for item in items:
+        label: str
+        dataset_name: str
+        if isinstance(item, dict):
+            dataset_name = str(item.get("dataset") or item.get("name") or "").strip()
+            label = str(item.get("label") or dataset_name).strip()
+        else:
+            dataset_name = str(item).strip()
+            label = dataset_name
+        if not dataset_name:
+            raise ValueError("dataset_variants entries must define a dataset name.")
+        dataset_cfg = _load_dataset_config_by_name(dataset_name, cfg.paths)
+        variants.append((label, dataset_cfg))
+    return variants
+
+
+def _maybe_run_selector_eval(cfg: DictConfig) -> Dict[str, Any]:
+    sel_cfg = cfg.get("selector_eval") or {}
+    if not bool(sel_cfg.get("enabled", False)):
+        return {}
+
+    selector = str(sel_cfg.get("selector", "")).strip().lower()
+    if selector not in {"retriever_topk", "gflownet_rollouts"}:
+        raise ValueError(f"selector_eval.selector must be retriever_topk or gflownet_rollouts, got {selector!r}")
+
+    k_values = sel_cfg.get("k_values")
+    if not k_values:
+        window_cfg = cfg.get("window") or {}
+        if selector == "gflownet_rollouts":
+            k_values = window_cfg.get("rollout_k_values") or window_cfg.get("k_values")
+        else:
+            k_values = window_cfg.get("k_values")
+    k_values = [int(v) for v in (list(k_values) if k_values is not None else [])]
+    if not k_values:
+        raise ValueError("selector_eval.k_values must be a non-empty list of ints.")
+
+    dataset_cfg = cfg.get("dataset") or {}
+    run_cfg = cfg.get("run") or {}
+    split = str(run_cfg.get("split", "test"))
+    artifact_root = Path(dataset_cfg.get("artifact_dir") or dataset_cfg.get("materialized_dir") or ".")
+    default_g_agent = artifact_root / "g_agent" / f"{split}_g_agent.pt"
+
+    g_agent_path = sel_cfg.get("g_agent_path") or str(default_g_agent)
+    output_dir = sel_cfg.get("output_dir") or str(cfg.paths.output_dir)
+    allow_empty_dag = bool(sel_cfg.get("allow_empty_dag", False))
+    drop_unreachable = bool(sel_cfg.get("drop_unreachable", False))
+    num_workers = int(sel_cfg.get("num_workers", 0))
+
+    eval_gflownet_path = None
+    eval_gflownet_artifact_name = "eval_gflownet"
+    eval_gflownet_schema_version = 1
+    if selector == "gflownet_rollouts":
+        eval_gflownet_path = sel_cfg.get("eval_gflownet_path")
+        if not eval_gflownet_path:
+            default_eval = artifact_root / "eval_gflownet" / f"{split}.jsonl"
+            eval_gflownet_path = str(default_eval)
+        eval_gflownet_artifact_name = str(sel_cfg.get("eval_gflownet_artifact_name", "eval_gflownet")).strip()
+        eval_gflownet_schema_version = int(sel_cfg.get("eval_gflownet_schema_version", 1))
+
+    datamodule = SelectorEvalDataModule(
+        dataset=str(dataset_cfg.get("name", "")),
+        split=split,
+        g_agent_path=str(g_agent_path),
+        selector=selector,
+        k_values=k_values,
+        eval_gflownet_path=str(eval_gflownet_path) if eval_gflownet_path else None,
+        eval_gflownet_artifact_name=eval_gflownet_artifact_name,
+        eval_gflownet_schema_version=eval_gflownet_schema_version,
+        drop_unreachable=drop_unreachable,
+        num_workers=num_workers,
+    )
+    model = SelectorEvalModule(
+        dataset=str(dataset_cfg.get("name", "")),
+        split=split,
+        output_dir=str(output_dir),
+        selector=selector,
+        k_values=k_values,
+        allow_empty_dag=allow_empty_dag,
+    )
+    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=[], logger=[])
+    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
+    metrics: Dict[str, Any] = {}
+    model_metrics = getattr(model, "predict_metrics", None)
+    if isinstance(model_metrics, dict) and model_metrics:
+        metrics = model_metrics
+    elif trainer.callback_metrics:
+        metrics = dict(trainer.callback_metrics)
+    return metrics
+
+
+def _maybe_build_bfs_chains(cfg: DictConfig) -> Dict[str, Any]:
+    bfs_cfg = cfg.get("bfs_chain_eval") or {}
+    if not bool(bfs_cfg.get("enabled", False)):
+        return {}
+
+    dataset_cfg = cfg.get("dataset") or {}
+    run_cfg = cfg.get("run") or {}
+    split = str(run_cfg.get("split", "test"))
+    artifact_root = Path(dataset_cfg.get("artifact_dir") or dataset_cfg.get("materialized_dir") or ".")
+    default_g_agent = artifact_root / "g_agent" / f"{split}_g_agent.pt"
+    default_output_dir = artifact_root / "eval_bfs"
+
+    g_agent_path = bfs_cfg.get("g_agent_path") or str(default_g_agent)
+    output_dir = bfs_cfg.get("output_dir") or str(default_output_dir)
+    artifact_name = str(bfs_cfg.get("artifact_name", "eval_bfs")).strip()
+    schema_version = int(bfs_cfg.get("schema_version", 1))
+    if schema_version <= 0:
+        raise ValueError("bfs_chain_eval.schema_version must be a positive integer.")
+    max_chain_length = int(bfs_cfg.get("max_chain_length", 0))
+    if max_chain_length <= 0:
+        raise ValueError("bfs_chain_eval.max_chain_length must be a positive integer.")
+
+    settings = BFSChainSettings(
+        max_chain_length=max_chain_length,
+        min_chain_length=int(bfs_cfg.get("min_chain_length", 1)),
+        max_chains_per_sample=int(bfs_cfg.get("max_chains_per_sample", 100)),
+        max_total_chains=int(bfs_cfg.get("max_total_chains", 5000)),
+        allow_backward=bool(bfs_cfg.get("allow_backward", True)),
+        max_branch_per_node=bfs_cfg.get("max_branch_per_node"),
+        forbid_edge_revisit=bool(bfs_cfg.get("forbid_edge_revisit", True)),
+        forbid_node_revisit=bool(bfs_cfg.get("forbid_node_revisit", False)),
+    )
+    output_path, total = export_bfs_chain_cache(
+        g_agent_path=str(g_agent_path),
+        output_dir=str(output_dir),
+        split=split,
+        settings=settings,
+        artifact_name=artifact_name,
+        schema_version=schema_version,
+        overwrite=bool(bfs_cfg.get("overwrite", True)),
+        drop_unreachable=bool(bfs_cfg.get("drop_unreachable", False)),
+    )
+    log.info("BFS chains saved to %s (samples=%d).", output_path, total)
+    return {"bfs_chain/total": float(total)}
 
 
 def _preflight_validate(cfg: DictConfig) -> None:
@@ -139,6 +324,13 @@ def _preflight_validate(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
+    if bool(run_cfg.get("require_dual_datasets", False)):
+        variants = run_cfg.get("dataset_variants")
+        if not variants:
+            raise ValueError(
+                "run.require_dual_datasets=true but run.dataset_variants is empty. "
+                "Provide both full and sub dataset names."
+            )
 
 
 def _run_eval_all_splits(cfg: DictConfig) -> None:
@@ -156,6 +348,32 @@ def _run_eval_all_splits(cfg: DictConfig) -> None:
         evaluate(cfg)
 
 
+def _run_eval_all_datasets(cfg: DictConfig) -> None:
+    run_cfg = cfg.get("run") or {}
+    variants = _resolve_dataset_variants(cfg)
+    if not variants:
+        raise ValueError("run.dataset_variants must be a non-empty list when evaluating multiple datasets.")
+
+    if bool(run_cfg.get("require_dual_datasets", False)):
+        scopes = { _normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants }
+        if scopes != {"full", "sub"}:
+            names = [label for label, _ in variants]
+            raise ValueError(
+                "Dual-dataset evaluation requires both full and sub scopes. "
+                f"Got scopes={sorted(scopes)} for variants={names}."
+            )
+
+    for label, dataset_cfg in variants:
+        log.info("eval: dataset_variant=%s", label)
+        with open_dict(cfg):
+            cfg.dataset = dataset_cfg
+            cfg.run.dataset_variant = label
+        if bool(run_cfg.get("run_all_splits", False)):
+            _run_eval_all_splits(cfg)
+        else:
+            evaluate(cfg)
+
+
 @task_wrapper
 def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed") is not None:
@@ -167,9 +385,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             "Missing required config group: `run`. Example: "
             "`python src/eval.py experiment=eval_retriever dataset=webqsp`."
         )
-    return_predictions = bool(run_cfg.get("return_predictions", False))
-
-    log.info(f"Run: {run_cfg.get('name')} (return_predictions={return_predictions})")
+    log.info("Run: %s", run_cfg.get("name"))
 
     _enforce_single_gpu_eval(cfg.trainer)
 
@@ -204,7 +420,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log_hyperparameters(object_dict)
 
     log.info("Running trainer.predict()...")
-    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=return_predictions)
+    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
 
     metric_dict = trainer.callback_metrics
     if not metric_dict and hasattr(model, "predict_metrics"):
@@ -214,15 +430,27 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 metric_dict = metrics_from_model
         except Exception:
             pass
+    selector_metrics = _maybe_run_selector_eval(cfg)
+    if selector_metrics:
+        metric_dict = dict(metric_dict) if metric_dict else {}
+        metric_dict.update(selector_metrics)
+    bfs_metrics = _maybe_build_bfs_chains(cfg)
+    if bfs_metrics:
+        metric_dict = dict(metric_dict) if metric_dict else {}
+        metric_dict.update(bfs_metrics)
+
     run_cfg = cfg.get("run") or {}
-    save_metrics = bool(run_cfg.get("save_metrics", True))
-    if save_metrics:
-        if not metric_dict:
-            raise ValueError("No metrics were produced; check model.predict/test hooks or run.save_metrics.")
+    if not metric_dict:
+        log.warning("No metrics were produced; skipping metrics.json.")
+    else:
         metrics_filename = "metrics.json"
         split = run_cfg.get("split")
+        dataset_variant = run_cfg.get("dataset_variant")
+        if dataset_variant:
+            metrics_filename = f"metrics_{dataset_variant}.json"
         if bool(run_cfg.get("run_all_splits", False)) and split not in (None, ""):
-            metrics_filename = f"metrics_{split}.json"
+            prefix = f"metrics_{dataset_variant}_" if dataset_variant else "metrics_"
+            metrics_filename = f"{prefix}{split}.json"
         metrics_path = _save_metrics(cfg, metric_dict, filename=metrics_filename)
         log.info("Metrics saved to %s", metrics_path)
     return metric_dict, object_dict
@@ -233,6 +461,9 @@ def main(cfg: DictConfig) -> None:
     _preflight_validate(cfg)
     extras(cfg)
     run_cfg = cfg.get("run") or {}
+    if run_cfg.get("dataset_variants"):
+        _run_eval_all_datasets(cfg)
+        return
     if bool(run_cfg.get("run_all_splits", False)):
         _run_eval_all_splits(cfg)
         return

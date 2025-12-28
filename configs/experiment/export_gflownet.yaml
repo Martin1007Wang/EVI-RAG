@@ -14,16 +14,18 @@ run:
   task_name: "export/gflownet"
   tags: ["export", "gflownet"]
   split: test
-  return_predictions: false
-  save_metrics: false
   ckpt_path: ${ckpt.gflownet}
+  dataset_variants:
+    - ${dataset.dataset_family}
+    - ${dataset.dataset_family}-sub
+  require_dual_datasets: true
 
 ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
 data:
   cache_paths:
-    test: ${dataset.materialized_dir}/g_agent/${run.split}_g_agent.pt
+    test: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
 
 model:
   embedder_cfg:
@@ -31,7 +33,7 @@ model:
 
 callbacks:
   gflownet_rollout_writer:
-    output_dir: ${dataset.materialized_dir}/export_gflownet
+    output_dir: ${dataset.artifact_dir}/export_gflownet
     split: ${run.split}
     artifact_name: export_gflownet
     schema_version: 1

@@ -13,6 +13,7 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from ..g_retrieval_dataset import GRetrievalDataset
+from src.utils.graph_utils import compute_edge_batch
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +28,9 @@ class UnifiedDataLoader(DataLoader):
         shuffle: bool = True,
         num_workers: int = 0,
         random_seed: Optional[int] = None,
-        build_reverse_edge_index: bool = True,
         **kwargs: Any,
     ) -> None:
         self.random_seed = random_seed
-        self.build_reverse_edge_index = bool(build_reverse_edge_index)
 
         worker_init_fn: Optional[Callable[[int], None]] = kwargs.pop("worker_init_fn", None)
         if random_seed is not None:
@@ -75,12 +74,29 @@ class UnifiedDataLoader(DataLoader):
         pin_outputs = bool(getattr(self, "pin_memory", False)) and torch.cuda.is_available()
 
         for batch in super().__iter__():
+            edge_index = getattr(batch, "edge_index", None)
+            if edge_index is None:
+                raise AttributeError("Batch missing edge_index required for edge_batch computation.")
+            reverse_edge_index = edge_index.flip(0)
+            batch.reverse_edge_index = reverse_edge_index
+
+            node_ptr = getattr(batch, "ptr", None)
+            if node_ptr is None:
+                raise AttributeError("Batch missing ptr required for edge_batch computation.")
+            node_ptr = node_ptr.to(device=edge_index.device)
+            num_graphs = int(node_ptr.numel() - 1)
+            if num_graphs <= 0:
+                raise ValueError("Batch ptr is empty; cannot compute edge_batch.")
+            edge_batch, _ = compute_edge_batch(
+                edge_index,
+                node_ptr=node_ptr,
+                num_graphs=num_graphs,
+                device=edge_index.device,
+            )
+            batch.edge_batch = edge_batch
+
             node_embedding_ids = torch.as_tensor(batch.node_embedding_ids, dtype=torch.long, device="cpu")
             relation_ids = torch.as_tensor(batch.edge_attr, dtype=torch.long, device="cpu")
-
-            if self.build_reverse_edge_index and hasattr(batch, "edge_index") and batch.edge_index is not None:
-                batch.reverse_edge_index = batch.edge_index.flip(0)
-
             batch.node_embeddings = self.global_embeddings.get_entity_embeddings(node_embedding_ids)
             batch.edge_embeddings = self.global_embeddings.get_relation_embeddings(relation_ids)
             if pin_outputs:
@@ -94,9 +110,6 @@ class UnifiedDataLoader(DataLoader):
             answer_ptr = getattr(batch, "answer_entity_ids_ptr", None)
             if answer_ptr is None and hasattr(batch, "_slice_dict"):
                 answer_ptr = batch._slice_dict.get("answer_entity_ids")
-            if answer_ptr is None and hasattr(batch, "answer_entity_ids_len"):
-                lens = torch.as_tensor(batch.answer_entity_ids_len, dtype=torch.long, device="cpu").view(-1)
-                answer_ptr = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)], dim=0)
             if answer_ptr is None:
                 raise AttributeError("Batch missing answer_entity_ids_ptr; PyG collate may have failed.")
             batch.answer_entity_ids_ptr = torch.as_tensor(answer_ptr, dtype=torch.long, device="cpu")

@@ -76,7 +76,6 @@ def build_difficulty_split(
     cache_path: Path,
     beam_k: int,
     max_steps: int,
-    use_top_mask: bool,
 ) -> Dict:
     ds = GAgentPyGDataset(cache_path, drop_unreachable=False)
     easy: List[str] = []
@@ -90,10 +89,9 @@ def build_difficulty_split(
         sample_id = sample.sample_id
         answerable = bool(sample.is_answer_reachable) and bool(sample.gt_path_exists)
 
-        beam = _beam_greedy_metrics(data, [beam_k], max_steps, use_top_mask)[beam_k]
+        beam = _beam_greedy_metrics(data, [beam_k], max_steps)[beam_k]
         beam_success = float(beam["success"])
-        mask = data.top_edge_mask if use_top_mask and hasattr(data, "top_edge_mask") else None
-        ranks, gaps = _gt_ranks(data.edge_scores, data.gt_path_edge_local_ids, mask)
+        ranks, gaps = _gt_ranks(data.edge_scores, data.gt_path_edge_local_ids, None)
         min_rank = min(ranks) if ranks else None
 
         if not answerable:
@@ -127,7 +125,6 @@ def build_difficulty_split(
             "cache_path": str(cache_path),
             "beam_k": beam_k,
             "max_steps": max_steps,
-            "use_top_mask": use_top_mask,
         },
     }
 
@@ -153,7 +150,6 @@ def main() -> None:
         default=DEFAULT_MAX_STEPS,
         help=f"Max steps for beam rollout (align with env.max_steps; default: {DEFAULT_MAX_STEPS})",
     )
-    parser.add_argument("--use-top-mask", action="store_true", help="Restrict beam to top_edge_mask if present")
     parser.add_argument(
         "--write-caches-dir",
         type=Path,
@@ -166,7 +162,6 @@ def main() -> None:
         cache_path=args.g_agent_path,
         beam_k=args.beam_k,
         max_steps=args.max_steps,
-        use_top_mask=args.use_top_mask,
     )
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

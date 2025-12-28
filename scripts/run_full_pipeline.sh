@@ -11,6 +11,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 DATASET=""
+DATASET_FAMILY=""
+DATASET_FULL=""
+DATASET_SUB=""
 SKIP_PREPROCESS="false"
 RETRIEVER_CKPT_OVERRIDE=""
 
@@ -54,8 +57,16 @@ if [[ -z "${DATASET}" ]]; then
   ls -1 configs/dataset/*.yaml | xargs -n1 basename | sed 's/\\.yaml$//' >&2
   exit 2
 fi
-if [[ ! -f "configs/dataset/${DATASET}.yaml" ]]; then
-  echo "Unknown dataset: ${DATASET}" >&2
+DATASET_FAMILY="${DATASET%-sub}"
+DATASET_FULL="${DATASET_FAMILY}"
+DATASET_SUB="${DATASET_FAMILY}-sub"
+if [[ ! -f "configs/dataset/${DATASET_FULL}.yaml" ]]; then
+  echo "Unknown full dataset: ${DATASET_FULL}" >&2
+  ls -1 configs/dataset/*.yaml | xargs -n1 basename | sed 's/\\.yaml$//' >&2
+  exit 2
+fi
+if [[ ! -f "configs/dataset/${DATASET_SUB}.yaml" ]]; then
+  echo "Missing sub dataset config: ${DATASET_SUB}" >&2
   ls -1 configs/dataset/*.yaml | xargs -n1 basename | sed 's/\\.yaml$//' >&2
   exit 2
 fi
@@ -72,11 +83,13 @@ if [[ -d /dev/shm ]]; then
   fi
 fi
 
-COMMON_OVERRIDES=("dataset=${DATASET}" "hydra.job.chdir=false")
+COMMON_OVERRIDES_FULL=("dataset=${DATASET_FULL}" "hydra.job.chdir=false")
+COMMON_OVERRIDES_SUB=("dataset=${DATASET_SUB}" "hydra.job.chdir=false")
 
 latest_run_dir() {
   local task="$1"
-  local base="${ROOT}/logs/${task}/runs"
+  local dataset="$2"
+  local base="${ROOT}/logs/${task}_${dataset}/runs"
   ls -1dt "${base}"/* 2>/dev/null | head -n 1
 }
 
@@ -98,14 +111,14 @@ pick_best_ckpt() {
 }
 
 if [[ "${SKIP_PREPROCESS}" != "true" ]]; then
-  echo "==> [1/8] build_retrieval_parquet (${DATASET})"
-  python scripts/build_retrieval_parquet.py "${COMMON_OVERRIDES[@]}"
+  echo "==> [1/7] build_retrieval_parquet (full=${DATASET_FULL}, emit sub mask)"
+  python scripts/build_retrieval_parquet.py "${COMMON_OVERRIDES_FULL[@]}"
 
-  echo "==> [2/8] build_retrieval_dataset (${DATASET})"
-  python scripts/build_retrieval_dataset.py "${COMMON_OVERRIDES[@]}"
+  echo "==> [2/7] build_retrieval_dataset (full=${DATASET_FULL})"
+  python scripts/build_retrieval_dataset.py "${COMMON_OVERRIDES_FULL[@]}"
 else
-  echo "==> [1/8] build_retrieval_parquet (${DATASET}) [skipped]"
-  echo "==> [2/8] build_retrieval_dataset (${DATASET}) [skipped]"
+  echo "==> [1/7] build_retrieval_parquet (full=${DATASET_FULL}) [skipped]"
+  echo "==> [2/7] build_retrieval_dataset (full=${DATASET_FULL}) [skipped]"
 fi
 
 if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
@@ -114,13 +127,13 @@ if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
     exit 1
   fi
   RETR_CKPT="${RETRIEVER_CKPT_OVERRIDE}"
-  echo "==> [3/8] train_retriever (skipped, using retriever ckpt override)"
+  echo "==> [3/7] train_retriever (skipped, using retriever ckpt override)"
 else
-echo "==> [3/8] train_retriever (experiment=train_retriever)"
+echo "==> [3/7] train_retriever (experiment=train_retriever, sub=${DATASET_SUB})"
 RETR_EXP="train_retriever"
-  RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${RETR_EXP}")
+  RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${RETR_EXP}")
   python src/train.py "${RETR_TRAIN_OVERRIDES[@]}"
-  RETR_RUN_DIR="$(latest_run_dir "${RETR_EXP}")"
+  RETR_RUN_DIR="$(latest_run_dir "${RETR_EXP}" "${DATASET_SUB}")"
   RETR_CKPT="$(pick_best_ckpt "${RETR_RUN_DIR}")"
   if [[ -z "${RETR_CKPT}" ]]; then
     echo "Retriever checkpoint not found under run dir: ${RETR_RUN_DIR:-<missing>}" >&2
@@ -129,18 +142,18 @@ RETR_EXP="train_retriever"
 fi
 echo "Retriever checkpoint: ${RETR_CKPT}"
 
-echo "==> [4/8] eval_retriever (train/val/test + g_agent)"
+echo "==> [4/7] eval_retriever (full+sub, train/val/test + g_agent)"
 python src/eval.py \
-  "${COMMON_OVERRIDES[@]}" \
+  "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=eval_retriever" \
   "ckpt.retriever=${RETR_CKPT}" \
   "run.run_all_splits=true"
 
-echo "==> [5/8] train_gflownet (experiment=train_gflownet)"
+echo "==> [5/7] train_gflownet (experiment=train_gflownet, sub=${DATASET_SUB})"
 GFLOW_EXP="train_gflownet"
-GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES[@]}" "experiment=${GFLOW_EXP}" "ckpt.retriever=${RETR_CKPT}")
+GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${GFLOW_EXP}" "ckpt.retriever=${RETR_CKPT}")
 python src/train.py "${GFLOW_TRAIN_OVERRIDES[@]}"
-GFLOW_RUN_DIR="$(latest_run_dir "${GFLOW_EXP}")"
+GFLOW_RUN_DIR="$(latest_run_dir "${GFLOW_EXP}" "${DATASET_SUB}")"
 GFLOW_CKPT="$(pick_best_ckpt "${GFLOW_RUN_DIR}")"
 if [[ -z "${GFLOW_CKPT}" ]]; then
   echo "GFlowNet checkpoint not found under run dir: ${GFLOW_RUN_DIR:-<missing>}" >&2
@@ -148,15 +161,15 @@ if [[ -z "${GFLOW_CKPT}" ]]; then
 fi
 echo "GFlowNet checkpoint: ${GFLOW_CKPT}"
 
-echo "==> [6/8] eval_gflownet"
+echo "==> [6/7] eval_gflownet (full+sub)"
 python src/eval.py \
-  "${COMMON_OVERRIDES[@]}" \
+  "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=eval_gflownet" \
   "ckpt.gflownet=${GFLOW_CKPT}"
 
-echo "==> [7/8] oracle (retriever upper bound)"
+echo "==> [7/7] oracle (retriever upper bound, full+sub)"
 python src/eval.py \
-  "${COMMON_OVERRIDES[@]}" \
+  "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=reasoner_oracle"
 
 echo "Pipeline finished."

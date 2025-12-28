@@ -43,3 +43,4 @@ dependencies:
       - hydra-optuna-sweeper
       - hydra-colorlog
       - rootutils
+      - pytorch-metric-learning>=2.0.0

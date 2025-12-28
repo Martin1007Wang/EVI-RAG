@@ -19,11 +19,10 @@ path materialization (avoid recomputing shortest paths later).
 
 from __future__ import annotations
 
-import os
 import pickle
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence
 
 try:
     import hydra
@@ -31,6 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover
     hydra = None  # type: ignore[assignment]
 import lmdb
 import torch
+import torch.nn.functional as F
 import numpy as np
 try:
     from omegaconf import DictConfig
@@ -185,13 +185,6 @@ def _encode_to_memmap(
     return tensor
 
 
-def _ensure_symlink(link_path: Path, target_path: Path) -> None:
-    if link_path.exists() or link_path.is_symlink():
-        return
-    _ensure_dir(link_path.parent)
-    os.symlink(str(target_path), str(link_path))
-
-
 def _prepare_lmdb_dir(path: Path, *, overwrite: bool) -> Path:
     """Prepare a clean temporary LMDB directory and return its path.
 
@@ -217,43 +210,15 @@ def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> 
     tmp_path.rename(final_path)
 
 
-def _mean_aggregate(edge_index: torch.Tensor, x: torch.Tensor, num_nodes: int) -> torch.Tensor:
-    if edge_index.numel() == 0:
-        return x.new_zeros((num_nodes, x.size(1)))
-    src = edge_index[0].to(dtype=torch.long)
-    dst = edge_index[1].to(dtype=torch.long)
-    out = x.new_zeros((num_nodes, x.size(1)))
-    out.index_add_(0, dst, x[src])
-    deg = x.new_zeros((num_nodes,), dtype=x.dtype)
-    deg.index_add_(0, dst, torch.ones_like(dst, dtype=x.dtype))
-    return out / deg.clamp_min(1.0).unsqueeze(-1)
-
-
-def _build_topic_pe(
-    *,
-    topic_one_hot: torch.Tensor,
-    edge_index: torch.Tensor,
-    num_rounds: int,
-    num_reverse_rounds: int,
-) -> torch.Tensor:
-    num_nodes = int(topic_one_hot.size(0))
-    if num_nodes == 0:
-        return topic_one_hot.new_empty((0, topic_one_hot.size(1) * (1 + num_rounds + num_reverse_rounds)))
-    features = [topic_one_hot]
-    h = topic_one_hot
-    for _ in range(num_rounds):
-        h = _mean_aggregate(edge_index, h, num_nodes)
-        features.append(h)
-    rev_edge_index = edge_index.flip(0)
-    h_rev = topic_one_hot
-    for _ in range(num_reverse_rounds):
-        h_rev = _mean_aggregate(rev_edge_index, h_rev, num_nodes)
-        features.append(h_rev)
-    stacked = torch.stack(features, dim=-1)
-    return stacked.reshape(num_nodes, -1)
-
-
 def build_dataset(cfg: DictConfig) -> None:
+    dataset_cfg = cfg.get("dataset") if hasattr(cfg, "get") else {}
+    dataset_name = str(dataset_cfg.get("name", "") or "")
+    dataset_scope = str(dataset_cfg.get("dataset_scope", "") or "").strip().lower()
+    if dataset_scope == "sub" or dataset_name.endswith("-sub"):
+        raise ValueError(
+            "Sub datasets are mask-only and must not be materialized into LMDB. "
+            "Build the full dataset once, then use sample_filter_path at runtime."
+        )
     if cfg.get("seed") is not None:
         torch.manual_seed(int(cfg.seed))
         if torch.cuda.is_available():
@@ -261,20 +226,9 @@ def build_dataset(cfg: DictConfig) -> None:
     if cfg.get("deterministic", False):
         torch.use_deterministic_algorithms(True)
 
-    # Topic features follow SubgraphRAG parity: 2-class one-hot {non-topic, topic}.
-    # Topic is defined by query entities only; answers are supervision and must NOT leak into inputs.
-    num_topics = int(cfg.get("num_topics", 2))
-    if num_topics < 2:
-        raise ValueError("num_topics must be >= 2 to build SubgraphRAG-parity topic features.")
-
-    topic_pe_cfg = cfg.get("topic_pe") or {}
-    topic_pe_precompute = bool(topic_pe_cfg.get("precompute", False))
-    if topic_pe_precompute and ("num_rounds" not in topic_pe_cfg or "num_reverse_rounds" not in topic_pe_cfg):
-        raise ValueError("topic_pe.precompute=true requires explicit num_rounds and num_reverse_rounds.")
-    topic_pe_rounds = int(topic_pe_cfg.get("num_rounds", 0))
-    topic_pe_rev_rounds = int(topic_pe_cfg.get("num_reverse_rounds", 0))
-    if topic_pe_rounds < 0 or topic_pe_rev_rounds < 0:
-        raise ValueError("topic_pe.num_rounds and num_reverse_rounds must be >= 0.")
+    num_topics = int(cfg.get("num_topics", 0))
+    if num_topics <= 0:
+        raise ValueError(f"num_topics must be positive to build topic_one_hot, got {num_topics}")
 
     # Load vocabulary tables (small) and convert to Python dicts
     entity_vocab = _load_parquet(Path(cfg.parquet_dir) / "entity_vocab.parquet").to_pydict()
@@ -318,33 +272,7 @@ def build_dataset(cfg: DictConfig) -> None:
     relation_emb = encoder.encode(relation_labels, cfg.batch_size, show_progress=cfg.progress_bar, desc="Relations")
     torch.save(relation_emb, emb_dir / "relation_embeddings.pt")
 
-    sub_cfg = cfg.get("sub", {})
-    build_sub = bool(sub_cfg.get("enabled", False))
-    sub_parquet_dir = Path(sub_cfg.get("parquet_dir", ""))
-    sub_output_dir = Path(sub_cfg.get("output_dir", ""))
-    share_artifacts = bool(sub_cfg.get("share_vocab_and_embeddings", True))
-    sub_graph_ids: Set[str] = set()
-    if build_sub:
-        if not sub_parquet_dir.exists():
-            build_sub = False
-        else:
-            sub_questions_path = sub_parquet_dir / "questions.parquet"
-            if not sub_questions_path.exists():
-                build_sub = False
-            else:
-                sub_graph_ids = set(pq.read_table(sub_questions_path, columns=["graph_id"]).column("graph_id").to_pylist())
-
-    if build_sub and share_artifacts:
-        _ensure_dir(sub_output_dir)
-        base_vocab_dir = Path(cfg.output_dir) / "vocabulary" / "vocabulary.lmdb"
-        sub_vocab_dir = sub_output_dir / "vocabulary" / "vocabulary.lmdb"
-        _ensure_symlink(sub_vocab_dir, base_vocab_dir)
-        sub_emb_dir = sub_output_dir / "embeddings"
-        _ensure_dir(sub_emb_dir)
-        _ensure_symlink(sub_emb_dir / "entity_embeddings.pt", emb_dir / "entity_embeddings.pt")
-        _ensure_symlink(sub_emb_dir / "relation_embeddings.pt", emb_dir / "relation_embeddings.pt")
-    elif build_sub and not share_artifacts:
-        raise NotImplementedError("sub.share_vocab_and_embeddings=false is not supported; use symlinks to enforce SSOT.")
+    # Sub-datasets are no longer materialized; use split filters in parquet preprocessing instead.
 
     # Load main tables as pyarrow objects without converting to dicts
     graphs_table = _load_parquet(Path(cfg.parquet_dir) / "graphs.parquet")
@@ -367,27 +295,57 @@ def build_dataset(cfg: DictConfig) -> None:
             "graphs.parquet is missing required column `positive_triple_mask`. "
             "Re-run scripts/build_retrieval_parquet.py to regenerate normalized parquet with triple-level supervision."
         )
+    if "pair_edge_offsets" in graphs_table.schema.names:
+        raise RuntimeError(
+            "graphs.parquet contains deprecated column `pair_edge_offsets`. "
+            "Re-run scripts/build_retrieval_parquet.py to regenerate with pair_edge_counts only."
+        )
+    deprecated_cols = [name for name in ("gt_path_edge_indices", "gt_path_node_indices", "gt_source") if name in graphs_table.schema.names]
+    if deprecated_cols:
+        raise RuntimeError(
+            "graphs.parquet contains deprecated columns "
+            f"{deprecated_cols}. Re-run scripts/build_retrieval_parquet.py to regenerate with the new schema."
+        )
+    if "pair_edge_counts" not in graphs_table.schema.names:
+        raise RuntimeError(
+            "graphs.parquet is missing required column `pair_edge_counts`. "
+            "Re-run scripts/build_retrieval_parquet.py to regenerate with pair_edge_counts."
+        )
+    if "pair_edge_local_ids" not in graphs_table.schema.names:
+        raise RuntimeError(
+            "graphs.parquet is missing required column `pair_edge_local_ids`. "
+            "Re-run scripts/build_retrieval_parquet.py to regenerate with pair_edge_local_ids."
+        )
+    if "pair_edge_indices" in graphs_table.schema.names:
+        raise RuntimeError(
+            "graphs.parquet contains deprecated column `pair_edge_indices`. "
+            "Re-run scripts/build_retrieval_parquet.py to regenerate with pair_edge_local_ids."
+        )
 
-    def _optional_graph_col(name: str, default: object) -> List:
-        if name in graphs_table.schema.names:
-            return graphs_table.column(name).to_pylist()
-        return [default for _ in range(graphs_table.num_rows)]
+    def _require_graph_col(name: str) -> List:
+        if name not in graphs_table.schema.names:
+            raise RuntimeError(
+                f"graphs.parquet is missing required column `{name}`. "
+                "Re-run scripts/build_retrieval_parquet.py to regenerate with the updated schema."
+            )
+        return graphs_table.column(name).to_pylist()
 
     graph_cols: Dict[str, List] = {
-        "node_entity_ids": graphs_table.column("node_entity_ids").to_pylist(),
-        "node_embedding_ids": graphs_table.column("node_embedding_ids").to_pylist(),
-        "edge_src": graphs_table.column("edge_src").to_pylist(),
-        "edge_dst": graphs_table.column("edge_dst").to_pylist(),
-        "edge_relation_ids": graphs_table.column("edge_relation_ids").to_pylist(),
+        "node_entity_ids": _require_graph_col("node_entity_ids"),
+        "node_embedding_ids": _require_graph_col("node_embedding_ids"),
+        "edge_src": _require_graph_col("edge_src"),
+        "edge_dst": _require_graph_col("edge_dst"),
+        "edge_relation_ids": _require_graph_col("edge_relation_ids"),
         # Fixed invariant: retriever supervision is ALWAYS triple-level.
-        "positive_triple_mask": graphs_table.column("positive_triple_mask").to_pylist(),
-        "pair_start_node_locals": _optional_graph_col("pair_start_node_locals", []),
-        "pair_answer_node_locals": _optional_graph_col("pair_answer_node_locals", []),
-        "pair_edge_indices": _optional_graph_col("pair_edge_indices", []),
-        "pair_edge_ptr": _optional_graph_col("pair_edge_ptr", [0]),
-        "gt_path_edge_indices": graphs_table.column("gt_path_edge_indices").to_pylist(),
-        "gt_path_node_indices": graphs_table.column("gt_path_node_indices").to_pylist(),
+        "positive_triple_mask": _require_graph_col("positive_triple_mask"),
+        "pair_start_node_locals": _require_graph_col("pair_start_node_locals"),
+        "pair_answer_node_locals": _require_graph_col("pair_answer_node_locals"),
+        "pair_edge_local_ids": _require_graph_col("pair_edge_local_ids"),
+        "pair_edge_counts": _require_graph_col("pair_edge_counts"),
     }
+    has_pair_shortest_lengths = "pair_shortest_lengths" in graphs_table.schema.names
+    if has_pair_shortest_lengths:
+        graph_cols["pair_shortest_lengths"] = graphs_table.column("pair_shortest_lengths").to_pylist()
 
     questions_rows = questions_table.num_rows
     print(f"Preparing {questions_rows} samples...")
@@ -396,11 +354,9 @@ def build_dataset(cfg: DictConfig) -> None:
 
     # Set up LMDB environments
     envs: Dict[str, lmdb.Environment] = {}
-    sub_envs: Dict[str, lmdb.Environment] = {}
     map_size = cfg.map_size_gb * (1 << 30)
     all_splits = questions_table.column("split").unique().to_pylist()
     tmp_dirs: Dict[str, Path] = {}
-    sub_tmp_dirs: Dict[str, Path] = {}
     for split in all_splits:
         final_dir = emb_dir / f"{split}.lmdb"
         tmp_dir = _prepare_lmdb_dir(final_dir, overwrite=overwrite_lmdb)
@@ -411,24 +367,11 @@ def build_dataset(cfg: DictConfig) -> None:
             subdir=True,
             lock=False,
         )
-        if build_sub and share_artifacts:
-            sub_emb_dir = sub_output_dir / "embeddings"
-            sub_final_dir = sub_emb_dir / f"{split}.lmdb"
-            sub_tmp_dir = _prepare_lmdb_dir(sub_final_dir, overwrite=overwrite_lmdb)
-            sub_tmp_dirs[str(split)] = sub_tmp_dir
-            sub_envs[split] = lmdb.open(
-                str(sub_tmp_dir),
-                map_size=map_size,
-                subdir=True,
-                lock=False,
-            )
 
     success = False
     try:
         txn_cache: Dict[str, lmdb.Transaction] = {split: env.begin(write=True) for split, env in envs.items()}
         pending: Dict[str, int] = {split: 0 for split in envs.keys()}
-        sub_txn_cache: Dict[str, lmdb.Transaction] = {split: env.begin(write=True) for split, env in sub_envs.items()}
-        sub_pending: Dict[str, int] = {split: 0 for split in sub_envs.keys()}
 
         question_batches = questions_table.to_batches(max_chunksize=cfg.batch_size)
         total_batches = questions_table.num_rows / cfg.batch_size
@@ -459,10 +402,12 @@ def build_dataset(cfg: DictConfig) -> None:
                 if split not in envs:
                     continue
 
-                meta_val = ""
-                if "metadata" in q_batch_dict:
-                    meta_candidate = q_batch_dict["metadata"][i]
-                    meta_val = "" if meta_candidate is None else str(meta_candidate)
+                if "metadata" not in q_batch_dict:
+                    raise RuntimeError("questions.parquet missing required column `metadata`.")
+                meta_candidate = q_batch_dict["metadata"][i]
+                if meta_candidate is None:
+                    raise ValueError(f"metadata is null for {graph_id}")
+                meta_val = str(meta_candidate)
 
                 g_idx = graph_id_to_row[graph_id]
                 node_entity_ids = graph_cols["node_entity_ids"][g_idx]
@@ -490,33 +435,39 @@ def build_dataset(cfg: DictConfig) -> None:
                         "Rebuild normalized parquet caches to match the updated schema."
                     )
 
-                q_entities = q_batch_dict["seed_entity_ids"][i] or []
-                a_entities = q_batch_dict["answer_entity_ids"][i] or []
+                q_entities = q_batch_dict["seed_entity_ids"][i]
+                a_entities = q_batch_dict["answer_entity_ids"][i]
+                if q_entities is None:
+                    raise ValueError(f"seed_entity_ids is null for {graph_id}")
+                if a_entities is None:
+                    raise ValueError(f"answer_entity_ids is null for {graph_id}")
                 q_local = _local_indices(node_entity_ids, q_entities)
                 a_local = _local_indices(node_entity_ids, a_entities)
-
                 topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long)
-
                 if q_local:
                     topic_entity_mask[torch.as_tensor(q_local, dtype=torch.long)] = 1
-                topic_one_hot = torch.nn.functional.one_hot(topic_entity_mask, num_classes=num_topics).float()
-                topic_pe = None
-                if topic_pe_precompute:
-                    topic_pe = _build_topic_pe(
-                        topic_one_hot=topic_one_hot,
-                        edge_index=edge_index,
-                        num_rounds=topic_pe_rounds,
-                        num_reverse_rounds=topic_pe_rev_rounds,
-                    )
-                q_emb_ids = (q_batch_dict.get("seed_embedding_ids", [[]] * (i + 1)) or [[]])[i] or []
-                a_emb_ids = (q_batch_dict.get("answer_embedding_ids", [[]] * (i + 1)) or [[]])[i] or []
+                topic_one_hot = F.one_hot(topic_entity_mask, num_classes=num_topics).to(dtype=torch.float32)
+                q_emb_ids = q_batch_dict["seed_embedding_ids"][i]
+                a_emb_ids = q_batch_dict["answer_embedding_ids"][i]
+                if q_emb_ids is None:
+                    raise ValueError(f"seed_embedding_ids is null for {graph_id}")
+                if a_emb_ids is None:
+                    raise ValueError(f"answer_embedding_ids is null for {graph_id}")
 
-                path_edge_indices = graph_cols["gt_path_edge_indices"][g_idx] or []
-                path_node_indices = graph_cols["gt_path_node_indices"][g_idx] or []
-                pair_start_node_locals = graph_cols["pair_start_node_locals"][g_idx] or []
-                pair_answer_node_locals = graph_cols["pair_answer_node_locals"][g_idx] or []
-                pair_edge_indices = graph_cols["pair_edge_indices"][g_idx] or []
-                pair_edge_ptr = graph_cols["pair_edge_ptr"][g_idx] or [0]
+                pair_start_node_locals = graph_cols["pair_start_node_locals"][g_idx]
+                pair_answer_node_locals = graph_cols["pair_answer_node_locals"][g_idx]
+                pair_edge_local_ids = graph_cols["pair_edge_local_ids"][g_idx]
+                pair_edge_counts = graph_cols["pair_edge_counts"][g_idx]
+                pair_shortest_lengths = graph_cols["pair_shortest_lengths"][g_idx] if has_pair_shortest_lengths else None
+                if pair_start_node_locals is None or pair_answer_node_locals is None:
+                    raise ValueError(f"pair_start/answer_node_locals missing for {graph_id}")
+                if pair_edge_local_ids is None or pair_edge_counts is None:
+                    raise ValueError(f"pair_edge_local_ids/counts missing for {graph_id}")
+                if pair_start_node_locals and len(pair_edge_counts) != len(pair_start_node_locals):
+                    raise ValueError(
+                        f"pair_edge_counts length {len(pair_edge_counts)} != pair_count "
+                        f"{len(pair_start_node_locals)} for {graph_id}"
+                    )
 
                 sample = {
                     "edge_index": edge_index,
@@ -525,32 +476,27 @@ def build_dataset(cfg: DictConfig) -> None:
                     "num_nodes": num_nodes,
                     "node_global_ids": node_global_ids,
                     "node_embedding_ids": node_emb_ids,
-                    "question_emb": q_batch_emb[i],
+                    "question_emb": q_batch_emb[i].unsqueeze(0),
                     "question": q_batch_dict["question"][i],
+                    "topic_one_hot": topic_one_hot,
                     # 全局种子实体（用于下游 start_entity_ids）
                     "seed_entity_ids": torch.as_tensor(q_entities, dtype=torch.long),
-                    "q_local_indices": q_local,
-                    "a_local_indices": a_local,
+                    "q_local_indices": torch.as_tensor(q_local, dtype=torch.long),
+                    "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
                     "answer_entity_ids": torch.as_tensor(a_entities, dtype=torch.long),
                     "answer_entity_ids_len": torch.tensor([len(a_entities)], dtype=torch.long),
                     "q_embedding_ids": q_emb_ids,
                     "a_embedding_ids": a_emb_ids,
-                    "pair_start_node_locals": pair_start_node_locals,
-                    "pair_answer_node_locals": pair_answer_node_locals,
-                    "pair_edge_indices": pair_edge_indices,
-                    "pair_edge_ptr": pair_edge_ptr,
-                    # 直接存检索图中的 GT 边索引，便于下游无需反推
-                    "gt_path_edge_indices": path_edge_indices if path_edge_indices else [],
-                    # 兼容性：存原始节点索引列表（非必需）
-                    "gt_path_node_indices": path_node_indices if path_node_indices else [],
+                    "pair_start_node_locals": torch.as_tensor(pair_start_node_locals, dtype=torch.long),
+                    "pair_answer_node_locals": torch.as_tensor(pair_answer_node_locals, dtype=torch.long),
+                    "pair_edge_local_ids": torch.as_tensor(pair_edge_local_ids, dtype=torch.long),
+                    "pair_edge_counts": torch.as_tensor(pair_edge_counts, dtype=torch.long),
                     "sample_id": graph_id,
                     "idx": processed + i,
                     "metadata": meta_val,
                 }
-                if not topic_pe_precompute:
-                    sample["topic_one_hot"] = topic_one_hot
-                if topic_pe is not None:
-                    sample["topic_pe"] = topic_pe
+                if has_pair_shortest_lengths:
+                    sample["pair_shortest_lengths"] = torch.as_tensor(pair_shortest_lengths, dtype=torch.long)
 
                 txn = txn_cache[split]
                 _write_sample(txn, graph_id, sample)
@@ -559,38 +505,20 @@ def build_dataset(cfg: DictConfig) -> None:
                     txn.commit()
                     txn_cache[split] = envs[split].begin(write=True)
                     pending[split] = 0
-
-                if sub_envs and graph_id in sub_graph_ids:
-                    sub_txn = sub_txn_cache[split]
-                    _write_sample(sub_txn, graph_id, sample)
-                    sub_pending[split] += 1
-                    if sub_pending[split] >= cfg.txn_size:
-                        sub_txn.commit()
-                        sub_txn_cache[split] = sub_envs[split].begin(write=True)
-                        sub_pending[split] = 0
             processed += q_batch.num_rows
 
         for split, txn in txn_cache.items():
             if pending[split] > 0:
                 txn.commit()
-        for split, txn in sub_txn_cache.items():
-            if sub_pending[split] > 0:
-                txn.commit()
         success = True
     finally:
         for env in envs.values():
-            env.close()
-        for env in sub_envs.values():
             env.close()
         if success:
             for split in all_splits:
                 split_key = str(split)
                 final_dir = emb_dir / f"{split}.lmdb"
                 _finalize_lmdb_dir(tmp_path=tmp_dirs[split_key], final_path=final_dir, overwrite=overwrite_lmdb)
-                if build_sub and share_artifacts and split_key in sub_tmp_dirs:
-                    sub_emb_dir = sub_output_dir / "embeddings"
-                    sub_final_dir = sub_emb_dir / f"{split}.lmdb"
-                    _finalize_lmdb_dir(tmp_path=sub_tmp_dirs[split_key], final_path=sub_final_dir, overwrite=overwrite_lmdb)
         else:
             # Keep tmp dirs for debugging, but avoid silently masking partial builds.
             pass

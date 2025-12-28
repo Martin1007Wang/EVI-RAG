@@ -1,6 +1,7 @@
 # @package _global_
 #
 # Retriever training (single recommended config).
+# Structural encoding uses topic_one_hot + runtime DDE (single supported path).
 
 defaults:
   - override /data: retriever
@@ -15,19 +16,21 @@ trainer:
   min_epochs: 0
   max_epochs: 10000
   check_val_every_n_epoch: 1
-  precision: 16-mixed
 
 model:
   compile_model: true
+  loss:
+    infonce_weight: 0.0
+    bce_weight: 1.0
 
 callbacks:
   model_checkpoint:
-    monitor: val/reachability/answer_reachable@100
+    monitor: val/ranking/recall@100
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/reachability/answer_reachable@100
+    monitor: val/ranking/recall@100
     mode: max
     patience: 10

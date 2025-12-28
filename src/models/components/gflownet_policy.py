@@ -47,7 +47,7 @@ def _segment_softmax_1d(logits: torch.Tensor, segment_ids: torch.Tensor, num_seg
 
 
 class GFlowNetEdgePolicy(nn.Module):
-    """Edge policy with local attention pooling and direction-aware FiLM."""
+    """Edge policy with local attention pooling and direction awareness."""
 
     def __init__(
         self,
@@ -59,11 +59,6 @@ class GFlowNetEdgePolicy(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.state_norm = nn.LayerNorm(self.hidden_dim)
 
-        self.q_film = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
-        )
         if int(direction_vocab_size) <= 0:
             raise ValueError(f"direction_vocab_size must be positive, got {direction_vocab_size}")
         self.direction_embeddings = nn.Embedding(int(direction_vocab_size), self.hidden_dim)
@@ -88,8 +83,8 @@ class GFlowNetEdgePolicy(nn.Module):
             nn.Linear(self.hidden_dim, 1),
         )
         self.stop_head = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
@@ -104,7 +99,6 @@ class GFlowNetEdgePolicy(nn.Module):
         valid_edges_mask: torch.Tensor,    # [E_total]
         *,
         edge_direction: Optional[torch.Tensor] = None,    # [E_total]
-        question_tokens: Optional[torch.Tensor] = None,   # [B, H]
         **_: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
@@ -116,8 +110,6 @@ class GFlowNetEdgePolicy(nn.Module):
             raise ValueError("edge_batch must be [E_total] and aligned with edge_tokens.")
         if valid_edges_mask.shape != edge_batch.shape:
             raise ValueError("valid_edges_mask must have shape [E_total] aligned with edge_batch.")
-        if question_tokens is not None and question_tokens.shape != state_tokens.shape:
-            raise ValueError("question_tokens must have the same shape as state_tokens.")
 
         num_graphs = int(state_tokens.size(0))
         if num_graphs <= 0:
@@ -132,8 +124,6 @@ class GFlowNetEdgePolicy(nn.Module):
             )
             edge_repr = edge_repr + self.direction_embeddings(dir_idx)
 
-        film_tokens = state_tokens if question_tokens is None else question_tokens
-        edge_repr = edge_repr + self.q_film(film_tokens.to(device=device, dtype=edge_repr.dtype)[edge_batch])
         edge_repr = self.edge_proj(edge_repr)
 
         candidate = valid_edges_mask.to(device=device, dtype=torch.bool)
@@ -142,8 +132,7 @@ class GFlowNetEdgePolicy(nn.Module):
 
         if not bool(candidate.any().item()):
             state_out = self.state_norm(state_tokens.to(device=device, dtype=edge_repr.dtype))
-            stop_in = torch.cat([state_out, state_tokens.to(device=device, dtype=edge_repr.dtype)], dim=-1)
-            stop_logits = self.stop_head(stop_in).squeeze(-1)
+            stop_logits = self.stop_head(state_out).squeeze(-1)
             return edge_logits, stop_logits, state_out
 
         cand_idx = torch.nonzero(candidate, as_tuple=False).view(-1)
@@ -165,8 +154,7 @@ class GFlowNetEdgePolicy(nn.Module):
         edge_in = torch.cat([state_out[seg], edge_repr[cand_idx]], dim=-1)
         edge_logits[cand_idx] = self.edge_head(edge_in).squeeze(-1)
 
-        stop_in = torch.cat([state_out, state_tokens.to(device=device, dtype=edge_repr.dtype)], dim=-1)
-        stop_logits = self.stop_head(stop_in).squeeze(-1)
+        stop_logits = self.stop_head(state_out).squeeze(-1)
         return edge_logits, stop_logits, state_out
 
 

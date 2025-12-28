@@ -83,6 +83,52 @@ def _validate_gflownet_required_args(cfg: DictConfig) -> None:
         )
 
 
+def _normalize_dataset_scope(dataset_cfg: DictConfig | Dict[str, Any]) -> str:
+    scope_raw = None
+    if isinstance(dataset_cfg, DictConfig):
+        scope_raw = dataset_cfg.get("dataset_scope")
+    elif isinstance(dataset_cfg, dict):
+        scope_raw = dataset_cfg.get("dataset_scope")
+    scope = str(scope_raw or "").strip().lower()
+    if scope in {"full", "sub"}:
+        return scope
+    name_raw = ""
+    if isinstance(dataset_cfg, DictConfig):
+        name_raw = str(dataset_cfg.get("name", "") or "")
+    elif isinstance(dataset_cfg, dict):
+        name_raw = str(dataset_cfg.get("name", "") or "")
+    if name_raw.endswith("-sub"):
+        return "sub"
+    return "full"
+
+
+def _enforce_sub_training_scope(cfg: DictConfig) -> None:
+    dataset_cfg = cfg.get("dataset") or {}
+    scope = _normalize_dataset_scope(dataset_cfg)
+    model_cfg = cfg.get("model") or {}
+    data_cfg = cfg.get("data") or {}
+    model_target = str(model_cfg.get("_target_", ""))
+    data_target = str(data_cfg.get("_target_", ""))
+    is_retriever = (
+        model_target == "src.models.retriever_module.RetrieverModule"
+        or data_target == "src.data.g_retrieval_datamodule.GRetrievalDataModule"
+    )
+    is_gflownet = (
+        model_target == "src.models.gflownet_module.GFlowNetModule"
+        or data_target == "src.data.g_agent_datamodule.GAgentDataModule"
+    )
+    if (is_retriever or is_gflownet) and scope != "sub":
+        dataset_name = ""
+        if isinstance(dataset_cfg, DictConfig):
+            dataset_name = str(dataset_cfg.get("name", "") or "")
+        elif isinstance(dataset_cfg, dict):
+            dataset_name = str(dataset_cfg.get("name", "") or "")
+        raise ValueError(
+            "Training scope violation: retriever/GFlowNet training must use sub datasets only. "
+            f"Got dataset={dataset_name!r} (dataset_scope={scope})."
+        )
+
+
 @task_wrapper
 def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
@@ -178,6 +224,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     _validate_gflownet_required_args(cfg)
+    _enforce_sub_training_scope(cfg)
     extras(cfg)
 
     # train the model

@@ -10,11 +10,7 @@ from typing import Iterable, Sequence, Tuple
 import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-
-try:
-    from tqdm import tqdm
-except ModuleNotFoundError:  # pragma: no cover
-    tqdm = None  # type: ignore[assignment]
+from tqdm import tqdm
 
 
 def _load_num_relations(vocab_path: Path) -> int:
@@ -31,13 +27,10 @@ def _load_num_relations(vocab_path: Path) -> int:
     return num_rel
 
 
-def _resolve_mask_field(schema_names: Iterable[str], requested: str, fallback: str | None) -> str:
+def _resolve_mask_field(schema_names: Iterable[str], requested: str) -> str:
     names = set(schema_names)
     if requested in names:
         return requested
-    if fallback and fallback in names:
-        print(f"[info] mask field '{requested}' missing; falling back to '{fallback}'.")
-        return fallback
     raise ValueError(f"Mask field '{requested}' not found in schema: {sorted(names)}")
 
 
@@ -115,7 +108,6 @@ def main() -> None:
     parser.add_argument("--graphs-path", type=Path, default=None)
     parser.add_argument("--relation-vocab", type=Path, default=None)
     parser.add_argument("--mask-field", type=str, default="gt_shortest_edge_mask")
-    parser.add_argument("--fallback-mask-field", type=str, default="positive_triple_mask")
     parser.add_argument("--output", type=Path, default=Path("relation_bigrams.npy"))
     parser.add_argument("--batch-size", type=int, default=256)
     args = parser.parse_args()
@@ -131,7 +123,7 @@ def main() -> None:
     print(f"[info] num_relations={num_rel}")
 
     schema_names = ds.dataset(graphs_path, format="parquet").schema.names
-    mask_field = _resolve_mask_field(schema_names, args.mask_field, args.fallback_mask_field)
+    mask_field = _resolve_mask_field(schema_names, args.mask_field)
     columns = ["edge_src", "edge_dst", "edge_relation_ids", mask_field, "node_entity_ids"]
 
     output_path = args.output
@@ -141,7 +133,7 @@ def main() -> None:
     bigram[:] = 0
 
     total_rows = pq.ParquetFile(graphs_path).metadata.num_rows
-    pbar = tqdm(total=total_rows, desc="Scanning graphs") if tqdm else None
+    pbar = tqdm(total=total_rows, desc="Scanning graphs")
 
     total_edges = 0
     total_masked = 0
@@ -167,11 +159,9 @@ def main() -> None:
             total_edges += edges
             total_masked += masked
         processed += rows
-        if pbar:
-            pbar.update(rows)
+        pbar.update(rows)
 
-    if pbar:
-        pbar.close()
+    pbar.close()
 
     bigram.flush()
     print(f"[done] graphs={processed} edges={total_edges} masked_edges={total_masked}")

@@ -22,6 +22,7 @@ __all__ = [
     "DeterministicHead",
     "EmbeddingProjector",
     "Retriever",
+    "Retriever",
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
@@ -43,6 +44,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "DeterministicHead": (".heads", "DeterministicHead"),
     "EmbeddingProjector": (".projections", "EmbeddingProjector"),
     "Retriever": (".retriever", "Retriever"),
+    "Retriever": (".retriever", "Retriever"),
 }
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -57,6 +59,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .graph import DDE, PEConv
     from .heads import DenseFeatureExtractor, DeterministicHead
     from .projections import EmbeddingProjector
+    from .retriever import Retriever
     from .retriever import Retriever
 
 

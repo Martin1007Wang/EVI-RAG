@@ -1,0 +1,4 @@
+defaults:
+  - g_agent_generation
+  - retriever_prediction_writer
+  - _self_

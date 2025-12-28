@@ -3,8 +3,9 @@ _target_: lightning.pytorch.trainer.Trainer
 
 accelerator: gpu
 devices: 1
+profiler: null
 strategy: auto
-precision: 16-mixed
+precision: 32-true
 max_epochs: 1
 logger: null
 enable_checkpointing: false

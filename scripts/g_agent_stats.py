@@ -49,8 +49,10 @@ def _safe_ratio(num: float, denom: float) -> float:
 
 def _load_samples(path: Path) -> List[Dict[str, Any]]:
     payload = torch.load(path, map_location="cpu")
-    samples = payload.get("samples")
-    if not samples:
+    if "samples" not in payload:
+        raise RuntimeError(f"Missing 'samples' in {path}")
+    samples = payload["samples"]
+    if not isinstance(samples, list) or not samples:
         raise RuntimeError(f"No samples found in {path}")
     return samples
 
@@ -92,20 +94,26 @@ def _compute_stats(
     scores_off_path: List[float] = []
 
     for sample in samples_list:
-        edges = sample.get("selected_edges") or []
-        top_list = sample.get("top_edge_local_indices") or []
-        selected_ids: Set[int] = {int(e.get("local_index")) for e in edges}
+        if "selected_edges" not in sample:
+            raise KeyError("selected_edges missing from sample")
+        if "top_edge_local_indices" not in sample:
+            raise KeyError("top_edge_local_indices missing from sample")
+        edges = sample["selected_edges"]
+        top_list = sample["top_edge_local_indices"]
+        selected_ids: Set[int] = {int(e["local_index"]) for e in edges}
         top_ids: Set[int] = {int(x) for x in top_list}
-        score_by_loc = {int(e.get("local_index", -1)): float(e.get("score", 0.0)) for e in edges}
+        score_by_loc = {int(e["local_index"]): float(e["score"]) for e in edges}
 
         edge_counts.append(len(edges))
         total_edges += len(edges)
 
         for e in edges:
-            if float(e.get("label", 0.0)) > pos_threshold:
+            if float(e["label"]) > pos_threshold:
                 pos_edges += 1
 
-        path_ids: Set[int] = {int(x) for x in (sample.get("gt_path_edge_local_indices") or [])}
+        if "gt_path_edge_local_indices" not in sample:
+            raise KeyError("gt_path_edge_local_indices missing from sample")
+        path_ids: Set[int] = {int(x) for x in sample["gt_path_edge_local_indices"]}
         if path_ids:
             with_gt_path += 1
             path_lengths.append(len(path_ids))
@@ -123,8 +131,8 @@ def _compute_stats(
             path_edges_in_selected += present_sel
             path_edges_in_top += present_top
             for e in edges:
-                loc = int(e.get("local_index", -1))
-                if loc in path_ids and float(e.get("label", 0.0)) > pos_threshold:
+                loc = int(e["local_index"])
+                if loc in path_ids and float(e["label"]) > pos_threshold:
                     path_edges_pos += 1
             # Score signal split
             for pid in path_ids:
@@ -137,11 +145,17 @@ def _compute_stats(
                 perm = np.random.permutation(len(neg_candidates))[:k]
                 scores_off_path.extend([neg_candidates[j] for j in perm])
 
-        if bool(sample.get("gt_path_exists", bool(path_ids))):
+        if "gt_path_exists" not in sample:
+            raise KeyError("gt_path_exists missing from sample")
+        if bool(sample["gt_path_exists"]):
             gt_path_exists += 1
-        if bool(sample.get("retrieval_failed")):
+        if "retrieval_failed" not in sample:
+            raise KeyError("retrieval_failed missing from sample")
+        if bool(sample["retrieval_failed"]):
             retrieval_failed += 1
-        triples = sample.get("gt_paths_triples") or []
+        if "gt_paths_triples" not in sample:
+            raise KeyError("gt_paths_triples missing from sample")
+        triples = sample["gt_paths_triples"]
         if triples:
             gt_triples_nonempty += 1
             gt_triples_len.append(len(triples[0]) if triples and len(triples) > 0 else 0)

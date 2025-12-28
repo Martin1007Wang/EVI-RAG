@@ -57,6 +57,20 @@ class Sample:
     test_type: List[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class TextEntityConfig:
+    mode: str
+    prefixes: Tuple[str, ...]
+    regex: Optional[re.Pattern]
+
+    def is_text(self, entity: str) -> bool:
+        if self.mode == "prefix_allowlist":
+            return any(entity.startswith(prefix) for prefix in self.prefixes)
+        if self.mode == "regex":
+            return bool(self.regex.match(entity)) if self.regex is not None else False
+        raise ValueError(f"Unsupported entity_text_mode: {self.mode}")
+
+
 @dataclass
 class GraphRecord:
     graph_id: str
@@ -66,24 +80,22 @@ class GraphRecord:
     edge_src: List[int]
     edge_dst: List[int]
     edge_relation_ids: List[int]
-    # Triple-level positives: union of all undirected shortest-path edges per (seed, answer) pair.
+    # Triple-level positives: union of shortest-path edges per (seed, answer) pair.
     positive_triple_mask: List[bool]
     # Pair-level shortest-path supervision (CSR-style).
     pair_start_node_locals: List[int]
     pair_answer_node_locals: List[int]
-    pair_edge_indices: List[int]
-    pair_edge_ptr: List[int]
-    gt_path_edge_indices: List[int]
-    gt_path_node_indices: List[int]
-    # Provenance of gt_path_* (diagnostics only).
-    gt_source: str
+    pair_edge_local_ids: List[int]
+    pair_edge_counts: List[int]
+    pair_shortest_lengths: List[int]
 
 
 class EntityVocab:
     """Assign structural IDs and embedding IDs; separate text vs non-text."""
 
-    def __init__(self, kb: str) -> None:
+    def __init__(self, kb: str, text_cfg: TextEntityConfig) -> None:
         self.kb = kb
+        self._text_cfg = text_cfg
         self._entity_to_struct: Dict[str, int] = {}
         self._struct_records: List[Dict[str, object]] = []
         self._embedding_records: List[Dict[str, object]] = []
@@ -98,7 +110,7 @@ class EntityVocab:
             raise RuntimeError("Cannot add entities after finalize")
         idx = len(self._entity_to_struct)
         self._entity_to_struct[ent] = idx
-        if is_text_entity(ent):
+        if self._text_cfg.is_text(ent):
             self._text_entities.append(ent)
         else:
             # non-text handled via embedding_id=0; no separate list needed
@@ -115,7 +127,7 @@ class EntityVocab:
         }
         for ent in sorted(self._entity_to_struct, key=self._entity_to_struct.get):
             struct_id = self._entity_to_struct[ent]
-            is_text = is_text_entity(ent)
+            is_text = self._text_cfg.is_text(ent)
             embedding_id = text_embedding_ids.get(ent, 0)
             record = {
                 "entity_id": struct_id,
@@ -154,7 +166,7 @@ class EntityVocab:
         return self._entity_to_struct[ent]
 
     def embedding_id(self, ent: str) -> int:
-        return 0 if not is_text_entity(ent) else self._embedding_id_for_text(ent)
+        return 0 if not self._text_cfg.is_text(ent) else self._embedding_id_for_text(ent)
 
     def _embedding_id_for_text(self, ent: str) -> int:
         if not self._finalized:
@@ -217,17 +229,13 @@ class ParquetDatasetWriter:
                     "pair_answer_node_locals": pa.array(
                         [g.pair_answer_node_locals for g in self.graphs], type=pa.list_(pa.int64())
                     ),
-                    "pair_edge_indices": pa.array(
-                        [g.pair_edge_indices for g in self.graphs], type=pa.list_(pa.int64())
+                    "pair_edge_local_ids": pa.array(
+                        [g.pair_edge_local_ids for g in self.graphs], type=pa.list_(pa.int64())
                     ),
-                    "pair_edge_ptr": pa.array([g.pair_edge_ptr for g in self.graphs], type=pa.list_(pa.int64())),
-                    "gt_path_edge_indices": pa.array(
-                        [g.gt_path_edge_indices for g in self.graphs], type=pa.list_(pa.int64())
+                    "pair_edge_counts": pa.array([g.pair_edge_counts for g in self.graphs], type=pa.list_(pa.int64())),
+                    "pair_shortest_lengths": pa.array(
+                        [g.pair_shortest_lengths for g in self.graphs], type=pa.list_(pa.int64())
                     ),
-                    "gt_path_node_indices": pa.array(
-                        [g.gt_path_node_indices for g in self.graphs], type=pa.list_(pa.int64())
-                    ),
-                    "gt_source": pa.array([g.gt_source for g in self.graphs], type=pa.string()),
                 }
             )
             if self.graph_writer is None:
@@ -278,6 +286,14 @@ class ParquetDatasetWriter:
             self.question_writer.close()
 
 
+# Regex compiled once for reuse.
+_QID_IN_PARENS_RE = re.compile(r"(Q\d+)")
+_LABEL_QID_RE = re.compile(r"(.+)\s+\((Q\d+)\)$")
+_PATH_MODE_UNDIRECTED = "undirected"
+_PATH_MODE_QA_DIRECTED = "qa_directed"
+_PATH_MODES = (_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)
+
+
 # Helpers
 
 
@@ -285,8 +301,24 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def is_text_entity(entity: str) -> bool:
-    return not (entity.startswith("m.") or entity.startswith("g."))
+def _validate_path_mode(path_mode: str) -> str:
+    mode = str(path_mode)
+    if mode not in _PATH_MODES:
+        raise ValueError(f"Unsupported path_mode: {mode}. Expected one of {_PATH_MODES}.")
+    return mode
+
+
+def build_text_entity_config(cfg: DictConfig) -> TextEntityConfig:
+    mode = str(cfg.get("entity_text_mode", "regex"))
+    prefixes_cfg = cfg.get("text_prefixes") or []
+    prefixes = tuple(str(prefix) for prefix in prefixes_cfg)
+    regex_str = cfg.get("text_regex")
+    regex = re.compile(str(regex_str)) if regex_str else None
+    if mode == "regex" and regex is None:
+        raise ValueError("entity_text_mode=regex requires text_regex to be set.")
+    if mode == "prefix_allowlist" and not prefixes:
+        raise ValueError("entity_text_mode=prefix_allowlist requires non-empty text_prefixes.")
+    return TextEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
 
 
 def _shortest_path_single(
@@ -363,9 +395,9 @@ def _shortest_path_single(
         cur = prev
 
     edges = list(reversed(edges_rev))
-    if not edges:
-        return [], []
     nodes = list(reversed(nodes_rev))
+    if not edges:
+        return [], nodes
     return edges, nodes
 
 
@@ -386,6 +418,27 @@ def _build_undirected_adjacency(
     for nbrs in adjacency:
         nbrs.sort()
     return adjacency
+
+
+def _build_directed_adjacency(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+) -> List[List[int]]:
+    adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
+    for u_raw, v_raw in zip(edge_src, edge_dst):
+        u = int(u_raw)
+        v = int(v_raw)
+        if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
+            continue
+        adjacency[u].append(v)
+    for nbrs in adjacency:
+        nbrs.sort()
+    return adjacency
+
+
+def _normalize_local_nodes(num_nodes: int, nodes: Sequence[int]) -> List[int]:
+    return sorted({int(n) for n in nodes if 0 <= int(n) < num_nodes})
 
 
 def _bfs_dist(num_nodes: int, adjacency: Sequence[Sequence[int]], sources: Sequence[int]) -> List[int]:
@@ -418,16 +471,16 @@ def _shortest_path_union_mask_by_pair(
     edge_dst: Sequence[int],
     sources: Sequence[int],
     targets: Sequence[int],
-) -> Tuple[List[bool], List[int], List[int], List[int], List[int]]:
+) -> Tuple[List[bool], List[int], List[int], List[int], List[int], List[int]]:
     num_edges = len(edge_src)
     if num_nodes <= 0 or num_edges == 0 or not sources or not targets:
-        return [False] * num_edges, [], [], [], [0]
+        return [False] * num_edges, [], [], [], [], []
 
     adjacency = _build_undirected_adjacency(num_nodes, edge_src, edge_dst)
     starts = sorted({int(s) for s in sources if 0 <= int(s) < num_nodes})
     answers = sorted({int(t) for t in targets if 0 <= int(t) < num_nodes})
     if not starts or not answers:
-        return [False] * num_edges, [], [], [], [0]
+        return [False] * num_edges, [], [], [], [], []
 
     dist_from_start: Dict[int, List[int]] = {s: _bfs_dist(num_nodes, adjacency, [s]) for s in starts}
     dist_to_answer: Dict[int, List[int]] = {a: _bfs_dist(num_nodes, adjacency, [a]) for a in answers}
@@ -435,8 +488,9 @@ def _shortest_path_union_mask_by_pair(
     mask = [False] * num_edges
     pair_start_nodes: List[int] = []
     pair_answer_nodes: List[int] = []
-    pair_edge_indices: List[int] = []
-    pair_edge_ptr: List[int] = [0]
+    pair_edge_local_ids: List[int] = []
+    pair_edge_counts: List[int] = []
+    pair_shortest_lengths: List[int] = []
 
     for s in starts:
         dist_s = dist_from_start[s]
@@ -447,24 +501,107 @@ def _shortest_path_union_mask_by_pair(
                 continue
             pair_start_nodes.append(s)
             pair_answer_nodes.append(a)
+            pair_shortest_lengths.append(int(dist_sa))
+            before = len(pair_edge_local_ids)
             for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
                 u = int(u_raw)
                 v = int(v_raw)
                 if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
                     continue
                 if dist_s[u] >= 0 and dist_a[v] >= 0 and dist_s[u] + 1 + dist_a[v] == dist_sa:
-                    pair_edge_indices.append(idx)
+                    pair_edge_local_ids.append(idx)
                     mask[idx] = True
                     continue
                 if dist_s[v] >= 0 and dist_a[u] >= 0 and dist_s[v] + 1 + dist_a[u] == dist_sa:
-                    pair_edge_indices.append(idx)
+                    pair_edge_local_ids.append(idx)
                     mask[idx] = True
-            pair_edge_ptr.append(len(pair_edge_indices))
+            pair_edge_counts.append(len(pair_edge_local_ids) - before)
 
-    return mask, pair_start_nodes, pair_answer_nodes, pair_edge_indices, pair_edge_ptr
+    return (
+        mask,
+        pair_start_nodes,
+        pair_answer_nodes,
+        pair_edge_local_ids,
+        pair_edge_counts,
+        pair_shortest_lengths,
+    )
 
 
-def shortest_path_edge_indices_directed(
+def _shortest_path_union_mask_by_pair_directed(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    sources: Sequence[int],
+    targets: Sequence[int],
+) -> Tuple[List[bool], List[int], List[int], List[int], List[int], List[int]]:
+    num_edges = len(edge_src)
+    if num_nodes <= 0 or num_edges == 0 or not sources or not targets:
+        return [False] * num_edges, [], [], [], [], []
+
+    starts = _normalize_local_nodes(num_nodes, sources)
+    answers = _normalize_local_nodes(num_nodes, targets)
+    if not starts or not answers:
+        return [False] * num_edges, [], [], [], [], []
+
+    adjacency = _build_directed_adjacency(num_nodes, edge_src, edge_dst)
+    reverse_adjacency = _build_directed_adjacency(num_nodes, edge_dst, edge_src)
+    dist_from_start = {s: _bfs_dist(num_nodes, adjacency, [s]) for s in starts}
+    dist_to_answer = {a: _bfs_dist(num_nodes, reverse_adjacency, [a]) for a in answers}
+
+    mask = [False] * num_edges
+    pair_start_nodes: List[int] = []
+    pair_answer_nodes: List[int] = []
+    pair_edge_local_ids: List[int] = []
+    pair_edge_counts: List[int] = []
+    pair_shortest_lengths: List[int] = []
+
+    for s in starts:
+        dist_s = dist_from_start[s]
+        for a in answers:
+            dist_a = dist_to_answer[a]
+            dist_sa = dist_s[a]
+            if dist_sa < 0:
+                continue
+            pair_start_nodes.append(s)
+            pair_answer_nodes.append(a)
+            pair_shortest_lengths.append(int(dist_sa))
+            before = len(pair_edge_local_ids)
+            for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
+                u = int(u_raw)
+                v = int(v_raw)
+                if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
+                    continue
+                if dist_s[u] >= 0 and dist_a[v] >= 0 and dist_s[u] + 1 + dist_a[v] == dist_sa:
+                    pair_edge_local_ids.append(idx)
+                    mask[idx] = True
+            pair_edge_counts.append(len(pair_edge_local_ids) - before)
+
+    return (
+        mask,
+        pair_start_nodes,
+        pair_answer_nodes,
+        pair_edge_local_ids,
+        pair_edge_counts,
+        pair_shortest_lengths,
+    )
+
+
+def _shortest_path_union_mask_by_pair_mode(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    sources: Sequence[int],
+    targets: Sequence[int],
+    *,
+    path_mode: str,
+) -> Tuple[List[bool], List[int], List[int], List[int], List[int], List[int]]:
+    mode = _validate_path_mode(path_mode)
+    if mode == _PATH_MODE_QA_DIRECTED:
+        return _shortest_path_union_mask_by_pair_directed(num_nodes, edge_src, edge_dst, sources, targets)
+    return _shortest_path_union_mask_by_pair(num_nodes, edge_src, edge_dst, sources, targets)
+
+
+def shortest_path_edge_indices_undirected(
     num_nodes: int,
     edge_src: Sequence[int],
     edge_dst: Sequence[int],
@@ -476,9 +613,13 @@ def shortest_path_edge_indices_directed(
 
 
 def has_connectivity(
-    graph: Sequence[Tuple[str, str, str]], seeds: Sequence[str], answers: Sequence[str]
+    graph: Sequence[Tuple[str, str, str]],
+    seeds: Sequence[str],
+    answers: Sequence[str],
+    *,
+    path_mode: str = _PATH_MODE_UNDIRECTED,
 ) -> bool:
-    """Check existence of path seed->answer using local indexing (undirected traversal)."""
+    """Check existence of path seed->answer using local indexing."""
     if not graph or not seeds or not answers:
         return False
     node_index: Dict[str, int] = {}
@@ -498,13 +639,18 @@ def has_connectivity(
     answer_ids = [node_index[a] for a in answers if a in node_index]
     if not seed_ids or not answer_ids:
         return False
-    path_edges, _ = shortest_path_edge_indices_directed(len(node_index), edge_src, edge_dst, seed_ids, answer_ids)
-    return len(path_edges) > 0
+    mode = _validate_path_mode(path_mode)
+    if mode == _PATH_MODE_QA_DIRECTED:
+        adjacency = _build_directed_adjacency(len(node_index), edge_src, edge_dst)
+    else:
+        adjacency = _build_undirected_adjacency(len(node_index), edge_src, edge_dst)
+    dist = _bfs_dist(len(node_index), adjacency, seed_ids)
+    return any(dist[a] >= 0 for a in answer_ids)
 
 
 def normalize_entity(entity: str, mode: str) -> str:
     if mode == "qid_in_parentheses":
-        match = re.search(r"(Q\d+)", entity)
+        match = _QID_IN_PARENS_RE.search(entity)
         if match:
             return match.group(1)
     return entity
@@ -550,21 +696,24 @@ def _resolve_split_filter(
 def _should_keep_sample(
     sample: Sample,
     split_filter: SplitFilter,
-    connectivity_cache: Dict[Tuple[str, str], bool],
+    connectivity_cache: Dict[Tuple[str, str, str], bool],
+    *,
+    path_mode: str,
 ) -> bool:
     node_strings = {h for h, _, t in sample.graph} | {t for _, _, t in sample.graph}
     has_topic = any(ent in node_strings for ent in sample.q_entity)
     has_answer = any(ent in node_strings for ent in sample.a_entity)
 
-    has_path = connectivity_cache.get((sample.split, sample.question_id))
+    cache_key = (sample.dataset, sample.split, sample.question_id)
+    has_path = connectivity_cache.get(cache_key)
     if has_path is None:
         if sample.answer_subgraph:
             has_path = True
         elif split_filter.skip_no_path:
-            has_path = has_connectivity(sample.graph, sample.q_entity, sample.a_entity)
+            has_path = has_connectivity(sample.graph, sample.q_entity, sample.a_entity, path_mode=path_mode)
         else:
             has_path = True
-        connectivity_cache[(sample.split, sample.question_id)] = has_path
+        connectivity_cache[cache_key] = has_path
 
     if split_filter.skip_no_topic and not has_topic:
         return False
@@ -596,7 +745,7 @@ def iter_samples(
                         t_raw = str(tr[2])
                         if entity_normalization == "qid_in_parentheses":
                             for node_raw in (h_raw, t_raw):
-                                label_match = re.match(r"(.+)\s+\((Q\d+)\)$", node_raw)
+                                label_match = _LABEL_QID_RE.match(node_raw)
                                 if label_match:
                                     label_to_qid[label_match.group(1).strip()] = label_match.group(2)
                         h = normalize_entity_with_lookup(h_raw, entity_normalization, label_to_qid)
@@ -662,26 +811,32 @@ def preprocess(
     kb: str,
     raw_root: Path,
     out_dir: Path,
-    sub_out_dir: Optional[Path],
     column_map: Dict[str, str],
     entity_normalization: str,
+    text_cfg: TextEntityConfig,
     train_filter: SplitFilter,
     eval_filter: SplitFilter,
     override_filters: Dict[str, SplitFilter],
-    write_sub_if_filtered: bool,
+    path_mode: str = _PATH_MODE_UNDIRECTED,
+    *,
+    emit_sub_filter: bool = False,
+    sub_filter_filename: str = "sub_filter.json",
 ) -> None:
+    path_mode = _validate_path_mode(path_mode)
     ensure_dir(out_dir)
-    entity_vocab = EntityVocab(kb=kb)
+    entity_vocab = EntityVocab(kb=kb, text_cfg=text_cfg)
     relation_vocab = RelationVocab(kb=kb)
 
     available_files = {p.name for p in raw_root.glob("*.parquet")}
     splits = sorted({name.split("-")[0] for name in available_files})
-    connectivity_cache: Dict[Tuple[str, str], bool] = {}
+    connectivity_cache: Dict[Tuple[str, str, str], bool] = {}
     total_by_split: Dict[str, int] = {}
     kept_by_split: Dict[str, int] = {}
+    sub_by_split: Dict[str, int] = {}
     empty_graph_by_split: Dict[str, int] = {}
     empty_graph_ids: List[str] = []
     empty_graph_id_set: Set[str] = set()
+    sub_sample_ids: List[str] = []
 
     # Pass 1: Build vocabularies
     print("Pass 1: Building vocabularies...")
@@ -705,15 +860,10 @@ def preprocess(
             entity_vocab.add_entity(ent)
 
         split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
-        if _should_keep_sample(sample, split_filter, connectivity_cache):
+        if _should_keep_sample(sample, split_filter, connectivity_cache, path_mode=path_mode):
             kept_by_split[sample.split] = kept_by_split.get(sample.split, 0) + 1
 
     entity_vocab.finalize()
-
-    filtered_any = any(kept_by_split.get(s, 0) != total_by_split.get(s, 0) for s in total_by_split)
-    write_sub = bool(write_sub_if_filtered) and bool(sub_out_dir) and filtered_any
-    if write_sub:
-        ensure_dir(sub_out_dir)
 
     def _format_counts(counts: Dict[str, int]) -> str:
         return ", ".join(f"{s}={counts.get(s, 0)}" for s in splits)
@@ -724,13 +874,11 @@ def preprocess(
         print(f"Samples dropped (empty graph): {_format_counts(empty_graph_by_split)}")
         if empty_graph_ids:
             print(f"Empty-graph examples: {empty_graph_ids}")
-    print(f"Write sub dataset: {write_sub}")
 
     # Pass 2: Build graphs and questions
     print("Pass 2: Building graphs and questions...")
     chunk_size = 2000
     base_writer = ParquetDatasetWriter(out_dir=out_dir)
-    sub_writer = ParquetDatasetWriter(out_dir=sub_out_dir) if write_sub and sub_out_dir is not None else None
 
     for sample in tqdm(
         iter_samples(dataset, kb, raw_root, splits, column_map, entity_normalization),
@@ -740,30 +888,44 @@ def preprocess(
         if graph_id in empty_graph_id_set:
             continue
         split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
-        keep_for_sub = _should_keep_sample(sample, split_filter, connectivity_cache) if write_sub else False
+        if not _should_keep_sample(sample, split_filter, connectivity_cache, path_mode=path_mode):
+            continue
 
-        graph = build_graph(sample, entity_vocab, relation_vocab, graph_id)
+        graph = build_graph(sample, entity_vocab, relation_vocab, graph_id, path_mode=path_mode)
         question = build_question_record(sample, entity_vocab, graph_id)
         base_writer.append(graph, question)
-        if sub_writer is not None and keep_for_sub:
-            sub_writer.append(graph, question)
+        if emit_sub_filter:
+            label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
+            q_local = {label_to_idx[ent] for ent in sample.q_entity if ent in label_to_idx}
+            a_local = {label_to_idx[ent] for ent in sample.a_entity if ent in label_to_idx}
+            has_topic = bool(q_local)
+            has_answer = bool(a_local)
+            has_path = len(graph.pair_start_node_locals) > 0
+            nonzero_min_len = False
+            if graph.pair_shortest_lengths:
+                nonzero_min_len = min(graph.pair_shortest_lengths) > 0
+            no_overlap = q_local.isdisjoint(a_local)
+            if has_topic and has_answer and has_path and (nonzero_min_len or no_overlap):
+                sub_sample_ids.append(graph_id)
+                sub_by_split[sample.split] = sub_by_split.get(sample.split, 0) + 1
 
         if len(base_writer.graphs) >= chunk_size or len(base_writer.questions) >= chunk_size:
             base_writer.flush()
-        if sub_writer is not None and (len(sub_writer.graphs) >= chunk_size or len(sub_writer.questions) >= chunk_size):
-            sub_writer.flush()
 
     base_writer.close()
-    if sub_writer is not None:
-        sub_writer.close()
 
     write_entity_vocab(entity_vocab.struct_records, out_dir / "entity_vocab.parquet")
     write_embedding_vocab(entity_vocab.embedding_records, out_dir / "embedding_vocab.parquet")
     write_relation_vocab(relation_vocab.records, out_dir / "relation_vocab.parquet")
-    if write_sub and sub_out_dir is not None:
-        write_entity_vocab(entity_vocab.struct_records, sub_out_dir / "entity_vocab.parquet")
-        write_embedding_vocab(entity_vocab.embedding_records, sub_out_dir / "embedding_vocab.parquet")
-        write_relation_vocab(relation_vocab.records, sub_out_dir / "relation_vocab.parquet")
+
+    if emit_sub_filter:
+        sub_payload = {
+            "dataset": dataset,
+            "sample_ids": sorted(sub_sample_ids),
+        }
+        (out_dir / sub_filter_filename).write_text(json.dumps(sub_payload, indent=2))
+        print(f"Sub filter samples kept: {_format_counts(sub_by_split)}")
+        print(f"Sub filter written to: {out_dir / sub_filter_filename}")
 
 
 def build_graph(
@@ -771,7 +933,10 @@ def build_graph(
     entity_vocab: EntityVocab,
     relation_vocab: RelationVocab,
     graph_id: str,
+    *,
+    path_mode: str = _PATH_MODE_UNDIRECTED,
 ) -> GraphRecord:
+    path_mode = _validate_path_mode(path_mode)
     node_index: Dict[str, int] = {}
     node_entity_ids: List[int] = []
     node_embedding_ids: List[int] = []
@@ -815,14 +980,11 @@ def build_graph(
 
     num_edges = len(edge_src)
     positive_triple_mask = [False] * num_edges
-    path_edge_indices: List[int] = []
-    path_node_indices: List[int] = []
-    gt_source = "none"
-
     pair_start_node_locals: List[int] = []
     pair_answer_node_locals: List[int] = []
-    pair_edge_indices: List[int] = []
-    pair_edge_ptr: List[int] = [0]
+    pair_edge_local_ids: List[int] = []
+    pair_edge_counts: List[int] = []
+    pair_shortest_lengths: List[int] = []
 
     if answer_edge_indices:
         # Deduplicate while preserving order for determinism.
@@ -835,75 +997,61 @@ def build_graph(
 
         sub_edge_src = [edge_src[idx] for idx in dedup_answer_edges]
         sub_edge_dst = [edge_dst[idx] for idx in dedup_answer_edges]
-        sub_mask, pair_start_node_locals, pair_answer_node_locals, pair_edge_indices, pair_edge_ptr = _shortest_path_union_mask_by_pair(
+        (
+            sub_mask,
+            pair_start_node_locals,
+            pair_answer_node_locals,
+            pair_edge_local_ids,
+            pair_edge_counts,
+            pair_shortest_lengths,
+        ) = _shortest_path_union_mask_by_pair_mode(
             num_nodes=len(node_entity_ids),
             edge_src=sub_edge_src,
             edge_dst=sub_edge_dst,
             sources=q_local,
             targets=a_local,
+            path_mode=path_mode,
         )
-        if any(sub_mask):
+        has_pairs = len(pair_start_node_locals) > 0
+        if has_pairs:
             positive_triple_mask = [False] * num_edges
             for sub_idx, keep in enumerate(sub_mask):
                 if keep:
                     positive_triple_mask[dedup_answer_edges[sub_idx]] = True
-            if pair_edge_indices:
-                pair_edge_indices = [dedup_answer_edges[idx] for idx in pair_edge_indices]
-            sub_path_edges, sub_path_nodes = shortest_path_edge_indices_directed(
-                num_nodes=len(node_entity_ids),
-                edge_src=sub_edge_src,
-                edge_dst=sub_edge_dst,
-                seeds=q_local,
-                answers=a_local,
-            )
-            if sub_path_edges:
-                path_edge_indices = [dedup_answer_edges[idx] for idx in sub_path_edges]
-                path_node_indices = sub_path_nodes
-            gt_source = "answer_subgraph_dag" if path_edge_indices else "none"
+            if pair_edge_local_ids:
+                pair_edge_local_ids = [dedup_answer_edges[idx] for idx in pair_edge_local_ids]
         else:
             (
                 positive_triple_mask,
                 pair_start_node_locals,
                 pair_answer_node_locals,
-                pair_edge_indices,
-                pair_edge_ptr,
-            ) = _shortest_path_union_mask_by_pair(
+                pair_edge_local_ids,
+                pair_edge_counts,
+                pair_shortest_lengths,
+            ) = _shortest_path_union_mask_by_pair_mode(
                 num_nodes=len(node_entity_ids),
                 edge_src=edge_src,
                 edge_dst=edge_dst,
                 sources=q_local,
                 targets=a_local,
+                path_mode=path_mode,
             )
-            path_edge_indices, path_node_indices = shortest_path_edge_indices_directed(
-                num_nodes=len(node_entity_ids),
-                edge_src=edge_src,
-                edge_dst=edge_dst,
-                seeds=q_local,
-                answers=a_local,
-            )
-            gt_source = "shortest_path_dag" if path_edge_indices else "none"
     else:
         (
             positive_triple_mask,
             pair_start_node_locals,
             pair_answer_node_locals,
-            pair_edge_indices,
-            pair_edge_ptr,
-        ) = _shortest_path_union_mask_by_pair(
+            pair_edge_local_ids,
+            pair_edge_counts,
+            pair_shortest_lengths,
+        ) = _shortest_path_union_mask_by_pair_mode(
             num_nodes=len(node_entity_ids),
             edge_src=edge_src,
             edge_dst=edge_dst,
             sources=q_local,
             targets=a_local,
+            path_mode=path_mode,
         )
-        path_edge_indices, path_node_indices = shortest_path_edge_indices_directed(
-            num_nodes=len(node_entity_ids),
-            edge_src=edge_src,
-            edge_dst=edge_dst,
-            seeds=q_local,
-            answers=a_local,
-        )
-        gt_source = "shortest_path_dag" if path_edge_indices else "none"
 
     return GraphRecord(
         graph_id=graph_id,
@@ -916,11 +1064,9 @@ def build_graph(
         positive_triple_mask=positive_triple_mask,
         pair_start_node_locals=pair_start_node_locals,
         pair_answer_node_locals=pair_answer_node_locals,
-        pair_edge_indices=pair_edge_indices,
-        pair_edge_ptr=pair_edge_ptr,
-        gt_path_edge_indices=path_edge_indices,
-        gt_path_node_indices=path_node_indices,
-        gt_source=gt_source,
+        pair_edge_local_ids=pair_edge_local_ids,
+        pair_edge_counts=pair_edge_counts,
+        pair_shortest_lengths=pair_shortest_lengths,
     )
 
 
@@ -975,11 +1121,9 @@ def write_graphs(graphs: List[GraphRecord], output_path: Path) -> None:
             "positive_triple_mask": pa.array([g.positive_triple_mask for g in graphs], type=pa.list_(pa.bool_())),
             "pair_start_node_locals": pa.array([g.pair_start_node_locals for g in graphs], type=pa.list_(pa.int64())),
             "pair_answer_node_locals": pa.array([g.pair_answer_node_locals for g in graphs], type=pa.list_(pa.int64())),
-            "pair_edge_indices": pa.array([g.pair_edge_indices for g in graphs], type=pa.list_(pa.int64())),
-            "pair_edge_ptr": pa.array([g.pair_edge_ptr for g in graphs], type=pa.list_(pa.int64())),
-            "gt_path_edge_indices": pa.array([g.gt_path_edge_indices for g in graphs], type=pa.list_(pa.int64())),
-            "gt_path_node_indices": pa.array([g.gt_path_node_indices for g in graphs], type=pa.list_(pa.int64())),
-            "gt_source": pa.array([g.gt_source for g in graphs], type=pa.string()),
+            "pair_edge_local_ids": pa.array([g.pair_edge_local_ids for g in graphs], type=pa.list_(pa.int64())),
+            "pair_edge_counts": pa.array([g.pair_edge_counts for g in graphs], type=pa.list_(pa.int64())),
+            "pair_shortest_lengths": pa.array([g.pair_shortest_lengths for g in graphs], type=pa.list_(pa.int64())),
         }
     )
     pq.write_table(table, output_path, compression="zstd")
@@ -1050,10 +1194,9 @@ if hydra is not None:
     def main(cfg: DictConfig) -> None:
         raw_root = Path(hydra.utils.to_absolute_path(cfg.raw_root))
         out_dir = Path(hydra.utils.to_absolute_path(cfg.out_dir))
-        sub_out_dir = None
-        if cfg.get("sub") and bool(cfg.sub.get("enabled", True)):
-            sub_out_dir = Path(hydra.utils.to_absolute_path(cfg.sub.out_dir))
         dataset_name = cfg.get("dataset_name") or cfg.get("dataset") or "dataset"
+        text_cfg = build_text_entity_config(cfg)
+        path_mode = str(cfg.get("path_mode", _PATH_MODE_UNDIRECTED))
 
         def _as_filter(section: DictConfig) -> SplitFilter:
             return SplitFilter(
@@ -1075,13 +1218,15 @@ if hydra is not None:
             kb=cfg.kb,
             raw_root=raw_root,
             out_dir=out_dir,
-            sub_out_dir=sub_out_dir,
             column_map=dict(cfg.column_map),
             entity_normalization=cfg.entity_normalization,
+            text_cfg=text_cfg,
             train_filter=train_filter,
             eval_filter=eval_filter,
             override_filters=override_filters,
-            write_sub_if_filtered=bool(cfg.get("sub", {}).get("enabled", True)),
+            path_mode=path_mode,
+            emit_sub_filter=bool(cfg.get("emit_sub_filter", False)),
+            sub_filter_filename=str(cfg.get("sub_filter_filename", "sub_filter.json")),
         )
 
 else:  # pragma: no cover

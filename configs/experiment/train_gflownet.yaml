@@ -20,15 +20,31 @@ optimized_metric: "val/answer_hit"
 ckpt:
   retriever: ${oc.env:RETRIEVER_CKPT,null}
 
-window:
-  max_hops: 3
-
 trainer:
   check_val_every_n_epoch: 1
 
 model:
   training_cfg:
-    num_train_rollouts: 2
+    num_train_rollouts: 1
+    bc_weight: 1.0
+    bc_weight_floor: 0.0
+    bc_hold_ratio: 0.2
+    bc_decay_ratio: 0.6
+    bc_teacher_mode: pair_sampled
+    bc_soft_teacher_weight: 0.0
+    bc_soft_teacher_use_edge_scores: false
+
+  optimizer_cfg:
+    type: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+
+  scheduler_cfg:
+    type: cosine_restart
+    t_0: 10
+    t_mult: 2
+    eta_min: 1.0e-6
+    interval: epoch
 
   evaluation_cfg:
     num_eval_rollouts: 10
@@ -36,13 +52,16 @@ model:
 
   env_cfg:
     max_steps: 3
+    potential_scale: 0.0
 
   actor_cfg:
     policy_temperature: 1.0
-    action_topk: 100
+    action_topk: null
 
   reward_cfg:
-    shaping_coef: 5.0
+    semantic_coef: 1.0
+    length_coef: 1.0
+
 
 callbacks:
   model_checkpoint:

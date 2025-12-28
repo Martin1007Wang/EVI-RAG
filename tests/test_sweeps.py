@@ -37,7 +37,7 @@ def test_hydra_sweep(tmp_path: Path) -> None:
         startfile,
         "-m",
         "hydra.sweep.dir=" + str(tmp_path),
-        "model.optimizer.lr=0.005,0.01",
+        "model.optimizer_cfg.lr=0.005,0.01",
         "++trainer.fast_dev_run=true",
     ] + overrides
 
@@ -60,7 +60,7 @@ def test_hydra_sweep_ddp_sim(tmp_path: Path) -> None:
         "+trainer.limit_train_batches=0.01",
         "+trainer.limit_val_batches=0.1",
         "+trainer.limit_test_batches=0.1",
-        "model.optimizer.lr=0.005,0.01,0.02",
+        "model.optimizer_cfg.lr=0.005,0.01,0.02",
     ] + overrides
     run_sh_command(command)
 

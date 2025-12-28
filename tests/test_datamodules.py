@@ -28,17 +28,21 @@ def _mock_sample() -> dict:
     return {
         "edge_index": torch.tensor([[0, 2], [1, 0]], dtype=torch.long),
         "edge_attr": torch.zeros(2, dtype=torch.long),
-        "labels": torch.tensor([1, 0], dtype=torch.long),
+        "labels": torch.tensor([1.0, 0.0], dtype=torch.float32),
         "num_nodes": node_ids.numel(),
         "node_global_ids": node_ids,
         "node_embedding_ids": node_ids,
         "topic_one_hot": torch.tensor([[0.0, 1.0], [1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
-        "question_emb": torch.tensor([0.25, 0.5, 0.75, 1.0], dtype=torch.float32),
+        "question_emb": torch.tensor([[0.25, 0.5, 0.75, 1.0]], dtype=torch.float32),
         "question": "mock question",
-        "q_local_indices": [0],
-        "a_local_indices": [1],
-        "gt_paths_nodes": [],
-        "gt_paths_triples": [],
+        "q_local_indices": torch.tensor([0], dtype=torch.long),
+        "a_local_indices": torch.tensor([1], dtype=torch.long),
+        "answer_entity_ids": torch.tensor([1], dtype=torch.long),
+        "answer_entity_ids_len": torch.tensor([1], dtype=torch.long),
+        "pair_start_node_locals": torch.empty(0, dtype=torch.long),
+        "pair_answer_node_locals": torch.empty(0, dtype=torch.long),
+        "pair_edge_local_ids": torch.empty(0, dtype=torch.long),
+        "pair_edge_counts": torch.empty(0, dtype=torch.long),
     }
 
 
@@ -76,7 +80,13 @@ def _setup_mock_retrieval_root(tmp_path: Path):
 
 def test_retrieval_datamodule_preserves_indices(tmp_path) -> None:
     root, entity_emb, relation_emb = _setup_mock_retrieval_root(tmp_path)
-    cfg = {"name": "mock_retrieval", "data_dir": str(root)}
+    cfg = {
+        "name": "mock_retrieval",
+        "paths": {
+            "vocabulary": str(root / "vocabulary" / "vocabulary.lmdb"),
+            "embeddings": str(root / "embeddings"),
+        },
+    }
     dm = GRetrievalDataModule(
         dataset_cfg=cfg,
         batch_size=1,
@@ -97,6 +107,9 @@ def test_retrieval_datamodule_preserves_indices(tmp_path) -> None:
     tail_global = batch.node_global_ids[batch.edge_index[1]]
     assert torch.equal(head_global, torch.tensor([0, 2], dtype=torch.long))
     assert torch.equal(tail_global, torch.tensor([1, 0], dtype=torch.long))
+    assert hasattr(batch, "edge_batch")
+    expected_edge_batch = batch.batch[batch.edge_index[0]]
+    assert torch.equal(batch.edge_batch, expected_edge_batch)
 
 
 def test_retrieval_datamodule_real_dataset(tmp_path) -> None:
@@ -115,7 +128,10 @@ def test_retrieval_datamodule_real_dataset(tmp_path) -> None:
 
     cfg = {
         "name": root.name,
-        "data_dir": str(root),
+        "paths": {
+            "vocabulary": str(root / "vocabulary" / "vocabulary.lmdb"),
+            "embeddings": str(root / "embeddings"),
+        },
         "sample_limit": {"train": 2},
     }
     dm = GRetrievalDataModule(
@@ -142,7 +158,13 @@ def test_retrieval_datamodule_real_dataset(tmp_path) -> None:
 
 def test_retriever_forward_smoke(tmp_path) -> None:
     root, _, _ = _setup_mock_retrieval_root(tmp_path)
-    cfg = {"name": "mock_retrieval", "data_dir": str(root)}
+    cfg = {
+        "name": "mock_retrieval",
+        "paths": {
+            "vocabulary": str(root / "vocabulary" / "vocabulary.lmdb"),
+            "embeddings": str(root / "embeddings"),
+        },
+    }
     dm = GRetrievalDataModule(
         dataset_cfg=cfg,
         batch_size=1,
@@ -157,11 +179,10 @@ def test_retriever_forward_smoke(tmp_path) -> None:
     model = Retriever(
         emb_dim=int(batch.question_emb.shape[-1]),
         hidden_dim=8,
-        topic_pe=False,
+        topic_pe=True,
         num_topics=2,
         dde_cfg={"num_rounds": 0, "num_reverse_rounds": 0},
         dropout_p=0.0,
-        feature_extractor_activation=torch.nn.ReLU(),
     ).eval()
     with torch.no_grad():
         output = model(batch)
@@ -173,7 +194,7 @@ def test_retriever_forward_smoke(tmp_path) -> None:
 
 def test_retrieval_datamodule_requires_paths_or_data_dir() -> None:
     cfg = {"name": "mock"}
-    with pytest.raises(ValueError, match="data_dir|paths"):
+    with pytest.raises(ValueError, match="paths"):
         GRetrievalDataModule(
             dataset_cfg=cfg,
             batch_size=1,

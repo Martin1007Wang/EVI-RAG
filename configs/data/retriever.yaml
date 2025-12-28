@@ -9,7 +9,7 @@ batch_size: 32
 num_workers: 8
 pin_memory: true
 drop_last: false
-persistent_workers: false
+persistent_workers: true
 
 splits:
   train: train

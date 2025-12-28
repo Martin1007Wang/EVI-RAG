@@ -1,0 +1,32 @@
+# configs/dataset/kgqagen-sub.yaml
+
+name: kgqagen-sub
+kb: wikidata
+dataset_scope: sub
+dataset_family: kgqagen
+
+raw_root: ${paths.data_dir}/KGQAGen-10k/raw/data
+out_dir: ${paths.data_dir}/KGQAGen-10k/normalized
+materialized_dir: ${paths.data_dir}/KGQAGen-10k/materialized
+artifact_dir: ${paths.data_dir}/KGQAGen-10k/artifacts/${dataset.name}
+
+# graph/seed/answers混用 label+Qid，需要归一化到 Qid
+entity_normalization: qid_in_parentheses
+entity_text_mode: regex
+text_prefixes: []
+text_regex: "^(?!Q\\d+|P\\d+).+"
+num_topics: 2
+topic_pe:
+  # Precomputed DDE features; runtime DDE is disabled.
+  num_rounds: 2
+  num_reverse_rounds: 2
+
+column_map:
+  question_id_field: id
+  question_field: question
+  answer_text_field: answer
+  q_entity_field: seed
+  a_entity_field: answer
+  graph_field: proof
+
+sample_filter_path: ${dataset.out_dir}/sub_filter.json

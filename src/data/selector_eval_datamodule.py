@@ -160,9 +160,25 @@ class SelectorEvalDataModule(LightningDataModule):
                 raise ValueError(f"Sample {sample_id} missing rollouts list in {path}")
             edge_lists: List[List[int]] = []
             for ridx, rollout in enumerate(rollouts):
-                edges = rollout.get("edges") if isinstance(rollout, dict) else None
+                if not isinstance(rollout, dict):
+                    raise ValueError(f"Rollout {ridx} must be dict for sample_id={sample_id}")
+                if "edge_ids" in rollout:
+                    edge_ids_raw = rollout.get("edge_ids")
+                    if not isinstance(edge_ids_raw, list):
+                        raise ValueError(f"Rollout {ridx} edge_ids must be list for sample_id={sample_id}")
+                    edge_ids: List[int] = []
+                    for eidx, edge_id in enumerate(edge_ids_raw):
+                        if not isinstance(edge_id, int):
+                            raise ValueError(
+                                f"Rollout {ridx} edge_ids[{eidx}] must be int for sample_id={sample_id}"
+                            )
+                        edge_ids.append(int(edge_id))
+                    edge_lists.append(edge_ids)
+                    continue
+
+                edges = rollout.get("edges")
                 if edges is None:
-                    raise ValueError(f"Rollout {ridx} missing edges for sample_id={sample_id}")
+                    raise ValueError(f"Rollout {ridx} missing edges/edge_ids for sample_id={sample_id}")
                 if not isinstance(edges, list):
                     raise ValueError(f"Rollout {ridx} edges must be list for sample_id={sample_id}")
                 edge_ids: List[int] = []

@@ -12,7 +12,6 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from src.utils.llm_client import init_llm, run_chat
 from src.utils.llm_metrics import evaluate_predictions
 from src.utils.metrics import normalize_k_values
-from src.utils.text_utils import count_tokens
 
 
 def _oracle_metrics_for_sample(
@@ -145,9 +144,9 @@ class ReasonerModule(LightningModule):
                 )
                 outputs.append(
                     {
-                        "id": sample.get("id"),
-                        "question": sample.get("question", ""),
-                        "answer_entity_ids": sample.get("answer_entity_ids", []),
+                        "id": sample["id"],
+                        "question": sample["question"],
+                        "answer_entity_ids": sample["answer_entity_ids"],
                         "oracle": oracle,
                     }
                 )
@@ -160,27 +159,25 @@ class ReasonerModule(LightningModule):
                 {"role": "user", "content": sample["user_prompt"]},
             ]
             prediction = run_chat(self.llm, messages, is_openai=self._is_openai)
-            prompt_token_count = sample.get("prompt_token_count")
-            if prompt_token_count is None:
-                prompt_token_count = count_tokens(f"{sample['system_prompt']}\n{sample['user_prompt']}")
-            evidence_token_count = sample.get("evidence_token_count")
-            token_budget = sample.get("token_budget")
-            evidence_truncated = bool(sample.get("evidence_truncated", False))
+            prompt_token_count = sample["prompt_token_count"]
+            evidence_token_count = sample["evidence_token_count"]
+            token_budget = sample["token_budget"]
+            evidence_truncated = bool(sample["evidence_truncated"])
             outputs.append(
                 {
                     "id": sample["id"],
                     "question": sample["question"],
-                    "answers": sample.get("answers", []),
+                    "answers": sample["answers"],
                     "prediction": prediction,
-                    "triplets": sample.get("triplets", []),
-                    "paths": sample.get("paths", []),
-                    "window_k": sample.get("window_k"),
-                    "k_effective": sample.get("k_effective"),
-                    "retrieved_edge_ids": sample.get("retrieved_edge_ids", []),
-                    "visible_edge_ids": sample.get("visible_edge_ids", []),
-                    "gt_path_edge_local_ids": sample.get("gt_path_edge_local_ids", []),
-                    "hit_set": sample.get("hit_set"),
-                    "hit_vis": sample.get("hit_vis"),
+                    "triplets": sample["triplets"],
+                    "paths": sample["paths"],
+                    "window_k": sample["window_k"],
+                    "k_effective": sample["k_effective"],
+                    "retrieved_edge_ids": sample["retrieved_edge_ids"],
+                    "visible_edge_ids": sample["visible_edge_ids"],
+                    "gt_path_edge_local_ids": sample["gt_path_edge_local_ids"],
+                    "hit_set": sample["hit_set"],
+                    "hit_vis": sample["hit_vis"],
                     "evidence_token_count": evidence_token_count,
                     "prompt_token_count": prompt_token_count,
                     "token_budget": token_budget,
@@ -195,15 +192,19 @@ class ReasonerModule(LightningModule):
         sums: Dict[str, float] = {f"answer_hit@{k}": 0.0 for k in k_values}
         sums.update({f"answer_recall@{k}": 0.0 for k in k_values})
         for row in rows:
-            oracle = row.get("oracle")
+            if "oracle" not in row:
+                raise ValueError("oracle metrics missing from prediction row.")
+            oracle = row["oracle"]
             if not isinstance(oracle, dict):
-                continue
+                raise ValueError("oracle metrics must be a dict.")
             total += 1
             for k in k_values:
                 hit_key = f"answer_hit@{k}"
                 rec_key = f"answer_recall@{k}"
-                sums[hit_key] += float(oracle.get(hit_key, 0.0))
-                sums[rec_key] += float(oracle.get(rec_key, 0.0))
+                if hit_key not in oracle or rec_key not in oracle:
+                    raise ValueError("oracle metrics missing required keys.")
+                sums[hit_key] += float(oracle[hit_key])
+                sums[rec_key] += float(oracle[rec_key])
         denom = float(max(total, 1))
         metrics: Dict[str, float] = {
             "oracle/total": float(total),

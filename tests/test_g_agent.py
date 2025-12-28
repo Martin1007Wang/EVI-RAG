@@ -44,7 +44,6 @@ def test_g_agent_builder_roundtrip(tmp_path: Path) -> None:
         "question": "mock question",
         "seed_entity_ids": torch.tensor([10], dtype=torch.long),
         "answer_entity_ids": torch.tensor([11], dtype=torch.long),
-        "gt_path_edge_indices": [0],
     }
     _write_lmdb(lmdb_path, {sample_id: raw})
 
@@ -52,7 +51,7 @@ def test_g_agent_builder_roundtrip(tmp_path: Path) -> None:
     try:
         settings = GAgentSettings(
             enabled=True,
-            anchor_top_k=1,
+            edge_top_k=1,
             max_hops=2,
             output_path=tmp_path / "g_agent_samples.pt",
         )
@@ -97,7 +96,6 @@ def test_g_agent_builder_keeps_unreachable_answers(tmp_path: Path) -> None:
         "seed_entity_ids": torch.tensor([10], dtype=torch.long),
         # Answer entity is not present in the selected subgraph nodes.
         "answer_entity_ids": torch.tensor([999], dtype=torch.long),
-        "gt_path_edge_indices": [],
     }
     _write_lmdb(lmdb_path, {sample_id: raw})
 
@@ -105,7 +103,7 @@ def test_g_agent_builder_keeps_unreachable_answers(tmp_path: Path) -> None:
     try:
         settings = GAgentSettings(
             enabled=True,
-            anchor_top_k=1,
+            edge_top_k=1,
             max_hops=2,
             output_path=tmp_path / "g_agent_samples_unreachable.pt",
         )
@@ -154,8 +152,6 @@ def test_g_agent_builder_fills_missing_gt_with_shortest_path(tmp_path: Path) -> 
         "question": "mock question missing gt",
         "seed_entity_ids": torch.tensor([10], dtype=torch.long),
         "answer_entity_ids": torch.tensor([11], dtype=torch.long),
-        # No gt_path_edge_indices / gt_paths_triples provided.
-        "gt_path_edge_indices": [],
     }
     _write_lmdb(lmdb_path, {sample_id: raw})
 
@@ -163,7 +159,7 @@ def test_g_agent_builder_fills_missing_gt_with_shortest_path(tmp_path: Path) -> 
     try:
         settings = GAgentSettings(
             enabled=True,
-            anchor_top_k=2,
+            edge_top_k=2,
             max_hops=2,
             output_path=tmp_path / "g_agent_samples_missing_gt.pt",
         )

@@ -2708,3 +2708,860 @@ Total params: 20.0 M
 Total estimated model params size (MB): 79                                      
 Modules in train mode: 69                                                       
 Modules in eval mode: 0                                                         
+Epoch 59/199 ━━━━━━━━━━━━━━━━ 22/22 0:00:07 • 0:00:00 3.19it/s train/loss: 2.375
+                                                               train/log_reward:
+                                                               -3.010           
+                                                               train/answer_hit:
+                                                               0.302            
+[[36m2025-12-24 18:03:56,754[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting testing![0m
+[[36m2025-12-24 18:03:57,771[0m][[34msrc.data.g_agent_dataset[0m][[32mINFO[0m] - Loaded g_agent cache /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/test_g_agent.pt: 1619 samples.[0m
+Restoring states from the checkpoint path at /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/7/checkpoints/epoch_009.ckpt
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Loaded model weights from the checkpoint at /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/7/checkpoints/epoch_009.ckpt
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│      test/answer_hit      │    0.6578134894371033     │
+│    test/answer_hit@10     │    0.6578134894371033     │
+│     test/length_mean      │     1.733168601989746     │
+│      test/log_reward      │    -3.3161072731018066    │
+│         test/loss         │     7.146688461303711     │
+│        test/pos_f1        │    0.2750798761844635     │
+│    test/pos_precision     │    0.4728226959705353     │
+│      test/pos_recall      │    0.28316736221313477    │
+│      test/subtb_loss      │     7.146688461303711     │
+└───────────────────────────┴───────────────────────────┘
+Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 13/13 0:00:06 • 0:00:00 1.90it/s 
+[[36m2025-12-24 18:04:06,660[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Best ckpt path: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/7/checkpoints/epoch_009.ckpt[0m
+[[36m2025-12-24 18:04:06,661[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Output dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/7[0m
+[[36m2025-12-24 18:04:06,661[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Retrieved metric value! <val/answer_hit=0.6000000238418579>[0m
+[[36m2025-12-24 18:04:06,665[0m][[35mHYDRA[0m] Launching 1 jobs locally[0m
+[[36m2025-12-24 18:04:06,665[0m][[35mHYDRA[0m] 	#8 : model.actor_cfg.action_topk=100 model.reward_cfg.shaping_coef=0.0 model.optimizer_cfg.lr=0.00021888937469133481 experiment=train_gflownet hparams_search=gflownet_optuna dataset=webqsp ckpt.retriever=logs/train_retriever_default/runs/2025-12-24_13-39-33/checkpoints/epoch_010.ckpt logger=none[0m
+[[36m2025-12-24 18:04:06,794[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Enforcing tags! <cfg.extras.enforce_tags=True>[0m
+[[36m2025-12-24 18:04:06,795[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] torch.set_float32_matmul_precision(high)[0m
+[[36m2025-12-24 18:04:06,795[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Printing config tree with Rich! <cfg.extras.print_config=True>[0m
+CONFIG
+├── data
+│   └── _target_: src.data.g_agent_datamodule.GAgentDataModule                  
+│       cache_paths:                                                            
+│         train: /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/train_g
+│         validation: /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/va
+│         test: /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/test_g_a
+│       prefer_jsonl: true                                                      
+│       convert_pt_to_jsonl: true                                               
+│       batch_size: 128                                                         
+│       num_workers: 8                                                          
+│       pin_memory: true                                                        
+│       drop_last: false                                                        
+│       persistent_workers: true                                                
+│       prefetch_factor: 4                                                      
+│       shuffle_train: true                                                     
+│       drop_unreachable: false                                                 
+│       resources:                                                              
+│         vocabulary_path: /mnt/data/retrieval_dataset/webqsp/materialized/vocab
+│         embeddings_dir: /mnt/data/retrieval_dataset/webqsp/materialized/embedd
+│                                                                               
+├── model
+│   └── _target_: src.models.gflownet_module.GFlowNetModule                     
+│       _recursive_: false                                                      
+│       hidden_dim: 1024                                                        
+│       env_cfg:                                                                
+│         _target_: src.models.components.gflownet_env.GraphEnv                 
+│         max_steps: 3                                                          
+│       policy_cfg:                                                             
+│         _target_: src.models.components.gflownet_policy.GFlowNetEdgePolicy    
+│         hidden_dim: 1024                                                      
+│         dropout: 0.1                                                          
+│         direction_vocab_size: 2                                               
+│       reward_cfg:                                                             
+│         _target_: src.models.components.gflownet_rewards.GFlowNetReward       
+│         success_reward: 1.0                                                   
+│         failure_reward: 0.01                                                  
+│         shaping_coef: 0.0                                                     
+│       actor_cfg:                                                              
+│         _target_: src.models.components.gflownet_actor.GFlowNetActor          
+│         policy_temperature: 1.0                                               
+│         action_topk: 100                                                      
+│       embedder_cfg:                                                           
+│         _target_: src.models.components.gflownet_embedder.GraphEmbedder       
+│         hidden_dim: 1024                                                      
+│         projector_checkpoint: logs/train_retriever_default/runs/2025-12-24_13-
+│         allow_deferred_init: false                                            
+│       state_encoder_cfg:                                                      
+│         _target_: src.models.components.state_encoder.StateEncoder            
+│         hidden_dim: 1024                                                      
+│         max_steps: 3                                                          
+│       estimator_cfg:                                                          
+│         _target_: src.models.components.gflownet_estimator.GFlowNetEstimator  
+│         hidden_dim: 1024                                                      
+│         zero_init_last: true                                                  
+│       training_cfg:                                                           
+│         num_train_rollouts: 2                                                 
+│       evaluation_cfg:                                                         
+│         num_eval_rollouts: 10                                                 
+│         rollout_temperature: 1.0                                              
+│       optimizer_cfg:                                                          
+│         type: adamw                                                           
+│         lr: 0.00021888937469133481                                            
+│         weight_decay: 0.0001                                                  
+│       scheduler_cfg:                                                          
+│         type: cosine                                                          
+│         t_max: 200                                                            
+│         eta_min: 1.0e-06                                                      
+│         interval: epoch                                                       
+│         monitor: val/answer_hit@1                                             
+│       logging_cfg:                                                            
+│         train_prog_bar:                                                       
+│         - log_reward                                                          
+│         - answer_hit                                                          
+│         eval_prog_bar:                                                        
+│         - answer_hit@1                                                        
+│         log_on_step_train: false                                              
+│                                                                               
+├── callbacks
+│   └── model_checkpoint:                                                       
+│         _target_: lightning.pytorch.callbacks.ModelCheckpoint                 
+│         dirpath: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025
+│         filename: epoch_{epoch:03d}                                           
+│         monitor: val/answer_hit                                               
+│         verbose: false                                                        
+│         save_last: true                                                       
+│         save_top_k: 1                                                         
+│         mode: max                                                             
+│         auto_insert_metric_name: false                                        
+│         save_weights_only: true                                               
+│         every_n_train_steps: null                                             
+│         train_time_interval: null                                             
+│         every_n_epochs: null                                                  
+│         save_on_train_epoch_end: null                                         
+│       early_stopping:                                                         
+│         _target_: lightning.pytorch.callbacks.EarlyStopping                   
+│         monitor: val/answer_hit                                               
+│         min_delta: 0.0                                                        
+│         patience: 50                                                          
+│         verbose: false                                                        
+│         mode: max                                                             
+│         strict: true                                                          
+│         check_finite: true                                                    
+│         stopping_threshold: null                                              
+│         divergence_threshold: null                                            
+│         check_on_train_epoch_end: null                                        
+│       model_summary:                                                          
+│         _target_: lightning.pytorch.callbacks.RichModelSummary                
+│         max_depth: -1                                                         
+│       rich_progress_bar:                                                      
+│         _target_: lightning.pytorch.callbacks.RichProgressBar                 
+│                                                                               
+├── logger
+│   └── {}                                                                      
+│                                                                               
+├── trainer
+│   └── _target_: lightning.pytorch.trainer.Trainer                             
+│       default_root_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiru
+│       min_epochs: 0                                                           
+│       max_epochs: 200                                                         
+│       accelerator: gpu                                                        
+│       devices: 1                                                              
+│       precision: 16-mixed                                                     
+│       gradient_clip_val: 1.0                                                  
+│       check_val_every_n_epoch: 1                                              
+│       log_every_n_steps: 1                                                    
+│       deterministic: false                                                    
+│                                                                               
+├── paths
+│   └── root_dir: /mnt/wangjingxiong/EVI-RAG                                    
+│       data_dir: /mnt/data/retrieval_dataset                                   
+│       log_dir: /mnt/wangjingxiong/EVI-RAG/logs/                               
+│       output_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/202
+│       work_dir: /mnt/wangjingxiong/EVI-RAG                                    
+│                                                                               
+├── extras
+│   └── ignore_warnings: false                                                  
+│       enforce_tags: true                                                      
+│       print_config: true                                                      
+│       torch_float32_matmul_precision: high                                    
+│                                                                               
+├── task_name
+│   └── gflownet_train                                                          
+├── tags
+│   └── ['gflownet']                                                            
+├── train
+│   └── True                                                                    
+├── test
+│   └── True                                                                    
+├── test_ckpt_path
+│   └── None                                                                    
+├── allow_test_without_checkpoint
+│   └── False                                                                   
+├── ckpt_path
+│   └── None                                                                    
+├── seed
+│   └── 42                                                                      
+├── window
+│   └── k_values:                                                               
+│       - 1                                                                     
+│       - 5                                                                     
+│       - 10                                                                    
+│       - 25                                                                    
+│       - 50                                                                    
+│       - 100                                                                   
+│       - 200                                                                   
+│       - 300                                                                   
+│       - 400                                                                   
+│       rollout_k_values:                                                       
+│       - 1                                                                     
+│       - 5                                                                     
+│       - 10                                                                    
+│       - 25                                                                    
+│       - 50                                                                    
+│       max_hops: 3                                                             
+│                                                                               
+├── ckpt
+│   └── retriever: logs/train_retriever_default/runs/2025-12-24_13-39-33/checkpo
+│       gflownet: null                                                          
+│                                                                               
+├── dataset
+│   └── name: webqsp                                                            
+│       kb: freebase                                                            
+│       raw_root: /mnt/data/retrieval_dataset/webqsp/raw/data                   
+│       out_dir: /mnt/data/retrieval_dataset/webqsp/normalized                  
+│       materialized_dir: /mnt/data/retrieval_dataset/webqsp/materialized       
+│       paths:                                                                  
+│         vocabulary: /mnt/data/retrieval_dataset/webqsp/materialized/vocabulary
+│         embeddings: /mnt/data/retrieval_dataset/webqsp/materialized/embeddings
+│         processed: /mnt/data/retrieval_dataset/webqsp/materialized/processed  
+│       entity_normalization: none                                              
+│       num_topics: 2                                                           
+│       topic_pe:                                                               
+│         enabled: true                                                         
+│         precompute: true                                                      
+│         num_rounds: 2                                                         
+│         num_reverse_rounds: 2                                                 
+│       column_map:                                                             
+│         question_id_field: id                                                 
+│         question_field: question                                              
+│         answer_text_field: answer                                             
+│         q_entity_field: q_entity                                              
+│         a_entity_field: a_entity                                              
+│         graph_field: graph                                                    
+│                                                                               
+└── optimized_metric
+    └── val/answer_hit                                                          
+Seed set to 42
+[[36m2025-12-24 18:04:06,831[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Resolved run name: train_gflownet[0m
+[[36m2025-12-24 18:04:06,831[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating datamodule <src.data.g_agent_datamodule.GAgentDataModule>[0m
+[[36m2025-12-24 18:04:06,834[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating model <src.models.gflownet_module.GFlowNetModule>[0m
+[[36m2025-12-24 18:04:06,939[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating callbacks...[0m
+[[36m2025-12-24 18:04:06,939[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.ModelCheckpoint>[0m
+[[36m2025-12-24 18:04:06,940[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.EarlyStopping>[0m
+[[36m2025-12-24 18:04:06,941[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichModelSummary>[0m
+[[36m2025-12-24 18:04:06,941[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichProgressBar>[0m
+[[36m2025-12-24 18:04:06,941[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating loggers...[0m
+[[36m2025-12-24 18:04:06,941[0m][[34msrc.utils.instantiators[0m][[33mWARNING[0m] - [rank: 0] No logger configs found! Skipping...[0m
+[[36m2025-12-24 18:04:06,941[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating trainer <lightning.pytorch.trainer.Trainer>[0m
+Using 16bit Automatic Mixed Precision (AMP)
+Trainer already configured with model summary callbacks: [<class 'lightning.pytorch.callbacks.rich_model_summary.RichModelSummary'>]. Skipping setting a default `ModelSummary` callback.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+[[36m2025-12-24 18:04:06,950[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting training![0m
+[[36m2025-12-24 18:04:08,971[0m][[34msrc.data.g_agent_dataset[0m][[32mINFO[0m] - Loaded g_agent cache /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/train_g_agent.pt: 2812 samples.[0m
+[[36m2025-12-24 18:04:10,928[0m][[34msrc.data.g_agent_dataset[0m][[32mINFO[0m] - Loaded g_agent cache /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/validation_g_agent.pt: 245 samples.[0m
+[[36m2025-12-24 18:04:11,421[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Loading /mnt/data/retrieval_dataset/webqsp/materialized/embeddings/entity_embeddings.pt...[0m
+[[36m2025-12-24 18:04:12,383[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Loading /mnt/data/retrieval_dataset/webqsp/materialized/embeddings/relation_embeddings.pt...[0m
+[[36m2025-12-24 18:04:12,392[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Entity embedding rows: 539675 (vocab entities: 1316464). Non-text entities use embedding_id=0; textual entities occupy 1..max_id.[0m
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃    ┃ Name                                       ┃ Type      ┃ Params ┃ Mode  ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ 0  │ policy                                     │ GFlowNet… │  9.5 M │ train │
+│ 1  │ policy.state_norm                          │ LayerNorm │  2.0 K │ train │
+│ 2  │ policy.q_film                              │ Sequenti… │  1.1 M │ train │
+│ 3  │ policy.q_film.0                            │ LayerNorm │  2.0 K │ train │
+│ 4  │ policy.q_film.1                            │ Linear    │  1.0 M │ train │
+│ 5  │ policy.q_film.2                            │ GELU      │      0 │ train │
+│ 6  │ policy.direction_embeddings                │ Embedding │  2.0 K │ train │
+│ 7  │ policy.edge_proj                           │ Sequenti… │  1.1 M │ train │
+│ 8  │ policy.edge_proj.0                         │ LayerNorm │  2.0 K │ train │
+│ 9  │ policy.edge_proj.1                         │ Linear    │  1.0 M │ train │
+│ 10 │ policy.edge_proj.2                         │ GELU      │      0 │ train │
+│ 11 │ policy.edge_proj.3                         │ Dropout   │      0 │ train │
+│ 12 │ policy.attn_q                              │ Linear    │  1.0 M │ train │
+│ 13 │ policy.attn_k                              │ Linear    │  1.0 M │ train │
+│ 14 │ policy.attn_v                              │ Linear    │  1.0 M │ train │
+│ 15 │ policy.edge_head                           │ Sequenti… │  2.1 M │ train │
+│ 16 │ policy.edge_head.0                         │ LayerNorm │  4.1 K │ train │
+│ 17 │ policy.edge_head.1                         │ Linear    │  2.1 M │ train │
+│ 18 │ policy.edge_head.2                         │ GELU      │      0 │ train │
+│ 19 │ policy.edge_head.3                         │ Dropout   │      0 │ train │
+│ 20 │ policy.edge_head.4                         │ Linear    │  1.0 K │ train │
+│ 21 │ policy.stop_head                           │ Sequenti… │  2.1 M │ train │
+│ 22 │ policy.stop_head.0                         │ LayerNorm │  4.1 K │ train │
+│ 23 │ policy.stop_head.1                         │ Linear    │  2.1 M │ train │
+│ 24 │ policy.stop_head.2                         │ GELU      │      0 │ train │
+│ 25 │ policy.stop_head.3                         │ Linear    │  1.0 K │ train │
+│ 26 │ reward_fn                                  │ GFlowNet… │      0 │ train │
+│ 27 │ env                                        │ GraphEnv  │      0 │ train │
+│ 28 │ embedder                                   │ GraphEmb… │  8.4 M │ train │
+│ 29 │ embedder.entity_proj                       │ Embeddin… │  1.0 M │ train │
+│ 30 │ embedder.entity_proj.network               │ Sequenti… │  1.0 M │ train │
+│ 31 │ embedder.entity_proj.network.0             │ Linear    │  1.0 M │ train │
+│ 32 │ embedder.entity_proj.network.1             │ Tanh      │      0 │ train │
+│ 33 │ embedder.relation_proj                     │ Embeddin… │  1.0 M │ train │
+│ 34 │ embedder.relation_proj.network             │ Sequenti… │  1.0 M │ train │
+│ 35 │ embedder.relation_proj.network.0           │ Linear    │  1.0 M │ train │
+│ 36 │ embedder.relation_proj.network.1           │ Tanh      │      0 │ train │
+│ 37 │ embedder.query_proj                        │ Embeddin… │  1.0 M │ train │
+│ 38 │ embedder.query_proj.network                │ Sequenti… │  1.0 M │ train │
+│ 39 │ embedder.query_proj.network.0              │ Linear    │  1.0 M │ train │
+│ 40 │ embedder.query_proj.network.1              │ Tanh      │      0 │ train │
+│ 41 │ embedder.non_text_entity_emb               │ Embedding │  1.0 K │ train │
+│ 42 │ embedder._dde                              │ DDE       │      0 │ train │
+│ 43 │ embedder._dde.layers                       │ ModuleLi… │      0 │ train │
+│ 44 │ embedder._dde.layers.0                     │ PEConv    │      0 │ train │
+│ 45 │ embedder._dde.layers.0.aggr_module         │ MeanAggr… │      0 │ train │
+│ 46 │ embedder._dde.layers.1                     │ PEConv    │      0 │ train │
+│ 47 │ embedder._dde.layers.1.aggr_module         │ MeanAggr… │      0 │ train │
+│ 48 │ embedder._dde.reverse_layers               │ ModuleLi… │      0 │ train │
+│ 49 │ embedder._dde.reverse_layers.0             │ PEConv    │      0 │ train │
+│ 50 │ embedder._dde.reverse_layers.0.aggr_module │ MeanAggr… │      0 │ train │
+│ 51 │ embedder._dde.reverse_layers.1             │ PEConv    │      0 │ train │
+│ 52 │ embedder._dde.reverse_layers.1.aggr_module │ MeanAggr… │      0 │ train │
+│ 53 │ embedder.edge_adapter                      │ Sequenti… │  5.3 M │ train │
+│ 54 │ embedder.edge_adapter.0                    │ Linear    │  4.2 M │ train │
+│ 55 │ embedder.edge_adapter.1                    │ LayerNorm │  2.0 K │ train │
+│ 56 │ embedder.edge_adapter.2                    │ GELU      │      0 │ train │
+│ 57 │ embedder.edge_adapter.3                    │ Linear    │  1.0 M │ train │
+│ 58 │ embedder.edge_score_proj                   │ Linear    │  1.0 K │ train │
+│ 59 │ estimator                                  │ GFlowNet… │  2.1 M │ train │
+│ 60 │ estimator.log_z_head                       │ Sequenti… │  2.1 M │ train │
+│ 61 │ estimator.log_z_head.0                     │ LayerNorm │  4.1 K │ train │
+│ 62 │ estimator.log_z_head.1                     │ Linear    │  2.1 M │ train │
+│ 63 │ estimator.log_z_head.2                     │ GELU      │      0 │ train │
+│ 64 │ estimator.log_z_head.3                     │ Linear    │  1.0 K │ train │
+│ 65 │ actor                                      │ GFlowNet… │  9.5 M │ train │
+│ 66 │ actor.state_encoder                        │ StateEnc… │  6.1 K │ train │
+│ 67 │ actor.state_encoder.step_embeddings        │ Embedding │  4.1 K │ train │
+│ 68 │ actor.state_encoder.norm                   │ LayerNorm │  2.0 K │ train │
+└────┴────────────────────────────────────────────┴───────────┴────────┴───────┘
+Trainable params: 20.0 M                                                        
+Non-trainable params: 0                                                         
+Total params: 20.0 M                                                            
+Total estimated model params size (MB): 79                                      
+Modules in train mode: 69                                                       
+Modules in eval mode: 0                                                         
+Epoch 95/199 ━━━━━━━━━━━━━━━━ 22/22 0:00:06 • 0:00:00 3.41it/s train/loss: 1.110
+                                                               train/log_reward:
+                                                               -2.873           
+                                                               train/answer_hit:
+                                                               0.376            
+[[36m2025-12-24 18:16:59,336[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting testing![0m
+[[36m2025-12-24 18:17:00,379[0m][[34msrc.data.g_agent_dataset[0m][[32mINFO[0m] - Loaded g_agent cache /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/test_g_agent.pt: 1619 samples.[0m
+Restoring states from the checkpoint path at /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/8/checkpoints/epoch_045.ckpt
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Loaded model weights from the checkpoint at /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/8/checkpoints/epoch_045.ckpt
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│      test/answer_hit      │     0.661519467830658     │
+│    test/answer_hit@10     │     0.661519467830658     │
+│     test/length_mean      │     2.181593656539917     │
+│      test/log_reward      │    -3.1977345943450928    │
+│         test/loss         │     2.014739990234375     │
+│        test/pos_f1        │    0.3059893548488617     │
+│    test/pos_precision     │    0.5145151615142822     │
+│      test/pos_recall      │    0.3115004301071167     │
+│      test/subtb_loss      │     2.014739990234375     │
+└───────────────────────────┴───────────────────────────┘
+Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 13/13 0:00:06 • 0:00:00 2.00it/s 
+[[36m2025-12-24 18:17:08,920[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Best ckpt path: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/8/checkpoints/epoch_045.ckpt[0m
+[[36m2025-12-24 18:17:08,921[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Output dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/8[0m
+[[36m2025-12-24 18:17:08,921[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Retrieved metric value! <val/answer_hit=0.6693877577781677>[0m
+[[36m2025-12-24 18:17:08,925[0m][[35mHYDRA[0m] Launching 1 jobs locally[0m
+[[36m2025-12-24 18:17:08,925[0m][[35mHYDRA[0m] 	#9 : model.actor_cfg.action_topk=50 model.reward_cfg.shaping_coef=5.0 model.optimizer_cfg.lr=8.898896996100196e-05 experiment=train_gflownet hparams_search=gflownet_optuna dataset=webqsp ckpt.retriever=logs/train_retriever_default/runs/2025-12-24_13-39-33/checkpoints/epoch_010.ckpt logger=none[0m
+[[36m2025-12-24 18:17:09,053[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Enforcing tags! <cfg.extras.enforce_tags=True>[0m
+[[36m2025-12-24 18:17:09,054[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] torch.set_float32_matmul_precision(high)[0m
+[[36m2025-12-24 18:17:09,055[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Printing config tree with Rich! <cfg.extras.print_config=True>[0m
+CONFIG
+├── data
+│   └── _target_: src.data.g_agent_datamodule.GAgentDataModule                  
+│       cache_paths:                                                            
+│         train: /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/train_g
+│         validation: /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/va
+│         test: /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/test_g_a
+│       prefer_jsonl: true                                                      
+│       convert_pt_to_jsonl: true                                               
+│       batch_size: 128                                                         
+│       num_workers: 8                                                          
+│       pin_memory: true                                                        
+│       drop_last: false                                                        
+│       persistent_workers: true                                                
+│       prefetch_factor: 4                                                      
+│       shuffle_train: true                                                     
+│       drop_unreachable: false                                                 
+│       resources:                                                              
+│         vocabulary_path: /mnt/data/retrieval_dataset/webqsp/materialized/vocab
+│         embeddings_dir: /mnt/data/retrieval_dataset/webqsp/materialized/embedd
+│                                                                               
+├── model
+│   └── _target_: src.models.gflownet_module.GFlowNetModule                     
+│       _recursive_: false                                                      
+│       hidden_dim: 1024                                                        
+│       env_cfg:                                                                
+│         _target_: src.models.components.gflownet_env.GraphEnv                 
+│         max_steps: 3                                                          
+│       policy_cfg:                                                             
+│         _target_: src.models.components.gflownet_policy.GFlowNetEdgePolicy    
+│         hidden_dim: 1024                                                      
+│         dropout: 0.1                                                          
+│         direction_vocab_size: 2                                               
+│       reward_cfg:                                                             
+│         _target_: src.models.components.gflownet_rewards.GFlowNetReward       
+│         success_reward: 1.0                                                   
+│         failure_reward: 0.01                                                  
+│         shaping_coef: 5.0                                                     
+│       actor_cfg:                                                              
+│         _target_: src.models.components.gflownet_actor.GFlowNetActor          
+│         policy_temperature: 1.0                                               
+│         action_topk: 50                                                       
+│       embedder_cfg:                                                           
+│         _target_: src.models.components.gflownet_embedder.GraphEmbedder       
+│         hidden_dim: 1024                                                      
+│         projector_checkpoint: logs/train_retriever_default/runs/2025-12-24_13-
+│         allow_deferred_init: false                                            
+│       state_encoder_cfg:                                                      
+│         _target_: src.models.components.state_encoder.StateEncoder            
+│         hidden_dim: 1024                                                      
+│         max_steps: 3                                                          
+│       estimator_cfg:                                                          
+│         _target_: src.models.components.gflownet_estimator.GFlowNetEstimator  
+│         hidden_dim: 1024                                                      
+│         zero_init_last: true                                                  
+│       training_cfg:                                                           
+│         num_train_rollouts: 2                                                 
+│       evaluation_cfg:                                                         
+│         num_eval_rollouts: 10                                                 
+│         rollout_temperature: 1.0                                              
+│       optimizer_cfg:                                                          
+│         type: adamw                                                           
+│         lr: 8.898896996100196e-05                                             
+│         weight_decay: 0.0001                                                  
+│       scheduler_cfg:                                                          
+│         type: cosine                                                          
+│         t_max: 200                                                            
+│         eta_min: 1.0e-06                                                      
+│         interval: epoch                                                       
+│         monitor: val/answer_hit@1                                             
+│       logging_cfg:                                                            
+│         train_prog_bar:                                                       
+│         - log_reward                                                          
+│         - answer_hit                                                          
+│         eval_prog_bar:                                                        
+│         - answer_hit@1                                                        
+│         log_on_step_train: false                                              
+│                                                                               
+├── callbacks
+│   └── model_checkpoint:                                                       
+│         _target_: lightning.pytorch.callbacks.ModelCheckpoint                 
+│         dirpath: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025
+│         filename: epoch_{epoch:03d}                                           
+│         monitor: val/answer_hit                                               
+│         verbose: false                                                        
+│         save_last: true                                                       
+│         save_top_k: 1                                                         
+│         mode: max                                                             
+│         auto_insert_metric_name: false                                        
+│         save_weights_only: true                                               
+│         every_n_train_steps: null                                             
+│         train_time_interval: null                                             
+│         every_n_epochs: null                                                  
+│         save_on_train_epoch_end: null                                         
+│       early_stopping:                                                         
+│         _target_: lightning.pytorch.callbacks.EarlyStopping                   
+│         monitor: val/answer_hit                                               
+│         min_delta: 0.0                                                        
+│         patience: 50                                                          
+│         verbose: false                                                        
+│         mode: max                                                             
+│         strict: true                                                          
+│         check_finite: true                                                    
+│         stopping_threshold: null                                              
+│         divergence_threshold: null                                            
+│         check_on_train_epoch_end: null                                        
+│       model_summary:                                                          
+│         _target_: lightning.pytorch.callbacks.RichModelSummary                
+│         max_depth: -1                                                         
+│       rich_progress_bar:                                                      
+│         _target_: lightning.pytorch.callbacks.RichProgressBar                 
+│                                                                               
+├── logger
+│   └── {}                                                                      
+│                                                                               
+├── trainer
+│   └── _target_: lightning.pytorch.trainer.Trainer                             
+│       default_root_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiru
+│       min_epochs: 0                                                           
+│       max_epochs: 200                                                         
+│       accelerator: gpu                                                        
+│       devices: 1                                                              
+│       precision: 16-mixed                                                     
+│       gradient_clip_val: 1.0                                                  
+│       check_val_every_n_epoch: 1                                              
+│       log_every_n_steps: 1                                                    
+│       deterministic: false                                                    
+│                                                                               
+├── paths
+│   └── root_dir: /mnt/wangjingxiong/EVI-RAG                                    
+│       data_dir: /mnt/data/retrieval_dataset                                   
+│       log_dir: /mnt/wangjingxiong/EVI-RAG/logs/                               
+│       output_dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/202
+│       work_dir: /mnt/wangjingxiong/EVI-RAG                                    
+│                                                                               
+├── extras
+│   └── ignore_warnings: false                                                  
+│       enforce_tags: true                                                      
+│       print_config: true                                                      
+│       torch_float32_matmul_precision: high                                    
+│                                                                               
+├── task_name
+│   └── gflownet_train                                                          
+├── tags
+│   └── ['gflownet']                                                            
+├── train
+│   └── True                                                                    
+├── test
+│   └── True                                                                    
+├── test_ckpt_path
+│   └── None                                                                    
+├── allow_test_without_checkpoint
+│   └── False                                                                   
+├── ckpt_path
+│   └── None                                                                    
+├── seed
+│   └── 42                                                                      
+├── window
+│   └── k_values:                                                               
+│       - 1                                                                     
+│       - 5                                                                     
+│       - 10                                                                    
+│       - 25                                                                    
+│       - 50                                                                    
+│       - 100                                                                   
+│       - 200                                                                   
+│       - 300                                                                   
+│       - 400                                                                   
+│       rollout_k_values:                                                       
+│       - 1                                                                     
+│       - 5                                                                     
+│       - 10                                                                    
+│       - 25                                                                    
+│       - 50                                                                    
+│       max_hops: 3                                                             
+│                                                                               
+├── ckpt
+│   └── retriever: logs/train_retriever_default/runs/2025-12-24_13-39-33/checkpo
+│       gflownet: null                                                          
+│                                                                               
+├── dataset
+│   └── name: webqsp                                                            
+│       kb: freebase                                                            
+│       raw_root: /mnt/data/retrieval_dataset/webqsp/raw/data                   
+│       out_dir: /mnt/data/retrieval_dataset/webqsp/normalized                  
+│       materialized_dir: /mnt/data/retrieval_dataset/webqsp/materialized       
+│       paths:                                                                  
+│         vocabulary: /mnt/data/retrieval_dataset/webqsp/materialized/vocabulary
+│         embeddings: /mnt/data/retrieval_dataset/webqsp/materialized/embeddings
+│         processed: /mnt/data/retrieval_dataset/webqsp/materialized/processed  
+│       entity_normalization: none                                              
+│       num_topics: 2                                                           
+│       topic_pe:                                                               
+│         enabled: true                                                         
+│         precompute: true                                                      
+│         num_rounds: 2                                                         
+│         num_reverse_rounds: 2                                                 
+│       column_map:                                                             
+│         question_id_field: id                                                 
+│         question_field: question                                              
+│         answer_text_field: answer                                             
+│         q_entity_field: q_entity                                              
+│         a_entity_field: a_entity                                              
+│         graph_field: graph                                                    
+│                                                                               
+└── optimized_metric
+    └── val/answer_hit                                                          
+Seed set to 42
+[[36m2025-12-24 18:17:09,089[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Resolved run name: train_gflownet[0m
+[[36m2025-12-24 18:17:09,089[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating datamodule <src.data.g_agent_datamodule.GAgentDataModule>[0m
+[[36m2025-12-24 18:17:09,092[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating model <src.models.gflownet_module.GFlowNetModule>[0m
+[[36m2025-12-24 18:17:09,187[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating callbacks...[0m
+[[36m2025-12-24 18:17:09,187[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.ModelCheckpoint>[0m
+[[36m2025-12-24 18:17:09,188[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.EarlyStopping>[0m
+[[36m2025-12-24 18:17:09,189[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichModelSummary>[0m
+[[36m2025-12-24 18:17:09,189[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichProgressBar>[0m
+[[36m2025-12-24 18:17:09,189[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating loggers...[0m
+[[36m2025-12-24 18:17:09,189[0m][[34msrc.utils.instantiators[0m][[33mWARNING[0m] - [rank: 0] No logger configs found! Skipping...[0m
+[[36m2025-12-24 18:17:09,190[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating trainer <lightning.pytorch.trainer.Trainer>[0m
+Using 16bit Automatic Mixed Precision (AMP)
+Trainer already configured with model summary callbacks: [<class 'lightning.pytorch.callbacks.rich_model_summary.RichModelSummary'>]. Skipping setting a default `ModelSummary` callback.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+[[36m2025-12-24 18:17:09,198[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting training![0m
+[[36m2025-12-24 18:17:11,225[0m][[34msrc.data.g_agent_dataset[0m][[32mINFO[0m] - Loaded g_agent cache /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/train_g_agent.pt: 2812 samples.[0m
+[[36m2025-12-24 18:17:13,331[0m][[34msrc.data.g_agent_dataset[0m][[32mINFO[0m] - Loaded g_agent cache /mnt/data/retrieval_dataset/webqsp/materialized/g_agent/validation_g_agent.pt: 245 samples.[0m
+[[36m2025-12-24 18:17:13,803[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Loading /mnt/data/retrieval_dataset/webqsp/materialized/embeddings/entity_embeddings.pt...[0m
+[[36m2025-12-24 18:17:14,761[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Loading /mnt/data/retrieval_dataset/webqsp/materialized/embeddings/relation_embeddings.pt...[0m
+[[36m2025-12-24 18:17:14,770[0m][[34msrc.data.components.embedding_store[0m][[32mINFO[0m] - Entity embedding rows: 539675 (vocab entities: 1316464). Non-text entities use embedding_id=0; textual entities occupy 1..max_id.[0m
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃    ┃ Name                                       ┃ Type      ┃ Params ┃ Mode  ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ 0  │ policy                                     │ GFlowNet… │  9.5 M │ train │
+│ 1  │ policy.state_norm                          │ LayerNorm │  2.0 K │ train │
+│ 2  │ policy.q_film                              │ Sequenti… │  1.1 M │ train │
+│ 3  │ policy.q_film.0                            │ LayerNorm │  2.0 K │ train │
+│ 4  │ policy.q_film.1                            │ Linear    │  1.0 M │ train │
+│ 5  │ policy.q_film.2                            │ GELU      │      0 │ train │
+│ 6  │ policy.direction_embeddings                │ Embedding │  2.0 K │ train │
+│ 7  │ policy.edge_proj                           │ Sequenti… │  1.1 M │ train │
+│ 8  │ policy.edge_proj.0                         │ LayerNorm │  2.0 K │ train │
+│ 9  │ policy.edge_proj.1                         │ Linear    │  1.0 M │ train │
+│ 10 │ policy.edge_proj.2                         │ GELU      │      0 │ train │
+│ 11 │ policy.edge_proj.3                         │ Dropout   │      0 │ train │
+│ 12 │ policy.attn_q                              │ Linear    │  1.0 M │ train │
+│ 13 │ policy.attn_k                              │ Linear    │  1.0 M │ train │
+│ 14 │ policy.attn_v                              │ Linear    │  1.0 M │ train │
+│ 15 │ policy.edge_head                           │ Sequenti… │  2.1 M │ train │
+│ 16 │ policy.edge_head.0                         │ LayerNorm │  4.1 K │ train │
+│ 17 │ policy.edge_head.1                         │ Linear    │  2.1 M │ train │
+│ 18 │ policy.edge_head.2                         │ GELU      │      0 │ train │
+│ 19 │ policy.edge_head.3                         │ Dropout   │      0 │ train │
+│ 20 │ policy.edge_head.4                         │ Linear    │  1.0 K │ train │
+│ 21 │ policy.stop_head                           │ Sequenti… │  2.1 M │ train │
+│ 22 │ policy.stop_head.0                         │ LayerNorm │  4.1 K │ train │
+│ 23 │ policy.stop_head.1                         │ Linear    │  2.1 M │ train │
+│ 24 │ policy.stop_head.2                         │ GELU      │      0 │ train │
+│ 25 │ policy.stop_head.3                         │ Linear    │  1.0 K │ train │
+│ 26 │ reward_fn                                  │ GFlowNet… │      0 │ train │
+│ 27 │ env                                        │ GraphEnv  │      0 │ train │
+│ 28 │ embedder                                   │ GraphEmb… │  8.4 M │ train │
+│ 29 │ embedder.entity_proj                       │ Embeddin… │  1.0 M │ train │
+│ 30 │ embedder.entity_proj.network               │ Sequenti… │  1.0 M │ train │
+│ 31 │ embedder.entity_proj.network.0             │ Linear    │  1.0 M │ train │
+│ 32 │ embedder.entity_proj.network.1             │ Tanh      │      0 │ train │
+│ 33 │ embedder.relation_proj                     │ Embeddin… │  1.0 M │ train │
+│ 34 │ embedder.relation_proj.network             │ Sequenti… │  1.0 M │ train │
+│ 35 │ embedder.relation_proj.network.0           │ Linear    │  1.0 M │ train │
+│ 36 │ embedder.relation_proj.network.1           │ Tanh      │      0 │ train │
+│ 37 │ embedder.query_proj                        │ Embeddin… │  1.0 M │ train │
+│ 38 │ embedder.query_proj.network                │ Sequenti… │  1.0 M │ train │
+│ 39 │ embedder.query_proj.network.0              │ Linear    │  1.0 M │ train │
+│ 40 │ embedder.query_proj.network.1              │ Tanh      │      0 │ train │
+│ 41 │ embedder.non_text_entity_emb               │ Embedding │  1.0 K │ train │
+│ 42 │ embedder._dde                              │ DDE       │      0 │ train │
+│ 43 │ embedder._dde.layers                       │ ModuleLi… │      0 │ train │
+│ 44 │ embedder._dde.layers.0                     │ PEConv    │      0 │ train │
+│ 45 │ embedder._dde.layers.0.aggr_module         │ MeanAggr… │      0 │ train │
+│ 46 │ embedder._dde.layers.1                     │ PEConv    │      0 │ train │
+│ 47 │ embedder._dde.layers.1.aggr_module         │ MeanAggr… │      0 │ train │
+│ 48 │ embedder._dde.reverse_layers               │ ModuleLi… │      0 │ train │
+│ 49 │ embedder._dde.reverse_layers.0             │ PEConv    │      0 │ train │
+│ 50 │ embedder._dde.reverse_layers.0.aggr_module │ MeanAggr… │      0 │ train │
+│ 51 │ embedder._dde.reverse_layers.1             │ PEConv    │      0 │ train │
+│ 52 │ embedder._dde.reverse_layers.1.aggr_module │ MeanAggr… │      0 │ train │
+│ 53 │ embedder.edge_adapter                      │ Sequenti… │  5.3 M │ train │
+│ 54 │ embedder.edge_adapter.0                    │ Linear    │  4.2 M │ train │
+│ 55 │ embedder.edge_adapter.1                    │ LayerNorm │  2.0 K │ train │
+│ 56 │ embedder.edge_adapter.2                    │ GELU      │      0 │ train │
+│ 57 │ embedder.edge_adapter.3                    │ Linear    │  1.0 M │ train │
+│ 58 │ embedder.edge_score_proj                   │ Linear    │  1.0 K │ train │
+│ 59 │ estimator                                  │ GFlowNet… │  2.1 M │ train │
+│ 60 │ estimator.log_z_head                       │ Sequenti… │  2.1 M │ train │
+│ 61 │ estimator.log_z_head.0                     │ LayerNorm │  4.1 K │ train │
+│ 62 │ estimator.log_z_head.1                     │ Linear    │  2.1 M │ train │
+│ 63 │ estimator.log_z_head.2                     │ GELU      │      0 │ train │
+│ 64 │ estimator.log_z_head.3                     │ Linear    │  1.0 K │ train │
+│ 65 │ actor                                      │ GFlowNet… │  9.5 M │ train │
+│ 66 │ actor.state_encoder                        │ StateEnc… │  6.1 K │ train │
+│ 67 │ actor.state_encoder.step_embeddings        │ Embedding │  4.1 K │ train │
+│ 68 │ actor.state_encoder.norm                   │ LayerNorm │  2.0 K │ train │
+└────┴────────────────────────────────────────────┴───────────┴────────┴───────┘
+Trainable params: 20.0 M                                                        
+Non-trainable params: 0                                                         
+Total params: 20.0 M                                                            
+Total estimated model params size (MB): 79                                      
+Modules in train mode: 69                                                       
+Modules in eval mode: 0                                                         
+Epoch 54/199                   0/22 0:00:06 • 0:00:00 0.00it/s train/loss: 2.795
+                                                               train/log_reward:
+                                                               -1.612           
+                                                               train/answer_hit:
+                                                               0.458            
+[[36m2025-12-24 18:24:04,995[0m][[34msrc.utils.utils[0m][[31mERROR[0m] - [rank: 0] [0m
+Traceback (most recent call last):
+  File "/mnt/wangjingxiong/EVI-RAG/src/utils/utils.py", line 75, in wrap
+    metric_dict, object_dict = task_func(cfg=cfg)
+                               ^^^^^^^^^^^^^^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/train.py", line 134, in train
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 560, in fit
+    call._call_and_handle_interrupt(
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 49, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 598, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1011, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1055, in _run_stage
+    self.fit_loop.run()
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 216, in run
+    self.advance()
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 458, in advance
+    self.epoch_loop.run(self._data_fetcher)
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 152, in run
+    self.advance(data_fetcher)
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 310, in advance
+    batch, _, __ = next(data_fetcher)
+                   ^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fetchers.py", line 134, in __next__
+    batch = super().__next__()
+            ^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fetchers.py", line 61, in __next__
+    batch = next(self.iterator)
+            ^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/utilities/combined_loader.py", line 341, in __next__
+    out = next(self._iterator)
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/utilities/combined_loader.py", line 78, in __next__
+    out[i] = next(self.iterators[i])
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 733, in __next__
+    data = self._next_data()
+           ^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1515, in _next_data
+    return self._process_data(data, worker_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1550, in _process_data
+    data.reraise()
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/_utils.py", line 750, in reraise
+    raise exception
+ValueError: Caught ValueError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+            ~~~~~~~~~~~~^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/data/g_agent_dataset.py", line 648, in __getitem__
+    record = self._read_jsonl_record(idx)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/data/g_agent_dataset.py", line 671, in _read_jsonl_record
+    raise ValueError(f"Empty line at idx={idx}")
+ValueError: Empty line at idx=2060
+
+[[36m2025-12-24 18:24:04,997[0m][[34msrc.utils.utils[0m][[32mINFO[0m] - [rank: 0] Output dir: /mnt/wangjingxiong/EVI-RAG/logs/train_gflownet/multiruns/2025-12-24_16-07-06/9[0m
+Error executing job with overrides: ['model.actor_cfg.action_topk=50', 'model.reward_cfg.shaping_coef=5.0', 'model.optimizer_cfg.lr=8.898896996100196e-05', 'experiment=train_gflownet', 'hparams_search=gflownet_optuna', 'dataset=webqsp', 'ckpt.retriever=logs/train_retriever_default/runs/2025-12-24_13-39-33/checkpoints/epoch_010.ckpt', 'logger=none']
+Error executing job with overrides: ['model.actor_cfg.action_topk=50', 'model.reward_cfg.shaping_coef=5.0', 'model.optimizer_cfg.lr=8.898896996100196e-05', 'experiment=train_gflownet', 'hparams_search=gflownet_optuna', 'dataset=webqsp', 'ckpt.retriever=logs/train_retriever_default/runs/2025-12-24_13-39-33/checkpoints/epoch_010.ckpt', 'logger=none']
+Traceback (most recent call last):
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+           ^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra/_internal/utils.py", line 466, in <lambda>
+    lambda: hydra.multirun(
+            ^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 162, in multirun
+    ret = sweeper.sweep(arguments=task_overrides)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra_plugins/hydra_optuna_sweeper/optuna_sweeper.py", line 52, in sweep
+    return self.sweeper.sweep(arguments)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra_plugins/hydra_optuna_sweeper/_impl.py", line 391, in sweep
+    raise e
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra_plugins/hydra_optuna_sweeper/_impl.py", line 360, in sweep
+    f"Return value must be float-castable. Got '{ret.return_value}'."
+                                                 ^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra/core/utils.py", line 260, in return_value
+    raise self._return_value
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra_plugins/hydra_optuna_sweeper/_impl.py", line 357, in sweep
+    values = [float(ret.return_value)]
+                    ^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra/core/utils.py", line 260, in return_value
+    raise self._return_value
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/train.py", line 184, in main
+    metric_dict, _ = train(cfg)
+                     ^^^^^^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/utils/utils.py", line 85, in wrap
+    raise ex
+  File "/mnt/wangjingxiong/EVI-RAG/src/utils/utils.py", line 75, in wrap
+    metric_dict, object_dict = task_func(cfg=cfg)
+                               ^^^^^^^^^^^^^^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/train.py", line 134, in train
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 560, in fit
+    call._call_and_handle_interrupt(
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 49, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 598, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1011, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1055, in _run_stage
+    self.fit_loop.run()
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 216, in run
+    self.advance()
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 458, in advance
+    self.epoch_loop.run(self._data_fetcher)
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 152, in run
+    self.advance(data_fetcher)
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 310, in advance
+    batch, _, __ = next(data_fetcher)
+                   ^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fetchers.py", line 134, in __next__
+    batch = super().__next__()
+            ^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/loops/fetchers.py", line 61, in __next__
+    batch = next(self.iterator)
+            ^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/utilities/combined_loader.py", line 341, in __next__
+    out = next(self._iterator)
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/lightning/pytorch/utilities/combined_loader.py", line 78, in __next__
+    out[i] = next(self.iterators[i])
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 733, in __next__
+    data = self._next_data()
+           ^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1515, in _next_data
+    return self._process_data(data, worker_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1550, in _process_data
+    data.reraise()
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/_utils.py", line 750, in reraise
+    raise exception
+ValueError: Caught ValueError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/anaconda3/envs/pog/lib/python3.11/site-packages/torch/utils/data/_utils/fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+            ~~~~~~~~~~~~^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/data/g_agent_dataset.py", line 648, in __getitem__
+    record = self._read_jsonl_record(idx)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/wangjingxiong/EVI-RAG/src/data/g_agent_dataset.py", line 671, in _read_jsonl_record
+    raise ValueError(f"Empty line at idx={idx}")
+ValueError: Empty line at idx=2060
+

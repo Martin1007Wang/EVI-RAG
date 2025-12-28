@@ -2,9 +2,10 @@
 _target_: src.data.reasoner_path_datamodule.ReasonerPathDataModule
 
 # Required paths (split-aware, eval_gflownet/<split>.jsonl + <split>.manifest.json)
-eval_cache_path: ${dataset.materialized_dir}/eval_gflownet/${.split}.jsonl
+eval_cache_path: ${dataset.artifact_dir}/eval_gflownet/${.split}.jsonl
 entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
 relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+g_agent_path: ${dataset.artifact_dir}/g_agent/${.split}_g_agent.pt
 questions_path: ${dataset.out_dir}/questions.parquet
 answer_text_field: answer_texts
 
@@ -16,13 +17,13 @@ artifact_name: eval_gflownet
 schema_version: 1
 
 # Chain filtering / prompt construction
-max_chains_per_sample: 20
+max_chains_per_sample: 100
 min_chain_length: 1
 max_chain_length: null
 include_meta: true
 sort_by: ["-frequency", "-length"]
-system_prompt: "You are a concise QA agent. Use the provided paths as evidence and return JSON answers."
-user_instruction: "Copy all answer entities exactly as they appear in the paths (no paraphrase or alias). Return JSON only: {\"answers\": [\"<entity>\", ...]}. Use [] if the answer is absent."
+system_prompt: "You are a QA agent. Use the provided paths as evidence. Output JSON only."
+user_instruction: "Return ONLY a valid JSON object with key \"answers\" and a list of strings. Example: {\"answers\": [\"Jamaican English\", \"Jamaican Creole English Language\"]}. If no answer, return {\"answers\": []}. Do not include any extra text, markdown, or additional keys. Copy entities exactly as they appear in the paths."
 
 # Loader
 num_workers: 0

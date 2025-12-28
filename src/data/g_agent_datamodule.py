@@ -124,9 +124,12 @@ class GAgentDataModule(LightningDataModule):
             raise FileNotFoundError(f"g_agent cache path not configured for split={split}")
         if not path.exists():
             raise FileNotFoundError(f"g_agent cache not found for split={split}: {path}")
+        # Training always drops unreachable samples to avoid wasting rollouts on no-answer graphs.
+        # Validation/test keep the caller-configured behavior for diagnostics.
+        drop_unreachable = True if split == "train" else self.drop_unreachable
         return GAgentPyGDataset(
             path,
-            drop_unreachable=self.drop_unreachable,
+            drop_unreachable=drop_unreachable,
             prefer_jsonl=self.prefer_jsonl,
             convert_pt_to_jsonl=self.convert_pt_to_jsonl,
         )

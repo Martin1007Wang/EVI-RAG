@@ -1,0 +1,14 @@
+# Stream retriever top-k edges during predict().
+
+retriever_prediction_writer:
+  _target_: src.callbacks.retriever_prediction_writer.RetrieverPredictionWriter
+  output_dir: ${dataset.artifact_dir}/eval_retriever
+  split: ${run.split}
+  enabled: true
+  artifact_name: eval_retriever
+  schema_version: 1
+  ranking_k: ${model.evaluation_cfg.ranking_k}
+  textualize: false
+  entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
+  relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+  overwrite: true

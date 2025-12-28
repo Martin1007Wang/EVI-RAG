@@ -12,20 +12,17 @@ from tqdm import tqdm
 # Ensure repository root on sys.path
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.data.components.embedding_store import EmbeddingStore
 
 def _default_cache_path(data_dir: Path, dataset: str, split: str) -> Path:
     return data_dir / dataset / "materialized" / "g_agent" / f"{split}_g_agent.pt"
 
 
-def _default_lmdb_path(data_dir: Path, dataset: str, split: str) -> Path:
-    return data_dir / dataset / "materialized" / "embeddings" / f"{split}.lmdb"
-
-
 def _load_samples(path: Path) -> List[Dict]:
     payload = torch.load(path, map_location="cpu")
-    samples = payload.get("samples") or []
-    if not isinstance(samples, list):
+    if "samples" not in payload:
+        raise RuntimeError(f"Missing 'samples' in {path}")
+    samples = payload["samples"]
+    if not isinstance(samples, list) or not samples:
         raise RuntimeError(f"Unexpected g_agent payload structure in {path}")
     return samples
 
@@ -35,12 +32,16 @@ def _build_node_maps(sample: Dict) -> Tuple[Dict[int, int], Dict[int, int], Set[
     g2l: Dict[int, int] = {}
     l2g: Dict[int, int] = {}
     locals_set: Set[int] = set()
-    for node in sample.get("selected_nodes") or []:
-        try:
-            local = int(node.get("local_index"))
-            gid = int(node.get("global_id"))
-        except Exception:
-            continue
+    if "selected_nodes" not in sample:
+        raise KeyError("selected_nodes missing from sample")
+    nodes = sample["selected_nodes"]
+    if not isinstance(nodes, list):
+        raise TypeError("selected_nodes must be a list")
+    for node in nodes:
+        if "local_index" not in node or "global_id" not in node:
+            raise KeyError("selected_nodes entries must include local_index and global_id")
+        local = int(node["local_index"])
+        gid = int(node["global_id"])
         g2l[gid] = local
         l2g[local] = gid
         locals_set.add(local)
@@ -49,15 +50,19 @@ def _build_node_maps(sample: Dict) -> Tuple[Dict[int, int], Dict[int, int], Set[
 
 def _build_edges(sample: Dict) -> List[Tuple[int, int, int, float]]:
     edges = []
-    for edge in sample.get("selected_edges") or []:
-        try:
-            h = int(edge.get("head"))
-            t = int(edge.get("tail"))
-            idx = int(edge.get("local_index"))
-            score = float(edge.get("score", 0.0))
-            rel = edge.get("relation")
-        except Exception:
-            continue
+    if "selected_edges" not in sample:
+        raise KeyError("selected_edges missing from sample")
+    raw_edges = sample["selected_edges"]
+    if not isinstance(raw_edges, list):
+        raise TypeError("selected_edges must be a list")
+    for edge in raw_edges:
+        if "head" not in edge or "tail" not in edge or "local_index" not in edge or "score" not in edge:
+            raise KeyError("selected_edges entries must include head/tail/local_index/score")
+        h = int(edge["head"])
+        t = int(edge["tail"])
+        idx = int(edge["local_index"])
+        score = float(edge["score"])
+        rel = edge["relation"]
         edges.append((h, t, idx, score, rel))
     return edges
 
@@ -132,7 +137,7 @@ def _truncate_sample(sample: Dict, edges_sorted: List[Tuple[int, int, int, float
         selected_edges.append({"local_index": idx, "head": h, "tail": t, "relation": None, "label": 0.0, "score": score})
         nodes_needed.add(h)
         nodes_needed.add(t)
-    node_lookup = {int(n["local_index"]): n for n in sample.get("selected_nodes") or []}
+    node_lookup = {int(n["local_index"]): n for n in sample["selected_nodes"]}
     selected_nodes = []
     for loc in sorted(nodes_needed):
         node = node_lookup.get(loc)
@@ -154,7 +159,6 @@ def _truncate_sample(sample: Dict, edges_sorted: List[Tuple[int, int, int, float
 
 def evaluate_greedy(
     cache_path: Path,
-    store: Optional[EmbeddingStore],
     *,
     topk_list: List[int],
     save_dir: Optional[Path] = None,
@@ -188,46 +192,12 @@ def evaluate_greedy(
             break
         total += 1
         g2l, l2g, _ = _build_node_maps(sample)
-        answers_global = [int(a) for a in sample.get("answer_entity_ids") or [] if int(a) >= 0]
-        starts_global = [int(s) for s in sample.get("start_entity_ids") or [] if int(s) >= 0]
-        if store is not None:
-            try:
-                sample_id = str(sample.get("sample_id"))
-                raw = store.load_sample(sample_id)
-                node_global_ids = raw.get("node_global_ids")
-                if node_global_ids is not None:
-                    node_global_ids = torch.as_tensor(node_global_ids).view(-1)
-                    if not answers_global:
-                        a_locals = raw.get("a_local_indices") or []
-                        answers_global = []
-                        for loc in a_locals:
-                            loc_int = int(loc)
-                            if 0 <= loc_int < node_global_ids.numel():
-                                answers_global.append(int(node_global_ids[loc_int].item()))
-                    if not starts_global:
-                        q_locals = raw.get("q_local_indices") or []
-                        for loc in q_locals:
-                            loc_int = int(loc)
-                            if 0 <= loc_int < node_global_ids.numel():
-                                starts_global.append(int(node_global_ids[loc_int].item()))
-            except Exception:
-                pass
-        if not answers_global:
-            # fallback: use GT path nodes as proxy for answers
-            gt_nodes_local = sample.get("gt_path_node_local_indices") or []
-            answers_global = [l2g.get(int(loc)) for loc in gt_nodes_local if int(loc) in l2g]
-            answers_global = [a for a in answers_global if a is not None]
-        if not starts_global:
-            q_locals = sample.get("question_local_indices") or []
-            starts_global = [l2g.get(int(loc)) for loc in q_locals if int(loc) in l2g]
-            starts_global = [s for s in starts_global if s is not None]
-        if not starts_global:
-            # last resort: use first GT node as start
-            gt_nodes_local = sample.get("gt_path_node_local_indices") or []
-            if gt_nodes_local:
-                first = int(gt_nodes_local[0])
-                if first in l2g:
-                    starts_global = [l2g[first]]
+        if "answer_entity_ids" not in sample:
+            raise KeyError("answer_entity_ids missing from sample")
+        if "start_entity_ids" not in sample:
+            raise KeyError("start_entity_ids missing from sample")
+        answers_global = [int(a) for a in sample["answer_entity_ids"] if int(a) >= 0]
+        starts_global = [int(s) for s in sample["start_entity_ids"] if int(s) >= 0]
         answers_local = {g2l[a] for a in answers_global if a in g2l}
         starts_local = {g2l[s] for s in starts_global if s in g2l}
         edges = _build_edges(sample)
@@ -237,7 +207,9 @@ def evaluate_greedy(
         has_answer = _answer_hit(g2l, answers_global)
         if has_answer:
             answer_present += 1
-        gt_edge_locals = set(int(x) for x in sample.get("gt_path_edge_local_indices") or [])
+        if "gt_path_edge_local_indices" not in sample:
+            raise KeyError("gt_path_edge_local_indices missing from sample")
+        gt_edge_locals = set(int(x) for x in sample["gt_path_edge_local_indices"])
 
         for k in topk_list:
             top_edges = edges_sorted[:k]
@@ -327,7 +299,7 @@ def main() -> None:
     parser.add_argument("--dataset", type=str, default="webqsp", help="Dataset name (e.g., webqsp).")
     parser.add_argument("--split", type=str, default="test", choices=["train", "validation", "test"])
     parser.add_argument("--cache_path", type=Path, default=None, help="Override g_agent cache path.")
-    parser.add_argument("--lmdb_path", type=Path, default=None, help="Optional LMDB path to backfill starts/answers.")
+    parser.add_argument("--lmdb_path", type=Path, default=None, help="(deprecated) LMDB backfill is unsupported.")
     parser.add_argument("--topk", type=str, default="5,10,15,20,50", help="Comma-separated list of K for eval and export.")
     parser.add_argument("--save_dir", type=Path, default=None, help="Optional dir to save greedy_topK.pt artifacts.")
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for quick stats.")
@@ -336,16 +308,11 @@ def main() -> None:
     cache_path = args.cache_path or _default_cache_path(args.data_dir, args.dataset, args.split)
     if not cache_path.exists():
         raise FileNotFoundError(f"Cache not found: {cache_path}")
+    if args.lmdb_path is not None:
+        raise ValueError("lmdb_path backfill is no longer supported; provide start/answer ids in the cache.")
     topk_list = [int(x) for x in args.topk.split(",") if str(x).strip()]
-    lmdb_path = args.lmdb_path or _default_lmdb_path(args.data_dir, args.dataset, args.split)
-    store = None
-    if lmdb_path.exists():
-        store = EmbeddingStore(lmdb_path)
-    else:
-        print(f"LMDB not found at {lmdb_path}, skipping backfill for starts/answers.")
     evaluate_greedy(
         cache_path,
-        store=store,
         topk_list=topk_list,
         save_dir=args.save_dir,
         limit=args.limit,

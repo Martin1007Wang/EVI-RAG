@@ -27,7 +27,6 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 def _greedy_retriever_metrics(
     data: Data,
     k_list: list[int],
-    use_top_mask: bool,
 ) -> dict[int, dict[str, float]]:
     """Simulate greedy policy over edge_scores with start-constraint; length=1 rollout."""
     edge_scores = data.edge_scores
@@ -36,7 +35,6 @@ def _greedy_retriever_metrics(
     start_nodes = data.start_node_locals
     answer_nodes = data.answer_node_locals
     gt_edges = data.gt_path_edge_local_ids
-    edge_mask = data.top_edge_mask if use_top_mask and hasattr(data, "top_edge_mask") else None
 
     # mask to edges touching any start node
     if start_nodes.numel() > 0:
@@ -46,7 +44,7 @@ def _greedy_retriever_metrics(
     else:
         touch_start = torch.ones(num_edges, dtype=torch.bool)
 
-    valid_mask = touch_start if edge_mask is None else (touch_start & edge_mask)
+    valid_mask = touch_start
     if not valid_mask.any():
         return {k: {"success": 0.0, "answer_hit_any": 0.0, "answer_recall_union": 0.0, "path_hit_any": 0.0,
                     "path_hit_precision": 0.0, "path_hit_recall": 0.0, "path_hit_f1": 0.0} for k in k_list}
@@ -58,8 +56,6 @@ def _greedy_retriever_metrics(
     results: dict[int, dict[str, float]] = {}
     for k in k_list:
         topk = order[: min(k, num_edges)]
-        if edge_mask is not None:
-            topk = topk[valid_mask[topk]]
         if topk.numel() == 0:
             results[k] = {
                 "success": 0.0,
@@ -115,7 +111,6 @@ def _beam_greedy_metrics(
     data: Data,
     k_list: list[int],
     max_steps: int,
-    use_top_mask: bool,
 ) -> dict[int, dict[str, float]]:
     """Greedy beam search on edge_scores with env-like constraints (start-only step0, no revisit/backtrack)."""
     edge_scores = data.edge_scores
@@ -124,7 +119,6 @@ def _beam_greedy_metrics(
     start_nodes = data.start_node_locals
     answer_nodes = data.answer_node_locals
     gt_edges = data.gt_path_edge_local_ids
-    edge_mask = data.top_edge_mask if use_top_mask and hasattr(data, "top_edge_mask") else None
 
     # build adjacency lists per node for fast expansion
     num_nodes = int(edge_index.max().item()) + 1 if edge_index.numel() > 0 else 0
@@ -144,7 +138,7 @@ def _beam_greedy_metrics(
                 touch_start[eid] = True
     else:
         touch_start = torch.ones(num_edges, dtype=torch.bool)
-    valid_mask = touch_start if edge_mask is None else (touch_start & edge_mask)
+    valid_mask = touch_start
     if not valid_mask.any():
         empty = {k: {"success": 0.0, "answer_hit_any": 0.0, "answer_recall_union": 0.0, "path_hit_any": 0.0,
                      "path_hit_precision": 0.0, "path_hit_recall": 0.0, "path_hit_f1": 0.0} for k in k_list}
@@ -190,8 +184,6 @@ def _beam_greedy_metrics(
             visited = beam["visited"]  # type: ignore[assignment]
             valid = []
             for eid in adj[cur]:
-                if edge_mask is not None and not bool(edge_mask[eid]):
-                    continue
                 h = int(edge_index[0, eid].item())
                 t = int(edge_index[1, eid].item())
                 nxt = t if cur == h else h
@@ -330,7 +322,7 @@ def _gt_ranks(edge_scores: torch.Tensor, gt_ids: torch.Tensor, mask: torch.Tenso
     return ranks, gaps
 
 
-def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_steps: int | None, use_top_mask: bool) -> None:
+def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_steps: int | None) -> None:
     total = len(dataset)
     n = min(max_samples, total)
     indices = random.sample(range(total), n)
@@ -356,20 +348,15 @@ def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_
         data: Data = dataset[idx]
         edge_index = data.edge_index
         num_nodes = int(data.num_nodes)
-        # candidate mask
-        edge_mask = data.top_edge_mask if use_top_mask and hasattr(data, "top_edge_mask") else None
-        if hasattr(data, "answer_node_locals") and data.answer_node_locals.numel() > 0:
+        if data.answer_node_locals.numel() > 0:
             answer_present += 1
-        if hasattr(data, "is_answer_reachable") and bool(data.is_answer_reachable.item()):
+        if bool(data.is_answer_reachable.item()):
             answer_reachable += 1
-        if hasattr(data, "gt_path_exists") and bool(data.gt_path_exists.item()):
+        if bool(data.gt_path_exists.item()):
             gt_path_present += 1
 
         # branching factor: edges per start node (after mask)
-        if edge_mask is not None:
-            masked_edges = edge_index[:, edge_mask]
-        else:
-            masked_edges = edge_index
+        masked_edges = edge_index
         starts = data.start_node_locals
         out_deg = 0
         if starts.numel() > 0:
@@ -380,7 +367,7 @@ def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_
 
         # GT ranks
         gt_edges = data.gt_path_edge_local_ids
-        ranks, gaps = _gt_ranks(data.edge_scores, gt_edges, edge_mask)
+        ranks, gaps = _gt_ranks(data.edge_scores, gt_edges, None)
         rank_list.extend(ranks)
         gap_list.extend(gaps)
 
@@ -404,9 +391,7 @@ def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_
         f"GT rank count: {len(rank_list)} | MRR: {mrr:.4f} | Recall@1/5/10: {recall_at[1]:.4f}/{recall_at[5]:.4f}/{recall_at[10]:.4f}"
     )
     print(f"Avg score gap (gt - best_other): {_mean(gap_list):.4f}")
-    print(
-        f"Avg out-degree (per start, masked={use_top_mask}): {_mean(out_deg_list):.2f} | max: {max(out_deg_list) if out_deg_list else 0}"
-    )
+    print(f"Avg out-degree (per start): {_mean(out_deg_list):.2f} | max: {max(out_deg_list) if out_deg_list else 0}")
     finite_paths = [p for p in path_len_list if math.isfinite(p)]
     print(
         f"Shortest path len (finite only) mean: {_mean(finite_paths):.2f} | median: {float(torch.median(torch.tensor(finite_paths)).item()) if finite_paths else float('nan')}"
@@ -414,15 +399,15 @@ def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_
     # Greedy (retriever-score, 单步) 上界
     for idx in indices:
         data: Data = dataset[idx]
-        greedy = _greedy_retriever_metrics(data, greedy_k_list, use_top_mask)
+        greedy = _greedy_retriever_metrics(data, greedy_k_list)
         for k in greedy_k_list:
             greedy_counts[k]["all"] += 1
-            if data.answer_node_locals.numel() > 0 and bool(getattr(data, "is_answer_reachable", True)):
+            if data.answer_node_locals.numel() > 0 and bool(data.is_answer_reachable.item()):
                 greedy_counts[k]["answer"] += 1
                 greedy_sums[k]["answer_hit_any"] += greedy[k]["answer_hit_any"]
                 greedy_sums[k]["answer_recall_union"] += greedy[k]["answer_recall_union"]
                 greedy_sums[k]["success"] += greedy[k]["success"]
-            if bool(getattr(data, "gt_path_exists", True)):
+            if bool(data.gt_path_exists.item()):
                 greedy_counts[k]["path"] += 1
                 greedy_sums[k]["path_hit_any"] += greedy[k]["path_hit_any"]
                 greedy_sums[k]["path_hit_precision"] += greedy[k]["path_hit_precision"]
@@ -431,15 +416,15 @@ def analyze_dataset(dataset: GAgentPyGDataset, name: str, max_samples: int, max_
     # Beam 贪心（多步 env 约束）上界
     for idx in indices:
         data: Data = dataset[idx]
-        beam = _beam_greedy_metrics(data, greedy_k_list, max_steps if max_steps is not None else 6, use_top_mask)
+        beam = _beam_greedy_metrics(data, greedy_k_list, max_steps if max_steps is not None else 6)
         for k in greedy_k_list:
             beam_counts[k]["all"] += 1
-            if data.answer_node_locals.numel() > 0 and bool(getattr(data, "is_answer_reachable", True)):
+            if data.answer_node_locals.numel() > 0 and bool(data.is_answer_reachable.item()):
                 beam_counts[k]["answer"] += 1
                 beam_sums[k]["answer_hit_any"] += beam[k]["answer_hit_any"]
                 beam_sums[k]["answer_recall_union"] += beam[k]["answer_recall_union"]
                 beam_sums[k]["success"] += beam[k]["success"]
-            if bool(getattr(data, "gt_path_exists", True)):
+            if bool(data.gt_path_exists.item()):
                 beam_counts[k]["path"] += 1
                 beam_sums[k]["path_hit_any"] += beam[k]["path_hit_any"]
                 beam_sums[k]["path_hit_precision"] += beam[k]["path_hit_precision"]
@@ -509,7 +494,6 @@ def main() -> None:
     parser.add_argument(
         "--max-steps", type=int, default=6, help="Max steps for reachability stats (None to skip)", nargs="?", const=None
     )
-    parser.add_argument("--use-top-mask", action="store_true", help="Use top_edge_mask to filter edges")
     args = parser.parse_args()
 
     if not args.train_path.exists() or not args.val_path.exists():
@@ -518,12 +502,12 @@ def main() -> None:
     train_ds = GAgentPyGDataset(args.train_path, drop_unreachable=False)
     val_ds = GAgentPyGDataset(args.val_path, drop_unreachable=False)
 
-    analyze_dataset(train_ds, "train", args.max_samples, args.max_steps, args.use_top_mask)
-    analyze_dataset(val_ds, "val", args.max_samples, args.max_steps, args.use_top_mask)
+    analyze_dataset(train_ds, "train", args.max_samples, args.max_steps)
+    analyze_dataset(val_ds, "val", args.max_samples, args.max_steps)
 
     if args.test_path.exists():
         test_ds = GAgentPyGDataset(args.test_path, drop_unreachable=False)
-        analyze_dataset(test_ds, "test", args.max_samples, args.max_steps, args.use_top_mask)
+        analyze_dataset(test_ds, "test", args.max_samples, args.max_steps)
     else:
         print(f"Test path {args.test_path} not found; skipping test split.")
 
@@ -533,7 +517,6 @@ if __name__ == "__main__":
 def _greedy_retriever_metrics(
     data: Data,
     k_list: list[int],
-    use_top_mask: bool,
 ) -> dict[int, dict[str, float]]:
     """Simulate greedy policy over edge_scores with start-constraint; length=1 rollout."""
     edge_scores = data.edge_scores
@@ -542,7 +525,6 @@ def _greedy_retriever_metrics(
     start_nodes = data.start_node_locals
     answer_nodes = data.answer_node_locals
     gt_edges = data.gt_path_edge_local_ids
-    edge_mask = data.top_edge_mask if use_top_mask and hasattr(data, "top_edge_mask") else None
 
     # mask to edges touching any start node
     if start_nodes.numel() > 0:
@@ -552,7 +534,7 @@ def _greedy_retriever_metrics(
     else:
         touch_start = torch.ones(num_edges, dtype=torch.bool)
 
-    valid_mask = touch_start if edge_mask is None else (touch_start & edge_mask)
+    valid_mask = touch_start
     if not valid_mask.any():
         return {k: {"success": 0.0, "answer_hit_any": 0.0, "answer_recall_union": 0.0, "path_hit_any": 0.0,
                     "path_hit_precision": 0.0, "path_hit_recall": 0.0, "path_hit_f1": 0.0} for k in k_list}
@@ -564,8 +546,6 @@ def _greedy_retriever_metrics(
     results: dict[int, dict[str, float]] = {}
     for k in k_list:
         topk = order[: min(k, num_edges)]
-        if edge_mask is not None:
-            topk = topk[valid_mask[topk]]
         if topk.numel() == 0:
             results[k] = {
                 "success": 0.0,

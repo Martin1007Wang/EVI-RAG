@@ -6,7 +6,7 @@ split: ${run.split}
 prompt_tag: oracle
 
 # Input: persisted retriever eval cache (eval_retriever/<split>.pt + <split>.manifest.json).
-eval_retriever_path: ${dataset.materialized_dir}/eval_retriever/${data.split}.pt
+eval_retriever_path: ${dataset.artifact_dir}/eval_retriever/${data.split}.pt
 artifact_name: eval_retriever
 schema_version: 1
 

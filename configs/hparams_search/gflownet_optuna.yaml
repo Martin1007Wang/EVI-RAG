@@ -28,7 +28,7 @@ hydra:
     params:
       # Branching factor (online).
       model.actor_cfg.action_topk: choice(50, 100, 200, 400)
-      # F1 shaping strength in log-domain.
-      model.reward_cfg.shaping_coef: choice(0.0, 1.0, 2.0, 5.0)
+      # Semantic shaping strength in log-domain.
+      model.reward_cfg.semantic_coef: choice(0.5, 1.0, 2.0, 5.0)
       # Optimizer LR (log-uniform).
       model.optimizer_cfg.lr: tag(log, interval(3e-5, 3e-4))

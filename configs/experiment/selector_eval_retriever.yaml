@@ -14,12 +14,15 @@ run:
   task_name: "eval/selector_retriever"
   tags: ["eval", "selector", "retriever"]
   split: test
-  return_predictions: false
-  save_metrics: true
   ckpt_path: null
+  dataset_variants:
+    - ${dataset.dataset_family}
+    - ${dataset.dataset_family}-sub
+  require_dual_datasets: true
 
 data:
   selector: retriever_topk
 
 model:
   selector: retriever_topk
+  allow_empty_dag: true

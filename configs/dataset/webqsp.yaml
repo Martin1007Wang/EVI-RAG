@@ -2,10 +2,13 @@
 
 name: webqsp
 kb: freebase
+dataset_scope: full
+dataset_family: webqsp
 
 raw_root: ${paths.data_dir}/webqsp/raw/data
 out_dir: ${paths.data_dir}/webqsp/normalized
 materialized_dir: ${paths.data_dir}/webqsp/materialized
+artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
 
 paths:
   vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
@@ -13,10 +16,12 @@ paths:
   processed: ${dataset.materialized_dir}/processed
 
 entity_normalization: none
+entity_text_mode: regex
+text_prefixes: []
+text_regex: "^(?!m\\.|g\\.).*"
 num_topics: 2
 topic_pe:
-  enabled: true
-  precompute: true
+  # Precomputed DDE features; runtime DDE is disabled.
   num_rounds: 2
   num_reverse_rounds: 2
 

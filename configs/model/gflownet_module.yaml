@@ -7,7 +7,8 @@ _recursive_: false
 hidden_dim: 1024
 env_cfg:
   _target_: src.models.components.gflownet_env.GraphEnv
-  max_steps: ${window.max_hops}
+  max_steps: 2
+  potential_scale: 1.0
 
 policy_cfg:
   _target_: src.models.components.gflownet_policy.GFlowNetEdgePolicy
@@ -18,13 +19,14 @@ policy_cfg:
 reward_cfg:
   _target_: src.models.components.gflownet_rewards.GFlowNetReward
   success_reward: 1.0
-  failure_reward: 0.01
-  shaping_coef: 2.0
+  failure_reward: 1e-4
+  semantic_coef: 1.0
+  length_coef: 1.0
 
 actor_cfg:
   _target_: src.models.components.gflownet_actor.GFlowNetActor
   policy_temperature: 1.0
-  action_topk: 100
+  action_topk: 50
 
 embedder_cfg:
   _target_: src.models.components.gflownet_embedder.GraphEmbedder
@@ -36,6 +38,11 @@ state_encoder_cfg:
   _target_: src.models.components.state_encoder.StateEncoder
   hidden_dim: ${model.hidden_dim}
   max_steps: ${model.env_cfg.max_steps}
+  use_state_dde: true
+  state_dde_cfg:
+    num_topics: ${dataset.num_topics}
+    num_rounds: ${dataset.topic_pe.num_rounds}
+    num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
 
 estimator_cfg:
   _target_: src.models.components.gflownet_estimator.GFlowNetEstimator
@@ -44,6 +51,13 @@ estimator_cfg:
 
 training_cfg:
   num_train_rollouts: 1
+  bc_weight: 0.0
+  bc_weight_floor: 0.0
+  bc_hold_ratio: 0.0
+  bc_decay_ratio: 0.0
+  bc_teacher_mode: pair_sampled
+  bc_soft_teacher_weight: 0.0
+  bc_soft_teacher_use_edge_scores: false
 
 evaluation_cfg:
   num_eval_rollouts: 5

@@ -1,0 +1,40 @@
+defaults:
+  - paths: default
+  - dataset: webqsp-sub
+  - _self_
+
+# dataset config will inject dataset/kb/raw_root/out_dir/column_map/entity_normalization
+dataset_name: ${dataset.name}
+kb: ${dataset.kb}
+raw_root: ${dataset.raw_root}
+out_dir: ${dataset.out_dir}
+column_map: ${dataset.column_map}
+entity_normalization: ${dataset.entity_normalization}
+# Text-entity detection (controls embedding_id assignment).
+entity_text_mode: ${dataset.entity_text_mode}
+text_prefixes: ${dataset.text_prefixes}
+text_regex: ${dataset.text_regex}
+# Shortest-path supervision is computed with undirected BFS (fixed design choice).
+
+# Sub build emits only filtered samples; no extra mask.
+emit_sub_filter: false
+sub_filter_filename: sub_filter.json
+
+# filtering / labeling knobs (sub dataset: strict filtering for all splits)
+filter:
+  train:
+    skip_no_topic: true
+    skip_no_ans: true
+    skip_no_path: true
+  validation:
+    skip_no_topic: true
+    skip_no_ans: true
+    skip_no_path: true
+  test:
+    skip_no_topic: true
+    skip_no_ans: true
+    skip_no_path: true
+  eval:
+    skip_no_topic: true
+    skip_no_ans: true
+    skip_no_path: true

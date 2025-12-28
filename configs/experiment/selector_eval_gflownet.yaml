@@ -14,14 +14,17 @@ run:
   task_name: "eval/selector_gflownet"
   tags: ["eval", "selector", "gflownet"]
   split: test
-  return_predictions: false
-  save_metrics: true
   ckpt_path: null
+  dataset_variants:
+    - ${dataset.dataset_family}
+    - ${dataset.dataset_family}-sub
+  require_dual_datasets: true
 
 data:
   selector: gflownet_rollouts
-  eval_gflownet_path: ${dataset.materialized_dir}/eval_gflownet/${run.split}.jsonl
+  eval_gflownet_path: ${dataset.artifact_dir}/eval_gflownet/${run.split}.jsonl
   k_values: ${window.rollout_k_values}
 
 model:
   selector: gflownet_rollouts
+  allow_empty_dag: true

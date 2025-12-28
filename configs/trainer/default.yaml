@@ -8,15 +8,21 @@ max_epochs: 200
 # let Lightning pick the right accelerator/devices unless overridden
 accelerator: auto
 devices: auto
+profiler: null
 
-# mixed precision for extra speed-up
-precision: 16-mixed
+# full precision to avoid NaNs during loss computation
+precision: 32-true
 
 # gradient clipping to stabilize TB under rare large residuals
 gradient_clip_val: 1.0
 
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 10
+
+# optional batch limits for profiling/debugging
+limit_train_batches: null
+limit_val_batches: null
+limit_test_batches: null
 
 # log interval (steps); set small to avoid skipping logs when epoch has few batches
 log_every_n_steps: 1

@@ -1,13 +1,18 @@
 name: gtsqa
 kb: wikidata
+dataset_scope: full
+dataset_family: gtsqa
 raw_root: ${paths.data_dir}/GTSQA/raw/gtsqa-with-graphs
 out_dir: ${paths.data_dir}/GTSQA/normalized
 materialized_dir: ${paths.data_dir}/GTSQA/materialized
+artifact_dir: ${paths.data_dir}/GTSQA/artifacts/${dataset.name}
 entity_normalization: none
+entity_text_mode: regex
+text_prefixes: []
+text_regex: "^(?!Q\\d+|P\\d+).+"
 num_topics: 2
 topic_pe:
-  enabled: true
-  precompute: true
+  # Precomputed DDE features; runtime DDE is disabled.
   num_rounds: 2
   num_reverse_rounds: 2
 column_map:

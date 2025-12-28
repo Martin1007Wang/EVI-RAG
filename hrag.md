@@ -119,9 +119,10 @@ $R(S_T) = \alpha \cdot \text{Recall}(S_T, G^*) + \beta \cdot \mathbb{I}(\text{LL
 
 Anchor 阶段输出的是 retriever 在 $G_{retrieval}$ 上的逐边分数 $s(e)$。为了承上启下，把这一层的“平铺边集合”变成 GFlowNet 可直接消费的 SSOT 图缓存（`g_agent`），我们实现了一个严格、确定性的 materialize：
 
-1.  **Top-K 截断**：对每个样本按 $s(e)$ 排序，保留前 $K$ 条边（`window.anchor_top_k`，默认来自 `configs/window/default.yaml` 的 `anchor_top_k`）。该集合对应 `top_edge_mask=True`。
-2.  **Triple 去重**：最终按三元组键 `(head_entity_id, relation_id, tail_entity_id)` 去重；`edge_scores` 用 max 聚合、`edge_labels` 用 max 聚合、`top_edge_mask` 用 OR 聚合（实现见 `src/data/components/g_agent_builder.py`）。
-3.  **GT 字段（可选，缺失静默）**：若 LMDB 提供 `gt_path_edge_indices`（或 `gt_paths_triples`）且其边恰好落在裁剪后的子图内，则写入 `gt_path_*`；否则 `gt_path_exists=false` 且 `gt_path_*` 为空张量。缺失 GT 不报错、不影响物化流程。
+1.  **全局 Top-K 选边（label-free）**：对 `G_{retrieval}` 的所有边按分数排序，直接保留 `edge_top_k` 条高分边。
+2.  **诱导子图 + Triple 去重**：对保留下来的边诱导子图，再按三元组键 `(head_entity_id, relation_id, tail_entity_id)` 去重；`edge_scores` 用 max 聚合、`edge_labels` 用 max 聚合（实现见 `src/data/components/g_agent_builder.py`）。
+3.  **Hop 裁剪 + 监督**：在去重后的子图上对 `start_node_locals` 做无向 BFS，保留 `max_hops` 内的节点/边；随后为每个 `(start, answer)` 对生成最短路 DAG 掩码（`pair_*` CSR + `edge_labels`）。
+4.  **GT 字段（可选，缺失静默）**：若 LMDB 提供 `gt_path_edge_indices`（或 `gt_paths_triples`）且其边恰好落在裁剪后的子图内，则写入 `gt_path_*`；否则 `gt_path_exists=false` 且 `gt_path_*` 为空张量。缺失 GT 不报错、不影响物化流程。
 
 g_agent 阶段会输出 `<split>_g_agent.pt`，包含每个样本的 Top-$K$ 边、由这些边诱导出的节点集合以及检索分数，形成 $G_{agent}$。运行方式示例：
 
@@ -139,7 +140,7 @@ python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path
 
 g_agent 管线会将 `experiment=eval_retriever` 的输出序列化成 `<split>_g_agent.pt`。为了直接用于 GFlowNet 训练，我们提供了：
 
-*   **数据模块**：`configs/data/gflownet.yaml` 读取 `{split}_g_agent.pt`，自动 padding 出批次级别的实体/关系 ID、Top-K 掩码与图结构。
+*   **数据模块**：`configs/data/gflownet.yaml` 读取 `{split}_g_agent.pt`，自动 padding 出批次级别的实体/关系 ID 与图结构。
 *   **策略模块**：`src/models/gflownet_module.py`（及 `src/models/components/`）实现策略网络与 SubTB 损失，依赖全局实体/关系嵌入 (`resources.{vocabulary_path, embeddings_dir}`) 进行 ID→语义映射。
 *   **训练入口**：使用 `python src/train.py experiment=train_gflownet data.cache_paths.train=/path/to/train_g_agent.pt ...` 启动。Reward 目前默认使用正例召回 + $\epsilon$ 平滑，可替换为任意 LLM 判别信号。
 

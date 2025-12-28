@@ -28,7 +28,6 @@ def test_g_agent_jsonl_dataset_stream_read(tmp_path: Path) -> None:
         edge_relations=torch.tensor([0]),
         edge_scores=torch.tensor([0.5]),
         edge_labels=torch.tensor([1.0]),
-        top_edge_mask=torch.tensor([True]),
         start_entity_ids=torch.tensor([1]),
         answer_entity_ids=torch.tensor([2]),
         gt_path_edge_local_ids=torch.tensor([0]),
@@ -38,7 +37,7 @@ def test_g_agent_jsonl_dataset_stream_read(tmp_path: Path) -> None:
         pair_start_node_locals=torch.tensor([0]),
         pair_answer_node_locals=torch.tensor([1]),
         pair_edge_local_ids=torch.tensor([0]),
-        pair_edge_ptr=torch.tensor([0, 1]),
+        pair_edge_counts=torch.tensor([1]),
         gt_path_exists=True,
         is_answer_reachable=True,
     )

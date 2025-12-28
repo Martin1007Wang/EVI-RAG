@@ -88,13 +88,7 @@ class ReasonerOracleDataModule(LightningDataModule):
         elif str(k) in triplets_by_k:
             key = str(k)
         else:
-            available: List[int] = []
-            for raw_key in triplets_by_k.keys():
-                try:
-                    available.append(int(raw_key))
-                except (TypeError, ValueError):
-                    continue
-            available.sort()
+            available = sorted(str(raw_key) for raw_key in triplets_by_k.keys())
             raise ValueError(f"triplets_by_k missing k={k} (available={available})")
         edges = triplets_by_k[key]
         if not isinstance(edges, list):
@@ -109,35 +103,31 @@ class ReasonerOracleDataModule(LightningDataModule):
         if not isinstance(payload, dict) or "samples" not in payload:
             raise ValueError(f"Unrecognized eval_retriever payload format at {self.eval_retriever_path}")
 
-        raw_samples = payload.get("samples") or []
-        if isinstance(raw_samples, dict):
-            raw_samples = list(raw_samples.values())
+        raw_samples = payload["samples"]
         if not isinstance(raw_samples, list) or not raw_samples:
             raise ValueError(f"Empty eval_retriever samples in {self.eval_retriever_path}")
 
         samples: List[Dict[str, Any]] = []
-        dropped_no_answer = 0
         for record in raw_samples:
             if not isinstance(record, dict):
-                continue
-            sample_id = record.get("sample_id")
+                raise ValueError("eval_retriever samples must be dicts.")
+            sample_id = record["sample_id"]
             if sample_id in (None, ""):
-                continue
-            answers = record.get("answer_entity_ids") or []
+                raise ValueError("sample_id is empty.")
+            answers = record["answer_entity_ids"]
             if not answers:
-                dropped_no_answer += 1
-                continue
-            triplets_by_k = record.get("triplets_by_k")
+                raise ValueError(f"answer_entity_ids empty for sample_id={sample_id}")
+            triplets_by_k = record["triplets_by_k"]
             if not isinstance(triplets_by_k, dict):
                 raise ValueError(f"Sample {sample_id} missing triplets_by_k dict.")
 
             edges = self._select_triplets_by_k(triplets_by_k, self.max_k)
-            head_ids = [int(e.get("head_entity_id", -1)) for e in edges]
-            tail_ids = [int(e.get("tail_entity_id", -1)) for e in edges]
+            head_ids = [int(e["head_entity_id"]) for e in edges]
+            tail_ids = [int(e["tail_entity_id"]) for e in edges]
             samples.append(
                 {
                     "id": str(sample_id),
-                    "question": str(record.get("question", "")),
+                    "question": str(record["question"]),
                     "answer_entity_ids": [int(x) for x in answers],
                     "head_entity_ids": head_ids,
                     "tail_entity_ids": tail_ids,
@@ -145,12 +135,11 @@ class ReasonerOracleDataModule(LightningDataModule):
             )
 
         logger.info(
-            "Prepared %d samples for %s/%s from %s (dropped_no_answer=%d, max_k=%d).",
+            "Prepared %d samples for %s/%s from %s (max_k=%d).",
             len(samples),
             self.dataset,
             self.split,
             self.eval_retriever_path,
-            dropped_no_answer,
             self.max_k,
         )
         return samples
@@ -160,20 +149,26 @@ class ReasonerOracleDataModule(LightningDataModule):
         if not manifest_path.exists():
             raise FileNotFoundError(f"Missing eval_retriever manifest: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("artifact") != self.artifact_name:
+        if "artifact" not in manifest:
+            raise ValueError("eval_retriever manifest missing artifact.")
+        if manifest["artifact"] != self.artifact_name:
             raise ValueError(
                 f"eval_retriever manifest artifact mismatch: expected '{self.artifact_name}', "
-                f"got '{manifest.get('artifact')}'."
+                f"got '{manifest['artifact']}'."
             )
-        if int(manifest.get("schema_version", -1)) != self.schema_version:
+        if "schema_version" not in manifest:
+            raise ValueError("eval_retriever manifest missing schema_version.")
+        if int(manifest["schema_version"]) != self.schema_version:
             raise ValueError(
                 f"eval_retriever manifest schema_version mismatch: expected {self.schema_version}, "
-                f"got {manifest.get('schema_version')}."
+                f"got {manifest['schema_version']}."
             )
-        if manifest.get("file") != data_path.name:
+        if "file" not in manifest:
+            raise ValueError("eval_retriever manifest missing file.")
+        if manifest["file"] != data_path.name:
             raise ValueError(
                 f"eval_retriever manifest file mismatch: expected '{data_path.name}', "
-                f"got '{manifest.get('file')}'."
+                f"got '{manifest['file']}'."
             )
 
     def _raise_missing_eval_retriever(self) -> None:

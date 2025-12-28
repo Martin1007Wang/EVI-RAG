@@ -14,21 +14,37 @@ run:
   task_name: "eval/gflownet"
   tags: ["eval", "gflownet"]
   split: test
-  return_predictions: false
-  save_metrics: false
   ckpt_path: ${ckpt.gflownet}
+  dataset_variants:
+    - ${dataset.dataset_family}
+    - ${dataset.dataset_family}-sub
+  require_dual_datasets: true
 
-# Checkpoints are run-dependent (not dataset-dependent).
+selector_eval:
+  enabled: true
+  selector: gflownet_rollouts
+  k_values: ${window.rollout_k_values}
+  allow_empty_dag: true
+  drop_unreachable: true
+  output_dir: ${paths.output_dir}
+  g_agent_path: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
+  eval_gflownet_path: ${dataset.artifact_dir}/eval_gflownet/${run.split}.jsonl
+  eval_gflownet_artifact_name: eval_gflownet
+  eval_gflownet_schema_version: 1
+  num_workers: 0
+
 ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
 data:
   cache_paths:
-    test: ${dataset.materialized_dir}/g_agent/${run.split}_g_agent.pt
+    test: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
 
 model:
+  env_cfg:
+    max_steps: 3
   evaluation_cfg:
-    num_eval_rollouts: ${window.rollout_k_values}
+    num_eval_rollouts: [1, 10, 25, 50, 100]
     rollout_temperature: 1.0
   embedder_cfg:
     allow_deferred_init: true

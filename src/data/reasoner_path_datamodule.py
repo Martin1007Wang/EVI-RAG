@@ -33,6 +33,7 @@ class ReasonerPathDataModule(LightningDataModule):
         eval_cache_path: str,
         entity_vocab_path: str,
         relation_vocab_path: Optional[str] = None,
+        g_agent_path: Optional[str] = None,
         questions_path: str,
         answer_text_field: str = "answer_texts",
         dataset: str = "webqsp",
@@ -56,6 +57,7 @@ class ReasonerPathDataModule(LightningDataModule):
         self.eval_cache_path = Path(eval_cache_path).expanduser().resolve()
         self.entity_vocab_path = Path(entity_vocab_path).expanduser().resolve()
         self.relation_vocab_path = Path(relation_vocab_path).expanduser().resolve() if relation_vocab_path else None
+        self.g_agent_path = Path(g_agent_path).expanduser().resolve() if g_agent_path else None
         self.questions_path = Path(questions_path).expanduser().resolve()
         self.answer_text_field = answer_text_field
         self.dataset = dataset
@@ -83,6 +85,7 @@ class ReasonerPathDataModule(LightningDataModule):
             eval_cache_path=str(self.eval_cache_path),
             entity_vocab_path=str(self.entity_vocab_path),
             relation_vocab_path=str(self.relation_vocab_path) if self.relation_vocab_path else None,
+            g_agent_path=str(self.g_agent_path) if self.g_agent_path else None,
             questions_path=str(self.questions_path),
             answer_text_field=self.answer_text_field,
             artifact_name=self.artifact_name,

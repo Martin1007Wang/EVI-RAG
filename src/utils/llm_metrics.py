@@ -29,27 +29,50 @@ def _extract_predictions(raw: Any) -> List[str]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise PredictionParseError(
-            f"invalid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
-        ) from exc
-
+        raise PredictionParseError("prediction must be a JSON object with 'answers'") from exc
     if not isinstance(parsed, dict):
         raise PredictionParseError(f"JSON root must be an object with 'answers', got {type(parsed).__name__}")
     if "answers" not in parsed:
         raise PredictionParseError("missing required key 'answers'")
-    answers = parsed["answers"]
-    if not isinstance(answers, list):
-        raise PredictionParseError(f"'answers' must be a list, got {type(answers).__name__}")
+    return _normalize_answer_list(parsed["answers"])
 
-    normalized: List[str] = []
-    for idx, ans in enumerate(answers):
-        if not isinstance(ans, str):
-            raise PredictionParseError(f"'answers[{idx}]' must be a string, got {type(ans).__name__}")
-        text_ans = ans.strip()
-        if not text_ans:
-            raise PredictionParseError(f"'answers[{idx}]' is empty")
-        normalized.append(text_ans)
-    return normalized
+
+def _normalize_answer_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        raise PredictionParseError(f"'answers' must be a list, got {type(values).__name__}")
+    return _flatten_answer_values(values)
+
+
+def _flatten_answer_values(values: List[Any]) -> List[str]:
+    out: List[str] = []
+    for item in values:
+        out.extend(_coerce_answer_item(item))
+    return out
+
+
+def _coerce_answer_item(item: Any) -> List[str]:
+    if item is None:
+        return []
+    if isinstance(item, dict):
+        for key in ("answers", "answer", "text", "name", "entity"):
+            if key in item:
+                return _coerce_answer_item(item[key])
+        return []
+    if isinstance(item, (list, tuple)):
+        out: List[str] = []
+        for sub in item:
+            out.extend(_coerce_answer_item(sub))
+        return out
+    if isinstance(item, set):
+        out: List[str] = []
+        for sub in sorted(item):
+            out.extend(_coerce_answer_item(sub))
+        return out
+    text = item if isinstance(item, str) else str(item)
+    text = text.strip()
+    if not text:
+        return []
+    return [text]
 
 
 def _match(pred: str, answer: str) -> bool:
@@ -88,7 +111,7 @@ def _dedupe_answers(values: List[str]) -> List[str]:
 def _score_answers(preds: List[str], gold_answers: List[str]) -> Dict[str, float]:
     if not gold_answers:
         return {
-            "hit@1": 0.0,
+            "hit": 0.0,
             "precision": 0.0,
             "recall": 0.0,
             "f1": 0.0,
@@ -99,7 +122,7 @@ def _score_answers(preds: List[str], gold_answers: List[str]) -> Dict[str, float
         }
 
     if preds:
-        hit = 1.0 if any(_match(preds[0], ans) for ans in gold_answers) else 0.0
+        hit = 1.0 if any(_match(pred, ans) for pred in preds for ans in gold_answers) else 0.0
     else:
         hit = 0.0
 
@@ -113,7 +136,7 @@ def _score_answers(preds: List[str], gold_answers: List[str]) -> Dict[str, float
     set_exact = 1.0 if pred_norm == gold_norm else 0.0
 
     return {
-        "hit@1": float(hit),
+        "hit": float(hit),
         "precision": list_scores["precision"],
         "recall": list_scores["recall"],
         "f1": list_scores["f1"],
@@ -268,7 +291,9 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
     base_by_window: Dict[int, Dict[str, List[float]]] = {}
 
     for item in predictions:
-        sample_id = str(item.get("id", "unknown"))
+        if "id" not in item:
+            raise ValueError("missing id in prediction item")
+        sample_id = str(item["id"])
         gold_raw = item.get("answers")
         if gold_raw is None:
             raise ValueError(f"missing gold answers for id={sample_id}")
@@ -294,7 +319,7 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
 
         if score is not None:
             total += 1
-            hits.append(score["hit@1"])
+            hits.append(score["hit"])
             precisions.append(score["precision"])
             recalls.append(score["recall"])
             f1s.append(score["f1"])
@@ -312,11 +337,19 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
             raise ValueError(f"missing visible_edge_ids for id={sample_id}")
         visible_edges = _as_int_list(item.get("visible_edge_ids"))
 
-        evidence_tokens = item.get("evidence_token_count")
-        prompt_tokens = item.get("prompt_token_count")
-        token_budget = item.get("token_budget")
+        if "evidence_token_count" not in item:
+            raise ValueError(f"missing evidence_token_count for id={sample_id}")
+        if "prompt_token_count" not in item:
+            raise ValueError(f"missing prompt_token_count for id={sample_id}")
+        if "token_budget" not in item:
+            raise ValueError(f"missing token_budget for id={sample_id}")
+        if "evidence_truncated" not in item:
+            raise ValueError(f"missing evidence_truncated for id={sample_id}")
+        evidence_tokens = item["evidence_token_count"]
+        prompt_tokens = item["prompt_token_count"]
+        token_budget = item["token_budget"]
         k_visible = len(visible_edges)
-        truncated = bool(item.get("evidence_truncated", False))
+        truncated = bool(item["evidence_truncated"])
         semantic_global.update(
             score=score["f1"] if score is not None else None,
             hit_set=hit_set,
@@ -330,10 +363,11 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
 
         window_k_raw = item.get("window_k")
         window_k: Optional[int] = None
-        try:
-            window_k = int(window_k_raw) if window_k_raw is not None else None
-        except (TypeError, ValueError):
-            window_k = None
+        if window_k_raw is not None:
+            try:
+                window_k = int(window_k_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"window_k must be int for id={sample_id}") from exc
 
         if window_k is not None:
             base_stats = base_by_window.setdefault(
@@ -351,7 +385,7 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
                 },
             )
             if score is not None:
-                base_stats["hits"].append(score["hit@1"])
+                base_stats["hits"].append(score["hit"])
                 base_stats["precisions"].append(score["precision"])
                 base_stats["recalls"].append(score["recall"])
                 base_stats["f1s"].append(score["f1"])
@@ -374,7 +408,7 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
             )
 
     metrics: Dict[str, float] = {
-        "results/hit@1": _mean(hits),
+        "results/hit": _mean(hits),
         "results/macro_precision": _mean(precisions),
         "results/macro_recall": _mean(recalls),
         "results/macro_f1": _mean(f1s),
@@ -388,7 +422,7 @@ def evaluate_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, float]:
     metrics.update(semantic_global.finalize(prefix="semantic"))
 
     for k_int, stats in sorted(base_by_window.items()):
-        metrics[f"results/window_{k_int}/hit@1"] = _mean(stats["hits"])
+        metrics[f"results/window_{k_int}/hit"] = _mean(stats["hits"])
         metrics[f"results/window_{k_int}/macro_precision"] = _mean(stats["precisions"])
         metrics[f"results/window_{k_int}/macro_recall"] = _mean(stats["recalls"])
         metrics[f"results/window_{k_int}/macro_f1"] = _mean(stats["f1s"])

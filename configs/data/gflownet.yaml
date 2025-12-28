@@ -1,9 +1,9 @@
 _target_: src.data.g_agent_datamodule.GAgentDataModule
 
 cache_paths:
-  train: ${dataset.materialized_dir}/g_agent/train_g_agent.pt
-  validation: ${dataset.materialized_dir}/g_agent/validation_g_agent.pt
-  test: ${dataset.materialized_dir}/g_agent/test_g_agent.pt
+  train: ${dataset.artifact_dir}/g_agent/train_g_agent.pt
+  validation: ${dataset.artifact_dir}/g_agent/validation_g_agent.pt
+  test: ${dataset.artifact_dir}/g_agent/test_g_agent.pt
 
 # 流式优先，若存在 jsonl 则直接使用；若仅有 pt，可选择自动转换为 jsonl 以便后续流式读取。
 prefer_jsonl: true

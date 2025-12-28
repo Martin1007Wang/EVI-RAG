@@ -16,6 +16,7 @@ from src.utils.metrics import normalize_k_values
 from src.utils.text_utils import count_tokens
 from datetime import datetime
 
+from .answer_utils import normalize_answer_texts
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +68,8 @@ class ReasonerTripletDataModule(LightningDataModule):
             raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
         self.token_budget = int(token_budget) if token_budget is not None else None
         self.token_budget_encoding = token_budget_encoding
+        if self.token_budget is not None and self.token_budget_encoding is None:
+            raise ValueError("token_budget_encoding must be set when token_budget is provided.")
         self.system_prompt = system_prompt
         self.num_workers = int(num_workers)
         self.prompt_tag = prompt_tag
@@ -87,29 +90,34 @@ class ReasonerTripletDataModule(LightningDataModule):
 
     def _load_vocab_maps(self) -> Tuple[Dict[int, str], Dict[int, str]]:
         """
-        Use vocabulary LMDB if provided; otherwise fall back to parquet maps.
+        Use vocabulary LMDB or parquet maps (explicit, no implicit fallback).
         """
-        if self._graph_store is None and self.entity_vocab_path.suffix == ".lmdb":
-            self._graph_store = GraphStore(self.entity_vocab_path)
-
-        if self._graph_store is not None:
+        if self.entity_vocab_path.suffix == ".lmdb" or self.relation_vocab_path.suffix == ".lmdb":
+            if self.entity_vocab_path.suffix != ".lmdb" or self.relation_vocab_path.suffix != ".lmdb":
+                raise ValueError("entity_vocab_path and relation_vocab_path must both be LMDB paths.")
+            if self.entity_vocab_path != self.relation_vocab_path:
+                raise ValueError("entity_vocab_path and relation_vocab_path must point to the same LMDB.")
+            if self._graph_store is None:
+                self._graph_store = GraphStore(self.entity_vocab_path)
             return dict(self._graph_store.id2entity), dict(self._graph_store.id2relation)
 
-        ent_map: Dict[int, str] = {}
-        rel_map: Dict[int, str] = {}
-        try:
-            if self.entity_vocab_path.exists():
-                ent_df = pd.read_parquet(self.entity_vocab_path)
-                if "entity_id" in ent_df.columns:
-                    ent_map = dict(zip(ent_df.entity_id.astype(int), ent_df.label.astype(str)))
-                elif "embedding_id" in ent_df.columns:
-                    ent_map = dict(zip(ent_df.embedding_id.astype(int), ent_df.label.astype(str)))
-            if self.relation_vocab_path.exists():
-                rel_df = pd.read_parquet(self.relation_vocab_path)
-                if "relation_id" in rel_df.columns and "label" in rel_df.columns:
-                    rel_map = dict(zip(rel_df.relation_id.astype(int), rel_df.label.astype(str)))
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Failed to load vocab maps: %s", exc)
+        if not self.entity_vocab_path.exists():
+            raise FileNotFoundError(f"entity_vocab_path not found: {self.entity_vocab_path}")
+        if not self.relation_vocab_path.exists():
+            raise FileNotFoundError(f"relation_vocab_path not found: {self.relation_vocab_path}")
+
+        ent_df = pd.read_parquet(self.entity_vocab_path)
+        if "entity_id" in ent_df.columns:
+            ent_map = dict(zip(ent_df.entity_id.astype(int), ent_df.label.astype(str)))
+        elif "embedding_id" in ent_df.columns:
+            ent_map = dict(zip(ent_df.embedding_id.astype(int), ent_df.label.astype(str)))
+        else:
+            raise ValueError("entity_vocab parquet missing entity_id/embedding_id columns.")
+
+        rel_df = pd.read_parquet(self.relation_vocab_path)
+        if "relation_id" not in rel_df.columns or "label" not in rel_df.columns:
+            raise ValueError("relation_vocab parquet missing relation_id/label columns.")
+        rel_map = dict(zip(rel_df.relation_id.astype(int), rel_df.label.astype(str)))
         return ent_map, rel_map
 
     @staticmethod
@@ -156,7 +164,7 @@ class ReasonerTripletDataModule(LightningDataModule):
         heads_local = torch.as_tensor(record["edge_head_locals"], dtype=torch.long)
         tails_local = torch.as_tensor(record["edge_tail_locals"], dtype=torch.long)
         relations = torch.as_tensor(record["edge_relations"], dtype=torch.long)
-        scores = torch.as_tensor(record.get("edge_scores", torch.zeros_like(relations)), dtype=torch.float)
+        scores = torch.as_tensor(record["edge_scores"], dtype=torch.float)
         node_entity_ids = torch.as_tensor(record["node_entity_ids"], dtype=torch.long)
 
         edges: List[Dict[str, Any]] = []
@@ -179,7 +187,7 @@ class ReasonerTripletDataModule(LightningDataModule):
                 }
             )
 
-        edges.sort(key=lambda e: float(e.get("score", 0.0)), reverse=True)
+        edges.sort(key=lambda e: float(e["score"]), reverse=True)
         return edges
 
     def _derive_answers(self, q_row: Optional[Any], *, sample_id: str) -> List[str]:
@@ -187,20 +195,7 @@ class ReasonerTripletDataModule(LightningDataModule):
             raise ValueError(f"missing question row for sample_id={sample_id}")
         if not hasattr(q_row, "answer_texts"):
             raise ValueError(f"questions.parquet missing 'answer_texts' column (sample_id={sample_id})")
-        raw = q_row.answer_texts
-        if not isinstance(raw, (list, tuple)) or not raw:
-            raise ValueError(f"answer_texts must be a non-empty list (sample_id={sample_id})")
-        answers: List[str] = []
-        for idx, ans in enumerate(raw):
-            if not isinstance(ans, str):
-                raise ValueError(
-                    f"answer_texts[{idx}] must be string (sample_id={sample_id}), got {type(ans).__name__}"
-                )
-            text = ans.strip()
-            if not text:
-                raise ValueError(f"answer_texts[{idx}] is empty (sample_id={sample_id})")
-            answers.append(text)
-        return answers
+        return normalize_answer_texts(q_row.answer_texts, field_name="answer_texts", sample_id=sample_id)
 
     def _build_samples(self) -> List[Dict[str, Any]]:
         if not self.score_dict_path.exists():
@@ -217,11 +212,11 @@ class ReasonerTripletDataModule(LightningDataModule):
         if "weights_only" in inspect.signature(torch.load).parameters:
             load_kwargs["weights_only"] = False
         cache = torch.load(self.score_dict_path, **load_kwargs)
-        raw_samples = cache.get("samples") or cache
-        if isinstance(raw_samples, dict):
-            raw_samples = list(raw_samples.values())
+        if "samples" not in cache:
+            raise ValueError("score_dict missing required 'samples' list.")
+        raw_samples = cache["samples"]
         if not isinstance(raw_samples, list):
-            raise ValueError("Unrecognized score dict format; expected list or mapping with 'samples' key.")
+            raise ValueError("score_dict['samples'] must be a list.")
 
         q_df = pd.read_parquet(self.questions_path)
         questions = {row.question_uid: row for row in q_df.itertuples()}
@@ -229,26 +224,29 @@ class ReasonerTripletDataModule(LightningDataModule):
 
         samples: List[Dict[str, Any]] = []
         for record in raw_samples:
-            sample_id = record.get("sample_id")
-            if not sample_id or sample_id not in questions:
-                continue
+            sample_id = record["sample_id"]
+            if sample_id not in questions:
+                raise ValueError(f"questions.parquet missing sample_id={sample_id}")
             q_row = questions[sample_id]
-            question_text = record.get("question") or q_row.question
+            question_text = record["question"]
             answers_text = self._derive_answers(q_row, sample_id=str(sample_id))
 
             edges = self._extract_edges(record, id2entity, id2relation)
-            gt_path_edges = [int(x) for x in record.get("gt_path_edge_local_ids", [])]
-            edge_labels = torch.as_tensor(record.get("edge_labels", []), dtype=torch.float32).view(-1)
-            if edge_labels.numel() not in (0, len(edges)):
+            if "gt_path_edge_local_ids" not in record:
+                raise KeyError(f"gt_path_edge_local_ids missing for sample_id={sample_id}")
+            gt_path_edges = [int(x) for x in record["gt_path_edge_local_ids"]]
+            edge_labels = torch.as_tensor(record["edge_labels"], dtype=torch.float32).view(-1)
+            if edge_labels.numel() != len(edges):
                 raise ValueError(f"edge_labels length mismatch for sample_id={sample_id}")
             dag_edge_ids = {int(idx) for idx, val in enumerate(edge_labels.tolist()) if val > 0.5}
-            edge_by_local_id = {int(edge["edge_idx"]): edge for edge in edges}
             triplets_all: List[Tuple[str, str, str, float, int]] = []
             for edge in edges:
-                head_name = edge.get("head_text") or str(edge["head_entity_id"])
-                tail_name = edge.get("tail_text") or str(edge["tail_entity_id"])
-                relation_name = edge.get("relation_text") or str(edge["relation_id"])
-                triplets_all.append((head_name, relation_name, tail_name, float(edge.get("score", 0.0)), int(edge["edge_idx"])))
+                if edge.get("head_text") is None or edge.get("tail_text") is None or edge.get("relation_text") is None:
+                    raise ValueError(f"Missing vocab text for edge {edge.get('edge_idx')} (sample_id={sample_id})")
+                head_name = edge["head_text"]
+                tail_name = edge["tail_text"]
+                relation_name = edge["relation_text"]
+                triplets_all.append((head_name, relation_name, tail_name, float(edge["score"]), int(edge["edge_idx"])))
 
             for k in self.triplet_limits:
                 triplets = triplets_all[: int(k)]

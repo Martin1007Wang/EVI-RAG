@@ -14,6 +14,8 @@ run:
   task_name: "reasoner/paths"
   tags: ["eval", "reasoner", "paths"]
   split: test
-  return_predictions: true
-  save_metrics: true
   ckpt_path: null
+  dataset_variants:
+    - ${dataset.dataset_family}
+    - ${dataset.dataset_family}-sub
+  require_dual_datasets: true

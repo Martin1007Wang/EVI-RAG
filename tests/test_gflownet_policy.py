@@ -9,7 +9,6 @@ from src.models.components.gflownet_policy import GFlowNetEdgePolicy
 def test_edge_policy_masks_non_candidates() -> None:
     policy = GFlowNetEdgePolicy(hidden_dim=8, dropout=0.0, direction_vocab_size=2).eval()
     edge_tokens = torch.randn(5, 8)
-    question_tokens = torch.randn(2, 8)
     state_tokens = torch.randn(2, 8)
     edge_batch = torch.tensor([0, 0, 0, 1, 1], dtype=torch.long)
     valid_edges_mask = torch.tensor([False, True, False, True, False], dtype=torch.bool)
@@ -21,7 +20,6 @@ def test_edge_policy_masks_non_candidates() -> None:
         edge_batch=edge_batch,
         valid_edges_mask=valid_edges_mask,
         edge_direction=edge_direction,
-        question_tokens=question_tokens,
     )
 
     assert edge_logits.shape == (5,)
@@ -39,7 +37,6 @@ def test_edge_policy_masks_non_candidates() -> None:
 def test_edge_policy_all_stop_when_no_candidates() -> None:
     policy = GFlowNetEdgePolicy(hidden_dim=4, dropout=0.0, direction_vocab_size=2).eval()
     edge_tokens = torch.randn(3, 4)
-    question_tokens = torch.randn(1, 4)
     state_tokens = torch.randn(1, 4)
     edge_batch = torch.tensor([0, 0, 0], dtype=torch.long)
     valid_edges_mask = torch.zeros(3, dtype=torch.bool)
@@ -49,7 +46,6 @@ def test_edge_policy_all_stop_when_no_candidates() -> None:
         state_tokens=state_tokens,
         edge_batch=edge_batch,
         valid_edges_mask=valid_edges_mask,
-        question_tokens=question_tokens,
     )
 
     neg_inf = torch.finfo(edge_logits.dtype).min

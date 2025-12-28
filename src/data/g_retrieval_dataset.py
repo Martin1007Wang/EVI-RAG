@@ -2,7 +2,7 @@ import json
 import logging
 import zlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import torch
 from torch_geometric.data import Data as GraphData
@@ -22,7 +22,9 @@ class GRetrievalData(GraphData):
     def __inc__(self, key: str, value: Any, *args, **kwargs) -> int:
         if key in {"q_local_indices", "a_local_indices", "pair_start_node_locals", "pair_answer_node_locals"}:
             return int(self.num_nodes)
-        if key in {"gt_path_edge_indices", "pair_edge_indices", "pair_edge_ptr"}:
+        if key in {"pair_edge_local_ids"}:
+            return int(self.edge_index.size(1))
+        if key in {"pair_edge_counts", "pair_shortest_lengths"}:
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
@@ -42,17 +44,16 @@ class GRetrievalDataset(Dataset):
         sample_filter_path: Optional[Path] = None,
         random_seed: Optional[int] = None,
         validate_on_init: bool = False,
-        include_topic_one_hot: bool = True,
     ):
         super().__init__()
         self.dataset_name = dataset_name
         self.split = split_name
         self.split_path = Path(split_path)
-        
+
         # 1. Path Validation
         if not split_path.exists():
             raise FileNotFoundError(f"Split LMDB not found at {split_path}")
-        
+
         # 2. Resource Initialization
         self.resources = resources
         if resources is not None:
@@ -76,18 +77,14 @@ class GRetrievalDataset(Dataset):
         # 4. Filtering Logic
         if sample_filter_path:
             self._apply_sample_filter(sample_filter_path)
-        
+
         if sample_limit:
             self._apply_sample_limit(sample_limit, random_seed)
 
-        self.include_topic_one_hot = bool(include_topic_one_hot)
         if validate_on_init:
             self._assert_all_samples_valid()
 
-        logger.info(
-            f"GRetrievalDataset[{self.split}] initialized: {len(self.sample_ids)} samples."
-        )
-
+        logger.info(f"GRetrievalDataset[{self.split}] initialized: {len(self.sample_ids)} samples.")
 
     def len(self) -> int:
         return len(self.sample_ids)
@@ -96,59 +93,65 @@ class GRetrievalDataset(Dataset):
         """Load single sample from LMDB with strict PyG validation."""
         sample_id = self.sample_ids[idx]
         raw = self._get_sample_store().load_sample(sample_id)
-        _validate_raw_sample(raw, sample_id, require_topic_one_hot=self.include_topic_one_hot)
+        return self._build_data(raw, sample_id, idx)
 
-        edge_index = torch.as_tensor(raw["edge_index"], dtype=torch.long)
+    def __getitems__(self, indices) -> list[GRetrievalData]:
+        if isinstance(indices, int):
+            return [self.get(indices)]
+        if isinstance(indices, slice):
+            indices = list(range(*indices.indices(len(self.sample_ids))))
+        indices = list(indices)
+        if not indices:
+            return []
+        sample_ids = [self.sample_ids[idx] for idx in indices]
+        raws = self._get_sample_store().load_samples(sample_ids)
+        return [self._build_data(raw, sample_id, idx) for raw, sample_id, idx in zip(raws, sample_ids, indices)]
+
+    def _build_data(self, raw: Dict[str, Any], sample_id: str, idx: int) -> GRetrievalData:
+        _validate_raw_sample(raw, sample_id)
+
+        edge_index = raw["edge_index"]
         num_nodes = int(raw["num_nodes"])
-        node_global_ids = torch.as_tensor(raw["node_global_ids"], dtype=torch.long)
-        node_embedding_ids = torch.as_tensor(raw["node_embedding_ids"], dtype=torch.long)
+        node_global_ids = raw["node_global_ids"]
+        node_embedding_ids = raw["node_embedding_ids"]
 
-        question_emb = torch.as_tensor(raw["question_emb"], dtype=torch.float32)
-        if question_emb.dim() == 1:
-            question_emb = question_emb.unsqueeze(0)
+        question_emb = raw["question_emb"]
 
-        answer_ids = raw.get("answer_entity_ids")
-        if answer_ids is None:
-            answer_ids = torch.empty(0, dtype=torch.long)
-        elif not torch.is_tensor(answer_ids):
-            answer_ids = torch.tensor(answer_ids, dtype=torch.long)
-        answer_ids_len = torch.tensor([answer_ids.numel()], dtype=torch.long)
+        answer_ids = raw["answer_entity_ids"]
+        answer_ids_len = raw["answer_entity_ids_len"]
 
-        q_local_indices = torch.as_tensor(raw.get("q_local_indices", []), dtype=torch.long).view(-1)
-        a_local_indices = torch.as_tensor(raw.get("a_local_indices", []), dtype=torch.long).view(-1)
-        gt_path_edge_indices = torch.as_tensor(raw.get("gt_path_edge_indices", []), dtype=torch.long).view(-1)
-        pair_start_node_locals = torch.as_tensor(raw.get("pair_start_node_locals", []), dtype=torch.long).view(-1)
-        pair_answer_node_locals = torch.as_tensor(raw.get("pair_answer_node_locals", []), dtype=torch.long).view(-1)
-        pair_edge_indices = torch.as_tensor(raw.get("pair_edge_indices", []), dtype=torch.long).view(-1)
-        pair_edge_ptr = torch.as_tensor(raw.get("pair_edge_ptr", [0]), dtype=torch.long).view(-1)
-        topic_pe_raw = raw.get("topic_pe")
-        topic_pe = torch.as_tensor(topic_pe_raw, dtype=torch.float32) if topic_pe_raw is not None else None
+        q_local_indices = raw["q_local_indices"]
+        a_local_indices = raw["a_local_indices"]
+        pair_start_node_locals = raw["pair_start_node_locals"]
+        pair_answer_node_locals = raw["pair_answer_node_locals"]
+        pair_edge_local_ids = raw["pair_edge_local_ids"]
+        pair_edge_counts = raw["pair_edge_counts"]
+        pair_shortest_lengths = raw.get("pair_shortest_lengths")
+        topic_one_hot = raw["topic_one_hot"]
 
         data_kwargs: Dict[str, Any] = {
             "num_nodes": num_nodes,
             "edge_index": edge_index,
-            "edge_attr": torch.as_tensor(raw["edge_attr"], dtype=torch.long),  # Global relation IDs
-            "labels": torch.as_tensor(raw["labels"], dtype=torch.float32),
+            "edge_attr": raw["edge_attr"],  # Global relation IDs
+            "labels": raw["labels"],
             "node_global_ids": node_global_ids,
             "node_embedding_ids": node_embedding_ids,
             "question_emb": question_emb,
-            "question": raw.get("question", ""),
+            "question": raw["question"],
+            "topic_one_hot": topic_one_hot,
             "q_local_indices": q_local_indices,
             "a_local_indices": a_local_indices,
             "pair_start_node_locals": pair_start_node_locals,
             "pair_answer_node_locals": pair_answer_node_locals,
-            "pair_edge_indices": pair_edge_indices,
-            "pair_edge_ptr": pair_edge_ptr,
-            "gt_path_edge_indices": gt_path_edge_indices,
+            "pair_edge_local_ids": pair_edge_local_ids,
+            "pair_edge_counts": pair_edge_counts,
             "answer_entity_ids": answer_ids,
             "answer_entity_ids_len": answer_ids_len,
             "sample_id": sample_id,
             "idx": idx,
         }
-        if self.include_topic_one_hot:
-            data_kwargs["topic_one_hot"] = torch.as_tensor(raw["topic_one_hot"], dtype=torch.float32)
-        if topic_pe is not None:
-            data_kwargs["topic_pe"] = topic_pe
+        if pair_shortest_lengths is not None:
+            data_kwargs["pair_shortest_lengths"] = pair_shortest_lengths
         data = GRetrievalData(**data_kwargs)
         return data
 
@@ -178,7 +181,7 @@ class GRetrievalDataset(Dataset):
             # Deterministic subset per split (avoid Python's randomized hash()).
             split_hash = zlib.crc32(str(self.split).encode("utf-8")) & 0x7FFFFFFF
             generator.manual_seed(int(seed) + int(split_hash))
-            
+
         perm = torch.randperm(len(self.sample_ids), generator=generator).tolist()
         self.sample_ids = [self.sample_ids[i] for i in perm[:limit]]
         logger.info(f"Subsampled {self.split} to {len(self.sample_ids)} samples.")
@@ -195,41 +198,41 @@ class GRetrievalDataset(Dataset):
         try:
             for sid in self.sample_ids:
                 raw = temp_store.load_sample(sid)
-                _validate_raw_sample(raw, sid, require_topic_one_hot=self.include_topic_one_hot)
+                _validate_raw_sample(raw, sid)
         finally:
             temp_store.close()
 
     def _apply_sample_filter(self, path: Path) -> None:
         if not path.exists():
-            logger.warning(f"Filter path {path} not found. Ignoring.")
-            return
-            
-        try:
-            keep_ids = self._load_filter_ids(path)
-            before = len(self.sample_ids)
-            self.sample_ids = [sid for sid in self.sample_ids if sid in keep_ids]
-            logger.info(f"Filtered {self.split}: {before} -> {len(self.sample_ids)} using {path.name}")
-        except Exception as e:
-            logger.error(f"Failed to load filter: {e}")
+            raise FileNotFoundError(f"Filter path {path} not found.")
+
+        keep_ids = self._load_filter_ids(path)
+        before = len(self.sample_ids)
+        self.sample_ids = [sid for sid in self.sample_ids if sid in keep_ids]
+        logger.info(f"Filtered {self.split}: {before} -> {len(self.sample_ids)} using {path.name}")
 
     @staticmethod
     def _load_filter_ids(path: Path) -> Set[str]:
         text = path.read_text(encoding="utf-8").strip()
         if not text:
             return set()
-        
-        # Auto-detect format
-        if text.startswith("{") or text.startswith("["):
-             data = json.loads(text)
-             if isinstance(data, list): return set(map(str, data))
-             if isinstance(data, dict): return set(map(str, data.get("sample_ids", [])))
-        
-        # Line-based fallback
-        return {line.strip() for line in text.splitlines() if line.strip()}
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Filter file must be JSON list/dict: {path}") from exc
+        if isinstance(data, list):
+            return set(map(str, data))
+        if isinstance(data, dict):
+            if "sample_ids" not in data:
+                raise ValueError(f"Filter JSON dict missing 'sample_ids': {path}")
+            return set(map(str, data["sample_ids"]))
+        raise ValueError(f"Filter JSON must be list or dict: {path}")
+
 
 # ------------------------------------------------------------------ #
 # Factory Function (The Adapter)
 # ------------------------------------------------------------------ #
+
 
 def create_g_retrieval_dataset(
     cfg: Dict[str, Any],
@@ -239,7 +242,7 @@ def create_g_retrieval_dataset(
 ) -> GRetrievalDataset:
     """
     Factory adapting the injected 'cfg' (dataset_cfg) to the Dataset class.
-    
+
     Expected cfg structure (from YAML):
     {
        "name": "webqsp",
@@ -251,19 +254,14 @@ def create_g_retrieval_dataset(
        "random_seed": 42
     }
     """
-    
+
     # 1. Resolve Split Path
     # Convention: ${embeddings_dir}/${split_name}.lmdb
     # This logic matches what the DataModule expects implicitly
     emb_root = Path(cfg["paths"]["embeddings"])
-    
-    # Handle aliases like 'validation' -> 'val.lmdb' if needed, 
-    # OR assume file names match split names exactly.
-    # Let's try explicit match first, then fallback.
+
     split_path = emb_root / f"{split_name}.lmdb"
-    if not split_path.exists() and split_name == "validation":
-        split_path = emb_root / "val.lmdb"
-    
+
     # 2. Resolve Filters
     sample_limit = None
     if "sample_limit" in cfg and cfg["sample_limit"]:
@@ -274,10 +272,7 @@ def create_g_retrieval_dataset(
         else:
             sample_limit = int(sl_cfg)
 
-    topic_pe_cfg = cfg.get("topic_pe") or {}
-    if bool(topic_pe_cfg.get("enabled", False)) and not bool(topic_pe_cfg.get("precompute", False)):
-        raise ValueError("topic_pe.enabled=true requires topic_pe.precompute=true (runtime DDE removed).")
-    include_topic_one_hot = not bool(topic_pe_cfg.get("precompute", False))
+    logger.info("Loaded retrieval LMDB; structural encoding is controlled by the retriever config.")
 
     return GRetrievalDataset(
         split_path=split_path,
@@ -290,7 +285,6 @@ def create_g_retrieval_dataset(
         sample_filter_path=Path(cfg.get("sample_filter_path")) if cfg.get("sample_filter_path") else None,
         random_seed=cfg.get("random_seed"),
         validate_on_init=bool(cfg.get("validate_on_init", False)),
-        include_topic_one_hot=include_topic_one_hot,
     )
 
 
@@ -303,16 +297,31 @@ def _validate_local_indices(local_idx: torch.Tensor, num_nodes: int, field: str,
         raise ValueError(f"{field} out of range for {sample_id}: num_nodes={num_nodes}, values={local_idx.tolist()}")
 
 
-def _ensure_tensor(obj: Any, dtype: torch.dtype, name: str, sample_id: str) -> torch.Tensor:
-    try:
-        return torch.as_tensor(obj, dtype=dtype)
-    except Exception as e:  # pragma: no cover - defensive guardrail
-        raise ValueError(f"Failed to convert {name} for {sample_id} to tensor: {e}") from e
+def _expect_tensor(
+    raw: Dict[str, Any],
+    key: str,
+    *,
+    sample_id: str,
+    dtype: Optional[torch.dtype] = None,
+    dim: Optional[int] = None,
+) -> torch.Tensor:
+    if key not in raw:
+        raise KeyError(f"Sample {sample_id} missing key: {key}")
+    value = raw[key]
+    if not torch.is_tensor(value):
+        raise TypeError(f"{key} for {sample_id} must be a torch.Tensor, got {type(value)!r}")
+    if dtype is not None and value.dtype != dtype:
+        raise ValueError(f"{key} for {sample_id} must be dtype={dtype}, got {value.dtype}")
+    if dim is not None and value.dim() != dim:
+        raise ValueError(f"{key} for {sample_id} must be {dim}D, got shape {tuple(value.shape)}")
+    return value
 
 
 def _validate_topic_one_hot(topic_one_hot: torch.Tensor, num_nodes: int, sample_id: str) -> None:
     if topic_one_hot.dim() == 1:
         topic_one_hot = topic_one_hot.unsqueeze(-1)
+    if topic_one_hot.dim() != 2:
+        raise ValueError(f"topic_one_hot must be 2D, got shape {tuple(topic_one_hot.shape)} for {sample_id}")
     if topic_one_hot.size(0) != num_nodes:
         raise ValueError(f"topic_one_hot first dim {topic_one_hot.size(0)} != num_nodes {num_nodes} for {sample_id}")
 
@@ -322,7 +331,7 @@ def _validate_answer_ids(answer_ids: torch.Tensor, sample_id: str) -> None:
         raise ValueError(f"answer_entity_ids for {sample_id} must be 1D.")
 
 
-def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_one_hot: bool = True) -> None:
+def _validate_raw_sample(raw: Dict[str, Any], sample_id: str) -> None:
     """Shared raw-schema validation to guarantee PyG Data integrity."""
     required_keys = [
         "edge_index",
@@ -332,14 +341,22 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_o
         "node_global_ids",
         "node_embedding_ids",
         "question_emb",
+        "question",
+        "topic_one_hot",
+        "q_local_indices",
+        "a_local_indices",
+        "answer_entity_ids",
+        "answer_entity_ids_len",
+        "pair_start_node_locals",
+        "pair_answer_node_locals",
+        "pair_edge_local_ids",
+        "pair_edge_counts",
     ]
-    if require_topic_one_hot:
-        required_keys.append("topic_one_hot")
     missing = [k for k in required_keys if k not in raw]
     if missing:
         raise KeyError(f"Sample {sample_id} missing keys: {missing}")
 
-    edge_index = _ensure_tensor(raw["edge_index"], torch.long, "edge_index", sample_id)
+    edge_index = _expect_tensor(raw, "edge_index", sample_id=sample_id, dtype=torch.long, dim=2)
     if edge_index.dim() != 2 or edge_index.size(0) != 2:
         raise ValueError(f"edge_index must have shape [2, E] for {sample_id}, got {tuple(edge_index.shape)}")
     num_edges = edge_index.size(1)
@@ -354,22 +371,26 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_o
             f"edge_index out of range for {sample_id}: min={edge_index.min().item()} max={edge_index.max().item()} num_nodes={num_nodes}"
         )
 
-    node_global_ids = _ensure_tensor(raw["node_global_ids"], torch.long, "node_global_ids", sample_id).view(-1)
+    node_global_ids = _expect_tensor(raw, "node_global_ids", sample_id=sample_id, dtype=torch.long, dim=1)
     if node_global_ids.numel() != num_nodes:
-        raise ValueError(
-            f"node_global_ids length {node_global_ids.numel()} != num_nodes {num_nodes} for {sample_id}"
-        )
+        raise ValueError(f"node_global_ids length {node_global_ids.numel()} != num_nodes {num_nodes} for {sample_id}")
     if torch.unique(node_global_ids).numel() != num_nodes:
         raise ValueError(f"node_global_ids must be unique per sample: {sample_id}")
 
-    node_embedding_ids = _ensure_tensor(raw["node_embedding_ids"], torch.long, "node_embedding_ids", sample_id).view(-1)
+    node_embedding_ids = _expect_tensor(raw, "node_embedding_ids", sample_id=sample_id, dtype=torch.long, dim=1)
     if node_embedding_ids.numel() != num_nodes:
-        raise ValueError(
-            f"node_embedding_ids length {node_embedding_ids.numel()} != num_nodes {num_nodes} for {sample_id}"
-        )
+        raise ValueError(f"node_embedding_ids length {node_embedding_ids.numel()} != num_nodes {num_nodes} for {sample_id}")
 
-    edge_attr = _ensure_tensor(raw["edge_attr"], torch.long, "edge_attr", sample_id).view(-1)
-    labels = _ensure_tensor(raw["labels"], torch.float32, "labels", sample_id).view(-1)
+    question_emb = _expect_tensor(raw, "question_emb", sample_id=sample_id, dim=2)
+    if not torch.is_floating_point(question_emb):
+        raise ValueError(f"question_emb for {sample_id} must be floating point, got dtype={question_emb.dtype}")
+    if not isinstance(raw.get("question"), str):
+        raise TypeError(f"question for {sample_id} must be a string.")
+
+    edge_attr = _expect_tensor(raw, "edge_attr", sample_id=sample_id, dtype=torch.long, dim=1)
+    labels = _expect_tensor(raw, "labels", sample_id=sample_id, dim=1)
+    if not torch.is_floating_point(labels):
+        raise ValueError(f"labels for {sample_id} must be floating point, got dtype={labels.dtype}")
     if edge_attr.numel() != num_edges:
         raise ValueError(f"edge_attr length {edge_attr.numel()} != num_edges {num_edges} for {sample_id}")
     if labels.numel() != num_edges:
@@ -377,83 +398,82 @@ def _validate_raw_sample(raw: Dict[str, Any], sample_id: str, *, require_topic_o
     if labels.numel() > 0:
         if labels.min().item() < 0.0 or labels.max().item() > 1.0:
             raise ValueError(
-                f"labels out of range for {sample_id}: min={float(labels.min().item())} "
-                f"max={float(labels.max().item())}"
+                f"labels out of range for {sample_id}: min={float(labels.min().item())} " f"max={float(labels.max().item())}"
             )
 
-    if require_topic_one_hot:
-        topic_one_hot = _ensure_tensor(raw["topic_one_hot"], torch.float32, "topic_one_hot", sample_id)
-        _validate_topic_one_hot(topic_one_hot, num_nodes, sample_id)
+    topic_one_hot = _expect_tensor(raw, "topic_one_hot", sample_id=sample_id)
+    if not torch.is_floating_point(topic_one_hot):
+        raise ValueError(f"topic_one_hot for {sample_id} must be floating point, got dtype={topic_one_hot.dtype}")
+    _validate_topic_one_hot(topic_one_hot, num_nodes, sample_id)
 
-    q_local_indices = _ensure_tensor(raw.get("q_local_indices", []), torch.long, "q_local_indices", sample_id).view(-1)
-    a_local_indices = _ensure_tensor(raw.get("a_local_indices", []), torch.long, "a_local_indices", sample_id).view(-1)
+    q_local_indices = _expect_tensor(raw, "q_local_indices", sample_id=sample_id, dtype=torch.long, dim=1)
+    a_local_indices = _expect_tensor(raw, "a_local_indices", sample_id=sample_id, dtype=torch.long, dim=1)
     _validate_local_indices(q_local_indices, num_nodes, "q_local_indices", sample_id)
     _validate_local_indices(a_local_indices, num_nodes, "a_local_indices", sample_id)
 
-    answer_ids = raw.get("answer_entity_ids")
-    if answer_ids is None:
-        answer_ids = torch.empty(0, dtype=torch.long)
-    else:
-        answer_ids = _ensure_tensor(answer_ids, torch.long, "answer_entity_ids", sample_id).view(-1)
+    answer_ids = _expect_tensor(raw, "answer_entity_ids", sample_id=sample_id, dtype=torch.long, dim=1)
+    answer_ids = answer_ids.view(-1)
     _validate_answer_ids(answer_ids, sample_id)
-    answer_len = raw.get("answer_entity_ids_len")
-    if answer_len is not None:
-        answer_len_tensor = _ensure_tensor(answer_len, torch.long, "answer_entity_ids_len", sample_id).view(-1)
-        if answer_len_tensor.numel() != 1 or int(answer_len_tensor.item()) != answer_ids.numel():
+    answer_len = _expect_tensor(raw, "answer_entity_ids_len", sample_id=sample_id, dtype=torch.long, dim=1)
+    answer_len_tensor = answer_len.view(-1)
+    if answer_len_tensor.numel() != 1 or int(answer_len_tensor.item()) != answer_ids.numel():
+        raise ValueError(
+            f"answer_entity_ids_len mismatch for {sample_id}: declared {answer_len_tensor.tolist()} vs actual {answer_ids.numel()}"
+        )
+    if "gt_path_edge_indices" in raw or "gt_path_node_indices" in raw:
+        raise ValueError(f"gt_path_* fields are deprecated for {sample_id}; rebuild dataset without them.")
+    if "pair_edge_offsets" in raw:
+        raise ValueError(f"pair_edge_offsets is deprecated for {sample_id}; rebuild dataset with pair_edge_counts only.")
+    if "pair_edge_indices" in raw:
+        raise ValueError(f"pair_edge_indices is deprecated for {sample_id}; use pair_edge_local_ids.")
+
+    pair_start = _expect_tensor(raw, "pair_start_node_locals", sample_id=sample_id, dtype=torch.long, dim=1)
+    pair_answer = _expect_tensor(raw, "pair_answer_node_locals", sample_id=sample_id, dtype=torch.long, dim=1)
+    if pair_start.numel() != pair_answer.numel():
+        raise ValueError(
+            f"pair_start_node_locals length {pair_start.numel()} != "
+            f"pair_answer_node_locals length {pair_answer.numel()} for {sample_id}"
+        )
+    _validate_local_indices(pair_start, num_nodes, "pair_start_node_locals", sample_id)
+    _validate_local_indices(pair_answer, num_nodes, "pair_answer_node_locals", sample_id)
+
+    pair_edge_local_ids = _expect_tensor(raw, "pair_edge_local_ids", sample_id=sample_id, dtype=torch.long, dim=1)
+    pair_edge_local_ids = pair_edge_local_ids.view(-1)
+    if pair_edge_local_ids.numel() > 0:
+        if pair_edge_local_ids.min().item() < 0 or pair_edge_local_ids.max().item() >= num_edges:
             raise ValueError(
-                f"answer_entity_ids_len mismatch for {sample_id}: declared {answer_len_tensor.tolist()} vs actual {answer_ids.numel()}"
+                f"pair_edge_local_ids out of range for {sample_id}: "
+                f"min={int(pair_edge_local_ids.min().item())} max={int(pair_edge_local_ids.max().item())} num_edges={num_edges}"
             )
-    gt_edges = raw.get("gt_path_edge_indices")
-    if gt_edges is not None:
-        gt_edges_tensor = _ensure_tensor(gt_edges, torch.long, "gt_path_edge_indices", sample_id).view(-1)
-        if gt_edges_tensor.numel() > 0:
-            if gt_edges_tensor.min().item() < 0 or gt_edges_tensor.max().item() >= num_edges:
-                raise ValueError(
-                    f"gt_path_edge_indices out of range for {sample_id}: "
-                    f"min={int(gt_edges_tensor.min().item())} max={int(gt_edges_tensor.max().item())} num_edges={num_edges}"
-                )
 
-    pair_keys = {"pair_start_node_locals", "pair_answer_node_locals", "pair_edge_indices", "pair_edge_ptr"}
-    has_pair = any(k in raw for k in pair_keys)
-    if has_pair:
-        missing_pair = [k for k in pair_keys if k not in raw]
-        if missing_pair:
-            raise ValueError(f"pair supervision missing keys for {sample_id}: {missing_pair}")
+    pair_edge_counts = _expect_tensor(raw, "pair_edge_counts", sample_id=sample_id, dtype=torch.long, dim=1)
+    pair_edge_counts = pair_edge_counts.view(-1)
+    if pair_edge_counts.numel() != pair_start.numel():
+        raise ValueError(
+            f"pair_edge_counts length {pair_edge_counts.numel()} != pair_count " f"({pair_start.numel()}) for {sample_id}"
+        )
+    if (pair_edge_counts < 0).any():
+        raise ValueError(f"pair_edge_counts contains negative values for {sample_id}")
+    total_edges = int(pair_edge_counts.sum().item())
+    if total_edges != pair_edge_local_ids.numel():
+        raise ValueError(
+            f"pair_edge_counts sum {total_edges} != "
+            f"pair_edge_local_ids length {pair_edge_local_ids.numel()} for {sample_id}"
+        )
 
-        pair_start = _ensure_tensor(raw["pair_start_node_locals"], torch.long, "pair_start_node_locals", sample_id).view(-1)
-        pair_answer = _ensure_tensor(raw["pair_answer_node_locals"], torch.long, "pair_answer_node_locals", sample_id).view(-1)
-        if pair_start.numel() != pair_answer.numel():
+    pair_shortest_lengths = raw.get("pair_shortest_lengths")
+    if pair_shortest_lengths is not None:
+        if not torch.is_tensor(pair_shortest_lengths):
+            raise TypeError(f"pair_shortest_lengths for {sample_id} must be a torch.Tensor.")
+        if pair_shortest_lengths.dtype != torch.long:
             raise ValueError(
-                f"pair_start_node_locals length {pair_start.numel()} != "
-                f"pair_answer_node_locals length {pair_answer.numel()} for {sample_id}"
+                f"pair_shortest_lengths for {sample_id} must be dtype=torch.long, got {pair_shortest_lengths.dtype}"
             )
-        _validate_local_indices(pair_start, num_nodes, "pair_start_node_locals", sample_id)
-        _validate_local_indices(pair_answer, num_nodes, "pair_answer_node_locals", sample_id)
-
-        pair_edge_indices = _ensure_tensor(raw["pair_edge_indices"], torch.long, "pair_edge_indices", sample_id).view(-1)
-        if pair_edge_indices.numel() > 0:
-            if pair_edge_indices.min().item() < 0 or pair_edge_indices.max().item() >= num_edges:
-                raise ValueError(
-                    f"pair_edge_indices out of range for {sample_id}: "
-                    f"min={int(pair_edge_indices.min().item())} max={int(pair_edge_indices.max().item())} num_edges={num_edges}"
-                )
-
-        pair_edge_ptr = _ensure_tensor(raw["pair_edge_ptr"], torch.long, "pair_edge_ptr", sample_id).view(-1)
-        if pair_edge_ptr.numel() == 0:
-            if pair_start.numel() != 0:
-                raise ValueError(f"pair_edge_ptr empty but pairs exist for {sample_id}")
-        else:
-            if pair_edge_ptr.numel() != pair_start.numel() + 1:
-                raise ValueError(
-                    f"pair_edge_ptr length {pair_edge_ptr.numel()} != pair_count+1 "
-                    f"({pair_start.numel() + 1}) for {sample_id}"
-                )
-            if pair_edge_ptr[0].item() != 0:
-                raise ValueError(f"pair_edge_ptr must start at 0 for {sample_id}")
-            if (pair_edge_ptr[1:] < pair_edge_ptr[:-1]).any():
-                raise ValueError(f"pair_edge_ptr must be non-decreasing for {sample_id}")
-            if pair_edge_ptr[-1].item() != pair_edge_indices.numel():
-                raise ValueError(
-                    f"pair_edge_ptr end {int(pair_edge_ptr[-1].item())} != "
-                    f"pair_edge_indices length {pair_edge_indices.numel()} for {sample_id}"
-                )
+        pair_shortest_lengths = pair_shortest_lengths.view(-1)
+        if pair_shortest_lengths.numel() != pair_start.numel():
+            raise ValueError(
+                f"pair_shortest_lengths length {pair_shortest_lengths.numel()} != pair_count "
+                f"({pair_start.numel()}) for {sample_id}"
+            )
+        if (pair_shortest_lengths < 0).any():
+            raise ValueError(f"pair_shortest_lengths contains negative values for {sample_id}")

@@ -2,23 +2,28 @@
 
 name: webqsp-sub
 kb: freebase
+dataset_scope: sub
+dataset_family: webqsp
 
-# NOTE: raw_root follows base webqsp; this config is primarily for consuming the
-# materialized `webqsp-sub` dataset (produced by the base build with filtering).
 raw_root: ${paths.data_dir}/webqsp/raw/data
-out_dir: ${paths.data_dir}/webqsp-sub/normalized
-materialized_dir: ${paths.data_dir}/webqsp-sub/materialized
+out_dir: ${paths.data_dir}/${dataset.dataset_family}/normalized
+materialized_dir: ${paths.data_dir}/${dataset.dataset_family}/materialized
+artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
 
 paths:
   vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
   embeddings: ${dataset.materialized_dir}/embeddings
   processed: ${dataset.materialized_dir}/processed
 
+sample_filter_path: ${dataset.out_dir}/sub_filter.json
+
 entity_normalization: none
+entity_text_mode: regex
+text_prefixes: []
+text_regex: "^(?!m\\.|g\\.).*"
 num_topics: 2
 topic_pe:
-  enabled: true
-  precompute: true
+  # Precomputed DDE features; runtime DDE is disabled.
   num_rounds: 2
   num_reverse_rounds: 2
 

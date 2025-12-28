@@ -153,7 +153,7 @@ class SelectorEvalModule(LightningModule):
             for eid in selected_ids:
                 if eid < 0 or eid >= num_edges:
                     raise ValueError(f"edge_id {eid} out of range for {sample_id}")
-            selected_mask = torch.zeros(num_edges, dtype=torch.bool)
+            selected_mask = torch.zeros(num_edges, dtype=torch.bool, device=pos_mask.device)
             if selected_ids:
                 selected_mask[selected_ids] = True
 

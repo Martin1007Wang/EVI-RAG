@@ -8,7 +8,7 @@ def test_semantic_metrics_respect_empty_visible_edges() -> None:
                 "id": "q1",
                 "question": "q",
                 "answers": ["A"],
-                "prediction": "Ans: A",
+                "prediction": "{\"answers\": [\"A\"]}",
                 "window_k": 5,
                 "k_effective": 5,
                 "retrieved_edge_ids": [1, 2, 3],
@@ -36,7 +36,7 @@ def test_semantic_metrics_use_explicit_hit_flags() -> None:
                 "id": "q1",
                 "question": "q",
                 "answers": ["A"],
-                "prediction": "Ans: A",
+                "prediction": "{\"answers\": [\"A\"]}",
                 "window_k": 5,
                 "retrieved_edge_ids": [1],
                 "visible_edge_ids": [1],
@@ -44,6 +44,10 @@ def test_semantic_metrics_use_explicit_hit_flags() -> None:
                 # Even if IDs suggest visibility, explicit flags are the SSOT for hit events.
                 "hit_set": True,
                 "hit_vis": False,
+                "evidence_token_count": 0,
+                "prompt_token_count": 10,
+                "token_budget": None,
+                "evidence_truncated": False,
             }
         ]
     )
@@ -51,4 +55,3 @@ def test_semantic_metrics_use_explicit_hit_flags() -> None:
     assert metrics["semantic/with_gt"] == 1.0
     assert metrics["semantic/s_ret_set"] == 1.0
     assert metrics["semantic/s_ret_vis"] == 0.0
-

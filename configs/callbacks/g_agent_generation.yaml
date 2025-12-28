@@ -5,9 +5,11 @@ g_agent_generation:
   settings:
     _target_: src.data.components.g_agent_builder.GAgentSettings
     enabled: true
-    anchor_top_k: 400
-    max_hops: ${window.max_hops}
+    # Dataset-dependent knobs are bound from the experiment (eval_retriever.yaml).
+    # Global top-k edges kept after score ranking.
+    edge_top_k: ${run.edge_top_k}
+    # Hop radius for shortest-path filtering on the selected edge space.
+    max_hops: ${run.max_hops}
     score_temperature: ${run.score_temperature}
-    score_bias: ${run.score_bias}
-    output_path: ${dataset.materialized_dir}/g_agent/${run.split}_g_agent.pt
+    output_path: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
   lmdb_path: ${dataset.paths.embeddings}/${run.split}.lmdb

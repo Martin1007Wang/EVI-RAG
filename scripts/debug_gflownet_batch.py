@@ -100,6 +100,47 @@ def inspect_batch(batch, *, batch_idx: int) -> None:
             bad, msg = _check_locals(label_name, locals_idx)
             print(f"  {msg}{'  <== BAD' if bad else ''}")
 
+        pair_start_ptr = batch._slice_dict["pair_start_node_locals"]
+        pair_answer_ptr = batch._slice_dict["pair_answer_node_locals"]
+        pair_edge_ids_ptr = batch._slice_dict["pair_edge_local_ids"]
+        pair_edge_counts_ptr = batch._slice_dict["pair_edge_counts"]
+        ps0, ps1 = int(pair_start_ptr[g].item()), int(pair_start_ptr[g + 1].item())
+        pa0, pa1 = int(pair_answer_ptr[g].item()), int(pair_answer_ptr[g + 1].item())
+        pe0, pe1 = int(pair_edge_ids_ptr[g].item()), int(pair_edge_ids_ptr[g + 1].item())
+        pc0, pc1 = int(pair_edge_counts_ptr[g].item()), int(pair_edge_counts_ptr[g + 1].item())
+        pair_start = batch.pair_start_node_locals[ps0:ps1] - ns
+        pair_answer = batch.pair_answer_node_locals[pa0:pa1] - ns
+        pair_edge_ids = batch.pair_edge_local_ids[pe0:pe1]
+        pair_edge_counts = batch.pair_edge_counts[pc0:pc1]
+
+        bad, msg = _check_locals("pair_start_node_locals", pair_start)
+        print(f"  {msg}{'  <== BAD' if bad else ''}")
+        bad, msg = _check_locals("pair_answer_node_locals", pair_answer)
+        print(f"  {msg}{'  <== BAD' if bad else ''}")
+
+        if pair_edge_counts.numel() != pair_start.numel():
+            print(
+                f"  pair_edge_counts length {pair_edge_counts.numel()} != pair_count {pair_start.numel()}  <== BAD"
+            )
+        if pair_edge_counts.numel() > 0:
+            if (pair_edge_counts < 0).any():
+                print(f"  pair_edge_counts has negative values {pair_edge_counts.tolist()}  <== BAD")
+            total_edges = int(pair_edge_counts.sum().item())
+            if total_edges != pair_edge_ids.numel():
+                print(
+                    f"  pair_edge_counts sum {total_edges} != pair_edge_local_ids length {pair_edge_ids.numel()}  <== BAD"
+                )
+        if pair_edge_ids.numel() > 0:
+            bad_edges = (pair_edge_ids < es) | (pair_edge_ids >= ee)
+            if bad_edges.any():
+                print(
+                    f"  pair_edge_local_ids out of range: {pair_edge_ids.tolist()} (valid [{es},{ee}))  <== BAD"
+                )
+            else:
+                print(
+                    f"  pair_edge_local_ids ok (count={pair_edge_ids.numel()}, range=[{es},{ee}))"
+                )
+
         if gt_edges.numel() > 0:
             bad_gt = (gt_edges < es) | (gt_edges >= ee)
             triples = []

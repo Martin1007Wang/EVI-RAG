@@ -12,7 +12,14 @@ from torch import nn
 import torch.nn.functional as F
 
 from src.data.components import SharedDataResources
-from src.models.components.graph import DDE
+from src.models.components.graph import (
+    DDE,
+    STRUCT_MODE_DIFFUSION,
+    STRUCT_MODE_DISTANCE,
+    STRUCT_MODE_NONE,
+    compute_topic_distances,
+)
+from src.utils.graph_utils import compute_edge_batch
 from src.models.components.projections import EmbeddingProjector
 
 logger = logging.getLogger(__name__)
@@ -60,15 +67,21 @@ class GraphEmbedder(nn.Module):
 
         self._edge_in_dim: Optional[int] = None
         self._use_topic_pe: bool = False
+        self._struct_mode: int = STRUCT_MODE_NONE
         self._num_topics: int = 0
         self._struct_dim: int = 0
         self._dde: Optional[DDE] = None
+        self._distance_max_hops: int = 0
+        self._distance_emb_dim: int = 0
+        self.distance_pe: Optional[nn.Embedding] = None
 
         self.entity_proj: Optional[EmbeddingProjector] = None
         self.relation_proj: Optional[EmbeddingProjector] = None
         self.query_proj: Optional[EmbeddingProjector] = None
         self.non_text_entity_emb: Optional[nn.Embedding] = None
         self.edge_adapter: Optional[nn.Module] = None
+        self.edge_adapter_residual: Optional[nn.Linear] = None
+        self.edge_adapter_residual_gate: Optional[nn.Parameter] = None
         self.edge_score_proj: Optional[nn.Linear] = None
         self._components_initialized = False
         self._retriever_meta_source: Optional[str] = None
@@ -301,28 +314,50 @@ class GraphEmbedder(nn.Module):
             raise ValueError(f"feature_extractor layer1 in-dim mismatch: ckpt={tuple(w1.shape)}")
 
         semantic_dim = 4 * self.hidden_dim
-        use_topic_pe, num_topics, num_rounds, num_rev = self._load_retriever_parity_meta(
+        struct_mode, num_topics, num_rounds, num_rev, max_hops, dist_dim = self._load_retriever_parity_meta(
             state_dict,
             edge_in_dim=edge_in_dim,
             semantic_dim=semantic_dim,
         )
         struct_dim = 0
-        if use_topic_pe:
+        if struct_mode == STRUCT_MODE_DIFFUSION:
             if num_topics <= 1:
-                raise ValueError(f"Invalid retriever parity_meta: num_topics must be >= 2 when topic_pe=1, got {num_topics}")
+                raise ValueError(f"Invalid retriever parity_meta: num_topics must be >= 2 when struct_mode=diffusion, got {num_topics}")
             struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_rev))
+        elif struct_mode == STRUCT_MODE_DISTANCE:
+            if dist_dim <= 0:
+                raise ValueError("Invalid retriever parity_meta: distance_emb_dim must be > 0 when struct_mode=distance.")
+            if max_hops <= 0:
+                raise ValueError("Invalid retriever parity_meta: distance_max_hops must be > 0 when struct_mode=distance.")
+            struct_dim = 2 * int(dist_dim)
+        elif struct_mode != STRUCT_MODE_NONE:
+            raise ValueError(f"Invalid retriever parity_meta: unknown struct_mode={struct_mode}")
         expected_in_dim = semantic_dim + struct_dim
         if edge_in_dim != expected_in_dim:
             raise ValueError(
                 f"feature_extractor input_dim mismatch: ckpt={edge_in_dim} vs expected={expected_in_dim} "
-                f"(semantic={semantic_dim}, struct={struct_dim}; topic_pe={int(use_topic_pe)}, "
-                f"num_topics={int(num_topics)}, dde_rounds={int(num_rounds)}, dde_reverse_rounds={int(num_rev)})."
+                f"(semantic={semantic_dim}, struct={struct_dim}; struct_mode={int(struct_mode)}, "
+                f"num_topics={int(num_topics)}, dde_rounds={int(num_rounds)}, dde_reverse_rounds={int(num_rev)}, "
+                f"distance_max_hops={int(max_hops)}, distance_emb_dim={int(dist_dim)})."
             )
         self._edge_in_dim = edge_in_dim
-        self._use_topic_pe = bool(use_topic_pe)
-        self._num_topics = int(num_topics) if use_topic_pe else 0
+        self._use_topic_pe = bool(struct_mode != STRUCT_MODE_NONE)
+        self._struct_mode = int(struct_mode)
+        self._num_topics = int(num_topics) if struct_mode == STRUCT_MODE_DIFFUSION else 0
         self._struct_dim = int(struct_dim)
-        self._dde = DDE(num_rounds=int(num_rounds), num_reverse_rounds=int(num_rev)) if use_topic_pe else None
+        self._dde = DDE(num_rounds=int(num_rounds), num_reverse_rounds=int(num_rev)) if struct_mode == STRUCT_MODE_DIFFUSION else None
+        self._distance_max_hops = int(max_hops) if struct_mode == STRUCT_MODE_DISTANCE else 0
+        self._distance_emb_dim = int(dist_dim) if struct_mode == STRUCT_MODE_DISTANCE else 0
+        if struct_mode == STRUCT_MODE_DISTANCE:
+            self.distance_pe = nn.Embedding(self._distance_max_hops + 2, self._distance_emb_dim)
+            dist_key = self._find_first_match(state_dict, "distance_pe.weight")
+            dist_weight = state_dict[dist_key]
+            if tuple(dist_weight.shape) != (self._distance_max_hops + 2, self._distance_emb_dim):
+                raise ValueError(
+                    "distance_pe.weight shape mismatch: "
+                    f"got {tuple(dist_weight.shape)} expected {(self._distance_max_hops + 2, self._distance_emb_dim)}"
+                )
+            self.distance_pe.weight.data.copy_(dist_weight)
 
         # Adapter: Linear -> LayerNorm -> GELU -> Linear, warm-start from retriever DenseFeatureExtractor linears.
         self.edge_adapter = nn.Sequential(
@@ -336,6 +371,7 @@ class GraphEmbedder(nn.Module):
             self.edge_adapter[0].bias.copy_(b0)
             self.edge_adapter[3].weight.copy_(w1)
             self.edge_adapter[3].bias.copy_(b1)
+        self._init_edge_adapter_residual(edge_in_dim)
         self.edge_score_proj = nn.Linear(1, self.hidden_dim, bias=False)
         nn.init.zeros_(self.edge_score_proj.weight)
         self._components_initialized = True
@@ -343,21 +379,48 @@ class GraphEmbedder(nn.Module):
     def _configure_struct_features(
         self,
         *,
-        use_topic_pe: bool,
+        struct_mode: int,
         num_topics: int,
         num_rounds: int,
         num_reverse_rounds: int,
+        distance_max_hops: int,
+        distance_emb_dim: int,
     ) -> None:
         struct_dim = 0
-        if use_topic_pe:
+        if struct_mode == STRUCT_MODE_DIFFUSION:
             if num_topics <= 1:
-                raise ValueError(f"Invalid retriever_meta: num_topics must be >= 2 when topic_pe=1, got {num_topics}")
+                raise ValueError(f"Invalid retriever_meta: num_topics must be >= 2 when struct_mode=diffusion, got {num_topics}")
             struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_reverse_rounds))
+        elif struct_mode == STRUCT_MODE_DISTANCE:
+            if distance_emb_dim <= 0:
+                raise ValueError("Invalid retriever_meta: distance_emb_dim must be > 0 when struct_mode=distance.")
+            if distance_max_hops <= 0:
+                raise ValueError("Invalid retriever_meta: distance_max_hops must be > 0 when struct_mode=distance.")
+            struct_dim = 2 * int(distance_emb_dim)
+        elif struct_mode != STRUCT_MODE_NONE:
+            raise ValueError(f"Invalid retriever_meta: unknown struct_mode={struct_mode}")
         self._edge_in_dim = 4 * self.hidden_dim + struct_dim
-        self._use_topic_pe = bool(use_topic_pe)
-        self._num_topics = int(num_topics) if use_topic_pe else 0
+        self._use_topic_pe = bool(struct_mode != STRUCT_MODE_NONE)
+        self._struct_mode = int(struct_mode)
+        self._num_topics = int(num_topics) if struct_mode == STRUCT_MODE_DIFFUSION else 0
         self._struct_dim = int(struct_dim)
-        self._dde = DDE(num_rounds=int(num_rounds), num_reverse_rounds=int(num_reverse_rounds)) if use_topic_pe else None
+        self._dde = (
+            DDE(num_rounds=int(num_rounds), num_reverse_rounds=int(num_reverse_rounds))
+            if struct_mode == STRUCT_MODE_DIFFUSION
+            else None
+        )
+        self._distance_max_hops = int(distance_max_hops) if struct_mode == STRUCT_MODE_DISTANCE else 0
+        self._distance_emb_dim = int(distance_emb_dim) if struct_mode == STRUCT_MODE_DISTANCE else 0
+        if struct_mode == STRUCT_MODE_DISTANCE:
+            self.distance_pe = nn.Embedding(self._distance_max_hops + 2, self._distance_emb_dim)
+
+    def _init_edge_adapter_residual(self, edge_in_dim: int) -> None:
+        self.edge_adapter_residual = nn.Linear(int(edge_in_dim), self.hidden_dim)
+        nn.init.zeros_(self.edge_adapter_residual.weight)
+        if self.edge_adapter_residual.bias is not None:
+            nn.init.zeros_(self.edge_adapter_residual.bias)
+        # Gate starts at 0 to preserve the original adapter behavior.
+        self.edge_adapter_residual_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
 
     def _init_fresh_components(self) -> None:
         """Initialize projector/adapter from scratch after struct configuration."""
@@ -375,6 +438,7 @@ class GraphEmbedder(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
+        self._init_edge_adapter_residual(self._edge_in_dim)
         self.edge_score_proj = nn.Linear(1, self.hidden_dim, bias=False)
         nn.init.zeros_(self.edge_score_proj.weight)
         self._components_initialized = True
@@ -385,17 +449,17 @@ class GraphEmbedder(nn.Module):
         *,
         edge_in_dim: int,
         semantic_dim: int,
-    ) -> tuple[bool, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int]:
         """Load minimal feature parity metadata from retriever checkpoint.
 
-        Returns (use_topic_pe, num_topics, num_rounds, num_reverse_rounds). If metadata is missing,
-        semantic-only checkpoints (edge_in_dim==semantic_dim) are accepted; otherwise we fail fast.
+        Returns (struct_mode, num_topics, num_rounds, num_reverse_rounds, distance_max_hops, distance_emb_dim).
+        If metadata is missing, semantic-only checkpoints (edge_in_dim==semantic_dim) are accepted; otherwise we fail fast.
         """
         try:
             meta_key = self._find_first_match(state_dict, "parity_meta")
         except KeyError:
             if int(edge_in_dim) == int(semantic_dim):
-                return False, 0, 0, 0
+                return STRUCT_MODE_NONE, 0, 0, 0, 0, 0
             raise ValueError(
                 "Retriever checkpoint is missing parity_meta required to disambiguate structural features "
                 f"(edge_in_dim={edge_in_dim}, semantic_dim={semantic_dim}). Re-export/retrain retriever with updated code."
@@ -404,26 +468,37 @@ class GraphEmbedder(nn.Module):
         if not torch.is_tensor(meta):
             raise ValueError(f"Invalid parity_meta type: expected torch.Tensor but got {type(meta)}")
         meta = meta.to(dtype=torch.long).view(-1)
-        if meta.numel() < 4:
-            raise ValueError(f"Invalid parity_meta length: expected >=4 but got {int(meta.numel())}")
-        use_topic_pe = bool(int(meta[0].item()))
+        if meta.numel() == 4:
+            use_topic_pe = bool(int(meta[0].item()))
+            num_topics = int(meta[1].item())
+            num_rounds = int(meta[2].item())
+            num_rev = int(meta[3].item())
+            struct_mode = STRUCT_MODE_DIFFUSION if use_topic_pe else STRUCT_MODE_NONE
+            return struct_mode, num_topics, num_rounds, num_rev, 0, 0
+        if meta.numel() < 6:
+            raise ValueError(f"Invalid parity_meta length: expected 4 or >=6 but got {int(meta.numel())}")
+        struct_mode = int(meta[0].item())
         num_topics = int(meta[1].item())
         num_rounds = int(meta[2].item())
         num_rev = int(meta[3].item())
-        return use_topic_pe, num_topics, num_rounds, num_rev
+        max_hops = int(meta[4].item())
+        dist_dim = int(meta[5].item())
+        return struct_mode, num_topics, num_rounds, num_rev, max_hops, dist_dim
 
     def init_from_retriever_meta(self, meta: Dict[str, Any]) -> None:
         """Initialize missing components from retriever meta stored in gflownet checkpoints."""
-        use_topic_pe, num_topics, num_rounds, num_rev = self._parse_retriever_meta(meta)
+        struct_mode, num_topics, num_rounds, num_rev, max_hops, dist_dim = self._parse_retriever_meta(meta)
         if self._components_initialized:
-            self._validate_retriever_meta(use_topic_pe, num_topics, num_rounds, num_rev, meta)
+            self._validate_retriever_meta(struct_mode, num_topics, num_rounds, num_rev, max_hops, dist_dim, meta)
             self._record_retriever_meta(meta, source="gflownet_ckpt", allow_override=False)
             return
         self._configure_struct_features(
-            use_topic_pe=use_topic_pe,
+            struct_mode=struct_mode,
             num_topics=num_topics,
             num_rounds=num_rounds,
             num_reverse_rounds=num_rev,
+            distance_max_hops=max_hops,
+            distance_emb_dim=dist_dim,
         )
         self._init_fresh_components()
         self._record_retriever_meta(meta, source="gflownet_ckpt", allow_override=True)
@@ -431,17 +506,23 @@ class GraphEmbedder(nn.Module):
     def export_retriever_meta(self) -> Dict[str, Any]:
         if not self._components_initialized:
             raise RuntimeError("GraphEmbedder is not initialized; cannot export retriever meta.")
-        use_topic_pe = bool(self._use_topic_pe)
-        num_topics = int(self._num_topics) if use_topic_pe else 0
+        struct_mode = int(self._struct_mode)
+        use_topic_pe = bool(struct_mode != STRUCT_MODE_NONE)
+        num_topics = int(self._num_topics) if struct_mode == STRUCT_MODE_DIFFUSION else 0
         num_rounds = int(self._dde.num_rounds) if self._dde is not None else 0
         num_rev = int(self._dde.num_reverse_rounds) if self._dde is not None else 0
-        parity_meta = [int(use_topic_pe), int(num_topics), int(num_rounds), int(num_rev)]
+        max_hops = int(self._distance_max_hops) if struct_mode == STRUCT_MODE_DISTANCE else 0
+        dist_dim = int(self._distance_emb_dim) if struct_mode == STRUCT_MODE_DISTANCE else 0
+        parity_meta = [struct_mode, num_topics, num_rounds, num_rev, max_hops, dist_dim]
         meta: Dict[str, Any] = {
             "parity_meta": parity_meta,
+            "struct_mode": int(struct_mode),
             "use_topic_pe": bool(use_topic_pe),
             "num_topics": int(num_topics),
             "num_rounds": int(num_rounds),
             "num_reverse_rounds": int(num_rev),
+            "distance_max_hops": int(max_hops),
+            "distance_emb_dim": int(dist_dim),
             "struct_dim": int(self._struct_dim or 0),
             "edge_in_dim": int(self._edge_in_dim or 0),
             "hidden_dim": int(self.hidden_dim),
@@ -477,53 +558,101 @@ class GraphEmbedder(nn.Module):
         if ckpt_name and (allow_override or self._retriever_ckpt_basename is None):
             self._retriever_ckpt_basename = str(ckpt_name)
 
-    def _parse_retriever_meta(self, meta: Dict[str, Any]) -> tuple[bool, int, int, int]:
+    @staticmethod
+    def _normalize_struct_mode(mode: Any) -> int:
+        if isinstance(mode, bool):
+            return STRUCT_MODE_DIFFUSION if mode else STRUCT_MODE_NONE
+        if isinstance(mode, int):
+            if mode in (STRUCT_MODE_NONE, STRUCT_MODE_DIFFUSION, STRUCT_MODE_DISTANCE):
+                return int(mode)
+            raise ValueError(f"Unknown struct_mode id: {mode}")
+        mode_clean = str(mode).strip().lower()
+        if mode_clean in {"", "diffusion", "precomputed", "topic_pe"}:
+            return STRUCT_MODE_DIFFUSION
+        if mode_clean in {"distance", "dist"}:
+            return STRUCT_MODE_DISTANCE
+        if mode_clean in {"none", "off", "disabled"}:
+            return STRUCT_MODE_NONE
+        raise ValueError(f"Unknown struct_mode: {mode}")
+
+    def _parse_retriever_meta(self, meta: Dict[str, Any]) -> tuple[int, int, int, int, int, int]:
         if not isinstance(meta, dict):
             raise TypeError("retriever_meta must be a dict.")
         parity_meta = meta.get("parity_meta")
         if parity_meta is not None:
             if isinstance(parity_meta, torch.Tensor):
                 parity_meta = parity_meta.detach().cpu().tolist()
-            if len(parity_meta) != 4:
-                raise ValueError(f"parity_meta must have 4 values; got {parity_meta}")
-            use_topic_pe, num_topics, num_rounds, num_rev = [int(v) for v in parity_meta]
+            if len(parity_meta) == 4:
+                use_topic_pe, num_topics, num_rounds, num_rev = [int(v) for v in parity_meta]
+                struct_mode = STRUCT_MODE_DIFFUSION if use_topic_pe else STRUCT_MODE_NONE
+                max_hops = 0
+                dist_dim = 0
+            elif len(parity_meta) >= 6:
+                struct_mode, num_topics, num_rounds, num_rev, max_hops, dist_dim = [int(v) for v in parity_meta[:6]]
+            else:
+                raise ValueError(f"parity_meta must have 4 or >=6 values; got {parity_meta}")
         else:
-            use_topic_pe = int(meta.get("use_topic_pe", 0))
+            struct_mode_raw = meta.get("struct_mode", None)
+            if struct_mode_raw is None:
+                use_topic_pe = int(meta.get("use_topic_pe", 0))
+                struct_mode = STRUCT_MODE_DIFFUSION if use_topic_pe else STRUCT_MODE_NONE
+            else:
+                struct_mode = self._normalize_struct_mode(struct_mode_raw)
             num_topics = int(meta.get("num_topics", 0))
             num_rounds = int(meta.get("num_rounds", 0))
             num_rev = int(meta.get("num_reverse_rounds", 0))
-        if use_topic_pe and num_topics <= 1:
-            raise ValueError(f"Invalid retriever_meta: num_topics must be >= 2 when topic_pe=1, got {num_topics}")
-        struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_rev)) if use_topic_pe else 0
+            max_hops = int(meta.get("distance_max_hops", 0))
+            dist_dim = int(meta.get("distance_emb_dim", 0))
+
+        if struct_mode == STRUCT_MODE_DIFFUSION and num_topics <= 1:
+            raise ValueError(f"Invalid retriever_meta: num_topics must be >= 2 when struct_mode=diffusion, got {num_topics}")
+        if struct_mode == STRUCT_MODE_DISTANCE:
+            if dist_dim <= 0:
+                raise ValueError("Invalid retriever_meta: distance_emb_dim must be > 0 when struct_mode=distance.")
+            if max_hops <= 0:
+                raise ValueError("Invalid retriever_meta: distance_max_hops must be > 0 when struct_mode=distance.")
+
+        if struct_mode == STRUCT_MODE_DIFFUSION:
+            struct_dim = 2 * int(num_topics) * (1 + int(num_rounds) + int(num_rev))
+        elif struct_mode == STRUCT_MODE_DISTANCE:
+            struct_dim = 2 * int(dist_dim)
+        else:
+            struct_dim = 0
         edge_in_dim = 4 * self.hidden_dim + struct_dim
         if "edge_in_dim" in meta and int(meta["edge_in_dim"]) != edge_in_dim:
             raise ValueError(f"retriever_meta edge_in_dim mismatch: meta={meta['edge_in_dim']} expected={edge_in_dim}")
         if "struct_dim" in meta and int(meta["struct_dim"]) != struct_dim:
             raise ValueError(f"retriever_meta struct_dim mismatch: meta={meta['struct_dim']} expected={struct_dim}")
-        return bool(use_topic_pe), int(num_topics), int(num_rounds), int(num_rev)
+        return int(struct_mode), int(num_topics), int(num_rounds), int(num_rev), int(max_hops), int(dist_dim)
 
     def _validate_retriever_meta(
         self,
-        use_topic_pe: bool,
+        struct_mode: int,
         num_topics: int,
         num_rounds: int,
         num_rev: int,
+        max_hops: int,
+        dist_dim: int,
         meta: Dict[str, Any],
     ) -> None:
-        current_use = bool(self._use_topic_pe)
-        current_topics = int(self._num_topics) if self._use_topic_pe else 0
+        current_mode = int(self._struct_mode)
+        current_topics = int(self._num_topics) if self._struct_mode == STRUCT_MODE_DIFFUSION else 0
         current_rounds = int(self._dde.num_rounds) if self._dde is not None else 0
         current_rev = int(self._dde.num_reverse_rounds) if self._dde is not None else 0
-        if (current_use, current_topics, current_rounds, current_rev) != (
-            bool(use_topic_pe),
+        current_hops = int(self._distance_max_hops) if self._struct_mode == STRUCT_MODE_DISTANCE else 0
+        current_dim = int(self._distance_emb_dim) if self._struct_mode == STRUCT_MODE_DISTANCE else 0
+        if (current_mode, current_topics, current_rounds, current_rev, current_hops, current_dim) != (
+            int(struct_mode),
             int(num_topics),
             int(num_rounds),
             int(num_rev),
+            int(max_hops),
+            int(dist_dim),
         ):
             raise ValueError(
                 "retriever_meta mismatch with existing embedder configuration: "
-                f"meta=({use_topic_pe},{num_topics},{num_rounds},{num_rev}) "
-                f"current=({current_use},{current_topics},{current_rounds},{current_rev})"
+                f"meta=({struct_mode},{num_topics},{num_rounds},{num_rev},{max_hops},{dist_dim}) "
+                f"current=({current_mode},{current_topics},{current_rounds},{current_rev},{current_hops},{current_dim})"
             )
         _ = self._parse_retriever_meta(meta)
 
@@ -536,33 +665,53 @@ class GraphEmbedder(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        if not self._use_topic_pe or self._num_topics <= 0:
-            raise RuntimeError("_build_structure_features called but topic_pe is disabled.")
+        if self._struct_mode == STRUCT_MODE_NONE:
+            raise RuntimeError("_build_structure_features called but struct_mode is none.")
         start_nodes = getattr(batch, "start_node_locals", None)
         if start_nodes is None:
-            raise ValueError("topic_pe is enabled in retriever checkpoint but batch.start_node_locals is missing.")
+            raise ValueError("struct features require batch.start_node_locals but it is missing.")
         start_nodes = start_nodes.to(device=device, dtype=torch.long).view(-1)
         if start_nodes.numel() > 0:
             if (start_nodes < 0).any() or (start_nodes >= num_nodes).any():
-                raise ValueError("start_node_locals out of range for topic_pe feature construction.")
+                raise ValueError("start_node_locals out of range for struct feature construction.")
 
-        topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long, device=device)
-        if start_nodes.numel() > 0:
-            topic_entity_mask[start_nodes] = 1
-        topic_one_hot = F.one_hot(topic_entity_mask, num_classes=int(self._num_topics)).to(dtype=dtype)
+        if self._struct_mode == STRUCT_MODE_DISTANCE:
+            if self.distance_pe is None:
+                raise RuntimeError("distance_pe is not initialized.")
+            dist = compute_topic_distances(
+                edge_index=edge_index,
+                num_nodes=int(num_nodes),
+                start_nodes=start_nodes,
+                max_hops=int(self._distance_max_hops),
+                undirected=True,
+            )
+            node_struct = self.distance_pe(dist).to(dtype=dtype)
+            head_struct = node_struct[edge_index[0]]
+            tail_struct = node_struct[edge_index[1]]
+            return torch.cat([head_struct, tail_struct], dim=-1)
 
-        feats: list[torch.Tensor] = [topic_one_hot]
-        if self._dde is not None:
-            reverse_edge_index = getattr(batch, "reverse_edge_index", None)
-            if reverse_edge_index is not None:
-                reverse_edge_index = reverse_edge_index.to(device=device)
-            feats.extend(self._dde(topic_one_hot, edge_index, reverse_edge_index))
+        if self._struct_mode == STRUCT_MODE_DIFFUSION:
+            if self._num_topics <= 0:
+                raise RuntimeError("struct_mode=diffusion requires num_topics > 0.")
+            topic_entity_mask = torch.zeros(num_nodes, dtype=torch.long, device=device)
+            if start_nodes.numel() > 0:
+                topic_entity_mask[start_nodes] = 1
+            topic_one_hot = F.one_hot(topic_entity_mask, num_classes=int(self._num_topics)).to(dtype=dtype)
 
-        stacked = torch.stack(feats, dim=-1)
-        node_struct = stacked.reshape(num_nodes, -1)
-        head_struct = node_struct[edge_index[0]]
-        tail_struct = node_struct[edge_index[1]]
-        return torch.cat([head_struct, tail_struct], dim=-1)
+            feats: list[torch.Tensor] = [topic_one_hot]
+            if self._dde is not None:
+                reverse_edge_index = getattr(batch, "reverse_edge_index", None)
+                if reverse_edge_index is not None:
+                    reverse_edge_index = reverse_edge_index.to(device=device)
+                feats.extend(self._dde(topic_one_hot, edge_index, reverse_edge_index))
+
+            stacked = torch.stack(feats, dim=-1)
+            node_struct = stacked.reshape(num_nodes, -1)
+            head_struct = node_struct[edge_index[0]]
+            tail_struct = node_struct[edge_index[1]]
+            return torch.cat([head_struct, tail_struct], dim=-1)
+
+        raise RuntimeError(f"Unknown struct_mode={self._struct_mode} in _build_structure_features.")
 
     # ------------------------------------------------------------------ #
     # Embedding + feature construction
@@ -645,7 +794,43 @@ class GraphEmbedder(nn.Module):
 
         out = norm0(out0)
         out = act0(out)
-        return linear1(out)
+        out = linear1(out)
+
+        if self.edge_adapter_residual is None or self.edge_adapter_residual_gate is None:
+            return out
+        residual_linear = self.edge_adapter_residual
+        if not isinstance(residual_linear, nn.Linear):
+            raise TypeError("edge_adapter_residual must be an nn.Linear.")
+        if int(residual_linear.in_features) != in_dim:
+            raise ValueError(
+                f"edge_adapter_residual in_features={int(residual_linear.in_features)} "
+                f"!= edge_adapter in_features={in_dim}"
+            )
+
+        w_res = residual_linear.weight
+        b_res = residual_linear.bias
+        offset = 0
+        wq_res = w_res[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        wh_res = w_res[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        wr_res = w_res[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        wt_res = w_res[:, offset : offset + hidden_dim]
+        offset += hidden_dim
+        residual = (
+            F.linear(q_edge, wq_res)
+            + F.linear(head_edge, wh_res)
+            + F.linear(relation_edge, wr_res)
+            + F.linear(tail_edge, wt_res)
+        )
+        if struct_edge is not None:
+            w_s = w_res[:, offset:]
+            residual = residual + F.linear(struct_edge, w_s)
+        if b_res is not None:
+            residual = residual + b_res
+        gate = self.edge_adapter_residual_gate.to(device=residual.device, dtype=residual.dtype)
+        return out + gate * residual
 
     def _apply_non_text_override(
         self,
@@ -670,18 +855,10 @@ class GraphEmbedder(nn.Module):
     def _prepare_question_embeddings(question_emb: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
         if question_emb is None or question_emb.numel() == 0:
             raise ValueError("question_emb is missing or empty; g_agent cache must provide question embeddings for every graph.")
-        if question_emb.dim() == 1:
-            if question_emb.numel() % max(batch_size, 1) != 0:
-                raise ValueError(f"question_emb flatten length {question_emb.numel()} not divisible by batch_size={batch_size}")
-            dim = question_emb.numel() // max(batch_size, 1)
-            question_emb = question_emb.view(batch_size, dim)
-        elif question_emb.dim() == 2:
-            if question_emb.size(0) == 1 and batch_size > 1:
-                question_emb = question_emb.expand(batch_size, -1)
-            elif question_emb.size(0) != batch_size:
-                raise ValueError(f"question_emb batch mismatch: {question_emb.size(0)} vs {batch_size}")
-        else:
-            raise ValueError(f"Unsupported question_emb rank={question_emb.dim()}")
+        if question_emb.dim() != 2:
+            raise ValueError(f"question_emb must be 2D [B, D], got rank={question_emb.dim()}")
+        if question_emb.size(0) != batch_size:
+            raise ValueError(f"question_emb batch mismatch: {question_emb.size(0)} vs {batch_size}")
         return question_emb.to(device)
 
     @staticmethod
@@ -692,27 +869,12 @@ class GraphEmbedder(nn.Module):
         num_graphs: int,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if node_ptr.numel() != num_graphs + 1:
-            raise ValueError(f"node_ptr length mismatch: got {node_ptr.numel()} expected {num_graphs + 1}")
-        # Map each edge to its graph id via head node global index and node_ptr boundaries.
-        # NOTE: `right=True` is required to assign boundary nodes correctly:
-        # for a prefix-sum ptr, node indices in graph g satisfy ptr[g] <= i < ptr[g+1].
-        # If we used `right=False`, a head index exactly equal to ptr[g] (the first node of graph g)
-        # would be bucketized into graph g-1, breaking the edge_ptr segmentation invariant.
-        edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
-        if edge_batch.numel() > 1 and not bool((edge_batch[:-1] <= edge_batch[1:]).all().item()):
-            inv = torch.nonzero(edge_batch[:-1] > edge_batch[1:], as_tuple=False).view(-1)
-            preview = inv[:5].detach().cpu().tolist()
-            raise ValueError(
-                "edge_batch is not non-decreasing along the flattened edge list, which breaks the per-graph "
-                "edge_ptr slice semantics required by GraphEnv; "
-                f"first_inversions={preview}. "
-                "Ensure edges are concatenated per-graph (PyG Batch) or sort edges by graph before building edge_ptr."
-            )
-        edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
-        edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
-        edge_ptr[1:] = edge_counts.cumsum(0)
-        return edge_batch, edge_ptr
+        return compute_edge_batch(
+            edge_index,
+            node_ptr=node_ptr,
+            num_graphs=num_graphs,
+            device=device,
+        )
 
     @staticmethod
     def _pad_start_entities(

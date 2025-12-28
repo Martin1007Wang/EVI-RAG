@@ -14,5 +14,5 @@ hydra:
     study_name: retriever_optuna
     params:
       model.retriever.dropout_p: choice(0.05, 0.1, 0.2)
-      model.optimizer.lr: tag(log, interval(1e-4, 1e-3))
-      model.optimizer.weight_decay: choice(0.0, 0.01)
+      model.optimizer_cfg.lr: tag(log, interval(1e-4, 1e-3))
+      model.optimizer_cfg.weight_decay: choice(0.0, 0.01)

@@ -1,14 +1,19 @@
 name: kgqagen
 kb: wikidata
+dataset_scope: full
+dataset_family: kgqagen
 raw_root: ${paths.data_dir}/KGQAGen-10k/raw/data
 out_dir: ${paths.data_dir}/KGQAGen-10k/normalized
 materialized_dir: ${paths.data_dir}/KGQAGen-10k/materialized
+artifact_dir: ${paths.data_dir}/KGQAGen-10k/artifacts/${dataset.name}
 # graph/seed/answers混用 label+Qid，需要归一化到 Qid
 entity_normalization: qid_in_parentheses
+entity_text_mode: regex
+text_prefixes: []
+text_regex: "^(?!Q\\d+|P\\d+).+"
 num_topics: 2
 topic_pe:
-  enabled: true
-  precompute: true
+  # Precomputed DDE features; runtime DDE is disabled.
   num_rounds: 2
   num_reverse_rounds: 2
 column_map:

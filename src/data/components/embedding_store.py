@@ -49,8 +49,7 @@ class GlobalEmbeddingStore:
 
     def _load_vocab_size(self, path: Path) -> int:
         if not path.exists():
-            logger.warning(f"Vocab LMDB not found at {path}, skipping size check.")
-            return 0
+            raise FileNotFoundError(f"Vocab LMDB not found at {path}")
         try:
             # Quick open just to check size
             with lmdb.open(str(path), readonly=True, lock=False, max_readers=1) as env:
@@ -186,6 +185,19 @@ class EmbeddingStore:
             if data is None:
                 raise KeyError(f"Sample {sample_id} not found in {self.path}")
             return pickle.loads(data)
+
+    def load_samples(self, sample_ids: List[str]) -> List[Dict]:
+        self._init_env()
+        if not sample_ids:
+            return []
+        with self.env.begin(write=False) as txn:
+            out: List[Dict] = []
+            for sample_id in sample_ids:
+                data = txn.get(sample_id.encode("utf-8"))
+                if data is None:
+                    raise KeyError(f"Sample {sample_id} not found in {self.path}")
+                out.append(pickle.loads(data))
+            return out
 
     def get_sample_ids(self) -> List[str]:
         """

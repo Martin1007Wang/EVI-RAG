@@ -131,6 +131,8 @@ class _EvalPersistProcessor:
         self.ent_map, self.rel_map = self._resolve_vocab_maps(self.cfg)
 
     def process(self, records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        if self.cfg.get("textualize"):
+            self._require_edge_metadata(records)
         if self.ent_map is not None or self.rel_map is not None:
             self._inject_text(records)
         for sample in records:
@@ -153,6 +155,19 @@ class _EvalPersistProcessor:
                         edge["dst_text"] = self.ent_map.get(d_id, str(d_id) if d_id is not None else None)
                     if self.rel_map is not None:
                         edge["relation_text"] = self.rel_map.get(r, str(r) if r is not None else None)
+
+    def _require_edge_metadata(self, records: list[Dict[str, Any]]) -> None:
+        for sample in records:
+            sample_id = sample.get("sample_id", "<unknown>")
+            rollouts = sample.get("rollouts")
+            if not isinstance(rollouts, list) or not rollouts:
+                raise ValueError(f"textualize=true requires non-empty rollouts (sample_id={sample_id}).")
+            for ridx, rollout in enumerate(rollouts):
+                if "edges" not in rollout:
+                    raise ValueError(
+                        "textualize=true requires rollout edge metadata; "
+                        f"missing 'edges' in sample_id={sample_id}, rollout_index={ridx}."
+                    )
 
     def _build_candidate_paths(self, sample: Dict[str, Any]) -> list[Dict[str, Any]]:
         chain_stats: Dict[tuple, Dict[str, Any]] = {}

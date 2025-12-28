@@ -107,6 +107,7 @@ def test_gflownet_env_start_answer_sets_hit_on_reset() -> None:
 
     state = env.reset(graph_dict, device=device)
     assert bool(state.answer_hits.item()) is True
+    assert bool(state.done.item()) is False
 
 
 def test_gflownet_env_empty_start_marks_done() -> None:

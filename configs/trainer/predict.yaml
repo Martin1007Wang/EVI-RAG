@@ -4,6 +4,8 @@ _target_: lightning.pytorch.trainer.Trainer
 # metric aggregation across ranks. Select a specific GPU via CUDA_VISIBLE_DEVICES.
 accelerator: gpu
 devices: 1
+profiler: null
+precision: 32-true
 max_epochs: 1
 logger: null
 enable_checkpointing: False

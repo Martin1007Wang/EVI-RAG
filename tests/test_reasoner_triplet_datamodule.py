@@ -5,6 +5,7 @@ import pytest
 import torch
 
 pytest.importorskip("lightning")
+pytest.importorskip("tiktoken")
 
 from src.data.reasoner_triplet_datamodule import ReasonerTripletDataModule
 
@@ -12,7 +13,8 @@ from src.data.reasoner_triplet_datamodule import ReasonerTripletDataModule
 def test_reasoner_triplet_datamodule_windows(tmp_path: Path) -> None:
     score_dict_path = tmp_path / "test_g_agent.pt"
     questions_path = tmp_path / "questions.parquet"
-    missing_vocab = tmp_path / "missing_vocab.parquet"
+    entity_vocab = tmp_path / "entity_vocab.parquet"
+    relation_vocab = tmp_path / "relation_vocab.parquet"
 
     record = {
         "sample_id": "q1",
@@ -23,10 +25,22 @@ def test_reasoner_triplet_datamodule_windows(tmp_path: Path) -> None:
         "edge_relations": [0, 0],
         "edge_scores": [0.9, 0.8],
         "edge_labels": [1.0, 0.0],
-        "top_edge_mask": [True, True],
         "answer_entity_ids": [42],
+        "gt_path_edge_local_ids": [0],
     }
     torch.save({"samples": [record]}, score_dict_path)
+
+    pd.DataFrame(
+        [
+            {"entity_id": 42, "label": "Ent42"},
+            {"entity_id": 3, "label": "Ent3"},
+        ]
+    ).to_parquet(entity_vocab, index=False)
+    pd.DataFrame(
+        [
+            {"relation_id": 0, "label": "rel"},
+        ]
+    ).to_parquet(relation_vocab, index=False)
 
     df = pd.DataFrame(
         [
@@ -44,11 +58,11 @@ def test_reasoner_triplet_datamodule_windows(tmp_path: Path) -> None:
         split="test",
         score_dict_path=str(score_dict_path),
         questions_path=str(questions_path),
-        entity_vocab_path=str(missing_vocab),
-        relation_vocab_path=str(missing_vocab),
+        entity_vocab_path=str(entity_vocab),
+        relation_vocab_path=str(relation_vocab),
         triplet_limits=[1, 5],
         token_budget=3,
-        token_budget_encoding=None,
+        token_budget_encoding="cl100k_base",
         num_workers=0,
         prompt_tag="triplet",
     )

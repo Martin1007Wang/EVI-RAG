@@ -1,4 +1,12 @@
+import re
+
 import scripts.build_retrieval_parquet as brp
+
+TEXT_CFG = brp.TextEntityConfig(
+    mode="regex",
+    prefixes=(),
+    regex=re.compile(r"^(?!m\\.|g\\.).*"),
+)
 
 
 def _write_raw_split(tmp_path, split: str, rows):
@@ -22,7 +30,7 @@ def test_shortest_path_directed_forward_only():
     # Simple forward path 0 -> 1 -> 2 should be recovered.
     edges_src = [0, 1]
     edges_dst = [1, 2]
-    path_edges, path_nodes = brp.shortest_path_edge_indices_directed(
+    path_edges, path_nodes = brp.shortest_path_edge_indices_undirected(
         num_nodes=3,
         edge_src=edges_src,
         edge_dst=edges_dst,
@@ -37,7 +45,7 @@ def test_shortest_path_includes_backward_when_forward_missing():
     # Only backward path exists; it should be used.
     edges_src = [1]
     edges_dst = [0]
-    path_edges, path_nodes = brp.shortest_path_edge_indices_directed(
+    path_edges, path_nodes = brp.shortest_path_edge_indices_undirected(
         num_nodes=2,
         edge_src=edges_src,
         edge_dst=edges_dst,
@@ -52,7 +60,7 @@ def test_shortest_path_preserves_parallel_edges():
     # Deterministic single path prefers the smallest edge index.
     edges_src = [0, 0, 1]
     edges_dst = [1, 1, 2]
-    path_edges, path_nodes = brp.shortest_path_edge_indices_directed(
+    path_edges, path_nodes = brp.shortest_path_edge_indices_undirected(
         num_nodes=3,
         edge_src=edges_src,
         edge_dst=edges_dst,
@@ -63,10 +71,21 @@ def test_shortest_path_preserves_parallel_edges():
     assert path_nodes == [0, 1, 2]
 
 
-def test_preprocess_writes_base_and_sub_only_when_filtered(tmp_path):
+def test_shortest_path_allows_zero_hop():
+    path_edges, path_nodes = brp.shortest_path_edge_indices_undirected(
+        num_nodes=2,
+        edge_src=[0],
+        edge_dst=[1],
+        seeds=[0],
+        answers=[0],
+    )
+    assert path_edges == []
+    assert path_nodes == [0]
+
+
+def test_preprocess_filters_base_dataset(tmp_path):
     raw_root = tmp_path / "raw"
     out_dir = tmp_path / "normalized"
-    sub_out_dir = tmp_path / "normalized-sub"
     raw_root.mkdir(parents=True)
 
     _write_raw_split(
@@ -143,7 +162,6 @@ def test_preprocess_writes_base_and_sub_only_when_filtered(tmp_path):
         kb="freebase",
         raw_root=raw_root,
         out_dir=out_dir,
-        sub_out_dir=sub_out_dir,
         column_map={
             "question_id_field": "id",
             "question_field": "question",
@@ -153,24 +171,21 @@ def test_preprocess_writes_base_and_sub_only_when_filtered(tmp_path):
             "graph_field": "graph",
         },
         entity_normalization="none",
+        text_cfg=TEXT_CFG,
         train_filter=train_filter,
         eval_filter=eval_filter,
         override_filters=override_filters,
-        write_sub_if_filtered=True,
     )
 
     import pyarrow.parquet as pq
 
     base_questions = pq.read_table(out_dir / "questions.parquet")
-    sub_questions = pq.read_table(sub_out_dir / "questions.parquet")
-    assert base_questions.num_rows == 4
-    assert sub_questions.num_rows == 2  # train(t0) + test(e0)
+    assert base_questions.num_rows == 2  # train(t0) + test(e0)
 
 
-def test_preprocess_skips_sub_when_no_rows_filtered(tmp_path):
+def test_preprocess_keeps_all_when_no_rows_filtered(tmp_path):
     raw_root = tmp_path / "raw"
     out_dir = tmp_path / "normalized"
-    sub_out_dir = tmp_path / "normalized-sub"
     raw_root.mkdir(parents=True)
 
     _write_raw_split(
@@ -218,7 +233,6 @@ def test_preprocess_skips_sub_when_no_rows_filtered(tmp_path):
         kb="freebase",
         raw_root=raw_root,
         out_dir=out_dir,
-        sub_out_dir=sub_out_dir,
         column_map={
             "question_id_field": "id",
             "question_field": "question",
@@ -228,12 +242,15 @@ def test_preprocess_skips_sub_when_no_rows_filtered(tmp_path):
             "graph_field": "graph",
         },
         entity_normalization="none",
+        text_cfg=TEXT_CFG,
         train_filter=train_filter,
         eval_filter=eval_filter,
         override_filters={},
-        write_sub_if_filtered=True,
     )
-    assert not sub_out_dir.exists()
+    import pyarrow.parquet as pq
+
+    base_questions = pq.read_table(out_dir / "questions.parquet")
+    assert base_questions.num_rows == 2
 
 
 def test_preprocess_drops_empty_graph_samples(tmp_path):
@@ -275,7 +292,6 @@ def test_preprocess_drops_empty_graph_samples(tmp_path):
         kb="freebase",
         raw_root=raw_root,
         out_dir=out_dir,
-        sub_out_dir=None,
         column_map={
             "question_id_field": "id",
             "question_field": "question",
@@ -285,10 +301,10 @@ def test_preprocess_drops_empty_graph_samples(tmp_path):
             "graph_field": "graph",
         },
         entity_normalization="none",
+        text_cfg=TEXT_CFG,
         train_filter=filter_all,
         eval_filter=filter_all,
         override_filters={},
-        write_sub_if_filtered=False,
     )
 
     import pyarrow.compute as pc
@@ -303,7 +319,7 @@ def test_preprocess_drops_empty_graph_samples(tmp_path):
 
 
 def _build_minimal_vocab_for_sample(sample: brp.Sample):
-    entity_vocab = brp.EntityVocab(kb=sample.kb)
+    entity_vocab = brp.EntityVocab(kb=sample.kb, text_cfg=TEXT_CFG)
     relation_vocab = brp.RelationVocab(kb=sample.kb)
     for h, r, t in sample.graph:
         entity_vocab.add_entity(h)
@@ -315,7 +331,7 @@ def _build_minimal_vocab_for_sample(sample: brp.Sample):
     return entity_vocab, relation_vocab
 
 
-def test_build_graph_emits_triple_mask_and_gt_source_answer_subgraph():
+def test_build_graph_emits_triple_mask_and_pair_counts_answer_subgraph():
     sample = brp.Sample(
         dataset="ds",
         split="train",
@@ -338,12 +354,12 @@ def test_build_graph_emits_triple_mask_and_gt_source_answer_subgraph():
         relation_vocab,
         graph_id="ds/train/0",
     )
-    assert graph.gt_source == "answer_subgraph_dag"
-    assert graph.gt_path_edge_indices == [0]
     assert graph.positive_triple_mask == [True, False]
+    assert graph.pair_edge_counts == [1]
+    assert graph.pair_shortest_lengths == [1]
 
 
-def test_build_graph_emits_gt_source_shortest_path():
+def test_build_graph_emits_pair_counts_shortest_path():
     sample = brp.Sample(
         dataset="ds",
         split="train",
@@ -363,4 +379,6 @@ def test_build_graph_emits_gt_source_shortest_path():
         relation_vocab,
         graph_id="ds/train/1",
     )
-    assert graph.gt_source == "shortest_path_dag"
+    assert graph.positive_triple_mask == [True]
+    assert graph.pair_edge_counts == [1]
+    assert graph.pair_shortest_lengths == [1]

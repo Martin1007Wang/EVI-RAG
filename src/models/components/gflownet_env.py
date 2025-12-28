@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 from torch import nn
@@ -25,6 +25,7 @@ class GraphBatch:
     answer_ptr: torch.Tensor          # [B+1]
     node_is_start: torch.Tensor       # [N_total] bool
     node_is_answer: torch.Tensor      # [N_total] bool
+    node_answer_dist: torch.Tensor    # [N_total] long
     node_batch: torch.Tensor          # [N_total]
 
 
@@ -37,9 +38,13 @@ class GraphState:
     actions: torch.Tensor             # [B, max_steps+1] long (edge id or STOP_RELATION)
     directions: torch.Tensor          # [B, max_steps+1] long (DIRECTION_*)
     action_embeddings: torch.Tensor   # [B, max_steps, H]
+    action_hidden: torch.Tensor       # [B, H] (incremental action history state)
+    action_hidden_step: torch.Tensor  # [B] long (#actions encoded in action_hidden)
     done: torch.Tensor                # [B] bool
     step_counts: torch.Tensor         # [B] long
     answer_hits: torch.Tensor         # [B] bool
+    answer_node_hit: torch.Tensor     # [B] long (local node id, -1 if none)
+    start_node_hit: torch.Tensor      # [B] long (local node id, -1 if none)
     selection_order: torch.Tensor     # [E_total] long (step index or -1)
 
 
@@ -49,13 +54,17 @@ class GraphEnv(nn.Module):
     def __init__(
         self,
         max_steps: int,
+        potential_scale: float = 0.0,
     ) -> None:
         super().__init__()
         self.max_steps = int(max_steps)
+        self.potential_scale = float(potential_scale)
         if self.max_steps <= 0:
             raise ValueError(f"max_steps must be positive, got {self.max_steps}")
+        if self.potential_scale < 0.0:
+            raise ValueError(f"potential_scale must be >= 0, got {self.potential_scale}")
 
-    def reset(self, batch: Dict[str, torch.Tensor], *, device: torch.device) -> GraphState:
+    def reset(self, batch: Dict[str, Any], *, device: torch.device) -> GraphState:
         edge_index = batch["edge_index"].to(device)
         edge_batch = batch["edge_batch"].to(device)
         edge_relations = batch["edge_relations"].to(device=device, dtype=torch.long)
@@ -94,39 +103,59 @@ class GraphEnv(nn.Module):
             raise ValueError("GraphEnv.reset received empty node_ptr; g_agent cache may be corrupt.")
 
         node_counts = (node_ptr[1:] - node_ptr[:-1]).clamp(min=0)
-        node_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), node_counts)
+        node_batch = batch.get("node_batch")
+        if not torch.is_tensor(node_batch) or node_batch.numel() != num_nodes_total:
+            node_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), node_counts)
+        else:
+            node_batch = node_batch.to(device=device, dtype=torch.long)
         if node_batch.numel() != num_nodes_total:
             raise ValueError("node_batch length mismatch with node_ptr.")
 
-        node_is_start = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
-        if start_node_locals.numel() > 0:
-            node_is_start[start_node_locals] = True
-        node_is_answer = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
-        if answer_node_locals.numel() > 0:
-            node_is_answer[answer_node_locals] = True
+        node_is_start = batch.get("node_is_start")
+        if not torch.is_tensor(node_is_start) or node_is_start.numel() != num_nodes_total:
+            node_is_start = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
+            if start_node_locals.numel() > 0:
+                node_is_start[start_node_locals] = True
+        else:
+            node_is_start = node_is_start.to(device=device, dtype=torch.bool)
+
+        node_is_answer = batch.get("node_is_answer")
+        if not torch.is_tensor(node_is_answer) or node_is_answer.numel() != num_nodes_total:
+            node_is_answer = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
+            if answer_node_locals.numel() > 0:
+                node_is_answer[answer_node_locals] = True
+        else:
+            node_is_answer = node_is_answer.to(device=device, dtype=torch.bool)
+
+        node_answer_dist = batch.get("node_answer_dist")
+        if not torch.is_tensor(node_answer_dist) or node_answer_dist.numel() != num_nodes_total:
+            node_answer_dist = torch.empty(0, dtype=torch.long, device=device)
+            if self.potential_scale != 0.0:
+                raise ValueError("node_answer_dist missing or invalid while potential_scale is enabled.")
+        else:
+            node_answer_dist = node_answer_dist.to(device=device, dtype=torch.long).view(-1)
 
         active_nodes = node_is_start.clone()
         visited_nodes = active_nodes.clone()
 
         answer_hits = torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        answer_node_hit = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
         if active_nodes.any():
             hit_nodes = active_nodes & node_is_answer
             if hit_nodes.any():
-                hit_batch = node_batch[hit_nodes]
-                answer_hits = torch.bincount(hit_batch, minlength=num_graphs) > 0
+                hit_idx = torch.nonzero(hit_nodes, as_tuple=False).view(-1)
+                hit_batch = node_batch[hit_idx]
+                local_idx = hit_idx - node_ptr[hit_batch]
+                sentinel = int(num_nodes_total) + 1
+                min_local = torch.full((num_graphs,), sentinel, device=device, dtype=torch.long)
+                min_local.scatter_reduce_(0, hit_batch, local_idx, reduce="amin", include_self=True)
+                has_hit = min_local != sentinel
+                answer_hits = has_hit
+                answer_node_hit = torch.where(has_hit, min_local, answer_node_hit)
 
-        done = missing_start.to(device=device)
-        step_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
-        actions = torch.full((num_graphs, self.max_steps + 1), STOP_RELATION, dtype=torch.long, device=device)
-        directions = torch.full(
-            (num_graphs, self.max_steps + 1),
-            DIRECTION_FORWARD,
-            dtype=torch.long,
-            device=device,
-        )
-        used_edge_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
-        action_embeddings = torch.zeros(num_graphs, self.max_steps, 0, device=device)
-        selection_order = torch.full((num_edges,), -1, dtype=torch.long, device=device)
+        start_node_hit = torch.full((num_graphs,), -1, dtype=torch.long, device=device)
+        if answer_hits.any():
+            start_node_hit = torch.where(answer_hits, answer_node_hit, start_node_hit)
 
         graph = GraphBatch(
             edge_index=edge_index,
@@ -141,21 +170,94 @@ class GraphEnv(nn.Module):
             answer_ptr=answer_ptr,
             node_is_start=node_is_start,
             node_is_answer=node_is_answer,
+            node_answer_dist=node_answer_dist,
             node_batch=node_batch,
         )
-        return GraphState(
-            graph=graph,
-            active_nodes=active_nodes,
-            visited_nodes=visited_nodes,
-            used_edge_mask=used_edge_mask,
-            actions=actions,
-            directions=directions,
-            action_embeddings=action_embeddings,
-            done=done,
-            step_counts=step_counts,
-            answer_hits=answer_hits,
-            selection_order=selection_order,
-        )
+
+        state_cache = batch.get("state_cache")
+        if isinstance(state_cache, GraphState):
+            reuse = (
+                state_cache.actions.shape == (num_graphs, self.max_steps + 1)
+                and state_cache.directions.shape == (num_graphs, self.max_steps + 1)
+                and state_cache.active_nodes.numel() == num_nodes_total
+                and state_cache.used_edge_mask.numel() == num_edges
+                and state_cache.selection_order.numel() == num_edges
+                and state_cache.step_counts.numel() == num_graphs
+            )
+        else:
+            reuse = False
+
+        if not reuse:
+            done = missing_start.to(device=device)
+            step_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
+            actions = torch.full((num_graphs, self.max_steps + 1), STOP_RELATION, dtype=torch.long, device=device)
+            directions = torch.full(
+                (num_graphs, self.max_steps + 1),
+                DIRECTION_FORWARD,
+                dtype=torch.long,
+                device=device,
+            )
+            used_edge_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
+            action_embeddings = torch.zeros(num_graphs, self.max_steps, 0, device=device)
+            action_hidden = torch.empty(0, dtype=torch.float32, device=device)
+            action_hidden_step = torch.zeros(num_graphs, dtype=torch.long, device=device)
+            selection_order = torch.full((num_edges,), -1, dtype=torch.long, device=device)
+            return GraphState(
+                graph=graph,
+                active_nodes=active_nodes,
+                visited_nodes=visited_nodes,
+                used_edge_mask=used_edge_mask,
+                actions=actions,
+                directions=directions,
+                action_embeddings=action_embeddings,
+                action_hidden=action_hidden,
+                action_hidden_step=action_hidden_step,
+                done=done,
+                step_counts=step_counts,
+                answer_hits=answer_hits,
+                answer_node_hit=answer_node_hit,
+                start_node_hit=start_node_hit,
+                selection_order=selection_order,
+            )
+
+        state = state_cache
+        state.graph = graph
+        if state.active_nodes.shape == active_nodes.shape:
+            state.active_nodes.copy_(active_nodes)
+        else:
+            state.active_nodes = active_nodes.clone()
+        if state.visited_nodes.shape == visited_nodes.shape:
+            state.visited_nodes.copy_(visited_nodes)
+        else:
+            state.visited_nodes = visited_nodes.clone()
+        state.used_edge_mask.zero_()
+        state.actions.fill_(STOP_RELATION)
+        state.directions.fill_(DIRECTION_FORWARD)
+        if state.action_embeddings.numel() > 0:
+            state.action_embeddings.zero_()
+        else:
+            state.action_embeddings = torch.zeros(num_graphs, self.max_steps, 0, device=device)
+        if state.action_hidden.numel() > 0 and state.action_hidden.shape[0] == num_graphs:
+            state.action_hidden.zero_()
+        else:
+            state.action_hidden = torch.empty(0, dtype=torch.float32, device=device)
+        state.action_hidden_step.zero_()
+        state.done.copy_(missing_start.to(device=device))
+        state.step_counts.zero_()
+        if state.answer_hits.shape == answer_hits.shape:
+            state.answer_hits.copy_(answer_hits)
+        else:
+            state.answer_hits = answer_hits.clone()
+        if state.answer_node_hit.shape == answer_node_hit.shape:
+            state.answer_node_hit.copy_(answer_node_hit)
+        else:
+            state.answer_node_hit = answer_node_hit.clone()
+        if state.start_node_hit.shape == start_node_hit.shape:
+            state.start_node_hit.copy_(start_node_hit)
+        else:
+            state.start_node_hit = start_node_hit.clone()
+        state.selection_order.fill_(-1)
+        return state
 
     def candidate_edge_mask(self, state: GraphState) -> torch.Tensor:
         forward_mask, backward_mask = self.candidate_edge_masks(state)
@@ -177,7 +279,22 @@ class GraphEnv(nn.Module):
         num_graphs = int(state.graph.node_ptr.numel() - 1)
         if num_graphs <= 0:
             return torch.zeros(0, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
-        return torch.zeros(num_graphs, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
+        if self.potential_scale == 0.0:
+            return torch.zeros(num_graphs, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
+        node_answer_dist = state.graph.node_answer_dist
+        if node_answer_dist.numel() == 0 or node_answer_dist.numel() != state.active_nodes.numel():
+            return torch.zeros(num_graphs, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
+        active = state.active_nodes.to(device=node_answer_dist.device, dtype=torch.bool)
+        if not bool(active.any().item()):
+            return torch.zeros(num_graphs, device=state.graph.edge_scores_norm.device, dtype=state.graph.edge_scores_norm.dtype)
+        active_dist = node_answer_dist[active].to(dtype=torch.float32)
+        active_batch = state.graph.node_batch[active].to(device=node_answer_dist.device, dtype=torch.long)
+        sentinel = float(self.max_steps + 1)
+        min_dist = torch.full((num_graphs,), sentinel, device=active_dist.device, dtype=active_dist.dtype)
+        min_dist.scatter_reduce_(0, active_batch, active_dist, reduce="amin", include_self=True)
+        min_dist = min_dist.clamp(min=0.0, max=float(self.max_steps))
+        phi = -min_dist / float(self.max_steps)
+        return phi.to(dtype=state.graph.edge_scores_norm.dtype) * float(self.potential_scale)
 
     def step(
         self,
@@ -238,6 +355,11 @@ class GraphEnv(nn.Module):
             tail_active = state.active_nodes[tails]
             if not bool((head_active | tail_active).any().item()):
                 raise ValueError("Selected directed edge is not incident to any active node.")
+            if step_index == 0:
+                chosen_start = torch.where(head_active, heads, tails)
+                graph_ids = edge_batch[edge_selected]
+                local_start = chosen_start - state.graph.node_ptr[graph_ids]
+                state.start_node_hit[graph_ids] = local_start
             is_backward = (~head_active) & tail_active
             if is_backward.any():
                 backward_graphs = edge_batch[edge_selected][is_backward]
@@ -258,9 +380,16 @@ class GraphEnv(nn.Module):
         if state.active_nodes.any():
             hit_nodes = state.active_nodes & state.graph.node_is_answer
             if hit_nodes.any():
-                hit_batch = state.graph.node_batch[hit_nodes]
-                hits = torch.bincount(hit_batch, minlength=num_graphs) > 0
-                state.answer_hits = state.answer_hits | hits
+                hit_idx = torch.nonzero(hit_nodes, as_tuple=False).view(-1)
+                hit_batch = state.graph.node_batch[hit_idx]
+                local_idx = hit_idx - state.graph.node_ptr[hit_batch]
+                sentinel = int(state.graph.node_ptr[-1].item()) + 1
+                min_local = torch.full((num_graphs,), sentinel, device=device, dtype=torch.long)
+                min_local.scatter_reduce_(0, hit_batch, local_idx, reduce="amin", include_self=True)
+                has_hit = min_local != sentinel
+                newly_hit = (~state.answer_hits) & has_hit
+                state.answer_node_hit = torch.where(newly_hit, min_local, state.answer_node_hit)
+                state.answer_hits = state.answer_hits | has_hit
 
         state.actions[:, step_index] = actions
         state.directions[:, step_index] = step_directions

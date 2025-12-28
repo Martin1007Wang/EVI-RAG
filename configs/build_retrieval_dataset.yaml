@@ -9,14 +9,6 @@ parquet_dir: ${dataset.out_dir}
 # Output directory for LMDB and embeddings
 output_dir: ${dataset.materialized_dir}
 
-# Optional: also materialize a `${dataset.name}-${sub.suffix}` dataset if its normalized parquet exists.
-sub:
-  enabled: false
-  suffix: sub
-  parquet_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/normalized
-  output_dir: ${paths.data_dir}/${dataset.name}-${sub.suffix}/materialized
-  share_vocab_and_embeddings: true
-
 # HF model name or path for text encoding.
 encoder: "Alibaba-NLP/gte-large-en-v1.5"
 
@@ -30,17 +22,10 @@ batch_size: 64
 progress_bar: true
 
 # Use FP16 for encoder forward pass.
-fp16: True
+fp16: False
 
-# Number of topic feature channels used in preprocessing.
-# SubgraphRAG parity: 2-class one-hot {non-topic, topic} built from query entities only.
+# Number of topic feature channels used in preprocessing (topic_one_hot).
 num_topics: ${dataset.num_topics}
-
-# Precompute topic structural features (DDE) to remove per-batch message passing in retriever.
-topic_pe:
-  precompute: ${dataset.topic_pe.precompute}
-  num_rounds: ${dataset.topic_pe.num_rounds}
-  num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
 
 # Supervision invariant: retriever labels are ALWAYS triple-level (positive_triple_mask).
 # This removes ambiguous transition-lifting and enforces relation-sensitive training.

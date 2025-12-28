@@ -23,17 +23,7 @@ def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
     paths = cfg.get("paths")
     if isinstance(paths, dict) and paths.get("vocabulary") and paths.get("embeddings"):
         return cfg
-
-    data_dir = cfg.get("data_dir")
-    if data_dir:
-        root = Path(str(data_dir)).expanduser().resolve()
-        cfg["paths"] = {
-            "vocabulary": str(root / "vocabulary" / "vocabulary.lmdb"),
-            "embeddings": str(root / "embeddings"),
-        }
-        return cfg
-
-    raise ValueError("dataset_cfg must define either `paths.{vocabulary,embeddings}` or `data_dir`.")
+    raise ValueError("dataset_cfg must define `paths.vocabulary` and `paths.embeddings`.")
 
 
 def _infer_batch_size(total_batch: int, world_size: int) -> int:
@@ -100,6 +90,10 @@ class GRetrievalDataModule(LightningDataModule):
         self.test_dataset: Optional[GRetrievalDataset] = None
         self.batch_size_per_device = self.batch_size
         self._shared_resources: Optional[SharedDataResources] = None
+
+    @property
+    def shared_resources(self) -> Optional[SharedDataResources]:
+        return self._shared_resources
 
     def prepare_data(self) -> None:
         """
@@ -205,9 +199,6 @@ class GRetrievalDataModule(LightningDataModule):
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Did you run setup()?")
         
-        topic_pe_cfg = self.dataset_cfg.get("topic_pe") or {}
-        build_reverse_edge_index = bool(topic_pe_cfg.get("enabled", False)) and not bool(topic_pe_cfg.get("precompute", False))
-
         return UnifiedDataLoader(
             dataset,
             batch_size=self.batch_size_per_device,
@@ -216,7 +207,6 @@ class GRetrievalDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
-            build_reverse_edge_index=build_reverse_edge_index,
 
             # Reproducibility
             random_seed=self.dataset_cfg.get("random_seed"),
