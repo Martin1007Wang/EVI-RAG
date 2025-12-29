@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -127,6 +128,23 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
             "Training scope violation: retriever/GFlowNet training must use sub datasets only. "
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
         )
+    if is_retriever and scope == "sub":
+        sample_filter_path = None
+        if isinstance(dataset_cfg, DictConfig):
+            sample_filter_path = dataset_cfg.get("sample_filter_path")
+        elif isinstance(dataset_cfg, dict):
+            sample_filter_path = dataset_cfg.get("sample_filter_path")
+        if _is_missing_value(sample_filter_path):
+            raise ValueError(
+                "Sub-scope retriever training requires `sample_filter_path` to sub_filter.json. "
+                "Set dataset.sample_filter_path to the emitted sub filter."
+            )
+        filter_path = Path(str(sample_filter_path)).expanduser()
+        if not filter_path.exists():
+            raise FileNotFoundError(
+                "Sub-scope retriever training requires an existing sub_filter.json at "
+                f"{filter_path}."
+            )
 
 
 @task_wrapper

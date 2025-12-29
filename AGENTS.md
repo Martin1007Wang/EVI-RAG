@@ -45,6 +45,7 @@
 ### 1. `g_retrieval` Schema (Retriever SSOT)
 
 **Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 Retriever 训练的唯一输入。
+**Note:** 当前所有数据集均不包含 `answer_subgraph` 字段；相关加权策略仅作为理论备忘。
 
 #### A. Topology (流形结构)
 *   `sample_id`: `str`. Unique Identifier.

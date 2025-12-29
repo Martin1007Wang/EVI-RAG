@@ -625,9 +625,8 @@ logger:
 - 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_retriever`, `eval_gflownet`, `export_gflownet`, `selector_eval_retriever`, `selector_eval_gflownet`, `reasoner_oracle`, `reasoner_paths`, `reasoner_triplet`
 
 数据构建（Retriever，triple-only 监督，不提供任何回退）：
-- `scripts/build_retrieval_parquet.py` 生成 normalized parquet；其中 `graphs.parquet` 必含 `positive_triple_mask`（GT 路径上的 canonical `(h,r,t)` 边）。
-- `scripts/build_retrieval_dataset.py` 物化 LMDB/embeddings；LMDB 中的 `labels` 恒等于 `positive_triple_mask`，不再支持 transition/hybrid 等旧语义。
-- 若已有旧缓存/旧 parquet，必须完整重建这两步，否则会 fail-fast。
+- `scripts/build_retrieval_pipeline.py` 一步完成 normalized parquet + LMDB；最短路监督为 **undirected**，不做 relation canonicalization，前置编码 entity/relation/question embeddings（`questions.parquet` 含 `question_emb`）。
+- 若已有旧缓存/旧 parquet，必须完整重建该流程，否则会 fail-fast。
 
 一致性设计要点：
 - 预处理阶段固定使用无向 BFS，并按 `(start, answer)` 对存储最短路 DAG（`pair_*` CSR 结构）。
@@ -635,8 +634,7 @@ logger:
 - 详细说明见 `docs/undirected-bfs-supervision.md`。
 
 ```bash
-python scripts/build_retrieval_parquet.py dataset=webqsp
-python scripts/build_retrieval_dataset.py dataset=webqsp
+python scripts/build_retrieval_pipeline.py dataset=webqsp paths=default
 ```
 
 评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：

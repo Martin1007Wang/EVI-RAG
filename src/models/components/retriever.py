@@ -376,10 +376,10 @@ class Retriever(nn.Module):
         if topic_one_hot.size(0) != int(num_nodes):
             raise ValueError(f"topic_one_hot first dim {topic_one_hot.size(0)} != num_nodes {int(num_nodes)}")
         if topic_one_hot.size(-1) < self.num_topics:
-            raise ValueError(
-                f"topic_one_hot feature dim {topic_one_hot.size(-1)} < num_topics={self.num_topics}; "
-                "rebuild g_retrieval caches or update configs/build_retrieval_dataset.yaml."
-            )
+                raise ValueError(
+                    f"topic_one_hot feature dim {topic_one_hot.size(-1)} < num_topics={self.num_topics}; "
+                    "rebuild g_retrieval caches or update configs/build_retrieval_pipeline.yaml."
+                )
         if topic_one_hot.size(-1) != self.num_topics:
             topic_one_hot = topic_one_hot[..., : self.num_topics]
         feats: list[torch.Tensor] = [topic_one_hot]

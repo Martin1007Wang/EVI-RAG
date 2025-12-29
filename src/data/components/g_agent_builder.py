@@ -17,6 +17,11 @@ from src.data.components.embedding_store import EmbeddingStore
 
 log = logging.getLogger(__name__)
 
+ZERO = 0
+ONE = 1
+POS_LABEL_THRESHOLD = 0.5
+PAIR_STRIDE_OFFSET = 1
+
 
 @dataclass
 class GAgentSettings:
@@ -408,6 +413,19 @@ class GAgentBuilder:
             start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
         )
+        # Canonicalize positives: one edge per undirected pair, keep highest score.
+        (
+            edge_labels,
+            pair_edge_local_ids,
+            pair_edge_counts,
+        ) = self._canonicalize_positive_edges_by_pair(
+            edge_head_locals=edge_head_locals,
+            edge_tail_locals=edge_tail_locals,
+            edge_scores=edge_scores,
+            edge_labels=edge_labels,
+            pair_edge_local_ids=pair_edge_local_ids,
+            pair_edge_counts=pair_edge_counts,
+        )
         node_answer_dist = self._min_dist_to_answers(
             num_nodes=int(node_embedding_ids.numel()),
             edge_head_locals=edge_head_locals,
@@ -415,7 +433,7 @@ class GAgentBuilder:
             answer_node_locals=answer_node_locals,
             fallback_dist=int(self.cfg.max_hops) + 1,
         )
-        edge_pos_mask = edge_labels > 0.5
+        edge_pos_mask = edge_labels > POS_LABEL_THRESHOLD
         gt_path_edge_local_ids = self._select_canonical_shortest_path_edges(
             num_nodes=int(node_embedding_ids.numel()),
             edge_head_locals=edge_head_locals,
@@ -568,6 +586,90 @@ class GAgentBuilder:
             return torch.arange(num_edges, dtype=torch.long)
         sorted_idx = torch.argsort(scores, descending=True, stable=True)
         return sorted_idx[:edge_top_k].to(dtype=torch.long)
+
+    @staticmethod
+    def _canonicalize_positive_edges_by_pair(
+        *,
+        edge_head_locals: torch.Tensor,
+        edge_tail_locals: torch.Tensor,
+        edge_scores: torch.Tensor,
+        edge_labels: torch.Tensor,
+        pair_edge_local_ids: torch.Tensor,
+        pair_edge_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        keep_mask = GAgentBuilder._select_best_positive_edges_by_pair(
+            edge_head_locals=edge_head_locals,
+            edge_tail_locals=edge_tail_locals,
+            edge_scores=edge_scores,
+            edge_labels=edge_labels,
+        )
+        if not bool(keep_mask.any().item()):
+            return edge_labels, pair_edge_local_ids, pair_edge_counts
+        edge_labels = torch.where(keep_mask, edge_labels, edge_labels.new_zeros(()))
+        new_pair_edge_local_ids, new_pair_edge_counts = GAgentBuilder._filter_pair_edges_by_mask(
+            pair_edge_local_ids=pair_edge_local_ids,
+            pair_edge_counts=pair_edge_counts,
+            keep_mask=keep_mask,
+        )
+        return edge_labels, new_pair_edge_local_ids, new_pair_edge_counts
+
+    @staticmethod
+    def _select_best_positive_edges_by_pair(
+        *,
+        edge_head_locals: torch.Tensor,
+        edge_tail_locals: torch.Tensor,
+        edge_scores: torch.Tensor,
+        edge_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        num_edges = int(edge_labels.numel())
+        if num_edges == ZERO:
+            return torch.zeros_like(edge_labels, dtype=torch.bool)
+        pos_mask = edge_labels > POS_LABEL_THRESHOLD
+        if not bool(pos_mask.any().item()):
+            return torch.zeros_like(edge_labels, dtype=torch.bool)
+        heads = edge_head_locals.view(-1)
+        tails = edge_tail_locals.view(-1)
+        if heads.numel() != num_edges or tails.numel() != num_edges:
+            raise ValueError("edge_head_locals/edge_tail_locals length mismatch when canonicalizing positives.")
+        max_node = torch.maximum(heads, tails).max()
+        stride = max_node + PAIR_STRIDE_OFFSET
+        u = torch.minimum(heads, tails)
+        v = torch.maximum(heads, tails)
+        pair_key = u * stride + v
+
+        pos_idx = torch.nonzero(pos_mask, as_tuple=False).view(-1)
+        pos_keys = pair_key.index_select(0, pos_idx)
+        pos_scores = edge_scores.view(-1).index_select(0, pos_idx)
+        order = torch.argsort(pos_idx, stable=True)
+        order = order[torch.argsort(pos_scores.index_select(0, order), descending=True, stable=True)]
+        order = order[torch.argsort(pos_keys.index_select(0, order), stable=True)]
+        sorted_keys = pos_keys.index_select(0, order)
+        is_first = torch.ones_like(sorted_keys, dtype=torch.bool)
+        if int(sorted_keys.numel()) > ONE:
+            is_first[ONE:] = sorted_keys[ONE:] != sorted_keys[:-ONE]
+        best_pos_idx = pos_idx.index_select(0, order[is_first])
+        keep_mask = torch.zeros_like(edge_labels, dtype=torch.bool)
+        keep_mask[best_pos_idx] = True
+        return keep_mask
+
+    @staticmethod
+    def _filter_pair_edges_by_mask(
+        *,
+        pair_edge_local_ids: torch.Tensor,
+        pair_edge_counts: torch.Tensor,
+        keep_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if pair_edge_local_ids.numel() == ZERO or pair_edge_counts.numel() == ZERO:
+            return pair_edge_local_ids, pair_edge_counts
+        keep_pair_mask = keep_mask[pair_edge_local_ids]
+        pair_ids = torch.repeat_interleave(
+            torch.arange(pair_edge_counts.numel(), device=pair_edge_counts.device),
+            pair_edge_counts,
+        )
+        new_counts = torch.zeros_like(pair_edge_counts)
+        new_counts.scatter_add_(0, pair_ids, keep_pair_mask.to(dtype=new_counts.dtype))
+        new_pair_edge_local_ids = pair_edge_local_ids[keep_pair_mask]
+        return new_pair_edge_local_ids, new_counts
 
     @staticmethod
     def _prune_to_hops(

@@ -28,8 +28,9 @@ When `start == answer`, the pair is **reachable** with zero edges:
 
 ## Preprocessing (Retriever)
 
-- `scripts/build_retrieval_parquet.py` computes shortest-path supervision with **undirected BFS**.
+- `scripts/build_retrieval_pipeline.py` computes shortest-path supervision with **undirected BFS**.
 - The `undirected_traversal` and `soft_label.undirected` flags are removed; this is a fixed design choice.
+- Parallel edges sharing the same `{h,t}` are **not** canonicalized (Option B); all relations are preserved.
 
 ## Retriever Scoring (Twin-View)
 

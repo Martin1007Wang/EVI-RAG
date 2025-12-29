@@ -42,6 +42,7 @@ class GRetrievalDataset(Dataset):
         resources: Optional[SharedDataResources] = None,
         sample_limit: Optional[int] = None,
         sample_filter_path: Optional[Path] = None,
+        drop_zero_positive: bool = False,
         random_seed: Optional[int] = None,
         validate_on_init: bool = False,
     ):
@@ -77,6 +78,9 @@ class GRetrievalDataset(Dataset):
         # 4. Filtering Logic
         if sample_filter_path:
             self._apply_sample_filter(sample_filter_path)
+
+        if drop_zero_positive:
+            self._apply_zero_positive_filter()
 
         if sample_limit:
             self._apply_sample_limit(sample_limit, random_seed)
@@ -211,6 +215,25 @@ class GRetrievalDataset(Dataset):
         self.sample_ids = [sid for sid in self.sample_ids if sid in keep_ids]
         logger.info(f"Filtered {self.split}: {before} -> {len(self.sample_ids)} using {path.name}")
 
+    def _apply_zero_positive_filter(self) -> None:
+        if not self.sample_ids:
+            return
+        before = len(self.sample_ids)
+        keep_ids = []
+        temp_store = EmbeddingStore(self.split_path)
+        try:
+            for sid in self.sample_ids:
+                raw = temp_store.load_sample(sid)
+                labels = raw.get("labels")
+                if not torch.is_tensor(labels):
+                    raise TypeError(f"labels for {sid} must be a torch.Tensor, got {type(labels)!r}")
+                if bool((labels > 0).any().item()):
+                    keep_ids.append(sid)
+        finally:
+            temp_store.close()
+        self.sample_ids = keep_ids
+        logger.info(f"Filtered {self.split}: {before} -> {len(self.sample_ids)} using nonzero positive labels.")
+
     @staticmethod
     def _load_filter_ids(path: Path) -> Set[str]:
         text = path.read_text(encoding="utf-8").strip()
@@ -274,6 +297,8 @@ def create_g_retrieval_dataset(
 
     logger.info("Loaded retrieval LMDB; structural encoding is controlled by the retriever config.")
 
+    drop_zero_positive = bool(cfg.get("drop_zero_positive", False)) and split_name == "train"
+
     return GRetrievalDataset(
         split_path=split_path,
         vocabulary_path=Path(cfg["paths"]["vocabulary"]),
@@ -283,6 +308,7 @@ def create_g_retrieval_dataset(
         resources=resources,
         sample_limit=sample_limit,
         sample_filter_path=Path(cfg.get("sample_filter_path")) if cfg.get("sample_filter_path") else None,
+        drop_zero_positive=drop_zero_positive,
         random_seed=cfg.get("random_seed"),
         validate_on_init=bool(cfg.get("validate_on_init", False)),
     )

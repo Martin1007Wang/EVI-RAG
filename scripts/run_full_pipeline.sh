@@ -83,8 +83,8 @@ if [[ -d /dev/shm ]]; then
   fi
 fi
 
-COMMON_OVERRIDES_FULL=("dataset=${DATASET_FULL}" "hydra.job.chdir=false")
-COMMON_OVERRIDES_SUB=("dataset=${DATASET_SUB}" "hydra.job.chdir=false")
+COMMON_OVERRIDES_FULL=("dataset=${DATASET_FULL}" "paths=default" "hydra.job.chdir=false")
+COMMON_OVERRIDES_SUB=("dataset=${DATASET_SUB}" "paths=default" "hydra.job.chdir=false")
 
 latest_run_dir() {
   local task="$1"
@@ -111,14 +111,10 @@ pick_best_ckpt() {
 }
 
 if [[ "${SKIP_PREPROCESS}" != "true" ]]; then
-  echo "==> [1/7] build_retrieval_parquet (full=${DATASET_FULL}, emit sub mask)"
-  python scripts/build_retrieval_parquet.py "${COMMON_OVERRIDES_FULL[@]}"
-
-  echo "==> [2/7] build_retrieval_dataset (full=${DATASET_FULL})"
-  python scripts/build_retrieval_dataset.py "${COMMON_OVERRIDES_FULL[@]}"
+  echo "==> [1/6] build_retrieval_pipeline (full=${DATASET_FULL}, emit sub mask)"
+  python scripts/build_retrieval_pipeline.py "${COMMON_OVERRIDES_FULL[@]}"
 else
-  echo "==> [1/7] build_retrieval_parquet (full=${DATASET_FULL}) [skipped]"
-  echo "==> [2/7] build_retrieval_dataset (full=${DATASET_FULL}) [skipped]"
+  echo "==> [1/6] build_retrieval_pipeline (full=${DATASET_FULL}) [skipped]"
 fi
 
 if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
@@ -127,9 +123,9 @@ if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
     exit 1
   fi
   RETR_CKPT="${RETRIEVER_CKPT_OVERRIDE}"
-  echo "==> [3/7] train_retriever (skipped, using retriever ckpt override)"
+  echo "==> [2/6] train_retriever (skipped, using retriever ckpt override)"
 else
-echo "==> [3/7] train_retriever (experiment=train_retriever, sub=${DATASET_SUB})"
+echo "==> [2/6] train_retriever (experiment=train_retriever, sub=${DATASET_SUB})"
 RETR_EXP="train_retriever"
   RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${RETR_EXP}")
   python src/train.py "${RETR_TRAIN_OVERRIDES[@]}"
@@ -142,14 +138,14 @@ RETR_EXP="train_retriever"
 fi
 echo "Retriever checkpoint: ${RETR_CKPT}"
 
-echo "==> [4/7] eval_retriever (full+sub, train/val/test + g_agent)"
+echo "==> [3/6] eval_retriever (full+sub, train/val/test + g_agent)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=eval_retriever" \
   "ckpt.retriever=${RETR_CKPT}" \
   "run.run_all_splits=true"
 
-echo "==> [5/7] train_gflownet (experiment=train_gflownet, sub=${DATASET_SUB})"
+echo "==> [4/6] train_gflownet (experiment=train_gflownet, sub=${DATASET_SUB})"
 GFLOW_EXP="train_gflownet"
 GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${GFLOW_EXP}" "ckpt.retriever=${RETR_CKPT}")
 python src/train.py "${GFLOW_TRAIN_OVERRIDES[@]}"
@@ -161,13 +157,13 @@ if [[ -z "${GFLOW_CKPT}" ]]; then
 fi
 echo "GFlowNet checkpoint: ${GFLOW_CKPT}"
 
-echo "==> [6/7] eval_gflownet (full+sub)"
+echo "==> [5/6] eval_gflownet (full+sub)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=eval_gflownet" \
   "ckpt.gflownet=${GFLOW_CKPT}"
 
-echo "==> [7/7] oracle (retriever upper bound, full+sub)"
+echo "==> [6/6] oracle (retriever upper bound, full+sub)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=reasoner_oracle"

@@ -20,8 +20,8 @@ trainer:
 model:
   compile_model: true
   loss:
-    infonce_weight: 0.0
-    bce_weight: 1.0
+    infonce_weight: 1.0
+    bce_weight: 0.0
 
 callbacks:
   model_checkpoint:

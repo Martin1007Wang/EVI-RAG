@@ -30,3 +30,4 @@ column_map:
   graph_field: proof
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json
+drop_zero_positive: true

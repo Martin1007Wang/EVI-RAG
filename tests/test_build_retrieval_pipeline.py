@@ -1,6 +1,8 @@
 import re
 
-import scripts.build_retrieval_parquet as brp
+import torch
+
+import scripts.build_retrieval_pipeline as brp
 
 TEXT_CFG = brp.TextEntityConfig(
     mode="regex",
@@ -382,3 +384,40 @@ def test_build_graph_emits_pair_counts_shortest_path():
     assert graph.positive_triple_mask == [True]
     assert graph.pair_edge_counts == [1]
     assert graph.pair_shortest_lengths == [1]
+
+
+def test_canonicalize_graph_edges_selects_relation():
+    sample = brp.Sample(
+        dataset="ds",
+        split="train",
+        question_id="2",
+        kb="freebase",
+        question="q",
+        graph=[
+            ("m.h", "r1", "m.t"),
+            ("m.h", "r2", "m.t"),
+        ],
+        q_entity=["m.h"],
+        a_entity=["m.t"],
+        answer_texts=["a"],
+        answer_subgraph=[],
+    )
+    entity_vocab, relation_vocab = _build_minimal_vocab_for_sample(sample)
+    graph = brp.build_graph(
+        sample,
+        entity_vocab,
+        relation_vocab,
+        graph_id="ds/train/2",
+    )
+    assert graph.positive_triple_mask == [True, True]
+    rel_id_r1 = relation_vocab.relation_id("r1")
+    rel_id_r2 = relation_vocab.relation_id("r2")
+    max_rel_id = max(rel_id_r1, rel_id_r2)
+    relation_embeddings = torch.zeros((max_rel_id + 1, 2), dtype=torch.float32)
+    relation_embeddings[rel_id_r1] = torch.tensor([1.0, 0.0])
+    relation_embeddings[rel_id_r2] = torch.tensor([0.0, 1.0])
+    question_embedding_norm = torch.tensor([1.0, 0.0])
+    brp._canonicalize_graph_edges(graph, question_embedding_norm, relation_embeddings)
+    assert graph.positive_triple_mask == [True, False]
+    assert graph.pair_edge_counts == [1]
+    assert graph.pair_edge_local_ids == [0]
