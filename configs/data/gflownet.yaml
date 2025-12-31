@@ -9,7 +9,7 @@ cache_paths:
 prefer_jsonl: true
 convert_pt_to_jsonl: true
 
-batch_size: 128
+batch_size: 64
 num_workers: 8
 pin_memory: true
 drop_last: false

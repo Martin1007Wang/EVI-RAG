@@ -16,8 +16,11 @@ class TextEncoder:
     def __init__(self, model_name: str, device: str, fp16: bool, progress: bool) -> None:
         try:
             from transformers import AutoModel, AutoTokenizer
-        except ImportError as exc:  # pragma: no cover
-            raise SystemExit("transformers is required for text encoding. pip install transformers.") from exc
+        except ImportError as exc:
+            raise SystemExit(
+                "transformers is required for text encoding. pip install transformers."
+            ) from exc
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
         self.model.to(device)
@@ -36,12 +39,14 @@ class TextEncoder:
     ) -> torch.Tensor:
         if not texts:
             return torch.empty((0, 0), dtype=torch.float32)
+
         all_embeds: List[torch.Tensor] = []
         iterator = _iter_batches(len(texts), batch_size)
         use_progress = self.progress if show_progress is None else show_progress
         if use_progress:
             total = (len(texts) + batch_size - 1) // batch_size
             iterator = tqdm(iterator, total=total, desc=desc or "Encoding", leave=False)
+
         for start, end in iterator:
             chunk = list(texts[start:end])
             inputs = self.tokenizer(
@@ -58,6 +63,7 @@ class TextEncoder:
             denom = mask.sum(dim=1).clamp(min=ENCODER_EPS)
             pooled = summed / denom
             all_embeds.append(pooled.to("cpu", dtype=torch.float32))
+
         return torch.cat(all_embeds, dim=0)
 
 
@@ -68,7 +74,7 @@ def encode_to_memmap(
     batch_size: int,
     max_embedding_id: int,
     out_path: Path,
-    desc: str,
+    desc: Optional[str],
     show_progress: bool,
 ) -> torch.Tensor:
     if max_embedding_id < 0:
@@ -89,8 +95,10 @@ def encode_to_memmap(
 
     iterator = _iter_batches(len(texts), batch_size, offset=batch_size)
     if show_progress:
-        total = max(0, (len(texts) - batch_size + batch_size - 1) // batch_size)
+        total = max(0, len(texts) - batch_size)
+        total = (total + batch_size - 1) // batch_size
         iterator = tqdm(iterator, total=total, desc=desc, leave=False)
+
     for start, end in iterator:
         chunk_texts = list(texts[start:end])
         chunk_ids = list(emb_ids[start:end])
@@ -104,7 +112,7 @@ def encode_to_memmap(
     return tensor
 
 
-def _iter_batches(total: int, batch_size: int, *, offset: int = 0) -> Iterable[Tuple[int, int]]:
+def _iter_batches(total: int, batch_size: int, offset: int = 0) -> Iterable[Tuple[int, int]]:
     for start in range(offset, total, batch_size):
         end = min(start + batch_size, total)
         yield start, end
@@ -116,19 +124,30 @@ def _embedding_dim(emb: torch.Tensor) -> int:
 
 def _init_memmap(out_path: Path, max_embedding_id: int, emb_dim: int) -> Tuple[np.memmap, Path]:
     mmap_path = out_path.with_suffix(out_path.suffix + ".mmap")
-    mem = np.memmap(mmap_path, mode="w+", dtype="float32", shape=(max_embedding_id + 1, emb_dim))
+    mem = np.memmap(
+        mmap_path,
+        mode="w+",
+        dtype="float32",
+        shape=(max_embedding_id + 1, emb_dim),
+    )
     mem[:] = 0.0
     return mem, mmap_path
 
 
-def _write_chunk(mem: np.memmap, emb_chunk: torch.Tensor, id_chunk: Sequence[int], max_embedding_id: int) -> None:
+def _write_chunk(
+    mem: np.memmap,
+    emb_chunk: torch.Tensor,
+    id_chunk: Sequence[int],
+    max_embedding_id: int,
+) -> None:
     for emb_tensor, emb_id in zip(emb_chunk, id_chunk):
-        if 0 <= int(emb_id) <= max_embedding_id:
-            mem[int(emb_id)] = emb_tensor.cpu().numpy()
+        if not 0 <= int(emb_id) <= max_embedding_id:
+            continue
+        mem[int(emb_id)] = emb_tensor.cpu().numpy()
 
 
 def _cleanup_memmap(mmap_path: Path) -> None:
     try:
         mmap_path.unlink(missing_ok=True)
     except Exception:
-        pass
+        return

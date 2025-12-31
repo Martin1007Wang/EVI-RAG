@@ -15,7 +15,10 @@ paths:
   embeddings: ${dataset.materialized_dir}/embeddings
   processed: ${dataset.materialized_dir}/processed
 
+validate_on_get: false
+
 sample_filter_path: ${dataset.out_dir}/sub_filter.json
+nonzero_positive_filter_path: ${dataset.out_dir}/nonzero_positive_filter.json
 drop_zero_positive: true
 
 entity_normalization: none

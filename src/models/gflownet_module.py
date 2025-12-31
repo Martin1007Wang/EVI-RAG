@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-from collections import deque
 import math
 from typing import Any, Dict, Optional
 
@@ -21,7 +20,11 @@ from src.models.components import (
 )
 from src.models.components.gflownet_env import STOP_RELATION, DIRECTION_FORWARD, DIRECTION_BACKWARD
 from src.utils import setup_optimizer
+from src.utils.graph_utils import POS_LABEL_THRESHOLD
 from src.utils.logging_utils import log_metric
+
+_ZERO = 0
+_ONE = 1
 
 
 class GFlowNetModule(LightningModule):
@@ -299,6 +302,7 @@ class GFlowNetModule(LightningModule):
         edge_relations = embed.edge_relations
         node_tokens = embed.node_tokens.to(dtype=torch.float32)
         question_tokens = embed.question_tokens.to(dtype=torch.float32)
+        node_struct_raw = embed.node_struct_raw
         base_edge_scores = batch.edge_scores.to(device=device, dtype=torch.float32).view(-1)
         num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
         node_counts = (node_ptr[1:] - node_ptr[:-1]).clamp(min=0)
@@ -311,11 +315,11 @@ class GFlowNetModule(LightningModule):
         answer_node_locals = batch.answer_node_locals.to(device)
         if answer_node_locals.numel() > 0:
             node_is_answer[answer_node_locals] = True
-        node_answer_dist = getattr(batch, "node_answer_dist", None)
-        if torch.is_tensor(node_answer_dist):
-            node_answer_dist = node_answer_dist.to(device=device, dtype=torch.long).view(-1)
+        dummy_mask = getattr(batch, "is_dummy_agent", None)
+        if torch.is_tensor(dummy_mask):
+            dummy_mask = dummy_mask.to(device=device, dtype=torch.bool).view(-1)
         else:
-            node_answer_dist = torch.empty(0, dtype=torch.long, device=device)
+            dummy_mask = torch.zeros(num_graphs, device=device, dtype=torch.bool)
 
         graph_cache: Dict[str, torch.Tensor] = {
             "edge_index": edge_index,
@@ -328,15 +332,15 @@ class GFlowNetModule(LightningModule):
             "node_batch": node_batch,
             "node_is_start": node_is_start,
             "node_is_answer": node_is_answer,
-            "node_answer_dist": node_answer_dist,
             "start_node_locals": start_node_locals,
             "start_ptr": batch._slice_dict["start_node_locals"].to(device),
             "answer_node_locals": answer_node_locals,
             "answer_ptr": batch._slice_dict["answer_node_locals"].to(device),
+            "dummy_mask": dummy_mask,
         }
 
         autocast_ctx = (
-            torch.autocast(device_type=device.type, enabled=False)
+            torch.autocast(device_type=device.type, enabled=torch.is_autocast_enabled())
             if device.type != "cpu"
             else contextlib.nullcontext()
         )
@@ -347,6 +351,7 @@ class GFlowNetModule(LightningModule):
                 question_tokens=question_tokens,
                 edge_index=edge_index,
                 start_node_locals=start_node_locals,
+                node_struct_raw=node_struct_raw,
             )
 
         num_rollouts = self._require_positive_int(self._eval_rollouts, "evaluation_cfg.num_eval_rollouts")
@@ -395,6 +400,7 @@ class GFlowNetModule(LightningModule):
         edge_relations = embed.edge_relations
         node_tokens = embed.node_tokens.to(dtype=torch.float32)
         question_tokens = embed.question_tokens.to(dtype=torch.float32)
+        node_struct_raw = embed.node_struct_raw
         answer_node_ptr = batch._slice_dict["answer_node_locals"].to(device)
         base_edge_scores = batch.edge_scores.to(device=device, dtype=torch.float32).view(-1)
         num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
@@ -408,11 +414,11 @@ class GFlowNetModule(LightningModule):
         answer_node_locals = batch.answer_node_locals.to(device)
         if answer_node_locals.numel() > 0:
             node_is_answer[answer_node_locals] = True
-        node_answer_dist = getattr(batch, "node_answer_dist", None)
-        if torch.is_tensor(node_answer_dist):
-            node_answer_dist = node_answer_dist.to(device=device, dtype=torch.long).view(-1)
+        dummy_mask = getattr(batch, "is_dummy_agent", None)
+        if torch.is_tensor(dummy_mask):
+            dummy_mask = dummy_mask.to(device=device, dtype=torch.bool).view(-1)
         else:
-            node_answer_dist = torch.empty(0, dtype=torch.long, device=device)
+            dummy_mask = torch.zeros(num_graphs, device=device, dtype=torch.bool)
 
         graph_cache: Dict[str, torch.Tensor] = {
             "edge_index": edge_index,
@@ -425,15 +431,15 @@ class GFlowNetModule(LightningModule):
             "node_batch": node_batch,
             "node_is_start": node_is_start,
             "node_is_answer": node_is_answer,
-            "node_answer_dist": node_answer_dist,
             "start_node_locals": start_node_locals,
             "start_ptr": batch._slice_dict["start_node_locals"].to(device),
             "answer_node_locals": answer_node_locals,
             "answer_ptr": batch._slice_dict["answer_node_locals"].to(device),
+            "dummy_mask": dummy_mask,
         }
 
         autocast_ctx = (
-            torch.autocast(device_type=device.type, enabled=False)
+            torch.autocast(device_type=device.type, enabled=torch.is_autocast_enabled())
             if device.type != "cpu"
             else contextlib.nullcontext()
         )
@@ -444,39 +450,14 @@ class GFlowNetModule(LightningModule):
                 question_tokens=question_tokens,
                 edge_index=edge_index,
                 start_node_locals=start_node_locals,
+                node_struct_raw=node_struct_raw,
             )
         bc_weight = self._compute_bc_weight() if self.training else 0.0
-        soft_bc_weight = float(self.training_cfg.get("bc_soft_teacher_weight", 0.0)) if self.training else 0.0
         bc_loss_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
         bc_steps_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
         bc_valid_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
         bc_pair_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-        soft_bc_loss_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-        soft_bc_steps_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-        soft_bc_valid_steps_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
         bc_loss_scalar = torch.zeros((), device=device, dtype=torch.float32)
-        if self.training and (bc_weight > 0.0 or soft_bc_weight > 0.0):
-            (
-                bc_loss_per_graph,
-                bc_steps_per_graph,
-                bc_valid_per_graph,
-                bc_pair_per_graph,
-                soft_bc_loss_per_graph,
-                soft_bc_steps_per_graph,
-                soft_bc_valid_steps_per_graph,
-            ) = self._compute_bc_loss(
-                batch=batch,
-                edge_tokens=edge_tokens,
-                node_tokens=node_tokens,
-                question_tokens=question_tokens,
-                edge_batch=edge_batch,
-                edge_ptr=edge_ptr,
-                node_ptr=node_ptr,
-                graph_cache=graph_cache,
-                state_encoder_cache=state_encoder_cache,
-            )
-            bc_loss_scalar = bc_loss_per_graph.mean()
-        soft_bc_loss_scalar = soft_bc_loss_per_graph.mean() if soft_bc_weight > 0.0 else torch.zeros((), device=device)
 
         if self.training:
             num_rollouts = self._require_positive_int(
@@ -488,6 +469,17 @@ class GFlowNetModule(LightningModule):
         loss_list = []
         metrics_list: list[Dict[str, torch.Tensor]] = []
         rollout_answer_hits: list[torch.Tensor] = []
+        need_bc = self.training and bc_weight > 0.0
+        dag_edge_mask = None
+        if need_bc:
+            edge_labels = getattr(batch, "edge_labels", None)
+            if not torch.is_tensor(edge_labels):
+                raise ValueError("edge_labels missing in g_agent batch; cannot derive dag_edge_mask.")
+            dag_edge_mask = edge_labels.to(device=device, dtype=torch.float32).view(-1) > POS_LABEL_THRESHOLD
+            if dag_edge_mask.numel() != edge_tokens.size(0):
+                raise ValueError(
+                    f"dag_edge_mask length {dag_edge_mask.numel()} != num_edges {edge_tokens.size(0)}."
+                )
 
         for _ in range(num_rollouts):
             rollout = self.actor.rollout(
@@ -502,6 +494,8 @@ class GFlowNetModule(LightningModule):
                 batch_idx=batch_idx,
                 graph_cache=graph_cache,
                 state_encoder_cache=state_encoder_cache,
+                dag_edge_mask=dag_edge_mask if need_bc else None,
+                return_bc_stats=need_bc,
             )
             # Rollout returns log_pf/log_pf_steps/actions_seq for SubTB.
             state_emb_seq = rollout.get("state_emb_seq")
@@ -513,6 +507,7 @@ class GFlowNetModule(LightningModule):
                 edge_scores=base_edge_scores,
                 edge_batch=edge_batch,
                 answer_hit=rollout["reach_success"],
+                dummy_mask=dummy_mask,
                 pair_start_node_locals=batch.pair_start_node_locals.to(device),
                 pair_answer_node_locals=batch.pair_answer_node_locals.to(device),
                 pair_shortest_lengths=batch.pair_shortest_lengths.to(device),
@@ -522,29 +517,19 @@ class GFlowNetModule(LightningModule):
             )
 
             log_reward = reward_out.log_reward
-            self._assert_finite(log_reward, "log_reward")
+            if bool(dummy_mask.any().item()):
+                log_reward_for_loss = torch.where(dummy_mask, torch.zeros_like(log_reward), log_reward)
+                self._assert_finite(log_reward_for_loss, "log_reward")
+            else:
+                self._assert_finite(log_reward, "log_reward")
+                log_reward_for_loss = log_reward
             self._assert_finite(rollout["log_pf"], "log_pf")
             log_flow_states = self._compute_log_flow_states(
                 state_emb_seq=state_emb_seq,
                 question_tokens=question_tokens,
-                log_reward=log_reward,
+                log_reward=log_reward_for_loss,
                 edge_lengths=rollout["length"].long(),
             )
-            phi_states = rollout.get("phi_states", None)
-            if phi_states is None:
-                raise ValueError("phi_states missing in rollout; GraphEnv.potential must be enabled.")
-            if phi_states.shape != log_flow_states.shape:
-                raise ValueError(
-                    f"phi_states shape {tuple(phi_states.shape)} != log_flow_states {tuple(log_flow_states.shape)}"
-                )
-            phi_states = phi_states.to(device=device, dtype=log_flow_states.dtype).detach()
-            term_state = rollout["length"].long().clamp(min=0, max=rollout["log_pf_steps"].size(1) - 1) + 1
-            phi_states.scatter_(
-                1,
-                term_state.view(-1, 1),
-                torch.zeros_like(term_state, dtype=phi_states.dtype).view(-1, 1),
-            )
-            log_flow_states = log_flow_states + phi_states
             # Backward policy P_B is deterministic under this state definition:
             # given the full trajectory state, the predecessor is uniquely obtained by removing the last action.
             log_pb_steps = self._compute_deterministic_log_pb_steps(
@@ -553,13 +538,38 @@ class GFlowNetModule(LightningModule):
                 dtype=rollout["log_pf_steps"].dtype,
                 device=device,
             )
+            graph_mask = None
+            if bool(dummy_mask.any().item()):
+                graph_mask = ~dummy_mask
             subtb_loss = self._compute_subtb_loss(
                 log_flow_states=log_flow_states,
                 log_pf_steps=rollout["log_pf_steps"],
                 log_pb_steps=log_pb_steps,
                 edge_lengths=rollout["length"].long(),
+                graph_mask=graph_mask,
             )
-            loss = subtb_loss + bc_weight * bc_loss_scalar + soft_bc_weight * soft_bc_loss_scalar
+            if need_bc:
+                bc_loss_per_graph = rollout.get("bc_loss_per_graph")
+                bc_steps_per_graph = rollout.get("bc_steps_per_graph")
+                bc_pair_per_graph = rollout.get("bc_has_dag")
+                if bc_loss_per_graph is None or bc_steps_per_graph is None or bc_pair_per_graph is None:
+                    bc_loss_per_graph, bc_steps_per_graph, bc_pair_per_graph = self._compute_dag_bc_loss(
+                        log_prob_edge_seq=rollout.get("log_prob_edge_seq"),
+                        valid_edges_seq=rollout.get("valid_edges_seq"),
+                        dag_edge_mask=dag_edge_mask,
+                        edge_batch=edge_batch,
+                        num_graphs=num_graphs,
+                    )
+                bc_valid_per_graph = (bc_steps_per_graph > 0).to(dtype=bc_loss_per_graph.dtype)
+                bc_loss_scalar = bc_loss_per_graph.mean()
+            else:
+                bc_loss_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+                bc_steps_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+                bc_valid_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+                bc_pair_per_graph = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+                bc_loss_scalar = torch.zeros((), device=device, dtype=torch.float32)
+
+            loss = subtb_loss + bc_weight * bc_loss_scalar
 
             reward_metrics = reward_out.as_dict()
             log_reward_metric = reward_metrics.pop("log_reward")
@@ -576,6 +586,11 @@ class GFlowNetModule(LightningModule):
                     if isinstance(answer_hit, torch.Tensor)
                     else rollout["reach_success"].detach()
                 ),
+                "prob_answer": (
+                    answer_hit.detach()
+                    if isinstance(answer_hit, torch.Tensor)
+                    else rollout["reach_success"].detach()
+                ),
                 "length_mean": rollout["length"].detach(),
                 "subtb_loss": subtb_loss.detach(),
                 "bc_loss": bc_loss_per_graph.detach(),
@@ -583,10 +598,6 @@ class GFlowNetModule(LightningModule):
                 "bc_valid": bc_valid_per_graph.detach(),
                 "bc_has_pair": bc_pair_per_graph.detach(),
                 "bc_weight": torch.full_like(bc_steps_per_graph, float(bc_weight)),
-                "soft_bc_loss": soft_bc_loss_per_graph.detach(),
-                "soft_bc_steps": soft_bc_steps_per_graph.detach(),
-                "soft_bc_valid_steps": soft_bc_valid_steps_per_graph.detach(),
-                "soft_bc_weight": torch.full_like(soft_bc_steps_per_graph, float(soft_bc_weight)),
                 **{k: v.detach() for k, v in reward_metrics.items()},
             }
 
@@ -648,6 +659,75 @@ class GFlowNetModule(LightningModule):
             else:
                 aggregated[key] = stack.mean(dim=0)
         return aggregated
+
+    @staticmethod
+    def _segment_logsumexp_1d(
+        logits: torch.Tensor,
+        segment_ids: torch.Tensor,
+        num_segments: int,
+    ) -> torch.Tensor:
+        if logits.dim() != 1 or segment_ids.dim() != 1:
+            raise ValueError("logits and segment_ids must be 1D tensors.")
+        if logits.numel() != segment_ids.numel():
+            raise ValueError("logits and segment_ids must have the same length.")
+        if num_segments <= 0:
+            raise ValueError(f"num_segments must be positive, got {num_segments}")
+        if logits.numel() == 0:
+            neg_inf = torch.finfo(logits.dtype).min
+            return torch.full((num_segments,), neg_inf, device=logits.device, dtype=logits.dtype)
+        neg_inf = torch.finfo(logits.dtype).min
+        max_per = torch.full((num_segments,), neg_inf, device=logits.device, dtype=logits.dtype)
+        max_per.scatter_reduce_(0, segment_ids, logits, reduce="amax", include_self=True)
+        shifted = logits - max_per[segment_ids]
+        exp = torch.exp(shifted)
+        sum_per = torch.zeros((num_segments,), device=logits.device, dtype=logits.dtype)
+        sum_per.index_add_(0, segment_ids, exp)
+        eps = torch.finfo(logits.dtype).eps
+        return torch.log(sum_per.clamp(min=eps)) + max_per
+
+    def _compute_dag_bc_loss(
+        self,
+        *,
+        log_prob_edge_seq: torch.Tensor | None,
+        valid_edges_seq: torch.Tensor | None,
+        dag_edge_mask: torch.Tensor | None,
+        edge_batch: torch.Tensor,
+        num_graphs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = edge_batch.device
+        if log_prob_edge_seq is None or valid_edges_seq is None or dag_edge_mask is None:
+            raise ValueError("dag BC loss requires log_prob_edge_seq/valid_edges_seq/dag_edge_mask.")
+        if log_prob_edge_seq.dim() != 2 or valid_edges_seq.shape != log_prob_edge_seq.shape:
+            raise ValueError("log_prob_edge_seq/valid_edges_seq must be [T,E] with matching shapes.")
+        dag_edge_mask = dag_edge_mask.to(device=device, dtype=torch.bool).view(1, -1)
+        if dag_edge_mask.size(1) != log_prob_edge_seq.size(1):
+            raise ValueError("dag_edge_mask length mismatch with log_prob_edge_seq.")
+
+        mask = valid_edges_seq.to(device=device, dtype=torch.bool) & dag_edge_mask
+        neg_inf = torch.finfo(log_prob_edge_seq.dtype).min
+        masked_logits = torch.where(mask, log_prob_edge_seq, torch.full_like(log_prob_edge_seq, neg_inf))
+        num_steps = int(log_prob_edge_seq.size(0))
+        edge_batch = edge_batch.to(device=device, dtype=torch.long).view(1, -1)
+        step_offsets = torch.arange(num_steps, device=device, dtype=edge_batch.dtype).view(-1, 1) * int(num_graphs)
+        segment_ids = (edge_batch + step_offsets).reshape(-1)
+        logsumexp = self._segment_logsumexp_1d(
+            masked_logits.reshape(-1),
+            segment_ids,
+            num_segments=num_steps * int(num_graphs),
+        ).view(num_steps, num_graphs)
+        mask_f = mask.reshape(-1).to(dtype=torch.float32)
+        counts = torch.zeros(num_steps * int(num_graphs), device=device, dtype=mask_f.dtype)
+        counts.index_add_(0, segment_ids, mask_f)
+        counts = counts.view(num_steps, num_graphs)
+        has_valid = counts > 0
+        loss_steps = torch.where(has_valid, -logsumexp, torch.zeros_like(logsumexp))
+        step_counts = has_valid.to(dtype=loss_steps.dtype).sum(dim=0)
+        bc_loss = loss_steps.sum(dim=0) / step_counts.clamp(min=1.0)
+
+        dag_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+        dag_counts.index_add_(0, edge_batch.view(-1), dag_edge_mask.view(-1).to(dtype=torch.float32))
+        bc_has_dag = (dag_counts > 0).to(dtype=bc_loss.dtype)
+        return bc_loss, step_counts, bc_has_dag
 
     def _refresh_eval_settings(self) -> None:
         """Ensure eval rollouts reflect current config (even when loading old checkpoints)."""
@@ -896,566 +976,6 @@ class GFlowNetModule(LightningModule):
             t = min(max(step - hold_steps, 0), decay_steps)
             scale = 0.5 * (1.0 + math.cos(math.pi * (t / decay_steps)))
         return bc_floor + (bc_weight - bc_floor) * scale
-
-    @staticmethod
-    def _bfs_dist(num_nodes: int, adj: list[list[int]], sources: list[int]) -> list[int]:
-        dist = [-1] * num_nodes
-        q: deque[int] = deque()
-        for s in sources:
-            if s < 0 or s >= num_nodes:
-                continue
-            if dist[s] == 0:
-                continue
-            dist[s] = 0
-            q.append(s)
-        while q:
-            u = q.popleft()
-            du = dist[u]
-            for v in adj[u]:
-                if dist[v] >= 0:
-                    continue
-                dist[v] = du + 1
-                q.append(v)
-        return dist
-
-    @classmethod
-    def _sample_shortest_path_edges(
-        cls,
-        *,
-        edge_index: torch.Tensor,
-        edge_ids: torch.Tensor,
-        node_offset: int,
-        num_nodes: int,
-        start_local: int,
-        answer_local: int,
-    ) -> list[int]:
-        if num_nodes <= 0:
-            return []
-        if start_local < 0 or start_local >= num_nodes or answer_local < 0 or answer_local >= num_nodes:
-            return []
-        if start_local == answer_local:
-            return []
-
-        edge_ids = edge_ids.to(dtype=torch.long).view(-1)
-        if edge_ids.numel() == 0:
-            return []
-
-        adj: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
-        heads = edge_index[0, edge_ids].tolist()
-        tails = edge_index[1, edge_ids].tolist()
-        for eid, h, t in zip(edge_ids.tolist(), heads, tails):
-            h_local = int(h) - node_offset
-            t_local = int(t) - node_offset
-            if h_local < 0 or h_local >= num_nodes or t_local < 0 or t_local >= num_nodes:
-                return []
-            adj[h_local].append((t_local, int(eid)))
-            if h_local != t_local:
-                adj[t_local].append((h_local, int(eid)))
-
-        adj_nodes = [[v for v, _ in nbrs] for nbrs in adj]
-        dist_s = cls._bfs_dist(num_nodes, adj_nodes, [start_local])
-        if dist_s[answer_local] < 0:
-            return []
-        dist_a = cls._bfs_dist(num_nodes, adj_nodes, [answer_local])
-        dist_sa = dist_s[answer_local]
-        if dist_sa <= 0:
-            return []
-
-        path_edges: list[int] = []
-        cur = start_local
-        for _ in range(dist_sa):
-            candidates: list[tuple[int, int]] = []
-            for v, eid in adj[cur]:
-                if dist_s[cur] + 1 + dist_a[v] == dist_sa:
-                    candidates.append((v, eid))
-            if not candidates:
-                return []
-            pick = int(torch.randint(len(candidates), (1,), device="cpu").item())
-            nxt, eid = candidates[pick]
-            path_edges.append(eid)
-            cur = nxt
-        if cur != answer_local:
-            return []
-        return path_edges
-
-    def _build_forced_actions_seq(
-        self,
-        *,
-        batch: Any,
-        num_graphs: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        num_action_steps = self.max_steps
-        num_steps = num_action_steps + 1
-        actions_seq = torch.full(
-            (num_graphs, num_steps),
-            STOP_RELATION,
-            device=device,
-            dtype=torch.long,
-        )
-        gt_edges = getattr(batch, "gt_path_edge_local_ids", None)
-        slice_dict = getattr(batch, "_slice_dict", None)
-        if gt_edges is None or slice_dict is None or "gt_path_edge_local_ids" not in slice_dict:
-            return actions_seq
-
-        gt_edges = gt_edges.to(device=device, dtype=torch.long).view(-1)
-        gt_ptr = slice_dict["gt_path_edge_local_ids"].to(device=device, dtype=torch.long).view(-1)
-        if gt_ptr.numel() != num_graphs + 1:
-            raise ValueError(
-                f"gt_path_edge_local_ids slice length {gt_ptr.numel()} != num_graphs+1 ({num_graphs + 1})."
-            )
-        if gt_edges.numel() == 0:
-            return actions_seq
-
-        counts = gt_ptr[1:] - gt_ptr[:-1]
-        if (counts < 0).any():
-            raise ValueError("gt_path_edge_local_ids slice must be non-decreasing.")
-        if int(counts.sum().item()) != int(gt_edges.numel()):
-            raise ValueError("gt_path_edge_local_ids slice sum mismatch with gt_path_edge_local_ids length.")
-
-        edge_batch = torch.repeat_interleave(torch.arange(num_graphs, device=device), counts)
-        step_idx = torch.arange(gt_edges.numel(), device=device) - gt_ptr[edge_batch]
-        valid = step_idx < num_action_steps
-        if valid.any():
-            actions_seq[edge_batch[valid], step_idx[valid]] = gt_edges[valid]
-
-        gt_exists = getattr(batch, "gt_path_exists", None)
-        if gt_exists is not None:
-            gt_exists = gt_exists.to(device=device, dtype=torch.bool).view(-1)
-            if gt_exists.numel() == num_graphs:
-                actions_seq = torch.where(
-                    gt_exists.view(-1, 1),
-                    actions_seq,
-                    torch.full_like(actions_seq, STOP_RELATION),
-                )
-        return actions_seq
-
-    def _build_pair_sampled_actions_seq(
-        self,
-        *,
-        batch: Any,
-        num_graphs: int,
-        device: torch.device,
-        node_ptr: torch.Tensor,
-        edge_ptr: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_action_steps = self.max_steps
-        num_steps = num_action_steps + 1
-        actions_seq = torch.full(
-            (num_graphs, num_steps),
-            STOP_RELATION,
-            device=device,
-            dtype=torch.long,
-        )
-        valid_graph = torch.zeros(num_graphs, device=device, dtype=torch.bool)
-        has_pair = torch.zeros(num_graphs, device=device, dtype=torch.bool)
-        pair_index = torch.full((num_graphs,), -1, device=device, dtype=torch.long)
-        pair_start_local = torch.full((num_graphs,), -1, device=device, dtype=torch.long)
-        pair_answer_local = torch.full((num_graphs,), -1, device=device, dtype=torch.long)
-
-        slice_dict = getattr(batch, "_slice_dict", None)
-        if slice_dict is None:
-            return actions_seq, valid_graph, has_pair, pair_index, pair_start_local, pair_answer_local
-        required = [
-            "pair_start_node_locals",
-            "pair_answer_node_locals",
-            "pair_edge_local_ids",
-            "pair_edge_counts",
-            "pair_shortest_lengths",
-        ]
-        if any(k not in slice_dict for k in required):
-            return actions_seq, valid_graph, has_pair, pair_index, pair_start_local, pair_answer_local
-
-        pair_start = batch.pair_start_node_locals.to(device="cpu", dtype=torch.long).view(-1)
-        pair_answer = batch.pair_answer_node_locals.to(device="cpu", dtype=torch.long).view(-1)
-        pair_edge_ids = batch.pair_edge_local_ids.to(device="cpu", dtype=torch.long).view(-1)
-        pair_edge_counts = batch.pair_edge_counts.to(device="cpu", dtype=torch.long).view(-1)
-        pair_lengths = batch.pair_shortest_lengths.to(device="cpu", dtype=torch.long).view(-1)
-        edge_index = batch.edge_index.to(device="cpu", dtype=torch.long)
-        node_ptr_cpu = node_ptr.to(device="cpu", dtype=torch.long).view(-1)
-        edge_ptr_cpu = edge_ptr.to(device="cpu", dtype=torch.long).view(-1)
-
-        start_ptr = slice_dict["pair_start_node_locals"].to(device="cpu", dtype=torch.long).view(-1)
-        answer_ptr = slice_dict["pair_answer_node_locals"].to(device="cpu", dtype=torch.long).view(-1)
-        edge_ids_ptr = slice_dict["pair_edge_local_ids"].to(device="cpu", dtype=torch.long).view(-1)
-        counts_ptr = slice_dict["pair_edge_counts"].to(device="cpu", dtype=torch.long).view(-1)
-
-        if start_ptr.numel() != num_graphs + 1:
-            return actions_seq, valid_graph, has_pair, pair_index, pair_start_local, pair_answer_local
-
-        for g in range(num_graphs):
-            ps0, ps1 = int(start_ptr[g].item()), int(start_ptr[g + 1].item())
-            pa0, pa1 = int(answer_ptr[g].item()), int(answer_ptr[g + 1].item())
-            pc0, pc1 = int(counts_ptr[g].item()), int(counts_ptr[g + 1].item())
-            pe0, pe1 = int(edge_ids_ptr[g].item()), int(edge_ids_ptr[g + 1].item())
-            if ps1 <= ps0:
-                continue
-            if pa1 - pa0 != ps1 - ps0:
-                continue
-            if pc1 - pc0 != ps1 - ps0:
-                continue
-            if pe1 < pe0:
-                continue
-
-            pair_lengths_g = pair_lengths[ps0:ps1]
-            pair_counts_g = pair_edge_counts[pc0:pc1]
-            if pair_counts_g.numel() != pair_lengths_g.numel():
-                continue
-            if int(pair_counts_g.sum().item()) != int(pair_edge_ids[pe0:pe1].numel()):
-                continue
-
-            has_pair[g] = True
-            valid_idx = torch.nonzero(pair_lengths_g <= int(num_action_steps), as_tuple=False).view(-1)
-            if valid_idx.numel() == 0:
-                continue
-            perm = valid_idx[torch.randperm(valid_idx.numel())]
-
-            pair_edge_ptr_g = torch.zeros(pair_counts_g.numel() + 1, dtype=torch.long)
-            pair_edge_ptr_g[1:] = pair_counts_g.cumsum(0)
-            pair_edge_ids_g = pair_edge_ids[pe0:pe1]
-
-            node_start = int(node_ptr_cpu[g].item())
-            node_end = int(node_ptr_cpu[g + 1].item())
-            num_nodes = int(node_end - node_start)
-            if num_nodes <= 0:
-                continue
-            edge_start = int(edge_ptr_cpu[g].item())
-            edge_end = int(edge_ptr_cpu[g + 1].item())
-
-            for local_idx in perm.tolist():
-                pair_idx = int(local_idx)
-                length = int(pair_lengths_g[pair_idx].item())
-                start_node = int(pair_start[ps0 + pair_idx].item()) - node_start
-                answer_node = int(pair_answer[ps0 + pair_idx].item()) - node_start
-                if start_node < 0 or start_node >= num_nodes or answer_node < 0 or answer_node >= num_nodes:
-                    continue
-                if length == 0:
-                    valid_graph[g] = True
-                    pair_index[g] = pair_idx
-                    pair_start_local[g] = start_node
-                    pair_answer_local[g] = answer_node
-                    break
-                e0 = int(pair_edge_ptr_g[pair_idx].item())
-                e1 = int(pair_edge_ptr_g[pair_idx + 1].item())
-                if e1 <= e0:
-                    continue
-                edge_ids = pair_edge_ids_g[e0:e1]
-                if edge_ids.numel() == 0:
-                    continue
-                if int(edge_ids.min().item()) < edge_start or int(edge_ids.max().item()) >= edge_end:
-                    continue
-                path_edges = self._sample_shortest_path_edges(
-                    edge_index=edge_index,
-                    edge_ids=edge_ids,
-                    node_offset=node_start,
-                    num_nodes=num_nodes,
-                    start_local=start_node,
-                    answer_local=answer_node,
-                )
-                if len(path_edges) != length:
-                    continue
-                for step, eid in enumerate(path_edges):
-                    if step >= num_action_steps:
-                        break
-                    actions_seq[g, step] = int(eid)
-                valid_graph[g] = True
-                pair_index[g] = pair_idx
-                pair_start_local[g] = start_node
-                pair_answer_local[g] = answer_node
-                break
-
-        return actions_seq, valid_graph, has_pair, pair_index, pair_start_local, pair_answer_local
-
-    def _compute_soft_teacher_loss(
-        self,
-        *,
-        actions_seq: torch.Tensor,
-        valid_graph: torch.Tensor,
-        pair_index: torch.Tensor,
-        pair_start_local: torch.Tensor,
-        pair_answer_local: torch.Tensor,
-        node_ptr: torch.Tensor,
-        edge_index: torch.Tensor,
-        pair_edge_local_ids: torch.Tensor,
-        pair_edge_counts: torch.Tensor,
-        slice_dict: Dict[str, torch.Tensor],
-        log_prob_edge_seq: torch.Tensor,
-        log_prob_stop_seq: torch.Tensor,
-        valid_edges_seq: torch.Tensor | None,
-        edge_scores: torch.Tensor,
-        use_edge_scores: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = log_prob_edge_seq.device
-        num_graphs = int(actions_seq.size(0))
-        num_steps = int(actions_seq.size(1))
-        losses = torch.zeros(num_graphs, device=device, dtype=log_prob_edge_seq.dtype)
-        step_counts = torch.zeros(num_graphs, device=device, dtype=log_prob_edge_seq.dtype)
-        valid_steps = torch.zeros(num_graphs, device=device, dtype=log_prob_edge_seq.dtype)
-
-        if num_graphs == 0 or log_prob_edge_seq.numel() == 0 or log_prob_stop_seq.numel() == 0:
-            return losses, step_counts, valid_steps
-
-        node_ptr_cpu = node_ptr.to(device="cpu", dtype=torch.long).view(-1)
-        edge_index_cpu = edge_index.to(device="cpu", dtype=torch.long)
-        pair_edge_ids_cpu = pair_edge_local_ids.to(device="cpu", dtype=torch.long).view(-1)
-        pair_edge_counts_cpu = pair_edge_counts.to(device="cpu", dtype=torch.long).view(-1)
-        start_ptr = slice_dict["pair_start_node_locals"].to(device="cpu", dtype=torch.long).view(-1)
-        edge_ids_ptr = slice_dict["pair_edge_local_ids"].to(device="cpu", dtype=torch.long).view(-1)
-        counts_ptr = slice_dict["pair_edge_counts"].to(device="cpu", dtype=torch.long).view(-1)
-
-        if start_ptr.numel() != num_graphs + 1:
-            return losses, step_counts, valid_steps
-
-        for g in range(num_graphs):
-            if not bool(valid_graph[g].item()):
-                continue
-            pidx = int(pair_index[g].item())
-            if pidx < 0:
-                continue
-            start_node = int(pair_start_local[g].item())
-            answer_node = int(pair_answer_local[g].item())
-            if start_node < 0 or answer_node < 0:
-                continue
-            if start_node == answer_node:
-                losses[g] += -log_prob_stop_seq[g, 0]
-                step_counts[g] += 1.0
-                valid_steps[g] += 1.0
-                continue
-
-            ps0, ps1 = int(start_ptr[g].item()), int(start_ptr[g + 1].item())
-            if pidx >= ps1 - ps0:
-                continue
-            pc0, pc1 = int(counts_ptr[g].item()), int(counts_ptr[g + 1].item())
-            pe0, pe1 = int(edge_ids_ptr[g].item()), int(edge_ids_ptr[g + 1].item())
-            if pc1 - pc0 != ps1 - ps0:
-                continue
-            if pe1 < pe0:
-                continue
-            pair_counts_g = pair_edge_counts_cpu[pc0:pc1]
-            if pair_counts_g.numel() == 0:
-                continue
-            if pidx >= pair_counts_g.numel():
-                continue
-
-            pair_edge_ptr_g = torch.zeros(pair_counts_g.numel() + 1, dtype=torch.long)
-            pair_edge_ptr_g[1:] = pair_counts_g.cumsum(0)
-            e0 = int(pair_edge_ptr_g[pidx].item())
-            e1 = int(pair_edge_ptr_g[pidx + 1].item())
-            if e1 <= e0:
-                continue
-            edge_ids = pair_edge_ids_cpu[pe0:pe1][e0:e1]
-            if edge_ids.numel() == 0:
-                continue
-
-            node_start = int(node_ptr_cpu[g].item())
-            node_end = int(node_ptr_cpu[g + 1].item())
-            num_nodes = int(node_end - node_start)
-            if num_nodes <= 0:
-                continue
-
-            adj: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
-            heads = edge_index_cpu[0, edge_ids].tolist()
-            tails = edge_index_cpu[1, edge_ids].tolist()
-            for eid, h, t in zip(edge_ids.tolist(), heads, tails):
-                h_local = int(h) - node_start
-                t_local = int(t) - node_start
-                if h_local < 0 or h_local >= num_nodes or t_local < 0 or t_local >= num_nodes:
-                    adj = []
-                    break
-                adj[h_local].append((t_local, int(eid)))
-                if h_local != t_local:
-                    adj[t_local].append((h_local, int(eid)))
-            if not adj:
-                continue
-
-            adj_nodes = [[v for v, _ in nbrs] for nbrs in adj]
-            dist_a = self._bfs_dist(num_nodes, adj_nodes, [answer_node])
-            dist_start = dist_a[start_node]
-            if dist_start < 0 or dist_start > self.max_steps:
-                continue
-
-            current = start_node
-            edge_count = int((actions_seq[g] != STOP_RELATION).sum().item())
-            stop_idx = min(edge_count, num_steps - 1)
-
-            for step in range(stop_idx + 1):
-                dist_cur = dist_a[current] if 0 <= current < len(dist_a) else -1
-                if dist_cur < 0:
-                    break
-                if dist_cur == 0:
-                    loss_step = -log_prob_stop_seq[g, step]
-                    losses[g] += loss_step
-                    step_counts[g] += 1.0
-                    valid_steps[g] += 1.0
-                    break
-
-                target_edges: list[int] = []
-                for v, eid in adj[current]:
-                    if dist_a[v] == dist_cur - 1:
-                        target_edges.append(eid)
-                if not target_edges:
-                    break
-
-                edge_ids_t = torch.tensor(target_edges, device=device, dtype=torch.long)
-                valid_target = True
-                if valid_edges_seq is not None and valid_edges_seq.numel() > 0:
-                    valid_mask = valid_edges_seq[step, edge_ids_t]
-                    if not bool(valid_mask.any().item()):
-                        valid_target = False
-                    edge_ids_t = edge_ids_t[valid_mask]
-                    if edge_ids_t.numel() == 0:
-                        valid_target = False
-                if valid_target:
-                    valid_steps[g] += 1.0
-                    log_probs = log_prob_edge_seq[step, edge_ids_t]
-                    if use_edge_scores:
-                        scores = edge_scores[edge_ids_t].to(dtype=log_probs.dtype)
-                        scores = scores.clamp(min=1e-6)
-                        log_w = torch.log(scores)
-                        denom = torch.logsumexp(log_w, dim=0)
-                        loss_step = -(torch.logsumexp(log_probs + log_w, dim=0) - denom)
-                    else:
-                        loss_step = -(torch.logsumexp(log_probs, dim=0) - math.log(float(edge_ids_t.numel())))
-                    losses[g] += loss_step
-                    step_counts[g] += 1.0
-
-                if step >= edge_count:
-                    break
-                eid_next = int(actions_seq[g, step].item())
-                if eid_next < 0:
-                    break
-                h = int(edge_index_cpu[0, eid_next].item()) - node_start
-                t = int(edge_index_cpu[1, eid_next].item()) - node_start
-                if h == current:
-                    current = t
-                elif t == current:
-                    current = h
-                else:
-                    break
-
-        denom = step_counts.clamp(min=1.0)
-        losses = losses / denom
-        return losses, step_counts, valid_steps
-
-    def _compute_bc_loss(
-        self,
-        *,
-        batch: Any,
-        edge_tokens: torch.Tensor,
-        node_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        edge_batch: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        node_ptr: torch.Tensor,
-        graph_cache: Dict[str, torch.Tensor],
-        state_encoder_cache: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_graphs = int(node_ptr.numel() - 1)
-        if num_graphs <= 0:
-            empty = torch.zeros(0, device=edge_tokens.device, dtype=torch.float32)
-            return empty, empty, empty, empty, empty, empty, empty
-
-        teacher_mode = str(self.training_cfg.get("bc_teacher_mode", "gt_path")).strip().lower()
-        use_pair = teacher_mode in {"pair", "pair_dag", "pair_sampled"}
-        soft_weight = float(self.training_cfg.get("bc_soft_teacher_weight", 0.0))
-        use_edge_scores = bool(self.training_cfg.get("bc_soft_teacher_use_edge_scores", False))
-        need_soft = soft_weight > 0.0
-
-        if use_pair:
-            (
-                actions_seq,
-                valid_graph,
-                has_pair,
-                pair_index,
-                pair_start_local,
-                pair_answer_local,
-            ) = self._build_pair_sampled_actions_seq(
-                batch=batch,
-                num_graphs=num_graphs,
-                device=edge_tokens.device,
-                node_ptr=node_ptr,
-                edge_ptr=edge_ptr,
-            )
-        else:
-            actions_seq = self._build_forced_actions_seq(batch=batch, num_graphs=num_graphs, device=edge_tokens.device)
-            gt_exists = getattr(batch, "gt_path_exists", None)
-            if gt_exists is not None:
-                valid_graph = gt_exists.to(device=edge_tokens.device, dtype=torch.bool).view(-1)
-            else:
-                valid_graph = torch.ones(num_graphs, device=edge_tokens.device, dtype=torch.bool)
-            has_pair = torch.zeros(num_graphs, device=edge_tokens.device, dtype=torch.bool)
-            pair_index = torch.full((num_graphs,), -1, device=edge_tokens.device, dtype=torch.long)
-            pair_start_local = torch.full((num_graphs,), -1, device=edge_tokens.device, dtype=torch.long)
-            pair_answer_local = torch.full((num_graphs,), -1, device=edge_tokens.device, dtype=torch.long)
-
-        edge_mask = actions_seq != STOP_RELATION
-        stop_pos = edge_mask.sum(dim=1).clamp(max=actions_seq.size(1) - 1)
-        stop_mask = torch.zeros_like(edge_mask)
-        stop_mask[torch.arange(num_graphs, device=edge_tokens.device), stop_pos] = True
-        bc_mask = edge_mask | stop_mask
-        if valid_graph.numel() == num_graphs:
-            bc_mask = bc_mask & valid_graph.view(-1, 1)
-        if not bool(bc_mask.any().item()) and not need_soft:
-            zeros = torch.zeros(num_graphs, device=edge_tokens.device, dtype=torch.float32)
-            return zeros, zeros, valid_graph.float(), has_pair.float(), zeros, zeros, zeros
-
-        rollout = self.actor.rollout(
-            batch=batch,
-            edge_tokens=edge_tokens,
-            node_tokens=node_tokens,
-            question_tokens=question_tokens,
-            edge_batch=edge_batch,
-            edge_ptr=edge_ptr,
-            node_ptr=node_ptr,
-            temperature=None,
-            graph_cache=graph_cache,
-            forced_actions_seq=actions_seq,
-            state_encoder_cache=state_encoder_cache,
-            return_log_probs=need_soft,
-            return_valid_edges=need_soft,
-        )
-        log_pf_steps = rollout["log_pf_steps"]
-        bc_mask_f = bc_mask.to(dtype=log_pf_steps.dtype)
-        step_counts = bc_mask_f.sum(dim=1)
-        denom = step_counts.clamp(min=1.0)
-        bc_loss = (-log_pf_steps * bc_mask_f).sum(dim=1) / denom
-        soft_loss = torch.zeros(num_graphs, device=edge_tokens.device, dtype=log_pf_steps.dtype)
-        soft_steps = torch.zeros(num_graphs, device=edge_tokens.device, dtype=log_pf_steps.dtype)
-        soft_valid_steps = torch.zeros(num_graphs, device=edge_tokens.device, dtype=log_pf_steps.dtype)
-        if need_soft:
-            log_prob_edge_seq = rollout.get("log_prob_edge_seq")
-            log_prob_stop_seq = rollout.get("log_prob_stop_seq")
-            valid_edges_seq = rollout.get("valid_edges_seq")
-            if log_prob_edge_seq is None or log_prob_stop_seq is None:
-                raise ValueError("Soft teacher enabled but log_prob_edge_seq/log_prob_stop_seq missing in rollout.")
-            if valid_edges_seq is None or valid_edges_seq.numel() == 0:
-                valid_edges_seq = None
-            soft_loss, soft_steps, soft_valid_steps = self._compute_soft_teacher_loss(
-                actions_seq=actions_seq,
-                valid_graph=valid_graph,
-                pair_index=pair_index,
-                pair_start_local=pair_start_local,
-                pair_answer_local=pair_answer_local,
-                node_ptr=node_ptr,
-                edge_index=batch.edge_index,
-                pair_edge_local_ids=batch.pair_edge_local_ids,
-                pair_edge_counts=batch.pair_edge_counts,
-                slice_dict=batch._slice_dict,
-                log_prob_edge_seq=log_prob_edge_seq,
-                log_prob_stop_seq=log_prob_stop_seq,
-                valid_edges_seq=valid_edges_seq,
-                edge_scores=batch.edge_scores.to(device=edge_tokens.device, dtype=log_pf_steps.dtype).view(-1),
-                use_edge_scores=use_edge_scores,
-            )
-        return (
-            bc_loss,
-            step_counts,
-            valid_graph.float(),
-            has_pair.float(),
-            soft_loss,
-            soft_steps,
-            soft_valid_steps,
-        )
 
     def _compute_subtb_loss(
         self,

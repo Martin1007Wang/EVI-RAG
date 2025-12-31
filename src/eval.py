@@ -16,8 +16,6 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.data.components.bfs_chain_builder import BFSChainSettings, export_bfs_chain_cache
-from src.data.selector_eval_datamodule import SelectorEvalDataModule
-from src.models.selector_eval_module import SelectorEvalModule
 from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -177,78 +175,12 @@ def _resolve_dataset_variants(cfg: DictConfig) -> List[Tuple[str, DictConfig]]:
     return variants
 
 
-def _maybe_run_selector_eval(cfg: DictConfig) -> Dict[str, Any]:
-    sel_cfg = cfg.get("selector_eval") or {}
-    if not bool(sel_cfg.get("enabled", False)):
-        return {}
-
-    selector = str(sel_cfg.get("selector", "")).strip().lower()
-    if selector not in {"retriever_topk", "gflownet_rollouts"}:
-        raise ValueError(f"selector_eval.selector must be retriever_topk or gflownet_rollouts, got {selector!r}")
-
-    k_values = sel_cfg.get("k_values")
-    if not k_values:
-        window_cfg = cfg.get("window") or {}
-        if selector == "gflownet_rollouts":
-            k_values = window_cfg.get("rollout_k_values") or window_cfg.get("k_values")
-        else:
-            k_values = window_cfg.get("k_values")
-    k_values = [int(v) for v in (list(k_values) if k_values is not None else [])]
-    if not k_values:
-        raise ValueError("selector_eval.k_values must be a non-empty list of ints.")
-
-    dataset_cfg = cfg.get("dataset") or {}
-    run_cfg = cfg.get("run") or {}
-    split = str(run_cfg.get("split", "test"))
-    artifact_root = Path(dataset_cfg.get("artifact_dir") or dataset_cfg.get("materialized_dir") or ".")
-    default_g_agent = artifact_root / "g_agent" / f"{split}_g_agent.pt"
-
-    g_agent_path = sel_cfg.get("g_agent_path") or str(default_g_agent)
-    output_dir = sel_cfg.get("output_dir") or str(cfg.paths.output_dir)
-    allow_empty_dag = bool(sel_cfg.get("allow_empty_dag", False))
-    drop_unreachable = bool(sel_cfg.get("drop_unreachable", False))
-    num_workers = int(sel_cfg.get("num_workers", 0))
-
-    eval_gflownet_path = None
-    eval_gflownet_artifact_name = "eval_gflownet"
-    eval_gflownet_schema_version = 1
-    if selector == "gflownet_rollouts":
-        eval_gflownet_path = sel_cfg.get("eval_gflownet_path")
-        if not eval_gflownet_path:
-            default_eval = artifact_root / "eval_gflownet" / f"{split}.jsonl"
-            eval_gflownet_path = str(default_eval)
-        eval_gflownet_artifact_name = str(sel_cfg.get("eval_gflownet_artifact_name", "eval_gflownet")).strip()
-        eval_gflownet_schema_version = int(sel_cfg.get("eval_gflownet_schema_version", 1))
-
-    datamodule = SelectorEvalDataModule(
-        dataset=str(dataset_cfg.get("name", "")),
-        split=split,
-        g_agent_path=str(g_agent_path),
-        selector=selector,
-        k_values=k_values,
-        eval_gflownet_path=str(eval_gflownet_path) if eval_gflownet_path else None,
-        eval_gflownet_artifact_name=eval_gflownet_artifact_name,
-        eval_gflownet_schema_version=eval_gflownet_schema_version,
-        drop_unreachable=drop_unreachable,
-        num_workers=num_workers,
-    )
-    model = SelectorEvalModule(
-        dataset=str(dataset_cfg.get("name", "")),
-        split=split,
-        output_dir=str(output_dir),
-        selector=selector,
-        k_values=k_values,
-        allow_empty_dag=allow_empty_dag,
-    )
-    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=[], logger=[])
-    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
-    metrics: Dict[str, Any] = {}
-    model_metrics = getattr(model, "predict_metrics", None)
-    if isinstance(model_metrics, dict) and model_metrics:
-        metrics = model_metrics
-    elif trainer.callback_metrics:
-        metrics = dict(trainer.callback_metrics)
-    return metrics
+def _resolve_eval_mode(run_cfg: DictConfig | Dict[str, Any]) -> str:
+    raw = run_cfg.get("eval_mode") if hasattr(run_cfg, "get") else None
+    mode = str(raw or "predict").strip().lower()
+    if mode in {"predict", "test"}:
+        return mode
+    raise ValueError("run.eval_mode must be one of {'predict', 'test'}.")
 
 
 def _maybe_build_bfs_chains(cfg: DictConfig) -> Dict[str, Any]:
@@ -345,6 +277,8 @@ def _run_eval_all_splits(cfg: DictConfig) -> None:
 
         with open_dict(cfg):
             cfg.run.split = split
+            if cfg.run.get("allow_empty_answer") is None:
+                cfg.run.allow_empty_answer = split != "train"
         evaluate(cfg)
 
 
@@ -385,6 +319,10 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             "Missing required config group: `run`. Example: "
             "`python src/eval.py experiment=eval_retriever dataset=webqsp`."
         )
+    split = str(run_cfg.get("split", "test"))
+    if run_cfg.get("allow_empty_answer") is None:
+        with open_dict(cfg):
+            cfg.run.allow_empty_answer = split != "train"
     log.info("Run: %s", run_cfg.get("name"))
 
     _enforce_single_gpu_eval(cfg.trainer)
@@ -419,8 +357,13 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Logging hyperparameters...")
         log_hyperparameters(object_dict)
 
-    log.info("Running trainer.predict()...")
-    trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
+    eval_mode = _resolve_eval_mode(cfg.get("run") or {})
+    if eval_mode == "test":
+        log.info("Running trainer.test()...")
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=None, verbose=False)
+    else:
+        log.info("Running trainer.predict()...")
+        trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
 
     metric_dict = trainer.callback_metrics
     if not metric_dict and hasattr(model, "predict_metrics"):
@@ -430,10 +373,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 metric_dict = metrics_from_model
         except Exception:
             pass
-    selector_metrics = _maybe_run_selector_eval(cfg)
-    if selector_metrics:
-        metric_dict = dict(metric_dict) if metric_dict else {}
-        metric_dict.update(selector_metrics)
     bfs_metrics = _maybe_build_bfs_chains(cfg)
     if bfs_metrics:
         metric_dict = dict(metric_dict) if metric_dict else {}

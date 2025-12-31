@@ -289,7 +289,7 @@ class AnswerReachability(Metric):
             return {}
         denom = self.total.clamp(min=1.0)
         return {
-            f"reachability/answer_reachable@{k}": getattr(self, f"hits_at_{k}") / denom
+            f"answer/reachability@{k}": getattr(self, f"hits_at_{k}") / denom
             for k in self.k_values
         }
 

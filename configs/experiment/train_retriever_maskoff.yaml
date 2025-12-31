@@ -1,7 +1,6 @@
 # @package _global_
 #
-# Retriever training (single recommended config).
-# Structural encoding uses topic_one_hot + runtime DDE (single supported path).
+# Retriever training (mask off). This disables hide-and-seek.
 
 defaults:
   - override /data: retriever
@@ -9,8 +8,11 @@ defaults:
   - override /trainer: gpu
   - override /logger: wandb
 
-task_name: "retriever_train"
-tags: ["retriever"]
+task_name: "retriever_train_maskoff"
+tags: ["retriever", "maskoff"]
+
+run:
+  edge_top_k: 100
 
 trainer:
   min_epochs: 0
@@ -18,19 +20,24 @@ trainer:
   check_val_every_n_epoch: 1
 
 model:
-  compile_model: false
+  compile_model: true
+  retriever:
+    hide_seek_cfg:
+      enabled: false
   loss:
     infonce_weight: 1.0
-    bce_weight: 0.0
+    bce_weight: 0.1
+  scheduler_cfg:
+    monitor: val/answer/reachability@${run.edge_top_k}
 
 callbacks:
   model_checkpoint:
-    monitor: val/answer/reachability@100
+    monitor: val/answer/reachability@${run.edge_top_k}
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/answer/reachability@100
+    monitor: val/answer/reachability@${run.edge_top_k}
     mode: max
     patience: 10

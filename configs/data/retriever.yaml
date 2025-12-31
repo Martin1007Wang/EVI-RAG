@@ -6,10 +6,12 @@ dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
 batch_size: 32
-num_workers: 8
+num_workers: 16
 pin_memory: true
 drop_last: false
 persistent_workers: true
+prefetch_factor: 2
+worker_embed_lookup: false
 
 splits:
   train: train

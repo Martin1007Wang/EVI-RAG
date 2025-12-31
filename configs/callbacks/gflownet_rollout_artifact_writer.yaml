@@ -1,7 +1,7 @@
 # Stream GFlowNet rollouts during predict().
 
-gflownet_rollout_writer:
-  _target_: src.callbacks.gflownet_rollout_writer.GFlowNetRolloutWriter
+gflownet_rollout_artifact_writer:
+  _target_: src.callbacks.gflownet_rollout_artifact_writer.GFlowNetRolloutArtifactWriter
   output_dir: ${dataset.artifact_dir}/eval_gflownet
   split: ${run.split}
   enabled: true

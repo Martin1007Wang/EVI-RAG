@@ -2,7 +2,7 @@ defaults:
   - override /hydra/sweeper: optuna
   - override /hydra/sweeper/sampler: tpe
 
-optimized_metric: "val/reachability/answer_reachable@100"
+optimized_metric: "val/answer/reachability@100"
 
 hydra:
   sweeper:

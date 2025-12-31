@@ -26,13 +26,10 @@ trainer:
 model:
   training_cfg:
     num_train_rollouts: 1
-    bc_weight: 1.0
-    bc_weight_floor: 0.0
-    bc_hold_ratio: 0.2
-    bc_decay_ratio: 0.6
-    bc_teacher_mode: pair_sampled
-    bc_soft_teacher_weight: 0.0
-    bc_soft_teacher_use_edge_scores: false
+    bc_weight: 0.7
+    bc_weight_floor: 0.05
+    bc_hold_ratio: 0.1
+    bc_decay_ratio: 0.5
 
   optimizer_cfg:
     type: adamw
@@ -52,11 +49,9 @@ model:
 
   env_cfg:
     max_steps: 3
-    potential_scale: 0.0
 
   actor_cfg:
     policy_temperature: 1.0
-    action_topk: null
 
   reward_cfg:
     semantic_coef: 1.0

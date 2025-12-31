@@ -61,6 +61,7 @@ class GFlowNetReward(nn.Module):
         edge_scores: torch.Tensor,  # [E_total]
         edge_batch: torch.Tensor,  # [E_total]
         answer_hit: torch.Tensor,  # [B]
+        dummy_mask: torch.Tensor | None = None,
         pair_start_node_locals: torch.Tensor | None = None,
         pair_answer_node_locals: torch.Tensor | None = None,
         pair_shortest_lengths: torch.Tensor | None = None,
@@ -114,10 +115,11 @@ class GFlowNetReward(nn.Module):
             device=device,
         )
         hit_mask = answer_hit.to(dtype=torch.bool)
-        if bool((hit_mask & (shortest_len < 0)).any().item()):
-            raise ValueError("Missing pair shortest length for answer-hit trajectories.")
         shortest_len_f = shortest_len.to(dtype=path_len.dtype)
-        length_cost = (path_len - shortest_len_f).clamp(min=0.0)
+        missing_shortest = shortest_len_f < 0
+        length_cost = torch.zeros_like(path_len)
+        valid_shortest = hit_mask & (~missing_shortest)
+        length_cost = torch.where(valid_shortest, (path_len - shortest_len_f).clamp(min=0.0), length_cost)
         semantic_score = torch.where(hit_mask, semantic_score, torch.zeros_like(semantic_score))
         length_cost = torch.where(hit_mask, length_cost, torch.zeros_like(length_cost))
 
@@ -128,6 +130,21 @@ class GFlowNetReward(nn.Module):
         )
 
         reward = torch.exp(log_reward)
+        if dummy_mask is not None:
+            dummy_mask = dummy_mask.to(device=device, dtype=torch.bool).view(-1)
+            if dummy_mask.numel() != num_graphs:
+                raise ValueError("dummy_mask length mismatch with batch size in reward.")
+            log_reward = torch.where(
+                dummy_mask,
+                torch.full_like(log_reward, float("-inf")),
+                log_reward,
+            )
+            reward = torch.where(dummy_mask, torch.zeros_like(reward), reward)
+            semantic_score = torch.where(dummy_mask, torch.zeros_like(semantic_score), semantic_score)
+            length_cost = torch.where(dummy_mask, torch.zeros_like(length_cost), length_cost)
+            path_len = torch.where(dummy_mask, torch.zeros_like(path_len), path_len)
+            shortest_len = torch.where(dummy_mask, torch.full_like(shortest_len, -1), shortest_len)
+            answer_hit = torch.where(dummy_mask, torch.zeros_like(answer_hit), answer_hit)
         return RewardOutput(
             reward=reward,
             log_reward=log_reward,
@@ -158,7 +175,7 @@ class GFlowNetReward(nn.Module):
             or answer_node_hit is None
             or node_ptr is None
         ):
-            raise ValueError("pair_* fields and node_ptr/start_node_hit/answer_node_hit are required for reward.")
+            return torch.full((num_graphs,), -1, device=device, dtype=torch.long)
 
         pair_start = pair_start_node_locals.to(device=device, dtype=torch.long).view(-1)
         pair_answer = pair_answer_node_locals.to(device=device, dtype=torch.long).view(-1)

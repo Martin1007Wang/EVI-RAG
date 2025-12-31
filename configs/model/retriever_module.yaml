@@ -16,6 +16,13 @@ retriever:
     num_rounds: ${dataset.topic_pe.num_rounds}
     num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
   dropout_p: 0.1
+  hide_seek_cfg:
+    enabled: true
+    p_near: 0.7
+    p_far: 0.1
+    bias_near: -2.0
+    bias_far: -0.5
+    apply_in_eval: false
 
 loss:
   _target_: src.losses.retriever_loss.RetrieverLoss
@@ -24,6 +31,8 @@ loss:
   infonce_temperature: 0.07
   infonce_weight: 1.0
   bce_weight: 0.0
+  edge_weight_near: 1.0
+  edge_weight_bridge: 1.0
 
 optimizer_cfg:
   type: adamw
@@ -35,11 +44,14 @@ scheduler_cfg:
   t_max: 200
   eta_min: 1.0e-6
   interval: epoch
-  monitor: val/reachability/answer_reachable@100
+  monitor: val/answer/reachability@100
 
 evaluation_cfg:
-  ranking_k: ${window.k_values}
-  recall_k: ${window.k_values}
-  reachability_k: ${window.k_values}
+  edge_recall_k: ${window.k_values}
+  connectivity_k: ${window.k_values}
+  bridge_metrics: true
+  bridge_recall_k: ${window.k_values}
   emit_predict_outputs: false
   metrics_enabled: true
+  feature_metrics: false
+  ablate_topic: false

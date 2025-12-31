@@ -8,11 +8,19 @@ import torch
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from torchmetrics import MetricCollection
-from torchmetrics.retrieval import RetrievalMRR, RetrievalRecall
 
 from src.losses import LossOutput
-from src.metrics import AnswerReachability, FeatureMonitor
+from src.metrics import (
+    AnswerReachability,
+    BridgeEdgeRecallAtK,
+    BridgePositiveCoverage,
+    BridgeProbQuality,
+    EdgeRecallAtK,
+    FeatureMonitor,
+    ScoreMargin,
+)
 from src.models.components.retriever import RetrieverOutput
+from src.utils.graph_utils import compute_qa_edge_mask
 from src.utils import (
     log_metric,
     normalize_k_values,
@@ -22,6 +30,7 @@ from src.utils import (
 logger = logging.getLogger(__name__)
 
 _LABEL_POSITIVE_THRESHOLD = 0.5
+_DEFAULT_K_VALUES = [1, 5, 10]
 
 
 class RetrieverModule(LightningModule):
@@ -36,7 +45,6 @@ class RetrieverModule(LightningModule):
         compile_dynamic: bool = True,
     ) -> None:
         super().__init__()
-        # 仅保存可序列化的原始标量；避免将 Hydra/nn.Module/partial 写入 checkpoint。
         self.save_hyperparameters(
             logger=False,
             ignore=[
@@ -49,42 +57,77 @@ class RetrieverModule(LightningModule):
         )
 
         self.model = retriever
-        if compile_model and hasattr(torch, "compile"):
-            logger.info("Compiling retriever with torch.compile (dynamic=%s)...", compile_dynamic)
-            self.model = torch.compile(self.model, dynamic=compile_dynamic)
+        if compile_model:
+            logger.warning(
+                "torch.compile is disabled for retriever; ignoring compile_model=true (dynamic=%s).",
+                compile_dynamic,
+            )
 
         self.loss = loss
         self.optimizer_cfg = self._to_dict(optimizer_cfg or {})
         self.scheduler_cfg = self._to_dict(scheduler_cfg or {})
 
         eval_cfg = self._to_dict(evaluation_cfg or {})
-        self._ranking_k = normalize_k_values(eval_cfg.get("ranking_k", [1, 5, 10]), default=[1, 5, 10])
-        self._recall_k = normalize_k_values(eval_cfg.get("recall_k", self._ranking_k), default=self._ranking_k)
-        self._reachability_k = normalize_k_values(eval_cfg.get("reachability_k", self._ranking_k), default=self._ranking_k)
+        self._edge_recall_k = self._resolve_k_values(
+            eval_cfg,
+            keys=("edge_recall_k",),
+            default=_DEFAULT_K_VALUES,
+        )
+        self._connectivity_k = self._resolve_k_values(
+            eval_cfg,
+            keys=("connectivity_k",),
+            default=self._edge_recall_k,
+        )
+        self._bridge_metrics = bool(eval_cfg.get("bridge_metrics", False))
+        self._bridge_recall_k: list[int] = []
+        if self._bridge_metrics:
+            self._bridge_recall_k = self._resolve_k_values(
+                eval_cfg,
+                keys=("bridge_recall_k",),
+                default=self._edge_recall_k,
+            )
         self._emit_predict_outputs = bool(eval_cfg.get("emit_predict_outputs", False))
         self._metrics_enabled = bool(eval_cfg.get("metrics_enabled", True))
+        self._feature_metrics = bool(eval_cfg.get("feature_metrics", False))
+        self._ablate_topic = bool(eval_cfg.get("ablate_topic", False))
 
         self.predict_metrics: Dict[str, Any] = {}
         self.val_metrics: Optional[MetricCollection] = None
         self.test_metrics: Optional[MetricCollection] = None
+        self.val_metrics_ablate: Optional[MetricCollection] = None
+        self.test_metrics_ablate: Optional[MetricCollection] = None
         if self._metrics_enabled:
-            metrics = MetricCollection(
-                {
-                    "ranking/mrr": RetrievalMRR(empty_target_action="skip"),
-                    **{f"ranking/recall@{k}": RetrievalRecall(top_k=int(k), empty_target_action="skip") for k in self._recall_k},
-                }
-            )
-            if self._reachability_k:
-                metrics.add_metrics({"reachability": AnswerReachability(k_values=self._reachability_k)})
-            metrics.add_metrics({"features": FeatureMonitor()})
+            metrics = MetricCollection({})
+            if self._edge_recall_k:
+                metrics.add_metrics({"edge_recall": EdgeRecallAtK(k_values=self._edge_recall_k)})
+            if self._connectivity_k:
+                metrics.add_metrics({"connectivity": AnswerReachability(k_values=self._connectivity_k)})
+            metrics.add_metrics({"signal": ScoreMargin()})
+            if self._bridge_metrics:
+                if self._bridge_recall_k:
+                    metrics.add_metrics({"bridge_edge_recall": BridgeEdgeRecallAtK(k_values=self._bridge_recall_k)})
+                metrics.add_metrics({"bridge_signal": BridgeProbQuality()})
+                metrics.add_metrics({"bridge_coverage": BridgePositiveCoverage()})
+            if self._feature_metrics:
+                metrics.add_metrics({"features": FeatureMonitor()})
             self.val_metrics = metrics.clone(prefix="val/")
             self.test_metrics = metrics.clone(prefix="test/")
+            if self._ablate_topic:
+                self.val_metrics_ablate = metrics.clone(prefix="val/ablate_topic/")
+                self.test_metrics_ablate = metrics.clone(prefix="test/ablate_topic/")
 
     @staticmethod
     def _to_dict(cfg: Union[DictConfig, Dict]) -> Dict[str, Any]:
         if isinstance(cfg, DictConfig):
             return OmegaConf.to_container(cfg, resolve=True)  # type: ignore[return-value]
         return dict(cfg)
+
+    @staticmethod
+    def _resolve_k_values(eval_cfg: Dict[str, Any], *, keys: tuple[str, ...], default: Any) -> list[int]:
+        for key in keys:
+            if key in eval_cfg:
+                return normalize_k_values(eval_cfg.get(key), default=default)
+        return normalize_k_values(default, default=None)
 
     # ------------------------------------------------------------------ #
     # Core Forward & Prediction
@@ -159,6 +202,52 @@ class RetrieverModule(LightningModule):
             raise ValueError(f"num_graphs must be positive, got {num_graphs}")
         return num_graphs
 
+    @staticmethod
+    def _compute_edge_is_near(batch: Any, *, device: torch.device) -> torch.Tensor:
+        cached = getattr(batch, "edge_is_near", None)
+        if cached is not None:
+            if not torch.is_tensor(cached):
+                return torch.as_tensor(cached, dtype=torch.bool, device=device)
+            return cached.to(device=device, dtype=torch.bool)
+        edge_index = getattr(batch, "edge_index", None)
+        if edge_index is None:
+            raise ValueError("Batch missing edge_index required for edge mask computation.")
+        q_local_indices = getattr(batch, "q_local_indices", None)
+        a_local_indices = getattr(batch, "a_local_indices", None)
+        if q_local_indices is None or a_local_indices is None:
+            raise ValueError("Batch missing q_local_indices/a_local_indices required for edge mask.")
+        num_nodes = getattr(batch, "num_nodes", None)
+        if num_nodes is None:
+            raise ValueError("Batch missing num_nodes required for edge mask.")
+        edge_index = edge_index.to(device=device)
+        return compute_qa_edge_mask(
+            edge_index,
+            num_nodes=int(num_nodes),
+            q_local_indices=q_local_indices,
+            a_local_indices=a_local_indices,
+        )
+
+    def _edge_is_near_required(self) -> bool:
+        if getattr(self.loss, "requires_edge_is_near", False):
+            return True
+        if not bool(getattr(self.model, "hide_seek_enabled", False)):
+            return False
+        if self.training:
+            return True
+        return bool(getattr(self.model, "hide_seek_apply_in_eval", False))
+
+    def _ensure_edge_is_near(self, batch: Any) -> Optional[torch.Tensor]:
+        if not self._edge_is_near_required():
+            return None
+        cached = getattr(batch, "edge_is_near", None)
+        if cached is not None:
+            return cached
+        edge_index = getattr(batch, "edge_index", None)
+        device = edge_index.device if torch.is_tensor(edge_index) else torch.device("cpu")
+        edge_is_near = self._compute_edge_is_near(batch, device=device)
+        batch.edge_is_near = edge_is_near
+        return edge_is_near
+
     def _compute_loss_output(
         self,
         *,
@@ -170,36 +259,20 @@ class RetrieverModule(LightningModule):
         targets = getattr(batch, "labels", None)
         if targets is None:
             raise ValueError("Batch missing labels required for retriever loss.")
+        edge_is_near = None
+        if getattr(self.loss, "requires_edge_is_near", False):
+            edge_is_near = getattr(batch, "edge_is_near", None)
+            if edge_is_near is None:
+                edge_is_near = self._compute_edge_is_near(batch, device=output.logits.device)
+                batch.edge_is_near = edge_is_near
         return self.loss(
             output,
             targets,
             training_step=training_step,
             edge_batch=output.query_ids,
             num_graphs=num_graphs,
+            edge_is_near=edge_is_near,
         )
-
-    @staticmethod
-    def _assert_pos_neg_per_graph(
-        *,
-        targets: torch.Tensor,
-        edge_batch: torch.Tensor,
-        num_graphs: int,
-    ) -> None:
-        if targets.numel() == 0:
-            raise ValueError("Retriever batch has empty labels; cannot compute InfoNCE.")
-        if edge_batch.numel() != targets.numel():
-            raise ValueError(f"edge_batch/labels mismatch: {edge_batch.shape} vs {targets.shape}")
-        pos_mask = targets.view(-1) > _LABEL_POSITIVE_THRESHOLD
-        edge_batch = edge_batch.view(-1).to(dtype=torch.long)
-        counts_dtype = targets.dtype if torch.is_floating_point(targets) else torch.float32
-        pos_counts = torch.zeros(num_graphs, device=targets.device, dtype=counts_dtype)
-        neg_counts = torch.zeros_like(pos_counts)
-        pos_counts.scatter_add_(0, edge_batch, pos_mask.to(dtype=counts_dtype))
-        neg_counts.scatter_add_(0, edge_batch, (~pos_mask).to(dtype=counts_dtype))
-        invalid = (pos_counts == 0) | (neg_counts == 0)
-        if bool(invalid.any().item()):
-            bad = torch.nonzero(invalid, as_tuple=False).view(-1).tolist()
-            raise ValueError(f"Retriever batch has graphs without positives/negatives: {bad}")
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Optional[RetrieverOutput]:
         """Predict loop returns detached outputs when emit_predict_outputs=true."""
@@ -216,6 +289,7 @@ class RetrieverModule(LightningModule):
     # ------------------------------------------------------------------ #
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         num_graphs = self._require_num_graphs(batch)
+        self._ensure_edge_is_near(batch)
         with self._profile("train/forward"):
             output = self(batch)
         with self._profile("train/loss"):
@@ -301,10 +375,14 @@ class RetrieverModule(LightningModule):
     def on_validation_epoch_start(self) -> None:
         if self.val_metrics is not None:
             self.val_metrics.reset()
+        if self.val_metrics_ablate is not None:
+            self.val_metrics_ablate.reset()
 
     def on_test_epoch_start(self) -> None:
         if self.test_metrics is not None:
             self.test_metrics.reset()
+        if self.test_metrics_ablate is not None:
+            self.test_metrics_ablate.reset()
 
     def validation_step(self, batch: Any, batch_idx: int) -> None:
         self._shared_eval_step(batch, batch_idx, split="val", metrics=self.val_metrics)
@@ -320,9 +398,11 @@ class RetrieverModule(LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         self._log_metric_collection(self.val_metrics)
+        self._log_metric_collection(self.val_metrics_ablate)
 
     def on_test_epoch_end(self) -> None:
         self._log_metric_collection(self.test_metrics)
+        self._log_metric_collection(self.test_metrics_ablate)
 
     def _shared_eval_step(
         self,
@@ -334,6 +414,7 @@ class RetrieverModule(LightningModule):
         collect_predict_payload: bool = False,
     ) -> Optional[RetrieverOutput]:
         num_graphs = self._require_num_graphs(batch)
+        self._ensure_edge_is_near(batch)
         with self._profile(f"{split}/forward"):
             output = self(batch)
         with self._profile(f"{split}/loss"):
@@ -356,9 +437,31 @@ class RetrieverModule(LightningModule):
         )
         with self._profile(f"{split}/metrics_update"):
             self._update_metrics(metrics, batch=batch, output=output, num_graphs=num_graphs)
+        if self._ablate_topic:
+            ablate_metrics = self.val_metrics_ablate if split == "val" else self.test_metrics_ablate
+            if ablate_metrics is not None:
+                with self._profile(f"{split}/metrics_ablate_topic"):
+                    ablate_output = self._forward_with_topic_ablation(batch)
+                self._update_metrics(ablate_metrics, batch=batch, output=ablate_output, num_graphs=num_graphs)
 
         if collect_predict_payload:
             pred_output = output.detach()
             pred_output.edge_embeddings = None
             return pred_output
         return None
+
+    @staticmethod
+    def _zero_like_topic(topic_one_hot: Any) -> torch.Tensor:
+        if torch.is_tensor(topic_one_hot):
+            return torch.zeros_like(topic_one_hot)
+        return torch.zeros_like(torch.as_tensor(topic_one_hot))
+
+    def _forward_with_topic_ablation(self, batch: Any) -> RetrieverOutput:
+        topic_one_hot = getattr(batch, "topic_one_hot", None)
+        if topic_one_hot is None:
+            raise ValueError("topic_one_hot is required for ablation metrics.")
+        batch.topic_one_hot = self._zero_like_topic(topic_one_hot)
+        try:
+            return self(batch)
+        finally:
+            batch.topic_one_hot = topic_one_hot

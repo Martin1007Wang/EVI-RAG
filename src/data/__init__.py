@@ -20,7 +20,6 @@ __all__ = [
     "SharedDataResources",
     "GAgentPyGDataset",
     "GAgentDataModule",
-    "SelectorEvalDataModule",
     "ReasonerPathDataset",
     "ReasonerPathDataModule",
     "ReasonerTripletDataModule",
@@ -34,7 +33,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from .g_agent_dataset import GAgentPyGDataset
     from .g_retrieval_datamodule import GRetrievalDataModule
     from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
-    from .selector_eval_datamodule import SelectorEvalDataModule
     from .reasoner_path_datamodule import ReasonerPathDataModule
     from .reasoner_path_dataset import ReasonerPathDataset
     from .reasoner_triplet_datamodule import ReasonerTripletDataModule
@@ -76,11 +74,6 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from .g_agent_datamodule import GAgentDataModule
 
         return GAgentDataModule
-
-    if name == "SelectorEvalDataModule":
-        from .selector_eval_datamodule import SelectorEvalDataModule
-
-        return SelectorEvalDataModule
 
     if name == "ReasonerPathDataset":
         from .reasoner_path_dataset import ReasonerPathDataset

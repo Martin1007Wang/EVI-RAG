@@ -6,6 +6,8 @@ raw_root: ${paths.data_dir}/GTSQA/raw/gtsqa-with-graphs
 out_dir: ${paths.data_dir}/GTSQA/normalized
 materialized_dir: ${paths.data_dir}/GTSQA/materialized
 artifact_dir: ${paths.data_dir}/GTSQA/artifacts/${dataset.name}
+
+validate_on_get: false
 entity_normalization: none
 entity_text_mode: regex
 text_prefixes: []

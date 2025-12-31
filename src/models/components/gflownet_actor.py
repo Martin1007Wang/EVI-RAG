@@ -8,12 +8,7 @@ import torch
 from torch import nn
 from torch_scatter import scatter_max
 
-from src.models.components.gflownet_env import (
-    GraphEnv,
-    STOP_RELATION,
-    DIRECTION_FORWARD,
-    DIRECTION_BACKWARD,
-)
+from src.models.components.gflownet_env import GraphEnv, STOP_RELATION
 from src.models.components.state_encoder import StateEncoder, StateEncoderCache
 
 MIN_TEMPERATURE = 1e-5
@@ -57,7 +52,6 @@ class GFlowNetActor(nn.Module):
         state_encoder: StateEncoder,
         max_steps: int,
         policy_temperature: float,
-        action_topk: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.policy = policy
@@ -65,9 +59,7 @@ class GFlowNetActor(nn.Module):
         self.state_encoder = state_encoder
         self.max_steps = int(max_steps)
         self.policy_temperature = float(policy_temperature)
-        self.action_topk = None if action_topk is None else int(action_topk)
-        if self.action_topk is not None and self.action_topk <= 0:
-            raise ValueError(f"action_topk must be positive when set, got {self.action_topk}")
+        self._policy_accepts_edge_base = False
         self._assert_edge_policy()
 
     def _assert_edge_policy(self) -> None:
@@ -77,44 +69,7 @@ class GFlowNetActor(nn.Module):
             raise ValueError(
                 "GFlowNetActor expects an edge-level policy in edge-action mode; " "relation-level policies are not supported."
             )
-
-    @staticmethod
-    def _select_topk_candidate_edges(
-        *,
-        candidate_edges: torch.Tensor,  # [E_cand]
-        edge_scores: torch.Tensor,  # [E_total]
-        edge_batch: torch.Tensor,  # [E_total]
-        num_graphs: int,
-        k: int,
-    ) -> torch.Tensor:
-        candidate_edges = candidate_edges.to(device=edge_scores.device, dtype=torch.long).view(-1)
-        if candidate_edges.numel() == 0:
-            return candidate_edges
-        if k <= 0:
-            raise ValueError(f"k must be positive, got {k}")
-        if (candidate_edges < 0).any() or (candidate_edges >= int(edge_scores.numel())).any():
-            raise ValueError("candidate_edges contains out-of-range indices.")
-
-        scores = edge_scores[candidate_edges].to(dtype=torch.float32)
-        seg = edge_batch[candidate_edges].to(device=edge_scores.device, dtype=torch.long)
-        if seg.numel() != candidate_edges.numel():
-            raise ValueError("candidate_edges indexing mismatch for edge_batch.")
-
-        order_score = torch.argsort(scores, descending=True)
-        cand_sorted = candidate_edges[order_score]
-        seg_sorted = seg[order_score]
-
-        order_seg = torch.argsort(seg_sorted, stable=True)
-        cand_sorted = cand_sorted[order_seg]
-        seg_sorted = seg_sorted[order_seg]
-
-        counts = torch.bincount(seg_sorted, minlength=num_graphs)
-        start = torch.zeros(num_graphs, device=edge_scores.device, dtype=torch.long)
-        if num_graphs > 1:
-            start[1:] = counts.cumsum(0)[:-1]
-        rank = torch.arange(cand_sorted.numel(), device=edge_scores.device, dtype=torch.long) - start[seg_sorted]
-        keep = rank < int(k)
-        return cand_sorted[keep]
+        self._policy_accepts_edge_base = "edge_base" in params
 
     def rollout(
         self,
@@ -134,6 +89,8 @@ class GFlowNetActor(nn.Module):
         return_log_probs: bool = False,
         return_valid_edges: bool = False,
         return_state_tokens: bool = False,
+        dag_edge_mask: Optional[torch.Tensor] = None,
+        return_bc_stats: bool = False,
     ) -> Dict[str, torch.Tensor]:
         base_temperature = self.policy_temperature if temperature is None else float(temperature)
         is_greedy = base_temperature < MIN_TEMPERATURE
@@ -145,8 +102,14 @@ class GFlowNetActor(nn.Module):
         edge_tokens_f = edge_tokens.to(device=device, dtype=torch.float32)
         question_tokens_f = question_tokens.to(device=device, dtype=torch.float32)
         autocast_ctx = (
-            torch.autocast(device_type=device.type, enabled=False) if device.type != "cpu" else contextlib.nullcontext()
+            torch.autocast(device_type=device.type, enabled=torch.is_autocast_enabled())
+            if device.type != "cpu"
+            else contextlib.nullcontext()
         )
+        edge_base = None
+        if self._policy_accepts_edge_base and hasattr(self.policy, "compute_edge_base"):
+            with autocast_ctx:
+                edge_base = self.policy.compute_edge_base(edge_tokens_f)
 
         if graph_cache is not None:
             graph_dict = graph_cache
@@ -167,6 +130,9 @@ class GFlowNetActor(nn.Module):
                 "answer_ptr": batch._slice_dict["answer_node_locals"].to(device),
                 "edge_scores": batch.edge_scores.to(device=device, dtype=torch.float32).view(-1),
             }
+            dummy_mask = getattr(batch, "is_dummy_agent", None)
+            if torch.is_tensor(dummy_mask):
+                graph_dict["dummy_mask"] = dummy_mask.to(device=device, dtype=torch.bool).view(-1)
         if state_encoder_cache is None:
             with autocast_ctx:
                 encoder_cache = self.state_encoder.precompute(
@@ -185,14 +151,6 @@ class GFlowNetActor(nn.Module):
         state = self.env.reset(graph_dict, device=device)
         if cache_state:
             graph_cache["state_cache"] = state
-        if state.action_embeddings.numel() == 0:
-            state.action_embeddings = torch.zeros(
-                num_graphs,
-                self.max_steps,
-                edge_tokens_f.size(-1),
-                device=device,
-                dtype=edge_tokens_f.dtype,
-            )
 
         log_pf_total = torch.zeros(num_graphs, dtype=torch.float32, device=device)
         num_steps = self.max_steps + 1
@@ -202,8 +160,19 @@ class GFlowNetActor(nn.Module):
         log_prob_edge_steps: list[torch.Tensor] = []
         log_prob_stop_steps: list[torch.Tensor] = []
         valid_edges_steps: list[torch.Tensor] = []
+        bc_loss_sum = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+        bc_step_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+        bc_has_dag = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+        if return_bc_stats:
+            if dag_edge_mask is None:
+                raise ValueError("return_bc_stats requires dag_edge_mask.")
+            dag_edge_mask = dag_edge_mask.to(device=device, dtype=torch.bool).view(-1)
+            if dag_edge_mask.numel() != edge_tokens_f.size(0):
+                raise ValueError("dag_edge_mask length mismatch with edge_tokens.")
+            dag_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
+            dag_counts.index_add_(0, edge_batch, dag_edge_mask.to(dtype=torch.float32))
+            bc_has_dag = (dag_counts > 0).to(dtype=dag_counts.dtype)
         actions_seq = torch.full((num_graphs, num_steps), STOP_RELATION, dtype=torch.long, device=device)
-        phi_states = torch.zeros(num_graphs, num_steps + 1, dtype=torch.float32, device=device)
 
         for step in range(num_steps):
             with autocast_ctx:
@@ -219,37 +188,18 @@ class GFlowNetActor(nn.Module):
             forward_mask = forward_mask & unused_edges
             backward_mask = backward_mask & unused_edges
             candidate_edges = forward_mask | backward_mask
-            pruned_mask = candidate_edges
-            if self.action_topk is not None and forced_actions_seq is None and bool(candidate_edges.any().item()):
-                cand_edges = torch.nonzero(candidate_edges, as_tuple=False).view(-1)
-                topk_edges = self._select_topk_candidate_edges(
-                    candidate_edges=cand_edges,
-                    edge_scores=state.graph.edge_scores_norm,
-                    edge_batch=edge_batch,
-                    num_graphs=num_graphs,
-                    k=self.action_topk,
-                )
-                pruned_mask = torch.zeros_like(candidate_edges, dtype=torch.bool)
-                if topk_edges.numel() > 0:
-                    pruned_mask[topk_edges] = True
-                pruned_mask = pruned_mask & candidate_edges
-                forward_mask = forward_mask & pruned_mask
-                backward_mask = backward_mask & pruned_mask
-            valid_edges = pruned_mask
+            valid_edges = candidate_edges
 
-            phi_states[:, step] = self.env.potential(state, valid_edges_override=valid_edges).detach()
-
-            edge_direction = torch.full((edge_index.size(1),), DIRECTION_FORWARD, device=device, dtype=torch.long)
-            if backward_mask.any():
-                edge_direction[backward_mask & (~forward_mask)] = DIRECTION_BACKWARD
-
+            policy_kwargs = {}
+            if self._policy_accepts_edge_base:
+                policy_kwargs["edge_base"] = edge_base
             with autocast_ctx:
                 edge_logits, stop_logits, state_out = self.policy(
                     edge_tokens=edge_tokens_f,
                     state_tokens=state_tokens,
                     edge_batch=edge_batch,
                     valid_edges_mask=valid_edges,
-                    edge_direction=edge_direction,
+                    **policy_kwargs,
                 )
             if not torch.isfinite(edge_logits).all():
                 bad = (~torch.isfinite(edge_logits)).sum().item()
@@ -278,6 +228,16 @@ class GFlowNetActor(nn.Module):
                 log_prob_stop_steps.append(log_prob_stop)
             if return_valid_edges:
                 valid_edges_steps.append(valid_edges)
+            if return_bc_stats:
+                step_loss, step_counts = self._compute_step_bc_stats(
+                    log_prob_edge=log_prob_edge,
+                    valid_edges=valid_edges,
+                    dag_edge_mask=dag_edge_mask,
+                    edge_batch=edge_batch,
+                    num_graphs=num_graphs,
+                )
+                bc_loss_sum = bc_loss_sum + step_loss
+                bc_step_counts = bc_step_counts + step_counts
 
             if forced_actions_seq is not None:
                 forced = forced_actions_seq[:, step].to(device=device, dtype=torch.long)
@@ -340,12 +300,24 @@ class GFlowNetActor(nn.Module):
             log_pf_total = log_pf_total + log_pf_vec
 
             state = self.env.step(state, actions, selected_action_emb, step_index=step)
+            if bool(state.done.all().item()):
+                break
 
         reach_success = state.answer_hits.float()
         length = state.step_counts.to(dtype=torch.float32)
 
-        if len(state_emb_steps) != num_steps:
-            raise RuntimeError(f"state_emb_steps length {len(state_emb_steps)} != num_steps {num_steps}")
+        if len(state_emb_steps) < num_steps:
+            pad = num_steps - len(state_emb_steps)
+            if state_emb_steps:
+                state_emb_steps.extend([state_emb_steps[-1]] * pad)
+            else:
+                filler = torch.zeros(
+                    num_graphs,
+                    edge_tokens_f.size(-1),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                state_emb_steps.extend([filler] * num_steps)
         state_emb_seq = torch.stack(state_emb_steps, dim=1)
         result = {
             "log_pf": log_pf_total,
@@ -358,30 +330,46 @@ class GFlowNetActor(nn.Module):
             "reach_fraction": reach_success,
             "reach_success": reach_success,
             "length": length,
-            "phi_states": phi_states,
             "answer_node_hit": state.answer_node_hit,
             "start_node_hit": state.start_node_hit,
             "active_nodes": state.active_nodes,
         }
         if return_log_probs:
             if log_prob_edge_steps:
+                if len(log_prob_edge_steps) < num_steps:
+                    pad = num_steps - len(log_prob_edge_steps)
+                    log_prob_edge_steps.extend([log_prob_edge_steps[-1]] * pad)
                 result["log_prob_edge_seq"] = torch.stack(log_prob_edge_steps, dim=0)
             else:
                 result["log_prob_edge_seq"] = torch.zeros(0, device=device, dtype=torch.float32)
             if log_prob_stop_steps:
+                if len(log_prob_stop_steps) < num_steps:
+                    pad = num_steps - len(log_prob_stop_steps)
+                    log_prob_stop_steps.extend([log_prob_stop_steps[-1]] * pad)
                 result["log_prob_stop_seq"] = torch.stack(log_prob_stop_steps, dim=1)
             else:
                 result["log_prob_stop_seq"] = torch.zeros(0, device=device, dtype=torch.float32)
         if return_valid_edges:
             if valid_edges_steps:
+                if len(valid_edges_steps) < num_steps:
+                    pad = num_steps - len(valid_edges_steps)
+                    valid_edges_steps.extend([valid_edges_steps[-1]] * pad)
                 result["valid_edges_seq"] = torch.stack(valid_edges_steps, dim=0)
             else:
                 result["valid_edges_seq"] = torch.zeros(0, device=device, dtype=torch.bool)
         if return_state_tokens:
             if state_tokens_steps:
+                if len(state_tokens_steps) < num_steps:
+                    pad = num_steps - len(state_tokens_steps)
+                    state_tokens_steps.extend([state_tokens_steps[-1]] * pad)
                 result["state_tokens_seq"] = torch.stack(state_tokens_steps, dim=1)
             else:
                 result["state_tokens_seq"] = torch.zeros(0, device=device, dtype=torch.float32)
+        if return_bc_stats:
+            bc_loss = bc_loss_sum / bc_step_counts.clamp(min=1.0)
+            result["bc_loss_per_graph"] = bc_loss
+            result["bc_steps_per_graph"] = bc_step_counts
+            result["bc_has_dag"] = bc_has_dag
         return result
 
     @staticmethod
@@ -401,6 +389,10 @@ class GFlowNetActor(nn.Module):
                 torch.zeros(0, device=stop_logits.device),
                 torch.zeros(0, device=stop_logits.device, dtype=torch.bool),
             )
+        if edge_logits.dtype != torch.float32:
+            edge_logits = edge_logits.to(dtype=torch.float32)
+        if stop_logits.dtype != torch.float32:
+            stop_logits = stop_logits.to(dtype=torch.float32)
         stop_scaled = stop_logits / float(temp)
         if edge_logits.numel() == 0:
             log_denom = stop_scaled
@@ -429,6 +421,29 @@ class GFlowNetActor(nn.Module):
     def _gumbel_like(tensor: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
         u = torch.rand_like(tensor)
         return -torch.log(-torch.log(u.clamp(min=eps, max=1.0 - eps)))
+
+    @staticmethod
+    def _compute_step_bc_stats(
+        *,
+        log_prob_edge: torch.Tensor,
+        valid_edges: torch.Tensor,
+        dag_edge_mask: torch.Tensor,
+        edge_batch: torch.Tensor,
+        num_graphs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mask = valid_edges & dag_edge_mask
+        device = log_prob_edge.device
+        if not bool(mask.any().item()):
+            zeros = torch.zeros(num_graphs, device=device, dtype=log_prob_edge.dtype)
+            return zeros, zeros
+        masked_logits = log_prob_edge[mask]
+        segments = edge_batch[mask]
+        logsumexp = _segment_logsumexp_1d(masked_logits, segments, num_graphs)
+        counts = torch.bincount(segments, minlength=num_graphs).to(device=device)
+        has_valid = counts > 0
+        step_loss = torch.where(has_valid, -logsumexp, torch.zeros_like(logsumexp))
+        step_counts = has_valid.to(dtype=step_loss.dtype)
+        return step_loss, step_counts
 
 
 __all__ = ["GFlowNetActor"]

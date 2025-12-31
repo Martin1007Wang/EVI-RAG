@@ -8,13 +8,12 @@ hidden_dim: 1024
 env_cfg:
   _target_: src.models.components.gflownet_env.GraphEnv
   max_steps: 2
-  potential_scale: 1.0
+  stop_on_answer: true
 
 policy_cfg:
   _target_: src.models.components.gflownet_policy.GFlowNetEdgePolicy
   hidden_dim: ${model.hidden_dim}
   dropout: 0.1
-  direction_vocab_size: 2
 
 reward_cfg:
   _target_: src.models.components.gflownet_rewards.GFlowNetReward
@@ -26,7 +25,6 @@ reward_cfg:
 actor_cfg:
   _target_: src.models.components.gflownet_actor.GFlowNetActor
   policy_temperature: 1.0
-  action_topk: 50
 
 embedder_cfg:
   _target_: src.models.components.gflownet_embedder.GraphEmbedder
@@ -55,9 +53,6 @@ training_cfg:
   bc_weight_floor: 0.0
   bc_hold_ratio: 0.0
   bc_decay_ratio: 0.0
-  bc_teacher_mode: pair_sampled
-  bc_soft_teacher_weight: 0.0
-  bc_soft_teacher_use_edge_scores: false
 
 evaluation_cfg:
   num_eval_rollouts: 5

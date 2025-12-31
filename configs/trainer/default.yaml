@@ -10,14 +10,20 @@ accelerator: auto
 devices: auto
 profiler: null
 
-# full precision to avoid NaNs during loss computation
-precision: 32-true
+# mixed precision for throughput; prefer bf16 on supported GPUs
+precision: 16-mixed
+
+# cudnn autotune for stable input shapes (disable if shapes vary wildly)
+benchmark: true
 
 # gradient clipping to stabilize TB under rare large residuals
 gradient_clip_val: 1.0
 
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 10
+
+# skip sanity validation to avoid cold-start stalls on large datasets
+num_sanity_val_steps: 0
 
 # optional batch limits for profiling/debugging
 limit_train_batches: null

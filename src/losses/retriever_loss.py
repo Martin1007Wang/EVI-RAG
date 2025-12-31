@@ -14,6 +14,9 @@ _NO_PATH_WARMUP = 0
 _DEFAULT_INFONCE_WEIGHT = 1.0
 _DEFAULT_BCE_WEIGHT = 0.0
 _LABEL_POSITIVE_THRESHOLD = 0.5
+_DEFAULT_EDGE_WEIGHT_NEAR = 1.0
+_DEFAULT_EDGE_WEIGHT_BRIDGE = 1.0
+_MIN_EDGE_WEIGHT = 1e-6
 
 @dataclass
 class LossOutput:
@@ -33,6 +36,8 @@ class RetrieverLoss(nn.Module):
         infonce_temperature: float = 1.0,
         infonce_weight: float = _DEFAULT_INFONCE_WEIGHT,
         bce_weight: float = _DEFAULT_BCE_WEIGHT,
+        edge_weight_near: float = _DEFAULT_EDGE_WEIGHT_NEAR,
+        edge_weight_bridge: float = _DEFAULT_EDGE_WEIGHT_BRIDGE,
     ) -> None:
         super().__init__()
         self.path_weight = float(path_weight)
@@ -52,6 +57,17 @@ class RetrieverLoss(nn.Module):
             raise ValueError("infonce_weight and bce_weight must be non-negative.")
         if self.infonce_weight == 0.0 and self.bce_weight == 0.0:
             raise ValueError("RetrieverLoss requires at least one non-zero loss weight.")
+        self.edge_weight_near = float(edge_weight_near)
+        self.edge_weight_bridge = float(edge_weight_bridge)
+        if self.edge_weight_near <= 0.0 or self.edge_weight_bridge <= 0.0:
+            raise ValueError("edge_weight_near and edge_weight_bridge must be positive.")
+
+    @property
+    def requires_edge_is_near(self) -> bool:
+        return (
+            self.edge_weight_near != _DEFAULT_EDGE_WEIGHT_NEAR
+            or self.edge_weight_bridge != _DEFAULT_EDGE_WEIGHT_BRIDGE
+        )
 
     def _infonce_loss(
         self,
@@ -60,6 +76,7 @@ class RetrieverLoss(nn.Module):
         edge_batch: torch.Tensor,
         num_graphs: int,
         logits: torch.Tensor,
+        edge_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         pos_mask = targets > _LABEL_POSITIVE_THRESHOLD
         neg_mask = ~pos_mask
@@ -73,6 +90,9 @@ class RetrieverLoss(nn.Module):
             }
 
         scores = logits / self.infonce_temperature
+        if edge_weights is not None:
+            log_weights = torch.log(edge_weights.clamp_min(_MIN_EDGE_WEIGHT))
+            scores = scores + log_weights
         dtype = scores.dtype
         device = scores.device
         neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
@@ -129,19 +149,29 @@ class RetrieverLoss(nn.Module):
         edge_batch: torch.Tensor,
         num_graphs: int,
         logits: torch.Tensor,
+        edge_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         per_edge = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        if edge_weights is not None:
+            per_edge = per_edge * edge_weights
         loss_sum = torch.zeros(num_graphs, device=logits.device, dtype=per_edge.dtype)
         loss_sum.scatter_add_(0, edge_batch, per_edge)
         edge_counts = torch.zeros(num_graphs, device=logits.device, dtype=per_edge.dtype)
         edge_counts.scatter_add_(0, edge_batch, torch.ones_like(per_edge, dtype=per_edge.dtype))
-        valid = edge_counts > 0
+        if edge_weights is not None:
+            weight_sum = torch.zeros(num_graphs, device=logits.device, dtype=per_edge.dtype)
+            weight_sum.scatter_add_(0, edge_batch, edge_weights.to(dtype=per_edge.dtype))
+            valid = weight_sum > 0
+            denom = weight_sum.clamp_min(_MIN_EDGE_WEIGHT)
+        else:
+            valid = edge_counts > 0
+            denom = edge_counts
         if not bool(valid.any().item()):
             return logits.new_zeros(()), {
                 "bce_graphs": 0.0,
                 "bce_edges": float(per_edge.numel()),
             }
-        loss = (loss_sum[valid] / edge_counts[valid]).mean()
+        loss = (loss_sum[valid] / denom[valid]).mean()
         return loss, {
             "bce_graphs": float(valid.sum().item()),
             "bce_edges": float(per_edge.numel()),
@@ -181,6 +211,11 @@ class RetrieverLoss(nn.Module):
             raise ValueError(f"num_graphs must be positive, got {num_graphs}")
         return logits, targets, edge_batch, num_graphs
 
+    def _build_edge_weights(self, edge_is_near: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        w_near = torch.tensor(self.edge_weight_near, device=edge_is_near.device, dtype=dtype)
+        w_bridge = torch.tensor(self.edge_weight_bridge, device=edge_is_near.device, dtype=dtype)
+        return torch.where(edge_is_near, w_near, w_bridge)
+
     @staticmethod
     def _compute_separation_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
         with torch.no_grad():
@@ -202,6 +237,7 @@ class RetrieverLoss(nn.Module):
         *,
         edge_batch: Optional[torch.Tensor] = None,
         num_graphs: Optional[int] = None,
+        edge_is_near: Optional[torch.Tensor] = None,
         path_edge_indices: Optional[torch.Tensor] = None,
     ) -> LossOutput:
         logits, targets, edge_batch, num_graphs = self._prepare_loss_inputs(
@@ -211,12 +247,23 @@ class RetrieverLoss(nn.Module):
             num_graphs=num_graphs,
             path_edge_indices=path_edge_indices,
         )
+        edge_weights = None
+        if self.requires_edge_is_near:
+            if edge_is_near is None:
+                raise ValueError("RetrieverLoss requires edge_is_near when edge weights are enabled.")
+            edge_is_near = edge_is_near.to(device=logits.device, dtype=torch.bool).view(-1)
+            if edge_is_near.numel() != logits.numel():
+                raise ValueError(
+                    f"edge_is_near length mismatch: {edge_is_near.numel()} vs logits {logits.numel()}"
+                )
+            edge_weights = self._build_edge_weights(edge_is_near, dtype=logits.dtype)
 
         infonce_loss, infonce_metrics = self._infonce_loss(
             targets=targets,
             edge_batch=edge_batch,
             num_graphs=num_graphs,
             logits=logits,
+            edge_weights=edge_weights,
         )
         bce_loss = logits.new_zeros(())
         bce_metrics = {"bce_graphs": 0.0, "bce_edges": 0.0}
@@ -226,6 +273,7 @@ class RetrieverLoss(nn.Module):
                 edge_batch=edge_batch,
                 num_graphs=num_graphs,
                 logits=logits,
+                edge_weights=edge_weights,
             )
         path_loss = logits.new_zeros(())
         path_weight = _NO_PATH_WEIGHT

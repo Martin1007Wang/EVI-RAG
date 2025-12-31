@@ -20,6 +20,7 @@ import json
 import pickle
 import re
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -28,6 +29,7 @@ try:
     import hydra
 except ModuleNotFoundError:  # pragma: no cover
     hydra = None  # type: ignore[assignment]
+import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
@@ -118,6 +120,32 @@ class GraphRecord:
     pair_shortest_lengths: List[int]
 
 
+@dataclass(frozen=True)
+class EntityLookup:
+    entity_to_struct: Dict[str, int]
+    text_kg_id_to_embed_id: Dict[str, int]
+
+    def entity_id(self, ent: str) -> int:
+        idx = self.entity_to_struct.get(ent)
+        if idx is None:
+            raise KeyError(f"Unknown entity id: {ent}")
+        return idx
+
+    def embedding_id(self, ent: str) -> int:
+        return self.text_kg_id_to_embed_id.get(ent, _NON_TEXT_EMBEDDING_ID)
+
+
+@dataclass(frozen=True)
+class RelationLookup:
+    rel_to_id: Dict[str, int]
+
+    def relation_id(self, rel: str) -> int:
+        idx = self.rel_to_id.get(rel)
+        if idx is None:
+            raise KeyError(f"Unknown relation id: {rel}")
+        return idx
+
+
 class EntityVocab:
     """Assign structural IDs and embedding IDs; separate text vs non-text."""
 
@@ -194,12 +222,20 @@ class EntityVocab:
         return self._entity_to_struct[ent]
 
     def embedding_id(self, ent: str) -> int:
-        return 0 if not self._text_cfg.is_text(ent) else self._embedding_id_for_text(ent)
+        return _NON_TEXT_EMBEDDING_ID if not self._text_cfg.is_text(ent) else self._embedding_id_for_text(ent)
 
     def _embedding_id_for_text(self, ent: str) -> int:
         if not self._finalized:
             self.finalize()
-        return self._text_kg_id_to_embed_id.get(ent, 0)
+        return self._text_kg_id_to_embed_id.get(ent, _NON_TEXT_EMBEDDING_ID)
+
+    def to_lookup(self) -> EntityLookup:
+        if not self._finalized:
+            self.finalize()
+        return EntityLookup(
+            entity_to_struct=dict(self._entity_to_struct),
+            text_kg_id_to_embed_id=dict(self._text_kg_id_to_embed_id),
+        )
 
 
 class RelationVocab:
@@ -219,6 +255,9 @@ class RelationVocab:
     @property
     def records(self) -> List[Dict[str, object]]:
         return self._records
+
+    def to_lookup(self) -> RelationLookup:
+        return RelationLookup(rel_to_id=dict(self._rel_to_id))
 
 
 @dataclass
@@ -279,22 +318,12 @@ class ParquetDatasetWriter:
                 "split": pa.array([row["split"] for row in self.questions], type=pa.string()),
                 "kb": pa.array([row["kb"] for row in self.questions], type=pa.string()),
                 "question": pa.array([row["question"] for row in self.questions], type=pa.string()),
-                "paraphrased_question": pa.array(
-                    [row.get("paraphrased_question") for row in self.questions], type=pa.string()
-                ),
                 "seed_entity_ids": pa.array([row["seed_entity_ids"] for row in self.questions], type=pa.list_(pa.int64())),
                 "answer_entity_ids": pa.array(
                     [row["answer_entity_ids"] for row in self.questions], type=pa.list_(pa.int64())
                 ),
-                "seed_embedding_ids": pa.array(
-                    [row["seed_embedding_ids"] for row in self.questions], type=pa.list_(pa.int64())
-                ),
-                "answer_embedding_ids": pa.array(
-                    [row["answer_embedding_ids"] for row in self.questions], type=pa.list_(pa.int64())
-                ),
                 "answer_texts": pa.array([row["answer_texts"] for row in self.questions], type=pa.list_(pa.string())),
                 "graph_id": pa.array([row["graph_id"] for row in self.questions], type=pa.string()),
-                "metadata": pa.array([row["metadata"] for row in self.questions], type=pa.string()),
             }
             if self.include_question_emb:
                 question_embs: List[object] = []
@@ -325,6 +354,24 @@ _LABEL_QID_RE = re.compile(r"(.+)\s+\((Q\d+)\)$")
 _PATH_MODE_UNDIRECTED = "undirected"
 _PATH_MODE_QA_DIRECTED = "qa_directed"
 _PATH_MODES = (_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)
+_ALLOWED_SPLITS = ("train", "validation", "test")
+_NON_TEXT_EMBEDDING_ID = 0
+_NUM_TOPICS_BINARY = 2
+_DIST_UNREACHABLE = -1
+_DIST_REACHABLE_MIN = 0
+_EDGE_STEP = 1
+_MIN_CHUNK_SIZE = 1
+_DISABLE_PARALLEL_WORKERS = 0
+_EDGE_INDEX_MIN = 0
+_BYTES_PER_GB = 1 << 30
+_LMDB_MAP_SIZE_GB_MIN = 1
+_LMDB_GROWTH_GB_MIN = 0
+_LMDB_GROWTH_FACTOR_MIN = 1.0
+_DEFAULT_LMDB_MAP_GROWTH_GB = 32
+_DEFAULT_LMDB_MAP_GROWTH_FACTOR = 1.5
+_VALIDATE_GRAPH_EDGES_DEFAULT = True
+_REMOVE_SELF_LOOPS_DEFAULT = True
+_AUX_LMDB_SUFFIX = ".aux.lmdb"
 
 
 # Helpers
@@ -341,6 +388,16 @@ def _validate_path_mode(path_mode: str) -> str:
     return mode
 
 
+def _validate_split_names(splits: Sequence[str], *, context: str) -> List[str]:
+    normalized = [str(split) for split in splits]
+    unknown = sorted(set(normalized) - set(_ALLOWED_SPLITS))
+    if unknown:
+        raise ValueError(
+            f"{context} contains unsupported split names: {unknown}. Expected one of {_ALLOWED_SPLITS}."
+        )
+    return normalized
+
+
 def build_text_entity_config(cfg: DictConfig) -> TextEntityConfig:
     mode = str(cfg.get("entity_text_mode", "regex"))
     prefixes_cfg = cfg.get("text_prefixes") or []
@@ -352,6 +409,45 @@ def build_text_entity_config(cfg: DictConfig) -> TextEntityConfig:
     if mode == "prefix_allowlist" and not prefixes:
         raise ValueError("entity_text_mode=prefix_allowlist requires non-empty text_prefixes.")
     return TextEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
+
+
+@dataclass(frozen=True)
+class _WorkerState:
+    entity_lookup: EntityLookup
+    relation_lookup: RelationLookup
+    path_mode: str
+    dedup_edges: bool
+    validate_graph_edges: bool
+    remove_self_loops: bool
+
+
+_WORKER_STATE: Optional[_WorkerState] = None
+
+
+def _init_worker_state(state: _WorkerState) -> None:
+    global _WORKER_STATE
+    _WORKER_STATE = state
+
+
+def _require_worker_state() -> _WorkerState:
+    if _WORKER_STATE is None:
+        raise RuntimeError("Worker state is not initialized.")
+    return _WORKER_STATE
+
+
+def _build_graph_worker(sample: Sample) -> GraphRecord:
+    state = _require_worker_state()
+    graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
+    return build_graph(
+        sample,
+        state.entity_lookup,
+        state.relation_lookup,
+        graph_id,
+        path_mode=state.path_mode,
+        dedup_edges=state.dedup_edges,
+        validate_graph_edges=state.validate_graph_edges,
+        remove_self_loops=state.remove_self_loops,
+    )
 
 
 def _shortest_path_single(
@@ -434,6 +530,43 @@ def _shortest_path_single(
     return edges, nodes
 
 
+def _validate_graph_record(graph: "GraphRecord") -> None:
+    num_nodes = len(graph.node_entity_ids)
+    num_edges = len(graph.edge_src)
+    if len(graph.edge_dst) != num_edges or len(graph.edge_relation_ids) != num_edges:
+        raise ValueError(f"Edge length mismatch for {graph.graph_id}: edges={num_edges}.")
+    if len(graph.positive_triple_mask) != num_edges:
+        raise ValueError(f"positive_triple_mask length mismatch for {graph.graph_id}: edges={num_edges}.")
+    if num_edges > _EDGE_INDEX_MIN:
+        min_src = min(graph.edge_src)
+        min_dst = min(graph.edge_dst)
+        max_src = max(graph.edge_src)
+        max_dst = max(graph.edge_dst)
+        if min_src < _EDGE_INDEX_MIN or min_dst < _EDGE_INDEX_MIN:
+            raise ValueError(f"Negative edge index detected for {graph.graph_id}.")
+        if max_src >= num_nodes or max_dst >= num_nodes:
+            raise ValueError(f"Edge index exceeds num_nodes for {graph.graph_id}.")
+    if graph.pair_edge_counts:
+        total_pairs = sum(graph.pair_edge_counts)
+        if total_pairs != len(graph.pair_edge_local_ids):
+            raise ValueError(f"pair_edge_counts sum mismatch for {graph.graph_id}.")
+    if graph.pair_edge_local_ids:
+        min_pair = min(graph.pair_edge_local_ids)
+        max_pair = max(graph.pair_edge_local_ids)
+        if min_pair < _EDGE_INDEX_MIN or max_pair >= num_edges:
+            raise ValueError(f"pair_edge_local_ids out of range for {graph.graph_id}.")
+    if graph.pair_start_node_locals:
+        min_start = min(graph.pair_start_node_locals)
+        max_start = max(graph.pair_start_node_locals)
+        if min_start < _EDGE_INDEX_MIN or max_start >= num_nodes:
+            raise ValueError(f"pair_start_node_locals out of range for {graph.graph_id}.")
+    if graph.pair_answer_node_locals:
+        min_ans = min(graph.pair_answer_node_locals)
+        max_ans = max(graph.pair_answer_node_locals)
+        if min_ans < _EDGE_INDEX_MIN or max_ans >= num_nodes:
+            raise ValueError(f"pair_answer_node_locals out of range for {graph.graph_id}.")
+
+
 def _build_undirected_adjacency(
     num_nodes: int,
     edge_src: Sequence[int],
@@ -475,7 +608,7 @@ def _normalize_local_nodes(num_nodes: int, nodes: Sequence[int]) -> List[int]:
 
 
 def _bfs_dist(num_nodes: int, adjacency: Sequence[Sequence[int]], sources: Sequence[int]) -> List[int]:
-    dist = [-1] * num_nodes
+    dist = [_DIST_UNREACHABLE] * num_nodes
     if num_nodes <= 0:
         return dist
     from collections import deque
@@ -498,6 +631,63 @@ def _bfs_dist(num_nodes: int, adjacency: Sequence[Sequence[int]], sources: Seque
     return dist
 
 
+def _as_numpy_int(values: Sequence[int]) -> np.ndarray:
+    return np.asarray(values, dtype=np.int64)
+
+
+def _valid_edge_indices(edge_src: np.ndarray, edge_dst: np.ndarray, num_nodes: int) -> np.ndarray:
+    if num_nodes <= _DIST_REACHABLE_MIN:
+        return np.empty((0,), dtype=np.int64)
+    valid = (
+        (edge_src >= _DIST_REACHABLE_MIN)
+        & (edge_dst >= _DIST_REACHABLE_MIN)
+        & (edge_src < num_nodes)
+        & (edge_dst < num_nodes)
+    )
+    return np.nonzero(valid)[0]
+
+
+def _select_shortest_edges_undirected(
+    edge_src: np.ndarray,
+    edge_dst: np.ndarray,
+    dist_s: np.ndarray,
+    dist_a: np.ndarray,
+    dist_sa: int,
+) -> np.ndarray:
+    dist_s_u = dist_s[edge_src]
+    dist_s_v = dist_s[edge_dst]
+    dist_a_u = dist_a[edge_src]
+    dist_a_v = dist_a[edge_dst]
+    mask_uv = (
+        (dist_s_u >= _DIST_REACHABLE_MIN)
+        & (dist_a_v >= _DIST_REACHABLE_MIN)
+        & (dist_s_u + _EDGE_STEP + dist_a_v == dist_sa)
+    )
+    mask_vu = (
+        (dist_s_v >= _DIST_REACHABLE_MIN)
+        & (dist_a_u >= _DIST_REACHABLE_MIN)
+        & (dist_s_v + _EDGE_STEP + dist_a_u == dist_sa)
+    )
+    return np.nonzero(mask_uv | mask_vu)[0]
+
+
+def _select_shortest_edges_directed(
+    edge_src: np.ndarray,
+    edge_dst: np.ndarray,
+    dist_s: np.ndarray,
+    dist_a: np.ndarray,
+    dist_sa: int,
+) -> np.ndarray:
+    dist_s_u = dist_s[edge_src]
+    dist_a_v = dist_a[edge_dst]
+    mask = (
+        (dist_s_u >= _DIST_REACHABLE_MIN)
+        & (dist_a_v >= _DIST_REACHABLE_MIN)
+        & (dist_s_u + _EDGE_STEP + dist_a_v == dist_sa)
+    )
+    return np.nonzero(mask)[0]
+
+
 def _shortest_path_union_mask_by_pair(
     num_nodes: int,
     edge_src: Sequence[int],
@@ -509,16 +699,26 @@ def _shortest_path_union_mask_by_pair(
     if num_nodes <= 0 or num_edges == 0 or not sources or not targets:
         return [False] * num_edges, [], [], [], [], []
 
+    edge_src_arr = _as_numpy_int(edge_src)
+    edge_dst_arr = _as_numpy_int(edge_dst)
+    valid_edge_indices = _valid_edge_indices(edge_src_arr, edge_dst_arr, num_nodes)
+    if valid_edge_indices.size == 0:
+        return [False] * num_edges, [], [], [], [], []
+    edge_src_valid = edge_src_arr[valid_edge_indices]
+    edge_dst_valid = edge_dst_arr[valid_edge_indices]
+
     adjacency = _build_undirected_adjacency(num_nodes, edge_src, edge_dst)
     starts = sorted({int(s) for s in sources if 0 <= int(s) < num_nodes})
     answers = sorted({int(t) for t in targets if 0 <= int(t) < num_nodes})
     if not starts or not answers:
         return [False] * num_edges, [], [], [], [], []
 
-    dist_from_start: Dict[int, List[int]] = {s: _bfs_dist(num_nodes, adjacency, [s]) for s in starts}
-    dist_to_answer: Dict[int, List[int]] = {a: _bfs_dist(num_nodes, adjacency, [a]) for a in answers}
+    dist_from_start: Dict[int, np.ndarray] = {
+        s: _as_numpy_int(_bfs_dist(num_nodes, adjacency, [s])) for s in starts
+    }
+    dist_to_answer: Dict[int, np.ndarray] = {a: _as_numpy_int(_bfs_dist(num_nodes, adjacency, [a])) for a in answers}
 
-    mask = [False] * num_edges
+    mask = np.zeros(num_edges, dtype=bool)
     pair_start_nodes: List[int] = []
     pair_answer_nodes: List[int] = []
     pair_edge_local_ids: List[int] = []
@@ -529,29 +729,21 @@ def _shortest_path_union_mask_by_pair(
         dist_s = dist_from_start[s]
         for a in answers:
             dist_a = dist_to_answer[a]
-            dist_sa = dist_s[a]
-            if dist_sa < 0:
+            dist_sa = int(dist_s[a])
+            if dist_sa < _DIST_REACHABLE_MIN:
                 continue
             pair_start_nodes.append(s)
             pair_answer_nodes.append(a)
-            pair_shortest_lengths.append(int(dist_sa))
-            before = len(pair_edge_local_ids)
-            for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
-                u = int(u_raw)
-                v = int(v_raw)
-                if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
-                    continue
-                if dist_s[u] >= 0 and dist_a[v] >= 0 and dist_s[u] + 1 + dist_a[v] == dist_sa:
-                    pair_edge_local_ids.append(idx)
-                    mask[idx] = True
-                    continue
-                if dist_s[v] >= 0 and dist_a[u] >= 0 and dist_s[v] + 1 + dist_a[u] == dist_sa:
-                    pair_edge_local_ids.append(idx)
-                    mask[idx] = True
-            pair_edge_counts.append(len(pair_edge_local_ids) - before)
+            pair_shortest_lengths.append(dist_sa)
+            edge_keep = _select_shortest_edges_undirected(edge_src_valid, edge_dst_valid, dist_s, dist_a, dist_sa)
+            edge_ids = valid_edge_indices[edge_keep]
+            if edge_ids.size > 0:
+                mask[edge_ids] = True
+                pair_edge_local_ids.extend(edge_ids.tolist())
+            pair_edge_counts.append(int(edge_ids.size))
 
     return (
-        mask,
+        mask.tolist(),
         pair_start_nodes,
         pair_answer_nodes,
         pair_edge_local_ids,
@@ -576,12 +768,20 @@ def _shortest_path_union_mask_by_pair_directed(
     if not starts or not answers:
         return [False] * num_edges, [], [], [], [], []
 
+    edge_src_arr = _as_numpy_int(edge_src)
+    edge_dst_arr = _as_numpy_int(edge_dst)
+    valid_edge_indices = _valid_edge_indices(edge_src_arr, edge_dst_arr, num_nodes)
+    if valid_edge_indices.size == 0:
+        return [False] * num_edges, [], [], [], [], []
+    edge_src_valid = edge_src_arr[valid_edge_indices]
+    edge_dst_valid = edge_dst_arr[valid_edge_indices]
+
     adjacency = _build_directed_adjacency(num_nodes, edge_src, edge_dst)
     reverse_adjacency = _build_directed_adjacency(num_nodes, edge_dst, edge_src)
-    dist_from_start = {s: _bfs_dist(num_nodes, adjacency, [s]) for s in starts}
-    dist_to_answer = {a: _bfs_dist(num_nodes, reverse_adjacency, [a]) for a in answers}
+    dist_from_start = {s: _as_numpy_int(_bfs_dist(num_nodes, adjacency, [s])) for s in starts}
+    dist_to_answer = {a: _as_numpy_int(_bfs_dist(num_nodes, reverse_adjacency, [a])) for a in answers}
 
-    mask = [False] * num_edges
+    mask = np.zeros(num_edges, dtype=bool)
     pair_start_nodes: List[int] = []
     pair_answer_nodes: List[int] = []
     pair_edge_local_ids: List[int] = []
@@ -592,25 +792,21 @@ def _shortest_path_union_mask_by_pair_directed(
         dist_s = dist_from_start[s]
         for a in answers:
             dist_a = dist_to_answer[a]
-            dist_sa = dist_s[a]
-            if dist_sa < 0:
+            dist_sa = int(dist_s[a])
+            if dist_sa < _DIST_REACHABLE_MIN:
                 continue
             pair_start_nodes.append(s)
             pair_answer_nodes.append(a)
-            pair_shortest_lengths.append(int(dist_sa))
-            before = len(pair_edge_local_ids)
-            for idx, (u_raw, v_raw) in enumerate(zip(edge_src, edge_dst)):
-                u = int(u_raw)
-                v = int(v_raw)
-                if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
-                    continue
-                if dist_s[u] >= 0 and dist_a[v] >= 0 and dist_s[u] + 1 + dist_a[v] == dist_sa:
-                    pair_edge_local_ids.append(idx)
-                    mask[idx] = True
-            pair_edge_counts.append(len(pair_edge_local_ids) - before)
+            pair_shortest_lengths.append(dist_sa)
+            edge_keep = _select_shortest_edges_directed(edge_src_valid, edge_dst_valid, dist_s, dist_a, dist_sa)
+            edge_ids = valid_edge_indices[edge_keep]
+            if edge_ids.size > 0:
+                mask[edge_ids] = True
+                pair_edge_local_ids.extend(edge_ids.tolist())
+            pair_edge_counts.append(int(edge_ids.size))
 
     return (
-        mask,
+        mask.tolist(),
         pair_start_nodes,
         pair_answer_nodes,
         pair_edge_local_ids,
@@ -953,18 +1149,35 @@ def preprocess(
     eval_filter: SplitFilter,
     override_filters: Dict[str, SplitFilter],
     path_mode: str = _PATH_MODE_UNDIRECTED,
+    dedup_edges: bool = True,
+    validate_graph_edges: bool = _VALIDATE_GRAPH_EDGES_DEFAULT,
+    remove_self_loops: bool = _REMOVE_SELF_LOOPS_DEFAULT,
     embedding_cfg: Optional[EmbeddingConfig] = None,
     *,
     emit_sub_filter: bool = False,
     sub_filter_filename: str = "sub_filter.json",
+    emit_nonzero_positive_filter: bool = False,
+    nonzero_positive_filter_filename: str = "nonzero_positive_filter.json",
+    nonzero_positive_filter_splits: Optional[Sequence[str]] = None,
+    parquet_chunk_size: int = _MIN_CHUNK_SIZE,
+    parquet_num_workers: int = _DISABLE_PARALLEL_WORKERS,
+    reuse_embeddings_if_exists: bool = False,
 ) -> None:
     path_mode = _validate_path_mode(path_mode)
+    dedup_edges = bool(dedup_edges)
+    validate_graph_edges = bool(validate_graph_edges)
+    remove_self_loops = bool(remove_self_loops)
+    if parquet_chunk_size < _MIN_CHUNK_SIZE:
+        raise ValueError(f"parquet_chunk_size must be >= {_MIN_CHUNK_SIZE}, got {parquet_chunk_size}")
+    if parquet_num_workers < _DISABLE_PARALLEL_WORKERS:
+        raise ValueError(f"parquet_num_workers must be >= {_DISABLE_PARALLEL_WORKERS}, got {parquet_num_workers}")
     ensure_dir(out_dir)
     entity_vocab = EntityVocab(kb=kb, text_cfg=text_cfg)
     relation_vocab = RelationVocab(kb=kb)
 
     available_files = {p.name for p in raw_root.glob("*.parquet")}
     splits = sorted({name.split("-")[0] for name in available_files})
+    splits = _validate_split_names(splits, context="raw parquet files")
     connectivity_cache: Dict[Tuple[str, str, str], bool] = {}
     total_by_split: Dict[str, int] = {}
     kept_by_split: Dict[str, int] = {}
@@ -973,6 +1186,22 @@ def preprocess(
     empty_graph_ids: List[str] = []
     empty_graph_id_set: Set[str] = set()
     sub_sample_ids: List[str] = []
+    nonzero_positive_sample_ids: List[str] = []
+    nonzero_positive_by_split: Dict[str, int] = {}
+    nonzero_positive_splits: Optional[Set[str]] = None
+    if emit_nonzero_positive_filter:
+        splits_cfg = nonzero_positive_filter_splits
+        if isinstance(splits_cfg, str):
+            splits_cfg = [splits_cfg]
+        if splits_cfg is None:
+            nonzero_positive_splits = None
+        else:
+            split_list = _validate_split_names(splits_cfg, context="nonzero_positive_filter_splits")
+            nonzero_positive_splits = set(split_list)
+            if not nonzero_positive_splits:
+                raise ValueError(
+                    "emit_nonzero_positive_filter=true requires nonzero_positive_filter_splits to be non-empty."
+                )
 
     # Pass 1: Build vocabularies
     print("Pass 1: Building vocabularies...")
@@ -1014,12 +1243,17 @@ def preprocess(
     encoder: Optional[TextEncoder] = None
     relation_embeddings_norm: Optional[torch.Tensor] = None
     if embedding_cfg is not None:
-        need_encoder = (
-            embedding_cfg.precompute_entities
-            or embedding_cfg.precompute_relations
-            or embedding_cfg.precompute_questions
-            or embedding_cfg.canonicalize_relations
+        embeddings_out_dir = embedding_cfg.embeddings_out_dir
+        entity_emb_path = embeddings_out_dir / "entity_embeddings.pt"
+        relation_emb_path = embeddings_out_dir / "relation_embeddings.pt"
+        need_entity_encode = embedding_cfg.precompute_entities and not (
+            reuse_embeddings_if_exists and entity_emb_path.exists()
         )
+        need_relation_encode = (embedding_cfg.precompute_relations or embedding_cfg.canonicalize_relations) and not (
+            reuse_embeddings_if_exists and relation_emb_path.exists()
+        )
+        need_question_encode = embedding_cfg.precompute_questions or embedding_cfg.canonicalize_relations
+        need_encoder = need_entity_encode or need_relation_encode or need_question_encode
         if need_encoder:
             encoder = TextEncoder(
                 embedding_cfg.encoder,
@@ -1028,40 +1262,47 @@ def preprocess(
                 embedding_cfg.progress_bar,
             )
         if embedding_cfg.precompute_entities or embedding_cfg.precompute_relations:
-            ensure_dir(embedding_cfg.embeddings_out_dir)
+            ensure_dir(embeddings_out_dir)
         if embedding_cfg.precompute_entities:
-            emb_rows = sorted(
-                ((rec["embedding_id"], rec.get("label", "")) for rec in entity_vocab.embedding_records),
-                key=lambda x: x[0],
-            )
-            text_labels = [str(label) for _, label in emb_rows]
-            text_ids = [int(eid) for eid, _ in emb_rows]
-            struct_records = entity_vocab.struct_records
-            max_embedding_id = max((int(rec["embedding_id"]) for rec in struct_records), default=0)
-            encode_to_memmap(
-                encoder=encoder,
-                texts=text_labels,
-                emb_ids=text_ids,
-                batch_size=embedding_cfg.batch_size,
-                max_embedding_id=max_embedding_id,
-                out_path=embedding_cfg.embeddings_out_dir / "entity_embeddings.pt",
-                desc="Entities",
-                show_progress=embedding_cfg.progress_bar,
-            )
+            if not need_entity_encode:
+                print(f"Reusing entity embeddings at {entity_emb_path}")
+            else:
+                emb_rows = sorted(
+                    ((rec["embedding_id"], rec.get("label", "")) for rec in entity_vocab.embedding_records),
+                    key=lambda x: x[0],
+                )
+                text_labels = [str(label) for _, label in emb_rows]
+                text_ids = [int(eid) for eid, _ in emb_rows]
+                struct_records = entity_vocab.struct_records
+                max_embedding_id = max((int(rec["embedding_id"]) for rec in struct_records), default=0)
+                encode_to_memmap(
+                    encoder=encoder,
+                    texts=text_labels,
+                    emb_ids=text_ids,
+                    batch_size=embedding_cfg.batch_size,
+                    max_embedding_id=max_embedding_id,
+                    out_path=entity_emb_path,
+                    desc="Entities",
+                    show_progress=embedding_cfg.progress_bar,
+                )
         if embedding_cfg.precompute_relations or embedding_cfg.canonicalize_relations:
-            relation_rows = sorted(
-                ((rec["relation_id"], rec.get("label", "")) for rec in relation_vocab.records),
-                key=lambda x: x[0],
-            )
-            relation_labels = [str(label) for _, label in relation_rows]
-            relation_emb = encoder.encode(
-                relation_labels,
-                embedding_cfg.batch_size,
-                show_progress=embedding_cfg.progress_bar,
-                desc="Relations",
-            )
-            if embedding_cfg.precompute_relations:
-                torch.save(relation_emb, embedding_cfg.embeddings_out_dir / "relation_embeddings.pt")
+            if need_relation_encode:
+                relation_rows = sorted(
+                    ((rec["relation_id"], rec.get("label", "")) for rec in relation_vocab.records),
+                    key=lambda x: x[0],
+                )
+                relation_labels = [str(label) for _, label in relation_rows]
+                relation_emb = encoder.encode(
+                    relation_labels,
+                    embedding_cfg.batch_size,
+                    show_progress=embedding_cfg.progress_bar,
+                    desc="Relations",
+                )
+                if embedding_cfg.precompute_relations:
+                    torch.save(relation_emb, relation_emb_path)
+            else:
+                print(f"Reusing relation embeddings at {relation_emb_path}")
+                relation_emb = torch.load(relation_emb_path, map_location="cpu")
             if embedding_cfg.canonicalize_relations:
                 relation_embeddings_norm = _normalize_embeddings(relation_emb, embedding_cfg.cosine_eps)
                 if relation_embeddings_norm.numel() == 0:
@@ -1069,12 +1310,12 @@ def preprocess(
 
     # Pass 2: Build graphs and questions
     print("Pass 2: Building graphs and questions...")
-    chunk_size = 2000
+    chunk_size = parquet_chunk_size
     include_question_emb = bool(embedding_cfg and embedding_cfg.precompute_questions)
     base_writer = ParquetDatasetWriter(out_dir=out_dir, include_question_emb=include_question_emb)
     need_question_emb = bool(embedding_cfg and (embedding_cfg.precompute_questions or embedding_cfg.canonicalize_relations))
 
-    def _process_sample_batch(samples: List[Sample]) -> None:
+    def _process_sample_batch(samples: List[Sample], executor: Optional[ProcessPoolExecutor]) -> None:
         if not samples:
             return
         question_emb_batch = None
@@ -1091,9 +1332,23 @@ def preprocess(
             )
             if embedding_cfg and embedding_cfg.canonicalize_relations:
                 question_emb_norm_batch = _normalize_embeddings(question_emb_batch, embedding_cfg.cosine_eps)
-        for idx, sample in enumerate(samples):
-            graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
-            graph = build_graph(sample, entity_vocab, relation_vocab, graph_id, path_mode=path_mode)
+        if executor is None:
+            graphs = [
+                build_graph(
+                    sample,
+                    entity_vocab,
+                    relation_vocab,
+                    f"{sample.dataset}/{sample.split}/{sample.question_id}",
+                    path_mode=path_mode,
+                    dedup_edges=dedup_edges,
+                    validate_graph_edges=validate_graph_edges,
+                    remove_self_loops=remove_self_loops,
+                )
+                for sample in samples
+            ]
+        else:
+            graphs = list(executor.map(_build_graph_worker, samples))
+        for idx, (sample, graph) in enumerate(zip(samples, graphs)):
             if embedding_cfg and embedding_cfg.canonicalize_relations:
                 if relation_embeddings_norm is None or question_emb_norm_batch is None:
                     raise RuntimeError("Canonicalization requested but embeddings are missing.")
@@ -1103,7 +1358,7 @@ def preprocess(
                 if question_emb_batch is None:
                     raise RuntimeError("question_emb batch missing while precompute_questions is enabled.")
                 question_emb = question_emb_batch[idx].tolist()
-            question = build_question_record(sample, entity_vocab, graph_id, question_emb=question_emb)
+            question = build_question_record(sample, entity_vocab, graph.graph_id, question_emb=question_emb)
             base_writer.append(graph, question)
             if emit_sub_filter:
                 label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
@@ -1117,29 +1372,53 @@ def preprocess(
                     nonzero_min_len = min(graph.pair_shortest_lengths) > 0
                 no_overlap = q_local.isdisjoint(a_local)
                 if has_topic and has_answer and has_path and (nonzero_min_len or no_overlap):
-                    sub_sample_ids.append(graph_id)
+                    sub_sample_ids.append(graph.graph_id)
                     sub_by_split[sample.split] = sub_by_split.get(sample.split, 0) + 1
+            if emit_nonzero_positive_filter:
+                split_ok = nonzero_positive_splits is None or sample.split in nonzero_positive_splits
+                if split_ok and any(graph.positive_triple_mask):
+                    nonzero_positive_sample_ids.append(graph.graph_id)
+                    nonzero_positive_by_split[sample.split] = nonzero_positive_by_split.get(sample.split, 0) + 1
             if len(base_writer.graphs) >= chunk_size or len(base_writer.questions) >= chunk_size:
                 base_writer.flush()
 
-    pending_samples: List[Sample] = []
-    for sample in tqdm(
-        iter_samples(dataset, kb, raw_root, splits, column_map, entity_normalization),
-        desc=f"Pass 2/2: Graphs from {dataset}",
-    ):
-        graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
-        if graph_id in empty_graph_id_set:
-            continue
-        split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
-        if not _should_keep_sample(sample, split_filter, connectivity_cache, path_mode=path_mode):
-            continue
-        pending_samples.append(sample)
-        if len(pending_samples) >= chunk_size:
-            _process_sample_batch(pending_samples)
-            pending_samples = []
+    def _run_pass2(executor: Optional[ProcessPoolExecutor]) -> None:
+        pending_samples: List[Sample] = []
+        for sample in tqdm(
+            iter_samples(dataset, kb, raw_root, splits, column_map, entity_normalization),
+            desc=f"Pass 2/2: Graphs from {dataset}",
+        ):
+            graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
+            if graph_id in empty_graph_id_set:
+                continue
+            split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
+            if not _should_keep_sample(sample, split_filter, connectivity_cache, path_mode=path_mode):
+                continue
+            pending_samples.append(sample)
+            if len(pending_samples) >= chunk_size:
+                _process_sample_batch(pending_samples, executor)
+                pending_samples = []
 
-    if pending_samples:
-        _process_sample_batch(pending_samples)
+        if pending_samples:
+            _process_sample_batch(pending_samples, executor)
+
+    if parquet_num_workers > _DISABLE_PARALLEL_WORKERS:
+        worker_state = _WorkerState(
+            entity_lookup=entity_vocab.to_lookup(),
+            relation_lookup=relation_vocab.to_lookup(),
+            path_mode=path_mode,
+            dedup_edges=dedup_edges,
+            validate_graph_edges=validate_graph_edges,
+            remove_self_loops=remove_self_loops,
+        )
+        with ProcessPoolExecutor(
+            max_workers=parquet_num_workers,
+            initializer=_init_worker_state,
+            initargs=(worker_state,),
+        ) as executor:
+            _run_pass2(executor)
+    else:
+        _run_pass2(None)
 
     base_writer.close()
 
@@ -1156,16 +1435,33 @@ def preprocess(
         print(f"Sub filter samples kept: {_format_counts(sub_by_split)}")
         print(f"Sub filter written to: {out_dir / sub_filter_filename}")
 
+    if emit_nonzero_positive_filter:
+        filter_splits = sorted(nonzero_positive_splits) if nonzero_positive_splits is not None else list(splits)
+        nonzero_payload = {
+            "dataset": dataset,
+            "splits": filter_splits,
+            "sample_ids": sorted(nonzero_positive_sample_ids),
+        }
+        (out_dir / nonzero_positive_filter_filename).write_text(json.dumps(nonzero_payload, indent=2))
+        print(f"Nonzero-positive filter samples kept: {_format_counts(nonzero_positive_by_split)}")
+        print(f"Nonzero-positive filter written to: {out_dir / nonzero_positive_filter_filename}")
+
 
 def build_graph(
     sample: Sample,
-    entity_vocab: EntityVocab,
-    relation_vocab: RelationVocab,
+    entity_vocab: EntityVocab | EntityLookup,
+    relation_vocab: RelationVocab | RelationLookup,
     graph_id: str,
     *,
     path_mode: str = _PATH_MODE_UNDIRECTED,
+    dedup_edges: bool = True,
+    validate_graph_edges: bool = _VALIDATE_GRAPH_EDGES_DEFAULT,
+    remove_self_loops: bool = _REMOVE_SELF_LOOPS_DEFAULT,
 ) -> GraphRecord:
     path_mode = _validate_path_mode(path_mode)
+    dedup_edges = bool(dedup_edges)
+    validate_graph_edges = bool(validate_graph_edges)
+    remove_self_loops = bool(remove_self_loops)
     node_index: Dict[str, int] = {}
     node_entity_ids: List[int] = []
     node_embedding_ids: List[int] = []
@@ -1186,14 +1482,19 @@ def build_graph(
     edge_key_to_indices: Dict[Tuple[str, str, str], List[int]] = {}
 
     for h, r, t in sample.graph:
+        if remove_self_loops and h == t:
+            continue
+        edge_key = (h, r, t)
+        if dedup_edges and edge_key in edge_key_to_indices:
+            continue
         src_idx = local_index(h)
         dst_idx = local_index(t)
         rel_idx = relation_vocab.relation_id(r)
         edge_src.append(src_idx)
         edge_dst.append(dst_idx)
         edge_relation_ids.append(rel_idx)
-        edge_keys.append((h, r, t))
-        edge_key_to_indices.setdefault((h, r, t), []).append(len(edge_keys) - 1)
+        edge_keys.append(edge_key)
+        edge_key_to_indices.setdefault(edge_key, []).append(len(edge_keys) - 1)
 
     q_local = [node_index[ent] for ent in sample.q_entity if ent in node_index]
     a_local = [node_index[ent] for ent in sample.a_entity if ent in node_index]
@@ -1282,7 +1583,7 @@ def build_graph(
             path_mode=path_mode,
         )
 
-    return GraphRecord(
+    graph = GraphRecord(
         graph_id=graph_id,
         node_entity_ids=node_entity_ids,
         node_embedding_ids=node_embedding_ids,
@@ -1297,6 +1598,9 @@ def build_graph(
         pair_edge_counts=pair_edge_counts,
         pair_shortest_lengths=pair_shortest_lengths,
     )
+    if validate_graph_edges:
+        _validate_graph_record(graph)
+    return graph
 
 
 def build_question_record(
@@ -1308,31 +1612,16 @@ def build_question_record(
 ) -> Dict[str, object]:
     seed_entity_ids = [entity_vocab.entity_id(ent) for ent in sample.q_entity]
     answer_entity_ids = [entity_vocab.entity_id(ent) for ent in sample.a_entity]
-    seed_embedding_ids = [entity_vocab.embedding_id(ent) for ent in sample.q_entity]
-    answer_embedding_ids = [entity_vocab.embedding_id(ent) for ent in sample.a_entity]
-    metadata: Dict[str, Any] = {}
-    if sample.graph_iso_type is not None:
-        metadata["graph_isomorphism"] = sample.graph_iso_type
-    if sample.redundant is not None:
-        metadata["redundant"] = sample.redundant
-    if sample.test_type:
-        metadata["test_type"] = sample.test_type
-    if sample.answer_subgraph:
-        metadata["answer_subgraph_len"] = len(sample.answer_subgraph)
     record = {
         "question_uid": graph_id,
         "dataset": sample.dataset,
         "split": sample.split,
         "kb": sample.kb,
         "question": sample.question,
-        "paraphrased_question": None,
         "seed_entity_ids": seed_entity_ids,
         "answer_entity_ids": answer_entity_ids,
-        "seed_embedding_ids": seed_embedding_ids,
-        "answer_embedding_ids": answer_embedding_ids,
         "answer_texts": sample.answer_texts,
         "graph_id": graph_id,
-        "metadata": json.dumps(metadata),
     }
     if question_emb is not None:
         record["question_emb"] = list(question_emb)
@@ -1370,14 +1659,10 @@ def write_questions(rows: List[Dict[str, object]], output_path: Path) -> None:
         "split": pa.array([row["split"] for row in rows], type=pa.string()),
         "kb": pa.array([row["kb"] for row in rows], type=pa.string()),
         "question": pa.array([row["question"] for row in rows], type=pa.string()),
-        "paraphrased_question": pa.array([row.get("paraphrased_question") for row in rows], type=pa.string()),
         "seed_entity_ids": pa.array([row["seed_entity_ids"] for row in rows], type=pa.list_(pa.int64())),
         "answer_entity_ids": pa.array([row["answer_entity_ids"] for row in rows], type=pa.list_(pa.int64())),
-        "seed_embedding_ids": pa.array([row["seed_embedding_ids"] for row in rows], type=pa.list_(pa.int64())),
-        "answer_embedding_ids": pa.array([row["answer_embedding_ids"] for row in rows], type=pa.list_(pa.int64())),
         "answer_texts": pa.array([row["answer_texts"] for row in rows], type=pa.list_(pa.string())),
         "graph_id": pa.array([row["graph_id"] for row in rows], type=pa.string()),
-        "metadata": pa.array([row["metadata"] for row in rows], type=pa.string()),
     }
     if any("question_emb" in row for row in rows):
         table_data["question_emb"] = pa.array(
@@ -1459,8 +1744,104 @@ def _local_indices(node_ids: Sequence[int], targets: Sequence[int]) -> List[int]
     return [position[t] for t in targets if t in position]
 
 
-def _write_sample(txn, sample_id: str, sample: Dict) -> None:
-    txn.put(sample_id.encode("utf-8"), pickle.dumps(sample, protocol=pickle.HIGHEST_PROTOCOL))
+def _serialize_sample(sample: Dict) -> bytes:
+    return pickle.dumps(sample, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _write_sample(txn: lmdb.Transaction, sample_key: bytes, payload: bytes) -> None:
+    txn.put(sample_key, payload)
+
+
+def _resolve_lmdb_map_config(cfg: DictConfig) -> Tuple[int, int, float, Optional[int]]:
+    map_size_gb_cfg = cfg.get("map_size_gb")
+    if map_size_gb_cfg is None:
+        raise ValueError("map_size_gb must be set for LMDB materialization.")
+    map_size_gb = int(map_size_gb_cfg)
+    growth_gb_cfg = cfg.get("map_growth_gb")
+    growth_gb = _DEFAULT_LMDB_MAP_GROWTH_GB if growth_gb_cfg is None else int(growth_gb_cfg)
+    growth_factor_cfg = cfg.get("map_growth_factor")
+    growth_factor = _DEFAULT_LMDB_MAP_GROWTH_FACTOR if growth_factor_cfg is None else float(growth_factor_cfg)
+    max_gb_cfg = cfg.get("map_max_gb")
+    max_map_size_bytes = None if max_gb_cfg is None else int(max_gb_cfg) * _BYTES_PER_GB
+    if map_size_gb < _LMDB_MAP_SIZE_GB_MIN:
+        raise ValueError(f"map_size_gb must be >= {_LMDB_MAP_SIZE_GB_MIN}, got {map_size_gb}")
+    if growth_gb <= _LMDB_GROWTH_GB_MIN and growth_factor <= _LMDB_GROWTH_FACTOR_MIN:
+        raise ValueError(
+            "LMDB map growth disabled; set map_growth_gb > 0 or map_growth_factor > 1.0."
+        )
+    map_size_bytes = map_size_gb * _BYTES_PER_GB
+    growth_bytes = growth_gb * _BYTES_PER_GB
+    if max_map_size_bytes is not None and max_map_size_bytes < map_size_bytes:
+        raise ValueError("map_max_gb must be >= map_size_gb when set.")
+    return map_size_bytes, growth_bytes, growth_factor, max_map_size_bytes
+
+
+def _next_lmdb_map_size_bytes(
+    current_size: int,
+    growth_bytes: int,
+    growth_factor: float,
+    max_size: Optional[int],
+) -> int:
+    next_size = max(current_size + growth_bytes, int(current_size * growth_factor))
+    if max_size is not None:
+        next_size = min(next_size, max_size)
+    if next_size <= current_size:
+        raise RuntimeError("LMDB map size limit reached; increase map_max_gb to continue.")
+    return next_size
+
+
+def _replay_pending_with_growth(
+    *,
+    env: lmdb.Environment,
+    pending_payloads: List[Tuple[bytes, bytes]],
+    map_size_bytes: int,
+    growth_bytes: int,
+    growth_factor: float,
+    max_size_bytes: Optional[int],
+) -> Tuple[lmdb.Transaction, int]:
+    while True:
+        txn = env.begin(write=True)
+        try:
+            for key, payload in pending_payloads:
+                txn.put(key, payload)
+            return txn, map_size_bytes
+        except lmdb.MapFullError:
+            txn.abort()
+            map_size_bytes = _next_lmdb_map_size_bytes(
+                current_size=map_size_bytes,
+                growth_bytes=growth_bytes,
+                growth_factor=growth_factor,
+                max_size=max_size_bytes,
+            )
+            env.set_mapsize(map_size_bytes)
+
+
+def _commit_pending_with_growth(
+    *,
+    env: lmdb.Environment,
+    txn: lmdb.Transaction,
+    pending_payloads: List[Tuple[bytes, bytes]],
+    map_size_bytes: int,
+    growth_bytes: int,
+    growth_factor: float,
+    max_size_bytes: Optional[int],
+) -> Tuple[lmdb.Transaction, int]:
+    while True:
+        try:
+            txn.commit()
+            return env.begin(write=True), map_size_bytes
+        except lmdb.MapFullError:
+            txn.abort()
+            map_size_bytes = _next_lmdb_map_size_bytes(
+                current_size=map_size_bytes,
+                growth_bytes=growth_bytes,
+                growth_factor=growth_factor,
+                max_size=max_size_bytes,
+            )
+            env.set_mapsize(map_size_bytes)
+            txn = env.begin(write=True)
+            for key, payload in pending_payloads:
+                txn.put(key, payload)
 
 
 def _prepare_lmdb_dir(path: Path, *, overwrite: bool) -> Path:
@@ -1505,8 +1886,10 @@ def build_dataset(cfg: DictConfig) -> None:
         torch.use_deterministic_algorithms(True)
 
     num_topics = int(cfg.get("num_topics", 0))
-    if num_topics <= 0:
-        raise ValueError(f"num_topics must be positive to build topic_one_hot, got {num_topics}")
+    if num_topics != _NUM_TOPICS_BINARY:
+        raise ValueError(
+            f"num_topics must be {_NUM_TOPICS_BINARY} (seed vs non-seed), got {num_topics}"
+        )
 
     # Load vocabulary tables (small) and convert to Python dicts
     entity_vocab = _load_parquet(Path(cfg.parquet_dir) / "entity_vocab.parquet").to_pydict()
@@ -1519,7 +1902,7 @@ def build_dataset(cfg: DictConfig) -> None:
     relation_rows = sorted(zip(relation_vocab["relation_id"], relation_vocab["label"]), key=lambda x: x[0])
     relation_labels: List[str] = [str(label) for _, label in relation_rows]
 
-    vocab_map_size = cfg.get("vocab_map_size_gb", 1) * (1 << 30)
+    vocab_map_size = cfg.get("vocab_map_size_gb", _LMDB_MAP_SIZE_GB_MIN) * _BYTES_PER_GB
     _write_vocab_lmdb(
         entity_labels,
         relation_labels,
@@ -1530,6 +1913,7 @@ def build_dataset(cfg: DictConfig) -> None:
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
     require_precomputed_questions = bool(cfg.get("require_precomputed_questions", False))
+    reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
 
     emb_dir = Path(cfg.output_dir) / "embeddings"
     _ensure_dir(emb_dir)
@@ -1543,6 +1927,11 @@ def build_dataset(cfg: DictConfig) -> None:
         if encoder is None:
             encoder = TextEncoder(cfg.encoder, cfg.device, cfg.fp16, cfg.progress_bar)
         return encoder
+
+    if not use_precomputed_embeddings and reuse_embeddings_if_exists:
+        if entity_emb_path.exists() and relation_emb_path.exists():
+            print(f"Reusing embeddings at {emb_dir}")
+            use_precomputed_embeddings = True
 
     if use_precomputed_embeddings:
         missing_paths = [str(p) for p in (entity_emb_path, relation_emb_path) if not p.exists()]
@@ -1576,6 +1965,21 @@ def build_dataset(cfg: DictConfig) -> None:
     graphs_table = _load_parquet(Path(cfg.parquet_dir) / "graphs.parquet")
     questions_table = _load_parquet(Path(cfg.parquet_dir) / "questions.parquet")
     questions_have_emb = "question_emb" in questions_table.schema.names
+    if dataset_name and "dataset" in questions_table.schema.names:
+        dataset_values = {
+            str(val)
+            for val in questions_table.column("dataset").unique().to_pylist()
+            if val is not None
+        }
+        if len(dataset_values) > 1:
+            raise RuntimeError(
+                f"questions.parquet contains multiple dataset names: {sorted(dataset_values)}"
+            )
+        if dataset_values and dataset_name not in dataset_values:
+            raise RuntimeError(
+                "questions.parquet dataset mismatch: "
+                f"expected={dataset_name} found={sorted(dataset_values)}"
+            )
     if use_precomputed_questions and not questions_have_emb:
         if require_precomputed_questions:
             raise RuntimeError(
@@ -1658,31 +2062,55 @@ def build_dataset(cfg: DictConfig) -> None:
 
     overwrite_lmdb = bool(cfg.get("overwrite_lmdb", True))
 
-    # Set up LMDB environments
-    envs: Dict[str, lmdb.Environment] = {}
-    map_size = cfg.map_size_gb * (1 << 30)
+    # Set up LMDB environments (core + aux)
+    _LMDB_CORE_KEY = "core"
+    _LMDB_AUX_KEY = "aux"
+    envs: Dict[str, Dict[str, lmdb.Environment]] = {}
     all_splits = questions_table.column("split").unique().to_pylist()
-    tmp_dirs: Dict[str, Path] = {}
+    all_splits = _validate_split_names(all_splits, context="questions.parquet")
+    map_size_bytes, map_growth_bytes, map_growth_factor, map_max_bytes = _resolve_lmdb_map_config(cfg)
+    map_sizes: Dict[str, Dict[str, int]] = {
+        split: {_LMDB_CORE_KEY: map_size_bytes, _LMDB_AUX_KEY: map_size_bytes} for split in all_splits
+    }
+    tmp_dirs: Dict[str, Dict[str, Path]] = {}
     for split in all_splits:
-        final_dir = emb_dir / f"{split}.lmdb"
-        tmp_dir = _prepare_lmdb_dir(final_dir, overwrite=overwrite_lmdb)
-        tmp_dirs[str(split)] = tmp_dir
-        envs[split] = lmdb.open(
-            str(tmp_dir),
-            map_size=map_size,
+        split_key = str(split)
+        tmp_dirs[split_key] = {}
+        envs[split_key] = {}
+        core_final_dir = emb_dir / f"{split}.lmdb"
+        aux_final_dir = emb_dir / f"{split}{_AUX_LMDB_SUFFIX}"
+        core_tmp_dir = _prepare_lmdb_dir(core_final_dir, overwrite=overwrite_lmdb)
+        aux_tmp_dir = _prepare_lmdb_dir(aux_final_dir, overwrite=overwrite_lmdb)
+        tmp_dirs[split_key][_LMDB_CORE_KEY] = core_tmp_dir
+        tmp_dirs[split_key][_LMDB_AUX_KEY] = aux_tmp_dir
+        envs[split_key][_LMDB_CORE_KEY] = lmdb.open(
+            str(core_tmp_dir),
+            map_size=map_sizes[split_key][_LMDB_CORE_KEY],
+            subdir=True,
+            lock=False,
+        )
+        envs[split_key][_LMDB_AUX_KEY] = lmdb.open(
+            str(aux_tmp_dir),
+            map_size=map_sizes[split_key][_LMDB_AUX_KEY],
             subdir=True,
             lock=False,
         )
 
     success = False
     try:
-        txn_cache: Dict[str, lmdb.Transaction] = {split: env.begin(write=True) for split, env in envs.items()}
-        pending: Dict[str, int] = {split: 0 for split in envs.keys()}
+        txn_cache: Dict[str, Dict[str, lmdb.Transaction]] = {}
+        pending_payloads: Dict[str, Dict[str, List[Tuple[bytes, bytes]]]] = {}
+        for split_key, env_group in envs.items():
+            txn_cache[split_key] = {
+                _LMDB_CORE_KEY: env_group[_LMDB_CORE_KEY].begin(write=True),
+                _LMDB_AUX_KEY: env_group[_LMDB_AUX_KEY].begin(write=True),
+            }
+            pending_payloads[split_key] = {_LMDB_CORE_KEY: [], _LMDB_AUX_KEY: []}
 
-        question_batches = questions_table.to_batches(max_chunksize=cfg.batch_size)
-        total_batches = questions_table.num_rows / cfg.batch_size
+        parquet_chunk_size = _resolve_parquet_chunk_size(cfg, fallback=int(cfg.batch_size))
+        question_batches = questions_table.to_batches(max_chunksize=parquet_chunk_size)
+        total_batches = questions_table.num_rows / parquet_chunk_size
         pbar = tqdm(question_batches, total=int(total_batches) + 1, desc="Writing LMDB")
-        processed = 0  # running row offset since RecordBatch has no native offset attribute
         missing_graph_ids: List[str] = []
 
         for q_batch in pbar:
@@ -1698,32 +2126,25 @@ def build_dataset(cfg: DictConfig) -> None:
                 q_batch_texts = [str(q) for q in q_batch_dict["question"]]
                 q_batch_emb = _get_encoder().encode(q_batch_texts, cfg.batch_size, show_progress=False)
 
-            required_indices: List[int] = []
-            for gid in q_batch_dict["graph_id"]:
+            graph_ids_batch = q_batch_dict["graph_id"]
+            graph_row_indices: List[int] = []
+            for gid in graph_ids_batch:
                 idx = graph_id_to_row.get(gid)
                 if idx is None:
                     missing_graph_ids.append(gid)
-                else:
-                    required_indices.append(idx)
+                graph_row_indices.append(idx)
 
             if missing_graph_ids:
                 sample_ids = ", ".join(list(dict.fromkeys(missing_graph_ids))[:5])
                 raise RuntimeError(f"Missing graph_id(s) in graphs.parquet, examples: {sample_ids}")
 
             for i in range(q_batch.num_rows):
-                graph_id = q_batch_dict["graph_id"][i]
+                graph_id = graph_ids_batch[i]
                 split = q_batch_dict["split"][i]
                 if split not in envs:
                     continue
 
-                if "metadata" not in q_batch_dict:
-                    raise RuntimeError("questions.parquet missing required column `metadata`.")
-                meta_candidate = q_batch_dict["metadata"][i]
-                if meta_candidate is None:
-                    raise ValueError(f"metadata is null for {graph_id}")
-                meta_val = str(meta_candidate)
-
-                g_idx = graph_id_to_row[graph_id]
+                g_idx = graph_row_indices[i]
                 node_entity_ids = graph_cols["node_entity_ids"][g_idx]
                 node_embedding_ids = graph_cols["node_embedding_ids"][g_idx]
                 edge_src = graph_cols["edge_src"][g_idx]
@@ -1761,13 +2182,6 @@ def build_dataset(cfg: DictConfig) -> None:
                 if q_local:
                     topic_entity_mask[torch.as_tensor(q_local, dtype=torch.long)] = 1
                 topic_one_hot = F.one_hot(topic_entity_mask, num_classes=num_topics).to(dtype=torch.float32)
-                q_emb_ids = q_batch_dict["seed_embedding_ids"][i]
-                a_emb_ids = q_batch_dict["answer_embedding_ids"][i]
-                if q_emb_ids is None:
-                    raise ValueError(f"seed_embedding_ids is null for {graph_id}")
-                if a_emb_ids is None:
-                    raise ValueError(f"answer_embedding_ids is null for {graph_id}")
-
                 pair_start_node_locals = graph_cols["pair_start_node_locals"][g_idx]
                 pair_answer_node_locals = graph_cols["pair_answer_node_locals"][g_idx]
                 pair_edge_local_ids = graph_cols["pair_edge_local_ids"][g_idx]
@@ -1783,7 +2197,7 @@ def build_dataset(cfg: DictConfig) -> None:
                         f"{len(pair_start_node_locals)} for {graph_id}"
                     )
 
-                sample = {
+                core_sample = {
                     "edge_index": edge_index,
                     "edge_attr": edge_attr,
                     "labels": label_tensor,
@@ -1791,48 +2205,92 @@ def build_dataset(cfg: DictConfig) -> None:
                     "node_global_ids": node_global_ids,
                     "node_embedding_ids": node_emb_ids,
                     "question_emb": q_batch_emb[i].unsqueeze(0),
-                    "question": q_batch_dict["question"][i],
                     "topic_one_hot": topic_one_hot,
-                    # 全局种子实体（用于下游 start_entity_ids）
-                    "seed_entity_ids": torch.as_tensor(q_entities, dtype=torch.long),
                     "q_local_indices": torch.as_tensor(q_local, dtype=torch.long),
                     "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
                     "answer_entity_ids": torch.as_tensor(a_entities, dtype=torch.long),
                     "answer_entity_ids_len": torch.tensor([len(a_entities)], dtype=torch.long),
-                    "q_embedding_ids": q_emb_ids,
-                    "a_embedding_ids": a_emb_ids,
+                }
+                aux_sample = {
+                    "question": q_batch_dict["question"][i],
+                    # Seed entities used by downstream start_entity_ids.
+                    "seed_entity_ids": torch.as_tensor(q_entities, dtype=torch.long),
                     "pair_start_node_locals": torch.as_tensor(pair_start_node_locals, dtype=torch.long),
                     "pair_answer_node_locals": torch.as_tensor(pair_answer_node_locals, dtype=torch.long),
                     "pair_edge_local_ids": torch.as_tensor(pair_edge_local_ids, dtype=torch.long),
                     "pair_edge_counts": torch.as_tensor(pair_edge_counts, dtype=torch.long),
-                    "sample_id": graph_id,
-                    "idx": processed + i,
-                    "metadata": meta_val,
                 }
                 if has_pair_shortest_lengths:
-                    sample["pair_shortest_lengths"] = torch.as_tensor(pair_shortest_lengths, dtype=torch.long)
+                    aux_sample["pair_shortest_lengths"] = torch.as_tensor(pair_shortest_lengths, dtype=torch.long)
 
-                txn = txn_cache[split]
-                _write_sample(txn, graph_id, sample)
-                pending[split] += 1
-                if pending[split] >= cfg.txn_size:
-                    txn.commit()
-                    txn_cache[split] = envs[split].begin(write=True)
-                    pending[split] = 0
-            processed += q_batch.num_rows
+                sample_key = graph_id.encode("utf-8")
+                core_payload = _serialize_sample(core_sample)
+                aux_payload = _serialize_sample(aux_sample)
 
-        for split, txn in txn_cache.items():
-            if pending[split] > 0:
-                txn.commit()
+                for kind, payload in (
+                    (_LMDB_CORE_KEY, core_payload),
+                    (_LMDB_AUX_KEY, aux_payload),
+                ):
+                    pending_payloads[split][kind].append((sample_key, payload))
+                    txn = txn_cache[split][kind]
+                    try:
+                        _write_sample(txn, sample_key, payload)
+                    except lmdb.MapFullError:
+                        txn.abort()
+                        txn, map_sizes[split][kind] = _replay_pending_with_growth(
+                            env=envs[split][kind],
+                            pending_payloads=pending_payloads[split][kind],
+                            map_size_bytes=map_sizes[split][kind],
+                            growth_bytes=map_growth_bytes,
+                            growth_factor=map_growth_factor,
+                            max_size_bytes=map_max_bytes,
+                        )
+                        txn_cache[split][kind] = txn
+                    if len(pending_payloads[split][kind]) >= cfg.txn_size:
+                        txn_cache[split][kind], map_sizes[split][kind] = _commit_pending_with_growth(
+                            env=envs[split][kind],
+                            txn=txn_cache[split][kind],
+                            pending_payloads=pending_payloads[split][kind],
+                            map_size_bytes=map_sizes[split][kind],
+                            growth_bytes=map_growth_bytes,
+                            growth_factor=map_growth_factor,
+                            max_size_bytes=map_max_bytes,
+                        )
+                        pending_payloads[split][kind].clear()
+
+        for split_key, txn_group in txn_cache.items():
+            for kind, txn in txn_group.items():
+                if pending_payloads[split_key][kind]:
+                    txn_cache[split_key][kind], map_sizes[split_key][kind] = _commit_pending_with_growth(
+                        env=envs[split_key][kind],
+                        txn=txn,
+                        pending_payloads=pending_payloads[split_key][kind],
+                        map_size_bytes=map_sizes[split_key][kind],
+                        growth_bytes=map_growth_bytes,
+                        growth_factor=map_growth_factor,
+                        max_size_bytes=map_max_bytes,
+                    )
+                    pending_payloads[split_key][kind].clear()
         success = True
     finally:
-        for env in envs.values():
-            env.close()
+        for env_group in envs.values():
+            for env in env_group.values():
+                env.close()
         if success:
             for split in all_splits:
                 split_key = str(split)
-                final_dir = emb_dir / f"{split}.lmdb"
-                _finalize_lmdb_dir(tmp_path=tmp_dirs[split_key], final_path=final_dir, overwrite=overwrite_lmdb)
+                core_final_dir = emb_dir / f"{split}.lmdb"
+                aux_final_dir = emb_dir / f"{split}{_AUX_LMDB_SUFFIX}"
+                _finalize_lmdb_dir(
+                    tmp_path=tmp_dirs[split_key][_LMDB_CORE_KEY],
+                    final_path=core_final_dir,
+                    overwrite=overwrite_lmdb,
+                )
+                _finalize_lmdb_dir(
+                    tmp_path=tmp_dirs[split_key][_LMDB_AUX_KEY],
+                    final_path=aux_final_dir,
+                    overwrite=overwrite_lmdb,
+                )
         else:
             # Keep tmp dirs for debugging, but avoid silently masking partial builds.
             pass
@@ -1865,6 +2323,22 @@ def _resolve_override_filters(cfg, *, default_filter: SplitFilter):
             continue
         overrides[str(key)] = _as_filter(filter_cfg.get(key), default=default_filter)
     return overrides
+
+
+def _resolve_parquet_chunk_size(cfg, *, fallback: int) -> int:
+    chunk_cfg = cfg.get("parquet_chunk_size")
+    chunk_size = fallback if chunk_cfg is None else int(chunk_cfg)
+    if chunk_size < _MIN_CHUNK_SIZE:
+        raise ValueError(f"parquet_chunk_size must be >= {_MIN_CHUNK_SIZE}, got {chunk_size}")
+    return chunk_size
+
+
+def _resolve_parquet_num_workers(cfg) -> int:
+    workers_cfg = cfg.get("parquet_num_workers", _DISABLE_PARALLEL_WORKERS)
+    num_workers = int(workers_cfg)
+    if num_workers < _DISABLE_PARALLEL_WORKERS:
+        raise ValueError(f"parquet_num_workers must be >= {_DISABLE_PARALLEL_WORKERS}, got {num_workers}")
+    return num_workers
 
 
 def _build_embedding_cfg(cfg):
@@ -1900,13 +2374,22 @@ def _validate_pipeline_cfg(cfg):
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
     require_precomputed_questions = bool(cfg.get("require_precomputed_questions", False))
+    skip_parquet_stage = bool(cfg.get("skip_parquet_stage", False))
+    skip_lmdb_stage = bool(cfg.get("skip_lmdb_stage", False))
+    reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
 
-    if use_precomputed_embeddings and not precompute_embeddings:
+    _resolve_parquet_chunk_size(cfg, fallback=int(cfg.get("batch_size", _MIN_CHUNK_SIZE)))
+    _resolve_parquet_num_workers(cfg)
+
+    if skip_parquet_stage or skip_lmdb_stage:
+        raise ValueError("skip_parquet_stage/skip_lmdb_stage are disabled; run the unified parquet+LMDB pipeline.")
+
+    if use_precomputed_embeddings and not precompute_embeddings and not skip_parquet_stage and not reuse_embeddings_if_exists:
         raise ValueError(
             "use_precomputed_embeddings=true requires precompute_entities or precompute_relations "
             "to be enabled in the same pipeline run."
         )
-    if use_precomputed_questions and not precompute_questions:
+    if use_precomputed_questions and not precompute_questions and not skip_parquet_stage:
         raise ValueError(
             "use_precomputed_questions=true requires precompute_questions "
             "to be enabled in the same pipeline run."
@@ -1929,12 +2412,32 @@ def _validate_pipeline_cfg(cfg):
             )
 
 
+def _assert_parquet_outputs(cfg) -> None:
+    parquet_dir = cfg.get("parquet_dir")
+    if not parquet_dir:
+        raise ValueError("skip_parquet_stage=true requires parquet_dir to be set.")
+    parquet_path = Path(hydra.utils.to_absolute_path(parquet_dir))
+    required = [
+        parquet_path / "graphs.parquet",
+        parquet_path / "questions.parquet",
+        parquet_path / "entity_vocab.parquet",
+        parquet_path / "embedding_vocab.parquet",
+        parquet_path / "relation_vocab.parquet",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"skip_parquet_stage=true but missing parquet outputs: {missing}")
+
+
 def _run_parquet_stage(cfg):
     raw_root = Path(hydra.utils.to_absolute_path(cfg.raw_root))
     out_dir = Path(hydra.utils.to_absolute_path(cfg.out_dir))
     dataset_name = cfg.get("dataset_name") or cfg.get("dataset") or "dataset"
     text_cfg = build_text_entity_config(cfg)
     path_mode = str(cfg.get("path_mode", _PATH_MODE_UNDIRECTED))
+    parquet_chunk_size = _resolve_parquet_chunk_size(cfg, fallback=int(cfg.get("batch_size", _MIN_CHUNK_SIZE)))
+    parquet_num_workers = _resolve_parquet_num_workers(cfg)
+    reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
 
     filter_cfg = cfg.get("filter")
     default_filter = _default_filter()
@@ -1961,17 +2464,34 @@ def _run_parquet_stage(cfg):
         eval_filter=eval_filter,
         override_filters=override_filters,
         path_mode=path_mode,
+        dedup_edges=bool(cfg.get("dedup_edges", True)),
+        validate_graph_edges=bool(cfg.get("validate_graph_edges", _VALIDATE_GRAPH_EDGES_DEFAULT)),
+        remove_self_loops=bool(cfg.get("remove_self_loops", _REMOVE_SELF_LOOPS_DEFAULT)),
         embedding_cfg=embedding_cfg,
         emit_sub_filter=bool(cfg.get("emit_sub_filter", False)),
         sub_filter_filename=str(cfg.get("sub_filter_filename", "sub_filter.json")),
+        emit_nonzero_positive_filter=bool(cfg.get("emit_nonzero_positive_filter", False)),
+        nonzero_positive_filter_filename=str(
+            cfg.get("nonzero_positive_filter_filename", "nonzero_positive_filter.json")
+        ),
+        nonzero_positive_filter_splits=cfg.get("nonzero_positive_filter_splits"),
+        parquet_chunk_size=parquet_chunk_size,
+        parquet_num_workers=parquet_num_workers,
+        reuse_embeddings_if_exists=reuse_embeddings_if_exists,
     )
 
 
 def build_pipeline(cfg):
     _validate_pipeline_cfg(cfg)
-    _run_parquet_stage(cfg)
-    _ensure_dir(Path(cfg.output_dir))
-    build_dataset(cfg)
+    skip_parquet_stage = bool(cfg.get("skip_parquet_stage", False))
+    skip_lmdb_stage = bool(cfg.get("skip_lmdb_stage", False))
+    if not skip_parquet_stage:
+        _run_parquet_stage(cfg)
+    else:
+        _assert_parquet_outputs(cfg)
+    if not skip_lmdb_stage:
+        _ensure_dir(Path(cfg.output_dir))
+        build_dataset(cfg)
 
 
 if hydra is not None:

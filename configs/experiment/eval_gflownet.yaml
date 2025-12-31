@@ -5,7 +5,7 @@
 defaults:
   - override /data: gflownet
   - override /model: gflownet_module
-  - override /callbacks: gflownet_rollout_writer
+  - override /callbacks: gflownet_rollout_artifact_writer
   - override /logger: none
   - override /trainer: predict
 
@@ -19,19 +19,6 @@ run:
     - ${dataset.dataset_family}
     - ${dataset.dataset_family}-sub
   require_dual_datasets: true
-
-selector_eval:
-  enabled: true
-  selector: gflownet_rollouts
-  k_values: ${window.rollout_k_values}
-  allow_empty_dag: true
-  drop_unreachable: true
-  output_dir: ${paths.output_dir}
-  g_agent_path: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
-  eval_gflownet_path: ${dataset.artifact_dir}/eval_gflownet/${run.split}.jsonl
-  eval_gflownet_artifact_name: eval_gflownet
-  eval_gflownet_schema_version: 1
-  num_workers: 0
 
 ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}

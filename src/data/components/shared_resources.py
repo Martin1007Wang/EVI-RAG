@@ -48,3 +48,12 @@ class SharedDataResources:
         if self._global_embeddings is not None:
             self._global_embeddings.clear_device_cache()
         self._global_embeddings = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_graph_store"] = None
+        state["_global_embeddings"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)

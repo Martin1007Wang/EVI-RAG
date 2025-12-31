@@ -622,7 +622,7 @@ logger:
 
 预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
 - 训练（`experiment=`）：`train_retriever`, `train_gflownet`
-- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_retriever`, `eval_gflownet`, `export_gflownet`, `selector_eval_retriever`, `selector_eval_gflownet`, `reasoner_oracle`, `reasoner_paths`, `reasoner_triplet`
+- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_retriever`, `eval_gflownet`, `export_gflownet`, `reasoner_oracle`, `reasoner_paths`, `reasoner_triplet`
 
 数据构建（Retriever，triple-only 监督，不提供任何回退）：
 - `scripts/build_retrieval_pipeline.py` 一步完成 normalized parquet + LMDB；最短路监督为 **undirected**，不做 relation canonicalization，前置编码 entity/relation/question embeddings（`questions.parquet` 含 `question_emb`）。
@@ -646,9 +646,7 @@ python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path
 # 2) GFlowNet 产物：eval_gflownet rollouts（供 paths reasoner）
 python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt
 
-# 3) Selector metrics + oracle upper bound / reasoner
-python src/eval.py experiment=selector_eval_retriever dataset=webqsp
-python src/eval.py experiment=selector_eval_gflownet dataset=webqsp
+# 3) Oracle upper bound / reasoner
 python src/eval.py experiment=reasoner_oracle dataset=webqsp
 python src/eval.py experiment=reasoner_paths dataset=webqsp model=reasoner/ollama
 python src/eval.py experiment=reasoner_triplet dataset=webqsp model=reasoner/ollama

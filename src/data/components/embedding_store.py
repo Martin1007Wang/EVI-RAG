@@ -7,6 +7,7 @@ import lmdb
 import torch
 
 logger = logging.getLogger(__name__)
+_LMDB_STAT_ENTRIES_KEY = "entries"
 
 class GlobalEmbeddingStore:
     """
@@ -69,7 +70,12 @@ class GlobalEmbeddingStore:
             raise FileNotFoundError(f"Embedding file missing: {path}")
         logger.info(f"Loading {path}...")
         # map_location='cpu' is crucial to avoid VRAM OOM
-        return torch.load(path, map_location="cpu")
+        try:
+            return torch.load(path, map_location="cpu", mmap=True)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+        except RuntimeError:
+            return torch.load(path, map_location="cpu")
 
     @staticmethod
     def _ensure_pinned_buffer(
@@ -210,6 +216,14 @@ class EmbeddingStore:
             for key in cursor.iternext(values=False):
                 keys.append(key.decode("utf-8"))
         return keys
+
+    def get_entry_count(self) -> int:
+        """Fast entry count from LMDB stats (no key scan)."""
+        self._init_env()
+        stats = self.env.stat()
+        if _LMDB_STAT_ENTRIES_KEY not in stats:
+            raise RuntimeError("LMDB stats missing entry count.")
+        return int(stats[_LMDB_STAT_ENTRIES_KEY])
 
     def close(self):
         if self.env:

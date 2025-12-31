@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 import math
 
 import torch
@@ -47,29 +47,23 @@ def _segment_softmax_1d(logits: torch.Tensor, segment_ids: torch.Tensor, num_seg
 
 
 class GFlowNetEdgePolicy(nn.Module):
-    """Edge policy with local attention pooling and direction awareness."""
+    """Edge policy with local attention pooling (undirected)."""
 
     def __init__(
         self,
         hidden_dim: int,
         dropout: float = 0.1,
-        direction_vocab_size: int = 2,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.state_norm = nn.LayerNorm(self.hidden_dim)
 
-        if int(direction_vocab_size) <= 0:
-            raise ValueError(f"direction_vocab_size must be positive, got {direction_vocab_size}")
-        self.direction_embeddings = nn.Embedding(int(direction_vocab_size), self.hidden_dim)
-        nn.init.constant_(self.direction_embeddings.weight, 0.0)
-
-        self.edge_proj = nn.Sequential(
+        self.edge_proj_base = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
         )
+        self.edge_proj_dropout = nn.Dropout(dropout)
         self.attn_q = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.attn_k = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.attn_v = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
@@ -91,14 +85,19 @@ class GFlowNetEdgePolicy(nn.Module):
         _zero_init_last_linear(self.edge_head)
         _zero_init_last_linear(self.stop_head)
 
+    def compute_edge_base(self, edge_tokens: torch.Tensor) -> torch.Tensor:
+        if edge_tokens.dim() != 2 or edge_tokens.size(-1) != self.hidden_dim:
+            raise ValueError("edge_tokens must be [E,H] with hidden_dim H.")
+        return self.edge_proj_base(edge_tokens)
+
     def forward(
         self,
         edge_tokens: torch.Tensor,         # [E_total, H]
         state_tokens: torch.Tensor,        # [B, H]
         edge_batch: torch.Tensor,          # [E_total]
         valid_edges_mask: torch.Tensor,    # [E_total]
+        edge_base: torch.Tensor | None = None,
         *,
-        edge_direction: Optional[torch.Tensor] = None,    # [E_total]
         **_: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = edge_tokens.device
@@ -115,16 +114,11 @@ class GFlowNetEdgePolicy(nn.Module):
         if num_graphs <= 0:
             raise ValueError("state_tokens must have positive batch size.")
 
-        edge_repr = edge_tokens
-        if edge_direction is not None:
-            if edge_direction.shape != edge_batch.shape:
-                raise ValueError("edge_direction must have shape [E_total] aligned with edge_batch.")
-            dir_idx = edge_direction.to(device=device, dtype=torch.long).clamp(
-                min=0, max=self.direction_embeddings.num_embeddings - 1
-            )
-            edge_repr = edge_repr + self.direction_embeddings(dir_idx)
-
-        edge_repr = self.edge_proj(edge_repr)
+        if edge_base is None:
+            edge_base = self.compute_edge_base(edge_tokens)
+        if edge_base.shape != edge_tokens.shape:
+            raise ValueError("edge_base must match edge_tokens shape [E,H].")
+        edge_repr = self.edge_proj_dropout(edge_base)
 
         candidate = valid_edges_mask.to(device=device, dtype=torch.bool)
         neg_inf = float(torch.finfo(edge_repr.dtype).min)

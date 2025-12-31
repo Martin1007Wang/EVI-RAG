@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Experiment: retriever artifact generation (g_agent + eval_retriever cache).
+# Experiment: retriever evaluation (mask-off checkpoint).
 
 defaults:
   - override /data: retriever
@@ -11,6 +11,9 @@ defaults:
 
 model:
   compile_model: false
+  retriever:
+    hide_seek_cfg:
+      enabled: false
   evaluation_cfg:
     split: ${run.split}
     emit_predict_outputs: false
@@ -21,7 +24,7 @@ model:
 run:
   name: eval_retriever
   task_name: "eval/retriever"
-  tags: ["eval", "retriever"]
+  tags: ["eval", "retriever", "maskoff"]
   run_all_splits: true
   edge_top_k: 500
   max_hops: 3

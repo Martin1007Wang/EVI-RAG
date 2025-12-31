@@ -46,6 +46,7 @@
 
 **Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 Retriever 训练的唯一输入。
 **Note:** 当前所有数据集均不包含 `answer_subgraph` 字段；相关加权策略仅作为理论备忘。
+**Storage Note:** 为了最小化 Retriever 训练 I/O，`g_retrieval` 在物化阶段拆分为 core (`<split>.lmdb`) 与 aux (`<split>.aux.lmdb`)。core 只包含 Retriever 必需字段；aux 仅保存 `pair_*`、问题文本与其他非 Retriever 必需字段。完整语义仍是两者的并集。
 
 #### A. Topology (流形结构)
 *   `sample_id`: `str`. Unique Identifier.
@@ -90,7 +91,6 @@
     *   **Derivation:** `edge_index` 必须在运行时通过 `stack` 生成，不可落盘。
 *   `edge_relations`: `Long[E]`.
 *   `edge_scores`: `Float[E]`. 来自 Retriever 的预校准分数 (Prior Flows).
-*   `node_answer_dist`: `Long[N]`. Reward Shaping 基础。$d(v, \text{answers})$。
 
 #### B. The Condition (边界条件)
 *   `start_node_locals`: `Long[K_s]`. $S_{loc}$ (Sources).
@@ -145,3 +145,9 @@
 *   ❌ **Transition/Hybrid in Retrieval:** Retriever 只能看到 Triple，不能看到 Path。
 *   ❌ **Pre-computing Embeddings in Forward:** 预处理逻辑属于 Dataset，不属于 Model Forward。
 *   ❌ **Python Loops for Graph Logic:** 使用 `scatter`, `gather`, `index_select` 代替循环。
+
+---
+
+## Ⅴ. Known Limitation (已知局限)
+
+*   **g_agent is subgraph-bounded:** 当前 `g_agent` 由 Retriever 子图裁剪构建（`edge_top_k` 控制候选边；`max_hops` 目前未在 builder 中生效），最短路监督与 reward 定义在该裁剪子图内，而非全图最短路。**原因**：$G_{raw}$ 极其庞大，$G_{sub}$ 也很大（平均约 10k 条边），直接在该规模上训练 GFlowNet 不可行；因此必须裁剪动作空间。若需要第一性“全图”语义，必须改变构图策略或在全图上计算最短路监督。

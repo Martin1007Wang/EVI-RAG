@@ -5,7 +5,7 @@
 defaults:
   - override /data: gflownet
   - override /model: gflownet_module
-  - override /callbacks: gflownet_rollout_writer
+  - override /callbacks: gflownet_rollout_artifact_writer
   - override /logger: none
   - override /trainer: predict
 
@@ -32,7 +32,7 @@ model:
     allow_deferred_init: true
 
 callbacks:
-  gflownet_rollout_writer:
+  gflownet_rollout_artifact_writer:
     output_dir: ${dataset.artifact_dir}/export_gflownet
     split: ${run.split}
     artifact_name: export_gflownet

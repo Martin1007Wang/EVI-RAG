@@ -10,6 +10,8 @@ out_dir: ${paths.data_dir}/KGQAGen-10k/normalized
 materialized_dir: ${paths.data_dir}/KGQAGen-10k/materialized
 artifact_dir: ${paths.data_dir}/KGQAGen-10k/artifacts/${dataset.name}
 
+validate_on_get: false
+
 # graph/seed/answers混用 label+Qid，需要归一化到 Qid
 entity_normalization: qid_in_parentheses
 entity_text_mode: regex
@@ -30,4 +32,5 @@ column_map:
   graph_field: proof
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json
+nonzero_positive_filter_path: ${dataset.out_dir}/nonzero_positive_filter.json
 drop_zero_positive: true

@@ -112,7 +112,7 @@ pick_best_ckpt() {
 
 if [[ "${SKIP_PREPROCESS}" != "true" ]]; then
   echo "==> [1/6] build_retrieval_pipeline (full=${DATASET_FULL}, emit sub mask)"
-  python scripts/build_retrieval_pipeline.py "${COMMON_OVERRIDES_FULL[@]}"
+  python scripts/build_retrieval_pipeline.py "+dataset=${DATASET_FULL}" "+paths=default" "hydra.job.chdir=false"
 else
   echo "==> [1/6] build_retrieval_pipeline (full=${DATASET_FULL}) [skipped]"
 fi

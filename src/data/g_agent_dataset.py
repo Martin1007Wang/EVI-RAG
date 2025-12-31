@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data as PyGData
 
-from src.utils.graph_utils import compute_edge_batch
+from src.utils.graph_utils import POS_LABEL_THRESHOLD, compute_edge_batch
 logger = logging.getLogger(__name__)
 
 
@@ -35,9 +35,8 @@ class GAgentSample:
     # 关键节点（全局/局部）
     start_entity_ids: torch.LongTensor  # [Ks]
     answer_entity_ids: torch.LongTensor  # [Ka]
-    # GT 路径（本地边/节点索引）
+    # GT 路径（本地边索引）
     gt_path_edge_local_ids: torch.LongTensor  # [P]
-    gt_path_node_local_ids: torch.LongTensor  # [P_node]
     # 可空节点索引（为空时使用 shape [0] 的 long tensor）
     start_node_locals: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
     answer_node_locals: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
@@ -47,10 +46,10 @@ class GAgentSample:
     pair_edge_local_ids: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
     pair_edge_counts: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
     pair_shortest_lengths: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    node_answer_dist: torch.LongTensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
     gt_path_exists: bool = False
     # 可达性标志
     is_answer_reachable: bool = False
+    is_dummy_agent: bool = False
 
 
 def _load_g_agent_cache(cache_path: Path):
@@ -81,7 +80,6 @@ def _builder_sample_to_record(sample: GAgentSample) -> Dict:
         "start_entity_ids": _tolist(sample.start_entity_ids),
         "answer_entity_ids": _tolist(sample.answer_entity_ids),
         "gt_path_edge_local_ids": _tolist(sample.gt_path_edge_local_ids),
-        "gt_path_node_local_ids": _tolist(sample.gt_path_node_local_ids),
         "gt_path_exists": bool(sample.gt_path_exists),
         "start_node_locals": _tolist(sample.start_node_locals),
         "answer_node_locals": _tolist(sample.answer_node_locals),
@@ -90,8 +88,8 @@ def _builder_sample_to_record(sample: GAgentSample) -> Dict:
         "pair_edge_local_ids": _tolist(sample.pair_edge_local_ids),
         "pair_edge_counts": _tolist(sample.pair_edge_counts),
         "pair_shortest_lengths": _tolist(sample.pair_shortest_lengths),
-        "node_answer_dist": _tolist(sample.node_answer_dist),
         "is_answer_reachable": bool(sample.is_answer_reachable),
+        "is_dummy_agent": bool(sample.is_dummy_agent),
     }
 
 
@@ -116,9 +114,7 @@ def _parse_sample(record: Dict) -> GAgentSample:
         "pair_edge_local_ids",
         "pair_edge_counts",
         "pair_shortest_lengths",
-        "node_answer_dist",
         "gt_path_edge_local_ids",
-        "gt_path_node_local_ids",
         "gt_path_exists",
         "is_answer_reachable",
     ]
@@ -136,9 +132,16 @@ def _parse_sample(record: Dict) -> GAgentSample:
     edge_scores = as_float("edge_scores")
     edge_labels = as_float("edge_labels")
     node_embedding_ids = as_long("node_embedding_ids")
-
     num_edges = edge_head_locals.numel()
     num_nodes = node_entity_ids.numel()
+    dag_edge_mask_raw = record.get("dag_edge_mask", None)
+    if dag_edge_mask_raw is not None:
+        dag_edge_mask = torch.as_tensor(dag_edge_mask_raw, dtype=torch.bool).view(-1)
+        if dag_edge_mask.numel() != num_edges:
+            raise ValueError(f"dag_edge_mask length {dag_edge_mask.numel()} != num_edges {num_edges} for {record.get('sample_id')}")
+        expected_mask = edge_labels > POS_LABEL_THRESHOLD
+        if not torch.equal(dag_edge_mask, expected_mask):
+            raise ValueError(f"dag_edge_mask mismatch with edge_labels for {record.get('sample_id')}")
     if torch.unique(node_entity_ids).numel() != num_nodes:
         raise ValueError(f"node_entity_ids must be unique per sample: {record.get('sample_id')}")
     tensors_with_expected_edges = {
@@ -191,7 +194,6 @@ def _parse_sample(record: Dict) -> GAgentSample:
     pair_edge_local_ids = as_long("pair_edge_local_ids")
     pair_edge_counts = as_long("pair_edge_counts")
     pair_shortest_lengths = as_long("pair_shortest_lengths")
-    node_answer_dist = as_long("node_answer_dist")
 
     for name, locals_tensor in (("start_node_locals", start_node_locals), ("answer_node_locals", answer_node_locals)):
         if locals_tensor.numel() > 0 and ((locals_tensor < 0).any() or (locals_tensor >= num_nodes).any()):
@@ -207,12 +209,6 @@ def _parse_sample(record: Dict) -> GAgentSample:
             f"pair_shortest_lengths length {pair_shortest_lengths.numel()} != "
             f"pair_start_node_locals length {pair_start_node_locals.numel()} for {record.get('sample_id')}"
         )
-    if node_answer_dist.numel() != num_nodes:
-        raise ValueError(
-            f"node_answer_dist length {node_answer_dist.numel()} != num_nodes {num_nodes} for {record.get('sample_id')}"
-        )
-    if (node_answer_dist < 0).any():
-        raise ValueError(f"node_answer_dist contains negative values for {record.get('sample_id')}")
     for name, locals_tensor in (
         ("pair_start_node_locals", pair_start_node_locals),
         ("pair_answer_node_locals", pair_answer_node_locals),
@@ -241,52 +237,19 @@ def _parse_sample(record: Dict) -> GAgentSample:
             )
 
     gt_path_edge_local_ids = as_long("gt_path_edge_local_ids")
-    gt_path_node_local_ids = as_long("gt_path_node_local_ids")
     if gt_path_edge_local_ids.numel() > 0:
         if ((gt_path_edge_local_ids < 0) | (gt_path_edge_local_ids >= num_edges)).any():
             raise ValueError(f"gt_path_edge_local_ids out of range for {record.get('sample_id')}")
-    if gt_path_node_local_ids.numel() > 0:
-        if ((gt_path_node_local_ids < 0) | (gt_path_node_local_ids >= num_nodes)).any():
-            raise ValueError(f"gt_path_node_local_ids out of range for {record.get('sample_id')}")
     gt_path_exists = bool(record["gt_path_exists"])
     if gt_path_exists:
-        if gt_path_edge_local_ids.numel() == 0:
-            if gt_path_node_local_ids.numel() != 1:
-                raise ValueError(f"gt_path zero-length but node path size != 1 for {record.get('sample_id')}")
-            if start_node_locals.numel() > 0:
-                if not bool((start_node_locals == gt_path_node_local_ids[0]).any().item()):
-                    raise ValueError(f"gt_path does not start from start_node_locals for {record.get('sample_id')}")
-            if answer_node_locals.numel() > 0:
-                if not bool((answer_node_locals == gt_path_node_local_ids[-1]).any().item()):
-                    raise ValueError(f"gt_path terminal not in answer_node_locals for {record.get('sample_id')}")
-        else:
-            if gt_path_node_local_ids.numel() == 0:
-                raise ValueError(f"gt_path_exists=True but gt_path_node_local_ids is empty for {record.get('sample_id')}")
-            if gt_path_node_local_ids.numel() != gt_path_edge_local_ids.numel() + 1:
-                raise ValueError(
-                    f"gt_path_node_local_ids length {gt_path_node_local_ids.numel()} != "
-                    f"gt_path_edge_local_ids+1 ({gt_path_edge_local_ids.numel() + 1}) for {record.get('sample_id')}"
-                )
-            if start_node_locals.numel() > 0:
-                if not bool((start_node_locals == gt_path_node_local_ids[0]).any().item()):
-                    raise ValueError(f"gt_path does not start from start_node_locals for {record.get('sample_id')}")
-            if answer_node_locals.numel() > 0:
-                if not bool((answer_node_locals == gt_path_node_local_ids[-1]).any().item()):
-                    raise ValueError(f"gt_path terminal not in answer_node_locals for {record.get('sample_id')}")
-            for idx, edge_id in enumerate(gt_path_edge_local_ids.tolist()):
-                h = int(edge_head_locals[edge_id].item())
-                t = int(edge_tail_locals[edge_id].item())
-                a = int(gt_path_node_local_ids[idx].item())
-                b = int(gt_path_node_local_ids[idx + 1].item())
-                if not ((a == h and b == t) or (a == t and b == h)):
-                    raise ValueError(f"gt_path edge/node mismatch at step {idx} for {record.get('sample_id')}")
-            if gt_path_edge_local_ids.numel() > 0:
-                if not bool((edge_labels[gt_path_edge_local_ids] > 0.5).all().item()):
-                    raise ValueError(f"gt_path edges must be subset of edge_labels for {record.get('sample_id')}")
-    elif gt_path_edge_local_ids.numel() > 0 or gt_path_node_local_ids.numel() > 0:
-        raise ValueError(f"gt_path_exists=False but gt_path_* is non-empty for {record.get('sample_id')}")
+        pass
+    elif gt_path_edge_local_ids.numel() > 0:
+        raise ValueError(f"gt_path_exists=False but gt_path_edge_local_ids is non-empty for {record.get('sample_id')}")
+    if gt_path_edge_local_ids.numel() > 0:
+        if not bool((edge_labels[gt_path_edge_local_ids] > POS_LABEL_THRESHOLD).all().item()):
+            raise ValueError(f"gt_path edges must be subset of edge_labels for {record.get('sample_id')}")
 
-    computed_reachable = bool(pair_start_node_locals.numel() > 0)
+    computed_reachable = bool(start_node_locals.numel() > 0 and answer_node_locals.numel() > 0)
     declared_reachable = bool(record["is_answer_reachable"])
     if computed_reachable != declared_reachable:
         raise ValueError(
@@ -303,6 +266,7 @@ def _parse_sample(record: Dict) -> GAgentSample:
     else:
         raise ValueError(f"question_emb must be 1D or 2D for {record.get('sample_id')}")
 
+    is_dummy_agent = bool(record.get("is_dummy_agent", False))
     sample = GAgentSample(
         sample_id=str(record["sample_id"]),
         question=str(record.get("question", "")),
@@ -323,11 +287,10 @@ def _parse_sample(record: Dict) -> GAgentSample:
         pair_edge_local_ids=pair_edge_local_ids,
         pair_edge_counts=pair_edge_counts,
         pair_shortest_lengths=pair_shortest_lengths,
-        node_answer_dist=node_answer_dist,
         gt_path_edge_local_ids=gt_path_edge_local_ids,
-        gt_path_node_local_ids=gt_path_node_local_ids,
         gt_path_exists=gt_path_exists,
         is_answer_reachable=declared_reachable,
+        is_dummy_agent=is_dummy_agent,
     )
     if sample.start_entity_ids.numel() == 0:
         raise ValueError(f"g_agent record missing non-empty start_entity_ids: {record.get('sample_id')}")
@@ -380,7 +343,6 @@ class GAgentData(PyGData):
         if key in {
             "start_node_locals",
             "answer_node_locals",
-            "gt_path_node_local_ids",
             "pair_start_node_locals",
             "pair_answer_node_locals",
         }:
@@ -388,6 +350,8 @@ class GAgentData(PyGData):
         if key in {"gt_path_edge_local_ids", "pair_edge_local_ids"}:
             return int(self.edge_index.size(1))
         if key == "pair_edge_counts":
+            return 0
+        if key == "is_dummy_agent":
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
@@ -415,11 +379,10 @@ def _sample_to_pyg_data(sample: GAgentSample) -> GAgentData:
         pair_edge_local_ids=sample.pair_edge_local_ids,
         pair_edge_counts=sample.pair_edge_counts,
         pair_shortest_lengths=sample.pair_shortest_lengths,
-        node_answer_dist=sample.node_answer_dist,
         gt_path_edge_local_ids=sample.gt_path_edge_local_ids,
-        gt_path_node_local_ids=sample.gt_path_node_local_ids,
         gt_path_exists=torch.tensor([sample.gt_path_exists], dtype=torch.bool),
         is_answer_reachable=torch.tensor([sample.is_answer_reachable], dtype=torch.bool),
+        is_dummy_agent=torch.tensor([sample.is_dummy_agent], dtype=torch.bool),
         sample_id=sample.sample_id,
         question=sample.question,
     )
@@ -464,7 +427,6 @@ def pyg_batch_to_dense(batch: PyGData) -> Dict[str, torch.Tensor | List[str | No
     start_entities_buf: List[torch.Tensor] = []
     answer_entities_buf: List[torch.Tensor] = []
     gt_edge_buf: List[torch.Tensor] = []
-    gt_node_buf: List[torch.Tensor] = []
 
     for g in range(num_graphs):
         es, ee = int(edge_ptr[g].item()), int(edge_ptr[g + 1].item())
@@ -500,10 +462,7 @@ def pyg_batch_to_dense(batch: PyGData) -> Dict[str, torch.Tensor | List[str | No
 
         gt_edges = batch.gt_path_edge_local_ids
         gt_edges = gt_edges[(gt_edges >= es) & (gt_edges < ee)] - es
-        gt_nodes = batch.gt_path_node_local_ids
-        gt_nodes = gt_nodes[(gt_nodes >= ns) & (gt_nodes < ne)] - ns
         gt_edge_buf.append(gt_edges)
-        gt_node_buf.append(gt_nodes)
 
     # pad variable-length fields
     if max_start_locals > 0:

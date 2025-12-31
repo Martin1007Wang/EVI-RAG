@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from lightning import LightningDataModule
+
 try:
     from omegaconf import DictConfig, OmegaConf  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
@@ -41,7 +42,7 @@ def _infer_batch_size(total_batch: int, world_size: int) -> int:
 class GRetrievalDataModule(LightningDataModule):
     """
     Refactored GRetrievalDataModule following System Engineering principles.
-    
+
     Principles:
     1. Dependency Injection: Receives a full `dataset_cfg` object.
     2. Zero Logic Config: Paths are resolved in YAML, not Python.
@@ -56,7 +57,9 @@ class GRetrievalDataModule(LightningDataModule):
         num_workers: int,
         pin_memory: bool = True,
         drop_last: bool = True,
+        prefetch_factor: int = 2,
         persistent_workers: bool = False,
+        worker_embed_lookup: bool = False,
         splits: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
@@ -81,7 +84,9 @@ class GRetrievalDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.drop_last = drop_last
         self.persistent_workers = persistent_workers
-        
+        self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
+        self.worker_embed_lookup = bool(worker_embed_lookup)
+
         # Default splits mapping if not provided in `data/retriever.yaml`
         self.splits = splits or {"train": "train", "validation": "validation", "test": "test"}
         # 3. Runtime State
@@ -97,7 +102,7 @@ class GRetrievalDataModule(LightningDataModule):
 
     def prepare_data(self) -> None:
         """
-        Verify data existence. 
+        Verify data existence.
         Since paths are injected via YAML, we just check them.
         """
         # Defensive check: ensure the injected config has what we need
@@ -119,8 +124,9 @@ class GRetrievalDataModule(LightningDataModule):
 
         if missing:
             raise FileNotFoundError(
-                f"Critical Data Error: The following injected paths do not exist:\n" + "\n".join(missing) +
-                "\nPlease check 'configs/dataset/YOUR_DATASET.yaml'."
+                f"Critical Data Error: The following injected paths do not exist:\n"
+                + "\n".join(missing)
+                + "\nPlease check 'configs/dataset/YOUR_DATASET.yaml'."
             )
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -198,7 +204,7 @@ class GRetrievalDataModule(LightningDataModule):
         """
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Did you run setup()?")
-        
+
         return UnifiedDataLoader(
             dataset,
             batch_size=self.batch_size_per_device,
@@ -207,7 +213,7 @@ class GRetrievalDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
-
-            # Reproducibility
+            prefetch_factor=self.prefetch_factor,
+            worker_embed_lookup=self.worker_embed_lookup,
             random_seed=self.dataset_cfg.get("random_seed"),
         )

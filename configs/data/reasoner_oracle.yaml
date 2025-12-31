@@ -10,7 +10,7 @@ eval_retriever_path: ${dataset.artifact_dir}/eval_retriever/${data.split}.pt
 artifact_name: eval_retriever
 schema_version: 1
 
-# Window sizes (must be <= max ranking_k used when generating retriever eval cache).
+# Window sizes (must be <= max topk_values used when generating retriever eval cache).
 k_values: ${window.k_values}
 
 num_workers: 0

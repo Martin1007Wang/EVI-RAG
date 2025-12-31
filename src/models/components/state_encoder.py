@@ -54,7 +54,6 @@ class StateEncoder(nn.Module):
             self._state_dde_num_topics = int(num_topics)
             self._state_dde_dim = int(struct_dim)
 
-        self.action_gru_cell = nn.GRUCell(self.hidden_dim, self.hidden_dim)
         self.step_embeddings = nn.Embedding(self.max_steps + 1, self.hidden_dim)
         nn.init.constant_(self.step_embeddings.weight, 0.0)
         self.norm = nn.LayerNorm(self.hidden_dim)
@@ -68,6 +67,7 @@ class StateEncoder(nn.Module):
         edge_index: Optional[torch.Tensor] = None,
         start_node_locals: Optional[torch.Tensor] = None,
         reverse_edge_index: Optional[torch.Tensor] = None,
+        node_struct_raw: Optional[torch.Tensor] = None,
         **_: torch.Tensor,
     ) -> StateEncoderCache:
         if question_tokens.dim() != 2 or question_tokens.size(-1) != self.hidden_dim:
@@ -84,18 +84,30 @@ class StateEncoder(nn.Module):
             raise ValueError("node_batch length mismatch with node_tokens in encoder precompute.")
         node_struct_tokens = torch.empty(0, self.hidden_dim, device=node_tokens.device, dtype=node_tokens.dtype)
         if self.use_state_dde:
-            if edge_index is None:
-                raise ValueError("use_state_dde=True but edge_index is missing in StateEncoder.precompute.")
-            if start_node_locals is None:
-                raise ValueError("use_state_dde=True but start_node_locals is missing in StateEncoder.precompute.")
-            node_struct_tokens = self._build_state_dde_tokens(
-                edge_index=edge_index,
-                start_node_locals=start_node_locals,
-                num_nodes=node_tokens.size(0),
-                device=node_tokens.device,
-                dtype=node_tokens.dtype,
-                reverse_edge_index=reverse_edge_index,
-            )
+            if node_struct_raw is not None and node_struct_raw.numel() > 0:
+                if self._state_dde_proj is None:
+                    raise RuntimeError("state_dde projection is not initialized.")
+                node_struct_raw = node_struct_raw.to(device=node_tokens.device, dtype=node_tokens.dtype)
+                if node_struct_raw.dim() != 2 or node_struct_raw.size(0) != node_tokens.size(0):
+                    raise ValueError("node_struct_raw must be [N_total, D] aligned with node_tokens.")
+                if node_struct_raw.size(1) != self._state_dde_dim:
+                    raise ValueError(
+                        f"node_struct_raw dim {node_struct_raw.size(1)} != expected {self._state_dde_dim}"
+                    )
+                node_struct_tokens = self._state_dde_proj(node_struct_raw)
+            else:
+                if edge_index is None:
+                    raise ValueError("use_state_dde=True but edge_index is missing in StateEncoder.precompute.")
+                if start_node_locals is None:
+                    raise ValueError("use_state_dde=True but start_node_locals is missing in StateEncoder.precompute.")
+                node_struct_tokens = self._build_state_dde_tokens(
+                    edge_index=edge_index,
+                    start_node_locals=start_node_locals,
+                    num_nodes=node_tokens.size(0),
+                    device=node_tokens.device,
+                    dtype=node_tokens.dtype,
+                    reverse_edge_index=reverse_edge_index,
+                )
         return StateEncoderCache(
             question_tokens=question_tokens,
             node_tokens=node_tokens,
@@ -221,46 +233,11 @@ class StateEncoder(nn.Module):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         action_hidden = getattr(state, "action_hidden", None)
-        action_hidden_step = getattr(state, "action_hidden_step", None)
         if action_hidden is None or not torch.is_tensor(action_hidden) or action_hidden.numel() == 0:
-            action_hidden = torch.zeros(num_graphs, self.hidden_dim, device=device, dtype=dtype)
-        else:
-            action_hidden = action_hidden.to(device=device, dtype=dtype)
+            return torch.zeros(num_graphs, self.hidden_dim, device=device, dtype=dtype)
+        action_hidden = action_hidden.to(device=device, dtype=dtype)
         if action_hidden.shape != (num_graphs, self.hidden_dim):
-            action_hidden = torch.zeros(num_graphs, self.hidden_dim, device=device, dtype=dtype)
-
-        if action_hidden_step is None or not torch.is_tensor(action_hidden_step) or action_hidden_step.numel() != num_graphs:
-            action_hidden_step = torch.zeros(num_graphs, device=device, dtype=torch.long)
-        else:
-            action_hidden_step = action_hidden_step.to(device=device, dtype=torch.long)
-
-        action_embeddings = getattr(state, "action_embeddings", None)
-        if action_embeddings is not None and action_embeddings.numel() > 0:
-            action_embeddings = action_embeddings.to(device=device, dtype=dtype)
-            if action_embeddings.size(-1) != self.hidden_dim:
-                raise ValueError("action_embeddings hidden dim mismatch with StateEncoder hidden_dim.")
-
-            step_counts = state.step_counts.to(device=device, dtype=torch.long).clamp(min=0, max=self.max_steps)
-            if step_counts.numel() != num_graphs:
-                raise ValueError("step_counts length mismatch with batch size in StateEncoder.")
-
-            delta = step_counts - action_hidden_step
-            max_delta = int(delta.max().item()) if delta.numel() > 0 else 0
-            if max_delta > 0:
-                graph_ids = torch.arange(num_graphs, device=device)
-                for t in range(max_delta):
-                    step_idx = action_hidden_step + t
-                    mask = step_idx < step_counts
-                    if not bool(mask.any().item()):
-                        break
-                    step_idx = step_idx.clamp(min=0, max=self.max_steps - 1)
-                    action_step = action_embeddings[graph_ids, step_idx]
-                    candidate = self.action_gru_cell(action_step, action_hidden)
-                    action_hidden = torch.where(mask.unsqueeze(-1), candidate, action_hidden)
-                action_hidden_step = torch.where(delta > 0, step_counts, action_hidden_step)
-
-        setattr(state, "action_hidden", action_hidden)
-        setattr(state, "action_hidden_step", action_hidden_step)
+            return torch.zeros(num_graphs, self.hidden_dim, device=device, dtype=dtype)
         return action_hidden
 
 

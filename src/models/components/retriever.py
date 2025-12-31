@@ -6,8 +6,75 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
+from src.utils.graph_utils import compute_edge_batch, compute_qa_edge_mask
 from .graph import DDE
 from .projections import EmbeddingProjector
+
+try:
+    from torch import _dynamo as _torch_dynamo
+except Exception:  # pragma: no cover - optional torch compile dependency
+    _torch_dynamo = None
+
+_HIDE_SEEK_ENABLED_DEFAULT = False
+_HIDE_SEEK_P_NEAR_DEFAULT = 0.0
+_HIDE_SEEK_P_FAR_DEFAULT = 0.0
+_HIDE_SEEK_BIAS_NEAR_DEFAULT = 0.0
+_HIDE_SEEK_BIAS_FAR_DEFAULT = 0.0
+_HIDE_SEEK_APPLY_IN_EVAL_DEFAULT = False
+_HIDE_SEEK_PROB_MIN = 0.0
+_HIDE_SEEK_PROB_MAX = 1.0
+_HIDE_SEEK_BIAS_MAX = 0.0
+_NUM_TOPICS_BINARY = 2
+_INVALID_EDGE_SAMPLE_PREVIEW = 5
+_INVALID_EDGE_INDEX_PREVIEW = 5
+
+
+def _dynamo_disable(fn):
+    if _torch_dynamo is None:
+        return fn
+    return _torch_dynamo.disable(fn)
+
+
+def _format_invalid_edge_range(
+    *,
+    batch: Any,
+    edge_index: torch.Tensor,
+    node_ptr: torch.Tensor,
+    num_graphs: int,
+) -> str:
+    total_nodes = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
+    min_idx = int(edge_index.min().item()) if edge_index.numel() > 0 else 0
+    max_idx = int(edge_index.max().item()) if edge_index.numel() > 0 else 0
+    invalid_mask = (
+        (edge_index[0] < 0)
+        | (edge_index[0] >= total_nodes)
+        | (edge_index[1] < 0)
+        | (edge_index[1] >= total_nodes)
+    )
+    invalid_edges = torch.nonzero(invalid_mask, as_tuple=False).view(-1)
+    preview_edges = invalid_edges[:_INVALID_EDGE_INDEX_PREVIEW].detach().cpu().tolist()
+    sample_preview: list[str] = []
+    slice_dict = getattr(batch, "_slice_dict", None)
+    sample_ids = getattr(batch, "sample_id", None)
+    if isinstance(slice_dict, dict) and "edge_index" in slice_dict and isinstance(sample_ids, (list, tuple)):
+        edge_ptr = slice_dict["edge_index"]
+        if torch.is_tensor(edge_ptr):
+            edge_ptr_cpu = edge_ptr.detach().cpu()
+        else:
+            edge_ptr_cpu = torch.as_tensor(edge_ptr, dtype=torch.long)
+        if invalid_edges.numel() > 0 and edge_ptr_cpu.numel() > 1:
+            invalid_cpu = invalid_edges.detach().cpu()
+            graph_ids = torch.bucketize(invalid_cpu, edge_ptr_cpu[1:], right=False)
+            unique_graphs = sorted(set(graph_ids.tolist()))
+            for gid in unique_graphs[:_INVALID_EDGE_SAMPLE_PREVIEW]:
+                if 0 <= gid < len(sample_ids):
+                    sample_preview.append(str(sample_ids[gid]))
+    detail = f"edge_index out of range: min={min_idx} max={max_idx} total_nodes={total_nodes} num_graphs={num_graphs}"
+    if preview_edges:
+        detail += f" invalid_edge_positions={preview_edges}"
+    if sample_preview:
+        detail += f" sample_id_preview={sample_preview}"
+    return detail
 
 
 @dataclass
@@ -45,6 +112,7 @@ class Retriever(nn.Module):
         dropout_p: float = 0.1,
         core_mode: str = "geometry",
         direction_mode: str = "bidirectional",
+        hide_seek_cfg: Optional[Dict[str, Any]] = None,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -54,8 +122,8 @@ class Retriever(nn.Module):
         if not self.use_topic_pe:
             raise ValueError("topic_pe must be enabled; retriever requires topic_one_hot + DDE.")
         self.num_topics = int(num_topics)
-        if self.num_topics <= 0:
-            raise ValueError(f"num_topics must be positive, got {self.num_topics}")
+        if self.num_topics != _NUM_TOPICS_BINARY:
+            raise ValueError(f"num_topics must be {_NUM_TOPICS_BINARY} (seed vs non-seed), got {self.num_topics}")
         _ = self._normalize_core_mode(core_mode)
         self.direction_mode = self._normalize_direction_mode(direction_mode)
 
@@ -112,6 +180,7 @@ class Retriever(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
         self.score_head = nn.Linear(self.hidden_dim, 1)
+        self._init_hide_seek(hide_seek_cfg)
 
     def forward(self, batch: Any) -> RetrieverOutput:
         output, _ = self._forward_impl(batch, return_features=False)
@@ -172,6 +241,19 @@ class Retriever(nn.Module):
                 tail_repr=head_repr,
                 struct_feat_raw=struct_bwd,
             )
+        logits_ref = logits_fwd if logits_fwd is not None else logits_bwd
+        if logits_ref is None:
+            raise RuntimeError("Retriever expected at least one directional logit for hide-and-seek bias.")
+        edge_bias = self._compute_hide_seek_bias(
+            batch,
+            edge_index=edge_index,
+            logits=logits_ref,
+        )
+        if edge_bias is not None:
+            if logits_fwd is not None:
+                logits_fwd = logits_fwd + edge_bias
+            if logits_bwd is not None:
+                logits_bwd = logits_bwd + edge_bias
 
         if self.direction_mode == "bidirectional":
             if logits_fwd is None or logits_bwd is None or features_fwd is None or features_bwd is None:
@@ -205,6 +287,84 @@ class Retriever(nn.Module):
         if return_features:
             return output, edge_embeddings
         return output, None
+
+    def _init_hide_seek(self, hide_seek_cfg: Optional[Dict[str, Any]]) -> None:
+        cfg = hide_seek_cfg or {}
+        self.hide_seek_enabled = bool(cfg.get("enabled", _HIDE_SEEK_ENABLED_DEFAULT))
+        self.hide_seek_apply_in_eval = bool(cfg.get("apply_in_eval", _HIDE_SEEK_APPLY_IN_EVAL_DEFAULT))
+        self.hide_seek_p_near = float(cfg.get("p_near", _HIDE_SEEK_P_NEAR_DEFAULT))
+        self.hide_seek_p_far = float(cfg.get("p_far", _HIDE_SEEK_P_FAR_DEFAULT))
+        self.hide_seek_bias_near = float(cfg.get("bias_near", _HIDE_SEEK_BIAS_NEAR_DEFAULT))
+        self.hide_seek_bias_far = float(cfg.get("bias_far", _HIDE_SEEK_BIAS_FAR_DEFAULT))
+
+        for name, prob in {"p_near": self.hide_seek_p_near, "p_far": self.hide_seek_p_far}.items():
+            if prob < _HIDE_SEEK_PROB_MIN or prob > _HIDE_SEEK_PROB_MAX:
+                raise ValueError(f"hide_seek_cfg.{name} must be in [0, 1], got {prob}")
+        for name, bias in {"bias_near": self.hide_seek_bias_near, "bias_far": self.hide_seek_bias_far}.items():
+            if bias > _HIDE_SEEK_BIAS_MAX:
+                raise ValueError(f"hide_seek_cfg.{name} must be <= 0 (penalty), got {bias}")
+
+    def _should_apply_hide_seek(self) -> bool:
+        if not self.hide_seek_enabled:
+            return False
+        if self.training:
+            return True
+        return self.hide_seek_apply_in_eval
+
+    def _compute_hide_seek_bias(
+        self,
+        batch: Any,
+        *,
+        edge_index: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not self._should_apply_hide_seek():
+            return None
+        edge_is_near = getattr(batch, "edge_is_near", None)
+        if edge_is_near is None:
+            q_local_indices = getattr(batch, "q_local_indices", None)
+            a_local_indices = getattr(batch, "a_local_indices", None)
+            if q_local_indices is None or a_local_indices is None:
+                raise ValueError("Batch missing q_local_indices/a_local_indices required for hide-and-seek.")
+            num_nodes = getattr(batch, "num_nodes", None)
+            if num_nodes is None:
+                raise ValueError("Batch missing num_nodes required for hide-and-seek.")
+            near_mask = compute_qa_edge_mask(
+                edge_index,
+                num_nodes=int(num_nodes),
+                q_local_indices=q_local_indices,
+                a_local_indices=a_local_indices,
+            )
+        else:
+            if not torch.is_tensor(edge_is_near):
+                edge_is_near = torch.as_tensor(edge_is_near, dtype=torch.bool, device=edge_index.device)
+            else:
+                edge_is_near = edge_is_near.to(device=edge_index.device, dtype=torch.bool)
+            if edge_is_near.numel() != edge_index.size(1):
+                raise ValueError(
+                    "edge_is_near length mismatch: "
+                    f"{edge_is_near.numel()} vs edges {edge_index.size(1)}"
+                )
+            near_mask = edge_is_near
+        if near_mask.numel() == 0:
+            return None
+        if (
+            self.hide_seek_p_near <= _HIDE_SEEK_PROB_MIN
+            and self.hide_seek_p_far <= _HIDE_SEEK_PROB_MIN
+        ):
+            return None
+        if self.hide_seek_bias_near == 0.0 and self.hide_seek_bias_far == 0.0:
+            return None
+
+        p_near = logits.new_tensor(self.hide_seek_p_near)
+        p_far = logits.new_tensor(self.hide_seek_p_far)
+        drop_prob = torch.where(near_mask, p_near, p_far)
+        drop_mask = torch.rand_like(drop_prob) < drop_prob
+
+        bias_near = logits.new_tensor(self.hide_seek_bias_near)
+        bias_far = logits.new_tensor(self.hide_seek_bias_far)
+        bias_values = torch.where(near_mask, bias_near, bias_far)
+        return torch.where(drop_mask, bias_values, logits.new_zeros(drop_prob.shape))
 
     @staticmethod
     def _combine_directional_outputs(
@@ -272,7 +432,7 @@ class Retriever(nn.Module):
         node_embeddings = node_embeddings.to(device=device, non_blocking=True)
         edge_embeddings = edge_embeddings.to(device=device, non_blocking=True)
 
-        query_ids = self._compute_query_ids(batch, head_idx)
+        query_ids = self._compute_query_ids(batch, head_idx, edge_index=edge_index)
         query_repr = self.query_proj(question_emb)[query_ids]
 
         node_repr = self._project_nodes(node_embeddings, node_embedding_ids)
@@ -280,20 +440,13 @@ class Retriever(nn.Module):
         tail_repr = node_repr[tail_idx]
         relation_repr = self.relation_proj(edge_embeddings)
 
-        struct_fwd = self._build_structure_features(
+        node_struct = self._build_node_structure_features(
             batch,
-            head_idx,
-            tail_idx,
             edge_index=edge_index,
             num_nodes=node_repr.size(0),
         )
-        struct_bwd = self._build_structure_features(
-            batch,
-            tail_idx,
-            head_idx,
-            edge_index=edge_index,
-            num_nodes=node_repr.size(0),
-        )
+        struct_fwd = self._edge_structure_from_nodes(node_struct, head_idx, tail_idx)
+        struct_bwd = self._edge_structure_from_nodes(node_struct, tail_idx, head_idx)
 
         return query_ids, query_repr, head_repr, tail_repr, relation_repr, struct_fwd, struct_bwd
 
@@ -353,11 +506,19 @@ class Retriever(nn.Module):
             node_repr = torch.where(non_text_mask.unsqueeze(-1), non_text_proj.unsqueeze(0), node_repr)
         return node_repr
 
-    def _build_structure_features(
+    def _edge_structure_from_nodes(
         self,
-        batch,
+        node_struct: torch.Tensor,
         head_idx: torch.Tensor,
         tail_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        head_struct = node_struct[head_idx]
+        tail_struct = node_struct[tail_idx]
+        return torch.cat([head_struct, tail_struct], dim=-1)
+
+    def _build_node_structure_features(
+        self,
+        batch,
         *,
         edge_index: torch.Tensor,
         num_nodes: int,
@@ -389,9 +550,7 @@ class Retriever(nn.Module):
         feats.extend(self.dde(topic_one_hot, edge_index, reverse_edge_index))
         stacked = torch.stack(feats, dim=-1)
         node_struct = stacked.reshape(stacked.size(0), -1)
-        head_struct = node_struct[head_idx]
-        tail_struct = node_struct[tail_idx]
-        return torch.cat([head_struct, tail_struct], dim=-1)
+        return node_struct
 
     @staticmethod
     def _normalize_core_mode(mode: str) -> str:
@@ -410,10 +569,47 @@ class Retriever(nn.Module):
             f"got {mode!r}."
         )
 
-    def _compute_query_ids(self, batch, head_idx: torch.Tensor) -> torch.Tensor:
+    @_dynamo_disable
+    def _compute_query_ids(
+        self,
+        batch,
+        head_idx: torch.Tensor,
+        *,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
         edge_batch = getattr(batch, "edge_batch", None)
         if edge_batch is None:
-            raise ValueError("Batch missing edge_batch; provide explicit edge-to-graph mapping in the DataLoader.")
+            node_ptr = getattr(batch, "ptr", None)
+            if node_ptr is None:
+                raise ValueError("Batch missing ptr required for edge_batch computation.")
+            device = head_idx.device
+            edge_index = edge_index.to(device=device)
+            node_ptr = node_ptr.to(device=device)
+            num_graphs = int(node_ptr.numel() - 1)
+            if num_graphs <= 0:
+                raise ValueError(f"num_graphs must be positive, got {num_graphs}")
+            total_nodes = int(node_ptr[-1].item())
+            if total_nodes <= 0:
+                raise ValueError(f"total_nodes must be positive, got {total_nodes}")
+            if edge_index.numel() > 0:
+                min_idx = int(edge_index.min().item())
+                max_idx = int(edge_index.max().item())
+                if min_idx < 0 or max_idx >= total_nodes:
+                    detail = _format_invalid_edge_range(
+                        batch=batch,
+                        edge_index=edge_index,
+                        node_ptr=node_ptr,
+                        num_graphs=num_graphs,
+                    )
+                    raise ValueError(f"Invalid edge_index range; {detail}.")
+            edge_batch, _ = compute_edge_batch(
+                edge_index,
+                node_ptr=node_ptr,
+                num_graphs=num_graphs,
+                device=device,
+                debug_batch=batch,
+            )
+            batch.edge_batch = edge_batch
         if not torch.is_tensor(edge_batch):
             edge_batch = torch.as_tensor(edge_batch, dtype=torch.long, device=head_idx.device)
         else:

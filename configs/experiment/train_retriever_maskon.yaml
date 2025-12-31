@@ -1,0 +1,47 @@
+# @package _global_
+#
+# Retriever training (mask on). This keeps hide-and-seek enabled.
+
+defaults:
+  - override /data: retriever
+  - override /model: retriever_module
+  - override /trainer: gpu
+  - override /logger: wandb
+
+task_name: "retriever_train_maskon"
+tags: ["retriever", "maskon"]
+
+run:
+  edge_top_k: 100
+
+trainer:
+  min_epochs: 0
+  max_epochs: 10000
+  check_val_every_n_epoch: 1
+
+model:
+  compile_model: true
+  retriever:
+    hide_seek_cfg:
+      enabled: true
+      p_near: 0.5
+      p_far: 0.05
+      bias_near: -1.0
+      bias_far: -0.2
+  loss:
+    infonce_weight: 1.0
+    bce_weight: 0.1
+  scheduler_cfg:
+    monitor: val/answer/reachability@${run.edge_top_k}
+
+callbacks:
+  model_checkpoint:
+    monitor: val/answer/reachability@${run.edge_top_k}
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: val/answer/reachability@${run.edge_top_k}
+    mode: max
+    patience: 10
