@@ -16,6 +16,8 @@ datasets
 transformers
 tqdm
 sentencepiece
+scipy
+safetensors
 
 # --------- loggers --------- #
 # wandb

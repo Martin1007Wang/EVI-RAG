@@ -1,4 +1,0 @@
-defaults:
-  - g_agent_materializer
-  - retriever_topk_edge_writer
-  - _self_

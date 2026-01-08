@@ -4,32 +4,65 @@ name: webqsp-sub
 kb: freebase
 dataset_scope: sub
 dataset_family: webqsp
+max_steps: 3
+hf_dataset: rmanluo/RoG-webqsp
+num_train_rollouts: 3
+num_eval_rollouts: 10
+vectorized_rollouts: true
 
-raw_root: ${paths.data_dir}/webqsp/raw/data
 out_dir: ${paths.data_dir}/${dataset.dataset_family}/normalized
 materialized_dir: ${paths.data_dir}/${dataset.dataset_family}/materialized
 artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
+distances_dir: ${dataset.materialized_dir}/distances
 
 paths:
   vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
   embeddings: ${dataset.materialized_dir}/embeddings
   processed: ${dataset.materialized_dir}/processed
 
-validate_on_get: false
+validate_on_get: true
+
+edge_dropout_p:
+  train: 0.0
+  validation: 0.0
+  test: 0.0
+edge_dropout_min_edges: 1
+edge_dropout_strategy:
+  train: uniform
+  validation: uniform
+  test: uniform
+edge_dropout_qa_bias:
+  train: 0.0
+  validation: 0.0
+  test: 0.0
+edge_dropout_degree_bias:
+  train: 0.0
+  validation: 0.0
+  test: 0.0
+edge_dropout_degree_power: 1.0
+cache_node_min_dists: true
+cache_max_entries: 5000
+preload_node_min_dists: true
+distance_cache_format: pt
+sample_ids_source: lmdb
+lmdb_readahead: true
+sequential_sample_ids: true
+filter_missing_start:
+  train: true
+  validation: true
+  test: true
+filter_missing_answer:
+  train: true
+  validation: true
+  test: true
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json
 nonzero_positive_filter_path: ${dataset.out_dir}/nonzero_positive_filter.json
-drop_zero_positive: true
 
 entity_normalization: none
 entity_text_mode: regex
 text_prefixes: []
 text_regex: "^(?!m\\.|g\\.).*"
-num_topics: 2
-topic_pe:
-  # Precomputed DDE features; runtime DDE is disabled.
-  num_rounds: 2
-  num_reverse_rounds: 2
 
 column_map:
   question_id_field: id

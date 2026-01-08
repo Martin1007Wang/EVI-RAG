@@ -31,7 +31,7 @@
 
 *   $\mathcal{G} = (\mathcal{V}, \mathcal{E})$: 全局知识图谱 (The Universe, `g_raw`)。
 *   $G_{sub} \subset \mathcal{G}$: 采样得到的子图 (Retrieval Context, `g_retrieval`)。
-*   $G_{env} \subseteq G_{sub}$: 代理交互的封闭环境 (Agent Environment, `g_agent`)。
+*   $G_{env} \subseteq G_{sub}$: 代理交互的封闭环境（运行时从 `g_retrieval` 派生，不落盘）。
 *   $s \in \mathcal{V}$: 起点 (Start Node)。
 *   $a \in \mathcal{V}$: 答案/终点 (Answer Node)。
 *   $\tau$: 轨迹/路径 (Trajectory)。
@@ -45,8 +45,9 @@
 ### 1. `g_retrieval` Schema (Retriever SSOT)
 
 **Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 Retriever 训练的唯一输入。
+**Note:** 当前训练管线是 label-free；离线最短路监督字段（`labels`, `pair_*` 等）已弃用，出现即视为数据错误。
 **Note:** 当前所有数据集均不包含 `answer_subgraph` 字段；相关加权策略仅作为理论备忘。
-**Storage Note:** 为了最小化 Retriever 训练 I/O，`g_retrieval` 在物化阶段拆分为 core (`<split>.lmdb`) 与 aux (`<split>.aux.lmdb`)。core 只包含 Retriever 必需字段；aux 仅保存 `pair_*`、问题文本与其他非 Retriever 必需字段。完整语义仍是两者的并集。
+**Storage Note:** 为了最小化 Retriever 训练 I/O，`g_retrieval` 在物化阶段拆分为 core (`<split>.lmdb`) 与 aux (`<split>.aux.lmdb`)。core 只包含 Retriever 必需字段；aux 保存问题文本与其他非 Retriever 必需字段（`pair_*` 已弃用，不应出现）。完整语义仍是两者的并集。
 
 #### A. Topology (流形结构)
 *   `sample_id`: `str`. Unique Identifier.
@@ -62,59 +63,23 @@
 *   `a_local_indices`: `Long[K_a]`. $a$ 在 $G_{sub}$ 中的索引。
 *   `answer_entity_ids`: `Long[K_a]`. Global Answer IDs (用于 Metrics).
 
-#### C. Supervision: The Triple-Level Set (三元组级集合)
-*   `labels`: `Float[E]`. Values $\in \{0, 1\}$.
-    *   **Invariant:** $\text{labels}[e] = 1 \iff e \in \bigcup_{(s, a)} \text{ShortestPaths}(s, a)$ (Undirected).
-    *   **Constraint:** 仅用于 Triple 分类任务。严禁包含任何路径连通性信息。
+#### C. Supervision: The Triple-Level Set (三元组级集合) - **DEPRECATED**
+*   `labels`: **已弃用**。当前实现禁止该字段落盘；如存在则应重建数据。
 
 #### D. Structural Anchors (结构锚点)
 *   `topic_one_hot`: `Float[N, C]`.
     *   **Runtime Logic:** Retriever 必须在 `forward` 中对此字段应用 DDE (Degree-aware Diffusion) 以生成 Structural Embeddings。
     *   **Prohibition:** 禁止存储 `topic_pe` 或 `node_topic_dist`。
 
-#### E. Pair-level Supervision (CSR Structure)
-*   **Structure:** `pair_start_node_locals`, `pair_answer_node_locals`, `pair_edge_local_ids`, `pair_edge_counts`.
-*   **Logic:** 存储所有可达 $(s, a)$ 对的最短路边集。
-    *   `pair_edge_counts`: `Long[P]`. 第 $i$ 个 pair 包含的边数。
-    *   `pair_shortest_lengths`: `Long[P]`. 对应的 $L_{s,a}$。
+#### E. Pair-level Supervision (CSR Structure) - **DEPRECATED**
+*   `pair_*` 字段已弃用，当前实现禁止落盘；如存在则应重建数据。
 
 ---
 
-### 2. `g_agent` Schema (Environment SSOT)
-
-**Definition:** $G_{env}$ 是 GFlowNet 游走的封闭环境。它关注的是**Action Space** 和 **Flows**。
-
-#### A. Topology & Priors (拓扑与先验)
-*   `sample_id`: `str`.
-*   `node_entity_ids`: `Long[N]`.
-*   `edge_head_locals`, `edge_tail_locals`: `Long[E]`. Defined as directed edges $u \to v$.
-    *   **Derivation:** `edge_index` 必须在运行时通过 `stack` 生成，不可落盘。
-*   `edge_relations`: `Long[E]`.
-*   `edge_scores`: `Float[E]`. 来自 Retriever 的预校准分数 (Prior Flows).
-
-#### B. The Condition (边界条件)
-*   `start_node_locals`: `Long[K_s]`. $S_{loc}$ (Sources).
-*   `answer_node_locals`: `Long[K_a]`. $A_{loc}$ (Sinks).
-    *   **Filter:** 若集合为空，样本必须标记为 `unreachable` 并剔除/负采样。
-
-#### C. Supervision Hierarchy (监督层级)
-
-请严格区分 **Set (边缘概率)** 与 **Instance (特定轨迹)**。
-
-1.  **The Solution Manifold (Set Supervision):**
-    *   `edge_labels`: `Float[E]`. Mask of the union of ALL shortest paths.
-    *   **Usage:** Flow Matching Loss 的边缘分布约束；F1 Reward 计算。
-
-2.  **The Pair-level DAG (CSR Logic):**
-    *   Same fields as `g_retrieval` (`pair_*` fields).
-    *   **Usage:** 为每个 $(s, a)$ 提供独立的 Reward 信号或 Sub-goal 引导。
-
-3.  **The Canonical Trajectory (Instance Supervision):**
-    *   `gt_path_edge_local_ids`: `Long[L]`.
-    *   `gt_path_node_local_ids`: `Long[L+1]`.
-    *   **Definition:** **一条**通过确定性 Tie-break 规则选出的最短路径。
-    *   **Usage:** 仅用于 Behavior Cloning (Warm-up) 或 Debug。
-    *   **Strict Constraint:** 该路径必须是 `edge_labels` 定义的子图的子集。
+### 2. Runtime Contract (Current Pipeline)
+*   **Training:** 仅提供 MPM-RAG 训练（`configs/experiment/train_mpm_rag.yaml`，`override /data: retriever`）；训练阶段仅消费 `g_retrieval`（LMDB）。
+*   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_retriever` 与 `eval_gflownet` 缓存；不生成/不读取 `g_agent`。
+*   **Shortcut Suppression/SP-Dropout:** 训练阶段默认启用 SP-Dropout（预选遮蔽）与 Safety Net（最短路保底），仅作用于 `g_retrieval` 子图采样。
 
 ---
 
@@ -150,4 +115,4 @@
 
 ## Ⅴ. Known Limitation (已知局限)
 
-*   **g_agent is subgraph-bounded:** 当前 `g_agent` 由 Retriever 子图裁剪构建（`edge_top_k` 控制候选边；`max_hops` 目前未在 builder 中生效），最短路监督与 reward 定义在该裁剪子图内，而非全图最短路。**原因**：$G_{raw}$ 极其庞大，$G_{sub}$ 也很大（平均约 10k 条边），直接在该规模上训练 GFlowNet 不可行；因此必须裁剪动作空间。若需要第一性“全图”语义，必须改变构图策略或在全图上计算最短路监督。
+*   **Subgraph-bounded supervision:** 当前训练/评估均在 `g_retrieval` 子图上进行（动作空间由采样与掩码裁剪），最短路监督与奖励都定义在该裁剪子图内，而非全图最短路。**原因**：$G_{raw}$ 极其庞大，$G_{sub}$ 也很大（平均约 10k 条边），直接在该规模上训练/推理不可行；因此必须裁剪动作空间。若需要第一性“全图”语义，必须改变构图策略或在全图上计算监督。

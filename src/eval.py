@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,21 +16,24 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.data.components.bfs_chain_builder import BFSChainSettings, export_bfs_chain_cache
 from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _RUN_REQUIRES_CKPT_KIND = {
-    "eval_retriever": "retriever",
     "eval_gflownet": "gflownet",
     "export_gflownet": "gflownet",
 }
 
 _DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"
+_ALLOW_CPU_EVAL_ENV = "GFLOWNET_ALLOW_CPU_EVAL"
+_ALLOW_CPU_EVAL_ON = "1"
+_ALLOW_CPU_EVAL_OFF = "0"
 
 
 def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
+    if os.getenv(_ALLOW_CPU_EVAL_ENV, _ALLOW_CPU_EVAL_OFF) == _ALLOW_CPU_EVAL_ON:
+        return
     accelerator = str(trainer_cfg.get("accelerator", "")).lower()
     if accelerator not in {"gpu", "cuda"}:
         raise ValueError(
@@ -183,51 +187,6 @@ def _resolve_eval_mode(run_cfg: DictConfig | Dict[str, Any]) -> str:
     raise ValueError("run.eval_mode must be one of {'predict', 'test'}.")
 
 
-def _maybe_build_bfs_chains(cfg: DictConfig) -> Dict[str, Any]:
-    bfs_cfg = cfg.get("bfs_chain_eval") or {}
-    if not bool(bfs_cfg.get("enabled", False)):
-        return {}
-
-    dataset_cfg = cfg.get("dataset") or {}
-    run_cfg = cfg.get("run") or {}
-    split = str(run_cfg.get("split", "test"))
-    artifact_root = Path(dataset_cfg.get("artifact_dir") or dataset_cfg.get("materialized_dir") or ".")
-    default_g_agent = artifact_root / "g_agent" / f"{split}_g_agent.pt"
-    default_output_dir = artifact_root / "eval_bfs"
-
-    g_agent_path = bfs_cfg.get("g_agent_path") or str(default_g_agent)
-    output_dir = bfs_cfg.get("output_dir") or str(default_output_dir)
-    artifact_name = str(bfs_cfg.get("artifact_name", "eval_bfs")).strip()
-    schema_version = int(bfs_cfg.get("schema_version", 1))
-    if schema_version <= 0:
-        raise ValueError("bfs_chain_eval.schema_version must be a positive integer.")
-    max_chain_length = int(bfs_cfg.get("max_chain_length", 0))
-    if max_chain_length <= 0:
-        raise ValueError("bfs_chain_eval.max_chain_length must be a positive integer.")
-
-    settings = BFSChainSettings(
-        max_chain_length=max_chain_length,
-        min_chain_length=int(bfs_cfg.get("min_chain_length", 1)),
-        max_chains_per_sample=int(bfs_cfg.get("max_chains_per_sample", 100)),
-        max_total_chains=int(bfs_cfg.get("max_total_chains", 5000)),
-        allow_backward=bool(bfs_cfg.get("allow_backward", True)),
-        max_branch_per_node=bfs_cfg.get("max_branch_per_node"),
-        forbid_edge_revisit=bool(bfs_cfg.get("forbid_edge_revisit", True)),
-        forbid_node_revisit=bool(bfs_cfg.get("forbid_node_revisit", False)),
-    )
-    output_path, total = export_bfs_chain_cache(
-        g_agent_path=str(g_agent_path),
-        output_dir=str(output_dir),
-        split=split,
-        settings=settings,
-        artifact_name=artifact_name,
-        schema_version=schema_version,
-        overwrite=bool(bfs_cfg.get("overwrite", True)),
-        drop_unreachable=bool(bfs_cfg.get("drop_unreachable", False)),
-    )
-    log.info("BFS chains saved to %s (samples=%d).", output_path, total)
-    return {"bfs_chain/total": float(total)}
-
 
 def _preflight_validate(cfg: DictConfig) -> None:
     """Fail-fast on missing Hydra groups to avoid confusing OmegaConf interpolation errors."""
@@ -236,7 +195,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
+            "  python src/eval.py experiment=eval_gflownet dataset=webqsp-sub ckpt.gflownet=/path/to/gflownet.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
@@ -248,7 +207,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `run`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt\n"
+            "  python src/eval.py experiment=eval_gflownet dataset=webqsp-sub ckpt.gflownet=/path/to/gflownet.ckpt\n"
         )
     required_kind = _RUN_REQUIRES_CKPT_KIND.get(run_name)
     if required_kind and cfg.get("ckpt_path") in (None, ""):
@@ -256,12 +215,22 @@ def _preflight_validate(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
-    if bool(run_cfg.get("require_dual_datasets", False)):
-        variants = run_cfg.get("dataset_variants")
-        if not variants:
+    variants = _resolve_dataset_variants(cfg)
+    require_dual = bool(run_cfg.get("require_dual_datasets", False))
+    if not variants:
+        if require_dual:
             raise ValueError(
-                "run.require_dual_datasets=true but run.dataset_variants is empty. "
+                "Dual-dataset evaluation is required, but run.dataset_variants is empty. "
                 "Provide both full and sub dataset names."
+            )
+        return
+    if require_dual:
+        scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
+        if scopes != {"full", "sub"}:
+            names = [label for label, _ in variants]
+            raise ValueError(
+                "Dual-dataset evaluation requires both full and sub scopes. "
+                f"Got scopes={sorted(scopes)} for variants={names}."
             )
 
 
@@ -317,12 +286,18 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if run_cfg is None:
         raise ValueError(
             "Missing required config group: `run`. Example: "
-            "`python src/eval.py experiment=eval_retriever dataset=webqsp`."
+            "`python src/eval.py experiment=eval_gflownet dataset=webqsp-sub`."
         )
     split = str(run_cfg.get("split", "test"))
     if run_cfg.get("allow_empty_answer") is None:
         with open_dict(cfg):
             cfg.run.allow_empty_answer = split != "train"
+    if bool(run_cfg.get("filter_missing_start", False)):
+        scope = _normalize_dataset_scope(cfg.dataset)
+        if scope == "full":
+            with open_dict(cfg.dataset):
+                cfg.dataset.filter_missing_start = True
+            log.info("eval: filter_missing_start enabled for scope=%s split=%s", scope, split)
     log.info("Run: %s", run_cfg.get("name"))
 
     _enforce_single_gpu_eval(cfg.trainer)
@@ -373,11 +348,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 metric_dict = metrics_from_model
         except Exception:
             pass
-    bfs_metrics = _maybe_build_bfs_chains(cfg)
-    if bfs_metrics:
-        metric_dict = dict(metric_dict) if metric_dict else {}
-        metric_dict.update(bfs_metrics)
-
     run_cfg = cfg.get("run") or {}
     if not metric_dict:
         log.warning("No metrics were produced; skipping metrics.json.")

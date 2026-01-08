@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import pickle
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -15,11 +15,8 @@ logger = logging.getLogger(__name__)
 class GraphStore:
     """Thin wrapper around the vocabulary LMDB (G_global metadata).
 
-    The previous implementation attempted to materialize adjacency matrices
-    and legacy pickle formats. Those code paths added branching, memory use and
-    implicit fallbacks that hid configuration issues. ``GraphStore`` now only
-    exposes the global entity/relation mappings required by the retrieval
-    pipeline, forcing datasets to rely on the single supported LMDB format.
+    ``GraphStore`` exposes the global entity/relation mappings required by the
+    retrieval pipeline, backed by a single LMDB format (label lists).
     """
 
     def __init__(self, vocabulary_path: Union[str, Path]):
@@ -37,21 +34,18 @@ class GraphStore:
         env = lmdb.open(str(self.vocabulary_path), readonly=True, lock=False)
         try:
             with env.begin() as txn:
-                entity_to_id_data = txn.get(b"entity_to_id")
-                id_to_entity_data = txn.get(b"id_to_entity")
-                relation_to_id_data = txn.get(b"relation_to_id")
-                id_to_relation_data = txn.get(b"id_to_relation")
+                entity_labels_data = txn.get(b"entity_labels")
+                relation_labels_data = txn.get(b"relation_labels")
 
-            if not all([entity_to_id_data, id_to_entity_data, relation_to_id_data, id_to_relation_data]):
-                raise ValueError("Vocabulary LMDB missing required mappings")
+            if not all([entity_labels_data, relation_labels_data]):
+                raise ValueError("Vocabulary LMDB missing required label lists")
 
-            self.entity2id = pickle.loads(entity_to_id_data)
-            raw_id_to_entity = pickle.loads(id_to_entity_data)
-            self.id2entity = {int(k): v for k, v in raw_id_to_entity.items()}
-
-            self.relation2id = pickle.loads(relation_to_id_data)
-            raw_id_to_relation = pickle.loads(id_to_relation_data)
-            self.id2relation = {int(k): v for k, v in raw_id_to_relation.items()}
+            entity_labels = json.loads(entity_labels_data.decode("utf-8"))
+            relation_labels = json.loads(relation_labels_data.decode("utf-8"))
+            self.entity2id = {label: idx for idx, label in enumerate(entity_labels)}
+            self.id2entity = {idx: label for idx, label in enumerate(entity_labels)}
+            self.relation2id = {label: idx for idx, label in enumerate(relation_labels)}
+            self.id2relation = {idx: label for idx, label in enumerate(relation_labels)}
 
             logger.info(
                 "Loaded vocabulary: %d entities / %d relations",

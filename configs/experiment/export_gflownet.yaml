@@ -3,7 +3,7 @@
 # Experiment: export GFlowNet rollouts (stream JSONL, no metrics).
 
 defaults:
-  - override /data: gflownet
+  - override /data: g_retrieval
   - override /model: gflownet_module
   - override /callbacks: gflownet_rollout_artifact_writer
   - override /logger: none
@@ -24,12 +24,8 @@ ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
 data:
-  cache_paths:
-    test: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
-
-model:
-  embedder_cfg:
-    allow_deferred_init: true
+  splits:
+    test: ${run.split}
 
 callbacks:
   gflownet_rollout_artifact_writer:
@@ -40,3 +36,4 @@ callbacks:
     textualize: true
     entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet
     relation_vocab_path: ${dataset.out_dir}/relation_vocab.parquet
+    questions_path: ${dataset.out_dir}/questions.parquet

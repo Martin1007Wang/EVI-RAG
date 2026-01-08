@@ -18,11 +18,9 @@ __all__ = [
     "normalize_k_values",
     "extract_sample_ids",
     "extract_answer_entity_ids",
-    "compute_ranking_metrics",
     "compute_answer_recall",
     "compute_answer_hit",
     "summarize_uncertainty",
-    "RankingStats",
     "setup_optimizer",
     "RankedLogger",
     "Registry",
@@ -31,54 +29,92 @@ __all__ = [
     "extras",
     "get_metric_value",
     "task_wrapper",
+    "resolve_run_name",
+    "apply_run_name",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .instantiators import instantiate_callbacks, instantiate_loggers
-    from .logging_utils import infer_batch_size, log_hyperparameters, log_metric
+    from .config import (
+        apply_run_name,
+        enforce_tags,
+        extras,
+        get_metric_value,
+        instantiate_callbacks,
+        instantiate_loggers,
+        print_config_tree,
+        resolve_run_name,
+        task_wrapper,
+    )
+    from .logging import RankedLogger, infer_batch_size, log_hyperparameters, log_metric
     from .metrics import (
-        RankingStats,
         compute_answer_hit,
         compute_answer_recall,
-        compute_ranking_metrics,
         extract_answer_entity_ids,
         extract_sample_ids,
         normalize_k_values,
         summarize_uncertainty,
     )
     from .optimization import setup_optimizer
-    from .pylogger import RankedLogger
     from .registry import Registry
-    from .rich_utils import enforce_tags, print_config_tree
-    from .utils import extras, get_metric_value, task_wrapper
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
-    if name in ("instantiate_callbacks", "instantiate_loggers"):
-        from .instantiators import instantiate_callbacks, instantiate_loggers
+    if name in (
+        "instantiate_callbacks",
+        "instantiate_loggers",
+        "enforce_tags",
+        "print_config_tree",
+        "extras",
+        "get_metric_value",
+        "task_wrapper",
+        "resolve_run_name",
+        "apply_run_name",
+    ):
+        from .config import (
+            apply_run_name,
+            enforce_tags,
+            extras,
+            get_metric_value,
+            instantiate_callbacks,
+            instantiate_loggers,
+            print_config_tree,
+            resolve_run_name,
+            task_wrapper,
+        )
 
-        return {"instantiate_callbacks": instantiate_callbacks, "instantiate_loggers": instantiate_loggers}[name]
+        return {
+            "instantiate_callbacks": instantiate_callbacks,
+            "instantiate_loggers": instantiate_loggers,
+            "enforce_tags": enforce_tags,
+            "print_config_tree": print_config_tree,
+            "extras": extras,
+            "get_metric_value": get_metric_value,
+            "task_wrapper": task_wrapper,
+            "resolve_run_name": resolve_run_name,
+            "apply_run_name": apply_run_name,
+        }[name]
 
-    if name in ("log_hyperparameters", "infer_batch_size", "log_metric"):
-        from .logging_utils import infer_batch_size, log_hyperparameters, log_metric
+    if name in ("log_hyperparameters", "infer_batch_size", "log_metric", "RankedLogger"):
+        from .logging import RankedLogger, infer_batch_size, log_hyperparameters, log_metric
 
-        return {"log_hyperparameters": log_hyperparameters, "infer_batch_size": infer_batch_size, "log_metric": log_metric}[name]
+        return {
+            "log_hyperparameters": log_hyperparameters,
+            "infer_batch_size": infer_batch_size,
+            "log_metric": log_metric,
+            "RankedLogger": RankedLogger,
+        }[name]
 
     if name in (
         "normalize_k_values",
         "extract_sample_ids",
         "extract_answer_entity_ids",
-        "compute_ranking_metrics",
         "compute_answer_recall",
         "compute_answer_hit",
         "summarize_uncertainty",
-        "RankingStats",
     ):
         from .metrics import (
-            RankingStats,
             compute_answer_hit,
             compute_answer_recall,
-            compute_ranking_metrics,
             extract_answer_entity_ids,
             extract_sample_ids,
             normalize_k_values,
@@ -89,11 +125,9 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
             "normalize_k_values": normalize_k_values,
             "extract_sample_ids": extract_sample_ids,
             "extract_answer_entity_ids": extract_answer_entity_ids,
-            "compute_ranking_metrics": compute_ranking_metrics,
             "compute_answer_recall": compute_answer_recall,
             "compute_answer_hit": compute_answer_hit,
             "summarize_uncertainty": summarize_uncertainty,
-            "RankingStats": RankingStats,
         }[name]
 
     if name == "setup_optimizer":
@@ -101,29 +135,13 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
 
         return setup_optimizer
 
-    if name == "RankedLogger":
-        from .pylogger import RankedLogger
-
-        return RankedLogger
-
     if name == "Registry":
         from .registry import Registry
 
         return Registry
-
-    if name in ("enforce_tags", "print_config_tree"):
-        from .rich_utils import enforce_tags, print_config_tree
-
-        return {"enforce_tags": enforce_tags, "print_config_tree": print_config_tree}[name]
-
-    if name in ("extras", "get_metric_value", "task_wrapper"):
-        from .utils import extras, get_metric_value, task_wrapper
-
-        return {"extras": extras, "get_metric_value": get_metric_value, "task_wrapper": task_wrapper}[name]
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:  # pragma: no cover
     return sorted(list(globals().keys()) + __all__)
-

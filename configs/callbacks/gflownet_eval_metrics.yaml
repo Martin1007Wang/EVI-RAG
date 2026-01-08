@@ -1,0 +1,6 @@
+# Aggregate GFlowNet rollout metrics during predict().
+
+gflownet_eval_metrics:
+  _target_: src.callbacks.gflownet_eval_metrics.GFlowNetEvalMetrics
+  enabled: true
+  k_values: ${model.evaluation_cfg.num_eval_rollouts}

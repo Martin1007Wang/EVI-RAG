@@ -18,25 +18,13 @@ __all__ = [
     "EmbeddingStore",
     "GlobalEmbeddingStore",
     "SharedDataResources",
-    "GAgentPyGDataset",
-    "GAgentDataModule",
-    "ReasonerPathDataset",
-    "ReasonerPathDataModule",
-    "ReasonerTripletDataModule",
-    "ReasonerOracleDataModule",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
     from .components import EmbeddingStore, GlobalEmbeddingStore, GraphStore, SharedDataResources
     from .components.loader import UnifiedDataLoader
-    from .g_agent_datamodule import GAgentDataModule
-    from .g_agent_dataset import GAgentPyGDataset
     from .g_retrieval_datamodule import GRetrievalDataModule
     from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
-    from .reasoner_path_datamodule import ReasonerPathDataModule
-    from .reasoner_path_dataset import ReasonerPathDataset
-    from .reasoner_triplet_datamodule import ReasonerTripletDataModule
-    from .reasoner_oracle_datamodule import ReasonerOracleDataModule
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
@@ -64,36 +52,6 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from .g_retrieval_datamodule import GRetrievalDataModule
 
         return GRetrievalDataModule
-
-    if name == "GAgentPyGDataset":
-        from .g_agent_dataset import GAgentPyGDataset
-
-        return GAgentPyGDataset
-
-    if name == "GAgentDataModule":
-        from .g_agent_datamodule import GAgentDataModule
-
-        return GAgentDataModule
-
-    if name == "ReasonerPathDataset":
-        from .reasoner_path_dataset import ReasonerPathDataset
-
-        return ReasonerPathDataset
-
-    if name == "ReasonerPathDataModule":
-        from .reasoner_path_datamodule import ReasonerPathDataModule
-
-        return ReasonerPathDataModule
-
-    if name == "ReasonerTripletDataModule":
-        from .reasoner_triplet_datamodule import ReasonerTripletDataModule
-
-        return ReasonerTripletDataModule
-
-    if name == "ReasonerOracleDataModule":
-        from .reasoner_oracle_datamodule import ReasonerOracleDataModule
-
-        return ReasonerOracleDataModule
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

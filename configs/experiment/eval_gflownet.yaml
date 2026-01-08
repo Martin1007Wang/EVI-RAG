@@ -1,11 +1,11 @@
 # @package _global_
 #
-# Experiment: GFlowNet artifact generation (eval_gflownet rollouts).
+# Experiment: GFlowNet evaluation (predict + metrics + rollouts).
 
 defaults:
-  - override /data: gflownet
+  - override /data: g_retrieval
   - override /model: gflownet_module
-  - override /callbacks: gflownet_rollout_artifact_writer
+  - override /callbacks: gflownet_eval
   - override /logger: none
   - override /trainer: predict
 
@@ -14,7 +14,9 @@ run:
   task_name: "eval/gflownet"
   tags: ["eval", "gflownet"]
   split: test
+  eval_mode: predict
   ckpt_path: ${ckpt.gflownet}
+  filter_missing_start: true
   dataset_variants:
     - ${dataset.dataset_family}
     - ${dataset.dataset_family}-sub
@@ -24,14 +26,10 @@ ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
 data:
-  cache_paths:
-    test: ${dataset.artifact_dir}/g_agent/${run.split}_g_agent.pt
+  splits:
+    test: ${run.split}
 
 model:
-  env_cfg:
-    max_steps: 3
   evaluation_cfg:
-    num_eval_rollouts: [1, 10, 25, 50, 100]
-    rollout_temperature: 1.0
-  embedder_cfg:
-    allow_deferred_init: true
+    num_eval_rollouts: ${dataset.num_eval_rollouts}
+    rollout_temperature: 0.07

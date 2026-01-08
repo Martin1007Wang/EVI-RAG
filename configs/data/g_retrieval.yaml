@@ -1,0 +1,23 @@
+# configs/data/g_retrieval.yaml
+
+_target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
+
+dataset_cfg: ${dataset}
+
+# === Dataloader 逻辑参数 ===
+batch_size: 16
+num_workers: 0
+pin_memory: true
+drop_last: false
+train_shuffle: false
+persistent_workers: false
+prefetch_factor: 1
+worker_embed_lookup: false
+precompute_edge_batch: false
+precompute_node_in_degree: false
+embeddings_device: cuda
+
+splits:
+  train: train
+  validation: validation
+  test: test

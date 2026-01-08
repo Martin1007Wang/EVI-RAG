@@ -1,59 +1,31 @@
-# Explicitly provide `dataset=<name>` and `paths=<name>` via CLI overrides.
+defaults:
+  - _self_
+  - paths: default
+  - dataset: null
+  - pipeline: default
+
+# Explicitly provide `dataset=<name>` via CLI override (paths default to configs/paths/default.yaml).
 
 # Shared encoder settings (used by both parquet + LMDB stages).
 encoder: "Alibaba-NLP/gte-large-en-v1.5"
 device: "cuda"
-batch_size: 64
+batch_size: 16
 parquet_chunk_size: 2000
 parquet_num_workers: 0
 progress_bar: true
 fp16: false
-skip_parquet_stage: false
-skip_lmdb_stage: false
-reuse_embeddings_if_exists: false
-validate_graph_edges: true
+pipeline_log_path: null
+dataset_source: hf
+hf_dataset: ${dataset.hf_dataset}
+hf_cache_dir: ${paths.hf_datasets_cache}
+hf_offline: true
 
 # === Stage 1: normalize raw parquet into retrieval parquet ===
 dataset_name: ${dataset.name}
 kb: ${dataset.kb}
-raw_root: ${dataset.raw_root}
 out_dir: ${dataset.out_dir}
 column_map: ${dataset.column_map}
 entity_normalization: ${dataset.entity_normalization}
 entity_text_mode: ${dataset.entity_text_mode}
 text_prefixes: ${dataset.text_prefixes}
 text_regex: ${dataset.text_regex}
-path_mode: undirected
-dedup_edges: true
-remove_self_loops: true
-
-embeddings_out_dir: ${dataset.materialized_dir}/embeddings
-precompute_entities: true
-precompute_relations: true
-precompute_questions: true
-canonicalize_relations: false
-cosine_eps: 1e-6
-
-emit_sub_filter: true
-sub_filter_filename: sub_filter.json
-emit_nonzero_positive_filter: true
-nonzero_positive_filter_filename: nonzero_positive_filter.json
-nonzero_positive_filter_splits: ["train"]
-
-# === Stage 2: materialize LMDBs from normalized parquet ===
-parquet_dir: ${dataset.out_dir}
-output_dir: ${dataset.materialized_dir}
-use_precomputed_embeddings: true
-use_precomputed_questions: true
-require_precomputed_questions: true
-num_topics: ${dataset.num_topics}
-
-map_size_gb: 128
-map_growth_gb: 32
-map_growth_factor: 1.5
-map_max_gb: null
-vocab_map_size_gb: 16
-overwrite_lmdb: true
-txn_size: 512
-seed: 42
-deterministic: false

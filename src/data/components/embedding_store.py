@@ -1,10 +1,12 @@
+import json
 import logging
-import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import lmdb
 import torch
+
+from src.data.io.lmdb_utils import _deserialize_sample
 
 logger = logging.getLogger(__name__)
 _LMDB_STAT_ENTRIES_KEY = "entries"
@@ -14,8 +16,18 @@ class GlobalEmbeddingStore:
     In-memory read-only store for Entity/Relation embeddings.
     Designed for fast lookups during training/inference.
     """
-    def __init__(self, embeddings_dir: Union[str, Path], vocabulary_path: Union[str, Path]):
+    def __init__(
+        self,
+        embeddings_dir: Union[str, Path],
+        vocabulary_path: Union[str, Path],
+        device: Optional[Union[str, torch.device]] = None,
+    ):
         self.embeddings_dir = Path(embeddings_dir)
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        if self.device.type not in ("cpu", "cuda"):
+            raise ValueError(f"Unsupported embeddings_device={self.device}; expected cpu or cuda.")
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("embeddings_device=cuda requested but CUDA is not available.")
         # 1. Vocabulary (Optional, only if needed for count checks)
         self.num_total_entities = self._load_vocab_size(Path(vocabulary_path))
         
@@ -25,20 +37,22 @@ class GlobalEmbeddingStore:
         self._pinned_entity_buffer: Optional[torch.Tensor] = None
         self._pinned_relation_buffer: Optional[torch.Tensor] = None
 
-        # Dimension note: embedding rows correspond to textual entities only;
-        # non-text entities map to embedding_id=0. So rows are expected to be
-        # <= vocab size. Warn only if the table is effectively empty.
+        # Dimension note: embedding rows correspond to textual entities only.
+        # Non-text entities map to embedding_id=0 and are re-embedded from
+        # adjacent relation embeddings in the dataloader. Warn only if empty.
         rows = self.entity_embeddings.size(0)
         if rows <= 1:
             logger.warning(
                 "Entity embedding table has <=1 row (rows=%d). "
-                "Non-text fallback uses id=0, but textual entities would be missing.",
+                "Non-text entities use embedding_id=0 and relation-neighbor embeddings, "
+                "but textual entities would be missing.",
                 rows,
             )
         else:
             logger.info(
                 "Entity embedding rows: %d (vocab entities: %d). "
-                "Non-text entities use embedding_id=0; textual entities occupy 1..max_id.",
+                "Non-text entities use embedding_id=0 and relation-neighbor embeddings; "
+                "textual entities occupy 1..max_id.",
                 rows,
                 self.num_total_entities,
             )
@@ -55,11 +69,10 @@ class GlobalEmbeddingStore:
             # Quick open just to check size
             with lmdb.open(str(path), readonly=True, lock=False, max_readers=1) as env:
                 with env.begin() as txn:
-                    # Faster than unpickling the whole dict if we just need length
-                    # But usually we store the dict.
-                    data = txn.get(b"entity_to_id")
+                    data = txn.get(b"entity_labels")
                     if data:
-                        return len(pickle.loads(data))
+                        labels = json.loads(data.decode("utf-8"))
+                        return len(labels)
             return 0
         except Exception as e:
             logger.warning(f"Failed to read vocab size: {e}")
@@ -71,11 +84,14 @@ class GlobalEmbeddingStore:
         logger.info(f"Loading {path}...")
         # map_location='cpu' is crucial to avoid VRAM OOM
         try:
-            return torch.load(path, map_location="cpu", mmap=True)
+            tensor = torch.load(path, map_location="cpu", mmap=True)
         except TypeError:
-            return torch.load(path, map_location="cpu")
+            tensor = torch.load(path, map_location="cpu")
         except RuntimeError:
-            return torch.load(path, map_location="cpu")
+            tensor = torch.load(path, map_location="cpu")
+        if self.device.type == "cuda":
+            tensor = tensor.to(device=self.device, non_blocking=False)
+        return tensor
 
     @staticmethod
     def _ensure_pinned_buffer(
@@ -104,12 +120,23 @@ class GlobalEmbeddingStore:
         The embedding tables live on CPU. `entity_ids` may be on CPU/GPU, while `device`
         controls the desired output device. Avoid moving ids to GPU when unnecessary.
         """
-        target_device = device if device is not None else entity_ids.device
+        target_device = torch.device(device) if device is not None else entity_ids.device
+        table_device = self.entity_embeddings.device
+        if entity_ids.numel() == 0:
+            return torch.empty(
+                (0, int(self.entity_embeddings.size(1))),
+                dtype=self.entity_embeddings.dtype,
+                device=target_device,
+            )
+        if table_device.type == "cuda":
+            ids = entity_ids.to(device=table_device, dtype=torch.long, non_blocking=True)
+            out = self.entity_embeddings.index_select(0, ids)
+            if target_device == table_device:
+                return out
+            return out.to(target_device, non_blocking=True)
         cpu_ids = entity_ids if entity_ids.device.type == "cpu" else entity_ids.detach().to("cpu", non_blocking=True)
         if cpu_ids.dtype != torch.long:
             cpu_ids = cpu_ids.to(dtype=torch.long)
-        if cpu_ids.numel() == 0:
-            return torch.empty((0, int(self.entity_embeddings.size(1))), dtype=self.entity_embeddings.dtype, device=target_device)
         if target_device.type == "cpu":
             return self.entity_embeddings.index_select(0, cpu_ids)
         if target_device.type == "cuda":
@@ -127,12 +154,23 @@ class GlobalEmbeddingStore:
         return self.entity_embeddings.index_select(0, cpu_ids).to(target_device)
 
     def get_relation_embeddings(self, relation_ids: torch.Tensor, *, device: Optional[torch.device] = None) -> torch.Tensor:
-        target_device = device if device is not None else relation_ids.device
+        target_device = torch.device(device) if device is not None else relation_ids.device
+        table_device = self.relation_embeddings.device
+        if relation_ids.numel() == 0:
+            return torch.empty(
+                (0, int(self.relation_embeddings.size(1))),
+                dtype=self.relation_embeddings.dtype,
+                device=target_device,
+            )
+        if table_device.type == "cuda":
+            ids = relation_ids.to(device=table_device, dtype=torch.long, non_blocking=True)
+            out = self.relation_embeddings.index_select(0, ids)
+            if target_device == table_device:
+                return out
+            return out.to(target_device, non_blocking=True)
         cpu_ids = relation_ids if relation_ids.device.type == "cpu" else relation_ids.detach().to("cpu", non_blocking=True)
         if cpu_ids.dtype != torch.long:
             cpu_ids = cpu_ids.to(dtype=torch.long)
-        if cpu_ids.numel() == 0:
-            return torch.empty((0, int(self.relation_embeddings.size(1))), dtype=self.relation_embeddings.dtype, device=target_device)
         if target_device.type == "cpu":
             return self.relation_embeddings.index_select(0, cpu_ids)
         if target_device.type == "cuda":
@@ -163,8 +201,9 @@ class EmbeddingStore:
     LMDB wrapper for reading graph samples.
     Safe for Multiprocessing DataLoader.
     """
-    def __init__(self, lmdb_path: Union[str, Path]):
+    def __init__(self, lmdb_path: Union[str, Path], *, readahead: bool = False):
         self.path = str(lmdb_path)
+        self._readahead = bool(readahead)
         self.env: Optional[lmdb.Environment] = None
         
         # Check existence immediately
@@ -179,7 +218,7 @@ class EmbeddingStore:
                 self.path,
                 readonly=True,
                 lock=False,
-                readahead=False, 
+                readahead=self._readahead,
                 meminit=False,
                 max_readers=256, # Bump this up for high num_workers
             )
@@ -190,7 +229,7 @@ class EmbeddingStore:
             data = txn.get(sample_id.encode("utf-8"))
             if data is None:
                 raise KeyError(f"Sample {sample_id} not found in {self.path}")
-            return pickle.loads(data)
+            return _deserialize_sample(data)
 
     def load_samples(self, sample_ids: List[str]) -> List[Dict]:
         self._init_env()
@@ -202,7 +241,7 @@ class EmbeddingStore:
                 data = txn.get(sample_id.encode("utf-8"))
                 if data is None:
                     raise KeyError(f"Sample {sample_id} not found in {self.path}")
-                out.append(pickle.loads(data))
+                out.append(_deserialize_sample(data))
             return out
 
     def get_sample_ids(self) -> List[str]:
@@ -231,7 +270,7 @@ class EmbeddingStore:
             self.env = None
     
     def __getstate__(self):
-        """Pickling support for Dataloader: Don't pickle the environment!"""
+        """Serialization support for Dataloader: don't serialize the environment."""
         state = self.__dict__.copy()
         state["env"] = None
         return state

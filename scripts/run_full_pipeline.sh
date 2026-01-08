@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 极简全流程：让 Hydra 按默认规则管理日志/输出目录，不再聚合到自定义文件夹。
+# 极简 EB-GFN 全流程：让 Hydra 按默认规则管理日志/输出目录。
 # 仅依赖默认的 config/experiment，必须显式传入 dataset。
 #
 # 用法：
-#   bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]
+#   bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess]
 #
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -15,7 +15,6 @@ DATASET_FAMILY=""
 DATASET_FULL=""
 DATASET_SUB=""
 SKIP_PREPROCESS="false"
-RETRIEVER_CKPT_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,20 +22,8 @@ while [[ $# -gt 0 ]]; do
       SKIP_PREPROCESS="true"
       shift
       ;;
-    --retriever-ckpt)
-      if [[ $# -lt 2 ]]; then
-        echo "Missing value for --retriever-ckpt" >&2
-        exit 2
-      fi
-      RETRIEVER_CKPT_OVERRIDE="${2}"
-      shift 2
-      ;;
-    --retriever-ckpt=*)
-      RETRIEVER_CKPT_OVERRIDE="${1#*=}"
-      shift
-      ;;
     -h|--help)
-      echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]" >&2
+      echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess]" >&2
       exit 0
       ;;
     *)
@@ -45,7 +32,7 @@ while [[ $# -gt 0 ]]; do
         shift
       else
         echo "Unknown argument: $1" >&2
-        echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]" >&2
+        echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess]" >&2
         exit 2
       fi
       ;;
@@ -53,7 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${DATASET}" ]]; then
-  echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess] [--retriever-ckpt /path/to/ckpt]" >&2
+  echo "Usage: bash scripts/run_full_pipeline.sh <dataset> [--skip-preprocess]" >&2
   ls -1 configs/dataset/*.yaml | xargs -n1 basename | sed 's/\\.yaml$//' >&2
   exit 2
 fi
@@ -111,61 +98,34 @@ pick_best_ckpt() {
 }
 
 if [[ "${SKIP_PREPROCESS}" != "true" ]]; then
-  echo "==> [1/6] build_retrieval_pipeline (full=${DATASET_FULL}, emit sub mask)"
-  python scripts/build_retrieval_pipeline.py "+dataset=${DATASET_FULL}" "+paths=default" "hydra.job.chdir=false"
+  echo "==> [1/5] build_retrieval_pipeline (full=${DATASET_FULL}, emit sub mask)"
+  python scripts/build_retrieval_pipeline.py "dataset=${DATASET_FULL}" "paths=default" "hydra.job.chdir=false"
 else
-  echo "==> [1/6] build_retrieval_pipeline (full=${DATASET_FULL}) [skipped]"
+  echo "==> [1/5] build_retrieval_pipeline (full=${DATASET_FULL}) [skipped]"
 fi
 
-if [[ -n "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
-  if [[ ! -f "${RETRIEVER_CKPT_OVERRIDE}" ]]; then
-    echo "Retriever checkpoint override not found: ${RETRIEVER_CKPT_OVERRIDE}" >&2
-    exit 1
-  fi
-  RETR_CKPT="${RETRIEVER_CKPT_OVERRIDE}"
-  echo "==> [2/6] train_retriever (skipped, using retriever ckpt override)"
-else
-echo "==> [2/6] train_retriever (experiment=train_retriever, sub=${DATASET_SUB})"
-RETR_EXP="train_retriever"
-  RETR_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${RETR_EXP}")
-  python src/train.py "${RETR_TRAIN_OVERRIDES[@]}"
-  RETR_RUN_DIR="$(latest_run_dir "${RETR_EXP}" "${DATASET_SUB}")"
-  RETR_CKPT="$(pick_best_ckpt "${RETR_RUN_DIR}")"
-  if [[ -z "${RETR_CKPT}" ]]; then
-    echo "Retriever checkpoint not found under run dir: ${RETR_RUN_DIR:-<missing>}" >&2
-    exit 1
-  fi
-fi
-echo "Retriever checkpoint: ${RETR_CKPT}"
-
-echo "==> [3/6] eval_retriever (full+sub, train/val/test + g_agent)"
-python src/eval.py \
-  "${COMMON_OVERRIDES_FULL[@]}" \
-  "experiment=eval_retriever" \
-  "ckpt.retriever=${RETR_CKPT}" \
-  "run.run_all_splits=true"
-
-echo "==> [4/6] train_gflownet (experiment=train_gflownet, sub=${DATASET_SUB})"
-GFLOW_EXP="train_gflownet"
-GFLOW_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${GFLOW_EXP}" "ckpt.retriever=${RETR_CKPT}")
-python src/train.py "${GFLOW_TRAIN_OVERRIDES[@]}"
-GFLOW_RUN_DIR="$(latest_run_dir "${GFLOW_EXP}" "${DATASET_SUB}")"
-GFLOW_CKPT="$(pick_best_ckpt "${GFLOW_RUN_DIR}")"
-if [[ -z "${GFLOW_CKPT}" ]]; then
-  echo "GFlowNet checkpoint not found under run dir: ${GFLOW_RUN_DIR:-<missing>}" >&2
+echo "==> [2/5] train_mpm_rag (EB-GFN, sub=${DATASET_SUB})"
+MPM_EXP="train_mpm_rag"
+MPM_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${MPM_EXP}")
+python src/train.py "${MPM_TRAIN_OVERRIDES[@]}"
+MPM_RUN_DIR="$(latest_run_dir "${MPM_EXP}" "${DATASET_SUB}")"
+MPM_CKPT="$(pick_best_ckpt "${MPM_RUN_DIR}")"
+if [[ -z "${MPM_CKPT}" ]]; then
+  echo "MPM-RAG checkpoint not found under run dir: ${MPM_RUN_DIR:-<missing>}" >&2
   exit 1
 fi
-echo "GFlowNet checkpoint: ${GFLOW_CKPT}"
+echo "MPM-RAG checkpoint: ${MPM_CKPT}"
 
-echo "==> [5/6] eval_gflownet (full+sub)"
+echo "==> [3/4] eval_gflownet (EB-GFN; full+sub)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=eval_gflownet" \
-  "ckpt.gflownet=${GFLOW_CKPT}"
+  "ckpt.gflownet=${MPM_CKPT}"
 
-echo "==> [6/6] oracle (retriever upper bound, full+sub)"
+echo "==> [4/4] export_gflownet (EB-GFN; full+sub)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
-  "experiment=reasoner_oracle"
+  "experiment=export_gflownet" \
+  "ckpt.gflownet=${MPM_CKPT}"
 
 echo "Pipeline finished."

@@ -16,6 +16,6 @@ job_logging:
   handlers:
     file:
       # Incorporates fix from https://github.com/facebookresearch/hydra/pull/2242
-      # NOTE: `task_name` may contain `/` (e.g., "eval/retriever"), which would be interpreted as a subdirectory
+      # NOTE: `task_name` may contain `/` (e.g., "eval/gflownet"), which would be interpreted as a subdirectory
       # and crash unless we pre-create it. Use a safe filename; the run directory already encodes the experiment.
       filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log

@@ -1,44 +1,58 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
-import inspect
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
 import contextlib
 
 import torch
 from torch import nn
 from torch_scatter import scatter_max
 
-from src.models.components.gflownet_env import GraphEnv, STOP_RELATION
-from src.models.components.state_encoder import StateEncoder, StateEncoderCache
+from src.models.components.gflownet_env import GraphEnv, STOP_EDGE_RELATION, STOP_RELATION
+from src.utils.gfn import compute_policy_log_probs, gumbel_noise_like, neg_inf_value
 
 MIN_TEMPERATURE = 1e-5
+_STOP_STEP_OFFSET = 1
+_STOP_NODE_NONE = -1
+_DEFAULT_CHECK_FINITE = True
+_STOP_LOGIT_DIM = 1
+_ZERO = 0
+_ONE = 1
 
 
-def _neg_inf_value(tensor: torch.Tensor) -> float:
-    return float(torch.finfo(tensor.dtype).min)
+@dataclass(frozen=True)
+class RolloutResult:
+    actions_seq: torch.Tensor
+    directions_seq: torch.Tensor
+    log_pf: torch.Tensor
+    log_pf_steps: torch.Tensor
+    log_pb_steps: torch.Tensor
+    selected_mask: torch.Tensor
+    reach_success: torch.Tensor
+    length: torch.Tensor
+    stop_node_locals: torch.Tensor
+    answer_node_hit: torch.Tensor
+    start_node_hit: torch.Tensor
+    visited_nodes: torch.Tensor
 
 
-def _segment_logsumexp_1d(logits: torch.Tensor, segment_ids: torch.Tensor, num_segments: int) -> torch.Tensor:
-    if logits.dim() != 1 or segment_ids.dim() != 1:
-        raise ValueError("logits and segment_ids must be 1D tensors.")
-    if logits.numel() != segment_ids.numel():
-        raise ValueError("logits and segment_ids must have the same length.")
-    if num_segments <= 0:
-        raise ValueError(f"num_segments must be positive, got {num_segments}")
-    if logits.numel() == 0:
-        return torch.full((num_segments,), _neg_inf_value(logits), device=logits.device, dtype=logits.dtype)
+@dataclass
+class RolloutBuffers:
+    actions_seq: torch.Tensor
+    log_pf_steps: torch.Tensor
+    log_pb_steps: torch.Tensor
 
-    device = logits.device
-    dtype = logits.dtype
-    neg_inf = torch.finfo(dtype).min
-    max_per = torch.full((num_segments,), neg_inf, device=device, dtype=dtype)
-    max_per.scatter_reduce_(0, segment_ids, logits, reduce="amax", include_self=True)
-    shifted = logits - max_per[segment_ids]
-    exp = torch.exp(shifted)
-    sum_per = torch.zeros((num_segments,), device=device, dtype=dtype)
-    sum_per.index_add_(0, segment_ids, exp)
-    eps = torch.finfo(dtype).eps
-    return torch.log(sum_per.clamp(min=eps)) + max_per
+    @classmethod
+    def create(cls, num_graphs: int, num_steps: int, device: torch.device) -> "RolloutBuffers":
+        actions_seq = torch.full(
+            (num_graphs, num_steps),
+            STOP_RELATION,
+            dtype=torch.long,
+            device=device,
+        )
+        log_pf_steps = torch.zeros(num_graphs, num_steps, dtype=torch.float32, device=device)
+        log_pb_steps = torch.zeros(num_graphs, num_steps, dtype=torch.float32, device=device)
+        return cls(actions_seq=actions_seq, log_pf_steps=log_pf_steps, log_pb_steps=log_pb_steps)
 
 
 class GFlowNetActor(nn.Module):
@@ -49,401 +63,511 @@ class GFlowNetActor(nn.Module):
         *,
         policy: nn.Module,
         env: GraphEnv,
-        state_encoder: StateEncoder,
+        forward_head: nn.Module,
+        backward_head: nn.Module,
+        state_encoder: nn.Module,
+        state_input_dim: int,
+        hidden_dim: int,
         max_steps: int,
         policy_temperature: float,
+        backward_temperature: Optional[float] = None,
+        check_finite: bool = _DEFAULT_CHECK_FINITE,
     ) -> None:
         super().__init__()
         self.policy = policy
         self.env = env
+        self.forward_head = forward_head
+        self.backward_head = backward_head
         self.state_encoder = state_encoder
+        self.stop_head = nn.Linear(int(state_input_dim), _STOP_LOGIT_DIM)
+        self.hidden_dim = int(hidden_dim)
         self.max_steps = int(max_steps)
         self.policy_temperature = float(policy_temperature)
-        self._policy_accepts_edge_base = False
-        self._assert_edge_policy()
-
-    def _assert_edge_policy(self) -> None:
-        sig = inspect.signature(self.policy.forward)
-        params = set(sig.parameters.keys())
-        if "relation_repr" in params or "relation_batch" in params:
-            raise ValueError(
-                "GFlowNetActor expects an edge-level policy in edge-action mode; " "relation-level policies are not supported."
-            )
-        self._policy_accepts_edge_base = "edge_base" in params
+        self.backward_temperature = self._resolve_backward_temperature(backward_temperature)
+        self.check_finite = bool(check_finite)
 
     def rollout(
         self,
         *,
-        batch: Any,
-        edge_tokens: torch.Tensor,
-        node_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        edge_batch: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        node_ptr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
         temperature: Optional[float] = None,
-        batch_idx: Optional[int] = None,
-        graph_cache: Optional[Dict[str, torch.Tensor]] = None,
-        forced_actions_seq: Optional[torch.Tensor] = None,
-        state_encoder_cache: Optional[StateEncoderCache] = None,
-        return_log_probs: bool = False,
-        return_valid_edges: bool = False,
-        return_state_tokens: bool = False,
-        dag_edge_mask: Optional[torch.Tensor] = None,
-        return_bc_stats: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        base_temperature = self.policy_temperature if temperature is None else float(temperature)
-        is_greedy = base_temperature < MIN_TEMPERATURE
-        temperature = max(base_temperature, MIN_TEMPERATURE)
-        logprob_temperature = temperature
-
-        device = edge_tokens.device
-        num_graphs = int(node_ptr.numel() - 1)
-        edge_tokens_f = edge_tokens.to(device=device, dtype=torch.float32)
-        question_tokens_f = question_tokens.to(device=device, dtype=torch.float32)
-        autocast_ctx = (
-            torch.autocast(device_type=device.type, enabled=torch.is_autocast_enabled())
-            if device.type != "cpu"
-            else contextlib.nullcontext()
-        )
-        edge_base = None
-        if self._policy_accepts_edge_base and hasattr(self.policy, "compute_edge_base"):
-            with autocast_ctx:
-                edge_base = self.policy.compute_edge_base(edge_tokens_f)
-
-        if graph_cache is not None:
-            graph_dict = graph_cache
-            edge_index = graph_cache["edge_index"]
-            edge_relations = graph_cache["edge_relations"]
-        else:
-            edge_index = batch.edge_index.to(device)
-            edge_relations = batch.edge_attr.to(device)
-            graph_dict = {
-                "edge_index": edge_index,
-                "edge_batch": edge_batch,
-                "edge_relations": edge_relations,
-                "node_ptr": node_ptr,
-                "edge_ptr": edge_ptr,
-                "start_node_locals": batch.start_node_locals.to(device),
-                "start_ptr": batch._slice_dict["start_node_locals"].to(device),
-                "answer_node_locals": batch.answer_node_locals.to(device),
-                "answer_ptr": batch._slice_dict["answer_node_locals"].to(device),
-                "edge_scores": batch.edge_scores.to(device=device, dtype=torch.float32).view(-1),
-            }
-            dummy_mask = getattr(batch, "is_dummy_agent", None)
-            if torch.is_tensor(dummy_mask):
-                graph_dict["dummy_mask"] = dummy_mask.to(device=device, dtype=torch.bool).view(-1)
-        if state_encoder_cache is None:
-            with autocast_ctx:
-                encoder_cache = self.state_encoder.precompute(
-                    node_ptr=node_ptr,
-                    node_tokens=node_tokens,
-                    question_tokens=question_tokens_f,
-                    edge_index=edge_index,
-                    start_node_locals=graph_dict.get("start_node_locals"),
-                )
-        else:
-            encoder_cache = state_encoder_cache
-
-        cache_state = graph_cache is not None and (not torch.is_grad_enabled())
-        if graph_cache is not None and torch.is_grad_enabled():
-            graph_cache.pop("state_cache", None)
-        state = self.env.reset(graph_dict, device=device)
-        if cache_state:
-            graph_cache["state_cache"] = state
-
+    ) -> RolloutResult:
+        temp, is_greedy = self._resolve_temperature(temperature)
+        edge_index = graph["edge_index"]
+        device = edge_index.device
+        state = self.env.reset(graph, device=device)
+        num_graphs = int(state.graph.node_ptr.numel() - 1)
+        num_steps = self.max_steps + _STOP_STEP_OFFSET
+        buffers = self._init_buffers(num_graphs, num_steps, device)
         log_pf_total = torch.zeros(num_graphs, dtype=torch.float32, device=device)
-        num_steps = self.max_steps + 1
-        log_pf_steps = torch.zeros(num_graphs, num_steps, dtype=torch.float32, device=device)
-        state_emb_steps: list[torch.Tensor] = []
-        state_tokens_steps: list[torch.Tensor] = []
-        log_prob_edge_steps: list[torch.Tensor] = []
-        log_prob_stop_steps: list[torch.Tensor] = []
-        valid_edges_steps: list[torch.Tensor] = []
-        bc_loss_sum = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-        bc_step_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-        bc_has_dag = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-        if return_bc_stats:
-            if dag_edge_mask is None:
-                raise ValueError("return_bc_stats requires dag_edge_mask.")
-            dag_edge_mask = dag_edge_mask.to(device=device, dtype=torch.bool).view(-1)
-            if dag_edge_mask.numel() != edge_tokens_f.size(0):
-                raise ValueError("dag_edge_mask length mismatch with edge_tokens.")
-            dag_counts = torch.zeros(num_graphs, device=device, dtype=torch.float32)
-            dag_counts.index_add_(0, edge_batch, dag_edge_mask.to(dtype=torch.float32))
-            bc_has_dag = (dag_counts > 0).to(dtype=dag_counts.dtype)
-        actions_seq = torch.full((num_graphs, num_steps), STOP_RELATION, dtype=torch.long, device=device)
+        stop_node_locals = torch.full((num_graphs,), _STOP_NODE_NONE, device=device, dtype=torch.long)
+        edge_batch = graph["edge_batch"]
+        edge_relations = graph["edge_relations"]
+        node_tokens = graph["node_tokens"]
+        node_batch = graph["node_batch"]
+        autocast_ctx = self._autocast_context(device)
+        state_vec = self.state_encoder.init_state(num_graphs, device=device, dtype=node_tokens.dtype)
 
         for step in range(num_steps):
-            with autocast_ctx:
-                state_tokens = self.state_encoder.encode_state(cache=encoder_cache, state=state)
-            if not torch.isfinite(state_tokens).all():
-                bad = (~torch.isfinite(state_tokens)).sum().item()
-                raise ValueError(f"state_tokens contains {bad} non-finite values.")
-            if return_state_tokens:
-                state_tokens_steps.append(state_tokens)
-
-            forward_mask, backward_mask = self.env.candidate_edge_masks(state)
-            unused_edges = ~state.used_edge_mask
-            forward_mask = forward_mask & unused_edges
-            backward_mask = backward_mask & unused_edges
-            candidate_edges = forward_mask | backward_mask
-            valid_edges = candidate_edges
-
-            policy_kwargs = {}
-            if self._policy_accepts_edge_base:
-                policy_kwargs["edge_base"] = edge_base
-            with autocast_ctx:
-                edge_logits, stop_logits, state_out = self.policy(
-                    edge_tokens=edge_tokens_f,
-                    state_tokens=state_tokens,
-                    edge_batch=edge_batch,
-                    valid_edges_mask=valid_edges,
-                    **policy_kwargs,
-                )
-            if not torch.isfinite(edge_logits).all():
-                bad = (~torch.isfinite(edge_logits)).sum().item()
-                raise ValueError(f"edge_logits contains {bad} non-finite values.")
-            if edge_logits.numel() != edge_tokens_f.size(0):
-                raise ValueError(f"edge_logits length {edge_logits.numel()} != num_edges {edge_tokens_f.size(0)}")
-            if not torch.isfinite(stop_logits).all():
-                bad = (~torch.isfinite(stop_logits)).sum().item()
-                raise ValueError(f"stop_logits contains {bad} non-finite values.")
-            if stop_logits.numel() != num_graphs:
-                raise ValueError(f"stop_logits length {stop_logits.numel()} != num_graphs {num_graphs}")
-            if state_out is None:
-                state_out = state_tokens
-            state_emb_steps.append(state_out.to(dtype=torch.float32))
-
-            log_prob_edge, log_prob_stop, log_denom, has_edge = self._log_probs_edges(
+            pre_done = state.done
+            valid_edges = self._valid_edges(state)
+            allow_stop = self._allow_stop(state)
+            edge_scores, stop_logits = self._score_forward_with_stop(
+                graph,
+                state_vec,
+                active_nodes=state.active_nodes,
+                autocast_ctx=autocast_ctx,
+            )
+            edge_logits = self._policy_logits(
+                valid_edges=valid_edges,
+                edge_logits=edge_scores,
+                autocast_ctx=autocast_ctx,
+            )
+            log_prob_edge, log_prob_stop, _, has_edge = compute_policy_log_probs(
                 edge_logits=edge_logits,
                 stop_logits=stop_logits,
                 edge_batch=edge_batch,
                 valid_edges=valid_edges,
                 num_graphs=num_graphs,
-                temp=logprob_temperature,
+                temperature=temp,
+                allow_stop=allow_stop,
             )
-            if return_log_probs:
-                log_prob_edge_steps.append(log_prob_edge)
-                log_prob_stop_steps.append(log_prob_stop)
-            if return_valid_edges:
-                valid_edges_steps.append(valid_edges)
-            if return_bc_stats:
-                step_loss, step_counts = self._compute_step_bc_stats(
-                    log_prob_edge=log_prob_edge,
-                    valid_edges=valid_edges,
-                    dag_edge_mask=dag_edge_mask,
-                    edge_batch=edge_batch,
-                    num_graphs=num_graphs,
-                )
-                bc_loss_sum = bc_loss_sum + step_loss
-                bc_step_counts = bc_step_counts + step_counts
-
-            if forced_actions_seq is not None:
-                forced = forced_actions_seq[:, step].to(device=device, dtype=torch.long)
-                if forced.numel() != num_graphs:
-                    raise ValueError("forced_actions_seq batch mismatch with num_graphs.")
-                forced_stop = forced == STOP_RELATION
-                if bool((~forced_stop).any().item()):
-                    if edge_logits.numel() == 0:
-                        raise ValueError("forced_actions_seq contains edge actions but edge_logits is empty.")
-                    if ((forced[~forced_stop] < 0) | (forced[~forced_stop] >= edge_logits.numel())).any():
-                        raise ValueError("forced_actions_seq contains out-of-range edge ids.")
-                    graph_ids = torch.arange(num_graphs, device=device, dtype=torch.long)
-                    if (edge_batch[forced[~forced_stop]] != graph_ids[~forced_stop]).any():
-                        raise ValueError("forced_actions_seq contains edges from the wrong graph.")
-                    if (~valid_edges[forced[~forced_stop]]).any():
-                        raise ValueError("forced_actions_seq contains edges not in the valid action set.")
-                actions = forced
-                log_pf_vec = log_prob_stop.clone()
-                if bool((~forced_stop).any().item()):
-                    log_pf_vec[~forced_stop] = log_prob_edge[forced[~forced_stop]]
-            else:
-                if is_greedy:
-                    score_edge = log_prob_edge
-                    score_stop = log_prob_stop
-                else:
-                    score_edge = log_prob_edge + self._gumbel_like(log_prob_edge)
-                    score_stop = log_prob_stop + self._gumbel_like(log_prob_stop)
-
-                neg_inf = _neg_inf_value(score_edge)
-                score_edge = torch.where(valid_edges, score_edge, torch.full_like(score_edge, neg_inf))
-                score_edge_max, edge_argmax = scatter_max(score_edge, edge_batch, dim=0, dim_size=num_graphs)
-                score_edge_max = torch.where(
-                    has_edge,
-                    score_edge_max,
-                    torch.full_like(score_edge_max, neg_inf),
-                )
-                edge_argmax = torch.where(has_edge, edge_argmax, torch.zeros_like(edge_argmax))
-
-                choose_edge = has_edge & (score_edge_max > score_stop)
-                actions = torch.where(choose_edge, edge_argmax, torch.full_like(edge_argmax, STOP_RELATION))
-                log_pf_vec = torch.where(choose_edge, log_prob_edge[edge_argmax], log_prob_stop)
-
-            if state.done.any():
-                done_mask = state.done
-                actions = torch.where(done_mask, torch.full_like(actions, STOP_RELATION), actions)
-                log_pf_vec = torch.where(done_mask, torch.zeros_like(log_pf_vec), log_pf_vec)
-
-            selected_action_emb = torch.zeros(
-                num_graphs,
-                edge_tokens_f.size(-1),
-                device=device,
-                dtype=edge_tokens_f.dtype,
+            actions, log_pf = self._sample_actions(
+                log_prob_edge=log_prob_edge,
+                log_prob_stop=log_prob_stop,
+                valid_edges=valid_edges,
+                edge_batch=edge_batch,
+                has_edge=has_edge,
+                is_greedy=is_greedy,
             )
-            edge_selected = actions >= 0
-            if bool(edge_selected.any().item()):
-                selected_action_emb[edge_selected] = edge_tokens_f[actions[edge_selected]]
+            actions, log_pf = self._apply_done_mask(pre_done, actions, log_pf)
+            stop_node_locals = self._update_stop_nodes(
+                stop_node_locals=stop_node_locals,
+                actions=actions,
+                done_mask=pre_done,
+                edge_index=edge_index,
+                edge_batch=edge_batch,
+                edge_relations=edge_relations,
+                node_ptr=state.graph.node_ptr,
+            )
+            buffers.actions_seq[:, step] = actions
+            buffers.log_pf_steps[:, step] = log_pf
+            log_pf_total = log_pf_total + log_pf
+            relation_tokens = self._gather_relation_tokens(
+                relation_tokens=graph["relation_tokens"],
+                actions=actions,
+                num_graphs=num_graphs,
+            )
+            update_mask = (actions >= _ZERO) & (~pre_done)
+            state_vec = self.state_encoder.update_state(
+                state_vec,
+                relation_tokens=relation_tokens,
+                update_mask=update_mask,
+            )
+            state = self.env.step(state, actions, step_index=step)
+            log_pb = self._compute_log_pb(
+                state=state,
+                graph=graph,
+                state_vec=state_vec,
+                actions=actions,
+                autocast_ctx=autocast_ctx,
+                num_graphs=num_graphs,
+            )
+            log_pb = torch.where(pre_done, torch.zeros_like(log_pb), log_pb)
+            buffers.log_pb_steps[:, step] = log_pb
 
-            actions_seq[:, step] = actions
-            log_pf_steps[:, step] = log_pf_vec
-            log_pf_total = log_pf_total + log_pf_vec
-
-            state = self.env.step(state, actions, selected_action_emb, step_index=step)
-            if bool(state.done.all().item()):
-                break
-
+        stop_node_locals = self._backfill_stop_nodes(stop_node_locals=stop_node_locals, state=state)
         reach_success = state.answer_hits.float()
         length = state.step_counts.to(dtype=torch.float32)
-
-        if len(state_emb_steps) < num_steps:
-            pad = num_steps - len(state_emb_steps)
-            if state_emb_steps:
-                state_emb_steps.extend([state_emb_steps[-1]] * pad)
-            else:
-                filler = torch.zeros(
-                    num_graphs,
-                    edge_tokens_f.size(-1),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                state_emb_steps.extend([filler] * num_steps)
-        state_emb_seq = torch.stack(state_emb_steps, dim=1)
-        result = {
-            "log_pf": log_pf_total,
-            "log_pf_steps": log_pf_steps,
-            "state_emb_seq": state_emb_seq,
-            "actions_seq": actions_seq,
-            "directions_seq": state.directions,
-            "selected_mask": state.used_edge_mask,
-            "actions": actions,
-            "reach_fraction": reach_success,
-            "reach_success": reach_success,
-            "length": length,
-            "answer_node_hit": state.answer_node_hit,
-            "start_node_hit": state.start_node_hit,
-            "active_nodes": state.active_nodes,
-        }
-        if return_log_probs:
-            if log_prob_edge_steps:
-                if len(log_prob_edge_steps) < num_steps:
-                    pad = num_steps - len(log_prob_edge_steps)
-                    log_prob_edge_steps.extend([log_prob_edge_steps[-1]] * pad)
-                result["log_prob_edge_seq"] = torch.stack(log_prob_edge_steps, dim=0)
-            else:
-                result["log_prob_edge_seq"] = torch.zeros(0, device=device, dtype=torch.float32)
-            if log_prob_stop_steps:
-                if len(log_prob_stop_steps) < num_steps:
-                    pad = num_steps - len(log_prob_stop_steps)
-                    log_prob_stop_steps.extend([log_prob_stop_steps[-1]] * pad)
-                result["log_prob_stop_seq"] = torch.stack(log_prob_stop_steps, dim=1)
-            else:
-                result["log_prob_stop_seq"] = torch.zeros(0, device=device, dtype=torch.float32)
-        if return_valid_edges:
-            if valid_edges_steps:
-                if len(valid_edges_steps) < num_steps:
-                    pad = num_steps - len(valid_edges_steps)
-                    valid_edges_steps.extend([valid_edges_steps[-1]] * pad)
-                result["valid_edges_seq"] = torch.stack(valid_edges_steps, dim=0)
-            else:
-                result["valid_edges_seq"] = torch.zeros(0, device=device, dtype=torch.bool)
-        if return_state_tokens:
-            if state_tokens_steps:
-                if len(state_tokens_steps) < num_steps:
-                    pad = num_steps - len(state_tokens_steps)
-                    state_tokens_steps.extend([state_tokens_steps[-1]] * pad)
-                result["state_tokens_seq"] = torch.stack(state_tokens_steps, dim=1)
-            else:
-                result["state_tokens_seq"] = torch.zeros(0, device=device, dtype=torch.float32)
-        if return_bc_stats:
-            bc_loss = bc_loss_sum / bc_step_counts.clamp(min=1.0)
-            result["bc_loss_per_graph"] = bc_loss
-            result["bc_steps_per_graph"] = bc_step_counts
-            result["bc_has_dag"] = bc_has_dag
-        return result
-
-    @staticmethod
-    def _log_probs_edges(
-        *,
-        edge_logits: torch.Tensor,
-        stop_logits: torch.Tensor,
-        edge_batch: torch.Tensor,
-        valid_edges: torch.Tensor,
-        num_graphs: int,
-        temp: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if num_graphs <= 0:
-            return (
-                torch.zeros(0, device=stop_logits.device),
-                torch.zeros(0, device=stop_logits.device),
-                torch.zeros(0, device=stop_logits.device),
-                torch.zeros(0, device=stop_logits.device, dtype=torch.bool),
-            )
-        if edge_logits.dtype != torch.float32:
-            edge_logits = edge_logits.to(dtype=torch.float32)
-        if stop_logits.dtype != torch.float32:
-            stop_logits = stop_logits.to(dtype=torch.float32)
-        stop_scaled = stop_logits / float(temp)
-        if edge_logits.numel() == 0:
-            log_denom = stop_scaled
-            has_edge = torch.zeros(num_graphs, device=stop_logits.device, dtype=torch.bool)
-            return edge_logits, stop_scaled - log_denom, log_denom, has_edge
-
-        edge_scaled = edge_logits / float(temp)
-        valid_edges = valid_edges.to(device=edge_scaled.device, dtype=torch.bool)
-        if bool(valid_edges.any().item()):
-            logsumexp_edges = _segment_logsumexp_1d(edge_scaled[valid_edges], edge_batch[valid_edges], num_graphs)
-        else:
-            neg_inf = _neg_inf_value(edge_scaled)
-            logsumexp_edges = torch.full((num_graphs,), neg_inf, device=edge_scaled.device, dtype=edge_scaled.dtype)
-        log_denom = torch.logaddexp(logsumexp_edges, stop_scaled)
-        log_prob_edge = edge_scaled - log_denom[edge_batch]
-        log_prob_edge = torch.where(
-            valid_edges,
-            log_prob_edge,
-            torch.full_like(log_prob_edge, _neg_inf_value(log_prob_edge)),
+        return RolloutResult(
+            actions_seq=buffers.actions_seq,
+            directions_seq=state.directions,
+            log_pf=log_pf_total,
+            log_pf_steps=buffers.log_pf_steps,
+            log_pb_steps=buffers.log_pb_steps,
+            selected_mask=state.used_edge_mask,
+            reach_success=reach_success,
+            length=length,
+            stop_node_locals=stop_node_locals,
+            answer_node_hit=state.answer_node_hit,
+            start_node_hit=state.start_node_hit,
+            visited_nodes=state.visited_nodes,
         )
-        log_prob_stop = stop_scaled - log_denom
-        has_edge = logsumexp_edges > _neg_inf_value(logsumexp_edges)
-        return log_prob_edge, log_prob_stop, log_denom, has_edge
 
     @staticmethod
-    def _gumbel_like(tensor: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
-        u = torch.rand_like(tensor)
-        return -torch.log(-torch.log(u.clamp(min=eps, max=1.0 - eps)))
+    def _autocast_context(device: torch.device):
+        if device.type == "cpu":
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=device.type, enabled=torch.is_autocast_enabled())
 
     @staticmethod
-    def _compute_step_bc_stats(
+    def _init_buffers(num_graphs: int, num_steps: int, device: torch.device) -> RolloutBuffers:
+        return RolloutBuffers.create(num_graphs=num_graphs, num_steps=num_steps, device=device)
+
+    def _resolve_temperature(self, temperature: Optional[float]) -> tuple[float, bool]:
+        base = self.policy_temperature if temperature is None else float(temperature)
+        is_greedy = base < MIN_TEMPERATURE
+        return max(base, MIN_TEMPERATURE), is_greedy
+
+    def _resolve_backward_temperature(self, temperature: Optional[float]) -> float:
+        base = self.policy_temperature if temperature is None else float(temperature)
+        return max(base, MIN_TEMPERATURE)
+
+    def _policy_logits(
+        self,
+        *,
+        valid_edges: torch.Tensor,
+        edge_logits: torch.Tensor,
+        autocast_ctx: contextlib.AbstractContextManager,
+    ) -> torch.Tensor:
+        with autocast_ctx:
+            edge_logits = self.policy(
+                edge_scores=edge_logits,
+                valid_edges_mask=valid_edges,
+            )
+        return edge_logits
+
+    def _valid_edges(self, state: Any) -> torch.Tensor:
+        forward_mask, backward_mask = self.env.candidate_edge_masks(state)
+        unused_edges = ~state.used_edge_mask
+        return (forward_mask | backward_mask) & unused_edges
+
+    def _allow_stop(self, state: Any) -> torch.Tensor:
+        step_counts = state.step_counts
+        allow_stop = ~state.done
+        if step_counts.numel() > _ZERO:
+            horizon_exhausted = step_counts >= self.max_steps
+            allow_stop = allow_stop & (~horizon_exhausted)
+        min_stop_steps = int(getattr(self.env, "min_stop_steps", 0))
+        if min_stop_steps > _ZERO:
+            allow_stop = allow_stop & (step_counts >= min_stop_steps)
+        return allow_stop
+
+    def _sample_actions(
+        self,
         *,
         log_prob_edge: torch.Tensor,
+        log_prob_stop: torch.Tensor | None,
         valid_edges: torch.Tensor,
-        dag_edge_mask: torch.Tensor,
         edge_batch: torch.Tensor,
+        has_edge: torch.Tensor,
+        is_greedy: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if log_prob_stop is None:
+            raise ValueError("log_prob_stop must be provided for stop-aware sampling.")
+        if log_prob_edge.numel() == 0:
+            actions = torch.full_like(has_edge, STOP_RELATION, dtype=torch.long)
+            log_pf = log_prob_stop.to(dtype=torch.float32)
+            return actions, log_pf
+
+        if is_greedy:
+            score_edge = log_prob_edge
+            score_stop = log_prob_stop
+        else:
+            score_edge = log_prob_edge + gumbel_noise_like(log_prob_edge)
+            score_stop = log_prob_stop + gumbel_noise_like(log_prob_stop)
+
+        neg_inf = neg_inf_value(score_edge)
+        score_edge = torch.where(valid_edges, score_edge, torch.full_like(score_edge, neg_inf))
+        score_edge_max, edge_argmax = scatter_max(score_edge, edge_batch, dim=0, dim_size=has_edge.numel())
+        score_edge_max = torch.where(has_edge, score_edge_max, torch.full_like(score_edge_max, neg_inf))
+        edge_argmax = torch.where(has_edge, edge_argmax, torch.zeros_like(edge_argmax))
+        choose_stop = score_stop > score_edge_max
+        choose_stop = choose_stop | (~has_edge)
+        actions = torch.where(choose_stop, torch.full_like(edge_argmax, STOP_RELATION), edge_argmax)
+        log_pf = torch.where(choose_stop, log_prob_stop, log_prob_edge[edge_argmax])
+        return actions, log_pf
+
+    def _score_edges_forward(
+        self,
+        graph: dict[str, torch.Tensor],
+        state_vec: torch.Tensor,
+        *,
+        active_nodes: torch.Tensor,
+        autocast_ctx: contextlib.AbstractContextManager,
+    ) -> torch.Tensor:
+        return self._score_edges(
+            graph=graph,
+            state_vec=state_vec,
+            active_nodes=active_nodes,
+            head=self.forward_head,
+            autocast_ctx=autocast_ctx,
+        )
+
+    def _score_forward_with_stop(
+        self,
+        graph: dict[str, torch.Tensor],
+        state_vec: torch.Tensor,
+        *,
+        active_nodes: torch.Tensor,
+        autocast_ctx: contextlib.AbstractContextManager,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        state_inputs = self._build_state_inputs(
+            node_tokens=graph["node_tokens"],
+            question_tokens=graph["question_tokens"],
+            state_vec=state_vec,
+            active_nodes=active_nodes,
+            node_batch=graph["node_batch"],
+        )
+        with autocast_ctx:
+            relation_logits = self.forward_head(state_inputs)
+            stop_logits = self.stop_head(state_inputs).squeeze(-1)
+        edge_scores = self._edge_logits_from_relations(
+            relation_logits=relation_logits,
+            edge_relations=graph["edge_relations"],
+            edge_batch=graph["edge_batch"],
+        )
+        return edge_scores, stop_logits
+
+    def _score_edges_backward(
+        self,
+        graph: dict[str, torch.Tensor],
+        state_vec: torch.Tensor,
+        *,
+        active_nodes: torch.Tensor,
+        autocast_ctx: contextlib.AbstractContextManager,
+    ) -> torch.Tensor:
+        return self._score_edges(
+            graph=graph,
+            state_vec=state_vec,
+            active_nodes=active_nodes,
+            head=self.backward_head,
+            autocast_ctx=autocast_ctx,
+        )
+
+    def _score_edges(
+        self,
+        *,
+        graph: dict[str, torch.Tensor],
+        state_vec: torch.Tensor,
+        active_nodes: torch.Tensor,
+        head: nn.Module,
+        autocast_ctx: contextlib.AbstractContextManager,
+    ) -> torch.Tensor:
+        state_inputs = self._build_state_inputs(
+            node_tokens=graph["node_tokens"],
+            question_tokens=graph["question_tokens"],
+            state_vec=state_vec,
+            active_nodes=active_nodes,
+            node_batch=graph["node_batch"],
+        )
+        with autocast_ctx:
+            relation_logits = head(state_inputs)
+        return self._edge_logits_from_relations(
+            relation_logits=relation_logits,
+            edge_relations=graph["edge_relations"],
+            edge_batch=graph["edge_batch"],
+        )
+
+    @staticmethod
+    def _pool_active_nodes(
+        *,
+        node_tokens: torch.Tensor,
+        node_batch: torch.Tensor,
+        active_nodes: torch.Tensor,
         num_graphs: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        mask = valid_edges & dag_edge_mask
-        device = log_prob_edge.device
-        if not bool(mask.any().item()):
-            zeros = torch.zeros(num_graphs, device=device, dtype=log_prob_edge.dtype)
-            return zeros, zeros
-        masked_logits = log_prob_edge[mask]
-        segments = edge_batch[mask]
-        logsumexp = _segment_logsumexp_1d(masked_logits, segments, num_graphs)
-        counts = torch.bincount(segments, minlength=num_graphs).to(device=device)
-        has_valid = counts > 0
-        step_loss = torch.where(has_valid, -logsumexp, torch.zeros_like(logsumexp))
-        step_counts = has_valid.to(dtype=step_loss.dtype)
-        return step_loss, step_counts
+    ) -> torch.Tensor:
+        device = node_tokens.device
+        dtype = node_tokens.dtype
+        out = torch.zeros((num_graphs, node_tokens.size(-1)), device=device, dtype=dtype)
+        active_mask = active_nodes.to(device=device, dtype=torch.bool)
+        if not torch.any(active_mask):
+            return out
+        active_tokens = node_tokens[active_mask]
+        active_batch = node_batch[active_mask]
+        out.index_add_(0, active_batch, active_tokens)
+        counts = torch.bincount(active_batch, minlength=num_graphs).to(device=device, dtype=dtype).clamp(min=_ONE)
+        return out / counts.unsqueeze(-1)
 
+    @classmethod
+    def _build_state_inputs(
+        cls,
+        *,
+        node_tokens: torch.Tensor,
+        question_tokens: torch.Tensor,
+        state_vec: torch.Tensor,
+        active_nodes: torch.Tensor,
+        node_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        num_graphs = int(state_vec.size(0))
+        current_entities = cls._pool_active_nodes(
+            node_tokens=node_tokens,
+            node_batch=node_batch,
+            active_nodes=active_nodes,
+            num_graphs=num_graphs,
+        )
+        return torch.cat([question_tokens, current_entities, state_vec], dim=-1)
 
-__all__ = ["GFlowNetActor"]
+    @staticmethod
+    def _edge_logits_from_relations(
+        *,
+        relation_logits: torch.Tensor,
+        edge_relations: torch.Tensor,
+        edge_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if relation_logits.dim() != 2:
+            raise ValueError("relation_logits must be [B,R] for relation-scored edges.")
+        rel_ids = edge_relations.to(device=relation_logits.device, dtype=torch.long).view(-1)
+        if torch.any(rel_ids == STOP_EDGE_RELATION):
+            raise ValueError("edge_relations contains STOP_EDGE_RELATION after stop-edge removal.")
+        out_of_range = (rel_ids < _ZERO) | (rel_ids >= relation_logits.size(1))
+        if torch.any(out_of_range):
+            raise ValueError("edge_relations contains ids outside relation_logits range.")
+        return relation_logits.index_select(0, edge_batch).gather(1, rel_ids.view(-1, 1)).view(-1)
+
+    @staticmethod
+    def _gather_relation_tokens(
+        *,
+        relation_tokens: torch.Tensor,
+        actions: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        device = relation_tokens.device
+        dtype = relation_tokens.dtype
+        out = torch.zeros((num_graphs, relation_tokens.size(-1)), device=device, dtype=dtype)
+        valid_action = actions >= _ZERO
+        if not torch.any(valid_action):
+            return out
+        action_ids = actions[valid_action]
+        out[valid_action] = relation_tokens.index_select(0, action_ids)
+        return out
+
+    def _backward_valid_edges(self, state: Any) -> torch.Tensor:
+        edge_index = state.graph.edge_index
+        edge_batch = state.graph.edge_batch
+        base = ~state.done[edge_batch]
+        heads = edge_index[0]
+        tails = edge_index[1]
+        active = state.active_nodes
+        visited = state.visited_nodes
+        head_active = active[heads]
+        tail_active = active[tails]
+        parent_from_tail = tail_active & visited[heads]
+        return base & parent_from_tail & (~head_active)
+
+    def _compute_log_pb(
+        self,
+        *,
+        state: Any,
+        graph: dict[str, torch.Tensor],
+        state_vec: torch.Tensor,
+        actions: torch.Tensor,
+        autocast_ctx: contextlib.AbstractContextManager,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        valid_edges = self._backward_valid_edges(state)
+        valid_action = actions >= _ZERO
+        if valid_action.any():
+            action_ids = actions[valid_action]
+            if action_ids.numel() > 0 and int(action_ids.max().item()) >= int(valid_edges.numel()):
+                raise ValueError("Action id out of range for backward valid_edges.")
+            action_mask = torch.zeros_like(valid_edges, dtype=torch.bool)
+            action_mask[action_ids] = True
+            valid_edges = valid_edges | action_mask
+        edge_logits = self._policy_logits(
+            valid_edges=valid_edges,
+            edge_logits=self._score_edges_backward(
+                graph,
+                state_vec,
+                active_nodes=state.active_nodes,
+                autocast_ctx=autocast_ctx,
+            ),
+            autocast_ctx=autocast_ctx,
+        )
+        log_prob_edge, _, _, _ = compute_policy_log_probs(
+            edge_logits=edge_logits,
+            stop_logits=None,
+            edge_batch=graph["edge_batch"],
+            valid_edges=valid_edges,
+            num_graphs=num_graphs,
+            temperature=self.backward_temperature,
+        )
+        log_pb = self._select_log_prob(log_prob_edge, actions)
+        if log_pb.numel() == 0:
+            return log_pb
+        edge_relations = graph["edge_relations"]
+        if edge_relations.numel() == 0:
+            return log_pb
+        if valid_action.any():
+            action_ids = actions[valid_action]
+            if action_ids.numel() > 0 and int(action_ids.max().item()) >= int(edge_relations.numel()):
+                raise ValueError("Action id out of range for edge_relations in log_pb computation.")
+            rel_ids = edge_relations.index_select(0, action_ids)
+            stop_mask = torch.zeros_like(actions, dtype=torch.bool)
+            stop_mask[valid_action] = rel_ids == STOP_EDGE_RELATION
+            log_pb = torch.where(stop_mask, torch.zeros_like(log_pb), log_pb)
+        return log_pb
+
+    @staticmethod
+    def _select_log_prob(log_prob_edge: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(actions.size(0), device=log_prob_edge.device, dtype=log_prob_edge.dtype)
+        valid_action = actions >= _ZERO
+        if valid_action.any():
+            out[valid_action] = log_prob_edge.index_select(0, actions[valid_action])
+        return out
+
+    @staticmethod
+    def _apply_done_mask(
+        done_mask: torch.Tensor,
+        actions: torch.Tensor,
+        log_pf: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        actions = torch.where(done_mask, torch.full_like(actions, STOP_RELATION), actions)
+        log_pf = torch.where(done_mask, torch.zeros_like(log_pf), log_pf)
+        return actions, log_pf
+
+    @staticmethod
+    def _update_stop_nodes(
+        *,
+        stop_node_locals: torch.Tensor,
+        actions: torch.Tensor,
+        done_mask: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_batch: torch.Tensor,
+        edge_relations: torch.Tensor,
+        node_ptr: torch.Tensor,
+    ) -> torch.Tensor:
+        done_mask = done_mask.to(device=stop_node_locals.device, dtype=torch.bool)
+        valid_action = actions >= _ZERO
+        stop_action = torch.zeros_like(actions, dtype=torch.bool)
+        if valid_action.any():
+            edge_ids = actions[valid_action]
+            rel_ids = edge_relations[edge_ids]
+            stop_action[valid_action] = rel_ids == STOP_EDGE_RELATION
+        update_mask = stop_action & (~done_mask) & (stop_node_locals == _STOP_NODE_NONE)
+        if not update_mask.any():
+            return stop_node_locals
+        edge_ids = actions[update_mask]
+        graph_ids = edge_batch[edge_ids]
+        head_nodes = edge_index[0, edge_ids]
+        local_idx = head_nodes - node_ptr[graph_ids]
+        updated = stop_node_locals.clone()
+        updated[update_mask] = local_idx
+        return updated
+
+    @staticmethod
+    def _backfill_stop_nodes(*, stop_node_locals: torch.Tensor, state: Any) -> torch.Tensor:
+        needs_backfill = (stop_node_locals == _STOP_NODE_NONE) & state.done
+        if not needs_backfill.any():
+            return stop_node_locals
+        active_idx = torch.nonzero(state.active_nodes, as_tuple=False).view(-1)
+        if active_idx.numel() == 0:
+            return stop_node_locals
+        node_ptr = state.graph.node_ptr
+        num_graphs = int(node_ptr.numel() - 1)
+        num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
+        sentinel = num_nodes_total + _ONE
+        active_batch = state.graph.node_batch[active_idx]
+        local_idx = active_idx - node_ptr[active_batch]
+        min_local = torch.full(
+            (num_graphs,),
+            sentinel,
+            device=stop_node_locals.device,
+            dtype=stop_node_locals.dtype,
+        )
+        min_local.scatter_reduce_(0, active_batch, local_idx, reduce="amin", include_self=True)
+        has_active = min_local != sentinel
+        backfill_mask = needs_backfill & has_active
+        return torch.where(backfill_mask, min_local, stop_node_locals)
+
+__all__ = ["GFlowNetActor", "RolloutResult"]

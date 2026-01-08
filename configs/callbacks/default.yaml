@@ -1,22 +1,35 @@
-defaults:
-  - model_checkpoint
-  - early_stopping
-  - model_summary
-  - rich_progress_bar
-  - _self_
-
 model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch_{epoch:03d}"
   monitor: "val/ranking/mrr"
-  mode: "max"
+  verbose: False
   save_last: True
+  save_top_k: 1
+  mode: "max"
   auto_insert_metric_name: False
+  save_weights_only: False
+  every_n_train_steps: null
+  train_time_interval: null
+  every_n_epochs: null
+  save_on_train_epoch_end: null
 
 early_stopping:
+  _target_: lightning.pytorch.callbacks.EarlyStopping
   monitor: "val/ranking/mrr"
+  min_delta: 0.0
   patience: 10
+  verbose: False
   mode: "max"
+  strict: True
+  check_finite: True
+  stopping_threshold: null
+  divergence_threshold: null
+  check_on_train_epoch_end: null
 
 model_summary:
+  _target_: lightning.pytorch.callbacks.RichModelSummary
   max_depth: -1
+
+rich_progress_bar:
+  _target_: lightning.pytorch.callbacks.RichProgressBar

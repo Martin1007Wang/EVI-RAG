@@ -1,0 +1,84 @@
+{
+  "dataset": "rmanluo/RoG-cwq",
+  "splits": [
+    "train",
+    "validation",
+    "test"
+  ],
+  "path_mode": "a2q",
+  "aggregation": "pairwise",
+  "stats": {
+    "train": {
+      "total_samples": 27639,
+      "total_pairs": 83100,
+      "missing_entity_samples": 6482,
+      "missing_entity_pairs": 23732,
+      "unreachable_samples": 0,
+      "unreachable_pairs": 4542,
+      "length_counts": {
+        "0": 463,
+        "1": 19365,
+        "2": 28195,
+        "3": 2844,
+        "4": 1906,
+        "5": 1140,
+        "6": 369,
+        "7": 258,
+        "8": 155,
+        "9": 87,
+        "10": 30,
+        "11": 4,
+        "12": 6,
+        "13": 2,
+        "15": 1,
+        "16": 1
+      }
+    },
+    "validation": {
+      "total_samples": 3519,
+      "total_pairs": 11098,
+      "missing_entity_samples": 807,
+      "missing_entity_pairs": 3482,
+      "unreachable_samples": 0,
+      "unreachable_pairs": 596,
+      "length_counts": {
+        "0": 46,
+        "1": 2356,
+        "2": 3508,
+        "3": 489,
+        "4": 387,
+        "5": 104,
+        "6": 45,
+        "7": 21,
+        "8": 27,
+        "9": 18,
+        "10": 6,
+        "11": 2,
+        "12": 11
+      }
+    },
+    "test": {
+      "total_samples": 3531,
+      "total_pairs": 9399,
+      "missing_entity_samples": 780,
+      "missing_entity_pairs": 2306,
+      "unreachable_samples": 0,
+      "unreachable_pairs": 503,
+      "length_counts": {
+        "0": 41,
+        "1": 2784,
+        "2": 3107,
+        "3": 330,
+        "4": 182,
+        "5": 55,
+        "6": 47,
+        "7": 14,
+        "8": 11,
+        "9": 14,
+        "13": 3,
+        "14": 1,
+        "17": 1
+      }
+    }
+  }
+}

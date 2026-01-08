@@ -1,7 +1,7 @@
 # Shared window settings for (K, B, φ) analysis.
 #
 # Keep this file as the single source of truth for all "window k" lists used by:
-# - retriever ranking metrics
+# - g_retrieval ranking metrics
 # - oracle/truth upper bound evaluation
 # - LLM triplet-window evaluation
 

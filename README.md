@@ -99,7 +99,7 @@ The directory structure of new project looks like this:
 │   ├── paths                    <- Project paths configs
 │   ├── trainer                  <- Trainer configs
 │   │
-│   ├── eval.yaml             <- Main config for retriever evaluation
+│   ├── eval.yaml             <- Main config for evaluation
 │   └── train.yaml            <- Main config for training
 │
 ├── data                   <- Project data
@@ -117,7 +117,7 @@ The directory structure of new project looks like this:
 │   ├── models                   <- Model scripts
 │   ├── utils                    <- Utility scripts
 │   │
-│   ├── eval.py               <- Evaluate retriever checkpoints
+│   ├── eval.py               <- Evaluate checkpoints
 │   └── train.py                 <- Run training
 │
 ├── tests                  <- Tests of any kind
@@ -340,12 +340,12 @@ python train.py -m data.batch_size=32,64,128 model.lr=0.001,0.0005
 <summary><b>Create a sweep over hyperparameters with Optuna</b></summary>
 
 ```bash
-# this will run hyperparameter search defined in `configs/hparams_search/retriever_optuna.yaml`
+# this will run hyperparameter search defined in `configs/hparams_search/<name>.yaml`
 # over chosen experiment config
-python train.py -m hparams_search=retriever_optuna experiment=example
+python train.py -m hparams_search=<name> experiment=example
 ```
 
-> **Note**: Using [Optuna Sweeper](https://hydra.cc/docs/next/plugins/optuna_sweeper) doesn't require you to add any boilerplate to your code, everything is defined in a [single config file](configs/hparams_search/retriever_optuna.yaml).
+> **Note**: Using [Optuna Sweeper](https://hydra.cc/docs/next/plugins/optuna_sweeper) doesn't require you to add any boilerplate to your code, everything is defined in a single config file under `configs/hparams_search/`.
 
 > **Warning**: Optuna sweeps are not failure-resistant (if one job crashes then the whole sweep crashes).
 
@@ -433,10 +433,10 @@ pytest -k "not slow"
 Each experiment should be tagged in order to easily filter them across files or in logger UI:
 
 ```bash
-python train.py tags=["retriever","experiment_X"]
+python train.py tags=["gflownet","experiment_X"]
 ```
 
-> **Note**: You might need to escape the bracket characters in your shell with `python train.py tags=\["retriever","experiment_X"\]`.
+> **Note**: You might need to escape the bracket characters in your shell with `python train.py tags=\["gflownet","experiment_X"\]`.
 
 If no tags are provided, you will be asked to input them from command line:
 
@@ -482,12 +482,8 @@ Suggestions for improvements are always welcome!
 All PyTorch Lightning modules are dynamically instantiated from module paths specified in config. Example model config:
 
 ```yaml
-_target_: src.models.retriever_module.RetrieverModule
-model_cfg:
-  model_type: evidential
-  emb_dim: 256
-loss_cfg:
-  type: edl
+_target_: src.models.gflownet_module.GFlowNetModule
+hidden_dim: 1024
 ```
 
 Using this config we can instantiate the object with the following line:
@@ -501,7 +497,7 @@ This allows you to easily iterate over new models! Every time you create a new o
 Switch between models and datamodules with command line arguments:
 
 ```bash
-python train.py model=retriever
+python train.py model=gflownet_module data=g_retrieval
 ```
 
 Example pipeline managing the instantiation logic: [src/train.py](src/train.py).
@@ -522,8 +518,8 @@ It determines how config is composed when simply executing command `python train
 defaults:
   - _self_
   - dataset: webqsp
-  - data: retriever
-  - model: deterministic_bce
+  - data: g_retrieval
+  - model: gflownet_module
   - callbacks: default
   - logger: wandb
   - trainer: default
@@ -587,15 +583,15 @@ For example, you can use them to version control best hyperparameters for each c
 
 defaults:
   - override /dataset: webqsp
-  - override /data: retriever
-  - override /model: deterministic_bce
+  - override /data: g_retrieval
+  - override /model: gflownet_module
   - override /callbacks: default
   - override /trainer: standard
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-tags: ["retrieval", "retriever"]
+tags: ["gflownet"]
 
 seed: 12345
 
@@ -617,21 +613,21 @@ data:
 logger:
   wandb:
     tags: ${tags}
-    group: "retrieval"
+    group: "gflownet"
 ```
 
 预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
-- 训练（`experiment=`）：`train_retriever`, `train_gflownet`
-- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_retriever`, `eval_gflownet`, `export_gflownet`, `reasoner_oracle`, `reasoner_paths`, `reasoner_triplet`
+- 训练（`experiment=`）：`train_mpm_rag`
+- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_gflownet`, `export_gflownet`
 
-数据构建（Retriever，triple-only 监督，不提供任何回退）：
-- `scripts/build_retrieval_pipeline.py` 一步完成 normalized parquet + LMDB；最短路监督为 **undirected**，不做 relation canonicalization，前置编码 entity/relation/question embeddings（`questions.parquet` 含 `question_emb`）。
+数据构建（g_retrieval）：
+- `scripts/build_retrieval_pipeline.py` 一步完成 normalized parquet + LMDB；以全图 PPR 采样得到 `g_retrieval`，仅保留图结构、问题 embedding、起点/答案节点索引与答案实体 ID。
 - 若已有旧缓存/旧 parquet，必须完整重建该流程，否则会 fail-fast。
 
 一致性设计要点：
-- 预处理阶段固定使用无向 BFS，并按 `(start, answer)` 对存储最短路 DAG（`pair_*` CSR 结构）。
-- Retriever 使用双视图打分 `max(fwd, bwd)`，GFlowNet 在有向图上通过 `backward_mask` + `direction` embedding 动态反向推理。
-- 详细说明见 `docs/undirected-bfs-supervision.md`。
+- 训练阶段仅消费 `g_retrieval`（LMDB）；评估/推理仅生成 `eval_gflownet` 缓存。
+- 假设 `g_retrieval` 覆盖完整证据，不可达样本视为数据错误并应剔除。
+- GFlowNet 动作空间通过随机采样 + 结构掩码构建，不再使用确定性 TopK。
 
 ```bash
 python scripts/build_retrieval_pipeline.py dataset=webqsp paths=default
@@ -640,16 +636,12 @@ python scripts/build_retrieval_pipeline.py dataset=webqsp paths=default
 评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：
 
 ```bash
-# 1) Retriever 产物：g_agent + eval_retriever cache（供 oracle/reasoner）
-python src/eval.py experiment=eval_retriever dataset=webqsp ckpt.retriever=/path/to/retriever.ckpt
-
-# 2) GFlowNet 产物：eval_gflownet rollouts（供 paths reasoner）
+# GFlowNet 产物：eval_gflownet rollouts
 python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt
 
-# 3) Oracle upper bound / reasoner
-python src/eval.py experiment=reasoner_oracle dataset=webqsp
-python src/eval.py experiment=reasoner_paths dataset=webqsp model=reasoner/ollama
-python src/eval.py experiment=reasoner_triplet dataset=webqsp model=reasoner/ollama
+# GFlowNet greedy 评估（temperature=0，单 rollout）
+python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt \
+  model.evaluation_cfg.num_eval_rollouts=1 model.evaluation_cfg.rollout_temperature=0.0
 ```
 
 </details>
@@ -660,7 +652,7 @@ python src/eval.py experiment=reasoner_triplet dataset=webqsp model=reasoner/oll
 
 **Basic workflow**
 
-1. Write your PyTorch Lightning module (see [models/retriever_module.py](src/models/retriever_module.py) for example)
+1. Write your PyTorch Lightning module (see [models/gflownet_module.py](src/models/gflownet_module.py) for example)
 2. Write your PyTorch Lightning datamodule (see [data/g_retrieval_datamodule.py](src/data/g_retrieval_datamodule.py) for example)
 3. Write your experiment config, containing paths to model and datamodule
 4. Run training with chosen experiment config:
@@ -729,7 +721,7 @@ You can use many of them at once (see [configs/logger/many_loggers.yaml](configs
 
 You can also write your own logger.
 
-Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the retriever example](src/models/retriever_module.py).
+Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the GFlowNet example](src/models/gflownet_module.py).
 
 <br>
 
@@ -809,7 +801,7 @@ hydra:
 
 </details>
 
-Next, execute it with: `python train.py -m hparams_search=retriever_optuna`
+Next, execute it with: `python train.py -m hparams_search=<name>`
 
 Using this approach doesn't require adding any boilerplate to code, everything is defined in a single config file. The only necessary thing is to return the optimized metric value from the launch file.
 
@@ -876,7 +868,7 @@ some_param: ${data.some_param}
 Another approach is to access datamodule in LightningModule directly through Trainer:
 
 ```python
-# ./src/models/retriever_module.py
+# ./src/models/gflownet_module.py
 def on_train_start(self):
   self.some_param = self.trainer.datamodule.some_param
 ```
@@ -1125,7 +1117,7 @@ pip install git+git://github.com/YourGithubName/your-repo-name.git --upgrade
 So any file can be easily imported into any other file like so:
 
 ```python
-from project_name.models.retriever_module import RetrieverModule
+from project_name.models.gflownet_module import GFlowNetModule
 from project_name.data.g_retrieval_datamodule import GRetrievalDataModule
 ```
 

@@ -17,13 +17,6 @@ defaults:
   - hydra: default
   - experiment: null 
 
-  # config for hyperparameter optimization
-  - hparams_search: null
-
-  # optional local config for machine/user specific settings
-  # it's optional since it doesn't need to exist and is excluded from version control
-  - optional local: default
-
 # task name, determines output directory path
 task_name: "train"
 

@@ -57,9 +57,13 @@ class GRetrievalDataModule(LightningDataModule):
         num_workers: int,
         pin_memory: bool = True,
         drop_last: bool = True,
+        train_shuffle: bool = True,
         prefetch_factor: int = 2,
         persistent_workers: bool = False,
         worker_embed_lookup: bool = False,
+        precompute_edge_batch: bool = False,
+        precompute_node_in_degree: bool = False,
+        embeddings_device: str | None = None,
         splits: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
@@ -83,11 +87,15 @@ class GRetrievalDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.drop_last = drop_last
+        self.train_shuffle = bool(train_shuffle)
         self.persistent_workers = persistent_workers
         self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
         self.worker_embed_lookup = bool(worker_embed_lookup)
+        self.precompute_edge_batch = bool(precompute_edge_batch)
+        self.precompute_node_in_degree = bool(precompute_node_in_degree)
+        self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
 
-        # Default splits mapping if not provided in `data/retriever.yaml`
+        # Default splits mapping if not provided in `data/g_retrieval.yaml`
         self.splits = splits or {"train": "train", "validation": "validation", "test": "test"}
         # 3. Runtime State
         self.train_dataset: Optional[GRetrievalDataset] = None
@@ -140,6 +148,7 @@ class GRetrievalDataModule(LightningDataModule):
             self._shared_resources = SharedDataResources(
                 vocabulary_path=Path(paths["vocabulary"]),
                 embeddings_dir=Path(paths["embeddings"]),
+                embeddings_device=self.embeddings_device,
             )
 
         # 3. Instantiate Datasets
@@ -165,7 +174,7 @@ class GRetrievalDataModule(LightningDataModule):
             )
 
     def train_dataloader(self):
-        return self._build_loader(self.train_dataset, shuffle=True, drop_last=self.drop_last)
+        return self._build_loader(self.train_dataset, shuffle=self.train_shuffle, drop_last=self.drop_last)
 
     def val_dataloader(self):
         return self._build_loader(self.val_dataset, shuffle=False, drop_last=False)
@@ -174,7 +183,7 @@ class GRetrievalDataModule(LightningDataModule):
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
 
     def predict_dataloader(self) -> UnifiedDataLoader:
-        # Support for GAgent generation pipeline
+        # Predict reuses the test split.
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
 
     def train_eval_dataloader(self) -> UnifiedDataLoader:
@@ -215,5 +224,8 @@ class GRetrievalDataModule(LightningDataModule):
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,
             worker_embed_lookup=self.worker_embed_lookup,
+            precompute_edge_batch=self.precompute_edge_batch,
+            precompute_node_in_degree=self.precompute_node_in_degree,
+            embeddings_device=self.embeddings_device,
             random_seed=self.dataset_cfg.get("random_seed"),
         )

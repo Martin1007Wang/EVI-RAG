@@ -6,6 +6,10 @@ root_dir: ${oc.env:PROJECT_ROOT,${oc.env:PWD}}
 # path to data directory (absolute to avoid ambiguity)
 data_dir: /mnt/data/retrieval_dataset
 
+# huggingface cache root (datasets expects ${paths.hf_home}/datasets)
+hf_home: /mnt/data/huggingface
+hf_datasets_cache: ${paths.hf_home}/datasets
+
 # path to logging directory
 log_dir: ${paths.root_dir}/logs/
 

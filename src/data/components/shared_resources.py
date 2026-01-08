@@ -20,9 +20,10 @@ class SharedDataResources:
     lightning-hydra-template style ``components`` that Hydra can instantiate.
     """
 
-    def __init__(self, *, vocabulary_path: Path, embeddings_dir: Path) -> None:
+    def __init__(self, *, vocabulary_path: Path, embeddings_dir: Path, embeddings_device: Optional[str] = None) -> None:
         self.vocabulary_path = Path(vocabulary_path).expanduser().resolve()
         self.embeddings_dir = Path(embeddings_dir).expanduser().resolve()
+        self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
         self._graph_store: Optional[GraphStore] = None
         self._global_embeddings: Optional[GlobalEmbeddingStore] = None
 
@@ -38,6 +39,7 @@ class SharedDataResources:
             self._global_embeddings = GlobalEmbeddingStore(
                 embeddings_dir=self.embeddings_dir,
                 vocabulary_path=self.vocabulary_path,
+                device=self.embeddings_device,
             )
         return self._global_embeddings
 

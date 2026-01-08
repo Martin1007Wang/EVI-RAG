@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -8,6 +9,26 @@ import torch
 from tqdm import tqdm
 
 ENCODER_EPS = 1e-6
+
+
+def _configure_hf_cache_env() -> None:
+    if os.environ.get("HF_HOME"):
+        return
+    legacy_cache = os.environ.get("TRANSFORMERS_CACHE")
+    if not legacy_cache:
+        return
+    os.environ["HF_HOME"] = legacy_cache
+    os.environ.pop("TRANSFORMERS_CACHE", None)
+
+
+def _configure_tokenizers_parallelism() -> None:
+    if os.environ.get("TOKENIZERS_PARALLELISM"):
+        return
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+_configure_hf_cache_env()
+_configure_tokenizers_parallelism()
 
 
 class TextEncoder:
@@ -77,6 +98,7 @@ def encode_to_memmap(
     desc: Optional[str],
     show_progress: bool,
 ) -> torch.Tensor:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     if max_embedding_id < 0:
         return torch.empty((0, 0), dtype=torch.float32)
     if len(texts) != len(emb_ids):

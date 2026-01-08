@@ -4,13 +4,11 @@ tags: []
 split: test
 run_all_splits: false
 splits: [train, validation, test]
-score_temperature: 1.0
-edge_score_mode: node_softmax
 start_keep_ratio: 0.25
 start_min_edges: 1
 start_max_edges: null
 ckpt_path: null
 dataset_variants: null
-require_dual_datasets: false
+require_dual_datasets: true
 dataset_variant: null
 eval_mode: predict

@@ -1,9 +1,0 @@
-_target_: src.models.reasoner_module.ReasonerModule
-
-mode: oracle
-
-dataset: ${data.dataset}
-split: ${data.split}
-output_dir: ${paths.output_dir}
-k_values: ${data.k_values}
-prompt_tag: ${data.prompt_tag}

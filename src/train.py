@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -36,18 +35,12 @@ from src.utils import (
     instantiate_loggers,
     log_hyperparameters,
     task_wrapper,
+    apply_run_name,
 )
-
-from src.utils.run_context import apply_run_name
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
-def _is_missing_value(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
-        return True
-    return False
+_GFLOWNET_MODEL_TARGET = "src.models.gflownet_module.GFlowNetModule"
 
 
 def _validate_gflownet_required_args(cfg: DictConfig) -> None:
@@ -55,10 +48,7 @@ def _validate_gflownet_required_args(cfg: DictConfig) -> None:
     data_cfg = cfg.get("data")
     model_target = model_cfg.get("_target_") if model_cfg else ""
     data_target = data_cfg.get("_target_") if data_cfg else ""
-    is_gflownet = (
-        model_target == "src.models.gflownet_module.GFlowNetModule"
-        or data_target == "src.data.g_agent_datamodule.GAgentDataModule"
-    )
+    is_gflownet = model_target == "src.models.gflownet_module.GFlowNetModule"
     if not is_gflownet:
         return
 
@@ -66,21 +56,23 @@ def _validate_gflownet_required_args(cfg: DictConfig) -> None:
     if cfg.get("dataset") is None:
         missing.append("dataset")
 
-    embedder_cfg = model_cfg.get("embedder_cfg") if model_cfg else None
-    allow_deferred = bool(embedder_cfg.get("allow_deferred_init", False)) if embedder_cfg else False
-    ckpt_cfg = cfg.get("ckpt") or {}
-    retriever_ckpt = ckpt_cfg.get("retriever") if hasattr(ckpt_cfg, "get") else None
-    if not allow_deferred and _is_missing_value(retriever_ckpt):
-        missing.append("ckpt.retriever")
-
     if missing:
         missing_str = ", ".join(missing)
         raise ValueError(
             "Missing required GFlowNet inputs: "
-            f"{missing_str}. Please specify both `dataset=<name>` and "
-            "`ckpt.retriever=/path/to/retriever.ckpt` for GFlowNet training. "
-            "Example: python src/train.py experiment=train_gflownet "
-            "dataset=webqsp ckpt.retriever=/path/to/epoch_003.ckpt"
+            f"{missing_str}. Please specify `dataset=<name>` for GFlowNet training. "
+            "Example: python src/train.py experiment=train_mpm_rag dataset=webqsp-sub"
+        )
+
+
+def _enforce_gflownet_training_only(cfg: DictConfig) -> None:
+    model_cfg = cfg.get("model") or {}
+    model_target = str(model_cfg.get("_target_", "") or "")
+    if model_target != _GFLOWNET_MODEL_TARGET:
+        raise ValueError(
+            "Energy GFlowNet-only training is enforced; non-GFlowNet branches are disabled. "
+            f"Got model._target_={model_target!r}. "
+            f"Use experiment=train_mpm_rag with model._target_={_GFLOWNET_MODEL_TARGET}."
         )
 
 
@@ -107,44 +99,18 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
     dataset_cfg = cfg.get("dataset") or {}
     scope = _normalize_dataset_scope(dataset_cfg)
     model_cfg = cfg.get("model") or {}
-    data_cfg = cfg.get("data") or {}
     model_target = str(model_cfg.get("_target_", ""))
-    data_target = str(data_cfg.get("_target_", ""))
-    is_retriever = (
-        model_target == "src.models.retriever_module.RetrieverModule"
-        or data_target == "src.data.g_retrieval_datamodule.GRetrievalDataModule"
-    )
-    is_gflownet = (
-        model_target == "src.models.gflownet_module.GFlowNetModule"
-        or data_target == "src.data.g_agent_datamodule.GAgentDataModule"
-    )
-    if (is_retriever or is_gflownet) and scope != "sub":
+    is_gflownet = model_target == "src.models.gflownet_module.GFlowNetModule"
+    if is_gflownet and scope != "sub":
         dataset_name = ""
         if isinstance(dataset_cfg, DictConfig):
             dataset_name = str(dataset_cfg.get("name", "") or "")
         elif isinstance(dataset_cfg, dict):
             dataset_name = str(dataset_cfg.get("name", "") or "")
         raise ValueError(
-            "Training scope violation: retriever/GFlowNet training must use sub datasets only. "
+            "Training scope violation: GFlowNet training must use sub datasets only. "
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
         )
-    if is_retriever and scope == "sub":
-        sample_filter_path = None
-        if isinstance(dataset_cfg, DictConfig):
-            sample_filter_path = dataset_cfg.get("sample_filter_path")
-        elif isinstance(dataset_cfg, dict):
-            sample_filter_path = dataset_cfg.get("sample_filter_path")
-        if _is_missing_value(sample_filter_path):
-            raise ValueError(
-                "Sub-scope retriever training requires `sample_filter_path` to sub_filter.json. "
-                "Set dataset.sample_filter_path to the emitted sub filter."
-            )
-        filter_path = Path(str(sample_filter_path)).expanduser()
-        if not filter_path.exists():
-            raise FileNotFoundError(
-                "Sub-scope retriever training requires an existing sub_filter.json at "
-                f"{filter_path}."
-            )
 
 
 @task_wrapper
@@ -242,6 +208,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     _validate_gflownet_required_args(cfg)
+    _enforce_gflownet_training_only(cfg)
     _enforce_sub_training_scope(cfg)
     extras(cfg)
 

@@ -1,0 +1,4 @@
+defaults:
+  - gflownet_rollout_artifact_writer
+  - gflownet_eval_metrics
+  - _self_

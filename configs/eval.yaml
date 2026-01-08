@@ -15,7 +15,6 @@ defaults:
   - extras: default
   - hydra: default
   - experiment: null
-  - optional local: default
 
 task_name: ${run.task_name}
 tags: ${run.tags}

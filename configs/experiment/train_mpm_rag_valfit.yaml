@@ -1,0 +1,62 @@
+# @package _global_
+#
+# EB-GFN debug: train/val on validation split for fast verification.
+
+defaults:
+  - override /data: g_retrieval
+  - override /model: gflownet_module
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /trainer: gpu
+
+task_name: "eb_gfn_valfit"
+tags: ["gflownet", "energy", "debug", "valfit"]
+train: true
+test: false
+ckpt_path: null
+seed: 42
+optimized_metric: "val/context_f1@${model.evaluation_cfg.num_eval_rollouts}"
+
+data:
+  splits:
+    train: validation
+    validation: validation
+    test: validation
+
+trainer:
+  check_val_every_n_epoch: 1
+
+model:
+  training_cfg:
+    num_train_rollouts: 3
+
+  optimizer_cfg:
+    type: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+
+  scheduler_cfg:
+    type: cosine_restart
+    t_0: 10
+    t_mult: 2
+    eta_min: 1.0e-6
+    interval: epoch
+
+  evaluation_cfg:
+    num_eval_rollouts: 1
+    rollout_temperature: 0.2
+
+  actor_cfg:
+    policy_temperature: 0.2
+
+callbacks:
+  model_checkpoint:
+    monitor: val/context_f1@${model.evaluation_cfg.num_eval_rollouts}
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: val/context_f1@${model.evaluation_cfg.num_eval_rollouts}
+    mode: max
+    patience: 50

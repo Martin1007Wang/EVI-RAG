@@ -7,14 +7,14 @@
 结论先行：
 1) **节点级 BFS**（只做可达性/最短路）不会组合爆炸；  
 2) 会爆炸的是**路径级枚举**（需要输出“多条候选路径/子图证据”且推理时未知答案），这才是与 GFlowNet Rollout 可比的 baseline；  
-3) GFlowNet 的价值是把“在巨大路径空间里找高奖励轨迹”的代价**摊销到训练**，推理时用固定预算采样获得更高的 `success@K / answer_hit_any@K`，从而在同样窗口预算下提升 `S_ret^{vis}` 与 `Acc_hit`。
+3) GFlowNet 的价值是把“在巨大路径空间里找高奖励轨迹”的代价**摊销到训练**，推理时用固定预算采样获得更高的 `hit@K`，从而在同样窗口预算下提升 `S_ret^{vis}` 与 `Acc_hit`。
 
 ---
 
 ### 0. 统一对象：把“证据生成”视为算子
-对每个样本 \(i\)，我们把 retriever 产生的子图（或其派生缓存）视为给证据选择器的输入：
+对每个样本 \(i\)，我们把 g_retrieval 采样得到的子图（或其派生缓存）视为给证据选择器的输入：
 
-- \(G_i=(V_i,E_i)\)：retriever 子图（例如 Top-\(K_e\) 边，经 `g_agent` 物化后的局部图）。
+- \(G_i=(V_i,E_i)\)：g_retrieval 子图（例如 Top-\(K_e\) 边，来自 `g_retrieval` 物化缓存）。
 - \(S_i\subseteq V_i\)：起点集合（seed entities，对应 `start_node_locals`）。
 - \(\mathcal{A}_i\subseteq V_{\text{global}}\)：答案实体集合（**推理时不可用**；离线评测时可用）。
 
@@ -24,7 +24,7 @@ $$ \mathcal{G}_\theta:\ (q_i, G_i, S_i)\ \mapsto\ \mathcal{E}_i $$
 - **边集合**（triplets）：\(\mathcal{E}_i \subseteq E_i\)
 - **路径集合**：\(\mathcal{E}_i = \{P_{i,1},\dots,P_{i,m}\}\)，每条路径是边序列
 
-后续所有 baseline（Retriever-TopK / BFS / Beam / GFlowNet）只是不同的 \(\mathcal{G}_\theta\) 实例；评测必须在同一预算与同一接口定义下进行，否则比较不成立。
+后续所有 baseline（Edge-TopK / BFS / Beam / GFlowNet）只是不同的 \(\mathcal{G}_\theta\) 实例；评测必须在同一预算与同一接口定义下进行，否则比较不成立。
 
 ---
 
@@ -58,11 +58,11 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 #### 2.2 Non-oracle baselines（可部署，推理时不看答案）
 这些才是与 GFlowNet 可公平比较的 baseline：
 
-1) **Retriever-TopK（边集合基线）**  
+1) **Edge-TopK（边集合基线）**  
 直接取 Top-\(K_e\) 边（或其 union/dedup），不显式建路径结构。
 
 2) **BFS-frontier（节点级扩展 → 选边）**  
-从 \(S_i\) 做深度限制 BFS 到 \(L\)，收集被访问到的边，再按某种启发式选出 \(K_e\) 条边作为证据（例如按 retriever score 排序、或按层次优先）。
+从 \(S_i\) 做深度限制 BFS 到 \(L\)，收集被访问到的边，再按某种启发式选出 \(K_e\) 条边作为证据（例如按 edge score 排序、或按层次优先）。
 它不爆炸，但通常“噪声大”：可达边集合迅速增大，窗口预算下易稀释关键边。
 
 3) **Beam search（路径级近似枚举）**  
@@ -95,8 +95,8 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 
 #### 4.1 无 LLM（只评“证据选择质量”）
 这层用来直接展示 GFlowNet 的采样优势，避免 LLM 噪声掩盖信号：
-- `success@K`：\(K_s\) 次 rollouts/paths 中是否至少命中一个答案实体（离线用 \(\mathcal{A}_i\) 判断）
-- `answer_hit_any@K`、`answer_recall_union@K`：多答案覆盖的并集指标
+- `hit@K`：\(K_s\) 次 rollouts/paths 中是否至少命中一个答案实体（离线用 \(\mathcal{A}_i\) 判断）
+- `answer_recall@K`：多答案覆盖的并集指标
 - `path_hit_any@K` / `path_hit_f1@k`：若存在 GT path，则评测与 GT 的重合（注意这不是 reward 必然优化的目标）
 
 #### 4.2 有 LLM（回到 Semantic Dissipation 的账本）
@@ -108,10 +108,8 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 ---
 
 ### 5. 在本仓库中的落点（数据/产物）
-本项目中，GFlowNet 训练与评测消费的是 `g_agent` 缓存（唯一持久化 schema）：
-- 生成：`experiment=eval_retriever` → `${dataset.materialized_dir}/g_agent/<split>_g_agent.pt`
+本项目中，训练只读取 `g_retrieval`（LMDB）；评估/推理只使用 `eval_gflownet` 缓存：
 - GFlowNet 评测：`experiment=eval_gflownet` → `${dataset.materialized_dir}/eval_gflownet/<split>.jsonl`
-- Retriever 评测缓存：`experiment=eval_retriever` → `${dataset.materialized_dir}/eval_retriever/<split>.pt`
 
 建议把 BFS/Beam baselines 的产物也做成“可解析缓存”，并沿用相同的下游评测接口（truth/LLM stages 只看缓存，不关心生成器来自哪里）。这样才符合“算子/变量分离”的可组合性。
 
@@ -121,7 +119,7 @@ $$\#\text{paths}\ \approx\ O(b^L)$$
 建议至少做两张图 + 一张表：
 
 1) **固定证据预算（\(K_e\) 或 \(B\)），扫搜索预算**：  
-横轴 \(K_s\)（rollouts）或 Beam 宽度 \(W\)，纵轴 `answer_hit_any@K / success@K`。  
+横轴 \(K_s\)（rollouts）或 Beam 宽度 \(W\)，纵轴 `hit@K`。  
 你会看到：Beam 在小预算下要么性能差，要么必须爆算力；GFlowNet 在固定 \(K_s\) 下更快贴近上界。
 
 2) **固定搜索预算，扫 token 预算 \(B\)**：  

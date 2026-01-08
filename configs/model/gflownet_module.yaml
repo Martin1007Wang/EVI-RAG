@@ -2,61 +2,58 @@ defaults:
   - _self_
 
 _target_: src.models.gflownet_module.GFlowNetModule
-_recursive_: false
+_recursive_: true
 
 hidden_dim: 1024
-env_cfg:
-  _target_: src.models.components.gflownet_env.GraphEnv
-  max_steps: 2
-  stop_on_answer: true
-
-policy_cfg:
-  _target_: src.models.components.gflownet_policy.GFlowNetEdgePolicy
+emb_dim: 1024
+backbone_finetune: true
+vocabulary_path: ${dataset.paths.vocabulary}
+edge_score_cfg:
   hidden_dim: ${model.hidden_dim}
+  num_layers: 2
   dropout: 0.1
+  bias_init: 0.0
+state_cfg:
+  state_dim: ${model.hidden_dim}
+  dropout: 0.0
+
+env:
+  _target_: src.models.components.gflownet_env.GraphEnv
+  max_steps: ${dataset.max_steps}
+  stop_on_answer: false
+  min_stop_steps: 0
+
+policy:
+  _target_: src.models.components.gflownet_policy.EnergyEdgePolicy
+  hidden_dim: ${model.hidden_dim}
+
+reward_fn:
+  _target_: src.models.components.gflownet_reward.GraphFusionReward
+  hard_target_bonus: 1.0
+  min_log_reward: -10.0
+  potential_weight: 1.0
+  potential_gamma: 1.0
+  potential_unreachable_offset: 1.0
 
 reward_cfg:
-  _target_: src.models.components.gflownet_rewards.GFlowNetReward
-  success_reward: 1.0
-  failure_reward: 1e-4
-  semantic_coef: 1.0
-  length_coef: 1.0
+  embedding_source: raw
+  potential_weight_end: 0.0
+  potential_weight_decay_epochs: ${trainer.min_epochs}
 
 actor_cfg:
-  _target_: src.models.components.gflownet_actor.GFlowNetActor
   policy_temperature: 1.0
-
-embedder_cfg:
-  _target_: src.models.components.gflownet_embedder.GraphEmbedder
-  hidden_dim: ${model.hidden_dim}
-  projector_checkpoint: ${ckpt.retriever}
-  allow_deferred_init: false
-
-state_encoder_cfg:
-  _target_: src.models.components.state_encoder.StateEncoder
-  hidden_dim: ${model.hidden_dim}
-  max_steps: ${model.env_cfg.max_steps}
-  use_state_dde: true
-  state_dde_cfg:
-    num_topics: ${dataset.num_topics}
-    num_rounds: ${dataset.topic_pe.num_rounds}
-    num_reverse_rounds: ${dataset.topic_pe.num_reverse_rounds}
-
-estimator_cfg:
-  _target_: src.models.components.gflownet_estimator.GFlowNetEstimator
-  hidden_dim: ${model.hidden_dim}
-  zero_init_last: true
+  check_finite: false
 
 training_cfg:
-  num_train_rollouts: 1
-  bc_weight: 0.0
-  bc_weight_floor: 0.0
-  bc_hold_ratio: 0.0
-  bc_decay_ratio: 0.0
+  num_train_rollouts: ${dataset.num_train_rollouts}
+
+runtime_cfg:
+  validate_edge_batch: true
+  vectorized_rollouts: ${dataset.vectorized_rollouts}
 
 evaluation_cfg:
-  num_eval_rollouts: 5
-  rollout_temperature: 1.0
+  num_eval_rollouts: ${dataset.num_eval_rollouts}
+  rollout_temperature: 0.0
 
 optimizer_cfg:
   type: adamw
@@ -68,9 +65,3 @@ scheduler_cfg:
   t_max: 200
   eta_min: 1.0e-6
   interval: epoch
-  monitor: val/answer_hit@1
-
-logging_cfg:
-  train_prog_bar: ["log_reward", "answer_hit"]
-  eval_prog_bar: ["answer_hit@1"]
-  log_on_step_train: false
