@@ -11,6 +11,6 @@ while ps -p "${PID}" > /dev/null 2>&1; do
   sleep "${CHECK_SECS}"
 done
 
-echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") PID ${PID} ended. Starting cwq-sub mpm training."
+echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") PID ${PID} ended. Starting cwq-sub gflownet training."
 cd "${ROOT_DIR}"
-python src/train.py experiment=train_mpm_rag dataset=cwq-sub model.env_cfg.max_steps=7
+python src/train.py experiment=train_gflownet dataset=cwq-sub model.env_cfg.max_steps=7

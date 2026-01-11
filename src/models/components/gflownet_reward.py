@@ -18,6 +18,8 @@ _DEFAULT_STEP_BIAS = 0.0
 _DEFAULT_POTENTIAL_WEIGHT = 0.0
 _DEFAULT_POTENTIAL_GAMMA = 1.0
 _POTENTIAL_UNREACHABLE_OFFSET = 1.0
+_DEFAULT_POTENTIAL_SCHEDULE = "linear"
+_DEFAULT_POTENTIAL_WEIGHT_END = 0.0
 
 
 @dataclass
@@ -42,6 +44,10 @@ class GraphFusionReward(nn.Module):
         potential_weight: float = _DEFAULT_POTENTIAL_WEIGHT,
         potential_gamma: float = _DEFAULT_POTENTIAL_GAMMA,
         potential_unreachable_offset: float = _POTENTIAL_UNREACHABLE_OFFSET,
+        potential_schedule: str = _DEFAULT_POTENTIAL_SCHEDULE,
+        potential_weight_end: float = _DEFAULT_POTENTIAL_WEIGHT_END,
+        potential_anneal_epochs: int | None = None,
+        potential_pure_phase_ratio: float | None = None,
     ) -> None:
         super().__init__()
         self.hard_target_bonus = float(hard_target_bonus)
@@ -50,6 +56,10 @@ class GraphFusionReward(nn.Module):
         self.potential_weight = float(potential_weight)
         self.potential_gamma = float(potential_gamma)
         self.potential_unreachable_offset = float(potential_unreachable_offset)
+        self.potential_schedule = str(potential_schedule)
+        self.potential_weight_end = float(potential_weight_end)
+        self.potential_anneal_epochs = potential_anneal_epochs
+        self.potential_pure_phase_ratio = potential_pure_phase_ratio
         if self.hard_target_bonus < float(_ZERO):
             raise ValueError("hard_target_bonus must be >= 0.")
         if self.potential_weight < float(_ZERO):
@@ -62,8 +72,6 @@ class GraphFusionReward(nn.Module):
     def forward(
         self,
         *,
-        node_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
         edge_index: torch.Tensor,
         start_node_locals: torch.Tensor,
         start_ptr: torch.Tensor,
@@ -76,10 +84,8 @@ class GraphFusionReward(nn.Module):
         dummy_mask: torch.Tensor | None = None,
         **_,
     ) -> RewardOutput:
-        node_tokens = node_tokens.detach()
-        question_tokens = question_tokens.detach()
         num_graphs = int(node_ptr.numel() - 1)
-        device = node_tokens.device
+        device = node_ptr.device
 
         stop_globals, valid_stop = self._resolve_stop_nodes(
             stop_node_locals=stop_node_locals,

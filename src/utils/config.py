@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from importlib.util import find_spec
 from pathlib import Path
@@ -30,7 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover
     rich = None
     Prompt = None
 
-from .logging import RankedLogger
+from .logging_utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -197,6 +198,8 @@ def extras(cfg: DictConfig) -> None:
 
     :param cfg: A DictConfig object containing the config tree.
     """
+    _configure_hf_cache(cfg)
+
     # return if no `extras` config
     if not cfg.get("extras"):
         log.warning("Extras config not found! <cfg.extras=null>")
@@ -222,6 +225,21 @@ def extras(cfg: DictConfig) -> None:
     if cfg.extras.get("print_config"):
         log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
         print_config_tree(cfg, resolve=True, save_to_file=True)
+
+
+def _configure_hf_cache(cfg: DictConfig) -> None:
+    paths = cfg.get("paths")
+    if paths is None:
+        return
+    hf_home = paths.get("hf_home")
+    hf_datasets_cache = paths.get("hf_datasets_cache")
+    if hf_home:
+        os.environ["HF_HOME"] = str(hf_home)
+    if hf_datasets_cache:
+        os.environ["HF_DATASETS_CACHE"] = str(hf_datasets_cache)
+    if "TRANSFORMERS_CACHE" in os.environ:
+        os.environ.pop("TRANSFORMERS_CACHE", None)
+        log.info("Unset TRANSFORMERS_CACHE; using HF_HOME=%s", os.environ.get("HF_HOME"))
 
 
 def task_wrapper(task_func: Callable) -> Callable:

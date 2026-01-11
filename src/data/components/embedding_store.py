@@ -7,8 +7,9 @@ import lmdb
 import torch
 
 from src.data.io.lmdb_utils import _deserialize_sample
+from src.utils.logging_utils import get_logger, log_event
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 _LMDB_STAT_ENTRIES_KEY = "entries"
 
 class GlobalEmbeddingStore:
@@ -42,19 +43,18 @@ class GlobalEmbeddingStore:
         # adjacent relation embeddings in the dataloader. Warn only if empty.
         rows = self.entity_embeddings.size(0)
         if rows <= 1:
-            logger.warning(
-                "Entity embedding table has <=1 row (rows=%d). "
-                "Non-text entities use embedding_id=0 and relation-neighbor embeddings, "
-                "but textual entities would be missing.",
-                rows,
+            log_event(
+                logger,
+                "entity_embedding_rows_low",
+                level=logging.WARNING,
+                rows=rows,
             )
         else:
-            logger.info(
-                "Entity embedding rows: %d (vocab entities: %d). "
-                "Non-text entities use embedding_id=0 and relation-neighbor embeddings; "
-                "textual entities occupy 1..max_id.",
-                rows,
-                self.num_total_entities,
+            log_event(
+                logger,
+                "entity_embedding_rows",
+                rows=rows,
+                vocab_entities=self.num_total_entities,
             )
 
     def clear_device_cache(self) -> None:
@@ -75,13 +75,22 @@ class GlobalEmbeddingStore:
                         return len(labels)
             return 0
         except Exception as e:
-            logger.warning(f"Failed to read vocab size: {e}")
+            log_event(
+                logger,
+                "vocab_size_read_failed",
+                level=logging.WARNING,
+                error=str(e),
+            )
             return 0
 
     def _load_tensor(self, path: Path) -> torch.Tensor:
         if not path.exists():
             raise FileNotFoundError(f"Embedding file missing: {path}")
-        logger.info(f"Loading {path}...")
+        log_event(
+            logger,
+            "embedding_load_start",
+            path=str(path),
+        )
         # map_location='cpu' is crucial to avoid VRAM OOM
         try:
             tensor = torch.load(path, map_location="cpu", mmap=True)

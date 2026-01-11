@@ -209,6 +209,11 @@ class GraphEnv(nn.Module):
         return forward_mask | backward_mask
 
     def candidate_edge_masks(self, state: GraphState) -> tuple[torch.Tensor, torch.Tensor]:
+        forward_mask = self.forward_edge_mask(state)
+        backward_mask = self.backward_edge_mask(state)
+        return forward_mask, backward_mask
+
+    def forward_edge_mask(self, state: GraphState) -> torch.Tensor:
         edge_batch = state.graph.edge_batch
         horizon_exhausted = state.step_counts[edge_batch] >= self.max_steps
         base = (~state.done[edge_batch]) & (~horizon_exhausted)
@@ -218,9 +223,20 @@ class GraphEnv(nn.Module):
         visited = state.visited_nodes
         head_active = active[heads]
         next_from_head = head_active & (~visited[tails])
-        move_mask = base & next_from_head
-        # Directed action space: only forward edges are valid.
-        return move_mask, torch.zeros_like(move_mask, dtype=torch.bool)
+        return base & next_from_head
+
+    def backward_edge_mask(self, state: GraphState) -> torch.Tensor:
+        edge_index = state.graph.edge_index
+        edge_batch = state.graph.edge_batch
+        base = ~state.done[edge_batch]
+        heads = edge_index[0]
+        tails = edge_index[1]
+        active = state.active_nodes
+        visited = state.visited_nodes
+        head_active = active[heads]
+        tail_active = active[tails]
+        parent_from_tail = tail_active & visited[heads]
+        return base & parent_from_tail & (~head_active)
 
     def step(
         self,

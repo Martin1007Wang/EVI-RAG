@@ -9,21 +9,25 @@ from torch import nn
 from torch_scatter import scatter_max
 
 from src.models.components.gflownet_env import GraphEnv, STOP_EDGE_RELATION, STOP_RELATION
-from src.utils.gfn import compute_policy_log_probs, gumbel_noise_like, neg_inf_value
+from src.gfn.ops import compute_factorized_log_probs, gumbel_noise_like, neg_inf_value
 
 MIN_TEMPERATURE = 1e-5
 _STOP_STEP_OFFSET = 1
 _STOP_NODE_NONE = -1
 _DEFAULT_CHECK_FINITE = True
+_DEFAULT_DEGREE_LOGIT_PENALTY = 0.0
 _STOP_LOGIT_DIM = 1
+_EDGE_HEAD_INDEX = 0
+_EDGE_TAIL_INDEX = 1
 _ZERO = 0
 _ONE = 1
+_NAN = float("nan")
 
 
 @dataclass(frozen=True)
 class RolloutResult:
-    actions_seq: torch.Tensor
-    directions_seq: torch.Tensor
+    actions_seq: Optional[torch.Tensor]
+    directions_seq: Optional[torch.Tensor]
     log_pf: torch.Tensor
     log_pf_steps: torch.Tensor
     log_pb_steps: torch.Tensor
@@ -33,23 +37,32 @@ class RolloutResult:
     stop_node_locals: torch.Tensor
     answer_node_hit: torch.Tensor
     start_node_hit: torch.Tensor
-    visited_nodes: torch.Tensor
+    visited_nodes: Optional[torch.Tensor]
 
 
 @dataclass
 class RolloutBuffers:
-    actions_seq: torch.Tensor
+    actions_seq: Optional[torch.Tensor]
     log_pf_steps: torch.Tensor
     log_pb_steps: torch.Tensor
 
     @classmethod
-    def create(cls, num_graphs: int, num_steps: int, device: torch.device) -> "RolloutBuffers":
-        actions_seq = torch.full(
-            (num_graphs, num_steps),
-            STOP_RELATION,
-            dtype=torch.long,
-            device=device,
-        )
+    def create(
+        cls,
+        num_graphs: int,
+        num_steps: int,
+        device: torch.device,
+        *,
+        record_actions: bool,
+    ) -> "RolloutBuffers":
+        actions_seq = None
+        if record_actions:
+            actions_seq = torch.full(
+                (num_graphs, num_steps),
+                STOP_RELATION,
+                dtype=torch.long,
+                device=device,
+            )
         log_pf_steps = torch.zeros(num_graphs, num_steps, dtype=torch.float32, device=device)
         log_pb_steps = torch.zeros(num_graphs, num_steps, dtype=torch.float32, device=device)
         return cls(actions_seq=actions_seq, log_pf_steps=log_pf_steps, log_pb_steps=log_pb_steps)
@@ -65,12 +78,16 @@ class GFlowNetActor(nn.Module):
         env: GraphEnv,
         forward_head: nn.Module,
         backward_head: nn.Module,
+        edge_forward_head: nn.Module,
+        edge_backward_head: nn.Module,
         state_encoder: nn.Module,
         state_input_dim: int,
         hidden_dim: int,
         max_steps: int,
         policy_temperature: float,
         backward_temperature: Optional[float] = None,
+        relation_use_active_nodes: bool = True,
+        degree_logit_penalty: float = _DEFAULT_DEGREE_LOGIT_PENALTY,
         check_finite: bool = _DEFAULT_CHECK_FINITE,
     ) -> None:
         super().__init__()
@@ -78,19 +95,80 @@ class GFlowNetActor(nn.Module):
         self.env = env
         self.forward_head = forward_head
         self.backward_head = backward_head
+        self.edge_forward_head = edge_forward_head
+        self.edge_backward_head = edge_backward_head
         self.state_encoder = state_encoder
         self.stop_head = nn.Linear(int(state_input_dim), _STOP_LOGIT_DIM)
         self.hidden_dim = int(hidden_dim)
         self.max_steps = int(max_steps)
         self.policy_temperature = float(policy_temperature)
         self.backward_temperature = self._resolve_backward_temperature(backward_temperature)
+        self.relation_use_active_nodes = bool(relation_use_active_nodes)
+        self.degree_logit_penalty = float(degree_logit_penalty)
         self.check_finite = bool(check_finite)
+        if self.degree_logit_penalty < float(_ZERO):
+            raise ValueError("degree_logit_penalty must be >= 0.")
+
+    def set_temperatures(
+        self,
+        *,
+        policy_temperature: float,
+        backward_temperature: Optional[float] = None,
+    ) -> None:
+        policy_temp = max(float(policy_temperature), MIN_TEMPERATURE)
+        if backward_temperature is None:
+            backward_temp = policy_temp
+        else:
+            backward_temp = max(float(backward_temperature), MIN_TEMPERATURE)
+        self.policy_temperature = policy_temp
+        self.backward_temperature = backward_temp
+
+    def _assert_finite_tensor(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        *,
+        step: Optional[int] = None,
+    ) -> None:
+        if not self.check_finite:
+            return
+        if torch.isfinite(tensor).all():
+            return
+        summary = self._summarize_non_finite(tensor)
+        step_part = f" step={step}" if step is not None else ""
+        raise RuntimeError(f"Non-finite detected in {name}{step_part}: {summary}")
+
+    @staticmethod
+    def _summarize_non_finite(tensor: torch.Tensor) -> str:
+        finite = torch.isfinite(tensor)
+        non_finite = int((~finite).sum().item())
+        nan_count = int(torch.isnan(tensor).sum().item())
+        inf_count = int(torch.isinf(tensor).sum().item())
+        finite_vals = tensor[finite]
+        if finite_vals.numel() > _ZERO:
+            calc = finite_vals.to(dtype=torch.float32)
+            min_val = float(calc.min().item())
+            max_val = float(calc.max().item())
+            mean_val = float(calc.mean().item())
+            abs_max = float(calc.abs().max().item())
+        else:
+            min_val = _NAN
+            max_val = _NAN
+            mean_val = _NAN
+            abs_max = _NAN
+        return (
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"non_finite={non_finite} (nan={nan_count}, inf={inf_count}), "
+            f"finite_min={min_val}, finite_max={max_val}, finite_mean={mean_val}, abs_max={abs_max}"
+        )
 
     def rollout(
         self,
         *,
         graph: dict[str, torch.Tensor],
         temperature: Optional[float] = None,
+        record_actions: bool = True,
+        record_visited: bool = True,
     ) -> RolloutResult:
         temp, is_greedy = self._resolve_temperature(temperature)
         edge_index = graph["edge_index"]
@@ -98,7 +176,7 @@ class GFlowNetActor(nn.Module):
         state = self.env.reset(graph, device=device)
         num_graphs = int(state.graph.node_ptr.numel() - 1)
         num_steps = self.max_steps + _STOP_STEP_OFFSET
-        buffers = self._init_buffers(num_graphs, num_steps, device)
+        buffers = self._init_buffers(num_graphs, num_steps, device, record_actions=record_actions)
         log_pf_total = torch.zeros(num_graphs, dtype=torch.float32, device=device)
         stop_node_locals = torch.full((num_graphs,), _STOP_NODE_NONE, device=device, dtype=torch.long)
         edge_batch = graph["edge_batch"]
@@ -112,26 +190,38 @@ class GFlowNetActor(nn.Module):
             pre_done = state.done
             valid_edges = self._valid_edges(state)
             allow_stop = self._allow_stop(state)
-            edge_scores, stop_logits = self._score_forward_with_stop(
+            relation_logits, edge_scores, stop_logits = self._score_forward_with_stop(
                 graph,
                 state_vec,
                 active_nodes=state.active_nodes,
                 autocast_ctx=autocast_ctx,
             )
+            self._assert_finite_tensor(relation_logits, "relation_logits", step=step)
+            self._assert_finite_tensor(edge_scores, "edge_scores", step=step)
+            if stop_logits is not None:
+                self._assert_finite_tensor(stop_logits, "stop_logits", step=step)
             edge_logits = self._policy_logits(
+                graph=graph,
+                edge_next_nodes=edge_index[_EDGE_TAIL_INDEX],
                 valid_edges=valid_edges,
                 edge_logits=edge_scores,
                 autocast_ctx=autocast_ctx,
             )
-            log_prob_edge, log_prob_stop, _, has_edge = compute_policy_log_probs(
+            self._assert_finite_tensor(edge_logits, "edge_logits", step=step)
+            log_prob_edge, log_prob_stop, _, has_edge = compute_factorized_log_probs(
+                relation_logits=relation_logits,
                 edge_logits=edge_logits,
-                stop_logits=stop_logits,
+                edge_relations=edge_relations,
                 edge_batch=edge_batch,
                 valid_edges=valid_edges,
                 num_graphs=num_graphs,
                 temperature=temp,
+                stop_logits=stop_logits,
                 allow_stop=allow_stop,
             )
+            self._assert_finite_tensor(log_prob_edge, "log_prob_edge", step=step)
+            if log_prob_stop is not None:
+                self._assert_finite_tensor(log_prob_stop, "log_prob_stop", step=step)
             actions, log_pf = self._sample_actions(
                 log_prob_edge=log_prob_edge,
                 log_prob_stop=log_prob_stop,
@@ -140,6 +230,7 @@ class GFlowNetActor(nn.Module):
                 has_edge=has_edge,
                 is_greedy=is_greedy,
             )
+            self._assert_finite_tensor(log_pf, "log_pf", step=step)
             actions, log_pf = self._apply_done_mask(pre_done, actions, log_pf)
             stop_node_locals = self._update_stop_nodes(
                 stop_node_locals=stop_node_locals,
@@ -150,7 +241,8 @@ class GFlowNetActor(nn.Module):
                 edge_relations=edge_relations,
                 node_ptr=state.graph.node_ptr,
             )
-            buffers.actions_seq[:, step] = actions
+            if buffers.actions_seq is not None:
+                buffers.actions_seq[:, step] = actions
             buffers.log_pf_steps[:, step] = log_pf
             log_pf_total = log_pf_total + log_pf
             relation_tokens = self._gather_relation_tokens(
@@ -164,6 +256,7 @@ class GFlowNetActor(nn.Module):
                 relation_tokens=relation_tokens,
                 update_mask=update_mask,
             )
+            self._assert_finite_tensor(state_vec, "state_vec", step=step)
             state = self.env.step(state, actions, step_index=step)
             log_pb = self._compute_log_pb(
                 state=state,
@@ -173,6 +266,7 @@ class GFlowNetActor(nn.Module):
                 autocast_ctx=autocast_ctx,
                 num_graphs=num_graphs,
             )
+            self._assert_finite_tensor(log_pb, "log_pb", step=step)
             log_pb = torch.where(pre_done, torch.zeros_like(log_pb), log_pb)
             buffers.log_pb_steps[:, step] = log_pb
 
@@ -181,7 +275,7 @@ class GFlowNetActor(nn.Module):
         length = state.step_counts.to(dtype=torch.float32)
         return RolloutResult(
             actions_seq=buffers.actions_seq,
-            directions_seq=state.directions,
+            directions_seq=state.directions if record_actions else None,
             log_pf=log_pf_total,
             log_pf_steps=buffers.log_pf_steps,
             log_pb_steps=buffers.log_pb_steps,
@@ -191,7 +285,7 @@ class GFlowNetActor(nn.Module):
             stop_node_locals=stop_node_locals,
             answer_node_hit=state.answer_node_hit,
             start_node_hit=state.start_node_hit,
-            visited_nodes=state.visited_nodes,
+            visited_nodes=state.visited_nodes if record_visited else None,
         )
 
     @staticmethod
@@ -201,8 +295,19 @@ class GFlowNetActor(nn.Module):
         return torch.autocast(device_type=device.type, enabled=torch.is_autocast_enabled())
 
     @staticmethod
-    def _init_buffers(num_graphs: int, num_steps: int, device: torch.device) -> RolloutBuffers:
-        return RolloutBuffers.create(num_graphs=num_graphs, num_steps=num_steps, device=device)
+    def _init_buffers(
+        num_graphs: int,
+        num_steps: int,
+        device: torch.device,
+        *,
+        record_actions: bool,
+    ) -> RolloutBuffers:
+        return RolloutBuffers.create(
+            num_graphs=num_graphs,
+            num_steps=num_steps,
+            device=device,
+            record_actions=record_actions,
+        )
 
     def _resolve_temperature(self, temperature: Optional[float]) -> tuple[float, bool]:
         base = self.policy_temperature if temperature is None else float(temperature)
@@ -216,21 +321,46 @@ class GFlowNetActor(nn.Module):
     def _policy_logits(
         self,
         *,
+        graph: dict[str, torch.Tensor],
+        edge_next_nodes: torch.Tensor,
         valid_edges: torch.Tensor,
         edge_logits: torch.Tensor,
         autocast_ctx: contextlib.AbstractContextManager,
     ) -> torch.Tensor:
         with autocast_ctx:
+            edge_logits = self._apply_edge_logit_penalties(
+                edge_logits=edge_logits,
+                graph=graph,
+                edge_next_nodes=edge_next_nodes,
+            )
             edge_logits = self.policy(
                 edge_scores=edge_logits,
                 valid_edges_mask=valid_edges,
             )
         return edge_logits
 
+    def _apply_edge_logit_penalties(
+        self,
+        *,
+        edge_logits: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        edge_next_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        if edge_logits.numel() == _ZERO:
+            return edge_logits
+        if self.degree_logit_penalty <= _ZERO:
+            return edge_logits
+        node_in_degree = graph.get("node_in_degree")
+        if node_in_degree is None:
+            raise ValueError("node_in_degree required for degree_logit_penalty.")
+        deg_vals = node_in_degree.index_select(0, edge_next_nodes).to(dtype=edge_logits.dtype)
+        edge_logits = edge_logits - (self.degree_logit_penalty * torch.log1p(deg_vals))
+        return edge_logits
+
     def _valid_edges(self, state: Any) -> torch.Tensor:
-        forward_mask, backward_mask = self.env.candidate_edge_masks(state)
         unused_edges = ~state.used_edge_mask
-        return (forward_mask | backward_mask) & unused_edges
+        forward_mask = self.env.forward_edge_mask(state)
+        return forward_mask & unused_edges
 
     def _allow_stop(self, state: Any) -> torch.Tensor:
         step_counts = state.step_counts
@@ -286,11 +416,19 @@ class GFlowNetActor(nn.Module):
         active_nodes: torch.Tensor,
         autocast_ctx: contextlib.AbstractContextManager,
     ) -> torch.Tensor:
-        return self._score_edges(
-            graph=graph,
+        edge_state_inputs = self._build_state_inputs(
+            node_tokens=graph["node_tokens"],
+            question_tokens=graph["question_tokens"],
             state_vec=state_vec,
             active_nodes=active_nodes,
-            head=self.forward_head,
+            node_batch=graph["node_batch"],
+            include_active_nodes=True,
+        )
+        return self._score_edge_entities(
+            graph=graph,
+            state_inputs=edge_state_inputs,
+            edge_head=self.edge_forward_head,
+            use_tail=True,
             autocast_ctx=autocast_ctx,
         )
 
@@ -301,23 +439,36 @@ class GFlowNetActor(nn.Module):
         *,
         active_nodes: torch.Tensor,
         autocast_ctx: contextlib.AbstractContextManager,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        state_inputs = self._build_state_inputs(
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        relation_state_inputs = self._build_state_inputs(
             node_tokens=graph["node_tokens"],
             question_tokens=graph["question_tokens"],
             state_vec=state_vec,
             active_nodes=active_nodes,
             node_batch=graph["node_batch"],
+            include_active_nodes=self.relation_use_active_nodes,
         )
+        edge_state_inputs = relation_state_inputs
+        if not self.relation_use_active_nodes:
+            edge_state_inputs = self._build_state_inputs(
+                node_tokens=graph["node_tokens"],
+                question_tokens=graph["question_tokens"],
+                state_vec=state_vec,
+                active_nodes=active_nodes,
+                node_batch=graph["node_batch"],
+                include_active_nodes=True,
+            )
         with autocast_ctx:
-            relation_logits = self.forward_head(state_inputs)
-            stop_logits = self.stop_head(state_inputs).squeeze(-1)
-        edge_scores = self._edge_logits_from_relations(
-            relation_logits=relation_logits,
-            edge_relations=graph["edge_relations"],
-            edge_batch=graph["edge_batch"],
+            relation_logits = self.forward_head(relation_state_inputs)
+            stop_logits = self.stop_head(relation_state_inputs).squeeze(-1)
+        edge_scores = self._score_edge_entities(
+            graph=graph,
+            state_inputs=edge_state_inputs,
+            edge_head=self.edge_forward_head,
+            use_tail=True,
+            autocast_ctx=autocast_ctx,
         )
-        return edge_scores, stop_logits
+        return relation_logits, edge_scores, stop_logits
 
     def _score_edges_backward(
         self,
@@ -326,38 +477,59 @@ class GFlowNetActor(nn.Module):
         *,
         active_nodes: torch.Tensor,
         autocast_ctx: contextlib.AbstractContextManager,
-    ) -> torch.Tensor:
-        return self._score_edges(
-            graph=graph,
-            state_vec=state_vec,
-            active_nodes=active_nodes,
-            head=self.backward_head,
-            autocast_ctx=autocast_ctx,
-        )
-
-    def _score_edges(
-        self,
-        *,
-        graph: dict[str, torch.Tensor],
-        state_vec: torch.Tensor,
-        active_nodes: torch.Tensor,
-        head: nn.Module,
-        autocast_ctx: contextlib.AbstractContextManager,
-    ) -> torch.Tensor:
-        state_inputs = self._build_state_inputs(
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        relation_state_inputs = self._build_state_inputs(
             node_tokens=graph["node_tokens"],
             question_tokens=graph["question_tokens"],
             state_vec=state_vec,
             active_nodes=active_nodes,
             node_batch=graph["node_batch"],
+            include_active_nodes=self.relation_use_active_nodes,
         )
+        edge_state_inputs = relation_state_inputs
+        if not self.relation_use_active_nodes:
+            edge_state_inputs = self._build_state_inputs(
+                node_tokens=graph["node_tokens"],
+                question_tokens=graph["question_tokens"],
+                state_vec=state_vec,
+                active_nodes=active_nodes,
+                node_batch=graph["node_batch"],
+                include_active_nodes=True,
+            )
         with autocast_ctx:
-            relation_logits = head(state_inputs)
-        return self._edge_logits_from_relations(
-            relation_logits=relation_logits,
-            edge_relations=graph["edge_relations"],
-            edge_batch=graph["edge_batch"],
+            relation_logits = self.backward_head(relation_state_inputs)
+        edge_scores = self._score_edge_entities(
+            graph=graph,
+            state_inputs=edge_state_inputs,
+            edge_head=self.edge_backward_head,
+            use_tail=False,
+            autocast_ctx=autocast_ctx,
         )
+        return relation_logits, edge_scores
+
+    def _score_edge_entities(
+        self,
+        *,
+        graph: dict[str, torch.Tensor],
+        state_inputs: torch.Tensor,
+        edge_head: nn.Module,
+        use_tail: bool,
+        autocast_ctx: contextlib.AbstractContextManager,
+    ) -> torch.Tensor:
+        edge_index = graph["edge_index"]
+        node_tokens = graph["node_tokens"]
+        relation_tokens = graph["relation_tokens"]
+        edge_batch = graph["edge_batch"]
+        edge_nodes = edge_index[_EDGE_TAIL_INDEX if use_tail else _EDGE_HEAD_INDEX]
+        edge_node_tokens = node_tokens.index_select(0, edge_nodes)
+        with autocast_ctx:
+            edge_scores = edge_head(
+                state_inputs=state_inputs,
+                relation_tokens=relation_tokens,
+                node_tokens=edge_node_tokens,
+                edge_batch=edge_batch,
+            )
+        return edge_scores
 
     @staticmethod
     def _pool_active_nodes(
@@ -388,32 +560,18 @@ class GFlowNetActor(nn.Module):
         state_vec: torch.Tensor,
         active_nodes: torch.Tensor,
         node_batch: torch.Tensor,
+        include_active_nodes: bool,
     ) -> torch.Tensor:
-        num_graphs = int(state_vec.size(0))
-        current_entities = cls._pool_active_nodes(
-            node_tokens=node_tokens,
-            node_batch=node_batch,
-            active_nodes=active_nodes,
-            num_graphs=num_graphs,
-        )
-        return torch.cat([question_tokens, current_entities, state_vec], dim=-1)
-
-    @staticmethod
-    def _edge_logits_from_relations(
-        *,
-        relation_logits: torch.Tensor,
-        edge_relations: torch.Tensor,
-        edge_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        if relation_logits.dim() != 2:
-            raise ValueError("relation_logits must be [B,R] for relation-scored edges.")
-        rel_ids = edge_relations.to(device=relation_logits.device, dtype=torch.long).view(-1)
-        if torch.any(rel_ids == STOP_EDGE_RELATION):
-            raise ValueError("edge_relations contains STOP_EDGE_RELATION after stop-edge removal.")
-        out_of_range = (rel_ids < _ZERO) | (rel_ids >= relation_logits.size(1))
-        if torch.any(out_of_range):
-            raise ValueError("edge_relations contains ids outside relation_logits range.")
-        return relation_logits.index_select(0, edge_batch).gather(1, rel_ids.view(-1, 1)).view(-1)
+        if include_active_nodes:
+            num_graphs = int(state_vec.size(0))
+            current_entities = cls._pool_active_nodes(
+                node_tokens=node_tokens,
+                node_batch=node_batch,
+                active_nodes=active_nodes,
+                num_graphs=num_graphs,
+            )
+            return torch.cat([question_tokens, current_entities, state_vec], dim=-1)
+        return torch.cat([question_tokens, state_vec], dim=-1)
 
     @staticmethod
     def _gather_relation_tokens(
@@ -433,17 +591,7 @@ class GFlowNetActor(nn.Module):
         return out
 
     def _backward_valid_edges(self, state: Any) -> torch.Tensor:
-        edge_index = state.graph.edge_index
-        edge_batch = state.graph.edge_batch
-        base = ~state.done[edge_batch]
-        heads = edge_index[0]
-        tails = edge_index[1]
-        active = state.active_nodes
-        visited = state.visited_nodes
-        head_active = active[heads]
-        tail_active = active[tails]
-        parent_from_tail = tail_active & visited[heads]
-        return base & parent_from_tail & (~head_active)
+        return self.env.backward_edge_mask(state)
 
     def _compute_log_pb(
         self,
@@ -464,19 +612,23 @@ class GFlowNetActor(nn.Module):
             action_mask = torch.zeros_like(valid_edges, dtype=torch.bool)
             action_mask[action_ids] = True
             valid_edges = valid_edges | action_mask
-        edge_logits = self._policy_logits(
-            valid_edges=valid_edges,
-            edge_logits=self._score_edges_backward(
-                graph,
-                state_vec,
-                active_nodes=state.active_nodes,
-                autocast_ctx=autocast_ctx,
-            ),
+        relation_logits, edge_scores = self._score_edges_backward(
+            graph,
+            state_vec,
+            active_nodes=state.active_nodes,
             autocast_ctx=autocast_ctx,
         )
-        log_prob_edge, _, _, _ = compute_policy_log_probs(
+        edge_logits = self._policy_logits(
+            graph=graph,
+            edge_next_nodes=graph["edge_index"][_EDGE_HEAD_INDEX],
+            valid_edges=valid_edges,
+            edge_logits=edge_scores,
+            autocast_ctx=autocast_ctx,
+        )
+        log_prob_edge, _, _, _ = compute_factorized_log_probs(
+            relation_logits=relation_logits,
             edge_logits=edge_logits,
-            stop_logits=None,
+            edge_relations=graph["edge_relations"],
             edge_batch=graph["edge_batch"],
             valid_edges=valid_edges,
             num_graphs=num_graphs,

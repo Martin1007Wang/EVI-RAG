@@ -1,14 +1,14 @@
-# configs/dataset/webqsp-sub.yaml
+# configs/dataset/webqsp-full.yaml
 
-name: webqsp-sub
+name: webqsp
 kb: freebase
-dataset_scope: sub
+dataset_scope: full
 dataset_family: webqsp
 max_steps: 3
 hf_dataset: rmanluo/RoG-webqsp
 
-out_dir: ${paths.data_dir}/${dataset.dataset_family}/normalized
-materialized_dir: ${paths.data_dir}/${dataset.dataset_family}/materialized
+out_dir: ${paths.data_dir}/webqsp/normalized
+materialized_dir: ${paths.data_dir}/webqsp/materialized
 artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
 distances_dir: ${dataset.materialized_dir}/distances
 
@@ -21,21 +21,14 @@ validate_on_get: false
 cache_node_min_dists: true
 cache_max_entries: 5000
 preload_node_min_dists: true
-distance_cache_format: pt
 sample_ids_source: lmdb
 lmdb_readahead: true
 sequential_sample_ids: true
-filter_missing_start:
-  train: true
-  validation: true
-  test: true
+distance_cache_format: pt
 filter_missing_answer:
-  train: true
-  validation: true
-  test: true
-
-sample_filter_path: ${dataset.out_dir}/sub_filter.json
-nonzero_positive_filter_path: ${dataset.out_dir}/nonzero_positive_filter.json
+  train: false
+  validation: false
+  test: false
 
 entity_normalization: none
 entity_text_mode: regex

@@ -5,19 +5,13 @@ _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 16
-num_workers: 0
-pin_memory: true
+batch_size: 8
+num_workers: 8
 drop_last: false
-train_shuffle: false
-persistent_workers: false
-prefetch_factor: 1
+train_shuffle: true
+prefetch_factor: 4
+persistent_workers: true
 worker_embed_lookup: false
-precompute_edge_batch: false
-precompute_node_in_degree: false
-embeddings_device: cuda
-
-splits:
-  train: train
-  validation: validation
-  test: test
+precompute_edge_batch: true
+precompute_node_in_degree: true
+embeddings_device: cpu

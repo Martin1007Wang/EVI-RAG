@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+import functools
+from typing import Any, Dict, Optional, Sequence, Callable
 
 import torch
 
@@ -12,12 +13,17 @@ from src.models.components.gflownet_env import (
     DIRECTION_FORWARD,
     STOP_RELATION,
 )
-from src.utils.gfn import GFlowNetBatchProcessor, GFlowNetInputValidator, RolloutInputs, pool_nodes_mean_by_ptr
+from src.gfn.ops import GFlowNetBatchProcessor, GFlowNetInputValidator, RolloutInputs, pool_nodes_mean_by_ptr
+from src.models.components.logz_features import LogZFeatureSpec, build_logz_features
 
 _ZERO = 0
 _ONE = 1
 _NAN = float("nan")
 _DIST_UNREACHABLE = -1
+_RESIDUAL_P95 = 0.95
+_LOG_REWARD_P50 = 0.5
+_LOG_REWARD_P90 = 0.9
+_LOG_REWARD_P99 = 0.99
 
 
 @dataclass(frozen=True)
@@ -25,7 +31,7 @@ class GFlowNetRolloutConfig:
     num_rollouts: int
     eval_rollout_prefixes: Sequence[int]
     eval_rollout_temperature: float
-    vectorized_rollouts: bool
+    rollout_chunk_size: int
     is_training: bool
 
     def __post_init__(self) -> None:
@@ -35,9 +41,56 @@ class GFlowNetRolloutConfig:
             raise ValueError(
                 f"eval_rollout_temperature must be >= 0, got {self.eval_rollout_temperature}."
             )
+        if self.rollout_chunk_size <= 0:
+            raise ValueError(f"rollout_chunk_size must be > 0, got {self.rollout_chunk_size}.")
+        if self.rollout_chunk_size > self.num_rollouts:
+            raise ValueError(
+                "rollout_chunk_size must be <= num_rollouts "
+                f"({self.num_rollouts}), got {self.rollout_chunk_size}."
+            )
 
-    def use_vectorized(self) -> bool:
-        return bool(self.vectorized_rollouts and self.num_rollouts > 1)
+
+@dataclass(frozen=True)
+class RolloutChunkInputs:
+    inputs: RolloutInputs
+    graph_cache: Dict[str, torch.Tensor]
+    log_z: torch.Tensor
+    graph_mask: torch.Tensor
+    num_graphs: int
+
+
+@dataclass
+class RolloutChunkState:
+    loss_list: list[torch.Tensor]
+    metrics_list: list[Dict[str, torch.Tensor]]
+    rollout_stop_nodes: list[torch.Tensor]
+    rollout_actions: list[torch.Tensor]
+    rollout_directions: list[torch.Tensor]
+    rollout_visited: list[torch.Tensor]
+
+
+@dataclass
+class StreamingChunkContext:
+    edge_debug: Dict[str, torch.Tensor]
+    node_ptr: Optional[torch.Tensor]
+    node_is_answer: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class RolloutMetricStub:
+    reach_success: torch.Tensor
+    length: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RolloutLossRecord:
+    reward_out: RewardOutput
+    log_reward: torch.Tensor
+    sum_log_pf: torch.Tensor
+    sum_log_pb: torch.Tensor
+    residual: torch.Tensor
+    reach_success: torch.Tensor
+    length: torch.Tensor
 
 
 class GFlowNetEngine:
@@ -48,24 +101,24 @@ class GFlowNetEngine:
         reward_fn: torch.nn.Module,
         env: GraphEnv,
         log_z: torch.nn.Module,
+        logz_spec: LogZFeatureSpec,
         batch_processor: GFlowNetBatchProcessor,
         input_validator: GFlowNetInputValidator,
-        reward_embedding_source: str,
-        vectorized_rollouts: bool,
+        context_debug_enabled: bool = False,
+        composite_score_cfg: Optional[Any] = None,
     ) -> None:
         self.actor = actor
         self.reward_fn = reward_fn
         self.env = env
         self.log_z = log_z
+        self.logz_spec = logz_spec
         self.batch_processor = batch_processor
         self.input_validator = input_validator
-        self.reward_embedding_source = str(reward_embedding_source).strip().lower()
-        self.vectorized_rollouts = bool(vectorized_rollouts)
-        if self.reward_embedding_source not in ("raw", "backbone"):
-            raise ValueError(
-                "reward_embedding_source must be 'raw' or 'backbone', "
-                f"got {self.reward_embedding_source!r}."
-            )
+        self._context_debug_enabled = bool(context_debug_enabled)
+        self._composite_score_cfg = gfn_metrics.resolve_composite_score_cfg(composite_score_cfg)
+
+    def set_composite_score_cfg(self, composite_score_cfg: Optional[Any]) -> None:
+        self._composite_score_cfg = gfn_metrics.resolve_composite_score_cfg(composite_score_cfg)
 
     def compute_batch_loss(
         self,
@@ -82,37 +135,13 @@ class GFlowNetEngine:
         )
         full_inputs = self.batch_processor.prepare_full_rollout_inputs(batch, device)
         num_graphs = int(full_inputs.node_ptr.numel() - 1)
-        vectorized = rollout_cfg.use_vectorized()
-        inputs = (
-            self.batch_processor.repeat_rollout_inputs(full_inputs, rollout_cfg.num_rollouts)
-            if vectorized
-            else full_inputs
-        )
+        inputs = full_inputs
         graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
         edge_debug = self._compute_edge_debug_metrics(inputs, graph_cache, device=device)
+        control_metrics = self._compute_control_metrics(inputs=inputs, num_graphs=num_graphs)
         log_z = self._compute_log_z(inputs)
         graph_mask = ~inputs.dummy_mask
         temperature = None if rollout_cfg.is_training else rollout_cfg.eval_rollout_temperature
-        if vectorized:
-            loss, metrics = self._compute_vectorized_rollout_loss(
-                inputs=inputs,
-                num_rollouts=rollout_cfg.num_rollouts,
-                num_graphs=num_graphs,
-                graph_cache=graph_cache,
-                log_z=log_z,
-                graph_mask=graph_mask,
-                temperature=temperature,
-                rollout_cfg=rollout_cfg,
-            )
-            if edge_debug:
-                edge_debug = self._reduce_rollout_metrics(
-                    edge_debug,
-                    num_rollouts=rollout_cfg.num_rollouts,
-                    num_graphs=num_graphs,
-                    best_of=False,
-                )
-                metrics.update({k: v.detach() for k, v in edge_debug.items()})
-            return loss, metrics
         loss, metrics = self._compute_loop_rollout_loss(
             inputs=inputs,
             num_rollouts=rollout_cfg.num_rollouts,
@@ -122,9 +151,45 @@ class GFlowNetEngine:
             graph_mask=graph_mask,
             temperature=temperature,
             rollout_cfg=rollout_cfg,
+            rollout_chunk_size=rollout_cfg.rollout_chunk_size,
         )
+        if control_metrics:
+            metrics.update(control_metrics)
         if edge_debug:
             metrics.update({k: v.detach() for k, v in edge_debug.items()})
+        return loss, metrics
+
+    def compute_batch_loss_streaming(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        rollout_cfg: GFlowNetRolloutConfig,
+        backward_fn: Callable[[torch.Tensor], None],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        self._validate_batch_inputs(
+            batch,
+            device=device,
+            require_rollout=True,
+            is_training=rollout_cfg.is_training,
+        )
+        if not rollout_cfg.is_training:
+            raise ValueError("compute_batch_loss_streaming requires training rollout config.")
+        with torch.no_grad():
+            control_metrics = self._compute_control_metrics_from_batch(batch=batch, device=device)
+        loss, metrics, edge_debug = self._compute_loop_rollout_loss_streaming(
+            batch=batch,
+            device=device,
+            num_rollouts=rollout_cfg.num_rollouts,
+            rollout_cfg=rollout_cfg,
+            rollout_chunk_size=rollout_cfg.rollout_chunk_size,
+            temperature=None,
+            backward_fn=backward_fn,
+        )
+        if control_metrics:
+            metrics.update(control_metrics)
+        if edge_debug:
+            metrics.update(edge_debug)
         return loss, metrics
 
     def compute_rollout_records(
@@ -148,7 +213,11 @@ class GFlowNetEngine:
             rollout = self.actor.rollout(
                 graph=graph_cache,
                 temperature=rollout_cfg.eval_rollout_temperature,
+                record_actions=True,
+                record_visited=False,
             )
+            if rollout.actions_seq is None or rollout.directions_seq is None:
+                raise RuntimeError("rollout missing actions/directions; record_actions=True required.")
             rollout_logs.append(
                 {
                     "actions_seq": rollout.actions_seq.detach().cpu(),
@@ -191,6 +260,8 @@ class GFlowNetEngine:
             rollout = self.actor.rollout(
                 graph=graph_cache,
                 temperature=temperature,
+                record_actions=False,
+                record_visited=False,
             )
             reach_success = rollout.reach_success.to(device=device, dtype=torch.bool)
             success_counts += reach_success.to(dtype=torch.long)
@@ -227,12 +298,6 @@ class GFlowNetEngine:
         *,
         inputs: RolloutInputs,
     ) -> Dict[str, Any]:
-        if self.reward_embedding_source == "raw":
-            node_tokens = inputs.reward_node_embeddings
-            question_tokens = inputs.reward_question_emb
-        else:
-            node_tokens = inputs.node_tokens
-            question_tokens = inputs.question_tokens
         return {
             "answer_hit": rollout.reach_success,
             "answer_node_locals": inputs.answer_node_locals,
@@ -240,13 +305,19 @@ class GFlowNetEngine:
             "edge_index": inputs.edge_index,
             "node_ptr": inputs.node_ptr,
             "node_min_dists": inputs.node_min_dists,
-            "node_tokens": node_tokens,
             "path_length": rollout.length,
-            "question_tokens": question_tokens,
             "start_node_locals": inputs.start_node_locals,
             "start_ptr": inputs.start_ptr,
             "stop_node_locals": rollout.stop_node_locals,
         }
+
+    def build_reward_kwargs(
+        self,
+        rollout: RolloutResult,
+        *,
+        inputs: RolloutInputs,
+    ) -> Dict[str, Any]:
+        return self._build_reward_kwargs(rollout, inputs=inputs)
 
     @staticmethod
     def _reduce_rollout_metrics(
@@ -300,7 +371,7 @@ class GFlowNetEngine:
             best_of=False,
         )
 
-    def _run_rollout_and_metrics(
+    def _run_rollout_and_loss(
         self,
         *,
         inputs: RolloutInputs,
@@ -308,27 +379,31 @@ class GFlowNetEngine:
         log_z: torch.Tensor,
         graph_mask: torch.Tensor,
         temperature: Optional[float],
-    ) -> tuple[RolloutResult, torch.Tensor, Dict[str, torch.Tensor]]:
+        record_actions: bool,
+        record_visited: bool,
+    ) -> tuple[RolloutResult, torch.Tensor, RolloutLossRecord]:
         rollout = self.actor.rollout(
             graph=graph_cache,
             temperature=temperature,
+            record_actions=record_actions,
+            record_visited=record_visited,
         )
-        tb_loss, metrics = self._compute_rollout_loss_metrics(
+        tb_loss, record = self._compute_rollout_loss(
             rollout=rollout,
             inputs=inputs,
             log_z=log_z,
             graph_mask=graph_mask,
         )
-        return rollout, tb_loss, metrics
+        return rollout, tb_loss, record
 
-    def _compute_rollout_loss_metrics(
+    def _compute_rollout_loss(
         self,
         *,
         rollout: RolloutResult,
         inputs: RolloutInputs,
         log_z: torch.Tensor,
         graph_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, RolloutLossRecord]:
         reward_out: RewardOutput = self.reward_fn(
             **self._build_reward_kwargs(rollout, inputs=inputs)
         )
@@ -337,7 +412,7 @@ class GFlowNetEngine:
             torch.zeros_like(reward_out.log_reward),
             reward_out.log_reward,
         )
-        tb_loss = self._compute_tb_loss(
+        sum_log_pf, sum_log_pb, residual = self._compute_tb_terms(
             log_pf_steps=rollout.log_pf_steps,
             log_pb_steps=rollout.log_pb_steps,
             log_z=log_z,
@@ -345,6 +420,7 @@ class GFlowNetEngine:
             lengths=rollout.length.long(),
             graph_mask=graph_mask,
         )
+        tb_loss = self._reduce_graph_loss(residual.pow(2), graph_mask)
         self._raise_if_non_finite_loss(
             tb_loss=tb_loss,
             log_pf_steps=rollout.log_pf_steps,
@@ -354,14 +430,91 @@ class GFlowNetEngine:
             lengths=rollout.length.long(),
             dummy_mask=inputs.dummy_mask,
         )
-        metrics = self._build_tb_metrics(
-            rollout=rollout,
+        record = self._build_rollout_loss_record(
             reward_out=reward_out,
-            tb_loss=tb_loss,
             log_reward=log_reward_for_loss,
+            sum_log_pf=sum_log_pf,
+            sum_log_pb=sum_log_pb,
+            residual=residual,
+            reach_success=rollout.reach_success,
+            length=rollout.length,
+        )
+        return tb_loss, record
+
+    def _build_rollout_loss_record(
+        self,
+        *,
+        reward_out: RewardOutput,
+        log_reward: torch.Tensor,
+        sum_log_pf: torch.Tensor,
+        sum_log_pb: torch.Tensor,
+        residual: torch.Tensor,
+        reach_success: torch.Tensor,
+        length: torch.Tensor,
+    ) -> RolloutLossRecord:
+        reward_detached = RewardOutput(
+            reward=reward_out.reward.detach(),
+            log_reward=reward_out.log_reward.detach(),
+            success=reward_out.success.detach(),
+        )
+        return RolloutLossRecord(
+            reward_out=reward_detached,
+            log_reward=log_reward.detach(),
+            sum_log_pf=sum_log_pf.detach(),
+            sum_log_pb=sum_log_pb.detach(),
+            residual=residual.detach(),
+            reach_success=reach_success.detach(),
+            length=length.detach(),
+        )
+
+    def _build_metrics_from_records(
+        self,
+        records: list[RolloutLossRecord],
+        *,
+        log_z: torch.Tensor,
+        graph_mask: torch.Tensor,
+    ) -> list[Dict[str, torch.Tensor]]:
+        if not records:
+            return []
+        log_z = log_z.detach()
+        metrics_list: list[Dict[str, torch.Tensor]] = []
+        for record in records:
+            metrics_list.append(
+                self._build_rollout_metrics_from_record(
+                    record,
+                    log_z=log_z,
+                    graph_mask=graph_mask,
+                )
+            )
+        return metrics_list
+
+    def _build_rollout_metrics_from_record(
+        self,
+        record: RolloutLossRecord,
+        *,
+        log_z: torch.Tensor,
+        graph_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        stub = RolloutMetricStub(
+            reach_success=record.reach_success,
+            length=record.length,
+        )
+        metrics = self._build_tb_metrics(
+            rollout=stub,
+            reward_out=record.reward_out,
+            log_reward=record.log_reward,
             log_z=log_z,
         )
-        return tb_loss, metrics
+        metrics.update(
+            self._build_tb_stats(
+                sum_log_pf=record.sum_log_pf,
+                sum_log_pb=record.sum_log_pb,
+                residual=record.residual,
+                log_reward=record.log_reward,
+                graph_mask=graph_mask,
+            )
+        )
+        return metrics
 
     def _raise_if_non_finite_loss(
         self,
@@ -504,7 +657,7 @@ class GFlowNetEngine:
         step_ids = torch.arange(num_steps, device=lengths.device, dtype=lengths.dtype).view(1, -1)
         return step_ids <= lengths.view(-1, 1)
 
-    def _compute_tb_loss(
+    def _compute_tb_terms(
         self,
         *,
         log_pf_steps: torch.Tensor,
@@ -513,7 +666,7 @@ class GFlowNetEngine:
         log_reward: torch.Tensor,
         lengths: torch.Tensor,
         graph_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_steps = int(log_pf_steps.size(1))
         step_mask = self._build_step_mask(lengths, num_steps).to(dtype=log_pf_steps.dtype)
         sum_log_pf = (log_pf_steps * step_mask).sum(dim=1)
@@ -522,8 +675,62 @@ class GFlowNetEngine:
         if graph_mask is not None:
             mask = graph_mask.to(dtype=residual.dtype).view(-1)
             residual = torch.where(mask > _ZERO, residual, torch.zeros_like(residual))
-        loss_per_graph = residual.pow(2)
-        return self._reduce_graph_loss(loss_per_graph, graph_mask)
+        return sum_log_pf, sum_log_pb, residual
+
+    @staticmethod
+    def _mask_values(values: torch.Tensor, graph_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if graph_mask is None:
+            return values
+        mask = graph_mask.to(dtype=torch.bool).view(-1)
+        return values[mask]
+
+    def _quantile_or_zero(self, values: torch.Tensor, q: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if values.numel() == _ZERO:
+            return torch.zeros((), device=device, dtype=dtype)
+        calc = values.to(dtype=torch.float32)
+        return torch.quantile(calc, torch.tensor(q, device=calc.device, dtype=calc.dtype)).to(device=device, dtype=dtype)
+
+    def _mean_std_or_zero(
+        self,
+        values: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if values.numel() == _ZERO:
+            zero = torch.zeros((), device=device, dtype=dtype)
+            return zero, zero
+        calc = values.to(dtype=torch.float32)
+        mean = calc.mean()
+        std = calc.std(unbiased=False)
+        return mean.to(device=device, dtype=dtype), std.to(device=device, dtype=dtype)
+
+    def _build_tb_stats(
+        self,
+        *,
+        sum_log_pf: torch.Tensor,
+        sum_log_pb: torch.Tensor,
+        residual: torch.Tensor,
+        log_reward: torch.Tensor,
+        graph_mask: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        device = residual.device
+        dtype = residual.dtype
+        residual_vals = self._mask_values(residual, graph_mask)
+        sum_log_pf_vals = self._mask_values(sum_log_pf, graph_mask)
+        sum_log_pb_vals = self._mask_values(sum_log_pb, graph_mask)
+        log_reward_vals = self._mask_values(log_reward, graph_mask)
+        residual_mean, residual_std = self._mean_std_or_zero(residual_vals, device=device, dtype=dtype)
+        return {
+            "tb/residual_mean": residual_mean,
+            "tb/residual_std": residual_std,
+            "tb/residual_p95": self._quantile_or_zero(residual_vals, _RESIDUAL_P95, device, dtype),
+            "tb/sum_log_pf_mean": self._mean_std_or_zero(sum_log_pf_vals, device=device, dtype=dtype)[0],
+            "tb/sum_log_pb_mean": self._mean_std_or_zero(sum_log_pb_vals, device=device, dtype=dtype)[0],
+            "tb/log_reward_p50": self._quantile_or_zero(log_reward_vals, _LOG_REWARD_P50, device, dtype),
+            "tb/log_reward_p90": self._quantile_or_zero(log_reward_vals, _LOG_REWARD_P90, device, dtype),
+            "tb/log_reward_p99": self._quantile_or_zero(log_reward_vals, _LOG_REWARD_P99, device, dtype),
+        }
 
     @staticmethod
     def _reduce_graph_loss(loss_per_graph: torch.Tensor, graph_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -532,6 +739,63 @@ class GFlowNetEngine:
         weights = graph_mask.to(dtype=loss_per_graph.dtype)
         denom = weights.sum().clamp(min=float(_ONE))
         return (loss_per_graph * weights).sum() / denom
+
+    def _compute_control_metrics(
+        self,
+        *,
+        inputs: RolloutInputs,
+        num_graphs: int,
+    ) -> Dict[str, torch.Tensor]:
+        if num_graphs <= _ZERO:
+            return {}
+        start_ptr = inputs.start_ptr
+        if start_ptr.numel() < _ONE + _ONE:
+            return {}
+        start_counts = (start_ptr[_ONE:] - start_ptr[:-_ONE]).to(dtype=torch.long)
+        missing_start = start_counts == _ZERO
+        max_steps = int(getattr(self.env, "max_steps", _ZERO))
+        stats = self._compute_min_start_dist_stats(
+            node_min_dists=inputs.node_min_dists,
+            start_node_locals=inputs.start_node_locals,
+            start_counts=start_counts,
+            num_graphs=num_graphs,
+            missing_start=missing_start,
+            max_steps=max_steps,
+        )
+        reachable = stats.get("reachable_horizon_frac")
+        if reachable is None:
+            return {}
+        return {
+            "control/reachable_horizon_frac": reachable.detach(),
+        }
+
+    def _compute_control_metrics_from_batch(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        node_ptr = self.batch_processor._get_node_ptr(batch, device)
+        num_graphs = int(node_ptr.numel() - 1)
+        if num_graphs <= _ZERO:
+            return {}
+        start_node_locals, _, start_ptr, _ = self.batch_processor._get_start_answer_ptrs(batch, device=device)
+        start_counts = (start_ptr[_ONE:] - start_ptr[:-_ONE]).to(dtype=torch.long)
+        missing_start = start_counts == _ZERO
+        node_min_dists = self.batch_processor._get_node_min_dists(batch, device=device)
+        max_steps = int(getattr(self.env, "max_steps", _ZERO))
+        stats = self._compute_min_start_dist_stats(
+            node_min_dists=node_min_dists,
+            start_node_locals=start_node_locals,
+            start_counts=start_counts,
+            num_graphs=num_graphs,
+            missing_start=missing_start,
+            max_steps=max_steps,
+        )
+        reachable = stats.get("reachable_horizon_frac")
+        if reachable is None:
+            return {}
+        return {"control/reachable_horizon_frac": reachable.detach()}
 
     def _compute_edge_debug_metrics(
         self,
@@ -571,31 +835,15 @@ class GFlowNetEngine:
         *,
         rollout: RolloutResult,
         reward_out: RewardOutput,
-        tb_loss: torch.Tensor,
         log_reward: torch.Tensor,
         log_z: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         return gfn_metrics.build_tb_metrics(
             rollout=rollout,
             reward_out=reward_out,
-            tb_loss=tb_loss,
             log_reward=log_reward,
             log_z=log_z,
         )
-
-    @staticmethod
-    def _build_log_z_graph_stats(
-        *,
-        node_ptr: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        start_ptr: torch.Tensor,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        node_counts = (node_ptr[1:] - node_ptr[:-1]).to(dtype=dtype)
-        edge_counts = (edge_ptr[1:] - edge_ptr[:-1]).to(dtype=dtype)
-        start_counts = (start_ptr[1:] - start_ptr[:-1]).to(dtype=dtype)
-        counts = torch.stack((node_counts, edge_counts, start_counts), dim=1)
-        return torch.log1p(counts)
 
     def _compute_log_z(self, inputs: RolloutInputs) -> torch.Tensor:
         num_graphs = int(inputs.node_ptr.numel() - 1)
@@ -605,83 +853,21 @@ class GFlowNetEngine:
             ptr=inputs.start_ptr,
             num_graphs=num_graphs,
         )
-        graph_stats = self._build_log_z_graph_stats(
+        graph_features = build_logz_features(
             node_ptr=inputs.node_ptr,
             edge_ptr=inputs.edge_ptr,
             start_ptr=inputs.start_ptr,
-            dtype=inputs.question_tokens.dtype,
+            edge_index=inputs.edge_index,
+            start_node_locals=inputs.start_node_locals,
+            node_tokens=inputs.node_tokens,
+            question_tokens=inputs.question_tokens,
+            spec=self.logz_spec,
         )
         return self.log_z(
             question_tokens=inputs.question_tokens,
             start_tokens=start_tokens,
-            graph_stats=graph_stats,
+            graph_features=graph_features,
         )
-
-    def _compute_vectorized_rollout_loss(
-        self,
-        *,
-        inputs: RolloutInputs,
-        num_rollouts: int,
-        num_graphs: int,
-        graph_cache: Dict[str, torch.Tensor],
-        log_z: torch.Tensor,
-        graph_mask: torch.Tensor,
-        temperature: Optional[float],
-        rollout_cfg: GFlowNetRolloutConfig,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        rollout, tb_loss, metrics = self._run_rollout_and_metrics(
-            inputs=inputs,
-            graph_cache=graph_cache,
-            log_z=log_z,
-            graph_mask=graph_mask,
-            temperature=temperature,
-        )
-        raw_metrics = metrics
-        metrics = self._reduce_rollout_metrics(
-            metrics,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-            best_of=False,
-        )
-        if "log_reward" in raw_metrics and "pass@1" in raw_metrics:
-            metrics["reward_gap"] = gfn_metrics.compute_reward_gap(
-                log_reward=raw_metrics["log_reward"],
-                pass_hits=raw_metrics["pass@1"],
-                num_rollouts=num_rollouts,
-                num_graphs=num_graphs,
-            )
-        k_values = rollout_cfg.eval_rollout_prefixes if not rollout_cfg.is_training else [num_rollouts]
-        if k_values:
-            terminal_hits = gfn_metrics.compute_terminal_hits(
-                stop_node_locals=rollout.stop_node_locals,
-                node_ptr=inputs.node_ptr,
-                node_is_answer=graph_cache["node_is_answer"],
-            ).reshape(num_rollouts, num_graphs)
-            metrics.update(
-                gfn_metrics.compute_terminal_hit_prefixes(
-                    terminal_hits=terminal_hits,
-                    k_values=k_values,
-                )
-            )
-        if not rollout_cfg.is_training:
-            node_ptr = inputs.node_ptr[: num_graphs + _ONE]
-            total_nodes = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else _ZERO
-            expected_nodes = total_nodes * num_rollouts
-            visited_nodes = rollout.visited_nodes
-            if visited_nodes.numel() != expected_nodes:
-                raise ValueError("visited_nodes length mismatch for eval metrics.")
-            visited_stack = visited_nodes.reshape(num_rollouts, total_nodes)
-            metrics = self._attach_eval_metrics(
-                metrics=metrics,
-                actions_seq=rollout.actions_seq,
-                directions_seq=rollout.directions_seq,
-                visited_stack=visited_stack,
-                inputs=inputs,
-                num_rollouts=num_rollouts,
-                num_graphs=num_graphs,
-                k_values=rollout_cfg.eval_rollout_prefixes,
-            )
-        return tb_loss, metrics
 
     def _collect_rollout_outputs(
         self,
@@ -693,6 +879,7 @@ class GFlowNetEngine:
         graph_mask: torch.Tensor,
         temperature: Optional[float],
         rollout_cfg: GFlowNetRolloutConfig,
+        collect_terminal_hits: bool,
     ) -> tuple[
         list[torch.Tensor],
         list[Dict[str, torch.Tensor]],
@@ -702,27 +889,41 @@ class GFlowNetEngine:
         list[torch.Tensor],
     ]:
         loss_list: list[torch.Tensor] = []
-        metrics_list: list[Dict[str, torch.Tensor]] = []
+        metric_records: list[RolloutLossRecord] = []
         rollout_stop_nodes: list[torch.Tensor] = []
         rollout_actions: list[torch.Tensor] = []
         rollout_directions: list[torch.Tensor] = []
         rollout_visited: list[torch.Tensor] = []
         collect_eval = not rollout_cfg.is_training
         for _ in range(num_rollouts):
-            rollout, tb_loss, metrics = self._run_rollout_and_metrics(
+            rollout, tb_loss, record = self._run_rollout_and_loss(
                 inputs=inputs,
                 graph_cache=graph_cache,
                 log_z=log_z,
                 graph_mask=graph_mask,
                 temperature=temperature,
+                record_actions=collect_eval,
+                record_visited=collect_eval,
             )
-            rollout_stop_nodes.append(rollout.stop_node_locals.detach())
+            if collect_terminal_hits:
+                rollout_stop_nodes.append(rollout.stop_node_locals.detach())
             if collect_eval:
+                if (
+                    rollout.actions_seq is None
+                    or rollout.directions_seq is None
+                    or rollout.visited_nodes is None
+                ):
+                    raise RuntimeError("rollout missing eval traces; record_actions/record_visited required.")
                 rollout_actions.append(rollout.actions_seq.detach())
                 rollout_directions.append(rollout.directions_seq.detach())
                 rollout_visited.append(rollout.visited_nodes.detach())
             loss_list.append(tb_loss)
-            metrics_list.append(metrics)
+            metric_records.append(record)
+        metrics_list = self._build_metrics_from_records(
+            metric_records,
+            log_z=log_z,
+            graph_mask=graph_mask,
+        )
         return (
             loss_list,
             metrics_list,
@@ -731,6 +932,78 @@ class GFlowNetEngine:
             rollout_directions,
             rollout_visited,
         )
+
+    @staticmethod
+    def _iter_rollout_chunk_sizes(num_rollouts: int, rollout_chunk_size: int) -> Sequence[int]:
+        if rollout_chunk_size <= 0:
+            raise ValueError(f"rollout_chunk_size must be > 0, got {rollout_chunk_size}.")
+        chunk_size = min(int(rollout_chunk_size), int(num_rollouts))
+        return [
+            min(chunk_size, num_rollouts - chunk_start)
+            for chunk_start in range(_ZERO, num_rollouts, chunk_size)
+        ]
+
+    @staticmethod
+    def _init_rollout_chunk_state() -> RolloutChunkState:
+        return RolloutChunkState(
+            loss_list=[],
+            metrics_list=[],
+            rollout_stop_nodes=[],
+            rollout_actions=[],
+            rollout_directions=[],
+            rollout_visited=[],
+        )
+
+    def _run_chunked_rollouts(
+        self,
+        *,
+        num_rollouts: int,
+        rollout_chunk_size: int,
+        rollout_cfg: GFlowNetRolloutConfig,
+        temperature: Optional[float],
+        collect_terminal_hits: bool,
+        collect_eval: bool,
+        chunk_inputs_fn: Callable[[], RolloutChunkInputs],
+        store_loss_list: bool,
+        on_chunk_loss: Optional[Callable[[list[torch.Tensor]], torch.Tensor]],
+    ) -> tuple[RolloutChunkState, int, Optional[torch.Tensor]]:
+        state = self._init_rollout_chunk_state()
+        loss_total: Optional[torch.Tensor] = None
+        num_graphs = _ZERO
+        for current in self._iter_rollout_chunk_sizes(num_rollouts, rollout_chunk_size):
+            chunk_inputs = chunk_inputs_fn()
+            num_graphs = chunk_inputs.num_graphs
+            (
+                chunk_loss_list,
+                chunk_metrics_list,
+                chunk_stop_nodes,
+                chunk_actions,
+                chunk_directions,
+                chunk_visited,
+            ) = self._collect_rollout_outputs(
+                inputs=chunk_inputs.inputs,
+                num_rollouts=current,
+                graph_cache=chunk_inputs.graph_cache,
+                log_z=chunk_inputs.log_z,
+                graph_mask=chunk_inputs.graph_mask,
+                temperature=temperature,
+                rollout_cfg=rollout_cfg,
+                collect_terminal_hits=collect_terminal_hits,
+            )
+            if store_loss_list:
+                state.loss_list.extend(chunk_loss_list)
+            state.metrics_list.extend(chunk_metrics_list)
+            if collect_terminal_hits:
+                state.rollout_stop_nodes.extend(chunk_stop_nodes)
+            if collect_eval:
+                state.rollout_actions.extend(chunk_actions)
+                state.rollout_directions.extend(chunk_directions)
+                state.rollout_visited.extend(chunk_visited)
+            if on_chunk_loss is not None:
+                chunk_loss = on_chunk_loss(chunk_loss_list)
+                chunk_detached = chunk_loss.detach()
+                loss_total = chunk_detached if loss_total is None else loss_total + chunk_detached
+        return state, num_graphs, loss_total
 
     def _compute_loop_rollout_loss(
         self,
@@ -743,45 +1016,83 @@ class GFlowNetEngine:
         graph_mask: torch.Tensor,
         temperature: Optional[float],
         rollout_cfg: GFlowNetRolloutConfig,
+        rollout_chunk_size: int,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        (
-            loss_list,
-            metrics_list,
-            rollout_stop_nodes,
-            rollout_actions,
-            rollout_directions,
-            rollout_visited,
-        ) = self._collect_rollout_outputs(
+        collect_eval = not rollout_cfg.is_training
+        collect_terminal_hits = self._should_collect_terminal_hits(rollout_cfg)
+        chunk_inputs = RolloutChunkInputs(
             inputs=inputs,
-            num_rollouts=num_rollouts,
             graph_cache=graph_cache,
             log_z=log_z,
             graph_mask=graph_mask,
-            temperature=temperature,
+            num_graphs=num_graphs,
+        )
+
+        def chunk_inputs_fn() -> RolloutChunkInputs:
+            return chunk_inputs
+
+        state, _, _ = self._run_chunked_rollouts(
+            num_rollouts=num_rollouts,
+            rollout_chunk_size=rollout_chunk_size,
             rollout_cfg=rollout_cfg,
+            temperature=temperature,
+            collect_terminal_hits=collect_terminal_hits,
+            collect_eval=collect_eval,
+            chunk_inputs_fn=chunk_inputs_fn,
+            store_loss_list=True,
+            on_chunk_loss=None,
         )
         loss, metrics = self._finalize_loop_rollout_metrics(
-            loss_list=loss_list,
-            metrics_list=metrics_list,
+            loss_list=state.loss_list,
+            metrics_list=state.metrics_list,
             num_rollouts=num_rollouts,
             num_graphs=num_graphs,
         )
+        metrics = self._postprocess_rollout_metrics(
+            metrics=metrics,
+            metrics_list=state.metrics_list,
+            rollout_stop_nodes=state.rollout_stop_nodes,
+            rollout_actions=state.rollout_actions,
+            rollout_directions=state.rollout_directions,
+            rollout_visited=state.rollout_visited,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            rollout_cfg=rollout_cfg,
+            num_rollouts=num_rollouts,
+            num_graphs=num_graphs,
+        )
+        return loss, metrics
+
+    def _append_common_rollout_metrics(
+        self,
+        *,
+        metrics: Dict[str, torch.Tensor],
+        metrics_list: list[Dict[str, torch.Tensor]],
+        rollout_stop_nodes: list[torch.Tensor],
+        node_ptr: torch.Tensor,
+        node_is_answer: torch.Tensor,
+        rollout_cfg: GFlowNetRolloutConfig,
+        num_rollouts: int,
+        num_graphs: int,
+    ) -> Dict[str, torch.Tensor]:
         stacked = self._stack_rollout_metrics(metrics_list)
-        if "log_reward" in stacked and "pass@1" in stacked:
+        if (not rollout_cfg.is_training) and "log_reward" in stacked and "pass@1" in stacked:
             metrics["reward_gap"] = gfn_metrics.compute_reward_gap(
                 log_reward=stacked["log_reward"],
                 pass_hits=stacked["pass@1"],
                 num_rollouts=num_rollouts,
                 num_graphs=num_graphs,
             )
-        k_values = rollout_cfg.eval_rollout_prefixes if not rollout_cfg.is_training else [num_rollouts]
-        if k_values:
+        if rollout_stop_nodes:
+            k_values = rollout_cfg.eval_rollout_prefixes
+            if not k_values:
+                k_values = [num_rollouts]
             terminal_hits = torch.stack(
                 [
                     gfn_metrics.compute_terminal_hits(
                         stop_node_locals=stop_nodes,
-                        node_ptr=inputs.node_ptr,
-                        node_is_answer=graph_cache["node_is_answer"],
+                        node_ptr=node_ptr,
+                        node_is_answer=node_is_answer,
                     )
                     for stop_nodes in rollout_stop_nodes
                 ],
@@ -793,6 +1104,33 @@ class GFlowNetEngine:
                     k_values=k_values,
                 )
             )
+        return metrics
+
+    def _postprocess_rollout_metrics(
+        self,
+        *,
+        metrics: Dict[str, torch.Tensor],
+        metrics_list: list[Dict[str, torch.Tensor]],
+        rollout_stop_nodes: list[torch.Tensor],
+        rollout_actions: list[torch.Tensor],
+        rollout_directions: list[torch.Tensor],
+        rollout_visited: list[torch.Tensor],
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        rollout_cfg: GFlowNetRolloutConfig,
+        num_rollouts: int,
+        num_graphs: int,
+    ) -> Dict[str, torch.Tensor]:
+        metrics = self._append_common_rollout_metrics(
+            metrics=metrics,
+            metrics_list=metrics_list,
+            rollout_stop_nodes=rollout_stop_nodes,
+            node_ptr=inputs.node_ptr,
+            node_is_answer=graph_cache["node_is_answer"],
+            rollout_cfg=rollout_cfg,
+            num_rollouts=num_rollouts,
+            num_graphs=num_graphs,
+        )
         if not rollout_cfg.is_training:
             metrics = self._attach_eval_metrics_from_rollout_lists(
                 metrics=metrics,
@@ -804,7 +1142,264 @@ class GFlowNetEngine:
                 num_graphs=num_graphs,
                 k_values=rollout_cfg.eval_rollout_prefixes,
             )
-        return loss, metrics
+            composite = gfn_metrics.compute_composite_score(
+                metrics=metrics,
+                k_values=rollout_cfg.eval_rollout_prefixes,
+                composite_cfg=self._composite_score_cfg,
+            )
+            if composite:
+                metrics.update(composite)
+        return metrics
+
+    @staticmethod
+    def _should_collect_terminal_hits(rollout_cfg: GFlowNetRolloutConfig) -> bool:
+        return (not rollout_cfg.is_training) and bool(rollout_cfg.eval_rollout_prefixes)
+
+    def _compute_loop_rollout_loss_streaming(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        num_rollouts: int,
+        rollout_cfg: GFlowNetRolloutConfig,
+        rollout_chunk_size: int,
+        temperature: Optional[float],
+        backward_fn: Callable[[torch.Tensor], None],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        collect_terminal_hits = self._should_collect_terminal_hits(rollout_cfg)
+        (
+            loss_total,
+            metrics_list,
+            rollout_stop_nodes,
+            edge_debug,
+            node_ptr,
+            node_is_answer,
+            num_graphs,
+        ) = self._run_streaming_chunks(
+            batch=batch,
+            device=device,
+            num_rollouts=num_rollouts,
+            rollout_chunk_size=rollout_chunk_size,
+            rollout_cfg=rollout_cfg,
+            temperature=temperature,
+            backward_fn=backward_fn,
+            collect_terminal_hits=collect_terminal_hits,
+            collect_edge_debug=False,
+        )
+        if loss_total is None or node_ptr is None or node_is_answer is None:
+            raise RuntimeError("Streaming rollout loss did not produce any rollouts.")
+        metrics = self._finalize_streaming_metrics(
+            metrics_list=metrics_list,
+            rollout_stop_nodes=rollout_stop_nodes,
+            node_ptr=node_ptr,
+            node_is_answer=node_is_answer,
+            rollout_cfg=rollout_cfg,
+            num_rollouts=num_rollouts,
+            num_graphs=num_graphs,
+        )
+        return loss_total, metrics, edge_debug
+
+    def _run_streaming_chunks(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        num_rollouts: int,
+        rollout_chunk_size: int,
+        rollout_cfg: GFlowNetRolloutConfig,
+        temperature: Optional[float],
+        backward_fn: Callable[[torch.Tensor], None],
+        collect_terminal_hits: bool,
+        collect_edge_debug: bool,
+    ) -> tuple[
+        Optional[torch.Tensor],
+        list[Dict[str, torch.Tensor]],
+        list[torch.Tensor],
+        Dict[str, torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        int,
+    ]:
+        collect_eval = not rollout_cfg.is_training
+        context, chunk_inputs_fn, on_chunk_loss = self._init_streaming_chunk_runner(
+            batch=batch,
+            device=device,
+            num_rollouts=num_rollouts,
+            backward_fn=backward_fn,
+            collect_edge_debug=collect_edge_debug,
+        )
+        state, num_graphs, loss_total = self._run_chunked_rollouts(
+            num_rollouts=num_rollouts,
+            rollout_chunk_size=rollout_chunk_size,
+            rollout_cfg=rollout_cfg,
+            temperature=temperature,
+            collect_terminal_hits=collect_terminal_hits,
+            collect_eval=collect_eval,
+            chunk_inputs_fn=chunk_inputs_fn,
+            store_loss_list=False,
+            on_chunk_loss=on_chunk_loss,
+        )
+        return (
+            loss_total,
+            state.metrics_list,
+            state.rollout_stop_nodes,
+            context.edge_debug,
+            context.node_ptr,
+            context.node_is_answer,
+            num_graphs,
+        )
+
+    def _prepare_streaming_inputs(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        edge_debug: Dict[str, torch.Tensor],
+        node_ptr: Optional[torch.Tensor],
+        node_is_answer: Optional[torch.Tensor],
+        collect_edge_debug: bool,
+    ) -> tuple[
+        RolloutInputs,
+        Dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+    ]:
+        inputs = self.batch_processor.prepare_full_rollout_inputs(batch, device)
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        node_ptr = inputs.node_ptr if node_ptr is None else node_ptr
+        graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
+        node_is_answer = graph_cache["node_is_answer"] if node_is_answer is None else node_is_answer
+        if collect_edge_debug and not edge_debug:
+            edge_debug = {
+                k: v.detach()
+                for k, v in self._compute_edge_debug_metrics(inputs, graph_cache, device=device).items()
+            }
+        log_z = self._compute_log_z(inputs)
+        graph_mask = ~inputs.dummy_mask
+        return (
+            inputs,
+            graph_cache,
+            log_z,
+            graph_mask,
+            num_graphs,
+            node_ptr,
+            node_is_answer,
+            edge_debug,
+        )
+
+    def _build_streaming_chunk_inputs(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        context: StreamingChunkContext,
+        collect_edge_debug: bool,
+    ) -> RolloutChunkInputs:
+        (
+            inputs,
+            graph_cache,
+            log_z,
+            graph_mask,
+            num_graphs,
+            node_ptr_local,
+            node_is_answer_local,
+            edge_debug,
+        ) = self._prepare_streaming_inputs(
+            batch=batch,
+            device=device,
+            edge_debug=context.edge_debug,
+            node_ptr=context.node_ptr,
+            node_is_answer=context.node_is_answer,
+            collect_edge_debug=collect_edge_debug,
+        )
+        if context.node_ptr is None:
+            context.node_ptr = node_ptr_local
+        if context.node_is_answer is None:
+            context.node_is_answer = node_is_answer_local
+        context.edge_debug = edge_debug
+        return RolloutChunkInputs(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            log_z=log_z,
+            graph_mask=graph_mask,
+            num_graphs=num_graphs,
+        )
+
+    @staticmethod
+    def _run_streaming_chunk_backward(
+        chunk_loss_list: list[torch.Tensor],
+        *,
+        num_rollouts: int,
+        backward_fn: Callable[[torch.Tensor], None],
+    ) -> torch.Tensor:
+        chunk_loss = torch.stack(chunk_loss_list, dim=0).sum() / float(num_rollouts)
+        backward_fn(chunk_loss)
+        return chunk_loss
+
+    def _init_streaming_chunk_runner(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        num_rollouts: int,
+        backward_fn: Callable[[torch.Tensor], None],
+        collect_edge_debug: bool,
+    ) -> tuple[
+        StreamingChunkContext,
+        Callable[[], RolloutChunkInputs],
+        Callable[[list[torch.Tensor]], torch.Tensor],
+    ]:
+        context = StreamingChunkContext(
+            edge_debug={},
+            node_ptr=None,
+            node_is_answer=None,
+        )
+        chunk_inputs_fn = functools.partial(
+            self._build_streaming_chunk_inputs,
+            batch=batch,
+            device=device,
+            context=context,
+            collect_edge_debug=collect_edge_debug,
+        )
+        on_chunk_loss = functools.partial(
+            self._run_streaming_chunk_backward,
+            num_rollouts=num_rollouts,
+            backward_fn=backward_fn,
+        )
+        return context, chunk_inputs_fn, on_chunk_loss
+
+    def _finalize_streaming_metrics(
+        self,
+        *,
+        metrics_list: list[Dict[str, torch.Tensor]],
+        rollout_stop_nodes: list[torch.Tensor],
+        node_ptr: torch.Tensor,
+        node_is_answer: torch.Tensor,
+        rollout_cfg: GFlowNetRolloutConfig,
+        num_rollouts: int,
+        num_graphs: int,
+    ) -> Dict[str, torch.Tensor]:
+        stacked = self._stack_rollout_metrics(metrics_list)
+        metrics = self._reduce_rollout_metrics(
+            stacked,
+            num_rollouts=num_rollouts,
+            num_graphs=num_graphs,
+            best_of=False,
+        )
+        return self._append_common_rollout_metrics(
+            metrics=metrics,
+            metrics_list=metrics_list,
+            rollout_stop_nodes=rollout_stop_nodes,
+            node_ptr=node_ptr,
+            node_is_answer=node_is_answer,
+            rollout_cfg=rollout_cfg,
+            num_rollouts=num_rollouts,
+            num_graphs=num_graphs,
+        )
 
     def _attach_eval_metrics(
         self,
@@ -849,15 +1444,16 @@ class GFlowNetEngine:
             num_graphs=num_graphs,
             edge_ptr=inputs.edge_ptr,
         )
-        context_stats = self._collect_context_debug_stats(
-            visited_stack=visited_stack,
-            inputs=inputs,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-            node_is_start=node_is_start,
-        )
-        if context_stats:
-            metrics.update({f"context_debug/{k}": v for k, v in context_stats.items()})
+        if self._context_debug_enabled:
+            context_stats = self._collect_context_debug_stats(
+                visited_stack=visited_stack,
+                inputs=inputs,
+                num_rollouts=num_rollouts,
+                num_graphs=num_graphs,
+                node_is_start=node_is_start,
+            )
+            if context_stats:
+                metrics.update({f"context_debug/{k}": v for k, v in context_stats.items()})
         return metrics
 
     def _attach_eval_metrics_from_rollout_lists(
@@ -1420,7 +2016,20 @@ class GFlowNetEngine:
             edge_start = int(edge_ptr[g].item())
             edge_end = int(edge_ptr[g + 1].item())
             node_offset = int(node_ptr[g].item())
+            node_end = int(node_ptr[g + 1].item())
             start_locals = start_local_indices[g] if g < len(start_local_indices) else []
+            if start_locals:
+                # Convert batch-global q indices into per-graph local indices.
+                converted: list[int] = []
+                for idx in start_locals:
+                    local = int(idx) - node_offset
+                    if local < _ZERO or (node_offset + local) >= node_end:
+                        raise ValueError(
+                            "q_local_indices out of range for rollout record reconstruction "
+                            f"(graph={g}, global={idx}, offset={node_offset}, end={node_end})."
+                        )
+                    converted.append(local)
+                start_locals = converted
             for ridx, (actions_seq, directions_seq, log_pf, reach_success, stop_node_locals) in enumerate(
                 normalized_logs
             ):

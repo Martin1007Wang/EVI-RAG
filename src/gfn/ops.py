@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import nn
 
+from src.utils.graph import compute_edge_batch, compute_undirected_degree
+
 
 
 _GUMBEL_EPS = 1e-10
@@ -120,6 +122,244 @@ def compute_policy_log_probs(
     )
     return log_prob_edge, log_prob_stop, log_denom, has_edge
 
+
+def _build_relation_mask(
+    *,
+    edge_batch: torch.Tensor,
+    edge_relations: torch.Tensor,
+    valid_edges: torch.Tensor,
+    num_graphs: int,
+    num_relations: int,
+) -> torch.Tensor:
+    if num_graphs <= _ZERO or num_relations <= _ZERO:
+        return torch.zeros((num_graphs, num_relations), device=edge_batch.device, dtype=torch.bool)
+    rel_mask_flat = torch.zeros(
+        num_graphs * num_relations,
+        device=edge_batch.device,
+        dtype=torch.bool,
+    )
+    if valid_edges.any():
+        rel_index = edge_batch[valid_edges] * num_relations + edge_relations[valid_edges]
+        rel_mask_flat[rel_index] = True
+    return rel_mask_flat.view(num_graphs, num_relations)
+
+
+def _prepare_factorized_inputs(
+    *,
+    relation_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    edge_batch: torch.Tensor,
+    edge_relations: torch.Tensor,
+    valid_edges: torch.Tensor,
+    stop_logits: Optional[torch.Tensor],
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    if relation_logits.dim() != _TWO:
+        raise ValueError("relation_logits must be [B, R] for factorized policy.")
+    if relation_logits.dtype != torch.float32:
+        relation_logits = relation_logits.to(dtype=torch.float32)
+    if edge_logits.dtype != torch.float32:
+        edge_logits = edge_logits.to(dtype=torch.float32)
+    if stop_logits is not None and stop_logits.dtype != torch.float32:
+        stop_logits = stop_logits.to(dtype=torch.float32)
+    edge_batch = edge_batch.to(device=relation_logits.device, dtype=torch.long).view(-1)
+    edge_relations = edge_relations.to(device=relation_logits.device, dtype=torch.long).view(-1)
+    valid_edges = valid_edges.to(device=relation_logits.device, dtype=torch.bool).view(-1)
+    return relation_logits, edge_logits, stop_logits, edge_batch, edge_relations, valid_edges
+
+
+def _resolve_empty_factorized(
+    *,
+    relation_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    stop_logits: Optional[torch.Tensor],
+    num_graphs: int,
+    temperature: float,
+) -> Optional[tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]]:
+    if num_graphs <= _ZERO:
+        device = edge_logits.device
+        zeros = torch.zeros(0, device=device)
+        has_edge = torch.zeros(0, device=device, dtype=torch.bool)
+        if stop_logits is None:
+            return zeros, None, zeros, has_edge
+        return zeros, zeros, zeros, has_edge
+    if edge_logits.numel() != _ZERO:
+        return None
+    log_denom = relation_logits.new_full((num_graphs,), neg_inf_value(relation_logits))
+    has_edge = torch.zeros(num_graphs, device=relation_logits.device, dtype=torch.bool)
+    if stop_logits is None:
+        return edge_logits, None, log_denom, has_edge
+    log_denom = stop_logits / float(temperature)
+    log_prob_stop = log_denom - log_denom
+    return edge_logits, log_prob_stop, log_denom, has_edge
+
+
+def _compute_relation_log_probs(
+    *,
+    relation_logits: torch.Tensor,
+    relation_mask: torch.Tensor,
+    stop_logits: Optional[torch.Tensor],
+    temperature: float,
+    allow_stop: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    rel_scaled = relation_logits / float(temperature)
+    neg_inf = neg_inf_value(rel_scaled)
+    rel_mask = relation_mask.to(device=rel_scaled.device, dtype=torch.bool)
+    rel_scaled = rel_scaled.masked_fill(~rel_mask, neg_inf)
+    logsumexp_rel = torch.logsumexp(rel_scaled, dim=1)
+    has_relation = logsumexp_rel > neg_inf
+    if stop_logits is None:
+        log_denom = logsumexp_rel
+        log_prob_rel = rel_scaled - log_denom.unsqueeze(1)
+        log_prob_rel = torch.where(rel_mask, log_prob_rel, torch.full_like(log_prob_rel, neg_inf))
+        return log_prob_rel, None, log_denom, has_relation
+    stop_scaled = stop_logits / float(temperature)
+    if allow_stop is None:
+        allow_stop_mask = torch.ones_like(stop_scaled, dtype=torch.bool)
+    else:
+        allow_stop_mask = allow_stop.to(device=stop_scaled.device, dtype=torch.bool).view(-1)
+        if allow_stop_mask.numel() != stop_scaled.numel():
+            raise ValueError("allow_stop length mismatch with batch size.")
+    allow_stop_mask = allow_stop_mask | (~has_relation)
+    log_denom = torch.where(
+        allow_stop_mask,
+        torch.logaddexp(logsumexp_rel, stop_scaled),
+        logsumexp_rel,
+    )
+    log_prob_rel = rel_scaled - log_denom.unsqueeze(1)
+    log_prob_rel = torch.where(rel_mask, log_prob_rel, torch.full_like(log_prob_rel, neg_inf))
+    log_prob_stop = stop_scaled - log_denom
+    log_prob_stop = torch.where(
+        allow_stop_mask,
+        log_prob_stop,
+        torch.full_like(log_prob_stop, neg_inf),
+    )
+    return log_prob_rel, log_prob_stop, log_denom, has_relation
+
+
+def _compute_edge_log_probs_given_relation(
+    *,
+    edge_logits: torch.Tensor,
+    edge_batch: torch.Tensor,
+    edge_relations: torch.Tensor,
+    valid_edges: torch.Tensor,
+    num_graphs: int,
+    num_relations: int,
+    temperature: float,
+) -> torch.Tensor:
+    if edge_logits.numel() == _ZERO:
+        return edge_logits
+    edge_scaled = edge_logits / float(temperature)
+    valid_edges = valid_edges.to(device=edge_scaled.device, dtype=torch.bool)
+    seg_ids = edge_batch * num_relations + edge_relations
+    seg_ids = seg_ids.to(device=edge_scaled.device, dtype=torch.long)
+    logsumexp_seg = segment_logsumexp_1d(
+        edge_scaled[valid_edges],
+        seg_ids[valid_edges],
+        num_graphs * num_relations,
+    )
+    log_prob = edge_scaled - logsumexp_seg.index_select(0, seg_ids)
+    neg_inf = neg_inf_value(edge_scaled)
+    return torch.where(valid_edges, log_prob, torch.full_like(log_prob, neg_inf))
+
+
+def _compute_factorized_nonempty(
+    *,
+    relation_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    edge_relations: torch.Tensor,
+    edge_batch: torch.Tensor,
+    valid_edges: torch.Tensor,
+    num_graphs: int,
+    temperature: float,
+    stop_logits: Optional[torch.Tensor],
+    allow_stop: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    num_relations = int(relation_logits.size(1))
+    out_of_range = (edge_relations < _ZERO) | (edge_relations >= num_relations)
+    if torch.any(out_of_range):
+        raise ValueError("edge_relations contains ids outside relation_logits range.")
+    relation_mask = _build_relation_mask(
+        edge_batch=edge_batch,
+        edge_relations=edge_relations,
+        valid_edges=valid_edges,
+        num_graphs=num_graphs,
+        num_relations=num_relations,
+    )
+    log_prob_rel, log_prob_stop, log_denom, has_relation = _compute_relation_log_probs(
+        relation_logits=relation_logits,
+        relation_mask=relation_mask,
+        stop_logits=stop_logits,
+        temperature=temperature,
+        allow_stop=allow_stop,
+    )
+    log_prob_edge_given_rel = _compute_edge_log_probs_given_relation(
+        edge_logits=edge_logits,
+        edge_batch=edge_batch,
+        edge_relations=edge_relations,
+        valid_edges=valid_edges,
+        num_graphs=num_graphs,
+        num_relations=num_relations,
+        temperature=temperature,
+    )
+    rel_for_edge = log_prob_rel.index_select(0, edge_batch).gather(
+        1,
+        edge_relations.view(-1, 1),
+    ).view(-1)
+    neg_inf = neg_inf_value(log_prob_edge_given_rel)
+    log_prob_edge = rel_for_edge + log_prob_edge_given_rel
+    log_prob_edge = torch.where(valid_edges, log_prob_edge, torch.full_like(log_prob_edge, neg_inf))
+    return log_prob_edge, log_prob_stop, log_denom, has_relation
+
+
+def compute_factorized_log_probs(
+    *,
+    relation_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    edge_relations: torch.Tensor,
+    edge_batch: torch.Tensor,
+    valid_edges: torch.Tensor,
+    num_graphs: int,
+    temperature: float,
+    stop_logits: Optional[torch.Tensor] = None,
+    allow_stop: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    relation_logits, edge_logits, stop_logits, edge_batch, edge_relations, valid_edges = (
+        _prepare_factorized_inputs(
+            relation_logits=relation_logits,
+            edge_logits=edge_logits,
+            edge_batch=edge_batch,
+            edge_relations=edge_relations,
+            valid_edges=valid_edges,
+            stop_logits=stop_logits,
+        )
+    )
+    empty = _resolve_empty_factorized(
+        relation_logits=relation_logits,
+        edge_logits=edge_logits,
+        stop_logits=stop_logits,
+        num_graphs=num_graphs,
+        temperature=temperature,
+    )
+    if empty is not None:
+        return empty
+    return _compute_factorized_nonempty(
+        relation_logits=relation_logits,
+        edge_logits=edge_logits,
+        edge_relations=edge_relations,
+        edge_batch=edge_batch,
+        valid_edges=valid_edges,
+        num_graphs=num_graphs,
+        temperature=temperature,
+        stop_logits=stop_logits,
+        allow_stop=allow_stop,
+    )
 
 def gumbel_noise_like(tensor: torch.Tensor) -> torch.Tensor:
     u = torch.rand_like(tensor)
@@ -242,7 +482,7 @@ class GFlowNetInputValidator:
         self._validate_integer_dtype(tensors.node_ptr, "ptr")
         num_graphs, num_nodes_total, node_counts = self._validate_node_ptr(tensors.node_ptr)
         self._validate_integer_dtype(tensors.edge_index, "edge_index")
-        num_edges = self._validate_edge_index(tensors.edge_index, tensors.node_ptr, num_nodes_total, num_graphs)
+        num_edges = self._validate_edge_index(tensors.edge_index, tensors.node_ptr, num_graphs)
         self._validate_integer_dtype(tensors.edge_attr, "edge_attr")
         self._validate_edge_attr(tensors.edge_attr, num_edges)
         return CommonBatchStats(
@@ -286,7 +526,6 @@ class GFlowNetInputValidator:
         self,
         edge_index: torch.Tensor,
         node_ptr: torch.Tensor,
-        num_nodes_total: int,
         num_graphs: int,
     ) -> int:
         if edge_index.dim() != _TWO or edge_index.size(0) != _TWO:
@@ -294,20 +533,15 @@ class GFlowNetInputValidator:
         num_edges = int(edge_index.size(1))
         if edge_index.numel() == _ZERO:
             return num_edges
-        if bool((edge_index < _ZERO).any().item()):
-            raise ValueError("edge_index contains negative node ids.")
-        if bool((edge_index >= num_nodes_total).any().item()):
-            raise ValueError("edge_index contains node ids out of range.")
         if not self.validate_edge_batch:
             return num_edges
-        edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
-        tail_batch = torch.bucketize(edge_index[1], node_ptr[1:], right=True)
-        if bool((edge_batch != tail_batch).any().item()):
-            raise ValueError("edge_index crosses graph boundaries; head/tail graph assignments differ.")
-        if num_edges > _ONE and bool((edge_batch[:-1] > edge_batch[1:]).any().item()):
-            raise ValueError("edge_index must be grouped by graph for packed slicing.")
-        if bool((edge_batch < _ZERO).any().item()) or bool((edge_batch >= num_graphs).any().item()):
-            raise ValueError("edge_index induces out-of-range graph ids.")
+        compute_edge_batch(
+            edge_index,
+            node_ptr=node_ptr,
+            num_graphs=num_graphs,
+            device=edge_index.device,
+            validate=True,
+        )
         return num_edges
 
     @staticmethod
@@ -436,6 +670,7 @@ class GFlowNetInputValidator:
 @dataclass(frozen=True)
 class EdgeTokenInputs:
     edge_batch: torch.Tensor
+    edge_ptr: torch.Tensor
     node_ptr: torch.Tensor
     edge_index: torch.Tensor
     edge_relations: torch.Tensor
@@ -454,8 +689,6 @@ class RolloutInputs:
     node_tokens: torch.Tensor
     relation_tokens: torch.Tensor
     question_tokens: torch.Tensor
-    reward_node_embeddings: torch.Tensor
-    reward_question_emb: torch.Tensor
     node_in_degree: torch.Tensor
     node_min_dists: torch.Tensor
     start_node_locals: torch.Tensor
@@ -472,8 +705,12 @@ class GFlowNetBatchProcessor:
         self,
         *,
         backbone: nn.Module,
+        require_precomputed_edge_batch: bool = True,
+        require_precomputed_node_in_degree: bool = True,
     ) -> None:
         self.backbone = backbone
+        self.require_precomputed_edge_batch = bool(require_precomputed_edge_batch)
+        self.require_precomputed_node_in_degree = bool(require_precomputed_node_in_degree)
 
     @staticmethod
     def _get_node_ptr(batch: Any, device: torch.device) -> torch.Tensor:
@@ -503,15 +740,55 @@ class GFlowNetBatchProcessor:
             raise ValueError("Answer nodes missing in batch; filter missing answers before GFlowNet.")
         return missing.to(dtype=torch.bool)
 
-    def resolve_edge_batch(
+    def _resolve_edge_batch_and_ptr(
         self,
+        batch: Any,
         *,
         edge_index: torch.Tensor,
         node_ptr: torch.Tensor,
+        num_graphs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_edges = int(edge_index.size(1))
+        edge_batch = getattr(batch, "edge_batch", None)
+        edge_ptr = getattr(batch, "edge_ptr", None)
+        if edge_batch is None and edge_ptr is None:
+            if self.require_precomputed_edge_batch:
+                raise ValueError("Batch missing edge_batch/edge_ptr; enable precompute_edge_batch.")
+            edge_batch, edge_ptr = compute_edge_batch(
+                edge_index,
+                node_ptr=node_ptr,
+                num_graphs=num_graphs,
+                device=edge_index.device,
+                validate=False,
+            )
+            return (
+                edge_batch.to(device=edge_index.device, dtype=torch.long).view(-1),
+                edge_ptr.to(device=edge_index.device, dtype=torch.long).view(-1),
+            )
+        if not (torch.is_tensor(edge_batch) and torch.is_tensor(edge_ptr)):
+            raise ValueError("edge_batch and edge_ptr must be provided together.")
+        edge_batch = edge_batch.to(device=edge_index.device, dtype=torch.long, non_blocking=True).view(-1)
+        edge_ptr = edge_ptr.to(device=edge_index.device, dtype=torch.long, non_blocking=True).view(-1)
+        if edge_batch.numel() != num_edges:
+            raise ValueError("edge_batch length mismatch with edge_index.")
+        if edge_ptr.numel() != num_graphs + _ONE:
+            raise ValueError("edge_ptr length mismatch with num_graphs.")
+        return edge_batch, edge_ptr
+
+    @staticmethod
+    def _get_precomputed_node_in_degree(
+        batch: Any,
+        *,
         device: torch.device,
-    ) -> torch.Tensor:
-        edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
-        return edge_batch.to(device=device, dtype=torch.long).view(-1)
+        num_nodes_total: int,
+    ) -> torch.Tensor | None:
+        node_in_degree = getattr(batch, "node_in_degree", None)
+        if not torch.is_tensor(node_in_degree):
+            return None
+        node_in_degree = node_in_degree.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+        if node_in_degree.numel() != num_nodes_total:
+            raise ValueError("node_in_degree length mismatch with ptr.")
+        return node_in_degree
 
     def encode_batch_tokens(
         self,
@@ -526,21 +803,6 @@ class GFlowNetBatchProcessor:
             question_tokens.to(device=device, dtype=torch.float32),
         )
 
-    @staticmethod
-    def _get_reward_embeddings(
-        batch: Any,
-        *,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        node_embeddings = getattr(batch, "node_embeddings", None)
-        question_emb = getattr(batch, "question_emb", None)
-        if not torch.is_tensor(node_embeddings) or not torch.is_tensor(question_emb):
-            raise ValueError("Batch missing node_embeddings/question_emb required for reward embeddings.")
-        return (
-            node_embeddings.to(device=device, dtype=torch.float32, non_blocking=True),
-            question_emb.to(device=device, dtype=torch.float32, non_blocking=True),
-        )
-
     def prepare_edge_token_inputs(
         self,
         batch: Any,
@@ -549,14 +811,16 @@ class GFlowNetBatchProcessor:
         node_ptr = self._get_node_ptr(batch, device)
         edge_index = batch.edge_index.to(device=device, non_blocking=True)
         edge_relations = batch.edge_attr.to(device=device, non_blocking=True)
-        edge_batch_full = self.resolve_edge_batch(
+        edge_batch_full, edge_ptr = self._resolve_edge_batch_and_ptr(
+            batch,
             edge_index=edge_index,
             node_ptr=node_ptr,
-            device=device,
+            num_graphs=int(node_ptr.numel() - 1),
         )
         node_tokens, relation_tokens, question_tokens = self.encode_batch_tokens(batch, device=device)
         return EdgeTokenInputs(
             edge_batch=edge_batch_full,
+            edge_ptr=edge_ptr,
             node_ptr=node_ptr,
             edge_index=edge_index,
             edge_relations=edge_relations,
@@ -566,31 +830,12 @@ class GFlowNetBatchProcessor:
         )
 
     @staticmethod
-    def _compute_node_in_degree(
-        *,
-        edge_index: torch.Tensor,
-        num_nodes_total: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if num_nodes_total <= _ZERO:
-            return torch.zeros((_ZERO,), device=device, dtype=torch.long)
-        node_in_degree = torch.bincount(edge_index.view(-1), minlength=num_nodes_total)
-        return node_in_degree.to(device=device, dtype=torch.long)
-
-    @staticmethod
     def _get_node_min_dists(
         batch: Any,
         *,
         device: torch.device,
     ) -> torch.Tensor:
         return batch.node_min_dists.to(device=device, dtype=torch.long, non_blocking=True)
-
-    @staticmethod
-    def build_edge_ptr(edge_batch: torch.Tensor, num_graphs: int, device: torch.device) -> torch.Tensor:
-        counts = torch.bincount(edge_batch, minlength=num_graphs).to(device=device)
-        edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
-        edge_ptr[1:] = counts.cumsum(0)
-        return edge_ptr
 
     @staticmethod
     def _build_rollout_inputs(
@@ -603,8 +848,6 @@ class GFlowNetBatchProcessor:
         node_tokens: torch.Tensor,
         relation_tokens: torch.Tensor,
         question_tokens: torch.Tensor,
-        reward_node_embeddings: torch.Tensor,
-        reward_question_emb: torch.Tensor,
         node_in_degree: torch.Tensor,
         node_min_dists: torch.Tensor,
         start_node_locals: torch.Tensor,
@@ -622,8 +865,6 @@ class GFlowNetBatchProcessor:
             node_tokens=node_tokens,
             relation_tokens=relation_tokens,
             question_tokens=question_tokens,
-            reward_node_embeddings=reward_node_embeddings,
-            reward_question_emb=reward_question_emb,
             node_in_degree=node_in_degree,
             node_min_dists=node_min_dists,
             start_node_locals=start_node_locals,
@@ -642,28 +883,35 @@ class GFlowNetBatchProcessor:
         node_ptr = token_inputs.node_ptr
         num_graphs = int(node_ptr.numel() - 1)
         num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
-        edge_index_base = batch.edge_index.to(device=device, non_blocking=True)
-        node_in_degree = self._compute_node_in_degree(
-            edge_index=edge_index_base, num_nodes_total=num_nodes_total, device=device
+        edge_index_base = token_inputs.edge_index
+        node_in_degree = self._get_precomputed_node_in_degree(
+            batch,
+            device=device,
+            num_nodes_total=num_nodes_total,
         )
+        if node_in_degree is None:
+            if self.require_precomputed_node_in_degree:
+                raise ValueError("Batch missing node_in_degree; enable precompute_node_in_degree.")
+            node_in_degree = compute_undirected_degree(
+                edge_index_base,
+                num_nodes=num_nodes_total,
+            ).to(device=device, dtype=torch.long)
         node_min_dists = self._get_node_min_dists(batch, device=device)
-        reward_node_embeddings, reward_question_emb = self._get_reward_embeddings(batch, device=device)
 
         start_node_locals, answer_node_locals, start_ptr, answer_ptr = self._get_start_answer_ptrs(
             batch, device=device
         )
         dummy_mask = self.build_dummy_mask(answer_ptr=answer_ptr)
+        edge_ptr = token_inputs.edge_ptr
         return self._build_rollout_inputs(
             edge_batch=token_inputs.edge_batch,
-            edge_ptr=self.build_edge_ptr(token_inputs.edge_batch, num_graphs, device),
+            edge_ptr=edge_ptr,
             node_ptr=node_ptr,
             edge_index=token_inputs.edge_index,
             edge_relations=token_inputs.edge_relations,
             node_tokens=token_inputs.node_tokens,
             relation_tokens=token_inputs.relation_tokens,
             question_tokens=token_inputs.question_tokens,
-            reward_node_embeddings=reward_node_embeddings,
-            reward_question_emb=reward_question_emb,
             node_in_degree=node_in_degree,
             node_min_dists=node_min_dists,
             start_node_locals=start_node_locals,
@@ -679,235 +927,6 @@ class GFlowNetBatchProcessor:
         device: torch.device,
     ) -> RolloutInputs:
         return self.prepare_full_rollout_inputs(batch, device)
-
-    @staticmethod
-    def _repeat_ptr(counts: torch.Tensor, repeats: int) -> torch.Tensor:
-        counts_rep = counts.repeat(repeats)
-        ptr = torch.zeros(counts_rep.numel() + 1, dtype=counts.dtype, device=counts.device)
-        if counts_rep.numel() > 0:
-            ptr[1:] = counts_rep.cumsum(0)
-        return ptr
-
-    @staticmethod
-    def _repeat_edges(
-        *,
-        edge_index: torch.Tensor,
-        edge_relations: torch.Tensor,
-        relation_tokens: torch.Tensor,
-        edge_batch: torch.Tensor,
-        num_rollouts: int,
-        num_graphs: int,
-        total_nodes: int,
-        total_edges: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        edge_offsets = (
-            torch.arange(num_rollouts, device=device, dtype=edge_index.dtype) * total_nodes
-        ).repeat_interleave(total_edges)
-        edge_index_rep = edge_index.repeat(1, num_rollouts)
-        if edge_offsets.numel() > 0:
-            edge_index_rep = edge_index_rep + edge_offsets
-        edge_relations_rep = edge_relations.repeat(num_rollouts)
-        relation_tokens_rep = relation_tokens.repeat(num_rollouts, 1)
-        edge_batch_offsets = (
-            torch.arange(num_rollouts, device=device, dtype=edge_batch.dtype) * num_graphs
-        ).repeat_interleave(total_edges)
-        edge_batch_rep = edge_batch.repeat(num_rollouts)
-        if edge_batch_offsets.numel() > 0:
-            edge_batch_rep = edge_batch_rep + edge_batch_offsets
-        return edge_index_rep, edge_relations_rep, relation_tokens_rep, edge_batch_rep
-
-    @staticmethod
-    def _repeat_nodes(
-        *,
-        node_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        reward_node_embeddings: torch.Tensor,
-        reward_question_emb: torch.Tensor,
-        node_in_degree: torch.Tensor,
-        node_min_dists: torch.Tensor,
-        num_rollouts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        node_tokens_rep = node_tokens.repeat(num_rollouts, 1)
-        question_tokens_rep = question_tokens.repeat(num_rollouts, 1)
-        reward_node_embeddings_rep = reward_node_embeddings.repeat(num_rollouts, 1)
-        reward_question_emb_rep = reward_question_emb.repeat(num_rollouts, 1)
-        node_in_degree_rep = node_in_degree.repeat(num_rollouts)
-        node_min_dists_rep = node_min_dists.repeat(num_rollouts)
-        return (
-            node_tokens_rep,
-            question_tokens_rep,
-            reward_node_embeddings_rep,
-            reward_question_emb_rep,
-            node_in_degree_rep,
-            node_min_dists_rep,
-        )
-
-    @classmethod
-    def _repeat_start_answer(
-        cls,
-        *,
-        start_node_locals: torch.Tensor,
-        answer_node_locals: torch.Tensor,
-        start_ptr: torch.Tensor,
-        answer_ptr: torch.Tensor,
-        total_nodes: int,
-        num_rollouts: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        start_counts = (start_ptr[1:] - start_ptr[:-1]).clamp(min=0)
-        answer_counts = (answer_ptr[1:] - answer_ptr[:-1]).clamp(min=0)
-        start_ptr_rep = cls._repeat_ptr(start_counts, num_rollouts)
-        answer_ptr_rep = cls._repeat_ptr(answer_counts, num_rollouts)
-        start_offsets = (
-            torch.arange(num_rollouts, device=device, dtype=start_node_locals.dtype) * total_nodes
-        ).repeat_interleave(start_node_locals.numel())
-        answer_offsets = (
-            torch.arange(num_rollouts, device=device, dtype=answer_node_locals.dtype) * total_nodes
-        ).repeat_interleave(answer_node_locals.numel())
-        start_locals_rep = start_node_locals.repeat(num_rollouts)
-        answer_locals_rep = answer_node_locals.repeat(num_rollouts)
-        if start_offsets.numel() > 0:
-            start_locals_rep = start_locals_rep + start_offsets
-        if answer_offsets.numel() > 0:
-            answer_locals_rep = answer_locals_rep + answer_offsets
-        return start_locals_rep, answer_locals_rep, start_ptr_rep, answer_ptr_rep
-
-    def _repeat_rollout_meta(
-        self,
-        inputs: RolloutInputs,
-        *,
-        num_rollouts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, torch.device]:
-        node_ptr = inputs.node_ptr
-        edge_ptr = inputs.edge_ptr
-        num_graphs = int(node_ptr.numel() - 1)
-        total_nodes = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
-        total_edges = int(edge_ptr[-1].item()) if edge_ptr.numel() > 0 else 0
-        device = node_ptr.device
-        node_counts = (node_ptr[1:] - node_ptr[:-1]).clamp(min=0)
-        edge_counts = (edge_ptr[1:] - edge_ptr[:-1]).clamp(min=0)
-        node_ptr_rep = self._repeat_ptr(node_counts, num_rollouts)
-        edge_ptr_rep = self._repeat_ptr(edge_counts, num_rollouts)
-        return node_ptr_rep, edge_ptr_rep, num_graphs, total_nodes, total_edges, device
-
-    def _repeat_rollout_payload(
-        self,
-        inputs: RolloutInputs,
-        *,
-        num_rollouts: int,
-        num_graphs: int,
-        total_nodes: int,
-        total_edges: int,
-        device: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        edges = self._repeat_edges(
-            edge_index=inputs.edge_index,
-            edge_relations=inputs.edge_relations,
-            relation_tokens=inputs.relation_tokens,
-            edge_batch=inputs.edge_batch,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-            total_nodes=total_nodes,
-            total_edges=total_edges,
-            device=device,
-        )
-        nodes = self._repeat_nodes(
-            node_tokens=inputs.node_tokens,
-            question_tokens=inputs.question_tokens,
-            reward_node_embeddings=inputs.reward_node_embeddings,
-            reward_question_emb=inputs.reward_question_emb,
-            node_in_degree=inputs.node_in_degree,
-            node_min_dists=inputs.node_min_dists,
-            num_rollouts=num_rollouts,
-        )
-        start = self._repeat_start_answer(
-            start_node_locals=inputs.start_node_locals,
-            answer_node_locals=inputs.answer_node_locals,
-            start_ptr=inputs.start_ptr,
-            answer_ptr=inputs.answer_ptr,
-            total_nodes=total_nodes,
-            num_rollouts=num_rollouts,
-            device=device,
-        )
-        return self._assemble_repeat_payload(
-            edges,
-            nodes,
-            start,
-            dummy_mask=inputs.dummy_mask.repeat(num_rollouts),
-        )
-
-    @staticmethod
-    def _assemble_repeat_payload(
-        edges: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        nodes: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        start: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        *,
-        dummy_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        edge_index_rep, edge_relations_rep, relation_tokens_rep, edge_batch_rep = edges
-        (
-            node_tokens_rep,
-            question_tokens_rep,
-            reward_node_embeddings_rep,
-            reward_question_emb_rep,
-            node_in_degree_rep,
-            node_min_dists_rep,
-        ) = nodes
-        start_locals_rep, answer_locals_rep, start_ptr_rep, answer_ptr_rep = start
-        return {
-            "edge_index": edge_index_rep,
-            "edge_relations": edge_relations_rep,
-            "relation_tokens": relation_tokens_rep,
-            "edge_batch": edge_batch_rep,
-            "node_tokens": node_tokens_rep,
-            "question_tokens": question_tokens_rep,
-            "reward_node_embeddings": reward_node_embeddings_rep,
-            "reward_question_emb": reward_question_emb_rep,
-            "node_in_degree": node_in_degree_rep,
-            "node_min_dists": node_min_dists_rep,
-            "start_node_locals": start_locals_rep,
-            "answer_node_locals": answer_locals_rep,
-            "start_ptr": start_ptr_rep,
-            "answer_ptr": answer_ptr_rep,
-            "dummy_mask": dummy_mask,
-        }
-
-    def repeat_rollout_inputs(self, inputs: RolloutInputs, num_rollouts: int) -> RolloutInputs:
-        if num_rollouts <= 1:
-            return inputs
-        node_ptr_rep, edge_ptr_rep, num_graphs, total_nodes, total_edges, device = self._repeat_rollout_meta(
-            inputs,
-            num_rollouts=num_rollouts,
-        )
-        payload = self._repeat_rollout_payload(
-            inputs,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-            total_nodes=total_nodes,
-            total_edges=total_edges,
-            device=device,
-        )
-
-        return self._build_rollout_inputs(
-            edge_batch=payload["edge_batch"],
-            edge_ptr=edge_ptr_rep,
-            node_ptr=node_ptr_rep,
-            edge_index=payload["edge_index"],
-            edge_relations=payload["edge_relations"],
-            node_tokens=payload["node_tokens"],
-            relation_tokens=payload["relation_tokens"],
-            question_tokens=payload["question_tokens"],
-            reward_node_embeddings=payload["reward_node_embeddings"],
-            reward_question_emb=payload["reward_question_emb"],
-            node_in_degree=payload["node_in_degree"],
-            node_min_dists=payload["node_min_dists"],
-            start_node_locals=payload["start_node_locals"],
-            answer_node_locals=payload["answer_node_locals"],
-            start_ptr=payload["start_ptr"],
-            answer_ptr=payload["answer_ptr"],
-            dummy_mask=payload["dummy_mask"],
-        )
 
     @staticmethod
     def compute_node_batch(node_ptr: torch.Tensor, num_graphs: int, device: torch.device) -> torch.Tensor:
@@ -953,6 +972,7 @@ class GFlowNetBatchProcessor:
             "node_is_start": node_is_start,
             "node_is_answer": node_is_answer,
             "node_in_degree": inputs.node_in_degree,
+            "node_min_dists": inputs.node_min_dists,
             "start_node_locals": inputs.start_node_locals,
             "start_ptr": inputs.start_ptr,
             "answer_node_locals": inputs.answer_node_locals,
@@ -963,6 +983,7 @@ class GFlowNetBatchProcessor:
 
 
 __all__ = [
+    "compute_factorized_log_probs",
     "compute_policy_log_probs",
     "gumbel_noise_like",
     "neg_inf_value",

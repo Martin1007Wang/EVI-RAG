@@ -1,0 +1,4 @@
+defaults:
+  - gpu
+
+precision: 32-true

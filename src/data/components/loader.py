@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import functools
 import random
 from typing import Any, Callable, Optional
 
@@ -13,13 +13,37 @@ import torch
 from torch.utils.data import DataLoader
 from torch_geometric.loader.dataloader import Collater
 
-from ...utils.graph import compute_edge_batch, compute_undirected_degree
+from ...utils.graph import (
+    build_edge_batch_debug_context,
+    compute_edge_batch,
+    compute_undirected_degree,
+)
+from ...utils.logging_utils import get_logger, log_event
 from ..schema.constants import _NON_TEXT_EMBEDDING_ID, _ONE
 from ..g_retrieval_dataset import GRetrievalDataset
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _NON_TEXT_RELATION_MEAN_AGG = True
+_NUMPY_SEED_MOD = 2**32 - 1
+
+
+def _init_worker_seed(
+    worker_id: int,
+    *,
+    base_seed: Optional[int],
+    user_init_fn: Optional[Callable[[int], None]],
+) -> None:
+    if base_seed is not None:
+        worker_seed = int(base_seed) + int(worker_id)
+        torch.manual_seed(worker_seed)
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.manual_seed_all(worker_seed)
+        random.seed(worker_seed)
+        if np is not None:
+            np.random.seed(worker_seed % _NUMPY_SEED_MOD)
+    if user_init_fn is not None:
+        user_init_fn(worker_id)
 
 
 def _apply_non_text_relation_embeddings(batch: Any) -> None:
@@ -132,12 +156,13 @@ class RetrievalCollater:
         num_graphs = int(node_ptr.numel() - 1)
         if num_graphs <= 0:
             raise ValueError("ptr must encode at least one graph when precomputing edge_batch.")
+        debug_context = build_edge_batch_debug_context(batch)
         edge_batch, edge_ptr = compute_edge_batch(
             edge_index,
             node_ptr=node_ptr,
             num_graphs=num_graphs,
             device=edge_index.device,
-            debug_batch=batch,
+            debug_context=debug_context,
             validate=True,
         )
         batch.edge_batch = edge_batch
@@ -182,26 +207,22 @@ class UnifiedDataLoader(DataLoader):
         if self._embeddings_device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("embeddings_device=cuda requested but CUDA is not available.")
 
-        worker_init_fn: Optional[Callable[[int], None]] = kwargs.pop("worker_init_fn", None)
+        user_init_fn: Optional[Callable[[int], None]] = kwargs.pop("worker_init_fn", None)
         base_seed = int(random_seed) if random_seed is not None else None
-
-        def _init_worker(worker_id: int) -> None:
-            if base_seed is not None:
-                worker_seed = base_seed + worker_id
-                torch.manual_seed(worker_seed)
-                torch.cuda.manual_seed_all(worker_seed)
-                random.seed(worker_seed)
-                if np is not None:
-                    np.random.seed(worker_seed % (2**32 - 1))
-            if worker_init_fn is not None:
-                worker_init_fn(worker_id)
-
-        kwargs["worker_init_fn"] = _init_worker
+        kwargs["worker_init_fn"] = functools.partial(
+            _init_worker_seed,
+            base_seed=base_seed,
+            user_init_fn=user_init_fn,
+        )
 
         if base_seed is not None:
             generator = torch.Generator()
             generator.manual_seed(base_seed)
             kwargs.setdefault("generator", generator)
+
+        if num_workers > 0 and "multiprocessing_context" not in kwargs:
+            if torch.cuda.is_available():
+                kwargs["multiprocessing_context"] = "spawn"
 
         if prefetch_factor is not None and num_workers > 0:
             kwargs["prefetch_factor"] = int(prefetch_factor)
@@ -225,7 +246,12 @@ class UnifiedDataLoader(DataLoader):
         )
         self.shuffle = shuffle
         self._global_embeddings = None
-        logger.info("UnifiedDataLoader initialized: batch_size=%s shuffle=%s", batch_size, shuffle)
+        log_event(
+            logger,
+            "unified_dataloader_init",
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
 
     def __iter__(self):
         iterator = super().__iter__()

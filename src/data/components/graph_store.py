@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from typing import Dict, Optional, Union
 
 import lmdb
 
-logger = logging.getLogger(__name__)
+from src.utils.logging_utils import get_logger, log_event
+
+logger = get_logger(__name__)
 
 
 class GraphStore:
@@ -47,10 +48,11 @@ class GraphStore:
             self.relation2id = {label: idx for idx, label in enumerate(relation_labels)}
             self.id2relation = {idx: label for idx, label in enumerate(relation_labels)}
 
-            logger.info(
-                "Loaded vocabulary: %d entities / %d relations",
-                len(self.entity2id),
-                len(self.relation2id),
+            log_event(
+                logger,
+                "vocab_loaded",
+                entities=len(self.entity2id),
+                relations=len(self.relation2id),
             )
         finally:
             env.close()

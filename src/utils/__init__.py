@@ -13,17 +13,9 @@ __all__ = [
     "instantiate_callbacks",
     "instantiate_loggers",
     "log_hyperparameters",
-    "infer_batch_size",
     "log_metric",
-    "normalize_k_values",
-    "extract_sample_ids",
-    "extract_answer_entity_ids",
-    "compute_answer_recall",
-    "compute_answer_hit",
-    "summarize_uncertainty",
     "setup_optimizer",
     "RankedLogger",
-    "Registry",
     "enforce_tags",
     "print_config_tree",
     "extras",
@@ -45,17 +37,8 @@ if TYPE_CHECKING:  # pragma: no cover
         resolve_run_name,
         task_wrapper,
     )
-    from .logging import RankedLogger, infer_batch_size, log_hyperparameters, log_metric
-    from .metrics import (
-        compute_answer_hit,
-        compute_answer_recall,
-        extract_answer_entity_ids,
-        extract_sample_ids,
-        normalize_k_values,
-        summarize_uncertainty,
-    )
+    from .logging_utils import RankedLogger, log_hyperparameters, log_metric
     from .optimization import setup_optimizer
-    from .registry import Registry
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
@@ -94,51 +77,19 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
             "apply_run_name": apply_run_name,
         }[name]
 
-    if name in ("log_hyperparameters", "infer_batch_size", "log_metric", "RankedLogger"):
-        from .logging import RankedLogger, infer_batch_size, log_hyperparameters, log_metric
+    if name in ("log_hyperparameters", "log_metric", "RankedLogger"):
+        from .logging_utils import RankedLogger, log_hyperparameters, log_metric
 
         return {
             "log_hyperparameters": log_hyperparameters,
-            "infer_batch_size": infer_batch_size,
             "log_metric": log_metric,
             "RankedLogger": RankedLogger,
-        }[name]
-
-    if name in (
-        "normalize_k_values",
-        "extract_sample_ids",
-        "extract_answer_entity_ids",
-        "compute_answer_recall",
-        "compute_answer_hit",
-        "summarize_uncertainty",
-    ):
-        from .metrics import (
-            compute_answer_hit,
-            compute_answer_recall,
-            extract_answer_entity_ids,
-            extract_sample_ids,
-            normalize_k_values,
-            summarize_uncertainty,
-        )
-
-        return {
-            "normalize_k_values": normalize_k_values,
-            "extract_sample_ids": extract_sample_ids,
-            "extract_answer_entity_ids": extract_answer_entity_ids,
-            "compute_answer_recall": compute_answer_recall,
-            "compute_answer_hit": compute_answer_hit,
-            "summarize_uncertainty": summarize_uncertainty,
         }[name]
 
     if name == "setup_optimizer":
         from .optimization import setup_optimizer
 
         return setup_optimizer
-
-    if name == "Registry":
-        from .registry import Registry
-
-        return Registry
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

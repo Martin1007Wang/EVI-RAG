@@ -15,7 +15,7 @@ train: true
 test: false
 ckpt_path: null
 seed: 42
-optimized_metric: "val/context_f1@${model.evaluation_cfg.num_eval_rollouts}"
+optimized_metric: "val/composite_score@${model.evaluation_cfg.num_eval_rollouts}"
 
 data:
   splits:
@@ -27,8 +27,15 @@ trainer:
   check_val_every_n_epoch: 1
 
 model:
-  training_cfg:
-    num_train_rollouts: 3
+  env:
+    max_steps: ${dataset.max_steps}
+
+  evaluation_cfg:
+    num_eval_rollouts: 1
+    rollout_chunk_size: 1
+
+  edge_score_cfg:
+    activation_checkpointing: true
 
   optimizer_cfg:
     type: adamw
@@ -42,21 +49,30 @@ model:
     eta_min: 1.0e-6
     interval: epoch
 
-  evaluation_cfg:
-    num_eval_rollouts: 1
-    rollout_temperature: 0.2
-
   actor_cfg:
     policy_temperature: 0.2
 
+  training_cfg:
+    num_train_rollouts: 3
+    rollout_chunk_size: 3
+    manual_gradient_clip_val: 1.0
+    manual_gradient_clip_algorithm: norm
+    manual_gradient_clip_norm_type: 2.0
+    adaptive_gradient_clip: false
+    grad_clip_ema_beta: null
+    grad_clip_tail_prob: null
+    grad_clip_log_eps: 1.0e-8
+    grad_clip_tail_prob_eps: 1.0e-6
+    grad_non_finite_max_params: 20
+
 callbacks:
   model_checkpoint:
-    monitor: val/context_f1@${model.evaluation_cfg.num_eval_rollouts}
+    monitor: val/composite_score@${model.evaluation_cfg.num_eval_rollouts}
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/context_f1@${model.evaluation_cfg.num_eval_rollouts}
+    monitor: val/composite_score@${model.evaluation_cfg.num_eval_rollouts}
     mode: max
     patience: 50

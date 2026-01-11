@@ -16,10 +16,14 @@ class GFlowNetEvalMetrics(Callback):
         *,
         enabled: bool = True,
         k_values: Optional[Sequence[int]] = None,
+        composite_score_cfg: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
-        self._accumulator = GFlowNetEvalAccumulator(k_values=k_values)
+        self._accumulator = GFlowNetEvalAccumulator(
+            k_values=k_values,
+            composite_score_cfg=composite_score_cfg,
+        )
 
     def on_predict_batch_end(
         self,

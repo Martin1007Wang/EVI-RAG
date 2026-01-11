@@ -77,7 +77,7 @@
 ---
 
 ### 2. Runtime Contract (Current Pipeline)
-*   **Training:** 仅提供 MPM-RAG 训练（`configs/experiment/train_mpm_rag.yaml`，`override /data: retriever`）；训练阶段仅消费 `g_retrieval`（LMDB）。
+*   **Training:** 仅提供 GFlowNet 训练（`configs/experiment/train_gflownet.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
 *   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_retriever` 与 `eval_gflownet` 缓存；不生成/不读取 `g_agent`。
 *   **Shortcut Suppression/SP-Dropout:** 训练阶段默认启用 SP-Dropout（预选遮蔽）与 Safety Net（最短路保底），仅作用于 `g_retrieval` 子图采样。
 

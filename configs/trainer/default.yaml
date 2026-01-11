@@ -11,13 +11,16 @@ devices: auto
 profiler: null
 
 # mixed precision for throughput; prefer bf16 on supported GPUs
-precision: 16-mixed
+precision: bf16-mixed
+
+# gradient accumulation to trade throughput for memory
+accumulate_grad_batches: 1
 
 # cudnn autotune for stable input shapes (disable if shapes vary wildly)
 benchmark: true
 
-# gradient clipping to stabilize TB under rare large residuals
-gradient_clip_val: 1.0
+# disable automatic clipping for manual optimization (model handles it)
+gradient_clip_val: null
 
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 10

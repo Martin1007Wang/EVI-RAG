@@ -22,7 +22,6 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 _RUN_REQUIRES_CKPT_KIND = {
     "eval_gflownet": "gflownet",
-    "export_gflownet": "gflownet",
 }
 
 _DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"
@@ -266,11 +265,13 @@ def _run_eval_all_datasets(cfg: DictConfig) -> None:
                 f"Got scopes={sorted(scopes)} for variants={names}."
             )
 
+    base_output_dir = cfg.paths.output_dir
     for label, dataset_cfg in variants:
         log.info("eval: dataset_variant=%s", label)
         with open_dict(cfg):
             cfg.dataset = dataset_cfg
             cfg.run.dataset_variant = label
+            cfg.paths.output_dir = base_output_dir
         if bool(run_cfg.get("run_all_splits", False)):
             _run_eval_all_splits(cfg)
         else:
@@ -356,9 +357,10 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         split = run_cfg.get("split")
         dataset_variant = run_cfg.get("dataset_variant")
         if dataset_variant:
-            metrics_filename = f"metrics_{dataset_variant}.json"
+            scope = _normalize_dataset_scope(cfg.dataset)
+            metrics_filename = f"metrics_{scope}.json"
         if bool(run_cfg.get("run_all_splits", False)) and split not in (None, ""):
-            prefix = f"metrics_{dataset_variant}_" if dataset_variant else "metrics_"
+            prefix = f"metrics_{scope}_" if dataset_variant else "metrics_"
             metrics_filename = f"{prefix}{split}.json"
         metrics_path = _save_metrics(cfg, metric_dict, filename=metrics_filename)
         log.info("Metrics saved to %s", metrics_path)

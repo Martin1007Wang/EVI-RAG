@@ -15,6 +15,11 @@ from torch.utils.data import Dataset
 from .components import SharedDataResources
 from .components.loader import UnifiedDataLoader
 from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
+from src.utils.logging_utils import get_logger, log_event
+
+LOGGER = get_logger(__name__)
+_EMBEDDINGS_DEVICE_CPU = "cpu"
+_EMBEDDINGS_DEVICE_CUDA = "cuda"
 
 
 def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -67,6 +72,17 @@ class GRetrievalDataModule(LightningDataModule):
         splits: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__()
+        normalized_embeddings_device = None if embeddings_device is None else str(embeddings_device).lower()
+        if num_workers > 0 and normalized_embeddings_device == _EMBEDDINGS_DEVICE_CUDA:
+            log_event(
+                LOGGER,
+                "datamodule_force_cpu_embeddings",
+                reason="avoid_cuda_init_in_workers",
+                num_workers=int(num_workers),
+            )
+            normalized_embeddings_device = _EMBEDDINGS_DEVICE_CPU
+        embeddings_device = normalized_embeddings_device
+
         # dataset_cfg 可能包含 OmegaConf 对象；避免写入 checkpoint 元数据。
         self.save_hyperparameters(logger=False, ignore=["dataset_cfg"])
 

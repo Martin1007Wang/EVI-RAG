@@ -617,7 +617,7 @@ logger:
 ```
 
 预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
-- 训练（`experiment=`）：`train_mpm_rag`
+- 训练（`experiment=`）：`train_gflownet`
 - 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_gflownet`, `export_gflownet`
 
 数据构建（g_retrieval）：

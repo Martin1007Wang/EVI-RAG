@@ -1,4 +1,4 @@
-from src.data.schema.constants import GraphFields, LMDBKeys
+from src.data.schema.constants import GraphFields
 from src.data.schema.types import (
     EmbeddingConfig,
     EntityLookup,
@@ -18,7 +18,6 @@ __all__ = [
     "EntityVocab",
     "GraphFields",
     "GraphRecord",
-    "LMDBKeys",
     "RelationLookup",
     "RelationVocab",
     "Sample",

@@ -104,28 +104,28 @@ else
   echo "==> [1/5] build_retrieval_pipeline (full=${DATASET_FULL}) [skipped]"
 fi
 
-echo "==> [2/5] train_mpm_rag (EB-GFN, sub=${DATASET_SUB})"
-MPM_EXP="train_mpm_rag"
-MPM_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${MPM_EXP}")
-python src/train.py "${MPM_TRAIN_OVERRIDES[@]}"
-MPM_RUN_DIR="$(latest_run_dir "${MPM_EXP}" "${DATASET_SUB}")"
-MPM_CKPT="$(pick_best_ckpt "${MPM_RUN_DIR}")"
-if [[ -z "${MPM_CKPT}" ]]; then
-  echo "MPM-RAG checkpoint not found under run dir: ${MPM_RUN_DIR:-<missing>}" >&2
+echo "==> [2/5] train_gflownet (EB-GFN, sub=${DATASET_SUB})"
+GFN_EXP="train_gflownet"
+GFN_TRAIN_OVERRIDES=("${COMMON_OVERRIDES_SUB[@]}" "experiment=${GFN_EXP}")
+python src/train.py "${GFN_TRAIN_OVERRIDES[@]}"
+GFN_RUN_DIR="$(latest_run_dir "${GFN_EXP}" "${DATASET_SUB}")"
+GFN_CKPT="$(pick_best_ckpt "${GFN_RUN_DIR}")"
+if [[ -z "${GFN_CKPT}" ]]; then
+  echo "GFlowNet checkpoint not found under run dir: ${GFN_RUN_DIR:-<missing>}" >&2
   exit 1
 fi
-echo "MPM-RAG checkpoint: ${MPM_CKPT}"
+echo "GFlowNet checkpoint: ${GFN_CKPT}"
 
 echo "==> [3/4] eval_gflownet (EB-GFN; full+sub)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=eval_gflownet" \
-  "ckpt.gflownet=${MPM_CKPT}"
+  "ckpt.gflownet=${GFN_CKPT}"
 
 echo "==> [4/4] export_gflownet (EB-GFN; full+sub)"
 python src/eval.py \
   "${COMMON_OVERRIDES_FULL[@]}" \
   "experiment=export_gflownet" \
-  "ckpt.gflownet=${MPM_CKPT}"
+  "ckpt.gflownet=${GFN_CKPT}"
 
 echo "Pipeline finished."

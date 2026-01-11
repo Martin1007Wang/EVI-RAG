@@ -41,15 +41,16 @@ from src.utils import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _GFLOWNET_MODEL_TARGET = "src.models.gflownet_module.GFlowNetModule"
+_SUPPORTED_MODEL_TARGETS = {_GFLOWNET_MODEL_TARGET}
 
 
-def _validate_gflownet_required_args(cfg: DictConfig) -> None:
+def _validate_required_args(cfg: DictConfig) -> None:
     model_cfg = cfg.get("model")
     data_cfg = cfg.get("data")
     model_target = model_cfg.get("_target_") if model_cfg else ""
     data_target = data_cfg.get("_target_") if data_cfg else ""
-    is_gflownet = model_target == "src.models.gflownet_module.GFlowNetModule"
-    if not is_gflownet:
+    requires_dataset = model_target in _SUPPORTED_MODEL_TARGETS
+    if not requires_dataset:
         return
 
     missing = []
@@ -59,20 +60,21 @@ def _validate_gflownet_required_args(cfg: DictConfig) -> None:
     if missing:
         missing_str = ", ".join(missing)
         raise ValueError(
-            "Missing required GFlowNet inputs: "
-            f"{missing_str}. Please specify `dataset=<name>` for GFlowNet training. "
-            "Example: python src/train.py experiment=train_mpm_rag dataset=webqsp-sub"
+            "Missing required training inputs: "
+            f"{missing_str}. Please specify `dataset=<name>` for training. "
+            "Example: python src/train.py experiment=train_gflownet dataset=webqsp-sub"
         )
 
 
-def _enforce_gflownet_training_only(cfg: DictConfig) -> None:
+def _enforce_supported_training_models(cfg: DictConfig) -> None:
     model_cfg = cfg.get("model") or {}
     model_target = str(model_cfg.get("_target_", "") or "")
-    if model_target != _GFLOWNET_MODEL_TARGET:
+    if model_target not in _SUPPORTED_MODEL_TARGETS:
+        supported = ", ".join(sorted(_SUPPORTED_MODEL_TARGETS))
         raise ValueError(
-            "Energy GFlowNet-only training is enforced; non-GFlowNet branches are disabled. "
+            "Unsupported model target for training. "
             f"Got model._target_={model_target!r}. "
-            f"Use experiment=train_mpm_rag with model._target_={_GFLOWNET_MODEL_TARGET}."
+            f"Supported targets: {supported}."
         )
 
 
@@ -207,8 +209,8 @@ def main(cfg: DictConfig) -> Optional[float]:
     """
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
-    _validate_gflownet_required_args(cfg)
-    _enforce_gflownet_training_only(cfg)
+    _validate_required_args(cfg)
+    _enforce_supported_training_models(cfg)
     _enforce_sub_training_scope(cfg)
     extras(cfg)
 

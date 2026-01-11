@@ -25,11 +25,34 @@ run:
 ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
 
+callbacks:
+  gflownet_rollout_artifact_writer:
+    textualize: true
+
 data:
   splits:
     test: ${run.split}
 
 model:
-  evaluation_cfg:
-    num_eval_rollouts: ${dataset.num_eval_rollouts}
-    rollout_temperature: 0.07
+  env:
+    max_steps: ${dataset.max_steps}
+
+  actor_cfg:
+    degree_logit_penalty: 0.5
+
+  reward_fn:
+    potential_weight: 2.0
+    potential_schedule: none
+
+  training_cfg:
+    num_train_rollouts: 3
+    rollout_chunk_size: 3
+    manual_gradient_clip_val: 1.0
+    manual_gradient_clip_algorithm: norm
+    manual_gradient_clip_norm_type: 2.0
+    adaptive_gradient_clip: false
+    grad_clip_ema_beta: null
+    grad_clip_tail_prob: null
+    grad_clip_log_eps: 1.0e-8
+    grad_clip_tail_prob_eps: 1.0e-6
+    grad_non_finite_max_params: 20

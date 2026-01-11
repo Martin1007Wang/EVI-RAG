@@ -1,5 +1,4 @@
 import json
-import logging
 import zlib
 from collections import OrderedDict
 from pathlib import Path
@@ -17,10 +16,9 @@ from .components import (
     GraphStore,
     SharedDataResources,
 )
-from src.utils.graph import compute_qa_edge_mask
-from src.utils.logging_utils import log_event
+from src.utils.logging_utils import get_logger, log_event
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 _QUESTIONS_PARQUET_FILENAME = "questions.parquet"
 _PARQUET_SCAN_BATCH_SIZE = 65536
 _MIN_SPLIT_SAMPLE_COUNT = 1
@@ -31,21 +29,6 @@ _ALLOWED_SAMPLE_ID_SOURCES = {_SAMPLE_IDS_SOURCE_LMDB, _SAMPLE_IDS_SOURCE_PARQUE
 _LMDB_SHARD_TOKEN = ".shard"
 _LMDB_SHARD_GLOB_TEMPLATE = "{split}.shard*.lmdb"
 _DUPLICATE_SAMPLE_ID_PREVIEW = 5
-_EDGE_DROPOUT_P_MIN = 0.0
-_EDGE_DROPOUT_P_MAX = 1.0
-_EDGE_DROPOUT_MIN_EDGES_DEFAULT = 1
-_EDGE_DROPOUT_STRATEGY_UNIFORM = "uniform"
-_EDGE_DROPOUT_STRATEGY_STRUCTURAL = "structural"
-_EDGE_DROPOUT_STRATEGIES = {_EDGE_DROPOUT_STRATEGY_UNIFORM, _EDGE_DROPOUT_STRATEGY_STRUCTURAL}
-_DEFAULT_EDGE_DROPOUT_STRATEGY = _EDGE_DROPOUT_STRATEGY_UNIFORM
-_EDGE_DROPOUT_BIAS_MIN = 0.0
-_EDGE_DROPOUT_BIAS_MAX = 1.0
-_DEFAULT_EDGE_DROPOUT_QA_BIAS = 0.0
-_DEFAULT_EDGE_DROPOUT_DEGREE_BIAS = 0.0
-_DEFAULT_EDGE_DROPOUT_DEGREE_POWER = 1.0
-_EDGE_DROPOUT_DEGREE_POWER_MIN = 0.0
-_EDGE_DROPOUT_EPS = 1e-6
-_DEGREE_NORM_MIN = 1.0
 _CACHE_DISABLED = 0
 _CACHE_MAX_ENTRIES_DEFAULT = 0
 _DISTANCE_PRELOAD_BATCH_SIZE = 256
@@ -53,6 +36,16 @@ _FILTER_MISSING_START_BATCH_SIZE = 256
 _FILTER_MISSING_ANSWER_BATCH_SIZE = 256
 _SEQUENTIAL_SAMPLE_IDS_DEFAULT = False
 _ZERO = 0
+_DEPRECATED_RAW_KEYS = ("labels", "answer_subgraph", "topic_pe", "node_topic_dist")
+_DEPRECATED_RAW_PREFIXES = ("pair_",)
+_REMOVED_DATASET_KEYS = (
+    "edge_dropout_p",
+    "edge_dropout_min_edges",
+    "edge_dropout_strategy",
+    "edge_dropout_qa_bias",
+    "edge_dropout_degree_bias",
+    "edge_dropout_degree_power",
+)
 
 
 class GRetrievalData(GraphData):
@@ -81,12 +74,6 @@ class GRetrievalDataset(Dataset):
         validate_on_init: bool = False,
         validate_on_get: bool = True,
         sample_ids: Optional[Sequence[str]] = None,
-        edge_dropout_p: Optional[tuple[float, float]] = None,
-        edge_dropout_min_edges: int = _EDGE_DROPOUT_MIN_EDGES_DEFAULT,
-        edge_dropout_strategy: str = _DEFAULT_EDGE_DROPOUT_STRATEGY,
-        edge_dropout_qa_bias: float = _DEFAULT_EDGE_DROPOUT_QA_BIAS,
-        edge_dropout_degree_bias: float = _DEFAULT_EDGE_DROPOUT_DEGREE_BIAS,
-        edge_dropout_degree_power: float = _DEFAULT_EDGE_DROPOUT_DEGREE_POWER,
         cache_node_min_dists: bool = False,
         cache_max_entries: int = _CACHE_MAX_ENTRIES_DEFAULT,
         sequential_sample_ids: bool = _SEQUENTIAL_SAMPLE_IDS_DEFAULT,
@@ -111,19 +98,6 @@ class GRetrievalDataset(Dataset):
         self._sample_stores: Optional[List[EmbeddingStore]] = None
         self._sample_ids_source = _SAMPLE_IDS_SOURCE_LMDB
         self._validate_on_get = bool(validate_on_get)
-        self._edge_dropout_p = _validate_edge_dropout(edge_dropout_p)
-        self._edge_dropout_enabled = (
-            self._edge_dropout_p is not None and self._edge_dropout_p[1] > _EDGE_DROPOUT_P_MIN
-        )
-        self._edge_dropout_min_edges = int(edge_dropout_min_edges)
-        if self._edge_dropout_min_edges < 0:
-            raise ValueError(f"edge_dropout_min_edges must be >= 0, got {self._edge_dropout_min_edges}")
-        self._edge_dropout_strategy = _validate_edge_dropout_strategy(edge_dropout_strategy)
-        self._edge_dropout_qa_bias = _validate_edge_dropout_bias(edge_dropout_qa_bias, "edge_dropout_qa_bias")
-        self._edge_dropout_degree_bias = _validate_edge_dropout_bias(
-            edge_dropout_degree_bias, "edge_dropout_degree_bias"
-        )
-        self._edge_dropout_degree_power = _validate_edge_dropout_degree_power(edge_dropout_degree_power)
         self._preload_node_min_dists = bool(preload_node_min_dists)
         self._cache_node_min_dists = bool(cache_node_min_dists) or self._preload_node_min_dists
         self._cache_max_entries = int(cache_max_entries)
@@ -137,8 +111,6 @@ class GRetrievalDataset(Dataset):
         self._distance_store_checked = False
         self._node_min_dists_cache: Optional[Dict[str, torch.Tensor]] = None
         if self._cache_node_min_dists:
-            if self._edge_dropout_enabled:
-                raise ValueError("cache_node_min_dists requires edge_dropout_p=0 to keep distances deterministic.")
             if not self._preload_node_min_dists and self._cache_max_entries <= _CACHE_DISABLED:
                 raise ValueError("cache_max_entries must be positive when cache_node_min_dists is enabled.")
             if self._preload_node_min_dists:
@@ -162,7 +134,12 @@ class GRetrievalDataset(Dataset):
         self._maybe_sort_sample_ids()
         self._maybe_preload_node_min_dists()
 
-        logger.info(f"GRetrievalDataset[{self.split}] initialized: {len(self.sample_ids)} samples.")
+        log_event(
+            logger,
+            "g_retrieval_dataset_init",
+            split=self.split,
+            samples=len(self.sample_ids),
+        )
 
     def _get_cached_node_min_dists(self, sample_id: str) -> Optional[torch.Tensor]:
         if self._node_min_dists_cache is None:
@@ -234,14 +211,6 @@ class GRetrievalDataset(Dataset):
 
         q_local_indices = raw["q_local_indices"]
         a_local_indices = raw["a_local_indices"]
-        edge_index, edge_attr = self._apply_edge_dropout(
-            edge_index=edge_index,
-            edge_attr=edge_attr,
-            sample_id=sample_id,
-            num_nodes=num_nodes,
-            q_local_indices=q_local_indices,
-            a_local_indices=a_local_indices,
-        )
         node_min_dists = self._get_cached_node_min_dists(sample_id)
         if node_min_dists is None:
             node_min_dists = self._load_distance_cache(sample_id, num_nodes)
@@ -267,55 +236,6 @@ class GRetrievalDataset(Dataset):
             data_kwargs["question"] = question_text
         data = GRetrievalData(**data_kwargs)
         return data
-
-    def _apply_edge_dropout(
-        self,
-        *,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
-        sample_id: str,
-        num_nodes: int,
-        q_local_indices: torch.Tensor,
-        a_local_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._edge_dropout_p is None:
-            return edge_index, edge_attr
-        if edge_index.dim() != 2 or edge_index.size(0) != 2:
-            raise ValueError(f"edge_index must have shape [2, E] for {sample_id}, got {tuple(edge_index.shape)}")
-        num_edges = int(edge_index.size(1))
-        if num_edges <= self._edge_dropout_min_edges or num_edges <= 0:
-            return edge_index, edge_attr
-        p_min, p_max = self._edge_dropout_p
-        if p_max <= _EDGE_DROPOUT_P_MIN:
-            return edge_index, edge_attr
-        if p_min == p_max:
-            drop_p = float(p_min)
-        else:
-            drop_p = float(torch.empty(1).uniform_(p_min, p_max).item())
-        drop_prob = torch.full((num_edges,), drop_p, dtype=torch.float32, device=edge_index.device)
-        if (
-            self._edge_dropout_strategy == _EDGE_DROPOUT_STRATEGY_STRUCTURAL
-            and (
-                self._edge_dropout_qa_bias > _EDGE_DROPOUT_BIAS_MIN
-                or self._edge_dropout_degree_bias > _EDGE_DROPOUT_BIAS_MIN
-            )
-        ):
-            bias = _compute_structural_drop_bias(
-                edge_index=edge_index,
-                num_nodes=num_nodes,
-                q_local_indices=q_local_indices,
-                a_local_indices=a_local_indices,
-                qa_bias=self._edge_dropout_qa_bias,
-                degree_bias=self._edge_dropout_degree_bias,
-                degree_power=self._edge_dropout_degree_power,
-            )
-            drop_prob = drop_prob + bias * (_EDGE_DROPOUT_P_MAX - drop_prob)
-            drop_prob = drop_prob.clamp(max=_EDGE_DROPOUT_P_MAX - _EDGE_DROPOUT_EPS)
-        keep_mask = torch.rand_like(drop_prob) >= drop_prob
-        keep_mask = _ensure_min_edges(keep_mask, num_edges, self._edge_dropout_min_edges)
-        edge_index = edge_index[:, keep_mask]
-        edge_attr = edge_attr[keep_mask]
-        return edge_index, edge_attr
 
     def close(self) -> None:
         if self._sample_stores is not None:
@@ -385,7 +305,12 @@ class GRetrievalDataset(Dataset):
             raise FileNotFoundError(f"Distance PT cache not found at {self._distance_cache_path}")
         try:
             self._distance_store = DistancePTStore(self._distance_cache_path)
-            logger.info("Distance cache enabled format=pt path=%s.", self._distance_cache_path)
+            log_event(
+                logger,
+                "distance_cache_enabled",
+                format=self._distance_cache_format,
+                path=str(self._distance_cache_path),
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to open distance PT cache at {self._distance_cache_path}: {exc}"
@@ -458,7 +383,12 @@ class GRetrievalDataset(Dataset):
             return
         if self._cache_max_entries < total:
             self._cache_max_entries = total
-        logger.info("Preloading distance cache for split=%s samples=%d", self.split, total)
+        log_event(
+            logger,
+            "distance_cache_preload_start",
+            split=self.split,
+            samples=total,
+        )
         batch_size = _DISTANCE_PRELOAD_BATCH_SIZE
         for start in range(_ZERO, total, batch_size):
             batch_ids = self.sample_ids[start:start + batch_size]
@@ -467,10 +397,11 @@ class GRetrievalDataset(Dataset):
                 num_nodes = int(raw["num_nodes"])
                 node_min_dists = self._load_distance_cache(sample_id, num_nodes)
                 self._store_cached_node_min_dists(sample_id, node_min_dists)
-        logger.info(
-            "Preloaded distance cache for split=%s entries=%d",
-            self.split,
-            len(self._node_min_dists_cache),
+        log_event(
+            logger,
+            "distance_cache_preload_done",
+            split=self.split,
+            entries=len(self._node_min_dists_cache),
         )
 
     @property
@@ -514,7 +445,13 @@ class GRetrievalDataset(Dataset):
 
         perm = torch.randperm(len(self.sample_ids), generator=generator).tolist()
         self.sample_ids = [self.sample_ids[i] for i in perm[:limit]]
-        logger.info(f"Subsampled {self.split} to {len(self.sample_ids)} samples.")
+        log_event(
+            logger,
+            "sample_limit_applied",
+            split=self.split,
+            limit=limit,
+            samples=len(self.sample_ids),
+        )
 
     def _assert_all_samples_valid(self) -> None:
         """
@@ -537,7 +474,14 @@ class GRetrievalDataset(Dataset):
         keep_ids = self._load_filter_ids(path)
         before = len(self.sample_ids)
         self.sample_ids = [sid for sid in self.sample_ids if sid in keep_ids]
-        logger.info(f"Filtered {self.split}: {before} -> {len(self.sample_ids)} using {path.name}")
+        log_event(
+            logger,
+            "sample_filter_applied",
+            split=self.split,
+            before=before,
+            after=len(self.sample_ids),
+            filter=path.name,
+        )
 
     def _filter_missing_start(self, *, batch_size: int) -> None:
         if not self.sample_ids:
@@ -629,6 +573,7 @@ def create_g_retrieval_dataset(
     resources: Optional[SharedDataResources] = None,
 ) -> GRetrievalDataset:
     """Factory adapting dataset_cfg into GRetrievalDataset."""
+    _assert_no_removed_dataset_keys(cfg)
     split_name = _assert_allowed_split_name(split_name)
     emb_root = Path(cfg["paths"]["embeddings"])
     split_path = emb_root / f"{split_name}.lmdb"
@@ -636,14 +581,6 @@ def create_g_retrieval_dataset(
     filter_missing_start = _resolve_split_bool(cfg, split_name, "filter_missing_start", False)
     filter_missing_answer = _resolve_split_bool(cfg, split_name, "filter_missing_answer", False)
     sample_ids = _load_sample_ids_from_parquet(cfg, split_name)
-    edge_dropout_p = _resolve_edge_dropout(cfg, split_name)
-    edge_dropout_min_edges = _resolve_edge_dropout_min_edges(cfg, split_name)
-    edge_dropout_strategy = _resolve_edge_dropout_strategy(cfg, split_name)
-    edge_dropout_qa_bias = _resolve_edge_dropout_bias(cfg, split_name, "edge_dropout_qa_bias", _DEFAULT_EDGE_DROPOUT_QA_BIAS)
-    edge_dropout_degree_bias = _resolve_edge_dropout_bias(
-        cfg, split_name, "edge_dropout_degree_bias", _DEFAULT_EDGE_DROPOUT_DEGREE_BIAS
-    )
-    edge_dropout_degree_power = _resolve_edge_dropout_degree_power(cfg, split_name)
     cache_node_min_dists = _resolve_split_bool(cfg, split_name, "cache_node_min_dists", False)
     cache_max_entries = _resolve_split_int(cfg, split_name, "cache_max_entries", _CACHE_MAX_ENTRIES_DEFAULT)
     sequential_sample_ids = _resolve_split_bool(
@@ -654,9 +591,19 @@ def create_g_retrieval_dataset(
     lmdb_readahead = _resolve_split_bool(cfg, split_name, "lmdb_readahead", False)
     preload_node_min_dists = _resolve_split_bool(cfg, split_name, "preload_node_min_dists", False)
     if sample_ids is None:
-        logger.info("Loaded sample ids from LMDB for split=%s.", split_name)
+        log_event(
+            logger,
+            "sample_ids_loaded",
+            split=split_name,
+            source=_SAMPLE_IDS_SOURCE_LMDB,
+        )
     else:
-        logger.info("Loaded sample ids from normalized parquet for split=%s.", split_name)
+        log_event(
+            logger,
+            "sample_ids_loaded",
+            split=split_name,
+            source=_SAMPLE_IDS_SOURCE_PARQUET,
+        )
 
     filter_paths = _resolve_filter_paths(cfg, split_name)
 
@@ -673,12 +620,6 @@ def create_g_retrieval_dataset(
         validate_on_init=bool(cfg.get("validate_on_init", False)),
         validate_on_get=bool(cfg.get("validate_on_get", True)),
         sample_ids=sample_ids,
-        edge_dropout_p=edge_dropout_p,
-        edge_dropout_min_edges=edge_dropout_min_edges,
-        edge_dropout_strategy=edge_dropout_strategy,
-        edge_dropout_qa_bias=edge_dropout_qa_bias,
-        edge_dropout_degree_bias=edge_dropout_degree_bias,
-        edge_dropout_degree_power=edge_dropout_degree_power,
         cache_node_min_dists=cache_node_min_dists,
         cache_max_entries=cache_max_entries,
         sequential_sample_ids=sequential_sample_ids,
@@ -700,49 +641,10 @@ def _resolve_sample_limit(cfg: Dict[str, Any], split_name: str) -> Optional[int]
     return int(sample_limit)
 
 
-def _resolve_edge_dropout(cfg: Dict[str, Any], split_name: str) -> Optional[tuple[float, float]]:
-    value = cfg.get("edge_dropout_p")
-    if isinstance(value, dict):
-        value = value.get(split_name)
-    if value is None:
-        return None
-    if isinstance(value, (list, tuple)):
-        if len(value) != 2:
-            raise ValueError("edge_dropout_p must be a float or a 2-item sequence.")
-        p_min, p_max = value
-    else:
-        p_min, p_max = value, value
-    p_min_f = float(p_min)
-    p_max_f = float(p_max)
-    return (p_min_f, p_max_f)
-
-
-def _resolve_edge_dropout_min_edges(cfg: Dict[str, Any], split_name: str) -> int:
-    value = cfg.get("edge_dropout_min_edges", _EDGE_DROPOUT_MIN_EDGES_DEFAULT)
-    if isinstance(value, dict):
-        value = value.get(split_name, _EDGE_DROPOUT_MIN_EDGES_DEFAULT)
-    return int(value)
-
-
-def _resolve_edge_dropout_strategy(cfg: Dict[str, Any], split_name: str) -> str:
-    value = cfg.get("edge_dropout_strategy", _DEFAULT_EDGE_DROPOUT_STRATEGY)
-    if isinstance(value, dict):
-        value = value.get(split_name, _DEFAULT_EDGE_DROPOUT_STRATEGY)
-    return str(value)
-
-
-def _resolve_edge_dropout_bias(cfg: Dict[str, Any], split_name: str, key: str, default: float) -> float:
-    value = cfg.get(key, default)
-    if isinstance(value, dict):
-        value = value.get(split_name, default)
-    return float(value)
-
-
-def _resolve_edge_dropout_degree_power(cfg: Dict[str, Any], split_name: str) -> float:
-    value = cfg.get("edge_dropout_degree_power", _DEFAULT_EDGE_DROPOUT_DEGREE_POWER)
-    if isinstance(value, dict):
-        value = value.get(split_name, _DEFAULT_EDGE_DROPOUT_DEGREE_POWER)
-    return float(value)
+def _assert_no_removed_dataset_keys(cfg: Dict[str, Any]) -> None:
+    removed = [key for key in _REMOVED_DATASET_KEYS if key in cfg]
+    if removed:
+        raise ValueError(f"Removed dataset config keys detected: {removed}. Edge dropout is no longer supported.")
 
 
 def _resolve_split_bool(cfg: Dict[str, Any], split_name: str, key: str, default: bool) -> bool:
@@ -933,93 +835,6 @@ def _load_lmdb_entry_total(paths: Sequence[Path]) -> int:
     return sum(_load_lmdb_entry_counts(paths))
 
 
-def _validate_edge_dropout(
-    edge_dropout_p: Optional[tuple[float, float]],
-) -> Optional[tuple[float, float]]:
-    if edge_dropout_p is None:
-        return None
-    p_min, p_max = edge_dropout_p
-    p_min_f = float(p_min)
-    p_max_f = float(p_max)
-    if p_min_f < _EDGE_DROPOUT_P_MIN or p_max_f > _EDGE_DROPOUT_P_MAX:
-        raise ValueError(f"edge_dropout_p must be in [{_EDGE_DROPOUT_P_MIN}, {_EDGE_DROPOUT_P_MAX}].")
-    if p_min_f > p_max_f:
-        raise ValueError(f"edge_dropout_p min {p_min_f} > max {p_max_f}.")
-    if p_min_f == _EDGE_DROPOUT_P_MAX and p_max_f == _EDGE_DROPOUT_P_MAX:
-        raise ValueError("edge_dropout_p cannot be 1.0; it would remove all edges.")
-    return (p_min_f, p_max_f)
-
-
-def _validate_edge_dropout_strategy(strategy: str) -> str:
-    mode = str(strategy)
-    if mode not in _EDGE_DROPOUT_STRATEGIES:
-        raise ValueError(f"edge_dropout_strategy must be one of {sorted(_EDGE_DROPOUT_STRATEGIES)}, got {mode}")
-    return mode
-
-
-def _validate_edge_dropout_bias(value: float, name: str) -> float:
-    val = float(value)
-    if not (_EDGE_DROPOUT_BIAS_MIN <= val <= _EDGE_DROPOUT_BIAS_MAX):
-        raise ValueError(f"{name} must be in [{_EDGE_DROPOUT_BIAS_MIN}, {_EDGE_DROPOUT_BIAS_MAX}], got {val}")
-    return val
-
-
-def _validate_edge_dropout_degree_power(value: float) -> float:
-    val = float(value)
-    if val < _EDGE_DROPOUT_DEGREE_POWER_MIN:
-        raise ValueError(f"edge_dropout_degree_power must be >= {_EDGE_DROPOUT_DEGREE_POWER_MIN}, got {val}")
-    return val
-
-
-def _compute_structural_drop_bias(
-    *,
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    q_local_indices: torch.Tensor,
-    a_local_indices: torch.Tensor,
-    qa_bias: float,
-    degree_bias: float,
-    degree_power: float,
-) -> torch.Tensor:
-    num_edges = int(edge_index.size(1))
-    if num_edges <= 0:
-        return edge_index.new_zeros((0,), dtype=torch.float32)
-    device = edge_index.device
-    deg = torch.bincount(edge_index.view(-1), minlength=int(num_nodes)).to(dtype=torch.float32, device=device)
-    deg_score = deg.index_select(0, edge_index[0]) + deg.index_select(0, edge_index[1])
-    if degree_power != _DEFAULT_EDGE_DROPOUT_DEGREE_POWER:
-        deg_score = deg_score.pow(float(degree_power))
-    deg_max = deg_score.max().clamp_min(_DEGREE_NORM_MIN)
-    deg_norm = deg_score / deg_max
-    qa_mask = compute_qa_edge_mask(
-        edge_index,
-        num_nodes=int(num_nodes),
-        q_local_indices=q_local_indices,
-        a_local_indices=a_local_indices,
-    ).to(dtype=torch.float32)
-    degree_bias_t = torch.tensor(float(degree_bias), device=device, dtype=torch.float32)
-    qa_bias_t = torch.tensor(float(qa_bias), device=device, dtype=torch.float32)
-    bias = degree_bias_t * deg_norm + qa_bias_t * qa_mask
-    denom = degree_bias_t + qa_bias_t
-    if float(denom.item()) > _EDGE_DROPOUT_BIAS_MIN:
-        bias = bias / denom
-    return bias.clamp(min=_EDGE_DROPOUT_BIAS_MIN, max=_EDGE_DROPOUT_BIAS_MAX)
-
-
-def _ensure_min_edges(keep_mask: torch.Tensor, num_edges: int, min_edges: int) -> torch.Tensor:
-    if min_edges <= 0:
-        return keep_mask
-    kept = int(keep_mask.sum().item())
-    if kept >= min_edges:
-        return keep_mask
-    if num_edges <= min_edges:
-        return torch.ones(num_edges, dtype=torch.bool)
-    perm = torch.randperm(num_edges)
-    new_mask = torch.zeros(num_edges, dtype=torch.bool)
-    new_mask[perm[:min_edges]] = True
-    return new_mask
-
-
 def _validate_local_indices(local_idx: torch.Tensor, num_nodes: int, field: str, sample_id: str) -> None:
     if local_idx.numel() == 0:
         return
@@ -1069,6 +884,7 @@ def _validate_raw_sample(
     sample_id: str,
 ) -> None:
     """Shared raw-schema validation to guarantee PyG Data integrity."""
+    _assert_no_deprecated_fields(raw, sample_id)
     num_nodes, num_edges = _validate_core_sample(raw, sample_id)
 
 
@@ -1102,6 +918,15 @@ def _require_keys(raw: Dict[str, Any], sample_id: str, keys: Sequence[str]) -> N
     missing = [k for k in keys if k not in raw]
     if missing:
         raise KeyError(f"Sample {sample_id} missing keys: {missing}")
+
+
+def _assert_no_deprecated_fields(raw: Dict[str, Any], sample_id: str) -> None:
+    raw_keys = set(raw.keys())
+    deprecated = [key for key in _DEPRECATED_RAW_KEYS if key in raw_keys]
+    prefixed = [key for key in raw_keys if key.startswith(_DEPRECATED_RAW_PREFIXES)]
+    if deprecated or prefixed:
+        blocked = sorted(deprecated + prefixed)
+        raise ValueError(f"Sample {sample_id} contains deprecated fields: {blocked}")
 
 
 def _validate_edge_index(raw: Dict[str, Any], sample_id: str) -> tuple[int, int]:

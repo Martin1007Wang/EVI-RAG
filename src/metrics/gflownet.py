@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -12,11 +12,82 @@ _ONE = 1
 _TWO = 2
 _NEG_ONE = -1
 _FLOAT_ZERO = 0.0
+_FLOAT_ONE = 1.0
 _DEFAULT_K = 10
 _DEFAULT_K_VALUES = (_DEFAULT_K,)
 _DEFAULT_STOP_MARGIN = 0.0
 _STOP_MARGIN_P50 = 0.5
 _STOP_MARGIN_P90 = 0.9
+_DEFAULT_COMPOSITE_ENABLED = False
+_DEFAULT_COMPOSITE_WEIGHT_CONTEXT_HIT = 0.6
+_DEFAULT_COMPOSITE_WEIGHT_TERMINAL_HIT = 0.3
+_DEFAULT_COMPOSITE_WEIGHT_PASS_BEST = 0.1
+
+
+@dataclass(frozen=True)
+class CompositeScoreConfig:
+    enabled: bool = _DEFAULT_COMPOSITE_ENABLED
+    weight_context_hit: float = _DEFAULT_COMPOSITE_WEIGHT_CONTEXT_HIT
+    weight_terminal_hit: float = _DEFAULT_COMPOSITE_WEIGHT_TERMINAL_HIT
+    weight_pass_best: float = _DEFAULT_COMPOSITE_WEIGHT_PASS_BEST
+
+    @property
+    def weight_sum(self) -> float:
+        return float(self.weight_context_hit + self.weight_terminal_hit + self.weight_pass_best)
+
+
+def _require_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a float, got bool.")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise TypeError(f"{name} must be a float, got empty string.")
+        try:
+            return float(text)
+        except ValueError as exc:
+            raise TypeError(f"{name} must be a float, got {value!r}.") from exc
+    raise TypeError(f"{name} must be a float, got {type(value).__name__}.")
+
+
+def _require_non_negative_float(value: Any, name: str) -> float:
+    parsed = _require_float(value, name)
+    if parsed < _FLOAT_ZERO:
+        raise ValueError(f"{name} must be >= 0, got {parsed}.")
+    return parsed
+
+
+def resolve_composite_score_cfg(raw_cfg: Optional[Any]) -> CompositeScoreConfig:
+    if isinstance(raw_cfg, CompositeScoreConfig):
+        return raw_cfg
+    if raw_cfg is None:
+        return CompositeScoreConfig()
+    if not isinstance(raw_cfg, Mapping):
+        raise TypeError(f"composite_score_cfg must be a mapping or None, got {type(raw_cfg).__name__}.")
+    enabled = bool(raw_cfg.get("enabled", _DEFAULT_COMPOSITE_ENABLED))
+    weight_context = _require_non_negative_float(
+        raw_cfg.get("weight_context_hit", _DEFAULT_COMPOSITE_WEIGHT_CONTEXT_HIT),
+        "composite_score_cfg.weight_context_hit",
+    )
+    weight_terminal = _require_non_negative_float(
+        raw_cfg.get("weight_terminal_hit", _DEFAULT_COMPOSITE_WEIGHT_TERMINAL_HIT),
+        "composite_score_cfg.weight_terminal_hit",
+    )
+    weight_pass_best = _require_non_negative_float(
+        raw_cfg.get("weight_pass_best", _DEFAULT_COMPOSITE_WEIGHT_PASS_BEST),
+        "composite_score_cfg.weight_pass_best",
+    )
+    cfg = CompositeScoreConfig(
+        enabled=enabled,
+        weight_context_hit=weight_context,
+        weight_terminal_hit=weight_terminal,
+        weight_pass_best=weight_pass_best,
+    )
+    if cfg.enabled and cfg.weight_sum <= _FLOAT_ZERO:
+        raise ValueError("composite_score_cfg weights must sum to a positive value.")
+    return cfg
 
 
 def _normalize_k_pairs(k_values: Sequence[int], num_rollouts: int) -> List[Tuple[int, int]]:
@@ -261,6 +332,48 @@ def compute_context_metrics(
     return metrics
 
 
+def compute_composite_score(
+    *,
+    metrics: Dict[str, torch.Tensor],
+    k_values: Sequence[int],
+    composite_cfg: CompositeScoreConfig,
+) -> Dict[str, torch.Tensor]:
+    if not composite_cfg.enabled:
+        return {}
+    ks = normalize_k_values(k_values)
+    if not ks:
+        return {}
+    pass_prob = metrics.get("pass@1")
+    if pass_prob is None:
+        return {}
+    if not torch.is_tensor(pass_prob):
+        pass_prob = torch.as_tensor(pass_prob)
+    pass_prob = pass_prob.to(dtype=torch.float32)
+    ones = torch.ones_like(pass_prob)
+    weight_context = float(composite_cfg.weight_context_hit)
+    weight_terminal = float(composite_cfg.weight_terminal_hit)
+    weight_pass_best = float(composite_cfg.weight_pass_best)
+    composite: Dict[str, torch.Tensor] = {}
+    for k_int in ks:
+        context = metrics.get(f"context_hit@{k_int}")
+        terminal = metrics.get(f"terminal_hit@{k_int}")
+        if context is None or terminal is None:
+            continue
+        if not torch.is_tensor(context):
+            context = torch.as_tensor(context, device=pass_prob.device)
+        if not torch.is_tensor(terminal):
+            terminal = torch.as_tensor(terminal, device=pass_prob.device)
+        context = context.to(dtype=torch.float32, device=pass_prob.device)
+        terminal = terminal.to(dtype=torch.float32, device=pass_prob.device)
+        pass_best = ones - torch.pow(ones - pass_prob, int(k_int))
+        composite[f"composite_score@{k_int}"] = (
+            (weight_context * context)
+            + (weight_terminal * terminal)
+            + (weight_pass_best * pass_best)
+        )
+    return composite
+
+
 def compute_path_diversity(
     *,
     actions_seq: torch.Tensor,
@@ -393,12 +506,13 @@ def build_tb_metrics(
     *,
     rollout: Any,
     reward_out: Any,
-    tb_loss: torch.Tensor,
     log_reward: torch.Tensor,
     log_z: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
     reward_metrics = reward_out.as_dict()
     log_reward_metric = reward_metrics.pop("log_reward")
+    if torch.is_tensor(log_reward_metric):
+        log_reward_metric = log_reward_metric.detach()
     reward_metrics.pop("reward", None)
     answer_hit = reward_metrics.pop("answer_hit", None)
     success = reward_metrics.pop("success", None)
@@ -407,14 +521,11 @@ def build_tb_metrics(
     answer_tensor = answer_hit if isinstance(answer_hit, torch.Tensor) else rollout.reach_success
     metrics: Dict[str, torch.Tensor] = {
         "log_reward": log_reward_metric,
-        "log_reward_post": log_reward.detach(),
         "log_z": log_z.detach(),
         "pass@1": answer_tensor.detach(),
         "length_mean": rollout.length.detach(),
-        "tb_loss": tb_loss.detach(),
         **{k: v.detach() for k, v in reward_metrics.items()},
     }
-    metrics.update(compute_diag_metrics(rollout))
     return metrics
 
 
@@ -624,6 +735,7 @@ class GFlowNetEvalState:
     context_precision_sum: Dict[int, float] = field(default_factory=dict)
     context_f1_sum: Dict[int, float] = field(default_factory=dict)
     context_hit_counts: Dict[int, int] = field(default_factory=dict)
+    composite_score_sum: Dict[int, float] = field(default_factory=dict)
 
 
 def _as_int_set(values: Iterable[Any]) -> set[int]:
@@ -761,6 +873,8 @@ def _update_prefix_state(
     prefix_terminal: List[bool],
     answer_set: set[int],
     start_set: set[int],
+    pass_rate: float,
+    composite_cfg: CompositeScoreConfig,
 ) -> None:
     for k_int, k_clamped in k_pairs:
         if k_clamped <= _ZERO:
@@ -779,17 +893,34 @@ def _update_prefix_state(
         state.context_f1_sum[k_int] += f1
         if hit > _FLOAT_ZERO:
             state.context_hit_counts[k_int] += _ONE
+        if composite_cfg.enabled:
+            pass_best = _FLOAT_ONE - (_FLOAT_ONE - pass_rate) ** float(k_int)
+            score = (
+                (composite_cfg.weight_context_hit * hit)
+                + (composite_cfg.weight_terminal_hit * float(prefix_terminal[idx]))
+                + (composite_cfg.weight_pass_best * pass_best)
+            )
+            state.composite_score_sum[k_int] = state.composite_score_sum.get(k_int, _FLOAT_ZERO) + score
 
 
 class GFlowNetEvalAccumulator:
-    def __init__(self, *, k_values: Optional[Sequence[int]] = None) -> None:
+    def __init__(
+        self,
+        *,
+        k_values: Optional[Sequence[int]] = None,
+        composite_score_cfg: Optional[Any] = None,
+    ) -> None:
         self.k_values = normalize_k_values(k_values, default=_DEFAULT_K_VALUES)
+        self._composite_cfg = resolve_composite_score_cfg(composite_score_cfg)
         self._state = GFlowNetEvalState(
             terminal_hit_counts={int(k): _ZERO for k in self.k_values},
             context_recall_sum={int(k): _FLOAT_ZERO for k in self.k_values},
             context_precision_sum={int(k): _FLOAT_ZERO for k in self.k_values},
             context_f1_sum={int(k): _FLOAT_ZERO for k in self.k_values},
             context_hit_counts={int(k): _ZERO for k in self.k_values},
+            composite_score_sum=(
+                {int(k): _FLOAT_ZERO for k in self.k_values} if self._composite_cfg.enabled else {}
+            ),
         )
 
     def update_from_records(self, records: List[Dict[str, Any]]) -> None:
@@ -820,6 +951,9 @@ class GFlowNetEvalAccumulator:
             metrics[f"context_precision@{k_int}"] = float(self._state.context_precision_sum.get(k_int, _FLOAT_ZERO)) / float(denom_answers)
             metrics[f"context_f1@{k_int}"] = float(self._state.context_f1_sum.get(k_int, _FLOAT_ZERO)) / float(denom_answers)
             metrics[f"context_hit@{k_int}"] = float(self._state.context_hit_counts.get(k_int, _ZERO)) / float(denom_answers)
+            if self._composite_cfg.enabled:
+                composite_sum = self._state.composite_score_sum.get(k_int, _FLOAT_ZERO)
+                metrics[f"composite_score@{k_int}"] = float(composite_sum) / float(denom_answers)
         return metrics
 
     def _update_from_record(self, record: Dict[str, Any]) -> None:
@@ -847,6 +981,8 @@ class GFlowNetEvalAccumulator:
         self._state.answer_samples += _ONE
         self._state.answer_rollouts += num_rollouts
         self._state.pass_hits += sum(pass_hits)
+        denom_rollouts = float(max(num_rollouts, _ONE))
+        pass_rate = float(sum(pass_hits)) / denom_rollouts
 
         k_pairs = _normalize_k_pairs(self.k_values, num_rollouts)
         if not k_pairs:
@@ -863,16 +999,21 @@ class GFlowNetEvalAccumulator:
             prefix_terminal=prefix_terminal,
             answer_set=answer_set,
             start_set=start_set,
+            pass_rate=pass_rate,
+            composite_cfg=self._composite_cfg,
         )
 
 
 __all__ = [
+    "CompositeScoreConfig",
+    "resolve_composite_score_cfg",
     "reduce_rollout_metrics",
     "stack_rollout_metrics",
     "finalize_rollout_metrics",
     "compute_terminal_hits",
     "compute_terminal_hit_prefixes",
     "compute_context_metrics",
+    "compute_composite_score",
     "compute_path_diversity",
     "compute_reward_gap",
     "compute_diag_metrics",

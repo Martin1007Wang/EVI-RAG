@@ -8,19 +8,22 @@ hidden_dim: 1024
 emb_dim: 1024
 backbone_finetune: true
 vocabulary_path: ${dataset.paths.vocabulary}
+relation_vocab_size: ${oc.env:RELATION_VOCAB_SIZE,null}
 edge_score_cfg:
   hidden_dim: ${model.hidden_dim}
   num_layers: 2
-  dropout: 0.1
+  dropout: 0.0
   bias_init: 0.0
+  activation_checkpointing: false
 state_cfg:
   state_dim: ${model.hidden_dim}
   dropout: 0.0
+  relation_use_active_nodes: false
 
 env:
   _target_: src.models.components.gflownet_env.GraphEnv
-  max_steps: ${dataset.max_steps}
-  stop_on_answer: false
+  max_steps: ???
+  stop_on_answer: true
   min_stop_steps: 0
 
 policy:
@@ -29,39 +32,55 @@ policy:
 
 reward_fn:
   _target_: src.models.components.gflownet_reward.GraphFusionReward
-  hard_target_bonus: 1.0
+  hard_target_bonus: 1000.0
   min_log_reward: -10.0
   potential_weight: 1.0
   potential_gamma: 1.0
   potential_unreachable_offset: 1.0
-
-reward_cfg:
-  embedding_source: raw
+  potential_schedule: cosine
   potential_weight_end: 0.0
-  potential_weight_decay_epochs: ${trainer.min_epochs}
+  potential_anneal_epochs: ${trainer.max_epochs}
+  potential_pure_phase_ratio: null
 
 actor_cfg:
   policy_temperature: 1.0
+  degree_logit_penalty: 0.0
   check_finite: false
 
-training_cfg:
-  num_train_rollouts: ${dataset.num_train_rollouts}
+control_cfg:
+  enabled: false
+  target_mode: reachable_horizon_frac
+  target_min: 0.0
+  target_max: 1.0
+  temperature_base: ${model.actor_cfg.policy_temperature}
+  temperature_min: ${model.actor_cfg.policy_temperature}
+  temperature_max: ${model.actor_cfg.policy_temperature}
+  lambda_init: 0.0
+  dual_lr: null
 
 runtime_cfg:
-  validate_edge_batch: true
-  vectorized_rollouts: ${dataset.vectorized_rollouts}
+  validate_edge_batch: false
+  require_precomputed_edge_batch: true
+  require_precomputed_node_in_degree: true
 
 evaluation_cfg:
-  num_eval_rollouts: ${dataset.num_eval_rollouts}
-  rollout_temperature: 0.0
+  num_eval_rollouts: 10
+  rollout_temperature: 1.0
+  rollout_temperature_extra:
+    - 0.7
+  rollout_chunk_size: 10
+  context_debug: false
+  composite_score_cfg:
+    enabled: true
+    weight_context_hit: 0.6
+    weight_terminal_hit: 0.3
+    weight_pass_best: 0.1
 
-optimizer_cfg:
-  type: adamw
-  lr: 1.0e-4
-  weight_decay: 1.0e-4
-
-scheduler_cfg:
-  type: cosine
-  t_max: 200
-  eta_min: 1.0e-6
-  interval: epoch
+logz_cfg:
+  use_graph_stats: true
+  graph_stats_log1p: true
+  use_hop_counts: false
+  use_relevance: false
+  use_relevance_stats: true
+  relevance_temperature: 1.0
+  bias_init: min_log_reward

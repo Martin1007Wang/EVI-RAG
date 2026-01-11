@@ -6,9 +6,6 @@ dataset_scope: full
 dataset_family: cwq
 max_steps: 10
 hf_dataset: rmanluo/RoG-cwq
-num_train_rollouts: 2
-num_eval_rollouts: 6
-vectorized_rollouts: false
 
 out_dir: ${paths.data_dir}/cwq/normalized
 materialized_dir: ${paths.data_dir}/cwq/materialized
@@ -20,26 +17,7 @@ paths:
   embeddings: ${dataset.materialized_dir}/embeddings
   processed: ${dataset.materialized_dir}/processed
 
-validate_on_get: true
-
-edge_dropout_p:
-  train: 0.0
-  validation: 0.0
-  test: 0.0
-edge_dropout_min_edges: 1
-edge_dropout_strategy:
-  train: uniform
-  validation: uniform
-  test: uniform
-edge_dropout_qa_bias:
-  train: 0.0
-  validation: 0.0
-  test: 0.0
-edge_dropout_degree_bias:
-  train: 0.0
-  validation: 0.0
-  test: 0.0
-edge_dropout_degree_power: 1.0
+validate_on_get: false
 cache_node_min_dists: true
 cache_max_entries: 2048
 preload_node_min_dists: true
