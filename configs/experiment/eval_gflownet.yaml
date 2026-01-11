@@ -37,13 +37,6 @@ model:
   env:
     max_steps: ${dataset.max_steps}
 
-  actor_cfg:
-    degree_logit_penalty: 0.5
-
-  reward_fn:
-    potential_weight: 2.0
-    potential_schedule: none
-
   training_cfg:
     num_train_rollouts: 3
     rollout_chunk_size: 3

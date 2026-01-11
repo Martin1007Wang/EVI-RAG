@@ -28,7 +28,6 @@ _ONE = 1
 _HALF = 0.5
 _NAN = float("nan")
 _DEFAULT_POLICY_TEMPERATURE = 1.0
-_DEFAULT_DEGREE_LOGIT_PENALTY = 0.0
 _DEFAULT_CHECK_FINITE = False
 _DEFAULT_VALIDATE_EDGE_BATCH = True
 _DEFAULT_REQUIRE_PRECOMPUTED_EDGE_BATCH = True
@@ -791,9 +790,6 @@ class GFlowNetModule(LightningModule):
         policy_temperature = float(self.actor_cfg.get("policy_temperature", _DEFAULT_POLICY_TEMPERATURE))
         backward_temperature = self.actor_cfg.get("backward_temperature")
         check_finite = bool(self.actor_cfg.get("check_finite", _DEFAULT_CHECK_FINITE))
-        degree_logit_penalty = float(
-            self.actor_cfg.get("degree_logit_penalty", _DEFAULT_DEGREE_LOGIT_PENALTY)
-        )
         return GFlowNetActor(
             policy=self.policy,
             env=self.env,
@@ -808,7 +804,6 @@ class GFlowNetModule(LightningModule):
             policy_temperature=policy_temperature,
             backward_temperature=backward_temperature,
             relation_use_active_nodes=relation_use_active_nodes,
-            degree_logit_penalty=degree_logit_penalty,
             check_finite=check_finite,
         )
 

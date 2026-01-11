@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Sequence, TYPE_CHECKING
 
 import torch
 from torch import nn
 from torchmetrics import MeanMetric, Metric, MetricCollection
+from torch_scatter import scatter_max
 
 from src.utils import log_metric, setup_optimizer
 
@@ -22,6 +24,10 @@ _DEFAULT_SCHED_T0 = 10
 _DEFAULT_SCHED_T_MULT = 1
 _DEFAULT_SCHED_ETA_MIN = 0.0
 _DEFAULT_SCHED_INTERVAL = "epoch"
+_START_BACKTRACK_CFG_KEY = "start_backtrack"
+_START_BACKTRACK_ENABLED_KEY = "enabled"
+_START_BACKTRACK_MIN_DIST_KEY = "min_dist"
+_START_BACKTRACK_MIN_DIST_DEFAULT = 1
 
 
 class GFlowNetMetricLogger:
@@ -457,6 +463,7 @@ class GFlowNetTrainingLoop:
         self.module = module
         self.metric_logger = GFlowNetMetricLogger(module)
         self.grad_clipper = GFlowNetGradClipper(module)
+        self._start_backtrack_total_steps: Optional[int] = None
 
     def init_metric_stores(self) -> None:
         self.metric_logger.init_metric_stores()
@@ -469,6 +476,7 @@ class GFlowNetTrainingLoop:
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def training_step(self, batch, batch_idx: int):
+        self._maybe_apply_start_backtrack(batch)
         self._maybe_init_logz_bias(batch)
         optimizer = self.module.optimizers()
         if self._should_zero_grad(batch_idx):
@@ -499,6 +507,120 @@ class GFlowNetTrainingLoop:
         self.metric_logger.update_metrics(metrics, prefix="train", batch_size=batch_size)
         self.metric_logger.log_metric_store(prefix="train", batch_size=batch_size)
         return loss
+
+    def _maybe_apply_start_backtrack(self, batch: Any) -> None:
+        cfg = self._resolve_start_backtrack_cfg()
+        if cfg is None:
+            return
+        node_min_dists = getattr(batch, "node_min_dists", None)
+        if not torch.is_tensor(node_min_dists):
+            raise ValueError("Batch missing node_min_dists for start_backtrack.")
+        node_ptr = getattr(batch, "ptr", None)
+        if not torch.is_tensor(node_ptr):
+            raise ValueError("Batch missing ptr for start_backtrack.")
+        min_dist = self._resolve_start_backtrack_min_dist(cfg)
+        ratio = self._resolve_start_backtrack_ratio()
+        node_ptr = node_ptr.to(device=node_min_dists.device, dtype=torch.long, non_blocking=True)
+        node_min_dists = node_min_dists.to(device=node_min_dists.device, dtype=torch.long, non_blocking=True).view(-1)
+        start_nodes = self._sample_start_nodes_from_dist(
+            node_min_dists=node_min_dists,
+            node_ptr=node_ptr,
+            min_dist=min_dist,
+            ratio=ratio,
+        )
+        num_graphs = int(node_ptr.numel() - 1)
+        start_ptr = torch.arange(num_graphs + _ONE, device=node_ptr.device, dtype=torch.long)
+        batch.start_override_locals = start_nodes.detach()
+        batch.start_override_ptr = start_ptr
+
+    def _resolve_start_backtrack_cfg(self) -> Optional[Mapping[str, Any]]:
+        cfg = self.module.training_cfg.get(_START_BACKTRACK_CFG_KEY)
+        if cfg is None:
+            return None
+        if isinstance(cfg, bool):
+            return {} if cfg else None
+        if not isinstance(cfg, Mapping):
+            raise TypeError("training_cfg.start_backtrack must be a mapping or bool.")
+        enabled = cfg.get(_START_BACKTRACK_ENABLED_KEY, True)
+        if not bool(enabled):
+            return None
+        return cfg
+
+    def _resolve_start_backtrack_min_dist(self, cfg: Mapping[str, Any]) -> int:
+        raw = cfg.get(_START_BACKTRACK_MIN_DIST_KEY, _START_BACKTRACK_MIN_DIST_DEFAULT)
+        value = self.module.require_non_negative_float(raw, "training_cfg.start_backtrack.min_dist")
+        parsed = int(value)
+        if float(parsed) != float(value):
+            raise ValueError("training_cfg.start_backtrack.min_dist must be an integer.")
+        return parsed
+
+    def _resolve_start_backtrack_ratio(self) -> float:
+        total_steps = self._resolve_start_backtrack_total_steps()
+        step = int(self.module.global_step)
+        denom = max(total_steps - _ONE, _ONE)
+        ratio = float(step) / float(denom)
+        return max(float(_ZERO), min(float(_ONE), ratio))
+
+    def _resolve_start_backtrack_total_steps(self) -> int:
+        if self._start_backtrack_total_steps is not None:
+            return self._start_backtrack_total_steps
+        trainer = self.module.trainer
+        if trainer is None:
+            raise RuntimeError("Trainer not initialized; cannot resolve start_backtrack total steps.")
+        total = getattr(trainer, "estimated_stepping_batches", None)
+        if total is None:
+            steps_per_epoch = self._estimate_optimizer_steps_per_epoch()
+            max_epochs = getattr(trainer, "max_epochs", None)
+            if steps_per_epoch is None or max_epochs is None:
+                raise RuntimeError("Trainer steps unavailable; cannot resolve start_backtrack total steps.")
+            total = int(steps_per_epoch) * int(max_epochs)
+        total_steps = int(total)
+        if total_steps <= _ZERO:
+            raise ValueError("Resolved start_backtrack total steps must be positive.")
+        self._start_backtrack_total_steps = total_steps
+        return total_steps
+
+    def _sample_start_nodes_from_dist(
+        self,
+        *,
+        node_min_dists: torch.Tensor,
+        node_ptr: torch.Tensor,
+        min_dist: int,
+        ratio: float,
+    ) -> torch.Tensor:
+        num_graphs = int(node_ptr.numel() - 1)
+        if num_graphs <= _ZERO:
+            raise ValueError("ptr must encode at least one graph for start_backtrack.")
+        device = node_min_dists.device
+        node_batch = self.module.batch_processor.compute_node_batch(node_ptr, num_graphs, device)
+        reachable = node_min_dists >= _ZERO
+        if not bool(reachable.any().item()):
+            raise ValueError("node_min_dists has no reachable nodes for start_backtrack.")
+        reachable_dists = torch.where(reachable, node_min_dists, torch.zeros_like(node_min_dists))
+        max_dists, _ = scatter_max(reachable_dists, node_batch, dim=0, dim_size=num_graphs)
+        reach_counts = torch.bincount(node_batch[reachable], minlength=num_graphs)
+        has_reach = reach_counts > _ZERO
+        max_dists = torch.where(has_reach, max_dists, torch.zeros_like(max_dists))
+        min_dist_tensor = torch.full_like(max_dists, int(min_dist))
+        ratio_t = torch.as_tensor(ratio, device=device, dtype=torch.float32)
+        max_dists_f = max_dists.to(dtype=torch.float32)
+        min_dist_f = min_dist_tensor.to(dtype=torch.float32)
+        k = min_dist_f + ratio_t * (max_dists_f - min_dist_f)
+        k = torch.floor(k).to(dtype=torch.long)
+        k = torch.minimum(k, max_dists)
+        eligible = reachable & (node_min_dists <= k[node_batch])
+        if min_dist > _ZERO:
+            eligible = eligible & (node_min_dists >= min_dist)
+        eligible_counts = torch.bincount(node_batch[eligible], minlength=num_graphs)
+        needs_fallback = eligible_counts == _ZERO
+        if bool(needs_fallback.any().item()):
+            fallback = reachable & (node_min_dists == _ZERO) & needs_fallback[node_batch]
+            eligible = eligible | fallback
+        scores = torch.rand(node_min_dists.size(0), device=device, dtype=torch.float32)
+        neg_inf = torch.finfo(scores.dtype).min
+        scores = torch.where(eligible, scores, torch.full_like(scores, neg_inf))
+        _, start_nodes = scatter_max(scores, node_batch, dim=0, dim_size=num_graphs)
+        return start_nodes.to(dtype=torch.long)
 
     def validation_step(self, batch, batch_idx: int) -> None:
         self._eval_step(batch, batch_idx, prefix="val")

@@ -722,10 +722,19 @@ class GFlowNetBatchProcessor:
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        start_node_locals = batch.q_local_indices.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+        override_nodes = getattr(batch, "start_override_locals", None)
+        override_ptr = getattr(batch, "start_override_ptr", None)
+        if torch.is_tensor(override_nodes) or torch.is_tensor(override_ptr):
+            if not torch.is_tensor(override_nodes) or not torch.is_tensor(override_ptr):
+                raise ValueError("start_override_locals/start_override_ptr must be provided together.")
+            start_node_locals = override_nodes.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+            start_ptr = override_ptr.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+        else:
+            start_node_locals = batch.q_local_indices.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+            slice_dict = batch._slice_dict
+            start_ptr = torch.as_tensor(slice_dict["q_local_indices"], dtype=torch.long, device=device)
         answer_node_locals = batch.a_local_indices.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
         slice_dict = batch._slice_dict
-        start_ptr = torch.as_tensor(slice_dict["q_local_indices"], dtype=torch.long, device=device)
         answer_ptr = torch.as_tensor(slice_dict["a_local_indices"], dtype=torch.long, device=device)
         return start_node_locals, answer_node_locals, start_ptr, answer_ptr
 

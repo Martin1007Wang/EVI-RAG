@@ -15,7 +15,6 @@ MIN_TEMPERATURE = 1e-5
 _STOP_STEP_OFFSET = 1
 _STOP_NODE_NONE = -1
 _DEFAULT_CHECK_FINITE = True
-_DEFAULT_DEGREE_LOGIT_PENALTY = 0.0
 _STOP_LOGIT_DIM = 1
 _EDGE_HEAD_INDEX = 0
 _EDGE_TAIL_INDEX = 1
@@ -87,7 +86,6 @@ class GFlowNetActor(nn.Module):
         policy_temperature: float,
         backward_temperature: Optional[float] = None,
         relation_use_active_nodes: bool = True,
-        degree_logit_penalty: float = _DEFAULT_DEGREE_LOGIT_PENALTY,
         check_finite: bool = _DEFAULT_CHECK_FINITE,
     ) -> None:
         super().__init__()
@@ -104,10 +102,7 @@ class GFlowNetActor(nn.Module):
         self.policy_temperature = float(policy_temperature)
         self.backward_temperature = self._resolve_backward_temperature(backward_temperature)
         self.relation_use_active_nodes = bool(relation_use_active_nodes)
-        self.degree_logit_penalty = float(degree_logit_penalty)
         self.check_finite = bool(check_finite)
-        if self.degree_logit_penalty < float(_ZERO):
-            raise ValueError("degree_logit_penalty must be >= 0.")
 
     def set_temperatures(
         self,
@@ -201,8 +196,6 @@ class GFlowNetActor(nn.Module):
             if stop_logits is not None:
                 self._assert_finite_tensor(stop_logits, "stop_logits", step=step)
             edge_logits = self._policy_logits(
-                graph=graph,
-                edge_next_nodes=edge_index[_EDGE_TAIL_INDEX],
                 valid_edges=valid_edges,
                 edge_logits=edge_scores,
                 autocast_ctx=autocast_ctx,
@@ -321,40 +314,15 @@ class GFlowNetActor(nn.Module):
     def _policy_logits(
         self,
         *,
-        graph: dict[str, torch.Tensor],
-        edge_next_nodes: torch.Tensor,
         valid_edges: torch.Tensor,
         edge_logits: torch.Tensor,
         autocast_ctx: contextlib.AbstractContextManager,
     ) -> torch.Tensor:
         with autocast_ctx:
-            edge_logits = self._apply_edge_logit_penalties(
-                edge_logits=edge_logits,
-                graph=graph,
-                edge_next_nodes=edge_next_nodes,
-            )
             edge_logits = self.policy(
                 edge_scores=edge_logits,
                 valid_edges_mask=valid_edges,
             )
-        return edge_logits
-
-    def _apply_edge_logit_penalties(
-        self,
-        *,
-        edge_logits: torch.Tensor,
-        graph: dict[str, torch.Tensor],
-        edge_next_nodes: torch.Tensor,
-    ) -> torch.Tensor:
-        if edge_logits.numel() == _ZERO:
-            return edge_logits
-        if self.degree_logit_penalty <= _ZERO:
-            return edge_logits
-        node_in_degree = graph.get("node_in_degree")
-        if node_in_degree is None:
-            raise ValueError("node_in_degree required for degree_logit_penalty.")
-        deg_vals = node_in_degree.index_select(0, edge_next_nodes).to(dtype=edge_logits.dtype)
-        edge_logits = edge_logits - (self.degree_logit_penalty * torch.log1p(deg_vals))
         return edge_logits
 
     def _valid_edges(self, state: Any) -> torch.Tensor:
@@ -619,8 +587,6 @@ class GFlowNetActor(nn.Module):
             autocast_ctx=autocast_ctx,
         )
         edge_logits = self._policy_logits(
-            graph=graph,
-            edge_next_nodes=graph["edge_index"][_EDGE_HEAD_INDEX],
             valid_edges=valid_edges,
             edge_logits=edge_scores,
             autocast_ctx=autocast_ctx,

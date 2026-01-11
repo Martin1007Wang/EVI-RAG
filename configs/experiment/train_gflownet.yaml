@@ -41,11 +41,6 @@ model:
 
   actor_cfg:
     policy_temperature: 1.0
-    degree_logit_penalty: 0.5
-
-  reward_fn:
-    potential_weight: 2.0
-    potential_schedule: none
 
   training_cfg:
     num_train_rollouts: 3
@@ -59,6 +54,9 @@ model:
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
     grad_non_finite_max_params: 20
+    start_backtrack:
+      enabled: true
+      min_dist: 1
 
   control_cfg:
     enabled: true

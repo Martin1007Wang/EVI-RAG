@@ -54,6 +54,9 @@ model:
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
     grad_non_finite_max_params: 20
+    start_backtrack:
+      enabled: true
+      min_dist: 1
 
 callbacks:
   model_checkpoint:
