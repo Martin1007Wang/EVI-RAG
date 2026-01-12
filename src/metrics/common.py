@@ -138,30 +138,24 @@ def compute_answer_recall(samples: Iterable[Dict[str, torch.Tensor]], k_values: 
     max_k = max(ks)
     recalls: Dict[int, List[float]] = {k: [] for k in ks}
     for sample in samples:
-        answer_ids = sample.get("answer_ids")
-        if answer_ids is None or answer_ids.numel() == _ZERO:
+        prepared = _prepare_topk_edges(sample, max_k)
+        if prepared is None:
             continue
-        answers = set(int(x) for x in answer_ids.tolist())
-        if not answers:
+        answers, head_top, tail_top, max_k_eff = prepared
+        num_answers = int(answers.numel())
+        if max_k_eff == _ZERO:
+            for k in ks:
+                recalls[k].append(_FLOAT_ZERO)
             continue
-        scores = sample["scores"]
-        order = torch.argsort(scores, descending=True)
-        head_ids = sample["head_ids"].tolist()
-        tail_ids = sample["tail_ids"].tolist()
-        found: set[int] = set()
-        k_pointer = _ZERO
-        for rank_idx, edge_idx in enumerate(order.tolist()[:max_k], start=_ONE):
-            if edge_idx < len(head_ids) and head_ids[edge_idx] in answers:
-                found.add(head_ids[edge_idx])
-            if edge_idx < len(tail_ids) and tail_ids[edge_idx] in answers:
-                found.add(tail_ids[edge_idx])
-            while k_pointer < len(ks) and rank_idx == ks[k_pointer]:
-                recalls[ks[k_pointer]].append(len(found) / len(answers))
-                k_pointer += _ONE
-        last_recall = len(found) / len(answers)
-        while k_pointer < len(ks):
-            recalls[ks[k_pointer]].append(last_recall)
-            k_pointer += _ONE
+        for k in ks:
+            k_eff = min(k, max_k_eff)
+            if k_eff == _ZERO:
+                recalls[k].append(_FLOAT_ZERO)
+                continue
+            prefix = torch.cat([head_top[:k_eff], tail_top[:k_eff]])
+            hits = torch.isin(prefix, answers)
+            found = torch.unique(prefix[hits])
+            recalls[k].append(float(found.numel()) / float(num_answers))
     return {
         f"answer_recall@{k}": float(sum(values) / len(values)) if values else _FLOAT_ZERO
         for k, values in recalls.items()
@@ -176,34 +170,68 @@ def compute_answer_hit(samples: Iterable[Dict[str, torch.Tensor]], k_values: Seq
     max_k = max(ks)
     hits: Dict[int, List[float]] = {k: [] for k in ks}
     for sample in samples:
-        answer_ids = sample.get("answer_ids")
-        if answer_ids is None or answer_ids.numel() == _ZERO:
+        prepared = _prepare_topk_edges(sample, max_k)
+        if prepared is None:
             continue
-        answers = set(int(x) for x in answer_ids.tolist())
-        if not answers:
+        answers, head_top, tail_top, max_k_eff = prepared
+        if max_k_eff == _ZERO:
+            for k in ks:
+                hits[k].append(_FLOAT_ZERO)
             continue
-        scores = sample["scores"]
-        order = torch.argsort(scores, descending=True)
-        head_ids = sample["head_ids"].tolist()
-        tail_ids = sample["tail_ids"].tolist()
-        found_any = False
-        k_pointer = _ZERO
-        for rank_idx, edge_idx in enumerate(order.tolist()[:max_k], start=_ONE):
-            if edge_idx < len(head_ids) and head_ids[edge_idx] in answers:
-                found_any = True
-            if edge_idx < len(tail_ids) and tail_ids[edge_idx] in answers:
-                found_any = True
-            while k_pointer < len(ks) and rank_idx == ks[k_pointer]:
-                hits[ks[k_pointer]].append(_FLOAT_ONE if found_any else _FLOAT_ZERO)
-                k_pointer += _ONE
-        last_val = _FLOAT_ONE if found_any else _FLOAT_ZERO
-        while k_pointer < len(ks):
-            hits[ks[k_pointer]].append(last_val)
-            k_pointer += _ONE
+        head_hit = torch.isin(head_top, answers)
+        tail_hit = torch.isin(tail_top, answers)
+        edge_hit = head_hit | tail_hit
+        prefix_any = edge_hit.cumsum(0) > _ZERO
+        for k in ks:
+            k_eff = min(k, max_k_eff)
+            if k_eff == _ZERO:
+                hits[k].append(_FLOAT_ZERO)
+                continue
+            found_any = bool(prefix_any[k_eff - _ONE].item())
+            hits[k].append(_FLOAT_ONE if found_any else _FLOAT_ZERO)
     return {
         f"answer_hit@{k}": float(sum(values) / len(values)) if values else _FLOAT_ZERO
         for k, values in hits.items()
     }
+
+
+def _prepare_topk_edges(
+    sample: Dict[str, torch.Tensor],
+    max_k: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]:
+    answer_ids = sample.get("answer_ids")
+    if answer_ids is None:
+        return None
+    if not torch.is_tensor(answer_ids):
+        answer_ids = torch.as_tensor(answer_ids, dtype=torch.long)
+    if answer_ids.numel() == _ZERO:
+        return None
+    answers = answer_ids.to(dtype=torch.long).view(-1).unique()
+    if answers.numel() == _ZERO:
+        return None
+    scores = sample["scores"]
+    if not torch.is_tensor(scores):
+        scores = torch.as_tensor(scores)
+    order = torch.argsort(scores, descending=True)
+    max_k_eff = min(max_k, int(order.numel()))
+    if max_k_eff == _ZERO:
+        empty = order.new_empty((_ZERO,), dtype=torch.long)
+        return answers.to(device=order.device), empty, empty, max_k_eff
+    topk = order[:max_k_eff]
+    head_ids = sample["head_ids"]
+    tail_ids = sample["tail_ids"]
+    if not torch.is_tensor(head_ids):
+        head_ids = torch.as_tensor(head_ids, device=topk.device, dtype=torch.long)
+    else:
+        head_ids = head_ids.to(device=topk.device, dtype=torch.long)
+    if not torch.is_tensor(tail_ids):
+        tail_ids = torch.as_tensor(tail_ids, device=topk.device, dtype=torch.long)
+    else:
+        tail_ids = tail_ids.to(device=topk.device, dtype=torch.long)
+    answers = answers.to(device=topk.device)
+    head_top = head_ids.index_select(0, topk)
+    tail_top = tail_ids.index_select(0, topk)
+    return answers, head_top, tail_top, max_k_eff
 
 
 # --------------------------------------------------------------------------- #

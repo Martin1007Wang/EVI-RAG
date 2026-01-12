@@ -68,6 +68,8 @@ class GraphFusionReward(nn.Module):
             raise ValueError("potential_gamma must be 1.0 when potential shaping is enabled.")
         if self.potential_unreachable_offset < float(_ZERO):
             raise ValueError("potential_unreachable_offset must be >= 0.")
+        if self.potential_weight != float(_ZERO) or self.potential_weight_end != float(_ZERO):
+            raise ValueError("Potential shaping is disabled; set potential_weight and potential_weight_end to 0.")
 
     def forward(
         self,

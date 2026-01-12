@@ -68,6 +68,7 @@ class GRetrievalDataModule(LightningDataModule):
         worker_embed_lookup: bool = False,
         precompute_edge_batch: bool = False,
         precompute_node_in_degree: bool = False,
+        validate_edge_batch: bool = False,
         embeddings_device: str | None = None,
         splits: Optional[Dict[str, str]] = None,
     ) -> None:
@@ -109,6 +110,7 @@ class GRetrievalDataModule(LightningDataModule):
         self.worker_embed_lookup = bool(worker_embed_lookup)
         self.precompute_edge_batch = bool(precompute_edge_batch)
         self.precompute_node_in_degree = bool(precompute_node_in_degree)
+        self.validate_edge_batch = bool(validate_edge_batch)
         self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
 
         # Default splits mapping if not provided in `data/g_retrieval.yaml`
@@ -242,6 +244,7 @@ class GRetrievalDataModule(LightningDataModule):
             worker_embed_lookup=self.worker_embed_lookup,
             precompute_edge_batch=self.precompute_edge_batch,
             precompute_node_in_degree=self.precompute_node_in_degree,
+            validate_edge_batch=self.validate_edge_batch,
             embeddings_device=self.embeddings_device,
             random_seed=self.dataset_cfg.get("random_seed"),
         )

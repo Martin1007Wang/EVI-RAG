@@ -18,7 +18,7 @@ edge_score_cfg:
 state_cfg:
   state_dim: ${model.hidden_dim}
   dropout: 0.0
-  relation_use_active_nodes: false
+  relation_use_active_nodes: true
 
 env:
   _target_: src.models.components.gflownet_env.GraphEnv
@@ -44,6 +44,9 @@ reward_fn:
 
 actor_cfg:
   policy_temperature: 1.0
+  cosine_bias_alpha: 0.0
+  cosine_relation_bias_alpha: 0.0
+  stop_bias_init: null
   check_finite: false
 
 control_cfg:
@@ -59,6 +62,7 @@ control_cfg:
 
 runtime_cfg:
   validate_edge_batch: false
+  validate_rollout_batch: false
   require_precomputed_edge_batch: true
   require_precomputed_node_in_degree: true
 
@@ -75,11 +79,7 @@ evaluation_cfg:
     weight_terminal_hit: 0.3
     weight_pass_best: 0.1
 
-logz_cfg:
-  use_graph_stats: true
+flow_cfg:
   graph_stats_log1p: true
-  use_hop_counts: false
-  use_relevance: false
-  use_relevance_stats: true
-  relevance_temperature: 1.0
-  bias_init: min_log_reward
+  bias_init: value
+  bias_init_value: -8.7168

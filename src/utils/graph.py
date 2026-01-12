@@ -154,13 +154,14 @@ def _undirected_bfs_distances_impl(
     frontier = dist == dist_origin
     edge_src = edge_index[0]
     edge_dst = edge_index[1]
+    if edge_src.numel() == 0:
+        return dist
     step = dist_origin
+    next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
     for _ in range(num_nodes):
         if not bool(frontier.any().item()):
             break
-        if edge_src.numel() == 0:
-            break
-        next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
+        next_counts.zero_()
         next_counts.index_add_(0, edge_dst, frontier[edge_src].to(dtype=torch.long))
         next_counts.index_add_(0, edge_src, frontier[edge_dst].to(dtype=torch.long))
         next_mask = (next_counts > 0) & (dist < 0)
@@ -195,13 +196,14 @@ def _directed_bfs_distances_impl(
     frontier = dist == dist_origin
     edge_src = edge_index[0]
     edge_dst = edge_index[1]
+    if edge_src.numel() == 0:
+        return dist
     step = dist_origin
+    next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
     for _ in range(num_nodes):
         if not bool(frontier.any().item()):
             break
-        if edge_src.numel() == 0:
-            break
-        next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
+        next_counts.zero_()
         next_counts.index_add_(0, edge_dst, frontier[edge_src].to(dtype=torch.long))
         next_mask = (next_counts > 0) & (dist < 0)
         if not bool(next_mask.any().item()):

@@ -502,12 +502,13 @@ def compute_diag_metrics(rollout: Any) -> Dict[str, torch.Tensor]:
     return metrics
 
 
-def build_tb_metrics(
+def build_flow_metrics(
     *,
     rollout: Any,
     reward_out: Any,
     log_reward: torch.Tensor,
-    log_z: torch.Tensor,
+    log_f_start: torch.Tensor,
+    log_f_target: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
     reward_metrics = reward_out.as_dict()
     log_reward_metric = reward_metrics.pop("log_reward")
@@ -521,7 +522,8 @@ def build_tb_metrics(
     answer_tensor = answer_hit if isinstance(answer_hit, torch.Tensor) else rollout.reach_success
     metrics: Dict[str, torch.Tensor] = {
         "log_reward": log_reward_metric,
-        "log_z": log_z.detach(),
+        "log_f": log_f_start.detach(),
+        "log_f_target": log_f_target.detach(),
         "pass@1": answer_tensor.detach(),
         "length_mean": rollout.length.detach(),
         **{k: v.detach() for k, v in reward_metrics.items()},
@@ -1017,7 +1019,7 @@ __all__ = [
     "compute_path_diversity",
     "compute_reward_gap",
     "compute_diag_metrics",
-    "build_tb_metrics",
+    "build_flow_metrics",
     "compute_edge_debug_metrics",
     "GFlowNetEvalAccumulator",
 ]

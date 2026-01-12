@@ -10,6 +10,8 @@ STOP_RELATION = -1  # Sentinel action id for graph-level stop.
 STOP_EDGE_RELATION = STOP_RELATION  # Legacy stop-edge relation id (should not appear in data).
 DIRECTION_FORWARD = 0
 DIRECTION_BACKWARD = 1
+_EDGE_HEAD_INDEX = 0
+_EDGE_TAIL_INDEX = 1
 _ZERO = 0
 
 
@@ -30,6 +32,7 @@ class GraphBatch:
     node_is_answer: torch.Tensor      # [N_total] bool
     node_batch: torch.Tensor          # [N_total]
     node_in_degree: torch.Tensor      # [N_total]
+    edge_corridor_mask: torch.Tensor | None  # [E_total] bool or None
 
 
 @dataclass
@@ -81,6 +84,11 @@ class GraphEnv(nn.Module):
         start_ptr = batch["start_ptr"].to(device)
         answer_node_locals = batch["answer_node_locals"].to(device=device, dtype=torch.long)
         answer_ptr = batch["answer_ptr"].to(device)
+        edge_corridor_mask = batch.get("edge_corridor_mask")
+        if torch.is_tensor(edge_corridor_mask):
+            edge_corridor_mask = edge_corridor_mask.to(device=device, dtype=torch.bool)
+        else:
+            edge_corridor_mask = None
         num_edges = edge_index.size(1)
         num_graphs = int(node_ptr.numel() - 1)
         start_counts = start_ptr[1:] - start_ptr[:-1]
@@ -131,6 +139,7 @@ class GraphEnv(nn.Module):
             node_is_answer=node_is_answer,
             node_batch=node_batch,
             node_in_degree=node_in_degree,
+            edge_corridor_mask=edge_corridor_mask,
         )
 
         state_cache = batch.get("state_cache")
@@ -223,7 +232,11 @@ class GraphEnv(nn.Module):
         visited = state.visited_nodes
         head_active = active[heads]
         next_from_head = head_active & (~visited[tails])
-        return base & next_from_head
+        mask = base & next_from_head
+        corridor_mask = state.graph.edge_corridor_mask
+        if corridor_mask is None:
+            return mask
+        return mask & corridor_mask
 
     def backward_edge_mask(self, state: GraphState) -> torch.Tensor:
         edge_index = state.graph.edge_index
@@ -236,7 +249,11 @@ class GraphEnv(nn.Module):
         head_active = active[heads]
         tail_active = active[tails]
         parent_from_tail = tail_active & visited[heads]
-        return base & parent_from_tail & (~head_active)
+        mask = base & parent_from_tail & (~head_active)
+        corridor_mask = state.graph.edge_corridor_mask
+        if corridor_mask is None:
+            return mask
+        return mask & corridor_mask
 
     def step(
         self,
@@ -248,47 +265,106 @@ class GraphEnv(nn.Module):
         device = state.graph.edge_index.device
         num_graphs = int(state.graph.node_ptr.numel() - 1)
         actions = actions.to(device=device, dtype=torch.long)
+        move_action, is_stop = self._resolve_action_masks(state, actions, num_graphs, device)
+        act_edges, edge_graph_ids, heads, tails = self._select_move_edges(state, actions, move_action)
+        self._mark_used_edges(state, act_edges)
+        next_active, step_directions = self._compute_next_active(
+            state,
+            heads=heads,
+            tails=tails,
+            edge_graph_ids=edge_graph_ids,
+            num_graphs=num_graphs,
+            device=device,
+            step_index=step_index,
+        )
+        self._update_active_and_visited(state, next_active, is_stop)
+        self._update_answer_hits(state, num_graphs, device)
+        self._record_step(state, actions, step_directions, is_stop, step_index)
+        return state
+
+    @staticmethod
+    def _resolve_action_masks(
+        state: GraphState,
+        actions: torch.Tensor,
+        num_graphs: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        stop_action = actions == STOP_RELATION
+        invalid_action = (actions < _ZERO) & (~stop_action)
+        if invalid_action.any():
+            active_invalid = invalid_action & (~state.done)
+            if active_invalid.any():
+                raise ValueError("Invalid action encountered in GraphEnv.step.")
         valid_action = actions >= _ZERO
         is_stop_edge = torch.zeros(num_graphs, dtype=torch.bool, device=device)
         if valid_action.any():
             edge_ids = actions[valid_action]
-            rel_ids = state.graph.edge_relations[edge_ids]
+            rel_ids = state.graph.edge_relations.index_select(0, edge_ids)
             is_stop_edge[valid_action] = rel_ids == STOP_EDGE_RELATION
-        is_stop = state.done | is_stop_edge | (~valid_action)
-
-        edge_batch = state.graph.edge_batch
-        edge_index = state.graph.edge_index
-        num_edges = int(edge_index.size(1))
-
+        is_stop = state.done | stop_action | is_stop_edge
         move_action = valid_action & (~is_stop_edge)
-        act_edges = actions[move_action]
-        edge_selected = torch.zeros(num_edges, dtype=torch.bool, device=device)
-        edge_selected[act_edges] = True
-        state.used_edge_mask = state.used_edge_mask | edge_selected
+        return move_action, is_stop
 
+    @staticmethod
+    def _select_move_edges(
+        state: GraphState,
+        actions: torch.Tensor,
+        move_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        act_edges = actions[move_action]
+        edge_index = state.graph.edge_index
+        edge_batch = state.graph.edge_batch
+        edge_pairs = edge_index.index_select(1, act_edges)
+        heads = edge_pairs[_EDGE_HEAD_INDEX]
+        tails = edge_pairs[_EDGE_TAIL_INDEX]
+        edge_graph_ids = edge_batch.index_select(0, act_edges)
+        head_active = state.active_nodes.index_select(0, heads)
+        if head_active.numel() > _ZERO and not bool(head_active.all().item()):
+            raise ValueError("Directed env selected edge whose head is not active.")
+        return act_edges, edge_graph_ids, heads, tails
+
+    @staticmethod
+    def _mark_used_edges(state: GraphState, act_edges: torch.Tensor) -> None:
+        if act_edges.numel() == _ZERO:
+            return
+        state.used_edge_mask.index_fill_(0, act_edges, True)
+
+    @staticmethod
+    def _compute_next_active(
+        state: GraphState,
+        *,
+        heads: torch.Tensor,
+        tails: torch.Tensor,
+        edge_graph_ids: torch.Tensor,
+        num_graphs: int,
+        device: torch.device,
+        step_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         step_directions = torch.full((num_graphs,), DIRECTION_FORWARD, device=device, dtype=torch.long)
         next_active = torch.zeros_like(state.active_nodes)
-        heads = edge_index[0, edge_selected]
-        tails = edge_index[1, edge_selected]
-        head_active = state.active_nodes[heads]
-        if bool((~head_active).any().item()):
-            raise ValueError("Directed env selected edge whose head is not active.")
+        if heads.numel() == _ZERO:
+            return next_active, step_directions
         if step_index == 0:
-            chosen_start = heads
-            edge_graph_ids = edge_batch[edge_selected]
-            local_start = chosen_start - state.graph.node_ptr[edge_graph_ids]
+            local_start = heads - state.graph.node_ptr[edge_graph_ids]
             state.start_node_hit[edge_graph_ids] = local_start
-        move_from_head = head_active
-        next_active[tails[move_from_head]] = True
+        next_active[tails] = True
+        return next_active, step_directions
 
-        node_batch = state.graph.node_batch
+    @staticmethod
+    def _update_active_and_visited(
+        state: GraphState,
+        next_active: torch.Tensor,
+        is_stop: torch.Tensor,
+    ) -> None:
         replace_graphs = (~is_stop) & (~state.done)
         if replace_graphs.any():
+            node_batch = state.graph.node_batch
             replace_nodes = replace_graphs[node_batch]
             state.active_nodes = torch.where(replace_nodes, next_active, state.active_nodes)
-
         state.visited_nodes = state.visited_nodes | state.active_nodes
 
+    @staticmethod
+    def _update_answer_hits(state: GraphState, num_graphs: int, device: torch.device) -> None:
         hit_nodes = state.active_nodes & state.graph.node_is_answer
         hit_idx = torch.nonzero(hit_nodes, as_tuple=False).view(-1)
         hit_batch = state.graph.node_batch[hit_idx]
@@ -301,6 +377,14 @@ class GraphEnv(nn.Module):
         state.answer_node_hit = torch.where(newly_hit, min_local, state.answer_node_hit)
         state.answer_hits = state.answer_hits | has_hit
 
+    def _record_step(
+        self,
+        state: GraphState,
+        actions: torch.Tensor,
+        step_directions: torch.Tensor,
+        is_stop: torch.Tensor,
+        step_index: int,
+    ) -> None:
         state.actions[:, step_index] = actions
         state.directions[:, step_index] = step_directions
         increment = (~is_stop).to(dtype=state.step_counts.dtype)
@@ -310,7 +394,6 @@ class GraphEnv(nn.Module):
         if self.stop_on_answer:
             done = done | state.answer_hits
         state.done = done
-        return state
 
 
 __all__ = [

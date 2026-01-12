@@ -21,7 +21,6 @@ from .gflownet import (
     compute_path_diversity,
     compute_reward_gap,
     compute_diag_metrics,
-    build_tb_metrics,
     compute_edge_debug_metrics,
     GFlowNetEvalAccumulator,
 )
@@ -45,7 +44,6 @@ __all__ = [
     "compute_path_diversity",
     "compute_reward_gap",
     "compute_diag_metrics",
-    "build_tb_metrics",
     "compute_edge_debug_metrics",
     "GFlowNetEvalAccumulator",
 ]

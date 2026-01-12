@@ -23,14 +23,24 @@ trainer:
 model:
   env:
     max_steps: ${dataset.max_steps}
+    min_stop_steps: 1
 
   edge_score_cfg:
     activation_checkpointing: false
+
+  state_cfg:
+    relation_use_active_nodes: true
 
   optimizer_cfg:
     type: adamw
     lr: 1.0e-4
     weight_decay: 1.0e-4
+    param_groups:
+      - names: ["log_f.*"]
+        lr: 5.0e-4
+
+  reward_fn:
+    hard_target_bonus: 1.0
 
   scheduler_cfg:
     type: cosine
@@ -40,7 +50,11 @@ model:
     interval: epoch
 
   actor_cfg:
-    policy_temperature: 1.0
+    policy_temperature: 0.7
+    stop_bias_init: -7.0
+
+  flow_cfg:
+    bias_init_value: -8.7168
 
   training_cfg:
     num_train_rollouts: 3
@@ -54,18 +68,32 @@ model:
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
     grad_non_finite_max_params: 20
-    start_backtrack:
+    corridor:
+      enabled: true
+      distance_bias_alpha: 0.0
+    distance_prior:
+      enabled: true
+      weight: 0.05
+      weight_end: 0.0
+      schedule: linear
+      beta: 1.0
+      mode: progress
+    dual_stream:
       enabled: true
       min_dist: 1
+      trust_delta: 2
+      stream_b_weight: 2.0
+      stream_b_max_steps: 5
+      schedule: linear
 
   control_cfg:
-    enabled: true
+    enabled: false
     target_mode: reachable_horizon_frac
     target_min: 0.0
     target_max: 1.0
-    temperature_base: ${model.actor_cfg.policy_temperature}
-    temperature_min: 0.2
-    temperature_max: 2.0
+    temperature_base: 0.7
+    temperature_min: 0.7
+    temperature_max: 0.7
     lambda_init: 0.0
     dual_lr: null
 

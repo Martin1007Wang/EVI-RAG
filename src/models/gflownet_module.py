@@ -17,7 +17,7 @@ from src.models.components import (
     GFlowNetActor,
     GraphEnv,
 )
-from src.models.components.logz_features import LogZFeatureSpec, resolve_logz_spec
+from src.models.components.logz_features import FlowFeatureSpec, resolve_flow_spec
 from src.gfn.training import GFlowNetTrainingLoop
 from src.gfn.ops import GFlowNetBatchProcessor, GFlowNetInputValidator, RolloutInputs
 from src.gfn.engine import GFlowNetEngine, GFlowNetRolloutConfig
@@ -29,7 +29,10 @@ _HALF = 0.5
 _NAN = float("nan")
 _DEFAULT_POLICY_TEMPERATURE = 1.0
 _DEFAULT_CHECK_FINITE = False
+_DEFAULT_COSINE_BIAS_ALPHA = 0.0
+_DEFAULT_COSINE_RELATION_BIAS_ALPHA = 0.0
 _DEFAULT_VALIDATE_EDGE_BATCH = True
+_DEFAULT_VALIDATE_ROLLOUT_BATCH = True
 _DEFAULT_REQUIRE_PRECOMPUTED_EDGE_BATCH = True
 _DEFAULT_REQUIRE_PRECOMPUTED_NODE_IN_DEGREE = True
 _DEFAULT_ROLLOUT_CHUNK_SIZE = 1
@@ -54,7 +57,7 @@ _CONTROL_TARGET_MODE_REACHABLE = "reachable_horizon_frac"
 _CONTROL_TARGET_MODE_FIXED = "fixed"
 _CONTROL_SUCCESS_KEY = "pass@1"
 _CONTROL_REACHABLE_KEY = "control/reachable_horizon_frac"
-_LOGZ_OUTPUT_DIM = 1
+_FLOW_OUTPUT_DIM = 1
 _EMBED_INIT_STD_POWER = 0.25
 _GRU_NUM_GATES = 3
 _GRU_ORTHO_GAIN = 1.0
@@ -69,14 +72,17 @@ _POTENTIAL_SCHEDULES = {
 }
 _MIN_PURE_PHASE_RATIO = 0.0
 _MAX_PURE_PHASE_RATIO = 1.0
-_LOGZ_BIAS_INIT_NONE = "none"
-_LOGZ_BIAS_INIT_MIN_LOG_REWARD = "min_log_reward"
-_LOGZ_BIAS_INIT_BATCH_LOG_REWARD = "batch_log_reward"
-_LOGZ_BIAS_INIT_OPTIONS = {
-    _LOGZ_BIAS_INIT_NONE,
-    _LOGZ_BIAS_INIT_MIN_LOG_REWARD,
-    _LOGZ_BIAS_INIT_BATCH_LOG_REWARD,
+_FLOW_BIAS_INIT_NONE = "none"
+_FLOW_BIAS_INIT_MIN_LOG_REWARD = "min_log_reward"
+_FLOW_BIAS_INIT_BATCH_LOG_REWARD = "batch_log_reward"
+_FLOW_BIAS_INIT_VALUE = "value"
+_FLOW_BIAS_INIT_OPTIONS = {
+    _FLOW_BIAS_INIT_NONE,
+    _FLOW_BIAS_INIT_MIN_LOG_REWARD,
+    _FLOW_BIAS_INIT_BATCH_LOG_REWARD,
+    _FLOW_BIAS_INIT_VALUE,
 }
+_FLOW_BIAS_INIT_VALUE_KEY = "bias_init_value"
 _BATCH_DEVICE_KEYS = (
     "edge_index",
     "edge_attr",
@@ -367,7 +373,7 @@ class EdgeEntityScorer(nn.Module):
             )
 
 
-class LogZPredictor(nn.Module):
+class FlowPredictor(nn.Module):
     def __init__(self, hidden_dim: int, feature_dim: int) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -377,7 +383,7 @@ class LogZPredictor(nn.Module):
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, self.hidden_dim),
             nn.GELU(),
-            nn.Linear(self.hidden_dim, _LOGZ_OUTPUT_DIM),
+            nn.Linear(self.hidden_dim, _FLOW_OUTPUT_DIM),
         )
         for layer in self.net:
             if isinstance(layer, nn.Linear):
@@ -386,15 +392,20 @@ class LogZPredictor(nn.Module):
     def forward(
         self,
         *,
+        node_tokens: torch.Tensor,
         question_tokens: torch.Tensor,
-        start_tokens: torch.Tensor,
         graph_features: torch.Tensor,
+        node_batch: torch.Tensor,
     ) -> torch.Tensor:
-        if question_tokens.shape != start_tokens.shape:
-            raise ValueError("question_tokens and start_tokens must have the same shape for LogZ.")
-        if question_tokens.size(0) != graph_features.size(0):
-            raise ValueError("graph_features batch size must match question_tokens for LogZ.")
-        context = torch.cat((question_tokens, start_tokens, graph_features), dim=-1)
+        if node_tokens.dim() != 2 or question_tokens.dim() != 2:
+            raise ValueError("node_tokens and question_tokens must be [*, H] for FlowPredictor.")
+        if graph_features.dim() != 2:
+            raise ValueError("graph_features must be [B, F] for FlowPredictor.")
+        if node_batch.dim() != 1:
+            raise ValueError("node_batch must be [N] for FlowPredictor.")
+        q_tokens = question_tokens.index_select(0, node_batch)
+        g_tokens = graph_features.index_select(0, node_batch)
+        context = torch.cat((q_tokens, node_tokens, g_tokens), dim=-1)
         return self.net(context).squeeze(-1)
 
     def set_output_bias(self, bias: float) -> None:
@@ -404,7 +415,7 @@ class LogZPredictor(nn.Module):
                 last_linear = layer
                 break
         if last_linear is None or last_linear.bias is None:
-            raise RuntimeError("LogZPredictor missing output bias for initialization.")
+            raise RuntimeError("FlowPredictor missing output bias for initialization.")
         with torch.no_grad():
             last_linear.bias.fill_(float(bias))
 
@@ -426,7 +437,7 @@ class GFlowNetModule(LightningModule):
         edge_score_cfg: Optional[Mapping[str, Any]] = None,
         entity_score_cfg: Optional[Mapping[str, Any]] = None,
         state_cfg: Optional[Mapping[str, Any]] = None,
-        logz_cfg: Optional[Mapping[str, Any]] = None,
+        flow_cfg: Optional[Mapping[str, Any]] = None,
         training_cfg: Mapping[str, Any],
         evaluation_cfg: Mapping[str, Any],
         actor_cfg: Optional[Mapping[str, Any]] = None,
@@ -452,7 +463,7 @@ class GFlowNetModule(LightningModule):
             edge_score_cfg=edge_score_cfg,
             entity_score_cfg=entity_score_cfg,
             state_cfg=state_cfg,
-            logz_cfg=logz_cfg,
+            flow_cfg=flow_cfg,
         )
         self._validate_runtime_cfg()
         self._init_relation_vocab(vocabulary_path, relation_vocab_size)
@@ -476,13 +487,9 @@ class GFlowNetModule(LightningModule):
         self._init_relation_heads(relation_state_input_dim, score_cfg)
         self._init_edge_heads(edge_state_input_dim, entity_cfg)
         self._init_reward_schedule()
-        self.logz_spec: LogZFeatureSpec = resolve_logz_spec(
-            self.logz_cfg,
-            hidden_dim=self.hidden_dim,
-            max_steps=self.max_steps,
-        )
-        self.log_z = LogZPredictor(self.hidden_dim, self.logz_spec.stats_dim)
-        self._init_logz_bias_settings()
+        self.flow_spec: FlowFeatureSpec = resolve_flow_spec(self.flow_cfg)
+        self.log_f = FlowPredictor(self.hidden_dim, self.flow_spec.stats_dim)
+        self._init_flow_bias_settings()
         self.actor = self._build_actor(
             relation_state_input_dim=relation_state_input_dim,
             relation_use_active_nodes=relation_use_active_nodes,
@@ -507,7 +514,7 @@ class GFlowNetModule(LightningModule):
         edge_score_cfg: Optional[Mapping[str, Any]],
         entity_score_cfg: Optional[Mapping[str, Any]],
         state_cfg: Optional[Mapping[str, Any]],
-        logz_cfg: Optional[Mapping[str, Any]],
+        flow_cfg: Optional[Mapping[str, Any]],
     ) -> None:
         self.training_cfg = self._require_mapping(training_cfg, "training_cfg")
         self.evaluation_cfg = self._require_mapping(evaluation_cfg, "evaluation_cfg")
@@ -520,8 +527,11 @@ class GFlowNetModule(LightningModule):
         self.edge_score_cfg = self._optional_mapping(edge_score_cfg, "edge_score_cfg")
         self.entity_score_cfg = self._optional_mapping(entity_score_cfg, "entity_score_cfg")
         self.state_cfg = self._optional_mapping(state_cfg, "state_cfg")
-        self.logz_cfg = self._optional_mapping(logz_cfg, "logz_cfg")
+        self.flow_cfg = self._optional_mapping(flow_cfg, "flow_cfg")
         self._validate_edge_batch = bool(self.runtime_cfg.get("validate_edge_batch", _DEFAULT_VALIDATE_EDGE_BATCH))
+        self._validate_rollout_batch = bool(
+            self.runtime_cfg.get("validate_rollout_batch", _DEFAULT_VALIDATE_ROLLOUT_BATCH)
+        )
         self._require_precomputed_edge_batch = bool(
             self.runtime_cfg.get(
                 "require_precomputed_edge_batch",
@@ -773,13 +783,20 @@ class GFlowNetModule(LightningModule):
             if not (_MIN_PURE_PHASE_RATIO <= self._potential_pure_phase_ratio <= _MAX_PURE_PHASE_RATIO):
                 raise ValueError("reward_fn.potential_pure_phase_ratio must be in [0, 1].")
 
-    def _init_logz_bias_settings(self) -> None:
-        bias_raw = self.logz_cfg.get("bias_init", _LOGZ_BIAS_INIT_NONE)
-        bias_init = str(bias_raw or _LOGZ_BIAS_INIT_NONE).strip().lower()
-        if bias_init not in _LOGZ_BIAS_INIT_OPTIONS:
-            raise ValueError(f"logz_cfg.bias_init must be one of {sorted(_LOGZ_BIAS_INIT_OPTIONS)}.")
-        self._logz_bias_init = bias_init
-        self._logz_bias_initialized = False
+    def _init_flow_bias_settings(self) -> None:
+        bias_raw = self.flow_cfg.get("bias_init", _FLOW_BIAS_INIT_NONE)
+        bias_init = str(bias_raw or _FLOW_BIAS_INIT_NONE).strip().lower()
+        if bias_init not in _FLOW_BIAS_INIT_OPTIONS:
+            raise ValueError(f"flow_cfg.bias_init must be one of {sorted(_FLOW_BIAS_INIT_OPTIONS)}.")
+        self._flow_bias_init = bias_init
+        self._flow_bias_initialized = False
+        if bias_init == _FLOW_BIAS_INIT_VALUE:
+            raw_value = self.flow_cfg.get(_FLOW_BIAS_INIT_VALUE_KEY)
+            if raw_value is None:
+                raise ValueError(f"flow_cfg.{_FLOW_BIAS_INIT_VALUE_KEY} must be set when bias_init='value'.")
+            self._flow_bias_value = self._require_float(raw_value, f"flow_cfg.{_FLOW_BIAS_INIT_VALUE_KEY}")
+        else:
+            self._flow_bias_value = None
 
     def _build_actor(
         self,
@@ -789,6 +806,15 @@ class GFlowNetModule(LightningModule):
     ) -> GFlowNetActor:
         policy_temperature = float(self.actor_cfg.get("policy_temperature", _DEFAULT_POLICY_TEMPERATURE))
         backward_temperature = self.actor_cfg.get("backward_temperature")
+        stop_bias_init = self.actor_cfg.get("stop_bias_init")
+        if stop_bias_init is None:
+            stop_bias = None
+        else:
+            stop_bias = self._require_float(stop_bias_init, "actor_cfg.stop_bias_init")
+        cosine_bias_alpha = float(self.actor_cfg.get("cosine_bias_alpha", _DEFAULT_COSINE_BIAS_ALPHA))
+        cosine_relation_bias_alpha = float(
+            self.actor_cfg.get("cosine_relation_bias_alpha", _DEFAULT_COSINE_RELATION_BIAS_ALPHA)
+        )
         check_finite = bool(self.actor_cfg.get("check_finite", _DEFAULT_CHECK_FINITE))
         return GFlowNetActor(
             policy=self.policy,
@@ -803,27 +829,36 @@ class GFlowNetModule(LightningModule):
             hidden_dim=self.hidden_dim,
             policy_temperature=policy_temperature,
             backward_temperature=backward_temperature,
+            stop_bias_init=stop_bias,
+            cosine_bias_alpha=cosine_bias_alpha,
+            cosine_relation_bias_alpha=cosine_relation_bias_alpha,
             relation_use_active_nodes=relation_use_active_nodes,
             check_finite=check_finite,
         )
 
     def _init_engine_components(self) -> None:
-        self.input_validator = GFlowNetInputValidator(validate_edge_batch=self._validate_edge_batch)
+        self.input_validator = GFlowNetInputValidator(
+            validate_edge_batch=self._validate_edge_batch,
+            validate_rollout_batch=self._validate_rollout_batch,
+        )
         self.batch_processor = GFlowNetBatchProcessor(
             backbone=self.backbone,
             require_precomputed_edge_batch=self._require_precomputed_edge_batch,
             require_precomputed_node_in_degree=self._require_precomputed_node_in_degree,
+            corridor_cfg=self.training_cfg.get("corridor"),
         )
         self.engine = GFlowNetEngine(
             actor=self.actor,
             reward_fn=self.reward_fn,
             env=self.env,
-            log_z=self.log_z,
-            logz_spec=self.logz_spec,
+            log_f=self.log_f,
+            flow_spec=self.flow_spec,
             batch_processor=self.batch_processor,
             input_validator=self.input_validator,
             context_debug_enabled=self._context_debug_enabled,
             composite_score_cfg=self._composite_score_cfg,
+            dual_stream_cfg=self.training_cfg.get("dual_stream"),
+            distance_prior_cfg=self.training_cfg.get("distance_prior"),
         )
 
     def _init_metric_stores(self) -> None:
@@ -838,6 +873,10 @@ class GFlowNetModule(LightningModule):
             raise ValueError("training_cfg.sp_dropout has been removed; do not configure SP-dropout.")
         if self.training_cfg.get("replay") is not None:
             raise ValueError("training_cfg.replay has been removed; do not configure replay trajectories.")
+        if self.training_cfg.get("start_backtrack") is not None:
+            raise ValueError("training_cfg.start_backtrack has been removed; use training_cfg.dual_stream.")
+        if self.training_cfg.get("backward_warmup") is not None:
+            raise ValueError("training_cfg.backward_warmup has been removed; use training_cfg.dual_stream.")
 
     def _save_serializable_hparams(self) -> None:
         # 仅保存可序列化的标量，避免将配置映射写入 checkpoint。
@@ -851,13 +890,13 @@ class GFlowNetModule(LightningModule):
                 "edge_forward_head",
                 "edge_backward_head",
                 "state_encoder",
-                "log_z",
+                "log_f",
                 "reward_fn",
                 "env",
                 "actor_cfg",
                 "training_cfg",
                 "evaluation_cfg",
-                "logz_cfg",
+                "flow_cfg",
                 "optimizer_cfg",
                 "scheduler_cfg",
                 "logging_cfg",
@@ -1212,8 +1251,8 @@ class GFlowNetModule(LightningModule):
         post_norm: torch.Tensor,
         clip_val: float,
         clip_coef: float,
-        logz_pre: torch.Tensor,
-        logz_post: torch.Tensor,
+        flow_pre: torch.Tensor,
+        flow_post: torch.Tensor,
         actor_pre: torch.Tensor,
         actor_post: torch.Tensor,
         log_mean: torch.Tensor,
@@ -1226,8 +1265,8 @@ class GFlowNetModule(LightningModule):
             post_norm=post_norm,
             clip_val=clip_val,
             clip_coef=clip_coef,
-            logz_pre=logz_pre,
-            logz_post=logz_post,
+            flow_pre=flow_pre,
+            flow_post=flow_post,
             actor_pre=actor_pre,
             actor_post=actor_post,
             log_mean=log_mean,
@@ -1287,9 +1326,6 @@ class GFlowNetModule(LightningModule):
 
     def on_train_epoch_end(self) -> None:
         self.training_loop.on_train_epoch_end()
-
-    def _maybe_init_logz_bias(self, batch: Any) -> None:
-        self.training_loop._maybe_init_logz_bias(batch)
 
     def _resolve_min_log_reward(self) -> float:
         return self.training_loop._resolve_min_log_reward()

@@ -11,7 +11,8 @@ drop_last: false
 train_shuffle: true
 prefetch_factor: 4
 persistent_workers: true
-worker_embed_lookup: false
+worker_embed_lookup: true
 precompute_edge_batch: true
+validate_edge_batch: false
 precompute_node_in_degree: true
 embeddings_device: cpu

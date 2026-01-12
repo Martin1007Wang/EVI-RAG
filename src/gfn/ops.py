@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 from torch import nn
 
-from src.utils.graph import compute_edge_batch, compute_undirected_degree
-
-
+from src.utils.graph import compute_edge_batch, compute_undirected_degree, directed_bfs_distances
 
 _GUMBEL_EPS = 1e-10
 _ZERO = 0
@@ -16,6 +14,36 @@ _ONE = 1
 _TWO = 2
 _NEG_ONE = -1
 _PTR_MIN_LEN = 2
+_CORRIDOR_ENABLED_KEY = "enabled"
+_CORRIDOR_DISTANCE_BIAS_ALPHA_KEY = "distance_bias_alpha"
+_DEFAULT_CORRIDOR_ENABLED = False
+_DEFAULT_CORRIDOR_DISTANCE_BIAS_ALPHA = 0.0
+
+
+@dataclass(frozen=True)
+class CorridorSpec:
+    enabled: bool
+    distance_bias_alpha: float
+
+
+def _resolve_corridor_spec(cfg: Optional[Mapping[str, Any]]) -> CorridorSpec:
+    if cfg is None:
+        return CorridorSpec(
+            enabled=_DEFAULT_CORRIDOR_ENABLED,
+            distance_bias_alpha=_DEFAULT_CORRIDOR_DISTANCE_BIAS_ALPHA,
+        )
+    if isinstance(cfg, bool):
+        return CorridorSpec(enabled=bool(cfg), distance_bias_alpha=_DEFAULT_CORRIDOR_DISTANCE_BIAS_ALPHA)
+    if not isinstance(cfg, Mapping):
+        raise TypeError("corridor_cfg must be a mapping or bool.")
+    enabled = bool(cfg.get(_CORRIDOR_ENABLED_KEY, _DEFAULT_CORRIDOR_ENABLED))
+    alpha_raw = cfg.get(_CORRIDOR_DISTANCE_BIAS_ALPHA_KEY, _DEFAULT_CORRIDOR_DISTANCE_BIAS_ALPHA)
+    if isinstance(alpha_raw, bool):
+        raise TypeError("corridor_cfg.distance_bias_alpha must be a float, got bool.")
+    alpha = float(alpha_raw)
+    if alpha < float(_ZERO):
+        raise ValueError("corridor_cfg.distance_bias_alpha must be >= 0.")
+    return CorridorSpec(enabled=enabled, distance_bias_alpha=alpha)
 
 
 def neg_inf_value(tensor: torch.Tensor) -> float:
@@ -418,16 +446,21 @@ class CommonBatchStats:
 
 
 class GFlowNetInputValidator:
-    def __init__(self, *, validate_edge_batch: bool = True) -> None:
-        self.validate_edge_batch = bool(validate_edge_batch)
+    def __init__(self, *, validate_edge_batch: bool = True, validate_rollout_batch: bool = True) -> None:
+        self.validate_edge_batch_enabled = bool(validate_edge_batch)
+        self.validate_rollout_batch_enabled = bool(validate_rollout_batch)
 
     def validate_edge_batch(self, batch: Any, *, device: torch.device) -> None:
+        if not self.validate_edge_batch_enabled:
+            return
         common = self._collect_common_tensors(batch, device)
         stats = self._validate_common(common)
         self._validate_embeddings(common, stats)
         self._validate_node_embedding_ids(common.node_embedding_ids, stats.num_nodes_total)
 
     def validate_rollout_batch(self, batch: Any, *, device: torch.device, is_training: bool) -> None:
+        if not self.validate_rollout_batch_enabled:
+            return
         common = self._collect_common_tensors(batch, device)
         stats = self._validate_common(common)
         self._validate_embeddings(common, stats)
@@ -533,7 +566,7 @@ class GFlowNetInputValidator:
         num_edges = int(edge_index.size(1))
         if edge_index.numel() == _ZERO:
             return num_edges
-        if not self.validate_edge_batch:
+        if not self.validate_edge_batch_enabled:
             return num_edges
         compute_edge_batch(
             edge_index,
@@ -691,6 +724,8 @@ class RolloutInputs:
     question_tokens: torch.Tensor
     node_in_degree: torch.Tensor
     node_min_dists: torch.Tensor
+    node_q_min_dists: torch.Tensor
+    node_embedding_ids: torch.Tensor
     start_node_locals: torch.Tensor
     answer_node_locals: torch.Tensor
     start_ptr: torch.Tensor
@@ -707,10 +742,12 @@ class GFlowNetBatchProcessor:
         backbone: nn.Module,
         require_precomputed_edge_batch: bool = True,
         require_precomputed_node_in_degree: bool = True,
+        corridor_cfg: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.backbone = backbone
         self.require_precomputed_edge_batch = bool(require_precomputed_edge_batch)
         self.require_precomputed_node_in_degree = bool(require_precomputed_node_in_degree)
+        self._corridor_spec = _resolve_corridor_spec(corridor_cfg)
 
     @staticmethod
     def _get_node_ptr(batch: Any, device: torch.device) -> torch.Tensor:
@@ -737,6 +774,14 @@ class GFlowNetBatchProcessor:
         slice_dict = batch._slice_dict
         answer_ptr = torch.as_tensor(slice_dict["a_local_indices"], dtype=torch.long, device=device)
         return start_node_locals, answer_node_locals, start_ptr, answer_ptr
+
+    @staticmethod
+    def _get_q_local_indices(
+        batch: Any,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return batch.q_local_indices.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
 
     @staticmethod
     def build_dummy_mask(
@@ -847,6 +892,29 @@ class GFlowNetBatchProcessor:
         return batch.node_min_dists.to(device=device, dtype=torch.long, non_blocking=True)
 
     @staticmethod
+    def _compute_node_q_min_dists(
+        edge_index: torch.Tensor,
+        *,
+        num_nodes_total: int,
+        q_node_locals: torch.Tensor,
+    ) -> torch.Tensor:
+        if num_nodes_total <= _ZERO:
+            return torch.zeros((_ZERO,), device=edge_index.device, dtype=torch.long)
+        return directed_bfs_distances(
+            edge_index,
+            num_nodes=num_nodes_total,
+            start_nodes=q_node_locals,
+        )
+
+    @staticmethod
+    def _get_node_embedding_ids(
+        batch: Any,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return batch.node_embedding_ids.to(device=device, dtype=torch.long, non_blocking=True)
+
+    @staticmethod
     def _build_rollout_inputs(
         *,
         edge_batch: torch.Tensor,
@@ -859,6 +927,8 @@ class GFlowNetBatchProcessor:
         question_tokens: torch.Tensor,
         node_in_degree: torch.Tensor,
         node_min_dists: torch.Tensor,
+        node_q_min_dists: torch.Tensor,
+        node_embedding_ids: torch.Tensor,
         start_node_locals: torch.Tensor,
         answer_node_locals: torch.Tensor,
         start_ptr: torch.Tensor,
@@ -876,6 +946,8 @@ class GFlowNetBatchProcessor:
             question_tokens=question_tokens,
             node_in_degree=node_in_degree,
             node_min_dists=node_min_dists,
+            node_q_min_dists=node_q_min_dists,
+            node_embedding_ids=node_embedding_ids,
             start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
             start_ptr=start_ptr,
@@ -906,6 +978,13 @@ class GFlowNetBatchProcessor:
                 num_nodes=num_nodes_total,
             ).to(device=device, dtype=torch.long)
         node_min_dists = self._get_node_min_dists(batch, device=device)
+        node_embedding_ids = self._get_node_embedding_ids(batch, device=device)
+        q_node_locals = self._get_q_local_indices(batch, device=device)
+        node_q_min_dists = self._compute_node_q_min_dists(
+            edge_index_base,
+            num_nodes_total=num_nodes_total,
+            q_node_locals=q_node_locals,
+        )
 
         start_node_locals, answer_node_locals, start_ptr, answer_ptr = self._get_start_answer_ptrs(
             batch, device=device
@@ -923,6 +1002,8 @@ class GFlowNetBatchProcessor:
             question_tokens=token_inputs.question_tokens,
             node_in_degree=node_in_degree,
             node_min_dists=node_min_dists,
+            node_q_min_dists=node_q_min_dists,
+            node_embedding_ids=node_embedding_ids,
             start_node_locals=start_node_locals,
             answer_node_locals=answer_node_locals,
             start_ptr=start_ptr,
@@ -957,6 +1038,36 @@ class GFlowNetBatchProcessor:
             node_is_answer[answer_node_locals] = True
         return node_is_start, node_is_answer
 
+    @staticmethod
+    def _compute_edge_corridor_mask(
+        *,
+        edge_index: torch.Tensor,
+        node_q_min_dists: torch.Tensor,
+        node_min_dists: torch.Tensor,
+    ) -> torch.Tensor:
+        heads = edge_index[0]
+        tails = edge_index[1]
+        from_start = node_q_min_dists.index_select(0, heads) >= _ZERO
+        to_answer = node_min_dists.index_select(0, tails) >= _ZERO
+        return from_start & to_answer
+
+    @staticmethod
+    def _compute_edge_distance_bias(
+        *,
+        edge_index: torch.Tensor,
+        node_q_min_dists: torch.Tensor,
+        node_min_dists: torch.Tensor,
+        corridor_mask: torch.Tensor,
+        alpha: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        heads = edge_index[0]
+        tails = edge_index[1]
+        dist_start = node_q_min_dists.index_select(0, heads).to(dtype=dtype)
+        dist_answer = node_min_dists.index_select(0, tails).to(dtype=dtype)
+        bias = (dist_start + dist_answer) * (-float(alpha))
+        return torch.where(corridor_mask, bias, torch.zeros_like(bias))
+
     def build_graph_cache(self, inputs: RolloutInputs, *, device: torch.device) -> Dict[str, torch.Tensor]:
         node_ptr = inputs.node_ptr
         num_graphs = int(node_ptr.numel() - 1)
@@ -968,6 +1079,28 @@ class GFlowNetBatchProcessor:
             inputs.answer_node_locals,
             device,
         )
+        edge_corridor_mask = None
+        edge_distance_bias = None
+        corridor_mask = None
+        if inputs.edge_index.numel() > 0 and (
+            self._corridor_spec.enabled or self._corridor_spec.distance_bias_alpha > float(_ZERO)
+        ):
+            corridor_mask = self._compute_edge_corridor_mask(
+                edge_index=inputs.edge_index,
+                node_q_min_dists=inputs.node_q_min_dists,
+                node_min_dists=inputs.node_min_dists,
+            )
+            if self._corridor_spec.enabled:
+                edge_corridor_mask = corridor_mask
+            if self._corridor_spec.distance_bias_alpha > float(_ZERO):
+                edge_distance_bias = self._compute_edge_distance_bias(
+                    edge_index=inputs.edge_index,
+                    node_q_min_dists=inputs.node_q_min_dists,
+                    node_min_dists=inputs.node_min_dists,
+                    corridor_mask=corridor_mask,
+                    alpha=self._corridor_spec.distance_bias_alpha,
+                    dtype=inputs.node_tokens.dtype,
+                )
         graph_cache: Dict[str, torch.Tensor] = {
             "edge_index": inputs.edge_index,
             "edge_batch": inputs.edge_batch,
@@ -977,17 +1110,23 @@ class GFlowNetBatchProcessor:
             "node_tokens": inputs.node_tokens,
             "relation_tokens": inputs.relation_tokens,
             "question_tokens": inputs.question_tokens,
+            "node_embedding_ids": inputs.node_embedding_ids,
             "node_batch": node_batch,
             "node_is_start": node_is_start,
             "node_is_answer": node_is_answer,
             "node_in_degree": inputs.node_in_degree,
             "node_min_dists": inputs.node_min_dists,
+            "node_q_min_dists": inputs.node_q_min_dists,
             "start_node_locals": inputs.start_node_locals,
             "start_ptr": inputs.start_ptr,
             "answer_node_locals": inputs.answer_node_locals,
             "answer_ptr": inputs.answer_ptr,
             "dummy_mask": inputs.dummy_mask,
         }
+        if edge_corridor_mask is not None:
+            graph_cache["edge_corridor_mask"] = edge_corridor_mask
+        if edge_distance_bias is not None:
+            graph_cache["edge_distance_bias"] = edge_distance_bias
         return graph_cache
 
 

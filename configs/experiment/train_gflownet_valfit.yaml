@@ -41,6 +41,9 @@ model:
     type: adamw
     lr: 1.0e-4
     weight_decay: 1.0e-4
+    param_groups:
+      - names: ["log_f.*"]
+        lr: 1.0e-3
 
   scheduler_cfg:
     type: cosine_restart
@@ -64,9 +67,16 @@ model:
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
     grad_non_finite_max_params: 20
-    start_backtrack:
+    corridor:
+      enabled: true
+      distance_bias_alpha: 1.0
+    dual_stream:
       enabled: true
       min_dist: 1
+      trust_delta: 1
+      stream_b_weight: 1.0
+      stream_b_max_steps: 3
+      schedule: linear
 
 callbacks:
   model_checkpoint:

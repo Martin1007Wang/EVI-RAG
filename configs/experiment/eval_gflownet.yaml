@@ -49,3 +49,6 @@ model:
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
     grad_non_finite_max_params: 20
+    corridor:
+      enabled: true
+      distance_bias_alpha: 1.0

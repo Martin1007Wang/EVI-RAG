@@ -94,11 +94,13 @@ class RetrievalCollater:
         attach_embeddings: bool = True,
         precompute_edge_batch: bool = True,
         precompute_node_in_degree: bool = True,
+        validate_edge_batch: bool = False,
     ) -> None:
         self._dataset = dataset
         self._attach_embeddings_enabled = bool(attach_embeddings)
         self._precompute_edge_batch = bool(precompute_edge_batch)
         self._precompute_node_in_degree = bool(precompute_node_in_degree)
+        self._validate_edge_batch = bool(validate_edge_batch)
         self._collater = Collater(
             dataset,
             follow_batch=follow_batch,
@@ -156,14 +158,14 @@ class RetrievalCollater:
         num_graphs = int(node_ptr.numel() - 1)
         if num_graphs <= 0:
             raise ValueError("ptr must encode at least one graph when precomputing edge_batch.")
-        debug_context = build_edge_batch_debug_context(batch)
+        debug_context = build_edge_batch_debug_context(batch) if self._validate_edge_batch else None
         edge_batch, edge_ptr = compute_edge_batch(
             edge_index,
             node_ptr=node_ptr,
             num_graphs=num_graphs,
             device=edge_index.device,
             debug_context=debug_context,
-            validate=True,
+            validate=self._validate_edge_batch,
         )
         batch.edge_batch = edge_batch
         batch.edge_ptr = edge_ptr
@@ -194,6 +196,7 @@ class UnifiedDataLoader(DataLoader):
         worker_embed_lookup: bool = True,
         precompute_edge_batch: bool = True,
         precompute_node_in_degree: bool = True,
+        validate_edge_batch: bool = False,
         embeddings_device: Optional[str] = None,
         follow_batch: Optional[list[str]] = None,
         exclude_keys: Optional[list[str]] = None,
@@ -234,6 +237,7 @@ class UnifiedDataLoader(DataLoader):
             attach_embeddings=self._worker_embed_lookup,
             precompute_edge_batch=precompute_edge_batch,
             precompute_node_in_degree=precompute_node_in_degree,
+            validate_edge_batch=validate_edge_batch,
         )
 
         super().__init__(
