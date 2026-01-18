@@ -68,6 +68,37 @@ class TextEntityConfig:
         raise ValueError(f"Unsupported entity_text_mode: {self.mode}")
 
 
+@dataclass(frozen=True)
+class CvtEntityConfig:
+    mode: str
+    prefixes: Tuple[str, ...]
+    regex: Optional[re.Pattern]
+
+    def is_cvt(self, entity: str) -> bool:
+        if self.mode == "prefix_allowlist":
+            return any(entity.startswith(prefix) for prefix in self.prefixes)
+        if self.mode == "regex":
+            return bool(self.regex.match(entity)) if self.regex is not None else False
+        raise ValueError(f"Unsupported entity_cvt_mode: {self.mode}")
+
+
+@dataclass(frozen=True)
+class TimeRelationConfig:
+    mode: str
+    relation_regex: Optional[re.Pattern]
+    question_regex: Optional[re.Pattern]
+
+    def is_time_relation(self, relation: str) -> bool:
+        if self.relation_regex is None:
+            return False
+        return bool(self.relation_regex.search(relation))
+
+    def is_time_question(self, question: str) -> bool:
+        if self.question_regex is None:
+            return False
+        return bool(self.question_regex.search(question))
+
+
 @dataclass
 class GraphRecord:
     graph_id: str
@@ -77,8 +108,6 @@ class GraphRecord:
     edge_src: List[int]
     edge_dst: List[int]
     edge_relation_ids: List[int]
-    node_type_counts: List[int]
-    node_type_ids: List[int]
 
 
 @dataclass(frozen=True)
@@ -110,9 +139,10 @@ class RelationLookup:
 class EntityVocab:
     """Assign structural IDs and embedding IDs; separate text vs non-text."""
 
-    def __init__(self, kb: str, text_cfg: TextEntityConfig) -> None:
+    def __init__(self, kb: str, text_cfg: TextEntityConfig, cvt_cfg: Optional[CvtEntityConfig] = None) -> None:
         self.kb = kb
         self._text_cfg = text_cfg
+        self._cvt_cfg = cvt_cfg
         self._entity_to_struct: Dict[str, int] = {}
         self._struct_records: List[Dict[str, object]] = []
         self._embedding_records: List[Dict[str, object]] = []
@@ -142,6 +172,9 @@ class EntityVocab:
         for ent in sorted(self._entity_to_struct, key=self._entity_to_struct.get):
             struct_id = self._entity_to_struct[ent]
             is_text = self._text_cfg.is_text(ent)
+            is_cvt = self._cvt_cfg.is_cvt(ent) if self._cvt_cfg is not None else False
+            if is_text and is_cvt:
+                raise ValueError(f"Entity cannot be both text and CVT: {ent}")
             embedding_id = text_embedding_ids.get(ent, 0)
             record = {
                 "entity_id": struct_id,
@@ -149,6 +182,7 @@ class EntityVocab:
                 "kg_id": ent,
                 "label": ent,
                 "is_text": is_text,
+                "is_cvt": is_cvt,
                 "embedding_id": embedding_id,
             }
             self._struct_records.append(record)
@@ -202,12 +236,26 @@ class RelationVocab:
         self._rel_to_id: Dict[str, int] = {}
         self._records: List[Dict[str, object]] = []
 
-    def relation_id(self, rel: str) -> int:
+    def relation_id(self, rel: str, *, label: Optional[str] = None) -> int:
         idx = self._rel_to_id.get(rel)
+        resolved_label = rel if label is None else str(label)
         if idx is None:
             idx = len(self._rel_to_id)
             self._rel_to_id[rel] = idx
-            self._records.append({"relation_id": idx, "kb": self.kb, "kg_id": rel, "label": rel})
+            self._records.append(
+                {
+                    "relation_id": idx,
+                    "kb": self.kb,
+                    "kg_id": rel,
+                    "label": resolved_label,
+                }
+            )
+            return idx
+        existing_label = self._records[idx].get("label")
+        if existing_label != resolved_label:
+            raise ValueError(
+                f"Relation label mismatch for {rel!r}: existing={existing_label!r} new={resolved_label!r}"
+            )
         return idx
 
     def add_relations(self, relations: Sequence[str]) -> None:

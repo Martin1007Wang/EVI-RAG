@@ -120,8 +120,8 @@ def _save_metrics(cfg: DictConfig, metrics: Dict[str, Any], *, filename: str = "
     def _to_python(value: Any) -> Any:
         if isinstance(value, torch.Tensor):
             if value.numel() == 1:
-                return value.item()
-            return value.detach().cpu().tolist()
+                return value.detach().tolist()
+            return value.detach().to(device="cpu").tolist()
         return value
 
     output_dir = Path(cfg.paths.output_dir)

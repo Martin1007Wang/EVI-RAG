@@ -15,7 +15,7 @@ train: true
 test: true
 ckpt_path: null
 seed: 42
-optimized_metric: "val/composite_score@${model.evaluation_cfg.num_eval_rollouts}"
+optimized_metric: "val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}"
 
 trainer:
   check_val_every_n_epoch: 5
@@ -23,42 +23,46 @@ trainer:
 model:
   env:
     max_steps: ${dataset.max_steps}
-    min_stop_steps: 1
-
-  edge_score_cfg:
-    activation_checkpointing: false
-
-  state_cfg:
-    relation_use_active_nodes: true
 
   optimizer_cfg:
     type: adamw
     lr: 1.0e-4
     weight_decay: 1.0e-4
     param_groups:
-      - names: ["log_f.*"]
+      - names: ["*log_f.*", "*log_f_backward.*"]
         lr: 5.0e-4
 
   reward_fn:
-    hard_target_bonus: 1.0
+    hard_target_bonus: 2.0
+    min_log_reward: -5.0
 
   scheduler_cfg:
     type: cosine
-    t_0: 10
-    t_mult: 2
+    t_max: 10
     eta_min: 1.0e-6
     interval: epoch
 
   actor_cfg:
-    policy_temperature: 0.7
-    stop_bias_init: -7.0
+    policy_temperature: 1.2
 
-  flow_cfg:
-    bias_init_value: -8.7168
+  backward_cfg:
+    share_state_encoder: false
+    share_edge_scorer: false
+
+  start_selection_cfg:
+    enabled: true
+    mode: flow
+    epsilon: 0.1
+  sink_selection_cfg:
+    enabled: true
+    mode: flow
+    epsilon: 0.1
+    force_uniform: false
 
   training_cfg:
-    num_train_rollouts: 3
-    rollout_chunk_size: 3
+    num_train_rollouts: 8
+    rollout_chunk_size: 4
+    accumulate_grad_batches: 4
     manual_gradient_clip_val: 1.0
     manual_gradient_clip_algorithm: norm
     manual_gradient_clip_norm_type: 2.0
@@ -67,44 +71,43 @@ model:
     grad_clip_tail_prob: null
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
+    grad_clip_log_interval: 10
     grad_non_finite_max_params: 20
-    corridor:
+    subtb:
       enabled: true
-      distance_bias_alpha: 0.0
-    distance_prior:
+      num_subtrajectories: 4
+    replay:
       enabled: true
-      weight: 0.05
-      weight_end: 0.0
-      schedule: linear
-      beta: 1.0
-      mode: progress
+      buffer_size: 4096
+      mix_ratio: 0.5
     dual_stream:
       enabled: true
-      min_dist: 1
-      trust_delta: 2
-      stream_b_weight: 2.0
-      stream_b_max_steps: 5
-      schedule: linear
-
-  control_cfg:
-    enabled: false
-    target_mode: reachable_horizon_frac
-    target_min: 0.0
-    target_max: 1.0
-    temperature_base: 0.7
-    temperature_min: 0.7
-    temperature_max: 0.7
-    lambda_init: 0.0
-    dual_lr: null
+      stream_forward_weight: 1.0
+      stream_forward_max_steps: null
+      disable_stop: false
+      stream_forward_weight_start: 0.0
+      stream_forward_weight_schedule: none
+      stream_forward_weight_anneal_epochs: null
+    z_align:
+      enabled: true
+      weight: 10.0
+    h_guidance:
+      enabled: true
+      beta_start: 0.0
+      beta_end: 1.0
+      warmup_progress: 0.1
+      apply_eval: true
+      stop_gradient: true
+      scale: 1.0
 
 callbacks:
   model_checkpoint:
-    monitor: val/composite_score@${model.evaluation_cfg.num_eval_rollouts}
+    monitor: val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/composite_score@${model.evaluation_cfg.num_eval_rollouts}
+    monitor: val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}
     mode: max
     patience: 50

@@ -10,21 +10,16 @@ hf_dataset: rmanluo/RoG-cwq
 out_dir: ${paths.data_dir}/cwq/normalized
 materialized_dir: ${paths.data_dir}/cwq/materialized
 artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
-distances_dir: ${dataset.materialized_dir}/distances
 
 paths:
-  vocabulary: ${dataset.materialized_dir}/vocabulary/vocabulary.lmdb
   embeddings: ${dataset.materialized_dir}/embeddings
   processed: ${dataset.materialized_dir}/processed
+  entity_vocab: ${dataset.out_dir}/entity_vocab.parquet
+  relation_vocab: ${dataset.out_dir}/relation_vocab.parquet
 
-validate_on_get: false
-cache_node_min_dists: true
-cache_max_entries: 2048
-preload_node_min_dists: true
-sample_ids_source: lmdb
+validate_on_get: true
 lmdb_readahead: true
 sequential_sample_ids: true
-distance_cache_format: pt
 filter_missing_answer:
   train: false
   validation: false
@@ -34,6 +29,12 @@ entity_normalization: none
 entity_text_mode: regex
 text_prefixes: []
 text_regex: "^(?!m\\.|g\\.).*"
+cvt_entity_mode: prefix_allowlist
+cvt_prefixes: ["m.", "g."]
+cvt_regex: null
+time_relation_mode: question_gated
+time_relation_regex: '(?:^|\\.)time(?:\\.|$)|(?:^|\\.)date(?:\\.|$)|(?:^|\\.)year(?:\\.|$)'
+time_question_regex: '\\bwhen\\b|\\bwhat\\s+year\\b|\\bwhich\\s+year\\b|\\bwhat\\s+date\\b|\\bwhich\\s+date\\b|\\bhow\\s+old\\b|\\bborn\\b|\\bbirth\\b|\\bdied\\b|\\bfounded\\b|\\bestablished\\b|\\breleased\\b|\\bpremiered\\b|\\byear\\b|\\bdate\\b|\\btime\\b'
 
 column_map:
   question_id_field: id

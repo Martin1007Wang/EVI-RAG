@@ -1,48 +1,46 @@
-import json
+from __future__ import annotations
+
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Optional, Union
 
-import lmdb
 import torch
 
-from src.data.io.lmdb_utils import _deserialize_sample
+from src.data.schema.constants import _ZERO
 from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
-_LMDB_STAT_ENTRIES_KEY = "entries"
+_VOCAB_MAX_READERS = 1
+_MIN_ENTITY_ROWS = 1
+
 
 class GlobalEmbeddingStore:
-    """
-    In-memory read-only store for Entity/Relation embeddings.
-    Designed for fast lookups during training/inference.
-    """
+    """In-memory read-only store for entity/relation embeddings."""
+
     def __init__(
         self,
         embeddings_dir: Union[str, Path],
-        vocabulary_path: Union[str, Path],
+        *,
+        entity_vocab_path: Optional[Union[str, Path]] = None,
         device: Optional[Union[str, torch.device]] = None,
-    ):
+    ) -> None:
         self.embeddings_dir = Path(embeddings_dir)
+        self.entity_vocab_path = None if entity_vocab_path is None else Path(entity_vocab_path)
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         if self.device.type not in ("cpu", "cuda"):
             raise ValueError(f"Unsupported embeddings_device={self.device}; expected cpu or cuda.")
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("embeddings_device=cuda requested but CUDA is not available.")
-        # 1. Vocabulary (Optional, only if needed for count checks)
-        self.num_total_entities = self._load_vocab_size(Path(vocabulary_path))
-        
-        # 2. Pre-load Embeddings (CPU Pinned Memory for speed)
+        self.num_total_entities = (
+            self._load_entity_vocab_size(self.entity_vocab_path) if self.entity_vocab_path is not None else _ZERO
+        )
         self.entity_embeddings = self._load_tensor(self.embeddings_dir / "entity_embeddings.pt")
         self.relation_embeddings = self._load_tensor(self.embeddings_dir / "relation_embeddings.pt")
         self._pinned_entity_buffer: Optional[torch.Tensor] = None
         self._pinned_relation_buffer: Optional[torch.Tensor] = None
 
-        # Dimension note: embedding rows correspond to textual entities only.
-        # Non-text entities map to embedding_id=0 and are re-embedded from
-        # adjacent relation embeddings in the dataloader. Warn only if empty.
         rows = self.entity_embeddings.size(0)
-        if rows <= 1:
+        if rows <= _MIN_ENTITY_ROWS:
             log_event(
                 logger,
                 "entity_embedding_rows_low",
@@ -58,30 +56,30 @@ class GlobalEmbeddingStore:
             )
 
     def clear_device_cache(self) -> None:
-        """Release transient pinned buffers used for async H2D transfers."""
+        """Release pinned buffers used for async H2D transfers."""
         self._pinned_entity_buffer = None
         self._pinned_relation_buffer = None
 
-    def _load_vocab_size(self, path: Path) -> int:
+    def _load_entity_vocab_size(self, path: Path) -> int:
         if not path.exists():
-            raise FileNotFoundError(f"Vocab LMDB not found at {path}")
+            raise FileNotFoundError(f"entity_vocab.parquet not found at {path}")
         try:
-            # Quick open just to check size
-            with lmdb.open(str(path), readonly=True, lock=False, max_readers=1) as env:
-                with env.begin() as txn:
-                    data = txn.get(b"entity_labels")
-                    if data:
-                        labels = json.loads(data.decode("utf-8"))
-                        return len(labels)
-            return 0
-        except Exception as e:
+            import pyarrow.parquet as pq
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError("pyarrow is required to load entity_vocab.parquet.") from exc
+        try:
+            table = pq.read_table(path, columns=["entity_id"])
+        except Exception as exc:
             log_event(
                 logger,
-                "vocab_size_read_failed",
+                "entity_vocab_read_failed",
                 level=logging.WARNING,
-                error=str(e),
+                error=str(exc),
             )
-            return 0
+            return _ZERO
+        if table.num_rows <= _ZERO:
+            return _ZERO
+        return int(table.num_rows)
 
     def _load_tensor(self, path: Path) -> torch.Tensor:
         if not path.exists():
@@ -91,7 +89,6 @@ class GlobalEmbeddingStore:
             "embedding_load_start",
             path=str(path),
         )
-        # map_location='cpu' is crucial to avoid VRAM OOM
         try:
             tensor = torch.load(path, map_location="cpu", mmap=True)
         except TypeError:
@@ -124,16 +121,11 @@ class GlobalEmbeddingStore:
         return buffer
 
     def get_entity_embeddings(self, entity_ids: torch.Tensor, *, device: Optional[torch.device] = None) -> torch.Tensor:
-        """Fetch entity embeddings.
-
-        The embedding tables live on CPU. `entity_ids` may be on CPU/GPU, while `device`
-        controls the desired output device. Avoid moving ids to GPU when unnecessary.
-        """
         target_device = torch.device(device) if device is not None else entity_ids.device
         table_device = self.entity_embeddings.device
-        if entity_ids.numel() == 0:
+        if entity_ids.numel() == _ZERO:
             return torch.empty(
-                (0, int(self.entity_embeddings.size(1))),
+                (_ZERO, int(self.entity_embeddings.size(1))),
                 dtype=self.entity_embeddings.dtype,
                 device=target_device,
             )
@@ -165,9 +157,9 @@ class GlobalEmbeddingStore:
     def get_relation_embeddings(self, relation_ids: torch.Tensor, *, device: Optional[torch.device] = None) -> torch.Tensor:
         target_device = torch.device(device) if device is not None else relation_ids.device
         table_device = self.relation_embeddings.device
-        if relation_ids.numel() == 0:
+        if relation_ids.numel() == _ZERO:
             return torch.empty(
-                (0, int(self.relation_embeddings.size(1))),
+                (_ZERO, int(self.relation_embeddings.size(1))),
                 dtype=self.relation_embeddings.dtype,
                 device=target_device,
             )
@@ -195,7 +187,7 @@ class GlobalEmbeddingStore:
             torch.index_select(self.relation_embeddings, 0, cpu_ids, out=out_cpu)
             return out_cpu.to(target_device, non_blocking=True)
         return self.relation_embeddings.index_select(0, cpu_ids).to(target_device)
-    
+
     @property
     def entity_dim(self) -> int:
         return self.entity_embeddings.size(-1)
@@ -205,84 +197,29 @@ class GlobalEmbeddingStore:
         return self.relation_embeddings.size(-1)
 
 
-class EmbeddingStore:
-    """
-    LMDB wrapper for reading graph samples.
-    Safe for Multiprocessing DataLoader.
-    """
-    def __init__(self, lmdb_path: Union[str, Path], *, readahead: bool = False):
-        self.path = str(lmdb_path)
-        self._readahead = bool(readahead)
-        self.env: Optional[lmdb.Environment] = None
-        
-        # Check existence immediately
-        if not Path(self.path).exists():
-            raise FileNotFoundError(f"LMDB not found: {self.path}")
-
-    def _init_env(self):
-        """Lazy initialization per process."""
-        if self.env is None:
-            # lock=False is critical for concurrent read-only access
-            self.env = lmdb.open(
-                self.path,
-                readonly=True,
-                lock=False,
-                readahead=self._readahead,
-                meminit=False,
-                max_readers=256, # Bump this up for high num_workers
+def attach_embeddings_to_batch(
+    batch: object,
+    *,
+    global_embeddings: GlobalEmbeddingStore,
+    embeddings_device: Optional[Union[str, torch.device]] = None,
+) -> None:
+    node_embedding_ids = torch.as_tensor(batch.node_embedding_ids, dtype=torch.long, device="cpu")
+    relation_ids = torch.as_tensor(batch.edge_attr, dtype=torch.long, device="cpu")
+    entity_rows = int(global_embeddings.entity_embeddings.size(0))
+    rel_rows = int(global_embeddings.relation_embeddings.size(0))
+    if node_embedding_ids.numel() > 0:
+        if node_embedding_ids.min().detach().tolist() < 0 or node_embedding_ids.max().detach().tolist() >= entity_rows:
+            sample_id = getattr(batch, "sample_id", None)
+            raise ValueError(
+                f"node_embedding_ids out of range for batch (sample_id={sample_id}); "
+                f"valid [0, {entity_rows - 1}]"
             )
-
-    def load_sample(self, sample_id: str) -> Dict:
-        self._init_env()
-        with self.env.begin(write=False) as txn:
-            data = txn.get(sample_id.encode("utf-8"))
-            if data is None:
-                raise KeyError(f"Sample {sample_id} not found in {self.path}")
-            return _deserialize_sample(data)
-
-    def load_samples(self, sample_ids: List[str]) -> List[Dict]:
-        self._init_env()
-        if not sample_ids:
-            return []
-        with self.env.begin(write=False) as txn:
-            out: List[Dict] = []
-            for sample_id in sample_ids:
-                data = txn.get(sample_id.encode("utf-8"))
-                if data is None:
-                    raise KeyError(f"Sample {sample_id} not found in {self.path}")
-                out.append(_deserialize_sample(data))
-            return out
-
-    def get_sample_ids(self) -> List[str]:
-        """
-        Scan all keys. This is slow, usually only done once at init.
-        """
-        self._init_env()
-        keys = []
-        with self.env.begin(write=False) as txn:
-            cursor = txn.cursor()
-            for key in cursor.iternext(values=False):
-                keys.append(key.decode("utf-8"))
-        return keys
-
-    def get_entry_count(self) -> int:
-        """Fast entry count from LMDB stats (no key scan)."""
-        self._init_env()
-        stats = self.env.stat()
-        if _LMDB_STAT_ENTRIES_KEY not in stats:
-            raise RuntimeError("LMDB stats missing entry count.")
-        return int(stats[_LMDB_STAT_ENTRIES_KEY])
-
-    def close(self):
-        if self.env:
-            self.env.close()
-            self.env = None
-    
-    def __getstate__(self):
-        """Serialization support for Dataloader: don't serialize the environment."""
-        state = self.__dict__.copy()
-        state["env"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
+    if relation_ids.numel() > 0:
+        if relation_ids.min().detach().tolist() < 0 or relation_ids.max().detach().tolist() >= rel_rows:
+            sample_id = getattr(batch, "sample_id", None)
+            raise ValueError(
+                f"edge_attr relation ids out of range for batch (sample_id={sample_id}); "
+                f"valid [0, {rel_rows - 1}]"
+            )
+    batch.node_embeddings = global_embeddings.get_entity_embeddings(node_embedding_ids, device=embeddings_device)
+    batch.edge_embeddings = global_embeddings.get_relation_embeddings(relation_ids, device=embeddings_device)

@@ -33,14 +33,14 @@ class CvtPatternStats:
 
 
 def _load_entity_vocab(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    table = pq.read_table(path, columns=["entity_id", "is_text"])
+    table = pq.read_table(path, columns=["entity_id", "is_cvt"])
     entity_ids = np.asarray(table.column("entity_id").to_numpy(), dtype=np.int64)
-    is_text = np.asarray(table.column("is_text").to_numpy(), dtype=bool)
+    is_cvt = np.asarray(table.column("is_cvt").to_numpy(), dtype=bool)
     if entity_ids.size == 0:
         raise ValueError("entity_vocab is empty.")
-    if entity_ids.size != is_text.size:
-        raise ValueError("entity_vocab entity_id/is_text length mismatch.")
-    return entity_ids, is_text
+    if entity_ids.size != is_cvt.size:
+        raise ValueError("entity_vocab entity_id/is_cvt length mismatch.")
+    return entity_ids, is_cvt
 
 
 def _load_tensor(path: Path) -> torch.Tensor:
@@ -229,11 +229,11 @@ def precompute_cvt_patterns(
     if output_dir.exists() and not overwrite:
         raise FileExistsError(f"CVT pattern dir already exists: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    entity_ids, is_text_flags = _load_entity_vocab(entity_vocab_path)
+    entity_ids, is_cvt_flags = _load_entity_vocab(entity_vocab_path)
     num_entities = int(entity_ids.max()) + _ONE
     is_cvt = np.zeros((num_entities,), dtype=bool)
-    is_cvt[entity_ids] = ~is_text_flags
-    cvt_entity_ids = entity_ids[~is_text_flags]
+    is_cvt[entity_ids] = is_cvt_flags
+    cvt_entity_ids = entity_ids[is_cvt_flags]
     cvt_entity_ids = np.asarray(np.sort(cvt_entity_ids), dtype=np.int64)
     log_event(
         LOGGER,

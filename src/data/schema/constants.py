@@ -5,6 +5,14 @@ import os
 _PATH_MODE_UNDIRECTED = "undirected"
 _PATH_MODE_QA_DIRECTED = "qa_directed"
 _PATH_MODES = (_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)
+_TIME_RELATION_MODE_KEEP = "keep"
+_TIME_RELATION_MODE_DROP = "drop"
+_TIME_RELATION_MODE_QUESTION = "question_gated"
+_TIME_RELATION_MODES = (
+    _TIME_RELATION_MODE_KEEP,
+    _TIME_RELATION_MODE_DROP,
+    _TIME_RELATION_MODE_QUESTION,
+)
 _ALLOWED_SPLITS = ("train", "validation", "test")
 _NON_TEXT_EMBEDDING_ID = 0
 _ZERO = 0
@@ -32,6 +40,8 @@ _EDGE_STAT_KEYS = (
     "kept_nodes",
 )
 _FILTER_STAT_KEYS = ("dropped_no_topic", "dropped_no_answer", "dropped_no_path")
+_FILTER_MISSING_START_FILENAME = "filter_missing_start.json"
+_FILTER_MISSING_ANSWER_FILENAME = "filter_missing_answer.json"
 _DISTANCE_PROGRESS_DISABLED = 0
 _DISTANCE_MIN_WORKERS = 1
 _DISTANCE_MIN_CHUNK_SIZE = 1
@@ -49,6 +59,7 @@ _DEFAULT_LMDB_MAP_GROWTH_FACTOR = 1.5
 _VALIDATE_GRAPH_EDGES_DEFAULT = True
 _REMOVE_SELF_LOOPS_DEFAULT = True
 _LMDB_SHARDS_MIN = 1
+_INVERSE_RELATION_SUFFIX_DEFAULT = "__inv"
 
 
 class GraphFields:
@@ -56,8 +67,6 @@ class GraphFields:
     NODE_IDS = "node_entity_ids"
     NODE_EMBED_IDS = "node_embedding_ids"
     NODE_LABELS = "node_labels"
-    NODE_TYPE_COUNTS = "node_type_counts"
-    NODE_TYPE_IDS = "node_type_ids"
     EDGE_SRC = "edge_src"
     EDGE_DST = "edge_dst"
     EDGE_REL_IDS = "edge_relation_ids"
@@ -82,6 +91,7 @@ class EntityVocabFields:
     KG_ID = "kg_id"
     LABEL = "label"
     IS_TEXT = "is_text"
+    IS_CVT = "is_cvt"
     EMBEDDING_ID = "embedding_id"
 
 
@@ -104,8 +114,6 @@ _GRAPH_PARQUET_FIELDS = (
     GraphFields.NODE_IDS,
     GraphFields.NODE_EMBED_IDS,
     GraphFields.NODE_LABELS,
-    GraphFields.NODE_TYPE_COUNTS,
-    GraphFields.NODE_TYPE_IDS,
     GraphFields.EDGE_SRC,
     GraphFields.EDGE_DST,
     GraphFields.EDGE_REL_IDS,
@@ -134,6 +142,7 @@ _ENTITY_VOCAB_FIELDS = (
     EntityVocabFields.KG_ID,
     EntityVocabFields.LABEL,
     EntityVocabFields.IS_TEXT,
+    EntityVocabFields.IS_CVT,
     EntityVocabFields.EMBEDDING_ID,
 )
 

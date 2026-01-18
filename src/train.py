@@ -27,6 +27,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
+from src.data.utils.config import resolve_entity_vocab_path
 from src.utils import (
     RankedLogger,
     extras,
@@ -113,6 +114,42 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
             "Training scope violation: GFlowNet training must use sub datasets only. "
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
         )
+
+
+def _validate_cvt_requirements(cfg: DictConfig) -> None:
+    model_cfg = cfg.get("model") or {}
+    model_target = str(model_cfg.get("_target_", "") or "")
+    if model_target not in _SUPPORTED_MODEL_TARGETS:
+        return
+    cvt_cfg = model_cfg.get("cvt_init_cfg") or {}
+    if not bool(cvt_cfg.get("enabled", True)):
+        raise ValueError("cvt_init_cfg.enabled must be true; CVT initialization is mandatory.")
+    dataset_cfg = cfg.get("dataset") or {}
+    data_cfg = cfg.get("data") or {}
+    data_dataset_cfg = None
+    if isinstance(data_cfg, DictConfig):
+        data_dataset_cfg = data_cfg.get("dataset_cfg")
+    elif isinstance(data_cfg, dict):
+        data_dataset_cfg = data_cfg.get("dataset_cfg")
+
+    dataset_entity_vocab = resolve_entity_vocab_path(dataset_cfg)
+    data_entity_vocab = resolve_entity_vocab_path(data_dataset_cfg)
+    if dataset_entity_vocab is not None and data_entity_vocab is not None:
+        if dataset_entity_vocab != data_entity_vocab:
+            raise ValueError(
+                "dataset and data.dataset_cfg must resolve the same entity_vocab.parquet "
+                f"for CVT initialization. dataset={dataset_entity_vocab} data.dataset_cfg={data_entity_vocab}"
+            )
+
+    for source_name, source_cfg in (("dataset", dataset_cfg), ("data.dataset_cfg", data_dataset_cfg)):
+        entity_vocab_path = resolve_entity_vocab_path(source_cfg)
+        if entity_vocab_path is None:
+            raise ValueError(
+                "CVT initialization requires entity_vocab.parquet. "
+                f"Missing path in {source_name}; set `{source_name}.paths.entity_vocab` or `{source_name}.out_dir`."
+            )
+        if not entity_vocab_path.exists():
+            raise FileNotFoundError(f"{source_name} entity_vocab.parquet not found: {entity_vocab_path}")
 
 
 @task_wrapper
@@ -212,6 +249,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     _validate_required_args(cfg)
     _enforce_supported_training_models(cfg)
     _enforce_sub_training_scope(cfg)
+    _validate_cvt_requirements(cfg)
     extras(cfg)
 
     # train the model

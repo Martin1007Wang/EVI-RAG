@@ -9,8 +9,13 @@ from src.data.relation_cleaning_rules import (
     RelationCleaningRules,
     relation_action,
 )
-from src.data.schema.constants import _PATH_MODE_UNDIRECTED
-from src.data.schema.types import Sample, SampleFilterOutcome, SplitFilter
+from src.data.schema.constants import (
+    _PATH_MODE_UNDIRECTED,
+    _TIME_RELATION_MODE_DROP,
+    _TIME_RELATION_MODE_KEEP,
+    _TIME_RELATION_MODE_QUESTION,
+)
+from src.data.schema.types import Sample, SampleFilterOutcome, SplitFilter, TimeRelationConfig
 from src.data.utils.connectivity import _validate_path_mode, has_connectivity
 
 
@@ -23,17 +28,42 @@ def _resolve_split_filter(
     return train_filter if split == "train" else eval_filter
 
 
+def _resolve_time_gate(time_relation_cfg: Optional[TimeRelationConfig], question_text: Optional[str]) -> Optional[bool]:
+    if time_relation_cfg is None:
+        return None
+    mode = time_relation_cfg.mode
+    if mode == _TIME_RELATION_MODE_KEEP:
+        return None
+    if mode == _TIME_RELATION_MODE_DROP:
+        return False
+    if mode == _TIME_RELATION_MODE_QUESTION:
+        if question_text is None:
+            raise ValueError("time_relation_mode=question_gated requires question_text.")
+        return time_relation_cfg.is_time_question(question_text)
+    raise ValueError(f"Unsupported time_relation_mode: {mode!r}.")
+
+
 def _partition_graph_edges(
     graph: Sequence[Tuple[str, str, str]],
     rules: RelationCleaningRules,
     *,
     remove_self_loops: bool,
     relation_cleaning_enabled: bool,
+    time_relation_cfg: Optional[TimeRelationConfig] = None,
+    question_text: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str]]]:
     kept_edges: List[Tuple[str, str, str]] = []
     type_edges: List[Tuple[str, str, str]] = []
+    time_gate = _resolve_time_gate(time_relation_cfg, question_text)
     for h, r, t in graph:
         if remove_self_loops and h == t:
+            continue
+        if (
+            time_gate is not None
+            and time_relation_cfg is not None
+            and time_relation_cfg.is_time_relation(r)
+            and not time_gate
+        ):
             continue
         action = relation_action(r, rules, enabled=relation_cleaning_enabled)
         if action == RELATION_ACTION_KEEP:
@@ -53,6 +83,7 @@ def _should_keep_sample(
     relation_cleaning_enabled: bool,
     relation_cleaning_rules: RelationCleaningRules,
     kept_edges: Optional[Sequence[Tuple[str, str, str]]] = None,
+    time_relation_cfg: Optional[TimeRelationConfig] = None,
 ) -> SampleFilterOutcome:
     if kept_edges is None:
         kept_edges, _ = _partition_graph_edges(
@@ -60,6 +91,8 @@ def _should_keep_sample(
             relation_cleaning_rules,
             remove_self_loops=remove_self_loops,
             relation_cleaning_enabled=relation_cleaning_enabled,
+            time_relation_cfg=time_relation_cfg,
+            question_text=sample.question,
         )
     node_strings = {h for h, _, t in kept_edges} | {t for _, _, t in kept_edges}
     has_topic = any(ent in node_strings for ent in sample.q_entity)

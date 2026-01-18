@@ -42,43 +42,37 @@
 
 ## Ⅲ. Data Specification (数据立法)
 
-### 1. `g_retrieval` Schema (Retriever SSOT)
+### 1. `g_retrieval` Schema (GFlowNet Subgraph SSOT)
 
-**Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 Retriever 训练的唯一输入。
-**Note:** 当前训练管线是 label-free；离线最短路监督字段（`labels`, `pair_*` 等）已弃用，出现即视为数据错误。
-**Note:** 当前所有数据集均不包含 `answer_subgraph` 字段；相关加权策略仅作为理论备忘。
-**Storage Note:** 为了最小化 Retriever 训练 I/O，`g_retrieval` 在物化阶段拆分为 core (`<split>.lmdb`) 与 aux (`<split>.aux.lmdb`)。core 只包含 Retriever 必需字段；aux 保存问题文本与其他非 Retriever 必需字段（`pair_*` 已弃用，不应出现）。完整语义仍是两者的并集。
+**Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 GFlowNet 训练的唯一输入。
+**Note:** 当前训练管线是 label-free；任何监督字段（如 `labels`, `pair_*`）出现即视为数据错误。
+**Storage Note:** `g_retrieval` 仅物化 core LMDB（`<split>.lmdb`）。不读取/不维护 aux LMDB。
 
 #### A. Topology (流形结构)
 *   `sample_id`: `str`. Unique Identifier.
 *   `num_nodes`: `int` ($N$).
-*   `edge_index`: `Long[E, 2]`. Local indices $u \to v$.
+*   `edge_index`: `Long[2, E]`. Local indices $u \to v$.
 *   `edge_attr`: `Long[E]`. Global Relation IDs.
 *   `node_global_ids`: `Long[N]`. Map local $i \to$ Global ID.
 *   `node_embedding_ids`: `Long[N]`. Embedding lookup table index.
+*   `node_type_counts`: `Long[N]`. Per-node type counts (CSR header).
+*   `node_type_ids`: `Long[sum(node_type_counts)]`. Flattened type ids.
 
 #### B. Semantics & Condition (语义与条件)
 *   `question_emb`: `Float[1, D]`. Dense query representation.
 *   `q_local_indices`: `Long[K_q]`. $s$ 在 $G_{sub}$ 中的索引。
 *   `a_local_indices`: `Long[K_a]`. $a$ 在 $G_{sub}$ 中的索引。
 *   `answer_entity_ids`: `Long[K_a]`. Global Answer IDs (用于 Metrics).
+*   `question`: `Optional[str]`. 仅用于日志/可视化；可缺省。
 
-#### C. Supervision: The Triple-Level Set (三元组级集合) - **DEPRECATED**
-*   `labels`: **已弃用**。当前实现禁止该字段落盘；如存在则应重建数据。
-
-#### D. Structural Anchors (结构锚点)
-*   `topic_one_hot`: `Float[N, C]`.
-    *   **Runtime Logic:** Retriever 必须在 `forward` 中对此字段应用 DDE (Degree-aware Diffusion) 以生成 Structural Embeddings。
-    *   **Prohibition:** 禁止存储 `topic_pe` 或 `node_topic_dist`。
-
-#### E. Pair-level Supervision (CSR Structure) - **DEPRECATED**
-*   `pair_*` 字段已弃用，当前实现禁止落盘；如存在则应重建数据。
+#### C. Forbidden Legacy Fields (禁止出现)
+*   `labels`, `pair_*`, `answer_subgraph`, `topic_pe`, `node_topic_dist` 等历史字段必须在预处理阶段剔除。
 
 ---
 
 ### 2. Runtime Contract (Current Pipeline)
 *   **Training:** 仅提供 GFlowNet 训练（`configs/experiment/train_gflownet.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
-*   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_retriever` 与 `eval_gflownet` 缓存；不生成/不读取 `g_agent`。
+*   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_gflownet` 缓存；不生成/不读取 `g_agent`。
 *   **Shortcut Suppression/SP-Dropout:** 训练阶段默认启用 SP-Dropout（预选遮蔽）与 Safety Net（最短路保底），仅作用于 `g_retrieval` 子图采样。
 
 ---
@@ -100,14 +94,13 @@
 *   **Sub Dataset Definition:** `sub` 指经过过滤的样本集合：
     * 起始实体或答案实体不在图中 → 必须剔除。
     * 起始实体与答案实体无任何联通路径 → 必须剔除。
-*   **Training Scope:** Retriever 与 GFlowNet 的训练 **只能** 使用 `sub` 数据集。
-*   **Evaluation Scope:** Retriever 与 GFlowNet 的评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行，并分别报告指标（建议 `full`/`sub` 作为显式前缀）。
+*   **Training Scope:** GFlowNet 的训练 **只能** 使用 `sub` 数据集。
+*   **Evaluation Scope:** GFlowNet 的评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行，并分别报告指标（建议 `full`/`sub` 作为显式前缀）。
 *   **LLM Evaluation:** LLM 评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行。
 *   **Runtime Contract:** 任何评估流程必须显式提供两套数据源（`full` 与 `sub`），不得隐式复用或覆盖。
 
 ### 4. Forbidden Patterns (反模式 - 此处即为红线)
 *   ❌ **Hardcoding Special Cases:** 不要写 `if dataset == 'fq': ...`。应当将差异抽象为配置参数。
-*   ❌ **Transition/Hybrid in Retrieval:** Retriever 只能看到 Triple，不能看到 Path。
 *   ❌ **Pre-computing Embeddings in Forward:** 预处理逻辑属于 Dataset，不属于 Model Forward。
 *   ❌ **Python Loops for Graph Logic:** 使用 `scatter`, `gather`, `index_select` 代替循环。
 

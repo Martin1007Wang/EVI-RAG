@@ -18,6 +18,14 @@ precompute_questions: true
 canonicalize_relations: false
 cosine_eps: 1e-6
 
+inverse_relations:
+  enabled: true
+  mapping_path: ${dataset.out_dir}/inverse_relations.json
+  kg_id_suffix: "__inv"
+  strict: true
+  fallback_template: null
+  global_vocab: false
+
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json
 emit_nonzero_positive_filter: false
@@ -35,17 +43,7 @@ map_size_gb: 128
 map_growth_gb: 32
 map_growth_factor: 1.5
 map_max_gb: null
-vocab_map_size_gb: 16
 overwrite_lmdb: true
 txn_size: 512
 seed: 42
 deterministic: false
-
-precompute_distances: true
-distance_splits: null
-distance_num_workers: null
-distance_chunk_size: 8
-distance_progress_interval: 0
-distance_skip_existing: true
-distance_pt_overwrite: true
-distance_prune_lmdb: false

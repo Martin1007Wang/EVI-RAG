@@ -165,7 +165,7 @@ def _write_chunk(
     for emb_tensor, emb_id in zip(emb_chunk, id_chunk):
         if not 0 <= int(emb_id) <= max_embedding_id:
             continue
-        mem[int(emb_id)] = emb_tensor.cpu().numpy()
+        mem[int(emb_id)] = emb_tensor.detach().to(device="cpu").tolist()
 
 
 def _cleanup_memmap(mmap_path: Path) -> None:

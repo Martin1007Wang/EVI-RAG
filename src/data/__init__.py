@@ -13,35 +13,33 @@ __all__ = [
     "GRetrievalDataset",
     "create_g_retrieval_dataset",
     "GRetrievalDataModule",
-    "UnifiedDataLoader",
-    "GraphStore",
+    "build_retrieval_dataloader",
     "EmbeddingStore",
     "GlobalEmbeddingStore",
     "SharedDataResources",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .components import EmbeddingStore, GlobalEmbeddingStore, GraphStore, SharedDataResources
-    from .components.loader import UnifiedDataLoader
+    from .components import EmbeddingStore, GlobalEmbeddingStore, SharedDataResources
+    from .components.loader import build_retrieval_dataloader
     from .g_retrieval_datamodule import GRetrievalDataModule
     from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
-    if name in ("SharedDataResources", "EmbeddingStore", "GlobalEmbeddingStore", "GraphStore"):
-        from .components import EmbeddingStore, GlobalEmbeddingStore, GraphStore, SharedDataResources
+    if name in ("SharedDataResources", "EmbeddingStore", "GlobalEmbeddingStore"):
+        from .components import EmbeddingStore, GlobalEmbeddingStore, SharedDataResources
 
         return {
             "SharedDataResources": SharedDataResources,
             "EmbeddingStore": EmbeddingStore,
             "GlobalEmbeddingStore": GlobalEmbeddingStore,
-            "GraphStore": GraphStore,
         }[name]
 
-    if name == "UnifiedDataLoader":
-        from .components.loader import UnifiedDataLoader
+    if name == "build_retrieval_dataloader":
+        from .components.loader import build_retrieval_dataloader
 
-        return UnifiedDataLoader
+        return build_retrieval_dataloader
 
     if name in ("GRetrievalDataset", "create_g_retrieval_dataset"):
         from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset

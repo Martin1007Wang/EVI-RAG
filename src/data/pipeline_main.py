@@ -4,9 +4,8 @@ import uuid
 
 from src.data.context import StageContext
 from src.data.io.lmdb_utils import ensure_dir
-from src.data.stages.sidecars.distance import run_distance_pt_stage
 from src.data.stages.step2_graph import preprocess
-from src.data.stages.step4_lmdb import build_dataset
+from src.data.stages.step3_lmdb import build_dataset
 from src.utils.logging_utils import get_logger, log_event
 
 LOGGER = get_logger(__name__)
@@ -22,7 +21,6 @@ def _validate_pipeline_cfg(ctx: StageContext) -> None:
     skip_parquet_stage = bool(cfg.get("skip_parquet_stage", False))
     skip_lmdb_stage = bool(cfg.get("skip_lmdb_stage", False))
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
-    precompute_distances = bool(cfg.get("precompute_distances", False))
 
     _ = ctx.parquet_chunk_size
     _ = ctx.parquet_num_workers
@@ -54,17 +52,6 @@ def _validate_pipeline_cfg(ctx: StageContext) -> None:
                 f"Got parquet_dir={ctx.parquet_dir} vs out_dir={ctx.out_dir}."
             )
 
-    if not precompute_distances:
-        raise ValueError("precompute_distances must be true; PT is the sole distance cache format.")
-    pt_overwrite = cfg.get("distance_pt_overwrite")
-    if pt_overwrite is None:
-        raise ValueError("distance_pt_overwrite must be set explicitly; no defaults are allowed.")
-    prune_lmdb = cfg.get("distance_prune_lmdb")
-    if prune_lmdb is None:
-        raise ValueError("distance_prune_lmdb must be set explicitly; set false for PT-only distances.")
-    if bool(prune_lmdb):
-        raise ValueError("distance_prune_lmdb must be false; distances are written directly to PT.")
-
 def _run_parquet_stage(ctx: StageContext) -> None:
     log_event(
         ctx.logger,
@@ -79,9 +66,8 @@ def _run_parquet_stage(ctx: StageContext) -> None:
 def _ensure_pipeline_dirs(ctx: StageContext) -> None:
     out_dir = ctx.out_dir
     output_dir = ctx.output_dir
-    distances_dir = output_dir / "distances"
     embeddings_dir = ctx.embeddings_dir
-    for path in (out_dir, output_dir, embeddings_dir, distances_dir):
+    for path in (out_dir, output_dir, embeddings_dir):
         ensure_dir(path)
     log_event(
         ctx.logger,
@@ -89,7 +75,6 @@ def _ensure_pipeline_dirs(ctx: StageContext) -> None:
         out_dir=str(out_dir),
         output_dir=str(output_dir),
         embeddings_dir=str(embeddings_dir),
-        distances_dir=str(distances_dir),
     )
 
 
@@ -100,4 +85,3 @@ def build_pipeline(cfg) -> None:
     _ensure_pipeline_dirs(ctx)
     _run_parquet_stage(ctx)
     build_dataset(ctx)
-    run_distance_pt_stage(ctx)

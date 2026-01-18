@@ -4,44 +4,31 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from lightning import LightningDataModule
+import torch
 
 try:
     from omegaconf import DictConfig, OmegaConf  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     DictConfig = ()  # type: ignore[assignment]
     OmegaConf = None  # type: ignore[assignment]
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 
 from .components import SharedDataResources
-from .components.loader import UnifiedDataLoader
+from .components.loader import build_retrieval_dataloader
 from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
-from src.utils.logging_utils import get_logger, log_event
-
-LOGGER = get_logger(__name__)
+from .io.lmdb_utils import _resolve_core_lmdb_paths
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"
 
 
 def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize dataset_cfg to the SSOT representation: `paths.vocabulary` + `paths.embeddings`."""
+    """Normalize dataset_cfg to the SSOT representation: `paths.entity_vocab` + `paths.embeddings`."""
 
     cfg = dict(dataset_cfg)
     paths = cfg.get("paths")
-    if isinstance(paths, dict) and paths.get("vocabulary") and paths.get("embeddings"):
+    if isinstance(paths, dict) and paths.get("entity_vocab") and paths.get("embeddings"):
         return cfg
-    raise ValueError("dataset_cfg must define `paths.vocabulary` and `paths.embeddings`.")
-
-
-def _infer_batch_size(total_batch: int, world_size: int) -> int:
-    """Helper to split batch size across GPUs."""
-    if world_size <= 1:
-        return total_batch
-    if total_batch % world_size != 0:
-        raise ValueError(
-            f"batch_size={total_batch} must be divisible by world_size={world_size}. "
-            "Please adjust `data.batch_size` or trainer devices to keep per-rank batch sizes equal."
-        )
-    return total_batch // world_size
+    raise ValueError("dataset_cfg must define `paths.entity_vocab` and `paths.embeddings`.")
 
 
 class GRetrievalDataModule(LightningDataModule):
@@ -65,23 +52,19 @@ class GRetrievalDataModule(LightningDataModule):
         train_shuffle: bool = True,
         prefetch_factor: int = 2,
         persistent_workers: bool = False,
-        worker_embed_lookup: bool = False,
         precompute_edge_batch: bool = False,
-        precompute_node_in_degree: bool = False,
         validate_edge_batch: bool = False,
         embeddings_device: str | None = None,
         splits: Optional[Dict[str, str]] = None,
+        expand_multi_start: bool = True,
+        expand_multi_answer: bool = True,
     ) -> None:
         super().__init__()
         normalized_embeddings_device = None if embeddings_device is None else str(embeddings_device).lower()
-        if num_workers > 0 and normalized_embeddings_device == _EMBEDDINGS_DEVICE_CUDA:
-            log_event(
-                LOGGER,
-                "datamodule_force_cpu_embeddings",
-                reason="avoid_cuda_init_in_workers",
-                num_workers=int(num_workers),
-            )
-            normalized_embeddings_device = _EMBEDDINGS_DEVICE_CPU
+        if normalized_embeddings_device not in (None, _EMBEDDINGS_DEVICE_CPU, _EMBEDDINGS_DEVICE_CUDA):
+            raise ValueError(f"embeddings_device must be cpu or cuda, got {normalized_embeddings_device!r}.")
+        if normalized_embeddings_device == _EMBEDDINGS_DEVICE_CUDA and not torch.cuda.is_available():
+            raise RuntimeError("embeddings_device=cuda requested but CUDA is not available.")
         embeddings_device = normalized_embeddings_device
 
         # dataset_cfg 可能包含 OmegaConf 对象；避免写入 checkpoint 元数据。
@@ -107,11 +90,11 @@ class GRetrievalDataModule(LightningDataModule):
         self.train_shuffle = bool(train_shuffle)
         self.persistent_workers = persistent_workers
         self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
-        self.worker_embed_lookup = bool(worker_embed_lookup)
         self.precompute_edge_batch = bool(precompute_edge_batch)
-        self.precompute_node_in_degree = bool(precompute_node_in_degree)
         self.validate_edge_batch = bool(validate_edge_batch)
         self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
+        self.expand_multi_start = bool(expand_multi_start)
+        self.expand_multi_answer = bool(expand_multi_answer)
 
         # Default splits mapping if not provided in `data/g_retrieval.yaml`
         self.splits = splits or {"train": "train", "validation": "validation", "test": "test"}
@@ -136,15 +119,15 @@ class GRetrievalDataModule(LightningDataModule):
         paths = self.dataset_cfg.get("paths")
         if not isinstance(paths, dict):
             raise ValueError("Invalid dataset_cfg: expected mapping at `paths`.")
-        if "vocabulary" not in paths or "embeddings" not in paths:
-            raise ValueError("Invalid dataset_cfg: expected `paths.vocabulary` and `paths.embeddings`.")
+        if "entity_vocab" not in paths or "embeddings" not in paths:
+            raise ValueError("Invalid dataset_cfg: expected `paths.entity_vocab` and `paths.embeddings`.")
 
-        vocab_path = Path(paths["vocabulary"])
+        entity_vocab_path = Path(paths["entity_vocab"])
         emb_dir = Path(paths["embeddings"])
 
         missing = []
-        if not vocab_path.exists():
-            missing.append(f"Vocabulary: {vocab_path}")
+        if not entity_vocab_path.exists():
+            missing.append(f"Entity vocab: {entity_vocab_path}")
         if not emb_dir.exists():
             missing.append(f"Embeddings Dir: {emb_dir}")
 
@@ -154,17 +137,18 @@ class GRetrievalDataModule(LightningDataModule):
                 + "\n".join(missing)
                 + "\nPlease check 'configs/dataset/YOUR_DATASET.yaml'."
             )
+        for split_name in sorted(set(self.splits.values())):
+            _resolve_core_lmdb_paths(emb_dir, split_name)
 
     def setup(self, stage: Optional[str] = None) -> None:
-        # 1. Adjust Batch Size for DDP
-        if self.trainer is not None:
-            self.batch_size_per_device = _infer_batch_size(self.batch_size, self.trainer.world_size)
+        # 1. Batch size is defined per device; keep as-is for DDP.
+        self.batch_size_per_device = self.batch_size
 
         # 2. Initialize Shared Resources (One-time load)
         if self._shared_resources is None:
             paths = self.dataset_cfg["paths"]
             self._shared_resources = SharedDataResources(
-                vocabulary_path=Path(paths["vocabulary"]),
+                entity_vocab_path=Path(paths["entity_vocab"]),
                 embeddings_dir=Path(paths["embeddings"]),
                 embeddings_device=self.embeddings_device,
             )
@@ -200,17 +184,17 @@ class GRetrievalDataModule(LightningDataModule):
     def test_dataloader(self):
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
 
-    def predict_dataloader(self) -> UnifiedDataLoader:
+    def predict_dataloader(self) -> DataLoader:
         # Predict reuses the test split.
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
 
-    def train_eval_dataloader(self) -> UnifiedDataLoader:
+    def train_eval_dataloader(self) -> DataLoader:
         """
         Deterministic loader for train split during evaluation/export stages.
         """
         return self._build_loader(self.train_dataset, shuffle=False, drop_last=False)
 
-    def get_split_dataloader(self, split: str) -> UnifiedDataLoader:
+    def get_split_dataloader(self, split: str) -> DataLoader:
         if split == "train":
             return self.train_eval_dataloader()
         if split in ("val", "validation"):
@@ -219,20 +203,31 @@ class GRetrievalDataModule(LightningDataModule):
             return self.test_dataloader()
         raise ValueError(f"Unsupported split: {split}")
 
+    def teardown(self, stage: Optional[str] = None) -> None:
+        for dataset in (self.train_dataset, self.val_dataset, self.test_dataset):
+            if dataset is not None:
+                dataset.close()
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        if self._shared_resources is not None:
+            self._shared_resources.clear()
+        self._shared_resources = None
+
     def _build_loader(
         self,
         dataset: GRetrievalDataset,
         *,
         shuffle: bool,
         drop_last: bool,
-    ) -> UnifiedDataLoader:
+    ) -> DataLoader:
         """
-        Constructs the UnifiedDataLoader using params injected via dataset_cfg.
+        Constructs the retrieval DataLoader using params injected via dataset_cfg.
         """
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Did you run setup()?")
 
-        return UnifiedDataLoader(
+        return build_retrieval_dataloader(
             dataset,
             batch_size=self.batch_size_per_device,
             shuffle=shuffle,
@@ -241,10 +236,9 @@ class GRetrievalDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,
-            worker_embed_lookup=self.worker_embed_lookup,
             precompute_edge_batch=self.precompute_edge_batch,
-            precompute_node_in_degree=self.precompute_node_in_degree,
             validate_edge_batch=self.validate_edge_batch,
-            embeddings_device=self.embeddings_device,
             random_seed=self.dataset_cfg.get("random_seed"),
+            expand_multi_start=self.expand_multi_start,
+            expand_multi_answer=self.expand_multi_answer,
         )

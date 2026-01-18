@@ -29,3 +29,9 @@ entity_normalization: ${dataset.entity_normalization}
 entity_text_mode: ${dataset.entity_text_mode}
 text_prefixes: ${dataset.text_prefixes}
 text_regex: ${dataset.text_regex}
+cvt_entity_mode: ${dataset.cvt_entity_mode}
+cvt_prefixes: ${dataset.cvt_prefixes}
+cvt_regex: ${dataset.cvt_regex}
+time_relation_mode: ${dataset.time_relation_mode}
+time_relation_regex: ${dataset.time_relation_regex}
+time_question_regex: ${dataset.time_question_regex}

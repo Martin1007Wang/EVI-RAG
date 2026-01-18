@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
+
+try:  # pragma: no cover - optional dependency guard
+    from omegaconf import DictConfig, OmegaConf  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    DictConfig = ()  # type: ignore[assignment]
+    OmegaConf = None  # type: ignore[assignment]
 
 from src.data.schema.constants import (
     _DEFAULT_BATCH_SIZE,
@@ -87,3 +93,25 @@ def build_split_filters(cfg) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitF
             skip_no_path=bool(section.get("skip_no_path", False)),
         )
     return train_filter, eval_filter, overrides
+
+
+_ENTITY_VOCAB_FILENAME = "entity_vocab.parquet"
+
+
+def resolve_entity_vocab_path(cfg: Any) -> Optional[Path]:
+    """Resolve entity_vocab.parquet from dataset cfg or fall back to out_dir."""
+    if OmegaConf is not None and isinstance(cfg, DictConfig):
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(cfg, dict):
+        return None
+    paths_cfg = cfg.get("paths")
+    if OmegaConf is not None and isinstance(paths_cfg, DictConfig):
+        paths_cfg = OmegaConf.to_container(paths_cfg, resolve=True)
+    if isinstance(paths_cfg, dict):
+        entity_vocab = paths_cfg.get("entity_vocab")
+        if entity_vocab:
+            return Path(entity_vocab)
+    out_dir = cfg.get("out_dir")
+    if out_dir:
+        return Path(out_dir) / _ENTITY_VOCAB_FILENAME
+    return None

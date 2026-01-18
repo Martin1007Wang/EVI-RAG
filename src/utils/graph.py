@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
+_ZERO = 0
 _DIST_UNREACHABLE = -1
 _DIST_ORIGIN = 0
 _DIST_STEP = 1
@@ -45,7 +46,7 @@ def build_edge_batch_debug_context(debug_batch: object) -> EdgeBatchDebugContext
         return None
     if not torch.is_tensor(edge_ptr):
         edge_ptr = torch.as_tensor(edge_ptr, dtype=torch.long)
-    edge_ptr = edge_ptr.detach().cpu()
+    edge_ptr = edge_ptr.detach().to(device="cpu")
     if edge_ptr.numel() < _EDGE_PTR_MIN_LEN:
         return None
     return EdgeBatchDebugContext(sample_ids=[str(sid) for sid in sample_ids], edge_ptr=edge_ptr)
@@ -55,7 +56,7 @@ def _preview_sample_ids(debug_context: EdgeBatchDebugContext, edge_positions: to
     edge_ptr = debug_context.edge_ptr
     if edge_ptr.numel() < _EDGE_PTR_MIN_LEN:
         return []
-    edge_positions = edge_positions.detach().cpu()
+    edge_positions = edge_positions.detach().to(device="cpu")
     graph_ids = torch.bucketize(edge_positions, edge_ptr[1:], right=False)
     unique_graphs = sorted(set(graph_ids.tolist()))
     preview: list[str] = []
@@ -86,11 +87,11 @@ def compute_edge_batch(
         tail_batch = torch.bucketize(edge_index[1], node_ptr[1:], right=True)
     if validate:
         if edge_batch.numel() > 0:
-            min_idx = int(edge_batch.min().item())
-            max_idx = int(edge_batch.max().item())
+            min_idx = int(edge_batch.min().detach().tolist())
+            max_idx = int(edge_batch.max().detach().tolist())
             if min_idx < _EDGE_BATCH_MIN or max_idx >= num_graphs:
                 invalid = torch.nonzero(edge_batch >= num_graphs, as_tuple=False).view(-1)
-                preview = invalid[:_EDGE_BATCH_POS_PREVIEW].detach().cpu().tolist()
+                preview = invalid[:_EDGE_BATCH_POS_PREVIEW].detach().to(device="cpu").tolist()
                 sample_preview = _preview_sample_ids(debug_context, invalid) if debug_context is not None else []
                 detail = f"min={min_idx} max={max_idx} num_graphs={num_graphs}"
                 if preview:
@@ -100,7 +101,7 @@ def compute_edge_batch(
                 raise ValueError(f"edge_batch contains out-of-range indices; {detail}.")
         if tail_batch is not None and not torch.equal(edge_batch, tail_batch):
             mismatch = torch.nonzero(edge_batch != tail_batch, as_tuple=False).view(-1)
-            preview = mismatch[:_EDGE_BATCH_MISMATCH_PREVIEW].detach().cpu().tolist()
+            preview = mismatch[:_EDGE_BATCH_MISMATCH_PREVIEW].detach().to(device="cpu").tolist()
             sample_preview = _preview_sample_ids(debug_context, mismatch) if debug_context is not None else []
             detail = f"first_mismatches={preview}"
             if sample_preview:
@@ -109,9 +110,9 @@ def compute_edge_batch(
                 "edge_index crosses graph boundaries; head/tail graph assignments differ. "
                 f"{detail}"
             )
-        if edge_batch.numel() > 1 and not bool((edge_batch[:-1] <= edge_batch[1:]).all().item()):
+        if edge_batch.numel() > 1 and not bool((edge_batch[:-1] <= edge_batch[1:]).all().detach().tolist()):
             inv = torch.nonzero(edge_batch[:-1] > edge_batch[1:], as_tuple=False).view(-1)
-            preview = inv[:_EDGE_BATCH_INVERSION_PREVIEW].detach().cpu().tolist()
+            preview = inv[:_EDGE_BATCH_INVERSION_PREVIEW].detach().to(device="cpu").tolist()
             sample_preview = _preview_sample_ids(debug_context, inv) if debug_context is not None else []
             detail = f"first_inversions={preview}"
             if sample_preview:
@@ -127,13 +128,24 @@ def compute_edge_batch(
     return edge_batch, edge_ptr
 
 
-def compute_undirected_degree(edge_index: torch.Tensor, *, num_nodes: int) -> torch.Tensor:
-    if edge_index.dim() != 2 or edge_index.size(0) != 2:
-        raise ValueError(f"edge_index must have shape [2, E], got {tuple(edge_index.shape)}")
-    num_nodes = int(num_nodes)
-    if num_nodes <= 0:
-        raise ValueError(f"num_nodes must be positive, got {num_nodes}")
-    return torch.bincount(edge_index.view(-1), minlength=num_nodes)
+def compute_invalid_nodes(
+    *,
+    edge_index: torch.Tensor,
+    node_is_start: torch.Tensor,
+    node_is_answer: torch.Tensor,
+) -> torch.Tensor:
+    num_nodes_total = int(node_is_start.numel())
+    neighbors = torch.zeros(num_nodes_total, device=edge_index.device, dtype=torch.bool)
+    if edge_index.numel() > _ZERO:
+        heads = edge_index[0]
+        tails = edge_index[1]
+        start_heads = node_is_start[heads]
+        if bool(start_heads.any().detach().tolist()):
+            neighbors[tails[start_heads]] = True
+        start_tails = node_is_start[tails]
+        if bool(start_tails.any().detach().tolist()):
+            neighbors[heads[start_tails]] = True
+    return (node_is_start | neighbors) & (~node_is_answer)
 
 
 def _undirected_bfs_distances_impl(
@@ -159,13 +171,13 @@ def _undirected_bfs_distances_impl(
     step = dist_origin
     next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
     for _ in range(num_nodes):
-        if not bool(frontier.any().item()):
+        if not bool(frontier.any().detach().tolist()):
             break
         next_counts.zero_()
         next_counts.index_add_(0, edge_dst, frontier[edge_src].to(dtype=torch.long))
         next_counts.index_add_(0, edge_src, frontier[edge_dst].to(dtype=torch.long))
         next_mask = (next_counts > 0) & (dist < 0)
-        if not bool(next_mask.any().item()):
+        if not bool(next_mask.any().detach().tolist()):
             break
         step += dist_step
         dist[next_mask] = step
@@ -201,12 +213,12 @@ def _directed_bfs_distances_impl(
     step = dist_origin
     next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
     for _ in range(num_nodes):
-        if not bool(frontier.any().item()):
+        if not bool(frontier.any().detach().tolist()):
             break
         next_counts.zero_()
         next_counts.index_add_(0, edge_dst, frontier[edge_src].to(dtype=torch.long))
         next_mask = (next_counts > 0) & (dist < 0)
-        if not bool(next_mask.any().item()):
+        if not bool(next_mask.any().detach().tolist()):
             break
         step += dist_step
         dist[next_mask] = step
@@ -334,7 +346,6 @@ __all__ = [
     "build_edge_batch_debug_context",
     "compute_edge_batch",
     "compute_qa_edge_mask",
-    "compute_undirected_degree",
     "directed_bfs_distances",
     "undirected_bfs_distances",
 ]

@@ -100,87 +100,45 @@ def _format_lmdb_path(base_dir: Path, split: str, shard_id: int, num_shards: int
 
 
 def _resolve_core_lmdb_paths(embeddings_dir: Path, split: str) -> List[Path]:
+    split = str(split)
     base_path = embeddings_dir / f"{split}.lmdb"
+    shard_paths = sorted(embeddings_dir.glob(f"{split}.shard*.lmdb"))
     if base_path.exists():
+        if shard_paths:
+            raise ValueError(f"Both sharded and unsharded LMDBs found under {embeddings_dir}.")
         return [base_path]
-    shard_glob = f"{split}.shard*.lmdb"
-    shard_paths = sorted(embeddings_dir.glob(shard_glob))
-    if shard_paths:
-        return shard_paths
-    raise FileNotFoundError(f"Core LMDB not found for split={split} under {embeddings_dir}")
+    if not shard_paths:
+        raise FileNotFoundError(f"Core LMDB not found for split={split} under {embeddings_dir}")
+    shard_map: Dict[int, Path] = {}
+    token = f"{split}.shard"
+    for path in shard_paths:
+        stem = path.stem
+        if not stem.startswith(token):
+            raise ValueError(f"Unexpected LMDB shard name: {path.name}")
+        shard_text = stem[len(token):]
+        if not shard_text.isdigit():
+            raise ValueError(f"Invalid shard id in LMDB shard {path.name}")
+        shard_id = int(shard_text)
+        if shard_id in shard_map:
+            raise ValueError(f"Duplicate LMDB shard id {shard_id} for {split}.")
+        shard_map[shard_id] = path
+    shard_ids = sorted(shard_map)
+    if not shard_ids:
+        raise FileNotFoundError(f"No LMDB shards found for {split}.")
+    expected = list(range(shard_ids[-1] + _ONE))
+    if shard_ids != expected:
+        raise ValueError(f"LMDB shards must be contiguous from 0; found {shard_ids}.")
+    return [shard_map[shard_id] for shard_id in expected]
 
 
-def _extract_shard_id(path: Path) -> int:
-    import re
-
-    match = re.search(r"\\.shard(\\d+)\\.lmdb$", path.name)
-    if match is None:
-        return 0
-    return int(match.group(1))
-
-
-def _assign_lmdb_shard(sample_key: bytes, num_shards: int) -> int:
+def _assign_lmdb_shard(sample_key: str | bytes, num_shards: int) -> int:
     if num_shards <= 1:
         return 0
     import zlib
 
+    if isinstance(sample_key, str):
+        sample_key = sample_key.encode("utf-8")
     return int(zlib.crc32(sample_key) % num_shards)
-
-
-def _open_lmdb_env(
-    path: Path,
-    *,
-    map_size_bytes: Optional[int] = None,
-    readonly: bool = False,
-    max_readers: int = _ONE,
-    subdir: bool = True,
-) -> lmdb.Environment:
-    if not readonly:
-        ensure_dir(path)
-    if readonly:
-        env = lmdb.open(
-            str(path),
-            readonly=True,
-            lock=False,
-            readahead=False,
-            meminit=False,
-            max_readers=max_readers,
-            subdir=subdir,
-        )
-    else:
-        if map_size_bytes is None:
-            raise ValueError("map_size_bytes must be set when opening a writable LMDB environment.")
-        map_size = int(map_size_bytes)
-        env = lmdb.open(
-            str(path),
-            map_size=map_size,
-            subdir=subdir,
-            create=True,
-            max_readers=max_readers,
-        )
-    if map_size_bytes is not None:
-        current_size = int(env.info().get("map_size", _ZERO))
-        if current_size < map_size_bytes:
-            env.set_mapsize(map_size_bytes)
-    return env
-
-
-def _build_core_envs(core_paths: List[Path], *, max_readers: int) -> Dict[int, lmdb.Environment]:
-    envs: Dict[int, lmdb.Environment] = {}
-    for path in core_paths:
-        shard_id = _extract_shard_id(path)
-        envs[shard_id] = _open_lmdb_env(path, readonly=True, max_readers=max_readers)
-    return envs
-
-
-def _select_core_env(sample_key: bytes, envs: Dict[int, lmdb.Environment]) -> lmdb.Environment:
-    if len(envs) == _ONE:
-        return next(iter(envs.values()))
-    shard_id = _assign_lmdb_shard(sample_key, len(envs))
-    env = envs.get(shard_id)
-    if env is None:
-        raise KeyError(f"Missing LMDB shard={shard_id} for sample_key.")
-    return env
 
 
 def _next_lmdb_map_size_bytes(
@@ -274,13 +232,6 @@ def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> 
             raise FileExistsError(f"Refusing to overwrite existing LMDB at {final_path}")
         shutil.rmtree(final_path)
     tmp_path.rename(final_path)
-
-
-def _require_ascii_key(key: bytes, *, context: str) -> None:
-    try:
-        key.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"{context} contains non-ASCII key: {key!r}") from exc
 
 
 def _load_filter_ids_from_path(path: Path) -> set[str]:

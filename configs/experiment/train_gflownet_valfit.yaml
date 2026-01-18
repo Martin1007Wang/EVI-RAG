@@ -1,91 +1,13 @@
 # @package _global_
 #
-# EB-GFN debug: train/val on validation split for fast verification.
+# Train/val on the validation split for fast verification.
 
 defaults:
-  - override /data: g_retrieval
-  - override /model: gflownet_module
-  - override /callbacks: default
-  - override /logger: wandb
-  - override /trainer: gpu
-
-task_name: "eb_gfn_valfit"
-tags: ["gflownet", "energy", "debug", "valfit"]
-train: true
-test: false
-ckpt_path: null
-seed: 42
-optimized_metric: "val/composite_score@${model.evaluation_cfg.num_eval_rollouts}"
+  - train_gflownet
+  - _self_
 
 data:
   splits:
     train: validation
     validation: validation
     test: validation
-
-trainer:
-  check_val_every_n_epoch: 1
-
-model:
-  env:
-    max_steps: ${dataset.max_steps}
-
-  evaluation_cfg:
-    num_eval_rollouts: 1
-    rollout_chunk_size: 1
-
-  edge_score_cfg:
-    activation_checkpointing: true
-
-  optimizer_cfg:
-    type: adamw
-    lr: 1.0e-4
-    weight_decay: 1.0e-4
-    param_groups:
-      - names: ["log_f.*"]
-        lr: 1.0e-3
-
-  scheduler_cfg:
-    type: cosine_restart
-    t_0: 10
-    t_mult: 2
-    eta_min: 1.0e-6
-    interval: epoch
-
-  actor_cfg:
-    policy_temperature: 0.2
-
-  training_cfg:
-    num_train_rollouts: 3
-    rollout_chunk_size: 3
-    manual_gradient_clip_val: 1.0
-    manual_gradient_clip_algorithm: norm
-    manual_gradient_clip_norm_type: 2.0
-    adaptive_gradient_clip: false
-    grad_clip_ema_beta: null
-    grad_clip_tail_prob: null
-    grad_clip_log_eps: 1.0e-8
-    grad_clip_tail_prob_eps: 1.0e-6
-    grad_non_finite_max_params: 20
-    corridor:
-      enabled: true
-      distance_bias_alpha: 1.0
-    dual_stream:
-      enabled: true
-      min_dist: 1
-      trust_delta: 1
-      stream_b_weight: 1.0
-      stream_b_max_steps: 3
-      schedule: linear
-
-callbacks:
-  model_checkpoint:
-    monitor: val/composite_score@${model.evaluation_cfg.num_eval_rollouts}
-    mode: max
-    filename: "epoch_{epoch:03d}"
-    auto_insert_metric_name: False
-    save_weights_only: True
-  early_stopping:
-    monitor: val/composite_score@${model.evaluation_cfg.num_eval_rollouts}
-    mode: max
-    patience: 50

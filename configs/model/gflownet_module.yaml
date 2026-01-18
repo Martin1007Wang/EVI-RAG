@@ -7,64 +7,57 @@ _recursive_: true
 hidden_dim: 1024
 emb_dim: 1024
 backbone_finetune: true
-vocabulary_path: ${dataset.paths.vocabulary}
+entity_vocab_path: ${dataset.paths.entity_vocab}
+relation_vocab_path: ${dataset.paths.relation_vocab}
 relation_vocab_size: ${oc.env:RELATION_VOCAB_SIZE,null}
-edge_score_cfg:
-  hidden_dim: ${model.hidden_dim}
-  num_layers: 2
-  dropout: 0.0
-  bias_init: 0.0
-  activation_checkpointing: false
+inverse_relation_suffix: "__inv"
 state_cfg:
   state_dim: ${model.hidden_dim}
   dropout: 0.0
-  relation_use_active_nodes: true
+cvt_init_cfg:
+  enabled: true
+
+start_selection_cfg:
+  enabled: false
+  mode: selector
+  temperature: null
+  sample_gumbel: true
+  dropout: 0.0
+  epsilon: 0.0
+  force_uniform: false
+
+sink_selection_cfg:
+  enabled: false
+  mode: selector
+  temperature: null
+  sample_gumbel: true
+  dropout: 0.0
+  epsilon: 0.0
+  force_uniform: false
 
 env:
   _target_: src.models.components.gflownet_env.GraphEnv
   max_steps: ???
-  stop_on_answer: true
-  min_stop_steps: 0
-
-policy:
-  _target_: src.models.components.gflownet_policy.EnergyEdgePolicy
-  hidden_dim: ${model.hidden_dim}
 
 reward_fn:
   _target_: src.models.components.gflownet_reward.GraphFusionReward
-  hard_target_bonus: 0.0
+  hard_target_bonus: 10.0
   min_log_reward: -10.0
-  potential_weight: 0.0
-  potential_gamma: 1.0
-  potential_unreachable_offset: 1.0
-  potential_schedule: none
-  potential_weight_end: 0.0
-  potential_anneal_epochs: null
-  potential_pure_phase_ratio: null
 
 actor_cfg:
   policy_temperature: 1.0
-  cosine_bias_alpha: 0.0
-  cosine_relation_bias_alpha: 0.0
   stop_bias_init: null
-  check_finite: false
 
-control_cfg:
-  enabled: false
-  target_mode: reachable_horizon_frac
-  target_min: 0.0
-  target_max: 1.0
-  temperature_base: ${model.actor_cfg.policy_temperature}
-  temperature_min: ${model.actor_cfg.policy_temperature}
-  temperature_max: ${model.actor_cfg.policy_temperature}
-  lambda_init: 0.0
-  dual_lr: null
+backward_cfg:
+  share_state_encoder: false
+  share_edge_scorer: false
 
 runtime_cfg:
   validate_edge_batch: false
   validate_rollout_batch: false
+  validate_on_device: false
+  force_fp32: false
   require_precomputed_edge_batch: true
-  require_precomputed_node_in_degree: true
 
 evaluation_cfg:
   num_eval_rollouts: 10
@@ -72,7 +65,6 @@ evaluation_cfg:
   rollout_temperature_extra:
     - 0.7
   rollout_chunk_size: 10
-  context_debug: false
   composite_score_cfg:
     enabled: true
     weight_context_hit: 0.6
@@ -81,5 +73,3 @@ evaluation_cfg:
 
 flow_cfg:
   graph_stats_log1p: true
-  bias_init: value
-  bias_init_value: -8.7168

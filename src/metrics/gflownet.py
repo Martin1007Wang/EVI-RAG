@@ -126,12 +126,6 @@ def _prefix_metric_map(
     return mapped
 
 
-def _batched_counts(mask: torch.Tensor, node_batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
-    counts = torch.zeros((mask.size(0), num_graphs), device=mask.device, dtype=torch.float32)
-    counts.index_add_(_ONE, node_batch, mask.to(dtype=torch.float32))
-    return counts
-
-
 def _reduce_rollout_stack(values: torch.Tensor, best_of: bool) -> torch.Tensor:
     if not best_of:
         return values.mean(dim=0)
@@ -212,22 +206,22 @@ def compute_terminal_hits(
     *,
     stop_node_locals: torch.Tensor,
     node_ptr: torch.Tensor,
-    node_is_answer: torch.Tensor,
+    node_is_target: torch.Tensor,
 ) -> torch.Tensor:
     num_graphs = int(node_ptr.numel() - _ONE)
     if num_graphs <= _ZERO:
-        return torch.zeros((_ZERO,), device=node_is_answer.device, dtype=torch.bool)
+        return torch.zeros((_ZERO,), device=node_is_target.device, dtype=torch.bool)
     stop_node_locals = stop_node_locals.to(device=node_ptr.device, dtype=torch.long)
     if stop_node_locals.numel() != num_graphs:
         raise ValueError("stop_node_locals length mismatch for terminal hit computation.")
-    node_ptr = node_ptr.to(device=node_is_answer.device, dtype=torch.long)
+    node_ptr = node_ptr.to(device=node_is_target.device, dtype=torch.long)
     node_offsets = node_ptr[:-_ONE]
     valid = stop_node_locals >= _ZERO
     stop_globals = node_offsets + stop_node_locals.clamp(min=_ZERO)
-    if stop_globals.numel() > _ZERO and int(stop_globals.max().item()) >= int(node_is_answer.numel()):
+    if stop_globals.numel() > _ZERO and int(stop_globals.max().detach().tolist()) >= int(node_is_target.numel()):
         raise ValueError("stop_node_locals index out of range for terminal hit computation.")
-    node_is_answer = node_is_answer.to(device=node_ptr.device, dtype=torch.bool)
-    hits = node_is_answer.index_select(_ZERO, stop_globals.clamp(min=_ZERO))
+    node_is_target = node_is_target.to(device=node_ptr.device, dtype=torch.bool)
+    hits = node_is_target.index_select(_ZERO, stop_globals.clamp(min=_ZERO))
     return valid & hits
 
 
@@ -244,92 +238,6 @@ def compute_terminal_hit_prefixes(
         return {}
     hit_cum = terminal_hits.to(dtype=torch.bool).cumsum(dim=0) > _ZERO
     return _prefix_metric_map(values=hit_cum.to(dtype=torch.float32), k_pairs=k_pairs, prefix="terminal_hit")
-
-
-def _compute_context_matrices(
-    *,
-    visited_cum: torch.Tensor,
-    node_batch: torch.Tensor,
-    num_graphs: int,
-    node_is_answer: torch.Tensor,
-    node_is_start: torch.Tensor,
-    answer_counts: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    visited_nonstart = visited_cum & (~node_is_start)
-    answer_nonstart = node_is_answer & (~node_is_start)
-    visited_answer = visited_cum & node_is_answer
-    visited_answer_nonstart = visited_cum & answer_nonstart
-    visited_counts = _batched_counts(visited_nonstart, node_batch, num_graphs)
-    visited_answer_counts = _batched_counts(visited_answer, node_batch, num_graphs)
-    visited_answer_nonstart_counts = _batched_counts(visited_answer_nonstart, node_batch, num_graphs)
-    answer_counts = answer_counts.to(dtype=torch.float32, device=visited_cum.device)
-    answer_counts = answer_counts.unsqueeze(0).expand_as(visited_answer_counts)
-    recall = torch.where(
-        answer_counts > _ZERO,
-        visited_answer_counts / answer_counts,
-        torch.zeros_like(visited_answer_counts),
-    )
-    precision = torch.where(
-        visited_counts > _ZERO,
-        visited_answer_nonstart_counts / visited_counts,
-        torch.zeros_like(visited_counts),
-    )
-    denom = precision + recall
-    f1 = torch.where(
-        denom > _ZERO,
-        (_TWO * precision * recall) / denom,
-        torch.zeros_like(denom),
-    )
-    hit = (visited_answer_counts > _ZERO).to(dtype=torch.float32)
-    return recall, precision, f1, hit
-
-
-def compute_context_metrics(
-    *,
-    visited_stack: torch.Tensor,
-    node_ptr: torch.Tensor,
-    node_is_answer: torch.Tensor,
-    node_is_start: torch.Tensor,
-    answer_ptr: torch.Tensor,
-    k_values: Sequence[int],
-) -> Dict[str, torch.Tensor]:
-    if visited_stack.dim() != _TWO:
-        raise ValueError("visited_stack must be [R, N] for context metrics.")
-    num_rollouts = int(visited_stack.size(0))
-    k_pairs = _normalize_k_pairs(k_values, num_rollouts)
-    if not k_pairs:
-        return {}
-    num_graphs = int(node_ptr.numel() - _ONE)
-    if num_graphs <= _ZERO:
-        return {}
-    node_ptr = node_ptr.to(device=visited_stack.device, dtype=torch.long)
-    total_nodes = int(node_ptr[-_ONE].item()) if node_ptr.numel() > _ZERO else _ZERO
-    if visited_stack.size(_ONE) != total_nodes:
-        raise ValueError("visited_stack node dimension mismatch for context metrics.")
-    if node_is_answer.numel() != total_nodes or node_is_start.numel() != total_nodes:
-        raise ValueError("node_is_answer/start length mismatch for context metrics.")
-    if answer_ptr.numel() != num_graphs + _ONE:
-        raise ValueError("answer_ptr length mismatch for context metrics.")
-    visited_cum = visited_stack.to(dtype=torch.bool).cumsum(dim=0) > _ZERO
-    node_batch = torch.repeat_interleave(
-        torch.arange(num_graphs, device=visited_stack.device),
-        (node_ptr[_ONE:] - node_ptr[:-_ONE]).clamp(min=_ZERO),
-    )
-    answer_counts = (answer_ptr[_ONE:] - answer_ptr[:-_ONE]).clamp(min=_ZERO)
-    recall, precision, f1, hit = _compute_context_matrices(
-        visited_cum=visited_cum,
-        node_batch=node_batch,
-        num_graphs=num_graphs,
-        node_is_answer=node_is_answer.to(dtype=torch.bool, device=visited_stack.device),
-        node_is_start=node_is_start.to(dtype=torch.bool, device=visited_stack.device),
-        answer_counts=answer_counts,
-    )
-    metrics: Dict[str, torch.Tensor] = {}
-    metrics.update(_prefix_metric_map(values=recall, k_pairs=k_pairs, prefix="context_recall"))
-    metrics.update(_prefix_metric_map(values=precision, k_pairs=k_pairs, prefix="context_precision"))
-    metrics.update(_prefix_metric_map(values=f1, k_pairs=k_pairs, prefix="context_f1"))
-    metrics.update(_prefix_metric_map(values=hit, k_pairs=k_pairs, prefix="context_hit"))
-    return metrics
 
 
 def compute_composite_score(
@@ -372,41 +280,6 @@ def compute_composite_score(
             + (weight_pass_best * pass_best)
         )
     return composite
-
-
-def compute_path_diversity(
-    *,
-    actions_seq: torch.Tensor,
-    directions_seq: torch.Tensor,
-    num_rollouts: int,
-    num_graphs: int,
-    edge_ptr: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if actions_seq.dim() != _TWO or directions_seq.dim() != _TWO:
-        raise ValueError("actions_seq/directions_seq must be [R*B, T].")
-    if actions_seq.shape != directions_seq.shape:
-        raise ValueError("actions_seq/directions_seq shape mismatch for diversity computation.")
-    num_paths = int(actions_seq.size(0))
-    expected = num_rollouts * num_graphs
-    if num_paths != expected:
-        raise ValueError("actions_seq length mismatch for diversity computation.")
-    if num_paths <= _ZERO or num_graphs <= _ZERO:
-        return torch.zeros((num_graphs,), device=actions_seq.device, dtype=torch.float32)
-    actions_norm = actions_seq
-    if edge_ptr is not None and num_rollouts > _ONE:
-        if edge_ptr.numel() <= num_graphs:
-            raise ValueError("edge_ptr length mismatch for diversity computation.")
-        total_edges = int(edge_ptr[num_graphs].item())
-        if total_edges > _ZERO:
-            actions_norm = torch.where(actions_seq >= _ZERO, actions_seq % total_edges, actions_seq)
-    path_tokens = actions_norm
-    graph_ids = torch.arange(num_paths, device=actions_seq.device, dtype=torch.long) % num_graphs
-    path_rows = torch.cat([graph_ids.view(-1, _ONE), path_tokens], dim=1)
-    unique_rows = torch.unique(path_rows, dim=0)
-    unique_graph_ids = unique_rows[:, _ZERO]
-    unique_counts = torch.bincount(unique_graph_ids, minlength=num_graphs).to(dtype=torch.float32)
-    denom = float(num_rollouts if num_rollouts > _ZERO else _ONE)
-    return unique_counts / denom
 
 
 def _reshape_rollout_metric(
@@ -529,196 +402,6 @@ def build_flow_metrics(
         **{k: v.detach() for k, v in reward_metrics.items()},
     }
     return metrics
-
-
-def _edge_debug_empty(num_graphs: int, *, device: torch.device, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
-    empty = torch.zeros((num_graphs,), device=device, dtype=dtype)
-    return {
-        "edge_top1_good@0": empty,
-        "edge_good_frac@0": empty,
-        "edge_score_gap@0": empty,
-    }
-
-
-def _edge_debug_graph_valid(
-    *,
-    node_is_start: torch.Tensor,
-    node_is_answer: torch.Tensor,
-    node_batch: torch.Tensor,
-    start_ptr: torch.Tensor,
-    dummy_mask: torch.Tensor,
-    num_graphs: int,
-    stop_on_answer: bool,
-) -> torch.Tensor:
-    start_counts = (start_ptr[_ONE:] - start_ptr[:-_ONE]).clamp(min=_ZERO)
-    missing_start = start_counts == _ZERO
-    start_answer = node_is_start & node_is_answer
-    start_answer_hit = torch.bincount(node_batch[start_answer], minlength=num_graphs) > _ZERO
-    graph_valid = (~dummy_mask) & (~missing_start)
-    if stop_on_answer:
-        graph_valid = graph_valid & (~start_answer_hit)
-    return graph_valid
-
-
-def _edge_debug_masks(
-    *,
-    edge_index: torch.Tensor,
-    node_is_start: torch.Tensor,
-    node_min_dists: torch.Tensor,
-    edge_batch: torch.Tensor,
-    graph_valid: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    heads = edge_index[_ZERO]
-    tails = edge_index[_ONE]
-    head_active = node_is_start[heads]
-    visited = node_is_start
-    forward_mask = head_active & (~visited[tails])
-    candidate_mask = forward_mask & graph_valid[edge_batch]
-    active_nodes = heads
-    next_nodes = tails
-    active_dist = node_min_dists[active_nodes]
-    next_dist = node_min_dists[next_nodes]
-    good_mask = (
-        candidate_mask
-        & (active_dist >= _ZERO)
-        & (next_dist >= _ZERO)
-        & (next_dist < active_dist)
-    )
-    return candidate_mask, good_mask
-
-
-def _edge_debug_counts(
-    *,
-    edge_batch: torch.Tensor,
-    candidate_mask: torch.Tensor,
-    good_mask: torch.Tensor,
-    num_graphs: int,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    candidate_count = torch.bincount(edge_batch[candidate_mask], minlength=num_graphs).to(dtype=dtype)
-    good_count = torch.bincount(edge_batch[good_mask], minlength=num_graphs).to(dtype=dtype)
-    good_frac = torch.where(
-        candidate_count > _ZERO,
-        good_count / candidate_count.clamp(min=_ONE),
-        torch.zeros_like(candidate_count),
-    )
-    return candidate_count, good_count, good_frac
-
-
-def _edge_debug_top1_good(
-    *,
-    edge_scores: torch.Tensor,
-    edge_batch: torch.Tensor,
-    candidate_mask: torch.Tensor,
-    good_mask: torch.Tensor,
-    num_graphs: int,
-) -> torch.Tensor:
-    neg_inf = torch.finfo(edge_scores.dtype).min
-    top_all = torch.full((num_graphs,), neg_inf, device=edge_scores.device, dtype=edge_scores.dtype)
-    top_good = torch.full((num_graphs,), neg_inf, device=edge_scores.device, dtype=edge_scores.dtype)
-    top_all.scatter_reduce_(
-        _ZERO,
-        edge_batch,
-        torch.where(candidate_mask, edge_scores, neg_inf),
-        reduce="amax",
-        include_self=True,
-    )
-    top_good.scatter_reduce_(
-        _ZERO,
-        edge_batch,
-        torch.where(good_mask, edge_scores, neg_inf),
-        reduce="amax",
-        include_self=True,
-    )
-    has_candidate = torch.bincount(edge_batch[candidate_mask], minlength=num_graphs) > _ZERO
-    return has_candidate & (top_good >= top_all)
-
-
-def _edge_debug_gap(
-    *,
-    edge_scores: torch.Tensor,
-    edge_batch: torch.Tensor,
-    candidate_mask: torch.Tensor,
-    good_mask: torch.Tensor,
-    candidate_count: torch.Tensor,
-    good_count: torch.Tensor,
-    num_graphs: int,
-) -> torch.Tensor:
-    good_sum = torch.zeros((num_graphs,), device=edge_scores.device, dtype=edge_scores.dtype)
-    bad_sum = torch.zeros((num_graphs,), device=edge_scores.device, dtype=edge_scores.dtype)
-    bad_mask = candidate_mask & (~good_mask)
-    if bool(good_mask.any().item()):
-        good_sum.index_add_(_ZERO, edge_batch[good_mask], edge_scores[good_mask])
-    if bool(bad_mask.any().item()):
-        bad_sum.index_add_(_ZERO, edge_batch[bad_mask], edge_scores[bad_mask])
-    mean_good = good_sum / good_count.clamp(min=_ONE)
-    bad_count = candidate_count - good_count
-    mean_bad = bad_sum / bad_count.clamp(min=_ONE)
-    has_candidate = candidate_count > _ZERO
-    return torch.where(has_candidate, mean_good - mean_bad, torch.zeros_like(mean_good))
-
-
-def compute_edge_debug_metrics(
-    *,
-    edge_scores: torch.Tensor,
-    edge_batch: torch.Tensor,
-    edge_index: torch.Tensor,
-    node_ptr: torch.Tensor,
-    node_min_dists: torch.Tensor,
-    start_ptr: torch.Tensor,
-    dummy_mask: torch.Tensor,
-    node_is_start: torch.Tensor,
-    node_is_answer: torch.Tensor,
-    node_batch: torch.Tensor,
-    stop_on_answer: bool,
-) -> Dict[str, torch.Tensor]:
-    num_graphs = int(node_ptr.numel() - _ONE)
-    if num_graphs <= _ZERO or edge_scores.numel() == _ZERO:
-        return _edge_debug_empty(num_graphs, device=edge_scores.device, dtype=edge_scores.dtype)
-    graph_valid = _edge_debug_graph_valid(
-        node_is_start=node_is_start,
-        node_is_answer=node_is_answer,
-        node_batch=node_batch,
-        start_ptr=start_ptr,
-        dummy_mask=dummy_mask,
-        num_graphs=num_graphs,
-        stop_on_answer=stop_on_answer,
-    )
-    candidate_mask, good_mask = _edge_debug_masks(
-        edge_index=edge_index,
-        node_is_start=node_is_start,
-        node_min_dists=node_min_dists,
-        edge_batch=edge_batch,
-        graph_valid=graph_valid,
-    )
-    candidate_count, good_count, good_frac = _edge_debug_counts(
-        edge_batch=edge_batch,
-        candidate_mask=candidate_mask,
-        good_mask=good_mask,
-        num_graphs=num_graphs,
-        dtype=edge_scores.dtype,
-    )
-    top1_good = _edge_debug_top1_good(
-        edge_scores=edge_scores,
-        edge_batch=edge_batch,
-        candidate_mask=candidate_mask,
-        good_mask=good_mask,
-        num_graphs=num_graphs,
-    )
-    gap = _edge_debug_gap(
-        edge_scores=edge_scores,
-        edge_batch=edge_batch,
-        candidate_mask=candidate_mask,
-        good_mask=good_mask,
-        candidate_count=candidate_count,
-        good_count=good_count,
-        num_graphs=num_graphs,
-    )
-    return {
-        "edge_top1_good@0": top1_good.to(dtype=torch.float32),
-        "edge_good_frac@0": good_frac,
-        "edge_score_gap@0": gap,
-    }
 
 
 @dataclass
@@ -1014,12 +697,9 @@ __all__ = [
     "finalize_rollout_metrics",
     "compute_terminal_hits",
     "compute_terminal_hit_prefixes",
-    "compute_context_metrics",
     "compute_composite_score",
-    "compute_path_diversity",
     "compute_reward_gap",
     "compute_diag_metrics",
     "build_flow_metrics",
-    "compute_edge_debug_metrics",
     "GFlowNetEvalAccumulator",
 ]

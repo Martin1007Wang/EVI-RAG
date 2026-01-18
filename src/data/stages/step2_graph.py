@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import json
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import torch
 from tqdm import tqdm
 
@@ -14,7 +14,7 @@ except ModuleNotFoundError:
 from src.data.io.lmdb_utils import ensure_dir
 from src.data.context import StageContext
 from src.data.io.parquet_io import ParquetDatasetWriter, write_embedding_vocab, write_entity_vocab, write_relation_vocab
-from src.data.io.raw_loader import build_text_entity_config, iter_samples
+from src.data.io.raw_loader import build_cvt_entity_config, build_text_entity_config, build_time_relation_config, iter_samples
 from src.data.relation_cleaning_rules import (
     DEFAULT_RELATION_CLEANING_RULES,
     RELATION_ACTION_DROP,
@@ -27,6 +27,7 @@ from src.data.schema.constants import (
     _EDGE_INDEX_MIN,
     _EDGE_STAT_KEYS,
     _FILTER_STAT_KEYS,
+    _INVERSE_RELATION_SUFFIX_DEFAULT,
     _PATH_MODE_QA_DIRECTED,
     _PATH_MODE_UNDIRECTED,
     _REL_LABEL_SAMPLE_LIMIT,
@@ -34,7 +35,15 @@ from src.data.schema.constants import (
     _VALIDATE_GRAPH_EDGES_DEFAULT,
     _ZERO,
 )
-from src.data.schema.types import EntityLookup, EntityVocab, GraphRecord, RelationLookup, RelationVocab, Sample
+from src.data.schema.types import (
+    EntityLookup,
+    EntityVocab,
+    GraphRecord,
+    RelationLookup,
+    RelationVocab,
+    Sample,
+    TimeRelationConfig,
+)
 from src.data.stages.step1_vocab import _partition_graph_edges, _resolve_split_filter, _should_keep_sample
 from src.data.utils.connectivity import _validate_path_mode, has_connectivity
 from src.data.utils.stats import _init_split_counters, _safe_div, _sample_labels
@@ -51,9 +60,32 @@ class _WorkerState:
     remove_self_loops: bool
     relation_cleaning_enabled: bool
     relation_cleaning_rules: RelationCleaningRules
+    inverse_relations_key_map: Optional[Dict[str, str]]
+    inverse_relations_suffix: str
+    time_relation_cfg: Optional[TimeRelationConfig]
 
 
 _WORKER_STATE: Optional[_WorkerState] = None
+
+_INVERSE_RELATIONS_CFG_KEY = "inverse_relations"
+_INVERSE_RELATIONS_ENABLED_KEY = "enabled"
+_INVERSE_RELATIONS_MAPPING_KEY = "mapping_path"
+_INVERSE_RELATIONS_SUFFIX_KEY = "kg_id_suffix"
+_INVERSE_RELATIONS_STRICT_KEY = "strict"
+_INVERSE_RELATIONS_FALLBACK_KEY = "fallback_template"
+_INVERSE_RELATIONS_GLOBAL_VOCAB_KEY = "global_vocab"
+_INVERSE_RELATIONS_LIST_KEY = "inverse_relations"
+_INVERSE_RELATIONS_FORWARD_KEY = "forward"
+_INVERSE_RELATIONS_FORWARD_LABEL_KEY = "forward_label"
+_INVERSE_RELATIONS_FORWARD_TEXT_KEY = "forward_text"
+_INVERSE_RELATIONS_INVERSE_KEY = "inverse"
+_INVERSE_RELATIONS_INVERSE_TEXT_KEY = "inverse_text"
+
+
+@dataclass(frozen=True)
+class _RelationTextMap:
+    forward_labels: Dict[str, str]
+    inverse_labels: Dict[str, str]
 
 
 def _init_worker_state(state: _WorkerState) -> None:
@@ -80,41 +112,10 @@ def _build_graph_worker(sample: Sample) -> GraphRecord:
         remove_self_loops=state.remove_self_loops,
         relation_cleaning_enabled=state.relation_cleaning_enabled,
         relation_cleaning_rules=state.relation_cleaning_rules,
+        inverse_relations_key_map=state.inverse_relations_key_map,
+        inverse_relations_suffix=state.inverse_relations_suffix,
+        time_relation_cfg=state.time_relation_cfg,
     )
-
-
-def _validate_node_type_fields(graph: GraphRecord) -> None:
-    num_nodes = len(graph.node_entity_ids)
-    counts = graph.node_type_counts
-    ids = graph.node_type_ids
-    if len(counts) != num_nodes:
-        raise ValueError(
-            f"node_type_counts length {len(counts)} != num_nodes {num_nodes} for {graph.graph_id}."
-        )
-    if any(count < _ZERO for count in counts):
-        raise ValueError(f"node_type_counts contains negatives for {graph.graph_id}.")
-    total = int(sum(counts))
-    if total != len(ids):
-        raise ValueError(
-            f"node_type_counts sum {total} != node_type_ids length {len(ids)} for {graph.graph_id}."
-        )
-
-
-def _build_node_type_fields(
-    node_labels: Sequence[str],
-    node_type_ids_by_entity: Dict[str, Set[int]],
-) -> Tuple[List[int], List[int]]:
-    node_type_counts: List[int] = []
-    node_type_ids: List[int] = []
-    for ent in node_labels:
-        type_ids = node_type_ids_by_entity.get(ent)
-        if not type_ids:
-            node_type_counts.append(_ZERO)
-            continue
-        sorted_ids = sorted(type_ids)
-        node_type_counts.append(len(sorted_ids))
-        node_type_ids.extend(sorted_ids)
-    return node_type_counts, node_type_ids
 
 
 def _validate_graph_record(graph: GraphRecord) -> None:
@@ -131,7 +132,6 @@ def _validate_graph_record(graph: GraphRecord) -> None:
             raise ValueError(f"Negative edge index detected for {graph.graph_id}.")
         if max_src >= num_nodes or max_dst >= num_nodes:
             raise ValueError(f"Edge index exceeds num_nodes for {graph.graph_id}.")
-    _validate_node_type_fields(graph)
 
 
 def _dedup_directed_edges(edges: Sequence[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
@@ -148,6 +148,212 @@ def _dedup_directed_edges(edges: Sequence[Tuple[str, str, str]]) -> List[Tuple[s
     return out
 
 
+def _build_inverse_relation_key(rel: str, suffix: str) -> str:
+    if not suffix:
+        raise ValueError("inverse_relations.kg_id_suffix must be non-empty.")
+    return f"{rel}{suffix}"
+
+
+def _resolve_forward_label(entry: Mapping[str, object], forward_key: str) -> str:
+    forward_label = entry.get(_INVERSE_RELATIONS_FORWARD_LABEL_KEY)
+    if forward_label is None:
+        forward_label = entry.get(_INVERSE_RELATIONS_FORWARD_TEXT_KEY)
+    return forward_key if forward_label is None else str(forward_label)
+
+
+def _resolve_inverse_label(entry: Mapping[str, object], *, context: str) -> str:
+    inverse_label = entry.get(_INVERSE_RELATIONS_INVERSE_KEY)
+    if inverse_label is None:
+        inverse_label = entry.get(_INVERSE_RELATIONS_INVERSE_TEXT_KEY)
+    if not inverse_label:
+        raise ValueError(f"{context} entry missing inverse label.")
+    return str(inverse_label)
+
+
+def _update_relation_texts(
+    mapping: _RelationTextMap,
+    *,
+    forward_key: str,
+    forward_label: str,
+    inverse_label: str,
+    context: str,
+) -> None:
+    existing_forward = mapping.forward_labels.get(forward_key)
+    if existing_forward is not None and existing_forward != forward_label:
+        raise ValueError(f"{context} duplicate mismatch for {forward_key!r} forward label.")
+    existing_inverse = mapping.inverse_labels.get(forward_key)
+    if existing_inverse is not None and existing_inverse != inverse_label:
+        raise ValueError(f"{context} duplicate mismatch for {forward_key!r} inverse label.")
+    mapping.forward_labels[forward_key] = forward_label
+    mapping.inverse_labels[forward_key] = inverse_label
+
+
+def _parse_inverse_relations_list(items: Sequence[object], *, context: str) -> _RelationTextMap:
+    mapping = _RelationTextMap(forward_labels={}, inverse_labels={})
+    for idx, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            raise ValueError(f"{context} entry {idx} must be a dict with forward/inverse fields.")
+        forward = raw.get(_INVERSE_RELATIONS_FORWARD_KEY)
+        if not forward:
+            raise ValueError(f"{context} entry {idx} missing forward field.")
+        forward_key = str(forward)
+        forward_label = _resolve_forward_label(raw, forward_key)
+        inverse_label = _resolve_inverse_label(raw, context=f"{context} entry {idx}")
+        _update_relation_texts(
+            mapping,
+            forward_key=forward_key,
+            forward_label=forward_label,
+            inverse_label=inverse_label,
+            context=context,
+        )
+    return mapping
+
+
+def _parse_inverse_relations_dict(mapping: Mapping[object, object], *, context: str) -> _RelationTextMap:
+    parsed = _RelationTextMap(forward_labels={}, inverse_labels={})
+    for raw_key, raw_val in mapping.items():
+        forward_key = str(raw_key)
+        if isinstance(raw_val, Mapping):
+            raw_forward = raw_val.get(_INVERSE_RELATIONS_FORWARD_KEY)
+            if raw_forward is not None and str(raw_forward) != forward_key:
+                raise ValueError(f"{context} entry forward key mismatch for {forward_key!r}.")
+            forward_label = _resolve_forward_label(raw_val, forward_key)
+            inverse_label = _resolve_inverse_label(raw_val, context=f"{context} entry {forward_key!r}")
+        else:
+            forward_label = forward_key
+            if raw_val is None or raw_val == "":
+                raise ValueError(f"{context} entry {forward_key!r} missing inverse label.")
+            inverse_label = str(raw_val)
+        _update_relation_texts(
+            parsed,
+            forward_key=forward_key,
+            forward_label=forward_label,
+            inverse_label=inverse_label,
+            context=context,
+        )
+    return parsed
+
+
+def _parse_inverse_relations_payload(payload: object, *, context: str) -> _RelationTextMap:
+    if isinstance(payload, dict):
+        inner = payload.get(_INVERSE_RELATIONS_LIST_KEY, payload)
+        if isinstance(inner, dict):
+            return _parse_inverse_relations_dict(inner, context=context)
+        if isinstance(inner, list):
+            return _parse_inverse_relations_list(inner, context=context)
+    if isinstance(payload, list):
+        return _parse_inverse_relations_list(payload, context=context)
+    raise ValueError(f"{context} must be a dict or list.")
+
+
+def _apply_inverse_relations_fallback(
+    mapping: _RelationTextMap,
+    missing: Sequence[str],
+    *,
+    fallback: str,
+) -> None:
+    for rel in missing:
+        mapping.forward_labels.setdefault(rel, rel)
+        mapping.inverse_labels.setdefault(rel, fallback.format(relation=rel))
+
+
+def _resolve_relation_vocab_labels(
+    mapping: _RelationTextMap,
+    dataset_rel_labels: Sequence[str],
+    *,
+    strict: bool,
+    fallback: Optional[str],
+    global_vocab: bool,
+    context: str,
+) -> List[str]:
+    dataset_set = set(dataset_rel_labels)
+    mapping_keys = set(mapping.inverse_labels)
+    if not global_vocab:
+        unknown = [rel for rel in mapping_keys if rel not in dataset_set]
+        if unknown:
+            preview = ", ".join(unknown[:5])
+            raise ValueError(f"{context} includes unknown relations, examples: {preview}.")
+    missing = [rel for rel in dataset_rel_labels if rel not in mapping_keys]
+    if missing:
+        if strict:
+            preview = ", ".join(missing[:5])
+            raise ValueError(f"{context} missing {len(missing)} relations, examples: {preview}.")
+        if not isinstance(fallback, str):
+            raise ValueError("inverse_relations.fallback_template must be set when strict=false.")
+        _apply_inverse_relations_fallback(mapping, missing, fallback=fallback)
+        mapping_keys = set(mapping.inverse_labels)
+    if global_vocab:
+        return sorted(mapping_keys)
+    return sorted(dataset_rel_labels)
+
+
+def _load_inverse_relations_map(
+    cfg: object,
+    ctx: StageContext,
+    *,
+    dataset_rel_labels: Sequence[str],
+) -> tuple[Optional[_RelationTextMap], str, List[str], bool]:
+    inv_cfg = cfg.get(_INVERSE_RELATIONS_CFG_KEY) if hasattr(cfg, "get") else None
+    if not isinstance(inv_cfg, Mapping):
+        return None, _INVERSE_RELATION_SUFFIX_DEFAULT, sorted(dataset_rel_labels), False
+    if not bool(inv_cfg.get(_INVERSE_RELATIONS_ENABLED_KEY, False)):
+        return None, _INVERSE_RELATION_SUFFIX_DEFAULT, sorted(dataset_rel_labels), False
+    mapping_path = inv_cfg.get(_INVERSE_RELATIONS_MAPPING_KEY)
+    if not mapping_path:
+        raise ValueError("inverse_relations.mapping_path must be set when inverse_relations.enabled=true.")
+    path = ctx.resolve_path(mapping_path)
+    if not path.exists():
+        raise FileNotFoundError(f"inverse_relations mapping not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mapping = _parse_inverse_relations_payload(payload, context=str(path))
+    strict = bool(inv_cfg.get(_INVERSE_RELATIONS_STRICT_KEY, True))
+    fallback = inv_cfg.get(_INVERSE_RELATIONS_FALLBACK_KEY)
+    global_vocab = bool(inv_cfg.get(_INVERSE_RELATIONS_GLOBAL_VOCAB_KEY, False))
+    forward_rel_labels = _resolve_relation_vocab_labels(
+        mapping,
+        dataset_rel_labels,
+        strict=strict,
+        fallback=fallback,
+        global_vocab=global_vocab,
+        context="inverse_relations",
+    )
+    suffix = str(inv_cfg.get(_INVERSE_RELATIONS_SUFFIX_KEY, _INVERSE_RELATION_SUFFIX_DEFAULT))
+    return mapping, suffix, forward_rel_labels, global_vocab
+
+
+def _build_inverse_relation_key_map(
+    mapping: Dict[str, str],
+    *,
+    suffix: str,
+    forward_rel_labels: Sequence[str],
+) -> Dict[str, str]:
+    forward_set = set(forward_rel_labels)
+    key_map: Dict[str, str] = {}
+    for rel, label in mapping.items():
+        inv_key = _build_inverse_relation_key(rel, suffix)
+        if inv_key in forward_set:
+            raise ValueError(f"inverse_relations key collision with forward relation: {inv_key!r}.")
+        if inv_key in key_map and key_map[inv_key] != label:
+            raise ValueError(f"inverse_relations duplicate key mismatch for {inv_key!r}.")
+        key_map[inv_key] = label
+    return key_map
+
+
+def _expand_edges_with_inverse(
+    edges: Sequence[Tuple[str, str, str]],
+    inverse_relations_key_map: Dict[str, str],
+    *,
+    suffix: str,
+) -> List[Tuple[str, str, str]]:
+    if not edges:
+        return []
+    expanded = list(edges)
+    for head, rel, tail in edges:
+        inv_rel = _build_inverse_relation_key(rel, suffix)
+        if inv_rel not in inverse_relations_key_map:
+            raise ValueError(f"inverse_relations missing label for {rel!r}.")
+        expanded.append((tail, inv_rel, head))
+    return expanded
 
 
 def _normalize_embeddings(embeddings: torch.Tensor, eps: float) -> torch.Tensor:
@@ -176,6 +382,8 @@ def preprocess(ctx: StageContext) -> None:
     column_map = dict(cfg.column_map)
     entity_normalization = cfg.entity_normalization
     text_cfg = build_text_entity_config(cfg)
+    cvt_cfg = build_cvt_entity_config(cfg)
+    time_relation_cfg = build_time_relation_config(cfg)
     dataset_family = cfg.get("dataset_family")
     dataset_source = str(cfg.get("dataset_source", "hf")).strip().lower()
     hf_dataset = cfg.get("hf_dataset")
@@ -186,10 +394,6 @@ def preprocess(ctx: StageContext) -> None:
         raise ValueError("dataset_source must be 'hf'; raw parquet ingestion is disabled.")
     train_filter, eval_filter, override_filters = ctx.split_filters
     path_mode = _validate_path_mode(str(cfg.get("path_mode", _PATH_MODE_UNDIRECTED)))
-    if path_mode != _PATH_MODE_QA_DIRECTED:
-        raise ValueError(
-            "path_mode must be qa_directed to match directed distance cache semantics."
-        )
     dedup_edges = bool(cfg.get("dedup_edges", True))
     validate_graph_edges = bool(cfg.get("validate_graph_edges", _VALIDATE_GRAPH_EDGES_DEFAULT))
     remove_self_loops = bool(cfg.get("remove_self_loops", _REMOVE_SELF_LOOPS_DEFAULT))
@@ -208,7 +412,7 @@ def preprocess(ctx: StageContext) -> None:
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
 
     ensure_dir(out_dir)
-    entity_vocab = EntityVocab(kb=kb, text_cfg=text_cfg)
+    entity_vocab = EntityVocab(kb=kb, text_cfg=text_cfg, cvt_cfg=cvt_cfg)
 
     splits = list(_ALLOWED_SPLITS)
     connectivity_cache: Dict[Tuple[str, str, str], bool] = {}
@@ -255,6 +459,13 @@ def preprocess(ctx: StageContext) -> None:
             drop_prefixes=sorted(relation_cleaning_rules.drop_prefixes),
             drop_regexes=sorted(pattern.pattern for pattern in relation_cleaning_rules.drop_regexes),
         )
+    log_event(
+        logger,
+        "time_relation_filter",
+        mode=time_relation_cfg.mode,
+        relation_regex=None if time_relation_cfg.relation_regex is None else time_relation_cfg.relation_regex.pattern,
+        question_regex=None if time_relation_cfg.question_regex is None else time_relation_cfg.question_regex.pattern,
+    )
 
     log_event(logger, "vocab_start", stage="vocab")
     for sample in tqdm(
@@ -280,6 +491,8 @@ def preprocess(ctx: StageContext) -> None:
             relation_cleaning_rules,
             remove_self_loops=remove_self_loops,
             relation_cleaning_enabled=relation_cleaning_enabled,
+            time_relation_cfg=time_relation_cfg,
+            question_text=sample.question,
         )
         kept_edges = _dedup_directed_edges(kept_edges)
         split_key = sample.split
@@ -349,8 +562,33 @@ def preprocess(ctx: StageContext) -> None:
 
     entity_vocab.finalize()
     relation_vocab = RelationVocab(kb=kb)
-    forward_rel_labels = sorted(kept_rel_labels)
-    relation_vocab.add_relations(forward_rel_labels)
+    dataset_rel_labels = sorted(kept_rel_labels)
+    relation_texts, inverse_relations_suffix, forward_rel_labels, inverse_global_vocab = _load_inverse_relations_map(
+        cfg,
+        ctx,
+        dataset_rel_labels=dataset_rel_labels,
+    )
+    inverse_relations_key_map = None
+    forward_label_map: Optional[Dict[str, str]] = None
+    if relation_texts is not None:
+        inverse_relations_key_map = _build_inverse_relation_key_map(
+            relation_texts.inverse_labels,
+            suffix=inverse_relations_suffix,
+            forward_rel_labels=forward_rel_labels,
+        )
+        forward_label_map = relation_texts.forward_labels
+    for rel in forward_rel_labels:
+        label = rel if forward_label_map is None else forward_label_map.get(rel)
+        if label is None:
+            raise ValueError(f"inverse_relations missing forward label for {rel!r}.")
+        relation_vocab.relation_id(rel, label=label)
+    if inverse_relations_key_map is not None:
+        for rel in forward_rel_labels:
+            inv_key = _build_inverse_relation_key(rel, inverse_relations_suffix)
+            inv_label = inverse_relations_key_map[inv_key]
+            relation_vocab.relation_id(inv_key, label=inv_label)
+
+    relation_lookup = relation_vocab.to_lookup()
 
     entity_count = len(entity_vocab.struct_records)
     text_entity_count = len(entity_vocab.embedding_records)
@@ -363,6 +601,14 @@ def preprocess(ctx: StageContext) -> None:
         non_text_entity_count=entity_count - text_entity_count,
         relation_count=relation_count,
     )
+    if inverse_relations_key_map is not None:
+        log_event(
+            logger,
+            "inverse_relations_loaded",
+            count=len(inverse_relations_key_map),
+            suffix=inverse_relations_suffix,
+            global_vocab=inverse_global_vocab,
+        )
     total_edges_raw = sum(edge_stats[split]["raw_edges"] for split in splits)
     total_edges_kept = sum(edge_stats[split]["kept_edges"] for split in splits)
     total_edges_type = sum(edge_stats[split]["type_edges"] for split in splits)
@@ -520,13 +766,16 @@ def preprocess(ctx: StageContext) -> None:
                 build_graph(
                     sample,
                     entity_vocab,
-                    relation_vocab,
+                    relation_lookup,
                     f"{sample.dataset}/{sample.split}/{sample.question_id}",
                     dedup_edges=dedup_edges,
                     validate_graph_edges=validate_graph_edges,
                     remove_self_loops=remove_self_loops,
                     relation_cleaning_enabled=relation_cleaning_enabled,
                     relation_cleaning_rules=relation_cleaning_rules,
+                    inverse_relations_key_map=inverse_relations_key_map,
+                    inverse_relations_suffix=inverse_relations_suffix,
+                    time_relation_cfg=time_relation_cfg,
                 )
                 for sample in samples
             ]
@@ -558,8 +807,16 @@ def preprocess(ctx: StageContext) -> None:
                         relation_cleaning_rules,
                         remove_self_loops=remove_self_loops,
                         relation_cleaning_enabled=relation_cleaning_enabled,
+                        time_relation_cfg=time_relation_cfg,
+                        question_text=sample.question,
                     )
                     cleaned_edges = _dedup_directed_edges(cleaned_edges)
+                    if inverse_relations_key_map is not None:
+                        cleaned_edges = _expand_edges_with_inverse(
+                            cleaned_edges,
+                            inverse_relations_key_map,
+                            suffix=inverse_relations_suffix,
+                        )
                     has_path = has_connectivity(cleaned_edges, sample.q_entity, sample.a_entity, path_mode=path_mode)
                 else:
                     has_path = False
@@ -599,6 +856,7 @@ def preprocess(ctx: StageContext) -> None:
                 remove_self_loops=remove_self_loops,
                 relation_cleaning_enabled=relation_cleaning_enabled,
                 relation_cleaning_rules=relation_cleaning_rules,
+                time_relation_cfg=time_relation_cfg,
             )
             if not outcome.keep:
                 continue
@@ -613,12 +871,15 @@ def preprocess(ctx: StageContext) -> None:
     if parquet_num_workers > _DISABLE_PARALLEL_WORKERS:
         worker_state = _WorkerState(
             entity_lookup=entity_vocab.to_lookup(),
-            relation_lookup=relation_vocab.to_lookup(),
+            relation_lookup=relation_lookup,
             dedup_edges=dedup_edges,
             validate_graph_edges=validate_graph_edges,
             remove_self_loops=remove_self_loops,
             relation_cleaning_enabled=relation_cleaning_enabled,
             relation_cleaning_rules=relation_cleaning_rules,
+            inverse_relations_key_map=inverse_relations_key_map,
+            inverse_relations_suffix=inverse_relations_suffix,
+            time_relation_cfg=time_relation_cfg,
         )
         with ProcessPoolExecutor(
             max_workers=parquet_num_workers,
@@ -661,11 +922,15 @@ def build_graph(
     remove_self_loops: bool = _REMOVE_SELF_LOOPS_DEFAULT,
     relation_cleaning_enabled: bool = True,
     relation_cleaning_rules: RelationCleaningRules = DEFAULT_RELATION_CLEANING_RULES,
+    inverse_relations_key_map: Optional[Dict[str, str]] = None,
+    inverse_relations_suffix: str = _INVERSE_RELATION_SUFFIX_DEFAULT,
+    time_relation_cfg: Optional[TimeRelationConfig] = None,
 ) -> GraphRecord:
     dedup_edges = bool(dedup_edges)
     validate_graph_edges = bool(validate_graph_edges)
     remove_self_loops = bool(remove_self_loops)
     relation_cleaning_enabled = bool(relation_cleaning_enabled)
+    inverse_enabled = inverse_relations_key_map is not None
     node_index: Dict[str, int] = {}
     node_entity_ids: List[int] = []
     node_embedding_ids: List[int] = []
@@ -686,36 +951,39 @@ def build_graph(
 
     # sample.graph must be derived only from q_entity (e.g., PPR on the full graph) with no answer-conditioned steps,
     # per prior work by rmanluo.
-    kept_edges, type_edges = _partition_graph_edges(
+    kept_edges, _ = _partition_graph_edges(
         sample.graph,
         relation_cleaning_rules,
         remove_self_loops=remove_self_loops,
         relation_cleaning_enabled=relation_cleaning_enabled,
+        time_relation_cfg=time_relation_cfg,
+        question_text=sample.question,
     )
     kept_edges = _dedup_directed_edges(kept_edges)
-    node_type_ids_by_entity: Dict[str, Set[int]] = {}
-    for h, _, t in type_edges:
-        type_id = entity_vocab.entity_id(t)
-        type_set = node_type_ids_by_entity.get(h)
-        if type_set is None:
-            type_set = set()
-            node_type_ids_by_entity[h] = type_set
-        type_set.add(type_id)
-
+    if inverse_enabled:
+        kept_edges = _expand_edges_with_inverse(
+            kept_edges,
+            inverse_relations_key_map,
+            suffix=inverse_relations_suffix,
+        )
     for h, r, t in kept_edges:
         edge_key = (h, r, t)
         if dedup_edges and edge_key in edge_key_to_indices:
             continue
         src_idx = local_index(h)
         dst_idx = local_index(t)
-        rel_idx = relation_vocab.relation_id(r)
+        label = None
+        if inverse_enabled and inverse_relations_key_map is not None:
+            label = inverse_relations_key_map.get(r)
+        if isinstance(relation_vocab, RelationLookup):
+            rel_idx = relation_vocab.relation_id(r)
+        else:
+            rel_idx = relation_vocab.relation_id(r, label=label)
         edge_src.append(src_idx)
         edge_dst.append(dst_idx)
         edge_relation_ids.append(rel_idx)
         if dedup_edges:
             edge_key_to_indices[edge_key] = len(edge_src) - 1
-
-    node_type_counts, node_type_ids = _build_node_type_fields(node_labels, node_type_ids_by_entity)
 
     graph = GraphRecord(
         graph_id=graph_id,
@@ -725,8 +993,6 @@ def build_graph(
         edge_src=edge_src,
         edge_dst=edge_dst,
         edge_relation_ids=edge_relation_ids,
-        node_type_counts=node_type_counts,
-        node_type_ids=node_type_ids,
     )
     if validate_graph_edges:
         _validate_graph_record(graph)

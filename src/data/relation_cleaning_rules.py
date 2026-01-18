@@ -33,7 +33,6 @@ RELATION_TYPE_REGEXES: Tuple[Pattern[str], ...] = (
     re.compile(r"(?:^|[._])gender(?:[._]|$)"),
     re.compile(r"(?:^|[._])sex(?:[._]|$)"),
     re.compile(r"(?:^|[._])nationality(?:[._]|$)"),
-    re.compile(r"(?:^|[._])languages?(?:[._]|$)"),
 )
 RELATION_DROP_EXACT = frozenset(
     (
@@ -56,7 +55,7 @@ RELATION_DROP_PREFIXES = (
     "type.type.",
 )
 RELATION_DROP_REGEXES: Tuple[Pattern[str], ...] = (
-    re.compile(r"^freebase\\.valuenotation\\."),
+    re.compile(r"^freebase\.valuenotation\."),
     re.compile(r"^rdf-schema#"),
 )
 
@@ -73,12 +72,12 @@ DEFAULT_RELATION_CLEANING_RULES = RelationCleaningRules(
 def relation_action(rel: str, rules: RelationCleaningRules, *, enabled: bool) -> str:
     if not enabled:
         return RELATION_ACTION_KEEP
-    if rel in rules.drop_exact or any(rel.startswith(prefix) for prefix in rules.drop_prefixes):
-        return RELATION_ACTION_DROP
-    if any(pattern.search(rel) for pattern in rules.drop_regexes):
-        return RELATION_ACTION_DROP
     if rel in rules.type_exact or any(rel.startswith(prefix) for prefix in rules.type_prefixes):
         return RELATION_ACTION_TYPE
     if any(pattern.search(rel) for pattern in rules.type_regexes):
         return RELATION_ACTION_TYPE
+    if rel in rules.drop_exact or any(rel.startswith(prefix) for prefix in rules.drop_prefixes):
+        return RELATION_ACTION_DROP
+    if any(pattern.search(rel) for pattern in rules.drop_regexes):
+        return RELATION_ACTION_DROP
     return RELATION_ACTION_KEEP

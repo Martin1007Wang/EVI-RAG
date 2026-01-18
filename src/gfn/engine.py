@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections import deque
+import inspect
+import math
 import functools
+from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional, Sequence, Callable
 
 import torch
@@ -9,60 +13,151 @@ from torch_scatter import scatter_max
 
 from src.metrics import gflownet as gfn_metrics
 from src.models.components import GFlowNetActor, GraphEnv, RewardOutput, RolloutResult
-from src.models.components.gflownet_env import (
-    DIRECTION_BACKWARD,
-    DIRECTION_FORWARD,
-    STOP_RELATION,
-)
+from src.models.components.gflownet_env import STOP_RELATION
 from src.gfn.ops import (
+    compute_policy_log_probs,
     GFlowNetBatchProcessor,
     GFlowNetInputValidator,
     RolloutInputs,
+    gumbel_noise_like,
     neg_inf_value,
     segment_logsumexp_1d,
 )
-from src.models.components.logz_features import FlowFeatureSpec, build_flow_features
-from src.utils.graph import directed_bfs_distances
-
 _ZERO = 0
 _ONE = 1
+_TWO = 2
+_THREE = 3
+_PI = math.pi
 _NAN = float("nan")
-_DIST_UNREACHABLE = -1
-_RESIDUAL_P95 = 0.95
-_LOG_REWARD_P50 = 0.5
-_LOG_REWARD_P90 = 0.9
-_LOG_REWARD_P99 = 0.99
+_EDGE_INV_PREVIEW = 5
 _DUAL_STREAM_CFG_KEY = "dual_stream"
 _DUAL_STREAM_ENABLED_KEY = "enabled"
-_DUAL_STREAM_MIN_DIST_KEY = "min_dist"
-_DUAL_STREAM_MAX_DIST_KEY = "max_dist"
-_DUAL_STREAM_DELTA_KEY = "trust_delta"
-_DUAL_STREAM_WEIGHT_KEY = "stream_b_weight"
-_DUAL_STREAM_B_MAX_STEPS_KEY = "stream_b_max_steps"
+_DUAL_STREAM_WEIGHT_KEY = "stream_forward_weight"
+_DUAL_STREAM_FORWARD_MAX_STEPS_KEY = "stream_forward_max_steps"
 _DUAL_STREAM_SCHEDULE_KEY = "schedule"
+_DUAL_STREAM_DISABLE_STOP_KEY = "disable_stop"
+_DUAL_STREAM_WEIGHT_START_KEY = "stream_forward_weight_start"
+_DUAL_STREAM_WEIGHT_SCHEDULE_KEY = "stream_forward_weight_schedule"
+_DUAL_STREAM_WEIGHT_ANNEAL_EPOCHS_KEY = "stream_forward_weight_anneal_epochs"
+_DUAL_STREAM_WEIGHT_SCHEDULE_NONE = "none"
+_DUAL_STREAM_WEIGHT_SCHEDULE_LINEAR = "linear"
+_DUAL_STREAM_WEIGHT_SCHEDULE_COSINE = "cosine"
+_DUAL_STREAM_WEIGHT_SCHEDULES = {
+    _DUAL_STREAM_WEIGHT_SCHEDULE_NONE,
+    _DUAL_STREAM_WEIGHT_SCHEDULE_LINEAR,
+    _DUAL_STREAM_WEIGHT_SCHEDULE_COSINE,
+}
 _DUAL_STREAM_SCHEDULE_LINEAR = "linear"
 _DUAL_STREAM_SCHEDULES = {_DUAL_STREAM_SCHEDULE_LINEAR}
-_DEFAULT_DUAL_STREAM_MIN_DIST = 1
-_DEFAULT_DUAL_STREAM_DELTA = 0
 _DEFAULT_DUAL_STREAM_WEIGHT = 1.0
-_DISTANCE_PRIOR_CFG_KEY = "distance_prior"
-_DISTANCE_PRIOR_ENABLED_KEY = "enabled"
-_DISTANCE_PRIOR_WEIGHT_KEY = "weight"
-_DISTANCE_PRIOR_WEIGHT_END_KEY = "weight_end"
-_DISTANCE_PRIOR_BETA_KEY = "beta"
-_DISTANCE_PRIOR_MODE_KEY = "mode"
-_DISTANCE_PRIOR_SCHEDULE_KEY = "schedule"
-_DISTANCE_PRIOR_MODE_PROGRESS = "progress"
-_DISTANCE_PRIOR_MODES = {_DISTANCE_PRIOR_MODE_PROGRESS}
-_DISTANCE_PRIOR_SCHEDULE_NONE = "none"
-_DISTANCE_PRIOR_SCHEDULE_LINEAR = "linear"
-_DISTANCE_PRIOR_SCHEDULES = {_DISTANCE_PRIOR_SCHEDULE_NONE, _DISTANCE_PRIOR_SCHEDULE_LINEAR}
-_DEFAULT_DISTANCE_PRIOR_ENABLED = False
-_DEFAULT_DISTANCE_PRIOR_WEIGHT = 0.1
-_DEFAULT_DISTANCE_PRIOR_WEIGHT_END = 0.0
-_DEFAULT_DISTANCE_PRIOR_BETA = 1.0
-_DEFAULT_DISTANCE_PRIOR_MODE = _DISTANCE_PRIOR_MODE_PROGRESS
-_DEFAULT_DISTANCE_PRIOR_SCHEDULE = _DISTANCE_PRIOR_SCHEDULE_NONE
+_DEFAULT_DUAL_STREAM_DISABLE_STOP = False
+_DEFAULT_DUAL_STREAM_WEIGHT_START = 0.0
+_DEFAULT_DUAL_STREAM_WEIGHT_SCHEDULE = _DUAL_STREAM_WEIGHT_SCHEDULE_NONE
+_DEFAULT_DUAL_STREAM_WEIGHT_ANNEAL_EPOCHS = None
+_START_SELECTION_CFG_KEY = "start_selection"
+_START_SELECTION_ENABLED_KEY = "enabled"
+_START_SELECTION_TEMPERATURE_KEY = "temperature"
+_START_SELECTION_SAMPLE_GUMBEL_KEY = "sample_gumbel"
+_START_SELECTION_EPSILON_KEY = "epsilon"
+_START_SELECTION_FORCE_UNIFORM_KEY = "force_uniform"
+_START_SELECTION_MODE_KEY = "mode"
+_SINK_SELECTION_CFG_KEY = "sink_selection"
+_SINK_SELECTION_ENABLED_KEY = "enabled"
+_SINK_SELECTION_TEMPERATURE_KEY = "temperature"
+_SINK_SELECTION_SAMPLE_GUMBEL_KEY = "sample_gumbel"
+_SINK_SELECTION_EPSILON_KEY = "epsilon"
+_SINK_SELECTION_FORCE_UNIFORM_KEY = "force_uniform"
+_SINK_SELECTION_MODE_KEY = "mode"
+_SELECTION_MODE_SELECTOR = "selector"
+_SELECTION_MODE_FLOW = "flow"
+_SELECTION_MODES = {_SELECTION_MODE_SELECTOR, _SELECTION_MODE_FLOW}
+_DEFAULT_START_SELECTION_MODE = _SELECTION_MODE_SELECTOR
+_DEFAULT_SINK_SELECTION_MODE = _SELECTION_MODE_SELECTOR
+_DEFAULT_SINK_SELECTION_ENABLED = False
+_DEFAULT_SINK_SELECTION_EPSILON = 0.0
+_DEFAULT_SINK_SELECTION_FORCE_UNIFORM = False
+_DEFAULT_START_SELECTION_EPSILON = 0.0
+_DEFAULT_START_SELECTION_FORCE_UNIFORM = False
+_SUBTB_CFG_KEY = "subtb"
+_SUBTB_ENABLED_KEY = "enabled"
+_SUBTB_NUM_KEY = "num_subtrajectories"
+_DEFAULT_SUBTB_ENABLED = False
+_DEFAULT_SUBTB_NUM = 1
+_Z_ALIGN_ENABLED_KEY = "enabled"
+_Z_ALIGN_WEIGHT_KEY = "weight"
+_DEFAULT_Z_ALIGN_ENABLED = False
+_DEFAULT_Z_ALIGN_WEIGHT = 1.0
+_H_GUIDANCE_CFG_KEY = "h_guidance"
+_H_GUIDANCE_ENABLED_KEY = "enabled"
+_H_GUIDANCE_BETA_START_KEY = "beta_start"
+_H_GUIDANCE_BETA_END_KEY = "beta_end"
+_H_GUIDANCE_WARMUP_KEY = "warmup_progress"
+_H_GUIDANCE_APPLY_EVAL_KEY = "apply_eval"
+_H_GUIDANCE_STOP_GRAD_KEY = "stop_gradient"
+_H_GUIDANCE_SCALE_KEY = "scale"
+_DEFAULT_H_GUIDANCE_ENABLED = False
+_DEFAULT_H_GUIDANCE_BETA_START = 0.0
+_DEFAULT_H_GUIDANCE_BETA_END = 1.0
+_DEFAULT_H_GUIDANCE_WARMUP = 0.1
+_DEFAULT_H_GUIDANCE_APPLY_EVAL = False
+_DEFAULT_H_GUIDANCE_STOP_GRAD = True
+_DEFAULT_H_GUIDANCE_SCALE = 1.0
+_REPLAY_CFG_KEY = "replay"
+_REPLAY_ENABLED_KEY = "enabled"
+_REPLAY_BUFFER_SIZE_KEY = "buffer_size"
+_REPLAY_MIX_RATIO_KEY = "mix_ratio"
+_DEFAULT_REPLAY_ENABLED = False
+_DEFAULT_REPLAY_BUFFER_SIZE = 4096
+_DEFAULT_REPLAY_MIX_RATIO = 0.5
+_FLOW_STATS_DIM = 2
+_BACKWARD_LOG_PB_MAX_REPEATED_EDGES = 500_000
+_STOP_NODE_NONE = -1
+
+
+@dataclass(frozen=True)
+class FlowFeatureSpec:
+    graph_stats_log1p: bool
+    stats_dim: int
+
+
+def resolve_flow_spec(flow_cfg: Mapping[str, object] | None) -> FlowFeatureSpec:
+    if flow_cfg is None:
+        raise ValueError("flow_cfg must be provided for Flow features.")
+    graph_stats_log1p = bool(flow_cfg.get("graph_stats_log1p", True))
+    return FlowFeatureSpec(
+        graph_stats_log1p=graph_stats_log1p,
+        stats_dim=_FLOW_STATS_DIM,
+    )
+
+
+def _compute_flow_graph_stats(
+    *,
+    node_ptr: torch.Tensor,
+    edge_ptr: torch.Tensor,
+    log1p: bool,
+) -> torch.Tensor:
+    node_counts = (node_ptr[_ONE:] - node_ptr[:-_ONE]).to(dtype=torch.float32)
+    edge_counts = (edge_ptr[_ONE:] - edge_ptr[:-_ONE]).to(dtype=torch.float32)
+    stats = torch.stack((node_counts, edge_counts), dim=1)
+    if log1p:
+        stats = torch.log1p(stats)
+    return stats
+
+
+def build_flow_features(
+    *,
+    node_ptr: torch.Tensor,
+    edge_ptr: torch.Tensor,
+    spec: FlowFeatureSpec,
+) -> torch.Tensor:
+    num_graphs = int(node_ptr.numel() - _ONE)
+    if num_graphs <= _ZERO:
+        return torch.zeros((num_graphs, spec.stats_dim), device=node_ptr.device, dtype=torch.float32)
+    return _compute_flow_graph_stats(
+        node_ptr=node_ptr,
+        edge_ptr=edge_ptr,
+        log1p=spec.graph_stats_log1p,
+    )
 
 
 @dataclass(frozen=True)
@@ -94,6 +189,8 @@ class RolloutChunkInputs:
     log_f_start: torch.Tensor
     graph_mask: torch.Tensor
     num_graphs: int
+    node_ptr: torch.Tensor
+    node_is_target: torch.Tensor
 
 
 @dataclass
@@ -102,15 +199,19 @@ class RolloutChunkState:
     metrics_list: list[Dict[str, torch.Tensor]]
     rollout_stop_nodes: list[torch.Tensor]
     rollout_actions: list[torch.Tensor]
-    rollout_directions: list[torch.Tensor]
-    rollout_visited: list[torch.Tensor]
 
 
 @dataclass
 class StreamingChunkContext:
-    edge_debug: Dict[str, torch.Tensor]
     node_ptr: Optional[torch.Tensor]
-    node_is_answer: Optional[torch.Tensor]
+    node_is_target: Optional[torch.Tensor]
+    inputs: Optional[RolloutInputs]
+    graph_cache: Optional[Dict[str, torch.Tensor]]
+    flow_features: Optional[torch.Tensor]
+    log_f_start: Optional[torch.Tensor]
+    graph_mask: Optional[torch.Tensor]
+    num_graphs: int
+    cache_inputs: bool
 
 
 @dataclass(frozen=True)
@@ -120,19 +221,9 @@ class RolloutMetricStub:
 
 
 @dataclass(frozen=True)
-class StreamingTrustState:
-    node_ptr: torch.Tensor
-    node_batch: torch.Tensor
-    node_min_dists: torch.Tensor
-    node_q_min_dists: torch.Tensor
-    q_local_indices: torch.Tensor
-    start_ptr: torch.Tensor
-    num_graphs: int
-
-
-@dataclass(frozen=True)
 class RolloutLossRecord:
     reward_out: RewardOutput
+    log_f_start: torch.Tensor
     log_reward: torch.Tensor
     log_target: torch.Tensor
     sum_log_pf: torch.Tensor
@@ -140,30 +231,145 @@ class RolloutLossRecord:
     residual: torch.Tensor
     reach_success: torch.Tensor
     length: torch.Tensor
-    prior_loss: torch.Tensor
+
+
+@dataclass(frozen=True)
+class FlowModules:
+    log_f: torch.nn.Module
+
+
+@dataclass(frozen=True)
+class SubTrajectorySpec:
+    num_subtrajectories: int
+
+
+@dataclass(frozen=True)
+class ReplaySpec:
+    buffer_size: int
+    mix_ratio: float
 
 
 @dataclass(frozen=True)
 class DualStreamSpec:
-    min_dist: int
-    max_dist: Optional[int]
-    trust_delta: int
-    stream_b_weight: float
-    stream_b_max_steps: int
+    stream_forward_weight: float
+    stream_forward_max_steps: int
     schedule: str
+    disable_stop: bool
+    stream_forward_weight_start: float
+    stream_forward_weight_schedule: str
+    stream_forward_weight_anneal_epochs: Optional[int]
 
 
 @dataclass(frozen=True)
-class StreamGateSpec:
-    trust_radius: torch.Tensor
-    delta: int
+class HGuidanceSpec:
+    beta_start: float
+    beta_end: float
+    warmup_progress: float
+    apply_eval: bool
+    stop_gradient: bool
+    scale: float
 
 
 @dataclass(frozen=True)
-class DistancePriorSpec:
-    weight: float
-    beta: float
+class StartSelectionSpec:
     mode: str
+    temperature: float
+    sample_gumbel: bool
+    epsilon: float
+    force_uniform: bool
+
+
+class TrajectoryReplayBuffer:
+    def __init__(self, *, capacity: int, num_steps: int) -> None:
+        if capacity <= _ZERO:
+            raise ValueError(f"Replay buffer capacity must be > 0, got {capacity}.")
+        if num_steps <= _ZERO:
+            raise ValueError(f"Replay buffer num_steps must be > 0, got {num_steps}.")
+        self.capacity = int(capacity)
+        self.num_steps = int(num_steps)
+        self._actions: dict[str, torch.Tensor] = {}
+        self._order: deque[str] = deque()
+
+    def __len__(self) -> int:
+        return len(self._actions)
+
+    def add(self, *, sample_ids: Sequence[str], actions: torch.Tensor, mask: torch.Tensor) -> None:
+        if actions.dim() != _TWO:
+            raise ValueError("Replay actions must be [B, T].")
+        if actions.size(1) != self.num_steps:
+            raise ValueError("Replay actions length mismatch with buffer num_steps.")
+        mask = mask.to(device=actions.device, dtype=torch.bool).view(-1)
+        if actions.size(0) != mask.numel() or actions.size(0) != len(sample_ids):
+            raise ValueError("Replay add expects sample_ids/mask aligned with actions.")
+        if not bool(mask.any().detach().tolist()):
+            return
+        actions_cpu = actions.detach().to(device="cpu", dtype=torch.long)
+        for idx, sample_id in enumerate(sample_ids):
+            if not bool(mask[idx].detach().tolist()):
+                continue
+            sid = str(sample_id)
+            if sid in self._actions:
+                self._actions[sid] = actions_cpu[idx]
+                continue
+            while len(self._actions) >= self.capacity:
+                oldest = self._order.popleft()
+                self._actions.pop(oldest, None)
+            self._actions[sid] = actions_cpu[idx]
+            self._order.append(sid)
+
+    def fetch(
+        self,
+        *,
+        sample_ids: Sequence[str],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_graphs = len(sample_ids)
+        actions = torch.full(
+            (num_graphs, self.num_steps),
+            STOP_RELATION,
+            device=device,
+            dtype=torch.long,
+        )
+        mask = torch.zeros((num_graphs,), device=device, dtype=torch.bool)
+        for idx, sample_id in enumerate(sample_ids):
+            sid = str(sample_id)
+            stored = self._actions.get(sid)
+            if stored is None:
+                continue
+            if stored.size(0) != self.num_steps:
+                raise ValueError("Replay buffer stored actions length mismatch.")
+            actions[idx] = stored.to(device=device, dtype=torch.long)
+            mask[idx] = True
+        return actions, mask
+
+
+@dataclass(frozen=True)
+class SinkSelectionSpec:
+    mode: str
+    temperature: float
+    sample_gumbel: bool
+    epsilon: float
+    force_uniform: bool
+
+
+@dataclass(frozen=True)
+class ZAlignSpec:
+    weight: float
+
+
+@dataclass(frozen=True)
+class SelectionDistribution:
+    log_probs: torch.Tensor
+    scores: torch.Tensor
+    candidate_batch: torch.Tensor
+    uniform_log_probs: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StartSelectionOutput:
+    inputs: RolloutInputs
+    graph_cache: Dict[str, torch.Tensor]
+    log_pf_start: torch.Tensor
 
 
 class GFlowNetEngine:
@@ -171,28 +377,59 @@ class GFlowNetEngine:
         self,
         *,
         actor: GFlowNetActor,
+        actor_backward: Optional[GFlowNetActor] = None,
         reward_fn: torch.nn.Module,
         env: GraphEnv,
         log_f: torch.nn.Module,
+        log_f_backward: Optional[torch.nn.Module] = None,
+        start_selector: Optional[torch.nn.Module] = None,
+        sink_selector: Optional[torch.nn.Module] = None,
         flow_spec: FlowFeatureSpec,
+        relation_inverse_map: Optional[torch.Tensor] = None,
+        relation_is_inverse: Optional[torch.Tensor] = None,
         batch_processor: GFlowNetBatchProcessor,
         input_validator: GFlowNetInputValidator,
-        context_debug_enabled: bool = False,
         composite_score_cfg: Optional[Any] = None,
         dual_stream_cfg: Optional[Mapping[str, Any]] = None,
-        distance_prior_cfg: Optional[Mapping[str, Any]] = None,
+        subtb_cfg: Optional[Mapping[str, Any]] = None,
+        start_selection_cfg: Optional[Mapping[str, Any]] = None,
+        sink_selection_cfg: Optional[Mapping[str, Any]] = None,
+        z_align_cfg: Optional[Mapping[str, Any]] = None,
+        h_guidance_cfg: Optional[Mapping[str, Any]] = None,
+        replay_cfg: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.actor = actor
+        self.actor_backward = actor if actor_backward is None else actor_backward
         self.reward_fn = reward_fn
         self.env = env
         self.log_f = log_f
+        self.log_f_backward = log_f_backward if log_f_backward is not None else log_f
+        self._start_selector = start_selector
+        self._sink_selector = sink_selector
         self.flow_spec = flow_spec
+        self._relation_inverse_map = relation_inverse_map
+        self._relation_is_inverse = relation_is_inverse
         self.batch_processor = batch_processor
         self.input_validator = input_validator
-        self._context_debug_enabled = bool(context_debug_enabled)
         self._composite_score_cfg = gfn_metrics.resolve_composite_score_cfg(composite_score_cfg)
         self._dual_stream_cfg = dual_stream_cfg
-        self._distance_prior_cfg = distance_prior_cfg
+        self._subtb_cfg = subtb_cfg
+        self._start_selection_cfg = start_selection_cfg
+        self._sink_selection_cfg = sink_selection_cfg
+        self._z_align_cfg = z_align_cfg
+        self._z_align_spec: Optional[ZAlignSpec] = self._resolve_z_align_spec(z_align_cfg)
+        self._h_guidance_cfg = h_guidance_cfg
+        self._h_guidance_spec: Optional[HGuidanceSpec] = self._resolve_h_guidance_spec(h_guidance_cfg)
+        self._replay_cfg = replay_cfg
+        self._replay_spec: Optional[ReplaySpec] = self._resolve_replay_spec(replay_cfg)
+        self._replay_buffer: Optional[TrajectoryReplayBuffer] = None
+        if self._replay_spec is not None:
+            num_steps = int(self.env.max_steps) + _ONE
+            self._replay_buffer = TrajectoryReplayBuffer(
+                capacity=int(self._replay_spec.buffer_size),
+                num_steps=num_steps,
+            )
+        self._log_pb_max_repeated_edges = int(_BACKWARD_LOG_PB_MAX_REPEATED_EDGES)
 
     def set_composite_score_cfg(self, composite_score_cfg: Optional[Any]) -> None:
         self._composite_score_cfg = gfn_metrics.resolve_composite_score_cfg(composite_score_cfg)
@@ -216,37 +453,56 @@ class GFlowNetEngine:
         enabled = cfg.get(_DUAL_STREAM_ENABLED_KEY, True)
         if not bool(enabled):
             return None
-        min_dist = self._require_non_negative_int(cfg.get(_DUAL_STREAM_MIN_DIST_KEY, _DEFAULT_DUAL_STREAM_MIN_DIST))
-        max_dist_raw = cfg.get(_DUAL_STREAM_MAX_DIST_KEY)
-        max_dist = None if max_dist_raw is None else self._require_positive_int(max_dist_raw)
-        trust_delta = self._require_non_negative_int(cfg.get(_DUAL_STREAM_DELTA_KEY, _DEFAULT_DUAL_STREAM_DELTA))
-        stream_b_weight = self._require_non_negative_float(cfg.get(_DUAL_STREAM_WEIGHT_KEY, _DEFAULT_DUAL_STREAM_WEIGHT))
-        max_steps_raw = cfg.get(_DUAL_STREAM_B_MAX_STEPS_KEY)
-        stream_b_max_steps = int(self.env.max_steps) if max_steps_raw is None else self._require_positive_int(max_steps_raw)
+        stream_forward_weight = self._require_non_negative_float(cfg.get(_DUAL_STREAM_WEIGHT_KEY, _DEFAULT_DUAL_STREAM_WEIGHT))
+        max_steps_raw = cfg.get(_DUAL_STREAM_FORWARD_MAX_STEPS_KEY)
+        stream_forward_max_steps = int(self.env.max_steps) if max_steps_raw is None else self._require_positive_int(max_steps_raw)
         schedule_raw = cfg.get(_DUAL_STREAM_SCHEDULE_KEY, _DUAL_STREAM_SCHEDULE_LINEAR)
         schedule = str(schedule_raw or _DUAL_STREAM_SCHEDULE_LINEAR).strip().lower()
         if schedule not in _DUAL_STREAM_SCHEDULES:
             raise ValueError(
                 "training_cfg.dual_stream.schedule must be one of " f"{sorted(_DUAL_STREAM_SCHEDULES)}, got {schedule!r}."
             )
+        disable_stop = bool(cfg.get(_DUAL_STREAM_DISABLE_STOP_KEY, _DEFAULT_DUAL_STREAM_DISABLE_STOP))
+        weight_start = self._require_non_negative_float(
+            cfg.get(_DUAL_STREAM_WEIGHT_START_KEY, _DEFAULT_DUAL_STREAM_WEIGHT_START)
+        )
+        weight_schedule_raw = cfg.get(_DUAL_STREAM_WEIGHT_SCHEDULE_KEY, _DEFAULT_DUAL_STREAM_WEIGHT_SCHEDULE)
+        weight_schedule = str(weight_schedule_raw or _DEFAULT_DUAL_STREAM_WEIGHT_SCHEDULE).strip().lower()
+        if weight_schedule not in _DUAL_STREAM_WEIGHT_SCHEDULES:
+            raise ValueError(
+                "training_cfg.dual_stream.stream_forward_weight_schedule must be one of "
+                f"{sorted(_DUAL_STREAM_WEIGHT_SCHEDULES)}, got {weight_schedule!r}."
+            )
+        weight_anneal_raw = cfg.get(_DUAL_STREAM_WEIGHT_ANNEAL_EPOCHS_KEY, _DEFAULT_DUAL_STREAM_WEIGHT_ANNEAL_EPOCHS)
+        weight_anneal_epochs = None if weight_anneal_raw is None else self._require_positive_int(weight_anneal_raw)
         return DualStreamSpec(
-            min_dist=min_dist,
-            max_dist=max_dist,
-            trust_delta=trust_delta,
-            stream_b_weight=float(stream_b_weight),
-            stream_b_max_steps=stream_b_max_steps,
+            stream_forward_weight=float(stream_forward_weight),
+            stream_forward_max_steps=stream_forward_max_steps,
             schedule=schedule,
+            disable_stop=disable_stop,
+            stream_forward_weight_start=float(weight_start),
+            stream_forward_weight_schedule=weight_schedule,
+            stream_forward_weight_anneal_epochs=weight_anneal_epochs,
         )
 
-    def _resolve_distance_prior_spec(
-        self,
-        *,
-        is_training: bool,
-        progress: Optional[float],
-    ) -> Optional[DistancePriorSpec]:
-        if not is_training:
-            return None
-        cfg = self._distance_prior_cfg
+    def _resolve_subtb_spec(self, *, is_training: bool) -> SubTrajectorySpec:
+        _ = is_training
+        cfg = self._subtb_cfg
+        if cfg is None:
+            raise ValueError("training_cfg.subtb must be set; only SubTB is supported.")
+        if isinstance(cfg, bool):
+            cfg = {} if cfg else None
+        if cfg is None:
+            raise ValueError("training_cfg.subtb must enable SubTB; got disabled config.")
+        if not isinstance(cfg, Mapping):
+            raise TypeError("training_cfg.subtb must be a mapping or bool.")
+        enabled = cfg.get(_SUBTB_ENABLED_KEY, _DEFAULT_SUBTB_ENABLED)
+        if not bool(enabled):
+            raise ValueError("training_cfg.subtb.enabled must be true; only SubTB is supported.")
+        num_sub = self._require_positive_int(cfg.get(_SUBTB_NUM_KEY, _DEFAULT_SUBTB_NUM))
+        return SubTrajectorySpec(num_subtrajectories=num_sub)
+
+    def _resolve_z_align_spec(self, cfg: Optional[Mapping[str, Any]]) -> Optional[ZAlignSpec]:
         if cfg is None:
             return None
         if isinstance(cfg, bool):
@@ -254,34 +510,676 @@ class GFlowNetEngine:
         if cfg is None:
             return None
         if not isinstance(cfg, Mapping):
-            raise TypeError("training_cfg.distance_prior must be a mapping or bool.")
-        enabled = cfg.get(_DISTANCE_PRIOR_ENABLED_KEY, _DEFAULT_DISTANCE_PRIOR_ENABLED)
+            raise TypeError("training_cfg.z_align must be a mapping or bool.")
+        enabled = cfg.get(_Z_ALIGN_ENABLED_KEY, _DEFAULT_Z_ALIGN_ENABLED)
         if not bool(enabled):
             return None
-        weight = self._require_non_negative_float(cfg.get(_DISTANCE_PRIOR_WEIGHT_KEY, _DEFAULT_DISTANCE_PRIOR_WEIGHT))
-        weight_end = self._require_non_negative_float(
-            cfg.get(_DISTANCE_PRIOR_WEIGHT_END_KEY, _DEFAULT_DISTANCE_PRIOR_WEIGHT_END)
-        )
-        beta = self._require_non_negative_float(cfg.get(_DISTANCE_PRIOR_BETA_KEY, _DEFAULT_DISTANCE_PRIOR_BETA))
-        if weight <= float(_ZERO) or beta <= float(_ZERO):
+        weight = self._require_non_negative_float(cfg.get(_Z_ALIGN_WEIGHT_KEY, _DEFAULT_Z_ALIGN_WEIGHT))
+        return ZAlignSpec(weight=float(weight))
+
+
+    def _resolve_h_guidance_spec(self, cfg: Optional[Mapping[str, Any]]) -> Optional[HGuidanceSpec]:
+        if cfg is None:
             return None
-        schedule_raw = cfg.get(_DISTANCE_PRIOR_SCHEDULE_KEY, _DEFAULT_DISTANCE_PRIOR_SCHEDULE)
-        schedule = str(schedule_raw or _DEFAULT_DISTANCE_PRIOR_SCHEDULE).strip().lower()
-        if schedule not in _DISTANCE_PRIOR_SCHEDULES:
+        if isinstance(cfg, bool):
+            cfg = {} if cfg else None
+        if cfg is None:
+            return None
+        if not isinstance(cfg, Mapping):
+            raise TypeError("training_cfg.h_guidance must be a mapping or bool.")
+        enabled = cfg.get(_H_GUIDANCE_ENABLED_KEY, _DEFAULT_H_GUIDANCE_ENABLED)
+        if not bool(enabled):
+            return None
+        beta_start = self._require_non_negative_float(cfg.get(_H_GUIDANCE_BETA_START_KEY, _DEFAULT_H_GUIDANCE_BETA_START))
+        beta_end = self._require_non_negative_float(cfg.get(_H_GUIDANCE_BETA_END_KEY, _DEFAULT_H_GUIDANCE_BETA_END))
+        warmup = self._require_probability_closed(cfg.get(_H_GUIDANCE_WARMUP_KEY, _DEFAULT_H_GUIDANCE_WARMUP))
+        apply_eval = bool(cfg.get(_H_GUIDANCE_APPLY_EVAL_KEY, _DEFAULT_H_GUIDANCE_APPLY_EVAL))
+        stop_gradient = bool(cfg.get(_H_GUIDANCE_STOP_GRAD_KEY, _DEFAULT_H_GUIDANCE_STOP_GRAD))
+        scale = self._require_non_negative_float(cfg.get(_H_GUIDANCE_SCALE_KEY, _DEFAULT_H_GUIDANCE_SCALE))
+        return HGuidanceSpec(
+            beta_start=float(beta_start),
+            beta_end=float(beta_end),
+            warmup_progress=float(warmup),
+            apply_eval=apply_eval,
+            stop_gradient=stop_gradient,
+            scale=float(scale),
+        )
+
+    def _resolve_replay_spec(self, cfg: Optional[Mapping[str, Any]]) -> Optional[ReplaySpec]:
+        if cfg is None:
+            return None
+        if isinstance(cfg, bool):
+            cfg = {} if cfg else None
+        if cfg is None:
+            return None
+        if not isinstance(cfg, Mapping):
+            raise TypeError("training_cfg.replay must be a mapping or bool.")
+        enabled = cfg.get(_REPLAY_ENABLED_KEY, _DEFAULT_REPLAY_ENABLED)
+        if not bool(enabled):
+            return None
+        buffer_size = self._require_positive_int(cfg.get(_REPLAY_BUFFER_SIZE_KEY, _DEFAULT_REPLAY_BUFFER_SIZE))
+        mix_ratio = self._require_probability_closed(cfg.get(_REPLAY_MIX_RATIO_KEY, _DEFAULT_REPLAY_MIX_RATIO))
+        return ReplaySpec(buffer_size=int(buffer_size), mix_ratio=float(mix_ratio))
+
+    def _resolve_start_selection_spec(
+        self,
+        *,
+        temperature: Optional[float],
+        is_training: bool,
+        log_f_module: Optional[torch.nn.Module] = None,
+    ) -> Optional[StartSelectionSpec]:
+        cfg = self._start_selection_cfg
+        if cfg is None:
+            return None
+        if isinstance(cfg, bool):
+            cfg = {} if cfg else None
+        if cfg is None:
+            return None
+        if not isinstance(cfg, Mapping):
+            raise TypeError("start_selection_cfg must be a mapping or bool.")
+        enabled = cfg.get(_START_SELECTION_ENABLED_KEY, True)
+        if not bool(enabled):
+            return None
+        mode_raw = cfg.get(_START_SELECTION_MODE_KEY, _DEFAULT_START_SELECTION_MODE)
+        mode = str(mode_raw or _DEFAULT_START_SELECTION_MODE).strip().lower()
+        if mode not in _SELECTION_MODES:
             raise ValueError(
-                "training_cfg.distance_prior.schedule must be one of "
-                f"{sorted(_DISTANCE_PRIOR_SCHEDULES)}, got {schedule!r}."
+                f"start_selection_cfg.mode must be one of {sorted(_SELECTION_MODES)}, got {mode!r}."
             )
-        if schedule == _DISTANCE_PRIOR_SCHEDULE_LINEAR and progress is not None:
-            progress_val = float(max(min(progress, float(_ONE)), float(_ZERO)))
-            weight = weight + (weight_end - weight) * progress_val
-            if weight <= float(_ZERO):
-                return None
-        mode_raw = cfg.get(_DISTANCE_PRIOR_MODE_KEY, _DEFAULT_DISTANCE_PRIOR_MODE)
-        mode = str(mode_raw or _DEFAULT_DISTANCE_PRIOR_MODE).strip().lower()
-        if mode not in _DISTANCE_PRIOR_MODES:
-            raise ValueError("training_cfg.distance_prior.mode must be one of " f"{sorted(_DISTANCE_PRIOR_MODES)}, got {mode!r}.")
-        return DistancePriorSpec(weight=float(weight), beta=float(beta), mode=mode)
+        if mode == _SELECTION_MODE_SELECTOR and self._start_selector is None:
+            raise RuntimeError("start_selection requires start_selector module.")
+        temp_cfg = cfg.get(_START_SELECTION_TEMPERATURE_KEY)
+        if temp_cfg is None:
+            actor = self.actor if log_f_module is None else self._resolve_actor_for_log_f(log_f_module)
+            temp_val = actor.policy_temperature if temperature is None else temperature
+            temperature_val = self._require_positive_float(temp_val)
+        else:
+            temperature_val = self._require_positive_float(temp_cfg)
+        sample_gumbel = bool(cfg.get(_START_SELECTION_SAMPLE_GUMBEL_KEY, is_training))
+        epsilon_raw = cfg.get(_START_SELECTION_EPSILON_KEY, _DEFAULT_START_SELECTION_EPSILON)
+        epsilon_val = self._require_probability_closed(epsilon_raw)
+        force_uniform = bool(cfg.get(_START_SELECTION_FORCE_UNIFORM_KEY, _DEFAULT_START_SELECTION_FORCE_UNIFORM))
+        return StartSelectionSpec(
+            mode=mode,
+            temperature=float(temperature_val),
+            sample_gumbel=sample_gumbel,
+            epsilon=float(epsilon_val),
+            force_uniform=force_uniform,
+        )
+
+    def _resolve_sink_selection_spec(
+        self,
+        *,
+        temperature: Optional[float],
+        is_training: bool,
+        log_f_module: Optional[torch.nn.Module] = None,
+    ) -> Optional[SinkSelectionSpec]:
+        cfg = self._sink_selection_cfg
+        if cfg is None:
+            return None
+        if isinstance(cfg, bool):
+            cfg = {} if cfg else None
+        if cfg is None:
+            return None
+        if not isinstance(cfg, Mapping):
+            raise TypeError("sink_selection_cfg must be a mapping or bool.")
+        enabled = cfg.get(_SINK_SELECTION_ENABLED_KEY, _DEFAULT_SINK_SELECTION_ENABLED)
+        if not bool(enabled):
+            return None
+        mode_raw = cfg.get(_SINK_SELECTION_MODE_KEY, _DEFAULT_SINK_SELECTION_MODE)
+        mode = str(mode_raw or _DEFAULT_SINK_SELECTION_MODE).strip().lower()
+        if mode not in _SELECTION_MODES:
+            raise ValueError(
+                f"sink_selection_cfg.mode must be one of {sorted(_SELECTION_MODES)}, got {mode!r}."
+            )
+        if mode == _SELECTION_MODE_SELECTOR and self._sink_selector is None:
+            raise RuntimeError("sink_selection requires sink_selector module.")
+        temp_cfg = cfg.get(_SINK_SELECTION_TEMPERATURE_KEY)
+        if temp_cfg is None:
+            actor = self.actor if log_f_module is None else self._resolve_actor_for_log_f(log_f_module)
+            temp_val = actor.policy_temperature if temperature is None else temperature
+            temperature_val = self._require_positive_float(temp_val)
+        else:
+            temperature_val = self._require_positive_float(temp_cfg)
+        sample_gumbel = bool(cfg.get(_SINK_SELECTION_SAMPLE_GUMBEL_KEY, is_training))
+        epsilon_raw = cfg.get(_SINK_SELECTION_EPSILON_KEY, _DEFAULT_SINK_SELECTION_EPSILON)
+        epsilon_val = self._require_probability_closed(epsilon_raw)
+        force_uniform = bool(cfg.get(_SINK_SELECTION_FORCE_UNIFORM_KEY, _DEFAULT_SINK_SELECTION_FORCE_UNIFORM))
+        return SinkSelectionSpec(
+            mode=mode,
+            temperature=float(temperature_val),
+            sample_gumbel=sample_gumbel,
+            epsilon=float(epsilon_val),
+            force_uniform=force_uniform,
+        )
+
+    def _compute_start_log_probs(
+        self,
+        *,
+        inputs: RolloutInputs,
+        start_node_locals: torch.Tensor,
+        start_ptr: torch.Tensor,
+        temperature: float,
+        selector: Optional[torch.nn.Module] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device, num_graphs = inputs.node_ptr.device, int(inputs.node_ptr.numel() - 1)
+        if num_graphs <= _ZERO:
+            empty = torch.zeros((_ZERO,), device=device, dtype=torch.float32)
+            return empty, empty, torch.zeros((_ZERO,), device=device, dtype=torch.long)
+        start_node_locals = start_node_locals.to(device=device, dtype=torch.long).view(-1)
+        start_ptr = start_ptr.to(device=device, dtype=torch.long).view(-1)
+        if start_node_locals.numel() == _ZERO:
+            raise ValueError("start_node_locals must be non-empty for start selection.")
+        if start_ptr.numel() != num_graphs + _ONE:
+            raise ValueError("start_ptr length mismatch for start selection.")
+        start_batch = self.batch_processor.compute_node_batch(start_ptr, num_graphs, device)
+        if start_batch.numel() != start_node_locals.numel():
+            raise ValueError("start_ptr does not align with start_node_locals.")
+        node_tokens = inputs.node_tokens.index_select(0, start_node_locals)
+        question_tokens = inputs.question_tokens.index_select(0, start_batch)
+        selector = self._start_selector if selector is None else selector
+        if selector is None:
+            raise RuntimeError("Selection logits require a selector module.")
+        logits = selector(node_tokens=node_tokens, question_tokens=question_tokens)
+        scaled = logits.to(dtype=torch.float32) / float(temperature)
+        log_denom = segment_logsumexp_1d(scaled, start_batch, num_graphs)
+        log_probs = scaled - log_denom[start_batch]
+        return log_probs, scaled, start_batch
+
+    def _compute_start_log_probs_from_flow(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_features: torch.Tensor,
+        start_node_locals: torch.Tensor,
+        start_ptr: torch.Tensor,
+        temperature: float,
+        log_f_module: torch.nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device, num_graphs = inputs.node_ptr.device, int(inputs.node_ptr.numel() - 1)
+        if num_graphs <= _ZERO:
+            empty = torch.zeros((_ZERO,), device=device, dtype=torch.float32)
+            return empty, empty, torch.zeros((_ZERO,), device=device, dtype=torch.long)
+        start_node_locals = start_node_locals.to(device=device, dtype=torch.long).view(-1)
+        start_ptr = start_ptr.to(device=device, dtype=torch.long).view(-1)
+        if start_node_locals.numel() == _ZERO:
+            raise ValueError("start_node_locals must be non-empty for start selection.")
+        if start_ptr.numel() != num_graphs + _ONE:
+            raise ValueError("start_ptr length mismatch for start selection.")
+        actor = self._resolve_actor_for_log_f(log_f_module)
+        state_nodes, valid_mask = self._build_start_node_matrix(
+            start_nodes=start_node_locals,
+            start_ptr=start_ptr,
+            num_graphs=num_graphs,
+        )
+        state_vec = self._build_start_state_vec(inputs=inputs, actor=actor, state_nodes=state_nodes)
+        log_f_states = self._compute_log_f_states(
+            log_f_module=log_f_module,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            flow_features=flow_features,
+            state_nodes=state_nodes,
+            state_vec=state_vec,
+        )
+        log_f_flat = log_f_states[valid_mask]
+        start_batch = self.batch_processor.compute_node_batch(start_ptr, num_graphs, device)
+        if log_f_flat.numel() != start_batch.numel():
+            raise ValueError("start_ptr does not align with start_node_locals.")
+        scaled = log_f_flat.to(dtype=torch.float32) / float(temperature)
+        log_denom = segment_logsumexp_1d(scaled, start_batch, num_graphs)
+        log_probs = scaled - log_denom[start_batch]
+        return log_probs, scaled, start_batch
+
+    def _prepare_start_selection_distribution(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        spec: StartSelectionSpec,
+    ) -> SelectionDistribution:
+        if spec.mode == _SELECTION_MODE_FLOW:
+            flow_features = self._resolve_flow_features(inputs=inputs, graph_cache=graph_cache)
+            log_probs, scores, start_batch = self._compute_start_log_probs_from_flow(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                start_node_locals=inputs.start_node_locals,
+                start_ptr=inputs.start_ptr,
+                temperature=spec.temperature,
+                log_f_module=self.log_f,
+            )
+        else:
+            log_probs, scores, start_batch = self._compute_start_log_probs(
+                inputs=inputs,
+                start_node_locals=inputs.start_node_locals,
+                start_ptr=inputs.start_ptr,
+                temperature=spec.temperature,
+            )
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        uniform_log_probs = self._compute_uniform_log_probs(
+            ptr=inputs.start_ptr,
+            num_graphs=num_graphs,
+            device=inputs.node_ptr.device,
+        )
+        return SelectionDistribution(
+            log_probs=log_probs,
+            scores=scores,
+            candidate_batch=start_batch,
+            uniform_log_probs=uniform_log_probs,
+        )
+
+    def _sample_start_selection_from_distribution(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        spec: StartSelectionSpec,
+        distribution: SelectionDistribution,
+    ) -> StartSelectionOutput:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        uniform_choice = self._sample_uniform_choice_indices(
+            ptr=inputs.start_ptr,
+            num_graphs=num_graphs,
+            device=inputs.node_ptr.device,
+        )
+        if spec.force_uniform:
+            choice = uniform_choice
+            log_pf_start = distribution.uniform_log_probs
+        else:
+            learned_choice = self._sample_start_node_indices(
+                scores=distribution.scores,
+                start_batch=distribution.candidate_batch,
+                num_graphs=num_graphs,
+                sample_gumbel=spec.sample_gumbel,
+            )
+            epsilon = float(spec.epsilon)
+            if epsilon > float(_ZERO):
+                use_uniform = torch.rand(num_graphs, device=distribution.scores.device, dtype=torch.float32) < epsilon
+                choice = torch.where(use_uniform, uniform_choice, learned_choice)
+                log_prob_selected = distribution.log_probs.index_select(0, choice)
+                log_pf_start = self._mix_sink_log_probs(
+                    log_prob_selected=log_prob_selected,
+                    uniform_log_probs=distribution.uniform_log_probs,
+                    epsilon=epsilon,
+                )
+            else:
+                choice = learned_choice
+                log_pf_start = distribution.log_probs.index_select(0, choice)
+        start_nodes = inputs.start_node_locals.index_select(0, choice)
+        start_ptr = torch.arange(num_graphs + _ONE, device=inputs.node_ptr.device, dtype=torch.long)
+        updated_inputs, updated_cache = self._override_start_nodes(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            start_nodes=start_nodes,
+            start_ptr=start_ptr,
+        )
+        return StartSelectionOutput(
+            inputs=updated_inputs,
+            graph_cache=updated_cache,
+            log_pf_start=log_pf_start,
+        )
+
+    @staticmethod
+    def _compute_uniform_log_probs(
+        *,
+        ptr: torch.Tensor,
+        num_graphs: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        ptr = ptr.to(device=device, dtype=torch.long).view(-1)
+        if ptr.numel() != num_graphs + _ONE:
+            raise ValueError("ptr length mismatch for uniform log probs.")
+        counts = (ptr[_ONE:] - ptr[:-_ONE]).to(dtype=torch.long)
+        if bool((counts <= _ZERO).any().detach().tolist()):
+            raise ValueError("Uniform selection requires non-empty candidate sets.")
+        return -torch.log(counts.to(dtype=torch.float32))
+
+    def _sample_uniform_choice_indices(
+        self,
+        *,
+        ptr: torch.Tensor,
+        num_graphs: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        ptr = ptr.to(device=device, dtype=torch.long).view(-1)
+        if ptr.numel() != num_graphs + _ONE:
+            raise ValueError("ptr length mismatch for uniform sampling.")
+        batch = self.batch_processor.compute_node_batch(ptr, num_graphs, device)
+        scores = torch.rand(batch.numel(), device=device, dtype=torch.float32)
+        _, choice = scatter_max(scores, batch, dim=0, dim_size=num_graphs)
+        if bool((choice < _ZERO).any().detach().tolist()):
+            raise ValueError("Uniform sampling encountered empty graphs.")
+        return choice
+
+    @staticmethod
+    def _sample_start_node_indices(
+        *,
+        scores: torch.Tensor,
+        start_batch: torch.Tensor,
+        num_graphs: int,
+        sample_gumbel: bool,
+    ) -> torch.Tensor:
+        if num_graphs <= _ZERO:
+            return torch.zeros((_ZERO,), device=scores.device, dtype=torch.long)
+        if sample_gumbel:
+            scores = scores + gumbel_noise_like(scores)
+        _, choice = scatter_max(scores, start_batch, dim=0, dim_size=num_graphs)
+        if bool((choice < _ZERO).any().detach().tolist()):
+            raise ValueError("Start selection encountered empty graphs.")
+        return choice
+
+    def _override_start_nodes(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        start_nodes: torch.Tensor,
+        start_ptr: torch.Tensor,
+    ) -> tuple[RolloutInputs, Dict[str, torch.Tensor]]:
+        device = inputs.node_ptr.device
+        start_nodes = start_nodes.to(device=device, dtype=torch.long).view(-1)
+        start_ptr = start_ptr.to(device=device, dtype=torch.long).view(-1)
+        updated_inputs = replace(inputs, start_node_locals=start_nodes, start_ptr=start_ptr)
+        updated_cache = dict(graph_cache)
+        updated_cache["start_node_locals"] = start_nodes
+        updated_cache["start_ptr"] = start_ptr
+        num_nodes_total = int(inputs.node_ptr[-1].detach().tolist()) if inputs.node_ptr.numel() > 0 else _ZERO
+        node_is_start, _ = self.batch_processor.compute_node_flags(
+            num_nodes_total,
+            start_nodes,
+            inputs.answer_node_locals,
+            device,
+        )
+        updated_cache["node_is_start"] = node_is_start
+        return updated_inputs, updated_cache
+
+    def _apply_start_selection(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        spec: StartSelectionSpec,
+    ) -> StartSelectionOutput:
+        distribution = self._prepare_start_selection_distribution(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            spec=spec,
+        )
+        return self._sample_start_selection_from_distribution(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            spec=spec,
+            distribution=distribution,
+        )
+
+    def _apply_sink_selection(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        spec: SinkSelectionSpec,
+        is_training: bool,
+    ) -> StartSelectionOutput:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        device = inputs.node_ptr.device
+        if num_graphs <= _ZERO:
+            empty = torch.zeros((_ZERO,), device=device, dtype=torch.float32)
+            return StartSelectionOutput(inputs=inputs, graph_cache=graph_cache, log_pf_start=empty)
+        candidate_nodes, candidate_ptr = inputs.answer_node_locals, inputs.answer_ptr
+        distribution = self._prepare_sink_selection_distribution(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            candidate_nodes=candidate_nodes,
+            candidate_ptr=candidate_ptr,
+            spec=spec,
+        )
+        return self._sample_sink_selection_from_distribution(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            candidate_nodes=candidate_nodes,
+            candidate_ptr=candidate_ptr,
+            spec=spec,
+            distribution=distribution,
+            is_training=is_training,
+        )
+
+    def _compute_uniform_sink_selection(
+        self,
+        *,
+        ptr: torch.Tensor,
+        num_graphs: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        uniform_choice = self._sample_uniform_choice_indices(
+            ptr=ptr,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        uniform_log_probs = self._compute_uniform_log_probs(
+            ptr=ptr,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        return uniform_choice, uniform_log_probs
+
+    def _compute_sink_log_probs(
+        self,
+        *,
+        inputs: RolloutInputs,
+        candidate_nodes: torch.Tensor,
+        candidate_ptr: torch.Tensor,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._compute_start_log_probs(
+            inputs=inputs,
+            start_node_locals=candidate_nodes,
+            start_ptr=candidate_ptr,
+            temperature=temperature,
+            selector=self._sink_selector,
+        )
+
+    def _prepare_sink_selection_distribution(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        candidate_nodes: torch.Tensor,
+        candidate_ptr: torch.Tensor,
+        spec: SinkSelectionSpec,
+    ) -> SelectionDistribution:
+        if spec.mode == _SELECTION_MODE_FLOW:
+            flow_features = self._resolve_flow_features(inputs=inputs, graph_cache=graph_cache)
+            log_probs, scores, candidate_batch = self._compute_start_log_probs_from_flow(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                start_node_locals=candidate_nodes,
+                start_ptr=candidate_ptr,
+                temperature=spec.temperature,
+                log_f_module=self.log_f_backward,
+            )
+        else:
+            log_probs, scores, candidate_batch = self._compute_sink_log_probs(
+                inputs=inputs,
+                candidate_nodes=candidate_nodes,
+                candidate_ptr=candidate_ptr,
+                temperature=spec.temperature,
+            )
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        uniform_log_probs = self._compute_uniform_log_probs(
+            ptr=candidate_ptr,
+            num_graphs=num_graphs,
+            device=inputs.node_ptr.device,
+        )
+        return SelectionDistribution(
+            log_probs=log_probs,
+            scores=scores,
+            candidate_batch=candidate_batch,
+            uniform_log_probs=uniform_log_probs,
+        )
+
+    def _sample_sink_selection_from_distribution(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        candidate_nodes: torch.Tensor,
+        candidate_ptr: torch.Tensor,
+        spec: SinkSelectionSpec,
+        distribution: SelectionDistribution,
+        is_training: bool,
+    ) -> StartSelectionOutput:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        device = inputs.node_ptr.device
+        uniform_choice = self._sample_uniform_choice_indices(
+            ptr=candidate_ptr,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        if spec.force_uniform:
+            choice, log_pf_start = uniform_choice, distribution.uniform_log_probs
+        else:
+            epsilon = float(spec.epsilon) if is_training else float(_ZERO)
+            choice = self._sample_sink_choice_indices(
+                scores=distribution.scores,
+                candidate_batch=distribution.candidate_batch,
+                uniform_choice=uniform_choice,
+                num_graphs=num_graphs,
+                epsilon=epsilon,
+                sample_gumbel=spec.sample_gumbel,
+            )
+            log_prob_selected = distribution.log_probs.index_select(0, choice)
+            log_pf_start = self._mix_sink_log_probs(
+                log_prob_selected=log_prob_selected,
+                uniform_log_probs=distribution.uniform_log_probs,
+                epsilon=epsilon,
+            )
+        return self._finalize_sink_selection(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            candidate_nodes=candidate_nodes,
+            choice=choice,
+            log_pf_start=log_pf_start,
+        )
+
+    def _sample_sink_choice_indices(
+        self,
+        *,
+        scores: torch.Tensor,
+        candidate_batch: torch.Tensor,
+        uniform_choice: torch.Tensor,
+        num_graphs: int,
+        epsilon: float,
+        sample_gumbel: bool,
+    ) -> torch.Tensor:
+        if epsilon <= float(_ZERO):
+            return self._sample_start_node_indices(
+                scores=scores,
+                start_batch=candidate_batch,
+                num_graphs=num_graphs,
+                sample_gumbel=sample_gumbel,
+            )
+        learned_choice = self._sample_start_node_indices(
+            scores=scores,
+            start_batch=candidate_batch,
+            num_graphs=num_graphs,
+            sample_gumbel=sample_gumbel,
+        )
+        if epsilon >= float(_ONE):
+            return uniform_choice
+        use_uniform = torch.rand(num_graphs, device=scores.device, dtype=torch.float32) < float(epsilon)
+        return torch.where(use_uniform, uniform_choice, learned_choice)
+
+    @staticmethod
+    def _mix_sink_log_probs(
+        *,
+        log_prob_selected: torch.Tensor,
+        uniform_log_probs: torch.Tensor,
+        epsilon: float,
+    ) -> torch.Tensor:
+        if epsilon <= float(_ZERO):
+            return log_prob_selected
+        if epsilon >= float(_ONE):
+            return uniform_log_probs
+        log_eps = math.log(float(epsilon))
+        log_keep = math.log(float(_ONE) - float(epsilon))
+        return torch.logaddexp(
+            log_prob_selected + log_keep,
+            uniform_log_probs + log_eps,
+        )
+
+    def _finalize_sink_selection(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        candidate_nodes: torch.Tensor,
+        choice: torch.Tensor,
+        log_pf_start: torch.Tensor,
+    ) -> StartSelectionOutput:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        device = inputs.node_ptr.device
+        start_nodes = candidate_nodes.index_select(0, choice)
+        start_ptr = torch.arange(num_graphs + _ONE, device=device, dtype=torch.long)
+        updated_inputs, updated_cache = self._override_start_nodes(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            start_nodes=start_nodes,
+            start_ptr=start_ptr,
+        )
+        return StartSelectionOutput(
+            inputs=updated_inputs,
+            graph_cache=updated_cache,
+            log_pf_start=log_pf_start,
+        )
+
+    def _resolve_rollout_inputs_for_selection(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        start_spec: Optional[StartSelectionSpec],
+        start_distribution: Optional[SelectionDistribution] = None,
+    ) -> tuple[RolloutInputs, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+        if start_spec is None:
+            return inputs, graph_cache, None
+        if start_distribution is None:
+            selection = self._apply_start_selection(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=start_spec,
+            )
+        else:
+            selection = self._sample_start_selection_from_distribution(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=start_spec,
+                distribution=start_distribution,
+            )
+        return selection.inputs, selection.graph_cache, selection.log_pf_start
+
+    @staticmethod
+    def _append_rollout_outputs(
+        rollout: RolloutResult,
+        tb_loss: torch.Tensor,
+        record: RolloutLossRecord,
+        *,
+        collect_terminal_hits: bool,
+        collect_eval: bool,
+        rollout_stop_nodes: list[torch.Tensor],
+        rollout_actions: list[torch.Tensor],
+        loss_list: list[torch.Tensor],
+        metric_records: list[RolloutLossRecord],
+    ) -> None:
+        if collect_terminal_hits:
+            rollout_stop_nodes.append(rollout.stop_node_locals.detach())
+        if collect_eval:
+            if rollout.actions_seq is None:
+                raise RuntimeError("rollout missing actions; record_actions=True required.")
+            rollout_actions.append(rollout.actions_seq.detach())
+        loss_list.append(tb_loss)
+        metric_records.append(record)
 
     @staticmethod
     def _require_float(value: Any) -> float:
@@ -302,6 +1200,13 @@ class GFlowNetEngine:
         parsed = cls._require_float(value)
         if parsed < float(_ZERO):
             raise ValueError(f"Value must be >= 0, got {parsed}.")
+        return parsed
+
+    @classmethod
+    def _require_positive_float(cls, value: Any) -> float:
+        parsed = cls._require_float(value)
+        if parsed <= float(_ZERO):
+            raise ValueError(f"Value must be > 0, got {parsed}.")
         return parsed
 
     @classmethod
@@ -371,32 +1276,64 @@ class GFlowNetEngine:
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
+        flow_modules: FlowModules,
         log_f_start: torch.Tensor,
+        guidance_beta: float,
         graph_mask: torch.Tensor,
         rollout_cfg: GFlowNetRolloutConfig,
         temperature: Optional[float],
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
+        disable_stop: bool,
+        sample_ids: Optional[Sequence[str]] = None,
+        rollout_hook: Optional[Callable[[RolloutResult, RolloutInputs, Dict[str, torch.Tensor]], None]] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         num_graphs = int(inputs.node_ptr.numel() - 1)
-        return self._compute_loop_rollout_loss(
+        loss, metrics = self._compute_loop_rollout_loss(
             inputs=inputs,
             num_rollouts=rollout_cfg.num_rollouts,
             num_graphs=num_graphs,
             graph_cache=graph_cache,
             flow_features=flow_features,
+            flow_modules=flow_modules,
             log_f_start=log_f_start,
+            guidance_beta=guidance_beta,
             graph_mask=graph_mask,
             temperature=temperature,
             rollout_cfg=rollout_cfg,
             rollout_chunk_size=rollout_cfg.rollout_chunk_size,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
+            subtb_spec=subtb_spec,
             max_steps_override=max_steps_override,
             force_stop_at_end=force_stop_at_end,
+            disable_stop=disable_stop,
+            rollout_hook=rollout_hook,
         )
+        if (
+            self._replay_spec is not None
+            and self._replay_buffer is not None
+            and flow_modules.log_f is self.log_f
+            and sample_ids is not None
+        ):
+            replay_loss, replay_metrics = self._compute_replay_loss(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                flow_modules=flow_modules,
+                temperature=temperature,
+                subtb_spec=subtb_spec,
+                sample_ids=sample_ids,
+            )
+            if replay_loss is not None:
+                mix_ratio = float(self._replay_spec.mix_ratio)
+                loss = (float(_ONE) - mix_ratio) * loss + mix_ratio * replay_loss
+                replay_metrics["replay/mix_ratio"] = torch.as_tensor(
+                    mix_ratio,
+                    device=loss.device,
+                    dtype=loss.dtype,
+                )
+                metrics.update(replay_metrics)
+        return loss, metrics
 
     def _compute_dual_stream_loss(
         self,
@@ -404,127 +1341,245 @@ class GFlowNetEngine:
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
-        log_f_start: torch.Tensor,
         graph_mask: torch.Tensor,
         rollout_cfg: GFlowNetRolloutConfig,
         temperature: Optional[float],
         spec: DualStreamSpec,
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         progress: float,
+        stream_forward_progress: Optional[float],
+        guidance_beta: float,
+        sample_ids: Optional[Sequence[str]] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        num_graphs = int(inputs.node_ptr.numel() - 1)
-        trust_radius_answer = self._compute_trust_radius(
-            node_min_dists=inputs.node_min_dists,
-            node_batch=graph_cache["node_batch"],
-            num_graphs=num_graphs,
-            spec=spec,
-            progress=float(progress),
-        )
-        trust_radius_start = self._compute_trust_radius(
-            node_min_dists=inputs.node_q_min_dists,
-            node_batch=graph_cache["node_batch"],
-            num_graphs=num_graphs,
-            spec=spec,
-            progress=float(progress),
-        )
-        start_nodes, start_ptr = self._build_stream_a_override(
+        flow_modules_backward = self._resolve_flow_modules(direction="backward")
+        flow_modules_forward = self._resolve_flow_modules(direction="forward")
+        inputs_backward, graph_cache_backward, _ = self._prepare_backward_inputs(
             inputs=inputs,
             graph_cache=graph_cache,
-            trust_radius=trust_radius_start,
-            spec=spec,
+            temperature=temperature,
+            is_training=True,
         )
-        inputs_a = replace(inputs, start_node_locals=start_nodes, start_ptr=start_ptr)
-        graph_cache_a = self.batch_processor.build_graph_cache(inputs_a, device=inputs.node_ptr.device)
-        flow_features_a = self._compute_flow_features(inputs_a)
-        log_f_start_a = self._compute_log_f_start(
-            inputs=inputs_a,
-            graph_cache=graph_cache_a,
-            flow_features=flow_features_a,
+        flow_features_backward = self._compute_flow_features(inputs_backward)
+        log_f_start_backward = self._compute_log_f_start(
+            inputs=inputs_backward,
+            graph_cache=graph_cache_backward,
+            flow_features=flow_features_backward,
+            log_f_module=flow_modules_backward.log_f,
+            start_node_locals=inputs.answer_node_locals,
+            start_ptr=inputs.answer_ptr,
         )
-        loss_a, metrics_a = self._compute_single_stream_loss(
-            inputs=inputs_a,
-            graph_cache=graph_cache_a,
-            flow_features=flow_features_a,
-            log_f_start=log_f_start_a,
-            graph_mask=graph_mask,
+        graph_mask_backward = ~inputs_backward.dummy_mask
+        replay_hook = None
+        if self._replay_buffer is not None and sample_ids is not None:
+            def _hook(
+                rollout: RolloutResult,
+                rollout_inputs: RolloutInputs,
+                rollout_cache: Dict[str, torch.Tensor],
+            ) -> None:
+                self._store_replay_from_backward_rollout(
+                    rollout=rollout,
+                    inputs=rollout_inputs,
+                    graph_cache=rollout_cache,
+                    sample_ids=sample_ids,
+                )
+            replay_hook = _hook
+        loss_backward, metrics_backward = self._compute_single_stream_loss(
+            inputs=inputs_backward,
+            graph_cache=graph_cache_backward,
+            flow_features=flow_features_backward,
+            flow_modules=flow_modules_backward,
+            log_f_start=log_f_start_backward,
+            guidance_beta=guidance_beta,
+            graph_mask=graph_mask_backward,
             rollout_cfg=rollout_cfg,
             temperature=temperature,
-            gate_spec=None,
-            distance_prior_spec=distance_prior_spec,
+            subtb_spec=subtb_spec,
             max_steps_override=None,
             force_stop_at_end=False,
+            disable_stop=False,
+            rollout_hook=replay_hook,
         )
-        gate_spec = StreamGateSpec(trust_radius=trust_radius_answer, delta=spec.trust_delta)
-        loss_b, metrics_b = self._compute_single_stream_loss(
+        log_f_start_forward = self._compute_log_f_start(
             inputs=inputs,
             graph_cache=graph_cache,
             flow_features=flow_features,
-            log_f_start=log_f_start,
+            log_f_module=flow_modules_forward.log_f,
+        )
+        loss_forward, metrics_forward = self._compute_single_stream_loss(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            flow_features=flow_features,
+            flow_modules=flow_modules_forward,
+            log_f_start=log_f_start_forward,
+            guidance_beta=guidance_beta,
             graph_mask=graph_mask,
             rollout_cfg=rollout_cfg,
             temperature=temperature,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
-            max_steps_override=spec.stream_b_max_steps,
+            subtb_spec=subtb_spec,
+            max_steps_override=spec.stream_forward_max_steps,
             force_stop_at_end=True,
+            disable_stop=spec.disable_stop,
+            sample_ids=sample_ids,
         )
-        loss = loss_a + (float(spec.stream_b_weight) * loss_b)
-        metrics = dict(metrics_a)
-        metrics.update(self._suffix_metrics(metrics_b, suffix="stream_b"))
-        metrics["stream_b_loss"] = loss_b.detach()
+        weight_progress = stream_forward_progress if stream_forward_progress is not None else progress
+        stream_forward_weight = self._compute_stream_forward_weight(spec=spec, progress=weight_progress)
+        loss = loss_backward + (float(stream_forward_weight) * loss_forward)
+        if self._z_align_spec is not None:
+            align_loss = self._compute_z_align_loss(
+                log_f_forward=log_f_start_forward,
+                log_f_backward=log_f_start_backward,
+                graph_mask_forward=graph_mask,
+                graph_mask_backward=graph_mask_backward,
+            )
+            align_weight = float(self._z_align_spec.weight)
+            loss = loss + (align_weight * align_loss)
+        metrics_backward = self._filter_stream_backward_metrics(metrics_backward)
+        metrics = {}
+        metrics.update(self._suffix_metrics(metrics_backward, suffix="stream_backward"))
+        metrics.update(self._suffix_metrics(metrics_forward, suffix="stream_forward"))
+        metrics["stream_backward_loss"] = loss_backward.detach()
+        metrics["stream_forward_loss"] = loss_forward.detach()
+        metrics["stream_forward_weight"] = torch.as_tensor(
+            float(stream_forward_weight),
+            device=loss_backward.device,
+            dtype=loss_backward.dtype,
+        )
+        if self._z_align_spec is not None:
+            metrics["z_align_loss"] = align_loss.detach()
+            metrics["z_align_weight"] = torch.as_tensor(
+                float(self._z_align_spec.weight),
+                device=loss_backward.device,
+                dtype=loss_backward.dtype,
+            )
         return loss, metrics
 
-    def _prepare_streaming_trust_state(
-        self,
-        *,
-        batch: Any,
-        device: torch.device,
-    ) -> StreamingTrustState:
-        node_ptr = batch.ptr.to(device=device, dtype=torch.long, non_blocking=True)
-        num_graphs = int(node_ptr.numel() - 1)
-        node_batch = self.batch_processor.compute_node_batch(node_ptr, num_graphs, device)
-        num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
-        edge_index = batch.edge_index.to(device=device, dtype=torch.long, non_blocking=True)
-        node_min_dists = batch.node_min_dists.to(device=device, dtype=torch.long, non_blocking=True)
-        q_local_indices = batch.q_local_indices.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
-        node_q_min_dists = directed_bfs_distances(
-            edge_index,
-            num_nodes=num_nodes_total,
-            start_nodes=q_local_indices,
-        )
-        start_ptr = torch.as_tensor(batch._slice_dict["q_local_indices"], dtype=torch.long, device=device)
-        return StreamingTrustState(
-            node_ptr=node_ptr,
-            node_batch=node_batch,
-            node_min_dists=node_min_dists,
-            node_q_min_dists=node_q_min_dists,
-            q_local_indices=q_local_indices,
-            start_ptr=start_ptr,
-            num_graphs=num_graphs,
-        )
+    @staticmethod
+    def _slice_ptr(ptr: torch.Tensor, *, start_graph: int, end_graph: int) -> tuple[torch.Tensor, int]:
+        start = int(ptr[start_graph].detach().tolist())
+        end = int(ptr[end_graph].detach().tolist())
+        sliced = ptr[start_graph : end_graph + _ONE] - start
+        return sliced, start
 
-    def _compute_streaming_trust_radii(
+    @staticmethod
+    def _slice_indices(values: torch.Tensor, *, ptr: torch.Tensor, start_graph: int, end_graph: int) -> tuple[torch.Tensor, torch.Tensor]:
+        start = int(ptr[start_graph].detach().tolist())
+        end = int(ptr[end_graph].detach().tolist())
+        sliced = values[start:end]
+        new_ptr = ptr[start_graph : end_graph + _ONE] - start
+        return sliced, new_ptr
+
+    def _build_batch_slice(
         self,
+        batch: Any,
         *,
-        trust_state: StreamingTrustState,
-        spec: DualStreamSpec,
-        progress: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        trust_radius_answer = self._compute_trust_radius(
-            node_min_dists=trust_state.node_min_dists,
-            node_batch=trust_state.node_batch,
-            num_graphs=trust_state.num_graphs,
-            spec=spec,
-            progress=float(progress),
+        start_graph: int,
+        end_graph: int,
+    ) -> Any:
+        node_ptr = batch.ptr
+        edge_ptr = getattr(batch, "edge_ptr", None)
+        edge_batch = getattr(batch, "edge_batch", None)
+        if not torch.is_tensor(edge_ptr) or not torch.is_tensor(edge_batch):
+            raise ValueError("Dual stream forwardatch splitting requires precomputed edge_ptr and edge_batch.")
+        node_ptr_slice, node_offset = self._slice_ptr(node_ptr, start_graph=start_graph, end_graph=end_graph)
+        edge_ptr_slice, edge_offset = self._slice_ptr(edge_ptr, start_graph=start_graph, end_graph=end_graph)
+        node_slice = slice(node_offset, node_offset + int(node_ptr_slice[-1].detach().tolist()))
+        edge_slice = slice(edge_offset, edge_offset + int(edge_ptr_slice[-1].detach().tolist()))
+
+        edge_index = batch.edge_index[:, edge_slice] - node_offset
+        edge_attr = batch.edge_attr[edge_slice]
+        edge_batch_slice = edge_batch[edge_slice] - int(start_graph)
+
+        question_emb = batch.question_emb[start_graph:end_graph]
+        node_embeddings = batch.node_embeddings[node_slice]
+        node_embedding_ids = batch.node_embedding_ids[node_slice]
+        edge_embeddings = batch.edge_embeddings[edge_slice]
+        node_global_ids = getattr(batch, "node_global_ids", None)
+        if torch.is_tensor(node_global_ids):
+            node_global_ids = node_global_ids[node_slice]
+        node_is_cvt = getattr(batch, "node_is_cvt", None)
+        if torch.is_tensor(node_is_cvt):
+            node_is_cvt = node_is_cvt[node_slice]
+        node_type_counts_all = getattr(batch, "node_type_counts", None)
+        node_type_counts = None
+        node_type_ids = None
+        if torch.is_tensor(node_type_counts_all):
+            node_type_counts = node_type_counts_all[node_slice]
+            node_type_ids_all = getattr(batch, "node_type_ids", None)
+            if node_type_ids_all is None:
+                raise ValueError("Batch missing node_type_ids for node_type_counts slicing.")
+            if not torch.is_tensor(node_type_ids_all):
+                node_type_ids_all = torch.as_tensor(node_type_ids_all, dtype=torch.long)
+            if node_offset <= _ZERO:
+                type_start = _ZERO
+            else:
+                type_start = int(node_type_counts_all[:node_offset].sum().detach().tolist())
+            type_count = int(node_type_counts.sum().detach().tolist())
+            node_type_ids = node_type_ids_all[type_start : type_start + type_count]
+
+        slice_dict = getattr(batch, "_slice_dict", None)
+        if not isinstance(slice_dict, dict):
+            raise ValueError("Batch missing _slice_dict required for dual stream splitting.")
+        q_ptr_raw = torch.as_tensor(slice_dict.get("q_local_indices"), dtype=torch.long)
+        a_ptr_raw = torch.as_tensor(slice_dict.get("a_local_indices"), dtype=torch.long)
+        q_local_indices, q_ptr = self._slice_indices(
+            batch.q_local_indices,
+            ptr=q_ptr_raw,
+            start_graph=start_graph,
+            end_graph=end_graph,
         )
-        trust_radius_start = self._compute_trust_radius(
-            node_min_dists=trust_state.node_q_min_dists,
-            node_batch=trust_state.node_batch,
-            num_graphs=trust_state.num_graphs,
-            spec=spec,
-            progress=float(progress),
+        a_local_indices, a_ptr = self._slice_indices(
+            batch.a_local_indices,
+            ptr=a_ptr_raw,
+            start_graph=start_graph,
+            end_graph=end_graph,
         )
-        return trust_radius_answer, trust_radius_start
+        if q_local_indices.numel() > 0:
+            q_local_indices = q_local_indices - node_offset
+        if a_local_indices.numel() > 0:
+            a_local_indices = a_local_indices - node_offset
+
+        view = SimpleNamespace(
+            ptr=node_ptr_slice,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            question_emb=question_emb,
+            node_embeddings=node_embeddings,
+            node_global_ids=node_global_ids,
+            node_embedding_ids=node_embedding_ids,
+            edge_embeddings=edge_embeddings,
+            q_local_indices=q_local_indices,
+            a_local_indices=a_local_indices,
+            edge_batch=edge_batch_slice,
+            edge_ptr=edge_ptr_slice,
+        )
+        sample_ids = getattr(batch, "sample_id", None)
+        if isinstance(sample_ids, (list, tuple)):
+            view.sample_id = list(sample_ids[start_graph:end_graph])
+        elif torch.is_tensor(sample_ids):
+            view.sample_id = [str(s.detach().tolist()) for s in sample_ids[start_graph:end_graph]]
+        if node_is_cvt is not None:
+            view.node_is_cvt = node_is_cvt
+        if node_type_counts is not None:
+            view.node_type_counts = node_type_counts
+        if node_type_ids is not None:
+            view.node_type_ids = node_type_ids
+        view._slice_dict = {
+            "q_local_indices": q_ptr,
+            "a_local_indices": a_ptr,
+        }
+        return view
+
+    def _split_batch_for_dual_stream(self, batch: Any) -> tuple[Any, Any]:
+        node_ptr = batch.ptr
+        if not torch.is_tensor(node_ptr):
+            raise ValueError("Batch missing ptr required for dual stream splitting.")
+        num_graphs = int(node_ptr.numel() - _ONE)
+        split_graphs = num_graphs // _TWO
+        if split_graphs <= _ZERO or split_graphs >= num_graphs:
+            raise ValueError("Dual stream split requires at least two graphs.")
+        batch_backward = self._build_batch_slice(batch, start_graph=_ZERO, end_graph=split_graphs)
+        batch_forward = self._build_batch_slice(batch, start_graph=split_graphs, end_graph=num_graphs)
+        return batch_backward, batch_forward
 
     def _compute_dual_stream_loss_streaming(
         self,
@@ -534,32 +1589,191 @@ class GFlowNetEngine:
         rollout_cfg: GFlowNetRolloutConfig,
         backward_fn: Callable[[torch.Tensor], None],
         spec: DualStreamSpec,
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         progress: float,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        trust_state = self._prepare_streaming_trust_state(batch=batch, device=device)
-        trust_radius_answer, trust_radius_start = self._compute_streaming_trust_radii(
-            trust_state=trust_state,
+        stream_forward_progress: Optional[float],
+        guidance_beta: float,
+        sample_ids: Optional[Sequence[str]] = None,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self._z_align_spec is None:
+            try:
+                batch_backward, batch_forward = self._split_batch_for_dual_stream(batch)
+            except ValueError:
+                batch_backward = batch
+                batch_forward = batch
+        else:
+            batch_backward = batch
+            batch_forward = batch
+        sample_ids_backward = None
+        sample_ids_forward = None
+        if self._replay_spec is not None and self._replay_buffer is not None:
+            def _num_graphs(batch_obj: Any) -> int:
+                ptr = getattr(batch_obj, "ptr", None)
+                if torch.is_tensor(ptr):
+                    return int(ptr.numel() - _ONE)
+                num_graphs = getattr(batch_obj, "num_graphs", None)
+                if num_graphs is None:
+                    raise ValueError("Batch missing ptr/num_graphs required for replay sample_ids.")
+                return int(num_graphs)
+
+            if sample_ids is None:
+                sample_ids_backward = self._extract_sample_ids_for_replay(batch_backward, _num_graphs(batch_backward))
+                sample_ids_forward = self._extract_sample_ids_for_replay(batch_forward, _num_graphs(batch_forward))
+            else:
+                sample_ids_list = list(sample_ids)
+                if batch_backward is batch_forward:
+                    sample_ids_backward = sample_ids_list
+                    sample_ids_forward = sample_ids_list
+                else:
+                    num_graphs_backward = _num_graphs(batch_backward)
+                    num_graphs_forward = _num_graphs(batch_forward)
+                    total_graphs = num_graphs_backward + num_graphs_forward
+                    if total_graphs != len(sample_ids_list):
+                        raise ValueError(
+                            f"sample_ids length {len(sample_ids_list)} != split graphs {total_graphs}."
+                        )
+                    sample_ids_backward = sample_ids_list[:num_graphs_backward]
+                    sample_ids_forward = sample_ids_list[num_graphs_backward:total_graphs]
+        align_loss = None
+        if self._z_align_spec is not None:
+            inputs = self.batch_processor.prepare_full_rollout_inputs(batch, device)
+            graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
+            flow_features = self._compute_flow_features(inputs)
+            flow_modules_forward = self._resolve_flow_modules(direction="forward")
+            log_f_start_forward = self._compute_log_f_start(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                log_f_module=flow_modules_forward.log_f,
+            )
+            inputs_backward, graph_cache_backward, _ = self._prepare_backward_inputs(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                temperature=None,
+                is_training=True,
+            )
+            flow_features_backward = self._compute_flow_features(inputs_backward)
+            flow_modules_backward = self._resolve_flow_modules(direction="backward")
+            log_f_start_backward = self._compute_log_f_start(
+                inputs=inputs_backward,
+                graph_cache=graph_cache_backward,
+                flow_features=flow_features_backward,
+                log_f_module=flow_modules_backward.log_f,
+                start_node_locals=inputs.answer_node_locals,
+                start_ptr=inputs.answer_ptr,
+            )
+            align_loss = self._compute_z_align_loss(
+                log_f_forward=log_f_start_forward,
+                log_f_backward=log_f_start_backward,
+                graph_mask_forward=~inputs.dummy_mask,
+                graph_mask_backward=~inputs_backward.dummy_mask,
+            )
+        loss_backward, metrics_backward = self._run_stream_backward_streaming(
+            batch=batch_backward,
+            device=device,
+            rollout_cfg=rollout_cfg,
+            backward_fn=backward_fn,
+            subtb_spec=subtb_spec,
+            guidance_beta=guidance_beta,
+            sample_ids=sample_ids_backward,
+        )
+        forward_loss_scale = float(_ONE)
+        if self._replay_spec is not None and sample_ids_forward is not None:
+            forward_loss_scale = float(_ONE) - float(self._replay_spec.mix_ratio)
+        loss_forward, metrics_forward = self._run_stream_forward_streaming(
+            batch=batch_forward,
+            device=device,
+            rollout_cfg=rollout_cfg,
+            backward_fn=backward_fn,
             spec=spec,
-            progress=progress,
+            subtb_spec=subtb_spec,
+            guidance_beta=guidance_beta,
+            sample_ids=sample_ids_forward,
+            loss_scale=forward_loss_scale,
         )
-        start_nodes, start_ptr_override = self._build_stream_a_override_from_tensors(
-            node_ptr=trust_state.node_ptr,
-            node_batch=trust_state.node_batch,
-            node_q_min_dists=trust_state.node_q_min_dists,
-            node_min_dists=trust_state.node_min_dists,
-            trust_radius=trust_radius_start,
-            spec=spec,
-            start_node_locals=trust_state.q_local_indices,
-            start_ptr=trust_state.start_ptr,
+        weight_progress = stream_forward_progress if stream_forward_progress is not None else progress
+        stream_forward_weight = self._compute_stream_forward_weight(spec=spec, progress=weight_progress)
+        loss = loss_backward + (float(stream_forward_weight) * loss_forward)
+        if align_loss is not None:
+            align_weight = float(self._z_align_spec.weight)
+            loss = loss + (align_weight * align_loss)
+        metrics_backward = self._filter_stream_backward_metrics(metrics_backward)
+        metrics = {}
+        metrics.update(self._suffix_metrics(metrics_backward, suffix="stream_backward"))
+        metrics.update(self._suffix_metrics(metrics_forward, suffix="stream_forward"))
+        metrics["stream_backward_loss"] = loss_backward.detach()
+        metrics["stream_forward_loss"] = loss_forward.detach()
+        metrics["stream_forward_weight"] = torch.as_tensor(
+            float(stream_forward_weight),
+            device=loss_backward.device,
+            dtype=loss_backward.dtype,
         )
-        prev_nodes, prev_ptr = self._swap_start_override(
-            batch=batch,
-            start_nodes=start_nodes,
-            start_ptr=start_ptr_override,
+        if align_loss is not None:
+            metrics["z_align_loss"] = align_loss.detach()
+            metrics["z_align_weight"] = torch.as_tensor(
+                float(self._z_align_spec.weight),
+                device=loss_backward.device,
+                dtype=loss_backward.dtype,
+            )
+        return loss, metrics
+
+    def _run_stream_backward_streaming(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        rollout_cfg: GFlowNetRolloutConfig,
+        backward_fn: Callable[[torch.Tensor], None],
+        subtb_spec: Optional[SubTrajectorySpec],
+        guidance_beta: float,
+        sample_ids: Optional[Sequence[str]] = None,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        flow_modules = self._resolve_flow_modules(direction="backward")
+        log_f_start_nodes = getattr(batch, "a_local_indices", None)
+        slice_dict = getattr(batch, "_slice_dict", None)
+        if not torch.is_tensor(log_f_start_nodes) or not isinstance(slice_dict, dict):
+            raise ValueError("Batch missing a_local_indices/_slice_dict for backward log_f_start.")
+        log_f_start_ptr = slice_dict.get("a_local_indices")
+        if log_f_start_ptr is None:
+            raise ValueError("Batch missing a_local_indices ptr for backward log_f_start.")
+        prev_override_nodes = None
+        prev_override_ptr = None
+        sink_spec = self._resolve_sink_selection_spec(
+            temperature=None,
+            is_training=True,
+            log_f_module=flow_modules.log_f,
         )
+        if sink_spec is not None:
+            inputs = self.batch_processor.prepare_full_rollout_inputs(batch, device)
+            graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
+            selection = self._apply_sink_selection(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=sink_spec,
+                is_training=True,
+            )
+            prev_override_nodes, prev_override_ptr = self._swap_start_override(
+                batch=batch,
+                start_nodes=selection.inputs.start_node_locals,
+                start_ptr=selection.inputs.start_ptr,
+            )
+        prev_q_local, prev_a_local, prev_q_ptr, prev_a_ptr = self._swap_stream_direction_batch(batch)
+        replay_hook = None
+        if self._replay_buffer is not None and sample_ids is not None:
+            def _hook(
+                rollout: RolloutResult,
+                rollout_inputs: RolloutInputs,
+                rollout_cache: Dict[str, torch.Tensor],
+            ) -> None:
+                self._store_replay_from_backward_rollout(
+                    rollout=rollout,
+                    inputs=rollout_inputs,
+                    graph_cache=rollout_cache,
+                    sample_ids=sample_ids,
+                )
+            replay_hook = _hook
         try:
-            loss_a, metrics_a, edge_debug = self._compute_loop_rollout_loss_streaming(
+            loss_backward, metrics_backward = self._compute_loop_rollout_loss_streaming(
                 batch=batch,
                 device=device,
                 num_rollouts=rollout_cfg.num_rollouts,
@@ -567,15 +1781,47 @@ class GFlowNetEngine:
                 rollout_chunk_size=rollout_cfg.rollout_chunk_size,
                 temperature=None,
                 backward_fn=backward_fn,
-                gate_spec=None,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
+                flow_modules=flow_modules,
+                guidance_beta=guidance_beta,
                 max_steps_override=None,
                 force_stop_at_end=False,
+                disable_stop=False,
+                log_f_start_node_locals=log_f_start_nodes,
+                log_f_start_ptr=log_f_start_ptr,
+                rollout_hook=replay_hook,
             )
         finally:
-            self._restore_start_override(batch=batch, prev_nodes=prev_nodes, prev_ptr=prev_ptr)
-        gate_spec = StreamGateSpec(trust_radius=trust_radius_answer, delta=spec.trust_delta)
-        loss_b, metrics_b, _ = self._compute_loop_rollout_loss_streaming(
+            self._restore_stream_direction_batch(
+                batch,
+                prev_q_local=prev_q_local,
+                prev_a_local=prev_a_local,
+                prev_q_ptr=prev_q_ptr,
+                prev_a_ptr=prev_a_ptr,
+            )
+            if sink_spec is not None:
+                self._restore_start_override(
+                    batch=batch,
+                    prev_nodes=prev_override_nodes,
+                    prev_ptr=prev_override_ptr,
+                )
+        return loss_backward, metrics_backward
+
+    def _run_stream_forward_streaming(
+        self,
+        *,
+        batch: Any,
+        device: torch.device,
+        rollout_cfg: GFlowNetRolloutConfig,
+        backward_fn: Callable[[torch.Tensor], None],
+        spec: DualStreamSpec,
+        subtb_spec: Optional[SubTrajectorySpec],
+        guidance_beta: float,
+        sample_ids: Optional[Sequence[str]] = None,
+        loss_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        flow_modules = self._resolve_flow_modules(direction="forward")
+        loss_forward, metrics_forward = self._compute_loop_rollout_loss_streaming(
             batch=batch,
             device=device,
             num_rollouts=rollout_cfg.num_rollouts,
@@ -583,16 +1829,16 @@ class GFlowNetEngine:
             rollout_chunk_size=rollout_cfg.rollout_chunk_size,
             temperature=None,
             backward_fn=backward_fn,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
-            max_steps_override=spec.stream_b_max_steps,
+            subtb_spec=subtb_spec,
+            flow_modules=flow_modules,
+            guidance_beta=guidance_beta,
+            max_steps_override=spec.stream_forward_max_steps,
             force_stop_at_end=True,
+            disable_stop=spec.disable_stop,
+            loss_scale=loss_scale,
+            sample_ids=sample_ids,
         )
-        loss = loss_a + (float(spec.stream_b_weight) * loss_b)
-        metrics = dict(metrics_a)
-        metrics.update(self._suffix_metrics(metrics_b, suffix="stream_b"))
-        metrics["stream_b_loss"] = loss_b.detach()
-        return loss, metrics, edge_debug
+        return loss_forward, metrics_forward
 
     def compute_batch_loss(
         self,
@@ -601,6 +1847,7 @@ class GFlowNetEngine:
         device: torch.device,
         rollout_cfg: GFlowNetRolloutConfig,
         progress: Optional[float] = None,
+        stream_forward_progress: Optional[float] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         self._validate_batch_inputs(
             batch,
@@ -611,34 +1858,39 @@ class GFlowNetEngine:
         inputs = self.batch_processor.prepare_full_rollout_inputs(batch, device)
         num_graphs = int(inputs.node_ptr.numel() - 1)
         graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
-        edge_debug = self._compute_edge_debug_metrics(inputs, graph_cache, device=device)
-        control_metrics = self._compute_control_metrics(inputs=inputs, num_graphs=num_graphs)
         flow_features = self._compute_flow_features(inputs)
-        log_f_start = self._compute_log_f_start(
-            inputs=inputs,
-            graph_cache=graph_cache,
-            flow_features=flow_features,
-        )
+        graph_cache["flow_features"] = flow_features
         graph_mask = ~inputs.dummy_mask
         temperature = None if rollout_cfg.is_training else rollout_cfg.eval_rollout_temperature
+        guidance_beta = self._resolve_h_guidance_beta(progress=progress, is_training=rollout_cfg.is_training)
         dual_spec = self._resolve_dual_stream_spec(is_training=rollout_cfg.is_training)
-        distance_prior_spec = self._resolve_distance_prior_spec(
-            is_training=rollout_cfg.is_training,
-            progress=progress,
-        )
+        subtb_spec = self._resolve_subtb_spec(is_training=rollout_cfg.is_training)
+        sample_ids = None
+        if self._replay_spec is not None:
+            sample_ids = self._extract_sample_ids_for_replay(batch, num_graphs)
         if dual_spec is None:
+            flow_modules = self._resolve_flow_modules(direction="forward")
+            log_f_start = self._compute_log_f_start(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                log_f_module=flow_modules.log_f,
+            )
             loss, metrics = self._compute_single_stream_loss(
                 inputs=inputs,
                 graph_cache=graph_cache,
                 flow_features=flow_features,
+                flow_modules=flow_modules,
                 log_f_start=log_f_start,
+                guidance_beta=guidance_beta,
                 graph_mask=graph_mask,
                 rollout_cfg=rollout_cfg,
                 temperature=temperature,
-                gate_spec=None,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
                 max_steps_override=None,
                 force_stop_at_end=False,
+                disable_stop=False,
+                sample_ids=sample_ids,
             )
         else:
             progress_val = float(_ZERO) if progress is None else float(progress)
@@ -646,18 +1898,16 @@ class GFlowNetEngine:
                 inputs=inputs,
                 graph_cache=graph_cache,
                 flow_features=flow_features,
-                log_f_start=log_f_start,
                 graph_mask=graph_mask,
                 rollout_cfg=rollout_cfg,
                 temperature=temperature,
                 spec=dual_spec,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
                 progress=progress_val,
+                stream_forward_progress=stream_forward_progress,
+                guidance_beta=guidance_beta,
+                sample_ids=sample_ids,
             )
-        if control_metrics:
-            metrics.update(control_metrics)
-        if edge_debug:
-            metrics.update({k: v.detach() for k, v in edge_debug.items()})
         return loss, metrics
 
     def compute_batch_loss_streaming(
@@ -668,6 +1918,7 @@ class GFlowNetEngine:
         rollout_cfg: GFlowNetRolloutConfig,
         backward_fn: Callable[[torch.Tensor], None],
         progress: Optional[float] = None,
+        stream_forward_progress: Optional[float] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         self._validate_batch_inputs(
             batch,
@@ -677,15 +1928,16 @@ class GFlowNetEngine:
         )
         if not rollout_cfg.is_training:
             raise ValueError("compute_batch_loss_streaming requires training rollout config.")
-        with torch.no_grad():
-            control_metrics = self._compute_control_metrics_from_batch(batch=batch, device=device)
         dual_spec = self._resolve_dual_stream_spec(is_training=True)
-        distance_prior_spec = self._resolve_distance_prior_spec(
-            is_training=True,
-            progress=progress,
-        )
+        subtb_spec = self._resolve_subtb_spec(is_training=True)
+        guidance_beta = self._resolve_h_guidance_beta(progress=progress, is_training=True)
         if dual_spec is None:
-            loss, metrics, edge_debug = self._compute_loop_rollout_loss_streaming(
+            sample_ids = None
+            if self._replay_spec is not None:
+                num_graphs = int(batch.ptr.numel() - 1) if torch.is_tensor(batch.ptr) else int(getattr(batch, "num_graphs", 0))
+                sample_ids = self._extract_sample_ids_for_replay(batch, num_graphs)
+            flow_modules = self._resolve_flow_modules(direction="forward")
+            loss, metrics = self._compute_loop_rollout_loss_streaming(
                 batch=batch,
                 device=device,
                 num_rollouts=rollout_cfg.num_rollouts,
@@ -693,26 +1945,36 @@ class GFlowNetEngine:
                 rollout_chunk_size=rollout_cfg.rollout_chunk_size,
                 temperature=None,
                 backward_fn=backward_fn,
-                gate_spec=None,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
+                flow_modules=flow_modules,
+                guidance_beta=guidance_beta,
                 max_steps_override=None,
                 force_stop_at_end=False,
+                disable_stop=False,
+                loss_scale=float(_ONE) - float(self._replay_spec.mix_ratio) if self._replay_spec is not None else float(_ONE),
+                sample_ids=sample_ids,
             )
         else:
             progress_val = float(_ZERO) if progress is None else float(progress)
-            loss, metrics, edge_debug = self._compute_dual_stream_loss_streaming(
+            sample_ids = None
+            if self._replay_spec is not None:
+                if torch.is_tensor(batch.ptr):
+                    num_graphs = int(batch.ptr.numel() - _ONE)
+                else:
+                    num_graphs = int(getattr(batch, "num_graphs", _ZERO))
+                sample_ids = self._extract_sample_ids_for_replay(batch, num_graphs)
+            loss, metrics = self._compute_dual_stream_loss_streaming(
                 batch=batch,
                 device=device,
                 rollout_cfg=rollout_cfg,
                 backward_fn=backward_fn,
                 spec=dual_spec,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
                 progress=progress_val,
+                stream_forward_progress=stream_forward_progress,
+                guidance_beta=guidance_beta,
+                sample_ids=sample_ids,
             )
-        if control_metrics:
-            metrics.update(control_metrics)
-        if edge_debug:
-            metrics.update(edge_debug)
         return loss, metrics
 
     def compute_rollout_records(
@@ -731,72 +1993,66 @@ class GFlowNetEngine:
         inputs = self.batch_processor.prepare_rollout_inputs(batch, device)
         num_graphs = int(inputs.node_ptr.numel() - 1)
         graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
+        flow_features = self._compute_flow_features(inputs)
         rollout_logs: list[Dict[str, torch.Tensor]] = []
+        guidance_beta = self._resolve_h_guidance_beta(progress=None, is_training=False)
+        guidance_fn = None
+        if self._should_apply_h_guidance(flow_modules=self._resolve_flow_modules(direction="forward")):
+            guidance_fn = self._build_h_guidance_fn(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                beta=guidance_beta,
+            )
+        start_spec = self._resolve_start_selection_spec(
+            temperature=rollout_cfg.eval_rollout_temperature,
+            is_training=False,
+            log_f_module=self.log_f,
+        )
+        start_distribution = None
+        if start_spec is not None:
+            start_distribution = self._prepare_start_selection_distribution(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=start_spec,
+            )
         for _ in range(rollout_cfg.num_rollouts):
+            rollout_inputs, rollout_cache, log_pf_start = self._resolve_rollout_inputs_for_selection(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                start_spec=start_spec,
+                start_distribution=start_distribution,
+            )
             rollout = self.actor.rollout(
-                graph=graph_cache,
+                graph=rollout_cache,
                 temperature=rollout_cfg.eval_rollout_temperature,
                 record_actions=True,
-                record_visited=False,
+                guidance_fn=guidance_fn,
             )
-            if rollout.actions_seq is None or rollout.directions_seq is None:
-                raise RuntimeError("rollout missing actions/directions; record_actions=True required.")
+            if log_pf_start is not None:
+                log_pf_start = log_pf_start.to(device=rollout.log_pf.device, dtype=rollout.log_pf.dtype).view(-1)
+                if log_pf_start.numel() != rollout.log_pf.numel():
+                    raise ValueError("log_pf_start length mismatch with rollout log_pf.")
+                rollout = replace(rollout, log_pf=rollout.log_pf + log_pf_start)
+            if rollout.actions_seq is None:
+                raise RuntimeError("rollout missing actions; record_actions=True required.")
             rollout_logs.append(
                 {
-                    "actions_seq": rollout.actions_seq.detach().cpu(),
-                    "log_pf": rollout.log_pf.detach().cpu(),
-                    "directions_seq": rollout.directions_seq.detach().cpu(),
-                    "reach_success": rollout.reach_success.detach().cpu(),
-                    "stop_node_locals": rollout.stop_node_locals.detach().cpu(),
+                    "actions_seq": rollout.actions_seq.detach().to(device="cpu"),
+                    "log_pf": rollout.log_pf.detach().to(device="cpu"),
+                    "reach_success": rollout.reach_success.detach().to(device="cpu"),
+                    "stop_node_locals": rollout.stop_node_locals.detach().to(device="cpu"),
                 }
             )
         return self._build_rollout_records(
             batch=batch,
             rollout_logs=rollout_logs,
-            node_ptr=inputs.node_ptr.detach().cpu(),
-            edge_ptr=inputs.edge_ptr.detach().cpu(),
-            edge_index=inputs.edge_index.detach().cpu(),
-            edge_relations=inputs.edge_relations.detach().cpu(),
+            node_ptr=inputs.node_ptr.detach().to(device="cpu"),
+            edge_ptr=inputs.edge_ptr.detach().to(device="cpu"),
+            edge_index=inputs.edge_index.detach().to(device="cpu"),
+            edge_relations=inputs.edge_relations.detach().to(device="cpu"),
             num_graphs=num_graphs,
         )
-
-    def sample_edge_targets(
-        self,
-        *,
-        batch: Any,
-        device: torch.device,
-        num_rollouts: int,
-        temperature: float,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        self._validate_batch_inputs(
-            batch,
-            device=device,
-            require_rollout=True,
-            is_training=False,
-        )
-        inputs = self.batch_processor.prepare_rollout_inputs(batch, device)
-        num_graphs = int(inputs.node_ptr.numel() - 1)
-        graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
-        edge_targets = torch.zeros(inputs.edge_batch.numel(), device=device, dtype=torch.bool)
-        success_counts = torch.zeros(num_graphs, device=device, dtype=torch.long)
-        for _ in range(num_rollouts):
-            rollout = self.actor.rollout(
-                graph=graph_cache,
-                temperature=temperature,
-                record_actions=False,
-                record_visited=False,
-            )
-            reach_success = rollout.reach_success.to(device=device, dtype=torch.bool)
-            success_counts += reach_success.to(dtype=torch.long)
-            selected_mask = rollout.selected_mask.to(device=device, dtype=torch.bool)
-            if selected_mask.numel() != edge_targets.numel():
-                raise ValueError("selected_mask length mismatch in sample_edge_targets.")
-            edge_targets |= selected_mask & reach_success[inputs.edge_batch]
-        metrics = {
-            "success_counts": success_counts,
-            "num_rollouts": torch.full_like(success_counts, int(num_rollouts)),
-        }
-        return edge_targets.to(dtype=torch.float32), metrics
 
     def _validate_batch_inputs(
         self,
@@ -820,18 +2076,18 @@ class GFlowNetEngine:
         rollout: RolloutResult,
         *,
         inputs: RolloutInputs,
+        graph_cache: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, Any]:
+        if graph_cache is None:
+            raise ValueError("graph_cache required for reward computation.")
+        node_is_target = graph_cache.get("node_is_target") or graph_cache.get("node_is_answer")
+        if node_is_target is None:
+            raise ValueError("node_is_target missing from graph_cache; reward_fn requires explicit flags.")
         return {
-            "answer_hit": rollout.reach_success,
-            "answer_node_locals": inputs.answer_node_locals,
             "dummy_mask": inputs.dummy_mask,
-            "edge_index": inputs.edge_index,
             "node_ptr": inputs.node_ptr,
-            "node_min_dists": inputs.node_min_dists,
-            "path_length": rollout.length,
-            "start_node_locals": inputs.start_node_locals,
-            "start_ptr": inputs.start_ptr,
             "stop_node_locals": rollout.stop_node_locals,
+            "node_is_target": node_is_target,
         }
 
     def build_reward_kwargs(
@@ -839,35 +2095,38 @@ class GFlowNetEngine:
         rollout: RolloutResult,
         *,
         inputs: RolloutInputs,
+        graph_cache: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, Any]:
-        return self._build_reward_kwargs(rollout, inputs=inputs)
+        return self._build_reward_kwargs(rollout, inputs=inputs, graph_cache=graph_cache)
 
-    def _compute_trust_radius(
-        self,
-        *,
-        node_min_dists: torch.Tensor,
-        node_batch: torch.Tensor,
-        num_graphs: int,
-        spec: DualStreamSpec,
-        progress: float,
-    ) -> torch.Tensor:
-        if num_graphs <= _ZERO:
-            return torch.zeros((num_graphs,), device=node_min_dists.device, dtype=torch.long)
-        if spec.schedule != _DUAL_STREAM_SCHEDULE_LINEAR:
-            raise ValueError(f"Unsupported dual stream schedule: {spec.schedule!r}.")
-        max_dist, _ = scatter_max(node_min_dists, node_batch, dim=0, dim_size=num_graphs)
-        if (max_dist < _ZERO).any():
-            raise ValueError("node_min_dists contains only unreachable nodes; dual stream expects reachable graphs.")
-        max_dist = max_dist.to(dtype=torch.float32)
-        if spec.max_dist is not None:
-            max_cap = torch.full_like(max_dist, float(spec.max_dist))
-            max_dist = torch.minimum(max_dist, max_cap)
-        min_dist = torch.full_like(max_dist, float(spec.min_dist))
-        max_dist = torch.maximum(max_dist, min_dist)
-        progress = float(max(min(progress, float(_ONE)), float(_ZERO)))
-        radius = min_dist + progress * (max_dist - min_dist)
-        radius = torch.floor(radius).to(dtype=torch.long)
-        return torch.maximum(radius, min_dist.to(dtype=torch.long))
+    @staticmethod
+    def _compute_stream_forward_weight(*, spec: DualStreamSpec, progress: Optional[float]) -> float:
+        weight_end = float(spec.stream_forward_weight)
+        schedule = spec.stream_forward_weight_schedule
+        if schedule == _DUAL_STREAM_WEIGHT_SCHEDULE_NONE:
+            return weight_end
+        if progress is None:
+            return weight_end
+        progress_val = float(max(min(progress, float(_ONE)), float(_ZERO)))
+        start = float(spec.stream_forward_weight_start)
+        if schedule == _DUAL_STREAM_WEIGHT_SCHEDULE_LINEAR:
+            scale = progress_val
+        elif schedule == _DUAL_STREAM_WEIGHT_SCHEDULE_COSINE:
+            half = float(_ONE) / float(_TWO)
+            scale = half * (float(_ONE) - math.cos(float(_PI) * progress_val))
+        else:
+            raise ValueError(f"Unsupported stream_forward_weight_schedule: {schedule!r}.")
+        return start + (weight_end - start) * scale
+
+    def resolve_stream_forward_weight_progress(self, *, current_epoch: int) -> Optional[float]:
+        spec = self._resolve_dual_stream_spec(is_training=True)
+        if spec is None:
+            return None
+        anneal_epochs = spec.stream_forward_weight_anneal_epochs
+        if anneal_epochs is None:
+            return None
+        epoch = max(int(current_epoch) + _ONE, _ZERO)
+        return min(max(epoch / float(anneal_epochs), float(_ZERO)), float(_ONE))
 
     def _sample_nodes_from_ptr(
         self,
@@ -893,7 +2152,7 @@ class GFlowNetEngine:
         counts = (ptr[_ONE:] - ptr[:-_ONE]).to(dtype=torch.long)
         has_nodes = counts > _ZERO
         if fallback is None:
-            if bool((~has_nodes).any().item()):
+            if bool((~has_nodes).any().detach().tolist()):
                 raise ValueError("Empty node list encountered in node sampling.")
             return selected
         fallback = fallback.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
@@ -933,48 +2192,53 @@ class GFlowNetEngine:
             spec=self.flow_spec,
         )
 
-    def _build_stream_a_override(
+    def _resolve_flow_features(
         self,
         *,
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
-        trust_radius: torch.Tensor,
-        spec: DualStreamSpec,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._build_stream_a_override_from_tensors(
-            node_ptr=inputs.node_ptr,
-            node_batch=graph_cache["node_batch"],
-            node_q_min_dists=inputs.node_q_min_dists,
-            node_min_dists=inputs.node_min_dists,
-            trust_radius=trust_radius,
-            spec=spec,
-            start_node_locals=inputs.start_node_locals,
-            start_ptr=inputs.start_ptr,
-        )
+    ) -> torch.Tensor:
+        cached = graph_cache.get("flow_features")
+        if cached is not None:
+            return cached
+        flow_features = self._compute_flow_features(inputs)
+        graph_cache["flow_features"] = flow_features
+        return flow_features
 
-    def _build_stream_a_override_from_tensors(
-        self,
-        *,
-        node_ptr: torch.Tensor,
-        node_batch: torch.Tensor,
-        node_q_min_dists: torch.Tensor,
-        node_min_dists: torch.Tensor,
-        trust_radius: torch.Tensor,
-        spec: DualStreamSpec,
-        start_node_locals: torch.Tensor,
-        start_ptr: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_graphs = int(node_ptr.numel() - 1)
-        node_mask = (node_q_min_dists >= _ZERO) & (node_min_dists >= _ZERO)
-        start_nodes = self._sample_nodes_from_mask(
-            node_mask=node_mask,
-            node_batch=node_batch,
-            num_graphs=num_graphs,
-            fallback_nodes=start_node_locals,
-            fallback_ptr=start_ptr,
-        )
-        start_ptr_override = torch.arange(num_graphs + _ONE, device=node_ptr.device, dtype=torch.long)
-        return start_nodes, start_ptr_override
+    def _resolve_actor_for_log_f(self, log_f_module: torch.nn.Module) -> GFlowNetActor:
+        if log_f_module is self.log_f_backward:
+            return self.actor_backward
+        return self.actor
+
+    def _resolve_actor_for_flow(self, flow_modules: FlowModules) -> GFlowNetActor:
+        if flow_modules.log_f is self.log_f_backward:
+            return self.actor_backward
+        return self.actor
+
+    def _resolve_flow_modules(self, *, direction: str) -> FlowModules:
+        if direction == "backward":
+            log_f = self.log_f_backward
+        else:
+            log_f = self.log_f
+        return FlowModules(log_f=log_f)
+
+    def _should_apply_h_guidance(self, *, flow_modules: FlowModules) -> bool:
+        if self._h_guidance_spec is None:
+            return False
+        return flow_modules.log_f is self.log_f
+
+    def _resolve_h_guidance_beta(self, *, progress: Optional[float], is_training: bool) -> float:
+        spec = self._h_guidance_spec
+        if spec is None:
+            return float(_ZERO)
+        if not is_training:
+            return float(spec.beta_end) if spec.apply_eval else float(_ZERO)
+        if progress is None:
+            return float(spec.beta_start)
+        progress_val = float(max(min(progress, float(_ONE)), float(_ZERO)))
+        if progress_val < float(spec.warmup_progress):
+            return float(spec.beta_start)
+        return float(spec.beta_end)
 
     @staticmethod
     def _swap_start_override(
@@ -1007,28 +2271,350 @@ class GFlowNetEngine:
         batch.start_override_locals = prev_nodes
         batch.start_override_ptr = prev_ptr
 
+    def _assert_inverse_relations_present(self, edge_relations: torch.Tensor) -> None:
+        inverse_map = self._relation_inverse_map
+        if inverse_map is None:
+            raise RuntimeError("Backward stream requires relation_inverse_map to validate inverse relations.")
+        edge_relations = edge_relations.to(device=inverse_map.device, dtype=torch.long).view(-1)
+        if edge_relations.numel() == _ZERO:
+            return
+        rel_ids = torch.unique(edge_relations)
+        inv_ids = inverse_map.index_select(0, rel_ids)
+        if bool((inv_ids < _ZERO).any().detach().tolist()):
+            bad = inv_ids[inv_ids < _ZERO][:5].tolist()
+            raise ValueError(f"relation_inverse_map contains invalid ids (preview): {bad}.")
+        max_id = int(torch.stack((rel_ids.max(), inv_ids.max())).max().detach().tolist())
+        present = torch.zeros(max_id + _ONE, device=rel_ids.device, dtype=torch.bool)
+        present.index_fill_(0, rel_ids, True)
+        missing = ~present.index_select(0, inv_ids)
+        if bool(missing.any().detach().tolist()):
+            preview = inv_ids[missing][:5].tolist()
+            raise ValueError(
+                "Backward stream requires inverse relations present in the graph "
+                f"(missing inverse ids preview: {preview})."
+            )
+
+    def _build_inverse_edge_ids(
+        self,
+        *,
+        edge_index: torch.Tensor,
+        edge_relations: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        inverse_map = self._relation_inverse_map
+        if inverse_map is None:
+            raise RuntimeError("relation_inverse_map is required to build inverse edge ids.")
+        if edge_index.numel() == _ZERO:
+            return torch.zeros((0,), device=edge_index.device, dtype=torch.long)
+        edge_relations = edge_relations.to(device=edge_index.device, dtype=torch.long).view(-1)
+        if bool((edge_relations < _ZERO).any().detach().tolist()):
+            bad = edge_relations[edge_relations < _ZERO][:_EDGE_INV_PREVIEW].tolist()
+            raise ValueError(f"edge_relations contain invalid ids for inverse mapping (preview: {bad}).")
+        inv_relations = inverse_map.index_select(0, edge_relations)
+        if bool((inv_relations < _ZERO).any().detach().tolist()):
+            bad = inv_relations[inv_relations < _ZERO][:_EDGE_INV_PREVIEW].tolist()
+            raise ValueError(f"relation_inverse_map missing ids for edges (preview: {bad}).")
+        heads = edge_index[_ZERO].to(dtype=torch.long)
+        tails = edge_index[_ONE].to(dtype=torch.long)
+        num_relations = int(inverse_map.numel())
+        stride_tail = num_relations
+        stride_head = num_nodes * num_relations
+        edge_keys = heads * stride_head + tails * stride_tail + edge_relations
+        inv_keys = tails * stride_head + heads * stride_tail + inv_relations
+        sorted_keys, sorted_idx = torch.sort(edge_keys)
+        if sorted_keys.numel() > _ONE:
+            dup = sorted_keys[1:] == sorted_keys[:-1]
+            if bool(dup.any().detach().tolist()):
+                preview = sorted_keys[1:][dup][:_EDGE_INV_PREVIEW].tolist()
+                raise ValueError(f"Duplicate edges detected while building inverse map (preview: {preview}).")
+        pos = torch.searchsorted(sorted_keys, inv_keys)
+        num_keys = int(sorted_keys.numel())
+        max_pos = max(num_keys - _ONE, _ZERO)
+        pos_safe = pos.clamp(min=_ZERO, max=max_pos)
+        matched = sorted_keys.index_select(0, pos_safe) == inv_keys
+        within = pos < num_keys
+        valid = within & matched
+        if not bool(valid.all().detach().tolist()):
+            preview = inv_keys[~valid][:_EDGE_INV_PREVIEW].tolist()
+            raise ValueError(f"Missing inverse edges for backward policy (preview keys: {preview}).")
+        return sorted_idx.index_select(0, pos_safe)
+
+    def _attach_inverse_edge_mask(self, graph_cache: Dict[str, torch.Tensor]) -> None:
+        if self._relation_is_inverse is None:
+            return
+        edge_relations = graph_cache.get("edge_relations")
+        if edge_relations is None:
+            raise ValueError("edge_relations required to build inverse edge mask.")
+        rel_ids = edge_relations.to(device=self._relation_is_inverse.device, dtype=torch.long).view(-1)
+        mask = self._relation_is_inverse.index_select(0, rel_ids)
+        graph_cache["edge_is_inverse"] = mask.to(device=edge_relations.device, dtype=torch.bool)
+
+    def _prepare_backward_inputs(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        temperature: Optional[float],
+        is_training: bool,
+    ) -> tuple[RolloutInputs, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+        self._assert_inverse_relations_present(inputs.edge_relations)
+        sink_spec = self._resolve_sink_selection_spec(
+            temperature=temperature,
+            is_training=is_training,
+            log_f_module=self.log_f_backward,
+        )
+        if sink_spec is None:
+            start_nodes = inputs.answer_node_locals
+            start_ptr = inputs.answer_ptr
+            log_pf_start = None
+        else:
+            selection = self._apply_sink_selection(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=sink_spec,
+                is_training=is_training,
+            )
+            start_nodes = selection.inputs.start_node_locals
+            start_ptr = selection.inputs.start_ptr
+            log_pf_start = selection.log_pf_start
+        answer_context = self._compute_answer_context_tokens(
+            inputs,
+            node_locals=start_nodes,
+            node_ptr=start_ptr,
+        )
+        back_inputs = replace(
+            inputs,
+            question_tokens=answer_context,
+            start_node_locals=start_nodes,
+            start_ptr=start_ptr,
+            answer_node_locals=inputs.start_node_locals,
+            answer_ptr=inputs.start_ptr,
+        )
+        back_graph_cache = self.batch_processor.build_graph_cache(back_inputs, device=inputs.node_ptr.device)
+        self._attach_inverse_edge_mask(back_graph_cache)
+        return back_inputs, back_graph_cache, log_pf_start
+
+    @staticmethod
+    def _swap_stream_direction_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, Any, Any]:
+        q_local = getattr(batch, "q_local_indices", None)
+        a_local = getattr(batch, "a_local_indices", None)
+        if not torch.is_tensor(q_local) or not torch.is_tensor(a_local):
+            raise ValueError("Batch missing q_local_indices/a_local_indices required for stream swap.")
+        slice_dict = getattr(batch, "_slice_dict", None)
+        if not isinstance(slice_dict, dict):
+            raise ValueError("Batch missing _slice_dict required for stream swap.")
+        q_ptr = slice_dict.get("q_local_indices")
+        a_ptr = slice_dict.get("a_local_indices")
+        if q_ptr is None or a_ptr is None:
+            raise ValueError("Batch missing q_local_indices/a_local_indices ptr for stream swap.")
+        batch.q_local_indices, batch.a_local_indices = a_local, q_local
+        slice_dict["q_local_indices"], slice_dict["a_local_indices"] = a_ptr, q_ptr
+        return q_local, a_local, q_ptr, a_ptr
+
+    @staticmethod
+    def _restore_stream_direction_batch(
+        batch: Any,
+        prev_q_local: torch.Tensor,
+        prev_a_local: torch.Tensor,
+        prev_q_ptr: Any,
+        prev_a_ptr: Any,
+    ) -> None:
+        slice_dict = getattr(batch, "_slice_dict", None)
+        if not isinstance(slice_dict, dict):
+            raise ValueError("Batch missing _slice_dict required for stream restore.")
+        batch.q_local_indices = prev_q_local
+        batch.a_local_indices = prev_a_local
+        slice_dict["q_local_indices"] = prev_q_ptr
+        slice_dict["a_local_indices"] = prev_a_ptr
+
+    @staticmethod
+    def _build_start_node_matrix(
+        *,
+        start_nodes: torch.Tensor,
+        start_ptr: torch.Tensor,
+        num_graphs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        start_nodes = start_nodes.to(device=start_ptr.device, dtype=torch.long).view(-1)
+        start_ptr = start_ptr.to(device=start_ptr.device, dtype=torch.long).view(-1)
+        if start_ptr.numel() != num_graphs + _ONE:
+            raise ValueError("start_ptr length mismatch for log_f_start.")
+        counts = start_ptr[_ONE:] - start_ptr[:-_ONE]
+        if not bool((counts > _ZERO).all().detach().tolist()):
+            raise ValueError("start_node_locals missing for some graphs; filter_missing_start required.")
+        total = int(start_nodes.numel())
+        if total != int(counts.sum().detach().tolist()):
+            raise ValueError("start_node_locals length mismatch with start_ptr counts.")
+        max_count = int(counts.max().detach().tolist())
+        graph_ids = torch.repeat_interleave(torch.arange(num_graphs, device=start_ptr.device), counts)
+        offsets = torch.arange(total, device=start_ptr.device) - start_ptr.index_select(0, graph_ids)
+        state_nodes = torch.zeros((num_graphs, max_count), device=start_ptr.device, dtype=torch.long)
+        state_nodes.index_put_((graph_ids, offsets), start_nodes)
+        col_ids = torch.arange(max_count, device=start_ptr.device).view(1, -1)
+        valid_mask = col_ids < counts.view(-1, 1)
+        return state_nodes, valid_mask
+
+    def _compute_initial_hidden(
+        self,
+        *,
+        inputs: RolloutInputs,
+        actor: GFlowNetActor,
+        start_node_locals: Optional[torch.Tensor] = None,
+        start_ptr: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        device = inputs.node_ptr.device
+        if num_graphs <= _ZERO:
+            return torch.zeros((num_graphs, actor.agent.hidden_dim), device=device, dtype=inputs.node_tokens.dtype)
+        if actor.context_mode == "question":
+            return actor.agent.initialize_state(inputs.question_tokens)
+        if actor.context_mode == "start_node":
+            if start_node_locals is None:
+                start_node_locals = inputs.start_node_locals
+            if start_ptr is None:
+                start_ptr = inputs.start_ptr
+            start_nodes, has_start = GFlowNetBatchProcessor.compute_single_start_nodes(
+                start_node_locals=start_node_locals,
+                start_ptr=start_ptr,
+                num_graphs=num_graphs,
+                device=device,
+            )
+            node_tokens = inputs.node_tokens.index_select(0, start_nodes.clamp(min=_ZERO))
+            valid = has_start.to(device=node_tokens.device, dtype=torch.bool)
+            context_tokens = torch.where(valid.unsqueeze(-1), node_tokens, torch.zeros_like(node_tokens))
+            return actor.agent.initialize_state(context_tokens)
+        raise ValueError(f"Unknown actor.context_mode: {actor.context_mode!r}.")
+
+    def _compute_answer_context_tokens(
+        self,
+        inputs: RolloutInputs,
+        *,
+        node_locals: Optional[torch.Tensor] = None,
+        node_ptr: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        device = inputs.node_ptr.device
+        if num_graphs <= _ZERO:
+            return torch.zeros((num_graphs, inputs.node_tokens.size(-1)), device=device, dtype=inputs.node_tokens.dtype)
+        node_locals = inputs.answer_node_locals if node_locals is None else node_locals
+        node_ptr = inputs.answer_ptr if node_ptr is None else node_ptr
+        answer_nodes, has_answer = GFlowNetBatchProcessor.compute_single_start_nodes(
+            start_node_locals=node_locals,
+            start_ptr=node_ptr,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        node_tokens = inputs.node_tokens.index_select(0, answer_nodes.clamp(min=_ZERO))
+        valid = has_answer.to(device=node_tokens.device, dtype=torch.bool)
+        return torch.where(valid.unsqueeze(-1), node_tokens, torch.zeros_like(node_tokens))
+
+    def _build_start_state_vec(
+        self,
+        *,
+        inputs: RolloutInputs,
+        actor: GFlowNetActor,
+        state_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        num_graphs, num_steps = state_nodes.shape
+        device = inputs.node_ptr.device
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            return torch.zeros((num_graphs, num_steps, actor.agent.hidden_dim), device=device, dtype=inputs.node_tokens.dtype)
+        if actor.context_mode == "question":
+            hidden = actor.agent.initialize_state(inputs.question_tokens)
+            return hidden.unsqueeze(1).expand(num_graphs, num_steps, -1)
+        if actor.context_mode == "start_node":
+            node_tokens = inputs.node_tokens.index_select(0, state_nodes.to(device=device, dtype=torch.long).view(-1))
+            hidden_flat = actor.agent.initialize_state(node_tokens)
+            return hidden_flat.view(num_graphs, num_steps, -1)
+        raise ValueError(f"Unknown actor.context_mode: {actor.context_mode!r}.")
+
+    def _build_action_token_sequence(
+        self,
+        *,
+        actions: torch.Tensor,
+        inputs: RolloutInputs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if actions.dim() != _TWO:
+            raise ValueError("actions must be [B, T] for action token encoding.")
+        num_graphs, num_steps = actions.shape
+        device = inputs.node_ptr.device
+        action_mask = actions >= _ZERO
+        token_dim = int(inputs.node_tokens.size(-1))
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            zeros = torch.zeros((num_graphs, num_steps, token_dim), device=device, dtype=inputs.node_tokens.dtype)
+            return zeros, zeros, action_mask
+        num_edges = int(inputs.edge_index.size(1))
+        if num_edges <= _ZERO:
+            zeros = torch.zeros((num_graphs, num_steps, token_dim), device=device, dtype=inputs.node_tokens.dtype)
+            return zeros, zeros, action_mask
+        action_ids = actions.to(device=device, dtype=torch.long).clamp(min=_ZERO)
+        flat_ids = action_ids.view(-1)
+        relation_tokens = inputs.relation_tokens.index_select(0, flat_ids).view(num_graphs, num_steps, -1)
+        tail_nodes = inputs.edge_index[_ONE].index_select(0, flat_ids).view(num_graphs, num_steps)
+        node_tokens = inputs.node_tokens.index_select(0, tail_nodes.view(-1)).view(num_graphs, num_steps, -1)
+        return relation_tokens, node_tokens, action_mask
+
+    def _compute_state_sequence(
+        self,
+        *,
+        actions: torch.Tensor,
+        inputs: RolloutInputs,
+        actor: GFlowNetActor,
+        start_node_locals: Optional[torch.Tensor] = None,
+        start_ptr: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        relation_tokens, node_tokens, action_mask = self._build_action_token_sequence(actions=actions, inputs=inputs)
+        hidden = self._compute_initial_hidden(
+            inputs=inputs,
+            actor=actor,
+            start_node_locals=start_node_locals,
+            start_ptr=start_ptr,
+        )
+        state_seq, output_seq = actor.agent.encode_state_sequence(
+            hidden=hidden,
+            relation_tokens=relation_tokens,
+            node_tokens=node_tokens,
+            action_mask=action_mask,
+        )
+        lengths = action_mask.to(dtype=torch.long).sum(dim=1)
+        return state_seq, output_seq, lengths, action_mask
+
     def _compute_log_f_start(
         self,
         *,
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
+        log_f_module: torch.nn.Module,
+        start_node_locals: Optional[torch.Tensor] = None,
+        start_ptr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_graphs = int(inputs.node_ptr.numel() - 1)
         if num_graphs <= _ZERO:
             return torch.zeros((num_graphs,), device=inputs.node_ptr.device, dtype=torch.float32)
-        start_nodes = inputs.start_node_locals
-        if start_nodes.numel() == _ZERO:
-            raise ValueError("start_node_locals must be non-empty for log_f initialization.")
-        node_batch = graph_cache["node_batch"]
-        start_batch = node_batch.index_select(0, start_nodes)
-        log_f_nodes = self.log_f(
-            node_tokens=inputs.node_tokens.index_select(0, start_nodes),
-            question_tokens=inputs.question_tokens,
-            graph_features=flow_features,
-            node_batch=start_batch,
+        if start_node_locals is None:
+            start_node_locals = inputs.start_node_locals
+        if start_ptr is None:
+            start_ptr = inputs.start_ptr
+        start_node_locals = start_node_locals.to(device=inputs.node_ptr.device, dtype=torch.long)
+        start_ptr = start_ptr.to(device=inputs.node_ptr.device, dtype=torch.long)
+        state_nodes, valid_mask = self._build_start_node_matrix(
+            start_nodes=start_node_locals,
+            start_ptr=start_ptr,
+            num_graphs=num_graphs,
         )
-        return segment_logsumexp_1d(log_f_nodes, start_batch, num_graphs)
+        actor = self._resolve_actor_for_log_f(log_f_module)
+        state_vec = self._build_start_state_vec(inputs=inputs, actor=actor, state_nodes=state_nodes)
+        log_f_states = self._compute_log_f_states(
+            log_f_module=log_f_module,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            flow_features=flow_features,
+            state_nodes=state_nodes,
+            state_vec=state_vec,
+        )
+        neg_inf = neg_inf_value(log_f_states)
+        masked = torch.where(valid_mask, log_f_states, torch.full_like(log_f_states, neg_inf))
+        return torch.logsumexp(masked, dim=1)
 
     def _compute_log_f_stop(
         self,
@@ -1037,43 +2623,738 @@ class GFlowNetEngine:
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
         stop_node_locals: torch.Tensor,
+        state_vec_stop: torch.Tensor,
+        log_f_module: torch.nn.Module,
     ) -> torch.Tensor:
         num_graphs = int(inputs.node_ptr.numel() - 1)
         if stop_node_locals.numel() != num_graphs:
             raise ValueError("stop_node_locals length mismatch for log_f_stop.")
+        if state_vec_stop.dim() != _TWO or state_vec_stop.size(0) != num_graphs:
+            raise ValueError("state_vec_stop must be [B, S] for log_f_stop.")
         stop_local = stop_node_locals.to(device=inputs.node_ptr.device, dtype=torch.long).view(-1)
         valid = stop_local >= _ZERO
         stop_local = stop_local.clamp(min=_ZERO)
         stop_global = inputs.node_ptr[:-1] + stop_local
         node_batch = graph_cache["node_batch"].index_select(0, stop_global)
-        log_f_stop = self.log_f(
+        state_vec_nodes = state_vec_stop.index_select(0, node_batch)
+        log_f_stop = log_f_module(
             node_tokens=inputs.node_tokens.index_select(0, stop_global),
             question_tokens=inputs.question_tokens,
             graph_features=flow_features,
+            state_vec=state_vec_nodes,
             node_batch=node_batch,
         )
-        if not bool(valid.all().item()):
+        if not bool(valid.all().detach().tolist()):
             log_f_stop = torch.where(valid, log_f_stop, torch.zeros_like(log_f_stop))
         return log_f_stop
 
-    def _build_gate_mask(
+    def _compute_start_nodes(self, *, inputs: RolloutInputs) -> torch.Tensor:
+        num_graphs = int(inputs.node_ptr.numel() - 1)
+        device = inputs.node_ptr.device
+        start_nodes, _ = GFlowNetBatchProcessor.compute_single_start_nodes(
+            start_node_locals=inputs.start_node_locals,
+            start_ptr=inputs.start_ptr,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        return start_nodes
+
+    def _build_state_nodes(
+        self,
+        *,
+        actions: torch.Tensor,
+        inputs: RolloutInputs,
+    ) -> torch.Tensor:
+        if actions.dim() != _TWO:
+            raise ValueError("actions must be [B, T] for state node reconstruction.")
+        num_graphs, num_steps = actions.shape
+        device = inputs.edge_index.device
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            return torch.zeros((num_graphs, num_steps), device=device, dtype=torch.long)
+        start_nodes = self._compute_start_nodes(inputs=inputs).to(device=device, dtype=torch.long)
+        if inputs.edge_index.numel() == _ZERO:
+            return start_nodes.view(-1, 1).expand(num_graphs, num_steps)
+        actions = actions.to(device=device, dtype=torch.long)
+        action_ids = actions.clamp(min=_ZERO)
+        flat_ids = action_ids.view(-1)
+        tails = inputs.edge_index[_ONE].index_select(0, flat_ids).view(num_graphs, num_steps)
+        step_ids = torch.arange(num_steps, device=device, dtype=torch.long).view(1, -1).expand(num_graphs, -1)
+        valid_idx = torch.where(actions >= _ZERO, step_ids, torch.full_like(step_ids, -_ONE))
+        last_idx = torch.cummax(valid_idx, dim=1).values
+        tail_last = tails.gather(1, last_idx.clamp(min=_ZERO))
+        node_after = torch.where(last_idx >= _ZERO, tail_last, start_nodes.view(-1, 1))
+        state_nodes = torch.empty((num_graphs, num_steps), device=device, dtype=torch.long)
+        state_nodes[:, 0] = start_nodes
+        if num_steps > _ONE:
+            state_nodes[:, 1:] = node_after[:, :-1]
+        return state_nodes
+
+    def _compute_stop_node_locals_from_actions(
+        self,
+        *,
+        actions: torch.Tensor,
+        inputs: RolloutInputs,
+    ) -> torch.Tensor:
+        if actions.dim() != _TWO:
+            raise ValueError("actions must be [B, T] for stop node reconstruction.")
+        num_graphs, num_steps = actions.shape
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            return torch.full((num_graphs,), _STOP_NODE_NONE, device=actions.device, dtype=torch.long)
+        state_nodes = self._build_state_nodes(actions=actions, inputs=inputs)
+        stop_mask = actions == STOP_RELATION
+        has_stop = stop_mask.any(dim=1)
+        lengths = (actions >= _ZERO).to(dtype=torch.long).sum(dim=1)
+        stop_idx = torch.where(has_stop, stop_mask.to(dtype=torch.long).argmax(dim=1), lengths.clamp(max=num_steps - _ONE))
+        stop_nodes = state_nodes.gather(1, stop_idx.view(-1, _ONE)).squeeze(1)
+        stop_locals, has_active = GFlowNetActor._resolve_current_stop_locals(
+            curr_nodes=stop_nodes,
+            node_ptr=inputs.node_ptr,
+            dtype=torch.long,
+        )
+        valid = has_stop & has_active
+        return torch.where(valid, stop_locals, torch.full_like(stop_locals, _STOP_NODE_NONE))
+
+    def _compute_state_vec_sequence(
+        self,
+        *,
+        actions: torch.Tensor,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_modules: FlowModules,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if actions.dim() != _TWO:
+            raise ValueError("actions must be [B, T] for state reconstruction.")
+        actor = self._resolve_actor_for_flow(flow_modules)
+        state_vec, _, lengths, _ = self._compute_state_sequence(actions=actions, inputs=inputs, actor=actor)
+        return state_vec, lengths
+
+    @staticmethod
+    def _build_edge_tail_matrix(
+        *,
+        edge_index: torch.Tensor,
+        edge_batch: torch.Tensor,
+        edge_ptr: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        num_edges = int(edge_index.size(1))
+        num_graphs = int(edge_ptr.numel() - 1)
+        if num_edges <= _ZERO or num_graphs <= _ZERO:
+            return None, None, _ZERO
+        edge_batch = edge_batch.to(device=edge_index.device, dtype=torch.long).view(-1)
+        edge_ptr = edge_ptr.to(device=edge_index.device, dtype=torch.long).view(-1)
+        edge_counts = edge_ptr[_ONE:] - edge_ptr[:-_ONE]
+        max_edges = int(edge_counts.max().detach().tolist()) if edge_counts.numel() > _ZERO else _ZERO
+        if max_edges <= _ZERO:
+            return None, None, _ZERO
+        edge_ids = torch.arange(num_edges, device=edge_index.device, dtype=torch.long)
+        edge_offsets = edge_ids - edge_ptr.index_select(0, edge_batch)
+        tail_nodes = torch.zeros((num_graphs, max_edges), device=edge_index.device, dtype=torch.long)
+        tail_nodes.index_put_((edge_batch, edge_offsets), edge_index[_ONE].to(dtype=torch.long), accumulate=False)
+        return tail_nodes, edge_offsets, max_edges
+
+    def _compute_h_guidance(
+        self,
+        *,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_features: torch.Tensor,
+        context_hidden: torch.Tensor,
+        context_tokens: torch.Tensor,
+        valid_edges: Optional[torch.Tensor],
+        log_f_module: torch.nn.Module,
+        stop_gradient: bool,
+    ) -> torch.Tensor:
+        edge_index = graph_cache["edge_index"]
+        num_edges = int(edge_index.size(1))
+        if num_edges <= _ZERO:
+            return torch.zeros((num_edges,), device=edge_index.device, dtype=torch.float32)
+        edge_batch = graph_cache["edge_batch"].to(device=edge_index.device, dtype=torch.long).view(-1)
+        edge_tail_nodes = edge_index[_ONE]
+        node_tokens = graph_cache["node_tokens"].index_select(0, edge_tail_nodes)
+        hidden_edges = context_hidden.index_select(0, edge_batch)
+
+        def _compute_log_f() -> torch.Tensor:
+            node_batch = graph_cache["node_batch"].index_select(0, edge_tail_nodes)
+            return log_f_module(
+                node_tokens=node_tokens,
+                question_tokens=context_tokens,
+                graph_features=flow_features,
+                state_vec=hidden_edges,
+                node_batch=node_batch,
+            )
+
+        if stop_gradient:
+            with torch.no_grad():
+                log_f_flat = _compute_log_f()
+        else:
+            log_f_flat = _compute_log_f()
+        if valid_edges is not None:
+            valid_mask = valid_edges.to(device=log_f_flat.device, dtype=torch.bool).view(-1)
+            log_f_flat = torch.where(valid_mask, log_f_flat, torch.zeros_like(log_f_flat))
+        return log_f_flat
+
+    def _build_h_guidance_fn(
         self,
         *,
         inputs: RolloutInputs,
-        stop_node_locals: torch.Tensor,
-        trust_radius: torch.Tensor,
-        delta: int,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_features: torch.Tensor,
+        beta: float,
+    ) -> Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]]:
+        spec = self._h_guidance_spec
+        if spec is None or beta <= float(_ZERO):
+            return None
+        log_f_module = self.log_f_backward
+        stop_gradient = spec.stop_gradient
+        scale = float(spec.scale)
+        answer_context = self._compute_answer_context_tokens(inputs)
+        context_hidden = self._compute_initial_hidden(
+            inputs=inputs,
+            actor=self.actor_backward,
+            start_node_locals=inputs.answer_node_locals,
+            start_ptr=inputs.answer_ptr,
+        )
+
+        def _guidance(step_counts: torch.Tensor, valid_edges: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+            _ = step_counts
+            _ = hidden
+            log_f = self._compute_h_guidance(
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                context_hidden=context_hidden,
+                context_tokens=answer_context,
+                valid_edges=valid_edges,
+                log_f_module=log_f_module,
+                stop_gradient=stop_gradient,
+            )
+            return log_f * float(beta) * scale
+
+        return _guidance
+
+    def _compute_backward_log_pb_steps(
+        self,
+        *,
+        rollout: RolloutResult,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        temperature: Optional[float],
+        flow_modules: FlowModules,
     ) -> torch.Tensor:
+        if rollout.actions_seq is None:
+            raise RuntimeError("Backward log-prob requires rollout actions; set record_actions=True.")
+        actions = rollout.actions_seq
+        if actions.dim() != _TWO:
+            raise ValueError("actions_seq must be [B, T] for backward log-prob.")
+        num_graphs, num_steps = actions.shape
+        device = actions.device
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            return torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
+        self._assert_inverse_relations_present(inputs.edge_relations)
+        num_nodes_total = int(inputs.node_ptr[-1].detach().tolist()) if inputs.node_ptr.numel() > 0 else _ZERO
+        inverse_edge_ids = self._build_inverse_edge_ids(
+            edge_index=graph_cache["edge_index"],
+            edge_relations=graph_cache["edge_relations"],
+            num_nodes=num_nodes_total,
+        )
+        state_nodes = self._build_state_nodes(actions=actions, inputs=inputs)
+        state_nodes_after = state_nodes.clone()
+        if num_steps > _ONE:
+            state_nodes_after[:, :-1] = state_nodes[:, 1:]
+            state_nodes_after[:, -1] = state_nodes[:, -1]
+        actor = self._resolve_actor_for_flow(flow_modules)
+        _, state_vec_after, lengths, move_mask = self._compute_state_sequence(
+            actions=actions,
+            inputs=inputs,
+            actor=actor,
+        )
+        step_ids = torch.arange(num_steps, device=device, dtype=lengths.dtype).view(1, -1)
+        step_counts_after = (lengths.view(-1, 1) - _ONE - step_ids).clamp(min=_ZERO)
+        edge_index = graph_cache["edge_index"]
+        num_edges = int(edge_index.size(1))
+        if num_edges <= _ZERO:
+            if bool(move_mask.any().detach().tolist()):
+                raise ValueError("Backward log_pb encountered move actions with empty edge_index.")
+            return torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
+        log_pb_steps = torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
+        edge_batch = graph_cache["edge_batch"].to(device=device, dtype=torch.long).view(-1)
+        node_tokens = graph_cache["node_tokens"]
+        relation_tokens = graph_cache["relation_tokens"]
+        action_ids = actions.clamp(min=_ZERO)
+        inv_edge_ids = inverse_edge_ids.index_select(0, action_ids.view(-1)).view(num_graphs, num_steps)
+        inv_edge_ids_t = inv_edge_ids.transpose(0, 1)
+        temp, _ = actor._resolve_temperature(temperature)
+        # Chunk over step dimension to cap repeated edge tensors and avoid OOM on large graphs.
+        max_repeated_edges = max(int(self._log_pb_max_repeated_edges), num_edges, _ONE)
+        block_span = max(_ONE, min(num_steps, max_repeated_edges // max(num_edges, _ONE)))
+        for block_start in range(_ZERO, num_steps, block_span):
+            block_end = min(num_steps, block_start + block_span)
+            block_size = block_end - block_start
+            block_mask = move_mask[:, block_start:block_end]
+            if not bool(block_mask.any().detach().tolist()):
+                continue
+            # Flatten step-major to align with edge_batch_rep (edges repeated per step).
+            state_vec_block = (
+                state_vec_after[:, block_start:block_end, :].transpose(0, 1).reshape(block_size * num_graphs, -1)
+            )
+            curr_nodes_block = state_nodes_after[:, block_start:block_end].transpose(0, 1).reshape(-1)
+            step_counts_block = step_counts_after[:, block_start:block_end].transpose(0, 1).reshape(-1)
+            step_offsets = torch.arange(block_size, device=device, dtype=edge_batch.dtype)
+            step_offsets = step_offsets.repeat_interleave(num_edges)
+            edge_batch_rep = edge_batch.repeat(block_size) + (step_offsets * int(num_graphs))
+            edge_index_rep = edge_index.repeat(1, block_size)
+            heads_rep = edge_index_rep[_ZERO]
+            tails_rep = edge_index_rep[_ONE]
+            edge_tail_tokens = node_tokens.index_select(0, tails_rep)
+            relation_tokens_rep = relation_tokens.repeat(block_size, 1)
+            curr_nodes_per_edge = curr_nodes_block.index_select(0, edge_batch_rep)
+            step_counts_per_edge = step_counts_block.index_select(0, edge_batch_rep)
+            horizon_exhausted = step_counts_per_edge >= int(self.env.max_steps)
+            head_match = heads_rep == curr_nodes_per_edge
+            valid_edges_rep = head_match & (~horizon_exhausted) & (curr_nodes_per_edge >= _ZERO)
+            edge_scores_rep = actor.agent.score(
+                hidden=state_vec_block,
+                relation_tokens=relation_tokens_rep,
+                node_tokens=edge_tail_tokens,
+                edge_batch=edge_batch_rep,
+            )
+            log_prob_edge_rep, _, _, _ = compute_policy_log_probs(
+                edge_logits=edge_scores_rep,
+                stop_logits=None,
+                edge_batch=edge_batch_rep,
+                valid_edges=valid_edges_rep,
+                num_graphs=num_graphs * block_size,
+                temperature=temp,
+                allow_stop=None,
+            )
+            log_prob_edge_steps = log_prob_edge_rep.view(block_size, num_edges)
+            valid_edges_steps = valid_edges_rep.view(block_size, num_edges)
+            inv_edge_ids_block = inv_edge_ids_t[block_start:block_end]
+            log_pb_block_t = log_prob_edge_steps.gather(1, inv_edge_ids_block)
+            edge_valid_block = valid_edges_steps.gather(1, inv_edge_ids_block).transpose(0, 1)
+            log_pb_block = log_pb_block_t.transpose(0, 1)
+            log_pb_block = torch.where(block_mask, log_pb_block, torch.zeros_like(log_pb_block))
+            if bool(block_mask.any().detach().tolist()) and not bool(edge_valid_block[block_mask].all().detach().tolist()):
+                raise ValueError("Backward log_pb encountered invalid parent edges.")
+            log_pb_steps[:, block_start:block_end] = log_pb_block
+        return log_pb_steps
+
+    def _compute_forward_log_pf_steps(
+        self,
+        *,
+        actions: torch.Tensor,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        temperature: Optional[float],
+        flow_modules: FlowModules,
+    ) -> torch.Tensor:
+        if actions.dim() != _TWO:
+            raise ValueError("actions must be [B, T] for forward log-prob.")
+        num_graphs, num_steps = actions.shape
+        device = actions.device
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            return torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
+        edge_index = graph_cache["edge_index"]
+        num_edges = int(edge_index.size(1))
+        move_mask = actions >= _ZERO
+        if num_edges <= _ZERO:
+            if bool(move_mask.any().detach().tolist()):
+                raise ValueError("Forward log_pf encountered move actions with empty edge_index.")
+            return torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
+        actor = self._resolve_actor_for_flow(flow_modules)
+        state_vec, _, lengths, move_mask = self._compute_state_sequence(
+            actions=actions,
+            inputs=inputs,
+            actor=actor,
+        )
+        state_nodes = self._build_state_nodes(actions=actions, inputs=inputs)
+        step_ids = torch.arange(num_steps, device=device, dtype=lengths.dtype).view(1, -1).expand(num_graphs, -1)
+        active_mask = step_ids <= lengths.view(-1, 1)
+        log_pf_steps = torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
+        edge_batch = graph_cache["edge_batch"].to(device=device, dtype=torch.long).view(-1)
+        node_tokens = graph_cache["node_tokens"]
+        relation_tokens = graph_cache["relation_tokens"]
+        temp, _ = actor._resolve_temperature(temperature)
+        max_repeated_edges = max(int(self._log_pb_max_repeated_edges), num_edges, _ONE)
+        block_span = max(_ONE, min(num_steps, max_repeated_edges // max(num_edges, _ONE)))
+        for block_start in range(_ZERO, num_steps, block_span):
+            block_end = min(num_steps, block_start + block_span)
+            block_size = block_end - block_start
+            block_active = active_mask[:, block_start:block_end]
+            if not bool(block_active.any().detach().tolist()):
+                continue
+            state_vec_block = (
+                state_vec[:, block_start:block_end, :].transpose(0, 1).reshape(block_size * num_graphs, -1)
+            )
+            curr_nodes_block = state_nodes[:, block_start:block_end].transpose(0, 1).reshape(-1)
+            step_counts_block = step_ids[:, block_start:block_end].transpose(0, 1).reshape(-1)
+            done_before_block = (~block_active).transpose(0, 1).reshape(-1)
+            step_offsets = torch.arange(block_size, device=device, dtype=edge_batch.dtype)
+            step_offsets = step_offsets.repeat_interleave(num_edges)
+            edge_batch_rep = edge_batch.repeat(block_size) + (step_offsets * int(num_graphs))
+            edge_index_rep = edge_index.repeat(1, block_size)
+            heads_rep = edge_index_rep[_ZERO]
+            tails_rep = edge_index_rep[_ONE]
+            edge_tail_tokens = node_tokens.index_select(0, tails_rep)
+            relation_tokens_rep = relation_tokens.repeat(block_size, 1)
+            curr_nodes_per_edge = curr_nodes_block.index_select(0, edge_batch_rep)
+            step_counts_per_edge = step_counts_block.index_select(0, edge_batch_rep)
+            done_before_per_edge = done_before_block.index_select(0, edge_batch_rep)
+            horizon_exhausted = step_counts_per_edge >= int(self.env.max_steps)
+            head_match = heads_rep == curr_nodes_per_edge
+            valid_edges_rep = head_match & (~horizon_exhausted) & (~done_before_per_edge) & (curr_nodes_per_edge >= _ZERO)
+            edge_scores_rep = actor.agent.score(
+                hidden=state_vec_block,
+                relation_tokens=relation_tokens_rep,
+                node_tokens=edge_tail_tokens,
+                edge_batch=edge_batch_rep,
+            )
+            stop_logits = actor.stop_head(state_vec_block).squeeze(-1)
+            allow_stop = block_active.transpose(0, 1).reshape(-1)
+            log_prob_edge_rep, log_prob_stop_rep, _, _ = compute_policy_log_probs(
+                edge_logits=edge_scores_rep,
+                stop_logits=stop_logits,
+                edge_batch=edge_batch_rep,
+                valid_edges=valid_edges_rep,
+                num_graphs=num_graphs * block_size,
+                temperature=temp,
+                allow_stop=allow_stop,
+            )
+            actions_block = actions[:, block_start:block_end]
+            action_ids = actions_block.clamp(min=_ZERO)
+            step_offsets = torch.arange(block_size, device=device, dtype=action_ids.dtype).view(1, -1) * num_edges
+            flat_idx = (action_ids + step_offsets).view(-1)
+            log_prob_edge_block = log_prob_edge_rep.index_select(0, flat_idx).view(num_graphs, block_size)
+            valid_edge_block = valid_edges_rep.index_select(0, flat_idx).view(num_graphs, block_size)
+            log_prob_stop_block = log_prob_stop_rep.view(block_size, num_graphs).transpose(0, 1)
+            selected = torch.where(actions_block == STOP_RELATION, log_prob_stop_block, log_prob_edge_block)
+            selected = torch.where(block_active, selected, torch.zeros_like(selected))
+            if bool(move_mask[:, block_start:block_end].any().detach().tolist()) and not bool(
+                valid_edge_block[move_mask[:, block_start:block_end]].all().detach().tolist()
+            ):
+                raise ValueError("Forward log_pf encountered invalid chosen edges.")
+            log_pf_steps[:, block_start:block_end] = selected
+        return log_pf_steps
+
+    def _build_replay_actions_from_backward(
+        self,
+        *,
+        rollout: RolloutResult,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if rollout.actions_seq is None:
+            raise RuntimeError("Replay requires rollout actions; set record_actions=True.")
+        actions = rollout.actions_seq
+        if actions.dim() != _TWO:
+            raise ValueError("actions_seq must be [B, T] for replay reversal.")
+        num_graphs, num_steps = actions.shape
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            empty = torch.zeros((num_graphs, num_steps), device=actions.device, dtype=torch.long)
+            mask = torch.zeros((num_graphs,), device=actions.device, dtype=torch.bool)
+            return empty, mask
+        success_mask = rollout.reach_success.to(device=actions.device, dtype=torch.bool).view(-1)
+        move_mask = actions >= _ZERO
+        lengths = move_mask.to(dtype=torch.long).sum(dim=1)
+        max_len = int(lengths.max().detach().tolist()) if lengths.numel() > 0 else _ZERO
+        replay_actions = torch.full_like(actions, STOP_RELATION, dtype=torch.long)
+        if max_len <= _ZERO:
+            return replay_actions, success_mask
+        num_nodes_total = int(inputs.node_ptr[-1].detach().tolist()) if inputs.node_ptr.numel() > 0 else _ZERO
+        inverse_edge_ids = self._build_inverse_edge_ids(
+            edge_index=graph_cache["edge_index"],
+            edge_relations=graph_cache["edge_relations"],
+            num_nodes=num_nodes_total,
+        )
+        step_idx = torch.arange(max_len, device=actions.device, dtype=lengths.dtype).view(1, -1)
+        orig_idx = lengths.view(-1, 1) - _ONE - step_idx
+        valid_rev = orig_idx >= _ZERO
+        orig_idx = orig_idx.clamp(min=_ZERO)
+        backward_edges = actions.gather(1, orig_idx)
+        backward_ids = backward_edges.clamp(min=_ZERO)
+        forward_ids = inverse_edge_ids.index_select(0, backward_ids.view(-1)).view_as(backward_edges)
+        reversed_edges = torch.where(
+            valid_rev,
+            forward_ids,
+            torch.full_like(forward_ids, STOP_RELATION),
+        )
+        replay_actions[:, :max_len] = reversed_edges
+        return replay_actions, success_mask
+
+    def _store_replay_from_backward_rollout(
+        self,
+        *,
+        rollout: RolloutResult,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        sample_ids: Sequence[str],
+    ) -> None:
+        if self._replay_buffer is None:
+            return
+        replay_actions, success_mask = self._build_replay_actions_from_backward(
+            rollout=rollout,
+            inputs=inputs,
+            graph_cache=graph_cache,
+        )
+        if replay_actions.numel() == _ZERO:
+            return
+        if len(sample_ids) != int(replay_actions.size(0)):
+            raise ValueError("Replay sample_ids length mismatch with rollout batch.")
+        self._replay_buffer.add(sample_ids=sample_ids, actions=replay_actions, mask=success_mask)
+
+    def _compute_replay_loss(
+        self,
+        *,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_features: torch.Tensor,
+        flow_modules: FlowModules,
+        temperature: Optional[float],
+        subtb_spec: Optional[SubTrajectorySpec],
+        sample_ids: Sequence[str],
+    ) -> tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if self._replay_spec is None or self._replay_buffer is None:
+            return None, {}
         num_graphs = int(inputs.node_ptr.numel() - 1)
-        stop_local = stop_node_locals.to(device=inputs.node_ptr.device, dtype=torch.long).view(-1)
-        valid = stop_local >= _ZERO
-        stop_global = inputs.node_ptr[:-1] + stop_local.clamp(min=_ZERO)
-        stop_dist = inputs.node_min_dists.index_select(0, stop_global)
-        stop_dist_start = inputs.node_q_min_dists.index_select(0, stop_global)
-        gate = (stop_dist >= _ZERO) & (stop_dist_start >= _ZERO)
-        if not bool(valid.all().item()):
-            gate = gate & valid
-        return gate
+        if len(sample_ids) != num_graphs:
+            raise ValueError("Replay sample_ids length mismatch with batch size.")
+        replay_actions, replay_mask = self._replay_buffer.fetch(sample_ids=sample_ids, device=inputs.node_ptr.device)
+        if not bool(replay_mask.any().detach().tolist()):
+            return None, {"replay/available_frac": torch.zeros((), device=inputs.node_ptr.device)}
+        graph_mask = (~inputs.dummy_mask) & replay_mask
+        if not bool(graph_mask.any().detach().tolist()):
+            return None, {"replay/available_frac": graph_mask.to(dtype=torch.float32).mean()}
+        first_actions = replay_actions[:, _ZERO].to(device=inputs.node_ptr.device, dtype=torch.long)
+        move_first = first_actions >= _ZERO
+        if move_first.any():
+            first_heads = inputs.edge_index[_ZERO].index_select(0, first_actions.clamp(min=_ZERO))
+            start_nodes = torch.where(move_first, first_heads, self._compute_start_nodes(inputs=inputs))
+        else:
+            start_nodes = self._compute_start_nodes(inputs=inputs)
+        start_ptr = torch.arange(num_graphs + _ONE, device=inputs.node_ptr.device, dtype=torch.long)
+        start_spec = self._resolve_start_selection_spec(
+            temperature=temperature,
+            is_training=True,
+            log_f_module=flow_modules.log_f,
+        )
+        log_pf_start = None
+        if start_spec is not None:
+            distribution = self._prepare_start_selection_distribution(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=start_spec,
+            )
+            candidate_nodes = inputs.start_node_locals.to(device=inputs.node_ptr.device, dtype=torch.long).view(-1)
+            start_batch = distribution.candidate_batch
+            selected_per_candidate = start_nodes.index_select(0, start_batch)
+            match = candidate_nodes == selected_per_candidate
+            match_scores = match.to(dtype=torch.long)
+            max_match, match_idx = scatter_max(match_scores, start_batch, dim=0, dim_size=num_graphs)
+            if bool((max_match == _ZERO).any().detach().tolist()):
+                raise ValueError("Replay start nodes missing from start_node_locals candidates.")
+            log_pf_start = distribution.log_probs.index_select(0, match_idx)
+        replay_inputs, replay_cache = self._override_start_nodes(
+            inputs=inputs,
+            graph_cache=graph_cache,
+            start_nodes=start_nodes,
+            start_ptr=start_ptr,
+        )
+        log_f_start = self._compute_log_f_start(
+            inputs=replay_inputs,
+            graph_cache=replay_cache,
+            flow_features=flow_features,
+            log_f_module=flow_modules.log_f,
+        )
+        log_pf_steps = self._compute_forward_log_pf_steps(
+            actions=replay_actions,
+            inputs=replay_inputs,
+            graph_cache=replay_cache,
+            temperature=temperature,
+            flow_modules=flow_modules,
+        )
+        log_pf = log_pf_steps.sum(dim=1)
+        stop_node_locals = self._compute_stop_node_locals_from_actions(actions=replay_actions, inputs=replay_inputs)
+        reach_success = GFlowNetActor._compute_reach_success(stop_node_locals=stop_node_locals, graph=replay_cache)
+        length = (replay_actions >= _ZERO).to(dtype=torch.long).sum(dim=1).to(dtype=torch.float32)
+        rollout = RolloutResult(
+            actions_seq=replay_actions,
+            log_pf=log_pf,
+            log_pf_steps=log_pf_steps,
+            log_pb_steps=torch.zeros_like(log_pf_steps),
+            reach_success=reach_success.to(dtype=torch.float32),
+            length=length,
+            stop_node_locals=stop_node_locals,
+        )
+        log_pb_steps = self._compute_backward_log_pb_steps(
+            rollout=rollout,
+            inputs=replay_inputs,
+            graph_cache=replay_cache,
+            temperature=temperature,
+            flow_modules=flow_modules,
+        )
+        rollout = replace(rollout, log_pb_steps=log_pb_steps)
+        tb_loss, record = self._compute_rollout_loss(
+            rollout=rollout,
+            inputs=replay_inputs,
+            graph_cache=replay_cache,
+            flow_features=flow_features,
+            flow_modules=flow_modules,
+            log_f_start=log_f_start,
+            log_pf_start=log_pf_start,
+            graph_mask=graph_mask,
+            subtb_spec=subtb_spec,
+        )
+        metrics = self._build_rollout_metrics_from_record(record, graph_mask=graph_mask)
+        metrics["replay/available_frac"] = graph_mask.to(dtype=torch.float32).mean()
+        metrics["replay/buffer_size"] = torch.as_tensor(len(self._replay_buffer), device=inputs.node_ptr.device)
+        metrics["replay/loss"] = tb_loss.detach()
+        return tb_loss, metrics
+    @staticmethod
+    def _gather_state_vec_at_step(
+        state_vec: torch.Tensor,
+        step_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if state_vec.dim() != _THREE:
+            raise ValueError("state_vec must be [B, T, S] for step selection.")
+        num_steps = int(state_vec.size(1))
+        if num_steps <= _ZERO:
+            return torch.zeros((state_vec.size(0), state_vec.size(2)), device=state_vec.device, dtype=state_vec.dtype)
+        step_idx = step_idx.to(device=state_vec.device, dtype=torch.long).clamp(min=_ZERO, max=num_steps - _ONE)
+        idx = step_idx.view(-1, 1, 1).expand(-1, 1, state_vec.size(2))
+        return state_vec.gather(1, idx).squeeze(1)
+
+    def _compute_log_f_states(
+        self,
+        *,
+        log_f_module: torch.nn.Module,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_features: torch.Tensor,
+        state_nodes: torch.Tensor,
+        state_vec: torch.Tensor,
+    ) -> torch.Tensor:
+        num_graphs, num_steps = state_nodes.shape
+        if num_graphs <= _ZERO or num_steps <= _ZERO:
+            return torch.zeros((num_graphs, num_steps), device=inputs.node_ptr.device, dtype=torch.float32)
+        if state_vec.dim() != _THREE:
+            raise ValueError("state_vec must be [B, T, S] for log_f states.")
+        if state_vec.size(0) != num_graphs or state_vec.size(1) != num_steps:
+            raise ValueError("state_vec shape mismatch with state_nodes.")
+        flat_nodes = state_nodes.view(-1)
+        node_tokens = inputs.node_tokens.index_select(0, flat_nodes)
+        node_batch = graph_cache["node_batch"].index_select(0, flat_nodes)
+        state_vec_flat = state_vec.reshape(-1, state_vec.size(-1))
+        log_f_flat = log_f_module(
+            node_tokens=node_tokens,
+            question_tokens=inputs.question_tokens,
+            graph_features=flow_features,
+            state_vec=state_vec_flat,
+            node_batch=node_batch,
+        )
+        return log_f_flat.view(num_graphs, num_steps)
+
+    @staticmethod
+    def _sample_subtrajectory_indices(
+        lengths: torch.Tensor,
+        *,
+        num_subtrajectories: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if lengths.dim() != _ONE:
+            raise ValueError("lengths must be [B] for sub-trajectory sampling.")
+        num_graphs = int(lengths.numel())
+        if num_graphs <= _ZERO:
+            empty = torch.zeros((num_graphs, num_subtrajectories), device=lengths.device, dtype=torch.long)
+            return empty, empty
+        lengths = lengths.to(dtype=torch.long)
+        max_start = (lengths - _ONE).clamp(min=_ZERO)
+        max_start_f = (max_start + _ONE).to(dtype=torch.float32)
+        start = torch.floor(
+            torch.rand((num_graphs, num_subtrajectories), device=lengths.device) * max_start_f.unsqueeze(1)
+        ).to(dtype=torch.long)
+        span = (lengths.unsqueeze(1) - start).clamp(min=_ONE)
+        span_f = span.to(dtype=torch.float32)
+        end = start + _ONE + torch.floor(
+            torch.rand((num_graphs, num_subtrajectories), device=lengths.device) * span_f
+        ).to(dtype=torch.long)
+        end = torch.minimum(end, lengths.unsqueeze(1))
+        return start, end
+
+    @staticmethod
+    def _segment_sum(prefix: torch.Tensor, start_idx: torch.Tensor, end_step: torch.Tensor) -> torch.Tensor:
+        end_vals = prefix.gather(1, end_step)
+        start_prev = (start_idx - _ONE).clamp(min=_ZERO)
+        start_vals = prefix.gather(1, start_prev)
+        start_vals = torch.where(start_idx > _ZERO, start_vals, torch.zeros_like(start_vals))
+        return end_vals - start_vals
+
+    def _compute_subtrajectory_values(
+        self,
+        *,
+        rollout: RolloutResult,
+        inputs: RolloutInputs,
+        graph_cache: Dict[str, torch.Tensor],
+        flow_features: torch.Tensor,
+        log_f_module: torch.nn.Module,
+        log_f_start: torch.Tensor,
+        log_pf_start: Optional[torch.Tensor],
+        log_target: torch.Tensor,
+        lengths: torch.Tensor,
+        state_vec: torch.Tensor,
+        spec: SubTrajectorySpec,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if rollout.actions_seq is None:
+            raise RuntimeError("SubTB requires rollout actions; set record_actions=True.")
+        state_nodes = self._build_state_nodes(actions=rollout.actions_seq, inputs=inputs)
+        log_f_states = self._compute_log_f_states(
+            log_f_module=log_f_module,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            flow_features=flow_features,
+            state_nodes=state_nodes,
+            state_vec=state_vec,
+        )
+        start_idx, end_idx = self._sample_subtrajectory_indices(lengths, num_subtrajectories=spec.num_subtrajectories)
+        end_is_terminal = end_idx == lengths.unsqueeze(1)
+        end_step = end_idx - _ONE + end_is_terminal.to(dtype=torch.long)
+        prefix_pf = rollout.log_pf_steps.cumsum(dim=1)
+        prefix_pb = rollout.log_pb_steps.cumsum(dim=1)
+        sum_pf = self._segment_sum(prefix_pf, start_idx, end_step)
+        sum_pb = self._segment_sum(prefix_pb, start_idx, end_step)
+        zero_len = end_idx == start_idx
+        if bool(zero_len.any().detach().tolist()):
+            sum_pf = torch.where(zero_len, torch.zeros_like(sum_pf), sum_pf)
+            sum_pb = torch.where(zero_len, torch.zeros_like(sum_pb), sum_pb)
+        log_f_start_nodes = log_f_states.gather(1, start_idx)
+        log_f_start_root = log_f_start
+        if log_pf_start is not None:
+            log_pf_start = log_pf_start.to(device=log_f_start.device, dtype=log_f_start.dtype).view(-1)
+            if log_pf_start.numel() != log_f_start.numel():
+                raise ValueError("log_pf_start length mismatch with batch size.")
+            log_f_start_root = log_f_start + log_pf_start
+        log_f_start_sub = torch.where(start_idx == _ZERO, log_f_start_root.unsqueeze(1), log_f_start_nodes)
+        log_f_end_nodes = log_f_states.gather(1, end_idx)
+        log_target_sub = torch.where(end_is_terminal, log_target.unsqueeze(1), log_f_end_nodes)
+        valid = (end_idx > start_idx) | (lengths.unsqueeze(1) == _ZERO)
+        residual = log_f_start_sub + sum_pf - sum_pb - log_target_sub
+        residual = torch.where(valid, residual, torch.zeros_like(residual))
+        return sum_pf, sum_pb, residual, log_f_start_sub, log_target_sub, valid, end_is_terminal
+
+    @staticmethod
+    def _reduce_subtrajectory_stats(
+        *,
+        sum_pf: torch.Tensor,
+        sum_pb: torch.Tensor,
+        residual: torch.Tensor,
+        log_f_start: torch.Tensor,
+        log_target: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_count = valid.sum(dim=1).clamp(min=_ONE)
+        weight = valid.to(dtype=residual.dtype)
+        loss_per_graph = (residual.pow(2) * weight).sum(dim=1) / valid_count
+        sum_pf_mean = (sum_pf * weight).sum(dim=1) / valid_count
+        sum_pb_mean = (sum_pb * weight).sum(dim=1) / valid_count
+        residual_mean = (residual * weight).sum(dim=1) / valid_count
+        log_f_start_mean = (log_f_start * weight).sum(dim=1) / valid_count
+        log_target_mean = (log_target * weight).sum(dim=1) / valid_count
+        return sum_pf_mean, sum_pb_mean, residual_mean, log_f_start_mean, log_target_mean, loss_per_graph
 
     @staticmethod
     def _reduce_rollout_metrics(
@@ -1131,40 +3412,63 @@ class GFlowNetEngine:
     def _suffix_metrics(metrics: Dict[str, torch.Tensor], *, suffix: str) -> Dict[str, torch.Tensor]:
         return {f"{name}_{suffix}": value for name, value in metrics.items()}
 
+    @staticmethod
+    def _filter_stream_backward_metrics(metrics: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return metrics
+
     def _run_rollout_and_loss(
         self,
         *,
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
+        flow_modules: FlowModules,
         log_f_start: torch.Tensor,
+        log_pf_start: Optional[torch.Tensor],
         graph_mask: torch.Tensor,
+        guidance_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
         temperature: Optional[float],
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
         record_actions: bool,
-        record_visited: bool,
+        disable_stop: bool,
     ) -> tuple[RolloutResult, torch.Tensor, RolloutLossRecord]:
-        rollout = self.actor.rollout(
+        if not record_actions:
+            record_actions = True
+        actor = self._resolve_actor_for_flow(flow_modules)
+        rollout = actor.rollout(
             graph=graph_cache,
             temperature=temperature,
             max_steps_override=max_steps_override,
             force_stop_at_end=force_stop_at_end,
+            disable_stop=disable_stop,
             record_actions=record_actions,
-            record_visited=record_visited,
-            distance_prior_beta=None if distance_prior_spec is None else distance_prior_spec.beta,
+            guidance_fn=guidance_fn,
         )
+        if log_pf_start is not None:
+            log_pf_start = log_pf_start.to(device=rollout.log_pf.device, dtype=rollout.log_pf.dtype).view(-1)
+            if log_pf_start.numel() != rollout.log_pf.numel():
+                raise ValueError("log_pf_start length mismatch with rollout log_pf.")
+            rollout = replace(rollout, log_pf=rollout.log_pf + log_pf_start)
+        log_pb_steps = self._compute_backward_log_pb_steps(
+            rollout=rollout,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            temperature=temperature,
+            flow_modules=flow_modules,
+        )
+        rollout = replace(rollout, log_pb_steps=log_pb_steps)
         tb_loss, record = self._compute_rollout_loss(
             rollout=rollout,
             inputs=inputs,
             graph_cache=graph_cache,
             flow_features=flow_features,
+            flow_modules=flow_modules,
             log_f_start=log_f_start,
+            log_pf_start=log_pf_start,
             graph_mask=graph_mask,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
+            subtb_spec=subtb_spec,
         )
         return rollout, tb_loss, record
 
@@ -1175,66 +3479,88 @@ class GFlowNetEngine:
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
+        flow_modules: FlowModules,
         log_f_start: torch.Tensor,
+        log_pf_start: Optional[torch.Tensor],
         graph_mask: torch.Tensor,
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
     ) -> tuple[torch.Tensor, RolloutLossRecord]:
-        reward_out: RewardOutput = self.reward_fn(**self._build_reward_kwargs(rollout, inputs=inputs))
-        log_reward_for_loss = torch.where(
-            inputs.dummy_mask,
-            torch.zeros_like(reward_out.log_reward),
-            reward_out.log_reward,
+        reward_out: RewardOutput = self.reward_fn(
+            **self._build_reward_kwargs(rollout, inputs=inputs, graph_cache=graph_cache)
         )
+        log_reward_for_loss = reward_out.log_reward
         invalid_stop = rollout.stop_node_locals < _ZERO
-        if bool(invalid_stop.any().item()):
+        if bool(invalid_stop.any().detach().tolist()):
             active_invalid = invalid_stop & graph_mask
-            if bool(active_invalid.any().item()):
+            if bool(active_invalid.any().detach().tolist()):
                 raise ValueError("stop_node_locals contains invalid entries for active graphs.")
-        success = rollout.reach_success.to(dtype=torch.bool)
         log_target = log_reward_for_loss
-        gate_mask = graph_mask
-        if gate_spec is not None:
-            gate = self._build_gate_mask(
-                inputs=inputs,
-                stop_node_locals=rollout.stop_node_locals,
-                trust_radius=gate_spec.trust_radius,
-                delta=gate_spec.delta,
-            )
-            gate_mask = gate_mask & gate
-        prior_loss_value = torch.zeros((), device=log_reward_for_loss.device, dtype=log_reward_for_loss.dtype)
-        if distance_prior_spec is not None and rollout.prior_loss is not None:
-            prior_loss_value = self._reduce_graph_loss(rollout.prior_loss, gate_mask)
-        sum_log_pf, sum_log_pb, residual = self._compute_subtb_terms(
-            log_pf_steps=rollout.log_pf_steps,
-            log_pb_steps=rollout.log_pb_steps,
-            log_f_start=log_f_start,
-            log_target=log_target,
-            lengths=rollout.length.long(),
-            graph_mask=gate_mask,
+        lengths = rollout.length.to(dtype=torch.long)
+        if subtb_spec is None:
+            raise RuntimeError("SubTB is required for trajectory balance; configure training_cfg.subtb.")
+        if rollout.actions_seq is None:
+            raise RuntimeError("SubTB requires rollout actions; set record_actions=True.")
+        state_vec_seq, state_lengths = self._compute_state_vec_sequence(
+            actions=rollout.actions_seq,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            flow_modules=flow_modules,
         )
-        tb_loss = self._reduce_graph_loss(residual.pow(2), gate_mask)
-        if distance_prior_spec is not None and rollout.prior_loss is not None:
-            tb_loss = tb_loss + (float(distance_prior_spec.weight) * prior_loss_value)
+        if state_lengths.numel() != lengths.numel():
+            raise ValueError("state length mismatch with rollout length.")
+        if bool((state_lengths != lengths).any().detach().tolist()):
+            raise ValueError("state length values mismatch with rollout length.")
+        sum_pf, sum_pb, residuals, log_f_start_sub, log_target_sub, valid, _ = self._compute_subtrajectory_values(
+            rollout=rollout,
+            inputs=inputs,
+            graph_cache=graph_cache,
+            flow_features=flow_features,
+            log_f_module=flow_modules.log_f,
+            log_f_start=log_f_start,
+            log_pf_start=log_pf_start,
+            log_target=log_target,
+            lengths=lengths,
+            state_vec=state_vec_seq,
+            spec=subtb_spec,
+        )
+        (
+            sum_log_pf,
+            sum_log_pb,
+            residual,
+            log_f_start_used,
+            log_target_used,
+            loss_per_graph,
+        ) = self._reduce_subtrajectory_stats(
+            sum_pf=sum_pf,
+            sum_pb=sum_pb,
+            residual=residuals,
+            log_f_start=log_f_start_sub,
+            log_target=log_target_sub,
+            valid=valid,
+        )
+        tb_loss = self._reduce_graph_loss(loss_per_graph, graph_mask)
         self._raise_if_non_finite_loss(
             tb_loss=tb_loss,
             log_pf_steps=rollout.log_pf_steps,
             log_pb_steps=rollout.log_pb_steps,
-            log_f_start=log_f_start,
-            log_target=log_target,
-            lengths=rollout.length.long(),
+            log_f_start=log_f_start_used,
+            log_target=log_target_used,
+            lengths=lengths,
             dummy_mask=inputs.dummy_mask,
+            sum_log_pf=sum_log_pf,
+            sum_log_pb=sum_log_pb,
+            residual=residual,
         )
         record = self._build_rollout_loss_record(
             reward_out=reward_out,
+            log_f_start=log_f_start_used,
             log_reward=log_reward_for_loss,
-            log_target=log_target,
+            log_target=log_target_used,
             sum_log_pf=sum_log_pf,
             sum_log_pb=sum_log_pb,
             residual=residual,
             reach_success=rollout.reach_success,
             length=rollout.length,
-            prior_loss=prior_loss_value,
         )
         return tb_loss, record
 
@@ -1242,6 +3568,7 @@ class GFlowNetEngine:
         self,
         *,
         reward_out: RewardOutput,
+        log_f_start: torch.Tensor,
         log_reward: torch.Tensor,
         log_target: torch.Tensor,
         sum_log_pf: torch.Tensor,
@@ -1249,15 +3576,14 @@ class GFlowNetEngine:
         residual: torch.Tensor,
         reach_success: torch.Tensor,
         length: torch.Tensor,
-        prior_loss: torch.Tensor,
     ) -> RolloutLossRecord:
         reward_detached = RewardOutput(
-            reward=reward_out.reward.detach(),
             log_reward=reward_out.log_reward.detach(),
             success=reward_out.success.detach(),
         )
         return RolloutLossRecord(
             reward_out=reward_detached,
+            log_f_start=log_f_start.detach(),
             log_reward=log_reward.detach(),
             log_target=log_target.detach(),
             sum_log_pf=sum_log_pf.detach(),
@@ -1265,25 +3591,21 @@ class GFlowNetEngine:
             residual=residual.detach(),
             reach_success=reach_success.detach(),
             length=length.detach(),
-            prior_loss=prior_loss.detach(),
         )
 
     def _build_metrics_from_records(
         self,
         records: list[RolloutLossRecord],
         *,
-        log_f_start: torch.Tensor,
         graph_mask: torch.Tensor,
     ) -> list[Dict[str, torch.Tensor]]:
         if not records:
             return []
-        log_f_start = log_f_start.detach()
         metrics_list: list[Dict[str, torch.Tensor]] = []
         for record in records:
             metrics_list.append(
                 self._build_rollout_metrics_from_record(
                     record,
-                    log_f_start=log_f_start,
                     graph_mask=graph_mask,
                 )
             )
@@ -1293,7 +3615,6 @@ class GFlowNetEngine:
         self,
         record: RolloutLossRecord,
         *,
-        log_f_start: torch.Tensor,
         graph_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         stub = RolloutMetricStub(
@@ -1304,16 +3625,12 @@ class GFlowNetEngine:
             rollout=stub,
             reward_out=record.reward_out,
             log_reward=record.log_reward,
-            log_f_start=log_f_start,
+            log_f_start=record.log_f_start,
             log_f_target=record.log_target,
         )
-        metrics["distance_prior_loss"] = record.prior_loss
         metrics.update(
             self._build_tb_stats(
-                sum_log_pf=record.sum_log_pf,
-                sum_log_pb=record.sum_log_pb,
                 residual=record.residual,
-                log_reward=record.log_reward,
                 graph_mask=graph_mask,
             )
         )
@@ -1329,14 +3646,18 @@ class GFlowNetEngine:
         log_target: torch.Tensor,
         lengths: torch.Tensor,
         dummy_mask: torch.Tensor,
+        sum_log_pf: Optional[torch.Tensor] = None,
+        sum_log_pb: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ) -> None:
         if torch.isfinite(tb_loss).all():
             return
-        num_steps = int(log_pf_steps.size(1))
-        step_mask = self._build_step_mask(lengths, num_steps).to(dtype=log_pf_steps.dtype)
-        sum_log_pf = (log_pf_steps * step_mask).sum(dim=1)
-        sum_log_pb = (log_pb_steps * step_mask).sum(dim=1)
-        residual = log_f_start + sum_log_pf - sum_log_pb - log_target
+        if sum_log_pf is None or sum_log_pb is None or residual is None:
+            num_steps = int(log_pf_steps.size(1))
+            step_mask = self._build_step_mask(lengths, num_steps).to(dtype=log_pf_steps.dtype)
+            sum_log_pf = (log_pf_steps * step_mask).sum(dim=1)
+            sum_log_pb = (log_pb_steps * step_mask).sum(dim=1)
+            residual = log_f_start + sum_log_pf - sum_log_pb - log_target
         message = self._format_non_finite_report(
             tb_loss=tb_loss,
             log_f_start=log_f_start,
@@ -1349,7 +3670,7 @@ class GFlowNetEngine:
         )
         dummy_mask = dummy_mask.to(dtype=torch.bool)
         dummy_total = int(dummy_mask.numel())
-        dummy_count = int(dummy_mask.sum().item())
+        dummy_count = int(dummy_mask.sum().detach().tolist())
         dummy_ratio = float(dummy_count) / float(dummy_total) if dummy_total > _ZERO else float(_ZERO)
         extra = [
             f"dummy_mask: count={dummy_count}, total={dummy_total}, ratio={dummy_ratio}",
@@ -1408,16 +3729,16 @@ class GFlowNetEngine:
     @staticmethod
     def _summarize_tensor(name: str, tensor: torch.Tensor) -> str | None:
         finite = torch.isfinite(tensor)
-        if bool(finite.all().item()):
+        if bool(finite.all().detach().tolist()):
             return None
         non_finite = ~finite
-        num_non_finite = int(non_finite.sum().item())
-        num_nan = int(torch.isnan(tensor).sum().item())
-        num_inf = int(torch.isinf(tensor).sum().item())
+        num_non_finite = int(non_finite.sum().detach().tolist())
+        num_nan = int(torch.isnan(tensor).sum().detach().tolist())
+        num_inf = int(torch.isinf(tensor).sum().detach().tolist())
         finite_vals = tensor[finite]
         if finite_vals.numel() > _ZERO:
-            finite_min = float(finite_vals.min().item())
-            finite_max = float(finite_vals.max().item())
+            finite_min = float(finite_vals.min().detach().tolist())
+            finite_max = float(finite_vals.max().detach().tolist())
         else:
             finite_min = _NAN
             finite_max = _NAN
@@ -1432,21 +3753,21 @@ class GFlowNetEngine:
         if tensor.numel() == 0:
             return f"{name}: empty"
         finite = torch.isfinite(tensor)
-        non_finite = int((~finite).sum().item())
+        non_finite = int((~finite).sum().detach().tolist())
         finite_vals = tensor[finite]
         if finite_vals.numel() == 0:
             return f"{name}: non_finite={non_finite} (all)"
         calc = finite_vals.to(dtype=torch.float32)
-        min_val = float(calc.min().item())
-        max_val = float(calc.max().item())
-        mean_val = float(calc.mean().item())
-        std_val = float(calc.std(unbiased=False).item())
-        abs_max = float(calc.abs().max().item())
+        min_val = float(calc.min().detach().tolist())
+        max_val = float(calc.max().detach().tolist())
+        mean_val = float(calc.mean().detach().tolist())
+        std_val = float(calc.std(unbiased=False).detach().tolist())
+        abs_max = float(calc.abs().max().detach().tolist())
         q_tensor = torch.quantile(
             calc,
             torch.tensor((0.0, 0.5, 0.9, 0.99, 1.0), device=calc.device, dtype=calc.dtype),
         )
-        q_vals = [float(q.item()) for q in q_tensor]
+        q_vals = [float(q.detach().tolist()) for q in q_tensor]
         q_parts = " ".join(f"q{idx}={val}" for idx, val in enumerate(q_vals))
         return (
             f"{name}: non_finite={non_finite}, min={min_val}, max={max_val}, "
@@ -1460,38 +3781,12 @@ class GFlowNetEngine:
         step_ids = torch.arange(num_steps, device=lengths.device, dtype=lengths.dtype).view(1, -1)
         return step_ids <= lengths.view(-1, 1)
 
-    def _compute_subtb_terms(
-        self,
-        *,
-        log_pf_steps: torch.Tensor,
-        log_pb_steps: torch.Tensor,
-        log_f_start: torch.Tensor,
-        log_target: torch.Tensor,
-        lengths: torch.Tensor,
-        graph_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_steps = int(log_pf_steps.size(1))
-        step_mask = self._build_step_mask(lengths, num_steps).to(dtype=log_pf_steps.dtype)
-        sum_log_pf = (log_pf_steps * step_mask).sum(dim=1)
-        sum_log_pb = (log_pb_steps * step_mask).sum(dim=1)
-        residual = log_f_start + sum_log_pf - sum_log_pb - log_target
-        if graph_mask is not None:
-            mask = graph_mask.to(dtype=residual.dtype).view(-1)
-            residual = torch.where(mask > _ZERO, residual, torch.zeros_like(residual))
-        return sum_log_pf, sum_log_pb, residual
-
     @staticmethod
     def _mask_values(values: torch.Tensor, graph_mask: Optional[torch.Tensor]) -> torch.Tensor:
         if graph_mask is None:
             return values
         mask = graph_mask.to(dtype=torch.bool).view(-1)
         return values[mask]
-
-    def _quantile_or_zero(self, values: torch.Tensor, q: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if values.numel() == _ZERO:
-            return torch.zeros((), device=device, dtype=dtype)
-        calc = values.to(dtype=torch.float32)
-        return torch.quantile(calc, torch.tensor(q, device=calc.device, dtype=calc.dtype)).to(device=device, dtype=dtype)
 
     def _mean_std_or_zero(
         self,
@@ -1511,28 +3806,16 @@ class GFlowNetEngine:
     def _build_tb_stats(
         self,
         *,
-        sum_log_pf: torch.Tensor,
-        sum_log_pb: torch.Tensor,
         residual: torch.Tensor,
-        log_reward: torch.Tensor,
         graph_mask: Optional[torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         device = residual.device
         dtype = residual.dtype
         residual_vals = self._mask_values(residual, graph_mask)
-        sum_log_pf_vals = self._mask_values(sum_log_pf, graph_mask)
-        sum_log_pb_vals = self._mask_values(sum_log_pb, graph_mask)
-        log_reward_vals = self._mask_values(log_reward, graph_mask)
         residual_mean, residual_std = self._mean_std_or_zero(residual_vals, device=device, dtype=dtype)
         return {
             "subtb/residual_mean": residual_mean,
             "subtb/residual_std": residual_std,
-            "subtb/residual_p95": self._quantile_or_zero(residual_vals, _RESIDUAL_P95, device, dtype),
-            "subtb/sum_log_pf_mean": self._mean_std_or_zero(sum_log_pf_vals, device=device, dtype=dtype)[0],
-            "subtb/sum_log_pb_mean": self._mean_std_or_zero(sum_log_pb_vals, device=device, dtype=dtype)[0],
-            "subtb/log_reward_p50": self._quantile_or_zero(log_reward_vals, _LOG_REWARD_P50, device, dtype),
-            "subtb/log_reward_p90": self._quantile_or_zero(log_reward_vals, _LOG_REWARD_P90, device, dtype),
-            "subtb/log_reward_p99": self._quantile_or_zero(log_reward_vals, _LOG_REWARD_P99, device, dtype),
         }
 
     @staticmethod
@@ -1543,95 +3826,21 @@ class GFlowNetEngine:
         denom = weights.sum().clamp(min=float(_ONE))
         return (loss_per_graph * weights).sum() / denom
 
-    def _compute_control_metrics(
-        self,
+    @staticmethod
+    def _compute_z_align_loss(
         *,
-        inputs: RolloutInputs,
-        num_graphs: int,
-    ) -> Dict[str, torch.Tensor]:
-        if num_graphs <= _ZERO:
-            return {}
-        start_ptr = inputs.start_ptr
-        if start_ptr.numel() < _ONE + _ONE:
-            return {}
-        start_counts = (start_ptr[_ONE:] - start_ptr[:-_ONE]).to(dtype=torch.long)
-        missing_start = start_counts == _ZERO
-        max_steps = int(getattr(self.env, "max_steps", _ZERO))
-        stats = self._compute_min_start_dist_stats(
-            node_min_dists=inputs.node_min_dists,
-            start_node_locals=inputs.start_node_locals,
-            start_counts=start_counts,
-            num_graphs=num_graphs,
-            missing_start=missing_start,
-            max_steps=max_steps,
-        )
-        reachable = stats.get("reachable_horizon_frac")
-        if reachable is None:
-            return {}
-        return {
-            "control/reachable_horizon_frac": reachable.detach(),
-        }
-
-    def _compute_control_metrics_from_batch(
-        self,
-        *,
-        batch: Any,
-        device: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        node_ptr = self.batch_processor._get_node_ptr(batch, device)
-        num_graphs = int(node_ptr.numel() - 1)
-        if num_graphs <= _ZERO:
-            return {}
-        start_node_locals, _, start_ptr, _ = self.batch_processor._get_start_answer_ptrs(batch, device=device)
-        start_counts = (start_ptr[_ONE:] - start_ptr[:-_ONE]).to(dtype=torch.long)
-        missing_start = start_counts == _ZERO
-        node_min_dists = self.batch_processor._get_node_min_dists(batch, device=device)
-        max_steps = int(getattr(self.env, "max_steps", _ZERO))
-        stats = self._compute_min_start_dist_stats(
-            node_min_dists=node_min_dists,
-            start_node_locals=start_node_locals,
-            start_counts=start_counts,
-            num_graphs=num_graphs,
-            missing_start=missing_start,
-            max_steps=max_steps,
-        )
-        reachable = stats.get("reachable_horizon_frac")
-        if reachable is None:
-            return {}
-        return {"control/reachable_horizon_frac": reachable.detach()}
-
-    def _compute_edge_debug_metrics(
-        self,
-        inputs: RolloutInputs,
-        graph_cache: Dict[str, torch.Tensor],
-        *,
-        device: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        num_graphs = int(inputs.node_ptr.numel() - 1)
-        state_vec = self.actor.state_encoder.init_state(
-            num_graphs,
-            device=inputs.node_tokens.device,
-            dtype=inputs.node_tokens.dtype,
-        )
-        edge_scores = self.actor._score_edges_forward(
-            graph_cache,
-            state_vec,
-            active_nodes=graph_cache["node_is_start"],
-            autocast_ctx=self.actor._autocast_context(device),
-        )
-        return gfn_metrics.compute_edge_debug_metrics(
-            edge_scores=edge_scores,
-            edge_batch=inputs.edge_batch,
-            edge_index=inputs.edge_index,
-            node_ptr=inputs.node_ptr,
-            node_min_dists=inputs.node_min_dists,
-            start_ptr=inputs.start_ptr,
-            dummy_mask=inputs.dummy_mask,
-            node_is_start=graph_cache["node_is_start"],
-            node_is_answer=graph_cache["node_is_answer"],
-            node_batch=graph_cache["node_batch"],
-            stop_on_answer=bool(self.env.stop_on_answer),
-        )
+        log_f_forward: torch.Tensor,
+        log_f_backward: torch.Tensor,
+        graph_mask_forward: Optional[torch.Tensor],
+        graph_mask_backward: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        diff = log_f_forward - log_f_backward
+        if graph_mask_forward is not None and graph_mask_backward is not None:
+            mask = graph_mask_forward.to(dtype=torch.bool) & graph_mask_backward.to(dtype=torch.bool)
+            diff = diff[mask]
+        if diff.numel() == _ZERO:
+            return torch.zeros((), device=log_f_forward.device, dtype=log_f_forward.dtype)
+        return diff.pow(_TWO).mean()
 
     @staticmethod
     def _build_flow_metrics(
@@ -1657,20 +3866,21 @@ class GFlowNetEngine:
         num_rollouts: int,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
+        flow_modules: FlowModules,
         log_f_start: torch.Tensor,
+        guidance_beta: float,
         graph_mask: torch.Tensor,
         temperature: Optional[float],
         rollout_cfg: GFlowNetRolloutConfig,
         collect_terminal_hits: bool,
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
+        disable_stop: bool,
+        rollout_hook: Optional[Callable[[RolloutResult, RolloutInputs, Dict[str, torch.Tensor]], None]] = None,
     ) -> tuple[
         list[torch.Tensor],
         list[Dict[str, torch.Tensor]],
-        list[torch.Tensor],
-        list[torch.Tensor],
         list[torch.Tensor],
         list[torch.Tensor],
     ]:
@@ -1678,37 +3888,66 @@ class GFlowNetEngine:
         metric_records: list[RolloutLossRecord] = []
         rollout_stop_nodes: list[torch.Tensor] = []
         rollout_actions: list[torch.Tensor] = []
-        rollout_directions: list[torch.Tensor] = []
-        rollout_visited: list[torch.Tensor] = []
         collect_eval = not rollout_cfg.is_training
-        for _ in range(num_rollouts):
-            rollout, tb_loss, record = self._run_rollout_and_loss(
+        record_actions = True
+        guidance_fn = None
+        if self._should_apply_h_guidance(flow_modules=flow_modules):
+            guidance_fn = self._build_h_guidance_fn(
                 inputs=inputs,
                 graph_cache=graph_cache,
                 flow_features=flow_features,
+                beta=guidance_beta,
+            )
+        start_spec = self._resolve_start_selection_spec(
+            temperature=temperature,
+            is_training=rollout_cfg.is_training,
+            log_f_module=flow_modules.log_f,
+        )
+        start_distribution = None
+        if start_spec is not None:
+            start_distribution = self._prepare_start_selection_distribution(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                spec=start_spec,
+            )
+        for _ in range(num_rollouts):
+            rollout_inputs, rollout_cache, log_pf_start = self._resolve_rollout_inputs_for_selection(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                start_spec=start_spec,
+                start_distribution=start_distribution,
+            )
+            rollout, tb_loss, record = self._run_rollout_and_loss(
+                inputs=rollout_inputs,
+                graph_cache=rollout_cache,
+                flow_features=flow_features,
+                flow_modules=flow_modules,
                 log_f_start=log_f_start,
+                log_pf_start=log_pf_start,
                 graph_mask=graph_mask,
+                guidance_fn=guidance_fn,
                 temperature=temperature,
-                gate_spec=gate_spec,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
                 max_steps_override=max_steps_override,
                 force_stop_at_end=force_stop_at_end,
-                record_actions=collect_eval,
-                record_visited=collect_eval,
+                record_actions=record_actions,
+                disable_stop=disable_stop,
             )
-            if collect_terminal_hits:
-                rollout_stop_nodes.append(rollout.stop_node_locals.detach())
-            if collect_eval:
-                if rollout.actions_seq is None or rollout.directions_seq is None or rollout.visited_nodes is None:
-                    raise RuntimeError("rollout missing eval traces; record_actions/record_visited required.")
-                rollout_actions.append(rollout.actions_seq.detach())
-                rollout_directions.append(rollout.directions_seq.detach())
-                rollout_visited.append(rollout.visited_nodes.detach())
-            loss_list.append(tb_loss)
-            metric_records.append(record)
+            if rollout_hook is not None:
+                rollout_hook(rollout, rollout_inputs, rollout_cache)
+            self._append_rollout_outputs(
+                rollout,
+                tb_loss,
+                record,
+                collect_terminal_hits=collect_terminal_hits,
+                collect_eval=collect_eval,
+                rollout_stop_nodes=rollout_stop_nodes,
+                rollout_actions=rollout_actions,
+                loss_list=loss_list,
+                metric_records=metric_records,
+            )
         metrics_list = self._build_metrics_from_records(
             metric_records,
-            log_f_start=log_f_start,
             graph_mask=graph_mask,
         )
         return (
@@ -1716,8 +3955,6 @@ class GFlowNetEngine:
             metrics_list,
             rollout_stop_nodes,
             rollout_actions,
-            rollout_directions,
-            rollout_visited,
         )
 
     @staticmethod
@@ -1734,8 +3971,6 @@ class GFlowNetEngine:
             metrics_list=[],
             rollout_stop_nodes=[],
             rollout_actions=[],
-            rollout_directions=[],
-            rollout_visited=[],
         )
 
     def _run_chunked_rollouts(
@@ -1743,22 +3978,31 @@ class GFlowNetEngine:
         *,
         num_rollouts: int,
         rollout_chunk_size: int,
+        chunk_sizes: Optional[Sequence[int]],
         rollout_cfg: GFlowNetRolloutConfig,
         temperature: Optional[float],
         collect_terminal_hits: bool,
         collect_eval: bool,
         chunk_inputs_fn: Callable[[], RolloutChunkInputs],
+        flow_modules: FlowModules,
+        guidance_beta: float,
         store_loss_list: bool,
         on_chunk_loss: Optional[Callable[[list[torch.Tensor]], torch.Tensor]],
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
+        disable_stop: bool,
+        rollout_hook: Optional[Callable[[RolloutResult, RolloutInputs, Dict[str, torch.Tensor]], None]] = None,
     ) -> tuple[RolloutChunkState, int, Optional[torch.Tensor]]:
         state = self._init_rollout_chunk_state()
         loss_total: Optional[torch.Tensor] = None
         num_graphs = _ZERO
-        for current in self._iter_rollout_chunk_sizes(num_rollouts, rollout_chunk_size):
+        sizes = (
+            list(chunk_sizes)
+            if chunk_sizes is not None
+            else self._iter_rollout_chunk_sizes(num_rollouts, rollout_chunk_size)
+        )
+        for current in sizes:
             chunk_inputs = chunk_inputs_fn()
             num_graphs = chunk_inputs.num_graphs
             (
@@ -1766,22 +4010,23 @@ class GFlowNetEngine:
                 chunk_metrics_list,
                 chunk_stop_nodes,
                 chunk_actions,
-                chunk_directions,
-                chunk_visited,
             ) = self._collect_rollout_outputs(
                 inputs=chunk_inputs.inputs,
                 num_rollouts=current,
                 graph_cache=chunk_inputs.graph_cache,
                 flow_features=chunk_inputs.flow_features,
+                flow_modules=flow_modules,
                 log_f_start=chunk_inputs.log_f_start,
+                guidance_beta=guidance_beta,
                 graph_mask=chunk_inputs.graph_mask,
                 temperature=temperature,
                 rollout_cfg=rollout_cfg,
                 collect_terminal_hits=collect_terminal_hits,
-                gate_spec=gate_spec,
-                distance_prior_spec=distance_prior_spec,
+                subtb_spec=subtb_spec,
                 max_steps_override=max_steps_override,
                 force_stop_at_end=force_stop_at_end,
+                disable_stop=disable_stop,
+                rollout_hook=rollout_hook,
             )
             if store_loss_list:
                 state.loss_list.extend(chunk_loss_list)
@@ -1790,8 +4035,6 @@ class GFlowNetEngine:
                 state.rollout_stop_nodes.extend(chunk_stop_nodes)
             if collect_eval:
                 state.rollout_actions.extend(chunk_actions)
-                state.rollout_directions.extend(chunk_directions)
-                state.rollout_visited.extend(chunk_visited)
             if on_chunk_loss is not None:
                 chunk_loss = on_chunk_loss(chunk_loss_list)
                 chunk_detached = chunk_loss.detach()
@@ -1806,15 +4049,18 @@ class GFlowNetEngine:
         num_graphs: int,
         graph_cache: Dict[str, torch.Tensor],
         flow_features: torch.Tensor,
+        flow_modules: FlowModules,
         log_f_start: torch.Tensor,
+        guidance_beta: float,
         graph_mask: torch.Tensor,
         temperature: Optional[float],
         rollout_cfg: GFlowNetRolloutConfig,
         rollout_chunk_size: int,
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
+        disable_stop: bool,
+        rollout_hook: Optional[Callable[[RolloutResult, RolloutInputs, Dict[str, torch.Tensor]], None]] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         collect_eval = not rollout_cfg.is_training
         collect_terminal_hits = self._should_collect_terminal_hits(rollout_cfg)
@@ -1833,17 +4079,21 @@ class GFlowNetEngine:
         state, _, _ = self._run_chunked_rollouts(
             num_rollouts=num_rollouts,
             rollout_chunk_size=rollout_chunk_size,
+            chunk_sizes=None,
             rollout_cfg=rollout_cfg,
             temperature=temperature,
             collect_terminal_hits=collect_terminal_hits,
             collect_eval=collect_eval,
             chunk_inputs_fn=chunk_inputs_fn,
+            flow_modules=flow_modules,
+            guidance_beta=guidance_beta,
             store_loss_list=True,
             on_chunk_loss=None,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
+            subtb_spec=subtb_spec,
             max_steps_override=max_steps_override,
             force_stop_at_end=force_stop_at_end,
+            disable_stop=disable_stop,
+            rollout_hook=rollout_hook,
         )
         loss, metrics = self._finalize_loop_rollout_metrics(
             loss_list=state.loss_list,
@@ -1856,8 +4106,6 @@ class GFlowNetEngine:
             metrics_list=state.metrics_list,
             rollout_stop_nodes=state.rollout_stop_nodes,
             rollout_actions=state.rollout_actions,
-            rollout_directions=state.rollout_directions,
-            rollout_visited=state.rollout_visited,
             inputs=inputs,
             graph_cache=graph_cache,
             rollout_cfg=rollout_cfg,
@@ -1873,7 +4121,7 @@ class GFlowNetEngine:
         metrics_list: list[Dict[str, torch.Tensor]],
         rollout_stop_nodes: list[torch.Tensor],
         node_ptr: torch.Tensor,
-        node_is_answer: torch.Tensor,
+        node_is_target: torch.Tensor,
         rollout_cfg: GFlowNetRolloutConfig,
         num_rollouts: int,
         num_graphs: int,
@@ -1895,7 +4143,7 @@ class GFlowNetEngine:
                     gfn_metrics.compute_terminal_hits(
                         stop_node_locals=stop_nodes,
                         node_ptr=node_ptr,
-                        node_is_answer=node_is_answer,
+                        node_is_target=node_is_target,
                     )
                     for stop_nodes in rollout_stop_nodes
                 ],
@@ -1916,8 +4164,6 @@ class GFlowNetEngine:
         metrics_list: list[Dict[str, torch.Tensor]],
         rollout_stop_nodes: list[torch.Tensor],
         rollout_actions: list[torch.Tensor],
-        rollout_directions: list[torch.Tensor],
-        rollout_visited: list[torch.Tensor],
         inputs: RolloutInputs,
         graph_cache: Dict[str, torch.Tensor],
         rollout_cfg: GFlowNetRolloutConfig,
@@ -1929,22 +4175,12 @@ class GFlowNetEngine:
             metrics_list=metrics_list,
             rollout_stop_nodes=rollout_stop_nodes,
             node_ptr=inputs.node_ptr,
-            node_is_answer=graph_cache["node_is_answer"],
+            node_is_target=graph_cache.get("node_is_target") or graph_cache["node_is_answer"],
             rollout_cfg=rollout_cfg,
             num_rollouts=num_rollouts,
             num_graphs=num_graphs,
         )
         if not rollout_cfg.is_training:
-            metrics = self._attach_eval_metrics_from_rollout_lists(
-                metrics=metrics,
-                rollout_actions=rollout_actions,
-                rollout_directions=rollout_directions,
-                rollout_visited=rollout_visited,
-                inputs=inputs,
-                num_rollouts=num_rollouts,
-                num_graphs=num_graphs,
-                k_values=rollout_cfg.eval_rollout_prefixes,
-            )
             composite = gfn_metrics.compute_composite_score(
                 metrics=metrics,
                 k_values=rollout_cfg.eval_rollout_prefixes,
@@ -1968,19 +4204,25 @@ class GFlowNetEngine:
         rollout_chunk_size: int,
         temperature: Optional[float],
         backward_fn: Callable[[torch.Tensor], None],
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
+        flow_modules: FlowModules,
+        guidance_beta: float,
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        disable_stop: bool,
+        log_f_start_node_locals: Optional[torch.Tensor] = None,
+        log_f_start_ptr: Optional[torch.Tensor] = None,
+        rollout_hook: Optional[Callable[[RolloutResult, RolloutInputs, Dict[str, torch.Tensor]], None]] = None,
+        loss_scale: float = 1.0,
+        sample_ids: Optional[Sequence[str]] = None,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         collect_terminal_hits = self._should_collect_terminal_hits(rollout_cfg)
         (
             loss_total,
             metrics_list,
             rollout_stop_nodes,
-            edge_debug,
             node_ptr,
-            node_is_answer,
+            node_is_target,
             num_graphs,
         ) = self._run_streaming_chunks(
             batch=batch,
@@ -1991,24 +4233,66 @@ class GFlowNetEngine:
             temperature=temperature,
             backward_fn=backward_fn,
             collect_terminal_hits=collect_terminal_hits,
-            collect_edge_debug=False,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
+            subtb_spec=subtb_spec,
+            flow_modules=flow_modules,
+            guidance_beta=guidance_beta,
             max_steps_override=max_steps_override,
             force_stop_at_end=force_stop_at_end,
+            disable_stop=disable_stop,
+            log_f_start_node_locals=log_f_start_node_locals,
+            log_f_start_ptr=log_f_start_ptr,
+            rollout_hook=rollout_hook,
+            loss_scale=loss_scale,
         )
-        if loss_total is None or node_ptr is None or node_is_answer is None:
+        if loss_total is None or node_ptr is None:
             raise RuntimeError("Streaming rollout loss did not produce any rollouts.")
         metrics = self._finalize_streaming_metrics(
             metrics_list=metrics_list,
             rollout_stop_nodes=rollout_stop_nodes,
             node_ptr=node_ptr,
-            node_is_answer=node_is_answer,
+            node_is_target=node_is_target,
             rollout_cfg=rollout_cfg,
             num_rollouts=num_rollouts,
             num_graphs=num_graphs,
         )
-        return loss_total, metrics, edge_debug
+        loss = loss_total
+        if (
+            self._replay_spec is not None
+            and self._replay_buffer is not None
+            and flow_modules.log_f is self.log_f
+            and sample_ids is not None
+        ):
+            inputs, graph_cache, flow_features, _, graph_mask, _, _, _ = self._prepare_streaming_inputs(
+                batch=batch,
+                device=device,
+                node_ptr=node_ptr,
+                node_is_target=node_is_target,
+                log_f_module=flow_modules.log_f,
+                log_f_start_node_locals=log_f_start_node_locals,
+                log_f_start_ptr=log_f_start_ptr,
+            )
+            replay_loss, replay_metrics = self._compute_replay_loss(
+                inputs=inputs,
+                graph_cache=graph_cache,
+                flow_features=flow_features,
+                flow_modules=flow_modules,
+                temperature=temperature,
+                subtb_spec=subtb_spec,
+                sample_ids=sample_ids,
+            )
+            if replay_loss is not None:
+                mix_ratio = float(self._replay_spec.mix_ratio)
+                replay_scaled = replay_loss * mix_ratio
+                backward_fn(replay_scaled)
+                loss = loss + replay_scaled.detach()
+                replay_metrics["replay/mix_ratio"] = torch.as_tensor(
+                    mix_ratio,
+                    device=loss.device,
+                    dtype=loss.dtype,
+                )
+                metrics.update(replay_metrics)
+                metrics["replay/graph_mask_frac"] = graph_mask.to(dtype=torch.float32).mean()
+        return loss, metrics
 
     def _run_streaming_chunks(
         self,
@@ -2021,50 +4305,77 @@ class GFlowNetEngine:
         temperature: Optional[float],
         backward_fn: Callable[[torch.Tensor], None],
         collect_terminal_hits: bool,
-        collect_edge_debug: bool,
-        gate_spec: Optional[StreamGateSpec],
-        distance_prior_spec: Optional[DistancePriorSpec],
+        subtb_spec: Optional[SubTrajectorySpec],
+        flow_modules: FlowModules,
+        guidance_beta: float,
         max_steps_override: Optional[int],
         force_stop_at_end: bool,
+        disable_stop: bool,
+        log_f_start_node_locals: Optional[torch.Tensor] = None,
+        log_f_start_ptr: Optional[torch.Tensor] = None,
+        rollout_hook: Optional[Callable[[RolloutResult, RolloutInputs, Dict[str, torch.Tensor]], None]] = None,
+        loss_scale: float = 1.0,
     ) -> tuple[
         Optional[torch.Tensor],
         list[Dict[str, torch.Tensor]],
         list[torch.Tensor],
-        Dict[str, torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         int,
     ]:
         collect_eval = not rollout_cfg.is_training
-        context, chunk_inputs_fn, on_chunk_loss = self._init_streaming_chunk_runner(
+        chunk_sizes = self._iter_rollout_chunk_sizes(num_rollouts, rollout_chunk_size)
+        supports_retain_graph = self._supports_retain_graph(backward_fn)
+        cache_inputs = bool(len(chunk_sizes) <= _ONE or supports_retain_graph)
+        context, chunk_inputs_fn = self._init_streaming_chunk_runner(
             batch=batch,
             device=device,
-            num_rollouts=num_rollouts,
-            backward_fn=backward_fn,
-            collect_edge_debug=collect_edge_debug,
+            cache_inputs=cache_inputs,
+            flow_modules=flow_modules,
+            log_f_start_node_locals=log_f_start_node_locals,
+            log_f_start_ptr=log_f_start_ptr,
         )
+        remaining_chunks = len(chunk_sizes)
+
+        def on_chunk_loss_wrapper(chunk_loss_list: list[torch.Tensor]) -> torch.Tensor:
+            nonlocal remaining_chunks
+            retain_graph = cache_inputs and remaining_chunks > _ONE
+            remaining_chunks -= _ONE
+            return self._run_streaming_chunk_backward(
+                chunk_loss_list,
+                num_rollouts=num_rollouts,
+                backward_fn=backward_fn,
+                retain_graph=retain_graph,
+                supports_retain_graph=supports_retain_graph,
+                loss_scale=loss_scale,
+            )
+
+        chunk_loss_fn = on_chunk_loss_wrapper
         state, num_graphs, loss_total = self._run_chunked_rollouts(
             num_rollouts=num_rollouts,
             rollout_chunk_size=rollout_chunk_size,
+            chunk_sizes=chunk_sizes,
             rollout_cfg=rollout_cfg,
             temperature=temperature,
             collect_terminal_hits=collect_terminal_hits,
             collect_eval=collect_eval,
             chunk_inputs_fn=chunk_inputs_fn,
+            flow_modules=flow_modules,
+            guidance_beta=guidance_beta,
             store_loss_list=False,
-            on_chunk_loss=on_chunk_loss,
-            gate_spec=gate_spec,
-            distance_prior_spec=distance_prior_spec,
+            on_chunk_loss=chunk_loss_fn,
+            subtb_spec=subtb_spec,
             max_steps_override=max_steps_override,
             force_stop_at_end=force_stop_at_end,
+            disable_stop=disable_stop,
+            rollout_hook=rollout_hook,
         )
         return (
             loss_total,
             state.metrics_list,
             state.rollout_stop_nodes,
-            context.edge_debug,
             context.node_ptr,
-            context.node_is_answer,
+            context.node_is_target,
             num_graphs,
         )
 
@@ -2073,10 +4384,11 @@ class GFlowNetEngine:
         *,
         batch: Any,
         device: torch.device,
-        edge_debug: Dict[str, torch.Tensor],
         node_ptr: Optional[torch.Tensor],
-        node_is_answer: Optional[torch.Tensor],
-        collect_edge_debug: bool,
+        node_is_target: Optional[torch.Tensor],
+        log_f_module: torch.nn.Module,
+        log_f_start_node_locals: Optional[torch.Tensor],
+        log_f_start_ptr: Optional[torch.Tensor],
     ) -> tuple[
         RolloutInputs,
         Dict[str, torch.Tensor],
@@ -2085,20 +4397,31 @@ class GFlowNetEngine:
         int,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor],
+        torch.Tensor,
     ]:
         inputs = self.batch_processor.prepare_full_rollout_inputs(batch, device)
+        if log_f_module is self.log_f_backward:
+            answer_context = self._compute_answer_context_tokens(
+                inputs,
+                node_locals=inputs.start_node_locals,
+                node_ptr=inputs.start_ptr,
+            )
+            inputs = replace(inputs, question_tokens=answer_context)
         num_graphs = int(inputs.node_ptr.numel() - 1)
         node_ptr = inputs.node_ptr if node_ptr is None else node_ptr
         graph_cache = self.batch_processor.build_graph_cache(inputs, device=device)
-        node_is_answer = graph_cache["node_is_answer"] if node_is_answer is None else node_is_answer
-        if collect_edge_debug and not edge_debug:
-            edge_debug = {k: v.detach() for k, v in self._compute_edge_debug_metrics(inputs, graph_cache, device=device).items()}
+        if log_f_module is self.log_f_backward:
+            self._attach_inverse_edge_mask(graph_cache)
+        if node_is_target is None:
+            node_is_target = graph_cache.get("node_is_target") or graph_cache["node_is_answer"]
         flow_features = self._compute_flow_features(inputs)
         log_f_start = self._compute_log_f_start(
             inputs=inputs,
             graph_cache=graph_cache,
             flow_features=flow_features,
+            log_f_module=log_f_module,
+            start_node_locals=log_f_start_node_locals,
+            start_ptr=log_f_start_ptr,
         )
         graph_mask = ~inputs.dummy_mask
         return (
@@ -2109,8 +4432,7 @@ class GFlowNetEngine:
             graph_mask,
             num_graphs,
             node_ptr,
-            node_is_answer,
-            edge_debug,
+            node_is_target,
         )
 
     def _build_streaming_chunk_inputs(
@@ -2119,31 +4441,47 @@ class GFlowNetEngine:
         batch: Any,
         device: torch.device,
         context: StreamingChunkContext,
-        collect_edge_debug: bool,
+        flow_modules: FlowModules,
+        log_f_start_node_locals: Optional[torch.Tensor],
+        log_f_start_ptr: Optional[torch.Tensor],
     ) -> RolloutChunkInputs:
-        (
-            inputs,
-            graph_cache,
-            flow_features,
-            log_f_start,
-            graph_mask,
-            num_graphs,
-            node_ptr_local,
-            node_is_answer_local,
-            edge_debug,
-        ) = self._prepare_streaming_inputs(
-            batch=batch,
-            device=device,
-            edge_debug=context.edge_debug,
-            node_ptr=context.node_ptr,
-            node_is_answer=context.node_is_answer,
-            collect_edge_debug=collect_edge_debug,
-        )
-        if context.node_ptr is None:
-            context.node_ptr = node_ptr_local
-        if context.node_is_answer is None:
-            context.node_is_answer = node_is_answer_local
-        context.edge_debug = edge_debug
+        if (not context.cache_inputs) or context.inputs is None:
+            (
+                inputs,
+                graph_cache,
+                flow_features,
+                log_f_start,
+                graph_mask,
+                num_graphs,
+                node_ptr_local,
+                node_is_target_local,
+            ) = self._prepare_streaming_inputs(
+                batch=batch,
+                device=device,
+                node_ptr=context.node_ptr,
+                node_is_target=context.node_is_target,
+                log_f_module=flow_modules.log_f,
+                log_f_start_node_locals=log_f_start_node_locals,
+                log_f_start_ptr=log_f_start_ptr,
+            )
+            context.inputs = inputs
+            context.graph_cache = graph_cache
+            context.flow_features = flow_features
+            context.log_f_start = log_f_start
+            context.graph_mask = graph_mask
+            context.num_graphs = num_graphs
+            if context.node_ptr is None:
+                context.node_ptr = node_ptr_local
+            if context.node_is_target is None:
+                context.node_is_target = node_is_target_local
+        inputs = context.inputs
+        graph_cache = context.graph_cache
+        flow_features = context.flow_features
+        log_f_start = context.log_f_start
+        graph_mask = context.graph_mask
+        num_graphs = context.num_graphs
+        if inputs is None or graph_cache is None or flow_features is None or log_f_start is None or graph_mask is None:
+            raise RuntimeError("Streaming chunk inputs missing cached tensors.")
         return RolloutChunkInputs(
             inputs=inputs,
             graph_cache=graph_cache,
@@ -2151,17 +4489,35 @@ class GFlowNetEngine:
             log_f_start=log_f_start,
             graph_mask=graph_mask,
             num_graphs=num_graphs,
+            node_ptr=context.node_ptr if context.node_ptr is not None else node_ptr_local,
+            node_is_target=context.node_is_target if context.node_is_target is not None else node_is_target_local,
         )
+
+    @staticmethod
+    def _supports_retain_graph(backward_fn: Callable[..., None]) -> bool:
+        try:
+            signature = inspect.signature(backward_fn)
+        except (TypeError, ValueError):
+            return False
+        return "retain_graph" in signature.parameters
 
     @staticmethod
     def _run_streaming_chunk_backward(
         chunk_loss_list: list[torch.Tensor],
         *,
         num_rollouts: int,
-        backward_fn: Callable[[torch.Tensor], None],
+        backward_fn: Callable[..., None],
+        retain_graph: bool,
+        supports_retain_graph: bool,
+        loss_scale: float,
     ) -> torch.Tensor:
         chunk_loss = torch.stack(chunk_loss_list, dim=0).sum() / float(num_rollouts)
-        backward_fn(chunk_loss)
+        if loss_scale != float(_ONE):
+            chunk_loss = chunk_loss * float(loss_scale)
+        if retain_graph and supports_retain_graph:
+            backward_fn(chunk_loss, retain_graph=True)
+        else:
+            backward_fn(chunk_loss)
         return chunk_loss
 
     def _init_streaming_chunk_runner(
@@ -2169,32 +4525,32 @@ class GFlowNetEngine:
         *,
         batch: Any,
         device: torch.device,
-        num_rollouts: int,
-        backward_fn: Callable[[torch.Tensor], None],
-        collect_edge_debug: bool,
-    ) -> tuple[
-        StreamingChunkContext,
-        Callable[[], RolloutChunkInputs],
-        Callable[[list[torch.Tensor]], torch.Tensor],
-    ]:
+        cache_inputs: bool,
+        flow_modules: FlowModules,
+        log_f_start_node_locals: Optional[torch.Tensor],
+        log_f_start_ptr: Optional[torch.Tensor],
+    ) -> tuple[StreamingChunkContext, Callable[[], RolloutChunkInputs]]:
         context = StreamingChunkContext(
-            edge_debug={},
             node_ptr=None,
-            node_is_answer=None,
+            node_is_target=None,
+            inputs=None,
+            graph_cache=None,
+            flow_features=None,
+            log_f_start=None,
+            graph_mask=None,
+            num_graphs=_ZERO,
+            cache_inputs=cache_inputs,
         )
         chunk_inputs_fn = functools.partial(
             self._build_streaming_chunk_inputs,
             batch=batch,
             device=device,
             context=context,
-            collect_edge_debug=collect_edge_debug,
+            flow_modules=flow_modules,
+            log_f_start_node_locals=log_f_start_node_locals,
+            log_f_start_ptr=log_f_start_ptr,
         )
-        on_chunk_loss = functools.partial(
-            self._run_streaming_chunk_backward,
-            num_rollouts=num_rollouts,
-            backward_fn=backward_fn,
-        )
-        return context, chunk_inputs_fn, on_chunk_loss
+        return context, chunk_inputs_fn
 
     def _finalize_streaming_metrics(
         self,
@@ -2202,7 +4558,7 @@ class GFlowNetEngine:
         metrics_list: list[Dict[str, torch.Tensor]],
         rollout_stop_nodes: list[torch.Tensor],
         node_ptr: torch.Tensor,
-        node_is_answer: torch.Tensor,
+        node_is_target: torch.Tensor,
         rollout_cfg: GFlowNetRolloutConfig,
         num_rollouts: int,
         num_graphs: int,
@@ -2219,96 +4575,10 @@ class GFlowNetEngine:
             metrics_list=metrics_list,
             rollout_stop_nodes=rollout_stop_nodes,
             node_ptr=node_ptr,
-            node_is_answer=node_is_answer,
+            node_is_target=node_is_target,
             rollout_cfg=rollout_cfg,
             num_rollouts=num_rollouts,
             num_graphs=num_graphs,
-        )
-
-    def _attach_eval_metrics(
-        self,
-        *,
-        metrics: Dict[str, torch.Tensor],
-        actions_seq: torch.Tensor,
-        directions_seq: torch.Tensor,
-        visited_stack: torch.Tensor,
-        inputs: RolloutInputs,
-        num_rollouts: int,
-        num_graphs: int,
-        k_values: Sequence[int],
-    ) -> Dict[str, torch.Tensor]:
-        node_ptr = inputs.node_ptr[: num_graphs + _ONE]
-        answer_ptr = inputs.answer_ptr[: num_graphs + _ONE]
-        start_ptr = inputs.start_ptr[: num_graphs + _ONE]
-        total_nodes = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else _ZERO
-        total_starts = int(start_ptr[-1].item()) if start_ptr.numel() > 0 else _ZERO
-        total_answers = int(answer_ptr[-1].item()) if answer_ptr.numel() > 0 else _ZERO
-        start_nodes = inputs.start_node_locals
-        answer_nodes = inputs.answer_node_locals
-        node_is_start = torch.zeros(total_nodes, device=visited_stack.device, dtype=torch.bool)
-        node_is_answer = torch.zeros(total_nodes, device=visited_stack.device, dtype=torch.bool)
-        if total_starts > _ZERO:
-            node_is_start[start_nodes[:total_starts].to(device=visited_stack.device, dtype=torch.long)] = True
-        if total_answers > _ZERO:
-            node_is_answer[answer_nodes[:total_answers].to(device=visited_stack.device, dtype=torch.long)] = True
-        metrics.update(
-            gfn_metrics.compute_context_metrics(
-                visited_stack=visited_stack,
-                node_ptr=node_ptr,
-                node_is_answer=node_is_answer,
-                node_is_start=node_is_start,
-                answer_ptr=answer_ptr,
-                k_values=k_values,
-            )
-        )
-        metrics["path_diversity"] = gfn_metrics.compute_path_diversity(
-            actions_seq=actions_seq,
-            directions_seq=directions_seq,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-            edge_ptr=inputs.edge_ptr,
-        )
-        if self._context_debug_enabled:
-            context_stats = self._collect_context_debug_stats(
-                visited_stack=visited_stack,
-                inputs=inputs,
-                num_rollouts=num_rollouts,
-                num_graphs=num_graphs,
-                node_is_start=node_is_start,
-            )
-            if context_stats:
-                metrics.update({f"context_debug/{k}": v for k, v in context_stats.items()})
-        return metrics
-
-    def _attach_eval_metrics_from_rollout_lists(
-        self,
-        *,
-        metrics: Dict[str, torch.Tensor],
-        rollout_actions: list[torch.Tensor],
-        rollout_directions: list[torch.Tensor],
-        rollout_visited: list[torch.Tensor],
-        inputs: RolloutInputs,
-        num_rollouts: int,
-        num_graphs: int,
-        k_values: Sequence[int],
-    ) -> Dict[str, torch.Tensor]:
-        if not rollout_actions or not rollout_directions or not rollout_visited:
-            raise ValueError("Missing rollout buffers for eval metrics.")
-        actions_stack = torch.stack(rollout_actions, dim=0)
-        directions_stack = torch.stack(rollout_directions, dim=0)
-        num_steps = int(actions_stack.size(2))
-        actions_seq = actions_stack.reshape(num_rollouts * num_graphs, num_steps)
-        directions_seq = directions_stack.reshape(num_rollouts * num_graphs, num_steps)
-        visited_stack = torch.stack(rollout_visited, dim=0)
-        return self._attach_eval_metrics(
-            metrics=metrics,
-            actions_seq=actions_seq,
-            directions_seq=directions_seq,
-            visited_stack=visited_stack,
-            inputs=inputs,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-            k_values=k_values,
         )
 
     @staticmethod
@@ -2352,236 +4622,6 @@ class GFlowNetEngine:
             "start_out_degree_mean": start_degrees.to(dtype=torch.float32).mean(),
         }
 
-    def _compute_min_start_dist_stats(
-        self,
-        *,
-        node_min_dists: torch.Tensor,
-        start_node_locals: torch.Tensor,
-        start_counts: torch.Tensor,
-        num_graphs: int,
-        missing_start: torch.Tensor,
-        max_steps: int,
-    ) -> Dict[str, torch.Tensor]:
-        if start_node_locals.numel() == 0:
-            zero = torch.tensor(_ZERO, device=node_min_dists.device, dtype=torch.float32)
-            return {
-                "reachable_frac": zero,
-                "reachable_horizon_frac": zero,
-                "min_start_dist_mean": zero,
-            }
-        start_batch = torch.repeat_interleave(
-            torch.arange(num_graphs, device=node_min_dists.device),
-            start_counts.clamp(min=_ZERO),
-        )
-        start_dists = node_min_dists[start_node_locals]
-        init_val = torch.full(
-            (num_graphs,),
-            torch.iinfo(start_dists.dtype).max,
-            device=node_min_dists.device,
-            dtype=start_dists.dtype,
-        )
-        min_start_dist = init_val.scatter_reduce_(0, start_batch, start_dists, reduce="amin", include_self=True)
-        min_start_dist = torch.where(
-            missing_start,
-            torch.full_like(min_start_dist, _DIST_UNREACHABLE),
-            min_start_dist,
-        )
-        reachable = (min_start_dist >= _ZERO) & (~missing_start)
-        reachable_count = reachable.to(dtype=torch.float32).sum()
-        reachable_sum = (min_start_dist.to(dtype=torch.float32) * reachable.to(dtype=torch.float32)).sum()
-        reachable_mean = reachable_sum / reachable_count.clamp(min=float(_ONE))
-        return {
-            "reachable_frac": self._fraction(reachable),
-            "reachable_horizon_frac": self._fraction(reachable & (min_start_dist <= max_steps)),
-            "min_start_dist_mean": reachable_mean,
-        }
-
-    def _compute_candidate_edge_stats(
-        self,
-        *,
-        edge_index: torch.Tensor,
-        edge_batch: torch.Tensor,
-        node_is_start: torch.Tensor,
-        num_graphs: int,
-    ) -> Dict[str, torch.Tensor]:
-        if edge_index.numel() == 0 or num_graphs <= _ZERO:
-            zero = torch.tensor(_ZERO, device=edge_index.device, dtype=torch.float32)
-            return {
-                "candidate_edges_mean": zero,
-                "candidate_edges_zero_frac": zero,
-            }
-        heads = edge_index[0]
-        tails = edge_index[1]
-        candidate_mask = node_is_start[heads] & (~node_is_start[tails])
-        candidate_counts = torch.zeros(num_graphs, device=edge_index.device, dtype=torch.long)
-        candidate_counts.index_add_(0, edge_batch, candidate_mask.to(dtype=torch.long))
-        return {
-            "candidate_edges_mean": candidate_counts.to(dtype=torch.float32).mean(),
-            "candidate_edges_zero_frac": self._fraction(candidate_counts == _ZERO),
-        }
-
-    def _compute_visited_stats(
-        self,
-        *,
-        visited_stack: torch.Tensor,
-        node_ptr: torch.Tensor,
-        answer_node_locals: torch.Tensor,
-        answer_counts: torch.Tensor,
-        num_graphs: int,
-    ) -> Dict[str, torch.Tensor]:
-        if num_graphs <= _ZERO or visited_stack.numel() == 0:
-            zero = torch.tensor(_ZERO, device=visited_stack.device, dtype=torch.float32)
-            return {
-                "visited_frac_first": zero,
-                "answer_hit_first_frac": zero,
-            }
-        node_counts = node_ptr[1:] - node_ptr[:-1]
-        node_batch = torch.repeat_interleave(
-            torch.arange(num_graphs, device=visited_stack.device),
-            node_counts.to(dtype=torch.long),
-        )
-        visited_first = visited_stack[0].to(dtype=torch.long)
-        visited_counts = torch.zeros(num_graphs, device=visited_stack.device, dtype=torch.long)
-        visited_counts.index_add_(0, node_batch, visited_first)
-        node_counts_safe = node_counts.clamp(min=_ONE).to(dtype=torch.float32)
-        visited_frac = (visited_counts.to(dtype=torch.float32) / node_counts_safe).mean()
-        if answer_node_locals.numel() == 0:
-            return {
-                "visited_frac_first": visited_frac,
-                "answer_hit_first_frac": torch.tensor(_ZERO, device=visited_stack.device, dtype=torch.float32),
-            }
-        answer_batch = torch.repeat_interleave(
-            torch.arange(num_graphs, device=visited_stack.device),
-            answer_counts.clamp(min=_ZERO),
-        )
-        answer_visited = visited_first[answer_node_locals].to(dtype=torch.long)
-        answer_hit_counts = torch.zeros(num_graphs, device=visited_stack.device, dtype=torch.long)
-        answer_hit_counts.index_add_(0, answer_batch, answer_visited)
-        answer_hit = answer_hit_counts > _ZERO
-        answer_has_any = answer_counts > _ZERO
-        answer_hit_frac = self._fraction(answer_hit, denom_mask=answer_has_any)
-        return {
-            "visited_frac_first": visited_frac,
-            "answer_hit_first_frac": answer_hit_frac,
-        }
-
-    @staticmethod
-    def _tensor_stats_to_floats(stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        return {key: float(val.item()) for key, val in stats.items()}
-
-    def _build_context_debug_base(
-        self,
-        *,
-        inputs: RolloutInputs,
-        num_rollouts: int,
-        num_graphs: int,
-    ) -> tuple[Dict[str, float], Dict[str, torch.Tensor | int]]:
-        if num_graphs <= _ZERO:
-            return {}, {}
-        node_ptr = inputs.node_ptr[: num_graphs + _ONE]
-        edge_ptr = inputs.edge_ptr[: num_graphs + _ONE]
-        start_ptr = inputs.start_ptr[: num_graphs + _ONE]
-        answer_ptr = inputs.answer_ptr[: num_graphs + _ONE]
-        total_nodes = int(node_ptr[-_ONE].item()) if node_ptr.numel() > _ZERO else _ZERO
-        total_edges = int(edge_ptr[-_ONE].item()) if edge_ptr.numel() > _ZERO else _ZERO
-        start_counts = (start_ptr[_ONE:] - start_ptr[:-_ONE]).to(dtype=torch.long)
-        answer_counts = (answer_ptr[_ONE:] - answer_ptr[:-_ONE]).to(dtype=torch.long)
-        missing_start = start_counts == _ZERO
-        missing_answer = answer_counts == _ZERO
-        dummy_mask = inputs.dummy_mask[:num_graphs].to(dtype=torch.bool)
-        stats: Dict[str, float] = {
-            "num_graphs": float(num_graphs),
-            "num_rollouts": float(num_rollouts),
-            "max_steps": float(getattr(self.env, "max_steps", _ZERO)),
-            "total_nodes": float(total_nodes),
-            "total_edges": float(total_edges),
-            "missing_start_frac": float(self._fraction(missing_start).item()),
-            "missing_answer_frac": float(self._fraction(missing_answer).item()),
-            "dummy_frac": float(self._fraction(dummy_mask).item()),
-            "start_count_mean": float(start_counts.to(dtype=torch.float32).mean().item()),
-            "answer_count_mean": float(answer_counts.to(dtype=torch.float32).mean().item()),
-        }
-        context = {
-            "node_ptr": node_ptr,
-            "edge_ptr": edge_ptr,
-            "start_counts": start_counts,
-            "answer_counts": answer_counts,
-            "missing_start": missing_start,
-            "total_nodes": total_nodes,
-        }
-        return stats, context
-
-    def _collect_context_debug_stats(
-        self,
-        *,
-        visited_stack: torch.Tensor,
-        inputs: RolloutInputs,
-        num_rollouts: int,
-        num_graphs: int,
-        node_is_start: torch.Tensor,
-    ) -> Dict[str, float]:
-        stats, context = self._build_context_debug_base(
-            inputs=inputs,
-            num_rollouts=num_rollouts,
-            num_graphs=num_graphs,
-        )
-        if not stats:
-            return {}
-        edge_index = inputs.edge_index
-        edge_batch = inputs.edge_batch
-        start_node_locals = inputs.start_node_locals
-        answer_node_locals = inputs.answer_node_locals
-        node_min_dists = inputs.node_min_dists
-        node_ptr = context["node_ptr"]
-        start_counts = context["start_counts"]
-        answer_counts = context["answer_counts"]
-        missing_start = context["missing_start"]
-        total_nodes = int(context["total_nodes"])
-        max_steps = int(getattr(self.env, "max_steps", _ZERO))
-        stats.update(
-            self._tensor_stats_to_floats(
-                self._compute_start_out_stats(
-                    edge_index=edge_index,
-                    start_node_locals=start_node_locals,
-                    start_counts=start_counts,
-                    num_graphs=num_graphs,
-                    total_nodes=total_nodes,
-                    missing_start=missing_start,
-                )
-            )
-        )
-        stats.update(
-            self._tensor_stats_to_floats(
-                self._compute_min_start_dist_stats(
-                    node_min_dists=node_min_dists,
-                    start_node_locals=start_node_locals,
-                    start_counts=start_counts,
-                    num_graphs=num_graphs,
-                    missing_start=missing_start,
-                    max_steps=max_steps,
-                )
-            )
-        )
-        stats.update(
-            self._tensor_stats_to_floats(
-                self._compute_candidate_edge_stats(
-                    edge_index=edge_index, edge_batch=edge_batch, node_is_start=node_is_start, num_graphs=num_graphs
-                )
-            )
-        )
-        stats.update(
-            self._tensor_stats_to_floats(
-                self._compute_visited_stats(
-                    visited_stack=visited_stack,
-                    node_ptr=node_ptr,
-                    answer_node_locals=answer_node_locals,
-                    answer_counts=answer_counts,
-                    num_graphs=num_graphs,
-                )
-            )
-        )
-        return stats
-
     @staticmethod
     def _extract_batch_meta(batch: Any, num_graphs: int) -> tuple[list[str], list[str]]:
         raw_ids = getattr(batch, "sample_id", None)
@@ -2604,6 +4644,21 @@ class GFlowNetEngine:
         return sample_ids, questions
 
     @staticmethod
+    def _extract_sample_ids_for_replay(batch: Any, num_graphs: int) -> list[str]:
+        raw_ids = getattr(batch, "sample_id", None)
+        if raw_ids is None:
+            raise ValueError("Batch missing sample_id required for replay.")
+        if isinstance(raw_ids, (list, tuple)):
+            sample_ids = [str(s) for s in raw_ids]
+        elif torch.is_tensor(raw_ids):
+            sample_ids = [str(s.detach().tolist()) for s in raw_ids.view(-1)]
+        else:
+            raise ValueError(f"batch.sample_id must be list/tuple/tensor, got {type(raw_ids)!r}.")
+        if len(sample_ids) != num_graphs:
+            raise ValueError(f"sample_id length {len(sample_ids)} != num_graphs {num_graphs}.")
+        return sample_ids
+
+    @staticmethod
     def _extract_answer_entity_ids(batch: Any, num_graphs: int) -> list[list[int]]:
         raw_ids = getattr(batch, "answer_entity_ids", None)
         if not torch.is_tensor(raw_ids):
@@ -2619,17 +4674,17 @@ class GFlowNetEngine:
         ptr = ptr.view(-1)
         if ptr.numel() != num_graphs + _ONE:
             raise ValueError(f"answer_entity_ids_ptr length {ptr.numel()} != num_graphs+1 ({num_graphs + _ONE}).")
-        if int(ptr[0].item()) != _ZERO:
+        if int(ptr[0].detach().tolist()) != _ZERO:
             raise ValueError("answer_entity_ids_ptr must start at 0.")
-        if bool((ptr[1:] < ptr[:-1]).any().item()):
+        if bool((ptr[1:] < ptr[:-1]).any().detach().tolist()):
             raise ValueError("answer_entity_ids_ptr must be non-decreasing.")
-        if int(ptr[-1].item()) != raw_ids.numel():
-            raise ValueError(f"answer_entity_ids_ptr must end at {raw_ids.numel()}, got {int(ptr[-1].item())}.")
+        if int(ptr[-1].detach().tolist()) != raw_ids.numel():
+            raise ValueError(f"answer_entity_ids_ptr must end at {raw_ids.numel()}, got {int(ptr[-1].detach().tolist())}.")
         answer_lists: list[list[int]] = []
         for gid in range(num_graphs):
-            start = int(ptr[gid].item())
-            end = int(ptr[gid + 1].item())
-            answer_lists.append([int(x) for x in raw_ids[start:end].detach().cpu().tolist()])
+            start = int(ptr[gid].detach().tolist())
+            end = int(ptr[gid + 1].detach().tolist())
+            answer_lists.append([int(x) for x in raw_ids[start:end].detach().to(device="cpu").tolist()])
         return answer_lists
 
     @staticmethod
@@ -2653,18 +4708,18 @@ class GFlowNetEngine:
         ptr = ptr.view(-1)
         if ptr.numel() != num_graphs + _ONE:
             raise ValueError(f"q_local_indices_ptr length {ptr.numel()} != num_graphs+1 ({num_graphs + _ONE}).")
-        if int(ptr[0].item()) != _ZERO:
+        if int(ptr[0].detach().tolist()) != _ZERO:
             raise ValueError("q_local_indices_ptr must start at 0.")
-        if bool((ptr[1:] < ptr[:-1]).any().item()):
+        if bool((ptr[1:] < ptr[:-1]).any().detach().tolist()):
             raise ValueError("q_local_indices_ptr must be non-decreasing.")
-        if int(ptr[-1].item()) != raw.numel():
-            raise ValueError(f"q_local_indices_ptr must end at {raw.numel()}, got {int(ptr[-1].item())}.")
+        if int(ptr[-1].detach().tolist()) != raw.numel():
+            raise ValueError(f"q_local_indices_ptr must end at {raw.numel()}, got {int(ptr[-1].detach().tolist())}.")
         start_lists: list[list[int]] = []
         for gid in range(num_graphs):
-            start = int(ptr[gid].item())
-            end = int(ptr[gid + 1].item())
+            start = int(ptr[gid].detach().tolist())
+            end = int(ptr[gid + 1].detach().tolist())
             indices = raw[start:end]
-            start_lists.append([int(x) for x in indices.detach().cpu().tolist()])
+            start_lists.append([int(x) for x in indices.detach().to(device="cpu").tolist()])
         return start_lists
 
     @staticmethod
@@ -2692,51 +4747,46 @@ class GFlowNetEngine:
         ptr = ptr.view(-1)
         if ptr.numel() != num_graphs + _ONE:
             raise ValueError(f"q_local_indices_ptr length {ptr.numel()} != num_graphs+1 ({num_graphs + _ONE}).")
-        if int(ptr[0].item()) != _ZERO:
+        if int(ptr[0].detach().tolist()) != _ZERO:
             raise ValueError("q_local_indices_ptr must start at 0.")
-        if bool((ptr[1:] < ptr[:-1]).any().item()):
+        if bool((ptr[1:] < ptr[:-1]).any().detach().tolist()):
             raise ValueError("q_local_indices_ptr must be non-decreasing.")
-        if int(ptr[-1].item()) != raw.numel():
-            raise ValueError(f"q_local_indices_ptr must end at {raw.numel()}, got {int(ptr[-1].item())}.")
+        if int(ptr[-1].detach().tolist()) != raw.numel():
+            raise ValueError(f"q_local_indices_ptr must end at {raw.numel()}, got {int(ptr[-1].detach().tolist())}.")
         start_lists: list[list[int]] = []
         for gid in range(num_graphs):
-            start = int(ptr[gid].item())
-            end = int(ptr[gid + 1].item())
+            start = int(ptr[gid].detach().tolist())
+            end = int(ptr[gid + 1].detach().tolist())
             indices = raw[start:end]
             if indices.numel() == 0:
                 start_lists.append([])
                 continue
             ids = node_global_ids.index_select(0, indices.to(device=node_global_ids.device))
-            start_lists.append([int(x) for x in ids.detach().cpu().tolist()])
+            start_lists.append([int(x) for x in ids.detach().to(device="cpu").tolist()])
         return start_lists
 
     @staticmethod
-    def _build_undirected_rollout_edges(
+    def _build_rollout_edges(
         *,
         actions: torch.Tensor,
-        directions: torch.Tensor,
         edge_index: torch.Tensor,
         edge_relations: torch.Tensor,
         node_global_ids: torch.Tensor,
         edge_start: int,
         edge_end: int,
         node_offset: int,
-        start_locals: Sequence[int],
-    ) -> tuple[list[int], list[int], list[Dict[str, Any]]]:
-        active = {int(x) for x in start_locals}
+        start_local: int,
+    ) -> tuple[list[int], list[Dict[str, Any]]]:
+        current_local = int(start_local)
         edge_ids: list[int] = []
-        dir_ids: list[int] = []
         edges_meta: list[Dict[str, Any]] = []
         actions = actions.view(-1)
-        directions = directions.view(-1)
-        if actions.numel() != directions.numel():
-            raise ValueError("actions/directions length mismatch in rollout edge metadata.")
-        for step_idx, action in enumerate(actions.tolist()):
+        first_edge = True
+        for action in actions.tolist():
             if action < _ZERO:
-                if action == STOP_RELATION and active:
-                    local = min(active)
-                    head_idx = node_offset + local
-                    head_gid = int(node_global_ids[head_idx].item())
+                if action == STOP_RELATION and current_local >= _ZERO:
+                    head_idx = node_offset + current_local
+                    head_gid = int(node_global_ids[head_idx].detach().tolist())
                     edges_meta.append(
                         {
                             "head_entity_id": head_gid,
@@ -2750,43 +4800,33 @@ class GFlowNetEngine:
             edge_id = int(action)
             if edge_id < edge_start or edge_id >= edge_end:
                 raise ValueError(f"rollout edge id {edge_id} out of range [{edge_start},{edge_end}).")
-            rel_id = int(edge_relations[edge_id].item())
-            head_idx = int(edge_index[0, edge_id].item())
-            tail_idx = int(edge_index[1, edge_id].item())
+            rel_id = int(edge_relations[edge_id].detach().tolist())
+            head_idx = int(edge_index[0, edge_id].detach().tolist())
+            tail_idx = int(edge_index[1, edge_id].detach().tolist())
             head_local = head_idx - node_offset
             tail_local = tail_idx - node_offset
-            dir_id = int(directions[step_idx].item())
-            if dir_id not in (DIRECTION_FORWARD, DIRECTION_BACKWARD):
-                raise ValueError(f"rollout directions_seq contains invalid values: {dir_id}.")
+            if current_local < _ZERO:
+                current_local = head_local
+            elif head_local != current_local:
+                if first_edge:
+                    current_local = head_local
+                else:
+                    raise ValueError("rollout edge head does not match current active node.")
+            first_edge = False
             edge_ids.append(edge_id - edge_start)
-            dir_ids.append(dir_id)
-            head_gid = int(node_global_ids[head_idx].item())
-            tail_gid = int(node_global_ids[tail_idx].item())
-            head_active = head_local in active
-            tail_active = tail_local in active
-            if head_active == tail_active:
-                raise ValueError(
-                    "Undirected rollout edge has ambiguous active endpoint; "
-                    f"head_active={head_active}, tail_active={tail_active}."
-                )
-            if head_active:
-                src_idx = head_idx
-                dst_idx = tail_idx
-                active = {tail_local}
-            else:
-                src_idx = tail_idx
-                dst_idx = head_idx
-                active = {head_local}
+            head_gid = int(node_global_ids[head_idx].detach().tolist())
+            tail_gid = int(node_global_ids[tail_idx].detach().tolist())
             edges_meta.append(
                 {
                     "head_entity_id": head_gid,
                     "tail_entity_id": tail_gid,
                     "relation_id": rel_id,
-                    "src_entity_id": int(node_global_ids[src_idx].item()),
-                    "dst_entity_id": int(node_global_ids[dst_idx].item()),
+                    "src_entity_id": head_gid,
+                    "dst_entity_id": tail_gid,
                 }
             )
-        return edge_ids, dir_ids, edges_meta
+            current_local = tail_local
+        return edge_ids, edges_meta
 
     def _build_rollout_records(
         self,
@@ -2806,11 +4846,11 @@ class GFlowNetEngine:
             raise ValueError(f"edge_ptr length {edge_ptr.numel()} != num_graphs+1 ({num_graphs + 1}).")
         if edge_ptr.numel() == 0:
             raise ValueError("edge_ptr must be non-empty.")
-        if int(edge_ptr[0].item()) != 0:
-            raise ValueError(f"edge_ptr must start at 0, got {int(edge_ptr[0].item())}.")
-        if bool((edge_ptr[1:] < edge_ptr[:-1]).any().item()):
+        if int(edge_ptr[0].detach().tolist()) != 0:
+            raise ValueError(f"edge_ptr must start at 0, got {int(edge_ptr[0].detach().tolist())}.")
+        if bool((edge_ptr[1:] < edge_ptr[:-1]).any().detach().tolist()):
             raise ValueError("edge_ptr must be non-decreasing.")
-        total_edges = int(edge_ptr[-1].item())
+        total_edges = int(edge_ptr[-1].detach().tolist())
         sample_ids, questions = self._extract_batch_meta(batch, num_graphs)
         answer_entity_ids = self._extract_answer_entity_ids(batch, num_graphs)
         node_global_ids = getattr(batch, "node_global_ids", None)
@@ -2818,31 +4858,25 @@ class GFlowNetEngine:
             raise ValueError("Batch missing node_global_ids required for rollout artifacts.")
         if not torch.is_tensor(node_global_ids):
             node_global_ids = torch.as_tensor(node_global_ids, dtype=torch.long)
-        node_global_ids = node_global_ids.view(-1).detach().cpu()
+        node_global_ids = node_global_ids.view(-1).detach().to(device="cpu")
         start_entity_ids = self._extract_start_entity_ids(batch, num_graphs, node_global_ids)
         start_local_indices = self._extract_start_local_indices(batch, num_graphs)
         edge_index = edge_index.to(dtype=torch.long)
         edge_relations = edge_relations.to(dtype=torch.long)
         if not rollout_logs:
             raise ValueError("rollout_logs must be non-empty.")
-        normalized_logs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        normalized_logs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for ridx, log in enumerate(rollout_logs):
             actions_seq = log.get("actions_seq")
-            directions_seq = log.get("directions_seq")
             log_pf = log.get("log_pf")
             reach_success = log.get("reach_success")
             stop_node_locals = log.get("stop_node_locals")
-            if actions_seq is None or directions_seq is None or log_pf is None:
-                raise ValueError(f"rollout_logs[{ridx}] missing required keys (actions_seq/directions_seq/log_pf).")
+            if actions_seq is None or log_pf is None:
+                raise ValueError(f"rollout_logs[{ridx}] missing required keys (actions_seq/log_pf).")
             if reach_success is None or stop_node_locals is None:
                 raise ValueError(f"rollout_logs[{ridx}] missing reach_success/stop_node_locals.")
             if actions_seq.dim() != 2:
                 raise ValueError(f"rollout_logs[{ridx}].actions_seq must be [B,T], got shape={tuple(actions_seq.shape)}.")
-            if directions_seq.shape != actions_seq.shape:
-                raise ValueError(
-                    f"rollout_logs[{ridx}].directions_seq shape mismatch with actions_seq: "
-                    f"{tuple(directions_seq.shape)} vs {tuple(actions_seq.shape)}."
-                )
             if actions_seq.size(0) != num_graphs:
                 raise ValueError(f"rollout_logs[{ridx}].actions_seq batch {actions_seq.size(0)} != num_graphs {num_graphs}.")
             if log_pf.dim() != 1 or log_pf.numel() != num_graphs:
@@ -2854,7 +4888,6 @@ class GFlowNetEngine:
             normalized_logs.append(
                 (
                     actions_seq.to(dtype=torch.long),
-                    directions_seq.to(dtype=torch.long),
                     log_pf,
                     reach_success.to(dtype=torch.float32),
                     stop_node_locals.to(dtype=torch.long),
@@ -2863,10 +4896,10 @@ class GFlowNetEngine:
         records: list[Dict[str, Any]] = []
         for g in range(num_graphs):
             rollouts: list[Dict[str, Any]] = []
-            edge_start = int(edge_ptr[g].item())
-            edge_end = int(edge_ptr[g + 1].item())
-            node_offset = int(node_ptr[g].item())
-            node_end = int(node_ptr[g + 1].item())
+            edge_start = int(edge_ptr[g].detach().tolist())
+            edge_end = int(edge_ptr[g + 1].detach().tolist())
+            node_offset = int(node_ptr[g].detach().tolist())
+            node_end = int(node_ptr[g + 1].detach().tolist())
             start_locals = start_local_indices[g] if g < len(start_local_indices) else []
             if start_locals:
                 # Convert batch-global q indices into per-graph local indices.
@@ -2880,43 +4913,36 @@ class GFlowNetEngine:
                         )
                     converted.append(local)
                 start_locals = converted
-            for ridx, (actions_seq, directions_seq, log_pf, reach_success, stop_node_locals) in enumerate(normalized_logs):
+            start_local = min(start_locals) if start_locals else -1
+            for ridx, (actions_seq, log_pf, reach_success, stop_node_locals) in enumerate(normalized_logs):
                 actions = actions_seq[g].to(dtype=torch.long)
-                directions = directions_seq[g].to(dtype=torch.long)
-                if actions.numel() != directions.numel():
-                    raise ValueError(
-                        f"rollout_logs[{ridx}] actions/directions length mismatch for graph {g}: "
-                        f"{actions.numel()} vs {directions.numel()}."
-                    )
-                if bool((actions < STOP_RELATION).any().item()):
+                if bool((actions < STOP_RELATION).any().detach().tolist()):
                     bad = actions[actions < STOP_RELATION][:5].tolist()
                     raise ValueError(f"rollout_logs[{ridx}] actions_seq contains invalid negatives: {bad}.")
-                edge_ids, dir_ids, edges_meta = self._build_undirected_rollout_edges(
+                edge_ids, edges_meta = self._build_rollout_edges(
                     actions=actions,
-                    directions=directions,
                     edge_index=edge_index,
                     edge_relations=edge_relations,
                     node_global_ids=node_global_ids,
                     edge_start=edge_start,
                     edge_end=edge_end,
                     node_offset=node_offset,
-                    start_locals=start_locals,
+                    start_local=start_local,
                 )
                 if edge_ids and total_edges <= 0:
                     raise ValueError("actions_seq selects edges but edge_ptr indicates zero total edges.")
                 rollouts.append(
                     {
                         "rollout_index": ridx,
-                        "log_pf": float(log_pf[g].item()),
-                        "reach_success": bool(reach_success[g].item()),
-                        "stop_node_local": int(stop_node_locals[g].item()),
+                        "log_pf": float(log_pf[g].detach().tolist()),
+                        "reach_success": bool(reach_success[g].detach().tolist()),
+                        "stop_node_local": int(stop_node_locals[g].detach().tolist()),
                         "stop_node_entity_id": (
-                            int(node_global_ids[int(node_ptr[g].item()) + int(stop_node_locals[g].item())].item())
-                            if int(stop_node_locals[g].item()) >= _ZERO
+                            int(node_global_ids[int(node_ptr[g].detach().tolist()) + int(stop_node_locals[g].detach().tolist())].detach().tolist())
+                            if int(stop_node_locals[g].detach().tolist()) >= _ZERO
                             else None
                         ),
                         "edge_ids": edge_ids,
-                        "directions": dir_ids,
                         "edges": edges_meta,
                     }
                 )

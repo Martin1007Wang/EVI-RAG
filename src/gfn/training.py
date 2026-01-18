@@ -22,6 +22,7 @@ _DEFAULT_SCHED_T0 = 10
 _DEFAULT_SCHED_T_MULT = 1
 _DEFAULT_SCHED_ETA_MIN = 0.0
 _DEFAULT_SCHED_INTERVAL = "epoch"
+_DEFAULT_MANUAL_ACCUMULATE_GRAD_BATCHES = 1
 
 
 class GFlowNetMetricLogger:
@@ -103,15 +104,59 @@ class GFlowNetGradClipper:
         if not params or device is None or dtype is None:
             return {}
         self._assert_finite_grads(params)
+        norm_type = self._resolve_norm_type()
+        log_metrics = self._should_log_clip_metrics()
+        pre_norm = None
+        flow_pre = None
+        actor_pre = None
+        if log_metrics or self.module._adaptive_grad_clip:
+            pre_norm = self._compute_grad_norm(params, norm_type=norm_type, device=device, dtype=dtype)
+        if log_metrics:
+            flow_pre = self._compute_module_grad_norm(
+                self.module.log_f,
+                norm_type=norm_type,
+                device=device,
+                dtype=dtype,
+            )
+            actor_pre = self._compute_module_grad_norm(
+                self.module.actor,
+                norm_type=norm_type,
+                device=device,
+                dtype=dtype,
+            )
         if self.module._adaptive_grad_clip:
             clip_val = self._resolve_adaptive_clip_val(clip_val, device=device, dtype=dtype)
-        norm_type = self._resolve_norm_type()
-        return self._build_clip_metrics(
-            optimizer_ref=optimizer,
-            params=params,
+        self._apply_clip_algorithm(
+            optimizer_ref=optimizer_ref,
             clip_val=clip_val,
-            norm_type=norm_type,
             algorithm=algorithm,
+        )
+        if not log_metrics:
+            if pre_norm is not None and self.module._adaptive_grad_clip:
+                log_norm = torch.log(pre_norm.to(dtype=torch.float32) + float(self.module._grad_clip_log_eps))
+                _ = self._update_grad_log_norm_ema(log_norm)
+            return {}
+        if pre_norm is None:
+            pre_norm = self._compute_grad_norm(params, norm_type=norm_type, device=device, dtype=dtype)
+        if flow_pre is None or actor_pre is None:
+            raise RuntimeError("Grad norm metrics missing pre-clip module norms.")
+        post_norm = self._compute_grad_norm(params, norm_type=norm_type, device=device, dtype=dtype)
+        flow_post = self._compute_module_grad_norm(self.module.log_f, norm_type=norm_type, device=device, dtype=dtype)
+        actor_post = self._compute_module_grad_norm(
+            self.module.actor,
+            norm_type=norm_type,
+            device=device,
+            dtype=dtype,
+        )
+        return self._build_clip_metrics(
+            pre_norm=pre_norm,
+            post_norm=post_norm,
+            clip_val=clip_val,
+            algorithm=algorithm,
+            flow_pre=flow_pre,
+            flow_post=flow_post,
+            actor_pre=actor_pre,
+            actor_post=actor_post,
             device=device,
             dtype=dtype,
         )
@@ -119,42 +164,22 @@ class GFlowNetGradClipper:
     def _build_clip_metrics(
         self,
         *,
-        optimizer_ref: torch.optim.Optimizer,
-        params: Sequence[torch.nn.Parameter],
         clip_val: float,
-        norm_type: float,
         algorithm: str,
         device: torch.device,
         dtype: torch.dtype,
+        pre_norm: torch.Tensor,
+        post_norm: torch.Tensor,
+        flow_pre: torch.Tensor,
+        flow_post: torch.Tensor,
+        actor_pre: torch.Tensor,
+        actor_post: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        flow_pre = self._compute_module_grad_norm(
-            self.module.log_f,
-            norm_type=norm_type,
-            device=device,
-            dtype=dtype,
-        )
-        actor_pre = self._compute_module_grad_norm(
-            self.module.actor,
-            norm_type=norm_type,
-            device=device,
-            dtype=dtype,
-        )
-        pre_norm = self._compute_grad_norm(params, norm_type=norm_type, device=device, dtype=dtype)
-        self._apply_clip_algorithm(
-            optimizer_ref=optimizer_ref,
-            clip_val=clip_val,
-            algorithm=algorithm,
-        )
-        post_norm = self._compute_grad_norm(params, norm_type=norm_type, device=device, dtype=dtype)
         clip_coef = self._compute_clip_coef(
             pre_norm=pre_norm,
             post_norm=post_norm,
             clip_val=clip_val,
             algorithm=algorithm,
-        )
-        flow_post = self._compute_module_grad_norm(self.module.log_f, norm_type=norm_type, device=device, dtype=dtype)
-        actor_post = self._compute_module_grad_norm(
-            self.module.actor, norm_type=norm_type, device=device, dtype=dtype
         )
         log_norm = torch.log(pre_norm.to(dtype=torch.float32) + float(self.module._grad_clip_log_eps))
         log_mean, log_std = self._update_grad_log_norm_ema(log_norm)
@@ -172,6 +197,13 @@ class GFlowNetGradClipper:
             device=device,
             dtype=dtype,
         )
+
+    def _should_log_clip_metrics(self) -> bool:
+        interval = int(getattr(self.module, "_grad_clip_log_interval", _ONE))
+        if interval <= _ONE:
+            return True
+        step = int(self.module.global_step)
+        return step % interval == _ZERO
 
     def _apply_clip_algorithm(
         self,
@@ -201,11 +233,11 @@ class GFlowNetGradClipper:
         clip_val: float,
         algorithm: str,
     ) -> float:
-        denom = float(pre_norm.item()) + float(self.module._grad_clip_log_eps)
+        denom = float(pre_norm.detach().tolist()) + float(self.module._grad_clip_log_eps)
         if clip_val <= float(_ZERO):
             return float(_ONE)
         if algorithm == "value":
-            return float(post_norm.item()) / denom
+            return float(post_norm.detach().tolist()) / denom
         return min(float(_ONE), clip_val / denom)
 
     def _resolve_clip_val(self) -> float:
@@ -281,16 +313,16 @@ class GFlowNetGradClipper:
     @staticmethod
     def _summarize_grad(name: str, grad: torch.Tensor) -> str:
         finite = torch.isfinite(grad)
-        non_finite = int((~finite).sum().item())
-        nan_count = int(torch.isnan(grad).sum().item())
-        inf_count = int(torch.isinf(grad).sum().item())
+        non_finite = int((~finite).sum().detach().tolist())
+        nan_count = int(torch.isnan(grad).sum().detach().tolist())
+        inf_count = int(torch.isinf(grad).sum().detach().tolist())
         finite_vals = grad[finite]
         if finite_vals.numel() > _ZERO:
             calc = finite_vals.to(dtype=torch.float32)
-            min_val = float(calc.min().item())
-            max_val = float(calc.max().item())
-            mean_val = float(calc.mean().item())
-            abs_max = float(calc.abs().max().item())
+            min_val = float(calc.min().detach().tolist())
+            max_val = float(calc.max().detach().tolist())
+            mean_val = float(calc.mean().detach().tolist())
+            abs_max = float(calc.abs().max().detach().tolist())
         else:
             min_val = _NAN
             max_val = _NAN
@@ -352,7 +384,7 @@ class GFlowNetGradClipper:
         beta = self._resolve_grad_clip_ema_beta()
         beta_t = torch.as_tensor(beta, device=log_norm.device, dtype=log_norm.dtype)
         one_t = torch.as_tensor(float(_ONE), device=log_norm.device, dtype=log_norm.dtype)
-        if int(self.module.grad_ema_initialized.item()) == _ZERO:
+        if int(self.module.grad_ema_initialized.detach().tolist()) == _ZERO:
             self.module.grad_log_norm_ema.copy_(log_norm)
             self.module.grad_log_norm_sq_ema.copy_(log_norm * log_norm)
             self.module.grad_ema_initialized.fill_(_ONE)
@@ -407,7 +439,7 @@ class GFlowNetGradClipper:
         device: torch.device,
         dtype: torch.dtype,
     ) -> float:
-        if int(self.module.grad_ema_initialized.item()) == _ZERO:
+        if int(self.module.grad_ema_initialized.detach().tolist()) == _ZERO:
             return fallback
         mean, std = self._grad_log_norm_stats(device=device, dtype=dtype)
         tail_prob = self._resolve_grad_clip_tail_prob()
@@ -415,7 +447,7 @@ class GFlowNetGradClipper:
         z_value = self._normal_icdf(tail)
         clip_log = mean + z_value * std
         clip_val = torch.exp(clip_log).clamp(min=float(self.module._grad_clip_log_eps))
-        return float(clip_val.item())
+        return float(clip_val.detach().tolist())
 
     def _build_grad_metrics(
         self,
@@ -469,30 +501,33 @@ class GFlowNetTrainingLoop:
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def training_step(self, batch, batch_idx: int):
-        self._maybe_init_flow_bias(batch)
         optimizer = self.module.optimizers()
         if self._should_zero_grad(batch_idx):
             optimizer.zero_grad(set_to_none=True)
         rollout_cfg = self.module.build_rollout_cfg(is_training=True)
+        accum_steps = self._accumulate_grad_batches()
         progress = self._resolve_training_progress()
+        stream_forward_progress = self._resolve_stream_forward_weight_progress()
         should_step = self._should_step_optimizer(batch_idx)
         sync_context = nullcontext()
         if not should_step:
             no_sync = getattr(self.module, "no_sync", None)
             if no_sync is not None:
                 sync_context = no_sync()
+
+        def _scaled_backward(loss: torch.Tensor, *, retain_graph: bool = False) -> None:
+            return self.module.manual_backward(loss / float(accum_steps), retain_graph=retain_graph)
+
         with sync_context:
             loss, metrics = self.module.engine.compute_batch_loss_streaming(
                 batch=batch,
                 device=self.module.device,
                 rollout_cfg=rollout_cfg,
-                backward_fn=self.module.manual_backward,
+                backward_fn=_scaled_backward,
                 progress=progress,
+                stream_forward_progress=stream_forward_progress,
             )
         metrics = self._attach_loss(metrics, loss)
-        control_metrics = self._update_success_controller(metrics)
-        if control_metrics:
-            metrics.update(control_metrics)
         if should_step:
             grad_metrics = self._step_optimizer(optimizer)
             if grad_metrics:
@@ -500,7 +535,7 @@ class GFlowNetTrainingLoop:
         batch_size = int(batch.num_graphs)
         self.metric_logger.update_metrics(metrics, prefix="train", batch_size=batch_size)
         self.metric_logger.log_metric_store(prefix="train", batch_size=batch_size)
-        return loss
+        return loss.detach()
 
     def validation_step(self, batch, batch_idx: int) -> None:
         self._eval_step(batch, batch_idx, prefix="val")
@@ -514,7 +549,6 @@ class GFlowNetTrainingLoop:
 
     def on_train_epoch_start(self) -> None:
         self._apply_potential_weight_schedule()
-        self._apply_control_temperature()
 
     def on_train_epoch_end(self) -> None:
         if self._resolve_scheduler_interval() == _DEFAULT_SCHED_INTERVAL:
@@ -687,9 +721,16 @@ class GFlowNetTrainingLoop:
         step = float(getattr(trainer, "global_step", self.module.global_step))
         return min(max(step / float(total), float(_ZERO)), float(_ONE))
 
+    def _resolve_stream_forward_weight_progress(self) -> Optional[float]:
+        return self.module.engine.resolve_stream_forward_weight_progress(current_epoch=int(self.module.current_epoch))
+
     def _accumulate_grad_batches(self) -> int:
+        manual = self.module.training_cfg.get("accumulate_grad_batches")
+        if manual is not None:
+            accum = self.module.require_positive_int(manual, "training_cfg.accumulate_grad_batches")
+            return max(accum, _ONE)
         if self.module.trainer is None:
-            return _ONE
+            return _DEFAULT_MANUAL_ACCUMULATE_GRAD_BATCHES
         accum = int(getattr(self.module.trainer, "accumulate_grad_batches", _ONE) or _ONE)
         return max(accum, _ONE)
 
@@ -714,144 +755,6 @@ class GFlowNetTrainingLoop:
         if self._is_last_train_batch(batch_idx):
             return True
         return (batch_idx + _ONE) % accum == _ZERO
-
-    def _maybe_init_flow_bias(self, batch: Any) -> None:
-        if self.module._flow_bias_initialized:
-            return
-        strategy = self.module._flow_bias_init
-        if strategy == "none":
-            self.module._flow_bias_initialized = True
-            return
-        if strategy == "min_log_reward":
-            bias = self._resolve_min_log_reward()
-            self.module.log_f.set_output_bias(bias)
-            self.module._flow_bias_initialized = True
-            return
-        if strategy == "batch_log_reward":
-            bias = self._estimate_log_reward_bias(batch)
-            self.module.log_f.set_output_bias(bias)
-            self.module._flow_bias_initialized = True
-            return
-        if strategy == "value":
-            bias = float(self.module._flow_bias_value)
-            self.module.log_f.set_output_bias(bias)
-            self.module._flow_bias_initialized = True
-            return
-        raise RuntimeError(f"Unhandled flow bias init strategy: {strategy!r}.")
-
-    def _resolve_min_log_reward(self) -> float:
-        min_log = getattr(self.module.reward_fn, "min_log_reward", None)
-        if min_log is None:
-            raise RuntimeError("reward_fn.min_log_reward is required for bias initialization.")
-        return float(min_log)
-
-    @torch.no_grad()
-    def _estimate_log_reward_bias(self, batch: Any) -> float:
-        device = self.module.device
-        self.module.validate_batch_inputs(batch, is_training=True, require_rollout=True)
-        inputs = self.module.batch_processor.prepare_rollout_inputs(batch, device)
-        graph_cache = self.module.batch_processor.build_graph_cache(inputs, device=device)
-        rollout = self.module.actor.rollout(
-            graph=graph_cache,
-            temperature=None,
-            record_actions=False,
-            record_visited=False,
-        )
-        reward_out = self.module.reward_fn(
-            **self.module.engine.build_reward_kwargs(rollout, inputs=inputs)
-        )
-        log_reward = torch.where(
-            inputs.dummy_mask,
-            torch.zeros_like(reward_out.log_reward),
-            reward_out.log_reward,
-        )
-        valid = torch.isfinite(log_reward)
-        if not bool(valid.any().item()):
-            raise RuntimeError("log_reward contains no finite values for flow bias init.")
-        return float(log_reward[valid].mean().item())
-
-    def _extract_scalar_metric(
-        self,
-        metrics: Dict[str, torch.Tensor],
-        key: str,
-        *,
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        value = metrics.get(key)
-        if value is None:
-            return None
-        if not torch.is_tensor(value):
-            value = torch.as_tensor(value)
-        value = value.detach().to(device=device)
-        if value.numel() > _ONE:
-            return value.float().mean()
-        return value.float().view(())
-
-    def _resolve_control_target(
-        self,
-        metrics: Dict[str, torch.Tensor],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if self.module._control_target_mode == "reachable_horizon_frac":
-            reachable = metrics.get("control/reachable_horizon_frac")
-            if reachable is None:
-                return None
-            if not torch.is_tensor(reachable):
-                reachable = torch.as_tensor(reachable, device=device, dtype=dtype)
-            else:
-                reachable = reachable.to(device=device, dtype=dtype)
-            target = reachable
-        elif self.module._control_target_mode == "fixed":
-            target = torch.as_tensor(self.module._control_target_min, device=device, dtype=dtype)
-        else:
-            raise ValueError("Unsupported control target mode.")
-        min_target = torch.as_tensor(self.module._control_target_min, device=device, dtype=dtype)
-        max_target = torch.as_tensor(self.module._control_target_max, device=device, dtype=dtype)
-        return target.clamp(min=min_target, max=max_target)
-
-    def _temperature_from_lambda(self, lambda_value: torch.Tensor) -> torch.Tensor:
-        base = torch.as_tensor(self.module._control_temperature_base, device=lambda_value.device, dtype=lambda_value.dtype)
-        min_temp = torch.as_tensor(self.module._control_temperature_min, device=lambda_value.device, dtype=lambda_value.dtype)
-        max_temp = torch.as_tensor(self.module._control_temperature_max, device=lambda_value.device, dtype=lambda_value.dtype)
-        temperature = base * torch.exp(lambda_value)
-        return temperature.clamp(min=min_temp, max=max_temp)
-
-    def _apply_control_temperature(self) -> None:
-        if not self.module._control_enabled:
-            return
-        temperature = self._temperature_from_lambda(self.module.lambda_success)
-        temp_value = float(temperature.item())
-        self.module.actor.set_temperatures(policy_temperature=temp_value, backward_temperature=temp_value)
-
-    def _update_success_controller(self, metrics: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if not self.module._control_enabled:
-            return {}
-        device = self.module.lambda_success.device
-        dtype = self.module.lambda_success.dtype
-        success = self._extract_scalar_metric(metrics, "pass@1", device=device)
-        if success is None:
-            return {}
-        target = self._resolve_control_target(metrics, device=device, dtype=dtype)
-        if target is None:
-            return {}
-        gap = target - success
-        dual_lr = torch.as_tensor(self.module._control_dual_lr, device=device, dtype=dtype)
-        lambda_min = torch.as_tensor(self.module._control_lambda_min, device=device, dtype=dtype)
-        lambda_max = torch.as_tensor(self.module._control_lambda_max, device=device, dtype=dtype)
-        updated = (self.module.lambda_success + dual_lr * gap).clamp(min=lambda_min, max=lambda_max)
-        self.module.lambda_success.copy_(updated)
-        temperature = self._temperature_from_lambda(updated)
-        temp_value = float(temperature.item())
-        self.module.actor.set_temperatures(policy_temperature=temp_value, backward_temperature=temp_value)
-        return {
-            "control/success_rate": success.detach(),
-            "control/target_success": target.detach(),
-            "control/gap": gap.detach(),
-            "control/lambda": updated.detach(),
-            "control/temperature": temperature.detach(),
-        }
 
     def _apply_potential_weight_schedule(self) -> None:
         if not hasattr(self.module.reward_fn, "potential_weight"):

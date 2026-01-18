@@ -16,12 +16,9 @@ from .gflownet import (
     finalize_rollout_metrics,
     compute_terminal_hits,
     compute_terminal_hit_prefixes,
-    compute_context_metrics,
     compute_composite_score,
-    compute_path_diversity,
     compute_reward_gap,
     compute_diag_metrics,
-    compute_edge_debug_metrics,
     GFlowNetEvalAccumulator,
 )
 
@@ -39,11 +36,8 @@ __all__ = [
     "finalize_rollout_metrics",
     "compute_terminal_hits",
     "compute_terminal_hit_prefixes",
-    "compute_context_metrics",
     "compute_composite_score",
-    "compute_path_diversity",
     "compute_reward_gap",
     "compute_diag_metrics",
-    "compute_edge_debug_metrics",
     "GFlowNetEvalAccumulator",
 ]

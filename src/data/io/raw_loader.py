@@ -8,7 +8,13 @@ import pyarrow.dataset as ds
 
 from omegaconf import DictConfig
 
-from src.data.schema.types import Sample, TextEntityConfig
+from src.data.schema.constants import (
+    _TIME_RELATION_MODE_DROP,
+    _TIME_RELATION_MODE_KEEP,
+    _TIME_RELATION_MODE_QUESTION,
+    _TIME_RELATION_MODES,
+)
+from src.data.schema.types import CvtEntityConfig, Sample, TextEntityConfig, TimeRelationConfig
 
 
 _QID_IN_PARENS_RE = re.compile(r"(Q\d+)")
@@ -33,6 +39,34 @@ def build_text_entity_config(cfg: DictConfig) -> TextEntityConfig:
     if mode == "prefix_allowlist" and not prefixes:
         raise ValueError("entity_text_mode=prefix_allowlist requires non-empty text_prefixes.")
     return TextEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
+
+
+def build_cvt_entity_config(cfg: DictConfig) -> CvtEntityConfig:
+    mode = str(cfg.get("cvt_entity_mode", "regex"))
+    prefixes_cfg = cfg.get("cvt_prefixes") or []
+    prefixes = tuple(str(prefix) for prefix in prefixes_cfg)
+    regex_str = cfg.get("cvt_regex")
+    regex = re.compile(str(regex_str)) if regex_str else None
+    if mode == "regex" and regex is None:
+        raise ValueError("cvt_entity_mode=regex requires cvt_regex to be set.")
+    if mode == "prefix_allowlist" and not prefixes:
+        raise ValueError("cvt_entity_mode=prefix_allowlist requires non-empty cvt_prefixes.")
+    return CvtEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
+
+
+def build_time_relation_config(cfg: DictConfig) -> TimeRelationConfig:
+    mode = str(cfg.get("time_relation_mode", _TIME_RELATION_MODE_KEEP)).strip().lower()
+    if mode not in _TIME_RELATION_MODES:
+        raise ValueError(f"Unsupported time_relation_mode: {mode!r}. Expected one of {_TIME_RELATION_MODES}.")
+    relation_regex_str = cfg.get("time_relation_regex")
+    question_regex_str = cfg.get("time_question_regex")
+    relation_regex = re.compile(str(relation_regex_str)) if relation_regex_str else None
+    question_regex = re.compile(str(question_regex_str), re.IGNORECASE) if question_regex_str else None
+    if mode in (_TIME_RELATION_MODE_DROP, _TIME_RELATION_MODE_QUESTION) and relation_regex is None:
+        raise ValueError("time_relation_regex must be set when time_relation_mode is not keep.")
+    if mode == _TIME_RELATION_MODE_QUESTION and question_regex is None:
+        raise ValueError("time_question_regex must be set when time_relation_mode=question_gated.")
+    return TimeRelationConfig(mode=mode, relation_regex=relation_regex, question_regex=question_regex)
 
 
 def normalize_entity(entity: str, mode: str) -> str:

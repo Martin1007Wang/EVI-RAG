@@ -3,7 +3,7 @@ _target_: lightning.pytorch.trainer.Trainer
 default_root_dir: ${paths.output_dir}
 
 min_epochs: 50 # prevents early stopping
-max_epochs: 999
+max_epochs: 9999
 
 # let Lightning pick the right accelerator/devices unless overridden
 accelerator: auto

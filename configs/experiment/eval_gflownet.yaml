@@ -37,6 +37,16 @@ model:
   env:
     max_steps: ${dataset.max_steps}
 
+  start_selection_cfg:
+    enabled: true
+  sink_selection_cfg:
+    enabled: true
+    epsilon: 0.0
+    force_uniform: false
+  backward_cfg:
+    share_state_encoder: false
+    share_edge_scorer: false
+
   training_cfg:
     num_train_rollouts: 3
     rollout_chunk_size: 3
@@ -49,6 +59,25 @@ model:
     grad_clip_log_eps: 1.0e-8
     grad_clip_tail_prob_eps: 1.0e-6
     grad_non_finite_max_params: 20
-    corridor:
+    subtb:
       enabled: true
-      distance_bias_alpha: 1.0
+      num_subtrajectories: 1
+    dual_stream:
+      enabled: true
+      stream_forward_weight: 1.0
+      stream_forward_max_steps: null
+      disable_stop: false
+      stream_forward_weight_start: 0.0
+      stream_forward_weight_schedule: none
+      stream_forward_weight_anneal_epochs: null
+    z_align:
+      enabled: false
+      weight: 1.0
+    h_guidance:
+      enabled: true
+      beta_start: 0.0
+      beta_end: 1.0
+      warmup_progress: 0.1
+      apply_eval: true
+      stop_gradient: true
+      scale: 1.0

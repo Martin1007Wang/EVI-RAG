@@ -29,27 +29,29 @@ from src.data.io.lmdb_utils import (
     ensure_dir,
 )
 from src.data.io.parquet_io import _load_parquet
-from src.data.schema.constants import _BYTES_PER_GB, _LMDB_MAP_SIZE_GB_MIN, _MIN_CHUNK_SIZE, _ONE, _ZERO
+from src.data.schema.constants import (
+    _BYTES_PER_GB,
+    _FILTER_MISSING_ANSWER_FILENAME,
+    _FILTER_MISSING_START_FILENAME,
+    _MIN_CHUNK_SIZE,
+    _ONE,
+    _ZERO,
+)
 from src.data.utils.config import _resolve_parquet_chunk_size
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
 
 
-def _write_vocab_lmdb(entity_labels: List[str], relation_labels: List[str], vocab_dir: Path, map_size_bytes: int) -> None:
-    ensure_dir(vocab_dir)
-    env = lmdb.open(str(vocab_dir), map_size=map_size_bytes)
-    try:
-        with env.begin(write=True) as txn:
-            entity_payload = json.dumps(entity_labels, ensure_ascii=True).encode("utf-8")
-            relation_payload = json.dumps(relation_labels, ensure_ascii=True).encode("utf-8")
-            txn.put(b"entity_labels", entity_payload)
-            txn.put(b"relation_labels", relation_payload)
-    finally:
-        env.close()
-
-
 def _format_core_path(base_dir: Path, split: str, shard_id: int, num_shards: int) -> Path:
     return _format_lmdb_path(base_dir, split, shard_id, num_shards, suffix=".lmdb")
+
+
+def _write_sample_filter(path: Path, *, dataset: str, sample_ids: List[str]) -> None:
+    payload = {
+        "dataset": dataset,
+        "sample_ids": sorted(sample_ids),
+    }
+    path.write_text(json.dumps(payload, indent=2))
 
 
 def build_dataset(ctx: StageContext) -> None:
@@ -81,25 +83,8 @@ def build_dataset(ctx: StageContext) -> None:
     embedding_vocab = _load_parquet(ctx.parquet_dir / "embedding_vocab.parquet").to_pydict()
     relation_vocab = _load_parquet(ctx.parquet_dir / "relation_vocab.parquet").to_pydict()
 
-    entity_rows = sorted(zip(entity_vocab["entity_id"], entity_vocab["label"]), key=lambda x: x[0])
-    entity_labels: List[str] = [str(label) for _, label in entity_rows]
     relation_rows = sorted(zip(relation_vocab["relation_id"], relation_vocab["label"]), key=lambda x: x[0])
     relation_labels: List[str] = [str(label) for _, label in relation_rows]
-
-    vocab_map_size = cfg.get("vocab_map_size_gb", _LMDB_MAP_SIZE_GB_MIN) * _BYTES_PER_GB
-    _write_vocab_lmdb(
-        entity_labels,
-        relation_labels,
-        ctx.output_dir / "vocabulary" / "vocabulary.lmdb",
-        vocab_map_size,
-    )
-    log_event(
-        logger,
-        "lmdb_vocab_written",
-        entity_count=len(entity_labels),
-        relation_count=len(relation_labels),
-        vocab_map_size_gb=cfg.get("vocab_map_size_gb", _LMDB_MAP_SIZE_GB_MIN),
-    )
 
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
@@ -187,8 +172,6 @@ def build_dataset(ctx: StageContext) -> None:
     graph_cols: Dict[str, List] = {
         "node_entity_ids": _require_graph_col("node_entity_ids"),
         "node_embedding_ids": _require_graph_col("node_embedding_ids"),
-        "node_type_counts": _require_graph_col("node_type_counts"),
-        "node_type_ids": _require_graph_col("node_type_ids"),
         "edge_src": _require_graph_col("edge_src"),
         "edge_dst": _require_graph_col("edge_dst"),
         "edge_relation_ids": _require_graph_col("edge_relation_ids"),
@@ -203,10 +186,7 @@ def build_dataset(ctx: StageContext) -> None:
     envs: Dict[str, Dict[int, lmdb.Environment]] = {}
     all_splits = questions_table.column("split").unique().to_pylist()
     all_splits = _validate_split_names(all_splits, context="questions.parquet")
-    lmdb_stats = {
-        str(split): {"samples": _ZERO, "nodes": _ZERO, "edges": _ZERO, "type_ids": _ZERO, "type_nodes": _ZERO}
-        for split in all_splits
-    }
+    lmdb_stats = {str(split): {"samples": _ZERO, "nodes": _ZERO, "edges": _ZERO} for split in all_splits}
     map_size_bytes, map_growth_bytes, map_growth_factor, map_max_bytes = _resolve_lmdb_map_config(cfg)
     map_sizes: Dict[str, Dict[int, int]] = {}
     tmp_dirs: Dict[str, Dict[int, Path]] = {}
@@ -246,6 +226,10 @@ def build_dataset(ctx: StageContext) -> None:
 
         pbar = tqdm(question_batches, total=int(total_batches) + 1, desc="Writing LMDB")
         missing_graph_ids: List[str] = []
+        keep_start_ids: List[str] = []
+        keep_answer_ids: List[str] = []
+        missing_start = _ZERO
+        missing_answer = _ZERO
 
         for q_batch in pbar:
             q_batch_dict = q_batch.to_pydict()
@@ -281,8 +265,6 @@ def build_dataset(ctx: StageContext) -> None:
                 g_idx = graph_row_indices[i]
                 node_entity_ids = graph_cols["node_entity_ids"][g_idx]
                 node_embedding_ids = graph_cols["node_embedding_ids"][g_idx]
-                node_type_counts = graph_cols["node_type_counts"][g_idx]
-                node_type_ids = graph_cols["node_type_ids"][g_idx]
                 edge_src = graph_cols["edge_src"][g_idx]
                 edge_dst = graph_cols["edge_dst"][g_idx]
                 edge_rel = graph_cols["edge_relation_ids"][g_idx]
@@ -294,45 +276,51 @@ def build_dataset(ctx: StageContext) -> None:
                         f"Invalid graph with zero edges for {graph_id} (split={split}). "
                         "Fix raw parquet/filters and rebuild; empty edge_index is unsupported."
                     )
-                if len(node_type_counts) != num_nodes:
-                    raise ValueError(
-                        f"node_type_counts length {len(node_type_counts)} != num_nodes {num_nodes} for {graph_id}."
-                    )
-                split_key = str(split)
-                lmdb_stats[split_key]["samples"] += 1
-                lmdb_stats[split_key]["nodes"] += num_nodes
-                lmdb_stats[split_key]["edges"] += num_edges
-                lmdb_stats[split_key]["type_ids"] += len(node_type_ids)
-                lmdb_stats[split_key]["type_nodes"] += sum(1 for count in node_type_counts if count > _ZERO)
                 num_nodes_tensor = torch.tensor(num_nodes, dtype=torch.long)
                 node_global_ids = torch.tensor(node_entity_ids, dtype=torch.long)
                 node_emb_ids = torch.tensor(node_embedding_ids, dtype=torch.long)
-                node_type_counts_tensor = torch.tensor(node_type_counts, dtype=torch.long)
-                node_type_ids_tensor = torch.tensor(node_type_ids, dtype=torch.long)
                 edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
                 edge_attr = torch.tensor(edge_rel, dtype=torch.long)
 
                 q_entities = q_batch_dict["seed_entity_ids"][i]
                 a_entities = q_batch_dict["answer_entity_ids"][i]
-                if q_entities is None:
-                    raise ValueError(f"seed_entity_ids is null for {graph_id}")
-                if a_entities is None:
-                    raise ValueError(f"answer_entity_ids is null for {graph_id}")
+                if q_entities is None or len(q_entities) == 0:
+                    missing_start += 1
+                    continue
+                if a_entities is None or len(a_entities) == 0:
+                    missing_answer += 1
+                    continue
                 q_local = _local_indices(node_entity_ids, q_entities)
                 a_local = _local_indices(node_entity_ids, a_entities)
+                if not q_local:
+                    missing_start += 1
+                    continue
+                keep_start_ids.append(graph_id)
+                retrieval_failure = bool(a_entities and not a_local)
+                if a_local:
+                    keep_answer_ids.append(graph_id)
+                elif retrieval_failure:
+                    keep_answer_ids.append(graph_id)
+                else:
+                    missing_answer += 1
+                    continue
+                retrieval_failure = torch.tensor(retrieval_failure, dtype=torch.bool)
+
+                split_key = str(split)
+                lmdb_stats[split_key]["samples"] += 1
+                lmdb_stats[split_key]["nodes"] += num_nodes
+                lmdb_stats[split_key]["edges"] += num_edges
                 core_sample = {
                     "edge_index": edge_index,
                     "edge_attr": edge_attr,
                     "num_nodes": num_nodes_tensor,
                     "node_global_ids": node_global_ids,
                     "node_embedding_ids": node_emb_ids,
-                    "node_type_counts": node_type_counts_tensor,
-                    "node_type_ids": node_type_ids_tensor,
                     "question_emb": q_batch_emb[i].unsqueeze(0),
                     "q_local_indices": torch.as_tensor(q_local, dtype=torch.long),
                     "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
                     "answer_entity_ids": torch.as_tensor(a_entities, dtype=torch.long),
-                    "answer_entity_ids_len": torch.tensor([len(a_entities)], dtype=torch.long),
+                    "retrieval_failure": retrieval_failure,
                 }
 
                 sample_key = graph_id.encode("utf-8")
@@ -397,16 +385,12 @@ def build_dataset(ctx: StageContext) -> None:
             total_samples = sum(stats["samples"] for stats in lmdb_stats.values())
             total_nodes = sum(stats["nodes"] for stats in lmdb_stats.values())
             total_edges = sum(stats["edges"] for stats in lmdb_stats.values())
-            total_type_ids = sum(stats["type_ids"] for stats in lmdb_stats.values())
-            total_type_nodes = sum(stats["type_nodes"] for stats in lmdb_stats.values())
             log_event(
                 logger,
                 "lmdb_write_summary_total",
                 samples=total_samples,
                 nodes=total_nodes,
                 edges=total_edges,
-                type_ids=total_type_ids,
-                type_nodes=total_type_nodes,
                 avg_nodes=total_nodes / total_samples if total_samples else 0.0,
                 avg_edges=total_edges / total_samples if total_samples else 0.0,
             )
@@ -418,8 +402,27 @@ def build_dataset(ctx: StageContext) -> None:
                     samples=stats["samples"],
                     nodes=stats["nodes"],
                     edges=stats["edges"],
-                    type_ids=stats["type_ids"],
-                    type_nodes=stats["type_nodes"],
                     avg_nodes=stats["nodes"] / stats["samples"] if stats["samples"] else 0.0,
                     avg_edges=stats["edges"] / stats["samples"] if stats["samples"] else 0.0,
                 )
+            processed_dir = ctx.output_dir / "processed"
+            ensure_dir(processed_dir)
+            _write_sample_filter(
+                processed_dir / _FILTER_MISSING_START_FILENAME,
+                dataset=dataset_name,
+                sample_ids=keep_start_ids,
+            )
+            _write_sample_filter(
+                processed_dir / _FILTER_MISSING_ANSWER_FILENAME,
+                dataset=dataset_name,
+                sample_ids=keep_answer_ids,
+            )
+            log_event(
+                logger,
+                "missing_anchor_filters_written",
+                missing_start=missing_start,
+                missing_answer=missing_answer,
+                keep_start=len(keep_start_ids),
+                keep_answer=len(keep_answer_ids),
+                path=str(processed_dir),
+            )

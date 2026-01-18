@@ -91,10 +91,6 @@ class ParquetDatasetWriter:
                         [g.node_embedding_ids for g in self.graphs], type=pa.list_(pa.int64())
                     ),
                     GraphFields.NODE_LABELS: pa.array([g.node_labels for g in self.graphs], type=pa.list_(pa.string())),
-                    GraphFields.NODE_TYPE_COUNTS: pa.array(
-                        [g.node_type_counts for g in self.graphs], type=pa.list_(pa.int64())
-                    ),
-                    GraphFields.NODE_TYPE_IDS: pa.array([g.node_type_ids for g in self.graphs], type=pa.list_(pa.int64())),
                     GraphFields.EDGE_SRC: pa.array([g.edge_src for g in self.graphs], type=pa.list_(pa.int64())),
                     GraphFields.EDGE_DST: pa.array([g.edge_dst for g in self.graphs], type=pa.list_(pa.int64())),
                     GraphFields.EDGE_REL_IDS: pa.array(
@@ -161,8 +157,6 @@ def write_graphs(graphs: List[GraphRecord], output_path: Path) -> None:
             GraphFields.NODE_IDS: pa.array([g.node_entity_ids for g in graphs], type=pa.list_(pa.int64())),
             GraphFields.NODE_EMBED_IDS: pa.array([g.node_embedding_ids for g in graphs], type=pa.list_(pa.int64())),
             GraphFields.NODE_LABELS: pa.array([g.node_labels for g in graphs], type=pa.list_(pa.string())),
-            GraphFields.NODE_TYPE_COUNTS: pa.array([g.node_type_counts for g in graphs], type=pa.list_(pa.int64())),
-            GraphFields.NODE_TYPE_IDS: pa.array([g.node_type_ids for g in graphs], type=pa.list_(pa.int64())),
             GraphFields.EDGE_SRC: pa.array([g.edge_src for g in graphs], type=pa.list_(pa.int64())),
             GraphFields.EDGE_DST: pa.array([g.edge_dst for g in graphs], type=pa.list_(pa.int64())),
             GraphFields.EDGE_REL_IDS: pa.array([g.edge_relation_ids for g in graphs], type=pa.list_(pa.int64())),
@@ -212,6 +206,9 @@ def write_entity_vocab(vocab_records: List[Dict[str, object]], output_path: Path
             ),
             EntityVocabFields.IS_TEXT: pa.array(
                 [rec[EntityVocabFields.IS_TEXT] for rec in vocab_records], type=pa.bool_()
+            ),
+            EntityVocabFields.IS_CVT: pa.array(
+                [rec[EntityVocabFields.IS_CVT] for rec in vocab_records], type=pa.bool_()
             ),
             EntityVocabFields.EMBEDDING_ID: pa.array(
                 [rec[EntityVocabFields.EMBEDDING_ID] for rec in vocab_records], type=pa.int64()

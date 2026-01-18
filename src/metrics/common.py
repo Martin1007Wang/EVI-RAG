@@ -62,7 +62,7 @@ def extract_sample_ids(batch) -> List[str]:
     if isinstance(raw, (list, tuple)):
         return [str(s) for s in raw]
     if torch.is_tensor(raw):
-        return [str(s.item()) for s in raw]
+        return [str(s.detach().tolist()) for s in raw]
     return [str(raw)]
 
 
@@ -82,8 +82,8 @@ def _slice_answer_indices(batch: Any, sample_idx: int) -> torch.Tensor:
         ptr = torch.as_tensor(ptr, dtype=torch.long)
         if ptr.numel() <= sample_idx + _ONE:
             return torch.empty(0, dtype=torch.long)
-        start = int(ptr[sample_idx].item())
-        end = int(ptr[sample_idx + _ONE].item())
+        start = int(ptr[sample_idx].detach().tolist())
+        end = int(ptr[sample_idx + _ONE].detach().tolist())
         return attr[start:end].to(dtype=torch.long).view(-_ONE)
     return torch.empty(0, dtype=torch.long)
 
@@ -96,8 +96,8 @@ def _map_answer_indices(
 ) -> torch.Tensor:
     if indices.numel() == _ZERO:
         return indices.to(device=node_ids.device, dtype=torch.long)
-    node_start = int(node_ptr[sample_idx].item())
-    node_end = int(node_ptr[sample_idx + _ONE].item())
+    node_start = int(node_ptr[sample_idx].detach().tolist())
+    node_end = int(node_ptr[sample_idx + _ONE].detach().tolist())
     if node_end <= node_start:
         return torch.empty(0, dtype=torch.long, device=node_ids.device)
     if node_end > int(node_ids.numel()):
@@ -105,16 +105,16 @@ def _map_answer_indices(
     num_nodes = node_end - node_start
     indices = indices.to(device=node_ids.device, dtype=torch.long)
     in_global = (indices >= node_start) & (indices < node_end)
-    if bool(in_global.all().item()):
+    if bool(in_global.all().detach().tolist()):
         return node_ids.index_select(0, indices)
     in_local = (indices >= _ZERO) & (indices < num_nodes)
-    if bool(in_local.all().item()):
+    if bool(in_local.all().detach().tolist()):
         node_slice = node_ids[node_start:node_end]
         return node_slice.index_select(0, indices)
     raise ValueError(
         "a_local_indices out of range for extract_answer_entity_ids: "
         f"sample_idx={sample_idx} node_start={node_start} node_end={node_end} "
-        f"indices_min={int(indices.min().item())} indices_max={int(indices.max().item())}"
+        f"indices_min={int(indices.min().detach().tolist())} indices_max={int(indices.max().detach().tolist())}"
     )
 
 
@@ -187,7 +187,7 @@ def compute_answer_hit(samples: Iterable[Dict[str, torch.Tensor]], k_values: Seq
             if k_eff == _ZERO:
                 hits[k].append(_FLOAT_ZERO)
                 continue
-            found_any = bool(prefix_any[k_eff - _ONE].item())
+            found_any = bool(prefix_any[k_eff - _ONE].detach().tolist())
             hits[k].append(_FLOAT_ONE if found_any else _FLOAT_ZERO)
     return {
         f"answer_hit@{k}": float(sum(values) / len(values)) if values else _FLOAT_ZERO
@@ -242,8 +242,8 @@ def summarize_uncertainty(values: Iterable[torch.Tensor], quantile: float = _DEF
     if not tensors:
         return _FLOAT_ZERO, _FLOAT_ZERO
     concat = torch.cat(tensors)
-    mean = float(concat.mean().item())
-    quant = float(concat.quantile(quantile).item())
+    mean = float(concat.mean().detach().tolist())
+    quant = float(concat.quantile(quantile).detach().tolist())
     return mean, quant
 
 
