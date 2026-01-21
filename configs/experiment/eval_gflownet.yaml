@@ -32,17 +32,18 @@ callbacks:
 data:
   splits:
     test: ${run.split}
+  precompute_edge_batch: false
+  expand_multi_start: false
+  expand_multi_answer: false
 
 model:
   env:
     max_steps: ${dataset.max_steps}
 
-  start_selection_cfg:
+  selector_cfg:
     enabled: true
-  sink_selection_cfg:
-    enabled: true
-    epsilon: 0.0
-    force_uniform: false
+    epsilon: 0.1
+
   backward_cfg:
     share_state_encoder: false
     share_edge_scorer: false
@@ -66,7 +67,6 @@ model:
       enabled: true
       stream_forward_weight: 1.0
       stream_forward_max_steps: null
-      disable_stop: false
       stream_forward_weight_start: 0.0
       stream_forward_weight_schedule: none
       stream_forward_weight_anneal_epochs: null
@@ -81,3 +81,5 @@ model:
       apply_eval: true
       stop_gradient: true
       scale: 1.0
+    target_sampling:
+      mode: random_one

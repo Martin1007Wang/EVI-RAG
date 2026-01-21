@@ -377,7 +377,8 @@ def compute_diag_metrics(rollout: Any) -> Dict[str, torch.Tensor]:
 
 def build_flow_metrics(
     *,
-    rollout: Any,
+    reach_success: torch.Tensor,
+    num_moves: torch.Tensor,
     reward_out: Any,
     log_reward: torch.Tensor,
     log_f_start: torch.Tensor,
@@ -392,13 +393,13 @@ def build_flow_metrics(
     success = reward_metrics.pop("success", None)
     if answer_hit is None:
         answer_hit = success
-    answer_tensor = answer_hit if isinstance(answer_hit, torch.Tensor) else rollout.reach_success
+    answer_tensor = answer_hit if isinstance(answer_hit, torch.Tensor) else reach_success
     metrics: Dict[str, torch.Tensor] = {
         "log_reward": log_reward_metric,
         "log_f": log_f_start.detach(),
         "log_f_target": log_f_target.detach(),
         "pass@1": answer_tensor.detach(),
-        "length_mean": rollout.length.detach(),
+        "length_mean": num_moves.detach(),
         **{k: v.detach() for k, v in reward_metrics.items()},
     }
     return metrics

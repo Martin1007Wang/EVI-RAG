@@ -20,9 +20,17 @@ optimized_metric: "val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}"
 trainer:
   check_val_every_n_epoch: 5
 
+data:
+  expand_multi_start: false
+  expand_multi_answer: false
+
 model:
   env:
     max_steps: ${dataset.max_steps}
+
+  selector_cfg:
+    enabled: true
+    epsilon: 0.1
 
   optimizer_cfg:
     type: adamw
@@ -49,16 +57,6 @@ model:
     share_state_encoder: false
     share_edge_scorer: false
 
-  start_selection_cfg:
-    enabled: true
-    mode: flow
-    epsilon: 0.1
-  sink_selection_cfg:
-    enabled: true
-    mode: flow
-    epsilon: 0.1
-    force_uniform: false
-
   training_cfg:
     num_train_rollouts: 8
     rollout_chunk_size: 4
@@ -76,20 +74,24 @@ model:
     subtb:
       enabled: true
       num_subtrajectories: 4
+    imitation:
+      # Online mutual imitation / distillation (no-cache replay).
+      enabled: false
+      weight: 1.0
     replay:
-      enabled: true
+      # Deprecated: replay buffer removed. Use `training_cfg.imitation` instead.
+      enabled: false
       buffer_size: 4096
       mix_ratio: 0.5
     dual_stream:
       enabled: true
       stream_forward_weight: 1.0
       stream_forward_max_steps: null
-      disable_stop: false
       stream_forward_weight_start: 0.0
       stream_forward_weight_schedule: none
       stream_forward_weight_anneal_epochs: null
     z_align:
-      enabled: true
+      enabled: false
       weight: 10.0
     h_guidance:
       enabled: true
@@ -99,6 +101,9 @@ model:
       apply_eval: true
       stop_gradient: true
       scale: 1.0
+    target_sampling:
+      # 多答案时为 backward rollout 采样单一起点，避免多起点报错。
+      mode: random_one
 
 callbacks:
   model_checkpoint:

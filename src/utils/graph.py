@@ -132,7 +132,7 @@ def compute_invalid_nodes(
     *,
     edge_index: torch.Tensor,
     node_is_start: torch.Tensor,
-    node_is_answer: torch.Tensor,
+    node_is_target: torch.Tensor,
 ) -> torch.Tensor:
     num_nodes_total = int(node_is_start.numel())
     neighbors = torch.zeros(num_nodes_total, device=edge_index.device, dtype=torch.bool)
@@ -145,7 +145,7 @@ def compute_invalid_nodes(
         start_tails = node_is_start[tails]
         if bool(start_tails.any().detach().tolist()):
             neighbors[heads[start_tails]] = True
-    return (node_is_start | neighbors) & (~node_is_answer)
+    return (node_is_start | neighbors) & (~node_is_target)
 
 
 def _undirected_bfs_distances_impl(

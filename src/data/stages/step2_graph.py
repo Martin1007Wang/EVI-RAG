@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import json
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from collections import deque
 import torch
 from tqdm import tqdm
 
@@ -59,10 +60,12 @@ class _WorkerState:
     validate_graph_edges: bool
     remove_self_loops: bool
     relation_cleaning_enabled: bool
+    keep_start_adjacent_edges: bool
     relation_cleaning_rules: RelationCleaningRules
     inverse_relations_key_map: Optional[Dict[str, str]]
     inverse_relations_suffix: str
     time_relation_cfg: Optional[TimeRelationConfig]
+    target_reachable_pruning: bool
 
 
 _WORKER_STATE: Optional[_WorkerState] = None
@@ -99,7 +102,7 @@ def _require_worker_state() -> _WorkerState:
     return _WORKER_STATE
 
 
-def _build_graph_worker(sample: Sample) -> GraphRecord:
+def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
     state = _require_worker_state()
     graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
     return build_graph(
@@ -111,10 +114,12 @@ def _build_graph_worker(sample: Sample) -> GraphRecord:
         validate_graph_edges=state.validate_graph_edges,
         remove_self_loops=state.remove_self_loops,
         relation_cleaning_enabled=state.relation_cleaning_enabled,
+        keep_start_adjacent_edges=state.keep_start_adjacent_edges,
         relation_cleaning_rules=state.relation_cleaning_rules,
         inverse_relations_key_map=state.inverse_relations_key_map,
         inverse_relations_suffix=state.inverse_relations_suffix,
         time_relation_cfg=state.time_relation_cfg,
+        target_reachable_pruning=state.target_reachable_pruning,
     )
 
 
@@ -146,6 +151,47 @@ def _dedup_directed_edges(edges: Sequence[Tuple[str, str, str]]) -> List[Tuple[s
         seen.add(key)
         out.append(key)
     return out
+
+
+def _compute_target_reachable_nodes(
+    edges: Sequence[Tuple[str, str, str]],
+    targets: Sequence[str],
+) -> Set[str]:
+    if not edges or not targets:
+        return set()
+    node_index: Dict[str, int] = {}
+    reverse_adj: List[List[int]] = []
+
+    def _add_node(label: str) -> int:
+        idx = node_index.get(label)
+        if idx is not None:
+            return idx
+        idx = len(node_index)
+        node_index[label] = idx
+        reverse_adj.append([])
+        return idx
+
+    for head, _, tail in edges:
+        head_idx = _add_node(head)
+        tail_idx = _add_node(tail)
+        reverse_adj[tail_idx].append(head_idx)
+
+    target_ids = [node_index[tgt] for tgt in targets if tgt in node_index]
+    if not target_ids:
+        return set()
+    visited = [False] * len(node_index)
+    q: deque[int] = deque()
+    for tid in target_ids:
+        visited[tid] = True
+        q.append(tid)
+    while q:
+        cur = q.popleft()
+        for nbr in reverse_adj[cur]:
+            if visited[nbr]:
+                continue
+            visited[nbr] = True
+            q.append(nbr)
+    return {label for label, idx in node_index.items() if visited[idx]}
 
 
 def _build_inverse_relation_key(rel: str, suffix: str) -> str:
@@ -394,11 +440,13 @@ def preprocess(ctx: StageContext) -> None:
         raise ValueError("dataset_source must be 'hf'; raw parquet ingestion is disabled.")
     train_filter, eval_filter, override_filters = ctx.split_filters
     path_mode = _validate_path_mode(str(cfg.get("path_mode", _PATH_MODE_UNDIRECTED)))
+    target_reachable_pruning = bool(cfg.get("target_reachable_pruning", False))
     dedup_edges = bool(cfg.get("dedup_edges", True))
     validate_graph_edges = bool(cfg.get("validate_graph_edges", _VALIDATE_GRAPH_EDGES_DEFAULT))
     remove_self_loops = bool(cfg.get("remove_self_loops", _REMOVE_SELF_LOOPS_DEFAULT))
     relation_cleaning_enabled = bool(cfg.get("relation_cleaning", True))
     relation_cleaning_rules = DEFAULT_RELATION_CLEANING_RULES
+    keep_start_adjacent_edges = bool(cfg.get("keep_start_adjacent_edges", False))
     embedding_cfg = ctx.embedding_cfg
     if embedding_cfg is not None and embedding_cfg.canonicalize_relations:
         raise ValueError("canonicalize_relations requires offline labels; disable it for GFlowNet.")
@@ -422,6 +470,7 @@ def preprocess(ctx: StageContext) -> None:
     empty_graph_by_split: Dict[str, int] = {}
     empty_graph_ids: List[str] = []
     empty_graph_id_set: Set[str] = set()
+    pruned_drop_by_split: Dict[str, int] = {}
     sub_sample_ids: List[str] = []
     edge_stats = _init_split_counters(splits, _EDGE_STAT_KEYS)
     filter_stats = _init_split_counters(splits, _FILTER_STAT_KEYS)
@@ -433,6 +482,14 @@ def preprocess(ctx: StageContext) -> None:
     if emit_nonzero_positive_filter:
         raise ValueError("emit_nonzero_positive_filter is disabled in GFlowNet; remove this flag.")
 
+    if target_reachable_pruning:
+        if path_mode != _PATH_MODE_QA_DIRECTED:
+            raise ValueError("target_reachable_pruning requires path_mode=qa_directed.")
+        if not train_filter.skip_no_path or not eval_filter.skip_no_path:
+            raise ValueError("target_reachable_pruning requires filter.*.skip_no_path=true for all splits.")
+        for split_name, override in override_filters.items():
+            if not override.skip_no_path:
+                raise ValueError(f"target_reachable_pruning requires skip_no_path for split {split_name}.")
     log_event(
         logger,
         "preprocess_start",
@@ -442,6 +499,7 @@ def preprocess(ctx: StageContext) -> None:
         dataset_source=dataset_source,
         hf_dataset=hf_dataset,
         path_mode=path_mode,
+        target_reachable_pruning=target_reachable_pruning,
         dedup_edges=dedup_edges,
         remove_self_loops=remove_self_loops,
         relation_cleaning=relation_cleaning_enabled,
@@ -493,6 +551,8 @@ def preprocess(ctx: StageContext) -> None:
             relation_cleaning_enabled=relation_cleaning_enabled,
             time_relation_cfg=time_relation_cfg,
             question_text=sample.question,
+            anchor_entities=sample.q_entity,
+            keep_anchor_edges=keep_start_adjacent_edges,
         )
         kept_edges = _dedup_directed_edges(kept_edges)
         split_key = sample.split
@@ -549,6 +609,8 @@ def preprocess(ctx: StageContext) -> None:
             relation_cleaning_enabled=relation_cleaning_enabled,
             relation_cleaning_rules=relation_cleaning_rules,
             kept_edges=kept_edges,
+            anchor_entities=sample.q_entity,
+            keep_anchor_edges=keep_start_adjacent_edges,
         )
         if outcome.keep:
             kept_by_split[sample.split] = kept_by_split.get(sample.split, 0) + 1
@@ -762,7 +824,7 @@ def preprocess(ctx: StageContext) -> None:
             if embedding_cfg and embedding_cfg.canonicalize_relations:
                 question_emb_norm_batch = _normalize_embeddings(question_emb_batch, embedding_cfg.cosine_eps)
         if executor is None:
-            graphs = [
+            graphs: List[Optional[GraphRecord]] = [
                 build_graph(
                     sample,
                     entity_vocab,
@@ -772,16 +834,21 @@ def preprocess(ctx: StageContext) -> None:
                     validate_graph_edges=validate_graph_edges,
                     remove_self_loops=remove_self_loops,
                     relation_cleaning_enabled=relation_cleaning_enabled,
+                    keep_start_adjacent_edges=keep_start_adjacent_edges,
                     relation_cleaning_rules=relation_cleaning_rules,
                     inverse_relations_key_map=inverse_relations_key_map,
                     inverse_relations_suffix=inverse_relations_suffix,
                     time_relation_cfg=time_relation_cfg,
+                    target_reachable_pruning=target_reachable_pruning,
                 )
                 for sample in samples
             ]
         else:
             graphs = list(executor.map(_build_graph_worker, samples))
         for idx, (sample, graph) in enumerate(zip(samples, graphs)):
+            if graph is None:
+                pruned_drop_by_split[sample.split] = pruned_drop_by_split.get(sample.split, 0) + 1
+                continue
             if embedding_cfg and embedding_cfg.canonicalize_relations:
                 if relation_embeddings_norm is None or question_emb_norm_batch is None:
                     raise RuntimeError("Canonicalization requested but embeddings are missing.")
@@ -809,6 +876,8 @@ def preprocess(ctx: StageContext) -> None:
                         relation_cleaning_enabled=relation_cleaning_enabled,
                         time_relation_cfg=time_relation_cfg,
                         question_text=sample.question,
+                        anchor_entities=sample.q_entity,
+                        keep_anchor_edges=keep_start_adjacent_edges,
                     )
                     cleaned_edges = _dedup_directed_edges(cleaned_edges)
                     if inverse_relations_key_map is not None:
@@ -857,6 +926,8 @@ def preprocess(ctx: StageContext) -> None:
                 relation_cleaning_enabled=relation_cleaning_enabled,
                 relation_cleaning_rules=relation_cleaning_rules,
                 time_relation_cfg=time_relation_cfg,
+                anchor_entities=sample.q_entity,
+                keep_anchor_edges=keep_start_adjacent_edges,
             )
             if not outcome.keep:
                 continue
@@ -876,10 +947,12 @@ def preprocess(ctx: StageContext) -> None:
             validate_graph_edges=validate_graph_edges,
             remove_self_loops=remove_self_loops,
             relation_cleaning_enabled=relation_cleaning_enabled,
+            keep_start_adjacent_edges=keep_start_adjacent_edges,
             relation_cleaning_rules=relation_cleaning_rules,
             inverse_relations_key_map=inverse_relations_key_map,
             inverse_relations_suffix=inverse_relations_suffix,
             time_relation_cfg=time_relation_cfg,
+            target_reachable_pruning=target_reachable_pruning,
         )
         with ProcessPoolExecutor(
             max_workers=parquet_num_workers,
@@ -891,6 +964,8 @@ def preprocess(ctx: StageContext) -> None:
         _run_pass2(None)
 
     base_writer.close()
+    if pruned_drop_by_split:
+        log_event(logger, "samples_dropped_target_pruning", counts=_format_counts(pruned_drop_by_split))
     log_event(
         logger,
         "graphs_questions_written",
@@ -921,11 +996,13 @@ def build_graph(
     validate_graph_edges: bool = _VALIDATE_GRAPH_EDGES_DEFAULT,
     remove_self_loops: bool = _REMOVE_SELF_LOOPS_DEFAULT,
     relation_cleaning_enabled: bool = True,
+    keep_start_adjacent_edges: bool = False,
     relation_cleaning_rules: RelationCleaningRules = DEFAULT_RELATION_CLEANING_RULES,
     inverse_relations_key_map: Optional[Dict[str, str]] = None,
     inverse_relations_suffix: str = _INVERSE_RELATION_SUFFIX_DEFAULT,
     time_relation_cfg: Optional[TimeRelationConfig] = None,
-) -> GraphRecord:
+    target_reachable_pruning: bool = False,
+) -> Optional[GraphRecord]:
     dedup_edges = bool(dedup_edges)
     validate_graph_edges = bool(validate_graph_edges)
     remove_self_loops = bool(remove_self_loops)
@@ -958,8 +1035,20 @@ def build_graph(
         relation_cleaning_enabled=relation_cleaning_enabled,
         time_relation_cfg=time_relation_cfg,
         question_text=sample.question,
+        anchor_entities=sample.q_entity,
+        keep_anchor_edges=keep_start_adjacent_edges,
     )
     kept_edges = _dedup_directed_edges(kept_edges)
+    if target_reachable_pruning:
+        reachable_nodes = _compute_target_reachable_nodes(kept_edges, sample.a_entity)
+        if not reachable_nodes:
+            return None
+        start_reachable = any(ent in reachable_nodes for ent in sample.q_entity)
+        if not start_reachable:
+            return None
+        kept_edges = [edge for edge in kept_edges if edge[0] in reachable_nodes and edge[2] in reachable_nodes]
+        if not kept_edges:
+            return None
     if inverse_enabled:
         kept_edges = _expand_edges_with_inverse(
             kept_edges,

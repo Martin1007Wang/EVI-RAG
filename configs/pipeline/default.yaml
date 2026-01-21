@@ -10,6 +10,14 @@ path_mode: qa_directed
 dedup_edges: true
 remove_self_loops: true
 relation_cleaning: true
+keep_start_adjacent_edges: true
+target_reachable_pruning: true
+
+filter:
+  train:
+    skip_no_path: true
+  eval:
+    skip_no_path: true
 
 embeddings_out_dir: ${dataset.materialized_dir}/embeddings
 precompute_entities: true
@@ -22,8 +30,8 @@ inverse_relations:
   enabled: true
   mapping_path: ${dataset.out_dir}/inverse_relations.json
   kg_id_suffix: "__inv"
-  strict: true
-  fallback_template: null
+  strict: false
+  fallback_template: "{relation}__inv"
   global_vocab: false
 
 emit_sub_filter: true

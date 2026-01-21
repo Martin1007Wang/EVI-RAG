@@ -28,6 +28,8 @@ _DEFAULT_MANUAL_ACCUMULATE_GRAD_BATCHES = 1
 class GFlowNetMetricLogger:
     def __init__(self, module: "LightningModule") -> None:
         self.module = module
+        self._update_tick: Dict[str, int] = {}
+        self._metric_last_update: Dict[tuple[str, str], int] = {}
 
     def init_metric_stores(self) -> None:
         self.module.train_metrics = MetricCollection({})
@@ -36,6 +38,7 @@ class GFlowNetMetricLogger:
 
     def update_metrics(self, metrics: Dict[str, torch.Tensor], *, prefix: str, batch_size: int) -> None:
         store = self._get_metric_store(prefix)
+        tick = self._bump_update_tick(prefix)
         for name, value in metrics.items():
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value)
@@ -47,25 +50,36 @@ class GFlowNetMetricLogger:
                 metric.update(value, weight=batch_size)
             else:
                 metric.update(value)
+            self._metric_last_update[(prefix, name)] = tick
 
     def log_metric_store(self, *, prefix: str, batch_size: int) -> None:
         if prefix == "predict":
             return
         store = self._get_metric_store(prefix)
+        tick = self._update_tick.get(prefix, _ZERO)
         sync_dist = bool(self.module.trainer and getattr(self.module.trainer, "num_devices", _ONE) > _ONE)
         is_train = prefix == "train"
         prog_bar_set = set(self.module._train_prog_bar if is_train else self.module._eval_prog_bar)
         log_on_step = self.module._log_on_step_train if is_train else False
         for name, metric in store.items():
+            last_tick = self._metric_last_update.get((prefix, name))
+            if last_tick is None:
+                continue
+            if isinstance(metric, MeanMetric):
+                weight = metric.weight
+                if torch.is_tensor(weight) and weight.numel() == _ONE:
+                    if float(weight.detach().to(device="cpu").item()) == float(_ZERO):
+                        continue
             prog_bar = name in prog_bar_set or (is_train and name == "loss")
             metric_attribute = f"{prefix}_metrics.{name}" if isinstance(metric, Metric) else None
+            on_step = log_on_step and last_tick == tick
             log_metric(
                 self.module,
                 f"{prefix}/{name}",
                 metric,
                 sync_dist=sync_dist,
                 prog_bar=prog_bar,
-                on_step=log_on_step,
+                on_step=on_step,
                 on_epoch=True,
                 batch_size=batch_size,
                 metric_attribute=metric_attribute,
@@ -89,6 +103,11 @@ class GFlowNetMetricLogger:
         else:
             store[name] = metric
         return metric
+
+    def _bump_update_tick(self, prefix: str) -> int:
+        tick = int(self._update_tick.get(prefix, _ZERO)) + _ONE
+        self._update_tick[prefix] = tick
+        return tick
 
 
 class GFlowNetGradClipper:
@@ -518,15 +537,22 @@ class GFlowNetTrainingLoop:
         def _scaled_backward(loss: torch.Tensor, *, retain_graph: bool = False) -> None:
             return self.module.manual_backward(loss / float(accum_steps), retain_graph=retain_graph)
 
-        with sync_context:
-            loss, metrics = self.module.engine.compute_batch_loss_streaming(
-                batch=batch,
-                device=self.module.device,
-                rollout_cfg=rollout_cfg,
-                backward_fn=_scaled_backward,
-                progress=progress,
-                stream_forward_progress=stream_forward_progress,
-            )
+        debug_enabled = self._resolve_debug_rollout_enabled(batch_idx)
+        self.module.engine.set_debug_rollout_epoch(self.module.current_epoch if debug_enabled else None)
+        self.module.engine.set_debug_rollout_steps(debug_enabled)
+        try:
+            with sync_context:
+                loss, metrics = self.module.engine.compute_batch_loss_streaming(
+                    batch=batch,
+                    device=self.module.device,
+                    rollout_cfg=rollout_cfg,
+                    backward_fn=_scaled_backward,
+                    progress=progress,
+                    stream_forward_progress=stream_forward_progress,
+                )
+        finally:
+            self.module.engine.set_debug_rollout_steps(False)
+            self.module.engine.set_debug_rollout_epoch(None)
         metrics = self._attach_loss(metrics, loss)
         if should_step:
             grad_metrics = self._step_optimizer(optimizer)
@@ -563,7 +589,14 @@ class GFlowNetTrainingLoop:
         return self.grad_clipper.clip_gradients(optimizer)
 
     def _eval_step(self, batch, batch_idx: int, *, prefix: str) -> None:
-        loss, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
+        debug_enabled = self._resolve_debug_rollout_enabled(batch_idx)
+        self.module.engine.set_debug_rollout_epoch(self.module.current_epoch if debug_enabled else None)
+        self.module.engine.set_debug_rollout_steps(debug_enabled)
+        try:
+            loss, metrics = self._compute_batch_loss(batch, batch_idx=batch_idx)
+        finally:
+            self.module.engine.set_debug_rollout_steps(False)
+            self.module.engine.set_debug_rollout_epoch(None)
         metrics = self._attach_loss(metrics, loss)
         extra_metrics = self._collect_eval_temperature_metrics(batch, batch_idx=batch_idx)
         if extra_metrics:
@@ -571,6 +604,15 @@ class GFlowNetTrainingLoop:
         batch_size = int(batch.num_graphs)
         self.metric_logger.update_metrics(metrics, prefix=prefix, batch_size=batch_size)
         self.metric_logger.log_metric_store(prefix=prefix, batch_size=batch_size)
+
+    def _resolve_debug_rollout_enabled(self, batch_idx: int) -> bool:
+        enabled = bool(getattr(self.module, "_debug_rollout_steps", False))
+        if not enabled:
+            return False
+        per_epoch = bool(getattr(self.module, "_debug_rollout_per_epoch", True))
+        if per_epoch:
+            return batch_idx == _ZERO
+        return True
 
     def _collect_eval_temperature_metrics(
         self,

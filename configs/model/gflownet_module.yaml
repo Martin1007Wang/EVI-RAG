@@ -17,24 +17,6 @@ state_cfg:
 cvt_init_cfg:
   enabled: true
 
-start_selection_cfg:
-  enabled: false
-  mode: selector
-  temperature: null
-  sample_gumbel: true
-  dropout: 0.0
-  epsilon: 0.0
-  force_uniform: false
-
-sink_selection_cfg:
-  enabled: false
-  mode: selector
-  temperature: null
-  sample_gumbel: true
-  dropout: 0.0
-  epsilon: 0.0
-  force_uniform: false
-
 env:
   _target_: src.models.components.gflownet_env.GraphEnv
   max_steps: ???
@@ -43,6 +25,10 @@ reward_fn:
   _target_: src.models.components.gflownet_reward.GraphFusionReward
   hard_target_bonus: 10.0
   min_log_reward: -10.0
+
+selector_cfg:
+  enabled: false
+  epsilon: 0.1
 
 actor_cfg:
   policy_temperature: 1.0
@@ -58,6 +44,12 @@ runtime_cfg:
   validate_on_device: false
   force_fp32: false
   require_precomputed_edge_batch: true
+  require_precomputed_edge_batch_train: true
+  require_precomputed_edge_batch_eval: false
+  cache_action_keys: true
+  debug_rollout_steps: false
+  debug_rollout_per_epoch: true
+  debug_rollout_log_path: null
 
 evaluation_cfg:
   num_eval_rollouts: 10

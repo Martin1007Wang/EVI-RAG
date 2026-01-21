@@ -50,8 +50,7 @@ class GraphFusionReward(nn.Module):
         node_ptr: torch.Tensor,
         stop_node_locals: torch.Tensor,
         dummy_mask: torch.Tensor | None = None,
-        node_is_target: torch.Tensor | None = None,
-        node_is_answer: torch.Tensor | None = None,
+        node_is_target: torch.Tensor,
         **_,
     ) -> RewardOutput:
         device = node_ptr.device
@@ -63,11 +62,6 @@ class GraphFusionReward(nn.Module):
         )
         if dummy_mask is not None:
             dummy_mask = dummy_mask.to(device=device, dtype=torch.bool)
-        # prefer unified naming; fallback to legacy node_is_answer
-        if node_is_target is None:
-            node_is_target = node_is_answer
-        if node_is_target is None:
-            raise ValueError("node_is_target is required for reward computation.")
         node_is_target = node_is_target.to(device=device, dtype=torch.bool)
         if int(node_is_target.numel()) != num_nodes_total:
             raise ValueError("node_is_target length mismatch with node_ptr.")

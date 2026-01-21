@@ -10,12 +10,11 @@ from torch import nn
 
 from src.models.components import (
     EmbeddingBackbone,
+    EntrySelector,
     FlowPredictor,
     GFlowNetActor,
     GraphEnv,
     CvtNodeInitializer,
-    SinkSelector,
-    StartSelector,
     TrajectoryAgent,
 )
 from src.data.components.embeddings import attach_embeddings_to_batch
@@ -39,7 +38,11 @@ _DEFAULT_VALIDATE_EDGE_BATCH = True
 _DEFAULT_VALIDATE_ROLLOUT_BATCH = True
 _DEFAULT_VALIDATE_ON_DEVICE = False
 _DEFAULT_REQUIRE_PRECOMPUTED_EDGE_BATCH = True
+_DEFAULT_REQUIRE_PRECOMPUTED_EDGE_BATCH_TRAIN = True
+_DEFAULT_REQUIRE_PRECOMPUTED_EDGE_BATCH_EVAL = False
 _DEFAULT_FORCE_FP32 = False
+_DEFAULT_CACHE_ACTION_KEYS = False
+_DEFAULT_DEBUG_ROLLOUT_PER_EPOCH = True
 _INVALID_RELATION_ID = -1
 _DEFAULT_ROLLOUT_CHUNK_SIZE = 1
 _DEFAULT_LOG_ON_STEP_TRAIN = False
@@ -47,12 +50,10 @@ _DEFAULT_EVAL_TEMPERATURE_EXTRAS: tuple[float, ...] = ()
 _DEFAULT_BACKBONE_FINETUNE = True
 _DEFAULT_AGENT_DROPOUT = 0.0
 _DEFAULT_CVT_INIT_ENABLED = True
-_DEFAULT_START_SELECTION_ENABLED = False
-_DEFAULT_START_SELECTION_DROPOUT = 0.0
-_DEFAULT_SINK_SELECTION_ENABLED = False
-_DEFAULT_SINK_SELECTION_DROPOUT = 0.0
 _DEFAULT_BACKWARD_SHARE_STATE_ENCODER = True
 _DEFAULT_BACKWARD_SHARE_EDGE_SCORER = True
+_DEFAULT_SELECTOR_ENABLED = False
+_DEFAULT_SELECTOR_EPSILON = 0.1
 _BACKWARD_SHARE_STATE_KEY = "share_state_encoder"
 _BACKWARD_SHARE_EDGE_KEY = "share_edge_scorer"
 _DEFAULT_MANUAL_GRAD_CLIP_ALGO = "norm"
@@ -147,11 +148,10 @@ class GFlowNetModule(LightningModule):
         state_cfg: Optional[Mapping[str, Any]] = None,
         cvt_init_cfg: Optional[Mapping[str, Any]] = None,
         flow_cfg: Optional[Mapping[str, Any]] = None,
-        start_selection_cfg: Optional[Mapping[str, Any]] = None,
-        sink_selection_cfg: Optional[Mapping[str, Any]] = None,
         backward_cfg: Optional[Mapping[str, Any]] = None,
         training_cfg: Mapping[str, Any],
         evaluation_cfg: Mapping[str, Any],
+        selector_cfg: Optional[Mapping[str, Any]] = None,
         actor_cfg: Optional[Mapping[str, Any]] = None,
         runtime_cfg: Optional[Mapping[str, Any]] = None,
         optimizer_cfg: Optional[Mapping[str, Any]] = None,
@@ -165,6 +165,7 @@ class GFlowNetModule(LightningModule):
         self._init_config_maps(
             training_cfg=training_cfg,
             evaluation_cfg=evaluation_cfg,
+            selector_cfg=selector_cfg,
             runtime_cfg=runtime_cfg,
             optimizer_cfg=optimizer_cfg,
             scheduler_cfg=scheduler_cfg,
@@ -175,8 +176,6 @@ class GFlowNetModule(LightningModule):
             state_cfg=state_cfg,
             cvt_init_cfg=cvt_init_cfg,
             flow_cfg=flow_cfg,
-            start_selection_cfg=start_selection_cfg,
-            sink_selection_cfg=sink_selection_cfg,
             backward_cfg=backward_cfg,
         )
         self._validate_runtime_cfg()
@@ -201,14 +200,13 @@ class GFlowNetModule(LightningModule):
         self._init_backward_agent_components()
         self._init_reward_schedule()
         self.flow_spec: FlowFeatureSpec = resolve_flow_spec(self.flow_cfg)
-        self._init_start_selection()
-        self._init_sink_selection()
-        self.log_f = FlowPredictor(self.hidden_dim, self._state_input_dim, self.flow_spec.stats_dim)
+        self.log_f = FlowPredictor(self.hidden_dim, self.flow_spec.stats_dim)
         self.log_f_backward = FlowPredictor(
             self.hidden_dim,
-            getattr(self, "_state_input_dim_backward", self._state_input_dim),
             self.flow_spec.stats_dim,
         )
+        self.source_selector = None
+        self.sink_selector = None
         self.actor = None
         self.actor_backward = None
         self.input_validator = None
@@ -224,6 +222,7 @@ class GFlowNetModule(LightningModule):
         *,
         training_cfg: Mapping[str, Any],
         evaluation_cfg: Mapping[str, Any],
+        selector_cfg: Optional[Mapping[str, Any]],
         runtime_cfg: Optional[Mapping[str, Any]],
         optimizer_cfg: Optional[Mapping[str, Any]],
         scheduler_cfg: Optional[Mapping[str, Any]],
@@ -234,12 +233,11 @@ class GFlowNetModule(LightningModule):
         state_cfg: Optional[Mapping[str, Any]],
         cvt_init_cfg: Optional[Mapping[str, Any]],
         flow_cfg: Optional[Mapping[str, Any]],
-        start_selection_cfg: Optional[Mapping[str, Any]],
-        sink_selection_cfg: Optional[Mapping[str, Any]],
         backward_cfg: Optional[Mapping[str, Any]],
     ) -> None:
         self.training_cfg = self._require_mapping(training_cfg, "training_cfg")
         self.evaluation_cfg = self._require_mapping(evaluation_cfg, "evaluation_cfg")
+        self.selector_cfg = self._optional_mapping(selector_cfg, "selector_cfg")
         self.runtime_cfg = self._optional_mapping(runtime_cfg, "runtime_cfg")
         self.optimizer_cfg = self._optional_mapping(optimizer_cfg, "optimizer_cfg")
         self.scheduler_cfg = self._optional_mapping(scheduler_cfg, "scheduler_cfg")
@@ -250,21 +248,39 @@ class GFlowNetModule(LightningModule):
         self.state_cfg = self._optional_mapping(state_cfg, "state_cfg")
         self.cvt_init_cfg = self._optional_mapping(cvt_init_cfg, "cvt_init_cfg")
         self.flow_cfg = self._optional_mapping(flow_cfg, "flow_cfg")
-        self.start_selection_cfg = self._optional_mapping(start_selection_cfg, "start_selection_cfg")
-        self.sink_selection_cfg = self._optional_mapping(sink_selection_cfg, "sink_selection_cfg")
         self.backward_cfg = self._optional_mapping(backward_cfg, "backward_cfg")
         self._validate_edge_batch = bool(self.runtime_cfg.get("validate_edge_batch", _DEFAULT_VALIDATE_EDGE_BATCH))
         self._validate_rollout_batch = bool(
             self.runtime_cfg.get("validate_rollout_batch", _DEFAULT_VALIDATE_ROLLOUT_BATCH)
         )
         self._validate_on_device = bool(self.runtime_cfg.get("validate_on_device", _DEFAULT_VALIDATE_ON_DEVICE))
-        self._require_precomputed_edge_batch = bool(
+        require_precomputed_edge_batch = bool(
             self.runtime_cfg.get(
                 "require_precomputed_edge_batch",
                 _DEFAULT_REQUIRE_PRECOMPUTED_EDGE_BATCH,
             )
         )
+        self._require_precomputed_edge_batch = require_precomputed_edge_batch
+        self._require_precomputed_edge_batch_train = bool(
+            self.runtime_cfg.get(
+                "require_precomputed_edge_batch_train",
+                require_precomputed_edge_batch,
+            )
+        )
+        self._require_precomputed_edge_batch_eval = bool(
+            self.runtime_cfg.get(
+                "require_precomputed_edge_batch_eval",
+                require_precomputed_edge_batch,
+            )
+        )
         self._force_fp32 = bool(self.runtime_cfg.get("force_fp32", _DEFAULT_FORCE_FP32))
+        self._cache_action_keys = bool(self.runtime_cfg.get("cache_action_keys", _DEFAULT_CACHE_ACTION_KEYS))
+        self._debug_rollout_steps = bool(self.runtime_cfg.get("debug_rollout_steps", False))
+        self._debug_rollout_per_epoch = bool(
+            self.runtime_cfg.get("debug_rollout_per_epoch", _DEFAULT_DEBUG_ROLLOUT_PER_EPOCH)
+        )
+        debug_log_path = self.runtime_cfg.get("debug_rollout_log_path")
+        self._debug_rollout_log_path = self._coerce_path(debug_log_path, "runtime_cfg.debug_rollout_log_path")
 
     def _validate_runtime_cfg(self) -> None:
         if "vectorized_rollouts" in self.runtime_cfg:
@@ -340,16 +356,28 @@ class GFlowNetModule(LightningModule):
             return
         self._load_vocab_assets()
         self._init_cvt_init()
-        self.actor = self._build_actor(agent=self.agent, context_mode="question")
+        self._init_entry_selectors()
+        self.actor = self._build_actor(agent=self.agent, context_mode="start_node", default_mode="forward")
         if self._backward_share_agent:
             self.actor_backward = self.actor
         else:
             self.actor_backward = self._build_actor(
                 agent=self.agent_backward,
                 context_mode="start_node",
+                default_mode="backward",
             )
         self._init_engine_components()
         self._runtime_initialized = True
+
+    def _init_entry_selectors(self) -> None:
+        cfg = self.selector_cfg
+        if cfg is None:
+            return
+        enabled = bool(cfg.get("enabled", _DEFAULT_SELECTOR_ENABLED))
+        if not enabled:
+            return
+        self.source_selector = EntrySelector(hidden_dim=self.hidden_dim)
+        self.sink_selector = EntrySelector(hidden_dim=self.hidden_dim)
 
     def _init_relation_vocab(
         self,
@@ -516,40 +544,6 @@ class GFlowNetModule(LightningModule):
             force_fp32=self._force_fp32,
         )
 
-    def _init_start_selection(self) -> None:
-        cfg = self.start_selection_cfg
-        enabled = bool(cfg.get("enabled", _DEFAULT_START_SELECTION_ENABLED)) if cfg else _DEFAULT_START_SELECTION_ENABLED
-        if not enabled:
-            self.start_selector = None
-            return
-        dropout = self._require_non_negative_float(
-            cfg.get("dropout", _DEFAULT_START_SELECTION_DROPOUT),
-            "start_selection_cfg.dropout",
-        )
-        self.start_selector = StartSelector(
-            token_dim=self.hidden_dim,
-            hidden_dim=self.hidden_dim,
-            dropout=dropout,
-            force_fp32=self._force_fp32,
-        )
-
-    def _init_sink_selection(self) -> None:
-        cfg = self.sink_selection_cfg
-        enabled = bool(cfg.get("enabled", _DEFAULT_SINK_SELECTION_ENABLED)) if cfg else _DEFAULT_SINK_SELECTION_ENABLED
-        if not enabled:
-            self.sink_selector = None
-            return
-        dropout = self._require_non_negative_float(
-            cfg.get("dropout", _DEFAULT_SINK_SELECTION_DROPOUT),
-            "sink_selection_cfg.dropout",
-        )
-        self.sink_selector = SinkSelector(
-            token_dim=self.hidden_dim,
-            hidden_dim=self.hidden_dim,
-            dropout=dropout,
-            force_fp32=self._force_fp32,
-        )
-
     def _init_backward_policy_settings(self) -> None:
         cfg = self.backward_cfg
         share_state = bool(cfg.get(_BACKWARD_SHARE_STATE_KEY, _DEFAULT_BACKWARD_SHARE_STATE_ENCODER))
@@ -621,6 +615,7 @@ class GFlowNetModule(LightningModule):
         *,
         agent: TrajectoryAgent,
         context_mode: str,
+        default_mode: str,
         actor_cfg: Optional[Mapping[str, Any]] = None,
     ) -> GFlowNetActor:
         cfg = self.actor_cfg if actor_cfg is None else actor_cfg
@@ -637,6 +632,7 @@ class GFlowNetModule(LightningModule):
             policy_temperature=policy_temperature,
             stop_bias_init=stop_bias,
             context_mode=context_mode,
+            default_mode=default_mode,
         )
 
     def _init_engine_components(self) -> None:
@@ -651,7 +647,7 @@ class GFlowNetModule(LightningModule):
             backbone=self.backbone,
             cvt_init=self.cvt_init,
             cvt_mask=self._cvt_mask,
-            require_precomputed_edge_batch=self._require_precomputed_edge_batch,
+            require_precomputed_edge_batch=self._require_precomputed_edge_batch_train,
         )
         self.engine = GFlowNetEngine(
             actor=self.actor,
@@ -660,8 +656,6 @@ class GFlowNetModule(LightningModule):
             env=self.env,
             log_f=self.log_f,
             log_f_backward=self.log_f_backward,
-            start_selector=self.start_selector,
-            sink_selector=self.sink_selector,
             flow_spec=self.flow_spec,
             relation_inverse_map=self._relation_inverse_map,
             relation_is_inverse=self._relation_is_inverse,
@@ -670,11 +664,17 @@ class GFlowNetModule(LightningModule):
             composite_score_cfg=self._composite_score_cfg,
             dual_stream_cfg=self.training_cfg.get("dual_stream"),
             subtb_cfg=self.training_cfg.get("subtb"),
-            start_selection_cfg=self.start_selection_cfg,
-            sink_selection_cfg=self.sink_selection_cfg,
             z_align_cfg=self.training_cfg.get("z_align"),
             h_guidance_cfg=self.training_cfg.get("h_guidance"),
-            replay_cfg=self.training_cfg.get("replay"),
+            imitation_cfg=self.training_cfg.get("imitation"),
+            target_sampling_cfg=self.training_cfg.get("target_sampling"),
+            entry_selector_cfg=self.selector_cfg,
+            source_selector=self.source_selector,
+            sink_selector=self.sink_selector,
+            cache_action_keys=self._cache_action_keys,
+            require_precomputed_edge_batch_train=self._require_precomputed_edge_batch_train,
+            require_precomputed_edge_batch_eval=self._require_precomputed_edge_batch_eval,
+            debug_rollout_steps=self._debug_rollout_steps,
         )
 
     def _assert_training_cfg_contract(self) -> None:
@@ -692,6 +692,17 @@ class GFlowNetModule(LightningModule):
             raise ValueError("training_cfg.curriculum has been removed; disable curriculum scheduling.")
         if self.training_cfg.get("log_f_target") is not None:
             raise ValueError("training_cfg.log_f_target has been removed; no target networks are used.")
+        replay_cfg = self.training_cfg.get("replay")
+        if replay_cfg is not None:
+            enabled = None
+            if isinstance(replay_cfg, bool):
+                enabled = replay_cfg
+            elif isinstance(replay_cfg, Mapping):
+                enabled = bool(replay_cfg.get("enabled", True))
+            else:
+                raise TypeError("training_cfg.replay must be a mapping, bool, or None.")
+            if bool(enabled):
+                raise ValueError("training_cfg.replay has been removed; use training_cfg.imitation for online distillation.")
         subtb_cfg = self.training_cfg.get("subtb")
         if subtb_cfg is None:
             raise ValueError("training_cfg.subtb is required; SubTB is the only trajectory balance loss.")
@@ -718,12 +729,11 @@ class GFlowNetModule(LightningModule):
                 "reward_fn",
                 "env",
                 "actor_backward",
-                "start_selector",
-                "sink_selector",
                 "actor_cfg",
                 "backward_cfg",
                 "training_cfg",
                 "evaluation_cfg",
+                "selector_cfg",
                 "flow_cfg",
                 "optimizer_cfg",
                 "scheduler_cfg",
@@ -951,10 +961,11 @@ class GFlowNetModule(LightningModule):
         self._ensure_answer_ids_device(batch, device=device)
         if device.type == "cpu":
             return batch
+        force_fp32 = self._force_fp32
         for key in _BATCH_DEVICE_KEYS:
             value = getattr(batch, key, None)
             if torch.is_tensor(value):
-                if key in _BATCH_FLOAT_KEYS:
+                if key in _BATCH_FLOAT_KEYS and force_fp32:
                     setattr(batch, key, value.to(device=device, dtype=torch.float32, non_blocking=True))
                 else:
                     setattr(batch, key, value.to(device=device, non_blocking=True))
@@ -976,11 +987,11 @@ class GFlowNetModule(LightningModule):
         answer_ptr = getattr(batch, "answer_entity_ids_ptr", None)
         if not torch.is_tensor(answer_ids) or not torch.is_tensor(answer_ptr):
             return
-        target = device
-        if device.type == "cpu":
-            target = torch.device("cpu")
-        batch.answer_entity_ids = answer_ids.to(device=target, dtype=torch.long, non_blocking=True)
-        batch.answer_entity_ids_ptr = answer_ptr.to(device=target, dtype=torch.long, non_blocking=True)
+        target = torch.device("cpu")
+        if answer_ids.device != target or answer_ids.dtype != torch.long:
+            batch.answer_entity_ids = answer_ids.to(device=target, dtype=torch.long, non_blocking=True)
+        if answer_ptr.device != target or answer_ptr.dtype != torch.long:
+            batch.answer_entity_ids_ptr = answer_ptr.to(device=target, dtype=torch.long, non_blocking=True)
 
     def on_before_optimizer_step(
         self,

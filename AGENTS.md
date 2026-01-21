@@ -6,6 +6,16 @@
 
 ---
 
+## 0. Anchor Semantics (QA vs Flow)
+
+*   **Data SSOT:** `q_local_indices` / `a_local_indices`（及其 ptr）仅表示**问题/答案实体集合**，是数据层唯一真相，严禁被覆盖或互换。
+*   **Flow-Derived:** `start_node_locals` / `target_node_locals` 仅表示 **GFlowNet 流向起终点**，由 `(q, a) + direction + selector/sampling` 派生，运行时存在，不落盘。
+*   **Direction Mapping:** `forward`: start = q, target = a；`backward`: start = a, target = q。
+*   **No Swapping:** 禁止通过交换 `q/a` 实现反向流；必须通过显式的 flow 映射/override。
+*   **Mask Semantics:** `dummy_mask` 仅由 data-level answer 计算；`node_is_target` 必须由 flow target 计算。
+
+---
+
 ## Ⅰ. The Axiomatic System (公理系统)
 
 我们不编写“功能”，我们实现“定义”。所有代码必须遵循以下三大公理：
@@ -106,6 +116,29 @@
 
 ---
 
-## Ⅴ. Known Limitation (已知局限)
+## Ⅴ. Policy Semantics (行动语义)
+
+### 1. Action Factorization (行动分解)
+*   **Two-Stage Actions:** 动作分解为 $P(r \mid h_t)$ 后接 $P(v \mid r, h_t)$；先选关系，再选尾节点。
+*   **Stop Depends on Edges:** Stop 头必须与出边分数耦合（如用 `logsumexp`/`max` 边分数），当无可走边时倾向 Stop。
+
+### 2. Backward Policy Contract (反向策略契约)
+*   **Transitions Only:** $P_B(\tau \mid x_{stop})$ 仅累积边转移概率；终止合法性由奖励函数承担。
+*   **Entry Selector Neutrality:** Stop 不在答案集合时，不得产生 $-\infty$；使用 $\log(1)$ 作为默认值。
+
+### 3. Multi-Start Handling (多起点处理)
+*   **DataLoader Responsibility:** 多起点样本必须在 DataLoader 展开（`expand_multi_start=true`），训练/验证/测试一致。
+*   **Model Assumption:** 模型仅接收单起点；若仍出现多起点，立即抛错。
+
+### 4. Replay Invariance (回放不变性)
+*   **Local Edge IDs:** Replay 必须以 per-graph local edge id 存储；通过 `edge_ptr` 在 add/fetch 时映射。
+
+### 5. Multi-Endpoint Reality (多终点现实)
+*   **Multi-Start & Multi-Target:** 数据可能同时包含多个起点与多个终点；在反向流中亦然。
+*   **No Pairwise Connectivity Guarantee:** 起点与终点两两配对不保证连通；可达性必须由数据过滤或奖励函数显式处理，模型不得隐式假设全连通。
+
+---
+
+## Ⅵ. Known Limitation (已知局限)
 
 *   **Subgraph-bounded supervision:** 当前训练/评估均在 `g_retrieval` 子图上进行（动作空间由采样与掩码裁剪），最短路监督与奖励都定义在该裁剪子图内，而非全图最短路。**原因**：$G_{raw}$ 极其庞大，$G_{sub}$ 也很大（平均约 10k 条边），直接在该规模上训练/推理不可行；因此必须裁剪动作空间。若需要第一性“全图”语义，必须改变构图策略或在全图上计算监督。

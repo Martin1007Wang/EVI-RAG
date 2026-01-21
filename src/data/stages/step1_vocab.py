@@ -43,6 +43,40 @@ def _resolve_time_gate(time_relation_cfg: Optional[TimeRelationConfig], question
     raise ValueError(f"Unsupported time_relation_mode: {mode!r}.")
 
 
+def _edge_nodes(edges: Sequence[Tuple[str, str, str]]) -> set[str]:
+    nodes: set[str] = set()
+    for head, _, tail in edges:
+        nodes.add(head)
+        nodes.add(tail)
+    return nodes
+
+
+def _maybe_relax_anchor_edges(
+    graph: Sequence[Tuple[str, str, str]],
+    kept_edges: List[Tuple[str, str, str]],
+    *,
+    anchor_entities: Optional[Sequence[str]],
+    remove_self_loops: bool,
+) -> List[Tuple[str, str, str]]:
+    if not anchor_entities:
+        return kept_edges
+    anchor_set = set(anchor_entities)
+    if not anchor_set:
+        return kept_edges
+    if _edge_nodes(kept_edges) & anchor_set:
+        return kept_edges
+    relaxed_edges: List[Tuple[str, str, str]] = []
+    for head, rel, tail in graph:
+        if remove_self_loops and head == tail:
+            continue
+        if head in anchor_set or tail in anchor_set:
+            # Anchor retention bypasses relation/time filtering to keep the start node.
+            relaxed_edges.append((head, rel, tail))
+    if not relaxed_edges:
+        return kept_edges
+    return kept_edges + relaxed_edges
+
+
 def _partition_graph_edges(
     graph: Sequence[Tuple[str, str, str]],
     rules: RelationCleaningRules,
@@ -51,25 +85,34 @@ def _partition_graph_edges(
     relation_cleaning_enabled: bool,
     time_relation_cfg: Optional[TimeRelationConfig] = None,
     question_text: Optional[str] = None,
+    anchor_entities: Optional[Sequence[str]] = None,
+    keep_anchor_edges: bool = False,
 ) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str]]]:
     kept_edges: List[Tuple[str, str, str]] = []
     type_edges: List[Tuple[str, str, str]] = []
     time_gate = _resolve_time_gate(time_relation_cfg, question_text)
-    for h, r, t in graph:
-        if remove_self_loops and h == t:
+    for head, rel, tail in graph:
+        if remove_self_loops and head == tail:
             continue
         if (
             time_gate is not None
             and time_relation_cfg is not None
-            and time_relation_cfg.is_time_relation(r)
+            and time_relation_cfg.is_time_relation(rel)
             and not time_gate
         ):
             continue
-        action = relation_action(r, rules, enabled=relation_cleaning_enabled)
+        action = relation_action(rel, rules, enabled=relation_cleaning_enabled)
         if action == RELATION_ACTION_KEEP:
-            kept_edges.append((h, r, t))
+            kept_edges.append((head, rel, tail))
         elif action == RELATION_ACTION_TYPE:
-            type_edges.append((h, r, t))
+            type_edges.append((head, rel, tail))
+    if keep_anchor_edges:
+        kept_edges = _maybe_relax_anchor_edges(
+            graph,
+            kept_edges,
+            anchor_entities=anchor_entities,
+            remove_self_loops=remove_self_loops,
+        )
     return kept_edges, type_edges
 
 
@@ -84,6 +127,8 @@ def _should_keep_sample(
     relation_cleaning_rules: RelationCleaningRules,
     kept_edges: Optional[Sequence[Tuple[str, str, str]]] = None,
     time_relation_cfg: Optional[TimeRelationConfig] = None,
+    anchor_entities: Optional[Sequence[str]] = None,
+    keep_anchor_edges: bool = False,
 ) -> SampleFilterOutcome:
     if kept_edges is None:
         kept_edges, _ = _partition_graph_edges(
@@ -93,6 +138,8 @@ def _should_keep_sample(
             relation_cleaning_enabled=relation_cleaning_enabled,
             time_relation_cfg=time_relation_cfg,
             question_text=sample.question,
+            anchor_entities=anchor_entities,
+            keep_anchor_edges=keep_anchor_edges,
         )
     node_strings = {h for h, _, t in kept_edges} | {t for _, _, t in kept_edges}
     has_topic = any(ent in node_strings for ent in sample.q_entity)

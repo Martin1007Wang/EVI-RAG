@@ -5,14 +5,15 @@ _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 1
+batch_size: 16
 num_workers: 4
 drop_last: false
 train_shuffle: true
 prefetch_factor: 4
 persistent_workers: true
 precompute_edge_batch: true
-validate_edge_batch: false
+validate_edge_batch: true
 embeddings_device: cpu
-expand_multi_start: true
-expand_multi_answer: true
+expand_multi_start: false
+# 多起点/多答案由引擎统一采样；DataLoader 不展开。
+expand_multi_answer: false
