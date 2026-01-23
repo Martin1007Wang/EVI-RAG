@@ -88,7 +88,6 @@ def build_dataset(ctx: StageContext) -> None:
 
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
-    require_precomputed_questions = bool(cfg.get("require_precomputed_questions", False))
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
 
     emb_dir = ctx.embeddings_dir
@@ -144,11 +143,6 @@ def build_dataset(ctx: StageContext) -> None:
         if dataset_values and dataset_name not in dataset_values:
             raise RuntimeError("questions.parquet dataset mismatch: " f"expected={dataset_name} found={sorted(dataset_values)}")
     if use_precomputed_questions and not questions_have_emb:
-        if require_precomputed_questions:
-            raise RuntimeError(
-                "questions.parquet is missing required column `question_emb`. "
-                "Re-run scripts/build_retrieval_pipeline.py with precomputed question embeddings."
-            )
         use_precomputed_questions = False
     graph_ids_all = graphs_table.column("graph_id")
     distinct = graph_ids_all.unique()
@@ -161,20 +155,12 @@ def build_dataset(ctx: StageContext) -> None:
 
     graph_id_list = graph_ids_all.to_pylist()
     graph_id_to_row: Dict[str, int] = {gid: idx for idx, gid in enumerate(graph_id_list)}
-    def _require_graph_col(name: str) -> List:
-        if name not in graphs_table.schema.names:
-            raise RuntimeError(
-                f"graphs.parquet is missing required column `{name}`. "
-                "Re-run scripts/build_retrieval_pipeline.py to regenerate with the updated schema."
-            )
-        return graphs_table.column(name).to_pylist()
-
     graph_cols: Dict[str, List] = {
-        "node_entity_ids": _require_graph_col("node_entity_ids"),
-        "node_embedding_ids": _require_graph_col("node_embedding_ids"),
-        "edge_src": _require_graph_col("edge_src"),
-        "edge_dst": _require_graph_col("edge_dst"),
-        "edge_relation_ids": _require_graph_col("edge_relation_ids"),
+        "node_entity_ids": graphs_table.column("node_entity_ids").to_pylist(),
+        "node_embedding_ids": graphs_table.column("node_embedding_ids").to_pylist(),
+        "edge_src": graphs_table.column("edge_src").to_pylist(),
+        "edge_dst": graphs_table.column("edge_dst").to_pylist(),
+        "edge_relation_ids": graphs_table.column("edge_relation_ids").to_pylist(),
     }
 
     questions_rows = questions_table.num_rows

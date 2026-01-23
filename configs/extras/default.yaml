@@ -8,4 +8,8 @@ enforce_tags: True
 print_config: True
 
 # leverage Tensor Cores for FP32 matmul (TF32). Set to null to disable.
-torch_float32_matmul_precision: high
+torch_float32_matmul_precision: highest
+
+# explicit TF32 backend switches (precision should be controlled by trainer only)
+allow_tf32_matmul: false
+allow_tf32_cudnn: false

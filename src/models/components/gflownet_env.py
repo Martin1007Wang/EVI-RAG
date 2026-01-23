@@ -53,14 +53,10 @@ class GraphEnv(nn.Module):
         num_graphs = int(node_ptr.numel() - 1)
         mode_val = str(mode).lower()
         if init_node_locals is None:
-            if mode_val == "forward":
-                resolved_node_locals = batch["start_node_locals"]
-                resolved_ptr = batch["start_ptr"]
-            elif mode_val == "backward":
-                resolved_node_locals = batch["target_node_locals"]
-                resolved_ptr = batch["target_ptr"]
-            else:
+            if mode_val not in {"forward", "backward"}:
                 raise ValueError(f"Unsupported mode: {mode}")
+            resolved_node_locals = batch["start_node_locals"]
+            resolved_ptr = batch["start_ptr"]
         else:
             resolved_node_locals = init_node_locals
             resolved_ptr = init_ptr

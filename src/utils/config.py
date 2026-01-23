@@ -220,6 +220,20 @@ def extras(cfg: DictConfig) -> None:
     if precision:
         torch.set_float32_matmul_precision(str(precision))
         log.info("torch.set_float32_matmul_precision(%s)", precision)
+    allow_tf32_matmul = cfg.extras.get("allow_tf32_matmul")
+    if allow_tf32_matmul is not None:
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32_matmul)
+            log.info("torch.backends.cuda.matmul.allow_tf32=%s", bool(allow_tf32_matmul))
+        except AttributeError:
+            log.warning("torch.backends.cuda.matmul.allow_tf32 not available in this build.")
+    allow_tf32_cudnn = cfg.extras.get("allow_tf32_cudnn")
+    if allow_tf32_cudnn is not None:
+        try:
+            torch.backends.cudnn.allow_tf32 = bool(allow_tf32_cudnn)
+            log.info("torch.backends.cudnn.allow_tf32=%s", bool(allow_tf32_cudnn))
+        except AttributeError:
+            log.warning("torch.backends.cudnn.allow_tf32 not available in this build.")
 
     # pretty print config tree using Rich library
     if cfg.extras.get("print_config"):

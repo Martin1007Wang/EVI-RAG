@@ -13,13 +13,13 @@ _ZERO = 0
 _ONE = 1
 
 
-def _expand_multi_start_answer_samples(
+def _expand_answer_samples(
     batch_list: list[Any],
     *,
-    expand_multi_start: bool,
     expand_multi_answer: bool,
+    filter_zero_hop: bool,
 ) -> list[Any]:
-    if not expand_multi_start and not expand_multi_answer:
+    if not expand_multi_answer and not filter_zero_hop:
         return batch_list
     expanded: list[Any] = []
     for data in batch_list:
@@ -41,11 +41,6 @@ def _expand_multi_start_answer_samples(
         answer_vals = answer_ids.view(-1)
         if a_vals.numel() != answer_vals.numel():
             raise ValueError("a_local_indices length mismatch with answer_entity_ids.")
-        q_candidates: list[tuple[torch.Tensor, int | None]] = []
-        if not expand_multi_start or q_vals.numel() <= _ONE:
-            q_candidates = [(q_vals, None)]
-        else:
-            q_candidates = [(q_vals[idx].view(_ONE), idx) for idx in range(q_vals.numel())]
         a_candidates: list[tuple[torch.Tensor, torch.Tensor, int | None]] = []
         if not expand_multi_answer or a_vals.numel() <= _ONE:
             a_candidates = [(a_vals, answer_vals, None)]
@@ -54,21 +49,18 @@ def _expand_multi_start_answer_samples(
                 (a_vals[idx].view(_ONE), answer_vals[idx].view(_ONE), idx) for idx in range(a_vals.numel())
             ]
         base_id = str(getattr(data, "sample_id", ""))
-        for q_val, q_idx in q_candidates:
-            for a_val, ans_val, a_idx in a_candidates:
-                clone = data.clone()
-                clone.q_local_indices = q_val
-                clone.a_local_indices = a_val
-                clone.answer_entity_ids = ans_val
-                if base_id:
-                    suffixes: list[str] = []
-                    if q_idx is not None:
-                        suffixes.append(f"q{q_idx}")
-                    if a_idx is not None:
-                        suffixes.append(f"a{a_idx}")
-                    if suffixes:
-                        clone.sample_id = f"{base_id}::" + "::".join(suffixes)
-                expanded.append(clone)
+        for a_val, ans_val, a_idx in a_candidates:
+            if filter_zero_hop and q_vals.numel() > _ZERO and a_val.numel() > _ZERO:
+                if bool((q_vals.view(-1, 1) == a_val.view(1, -1)).any().item()):
+                    continue
+            clone = data.clone()
+            clone.a_local_indices = a_val
+            clone.answer_entity_ids = ans_val
+            if base_id and a_idx is not None:
+                clone.sample_id = f"{base_id}::a{a_idx}"
+            expanded.append(clone)
+    if filter_zero_hop and not expanded:
+        raise ValueError("All samples filtered by zero-hop guard; disable filter_zero_hop to proceed.")
     return expanded
 
 
@@ -138,12 +130,12 @@ class RetrievalCollater:
         follow_batch: Optional[list[str]] = None,
         exclude_keys: Optional[list[str]] = None,
         augmenter: Optional[BatchAugmenter] = None,
-        expand_multi_start: bool = False,
         expand_multi_answer: bool = False,
+        filter_zero_hop: bool = True,
     ) -> None:
         self._augmenter = augmenter
-        self._expand_multi_start = bool(expand_multi_start)
         self._expand_multi_answer = bool(expand_multi_answer)
+        self._filter_zero_hop = bool(filter_zero_hop)
         self._collater = Collater(
             dataset,
             follow_batch=follow_batch,
@@ -151,11 +143,11 @@ class RetrievalCollater:
         )
 
     def __call__(self, batch_list: list[Any]) -> Any:
-        if self._expand_multi_start or self._expand_multi_answer:
-            batch_list = _expand_multi_start_answer_samples(
+        if self._expand_multi_answer or self._filter_zero_hop:
+            batch_list = _expand_answer_samples(
                 batch_list,
-                expand_multi_start=self._expand_multi_start,
                 expand_multi_answer=self._expand_multi_answer,
+                filter_zero_hop=self._filter_zero_hop,
             )
         batch = self._collater(batch_list)
         if self._augmenter is None:

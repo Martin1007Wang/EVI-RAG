@@ -56,8 +56,8 @@ def build_retrieval_dataloader(
     validate_edge_batch: bool = False,
     follow_batch: Optional[list[str]] = None,
     exclude_keys: Optional[list[str]] = None,
-    expand_multi_start: bool = True,
     expand_multi_answer: bool = True,
+    filter_zero_hop: bool = True,
     **kwargs: Any,
 ) -> DataLoader:
     if dataset is None:
@@ -75,8 +75,8 @@ def build_retrieval_dataloader(
         follow_batch=follow_batch,
         exclude_keys=exclude_keys,
         augmenter=augmenter,
-        expand_multi_start=expand_multi_start,
         expand_multi_answer=expand_multi_answer,
+        filter_zero_hop=filter_zero_hop,
     )
 
     user_init_fn: Optional[Callable[[int], None]] = kwargs.pop("worker_init_fn", None)

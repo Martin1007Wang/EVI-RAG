@@ -14,6 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from torch.utils.data import DataLoader
 
 from .components import SharedDataResources
+from .components.embeddings import attach_embeddings_to_batch
 from .components.loader import build_retrieval_dataloader
 from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
 from .io.lmdb_utils import _resolve_core_lmdb_paths
@@ -22,13 +23,13 @@ _EMBEDDINGS_DEVICE_CUDA = "cuda"
 
 
 def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize dataset_cfg to the SSOT representation: `paths.entity_vocab` + `paths.embeddings`."""
+    """Normalize dataset_cfg to the SSOT representation: `paths.entity_vocab` + `paths.relation_vocab` + `paths.embeddings`."""
 
     cfg = dict(dataset_cfg)
     paths = cfg.get("paths")
-    if isinstance(paths, dict) and paths.get("entity_vocab") and paths.get("embeddings"):
+    if isinstance(paths, dict) and paths.get("entity_vocab") and paths.get("relation_vocab") and paths.get("embeddings"):
         return cfg
-    raise ValueError("dataset_cfg must define `paths.entity_vocab` and `paths.embeddings`.")
+    raise ValueError("dataset_cfg must define `paths.entity_vocab`, `paths.relation_vocab`, and `paths.embeddings`.")
 
 
 class GRetrievalDataModule(LightningDataModule):
@@ -56,8 +57,8 @@ class GRetrievalDataModule(LightningDataModule):
         validate_edge_batch: bool = False,
         embeddings_device: str | None = None,
         splits: Optional[Dict[str, str]] = None,
-        expand_multi_start: bool = True,
         expand_multi_answer: bool = True,
+        filter_zero_hop: bool = True,
     ) -> None:
         super().__init__()
         normalized_embeddings_device = None if embeddings_device is None else str(embeddings_device).lower()
@@ -93,8 +94,8 @@ class GRetrievalDataModule(LightningDataModule):
         self.precompute_edge_batch = bool(precompute_edge_batch)
         self.validate_edge_batch = bool(validate_edge_batch)
         self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
-        self.expand_multi_start = bool(expand_multi_start)
         self.expand_multi_answer = bool(expand_multi_answer)
+        self.filter_zero_hop = bool(filter_zero_hop)
 
         # Default splits mapping if not provided in `data/g_retrieval.yaml`
         self.splits = splits or {"train": "train", "validation": "validation", "test": "test"}
@@ -119,15 +120,20 @@ class GRetrievalDataModule(LightningDataModule):
         paths = self.dataset_cfg.get("paths")
         if not isinstance(paths, dict):
             raise ValueError("Invalid dataset_cfg: expected mapping at `paths`.")
-        if "entity_vocab" not in paths or "embeddings" not in paths:
-            raise ValueError("Invalid dataset_cfg: expected `paths.entity_vocab` and `paths.embeddings`.")
+        if "entity_vocab" not in paths or "relation_vocab" not in paths or "embeddings" not in paths:
+            raise ValueError(
+                "Invalid dataset_cfg: expected `paths.entity_vocab`, `paths.relation_vocab`, and `paths.embeddings`."
+            )
 
         entity_vocab_path = Path(paths["entity_vocab"])
+        relation_vocab_path = Path(paths["relation_vocab"])
         emb_dir = Path(paths["embeddings"])
 
         missing = []
         if not entity_vocab_path.exists():
             missing.append(f"Entity vocab: {entity_vocab_path}")
+        if not relation_vocab_path.exists():
+            missing.append(f"Relation vocab: {relation_vocab_path}")
         if not emb_dir.exists():
             missing.append(f"Embeddings Dir: {emb_dir}")
 
@@ -149,6 +155,7 @@ class GRetrievalDataModule(LightningDataModule):
             paths = self.dataset_cfg["paths"]
             self._shared_resources = SharedDataResources(
                 entity_vocab_path=Path(paths["entity_vocab"]),
+                relation_vocab_path=Path(paths["relation_vocab"]),
                 embeddings_dir=Path(paths["embeddings"]),
                 embeddings_device=self.embeddings_device,
             )
@@ -187,6 +194,24 @@ class GRetrievalDataModule(LightningDataModule):
     def predict_dataloader(self) -> DataLoader:
         # Predict reuses the test split.
         return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
+
+    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
+        _ = dataloader_idx
+        resources = self._shared_resources
+        if resources is None:
+            return batch
+        if not hasattr(batch, "node_embeddings") or not hasattr(batch, "edge_embeddings"):
+            target_device = self.embeddings_device
+            if target_device is None:
+                target_device = device
+            attach_embeddings_to_batch(
+                batch,
+                global_embeddings=resources.global_embeddings,
+                embeddings_device=target_device,
+            )
+        # Keep the (potentially huge) PyG batch on CPU; the model moves only
+        # the required tensors to device in `_prepare_batch`.
+        return batch
 
     def train_eval_dataloader(self) -> DataLoader:
         """
@@ -239,6 +264,6 @@ class GRetrievalDataModule(LightningDataModule):
             precompute_edge_batch=self.precompute_edge_batch,
             validate_edge_batch=self.validate_edge_batch,
             random_seed=self.dataset_cfg.get("random_seed"),
-            expand_multi_start=self.expand_multi_start,
             expand_multi_answer=self.expand_multi_answer,
+            filter_zero_hop=self.filter_zero_hop,
         )

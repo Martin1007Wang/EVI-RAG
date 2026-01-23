@@ -35,58 +35,22 @@ class CompositeScoreConfig:
     def weight_sum(self) -> float:
         return float(self.weight_context_hit + self.weight_terminal_hit + self.weight_pass_best)
 
-
-def _require_float(value: Any, name: str) -> float:
-    if isinstance(value, bool):
-        raise TypeError(f"{name} must be a float, got bool.")
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise TypeError(f"{name} must be a float, got empty string.")
-        try:
-            return float(text)
-        except ValueError as exc:
-            raise TypeError(f"{name} must be a float, got {value!r}.") from exc
-    raise TypeError(f"{name} must be a float, got {type(value).__name__}.")
-
-
-def _require_non_negative_float(value: Any, name: str) -> float:
-    parsed = _require_float(value, name)
-    if parsed < _FLOAT_ZERO:
-        raise ValueError(f"{name} must be >= 0, got {parsed}.")
-    return parsed
-
-
 def resolve_composite_score_cfg(raw_cfg: Optional[Any]) -> CompositeScoreConfig:
     if isinstance(raw_cfg, CompositeScoreConfig):
         return raw_cfg
     if raw_cfg is None:
         return CompositeScoreConfig()
-    if not isinstance(raw_cfg, Mapping):
-        raise TypeError(f"composite_score_cfg must be a mapping or None, got {type(raw_cfg).__name__}.")
-    enabled = bool(raw_cfg.get("enabled", _DEFAULT_COMPOSITE_ENABLED))
-    weight_context = _require_non_negative_float(
-        raw_cfg.get("weight_context_hit", _DEFAULT_COMPOSITE_WEIGHT_CONTEXT_HIT),
-        "composite_score_cfg.weight_context_hit",
-    )
-    weight_terminal = _require_non_negative_float(
-        raw_cfg.get("weight_terminal_hit", _DEFAULT_COMPOSITE_WEIGHT_TERMINAL_HIT),
-        "composite_score_cfg.weight_terminal_hit",
-    )
-    weight_pass_best = _require_non_negative_float(
-        raw_cfg.get("weight_pass_best", _DEFAULT_COMPOSITE_WEIGHT_PASS_BEST),
-        "composite_score_cfg.weight_pass_best",
-    )
+    cfg = raw_cfg if isinstance(raw_cfg, Mapping) else {}
+    enabled = bool(cfg.get("enabled", _DEFAULT_COMPOSITE_ENABLED))
+    weight_context = float(cfg.get("weight_context_hit", _DEFAULT_COMPOSITE_WEIGHT_CONTEXT_HIT))
+    weight_terminal = float(cfg.get("weight_terminal_hit", _DEFAULT_COMPOSITE_WEIGHT_TERMINAL_HIT))
+    weight_pass_best = float(cfg.get("weight_pass_best", _DEFAULT_COMPOSITE_WEIGHT_PASS_BEST))
     cfg = CompositeScoreConfig(
         enabled=enabled,
         weight_context_hit=weight_context,
         weight_terminal_hit=weight_terminal,
         weight_pass_best=weight_pass_best,
     )
-    if cfg.enabled and cfg.weight_sum <= _FLOAT_ZERO:
-        raise ValueError("composite_score_cfg weights must sum to a positive value.")
     return cfg
 
 
@@ -188,7 +152,7 @@ def finalize_rollout_metrics(
     best_of: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if not loss_list:
-        raise RuntimeError("No rollouts recorded for rollout aggregation.")
+        return torch.zeros((), dtype=torch.float32), {}
     if num_rollouts > _ONE:
         loss = torch.stack(loss_list, dim=0).mean()
         stacked = stack_rollout_metrics(metrics_list)
@@ -212,14 +176,10 @@ def compute_terminal_hits(
     if num_graphs <= _ZERO:
         return torch.zeros((_ZERO,), device=node_is_target.device, dtype=torch.bool)
     stop_node_locals = stop_node_locals.to(device=node_ptr.device, dtype=torch.long)
-    if stop_node_locals.numel() != num_graphs:
-        raise ValueError("stop_node_locals length mismatch for terminal hit computation.")
     node_ptr = node_ptr.to(device=node_is_target.device, dtype=torch.long)
     node_offsets = node_ptr[:-_ONE]
     valid = stop_node_locals >= _ZERO
     stop_globals = node_offsets + stop_node_locals.clamp(min=_ZERO)
-    if stop_globals.numel() > _ZERO and int(stop_globals.max().detach().tolist()) >= int(node_is_target.numel()):
-        raise ValueError("stop_node_locals index out of range for terminal hit computation.")
     node_is_target = node_is_target.to(device=node_ptr.device, dtype=torch.bool)
     hits = node_is_target.index_select(_ZERO, stop_globals.clamp(min=_ZERO))
     return valid & hits
@@ -230,8 +190,6 @@ def compute_terminal_hit_prefixes(
     terminal_hits: torch.Tensor,
     k_values: Sequence[int],
 ) -> Dict[str, torch.Tensor]:
-    if terminal_hits.dim() != _TWO:
-        raise ValueError("terminal_hits must be [R, B] for prefix metrics.")
     num_rollouts = int(terminal_hits.size(0))
     k_pairs = _normalize_k_pairs(k_values, num_rollouts)
     if not k_pairs:
@@ -291,8 +249,6 @@ def _reshape_rollout_metric(
     if values.dim() == _TWO and values.shape == (num_rollouts, num_graphs):
         return values
     expected = num_rollouts * num_graphs
-    if values.numel() != expected:
-        raise ValueError("rollout metric length mismatch for reward gap.")
     return values.reshape(num_rollouts, num_graphs)
 
 

@@ -215,22 +215,15 @@ def _preflight_validate(cfg: DictConfig) -> None:
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
     variants = _resolve_dataset_variants(cfg)
-    require_dual = bool(run_cfg.get("require_dual_datasets", False))
     if not variants:
-        if require_dual:
-            raise ValueError(
-                "Dual-dataset evaluation is required, but run.dataset_variants is empty. "
-                "Provide both full and sub dataset names."
-            )
-        return
-    if require_dual:
-        scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
-        if scopes != {"full", "sub"}:
-            names = [label for label, _ in variants]
-            raise ValueError(
-                "Dual-dataset evaluation requires both full and sub scopes. "
-                f"Got scopes={sorted(scopes)} for variants={names}."
-            )
+        raise ValueError("Evaluation requires run.dataset_variants with both full and sub datasets.")
+    scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
+    if scopes != {"full", "sub"}:
+        names = [label for label, _ in variants]
+        raise ValueError(
+            "Evaluation requires both full and sub scopes. "
+            f"Got scopes={sorted(scopes)} for variants={names}."
+        )
 
 
 def _run_eval_all_splits(cfg: DictConfig) -> None:
@@ -256,14 +249,13 @@ def _run_eval_all_datasets(cfg: DictConfig) -> None:
     if not variants:
         raise ValueError("run.dataset_variants must be a non-empty list when evaluating multiple datasets.")
 
-    if bool(run_cfg.get("require_dual_datasets", False)):
-        scopes = { _normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants }
-        if scopes != {"full", "sub"}:
-            names = [label for label, _ in variants]
-            raise ValueError(
-                "Dual-dataset evaluation requires both full and sub scopes. "
-                f"Got scopes={sorted(scopes)} for variants={names}."
-            )
+    scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
+    if scopes != {"full", "sub"}:
+        names = [label for label, _ in variants]
+        raise ValueError(
+            "Evaluation requires both full and sub scopes. "
+            f"Got scopes={sorted(scopes)} for variants={names}."
+        )
 
     base_output_dir = cfg.paths.output_dir
     for label, dataset_cfg in variants:

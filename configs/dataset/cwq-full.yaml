@@ -17,7 +17,6 @@ paths:
   entity_vocab: ${dataset.out_dir}/entity_vocab.parquet
   relation_vocab: ${dataset.out_dir}/relation_vocab.parquet
 
-validate_on_get: true
 lmdb_readahead: true
 sequential_sample_ids: true
 filter_missing_answer:

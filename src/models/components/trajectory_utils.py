@@ -19,11 +19,7 @@ class TrajectoryStats:
     terminal_mask: torch.Tensor
 
 
-def derive_trajectory(
-    *,
-    actions_seq: torch.Tensor,
-    stop_value: int = _STOP_RELATION,
-) -> TrajectoryStats:
+def derive_trajectory(*, actions_seq: torch.Tensor, stop_value: int = _STOP_RELATION) -> TrajectoryStats:
     if actions_seq.dim() != 2:
         raise ValueError(f"actions_seq must be [B, T], got shape={tuple(actions_seq.shape)}")
     actions = actions_seq.to(dtype=torch.long)
@@ -71,11 +67,6 @@ def reflect_backward_to_forward(
     edge_inverse_map: torch.Tensor,
     stop_value: int = _STOP_RELATION,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reflect backward trajectories (t -> ... -> s -> STOP) into forward form (s -> ... -> t -> STOP).
-
-    Uses num_moves/stop_idx (STOP excluded from move count). Drops the trailing STOP, reverses remaining
-    edges, maps to inverse edges, then appends STOP. Padding beyond stop_idx is filled with STOP.
-    """
     if actions_seq.dim() != 2:
         raise ValueError(f"actions_seq must be [B, T], got shape={tuple(actions_seq.shape)}")
     if (num_moves is None) == (stop_idx is None):
@@ -96,22 +87,35 @@ def reflect_backward_to_forward(
     valid_len = stop_idx.clamp(min=_ZERO, max=max_steps)
     base_idx = torch.arange(max_steps, device=device).unsqueeze(0).expand(batch, -1)
     mask = base_idx < valid_len.unsqueeze(1)
-    # reverse indices within valid lengths
     rev_idx = valid_len.unsqueeze(1) - 1 - base_idx
     rev_idx = torch.where(mask, rev_idx, torch.zeros_like(rev_idx))
     gathered = actions_seq.gather(1, rev_idx.clamp(min=_ZERO))
-    # map to inverse edges for valid positions
     inv_edges = edge_inverse_map.to(device=device, dtype=torch.long)
     flat_idx = gathered.clamp(min=_ZERO).view(-1)
     mapped = inv_edges.index_select(0, flat_idx).view_as(gathered)
     mapped = torch.where(mask, mapped, torch.full_like(mapped, stop_value))
-    # assemble output and append STOP at new tail
     reflected = torch.full_like(actions_seq, stop_value)
     reflected = reflected.masked_scatter(mask, mapped[mask])
-    tail_indices = stop_idx
     batch_ids = torch.arange(batch, device=device, dtype=torch.long)
-    reflected[batch_ids, tail_indices] = stop_value
+    reflected[batch_ids, stop_idx] = stop_value
     return reflected, stop_idx
+
+
+def reflect_forward_to_backward(
+    *,
+    actions_seq: torch.Tensor,
+    num_moves: torch.Tensor | None = None,
+    stop_idx: torch.Tensor | None = None,
+    edge_inverse_map: torch.Tensor,
+    stop_value: int = _STOP_RELATION,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return reflect_backward_to_forward(
+        actions_seq=actions_seq,
+        num_moves=num_moves,
+        stop_idx=stop_idx,
+        edge_inverse_map=edge_inverse_map,
+        stop_value=stop_value,
+    )
 
 
 def resolve_current_stop_locals(
@@ -166,4 +170,11 @@ def stack_steps(
     return stacked
 
 
-__all__ = ["TrajectoryStats", "derive_trajectory", "reflect_backward_to_forward", "resolve_current_stop_locals", "stack_steps"]
+__all__ = [
+    "TrajectoryStats",
+    "derive_trajectory",
+    "reflect_backward_to_forward",
+    "reflect_forward_to_backward",
+    "resolve_current_stop_locals",
+    "stack_steps",
+]

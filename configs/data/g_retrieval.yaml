@@ -5,8 +5,8 @@ _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 16
-num_workers: 4
+batch_size: 32
+num_workers: 8
 drop_last: false
 train_shuffle: true
 prefetch_factor: 4
@@ -14,6 +14,7 @@ persistent_workers: true
 precompute_edge_batch: true
 validate_edge_batch: true
 embeddings_device: cpu
-expand_multi_start: false
-# 多起点/多答案由引擎统一采样；DataLoader 不展开。
+# 多答案由模型/奖励处理；DataLoader 不展开。
 expand_multi_answer: false
+# Zero-hop (q in A) 允许保留，交由模型处理原地 STOP。
+filter_zero_hop: false

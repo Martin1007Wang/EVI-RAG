@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .gflownet_actor import GFlowNetActor
+from .gflownet_actor import GFlowNetActor, RolloutDiagnostics, RolloutOutput
 from .gflownet_env import GraphEnv, GraphState
 from .gflownet_layers import (
     EmbeddingBackbone,
@@ -15,6 +15,8 @@ __all__ = [
     "GraphState",
     "GraphEnv",
     "GFlowNetActor",
+    "RolloutDiagnostics",
+    "RolloutOutput",
     "EmbeddingBackbone",
     "CvtNodeInitializer",
     "TrajectoryAgent",

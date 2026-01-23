@@ -44,7 +44,6 @@ parquet_dir: ${dataset.out_dir}
 output_dir: ${dataset.materialized_dir}
 use_precomputed_embeddings: true
 use_precomputed_questions: true
-require_precomputed_questions: true
 lmdb_shards: 1
 
 map_size_gb: 128

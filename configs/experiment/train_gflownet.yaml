@@ -19,25 +19,21 @@ optimized_metric: "val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}"
 
 trainer:
   check_val_every_n_epoch: 5
+  precision: 32
 
 data:
-  expand_multi_start: false
   expand_multi_answer: false
 
 model:
   env:
     max_steps: ${dataset.max_steps}
 
-  selector_cfg:
-    enabled: true
-    epsilon: 0.1
-
   optimizer_cfg:
     type: adamw
     lr: 1.0e-4
     weight_decay: 1.0e-4
     param_groups:
-      - names: ["*log_f.*", "*log_f_backward.*"]
+      - names: ["*log_f.*"]
         lr: 5.0e-4
 
   reward_fn:
@@ -58,52 +54,15 @@ model:
     share_edge_scorer: false
 
   training_cfg:
-    num_train_rollouts: 8
-    rollout_chunk_size: 4
+    num_train_rollouts: 0
+    num_miner_rollouts: 8
+    num_forward_rollouts: 8
+    mining_temperature: 1.2
     accumulate_grad_batches: 4
-    manual_gradient_clip_val: 1.0
-    manual_gradient_clip_algorithm: norm
-    manual_gradient_clip_norm_type: 2.0
-    adaptive_gradient_clip: true
-    grad_clip_ema_beta: null
-    grad_clip_tail_prob: null
-    grad_clip_log_eps: 1.0e-8
-    grad_clip_tail_prob_eps: 1.0e-6
-    grad_clip_log_interval: 10
-    grad_non_finite_max_params: 20
-    subtb:
-      enabled: true
-      num_subtrajectories: 4
-    imitation:
-      # Online mutual imitation / distillation (no-cache replay).
-      enabled: false
-      weight: 1.0
-    replay:
-      # Deprecated: replay buffer removed. Use `training_cfg.imitation` instead.
-      enabled: false
-      buffer_size: 4096
-      mix_ratio: 0.5
-    dual_stream:
-      enabled: true
-      stream_forward_weight: 1.0
-      stream_forward_max_steps: null
-      stream_forward_weight_start: 0.0
-      stream_forward_weight_schedule: none
-      stream_forward_weight_anneal_epochs: null
-    z_align:
-      enabled: false
-      weight: 10.0
-    h_guidance:
-      enabled: true
-      beta_start: 0.0
-      beta_end: 1.0
-      warmup_progress: 0.1
-      apply_eval: true
-      stop_gradient: true
-      scale: 1.0
-    target_sampling:
-      # 多答案时为 backward rollout 采样单一起点，避免多起点报错。
-      mode: random_one
+    allow_zero_hop: true
+    tb:
+      log_prob_min: -20.0
+      delta_max: 20.0
 
 callbacks:
   model_checkpoint:

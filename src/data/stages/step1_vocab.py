@@ -51,7 +51,7 @@ def _edge_nodes(edges: Sequence[Tuple[str, str, str]]) -> set[str]:
     return nodes
 
 
-def _maybe_relax_anchor_edges(
+def _relax_anchor_edges(
     graph: Sequence[Tuple[str, str, str]],
     kept_edges: List[Tuple[str, str, str]],
     *,
@@ -107,7 +107,7 @@ def _partition_graph_edges(
         elif action == RELATION_ACTION_TYPE:
             type_edges.append((head, rel, tail))
     if keep_anchor_edges:
-        kept_edges = _maybe_relax_anchor_edges(
+        kept_edges = _relax_anchor_edges(
             graph,
             kept_edges,
             anchor_entities=anchor_entities,

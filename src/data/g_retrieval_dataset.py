@@ -20,13 +20,8 @@ from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
 _ALLOWED_SPLITS = ("train", "validation", "test")
-_DUPLICATE_SAMPLE_ID_PREVIEW = 5
 _SEQUENTIAL_SAMPLE_IDS_DEFAULT = False
 _SPLIT_HASH_MASK = 0x7FFFFFFF
-_ZERO = 0
-_ONE = 1
-_DEPRECATED_RAW_KEYS = ("labels", "answer_subgraph", "topic_pe", "node_topic_dist")
-_DEPRECATED_RAW_PREFIXES = ("pair_",)
 _REMOVED_DATASET_KEYS = (
     "edge_dropout_p",
     "edge_dropout_min_edges",
@@ -56,13 +51,10 @@ class GRetrievalDataset(Dataset):
         sample_limit: Optional[int] = None,
         sample_filter_path: Optional[Union[Path, Sequence[Path]]] = None,
         random_seed: Optional[int] = None,
-        validate_on_init: bool = False,
-        validate_on_get: bool = True,
-        sequential_sample_ids: bool = _SEQUENTIAL_SAMPLE_IDS_DEFAULT,
         lmdb_readahead: bool = False,
     ):
         super().__init__()
-        self.split = _assert_allowed_split_name(split_name)
+        self.split = str(split_name)
         self._entity_vocab_path = Path(entity_vocab_path)
         self._embeddings_dir = Path(embeddings_dir)
         self._split_paths = _resolve_core_lmdb_paths(self._embeddings_dir, self.split)
@@ -71,8 +63,6 @@ class GRetrievalDataset(Dataset):
         self._global_embeddings: Optional[GlobalEmbeddingStore] = None
         self._sample_stores: Optional[List[EmbeddingStore]] = None
         self._entity_embedding_map: Optional[torch.Tensor] = None
-        self._validate_on_get = bool(validate_on_get)
-        self._sequential_sample_ids = bool(sequential_sample_ids)
         self._lmdb_readahead = bool(lmdb_readahead)
 
         self._init_sample_ids()
@@ -80,9 +70,7 @@ class GRetrievalDataset(Dataset):
             sample_filter_path=sample_filter_path,
             sample_limit=sample_limit,
             random_seed=random_seed,
-            validate_on_init=validate_on_init,
         )
-        self._maybe_sort_sample_ids()
 
         log_event(
             logger,
@@ -113,12 +101,6 @@ class GRetrievalDataset(Dataset):
         return self._build_data(raw, sample_id)
 
     def _build_data(self, raw: Dict[str, Any], sample_id: str) -> GRetrievalData:
-        if self._validate_on_get:
-            _validate_raw_sample(
-                raw,
-                sample_id,
-            )
-
         edge_index = raw["edge_index"]
         edge_attr = raw["edge_attr"]
         num_nodes = _coerce_num_nodes(raw.get("num_nodes"), sample_id)
@@ -205,7 +187,6 @@ class GRetrievalDataset(Dataset):
     def _init_sample_ids(self) -> None:
         self._sample_stores = None
         self.sample_ids = _load_sample_ids_from_lmdb(self._split_paths, readahead=self._lmdb_readahead)
-        _assert_unique_sample_ids(self.sample_ids)
 
     def _apply_filters(
         self,
@@ -213,7 +194,6 @@ class GRetrievalDataset(Dataset):
         sample_filter_path: Optional[Union[Path, Sequence[Path]]],
         sample_limit: Optional[int],
         random_seed: Optional[int],
-        validate_on_init: bool,
     ) -> None:
         if sample_filter_path:
             filter_paths = self._coerce_filter_paths(sample_filter_path)
@@ -229,15 +209,6 @@ class GRetrievalDataset(Dataset):
             )
         if sample_limit:
             self._apply_sample_limit(sample_limit, random_seed)
-        if validate_on_init:
-            self._assert_all_samples_valid()
-
-    def _maybe_sort_sample_ids(self) -> None:
-        if not self._sequential_sample_ids:
-            return
-        if not self.sample_ids:
-            return
-        self.sample_ids = sorted(self.sample_ids)
 
     @property
     def global_embeddings(self) -> GlobalEmbeddingStore:
@@ -288,20 +259,6 @@ class GRetrievalDataset(Dataset):
             samples=len(self.sample_ids),
         )
 
-    def _assert_all_samples_valid(self) -> None:
-        """
-        Eagerly validate every sample in the split and fail fast on malformed graphs.
-        This prevents silent sample drops that skew data distribution.
-        """
-        if not self.sample_ids:
-            return
-        for sid in self.sample_ids:
-            raw = self._load_raw_sample(sid)
-            _validate_raw_sample(
-                raw,
-                sid,
-            )
-
     @staticmethod
     def _coerce_filter_paths(path_or_paths: Union[Path, Sequence[Path]]) -> Sequence[Path]:
         if isinstance(path_or_paths, (list, tuple, set)):
@@ -346,7 +303,7 @@ def create_g_retrieval_dataset(
     if missing_filters:
         filter_paths.extend(missing_filters)
 
-    return GRetrievalDataset(
+    dataset = GRetrievalDataset(
         entity_vocab_path=Path(cfg["paths"]["entity_vocab"]),
         embeddings_dir=emb_root,
         split_name=split_name,
@@ -354,11 +311,11 @@ def create_g_retrieval_dataset(
         sample_limit=sample_limit,
         sample_filter_path=filter_paths if filter_paths else None,
         random_seed=cfg.get("random_seed"),
-        validate_on_init=bool(cfg.get("validate_on_init", False)),
-        validate_on_get=bool(cfg.get("validate_on_get", True)),
-        sequential_sample_ids=sequential_sample_ids,
         lmdb_readahead=lmdb_readahead,
     )
+    if sequential_sample_ids:
+        dataset.sample_ids = sorted(dataset.sample_ids)
+    return dataset
 
 
 def _resolve_sample_limit(cfg: Dict[str, Any], split_name: str) -> Optional[int]:
@@ -441,193 +398,9 @@ def _load_sample_ids_from_lmdb(paths: Sequence[Path], *, readahead: bool = False
     return sample_ids
 
 
-def _assert_unique_sample_ids(sample_ids: Sequence[str]) -> None:
-    if not sample_ids:
-        return
-    seen = set()
-    duplicates = set()
-    for sid in sample_ids:
-        if sid in seen:
-            duplicates.add(sid)
-        else:
-            seen.add(sid)
-    if duplicates:
-        preview = sorted(duplicates)[:_DUPLICATE_SAMPLE_ID_PREVIEW]
-        raise ValueError(f"Duplicate sample ids found across LMDB shards: {preview}")
-
-
-def _validate_local_indices(local_idx: torch.Tensor, num_nodes: int, field: str, sample_id: str) -> None:
-    if local_idx.numel() == 0:
-        return
-    if local_idx.dim() != 1:
-        raise ValueError(f"{field} for {sample_id} must be 1D.")
-    if local_idx.min().detach().tolist() < 0 or local_idx.max().detach().tolist() >= num_nodes:
-        raise ValueError(f"{field} out of range for {sample_id}: num_nodes={num_nodes}, values={local_idx.tolist()}")
-
-
-def _expect_tensor(
-    raw: Dict[str, Any],
-    key: str,
-    *,
-    sample_id: str,
-    dtype: Optional[torch.dtype] = None,
-    dim: Optional[int] = None,
-) -> torch.Tensor:
-    if key not in raw:
-        raise KeyError(f"Sample {sample_id} missing key: {key}")
-    value = raw[key]
-    if not torch.is_tensor(value):
-        raise TypeError(f"{key} for {sample_id} must be a torch.Tensor, got {type(value)!r}")
-    if dtype is not None and value.dtype != dtype:
-        raise ValueError(f"{key} for {sample_id} must be dtype={dtype}, got {value.dtype}")
-    if dim is not None and value.dim() != dim:
-        raise ValueError(f"{key} for {sample_id} must be {dim}D, got shape {tuple(value.shape)}")
-    return value
-
-
 def _coerce_num_nodes(value: Any, sample_id: str) -> int:
     if value is None:
         return 0
     if torch.is_tensor(value):
-        if value.numel() != 1:
-            raise ValueError(f"num_nodes for {sample_id} must be a scalar tensor, got shape={tuple(value.shape)}")
         return int(value.view(-1)[0].detach().tolist())
     return int(value)
-
-
-def _validate_answer_ids(answer_ids: torch.Tensor, sample_id: str) -> None:
-    if answer_ids.dim() != 1:
-        raise ValueError(f"answer_entity_ids for {sample_id} must be 1D.")
-
-
-def _validate_raw_sample(
-    raw: Dict[str, Any],
-    sample_id: str,
-) -> None:
-    """Shared raw-schema validation to guarantee PyG Data integrity."""
-    _assert_no_deprecated_fields(raw, sample_id)
-    num_nodes, num_edges = _validate_core_sample(raw, sample_id)
-
-
-def _validate_core_sample(raw: Dict[str, Any], sample_id: str) -> tuple[int, int]:
-    required_keys = [
-        "edge_index",
-        "edge_attr",
-        "num_nodes",
-        "node_global_ids",
-        "node_embedding_ids",
-        "question_emb",
-        "q_local_indices",
-        "a_local_indices",
-        "answer_entity_ids",
-    ]
-    _require_keys(raw, sample_id, required_keys)
-
-    num_nodes, num_edges = _validate_edge_index(raw, sample_id)
-    _validate_node_ids(raw, sample_id, num_nodes)
-    _validate_question_emb(raw, sample_id)
-    _validate_edge_attr(raw, sample_id, num_edges)
-    _validate_anchor_indices(raw, sample_id, num_nodes)
-    _validate_answer_fields(raw, sample_id)
-    retrieval_flag = raw.get("retrieval_failure", False)
-    if torch.is_tensor(retrieval_flag):
-        retrieval_failure = bool(retrieval_flag.detach().tolist())
-    else:
-        retrieval_failure = bool(retrieval_flag)
-    _validate_retrieval_failure(
-        answer_nodes=raw["a_local_indices"],
-        sample_id=sample_id,
-        retrieval_failure=retrieval_failure,
-    )
-    return num_nodes, num_edges
-
-
-def _require_keys(raw: Dict[str, Any], sample_id: str, keys: Sequence[str]) -> None:
-    missing = [k for k in keys if k not in raw]
-    if missing:
-        raise KeyError(f"Sample {sample_id} missing keys: {missing}")
-
-
-def _assert_no_deprecated_fields(raw: Dict[str, Any], sample_id: str) -> None:
-    raw_keys = set(raw.keys())
-    deprecated = [key for key in _DEPRECATED_RAW_KEYS if key in raw_keys]
-    prefixed = [key for key in raw_keys if key.startswith(_DEPRECATED_RAW_PREFIXES)]
-    if deprecated or prefixed:
-        blocked = sorted(deprecated + prefixed)
-        raise ValueError(f"Sample {sample_id} contains deprecated fields: {blocked}")
-
-
-def _validate_edge_index(raw: Dict[str, Any], sample_id: str) -> tuple[int, int]:
-    edge_index = _expect_tensor(raw, "edge_index", sample_id=sample_id, dtype=torch.long, dim=2)
-    if edge_index.dim() != 2 or edge_index.size(0) != 2:
-        raise ValueError(f"edge_index must have shape [2, E] for {sample_id}, got {tuple(edge_index.shape)}")
-    num_edges = int(edge_index.size(1))
-    if num_edges <= 0:
-        raise ValueError(f"edge_index empty for {sample_id}")
-
-    num_nodes = _coerce_num_nodes(raw.get("num_nodes"), sample_id)
-    if num_nodes <= 0:
-        raise ValueError(f"num_nodes must be positive for {sample_id}, got {num_nodes}")
-    if edge_index.min().detach().tolist() < 0 or edge_index.max().detach().tolist() >= num_nodes:
-        raise ValueError(
-            f"edge_index out of range for {sample_id}: "
-            f"min={edge_index.min().detach().tolist()} max={edge_index.max().detach().tolist()} num_nodes={num_nodes}"
-        )
-    return num_nodes, num_edges
-
-
-def _validate_node_ids(raw: Dict[str, Any], sample_id: str, num_nodes: int) -> None:
-    node_global_ids = _expect_tensor(raw, "node_global_ids", sample_id=sample_id, dtype=torch.long, dim=1)
-    if node_global_ids.numel() != num_nodes:
-        raise ValueError(f"node_global_ids length {node_global_ids.numel()} != num_nodes {num_nodes} for {sample_id}")
-    if torch.unique(node_global_ids).numel() != num_nodes:
-        raise ValueError(f"node_global_ids must be unique per sample: {sample_id}")
-
-    node_embedding_ids = _expect_tensor(raw, "node_embedding_ids", sample_id=sample_id, dtype=torch.long, dim=1)
-    if node_embedding_ids.numel() != num_nodes:
-        raise ValueError(f"node_embedding_ids length {node_embedding_ids.numel()} != num_nodes {num_nodes} for {sample_id}")
-
-
-def _validate_question_emb(raw: Dict[str, Any], sample_id: str) -> None:
-    question_emb = _expect_tensor(raw, "question_emb", sample_id=sample_id, dim=2)
-    if not torch.is_floating_point(question_emb):
-        raise ValueError(f"question_emb for {sample_id} must be floating point, got dtype={question_emb.dtype}")
-    if int(question_emb.size(0)) != _ONE:
-        raise ValueError(f"question_emb for {sample_id} must have shape [1, D], got {tuple(question_emb.shape)}")
-
-
-def _validate_edge_attr(raw: Dict[str, Any], sample_id: str, num_edges: int) -> None:
-    edge_attr = _expect_tensor(raw, "edge_attr", sample_id=sample_id, dtype=torch.long, dim=1)
-    if edge_attr.numel() != num_edges:
-        raise ValueError(f"edge_attr length {edge_attr.numel()} != num_edges {num_edges} for {sample_id}")
-
-
-def _validate_anchor_indices(raw: Dict[str, Any], sample_id: str, num_nodes: int) -> None:
-    q_local_indices = _expect_tensor(raw, "q_local_indices", sample_id=sample_id, dtype=torch.long, dim=1)
-    a_local_indices = _expect_tensor(raw, "a_local_indices", sample_id=sample_id, dtype=torch.long, dim=1)
-    if q_local_indices.numel() == 0:
-        raise ValueError(f"q_local_indices empty for {sample_id}; start node missing from graph.")
-    _validate_local_indices(q_local_indices, num_nodes, "q_local_indices", sample_id)
-    # a_local_indices 允许为空（检索失败计入分母）；非空时需合法
-    if a_local_indices.numel() > 0:
-        _validate_local_indices(a_local_indices, num_nodes, "a_local_indices", sample_id)
-
-
-def _validate_answer_fields(raw: Dict[str, Any], sample_id: str) -> None:
-    answer_ids = _expect_tensor(raw, "answer_entity_ids", sample_id=sample_id, dtype=torch.long, dim=1)
-    answer_ids = answer_ids.view(-1)
-    _validate_answer_ids(answer_ids, sample_id)
-
-
-def _validate_retrieval_failure(
-    *,
-    answer_nodes: torch.Tensor,
-    sample_id: str,
-    retrieval_failure: bool,
-) -> None:
-    if answer_nodes.numel() == _ZERO:
-        if retrieval_failure:
-            return
-        raise ValueError(f"answer nodes missing in subgraph for {sample_id} without retrieval_failure flag")
-    if retrieval_failure:
-        raise ValueError(f"retrieval_failure set but answer nodes present for {sample_id}")

@@ -160,8 +160,6 @@ class _RolloutArtifactProcessor:
         self.question_map = self._resolve_question_map(self.cfg)
 
     def process(self, records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-        if self.cfg.get("textualize"):
-            self._require_edge_metadata(records)
         if self.ent_map is not None or self.rel_map is not None:
             self._inject_text(records)
         if self.question_map is not None:
@@ -185,19 +183,6 @@ class _RolloutArtifactProcessor:
                         edge["dst_text"] = self.ent_map.get(d_id, str(d_id) if d_id is not None else None)
                     if self.rel_map is not None:
                         edge["relation_text"] = self.rel_map.get(r, str(r) if r is not None else None)
-
-    def _require_edge_metadata(self, records: list[Dict[str, Any]]) -> None:
-        for sample in records:
-            sample_id = sample.get("sample_id", "<unknown>")
-            rollouts = sample.get("rollouts")
-            if not isinstance(rollouts, list) or not rollouts:
-                raise ValueError(f"textualize=true requires non-empty rollouts (sample_id={sample_id}).")
-            for ridx, rollout in enumerate(rollouts):
-                if "edges" not in rollout:
-                    raise ValueError(
-                        "textualize=true requires rollout edge metadata; "
-                        f"missing 'edges' in sample_id={sample_id}, rollout_index={ridx}."
-                    )
 
     def _resolve_vocab_maps(self, cfg: Dict[str, Any]) -> tuple[Optional[Dict[int, str]], Optional[Dict[int, str]]]:
         if not cfg.get("textualize"):

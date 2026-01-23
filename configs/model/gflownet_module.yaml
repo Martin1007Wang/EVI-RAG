@@ -7,9 +7,6 @@ _recursive_: true
 hidden_dim: 1024
 emb_dim: 1024
 backbone_finetune: true
-entity_vocab_path: ${dataset.paths.entity_vocab}
-relation_vocab_path: ${dataset.paths.relation_vocab}
-relation_vocab_size: ${oc.env:RELATION_VOCAB_SIZE,null}
 inverse_relation_suffix: "__inv"
 state_cfg:
   state_dim: ${model.hidden_dim}
@@ -26,10 +23,6 @@ reward_fn:
   hard_target_bonus: 10.0
   min_log_reward: -10.0
 
-selector_cfg:
-  enabled: false
-  epsilon: 0.1
-
 actor_cfg:
   policy_temperature: 1.0
   stop_bias_init: null
@@ -40,28 +33,36 @@ backward_cfg:
 
 runtime_cfg:
   validate_edge_batch: false
-  validate_rollout_batch: false
-  validate_on_device: false
-  force_fp32: false
-  require_precomputed_edge_batch: true
-  require_precomputed_edge_batch_train: true
-  require_precomputed_edge_batch_eval: false
   cache_action_keys: true
-  debug_rollout_steps: false
-  debug_rollout_per_epoch: true
-  debug_rollout_log_path: null
+
+logging_cfg:
+  train_prog_bar: []
+  eval_prog_bar: []
+  log_on_step_train: false
+
+optimizer_cfg:
+  type: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  param_groups: null
+
+scheduler_cfg:
+  type: ""
+
+training_cfg:
+  num_train_rollouts: 0
+  num_miner_rollouts: 8
+  num_forward_rollouts: 8
+  mining_temperature: 1.2
+  accumulate_grad_batches: 1
+  allow_zero_hop: true
+  tb:
+    log_prob_min: -20.0
+    delta_max: 20.0
 
 evaluation_cfg:
   num_eval_rollouts: 10
   rollout_temperature: 1.0
-  rollout_temperature_extra:
-    - 0.7
-  rollout_chunk_size: 10
-  composite_score_cfg:
-    enabled: true
-    weight_context_hit: 0.6
-    weight_terminal_hit: 0.3
-    weight_pass_best: 0.1
 
 flow_cfg:
   graph_stats_log1p: true

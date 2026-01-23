@@ -9,6 +9,5 @@ start_min_edges: 1
 start_max_edges: null
 ckpt_path: null
 dataset_variants: null
-require_dual_datasets: true
 dataset_variant: null
 eval_mode: predict

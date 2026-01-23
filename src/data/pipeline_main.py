@@ -17,7 +17,6 @@ def _validate_pipeline_cfg(ctx: StageContext) -> None:
     precompute_questions = bool(cfg.get("precompute_questions", False))
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
-    require_precomputed_questions = bool(cfg.get("require_precomputed_questions", False))
     skip_parquet_stage = bool(cfg.get("skip_parquet_stage", False))
     skip_lmdb_stage = bool(cfg.get("skip_lmdb_stage", False))
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
@@ -37,12 +36,6 @@ def _validate_pipeline_cfg(ctx: StageContext) -> None:
         raise ValueError(
             "use_precomputed_questions=true requires precompute_questions to be enabled in the same pipeline run."
         )
-    if precompute_questions and not require_precomputed_questions:
-        raise ValueError(
-            "precompute_questions=true requires require_precomputed_questions=true "
-            "to ensure LMDB uses the freshly computed embeddings."
-        )
-
     parquet_dir_cfg = cfg.get("parquet_dir")
     out_dir_cfg = cfg.get("out_dir")
     if parquet_dir_cfg and out_dir_cfg:

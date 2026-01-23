@@ -96,14 +96,8 @@ def _init_worker_state(state: _WorkerState) -> None:
     _WORKER_STATE = state
 
 
-def _require_worker_state() -> _WorkerState:
-    if _WORKER_STATE is None:
-        raise RuntimeError("Worker state is not initialized.")
-    return _WORKER_STATE
-
-
 def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
-    state = _require_worker_state()
+    state = _WORKER_STATE
     graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
     return build_graph(
         sample,
