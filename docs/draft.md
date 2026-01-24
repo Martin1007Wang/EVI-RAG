@@ -1,7 +1,0 @@
- - 高：Stop 采样与允许条件不一致。sample_stop_mask 在无可走边时强制 STOP，而 _compute_forward_log_pf_steps 明确禁止在 allow_stop=False 时 STOP，遇到非 target 的 dead‑end 会直接报错。src/gfn/ops.py:251 src/gfn/engine.py:2997
-  - 中：轨迹长度语义不一致。reflect_backward_to_forward 明确要求 lengths 含 STOP，但 _compute_state_sequence 以及 SubTB 采样用的是 move count（不含 STOP），目前靠调用约定，极易 off‑by‑one。src/gfn/trajectory_utils.py:21 src/gfn/engine.py:2399 src/gfn/engine.py:3550
-  - 中：log_pf/log_pb 计算在每个 step block 重复构造 E * block_size 的临时张量（edge_batch.repeat/edge_index.repeat），E≈10k、T≈100 时很容易 OOM 或严重卡顿，靠 _BACKWARD_LOG_PB_MAX_REPEATED_EDGES 兜底仍然风险大。src/gfn/engine.py:2865 src/gfn/engine.py:2956
-  - 中：Replay buffer 的 add/fetch 逐样本 Python for‑loop + CPU copy，训练路径里会触发 host‑device 同步、吞吐下降，也违反“张量优先语义”。src/gfn/engine.py:328 src/gfn/engine.py:379
-  - 低：graph_cache 纯 dict + 字符串 key，依赖 _require_* 运行时检查；在 dual‑stream/replay/h‑guidance 的分支组合下很容易遗漏 key 或缓存不一致，问题发现晚。src/gfn/engine.py:982 src/gfn/engine.py:2122
-  - 低：多个核心函数远超 50 行（例如 _compute_forward_log_pf_steps），单文件 5k+ 行导致职责耦合严重，违反工程守则，可维护性很差。src/gfn/engine.py:2902
-  - 低：缺少 gfn 相关单元测试，回归风险高、重构缺乏安全网。

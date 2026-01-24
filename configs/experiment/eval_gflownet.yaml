@@ -16,7 +16,6 @@ run:
   split: test
   eval_mode: predict
   ckpt_path: ${ckpt.gflownet}
-  filter_missing_start: true
   dataset_variants:
     - ${dataset.dataset_family}
     - ${dataset.dataset_family}-sub
@@ -31,13 +30,6 @@ callbacks:
 data:
   splits:
     test: ${run.split}
-  expand_multi_answer: false
-  precompute_edge_batch: true
-
 model:
   env:
     max_steps: ${dataset.max_steps}
-
-  backward_cfg:
-    share_state_encoder: false
-    share_edge_scorer: false

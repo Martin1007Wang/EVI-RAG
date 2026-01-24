@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -11,6 +11,7 @@ from src.models.components.gflownet_ops import (
     STOP_NODE_MASK_KEY,
     OutgoingEdges,
     PolicyLogProbs,
+    apply_edge_policy_mask,
     compute_forward_log_probs,
     gather_outgoing_edges,
     neg_inf_value,
@@ -33,9 +34,12 @@ _CONTEXT_QUESTION_START = "question_start"
 _CONTEXT_MODES = {_CONTEXT_QUESTION_START}
 _DEFAULT_CONTEXT_MODE = _CONTEXT_QUESTION_START
 _FLOW_MODES = {"forward", "backward"}
-_SCORE_MODE_AGENT = "agent"
-_SCORE_MODE_H_TRANSFORM = "h_transform"
-_SCORE_MODES = {_SCORE_MODE_AGENT, _SCORE_MODE_H_TRANSFORM}
+_DEFAULT_H_TRANSFORM_BIAS = 1.0
+_DEFAULT_H_TRANSFORM_CLIP = 0.0
+_DEFAULT_DIRECTION_EMBEDDING = False
+_DEFAULT_DIRECTION_EMB_SCALE = 1.0
+_DIRECTION_ID_FORWARD = 0
+_DIRECTION_ID_BACKWARD = 1
 
 
 @dataclass(frozen=True)
@@ -43,7 +47,6 @@ class _RolloutStepScores:
     outgoing: OutgoingEdges
     edge_scores: torch.Tensor
     stop_logits: torch.Tensor
-    edge_guidance: Optional[torch.Tensor]
     allow_stop: torch.Tensor
     edge_valid_mask: torch.Tensor
 
@@ -71,6 +74,7 @@ class RolloutOutput:
     log_pf_steps: torch.Tensor
     num_moves: torch.Tensor
     diagnostics: Optional[RolloutDiagnostics]
+    state_vec_seq: Optional[torch.Tensor]
 
 
 class GFlowNetActor(nn.Module):
@@ -86,7 +90,10 @@ class GFlowNetActor(nn.Module):
         stop_bias_init: Optional[float] = None,
         context_mode: str = _DEFAULT_CONTEXT_MODE,
         default_mode: str = "forward",
-        score_mode: str = _SCORE_MODE_H_TRANSFORM,
+        h_transform_bias: Optional[float] = None,
+        h_transform_clip: Optional[float] = None,
+        direction_embedding: Optional[bool] = None,
+        direction_embedding_scale: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.env = env
@@ -99,10 +106,14 @@ class GFlowNetActor(nn.Module):
         if default_mode not in _FLOW_MODES:
             raise ValueError(f"default_mode must be one of {sorted(_FLOW_MODES)}, got {default_mode!r}.")
         self.default_mode = default_mode
-        score_mode = str(score_mode or _SCORE_MODE_H_TRANSFORM).strip().lower()
-        if score_mode not in _SCORE_MODES:
-            raise ValueError(f"score_mode must be one of {sorted(_SCORE_MODES)}, got {score_mode!r}.")
-        self.score_mode = score_mode
+        bias_value = _DEFAULT_H_TRANSFORM_BIAS if h_transform_bias is None else float(h_transform_bias)
+        if bias_value < float(_ZERO):
+            raise ValueError("h_transform_bias must be >= 0.")
+        clip_value = _DEFAULT_H_TRANSFORM_CLIP if h_transform_clip is None else float(h_transform_clip)
+        if clip_value < float(_ZERO):
+            raise ValueError("h_transform_clip must be >= 0.")
+        self.h_transform_bias = bias_value
+        self.h_transform_clip = clip_value
         stop_input_dim = int(agent.hidden_dim) + _TWO
         self.stop_input_norm = nn.LayerNorm(stop_input_dim)
         self.stop_head = nn.Linear(stop_input_dim, _STOP_LOGIT_DIM)
@@ -113,6 +124,16 @@ class GFlowNetActor(nn.Module):
                 self.stop_head.bias.fill_(float(stop_bias_init))
         self.max_steps = int(max_steps)
         self.policy_temperature = nn.Parameter(torch.tensor(float(policy_temperature), dtype=torch.float32))
+        direction_enabled = _DEFAULT_DIRECTION_EMBEDDING if direction_embedding is None else bool(direction_embedding)
+        if direction_enabled:
+            self.direction_embed = nn.Embedding(len(_FLOW_MODES), int(agent.hidden_dim))
+            scale = _DEFAULT_DIRECTION_EMB_SCALE if direction_embedding_scale is None else float(direction_embedding_scale)
+            if scale < float(_ZERO):
+                raise ValueError("direction_embedding_scale must be >= 0.")
+            self.direction_scale = scale
+        else:
+            self.direction_embed = None
+            self.direction_scale = float(_ZERO)
 
     def rollout(
         self,
@@ -121,8 +142,8 @@ class GFlowNetActor(nn.Module):
         temperature: Optional[Union[float, torch.Tensor]] = None,
         record_actions: bool = True,
         record_diagnostics: bool = False,
+        record_state: bool = False,
         max_steps_override: Optional[int] = None,
-        guidance_fn: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         mode: Optional[str] = None,
         init_node_locals: Optional[torch.Tensor] = None,
         init_ptr: Optional[torch.Tensor] = None,
@@ -143,11 +164,10 @@ class GFlowNetActor(nn.Module):
         question_tokens, node_tokens = self._condition_context_tokens(graph=graph, state=state)
         hidden = self.agent.initialize_state(question_tokens=question_tokens, node_tokens=node_tokens)
         action_keys = self._resolve_action_keys(graph=graph, mode=mode_val)
-        log_pf_steps, actions_steps, diag_steps, hidden, state = self._run_rollout_steps(
+        log_pf_steps, actions_steps, diag_steps, state_steps, hidden, state = self._run_rollout_steps(
             state=state,
             graph=graph,
             action_keys=action_keys,
-            guidance_fn=guidance_fn,
             hidden=hidden,
             num_steps=num_steps,
             num_graphs=num_graphs,
@@ -155,26 +175,41 @@ class GFlowNetActor(nn.Module):
             is_greedy=is_greedy,
             record_actions=record_actions,
             record_diagnostics=record_diagnostics,
+            record_state=record_state,
         )
         return self._finalize_rollout_outputs(
             log_pf_steps=log_pf_steps,
             actions_steps=actions_steps,
             diag_steps=diag_steps,
+            state_steps=state_steps,
             num_graphs=num_graphs,
             num_steps=num_steps,
             device=device,
             record_actions=record_actions,
             record_diagnostics=record_diagnostics,
+            record_state=record_state,
         )
 
     def resolve_temperature(self, temperature: Optional[Union[float, torch.Tensor]]) -> tuple[torch.Tensor, bool]:
         return self._resolve_temperature(temperature)
 
+    def condition_question_tokens(self, question_tokens: torch.Tensor) -> torch.Tensor:
+        if self.direction_embed is None:
+            return question_tokens
+        direction_id = _DIRECTION_ID_FORWARD if self.default_mode == "forward" else _DIRECTION_ID_BACKWARD
+        dir_vec = self.direction_embed.weight[direction_id].to(device=question_tokens.device, dtype=question_tokens.dtype)
+        scale = float(self.direction_scale)
+        if question_tokens.dim() == _TWO:
+            return question_tokens + dir_vec.view(1, -1) * scale
+        if question_tokens.dim() == 3:
+            return question_tokens + dir_vec.view(1, 1, -1) * scale
+        raise ValueError("question_tokens must be [B, H] or [B, 1, H] for direction conditioning.")
+
     def _resolve_temperature(self, temperature: Optional[Union[float, torch.Tensor]]) -> tuple[torch.Tensor, bool]:
         if temperature is None:
             base = self.policy_temperature
         elif isinstance(temperature, torch.Tensor):
-            base = temperature
+            base = temperature.to(device=self.policy_temperature.device, dtype=self.policy_temperature.dtype)
         else:
             base = torch.tensor(
                 float(temperature),
@@ -233,6 +268,8 @@ class GFlowNetActor(nn.Module):
                 relation_tokens=graph["relation_tokens"],
                 node_tokens=graph["node_tokens"],
                 edge_index=graph["edge_index"],
+                question_tokens=graph["question_tokens"],
+                edge_batch=graph["edge_batch"],
             )
         return action_keys
 
@@ -242,7 +279,6 @@ class GFlowNetActor(nn.Module):
         state: GraphState,
         graph: dict[str, torch.Tensor],
         action_keys: torch.Tensor,
-        guidance_fn: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]],
         hidden: torch.Tensor,
         num_steps: int,
         num_graphs: int,
@@ -250,16 +286,26 @@ class GFlowNetActor(nn.Module):
         is_greedy: bool,
         record_actions: bool,
         record_diagnostics: bool,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], Optional[dict[str, list[torch.Tensor]]], torch.Tensor, GraphState]:
+        record_state: bool,
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        Optional[dict[str, list[torch.Tensor]]],
+        Optional[list[torch.Tensor]],
+        torch.Tensor,
+        GraphState,
+    ]:
         log_pf_steps: list[torch.Tensor] = []
         actions_steps: list[torch.Tensor] = []
+        state_steps: Optional[list[torch.Tensor]] = [] if record_state else None
         diag_steps = self._init_diag_steps(record_diagnostics)
         for step in range(num_steps):
+            if state_steps is not None:
+                state_steps.append(hidden)
             scores = self._compute_step_scores(
                 state=state,
                 graph=graph,
                 action_keys=action_keys,
-                guidance_fn=guidance_fn,
                 hidden=hidden,
                 num_graphs=num_graphs,
             )
@@ -290,7 +336,7 @@ class GFlowNetActor(nn.Module):
                 actions_steps.append(actions)
             if bool(state.stopped.all().item()):
                 break
-        return log_pf_steps, actions_steps, diag_steps, hidden, state
+        return log_pf_steps, actions_steps, diag_steps, state_steps, hidden, state
 
     def _finalize_rollout_outputs(
         self,
@@ -298,11 +344,13 @@ class GFlowNetActor(nn.Module):
         log_pf_steps: list[torch.Tensor],
         actions_steps: list[torch.Tensor],
         diag_steps: Optional[dict[str, list[torch.Tensor]]],
+        state_steps: Optional[list[torch.Tensor]],
         num_graphs: int,
         num_steps: int,
         device: torch.device,
         record_actions: bool,
         record_diagnostics: bool,
+        record_state: bool,
     ) -> RolloutOutput:
         log_pf_dtype = log_pf_steps[0].dtype if log_pf_steps else torch.float32
         log_pf_steps_tensor = stack_steps(
@@ -339,12 +387,34 @@ class GFlowNetActor(nn.Module):
                 device=device,
                 dtype=log_pf_dtype,
             )
+        state_vec_seq = None
+        if record_state:
+            if state_steps is None or not state_steps:
+                state_vec_seq = torch.zeros(
+                    (num_graphs, num_steps, int(self.agent.hidden_dim)),
+                    device=device,
+                    dtype=log_pf_dtype,
+                )
+            else:
+                state_dtype = state_steps[0].dtype
+                stacked = torch.stack(state_steps, dim=1)
+                if stacked.size(1) > num_steps:
+                    raise ValueError("state stack exceeds expected rollout horizon.")
+                if stacked.size(1) < num_steps:
+                    pad = torch.zeros(
+                        (num_graphs, num_steps - stacked.size(1), stacked.size(2)),
+                        device=device,
+                        dtype=state_dtype,
+                    )
+                    stacked = torch.cat([stacked, pad], dim=1)
+                state_vec_seq = stacked
         return RolloutOutput(
             actions_seq=actions_seq,
             log_pf_total=log_pf_total,
             log_pf_steps=log_pf_steps_tensor,
             num_moves=num_moves,
             diagnostics=diagnostics,
+            state_vec_seq=state_vec_seq,
         )
 
     def _compute_step_scores(
@@ -353,12 +423,12 @@ class GFlowNetActor(nn.Module):
         state: GraphState,
         graph: dict[str, torch.Tensor],
         action_keys: torch.Tensor,
-        guidance_fn: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]],
         hidden: torch.Tensor,
         num_graphs: int,
     ) -> _RolloutStepScores:
         outgoing = self._gather_outgoing_edges(state=state, graph=graph)
         horizon_exhausted = state.step_counts >= int(state.max_steps)
+        last_step = state.step_counts + _ONE >= int(state.max_steps)
         edge_valid_mask = self._resolve_edge_valid_mask(
             outgoing=outgoing,
             horizon_exhausted=horizon_exhausted,
@@ -373,7 +443,7 @@ class GFlowNetActor(nn.Module):
         is_target = stop_node_mask.to(device=curr_nodes.device, dtype=torch.bool).index_select(0, safe_nodes)
         is_target = is_target & valid_node
         active = ~state.stopped
-        allow_stop = active & (is_target | (~has_edge))
+        allow_stop = active & (is_target | (~has_edge) | last_step)
         self._validate_horizon(state=state, allow_stop=allow_stop, horizon_exhausted=horizon_exhausted)
         edge_scores = self._compute_edge_scores(
             state_vec=hidden,
@@ -381,17 +451,7 @@ class GFlowNetActor(nn.Module):
             edge_batch=outgoing.edge_batch,
             edge_ids=outgoing.edge_ids,
             graph=graph,
-            edge_counts=outgoing.edge_counts,
         )
-        if self.score_mode == _SCORE_MODE_H_TRANSFORM:
-            edge_guidance = None
-        else:
-            edge_guidance = self._compute_edge_guidance(
-                guidance_fn=guidance_fn,
-                step_counts=state.step_counts,
-                edge_ids=outgoing.edge_ids,
-                hidden=hidden,
-            )
         stop_logits = self._compute_stop_logits(
             state_vec=hidden,
             edge_scores=edge_scores,
@@ -403,7 +463,6 @@ class GFlowNetActor(nn.Module):
             outgoing=outgoing,
             edge_scores=edge_scores,
             stop_logits=stop_logits,
-            edge_guidance=edge_guidance,
             allow_stop=allow_stop,
             edge_valid_mask=edge_valid_mask,
         )
@@ -424,7 +483,6 @@ class GFlowNetActor(nn.Module):
             edge_batch=scores.outgoing.edge_batch,
             num_graphs=num_graphs,
             temperature=temp,
-            edge_guidance=scores.edge_guidance,
             edge_valid_mask=scores.edge_valid_mask,
         )
         actions, log_pf = sample_actions(
@@ -549,21 +607,6 @@ class GFlowNetActor(nn.Module):
             count = int(invalid.sum().item())
             raise ValueError(f"max_steps reached without STOP at target for {count} graphs.")
 
-    @staticmethod
-    def _compute_edge_guidance(
-        *,
-        guidance_fn: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]],
-        step_counts: torch.Tensor,
-        edge_ids: torch.Tensor,
-        hidden: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if guidance_fn is None or edge_ids.numel() == _ZERO:
-            return None
-        edge_guidance = guidance_fn(step_counts, edge_ids, hidden).reshape(-1)
-        if edge_guidance.numel() != edge_ids.numel():
-            raise ValueError("edge_guidance length mismatch with outgoing edges.")
-        return edge_guidance
-
     def _rollout_step_update(
         self,
         *,
@@ -608,33 +651,11 @@ class GFlowNetActor(nn.Module):
             edge_ptr_by_head=graph["edge_ptr_by_head"],
             active_mask=active,
         )
-        return self._filter_outgoing_edges_by_policy(outgoing=outgoing, state=state, graph=graph)
-
-    @staticmethod
-    def _filter_outgoing_edges_by_policy(
-        *,
-        outgoing: OutgoingEdges,
-        state: GraphState,
-        graph: dict[str, torch.Tensor],
-    ) -> OutgoingEdges:
-        if outgoing.edge_ids.numel() == _ZERO:
-            return outgoing
         policy_mask = graph.get(EDGE_POLICY_MASK_KEY)
         if policy_mask is None:
             raise ValueError("edge_policy_mask missing from graph cache; strict edge policy requires it.")
-        policy_mask = policy_mask.view(-1)
-        keep = policy_mask.index_select(0, outgoing.edge_ids)
-        edge_ids = outgoing.edge_ids[keep]
-        edge_batch = outgoing.edge_batch[keep]
         num_graphs = int(state.curr_nodes.numel())
-        if edge_ids.numel() == _ZERO:
-            empty = edge_ids.new_empty((_ZERO,))
-            edge_counts = edge_ids.new_zeros((num_graphs,))
-            has_edge = edge_ids.new_zeros((num_graphs,), dtype=torch.bool)
-            return OutgoingEdges(edge_ids=empty, edge_batch=empty, edge_counts=edge_counts, has_edge=has_edge)
-        edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
-        has_edge = edge_counts > _ZERO
-        return OutgoingEdges(edge_ids=edge_ids, edge_batch=edge_batch, edge_counts=edge_counts, has_edge=has_edge)
+        return apply_edge_policy_mask(outgoing=outgoing, edge_policy_mask=policy_mask, num_graphs=num_graphs)
 
     def _compute_edge_scores(
         self,
@@ -644,41 +665,52 @@ class GFlowNetActor(nn.Module):
         edge_batch: torch.Tensor,
         edge_ids: torch.Tensor,
         graph: dict[str, torch.Tensor],
-        edge_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.score_mode == _SCORE_MODE_AGENT:
-            return self.agent.score_cached(
-                hidden=state_vec,
-                action_keys=action_keys,
-                edge_batch=edge_batch,
-                edge_ids=edge_ids,
-            )
-        return self._compute_h_transform_scores(
-            graph=graph,
-            edge_ids=edge_ids,
-            edge_batch=edge_batch,
-            edge_counts=edge_counts,
-        )
-
-    @staticmethod
-    def _compute_h_transform_scores(
-        *,
-        graph: dict[str, torch.Tensor],
-        edge_ids: torch.Tensor,
-        edge_batch: torch.Tensor,
-        edge_counts: torch.Tensor,
+        detach_agent: bool = False,
     ) -> torch.Tensor:
         if edge_ids.numel() == _ZERO:
             return edge_ids.new_empty((_ZERO,))
+        prior_scores = self._compute_prior_scores(
+            state_vec=state_vec,
+            action_keys=action_keys,
+            edge_batch=edge_batch,
+            edge_ids=edge_ids,
+            detach_agent=detach_agent,
+        )
+        flow_scores = self._compute_flow_scores(graph=graph, edge_ids=edge_ids)
+        return prior_scores + flow_scores * float(self.h_transform_bias)
+
+    def _compute_prior_scores(
+        self,
+        *,
+        state_vec: torch.Tensor,
+        action_keys: torch.Tensor,
+        edge_batch: torch.Tensor,
+        edge_ids: torch.Tensor,
+        detach_agent: bool,
+    ) -> torch.Tensor:
+        scores = self.agent.score_cached(
+            hidden=state_vec,
+            action_keys=action_keys,
+            edge_batch=edge_batch,
+            edge_ids=edge_ids,
+        )
+        return scores.detach() if detach_agent else scores
+
+    def _compute_flow_scores(self, *, graph: dict[str, torch.Tensor], edge_ids: torch.Tensor) -> torch.Tensor:
         log_f_nodes = graph.get("log_f_nodes")
         if log_f_nodes is None:
             raise ValueError("log_f_nodes missing from graph cache for h_transform score mode.")
         edge_index = graph["edge_index"]
         tail_nodes = edge_index[_EDGE_TAIL_INDEX].index_select(0, edge_ids)
         log_f_tail = log_f_nodes.index_select(0, tail_nodes.to(device=log_f_nodes.device))
-        counts = edge_counts.index_select(0, edge_batch.to(device=edge_counts.device)).clamp(min=_ONE)
-        log_p_uniform = -torch.log(counts.to(dtype=log_f_tail.dtype))
-        return log_f_tail + log_p_uniform
+        return self._apply_flow_clip(log_f_tail)
+
+    def _apply_flow_clip(self, log_f_tail: torch.Tensor) -> torch.Tensor:
+        clip_value = float(self.h_transform_clip)
+        if clip_value <= float(_ZERO):
+            return log_f_tail
+        clip = torch.tensor(clip_value, device=log_f_tail.device, dtype=log_f_tail.dtype)
+        return torch.tanh(log_f_tail / clip) * clip
 
     def _compute_stop_logits(
         self,

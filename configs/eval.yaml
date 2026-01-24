@@ -2,7 +2,6 @@
 
 defaults:
   - _self_
-  - window: default
   - ckpt: default
   - run: default
   - dataset: null

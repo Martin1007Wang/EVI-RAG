@@ -168,6 +168,7 @@ class TrajectoryAgent(nn.Module):
         self.query_proj = nn.Linear(self.hidden_dim, self.action_dim, bias=False)
         self.rel_key_proj = nn.Linear(self.token_dim, self.hidden_dim, bias=False)
         self.node_key_proj = nn.Linear(self.token_dim, self.hidden_dim, bias=False)
+        self.q_key_proj = nn.Linear(self.token_dim, self.action_dim, bias=False)
         self.context_adapter_question = nn.Sequential(
             nn.LayerNorm(self.token_dim),
             nn.Linear(self.token_dim, self.token_dim, bias=False),
@@ -186,6 +187,7 @@ class TrajectoryAgent(nn.Module):
         _init_linear(self.query_proj)
         _init_linear(self.rel_key_proj)
         _init_linear(self.node_key_proj)
+        _init_linear(self.q_key_proj)
         for adapter in (self.context_adapter_question, self.context_adapter_node):
             for layer in adapter:
                 if isinstance(layer, nn.Linear):
@@ -236,14 +238,27 @@ class TrajectoryAgent(nn.Module):
         relation_tokens: torch.Tensor,
         node_tokens: torch.Tensor,
         edge_index: torch.Tensor,
+        question_tokens: torch.Tensor,
+        edge_batch: torch.Tensor,
     ) -> torch.Tensor:
         edge_index = edge_index.to(device=relation_tokens.device, dtype=torch.long)
         num_edges = int(edge_index.size(1))
         tail_nodes = edge_index[_ONE]
         tail_tokens = node_tokens.index_select(0, tail_nodes)
+        q_tokens = question_tokens.to(device=relation_tokens.device, dtype=relation_tokens.dtype)
+        if q_tokens.dim() == 3 and q_tokens.size(1) == _ONE:
+            q_tokens = q_tokens.squeeze(1)
+        if q_tokens.dim() != 2:
+            raise ValueError("question_tokens must be [B, H] or [B, 1, H] for action keys.")
+        edge_batch = edge_batch.to(device=relation_tokens.device, dtype=torch.long).view(-1)
+        if edge_batch.numel() != num_edges:
+            raise ValueError("edge_batch length mismatch with edge_index for action keys.")
+        q_tokens = q_tokens.index_select(0, edge_batch)
         rel_key = self.dropout_layer(self.rel_key_proj(relation_tokens))
         node_key = self.dropout_layer(self.node_key_proj(tail_tokens))
+        q_gate = torch.sigmoid(self.q_key_proj(q_tokens))
         action_key = torch.cat((rel_key, node_key), dim=-1)
+        action_key = action_key * q_gate
         return self.action_mlp(action_key)
 
     def score_cached(

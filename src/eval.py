@@ -285,12 +285,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if run_cfg.get("allow_empty_answer") is None:
         with open_dict(cfg):
             cfg.run.allow_empty_answer = split != "train"
-    if bool(run_cfg.get("filter_missing_start", False)):
-        scope = _normalize_dataset_scope(cfg.dataset)
-        if scope == "full":
-            with open_dict(cfg.dataset):
-                cfg.dataset.filter_missing_start = True
-            log.info("eval: filter_missing_start enabled for scope=%s split=%s", scope, split)
     log.info("Run: %s", run_cfg.get("name"))
 
     _enforce_single_gpu_eval(cfg.trainer)

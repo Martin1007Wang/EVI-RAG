@@ -5,9 +5,6 @@ from dataclasses import dataclass
 import torch
 
 _ZERO = 0
-_DIST_UNREACHABLE = -1
-_DIST_ORIGIN = 0
-_DIST_STEP = 1
 
 try:
     from torch import _dynamo as _torch_dynamo
@@ -148,150 +145,6 @@ def compute_invalid_nodes(
     return (node_is_start | neighbors) & (~node_is_target)
 
 
-def _undirected_bfs_distances_impl(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    start_nodes: torch.Tensor,
-) -> torch.Tensor:
-    dist_unreachable = -1
-    dist_origin = 0
-    dist_step = 1
-    device = edge_index.device
-    dist = torch.full((num_nodes,), dist_unreachable, device=device, dtype=torch.long)
-    if num_nodes <= 0:
-        return dist
-    if start_nodes.numel() == 0:
-        return dist
-    dist[start_nodes] = dist_origin
-    frontier = dist == dist_origin
-    edge_src = edge_index[0]
-    edge_dst = edge_index[1]
-    if edge_src.numel() == 0:
-        return dist
-    step = dist_origin
-    next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
-    for _ in range(num_nodes):
-        if not bool(frontier.any().detach().tolist()):
-            break
-        next_counts.zero_()
-        next_counts.index_add_(0, edge_dst, frontier[edge_src].to(dtype=torch.long))
-        next_counts.index_add_(0, edge_src, frontier[edge_dst].to(dtype=torch.long))
-        next_mask = (next_counts > 0) & (dist < 0)
-        if not bool(next_mask.any().detach().tolist()):
-            break
-        step += dist_step
-        dist[next_mask] = step
-        frontier = next_mask
-    return dist
-
-
-_UNDIRECTED_BFS_SCRIPT = None
-_DIRECTED_BFS_SCRIPT = None
-
-
-@_dynamo_disable
-def _directed_bfs_distances_impl(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    start_nodes: torch.Tensor,
-    dist_unreachable: int = _DIST_UNREACHABLE,
-    dist_origin: int = _DIST_ORIGIN,
-    dist_step: int = _DIST_STEP,
-) -> torch.Tensor:
-    device = edge_index.device
-    dist = torch.full((num_nodes,), dist_unreachable, device=device, dtype=torch.long)
-    if num_nodes <= 0:
-        return dist
-    if start_nodes.numel() == 0:
-        return dist
-    dist[start_nodes] = dist_origin
-    frontier = dist == dist_origin
-    edge_src = edge_index[0]
-    edge_dst = edge_index[1]
-    if edge_src.numel() == 0:
-        return dist
-    step = dist_origin
-    next_counts = torch.zeros(num_nodes, device=device, dtype=torch.long)
-    for _ in range(num_nodes):
-        if not bool(frontier.any().detach().tolist()):
-            break
-        next_counts.zero_()
-        next_counts.index_add_(0, edge_dst, frontier[edge_src].to(dtype=torch.long))
-        next_mask = (next_counts > 0) & (dist < 0)
-        if not bool(next_mask.any().detach().tolist()):
-            break
-        step += dist_step
-        dist[next_mask] = step
-        frontier = next_mask
-    return dist
-
-
-def _get_undirected_bfs_script():
-    global _UNDIRECTED_BFS_SCRIPT
-    if _UNDIRECTED_BFS_SCRIPT is not None:
-        return _UNDIRECTED_BFS_SCRIPT
-    try:  # pragma: no cover - TorchScript availability depends on build
-        _UNDIRECTED_BFS_SCRIPT = torch.jit.script(_undirected_bfs_distances_impl)
-    except Exception as exc:  # pragma: no cover - TorchScript is required
-        raise RuntimeError("TorchScript is required for undirected_bfs_distances; scripting failed.") from exc
-    return _UNDIRECTED_BFS_SCRIPT
-
-
-def _get_directed_bfs_script():
-    global _DIRECTED_BFS_SCRIPT
-    if _DIRECTED_BFS_SCRIPT is not None:
-        return _DIRECTED_BFS_SCRIPT
-    try:  # pragma: no cover - TorchScript availability depends on build
-        _DIRECTED_BFS_SCRIPT = torch.jit.script(_directed_bfs_distances_impl)
-    except Exception as exc:  # pragma: no cover - TorchScript is required
-        raise RuntimeError("TorchScript is required for directed_bfs_distances; scripting failed.") from exc
-    return _DIRECTED_BFS_SCRIPT
-
-
-def undirected_bfs_distances(
-    edge_index: torch.Tensor,
-    *,
-    num_nodes: int,
-    start_nodes: torch.Tensor,
-) -> torch.Tensor:
-    """Tensor-only multi-source BFS over an undirected edge list (TorchScript compiled if available)."""
-    num_nodes = int(num_nodes)
-    if num_nodes <= 0:
-        return torch.full((0,), _DIST_UNREACHABLE, device=edge_index.device, dtype=torch.long)
-    if not torch.is_tensor(start_nodes):
-        start_nodes = torch.as_tensor(start_nodes, device=edge_index.device, dtype=torch.long)
-    else:
-        start_nodes = start_nodes.to(device=edge_index.device, dtype=torch.long)
-    start_nodes = start_nodes.view(-1)
-    if start_nodes.numel() == 0:
-        return torch.full((num_nodes,), _DIST_UNREACHABLE, device=edge_index.device, dtype=torch.long)
-    torch._assert((start_nodes >= 0).all(), "start_nodes contain negatives for BFS distances.")
-    torch._assert((start_nodes < num_nodes).all(), "start_nodes out of range for BFS distances.")
-    return _get_undirected_bfs_script()(edge_index, num_nodes, start_nodes)
-
-
-def directed_bfs_distances(
-    edge_index: torch.Tensor,
-    *,
-    num_nodes: int,
-    start_nodes: torch.Tensor,
-) -> torch.Tensor:
-    """Tensor-only multi-source BFS over directed edges (TorchScript compiled if available)."""
-    num_nodes = int(num_nodes)
-    if num_nodes <= 0:
-        return torch.full((0,), _DIST_UNREACHABLE, device=edge_index.device, dtype=torch.long)
-    if not torch.is_tensor(start_nodes):
-        start_nodes = torch.as_tensor(start_nodes, device=edge_index.device, dtype=torch.long)
-    else:
-        start_nodes = start_nodes.to(device=edge_index.device, dtype=torch.long)
-    start_nodes = start_nodes.view(-1)
-    if start_nodes.numel() == 0:
-        return torch.full((num_nodes,), _DIST_UNREACHABLE, device=edge_index.device, dtype=torch.long)
-    torch._assert((start_nodes >= 0).all(), "start_nodes contain negatives for BFS distances.")
-    torch._assert((start_nodes < num_nodes).all(), "start_nodes out of range for BFS distances.")
-    return _get_directed_bfs_script()(edge_index, num_nodes, start_nodes)
-
-
 def compute_qa_edge_mask(
     edge_index: torch.Tensor,
     *,
@@ -346,6 +199,4 @@ __all__ = [
     "build_edge_batch_debug_context",
     "compute_edge_batch",
     "compute_qa_edge_mask",
-    "directed_bfs_distances",
-    "undirected_bfs_distances",
 ]

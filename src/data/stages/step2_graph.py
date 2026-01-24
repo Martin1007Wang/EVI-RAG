@@ -29,6 +29,7 @@ from src.data.schema.constants import (
     _EDGE_STAT_KEYS,
     _FILTER_STAT_KEYS,
     _INVERSE_RELATION_SUFFIX_DEFAULT,
+    _ONE,
     _PATH_MODE_QA_DIRECTED,
     _PATH_MODE_UNDIRECTED,
     _REL_LABEL_SAMPLE_LIMIT,
@@ -46,7 +47,7 @@ from src.data.schema.types import (
     TimeRelationConfig,
 )
 from src.data.stages.step1_vocab import _partition_graph_edges, _resolve_split_filter, _should_keep_sample
-from src.data.utils.connectivity import _validate_path_mode, has_connectivity
+from src.data.utils.connectivity import _validate_path_mode, reachable_targets_by_index
 from src.data.utils.stats import _init_split_counters, _safe_div, _sample_labels
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
@@ -461,6 +462,24 @@ def preprocess(ctx: StageContext) -> None:
     total_by_split: Dict[str, int] = {}
     kept_by_split: Dict[str, int] = {}
     sub_by_split: Dict[str, int] = {}
+    sub_filter_stats: Dict[str, Dict[str, object]] = {
+        split: {
+            "total_samples": _ZERO,
+            "kept_samples": _ZERO,
+            "missing_q_any_samples": _ZERO,
+            "missing_q_all_samples": _ZERO,
+            "missing_a_any_samples": _ZERO,
+            "missing_a_all_samples": _ZERO,
+            "unreachable_a_any_samples": _ZERO,
+            "no_path_samples": _ZERO,
+            "missing_q_entities": _ZERO,
+            "missing_a_entities": _ZERO,
+            "reachable_a_entities": _ZERO,
+            "unreachable_a_entities": _ZERO,
+            "overlap_samples": {},
+        }
+        for split in splits
+    }
     empty_graph_by_split: Dict[str, int] = {}
     empty_graph_ids: List[str] = []
     empty_graph_id_set: Set[str] = set()
@@ -857,35 +876,64 @@ def preprocess(ctx: StageContext) -> None:
             graphs_written_by_split[sample.split] += 1
             questions_written_by_split[sample.split] += 1
             if emit_sub_filter:
+                split_key = sample.split
+                stats = sub_filter_stats[split_key]
+                stats["total_samples"] += _ONE
                 label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
-                q_local = {label_to_idx[ent] for ent in sample.q_entity if ent in label_to_idx}
-                a_local = {label_to_idx[ent] for ent in sample.a_entity if ent in label_to_idx}
-                has_topic = bool(q_local)
-                has_answer = bool(a_local)
-                if has_topic and has_answer:
-                    cleaned_edges, _ = _partition_graph_edges(
-                        sample.graph,
-                        relation_cleaning_rules,
-                        remove_self_loops=remove_self_loops,
-                        relation_cleaning_enabled=relation_cleaning_enabled,
-                        time_relation_cfg=time_relation_cfg,
-                        question_text=sample.question,
-                        anchor_entities=sample.q_entity,
-                        keep_anchor_edges=keep_start_adjacent_edges,
+                q_entities = set(sample.q_entity or [])
+                a_entities = set(sample.a_entity or [])
+                q_total = len(q_entities)
+                a_total = len(a_entities)
+                q_local = {label_to_idx[ent] for ent in q_entities if ent in label_to_idx}
+                a_local = {label_to_idx[ent] for ent in a_entities if ent in label_to_idx}
+                q_in_graph = len(q_local)
+                a_in_graph = len(a_local)
+                missing_q_entities = max(q_total - q_in_graph, _ZERO)
+                missing_a_entities = max(a_total - a_in_graph, _ZERO)
+                stats["missing_q_entities"] += missing_q_entities
+                stats["missing_a_entities"] += missing_a_entities
+                missing_q_any = (q_total == _ZERO) or (q_in_graph < q_total)
+                missing_a_any = (a_total == _ZERO) or (a_in_graph < a_total)
+                missing_q_all = q_in_graph == _ZERO
+                missing_a_all = a_in_graph == _ZERO
+                stats["missing_q_any_samples"] += _ONE if missing_q_any else _ZERO
+                stats["missing_q_all_samples"] += _ONE if missing_q_all else _ZERO
+                stats["missing_a_any_samples"] += _ONE if missing_a_any else _ZERO
+                stats["missing_a_all_samples"] += _ONE if missing_a_all else _ZERO
+                reachable_count = _ZERO
+                if q_in_graph > _ZERO and a_in_graph > _ZERO:
+                    reachable_targets = reachable_targets_by_index(
+                        num_nodes=len(graph.node_labels),
+                        edge_src=graph.edge_src,
+                        edge_dst=graph.edge_dst,
+                        seeds=sorted(q_local),
+                        targets=sorted(a_local),
+                        path_mode=path_mode,
                     )
-                    cleaned_edges = _dedup_directed_edges(cleaned_edges)
-                    if inverse_relations_key_map is not None:
-                        cleaned_edges = _expand_edges_with_inverse(
-                            cleaned_edges,
-                            inverse_relations_key_map,
-                            suffix=inverse_relations_suffix,
-                        )
-                    has_path = has_connectivity(cleaned_edges, sample.q_entity, sample.a_entity, path_mode=path_mode)
-                else:
-                    has_path = False
-                if has_topic and has_answer and has_path:
+                    reachable_count = len(reachable_targets)
+                unreachable_count = a_in_graph - reachable_count
+                if unreachable_count < _ZERO:
+                    unreachable_count = _ZERO
+                stats["reachable_a_entities"] += reachable_count
+                stats["unreachable_a_entities"] += unreachable_count
+                unreachable_a_any = a_in_graph > _ZERO and reachable_count < a_in_graph
+                no_path = q_in_graph > _ZERO and a_in_graph > _ZERO and reachable_count == _ZERO
+                stats["unreachable_a_any_samples"] += _ONE if unreachable_a_any else _ZERO
+                stats["no_path_samples"] += _ONE if no_path else _ZERO
+                overlap_flags: List[str] = []
+                if missing_q_any:
+                    overlap_flags.append("missing_q")
+                if missing_a_any:
+                    overlap_flags.append("missing_a")
+                if unreachable_a_any:
+                    overlap_flags.append("unreachable_a")
+                overlap_key = "+".join(overlap_flags) if overlap_flags else "ok"
+                overlap = stats["overlap_samples"]
+                overlap[overlap_key] = overlap.get(overlap_key, _ZERO) + _ONE
+                if not (missing_q_any or missing_a_any or unreachable_a_any):
                     sub_sample_ids.append(graph.graph_id)
-                    sub_by_split[sample.split] = sub_by_split.get(sample.split, 0) + 1
+                    sub_by_split[split_key] = sub_by_split.get(split_key, _ZERO) + _ONE
+                    stats["kept_samples"] += _ONE
             if len(base_writer.graphs) >= chunk_size or len(base_writer.questions) >= chunk_size:
                 base_writer.flush()
 
@@ -975,9 +1023,39 @@ def preprocess(ctx: StageContext) -> None:
         sub_payload = {
             "dataset": dataset,
             "sample_ids": sorted(sub_sample_ids),
+            "criteria": {
+                "require_all_questions_present": True,
+                "require_all_answers_present": True,
+                "require_all_answers_reachable": True,
+                "path_mode": path_mode,
+            },
+            "stats": sub_filter_stats,
         }
         (out_dir / sub_filter_filename).write_text(json.dumps(sub_payload, indent=2))
         log_event(logger, "sub_filter_saved", counts=_format_counts(sub_by_split), path=str(out_dir / sub_filter_filename))
+        for split in splits:
+            stats = sub_filter_stats[split]
+            total = int(stats["total_samples"])
+            kept = int(stats["kept_samples"])
+            log_event(
+                logger,
+                "sub_filter_stats",
+                split=split,
+                total=total,
+                kept=kept,
+                filtered=total - kept,
+                missing_q_any=int(stats["missing_q_any_samples"]),
+                missing_q_all=int(stats["missing_q_all_samples"]),
+                missing_a_any=int(stats["missing_a_any_samples"]),
+                missing_a_all=int(stats["missing_a_all_samples"]),
+                unreachable_a_any=int(stats["unreachable_a_any_samples"]),
+                no_path=int(stats["no_path_samples"]),
+                missing_q_entities=int(stats["missing_q_entities"]),
+                missing_a_entities=int(stats["missing_a_entities"]),
+                reachable_a_entities=int(stats["reachable_a_entities"]),
+                unreachable_a_entities=int(stats["unreachable_a_entities"]),
+                overlap=stats["overlap_samples"],
+            )
 
 
 def build_graph(

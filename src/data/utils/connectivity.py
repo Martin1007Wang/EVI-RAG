@@ -202,3 +202,30 @@ def has_connectivity(
         adjacency = _build_undirected_adjacency(len(node_index), edge_src, edge_dst)
     dist = _bfs_dist(len(node_index), adjacency, seed_ids)
     return any(dist[a] >= 0 for a in answer_ids)
+
+
+def reachable_targets_by_index(
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    seeds: Sequence[int],
+    targets: Sequence[int],
+    *,
+    path_mode: str = _PATH_MODE_UNDIRECTED,
+) -> List[int]:
+    if num_nodes <= 0 or not edge_src or not edge_dst or not seeds or not targets:
+        return []
+    mode = _validate_path_mode(path_mode)
+    if mode == _PATH_MODE_QA_DIRECTED:
+        adjacency = _build_directed_adjacency(num_nodes, edge_src, edge_dst)
+    else:
+        adjacency = _build_undirected_adjacency(num_nodes, edge_src, edge_dst)
+    dist = _bfs_dist(num_nodes, adjacency, seeds)
+    reachable: set[int] = set()
+    for t_raw in targets:
+        t = int(t_raw)
+        if 0 <= t < num_nodes and dist[t] >= 0:
+            reachable.add(t)
+    if not reachable:
+        return []
+    return sorted(reachable)

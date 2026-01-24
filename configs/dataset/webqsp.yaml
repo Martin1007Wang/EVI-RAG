@@ -20,9 +20,9 @@ paths:
 lmdb_readahead: true
 sequential_sample_ids: true
 filter_missing_answer:
-  train: true
-  validation: true
-  test: true
+  train: false
+  validation: false
+  test: false
 
 entity_normalization: none
 entity_text_mode: regex

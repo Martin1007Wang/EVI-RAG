@@ -24,6 +24,7 @@ from src.models.components.gflownet_ops import (
     EDGE_POLICY_MASK_KEY,
     STOP_NODE_MASK_KEY,
     OutgoingEdges,
+    apply_edge_policy_mask,
     compute_forward_log_probs,
     gather_outgoing_edges,
     neg_inf_value,
@@ -37,7 +38,6 @@ from src.models.components.trajectory_utils import (
     stack_steps,
 )
 from src.utils import log_metric, setup_optimizer
-from src.utils.graph import compute_edge_batch
 from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
@@ -53,13 +53,13 @@ _DEFAULT_CVT_INIT_ENABLED = True
 _DEFAULT_CACHE_ACTION_KEYS = True
 _DEFAULT_VALIDATE_EDGE_BATCH = False
 
-_PB_FIX_LAMBDA_SMOOTH = 1.0
-_PB_FIX_SELF_LOOP = 1.0
-
-_DEFAULT_MINING_TEMPERATURE = 1.2
 _DEFAULT_TB_LOG_PROB_MIN = -20.0
 _DEFAULT_TB_DELTA_MAX = 20.0
 _DEFAULT_ALLOW_ZERO_HOP = False
+_DEFAULT_SHAPING_WEIGHT = 0.0
+_DEFAULT_SHAPING_EPS = 1.0e-6
+_DEFAULT_SHAPING_ANNEAL_STEPS = 0
+_DEFAULT_SHAPING_ANNEAL_START = 0
 
 _EDGE_INV_PREVIEW = 5
 
@@ -121,6 +121,7 @@ class _TBBackwardInputs:
     log_pb_steps: torch.Tensor
     stats_fwd: Any
     reward_fwd: RewardOutput
+    log_reward: torch.Tensor
     success_mask: torch.Tensor
     log_f_start: torch.Tensor
     stats_bwd: Any
@@ -219,8 +220,7 @@ class GFlowNetModule(LightningModule):
         self.cvt_init = CvtNodeInitializer()
 
     def _build_agent(self, *, cfg: Mapping[str, Any], name: str) -> TrajectoryAgent:
-        _ = name
-        hidden_dim = int(cfg.get("state_dim", self.hidden_dim))
+        hidden_dim = self._resolve_agent_hidden_dim(cfg=cfg, name=name)
         dropout = float(cfg.get("dropout", 0.0))
         return TrajectoryAgent(
             token_dim=self.hidden_dim,
@@ -239,11 +239,36 @@ class GFlowNetModule(LightningModule):
         else:
             self.agent_backward = self._build_agent(cfg=self.state_cfg, name="backward_cfg.state_cfg")
 
+    def _resolve_agent_hidden_dim(self, *, cfg: Mapping[str, Any], name: str) -> int:
+        raw_state_dim = cfg.get("state_dim", None)
+        if raw_state_dim is None:
+            return int(self.hidden_dim)
+        state_dim = int(raw_state_dim)
+        if state_dim != int(self.hidden_dim):
+            raise ValueError(
+                f"{name}.state_dim must match model.hidden_dim ({self.hidden_dim}). "
+                f"Got {state_dim}."
+            )
+        return int(self.hidden_dim)
+
     def _init_actors(self) -> None:
+        if "score_mode" in self.actor_cfg:
+            raise ValueError("actor_cfg.score_mode is no longer supported; use agent prior + h_transform only.")
         policy_temperature = float(self.actor_cfg.get("policy_temperature", 1.0))
         stop_bias_raw = self.actor_cfg.get("stop_bias_init")
         stop_bias_init = None if stop_bias_raw is None else float(stop_bias_raw)
-        score_mode = str(self.actor_cfg.get("score_mode", "h_transform")).strip().lower()
+        h_transform_bias = self.actor_cfg.get("h_transform_bias")
+        if h_transform_bias is not None:
+            h_transform_bias = float(h_transform_bias)
+        h_transform_clip = self.actor_cfg.get("h_transform_clip")
+        if h_transform_clip is not None:
+            h_transform_clip = float(h_transform_clip)
+        direction_embedding = self.actor_cfg.get("direction_embedding")
+        if direction_embedding is not None:
+            direction_embedding = bool(direction_embedding)
+        direction_embedding_scale = self.actor_cfg.get("direction_embedding_scale")
+        if direction_embedding_scale is not None:
+            direction_embedding_scale = float(direction_embedding_scale)
         self.actor = GFlowNetActor(
             env=self.env,
             agent=self.agent,
@@ -252,7 +277,10 @@ class GFlowNetModule(LightningModule):
             stop_bias_init=stop_bias_init,
             context_mode="question_start",
             default_mode="forward",
-            score_mode=score_mode,
+            h_transform_bias=h_transform_bias,
+            h_transform_clip=h_transform_clip,
+            direction_embedding=direction_embedding,
+            direction_embedding_scale=direction_embedding_scale,
         )
         self.actor_backward = GFlowNetActor(
             env=self.env,
@@ -262,7 +290,10 @@ class GFlowNetModule(LightningModule):
             stop_bias_init=stop_bias_init,
             context_mode="question_start",
             default_mode="backward",
-            score_mode=score_mode,
+            h_transform_bias=h_transform_bias,
+            h_transform_clip=h_transform_clip,
+            direction_embedding=direction_embedding,
+            direction_embedding_scale=direction_embedding_scale,
         )
 
     def _init_flow_predictors(self) -> None:
@@ -274,9 +305,9 @@ class GFlowNetModule(LightningModule):
             "num_train_rollouts",
             "num_miner_rollouts",
             "num_forward_rollouts",
-            "mining_temperature",
             "accumulate_grad_batches",
             "allow_zero_hop",
+            "shaping",
             "tb",
         }
         extra_training = set(self.training_cfg.keys()) - allowed_training
@@ -412,7 +443,6 @@ class GFlowNetModule(LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int):
         self._ensure_runtime_initialized()
-        self._log_batch_scale(batch, batch_idx=batch_idx)
         optimizer = self.optimizers()
         accum = float(self._accumulate_grad_batches())
         if self._should_zero_grad(batch_idx):
@@ -713,12 +743,8 @@ class GFlowNetModule(LightningModule):
         edge_batch = getattr(batch, "edge_batch", None)
         edge_ptr = getattr(batch, "edge_ptr", None)
         if edge_batch is None or edge_ptr is None:
-            edge_batch, edge_ptr = compute_edge_batch(
-                edge_index.to(device="cpu"),
-                node_ptr=node_ptr.to(device="cpu"),
-                num_graphs=num_graphs,
-                device=device,
-                validate=bool(self._validate_edge_batch),
+            raise AttributeError(
+                "Batch missing edge_batch/edge_ptr; enable data.precompute_edge_batch to avoid per-step CPU builds."
             )
         edge_batch = torch.as_tensor(edge_batch, dtype=torch.long, device=device).view(-1)
         edge_ptr = torch.as_tensor(edge_ptr, dtype=torch.long, device=device).view(-1)
@@ -828,19 +854,6 @@ class GFlowNetModule(LightningModule):
             mask[target_locals.to(dtype=torch.long).clamp(min=_ZERO)] = True
         return mask
 
-    def _compute_fixed_log_pb_steps(self, *, actions: torch.Tensor, edge_index: torch.Tensor, degree: torch.Tensor) -> torch.Tensor:
-        stats = derive_trajectory(actions_seq=actions, stop_value=STOP_RELATION)
-        move_mask = stats.move_mask
-        tails = edge_index[_ONE].index_select(0, actions.clamp(min=_ZERO).view(-1)).view_as(actions)
-        denom = (
-            degree.index_select(0, tails.clamp(min=_ZERO).view(-1))
-            .to(dtype=torch.float32)
-            .view_as(tails)
-        )
-        denom = denom + float(_PB_FIX_LAMBDA_SMOOTH) + float(_PB_FIX_SELF_LOOP)
-        log_pb = -torch.log(denom)
-        return torch.where(move_mask.to(device=log_pb.device), log_pb, torch.zeros_like(log_pb))
-
     @staticmethod
     def _compute_log_f_nodes(
         *,
@@ -865,26 +878,6 @@ class GFlowNetModule(LightningModule):
         log_f_start = log_f_nodes.index_select(0, safe_nodes)
         return torch.where(valid, log_f_start, torch.zeros_like(log_f_start))
 
-    @staticmethod
-    def _compute_h_transform_edge_scores(
-        *,
-        graph: dict[str, torch.Tensor],
-        edge_ids: torch.Tensor,
-        edge_batch: torch.Tensor,
-        edge_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        if edge_ids.numel() == _ZERO:
-            return edge_ids.new_empty((_ZERO,))
-        log_f_nodes = graph.get("log_f_nodes")
-        if log_f_nodes is None:
-            raise ValueError("log_f_nodes missing from graph cache for h_transform scoring.")
-        edge_index = graph["edge_index"]
-        tail_nodes = edge_index[_ONE].index_select(0, edge_ids)
-        log_f_tail = log_f_nodes.index_select(0, tail_nodes.to(device=log_f_nodes.device))
-        counts = edge_counts.index_select(0, edge_batch.to(device=edge_counts.device)).clamp(min=_ONE)
-        log_p_uniform = -torch.log(counts.to(dtype=log_f_tail.dtype))
-        return log_f_tail + log_p_uniform
-
     def _resolve_tb_diag_spec(self) -> _TBDiagSpec:
         tb_cfg = self.training_cfg.get("tb") or {}
         log_prob_min = float(tb_cfg.get("log_prob_min", _DEFAULT_TB_LOG_PROB_MIN))
@@ -894,11 +887,171 @@ class GFlowNetModule(LightningModule):
             delta_max=delta_max,
         )
 
-    def _resolve_mining_temperature(self) -> float:
-        return float(self.training_cfg.get("mining_temperature", _DEFAULT_MINING_TEMPERATURE))
-
     def _resolve_allow_zero_hop(self) -> bool:
         return bool(self.training_cfg.get("allow_zero_hop", _DEFAULT_ALLOW_ZERO_HOP))
+
+    def _resolve_shaping_weight(self) -> float:
+        shaping_cfg = self.training_cfg.get("shaping") or {}
+        if not isinstance(shaping_cfg, Mapping):
+            return float(_DEFAULT_SHAPING_WEIGHT)
+        enabled = shaping_cfg.get("enabled", True)
+        if enabled is not None and not bool(enabled):
+            return float(_ZERO)
+        weight = float(shaping_cfg.get("weight", _DEFAULT_SHAPING_WEIGHT))
+        if weight < float(_ZERO):
+            raise ValueError("training_cfg.shaping.weight must be >= 0.")
+        anneal_steps = int(shaping_cfg.get("anneal_steps", _DEFAULT_SHAPING_ANNEAL_STEPS))
+        anneal_start = int(shaping_cfg.get("anneal_start_step", _DEFAULT_SHAPING_ANNEAL_START))
+        if anneal_steps <= _ZERO:
+            return weight
+        step = int(getattr(self, "global_step", _ZERO))
+        if step < anneal_start:
+            return weight
+        progress = (step - anneal_start) / float(anneal_steps)
+        factor = max(float(_ZERO), float(_ONE) - float(progress))
+        return weight * factor
+
+    @staticmethod
+    def _resolve_action_keys_from_graph(*, actor: GFlowNetActor, graph: dict[str, torch.Tensor]) -> torch.Tensor:
+        action_keys = graph.get("action_keys_shared")
+        if action_keys is None:
+            action_keys = graph.get("action_keys_backward")
+        if action_keys is None:
+            action_keys = graph.get("action_keys_forward")
+        if action_keys is None:
+            action_keys = actor.agent.precompute_action_keys(
+                relation_tokens=graph["relation_tokens"],
+                node_tokens=graph["node_tokens"],
+                edge_index=graph["edge_index"],
+                question_tokens=graph["question_tokens"],
+                edge_batch=graph["edge_batch"],
+            )
+        return action_keys
+
+    def _encode_state_sequence(
+        self,
+        *,
+        actor: GFlowNetActor,
+        graph: dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        stats: Any,
+        start_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        num_graphs, num_steps = actions.shape
+        hidden0 = self._compute_initial_hidden(
+            actor=actor,
+            node_tokens=graph["node_tokens"],
+            question_tokens=graph["question_tokens"],
+            start_nodes=start_nodes,
+        )
+        edge_index = graph["edge_index"]
+        actions_safe = actions.clamp(min=_ZERO)
+        relation_tokens_step = graph["relation_tokens"].index_select(0, actions_safe.view(-1)).view(num_graphs, num_steps, -1)
+        tails = edge_index[_ONE].index_select(0, actions_safe.view(-1)).view(num_graphs, num_steps)
+        node_tokens_step = graph["node_tokens"].index_select(0, tails.view(-1)).view(num_graphs, num_steps, -1)
+        state_vec, _ = actor.agent.encode_state_sequence(
+            hidden=hidden0,
+            relation_tokens=relation_tokens_step,
+            node_tokens=node_tokens_step,
+            action_mask=stats.move_mask,
+        )
+        return state_vec
+
+    @staticmethod
+    def _gather_policy_outgoing(
+        *,
+        curr_nodes: torch.Tensor,
+        active_mask: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+    ) -> OutgoingEdges:
+        outgoing = gather_outgoing_edges(
+            curr_nodes=curr_nodes,
+            edge_ids_by_head=graph["edge_ids_by_head"],
+            edge_ptr_by_head=graph["edge_ptr_by_head"],
+            active_mask=active_mask,
+        )
+        policy_mask = graph.get(EDGE_POLICY_MASK_KEY)
+        if policy_mask is None:
+            raise ValueError("edge_policy_mask missing from graph cache; strict edge policy requires it.")
+        num_graphs = int(curr_nodes.numel())
+        if outgoing.edge_ids.numel() == _ZERO:
+            empty = outgoing.edge_ids.new_empty((_ZERO,))
+            edge_counts = outgoing.edge_ids.new_zeros((num_graphs,))
+            has_edge = outgoing.edge_ids.new_zeros((num_graphs,), dtype=torch.bool)
+            return OutgoingEdges(edge_ids=empty, edge_batch=empty, edge_counts=edge_counts, has_edge=has_edge)
+        return apply_edge_policy_mask(outgoing=outgoing, edge_policy_mask=policy_mask, num_graphs=num_graphs)
+
+    @staticmethod
+    def _compute_cosine_potential(
+        *,
+        question_tokens: torch.Tensor,
+        state_vec_seq: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        if state_vec_seq.dim() != 3:
+            raise ValueError("state_vec_seq must be [B, T, H] for potential shaping.")
+        batch = int(state_vec_seq.size(0))
+        if question_tokens.dim() < 2:
+            raise ValueError("question_tokens must be at least [B, H] for potential shaping.")
+        q_tokens = question_tokens.to(device=state_vec_seq.device, dtype=state_vec_seq.dtype).reshape(batch, -1)
+        if q_tokens.size(0) != batch:
+            raise ValueError("question_tokens batch mismatch with state_vec_seq.")
+        if q_tokens.size(1) != state_vec_seq.size(2):
+            raise ValueError("question_tokens hidden dim mismatch with state_vec_seq.")
+        q_norm = torch.linalg.norm(q_tokens, dim=1).clamp(min=eps)
+        s_norm = torch.linalg.norm(state_vec_seq, dim=2).clamp(min=eps)
+        dot = (state_vec_seq * q_tokens.unsqueeze(1)).sum(dim=2)
+        denom = q_norm.unsqueeze(1) * s_norm
+        return dot / denom
+
+    @classmethod
+    def _compute_potential_shaping_sum(
+        cls,
+        *,
+        question_tokens: torch.Tensor,
+        state_vec_seq: torch.Tensor,
+        move_mask: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        phi = cls._compute_cosine_potential(
+            question_tokens=question_tokens,
+            state_vec_seq=state_vec_seq,
+            eps=eps,
+        )
+        if phi.shape != move_mask.shape:
+            raise ValueError("Potential shaping phi/move_mask shape mismatch.")
+        if phi.size(1) <= _ZERO:
+            return phi.new_zeros((phi.size(0),))
+        delta = phi[:, 1:] - phi[:, :-1]
+        pad = delta.new_zeros((delta.size(0), _ONE))
+        delta_steps = torch.cat((delta, pad), dim=1)
+        mask = move_mask.to(device=delta_steps.device, dtype=delta_steps.dtype)
+        return (delta_steps * mask).sum(dim=1)
+
+    def _apply_potential_shaping(
+        self,
+        *,
+        reward: RewardOutput,
+        question_tokens: torch.Tensor,
+        state_vec_seq: torch.Tensor,
+        stats: Any,
+        shaping_weight: float,
+    ) -> RewardOutput:
+        if shaping_weight <= float(_ZERO):
+            return reward
+        question_tokens = question_tokens.detach()
+        state_vec_seq = state_vec_seq.detach()
+        shaping_sum = self._compute_potential_shaping_sum(
+            question_tokens=question_tokens,
+            state_vec_seq=state_vec_seq,
+            move_mask=stats.move_mask,
+            eps=float(_DEFAULT_SHAPING_EPS),
+        )
+        log_reward = reward.log_reward + shaping_sum.to(dtype=reward.log_reward.dtype) * float(shaping_weight)
+        return RewardOutput(
+            log_reward=log_reward,
+            success=reward.success,
+        )
 
     @staticmethod
     def _reverse_steps(*, steps: torch.Tensor, stop_idx: torch.Tensor, fill_value: float) -> torch.Tensor:
@@ -1009,128 +1162,84 @@ class GFlowNetModule(LightningModule):
         temp, _ = actor.resolve_temperature(temperature)
         stats = derive_trajectory(actions_seq=actions, stop_value=STOP_RELATION)
         state_nodes = self._build_state_nodes(actions=actions, edge_index=graph["edge_index"], start_nodes=start_nodes)
-        hidden0 = self._compute_initial_hidden(
+        state_vec = self._encode_state_sequence(
             actor=actor,
-            node_tokens=graph["node_tokens"],
-            question_tokens=graph["question_tokens"],
+            graph=graph,
+            actions=actions,
+            stats=stats,
             start_nodes=start_nodes,
         )
-        edge_index = graph["edge_index"]
-        relation_tokens_step = graph["relation_tokens"].index_select(0, actions.clamp(min=_ZERO).view(-1)).view(num_graphs, num_steps, -1)
-        tails = edge_index[_ONE].index_select(0, actions.clamp(min=_ZERO).view(-1)).view(num_graphs, num_steps)
-        node_tokens_step = graph["node_tokens"].index_select(0, tails.view(-1)).view(num_graphs, num_steps, -1)
-        state_vec, _ = actor.agent.encode_state_sequence(
-            hidden=hidden0,
-            relation_tokens=relation_tokens_step,
-            node_tokens=node_tokens_step,
-            action_mask=stats.move_mask,
+        num_states = int(num_graphs * num_steps)
+        state_nodes_flat = state_nodes.reshape(-1)
+        active_flat = stats.step_mask_incl_stop.reshape(-1)
+        outgoing = self._gather_policy_outgoing(
+            curr_nodes=state_nodes_flat,
+            active_mask=active_flat,
+            graph=graph,
         )
-        action_keys = actor.agent.precompute_action_keys(
-            relation_tokens=graph["relation_tokens"],
-            node_tokens=graph["node_tokens"],
-            edge_index=edge_index,
-        )
+        if outgoing.edge_ids.numel() == _ZERO:
+            edge_scores = outgoing.edge_ids.new_empty((_ZERO,), dtype=state_vec.dtype)
+            edge_valid_mask = outgoing.edge_ids.new_empty((_ZERO,), dtype=torch.bool)
+        else:
+            step_ids = torch.arange(num_steps, device=device, dtype=torch.long).view(1, -1).expand(num_graphs, -1)
+            horizon_exhausted = (step_ids >= int(self.env.max_steps)).reshape(-1)
+            edge_valid_mask = ~horizon_exhausted.index_select(0, outgoing.edge_batch)
+            action_keys = self._resolve_action_keys_from_graph(actor=actor, graph=graph)
+            edge_scores = actor._compute_edge_scores(
+                state_vec=state_vec.reshape(num_states, -1),
+                action_keys=action_keys,
+                edge_batch=outgoing.edge_batch,
+                edge_ids=outgoing.edge_ids,
+                graph=graph,
+            )
+        safe_nodes = state_nodes_flat.clamp(min=_ZERO)
         stop_node_mask = graph[STOP_NODE_MASK_KEY].to(device=device, dtype=torch.bool).view(-1)
-        edge_policy_mask = graph[EDGE_POLICY_MASK_KEY].to(device=device, dtype=torch.bool).view(-1)
-        log_pf_steps = torch.zeros((num_graphs, num_steps), device=device, dtype=torch.float32)
-        diag_steps = self._init_rollout_diag_steps()
-        for step in range(num_steps):
-            active = stats.step_mask_incl_stop[:, step].to(device=device, dtype=torch.bool)
-            if not bool(active.any().detach().tolist()):
-                continue
-            curr_nodes = state_nodes[:, step]
-            outgoing = gather_outgoing_edges(
-                curr_nodes=curr_nodes,
-                edge_ids_by_head=graph["edge_ids_by_head"],
-                edge_ptr_by_head=graph["edge_ptr_by_head"],
-                active_mask=active,
-            )
-            horizon_exhausted = torch.full(
-                (num_graphs,),
-                step >= int(self.env.max_steps),
-                device=device,
-                dtype=torch.bool,
-            )
-            if outgoing.edge_ids.numel() == _ZERO:
-                edge_scores = outgoing.edge_ids.new_empty((_ZERO,), dtype=state_vec.dtype)
-                edge_valid_mask = outgoing.edge_ids.new_empty((_ZERO,), dtype=torch.bool)
-                edge_batch = outgoing.edge_ids.new_empty((_ZERO,))
-                has_edge = torch.zeros((num_graphs,), device=device, dtype=torch.bool)
-            else:
-                keep = edge_policy_mask.index_select(0, outgoing.edge_ids)
-                edge_ids = outgoing.edge_ids[keep]
-                edge_batch = outgoing.edge_batch[keep]
-                edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
-                has_edge = (edge_counts > _ZERO) & (~horizon_exhausted)
-                outgoing = OutgoingEdges(edge_ids=edge_ids, edge_batch=edge_batch, edge_counts=edge_counts, has_edge=has_edge)
-                edge_valid_mask = ~horizon_exhausted.index_select(0, outgoing.edge_batch)
-                if getattr(actor, "score_mode", "agent") == "h_transform":
-                    edge_scores = self._compute_h_transform_edge_scores(
-                        graph=graph,
-                        edge_ids=outgoing.edge_ids,
-                        edge_batch=outgoing.edge_batch,
-                        edge_counts=outgoing.edge_counts,
-                    )
-                else:
-                    edge_scores = actor.agent.score_cached(
-                        hidden=state_vec[:, step, :],
-                        action_keys=action_keys,
-                        edge_batch=outgoing.edge_batch,
-                        valid_edges_mask=edge_valid_mask,
-                        edge_ids=outgoing.edge_ids,
-                    )
-            safe_nodes = curr_nodes.clamp(min=_ZERO)
-            is_target = stop_node_mask.index_select(0, safe_nodes) & (curr_nodes >= _ZERO)
-            allow_stop = active & (is_target | (~has_edge))
-            stop_logits = actor._compute_stop_logits(
-                state_vec=state_vec[:, step, :],
-                edge_scores=edge_scores,
-                edge_batch=outgoing.edge_batch,
-                num_graphs=num_graphs,
-                edge_valid_mask=edge_valid_mask,
-            )
-            policy = compute_forward_log_probs(
-                edge_scores=edge_scores,
-                stop_logits=stop_logits,
-                allow_stop=allow_stop,
-                edge_batch=outgoing.edge_batch,
-                num_graphs=num_graphs,
-                temperature=temp,
-                edge_guidance=None,
-                edge_valid_mask=edge_valid_mask,
-            )
-            max_edge_score, _ = actor._max_edge_score(
-                edge_scores=edge_scores,
-                edge_batch=outgoing.edge_batch,
-                num_graphs=num_graphs,
-                edge_valid_mask=edge_valid_mask,
-            )
-            stop_margin = policy.stop - policy.not_stop
-            stop_margin = torch.where(policy.has_edge, stop_margin, torch.zeros_like(stop_margin))
-            diag_steps["stop_margin"].append(stop_margin)
-            diag_steps["has_edge"].append(policy.has_edge)
-            diag_steps["allow_stop"].append(allow_stop)
-            diag_steps["max_edge_score"].append(max_edge_score)
-            diag_steps["stop_logits"].append(stop_logits)
-            actions_step = actions[:, step].to(dtype=torch.long)
-            choose_stop = actions_step == STOP_RELATION
-            if outgoing.edge_ids.numel() == _ZERO:
-                selected_edge_lp = torch.full_like(policy.stop, neg_inf_value(policy.stop))
-            else:
-                desired = actions_step.index_select(0, outgoing.edge_batch)
-                match = outgoing.edge_ids == desired
-                neg_inf = neg_inf_value(policy.edge)
-                matched_lp = torch.where(match, policy.edge, torch.full_like(policy.edge, neg_inf))
-                selected_edge_lp, _ = segment_max(matched_lp, outgoing.edge_batch, num_graphs)
-            step_lp = torch.where(choose_stop, policy.stop, selected_edge_lp)
-            step_lp = torch.where(active, step_lp, torch.zeros_like(step_lp))
-            log_pf_steps[:, step] = step_lp
-        diag = self._build_rollout_diagnostics(
-            diag_steps=diag_steps,
-            num_graphs=num_graphs,
-            num_steps=num_steps,
-            device=device,
-            dtype=log_pf_steps.dtype,
+        is_target = stop_node_mask.index_select(0, safe_nodes) & (state_nodes_flat >= _ZERO)
+        last_step = (step_ids + _ONE >= int(self.env.max_steps)).reshape(-1)
+        allow_stop = active_flat & (is_target | (~outgoing.has_edge) | last_step)
+        stop_logits = actor._compute_stop_logits(
+            state_vec=state_vec.reshape(num_states, -1),
+            edge_scores=edge_scores,
+            edge_batch=outgoing.edge_batch,
+            num_graphs=num_states,
+            edge_valid_mask=edge_valid_mask,
+        )
+        policy = compute_forward_log_probs(
+            edge_scores=edge_scores,
+            stop_logits=stop_logits,
+            allow_stop=allow_stop,
+            edge_batch=outgoing.edge_batch,
+            num_graphs=num_states,
+            temperature=temp,
+            edge_valid_mask=edge_valid_mask,
+        )
+        max_edge_score, _ = actor._max_edge_score(
+            edge_scores=edge_scores,
+            edge_batch=outgoing.edge_batch,
+            num_graphs=num_states,
+            edge_valid_mask=edge_valid_mask,
+        )
+        stop_margin = policy.stop - policy.not_stop
+        stop_margin = torch.where(policy.has_edge, stop_margin, torch.zeros_like(stop_margin))
+        actions_flat = actions.reshape(-1).to(dtype=torch.long)
+        choose_stop = actions_flat == STOP_RELATION
+        if outgoing.edge_ids.numel() == _ZERO:
+            selected_edge_lp = torch.full_like(policy.stop, neg_inf_value(policy.stop))
+        else:
+            desired = actions_flat.index_select(0, outgoing.edge_batch)
+            match = outgoing.edge_ids == desired
+            neg_inf = neg_inf_value(policy.edge)
+            matched_lp = torch.where(match, policy.edge, torch.full_like(policy.edge, neg_inf))
+            selected_edge_lp, _ = segment_max(matched_lp, outgoing.edge_batch, num_states)
+        step_lp = torch.where(choose_stop, policy.stop, selected_edge_lp)
+        step_lp = torch.where(active_flat, step_lp, torch.zeros_like(step_lp))
+        log_pf_steps = step_lp.reshape(num_graphs, num_steps)
+        diag = RolloutDiagnostics(
+            has_edge_seq=policy.has_edge.reshape(num_graphs, num_steps),
+            stop_margin_seq=stop_margin.reshape(num_graphs, num_steps),
+            allow_stop_seq=allow_stop.reshape(num_graphs, num_steps),
+            max_edge_score_seq=max_edge_score.reshape(num_graphs, num_steps),
+            stop_logit_seq=stop_logits.reshape(num_graphs, num_steps),
         )
         return log_pf_steps, diag
 
@@ -1277,6 +1386,7 @@ class GFlowNetModule(LightningModule):
         log_f_nodes: torch.Tensor,
         actor: GFlowNetActor,
     ) -> dict[str, torch.Tensor]:
+        question_tokens = actor.condition_question_tokens(question_tokens)
         graph: dict[str, torch.Tensor] = {
             "node_ptr": prepared.node_ptr,
             "edge_index": prepared.edge_index,
@@ -1304,6 +1414,8 @@ class GFlowNetModule(LightningModule):
                 relation_tokens=relation_tokens,
                 node_tokens=node_tokens,
                 edge_index=prepared.edge_index,
+                question_tokens=question_tokens,
+                edge_batch=prepared.edge_batch,
             )
             cache_key = "action_keys_backward" if mode == "backward" else "action_keys_forward"
             graph[cache_key] = keys
@@ -1377,7 +1489,7 @@ class GFlowNetModule(LightningModule):
         graph_bwd: dict[str, torch.Tensor],
         node_is_question: torch.Tensor,
         graph_mask: torch.Tensor,
-        mining_temperature: float,
+        policy_temperature: float,
     ) -> tuple[
         torch.Tensor,
         Any,
@@ -1393,7 +1505,7 @@ class GFlowNetModule(LightningModule):
         graph_bwd_rollout["start_ptr"] = start_bwd_ptr
         rollout_bwd = self.actor_backward.rollout(
             graph=graph_bwd_rollout,
-            temperature=mining_temperature,
+            temperature=policy_temperature,
             record_actions=True,
             record_diagnostics=True,
             max_steps_override=None,
@@ -1538,7 +1650,8 @@ class GFlowNetModule(LightningModule):
         graph_mask: torch.Tensor,
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
-        mining_temperature: float,
+        policy_temperature: float,
+        shaping_weight: float,
     ) -> _TBBackwardInputs:
         actions_bwd, stats_bwd, start_bwd_nodes, stop_nodes_bwd, success_mask, bwd_diag, graph_bwd_rollout = (
             self._rollout_backward_trajectory(
@@ -1546,7 +1659,7 @@ class GFlowNetModule(LightningModule):
                 graph_bwd=graph_bwd,
                 node_is_question=node_is_question,
                 graph_mask=graph_mask,
-                mining_temperature=mining_temperature,
+                policy_temperature=policy_temperature,
             )
         )
         reflected, stats_fwd, log_pf_steps, log_pb_steps, fwd_diag = self._compute_forward_terms_from_backward(
@@ -1569,13 +1682,41 @@ class GFlowNetModule(LightningModule):
             stop_idx=stats_fwd.stop_idx,
             node_is_target=node_is_answer,
         )
+        state_nodes_bwd = self._build_state_nodes(
+            actions=actions_bwd,
+            edge_index=prepared.edge_index,
+            start_nodes=start_bwd_nodes,
+        )
+        reward_bwd = self._compute_reward_from_states(
+            prepared=prepared,
+            state_nodes=state_nodes_bwd,
+            stop_idx=stats_bwd.stop_idx,
+            node_is_target=node_is_question,
+        )
+        if shaping_weight > float(_ZERO):
+            state_vec_seq = self._encode_state_sequence(
+                actor=self.actor,
+                graph=graph_fwd,
+                actions=reflected,
+                stats=stats_fwd,
+                start_nodes=stop_nodes_bwd,
+            )
+            reward_fwd = self._apply_potential_shaping(
+                reward=reward_fwd,
+                question_tokens=graph_fwd["question_tokens"],
+                state_vec_seq=state_vec_seq,
+                stats=stats_fwd,
+                shaping_weight=shaping_weight,
+            )
+        log_reward = reward_fwd.log_reward + reward_bwd.log_reward
         log_f_start = self._gather_log_f_start(
             log_f_nodes=graph_fwd["log_f_nodes"],
             start_nodes=stop_nodes_bwd,
         )
         return _TBBackwardInputs(
             log_pf_steps=log_pf_steps, log_pb_steps=log_pb_steps, stats_fwd=stats_fwd, reward_fwd=reward_fwd,
-            success_mask=success_mask, log_f_start=log_f_start, stats_bwd=stats_bwd, bwd_diag=bwd_diag, fwd_diag=fwd_diag,
+            log_reward=log_reward, success_mask=success_mask, log_f_start=log_f_start, stats_bwd=stats_bwd,
+            bwd_diag=bwd_diag, fwd_diag=fwd_diag,
         )
 
     def _finalize_tb_backward_terms(
@@ -1590,12 +1731,12 @@ class GFlowNetModule(LightningModule):
             log_f_start=inputs.log_f_start,
             log_pf_steps=inputs.log_pf_steps,
             log_pb_steps=inputs.log_pb_steps,
-            log_reward=inputs.reward_fwd.log_reward,
+            log_reward=inputs.log_reward,
             stats=inputs.stats_fwd,
             graph_mask=graph_mask,
             diag_spec=diag_spec,
         )
-        weight = inputs.success_mask.to(dtype=loss_per_graph.dtype)
+        weight = graph_mask.to(dtype=loss_per_graph.dtype)
         weight, success_mask = self._apply_zero_hop_mask(
             num_moves=inputs.stats_fwd.num_moves,
             weight=weight,
@@ -1631,13 +1772,16 @@ class GFlowNetModule(LightningModule):
         graph_bwd: dict[str, torch.Tensor],
         graph_mask: torch.Tensor,
         node_is_answer: torch.Tensor,
+        shaping_weight: float,
     ) -> _TBForwardInputs:
-        actions_fwd, log_pf_steps, stats_fwd, stop_nodes_fwd, reward_fwd, success_mask, fwd_diag = (
+        actions_fwd, log_pf_steps, stats_fwd, stop_nodes_fwd, reward_fwd, success_mask, fwd_diag, _ = (
             self._rollout_forward_trajectory(
                 prepared=prepared,
                 graph_fwd=graph_fwd,
                 node_is_answer=node_is_answer,
                 graph_mask=graph_mask,
+                record_state=shaping_weight > float(_ZERO),
+                shaping_weight=shaping_weight,
             )
         )
         actions_bwd, stats_bwd, log_pb_steps, bwd_diag = self._compute_backward_terms_from_forward(
@@ -1725,9 +1869,10 @@ class GFlowNetModule(LightningModule):
         graph_mask: torch.Tensor,
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
-        mining_temperature: float,
+        policy_temperature: float,
         allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
+        shaping_weight: float,
     ) -> _TBViewTerms:
         inputs = self._compute_tb_backward_inputs(
             prepared=prepared,
@@ -1736,7 +1881,8 @@ class GFlowNetModule(LightningModule):
             graph_mask=graph_mask,
             node_is_answer=node_is_answer,
             node_is_question=node_is_question,
-            mining_temperature=mining_temperature,
+            policy_temperature=policy_temperature,
+            shaping_weight=shaping_weight,
         )
         return self._finalize_tb_backward_terms(
             inputs=inputs,
@@ -1752,6 +1898,8 @@ class GFlowNetModule(LightningModule):
         graph_fwd: dict[str, torch.Tensor],
         node_is_answer: torch.Tensor,
         graph_mask: torch.Tensor,
+        record_state: bool,
+        shaping_weight: float,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1760,12 +1908,14 @@ class GFlowNetModule(LightningModule):
         RewardOutput,
         torch.Tensor,
         Optional[RolloutDiagnostics],
+        Optional[torch.Tensor],
     ]:
         rollout_fwd = self.actor.rollout(
             graph=graph_fwd,
             temperature=None,
             record_actions=True,
             record_diagnostics=True,
+            record_state=record_state,
             max_steps_override=None,
             mode="forward",
             init_node_locals=graph_fwd["start_node_locals"],
@@ -1774,6 +1924,7 @@ class GFlowNetModule(LightningModule):
         actions_fwd = rollout_fwd.actions_seq
         if actions_fwd is None:
             raise RuntimeError("actor.rollout must return actions_seq when record_actions=True.")
+        state_vec_seq = rollout_fwd.state_vec_seq
         stats_fwd = derive_trajectory(actions_seq=actions_fwd, stop_value=STOP_RELATION)
         state_nodes_fwd = self._build_state_nodes(
             actions=actions_fwd,
@@ -1787,6 +1938,22 @@ class GFlowNetModule(LightningModule):
             stop_idx=stats_fwd.stop_idx,
             node_is_target=node_is_answer,
         )
+        if shaping_weight > float(_ZERO):
+            if state_vec_seq is None:
+                state_vec_seq = self._encode_state_sequence(
+                    actor=self.actor,
+                    graph=graph_fwd,
+                    actions=actions_fwd,
+                    stats=stats_fwd,
+                    start_nodes=graph_fwd["start_node_locals"],
+                )
+            reward_fwd = self._apply_potential_shaping(
+                reward=reward_fwd,
+                question_tokens=graph_fwd["question_tokens"],
+                state_vec_seq=state_vec_seq,
+                stats=stats_fwd,
+                shaping_weight=shaping_weight,
+            )
         success_mask = reward_fwd.success & graph_mask
         return (
             actions_fwd,
@@ -1796,6 +1963,7 @@ class GFlowNetModule(LightningModule):
             reward_fwd,
             success_mask,
             rollout_fwd.diagnostics,
+            rollout_fwd.state_vec_seq,
         )
 
     def _compute_backward_terms_from_forward(
@@ -1838,6 +2006,7 @@ class GFlowNetModule(LightningModule):
         node_is_question: torch.Tensor,
         allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
+        shaping_weight: float,
     ) -> _TBViewTerms:
         inputs = self._compute_tb_forward_inputs(
             prepared=prepared,
@@ -1845,6 +2014,7 @@ class GFlowNetModule(LightningModule):
             graph_bwd=graph_bwd,
             graph_mask=graph_mask,
             node_is_answer=node_is_answer,
+            shaping_weight=shaping_weight,
         )
         return self._finalize_tb_forward_terms(
             inputs=inputs,
@@ -1901,9 +2071,10 @@ class GFlowNetModule(LightningModule):
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
         num_rollouts: int,
-        mining_temperature: float,
+        policy_temperature: float,
         allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
+        shaping_weight: float,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         loss_num = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_den = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1917,12 +2088,19 @@ class GFlowNetModule(LightningModule):
                 graph_mask=graph_mask,
                 node_is_answer=node_is_answer,
                 node_is_question=node_is_question,
-                mining_temperature=mining_temperature,
+                policy_temperature=policy_temperature,
                 allow_zero_hop=allow_zero_hop,
                 diag_spec=diag_spec,
+                shaping_weight=shaping_weight,
             )
-            loss_num = loss_num + (terms.loss_per_graph * terms.weight_mask).sum()
-            loss_den = loss_den + terms.weight_mask.sum()
+            loss_per_graph = terms.loss_per_graph
+            weight_mask = terms.weight_mask
+            if not torch.isfinite(loss_per_graph).all().detach().tolist():
+                finite = torch.isfinite(loss_per_graph)
+                loss_per_graph = torch.where(finite, loss_per_graph, torch.zeros_like(loss_per_graph))
+                weight_mask = torch.where(finite, weight_mask, torch.zeros_like(weight_mask))
+            loss_num = loss_num + (loss_per_graph * weight_mask).sum()
+            loss_den = loss_den + weight_mask.sum()
             success_total = success_total + terms.success_mask.to(dtype=loss_num.dtype).sum()
             diag_total = self._merge_metric_totals(diag_total, terms.diag)
         metrics = self._finalize_tb_view_metrics(
@@ -1947,6 +2125,7 @@ class GFlowNetModule(LightningModule):
         num_rollouts: int,
         allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
+        shaping_weight: float,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         loss_num = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_den = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1962,9 +2141,16 @@ class GFlowNetModule(LightningModule):
                 node_is_question=node_is_question,
                 allow_zero_hop=allow_zero_hop,
                 diag_spec=diag_spec,
+                shaping_weight=shaping_weight,
             )
-            loss_num = loss_num + (terms.loss_per_graph * terms.weight_mask).sum()
-            loss_den = loss_den + terms.weight_mask.sum()
+            loss_per_graph = terms.loss_per_graph
+            weight_mask = terms.weight_mask
+            if not torch.isfinite(loss_per_graph).all().detach().tolist():
+                finite = torch.isfinite(loss_per_graph)
+                loss_per_graph = torch.where(finite, loss_per_graph, torch.zeros_like(loss_per_graph))
+                weight_mask = torch.where(finite, weight_mask, torch.zeros_like(weight_mask))
+            loss_num = loss_num + (loss_per_graph * weight_mask).sum()
+            loss_den = loss_den + weight_mask.sum()
             success_total = success_total + terms.success_mask.to(dtype=loss_num.dtype).sum()
             diag_total = self._merge_metric_totals(diag_total, terms.diag)
         metrics = self._finalize_tb_view_metrics(
@@ -1975,7 +2161,8 @@ class GFlowNetModule(LightningModule):
             success_total=success_total,
             diag_total=diag_total,
         )
-        return loss_num, loss_den, self._apply_metric_prefix(metrics, "fwd_")
+        metrics = self._apply_metric_prefix(metrics, "fwd_")
+        return loss_num, loss_den, metrics
 
     def _compute_tb_training_loss(
         self,
@@ -1988,10 +2175,11 @@ class GFlowNetModule(LightningModule):
         node_is_question: torch.Tensor,
         num_miner_rollouts: int,
         num_forward_rollouts: int,
-        mining_temperature: float,
+        policy_temperature: float,
         allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        shaping_weight = self._resolve_shaping_weight()
         bwd_num, bwd_den, bwd_metrics = self._compute_tb_backward_view_loss(
             prepared=prepared,
             graph_fwd=graph_fwd,
@@ -2000,9 +2188,10 @@ class GFlowNetModule(LightningModule):
             node_is_answer=node_is_answer,
             node_is_question=node_is_question,
             num_rollouts=num_miner_rollouts,
-            mining_temperature=mining_temperature,
+            policy_temperature=policy_temperature,
             allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
+            shaping_weight=shaping_weight,
         )
         fwd_num, fwd_den, fwd_metrics = self._compute_tb_forward_view_loss(
             prepared=prepared,
@@ -2014,13 +2203,16 @@ class GFlowNetModule(LightningModule):
             num_rollouts=num_forward_rollouts,
             allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
+            shaping_weight=shaping_weight,
         )
         loss_num = bwd_num + fwd_num
         loss_den = bwd_den + fwd_den
-        loss = torch.where(loss_den > float(_ZERO), loss_num / loss_den, torch.zeros_like(loss_num))
+        tb_loss = torch.where(loss_den > float(_ZERO), loss_num / loss_den, torch.zeros_like(loss_num))
+        loss = tb_loss
         metrics = {"loss_num": loss_num.detach(), "loss_den": loss_den.detach()}
         metrics.update(bwd_metrics)
         metrics.update(fwd_metrics)
+        metrics["shaping_weight"] = torch.tensor(float(shaping_weight), device=loss_num.device, dtype=torch.float32)
         return loss, metrics
 
     @staticmethod
@@ -2044,9 +2236,9 @@ class GFlowNetModule(LightningModule):
         num_forward_rollouts = int(self.training_cfg.get("num_forward_rollouts", num_miner_rollouts))
         if num_forward_rollouts <= _ZERO:
             raise ValueError("training_cfg.num_forward_rollouts must be > 0.")
-        mining_temperature = self._resolve_mining_temperature()
+        policy_temperature = float(self.actor.policy_temperature.detach().item())
         allow_zero_hop = self._resolve_allow_zero_hop()
-        return num_miner_rollouts, num_forward_rollouts, mining_temperature, allow_zero_hop
+        return num_miner_rollouts, num_forward_rollouts, policy_temperature, allow_zero_hop
 
     def _build_training_graphs(
         self,
@@ -2101,7 +2293,7 @@ class GFlowNetModule(LightningModule):
         metrics: dict[str, torch.Tensor],
         *,
         prepared: _PreparedBatch,
-        mining_temperature: float,
+        policy_temperature: float,
     ) -> dict[str, torch.Tensor]:
         edge_counts = (prepared.edge_ptr[_ONE:] - prepared.edge_ptr[:-_ONE]).to(dtype=torch.float32)
         node_counts = (prepared.node_ptr[_ONE:] - prepared.node_ptr[:-_ONE]).to(dtype=torch.float32)
@@ -2114,7 +2306,7 @@ class GFlowNetModule(LightningModule):
                 "edges_per_graph_mean": edge_counts.mean(),
                 "nodes_per_graph_mean": node_counts.mean(),
                 "inverse_edge_ratio": inverse_edge_ratio,
-                "mining_temperature": torch.tensor(mining_temperature, device=edge_counts.device, dtype=torch.float32),
+                "policy_temperature": torch.tensor(policy_temperature, device=edge_counts.device, dtype=torch.float32),
             }
         )
         return metrics
@@ -2125,7 +2317,7 @@ class GFlowNetModule(LightningModule):
         graph_mask, node_is_answer, node_is_question, edge_policy_forward, edge_policy_backward = self._compute_graph_masks(
             prepared
         )
-        num_miner_rollouts, num_forward_rollouts, mining_temperature, allow_zero_hop = self._resolve_training_specs()
+        num_miner_rollouts, num_forward_rollouts, policy_temperature, allow_zero_hop = self._resolve_training_specs()
         diag_spec = self._resolve_tb_diag_spec()
         graph_fwd, graph_bwd = self._build_training_graphs(
             prepared=prepared,
@@ -2144,14 +2336,14 @@ class GFlowNetModule(LightningModule):
             node_is_question=node_is_question,
             num_miner_rollouts=num_miner_rollouts,
             num_forward_rollouts=num_forward_rollouts,
-            mining_temperature=mining_temperature,
+            policy_temperature=policy_temperature,
             allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
         )
         metrics = self._augment_training_metrics(
             metrics,
             prepared=prepared,
-            mining_temperature=mining_temperature,
+            policy_temperature=policy_temperature,
         )
         return loss, metrics
 

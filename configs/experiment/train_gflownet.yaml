@@ -11,18 +11,12 @@ defaults:
 
 task_name: "eb_gfn_train"
 tags: ["gflownet", "energy"]
-train: true
-test: true
-ckpt_path: null
-seed: 42
 optimized_metric: "val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}"
 
 trainer:
   check_val_every_n_epoch: 5
   precision: 32
 
-data:
-  expand_multi_answer: false
 
 model:
   env:
@@ -49,20 +43,8 @@ model:
   actor_cfg:
     policy_temperature: 1.2
 
-  backward_cfg:
-    share_state_encoder: false
-    share_edge_scorer: false
-
   training_cfg:
-    num_train_rollouts: 0
-    num_miner_rollouts: 8
-    num_forward_rollouts: 8
-    mining_temperature: 1.2
     accumulate_grad_batches: 4
-    allow_zero_hop: true
-    tb:
-      log_prob_min: -20.0
-      delta_max: 20.0
 
 callbacks:
   model_checkpoint:

@@ -9,7 +9,6 @@ emb_dim: 1024
 backbone_finetune: true
 inverse_relation_suffix: "__inv"
 state_cfg:
-  state_dim: ${model.hidden_dim}
   dropout: 0.0
 cvt_init_cfg:
   enabled: true
@@ -26,6 +25,10 @@ reward_fn:
 actor_cfg:
   policy_temperature: 1.0
   stop_bias_init: null
+  h_transform_bias: 0.5
+  h_transform_clip: 10.0
+  direction_embedding: false
+  direction_embedding_scale: 1.0
 
 backward_cfg:
   share_state_encoder: false
@@ -34,11 +37,6 @@ backward_cfg:
 runtime_cfg:
   validate_edge_batch: false
   cache_action_keys: true
-
-logging_cfg:
-  train_prog_bar: []
-  eval_prog_bar: []
-  log_on_step_train: false
 
 optimizer_cfg:
   type: adamw
@@ -50,12 +48,14 @@ scheduler_cfg:
   type: ""
 
 training_cfg:
-  num_train_rollouts: 0
   num_miner_rollouts: 8
   num_forward_rollouts: 8
-  mining_temperature: 1.2
   accumulate_grad_batches: 1
   allow_zero_hop: true
+  shaping:
+    weight: 0.1
+    anneal_steps: 20000
+    anneal_start_step: 0
   tb:
     log_prob_min: -20.0
     delta_max: 20.0

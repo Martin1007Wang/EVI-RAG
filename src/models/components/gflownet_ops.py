@@ -181,7 +181,6 @@ def compute_forward_log_probs(
     edge_batch: torch.Tensor,
     num_graphs: int,
     temperature: Union[float, torch.Tensor],
-    edge_guidance: Optional[torch.Tensor],
     edge_valid_mask: torch.Tensor,
 ) -> PolicyLogProbs:
     if num_graphs <= _ZERO:
@@ -189,9 +188,6 @@ def compute_forward_log_probs(
         empty_stop = stop_logits.new_empty((_ZERO,))
         empty_bool = stop_logits.new_empty((_ZERO,), dtype=torch.bool)
         return PolicyLogProbs(edge=empty_edge, stop=empty_stop, not_stop=empty_stop, has_edge=empty_bool)
-    if edge_guidance is not None:
-        edge_guidance = edge_guidance.view(-1)
-        edge_scores = edge_scores + edge_guidance
     temp = _coerce_temperature(temperature, edge_scores)
     edge_logits = edge_scores / temp
     stop_logits = stop_logits / temp
@@ -233,6 +229,28 @@ class OutgoingEdges:
     edge_batch: torch.Tensor
     edge_counts: torch.Tensor
     has_edge: torch.Tensor
+
+
+def apply_edge_policy_mask(
+    *,
+    outgoing: OutgoingEdges,
+    edge_policy_mask: torch.Tensor,
+    num_graphs: int,
+) -> OutgoingEdges:
+    if outgoing.edge_ids.numel() == _ZERO:
+        return outgoing
+    edge_policy_mask = edge_policy_mask.to(device=outgoing.edge_ids.device, dtype=torch.bool).view(-1)
+    keep = edge_policy_mask.index_select(0, outgoing.edge_ids)
+    edge_ids = outgoing.edge_ids[keep]
+    edge_batch = outgoing.edge_batch[keep]
+    if edge_ids.numel() == _ZERO:
+        empty = edge_ids.new_empty((_ZERO,))
+        edge_counts = edge_ids.new_zeros((num_graphs,))
+        has_edge = edge_ids.new_zeros((num_graphs,), dtype=torch.bool)
+        return OutgoingEdges(edge_ids=empty, edge_batch=empty, edge_counts=edge_counts, has_edge=has_edge)
+    edge_counts = torch.bincount(edge_batch, minlength=num_graphs)
+    has_edge = edge_counts > _ZERO
+    return OutgoingEdges(edge_ids=edge_ids, edge_batch=edge_batch, edge_counts=edge_counts, has_edge=has_edge)
 
 
 def gather_outgoing_edges(

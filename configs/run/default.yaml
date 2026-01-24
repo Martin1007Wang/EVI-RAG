@@ -4,9 +4,6 @@ tags: []
 split: test
 run_all_splits: false
 splits: [train, validation, test]
-start_keep_ratio: 0.25
-start_min_edges: 1
-start_max_edges: null
 ckpt_path: null
 dataset_variants: null
 dataset_variant: null
