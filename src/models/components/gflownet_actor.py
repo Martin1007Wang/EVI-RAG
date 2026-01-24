@@ -36,10 +36,6 @@ _DEFAULT_CONTEXT_MODE = _CONTEXT_QUESTION_START
 _FLOW_MODES = {"forward", "backward"}
 _DEFAULT_H_TRANSFORM_BIAS = 1.0
 _DEFAULT_H_TRANSFORM_CLIP = 0.0
-_DEFAULT_DIRECTION_EMBEDDING = False
-_DEFAULT_DIRECTION_EMB_SCALE = 1.0
-_DIRECTION_ID_FORWARD = 0
-_DIRECTION_ID_BACKWARD = 1
 
 
 @dataclass(frozen=True)
@@ -92,8 +88,6 @@ class GFlowNetActor(nn.Module):
         default_mode: str = "forward",
         h_transform_bias: Optional[float] = None,
         h_transform_clip: Optional[float] = None,
-        direction_embedding: Optional[bool] = None,
-        direction_embedding_scale: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.env = env
@@ -124,16 +118,6 @@ class GFlowNetActor(nn.Module):
                 self.stop_head.bias.fill_(float(stop_bias_init))
         self.max_steps = int(max_steps)
         self.policy_temperature = nn.Parameter(torch.tensor(float(policy_temperature), dtype=torch.float32))
-        direction_enabled = _DEFAULT_DIRECTION_EMBEDDING if direction_embedding is None else bool(direction_embedding)
-        if direction_enabled:
-            self.direction_embed = nn.Embedding(len(_FLOW_MODES), int(agent.hidden_dim))
-            scale = _DEFAULT_DIRECTION_EMB_SCALE if direction_embedding_scale is None else float(direction_embedding_scale)
-            if scale < float(_ZERO):
-                raise ValueError("direction_embedding_scale must be >= 0.")
-            self.direction_scale = scale
-        else:
-            self.direction_embed = None
-            self.direction_scale = float(_ZERO)
 
     def rollout(
         self,
@@ -192,18 +176,6 @@ class GFlowNetActor(nn.Module):
 
     def resolve_temperature(self, temperature: Optional[Union[float, torch.Tensor]]) -> tuple[torch.Tensor, bool]:
         return self._resolve_temperature(temperature)
-
-    def condition_question_tokens(self, question_tokens: torch.Tensor) -> torch.Tensor:
-        if self.direction_embed is None:
-            return question_tokens
-        direction_id = _DIRECTION_ID_FORWARD if self.default_mode == "forward" else _DIRECTION_ID_BACKWARD
-        dir_vec = self.direction_embed.weight[direction_id].to(device=question_tokens.device, dtype=question_tokens.dtype)
-        scale = float(self.direction_scale)
-        if question_tokens.dim() == _TWO:
-            return question_tokens + dir_vec.view(1, -1) * scale
-        if question_tokens.dim() == 3:
-            return question_tokens + dir_vec.view(1, 1, -1) * scale
-        raise ValueError("question_tokens must be [B, H] or [B, 1, H] for direction conditioning.")
 
     def _resolve_temperature(self, temperature: Optional[Union[float, torch.Tensor]]) -> tuple[torch.Tensor, bool]:
         if temperature is None:
@@ -665,7 +637,6 @@ class GFlowNetActor(nn.Module):
         edge_batch: torch.Tensor,
         edge_ids: torch.Tensor,
         graph: dict[str, torch.Tensor],
-        detach_agent: bool = False,
     ) -> torch.Tensor:
         if edge_ids.numel() == _ZERO:
             return edge_ids.new_empty((_ZERO,))
@@ -674,7 +645,6 @@ class GFlowNetActor(nn.Module):
             action_keys=action_keys,
             edge_batch=edge_batch,
             edge_ids=edge_ids,
-            detach_agent=detach_agent,
         )
         flow_scores = self._compute_flow_scores(graph=graph, edge_ids=edge_ids)
         return prior_scores + flow_scores * float(self.h_transform_bias)
@@ -686,7 +656,6 @@ class GFlowNetActor(nn.Module):
         action_keys: torch.Tensor,
         edge_batch: torch.Tensor,
         edge_ids: torch.Tensor,
-        detach_agent: bool,
     ) -> torch.Tensor:
         scores = self.agent.score_cached(
             hidden=state_vec,
@@ -694,7 +663,7 @@ class GFlowNetActor(nn.Module):
             edge_batch=edge_batch,
             edge_ids=edge_ids,
         )
-        return scores.detach() if detach_agent else scores
+        return scores
 
     def _compute_flow_scores(self, *, graph: dict[str, torch.Tensor], edge_ids: torch.Tensor) -> torch.Tensor:
         log_f_nodes = graph.get("log_f_nodes")

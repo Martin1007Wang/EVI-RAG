@@ -55,11 +55,6 @@ _DEFAULT_VALIDATE_EDGE_BATCH = False
 
 _DEFAULT_TB_LOG_PROB_MIN = -20.0
 _DEFAULT_TB_DELTA_MAX = 20.0
-_DEFAULT_ALLOW_ZERO_HOP = False
-_DEFAULT_SHAPING_WEIGHT = 0.0
-_DEFAULT_SHAPING_EPS = 1.0e-6
-_DEFAULT_SHAPING_ANNEAL_STEPS = 0
-_DEFAULT_SHAPING_ANNEAL_START = 0
 
 _EDGE_INV_PREVIEW = 5
 
@@ -159,7 +154,6 @@ class GFlowNetModule(LightningModule):
         state_cfg: Optional[Mapping[str, Any]] = None,
         cvt_init_cfg: Optional[Mapping[str, Any]] = None,
         flow_cfg: Optional[Mapping[str, Any]] = None,
-        backward_cfg: Optional[Mapping[str, Any]] = None,
         training_cfg: Mapping[str, Any] = None,
         evaluation_cfg: Mapping[str, Any] = None,
         actor_cfg: Optional[Mapping[str, Any]] = None,
@@ -184,7 +178,6 @@ class GFlowNetModule(LightningModule):
         self.state_cfg = state_cfg or {}
         self.cvt_init_cfg = cvt_init_cfg or {}
         self.flow_cfg = flow_cfg or {}
-        self.backward_cfg = backward_cfg or {}
         self.runtime_cfg = runtime_cfg or {}
         self.optimizer_cfg = optimizer_cfg or {}
         self.scheduler_cfg = scheduler_cfg or {}
@@ -230,14 +223,7 @@ class GFlowNetModule(LightningModule):
 
     def _init_agents(self) -> None:
         self.agent = self._build_agent(cfg=self.state_cfg, name="state_cfg")
-        share_state = bool(self.backward_cfg.get("share_state_encoder", False))
-        share_edge = bool(self.backward_cfg.get("share_edge_scorer", False))
-        if share_state != share_edge:
-            raise ValueError("backward_cfg.share_state_encoder/share_edge_scorer must match for TrajectoryAgent.")
-        if share_state and share_edge:
-            self.agent_backward = self.agent
-        else:
-            self.agent_backward = self._build_agent(cfg=self.state_cfg, name="backward_cfg.state_cfg")
+        self.agent_backward = self.agent
 
     def _resolve_agent_hidden_dim(self, *, cfg: Mapping[str, Any], name: str) -> int:
         raw_state_dim = cfg.get("state_dim", None)
@@ -252,8 +238,6 @@ class GFlowNetModule(LightningModule):
         return int(self.hidden_dim)
 
     def _init_actors(self) -> None:
-        if "score_mode" in self.actor_cfg:
-            raise ValueError("actor_cfg.score_mode is no longer supported; use agent prior + h_transform only.")
         policy_temperature = float(self.actor_cfg.get("policy_temperature", 1.0))
         stop_bias_raw = self.actor_cfg.get("stop_bias_init")
         stop_bias_init = None if stop_bias_raw is None else float(stop_bias_raw)
@@ -263,12 +247,6 @@ class GFlowNetModule(LightningModule):
         h_transform_clip = self.actor_cfg.get("h_transform_clip")
         if h_transform_clip is not None:
             h_transform_clip = float(h_transform_clip)
-        direction_embedding = self.actor_cfg.get("direction_embedding")
-        if direction_embedding is not None:
-            direction_embedding = bool(direction_embedding)
-        direction_embedding_scale = self.actor_cfg.get("direction_embedding_scale")
-        if direction_embedding_scale is not None:
-            direction_embedding_scale = float(direction_embedding_scale)
         self.actor = GFlowNetActor(
             env=self.env,
             agent=self.agent,
@@ -279,8 +257,6 @@ class GFlowNetModule(LightningModule):
             default_mode="forward",
             h_transform_bias=h_transform_bias,
             h_transform_clip=h_transform_clip,
-            direction_embedding=direction_embedding,
-            direction_embedding_scale=direction_embedding_scale,
         )
         self.actor_backward = GFlowNetActor(
             env=self.env,
@@ -292,8 +268,6 @@ class GFlowNetModule(LightningModule):
             default_mode="backward",
             h_transform_bias=h_transform_bias,
             h_transform_clip=h_transform_clip,
-            direction_embedding=direction_embedding,
-            direction_embedding_scale=direction_embedding_scale,
         )
 
     def _init_flow_predictors(self) -> None:
@@ -306,8 +280,6 @@ class GFlowNetModule(LightningModule):
             "num_miner_rollouts",
             "num_forward_rollouts",
             "accumulate_grad_batches",
-            "allow_zero_hop",
-            "shaping",
             "tb",
         }
         extra_training = set(self.training_cfg.keys()) - allowed_training
@@ -330,14 +302,12 @@ class GFlowNetModule(LightningModule):
                 "reward_fn",
                 "env",
                 "log_f",
-                "log_f_backward",
                 "training_cfg",
                 "evaluation_cfg",
                 "actor_cfg",
                 "state_cfg",
                 "cvt_init_cfg",
                 "flow_cfg",
-                "backward_cfg",
                 "runtime_cfg",
                 "optimizer_cfg",
                 "scheduler_cfg",
@@ -887,30 +857,6 @@ class GFlowNetModule(LightningModule):
             delta_max=delta_max,
         )
 
-    def _resolve_allow_zero_hop(self) -> bool:
-        return bool(self.training_cfg.get("allow_zero_hop", _DEFAULT_ALLOW_ZERO_HOP))
-
-    def _resolve_shaping_weight(self) -> float:
-        shaping_cfg = self.training_cfg.get("shaping") or {}
-        if not isinstance(shaping_cfg, Mapping):
-            return float(_DEFAULT_SHAPING_WEIGHT)
-        enabled = shaping_cfg.get("enabled", True)
-        if enabled is not None and not bool(enabled):
-            return float(_ZERO)
-        weight = float(shaping_cfg.get("weight", _DEFAULT_SHAPING_WEIGHT))
-        if weight < float(_ZERO):
-            raise ValueError("training_cfg.shaping.weight must be >= 0.")
-        anneal_steps = int(shaping_cfg.get("anneal_steps", _DEFAULT_SHAPING_ANNEAL_STEPS))
-        anneal_start = int(shaping_cfg.get("anneal_start_step", _DEFAULT_SHAPING_ANNEAL_START))
-        if anneal_steps <= _ZERO:
-            return weight
-        step = int(getattr(self, "global_step", _ZERO))
-        if step < anneal_start:
-            return weight
-        progress = (step - anneal_start) / float(anneal_steps)
-        factor = max(float(_ZERO), float(_ONE) - float(progress))
-        return weight * factor
-
     @staticmethod
     def _resolve_action_keys_from_graph(*, actor: GFlowNetActor, graph: dict[str, torch.Tensor]) -> torch.Tensor:
         action_keys = graph.get("action_keys_shared")
@@ -981,77 +927,6 @@ class GFlowNetModule(LightningModule):
             return OutgoingEdges(edge_ids=empty, edge_batch=empty, edge_counts=edge_counts, has_edge=has_edge)
         return apply_edge_policy_mask(outgoing=outgoing, edge_policy_mask=policy_mask, num_graphs=num_graphs)
 
-    @staticmethod
-    def _compute_cosine_potential(
-        *,
-        question_tokens: torch.Tensor,
-        state_vec_seq: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        if state_vec_seq.dim() != 3:
-            raise ValueError("state_vec_seq must be [B, T, H] for potential shaping.")
-        batch = int(state_vec_seq.size(0))
-        if question_tokens.dim() < 2:
-            raise ValueError("question_tokens must be at least [B, H] for potential shaping.")
-        q_tokens = question_tokens.to(device=state_vec_seq.device, dtype=state_vec_seq.dtype).reshape(batch, -1)
-        if q_tokens.size(0) != batch:
-            raise ValueError("question_tokens batch mismatch with state_vec_seq.")
-        if q_tokens.size(1) != state_vec_seq.size(2):
-            raise ValueError("question_tokens hidden dim mismatch with state_vec_seq.")
-        q_norm = torch.linalg.norm(q_tokens, dim=1).clamp(min=eps)
-        s_norm = torch.linalg.norm(state_vec_seq, dim=2).clamp(min=eps)
-        dot = (state_vec_seq * q_tokens.unsqueeze(1)).sum(dim=2)
-        denom = q_norm.unsqueeze(1) * s_norm
-        return dot / denom
-
-    @classmethod
-    def _compute_potential_shaping_sum(
-        cls,
-        *,
-        question_tokens: torch.Tensor,
-        state_vec_seq: torch.Tensor,
-        move_mask: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        phi = cls._compute_cosine_potential(
-            question_tokens=question_tokens,
-            state_vec_seq=state_vec_seq,
-            eps=eps,
-        )
-        if phi.shape != move_mask.shape:
-            raise ValueError("Potential shaping phi/move_mask shape mismatch.")
-        if phi.size(1) <= _ZERO:
-            return phi.new_zeros((phi.size(0),))
-        delta = phi[:, 1:] - phi[:, :-1]
-        pad = delta.new_zeros((delta.size(0), _ONE))
-        delta_steps = torch.cat((delta, pad), dim=1)
-        mask = move_mask.to(device=delta_steps.device, dtype=delta_steps.dtype)
-        return (delta_steps * mask).sum(dim=1)
-
-    def _apply_potential_shaping(
-        self,
-        *,
-        reward: RewardOutput,
-        question_tokens: torch.Tensor,
-        state_vec_seq: torch.Tensor,
-        stats: Any,
-        shaping_weight: float,
-    ) -> RewardOutput:
-        if shaping_weight <= float(_ZERO):
-            return reward
-        question_tokens = question_tokens.detach()
-        state_vec_seq = state_vec_seq.detach()
-        shaping_sum = self._compute_potential_shaping_sum(
-            question_tokens=question_tokens,
-            state_vec_seq=state_vec_seq,
-            move_mask=stats.move_mask,
-            eps=float(_DEFAULT_SHAPING_EPS),
-        )
-        log_reward = reward.log_reward + shaping_sum.to(dtype=reward.log_reward.dtype) * float(shaping_weight)
-        return RewardOutput(
-            log_reward=log_reward,
-            success=reward.success,
-        )
 
     @staticmethod
     def _reverse_steps(*, steps: torch.Tensor, stop_idx: torch.Tensor, fill_value: float) -> torch.Tensor:
@@ -1073,19 +948,18 @@ class GFlowNetModule(LightningModule):
         return torch.where(mask, gathered, fill)
 
     @staticmethod
-    def _apply_zero_hop_mask(
+    def _assert_no_zero_hop(
         *,
         num_moves: torch.Tensor,
-        weight: torch.Tensor,
-        success_mask: torch.Tensor,
-        allow_zero_hop: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        zero_hop = num_moves.to(device=weight.device) == _ZERO
-        if allow_zero_hop:
-            return weight, success_mask
-        weight = torch.where(zero_hop, torch.zeros_like(weight), weight)
-        success_mask = success_mask & (~zero_hop)
-        return weight, success_mask
+        graph_mask: torch.Tensor,
+        context: str,
+    ) -> None:
+        graph_mask = graph_mask.to(device=num_moves.device, dtype=torch.bool)
+        zero_hop = (num_moves == _ZERO) & graph_mask
+        if bool(zero_hop.any().detach().tolist()):
+            count = int(zero_hop.sum().detach().tolist())
+            raise ValueError(f"Zero-hop trajectories detected in {context} rollout ({count} graphs).")
+
 
     def _compute_log_pb_forward(
         self,
@@ -1386,7 +1260,6 @@ class GFlowNetModule(LightningModule):
         log_f_nodes: torch.Tensor,
         actor: GFlowNetActor,
     ) -> dict[str, torch.Tensor]:
-        question_tokens = actor.condition_question_tokens(question_tokens)
         graph: dict[str, torch.Tensor] = {
             "node_ptr": prepared.node_ptr,
             "edge_index": prepared.edge_index,
@@ -1651,7 +1524,6 @@ class GFlowNetModule(LightningModule):
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
         policy_temperature: float,
-        shaping_weight: float,
     ) -> _TBBackwardInputs:
         actions_bwd, stats_bwd, start_bwd_nodes, stop_nodes_bwd, success_mask, bwd_diag, graph_bwd_rollout = (
             self._rollout_backward_trajectory(
@@ -1682,33 +1554,7 @@ class GFlowNetModule(LightningModule):
             stop_idx=stats_fwd.stop_idx,
             node_is_target=node_is_answer,
         )
-        state_nodes_bwd = self._build_state_nodes(
-            actions=actions_bwd,
-            edge_index=prepared.edge_index,
-            start_nodes=start_bwd_nodes,
-        )
-        reward_bwd = self._compute_reward_from_states(
-            prepared=prepared,
-            state_nodes=state_nodes_bwd,
-            stop_idx=stats_bwd.stop_idx,
-            node_is_target=node_is_question,
-        )
-        if shaping_weight > float(_ZERO):
-            state_vec_seq = self._encode_state_sequence(
-                actor=self.actor,
-                graph=graph_fwd,
-                actions=reflected,
-                stats=stats_fwd,
-                start_nodes=stop_nodes_bwd,
-            )
-            reward_fwd = self._apply_potential_shaping(
-                reward=reward_fwd,
-                question_tokens=graph_fwd["question_tokens"],
-                state_vec_seq=state_vec_seq,
-                stats=stats_fwd,
-                shaping_weight=shaping_weight,
-            )
-        log_reward = reward_fwd.log_reward + reward_bwd.log_reward
+        log_reward = reward_fwd.log_reward
         log_f_start = self._gather_log_f_start(
             log_f_nodes=graph_fwd["log_f_nodes"],
             start_nodes=stop_nodes_bwd,
@@ -1724,7 +1570,6 @@ class GFlowNetModule(LightningModule):
         *,
         inputs: _TBBackwardInputs,
         graph_mask: torch.Tensor,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
     ) -> _TBViewTerms:
         loss_per_graph, diag = self._compute_tb_loss_and_diag(
@@ -1736,13 +1581,13 @@ class GFlowNetModule(LightningModule):
             graph_mask=graph_mask,
             diag_spec=diag_spec,
         )
-        weight = graph_mask.to(dtype=loss_per_graph.dtype)
-        weight, success_mask = self._apply_zero_hop_mask(
+        self._assert_no_zero_hop(
             num_moves=inputs.stats_fwd.num_moves,
-            weight=weight,
-            success_mask=inputs.success_mask,
-            allow_zero_hop=allow_zero_hop,
+            graph_mask=graph_mask,
+            context="backward",
         )
+        weight = graph_mask.to(dtype=loss_per_graph.dtype)
+        success_mask = inputs.success_mask
         diag = self._update_stop_diagnostics(
             diag=diag,
             rollout_diag=inputs.bwd_diag,
@@ -1772,16 +1617,13 @@ class GFlowNetModule(LightningModule):
         graph_bwd: dict[str, torch.Tensor],
         graph_mask: torch.Tensor,
         node_is_answer: torch.Tensor,
-        shaping_weight: float,
     ) -> _TBForwardInputs:
-        actions_fwd, log_pf_steps, stats_fwd, stop_nodes_fwd, reward_fwd, success_mask, fwd_diag, _ = (
+        actions_fwd, log_pf_steps, stats_fwd, stop_nodes_fwd, reward_fwd, success_mask, fwd_diag = (
             self._rollout_forward_trajectory(
                 prepared=prepared,
                 graph_fwd=graph_fwd,
                 node_is_answer=node_is_answer,
                 graph_mask=graph_mask,
-                record_state=shaping_weight > float(_ZERO),
-                shaping_weight=shaping_weight,
             )
         )
         actions_bwd, stats_bwd, log_pb_steps, bwd_diag = self._compute_backward_terms_from_forward(
@@ -1807,7 +1649,6 @@ class GFlowNetModule(LightningModule):
         inputs: _TBForwardInputs,
         graph_mask: torch.Tensor,
         node_is_question: torch.Tensor,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
         prepared: _PreparedBatch,
     ) -> _TBViewTerms:
@@ -1820,13 +1661,13 @@ class GFlowNetModule(LightningModule):
             graph_mask=graph_mask,
             diag_spec=diag_spec,
         )
-        weight = graph_mask.to(dtype=loss_per_graph.dtype)
-        weight, success_mask = self._apply_zero_hop_mask(
+        self._assert_no_zero_hop(
             num_moves=inputs.stats_fwd.num_moves,
-            weight=weight,
-            success_mask=inputs.success_mask,
-            allow_zero_hop=allow_zero_hop,
+            graph_mask=graph_mask,
+            context="forward",
         )
+        weight = graph_mask.to(dtype=loss_per_graph.dtype)
+        success_mask = inputs.success_mask
         diag = self._update_stop_diagnostics(
             diag=diag,
             rollout_diag=inputs.fwd_diag,
@@ -1870,9 +1711,7 @@ class GFlowNetModule(LightningModule):
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
         policy_temperature: float,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
-        shaping_weight: float,
     ) -> _TBViewTerms:
         inputs = self._compute_tb_backward_inputs(
             prepared=prepared,
@@ -1882,12 +1721,10 @@ class GFlowNetModule(LightningModule):
             node_is_answer=node_is_answer,
             node_is_question=node_is_question,
             policy_temperature=policy_temperature,
-            shaping_weight=shaping_weight,
         )
         return self._finalize_tb_backward_terms(
             inputs=inputs,
             graph_mask=graph_mask,
-            allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
         )
 
@@ -1898,8 +1735,6 @@ class GFlowNetModule(LightningModule):
         graph_fwd: dict[str, torch.Tensor],
         node_is_answer: torch.Tensor,
         graph_mask: torch.Tensor,
-        record_state: bool,
-        shaping_weight: float,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1908,14 +1743,13 @@ class GFlowNetModule(LightningModule):
         RewardOutput,
         torch.Tensor,
         Optional[RolloutDiagnostics],
-        Optional[torch.Tensor],
     ]:
         rollout_fwd = self.actor.rollout(
             graph=graph_fwd,
             temperature=None,
             record_actions=True,
             record_diagnostics=True,
-            record_state=record_state,
+            record_state=False,
             max_steps_override=None,
             mode="forward",
             init_node_locals=graph_fwd["start_node_locals"],
@@ -1924,7 +1758,6 @@ class GFlowNetModule(LightningModule):
         actions_fwd = rollout_fwd.actions_seq
         if actions_fwd is None:
             raise RuntimeError("actor.rollout must return actions_seq when record_actions=True.")
-        state_vec_seq = rollout_fwd.state_vec_seq
         stats_fwd = derive_trajectory(actions_seq=actions_fwd, stop_value=STOP_RELATION)
         state_nodes_fwd = self._build_state_nodes(
             actions=actions_fwd,
@@ -1938,22 +1771,6 @@ class GFlowNetModule(LightningModule):
             stop_idx=stats_fwd.stop_idx,
             node_is_target=node_is_answer,
         )
-        if shaping_weight > float(_ZERO):
-            if state_vec_seq is None:
-                state_vec_seq = self._encode_state_sequence(
-                    actor=self.actor,
-                    graph=graph_fwd,
-                    actions=actions_fwd,
-                    stats=stats_fwd,
-                    start_nodes=graph_fwd["start_node_locals"],
-                )
-            reward_fwd = self._apply_potential_shaping(
-                reward=reward_fwd,
-                question_tokens=graph_fwd["question_tokens"],
-                state_vec_seq=state_vec_seq,
-                stats=stats_fwd,
-                shaping_weight=shaping_weight,
-            )
         success_mask = reward_fwd.success & graph_mask
         return (
             actions_fwd,
@@ -1963,7 +1780,6 @@ class GFlowNetModule(LightningModule):
             reward_fwd,
             success_mask,
             rollout_fwd.diagnostics,
-            rollout_fwd.state_vec_seq,
         )
 
     def _compute_backward_terms_from_forward(
@@ -2004,9 +1820,7 @@ class GFlowNetModule(LightningModule):
         graph_mask: torch.Tensor,
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
-        shaping_weight: float,
     ) -> _TBViewTerms:
         inputs = self._compute_tb_forward_inputs(
             prepared=prepared,
@@ -2014,13 +1828,11 @@ class GFlowNetModule(LightningModule):
             graph_bwd=graph_bwd,
             graph_mask=graph_mask,
             node_is_answer=node_is_answer,
-            shaping_weight=shaping_weight,
         )
         return self._finalize_tb_forward_terms(
             inputs=inputs,
             graph_mask=graph_mask,
             node_is_question=node_is_question,
-            allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
             prepared=prepared,
         )
@@ -2072,9 +1884,7 @@ class GFlowNetModule(LightningModule):
         node_is_question: torch.Tensor,
         num_rollouts: int,
         policy_temperature: float,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
-        shaping_weight: float,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         loss_num = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_den = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -2089,9 +1899,7 @@ class GFlowNetModule(LightningModule):
                 node_is_answer=node_is_answer,
                 node_is_question=node_is_question,
                 policy_temperature=policy_temperature,
-                allow_zero_hop=allow_zero_hop,
                 diag_spec=diag_spec,
-                shaping_weight=shaping_weight,
             )
             loss_per_graph = terms.loss_per_graph
             weight_mask = terms.weight_mask
@@ -2123,9 +1931,7 @@ class GFlowNetModule(LightningModule):
         node_is_answer: torch.Tensor,
         node_is_question: torch.Tensor,
         num_rollouts: int,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
-        shaping_weight: float,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         loss_num = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_den = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -2139,9 +1945,7 @@ class GFlowNetModule(LightningModule):
                 graph_mask=graph_mask,
                 node_is_answer=node_is_answer,
                 node_is_question=node_is_question,
-                allow_zero_hop=allow_zero_hop,
                 diag_spec=diag_spec,
-                shaping_weight=shaping_weight,
             )
             loss_per_graph = terms.loss_per_graph
             weight_mask = terms.weight_mask
@@ -2176,10 +1980,8 @@ class GFlowNetModule(LightningModule):
         num_miner_rollouts: int,
         num_forward_rollouts: int,
         policy_temperature: float,
-        allow_zero_hop: bool,
         diag_spec: _TBDiagSpec,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        shaping_weight = self._resolve_shaping_weight()
         bwd_num, bwd_den, bwd_metrics = self._compute_tb_backward_view_loss(
             prepared=prepared,
             graph_fwd=graph_fwd,
@@ -2189,9 +1991,7 @@ class GFlowNetModule(LightningModule):
             node_is_question=node_is_question,
             num_rollouts=num_miner_rollouts,
             policy_temperature=policy_temperature,
-            allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
-            shaping_weight=shaping_weight,
         )
         fwd_num, fwd_den, fwd_metrics = self._compute_tb_forward_view_loss(
             prepared=prepared,
@@ -2201,9 +2001,7 @@ class GFlowNetModule(LightningModule):
             node_is_answer=node_is_answer,
             node_is_question=node_is_question,
             num_rollouts=num_forward_rollouts,
-            allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
-            shaping_weight=shaping_weight,
         )
         loss_num = bwd_num + fwd_num
         loss_den = bwd_den + fwd_den
@@ -2212,7 +2010,6 @@ class GFlowNetModule(LightningModule):
         metrics = {"loss_num": loss_num.detach(), "loss_den": loss_den.detach()}
         metrics.update(bwd_metrics)
         metrics.update(fwd_metrics)
-        metrics["shaping_weight"] = torch.tensor(float(shaping_weight), device=loss_num.device, dtype=torch.float32)
         return loss, metrics
 
     @staticmethod
@@ -2229,7 +2026,7 @@ class GFlowNetModule(LightningModule):
 
     def _resolve_training_specs(
         self,
-    ) -> tuple[int, int, float, bool]:
+    ) -> tuple[int, int, float]:
         num_miner_rollouts = int(self.training_cfg.get("num_miner_rollouts", _ONE))
         if num_miner_rollouts <= _ZERO:
             raise ValueError("training_cfg.num_miner_rollouts must be > 0.")
@@ -2237,8 +2034,7 @@ class GFlowNetModule(LightningModule):
         if num_forward_rollouts <= _ZERO:
             raise ValueError("training_cfg.num_forward_rollouts must be > 0.")
         policy_temperature = float(self.actor.policy_temperature.detach().item())
-        allow_zero_hop = self._resolve_allow_zero_hop()
-        return num_miner_rollouts, num_forward_rollouts, policy_temperature, allow_zero_hop
+        return num_miner_rollouts, num_forward_rollouts, policy_temperature
 
     def _build_training_graphs(
         self,
@@ -2317,7 +2113,7 @@ class GFlowNetModule(LightningModule):
         graph_mask, node_is_answer, node_is_question, edge_policy_forward, edge_policy_backward = self._compute_graph_masks(
             prepared
         )
-        num_miner_rollouts, num_forward_rollouts, policy_temperature, allow_zero_hop = self._resolve_training_specs()
+        num_miner_rollouts, num_forward_rollouts, policy_temperature = self._resolve_training_specs()
         diag_spec = self._resolve_tb_diag_spec()
         graph_fwd, graph_bwd = self._build_training_graphs(
             prepared=prepared,
@@ -2337,7 +2133,6 @@ class GFlowNetModule(LightningModule):
             num_miner_rollouts=num_miner_rollouts,
             num_forward_rollouts=num_forward_rollouts,
             policy_temperature=policy_temperature,
-            allow_zero_hop=allow_zero_hop,
             diag_spec=diag_spec,
         )
         metrics = self._augment_training_metrics(

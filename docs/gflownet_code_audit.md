@@ -63,12 +63,10 @@
 
 `_init_agents`:
 
-- 若 `backward_cfg.share_state_encoder` 与 `share_edge_scorer` 不一致 → 抛错。
-- 若两者为 True → 正反共享同一 agent；否则单独构建 `agent_backward`。
+- 正反向强制共享同一 `TrajectoryAgent` 实例（`agent_backward = agent`）。
 
 `_init_actors`:
 
-- 若 `actor_cfg.score_mode` 存在 → 抛错（只允许 H-transform）。
 - 解析 `policy_temperature / stop_bias_init / h_transform_bias / h_transform_clip`。
 - 构造 `GFlowNetActor`（forward）与 `GFlowNetActor`（backward）。
 
@@ -79,7 +77,7 @@
 `_validate_cfg_contract`:
 
 - `training_cfg` 仅允许 {`num_train_rollouts`, `num_miner_rollouts`, `num_forward_rollouts`,
-  `accumulate_grad_batches`, `allow_zero_hop`, `shaping`, `tb`}。
+  `accumulate_grad_batches`, `tb`}。
 - `evaluation_cfg` 仅允许 {`num_eval_rollouts`, `rollout_temperature`}。
 - 多余键立即抛错。
 
@@ -207,22 +205,6 @@
 
 - `log_f_start = log_f_nodes[start_nodes]`（无效起点置 0）。
 
-### Potential Shaping（势能塑形）
-
-`_compute_cosine_potential`:
-
-- $\phi_{b,t} = \frac{\langle q_b, s_{b,t} \rangle}{\|q_b\|\cdot\|s_{b,t}\|}$，形状不匹配直接抛错。
-
-`_compute_potential_shaping_sum`:
-
-- $\Delta\phi_{b,t} = \phi_{b,t+1} - \phi_{b,t}$，末尾补 0。
-- $S_b = \sum_t \Delta\phi_{b,t}\cdot \mathbb{1}[\text{move\_mask}]$。
-
-`_apply_potential_shaping`:
-
-- `shaping_weight<=0` → 返回原 reward。
-- 否则 `log_reward' = log_reward + shaping_weight · S`。
-
 ### TB Loss 计算与诊断
 
 `_compute_tb_loss_per_graph`:
@@ -230,6 +212,7 @@
 - $\sum \log P_F = \sum_{t\le t^*} \log p_F(a_t)$
 - $\sum \log P_B = \sum_{t< t^*} \log p_B(a_t)$
 - $L = ( \log F(s_0) + \sum \log P_F - \sum \log P_B - \log R )^2$。
+- 训练阶段若出现 `num_moves==0`（zero-hop）直接抛错。
 
 `_summarize_tb_stats`:
 
@@ -443,4 +426,3 @@
 ## src/models/components/__init__.py
 
 仅做符号导出，无额外逻辑。
-
