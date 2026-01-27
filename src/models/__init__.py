@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from . import gflownet_module
-from .gflownet_module import GFlowNetModule
+from . import dual_flow_module
+from .dual_flow_module import DualFlowModule
 
-__all__ = ["GFlowNetModule", "gflownet_module"]
+__all__ = [
+    "DualFlowModule",
+    "dual_flow_module",
+]

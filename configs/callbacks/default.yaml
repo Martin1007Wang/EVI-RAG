@@ -2,7 +2,7 @@ model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch_{epoch:03d}"
-  monitor: "val/ranking/mrr"
+  monitor: "val/pass@beam"
   verbose: False
   save_last: True
   save_top_k: 1
@@ -16,7 +16,7 @@ model_checkpoint:
 
 early_stopping:
   _target_: lightning.pytorch.callbacks.EarlyStopping
-  monitor: "val/ranking/mrr"
+  monitor: "val/pass@beam"
   min_delta: 0.0
   patience: 10
   verbose: False

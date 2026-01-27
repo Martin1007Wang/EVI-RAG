@@ -3,22 +3,10 @@
 # Experiment: GFlowNet evaluation (predict + metrics + rollouts).
 
 defaults:
-  - override /data: g_retrieval
-  - override /model: gflownet_module
   - override /callbacks: gflownet_eval
   - override /logger: none
+  - override /run: eval_gflownet
   - override /trainer: predict
-
-run:
-  name: eval_gflownet
-  task_name: "eval/gflownet"
-  tags: ["eval", "gflownet"]
-  split: test
-  eval_mode: predict
-  ckpt_path: ${ckpt.gflownet}
-  dataset_variants:
-    - ${dataset.dataset_family}
-    - ${dataset.dataset_family}-sub
 
 ckpt:
   gflownet: ${oc.env:GFLOWNET_CKPT,null}
@@ -30,6 +18,3 @@ callbacks:
 data:
   splits:
     test: ${run.split}
-model:
-  env:
-    max_steps: ${dataset.max_steps}

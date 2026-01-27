@@ -118,22 +118,34 @@
 
 ## Ⅴ. Policy Semantics (行动语义)
 
-### 1. Action Factorization (行动分解)
-*   **Two-Stage Actions:** 动作分解为 $P(r \mid h_t)$ 后接 $P(v \mid r, h_t)$；先选关系，再选尾节点。
-*   **Stop Depends on Edges:** Stop 头必须与出边分数耦合（如用 `logsumexp`/`max` 边分数），当无可走边时倾向 Stop。
+### 1. Action Definition (动作定义)
+*   **Factorized Edge Policy:** 前向策略使用关系/实体的可微因子分解：
+    \[
+    P_F(e \mid s_t, Q)=P_R(r \mid s_t, Q)\cdot P_E(v \mid s_t, r, Q)
+    \]
+*   **Soft Weighting (Training):** 训练期采用软重加权（关系分布与实体分布均可微），避免硬采样导致的梯度断裂。
+*   **Hard Selection (Inference-Optional):** 推理期允许先采样关系再采样实体，但训练期默认不使用硬切断。
 
-### 2. Backward Policy Contract (反向策略契约)
-*   **Transitions Only:** $P_B(\tau \mid x_{stop})$ 仅累积边转移概率；终止合法性由奖励函数承担。
-*   **Entry Selector Neutrality:** Stop 不在答案集合时，不得产生 $-\infty$；使用 $\log(1)$ 作为默认值。
+### 2. Termination Rule (终止规则)
+*   **No Explicit STOP Action:** 终止由条件触发：命中答案、无出边或达到最大步数。
+*   **Reward Semantics:** 成功路径 $R=1$（$\log R=0$）；失败路径 $R=\epsilon$（$\log R \approx -C$）。
 
-### 3. Multi-Start Handling (多起点处理)
-*   **DataLoader Responsibility:** 多起点样本必须在 DataLoader 展开（`expand_multi_start=true`），训练/验证/测试一致。
-*   **Model Assumption:** 模型仅接收单起点；若仍出现多起点，立即抛错。
+### 3. Backward Policy Contract (反向策略契约)
+*   **Uniform Backward:** 反向策略固定为均匀分布：
+    \[
+    P_B(s_t \mid s_{t+1}) = \frac{1}{\deg_{\text{in}}(s_{t+1})}
+    \]
+*   **Log Form:** 训练中累积 $\log P_B = -\log \deg_{\text{in}}$，不引入可学习参数。
 
-### 4. Replay Invariance (回放不变性)
+### 4. Multi-Start Handling (多起点处理)
+*   **Set Semantics:** `q_local_indices` 表示完整起点集合，严禁覆盖或互换。
+*   **Single-Start Trajectory:** 每条轨迹仅选择一个起点；当前实现对集合**均匀采样**。
+*   **Fail Fast:** 若未解析出有效起点，立即抛错。
+
+### 5. Replay Invariance (回放不变性)
 *   **Local Edge IDs:** Replay 必须以 per-graph local edge id 存储；通过 `edge_ptr` 在 add/fetch 时映射。
 
-### 5. Multi-Endpoint Reality (多终点现实)
+### 6. Multi-Endpoint Reality (多终点现实)
 *   **Multi-Start & Multi-Target:** 数据可能同时包含多个起点与多个终点；在反向流中亦然。
 *   **No Pairwise Connectivity Guarantee:** 起点与终点两两配对不保证连通；可达性必须由数据过滤或奖励函数显式处理，模型不得隐式假设全连通。
 

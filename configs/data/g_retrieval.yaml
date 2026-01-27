@@ -5,14 +5,14 @@ _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 16
+batch_size: 32
 num_workers: 8
 drop_last: false
 train_shuffle: true
 prefetch_factor: 4
 persistent_workers: true
 precompute_edge_batch: true
-validate_edge_batch: true
+validate_edge_batch: false
 embeddings_device: cpu
 # 多答案由模型/奖励处理；DataLoader 不展开。
 expand_multi_answer: false

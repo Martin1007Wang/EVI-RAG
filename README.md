@@ -482,7 +482,7 @@ Suggestions for improvements are always welcome!
 All PyTorch Lightning modules are dynamically instantiated from module paths specified in config. Example model config:
 
 ```yaml
-_target_: src.models.gflownet_module.GFlowNetModule
+_target_: src.models.dual_flow_module.DualFlowModule
 hidden_dim: 1024
 ```
 
@@ -497,7 +497,7 @@ This allows you to easily iterate over new models! Every time you create a new o
 Switch between models and datamodules with command line arguments:
 
 ```bash
-python train.py model=gflownet_module data=g_retrieval
+python train.py model=gflownet data=g_retrieval
 ```
 
 Example pipeline managing the instantiation logic: [src/train.py](src/train.py).
@@ -517,26 +517,17 @@ It determines how config is composed when simply executing command `python train
 # order of defaults determines the order in which configs override each other
 defaults:
   - _self_
-  - dataset: webqsp
+  - ckpt: default
+  - dataset: null
   - data: g_retrieval
-  - model: gflownet_module
+  - model: gflownet
   - callbacks: default
-  - logger: wandb
+  - logger: null
   - trainer: default
   - paths: default
   - extras: default
   - hydra: default
-
-  # experiment configs allow for version control of specific hyperparameters
-  # e.g. best hyperparameters for given model and datamodule
   - experiment: null
-
-  # config for hyperparameter optimization
-  - hparams_search: null
-
-  # optional local config for machine/user specific settings
-  # it's optional since it doesn't need to exist and is excluded from version control
-  - optional local: default.yaml
 
 # task name, determines output directory path
 task_name: "train"
@@ -555,11 +546,17 @@ train: True
 # lightning chooses best weights based on the metric specified in checkpoint callback
 test: True
 
+# explicitly set checkpoint for testing
+test_ckpt_path: null
+
+# enforce explicit intent before falling back to current weights during testing
+allow_test_without_checkpoint: False
+
 # simply provide checkpoint path to resume training
 ckpt_path: null
 
 # seed for random number generators in pytorch, numpy and python.random
-seed: null
+seed: 42
 ```
 
 </details>
@@ -584,9 +581,9 @@ For example, you can use them to version control best hyperparameters for each c
 defaults:
   - override /dataset: webqsp
   - override /data: g_retrieval
-  - override /model: gflownet_module
+  - override /model: gflownet
   - override /callbacks: default
-  - override /trainer: standard
+  - override /trainer: gpu
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
@@ -601,9 +598,7 @@ trainer:
   gradient_clip_val: 0.5
 
 model:
-  model_cfg:
-    dropout_p: 0.2
-    hidden_dim: 384
+  hidden_dim: 384
   optimizer_cfg:
     lr: 0.0003
 
@@ -652,7 +647,7 @@ python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/t
 
 **Basic workflow**
 
-1. Write your PyTorch Lightning module (see [models/gflownet_module.py](src/models/gflownet_module.py) for example)
+1. Write your PyTorch Lightning module (see [models/dual_flow_module.py](src/models/dual_flow_module.py) for example)
 2. Write your PyTorch Lightning datamodule (see [data/g_retrieval_datamodule.py](src/data/g_retrieval_datamodule.py) for example)
 3. Write your experiment config, containing paths to model and datamodule
 4. Run training with chosen experiment config:
@@ -721,7 +716,7 @@ You can use many of them at once (see [configs/logger/many_loggers.yaml](configs
 
 You can also write your own logger.
 
-Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the GFlowNet example](src/models/gflownet_module.py).
+Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the GFlowNet example](src/models/dual_flow_module.py).
 
 <br>
 
@@ -868,7 +863,7 @@ some_param: ${data.some_param}
 Another approach is to access datamodule in LightningModule directly through Trainer:
 
 ```python
-# ./src/models/gflownet_module.py
+# ./src/models/dual_flow_module.py
 def on_train_start(self):
   self.some_param = self.trainer.datamodule.some_param
 ```
@@ -1117,7 +1112,7 @@ pip install git+git://github.com/YourGithubName/your-repo-name.git --upgrade
 So any file can be easily imported into any other file like so:
 
 ```python
-from project_name.models.gflownet_module import GFlowNetModule
+from project_name.models.dual_flow_module import DualFlowModule
 from project_name.data.g_retrieval_datamodule import GRetrievalDataModule
 ```
 

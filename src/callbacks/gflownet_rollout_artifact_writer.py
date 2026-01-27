@@ -9,11 +9,9 @@ from typing import Any, Dict, Optional
 import torch.distributed as dist
 from lightning.pytorch.callbacks import BasePredictionWriter
 
-from src.models.components.gflownet_env import STOP_RELATION
-
-
 _ZERO = 0
 _ONE = 1
+STOP_RELATION = -1
 _DEFAULT_SPLIT = "predict"
 _DEFAULT_ARTIFACT_NAME = "eval_gflownet"
 _DEFAULT_SCHEMA_VERSION = _ONE
@@ -287,7 +285,7 @@ class _RolloutArtifactProcessor:
                     rel = edge.get("relation_text") or edge.get("relation_id")
                     dst = edge.get("dst_text") or edge.get("dst_entity_id")
                     if rel == STOP_RELATION or str(rel) == str(STOP_RELATION):
-                        rel = "STOP"
+                        rel = "SELF"
                     parts.append(f"{src} --{rel}--> {dst}")
                 rollout["trajectory_text"] = " ; ".join(parts)
 

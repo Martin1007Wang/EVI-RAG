@@ -5,8 +5,8 @@ defaults:
   - ckpt: default
   - run: default
   - dataset: null
-  - data: null
-  - model: null
+  - data: g_retrieval
+  - model: gflownet
   - callbacks: default
   - logger: null
   - trainer: predict

@@ -26,6 +26,7 @@ def _expand_answer_samples(
         q_local = getattr(data, "q_local_indices", None)
         a_local = getattr(data, "a_local_indices", None)
         answer_ids = getattr(data, "answer_entity_ids", None)
+        node_global_ids = getattr(data, "node_global_ids", None)
         if q_local is None:
             raise AttributeError("Batch missing q_local_indices required for expansion.")
         if a_local is None or answer_ids is None:
@@ -36,11 +37,18 @@ def _expand_answer_samples(
             a_local = torch.as_tensor(a_local, dtype=torch.long)
         if answer_ids is not None and not torch.is_tensor(answer_ids):
             answer_ids = torch.as_tensor(answer_ids, dtype=torch.long)
+        if node_global_ids is not None and not torch.is_tensor(node_global_ids):
+            node_global_ids = torch.as_tensor(node_global_ids, dtype=torch.long)
         q_vals = q_local.view(-1)
         a_vals = a_local.view(-1)
         answer_vals = answer_ids.view(-1)
         if a_vals.numel() != answer_vals.numel():
-            raise ValueError("a_local_indices length mismatch with answer_entity_ids.")
+            if node_global_ids is None:
+                raise AttributeError("Batch missing node_global_ids required to align answers.")
+            if a_vals.numel() == _ZERO:
+                answer_vals = a_vals.new_empty((_ZERO,))
+            else:
+                answer_vals = node_global_ids.view(-1).index_select(0, a_vals)
         a_candidates: list[tuple[torch.Tensor, torch.Tensor, int | None]] = []
         if not expand_multi_answer or a_vals.numel() <= _ONE:
             a_candidates = [(a_vals, answer_vals, None)]

@@ -41,8 +41,8 @@ from src.utils import (
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
-_GFLOWNET_MODEL_TARGET = "src.models.gflownet_module.GFlowNetModule"
-_SUPPORTED_MODEL_TARGETS = {_GFLOWNET_MODEL_TARGET}
+_DUAL_FLOW_MODEL_TARGET = "src.models.dual_flow_module.DualFlowModule"
+_SUPPORTED_MODEL_TARGETS = {_DUAL_FLOW_MODEL_TARGET}
 
 
 def _validate_required_args(cfg: DictConfig) -> None:
@@ -103,15 +103,14 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
     scope = _normalize_dataset_scope(dataset_cfg)
     model_cfg = cfg.get("model") or {}
     model_target = str(model_cfg.get("_target_", ""))
-    is_gflownet = model_target == "src.models.gflownet_module.GFlowNetModule"
-    if is_gflownet and scope != "sub":
+    if model_target in _SUPPORTED_MODEL_TARGETS and scope != "sub":
         dataset_name = ""
         if isinstance(dataset_cfg, DictConfig):
             dataset_name = str(dataset_cfg.get("name", "") or "")
         elif isinstance(dataset_cfg, dict):
             dataset_name = str(dataset_cfg.get("name", "") or "")
         raise ValueError(
-            "Training scope violation: GFlowNet training must use sub datasets only. "
+            "Training scope violation: DualFlow training must use sub datasets only. "
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
         )
 

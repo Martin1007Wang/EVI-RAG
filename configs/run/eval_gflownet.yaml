@@ -1,0 +1,9 @@
+name: eval_gflownet
+task_name: "eval/gflownet"
+tags: ["eval", "gflownet"]
+split: test
+eval_mode: predict
+ckpt_path: ${ckpt.gflownet}
+dataset_variants:
+  - ${dataset.dataset_family}
+  - ${dataset.dataset_family}-sub

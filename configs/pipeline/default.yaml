@@ -32,7 +32,7 @@ inverse_relations:
   kg_id_suffix: "__inv"
   strict: false
   fallback_template: "{relation}__inv"
-  global_vocab: false
+  global_vocab: true
 
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json

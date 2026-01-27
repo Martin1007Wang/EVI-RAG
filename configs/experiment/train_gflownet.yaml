@@ -1,17 +1,15 @@
 # @package _global_
 #
-# Energy-based GFlowNet training (EB-GFN).
+# Dual-view GFlowNet training (Hi-SubTB v3).
 
 defaults:
-  - override /data: g_retrieval
-  - override /model: gflownet_module
   - override /callbacks: default
   - override /logger: wandb
   - override /trainer: gpu
 
-task_name: "eb_gfn_train"
-tags: ["gflownet", "energy"]
-optimized_metric: "val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}"
+task_name: "hi_subtb_train"
+tags: ["dual_flow", "hi_subtb"]
+optimized_metric: "val/pass@beam"
 
 trainer:
   check_val_every_n_epoch: 5
@@ -19,41 +17,23 @@ trainer:
 
 
 model:
-  env:
-    max_steps: ${dataset.max_steps}
-
-  optimizer_cfg:
-    type: adamw
-    lr: 1.0e-4
-    weight_decay: 1.0e-4
-    param_groups:
-      - names: ["*log_f.*"]
-        lr: 5.0e-4
-
-  reward_fn:
-    hard_target_bonus: 2.0
-    min_log_reward: -5.0
-
   scheduler_cfg:
     type: cosine
     t_max: 10
     eta_min: 1.0e-6
     interval: epoch
 
-  actor_cfg:
-    policy_temperature: 1.2
-
   training_cfg:
     accumulate_grad_batches: 4
 
 callbacks:
   model_checkpoint:
-    monitor: val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}
+    monitor: val/pass@beam
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/terminal_hit@${model.evaluation_cfg.num_eval_rollouts}
+    monitor: val/pass@beam
     mode: max
     patience: 50

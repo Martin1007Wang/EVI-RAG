@@ -1,14 +1,14 @@
-# configs/dataset/webqsp-full.yaml
+# Shared dataset defaults for g_retrieval.
 
-name: webqsp
+name: ???
+dataset_family: ???
+dataset_scope: ???
+max_steps: ???
+hf_dataset: ???
 kb: freebase
-dataset_scope: full
-dataset_family: webqsp
-max_steps: 3
-hf_dataset: rmanluo/RoG-webqsp
 
-out_dir: ${paths.data_dir}/webqsp/normalized
-materialized_dir: ${paths.data_dir}/webqsp/materialized
+out_dir: ${paths.data_dir}/${dataset.dataset_family}/normalized
+materialized_dir: ${paths.data_dir}/${dataset.dataset_family}/materialized
 artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
 
 paths:
@@ -19,10 +19,14 @@ paths:
 
 lmdb_readahead: true
 sequential_sample_ids: true
+filter_missing_start:
+  train: true
+  validation: true
+  test: true
 filter_missing_answer:
-  train: false
-  validation: false
-  test: false
+  train: true
+  validation: true
+  test: true
 
 entity_normalization: none
 entity_text_mode: regex

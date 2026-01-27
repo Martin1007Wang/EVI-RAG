@@ -291,7 +291,7 @@ def build_dataset(ctx: StageContext) -> None:
                     missing_answer += 1
                     continue
                 retrieval_failure = torch.tensor(retrieval_failure, dtype=torch.bool)
-                answer_in_graph = [node_entity_ids[idx] for idx in a_local]
+                answer_entity_ids = torch.as_tensor(a_entities, dtype=torch.long)
 
                 split_key = str(split)
                 lmdb_stats[split_key]["samples"] += 1
@@ -306,7 +306,7 @@ def build_dataset(ctx: StageContext) -> None:
                     "question_emb": q_batch_emb[i].unsqueeze(0),
                     "q_local_indices": torch.as_tensor(q_local, dtype=torch.long),
                     "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
-                    "answer_entity_ids": torch.as_tensor(answer_in_graph, dtype=torch.long),
+                    "answer_entity_ids": answer_entity_ids,
                     "retrieval_failure": retrieval_failure,
                 }
 

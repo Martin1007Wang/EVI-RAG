@@ -1,53 +1,16 @@
 # configs/dataset/cwq-sub.yaml
 
+defaults:
+  - base
+  - _self_
+
 name: cwq-sub
-kb: freebase
 dataset_scope: sub
 dataset_family: cwq
 max_steps: 10
 hf_dataset: rmanluo/RoG-cwq
 
-out_dir: ${paths.data_dir}/${dataset.dataset_family}/normalized
-materialized_dir: ${paths.data_dir}/${dataset.dataset_family}/materialized
-artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.name}
-
-paths:
-  embeddings: ${dataset.materialized_dir}/embeddings
-  processed: ${dataset.materialized_dir}/processed
-  entity_vocab: ${dataset.out_dir}/entity_vocab.parquet
-  relation_vocab: ${dataset.out_dir}/relation_vocab.parquet
-
-sequential_sample_ids: true
-lmdb_readahead: true
-filter_missing_start:
-  train: true
-  validation: true
-  test: true
-filter_missing_answer:
-  train: true
-  validation: true
-  test: true
-
 sample_filter_paths:
   train: ${dataset.out_dir}/sub_filter.json
   validation: ${dataset.out_dir}/sub_filter.json
   test: ${dataset.out_dir}/sub_filter.json
-
-entity_normalization: none
-entity_text_mode: regex
-text_prefixes: []
-text_regex: "^(?!m\\.|g\\.).*"
-cvt_entity_mode: prefix_allowlist
-cvt_prefixes: ["m.", "g."]
-cvt_regex: null
-time_relation_mode: question_gated
-time_relation_regex: '(?:^|\\.)time(?:\\.|$)|(?:^|\\.)date(?:\\.|$)|(?:^|\\.)year(?:\\.|$)'
-time_question_regex: '\\bwhen\\b|\\bwhat\\s+year\\b|\\bwhich\\s+year\\b|\\bwhat\\s+date\\b|\\bwhich\\s+date\\b|\\bhow\\s+old\\b|\\bborn\\b|\\bbirth\\b|\\bdied\\b|\\bfounded\\b|\\bestablished\\b|\\breleased\\b|\\bpremiered\\b|\\byear\\b|\\bdate\\b|\\btime\\b'
-
-column_map:
-  question_id_field: id
-  question_field: question
-  answer_text_field: answer
-  q_entity_field: q_entity
-  a_entity_field: a_entity
-  graph_field: graph

@@ -25,6 +25,7 @@ _RUN_REQUIRES_CKPT_KIND = {
 }
 
 _DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"
+_DATASET_BASE_CONFIG = _DATASET_CONFIG_DIR / "base.yaml"
 _ALLOW_CPU_EVAL_ENV = "GFLOWNET_ALLOW_CPU_EVAL"
 _ALLOW_CPU_EVAL_ON = "1"
 _ALLOW_CPU_EVAL_OFF = "0"
@@ -147,6 +148,33 @@ def _load_dataset_config_by_name(name: str, paths_cfg: DictConfig) -> DictConfig
     if not path.exists():
         raise FileNotFoundError(f"Dataset config not found: {path}")
     raw_cfg = OmegaConf.load(path)
+
+    def _strip_defaults(cfg: DictConfig) -> DictConfig:
+        if not isinstance(cfg, DictConfig) or "defaults" not in cfg:
+            return cfg
+        container = OmegaConf.to_container(cfg, resolve=False)
+        if isinstance(container, dict):
+            container.pop("defaults", None)
+        return OmegaConf.create(container)
+
+    defaults = raw_cfg.get("defaults") if isinstance(raw_cfg, DictConfig) else None
+    use_base = False
+    if defaults is not None and (OmegaConf.is_list(defaults) or isinstance(defaults, (list, tuple))):
+        for entry in list(defaults):
+            if entry == "base":
+                use_base = True
+                break
+            if isinstance(entry, dict) and "base" in entry:
+                use_base = True
+                break
+    if use_base:
+        if not _DATASET_BASE_CONFIG.exists():
+            raise FileNotFoundError(f"Dataset base config not found: {_DATASET_BASE_CONFIG}")
+        base_cfg = OmegaConf.load(_DATASET_BASE_CONFIG)
+        raw_cfg = _strip_defaults(raw_cfg)
+        raw_cfg = OmegaConf.merge(base_cfg, raw_cfg)
+    else:
+        raw_cfg = _strip_defaults(raw_cfg)
     container = OmegaConf.create({"paths": paths_cfg, "dataset": raw_cfg})
     OmegaConf.resolve(container)
     return container["dataset"]
