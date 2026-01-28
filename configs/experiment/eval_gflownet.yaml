@@ -18,3 +18,8 @@ callbacks:
 data:
   splits:
     test: ${run.split}
+
+model:
+  evaluation_cfg:
+    beam_size: 100
+    beam_sizes: [1, 10, 25, 50, 100]

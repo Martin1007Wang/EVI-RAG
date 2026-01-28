@@ -9,10 +9,15 @@
 ## 0. Anchor Semantics (QA vs Flow)
 
 *   **Data SSOT:** `q_local_indices` / `a_local_indices`（及其 ptr）仅表示**问题/答案实体集合**，是数据层唯一真相，严禁被覆盖或互换。
-*   **Flow-Derived:** `start_node_locals` / `target_node_locals` 仅表示 **GFlowNet 流向起终点**，由 `(q, a) + direction + selector/sampling` 派生，运行时存在，不落盘。
+*   **Flow-Derived (Code-Exact):**
+    * `start_nodes_fwd`: 每图单一起点，由 `q_local_indices` 经 **StartSelector** 采样得到（运行时存在，不落盘）。
+    * `start_nodes_bwd`: 每图单一后向起点，由 `a_local_indices` 均匀采样得到（运行时存在，不落盘）。
+    * `node_is_target` / `node_is_start`: 分别由 `a_local_indices` / `q_local_indices` 构造的集合掩码，用于 hit 判断。
 *   **Direction Mapping:** `forward`: start = q, target = a；`backward`: start = a, target = q。
 *   **No Swapping:** 禁止通过交换 `q/a` 实现反向流；必须通过显式的 flow 映射/override。
-*   **Mask Semantics:** `dummy_mask` 仅由 data-level answer 计算；`node_is_target` 必须由 flow target 计算。
+*   **Mask Semantics (Code-Exact):**
+    * `dummy_mask` 仅由 `answer_entity_ids_ptr` 推导（data-level answer 是否为空）。
+    * `node_is_target` 必须由 `a_local_indices`（flow target in-subgraph）计算；`node_is_start` 必须由 `q_local_indices` 计算。
 
 ---
 
@@ -83,7 +88,8 @@
 ### 2. Runtime Contract (Current Pipeline)
 *   **Training:** 仅提供 GFlowNet 训练（`configs/experiment/train_gflownet.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
 *   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_gflownet` 缓存；不生成/不读取 `g_agent`。
-*   **Shortcut Suppression/SP-Dropout:** 训练阶段默认启用 SP-Dropout（预选遮蔽）与 Safety Net（最短路保底），仅作用于 `g_retrieval` 子图采样。
+*   **Edge Dropout (Code-Exact):** 训练阶段仅实现 `pb_edge_dropout`（后向/Teacher 边 Dropout），由
+    `model.training_cfg.db_cfg.pb_edge_dropout` 控制；当前代码中不存在额外的 SP-Dropout / shortest-path safety net 逻辑。
 
 ---
 
@@ -119,31 +125,38 @@
 ## Ⅴ. Policy Semantics (行动语义)
 
 ### 1. Action Definition (动作定义)
-*   **Factorized Edge Policy:** 前向策略使用关系/实体的可微因子分解：
+*   **Edge-Logit Policy (Code-Exact):** 当前实现不做 $P_R\\cdot P_E$ 的两阶段分解；策略直接对边 $(u,r,v)$ 打分：
     \[
-    P_F(e \mid s_t, Q)=P_R(r \mid s_t, Q)\cdot P_E(v \mid s_t, r, Q)
+    \\text{logit}(u\\to v)=\\text{QCBiA}(c, h_u, h_r, h_v)
     \]
-*   **Soft Weighting (Training):** 训练期采用软重加权（关系分布与实体分布均可微），避免硬采样导致的梯度断裂。
-*   **Hard Selection (Inference-Optional):** 推理期允许先采样关系再采样实体，但训练期默认不使用硬切断。
+    其中 `QCBiANetwork` 为唯一策略头（`src/models/components/qc_bia_network.py`）。
+*   **Hard Rollout, Differentiable Eval:** 训练中的 rollout 采用 Gumbel-Max 硬采样（`torch.no_grad()`）；梯度通过 DB 损失里的
+    $\\log P_F, \\log P_B, \\log Z$ 反传（代码路径：`src/models/dual_flow_module.py`）。
 
 ### 2. Termination Rule (终止规则)
 *   **No Explicit STOP Action:** 终止由条件触发：命中答案、无出边或达到最大步数。
 *   **Reward Semantics:** 成功路径 $R=1$（$\log R=0$）；失败路径 $R=\epsilon$（$\log R \approx -C$）。
 
 ### 3. Backward Policy Contract (反向策略契约)
-*   **Uniform Backward:** 反向策略固定为均匀分布：
-    \[
-    P_B(s_t \mid s_{t+1}) = \frac{1}{\deg_{\text{in}}(s_{t+1})}
-    \]
-*   **Log Form:** 训练中累积 $\log P_B = -\log \deg_{\text{in}}$，不引入可学习参数。
+*   **Three PB Strategies (Code-Exact):** 当前实现提供三种 $P_B$（由 `model.training_cfg.db_cfg.pb_mode` 控制）：
+    * `uniform`（静态）：对每个状态的逆向出边做均匀分布，$\log P_B=-\\log |\\text{Out}_b(v)|$。
+    * `topo_semantic`（静态）：在 `uniform` 基础上加入
+      - 拓扑单调约束：逆边必须使 `dist_to_start` 严格下降（由 `pb_max_hops` 限步 BFS 计算）
+      - 语义偏置：$\\text{pb_semantic_weight}\\cdot \\cos(q_{emb}, r_{emb})$
+      并用 `pb_topo_penalty` 惩罚不可行边/无可行边情形。
+    * `learned`（可学习）：`policy_bwd`(QC-BiA) 直接建模 $P_B$，并在训练中通过 DB 损失更新。
+*   **Teacher Edge Dropout:** `pb_edge_dropout` 对逆向候选边做结构级 Dropout（同一掩码用于 backward rollout 与 DB 评估）。
+*   **Static vs Learned:** 当 `pb_mode in {uniform, topo_semantic}` 时，后向 backbone/policy/context 投影会被冻结（不训练）。
 
 ### 4. Multi-Start Handling (多起点处理)
 *   **Set Semantics:** `q_local_indices` 表示完整起点集合，严禁覆盖或互换。
-*   **Single-Start Trajectory:** 每条轨迹仅选择一个起点；当前实现对集合**均匀采样**。
+*   **Single-Start Trajectory (Code-Exact):** 每条轨迹仅选择一个起点；当前实现使用可学习 StartSelector 在 `q_local_indices`
+    上采样（末层零初始化使得初始分布等价于均匀）。
 *   **Fail Fast:** 若未解析出有效起点，立即抛错。
 
 ### 5. Replay Invariance (回放不变性)
-*   **Local Edge IDs:** Replay 必须以 per-graph local edge id 存储；通过 `edge_ptr` 在 add/fetch 时映射。
+*   **Note (Current Code):** 当前实现未引入 RL replay buffer；若未来加入回放，必须以 per-graph local edge id 存储并通过
+    `edge_ptr` 映射，避免跨图混淆。
 
 ### 6. Multi-Endpoint Reality (多终点现实)
 *   **Multi-Start & Multi-Target:** 数据可能同时包含多个起点与多个终点；在反向流中亦然。

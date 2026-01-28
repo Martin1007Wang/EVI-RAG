@@ -1,5 +1,9 @@
+#
+# DualFlow model configuration (GFlowNet training/eval).
+
 defaults:
   - _self_
+  - db: uniform
 
 _target_: src.models.dual_flow_module.DualFlowModule
 _recursive_: true
@@ -37,16 +41,9 @@ scheduler_cfg:
 training_cfg:
   accumulate_grad_batches: 1
   num_rollouts: 5
-  db_cfg:
-    sampling_temperature_schedule: cosine
-    sampling_temperature_start: 2.0
-    sampling_temperature_end: 0.5
-    teacher_edge_dropout: 0.1
-    dead_end_log_reward: -10.0
-    dead_end_weight: 1.0
   metrics:
     mode: minimal
 
 evaluation_cfg:
   beam_size: 50
-  beam_sizes: [1, 5, 10, 25, 50]
+  beam_sizes: [1, 10, 25, 50]

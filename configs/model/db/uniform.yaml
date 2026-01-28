@@ -1,0 +1,13 @@
+# @package model
+#
+# Backward policy: uniform (static).
+
+defaults:
+  - base
+  - _self_
+
+training_cfg:
+  db_cfg:
+    pb_mode: uniform
+    pb_edge_dropout: 0.0
+    pb_semantic_weight: 0.0

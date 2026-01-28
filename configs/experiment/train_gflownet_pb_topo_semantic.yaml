@@ -1,20 +1,20 @@
 # @package _global_
 #
-# DualFlow GFlowNet training (base config).
+# GFlowNet training: PB-topo-semantic (static backward policy).
 
 defaults:
+  - override /model/db: topo_semantic
   - override /callbacks: default
   - override /logger: wandb
   - override /trainer: gpu
 
-task_name: "train/gflownet"
-tags: ["dual_flow", "gflownet"]
+task_name: "train/gflownet/pb_topo_semantic"
+tags: ["dual_flow", "gflownet", "pb_topo_semantic"]
 optimized_metric: "val/f1@beam"
 
 trainer:
   check_val_every_n_epoch: 5
   precision: 32
-
 
 model:
   scheduler_cfg:

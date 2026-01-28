@@ -1,0 +1,13 @@
+# @package model
+#
+# Backward policy: learned (trainable).
+
+defaults:
+  - base
+  - _self_
+
+training_cfg:
+  db_cfg:
+    pb_mode: learned
+    pb_edge_dropout: 0.1
+    pb_semantic_weight: 0.0

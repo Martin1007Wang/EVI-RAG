@@ -593,6 +593,10 @@ class GFlowNetEvalAccumulator:
             metrics[f"context_precision@{k_int}"] = float(self._state.context_precision_sum.get(k_int, _FLOAT_ZERO)) / float(denom_answers)
             metrics[f"context_f1@{k_int}"] = float(self._state.context_f1_sum.get(k_int, _FLOAT_ZERO)) / float(denom_answers)
             metrics[f"context_hit@{k_int}"] = float(self._state.context_hit_counts.get(k_int, _ZERO)) / float(denom_answers)
+            metrics[f"hit@{k_int}"] = metrics[f"terminal_hit@{k_int}"]
+            metrics[f"recall@{k_int}"] = metrics[f"context_recall@{k_int}"]
+            metrics[f"precision@{k_int}"] = metrics[f"context_precision@{k_int}"]
+            metrics[f"f1@{k_int}"] = metrics[f"context_f1@{k_int}"]
             if self._composite_cfg.enabled:
                 composite_sum = self._state.composite_score_sum.get(k_int, _FLOAT_ZERO)
                 metrics[f"composite_score@{k_int}"] = float(composite_sum) / float(denom_answers)

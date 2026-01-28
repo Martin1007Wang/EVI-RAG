@@ -7,7 +7,7 @@ defaults:
   - ckpt: default
   - dataset: null
   - data: g_retrieval
-  - model: gflownet
+  - model: dual_flow
   - callbacks: default
   - logger: null
   - trainer: default

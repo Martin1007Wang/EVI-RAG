@@ -10,7 +10,6 @@ dataset_family: cwq
 max_steps: 10
 hf_dataset: rmanluo/RoG-cwq
 
+sample_filter_path: ${dataset.out_dir}/sub_filter.json
 sample_filter_paths:
-  train: ${dataset.out_dir}/sub_filter.json
-  validation: ${dataset.out_dir}/sub_filter.json
-  test: ${dataset.out_dir}/sub_filter.json
+  train: ${dataset.out_dir}/structured_filter_train.json
