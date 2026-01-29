@@ -28,7 +28,7 @@ from src.models.components.gflownet_ops import (
     segment_max,
 )
 from src.utils import log_metric, setup_optimizer
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
 
