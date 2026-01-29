@@ -18,10 +18,10 @@ trainer:
 
 model:
   scheduler_cfg:
-    type: cosine
-    t_max: 200
-    eta_min: 1.0e-6
-    interval: epoch
+    type: onecycle
+    interval: step
+    max_lr: ${model.optimizer_cfg.lr}
+    cycle_momentum: false
 
   training_cfg:
     accumulate_grad_batches: 4

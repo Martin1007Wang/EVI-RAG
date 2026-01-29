@@ -30,6 +30,16 @@ _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _DEFAULT_MAX_CANDIDATES_IN_PROMPT = 30
 _DEFAULT_MAX_JUSTIFICATION_WORDS = 25
+_DEFAULT_SCHEMA_ENABLED = True
+_DEFAULT_SCHEMA_MAX_RETRIES = 2
+_DEFAULT_SCHEMA_ALLOW_COERCE = True
+_DEFAULT_SCHEMA_MAX_RETRY_CHARS = 2000
+_DEFAULT_SCHEMA_RETRY_MESSAGE = (
+    "Your previous response did not match the required JSON schema. "
+    "Return a corrected JSON object only.\n\n"
+    "Schema:\n{schema}\n\n"
+    "Previous response:\n{response}"
+)
 
 _FIELD_SAMPLE_ID = "sample_id"
 _FIELD_QUESTION = "question_text"
@@ -46,6 +56,8 @@ _FIELD_EVIDENCE_TRAJECTORY_IDS = "evidence_trajectory_ids"
 _FIELD_ABSTAIN_REASON = "abstain_reason"
 _FIELD_BEST_GUESS = "best_guess"
 _FIELD_JUSTIFICATION = "justification"
+_FIELD_SCHEMA_VALID = "schema_valid"
+_FIELD_SCHEMA_RETRIES = "schema_retries"
 
 _LOG_PROGRESS_EVERY = 200
 
@@ -68,11 +80,30 @@ class OutputSpec:
 
 
 @dataclass(frozen=True)
+class SchemaSpec:
+    enabled: bool
+    max_retries: int
+    allow_coerce: bool
+    max_retry_chars: int
+    retry_message: str
+    schema: Optional[Dict[str, Any]]
+    schema_json: str
+    validator: Optional[Any]
+
+
+@dataclass(frozen=True)
 class _LLMRequest:
     sample_id: str
     question: str
     trajectories: List[str]
     messages: List[Dict[str, str]]
+
+
+@dataclass(frozen=True)
+class _ParsedResponse:
+    answer: str
+    payload: Optional[Dict[str, Any]]
+    schema_valid: bool
 
 
 def run_llm_eval(cfg: Any) -> None:
@@ -85,6 +116,7 @@ def run_llm_eval(cfg: Any) -> None:
     providers = _resolve_provider_list(llm_cfg)
     prompt_spec = _resolve_prompt_spec(llm_cfg)
     output_spec = _resolve_output_spec(llm_cfg)
+    schema_spec = _resolve_schema_spec(llm_cfg, prompt_spec)
     input_path = _resolve_input_path(dataset_cfg, llm_cfg, split)
     output_dir = _resolve_output_dir(dataset_cfg, llm_cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +137,7 @@ def run_llm_eval(cfg: Any) -> None:
                 split=split,
                 prompt_spec=prompt_spec,
                 output_spec=output_spec,
+                schema_spec=schema_spec,
                 top_k=top_k,
             )
 
@@ -159,6 +192,68 @@ def _resolve_output_spec(llm_cfg: Any) -> OutputSpec:
     )
 
 
+def _resolve_schema_spec(llm_cfg: Any, prompt_spec: PromptSpec) -> SchemaSpec:
+    schema_cfg = llm_cfg.get("schema") or {}
+    enabled = bool(schema_cfg.get("enabled", _DEFAULT_SCHEMA_ENABLED))
+    max_retries = int(schema_cfg.get("max_retries", _DEFAULT_SCHEMA_MAX_RETRIES))
+    allow_coerce = bool(schema_cfg.get("allow_coerce", _DEFAULT_SCHEMA_ALLOW_COERCE))
+    max_retry_chars = int(schema_cfg.get("max_retry_chars", _DEFAULT_SCHEMA_MAX_RETRY_CHARS))
+    retry_message = str(schema_cfg.get("retry_message", _DEFAULT_SCHEMA_RETRY_MESSAGE)).strip()
+    if max_retries < _ZERO:
+        raise ValueError("llm.schema.max_retries must be >= 0.")
+    if max_retry_chars < _ZERO:
+        raise ValueError("llm.schema.max_retry_chars must be >= 0.")
+    if not enabled:
+        return SchemaSpec(
+            enabled=False,
+            max_retries=max_retries,
+            allow_coerce=allow_coerce,
+            max_retry_chars=max_retry_chars,
+            retry_message=retry_message,
+            schema=None,
+            schema_json="",
+            validator=None,
+        )
+    try:
+        import jsonschema
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("jsonschema is required when llm.schema.enabled=true.") from exc
+    schema = _build_llm_output_schema(prompt_spec)
+    schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
+    validator = jsonschema.Draft7Validator(schema)
+    return SchemaSpec(
+        enabled=True,
+        max_retries=max_retries,
+        allow_coerce=allow_coerce,
+        max_retry_chars=max_retry_chars,
+        retry_message=retry_message,
+        schema=schema,
+        schema_json=schema_json,
+        validator=validator,
+    )
+
+
+def _build_llm_output_schema(prompt: PromptSpec) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            prompt.answer_key: {"type": "string"},
+            _FIELD_EVIDENCE_TRAJECTORY_IDS: {"type": "array", "items": {"type": "integer"}},
+            _FIELD_ABSTAIN_REASON: {"type": "string"},
+            _FIELD_BEST_GUESS: {"type": "string"},
+            _FIELD_JUSTIFICATION: {"type": "string"},
+        },
+        "required": [
+            prompt.answer_key,
+            _FIELD_EVIDENCE_TRAJECTORY_IDS,
+            _FIELD_ABSTAIN_REASON,
+            _FIELD_BEST_GUESS,
+            _FIELD_JUSTIFICATION,
+        ],
+        "additionalProperties": True,
+    }
+
+
 def _resolve_topk_list(llm_cfg: Any) -> List[int]:
     topk_list = llm_cfg.get("topk_list")
     if not topk_list:
@@ -205,6 +300,7 @@ def _run_provider_topk(
     split: str,
     prompt_spec: PromptSpec,
     output_spec: OutputSpec,
+    schema_spec: SchemaSpec,
     top_k: int,
 ) -> None:
     if not input_path.exists():
@@ -222,6 +318,7 @@ def _run_provider_topk(
         top_k=top_k,
         prompt_spec=prompt_spec,
         output_spec=output_spec,
+        schema_spec=schema_spec,
     )
     _log_llm_done(processed, written, top_k, output_path)
     if bool(llm_cfg.get("compute_metrics", True)):
@@ -292,6 +389,7 @@ def _run_llm_batches(
     top_k: int,
     prompt_spec: PromptSpec,
     output_spec: OutputSpec,
+    schema_spec: SchemaSpec,
 ) -> Tuple[int, int]:
     processed = _ZERO
     written = _ZERO
@@ -301,12 +399,12 @@ def _run_llm_batches(
             processed += _ONE
             batch_items.append(request)
             if len(batch_items) >= batch_size:
-                written += _flush_batch(backend, batch_items, f_out, prompt_spec, output_spec)
+                written += _flush_batch(backend, batch_items, f_out, prompt_spec, output_spec, schema_spec)
                 batch_items = []
             if processed % _LOG_PROGRESS_EVERY == _ZERO:
                 log_event(log, "llm_eval_progress", processed=processed, written=written, top_k=top_k)
         if batch_items:
-            written += _flush_batch(backend, batch_items, f_out, prompt_spec, output_spec)
+            written += _flush_batch(backend, batch_items, f_out, prompt_spec, output_spec, schema_spec)
     return processed, written
 
 
@@ -483,15 +581,36 @@ def _flush_batch(
     f_out,
     prompt_spec: PromptSpec,
     output_spec: OutputSpec,
+    schema_spec: SchemaSpec,
 ) -> int:
     messages_batch = [item.messages for item in batch_items]
     responses = backend.generate(messages_batch)
     written = _ZERO
     for request, response in zip(batch_items, responses):
         raw_response = (response or "").strip()
-        answer = _parse_response(response, prompt_spec)
-        extra = _build_output_extra(request, answer, raw_response, output_spec)
-        _write_answer(f_out, request.sample_id, answer, prompt_spec.answer_key, extra=extra)
+        parsed = _parse_and_validate_response(raw_response, prompt_spec, schema_spec)
+        retries = _ZERO
+        if schema_spec.enabled and not parsed.schema_valid:
+            raw_response, parsed, retries = _generate_with_schema_retry(
+                backend=backend,
+                messages=request.messages,
+                prompt_spec=prompt_spec,
+                schema_spec=schema_spec,
+                initial_response=raw_response,
+            )
+        if schema_spec.enabled and not parsed.schema_valid:
+            log_event(
+                log,
+                "llm_schema_invalid",
+                sample_id=request.sample_id,
+                retries=retries,
+            )
+        schema_meta = {
+            _FIELD_SCHEMA_VALID: bool(parsed.schema_valid),
+            _FIELD_SCHEMA_RETRIES: int(retries),
+        }
+        extra = _build_output_extra(request, parsed.answer, raw_response, output_spec, schema_meta=schema_meta)
+        _write_answer(f_out, request.sample_id, parsed.answer, prompt_spec.answer_key, extra=extra)
         written += _ONE
     return written
 
@@ -509,6 +628,101 @@ def _parse_response(response: str, prompt: PromptSpec) -> str:
         return _extract_answer_from_payload(fragment, prompt, raw)
 
     return raw
+
+
+def _parse_and_validate_response(
+    response: str,
+    prompt: PromptSpec,
+    schema_spec: SchemaSpec,
+) -> _ParsedResponse:
+    raw = (response or "").strip()
+    if not raw:
+        return _ParsedResponse(answer="", payload=None, schema_valid=not schema_spec.enabled)
+    payload = _parse_json_payload(raw)
+    if payload is None:
+        payload = _parse_json_fragment(raw)
+    if not schema_spec.enabled:
+        answer = _parse_response(raw, prompt)
+        return _ParsedResponse(answer=answer, payload=payload if isinstance(payload, dict) else None, schema_valid=True)
+    if not isinstance(payload, dict):
+        return _ParsedResponse(answer="", payload=None, schema_valid=False)
+    normalized = _normalize_payload(payload, prompt, allow_coerce=schema_spec.allow_coerce)
+    if normalized is None:
+        return _ParsedResponse(answer="", payload=None, schema_valid=False)
+    if not _validate_payload_schema(normalized, schema_spec):
+        return _ParsedResponse(answer="", payload=normalized, schema_valid=False)
+    answer = _extract_answer_from_payload(normalized, prompt, raw)
+    return _ParsedResponse(answer=answer, payload=normalized, schema_valid=True)
+
+
+def _normalize_payload(payload: Dict[str, Any], prompt: PromptSpec, *, allow_coerce: bool) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    normalized: Dict[str, Any] = dict(payload)
+    if prompt.answer_key not in normalized and _DEFAULT_ANSWER_KEY in normalized:
+        normalized[prompt.answer_key] = normalized.get(_DEFAULT_ANSWER_KEY)
+    if allow_coerce:
+        normalized = _coerce_payload(normalized)
+    return normalized
+
+
+def _coerce_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    coerced: Dict[str, Any] = dict(payload)
+    if _FIELD_EVIDENCE_TRAJECTORY_IDS in coerced:
+        value = coerced.get(_FIELD_EVIDENCE_TRAJECTORY_IDS)
+        if isinstance(value, list):
+            cleaned: List[int] = []
+            for item in value:
+                try:
+                    cleaned.append(int(item))
+                except Exception:
+                    continue
+            coerced[_FIELD_EVIDENCE_TRAJECTORY_IDS] = cleaned
+        else:
+            try:
+                coerced[_FIELD_EVIDENCE_TRAJECTORY_IDS] = [int(value)]
+            except Exception:
+                coerced[_FIELD_EVIDENCE_TRAJECTORY_IDS] = value
+    return coerced
+
+
+def _validate_payload_schema(payload: Dict[str, Any], schema_spec: SchemaSpec) -> bool:
+    if schema_spec.validator is None:
+        return True
+    return bool(schema_spec.validator.is_valid(payload))
+
+
+def _build_schema_retry_message(schema_spec: SchemaSpec, raw_response: str) -> str:
+    snippet = raw_response or ""
+    if schema_spec.max_retry_chars > _ZERO and len(snippet) > schema_spec.max_retry_chars:
+        snippet = snippet[: schema_spec.max_retry_chars] + "..."
+    try:
+        return schema_spec.retry_message.format(schema=schema_spec.schema_json, response=snippet)
+    except Exception:
+        return schema_spec.retry_message
+
+
+def _generate_with_schema_retry(
+    *,
+    backend: "_LLMBackend",
+    messages: List[Dict[str, str]],
+    prompt_spec: PromptSpec,
+    schema_spec: SchemaSpec,
+    initial_response: str,
+) -> Tuple[str, _ParsedResponse, int]:
+    retries = _ZERO
+    raw_response = (initial_response or "").strip()
+    parsed = _parse_and_validate_response(raw_response, prompt_spec, schema_spec)
+    if not schema_spec.enabled or parsed.schema_valid:
+        return raw_response, parsed, retries
+    current_messages = list(messages)
+    while retries < schema_spec.max_retries and not parsed.schema_valid:
+        retries += _ONE
+        retry_message = _build_schema_retry_message(schema_spec, raw_response)
+        current_messages = current_messages + [{"role": "user", "content": retry_message}]
+        raw_response = (backend.generate([current_messages])[0] or "").strip()
+        parsed = _parse_and_validate_response(raw_response, prompt_spec, schema_spec)
+    return raw_response, parsed, retries
 
 
 def _parse_json_payload(text: str) -> Optional[Any]:
@@ -585,9 +799,16 @@ def _normalize_answer(answer: Any, separator: str) -> str:
     return str(answer).strip()
 
 
-def _build_output_extra(request: _LLMRequest, answer: str, raw_response: str, spec: OutputSpec) -> Dict[str, Any]:
+def _build_output_extra(
+    request: _LLMRequest,
+    answer: str,
+    raw_response: str,
+    spec: OutputSpec,
+    *,
+    schema_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if spec.debug_only_on_empty and answer.strip():
-        return {}
+        return schema_meta or {}
     extra: Dict[str, Any] = {}
     if spec.include_question:
         extra[_FIELD_QUESTION] = request.question
@@ -597,6 +818,8 @@ def _build_output_extra(request: _LLMRequest, answer: str, raw_response: str, sp
         extra[_FIELD_MESSAGES] = request.messages
     if spec.include_raw_response:
         extra[_FIELD_RAW_RESPONSE] = raw_response
+    if schema_meta:
+        extra.update(schema_meta)
     extra.update(_extract_structured_model_fields(raw_response))
     return extra
 

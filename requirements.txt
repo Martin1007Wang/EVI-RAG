@@ -31,5 +31,6 @@ rootutils       # standardizing the project root setup
 pre-commit      # hooks for applying linters on commit
 rich            # beautiful text formatting in terminal
 pytest          # tests
+jsonschema      # schema validation for LLM outputs
 # sh            # for running bash commands in some tests (linux/macos only)
 muon-optimizer @ git+https://github.com/KellerJordan/Muon

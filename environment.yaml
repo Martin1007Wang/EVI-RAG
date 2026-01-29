@@ -46,3 +46,4 @@ dependencies:
       - rootutils
       - pytorch-metric-learning>=2.0.0
       - safetensors
+      - jsonschema

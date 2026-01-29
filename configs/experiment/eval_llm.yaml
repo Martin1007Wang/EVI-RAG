@@ -30,6 +30,11 @@ llm:
     include_messages: true
     include_raw_response: true
     debug_only_on_empty: true
+  schema:
+    enabled: true
+    max_retries: 2
+    allow_coerce: true
+    max_retry_chars: 2000
   prompt:
     system: "You are a KGQA assistant. Use only the provided trajectories. Output JSON only."
     answer_key: "answer"

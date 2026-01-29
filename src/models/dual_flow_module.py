@@ -86,10 +86,26 @@ _SCHED_INTERVAL_STEP = "step"
 _SCHED_INTERVALS = {_SCHED_INTERVAL_EPOCH, _SCHED_INTERVAL_STEP}
 _SCHED_TYPE_COSINE = "cosine"
 _SCHED_TYPE_COSINE_WARM_RESTARTS = "cosine_warm_restarts"
+_SCHED_TYPE_ONECYCLE = "onecycle"
 _DEFAULT_SCHED_T_MAX = 10
 _DEFAULT_SCHED_T0 = 10
 _DEFAULT_SCHED_T_MULT = 1
 _DEFAULT_SCHED_ETA_MIN = 0.0
+_DEFAULT_ONECYCLE_PCT_START = 0.3
+_DEFAULT_ONECYCLE_ANNEAL = "cos"
+_DEFAULT_ONECYCLE_CYCLE_MOMENTUM = True
+_DEFAULT_ONECYCLE_BASE_MOMENTUM = 0.85
+_DEFAULT_ONECYCLE_MAX_MOMENTUM = 0.95
+_DEFAULT_ONECYCLE_DIV_FACTOR = 25.0
+_DEFAULT_ONECYCLE_FINAL_DIV_FACTOR = 10000.0
+_DEFAULT_ONECYCLE_THREE_PHASE = False
+_DEFAULT_DIVERSE_BEAM_ENABLED = True
+_DEFAULT_DIVERSE_BEAM_GROUPS = 4
+_DEFAULT_DIVERSE_BEAM_LAMBDA = 1.0
+_DEFAULT_DIVERSE_BEAM_SIMILARITY = "tail"
+_DEFAULT_DIVERSE_BEAM_PENALTY = "hard"
+_DIVERSE_BEAM_SIMILARITIES = {"tail", "edge", "source"}
+_DIVERSE_BEAM_PENALTIES = {"hard", "soft"}
 
 
 @dataclass(frozen=True)
@@ -127,6 +143,33 @@ class _PreparedBatch:
     edge_ids_by_tail_bwd: torch.Tensor
     edge_ptr_by_tail_bwd: torch.Tensor
     edge_inverse_map: torch.Tensor
+
+
+@dataclass
+class _BeamState:
+    beam_nodes: torch.Tensor
+    beam_scores: torch.Tensor
+    beam_paths: torch.Tensor
+    beam_lengths: torch.Tensor
+    beam_done: torch.Tensor
+    flat_graph_ids: torch.Tensor
+    flat_beam_ids: torch.Tensor
+    beam_context: torch.Tensor
+    num_graphs: int
+    beam_size: int
+    max_steps: int
+    neg_inf: float
+
+
+@dataclass
+class _BeamCandidates:
+    cand_scores: torch.Tensor
+    cand_nodes: torch.Tensor
+    cand_graph: torch.Tensor
+    cand_src_beam: torch.Tensor
+    cand_edge_id: torch.Tensor
+    cand_is_edge: torch.Tensor
+    cand_done: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -242,12 +285,22 @@ class DualFlowModule(LightningModule):
             d_kg=self.hidden_dim,
             d_inter=actor_cfg["edge_inter_dim"],
             dropout=actor_cfg["edge_dropout"],
+            use_spherical=actor_cfg["use_spherical"],
+            temperature_init=actor_cfg["temperature_init"],
+            norm_eps=actor_cfg["norm_eps"],
+            logit_scale_min=actor_cfg["logit_scale_min"],
+            logit_scale_max=actor_cfg["logit_scale_max"],
         )
         self.policy_bwd = QCBiANetwork(
             d_plm=self.hidden_dim,
             d_kg=self.hidden_dim,
             d_inter=actor_cfg["edge_inter_dim"],
             dropout=actor_cfg["edge_dropout"],
+            use_spherical=actor_cfg["use_spherical"],
+            temperature_init=actor_cfg["temperature_init"],
+            norm_eps=actor_cfg["norm_eps"],
+            logit_scale_min=actor_cfg["logit_scale_min"],
+            logit_scale_max=actor_cfg["logit_scale_max"],
         )
         self.forward_ctx_proj = self._build_context_mlp(in_dim=self.hidden_dim * _TWO)
         self.backward_ctx_proj = self._build_context_mlp(in_dim=self.hidden_dim * _THREE)
@@ -381,9 +434,67 @@ class DualFlowModule(LightningModule):
                 T_mult=int(self.scheduler_cfg.get("t_mult", _DEFAULT_SCHED_T_MULT)),
                 eta_min=float(self.scheduler_cfg.get("eta_min", _DEFAULT_SCHED_ETA_MIN)),
             )
+        elif sched_type in {"onecycle", "one_cycle", "onecyclelr", _SCHED_TYPE_ONECYCLE}:
+            if interval != _SCHED_INTERVAL_STEP:
+                raise ValueError("OneCycleLR requires scheduler_cfg.interval='step'.")
+            max_lr = self.scheduler_cfg.get("max_lr", None)
+            if max_lr is None:
+                raise ValueError("scheduler_cfg.max_lr must be set for OneCycleLR.")
+            total_steps = self._resolve_onecycle_total_steps()
+            pct_start = float(self.scheduler_cfg.get("pct_start", _DEFAULT_ONECYCLE_PCT_START))
+            anneal_strategy = str(
+                self.scheduler_cfg.get("anneal_strategy", _DEFAULT_ONECYCLE_ANNEAL) or _DEFAULT_ONECYCLE_ANNEAL
+            ).strip().lower()
+            cycle_momentum = bool(self.scheduler_cfg.get("cycle_momentum", _DEFAULT_ONECYCLE_CYCLE_MOMENTUM))
+            base_momentum = float(self.scheduler_cfg.get("base_momentum", _DEFAULT_ONECYCLE_BASE_MOMENTUM))
+            max_momentum = float(self.scheduler_cfg.get("max_momentum", _DEFAULT_ONECYCLE_MAX_MOMENTUM))
+            div_factor = float(self.scheduler_cfg.get("div_factor", _DEFAULT_ONECYCLE_DIV_FACTOR))
+            final_div_factor = float(self.scheduler_cfg.get("final_div_factor", _DEFAULT_ONECYCLE_FINAL_DIV_FACTOR))
+            three_phase = bool(self.scheduler_cfg.get("three_phase", _DEFAULT_ONECYCLE_THREE_PHASE))
+            last_epoch = int(self.scheduler_cfg.get("last_epoch", -1))
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=max_lr,
+                total_steps=total_steps,
+                pct_start=pct_start,
+                anneal_strategy=anneal_strategy,
+                cycle_momentum=cycle_momentum,
+                base_momentum=base_momentum,
+                max_momentum=max_momentum,
+                div_factor=div_factor,
+                final_div_factor=final_div_factor,
+                three_phase=three_phase,
+                last_epoch=last_epoch,
+            )
         else:
             raise ValueError(f"Unsupported scheduler type: {sched_type}")
         return {"scheduler": scheduler, "interval": interval}
+
+    def _resolve_onecycle_total_steps(self) -> int:
+        total_steps = self.scheduler_cfg.get("total_steps", None)
+        if total_steps is not None:
+            total_steps = int(total_steps)
+            if total_steps <= _ZERO:
+                raise ValueError("scheduler_cfg.total_steps must be > 0.")
+            return total_steps
+        epochs = self.scheduler_cfg.get("epochs", None)
+        steps_per_epoch = self.scheduler_cfg.get("steps_per_epoch", None)
+        if epochs is not None or steps_per_epoch is not None:
+            if epochs is None or steps_per_epoch is None:
+                raise ValueError("scheduler_cfg.epochs and scheduler_cfg.steps_per_epoch must be set together.")
+            epochs = int(epochs)
+            steps_per_epoch = int(steps_per_epoch)
+            if epochs <= _ZERO or steps_per_epoch <= _ZERO:
+                raise ValueError("scheduler_cfg.epochs and steps_per_epoch must be > 0.")
+            return epochs * steps_per_epoch
+        trainer = getattr(self, "trainer", None)
+        estimated = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
+        if estimated is None:
+            raise ValueError("OneCycleLR requires total_steps or epochs+steps_per_epoch (trainer not initialized).")
+        total_steps = int(estimated)
+        if total_steps <= _ZERO:
+            raise ValueError("trainer.estimated_stepping_batches must be > 0 for OneCycleLR.")
+        return total_steps
 
     def _step_scheduler(self) -> None:
         sched = self.lr_schedulers()
@@ -1431,18 +1542,47 @@ class DualFlowModule(LightningModule):
 
     # ------------------------- Rollouts -------------------------
 
-    def _resolve_actor_cfg(self) -> dict[str, float | int]:
+    def _resolve_actor_cfg(self) -> dict[str, float | int | bool]:
         raw = self.actor_cfg or {}
-        extra = set(raw.keys()) - {"edge_inter_dim", "edge_dropout"}
+        extra = set(raw.keys()) - {
+            "edge_inter_dim",
+            "edge_dropout",
+            "use_spherical",
+            "temperature_init",
+            "norm_eps",
+            "logit_scale_min",
+            "logit_scale_max",
+        }
         if extra:
             raise ValueError(f"Unsupported actor_cfg keys: {sorted(extra)}")
         edge_inter_dim = int(raw.get("edge_inter_dim", _DEFAULT_EDGE_INTER_DIM))
         edge_dropout = float(raw.get("edge_dropout", _DEFAULT_EDGE_DROPOUT))
+        use_spherical = bool(raw.get("use_spherical", QCBiANetwork.DEFAULT_USE_SPHERICAL))
+        temperature_init = float(raw.get("temperature_init", QCBiANetwork.DEFAULT_TEMPERATURE_INIT))
+        norm_eps = float(raw.get("norm_eps", QCBiANetwork.DEFAULT_NORM_EPS))
+        logit_scale_min = float(raw.get("logit_scale_min", QCBiANetwork.DEFAULT_LOGIT_SCALE_MIN))
+        logit_scale_max = float(raw.get("logit_scale_max", QCBiANetwork.DEFAULT_LOGIT_SCALE_MAX))
         if edge_inter_dim <= _ZERO:
             raise ValueError("actor_cfg.edge_inter_dim must be > 0.")
         if edge_dropout < float(_ZERO):
             raise ValueError("actor_cfg.edge_dropout must be >= 0.")
-        return {"edge_inter_dim": edge_inter_dim, "edge_dropout": edge_dropout}
+        if temperature_init <= float(_ZERO):
+            raise ValueError("actor_cfg.temperature_init must be > 0.")
+        if norm_eps <= float(_ZERO):
+            raise ValueError("actor_cfg.norm_eps must be > 0.")
+        if logit_scale_min <= float(_ZERO):
+            raise ValueError("actor_cfg.logit_scale_min must be > 0.")
+        if logit_scale_max <= logit_scale_min:
+            raise ValueError("actor_cfg.logit_scale_max must be > logit_scale_min.")
+        return {
+            "edge_inter_dim": edge_inter_dim,
+            "edge_dropout": edge_dropout,
+            "use_spherical": use_spherical,
+            "temperature_init": temperature_init,
+            "norm_eps": norm_eps,
+            "logit_scale_min": logit_scale_min,
+            "logit_scale_max": logit_scale_max,
+        }
 
     @staticmethod
     def _require_cfg_mapping(raw: Any, name: str) -> Mapping[str, Any]:
@@ -2411,6 +2551,34 @@ class DualFlowModule(LightningModule):
             raise ValueError("evaluation_cfg.beam_size must be > 0.")
         return beam_size
 
+    def _resolve_diverse_beam_cfg(self) -> dict[str, Any]:
+        raw = self.evaluation_cfg.get("diverse_beam", None)
+        if raw is None:
+            raw = {}
+        raw = self._require_cfg_mapping(raw, "evaluation_cfg.diverse_beam")
+        enabled = bool(raw.get("enabled", _DEFAULT_DIVERSE_BEAM_ENABLED))
+        groups = int(raw.get("groups", _DEFAULT_DIVERSE_BEAM_GROUPS))
+        penalty = str(raw.get("penalty", _DEFAULT_DIVERSE_BEAM_PENALTY)).strip().lower()
+        similarity = str(raw.get("similarity", _DEFAULT_DIVERSE_BEAM_SIMILARITY)).strip().lower()
+        penalty_lambda = float(raw.get("lambda", _DEFAULT_DIVERSE_BEAM_LAMBDA))
+        if groups <= _ZERO:
+            raise ValueError("evaluation_cfg.diverse_beam.groups must be > 0.")
+        if penalty not in _DIVERSE_BEAM_PENALTIES:
+            raise ValueError(f"diverse_beam.penalty must be one of {sorted(_DIVERSE_BEAM_PENALTIES)}, got {penalty!r}.")
+        if similarity not in _DIVERSE_BEAM_SIMILARITIES:
+            raise ValueError(
+                f"diverse_beam.similarity must be one of {sorted(_DIVERSE_BEAM_SIMILARITIES)}, got {similarity!r}."
+            )
+        if penalty_lambda < float(_ZERO):
+            raise ValueError("evaluation_cfg.diverse_beam.lambda must be >= 0.")
+        return {
+            "enabled": enabled,
+            "groups": groups,
+            "penalty": penalty,
+            "similarity": similarity,
+            "lambda": penalty_lambda,
+        }
+
     def _resolve_beam_sizes(self) -> list[int]:
         raw = self.evaluation_cfg.get("beam_sizes", None)
         if raw is None:
@@ -2453,10 +2621,36 @@ class DualFlowModule(LightningModule):
         beam_size = int(beam_size)
         if beam_size <= _ZERO:
             return []
+        state = self._init_beam_state(prepared=prepared, beam_size=beam_size, node_is_target=node_is_target)
+        diverse_cfg = self._resolve_diverse_beam_cfg()
+        for step in range(state.max_steps):
+            candidates = self._beam_expand_candidates(
+                prepared=prepared,
+                state=state,
+                step=step,
+                node_is_target=node_is_target,
+            )
+            if candidates is None:
+                break
+            state = self._beam_update_from_candidates(
+                state=state,
+                candidates=candidates,
+                step=step,
+                diverse_cfg=diverse_cfg,
+            )
+        return self._beam_finalize(state)
+
+    def _init_beam_state(
+        self,
+        *,
+        prepared: _PreparedBatch,
+        beam_size: int,
+        node_is_target: torch.Tensor,
+    ) -> _BeamState:
+        num_graphs = int(prepared.node_ptr.numel() - _ONE)
         device = prepared.node_ptr.device
         max_steps = int(self.max_steps)
-        neg_inf = torch.finfo(torch.float32).min
-
+        neg_inf = float("-inf")
         start_nodes = prepared.start_nodes_fwd.to(device=device, dtype=torch.long)
         beam_nodes = torch.full((num_graphs, beam_size), _NEG_ONE, device=device, dtype=torch.long)
         beam_scores = torch.full((num_graphs, beam_size), neg_inf, device=device, dtype=torch.float32)
@@ -2468,139 +2662,205 @@ class DualFlowModule(LightningModule):
         start_target = node_is_target.index_select(0, start_nodes.clamp(min=_ZERO))
         beam_done = torch.zeros((num_graphs, beam_size), device=device, dtype=torch.bool)
         beam_done[:, 0] = valid_start & start_target
-
-        num_beams = num_graphs * beam_size
         flat_graph_ids = torch.arange(num_graphs, device=device).repeat_interleave(beam_size)
         flat_beam_ids = torch.arange(beam_size, device=device).repeat(num_graphs)
         beam_context = prepared.context_tokens.index_select(0, flat_graph_ids)
+        return _BeamState(
+            beam_nodes=beam_nodes,
+            beam_scores=beam_scores,
+            beam_paths=beam_paths,
+            beam_lengths=beam_lengths,
+            beam_done=beam_done,
+            flat_graph_ids=flat_graph_ids,
+            flat_beam_ids=flat_beam_ids,
+            beam_context=beam_context,
+            num_graphs=num_graphs,
+            beam_size=beam_size,
+            max_steps=max_steps,
+            neg_inf=neg_inf,
+        )
 
-        empty_long = torch.zeros((_ZERO,), device=device, dtype=torch.long)
-        empty_bool = torch.zeros((_ZERO,), device=device, dtype=torch.bool)
-        empty_float = torch.zeros((_ZERO,), device=device, dtype=torch.float32)
+    def _beam_expand_candidates(
+        self,
+        *,
+        prepared: _PreparedBatch,
+        state: _BeamState,
+        step: int,
+        node_is_target: torch.Tensor,
+    ) -> Optional[_BeamCandidates]:
+        flat_nodes = state.beam_nodes.view(-1)
+        flat_scores = state.beam_scores.view(-1)
+        flat_done = state.beam_done.view(-1)
+        flat_valid = flat_nodes >= _ZERO
+        expand_mask = flat_valid & ~flat_done
+        outgoing = gather_outgoing_edges(
+            curr_nodes=flat_nodes,
+            edge_ids_by_head=prepared.edge_ids_by_head_fwd,
+            edge_ptr_by_head=prepared.edge_ptr_by_head_fwd,
+            active_mask=expand_mask,
+        )
+        empty_long = torch.zeros((_ZERO,), device=flat_nodes.device, dtype=torch.long)
+        empty_bool = torch.zeros((_ZERO,), device=flat_nodes.device, dtype=torch.bool)
+        empty_float = torch.zeros((_ZERO,), device=flat_nodes.device, dtype=torch.float32)
 
-        for step in range(max_steps):
-            flat_nodes = beam_nodes.view(-1)
-            flat_scores = beam_scores.view(-1)
-            flat_done = beam_done.view(-1)
-            flat_valid = flat_nodes >= _ZERO
-            expand_mask = flat_valid & ~flat_done
-            outgoing = gather_outgoing_edges(
-                curr_nodes=flat_nodes,
-                edge_ids_by_head=prepared.edge_ids_by_head_fwd,
-                edge_ptr_by_head=prepared.edge_ptr_by_head_fwd,
-                active_mask=expand_mask,
+        if outgoing.edge_ids.numel() > _ZERO:
+            step_ids = torch.full((state.num_graphs * state.beam_size,), step, device=flat_nodes.device, dtype=torch.long)
+            logits = self._compute_edge_logits(
+                policy=self.policy_fwd,
+                prepared=prepared,
+                edge_ids=outgoing.edge_ids,
+                edge_batch=outgoing.edge_batch,
+                steps=step_ids + _ONE,
+                temperature=float(_ONE),
+                context_tokens=state.beam_context,
             )
+            log_denom = self._compute_log_denom(
+                logits=logits, edge_batch=outgoing.edge_batch, num_graphs=state.num_graphs * state.beam_size
+            )
+            log_probs = logits - log_denom.index_select(0, outgoing.edge_batch)
+            cand_scores_edge = flat_scores.index_select(0, outgoing.edge_batch) + log_probs
+            cand_nodes_edge = prepared.edge_index[_ONE].index_select(0, outgoing.edge_ids)
+            cand_graph_edge = state.flat_graph_ids.index_select(0, outgoing.edge_batch)
+            cand_src_beam_edge = state.flat_beam_ids.index_select(0, outgoing.edge_batch)
+            cand_edge_id_edge = outgoing.edge_ids
+            cand_is_edge_edge = torch.ones_like(cand_scores_edge, dtype=torch.bool)
+            cand_done_edge = node_is_target.index_select(0, cand_nodes_edge)
+        else:
+            cand_scores_edge = empty_float
+            cand_nodes_edge = empty_long
+            cand_graph_edge = empty_long
+            cand_src_beam_edge = empty_long
+            cand_edge_id_edge = empty_long
+            cand_is_edge_edge = empty_bool
+            cand_done_edge = empty_bool
 
-            if outgoing.edge_ids.numel() > _ZERO:
-                step_ids = torch.full((num_beams,), step, device=device, dtype=torch.long)
-                logits = self._compute_edge_logits(
-                    policy=self.policy_fwd,
-                    prepared=prepared,
-                    edge_ids=outgoing.edge_ids,
-                    edge_batch=outgoing.edge_batch,
-                    steps=step_ids + _ONE,
-                    temperature=float(_ONE),
-                    context_tokens=beam_context,
+        stay_mask = flat_valid & (flat_done | ~outgoing.has_edge)
+        cand_scores_stay = flat_scores[stay_mask]
+        cand_nodes_stay = flat_nodes[stay_mask]
+        cand_graph_stay = state.flat_graph_ids[stay_mask]
+        cand_src_beam_stay = state.flat_beam_ids[stay_mask]
+        cand_edge_id_stay = torch.full_like(cand_nodes_stay, _NEG_ONE)
+        cand_is_edge_stay = torch.zeros_like(cand_scores_stay, dtype=torch.bool)
+        cand_done_stay = torch.ones_like(cand_scores_stay, dtype=torch.bool)
+
+        cand_scores = torch.cat((cand_scores_edge, cand_scores_stay), dim=0)
+        if cand_scores.numel() == _ZERO:
+            return None
+        cand_nodes = torch.cat((cand_nodes_edge, cand_nodes_stay), dim=0)
+        cand_graph = torch.cat((cand_graph_edge, cand_graph_stay), dim=0)
+        cand_src_beam = torch.cat((cand_src_beam_edge, cand_src_beam_stay), dim=0)
+        cand_edge_id = torch.cat((cand_edge_id_edge, cand_edge_id_stay), dim=0)
+        cand_is_edge = torch.cat((cand_is_edge_edge, cand_is_edge_stay), dim=0)
+        cand_done = torch.cat((cand_done_edge, cand_done_stay), dim=0)
+        return _BeamCandidates(
+            cand_scores=cand_scores,
+            cand_nodes=cand_nodes,
+            cand_graph=cand_graph,
+            cand_src_beam=cand_src_beam,
+            cand_edge_id=cand_edge_id,
+            cand_is_edge=cand_is_edge,
+            cand_done=cand_done,
+        )
+
+    def _beam_update_from_candidates(
+        self,
+        *,
+        state: _BeamState,
+        candidates: _BeamCandidates,
+        step: int,
+        diverse_cfg: Mapping[str, Any],
+    ) -> _BeamState:
+        order = torch.argsort(candidates.cand_graph)
+        cand_graph = candidates.cand_graph.index_select(0, order)
+        cand_scores = candidates.cand_scores.index_select(0, order)
+        cand_nodes = candidates.cand_nodes.index_select(0, order)
+        cand_src_beam = candidates.cand_src_beam.index_select(0, order)
+        cand_edge_id = candidates.cand_edge_id.index_select(0, order)
+        cand_is_edge = candidates.cand_is_edge.index_select(0, order)
+        cand_done = candidates.cand_done.index_select(0, order)
+
+        counts = torch.bincount(cand_graph, minlength=state.num_graphs)
+        offsets = counts.cumsum(0)
+        counts_cpu = counts.detach().cpu().tolist()
+        offsets_cpu = offsets.detach().cpu().tolist()
+
+        new_nodes = torch.full_like(state.beam_nodes, _NEG_ONE)
+        new_scores = torch.full_like(state.beam_scores, state.neg_inf)
+        new_paths = torch.full_like(state.beam_paths, _NEG_ONE)
+        new_lengths = torch.zeros_like(state.beam_lengths)
+        new_done = torch.zeros_like(state.beam_done)
+
+        for graph_idx in range(state.num_graphs):
+            count = counts_cpu[graph_idx]
+            if count <= _ZERO:
+                continue
+            end = offsets_cpu[graph_idx]
+            start = end - count
+            scores_g = cand_scores[start:end]
+            k = min(state.beam_size, count)
+            if diverse_cfg["enabled"] and k > _ONE and diverse_cfg["groups"] > _ONE:
+                keys_g = self._select_diverse_keys(
+                    similarity=diverse_cfg["similarity"],
+                    cand_nodes=cand_nodes[start:end],
+                    cand_edge_id=cand_edge_id[start:end],
+                    cand_src_beam=cand_src_beam[start:end],
+                    cand_is_edge=cand_is_edge[start:end],
                 )
-                log_denom = self._compute_log_denom(
-                    logits=logits, edge_batch=outgoing.edge_batch, num_graphs=num_beams
+                top_idx = self._diverse_select_indices(
+                    scores=scores_g,
+                    keys=keys_g,
+                    k=k,
+                    groups=diverse_cfg["groups"],
+                    penalty=diverse_cfg["penalty"],
+                    penalty_lambda=diverse_cfg["lambda"],
+                    neg_inf=state.neg_inf,
                 )
-                log_probs = logits - log_denom.index_select(0, outgoing.edge_batch)
-                cand_scores_edge = flat_scores.index_select(0, outgoing.edge_batch) + log_probs
-                cand_nodes_edge = prepared.edge_index[_ONE].index_select(0, outgoing.edge_ids)
-                cand_graph_edge = flat_graph_ids.index_select(0, outgoing.edge_batch)
-                cand_src_beam_edge = flat_beam_ids.index_select(0, outgoing.edge_batch)
-                cand_edge_id_edge = outgoing.edge_ids
-                cand_is_edge_edge = torch.ones_like(cand_scores_edge, dtype=torch.bool)
-                cand_done_edge = node_is_target.index_select(0, cand_nodes_edge)
+                sel_idx = top_idx + start
+                top_scores = scores_g.index_select(0, top_idx)
             else:
-                cand_scores_edge = empty_float
-                cand_nodes_edge = empty_long
-                cand_graph_edge = empty_long
-                cand_src_beam_edge = empty_long
-                cand_edge_id_edge = empty_long
-                cand_is_edge_edge = empty_bool
-                cand_done_edge = empty_bool
-
-            stay_mask = flat_valid & (flat_done | ~outgoing.has_edge)
-            cand_scores_stay = flat_scores[stay_mask]
-            cand_nodes_stay = flat_nodes[stay_mask]
-            cand_graph_stay = flat_graph_ids[stay_mask]
-            cand_src_beam_stay = flat_beam_ids[stay_mask]
-            cand_edge_id_stay = torch.full_like(cand_nodes_stay, _NEG_ONE)
-            cand_is_edge_stay = torch.zeros_like(cand_scores_stay, dtype=torch.bool)
-            cand_done_stay = torch.ones_like(cand_scores_stay, dtype=torch.bool)
-
-            cand_scores = torch.cat((cand_scores_edge, cand_scores_stay), dim=0)
-            if cand_scores.numel() == _ZERO:
-                break
-            cand_nodes = torch.cat((cand_nodes_edge, cand_nodes_stay), dim=0)
-            cand_graph = torch.cat((cand_graph_edge, cand_graph_stay), dim=0)
-            cand_src_beam = torch.cat((cand_src_beam_edge, cand_src_beam_stay), dim=0)
-            cand_edge_id = torch.cat((cand_edge_id_edge, cand_edge_id_stay), dim=0)
-            cand_is_edge = torch.cat((cand_is_edge_edge, cand_is_edge_stay), dim=0)
-            cand_done = torch.cat((cand_done_edge, cand_done_stay), dim=0)
-
-            order = torch.argsort(cand_graph)
-            cand_graph = cand_graph.index_select(0, order)
-            cand_scores = cand_scores.index_select(0, order)
-            cand_nodes = cand_nodes.index_select(0, order)
-            cand_src_beam = cand_src_beam.index_select(0, order)
-            cand_edge_id = cand_edge_id.index_select(0, order)
-            cand_is_edge = cand_is_edge.index_select(0, order)
-            cand_done = cand_done.index_select(0, order)
-
-            counts = torch.bincount(cand_graph, minlength=num_graphs)
-            offsets = counts.cumsum(0)
-            counts_cpu = counts.detach().cpu().tolist()
-            offsets_cpu = offsets.detach().cpu().tolist()
-
-            new_nodes = torch.full_like(beam_nodes, _NEG_ONE)
-            new_scores = torch.full_like(beam_scores, neg_inf)
-            new_paths = torch.full_like(beam_paths, _NEG_ONE)
-            new_lengths = torch.zeros_like(beam_lengths)
-            new_done = torch.zeros_like(beam_done)
-
-            for graph_idx in range(num_graphs):
-                count = counts_cpu[graph_idx]
-                if count <= _ZERO:
-                    continue
-                end = offsets_cpu[graph_idx]
-                start = end - count
-                scores_g = cand_scores[start:end]
-                k = min(beam_size, count)
                 top_scores, top_idx = torch.topk(scores_g, k)
                 sel_idx = top_idx + start
-                sel_nodes = cand_nodes.index_select(0, sel_idx)
-                sel_src = cand_src_beam.index_select(0, sel_idx)
-                sel_edge_id = cand_edge_id.index_select(0, sel_idx)
-                sel_is_edge = cand_is_edge.index_select(0, sel_idx)
-                sel_done = cand_done.index_select(0, sel_idx)
-                sel_paths = beam_paths[graph_idx].index_select(0, sel_src)
-                sel_lengths = beam_lengths[graph_idx].index_select(0, sel_src)
-                sel_paths = sel_paths.clone()
-                sel_paths[:, step] = torch.where(sel_is_edge, sel_edge_id, sel_paths[:, step])
-                sel_lengths = sel_lengths + sel_is_edge.to(dtype=sel_lengths.dtype)
-                new_nodes[graph_idx, :k] = sel_nodes
-                new_scores[graph_idx, :k] = top_scores
-                new_paths[graph_idx, :k] = sel_paths
-                new_lengths[graph_idx, :k] = sel_lengths
-                new_done[graph_idx, :k] = sel_done
+            sel_nodes = cand_nodes.index_select(0, sel_idx)
+            sel_src = cand_src_beam.index_select(0, sel_idx)
+            sel_edge_id = cand_edge_id.index_select(0, sel_idx)
+            sel_is_edge = cand_is_edge.index_select(0, sel_idx)
+            sel_done = cand_done.index_select(0, sel_idx)
+            sel_paths = state.beam_paths[graph_idx].index_select(0, sel_src)
+            sel_lengths = state.beam_lengths[graph_idx].index_select(0, sel_src)
+            sel_paths = sel_paths.clone()
+            sel_paths[:, step] = torch.where(sel_is_edge, sel_edge_id, sel_paths[:, step])
+            sel_lengths = sel_lengths + sel_is_edge.to(dtype=sel_lengths.dtype)
+            new_nodes[graph_idx, :k] = sel_nodes
+            new_scores[graph_idx, :k] = top_scores
+            new_paths[graph_idx, :k] = sel_paths
+            new_lengths[graph_idx, :k] = sel_lengths
+            new_done[graph_idx, :k] = sel_done
 
-            beam_nodes = new_nodes
-            beam_scores = new_scores
-            beam_paths = new_paths
-            beam_lengths = new_lengths
-            beam_done = new_done
+        return _BeamState(
+            beam_nodes=new_nodes,
+            beam_scores=new_scores,
+            beam_paths=new_paths,
+            beam_lengths=new_lengths,
+            beam_done=new_done,
+            flat_graph_ids=state.flat_graph_ids,
+            flat_beam_ids=state.flat_beam_ids,
+            beam_context=state.beam_context,
+            num_graphs=state.num_graphs,
+            beam_size=state.beam_size,
+            max_steps=state.max_steps,
+            neg_inf=state.neg_inf,
+        )
 
-        beam_nodes_cpu = beam_nodes.detach().cpu()
-        beam_scores_cpu = beam_scores.detach().cpu()
-        beam_paths_cpu = beam_paths.detach().cpu()
-        beam_lengths_cpu = beam_lengths.detach().cpu()
+    @staticmethod
+    def _beam_finalize(state: _BeamState) -> list[list[tuple[int, float, list[int]]]]:
+        beam_nodes_cpu = state.beam_nodes.detach().cpu()
+        beam_scores_cpu = state.beam_scores.detach().cpu()
+        beam_paths_cpu = state.beam_paths.detach().cpu()
+        beam_lengths_cpu = state.beam_lengths.detach().cpu()
         beams: list[list[tuple[int, float, list[int]]]] = []
-        for graph_idx in range(num_graphs):
+        for graph_idx in range(state.num_graphs):
             graph_beams: list[tuple[int, float, list[int]]] = []
-            for beam_idx in range(beam_size):
+            for beam_idx in range(state.beam_size):
                 node_id = int(beam_nodes_cpu[graph_idx, beam_idx].item())
                 if node_id < _ZERO:
                     continue
@@ -2744,6 +3004,90 @@ class DualFlowModule(LightningModule):
         )
         metrics = self._reduce_eval_metrics(metrics, valid_mask=valid_mask)
         return metrics, valid_count
+
+    @staticmethod
+    def _select_diverse_keys(
+        *,
+        similarity: str,
+        cand_nodes: torch.Tensor,
+        cand_edge_id: torch.Tensor,
+        cand_src_beam: torch.Tensor,
+        cand_is_edge: torch.Tensor,
+    ) -> torch.Tensor:
+        if similarity == "tail":
+            return cand_nodes.to(dtype=torch.long)
+        if similarity == "edge":
+            cand_edge_id = cand_edge_id.to(dtype=torch.long)
+            cand_src_beam = cand_src_beam.to(dtype=torch.long)
+            cand_is_edge = cand_is_edge.to(dtype=torch.bool)
+            stay_keys = -cand_src_beam - _TWO
+            return torch.where(cand_is_edge, cand_edge_id, stay_keys)
+        if similarity == "source":
+            return cand_src_beam.to(dtype=torch.long)
+        raise ValueError(f"Unsupported diverse beam similarity: {similarity!r}.")
+
+    @staticmethod
+    def _diverse_select_indices(
+        *,
+        scores: torch.Tensor,
+        keys: torch.Tensor,
+        k: int,
+        groups: int,
+        penalty: str,
+        penalty_lambda: float,
+        neg_inf: float,
+    ) -> torch.Tensor:
+        if scores.numel() == _ZERO or k <= _ZERO:
+            return torch.zeros((_ZERO,), device=scores.device, dtype=torch.long)
+        total = int(scores.numel())
+        k = min(int(k), total)
+        groups = max(_ONE, min(int(groups), k))
+        base = k // groups
+        remainder = k % groups
+        group_sizes = [base + _ONE if idx < remainder else base for idx in range(groups)]
+        selected_mask = torch.zeros((total,), device=scores.device, dtype=torch.bool)
+        selected_indices = torch.zeros((_ZERO,), device=scores.device, dtype=torch.long)
+        used_keys = keys.new_empty((_ZERO,))
+        for group_size in group_sizes:
+            if group_size <= _ZERO:
+                continue
+            scores_adj = scores.clone()
+            scores_adj[selected_mask] = neg_inf
+            if used_keys.numel() > _ZERO:
+                used_mask = (keys.unsqueeze(1) == used_keys.unsqueeze(0)).any(dim=1)
+                if penalty == "hard":
+                    scores_adj = scores_adj.masked_fill(used_mask, neg_inf)
+                else:
+                    scores_adj = scores_adj - penalty_lambda * used_mask.to(dtype=scores_adj.dtype)
+            valid = torch.isfinite(scores_adj)
+            if not bool(valid.any().detach().tolist()):
+                break
+            group_k = min(int(group_size), int(valid.sum().detach().tolist()))
+            top_scores, top_idx = torch.topk(scores_adj, group_k)
+            _ = top_scores
+            selected_mask[top_idx] = True
+            selected_indices = torch.cat((selected_indices, top_idx), dim=0)
+            used_keys = torch.cat((used_keys, keys.index_select(0, top_idx)), dim=0)
+            if int(selected_indices.numel()) >= k:
+                break
+        if int(selected_indices.numel()) == _ZERO:
+            top_scores, top_idx = torch.topk(scores, k)
+            _ = top_scores
+            return top_idx
+        if int(selected_indices.numel()) < k:
+            remaining = k - int(selected_indices.numel())
+            scores_adj = scores.clone()
+            scores_adj[selected_mask] = neg_inf
+            if used_keys.numel() > _ZERO:
+                used_mask = (keys.unsqueeze(1) == used_keys.unsqueeze(0)).any(dim=1)
+                if penalty == "hard":
+                    scores_adj = scores_adj.masked_fill(used_mask, neg_inf)
+                else:
+                    scores_adj = scores_adj - penalty_lambda * used_mask.to(dtype=scores_adj.dtype)
+            extra_scores, extra_idx = torch.topk(scores_adj, remaining)
+            _ = extra_scores
+            selected_indices = torch.cat((selected_indices, extra_idx), dim=0)
+        return selected_indices
 
     @staticmethod
     def _reduce_eval_metrics(
