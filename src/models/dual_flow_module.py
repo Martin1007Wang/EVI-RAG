@@ -125,6 +125,11 @@ _STANDARD_EVAL_METRICS = {
     "length_mean",
     "rollout_success_rate",
 }
+_STANDARD_METRICS = {
+    "train": _STANDARD_TRAIN_METRICS,
+    "val": _STANDARD_EVAL_METRICS,
+    "test": _STANDARD_EVAL_METRICS,
+}
 
 
 @dataclass(frozen=True)
@@ -382,7 +387,7 @@ class DualFlowModule(LightningModule):
         extra_training = set(self.training_cfg.keys()) - allowed_training
         if extra_training:
             raise ValueError(f"Unsupported training_cfg keys: {sorted(extra_training)}")
-        allowed_eval = {"beam_size", "beam_sizes", "diverse_beam"}
+        allowed_eval = {"beam_size", "diverse_beam"}
         extra_eval = set(self.evaluation_cfg.keys()) - allowed_eval
         if extra_eval:
             raise ValueError(f"Unsupported evaluation_cfg keys: {sorted(extra_eval)}")
@@ -600,7 +605,7 @@ class DualFlowModule(LightningModule):
         if not torch.isfinite(loss).all().item():
             raise ValueError("Non-finite loss detected.")
         metrics.update(self._collect_logit_scale_metrics())
-        metrics = self._filter_metrics(metrics, _STANDARD_TRAIN_METRICS)
+        metrics = self._filter_metrics(metrics, self._get_standard_metrics("train"))
         self.manual_backward(loss / accum)
         if self._should_step_optimizer(batch_idx):
             optimizer.step()
@@ -620,12 +625,12 @@ class DualFlowModule(LightningModule):
         metrics, batch_size = self._compute_eval_metrics(batch)
         if batch_size <= _ZERO:
             return
-        metrics = self._filter_metrics(metrics, _STANDARD_EVAL_METRICS)
+        metrics = self._filter_metrics(metrics, self._get_standard_metrics("val"))
         scope = self._resolve_dataset_scope()
         for name, value in metrics.items():
             scoped_name = f"val/{scope}/{name}"
             log_metric(self, scoped_name, value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False)
-            if name.startswith(("pass@", "hit@", "recall@", "precision@", "f1@")):
+            if name.startswith(("hit@", "recall@", "precision@", "f1@")):
                 log_metric(self, f"val/{name}", value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False)
 
     def test_step(self, batch: Any, batch_idx: int) -> None:
@@ -634,12 +639,12 @@ class DualFlowModule(LightningModule):
         metrics, batch_size = self._compute_eval_metrics(batch)
         if batch_size <= _ZERO:
             return
-        metrics = self._filter_metrics(metrics, _STANDARD_EVAL_METRICS)
+        metrics = self._filter_metrics(metrics, self._get_standard_metrics("test"))
         scope = self._resolve_dataset_scope()
         for name, value in metrics.items():
             scoped_name = f"test/{scope}/{name}"
             log_metric(self, scoped_name, value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False)
-            if name.startswith(("pass@", "hit@", "recall@", "precision@", "f1@")):
+            if name.startswith(("hit@", "recall@", "precision@", "f1@")):
                 log_metric(self, f"test/{name}", value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False)
 
     # ------------------------- Grad helpers -------------------------
@@ -2640,6 +2645,12 @@ class DualFlowModule(LightningModule):
             return {}
         return {name: value for name, value in metrics.items() if name in keep}
 
+    def _get_standard_metrics(self, stage: str) -> set[str]:
+        key = str(stage).strip().lower()
+        if key not in _STANDARD_METRICS:
+            raise ValueError(f"Unsupported metrics stage: {stage!r}.")
+        return _STANDARD_METRICS[key]
+
     # ------------------------- Eval -------------------------
 
     def _resolve_dataset_scope(self) -> str:
@@ -2686,34 +2697,8 @@ class DualFlowModule(LightningModule):
             "lambda": penalty_lambda,
         }
 
-    def _resolve_beam_sizes(self) -> list[int]:
-        raw = self.evaluation_cfg.get("beam_sizes", None)
-        if raw is None:
-            return [self._resolve_beam_size_value()]
-        if isinstance(raw, Mapping):
-            raise ValueError("evaluation_cfg.beam_sizes must be a list of positive integers.")
-        if isinstance(raw, (list, tuple)):
-            values = list(raw)
-        elif isinstance(raw, str):
-            values = [part for part in (chunk.strip() for chunk in raw.split(",")) if part]
-        else:
-            try:
-                values = list(raw)
-            except TypeError:
-                values = [raw]
-        if not values:
-            values = [self._resolve_beam_size_value()]
-        parsed: list[int] = []
-        for value in values:
-            beam_size = int(value)
-            if beam_size <= _ZERO:
-                raise ValueError("evaluation_cfg.beam_sizes entries must be > 0.")
-            parsed.append(beam_size)
-        return sorted(set(parsed))
-
     def _resolve_beam_size(self) -> int:
-        beam_sizes = self._resolve_beam_sizes()
-        return max(beam_sizes)
+        return self._resolve_beam_size_value()
 
     def _beam_search(
         self,
@@ -3242,33 +3227,13 @@ class DualFlowModule(LightningModule):
                     prepared=prepared_fwd,
                     max_hops=int(pb_cfg["max_hops"]),
                 )
-        beam_sizes = self._resolve_beam_sizes()
-        max_beam_size = beam_sizes[-1]
-        beams = self._beam_search(prepared=prepared_fwd, beam_size=max_beam_size, node_is_target=node_is_target_all)
-        pass_hits = {
-            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
-            for beam_size in beam_sizes
-        }
-        hit_hits = {
-            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
-            for beam_size in beam_sizes
-        }
-        recall_scores = {
-            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
-            for beam_size in beam_sizes
-        }
-        precision_scores = {
-            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
-            for beam_size in beam_sizes
-        }
-        f1_scores = {
-            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
-            for beam_size in beam_sizes
-        }
-        diversity_scores = {
-            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
-            for beam_size in beam_sizes
-        }
+        beam_size = self._resolve_beam_size()
+        beams = self._beam_search(prepared=prepared_fwd, beam_size=beam_size, node_is_target=node_is_target_all)
+        hit_hits = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
+        recall_scores = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
+        precision_scores = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
+        f1_scores = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
+        diversity_scores = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
         length = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
         for graph_idx in range(num_graphs):
             if not bool(valid_mask[graph_idx].detach().tolist()):
@@ -3284,42 +3249,35 @@ class DualFlowModule(LightningModule):
             a_end = int(prepared_fwd.a_ptr[graph_idx + _ONE].detach().tolist())
             answer_nodes = prepared_fwd.a_local_indices[a_start:a_end].detach().tolist() if a_end > a_start else []
             answer_set = {int(node_id) for node_id in answer_nodes if int(node_id) >= _ZERO}
-            for beam_size in beam_sizes:
-                topk = min(int(beam_size), len(beam_nodes))
-                if topk > _ZERO and any(hits[:topk]):
-                    pass_hits[beam_size][graph_idx] = float(_ONE)
-                    hit_hits[beam_size][graph_idx] = float(_ONE)
-                pred_nodes = {beam_nodes[idx] for idx in range(topk) if beam_nodes[idx] >= _ZERO}
-                if answer_set:
-                    overlap = pred_nodes & answer_set
-                    recall = float(len(overlap)) / float(len(answer_set))
-                    precision = float(len(overlap)) / float(len(pred_nodes)) if pred_nodes else float(_ZERO)
-                    denom = recall + precision
-                    f1 = (float(_TWO) * recall * precision / denom) if denom > float(_ZERO) else float(_ZERO)
-                else:
-                    recall = float(_ZERO)
-                    precision = float(_ZERO)
-                    f1 = float(_ZERO)
-                if topk > _ZERO:
-                    diversity = float(len(pred_nodes)) / float(topk)
-                else:
-                    diversity = float(_ZERO)
-                recall_scores[beam_size][graph_idx] = recall
-                precision_scores[beam_size][graph_idx] = precision
-                f1_scores[beam_size][graph_idx] = f1
-                diversity_scores[beam_size][graph_idx] = diversity
-        metrics = {f"pass@{beam_size}": pass_hits[beam_size] for beam_size in beam_sizes}
-        metrics.update({f"hit@{beam_size}": hit_hits[beam_size] for beam_size in beam_sizes})
-        metrics.update({f"recall@{beam_size}": recall_scores[beam_size] for beam_size in beam_sizes})
-        metrics.update({f"precision@{beam_size}": precision_scores[beam_size] for beam_size in beam_sizes})
-        metrics.update({f"f1@{beam_size}": f1_scores[beam_size] for beam_size in beam_sizes})
-        metrics.update({f"diversity@{beam_size}": diversity_scores[beam_size] for beam_size in beam_sizes})
-        metrics["pass@beam"] = pass_hits[max_beam_size]
-        metrics["hit@beam"] = hit_hits[max_beam_size]
-        metrics["recall@beam"] = recall_scores[max_beam_size]
-        metrics["precision@beam"] = precision_scores[max_beam_size]
-        metrics["f1@beam"] = f1_scores[max_beam_size]
-        metrics["diversity@beam"] = diversity_scores[max_beam_size]
+            topk = min(int(beam_size), len(beam_nodes))
+            if topk > _ZERO and any(hits[:topk]):
+                hit_hits[graph_idx] = float(_ONE)
+            pred_nodes = {beam_nodes[idx] for idx in range(topk) if beam_nodes[idx] >= _ZERO}
+            if answer_set:
+                overlap = pred_nodes & answer_set
+                recall = float(len(overlap)) / float(len(answer_set))
+                precision = float(len(overlap)) / float(len(pred_nodes)) if pred_nodes else float(_ZERO)
+                denom = recall + precision
+                f1 = (float(_TWO) * recall * precision / denom) if denom > float(_ZERO) else float(_ZERO)
+            else:
+                recall = float(_ZERO)
+                precision = float(_ZERO)
+                f1 = float(_ZERO)
+            if topk > _ZERO:
+                diversity = float(len(pred_nodes)) / float(topk)
+            else:
+                diversity = float(_ZERO)
+            recall_scores[graph_idx] = recall
+            precision_scores[graph_idx] = precision
+            f1_scores[graph_idx] = f1
+            diversity_scores[graph_idx] = diversity
+        metrics = {
+            "hit@beam": hit_hits,
+            "recall@beam": recall_scores,
+            "precision@beam": precision_scores,
+            "f1@beam": f1_scores,
+            "diversity@beam": diversity_scores,
+        }
         metrics["length_mean"] = length
         eval_temperature = float(_ONE)
         rollout_fwd = self._rollout_policy(
@@ -3353,13 +3311,6 @@ class DualFlowModule(LightningModule):
         success = (rollout_fwd.stop_reason == _TERMINAL_HIT) & valid_mask
         metrics.update(db_metrics)
         metrics["rollout_success_rate"] = success.to(dtype=torch.float32).mean()
-        metrics.update(
-            self._build_terminal_metrics(
-                stop_reason=rollout_fwd.stop_reason,
-                graph_mask=valid_mask,
-                prefix="rollout",
-            )
-        )
         metrics = self._reduce_eval_metrics(metrics, valid_mask=valid_mask)
         return metrics, valid_count
 

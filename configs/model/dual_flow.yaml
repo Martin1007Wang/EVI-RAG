@@ -54,7 +54,6 @@ training_cfg:
 
 evaluation_cfg:
   beam_size: 50
-  beam_sizes: [1, 10, 25, 50]
   diverse_beam:
     enabled: true
     groups: 4
