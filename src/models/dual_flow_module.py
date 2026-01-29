@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 import math
 from typing import Any, Optional
 
+import logging
+
 import torch
 from lightning import LightningModule
 
@@ -233,6 +235,7 @@ class DualFlowModule(LightningModule):
         self.optimizer_cfg = optimizer_cfg or {}
         self.scheduler_cfg = scheduler_cfg or {}
         self.logging_cfg = logging_cfg or {}
+        self._onecycle_checked = False
 
         self._validate_edge_batch = bool(self.runtime_cfg.get("validate_edge_batch", _DEFAULT_VALIDATE_EDGE_BATCH))
         self._avoid_revisit = bool(self.runtime_cfg.get("avoid_revisit", _DEFAULT_AVOID_REVISIT))
@@ -523,6 +526,49 @@ class DualFlowModule(LightningModule):
     def on_train_epoch_start(self) -> None:
         return
 
+    def on_fit_start(self) -> None:
+        self._check_onecycle_total_steps()
+
+    def _check_onecycle_total_steps(self) -> None:
+        if self._onecycle_checked:
+            return
+        self._onecycle_checked = True
+        sched_type = str(self.scheduler_cfg.get("type", "") or "").strip().lower()
+        if sched_type not in {"onecycle", "one_cycle", "onecyclelr", _SCHED_TYPE_ONECYCLE}:
+            return
+        trainer = getattr(self, "trainer", None)
+        estimated = getattr(trainer, "estimated_stepping_batches", None) if trainer is not None else None
+        configured = None
+        source = None
+        if "total_steps" in self.scheduler_cfg and self.scheduler_cfg.get("total_steps") is not None:
+            configured = int(self.scheduler_cfg.get("total_steps"))
+            source = "total_steps"
+        elif self.scheduler_cfg.get("epochs") is not None or self.scheduler_cfg.get("steps_per_epoch") is not None:
+            epochs = self.scheduler_cfg.get("epochs")
+            steps_per_epoch = self.scheduler_cfg.get("steps_per_epoch")
+            if epochs is not None and steps_per_epoch is not None:
+                configured = int(epochs) * int(steps_per_epoch)
+                source = "epochs*steps_per_epoch"
+        if estimated is None:
+            log_event(logger, "onecycle_total_steps_check", configured=configured, source=source, estimated=None)
+            return
+        estimated = int(estimated)
+        if configured is None:
+            log_event(logger, "onecycle_total_steps_check", configured=None, source=None, estimated=estimated)
+            return
+        diff = abs(int(configured) - estimated)
+        ratio = float(diff) / float(estimated) if estimated > _ZERO else 0.0
+        log_event(
+            logger,
+            "onecycle_total_steps_check",
+            level=logging.WARNING if ratio >= 0.05 else logging.INFO,
+            configured=int(configured),
+            source=source,
+            estimated=estimated,
+            diff=diff,
+            ratio=ratio,
+        )
+
     # ------------------------- Lightning hooks -------------------------
 
     def forward(self, batch: Any) -> torch.Tensor:  # pragma: no cover
@@ -538,6 +584,7 @@ class DualFlowModule(LightningModule):
         if not torch.isfinite(loss).all().item():
             raise ValueError("Non-finite loss detected.")
         metrics = self._select_training_metrics(metrics)
+        metrics.update(self._collect_logit_scale_metrics())
         self.manual_backward(loss / accum)
         if self._should_step_optimizer(batch_idx):
             optimizer.step()
@@ -2272,9 +2319,15 @@ class DualFlowModule(LightningModule):
             pb_cfg=pb_cfg,
         )
         success = (rollout_fwd.stop_reason == _TERMINAL_HIT) & graph_mask
+        lengths = rollout_fwd.num_moves.to(dtype=torch.float32)
+        if bool(graph_mask.any().detach().tolist()):
+            length_mean = lengths[graph_mask].mean()
+        else:
+            length_mean = torch.zeros((), device=lengths.device, dtype=lengths.dtype)
         metrics = {
             **db_metrics,
             "rollout_success_rate": success.to(dtype=torch.float32).mean(),
+            "rollout_length_mean": length_mean,
         }
         metrics.update(
             self._build_terminal_metrics(
@@ -2354,9 +2407,15 @@ class DualFlowModule(LightningModule):
             pb_cfg=pb_cfg,
         )
         success = (rollout_bwd.stop_reason == _TERMINAL_HIT) & graph_mask
+        lengths = rollout_bwd.num_moves.to(dtype=torch.float32)
+        if bool(graph_mask.any().detach().tolist()):
+            length_mean = lengths[graph_mask].mean()
+        else:
+            length_mean = torch.zeros((), device=lengths.device, dtype=lengths.dtype)
         metrics = {
             **db_metrics,
             "rollout_bwd_success_rate": success.to(dtype=torch.float32).mean(),
+            "rollout_bwd_length_mean": length_mean,
         }
         metrics.update(
             self._build_terminal_metrics(
@@ -2543,6 +2602,19 @@ class DualFlowModule(LightningModule):
         if loss.requires_grad:
             return loss
         return loss + torch.zeros((), device=loss.device, dtype=loss.dtype, requires_grad=True)
+
+    def _collect_logit_scale_metrics(self) -> dict[str, torch.Tensor]:
+        metrics: dict[str, torch.Tensor] = {}
+        for prefix, policy in (("fwd", self.policy_fwd), ("bwd", self.policy_bwd)):
+            logit_scale = getattr(policy, "logit_scale", None)
+            if logit_scale is None:
+                continue
+            scale = logit_scale.exp()
+            scale = scale.clamp(min=policy.logit_scale_min, max=policy.logit_scale_max)
+            metrics[f"logit_scale_{prefix}"] = scale.detach()
+        if metrics:
+            metrics["logit_scale_max"] = torch.stack(list(metrics.values())).max()
+        return metrics
 
     # ------------------------- Eval -------------------------
 
@@ -3169,6 +3241,10 @@ class DualFlowModule(LightningModule):
             beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
             for beam_size in beam_sizes
         }
+        diversity_scores = {
+            beam_size: torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
+            for beam_size in beam_sizes
+        }
         length = torch.zeros((num_graphs,), device=self.device, dtype=torch.float32)
         for graph_idx in range(num_graphs):
             if not bool(valid_mask[graph_idx].detach().tolist()):
@@ -3200,19 +3276,26 @@ class DualFlowModule(LightningModule):
                     recall = float(_ZERO)
                     precision = float(_ZERO)
                     f1 = float(_ZERO)
+                if topk > _ZERO:
+                    diversity = float(len(pred_nodes)) / float(topk)
+                else:
+                    diversity = float(_ZERO)
                 recall_scores[beam_size][graph_idx] = recall
                 precision_scores[beam_size][graph_idx] = precision
                 f1_scores[beam_size][graph_idx] = f1
+                diversity_scores[beam_size][graph_idx] = diversity
         metrics = {f"pass@{beam_size}": pass_hits[beam_size] for beam_size in beam_sizes}
         metrics.update({f"hit@{beam_size}": hit_hits[beam_size] for beam_size in beam_sizes})
         metrics.update({f"recall@{beam_size}": recall_scores[beam_size] for beam_size in beam_sizes})
         metrics.update({f"precision@{beam_size}": precision_scores[beam_size] for beam_size in beam_sizes})
         metrics.update({f"f1@{beam_size}": f1_scores[beam_size] for beam_size in beam_sizes})
+        metrics.update({f"diversity@{beam_size}": diversity_scores[beam_size] for beam_size in beam_sizes})
         metrics["pass@beam"] = pass_hits[max_beam_size]
         metrics["hit@beam"] = hit_hits[max_beam_size]
         metrics["recall@beam"] = recall_scores[max_beam_size]
         metrics["precision@beam"] = precision_scores[max_beam_size]
         metrics["f1@beam"] = f1_scores[max_beam_size]
+        metrics["diversity@beam"] = diversity_scores[max_beam_size]
         metrics["length_mean"] = length
         eval_temperature = float(_ONE)
         rollout_fwd = self._rollout_policy(

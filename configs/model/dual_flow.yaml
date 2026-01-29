@@ -23,10 +23,10 @@ actor_cfg:
   edge_inter_dim: 256
   edge_dropout: 0.1
   use_spherical: true
-  temperature_init: 0.07
+  temperature_init: 0.1
   norm_eps: 1.0e-6
   logit_scale_min: 1.0e-3
-  logit_scale_max: 100.0
+  logit_scale_max: 50.0
 
 max_steps: ${dataset.max_steps}
 
@@ -38,7 +38,7 @@ runtime_cfg:
 
 optimizer_cfg:
   type: adamw
-  lr: 1.0e-4
+  lr: 5.0e-5
   weight_decay: 1.0e-4
   auto_param_groups: true
   param_group_overrides:
