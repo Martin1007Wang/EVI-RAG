@@ -58,8 +58,6 @@ _DEFAULT_GNN_DROPOUT = 0.0
 _DEFAULT_EDGE_INTER_DIM = 256
 _DEFAULT_EDGE_DROPOUT = 0.1
 
-_DEFAULT_METRIC_MODE = "minimal"
-_METRIC_MODES = {"minimal", "full"}
 
 _DB_SAMPLING_TEMPERATURE_SCHEDULES = {"constant", "cosine"}
 _DEFAULT_TRAIN_ROLLOUTS = 1
@@ -359,7 +357,6 @@ class DualFlowModule(LightningModule):
     def _validate_cfg_contract(self) -> None:
         allowed_training = {
             "accumulate_grad_batches",
-            "metrics",
             "db_cfg",
             "num_rollouts",
         }
@@ -583,7 +580,6 @@ class DualFlowModule(LightningModule):
         loss, metrics = self._compute_training_loss(batch)
         if not torch.isfinite(loss).all().item():
             raise ValueError("Non-finite loss detected.")
-        metrics = self._select_training_metrics(metrics)
         metrics.update(self._collect_logit_scale_metrics())
         self.manual_backward(loss / accum)
         if self._should_step_optimizer(batch_idx):
@@ -3458,42 +3454,5 @@ class DualFlowModule(LightningModule):
                 record["question"] = question_text
             records.append(record)
         return records
-
-    # ------------------------- Metrics -------------------------
-
-    def _resolve_metric_mode(self) -> str:
-        cfg = self.training_cfg.get("metrics") or {}
-        mode = str(cfg.get("mode", _DEFAULT_METRIC_MODE)).strip().lower()
-        if mode not in _METRIC_MODES:
-            raise ValueError(f"training_cfg.metrics.mode must be one of {sorted(_METRIC_MODES)}, got {mode!r}.")
-        return mode
-
-    def _select_training_metrics(self, metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        mode = self._resolve_metric_mode()
-        if mode == "full":
-            return metrics
-        keep = {
-            "db_loss",
-            "db_loss_fwd",
-            "db_loss_bwd",
-            "db_log_pb_mean",
-            "db_log_pb_min",
-            "db_log_z_u_mean",
-            "db_log_z_v_mean",
-            "db_inv_edge_invalid_rate",
-            "db_no_allowed_rate",
-            "db_topo_violation_rate",
-            "rollout_success_rate",
-            "rollout_length_mean",
-            "rollout_bwd_length_mean",
-            "rollout_terminal_hit_rate",
-            "rollout_terminal_dead_end_rate",
-            "rollout_terminal_max_steps_rate",
-            "rollout_terminal_invalid_start_rate",
-            "rollout_terminal_other_rate",
-            "loss_total",
-        }
-        return {name: value for name, value in metrics.items() if name in keep}
-
 
 __all__ = ["DualFlowModule"]

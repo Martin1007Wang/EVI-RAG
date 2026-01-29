@@ -51,8 +51,6 @@ scheduler_cfg:
 training_cfg:
   accumulate_grad_batches: 1
   num_rollouts: 5
-  metrics:
-    mode: minimal
 
 evaluation_cfg:
   beam_size: 50
