@@ -59,13 +59,10 @@ _DEFAULT_EDGE_INTER_DIM = 256
 _DEFAULT_EDGE_DROPOUT = 0.1
 
 
-_DB_SAMPLING_TEMPERATURE_SCHEDULES = {"constant", "cosine"}
 _DEFAULT_TRAIN_ROLLOUTS = 1
 _DB_CFG_KEYS = {
-    "sampling_temperature",
     "sampling_temperature_start",
     "sampling_temperature_end",
-    "sampling_temperature_schedule",
     "dead_end_log_reward",
     "dead_end_weight",
     "pb_mode",
@@ -1683,10 +1680,8 @@ class DualFlowModule(LightningModule):
     @staticmethod
     def _coerce_db_cfg(raw: Mapping[str, Any]) -> dict[str, float | int | str]:
         return {
-            "sampling_temperature": float(raw["sampling_temperature"]),
             "sampling_temperature_start": float(raw["sampling_temperature_start"]),
             "sampling_temperature_end": float(raw["sampling_temperature_end"]),
-            "sampling_temperature_schedule": str(raw["sampling_temperature_schedule"]).strip().lower(),
             "dead_end_log_reward": float(raw["dead_end_log_reward"]),
             "dead_end_weight": float(raw["dead_end_weight"]),
             "pb_mode": str(raw["pb_mode"]).strip().lower(),
@@ -1699,20 +1694,11 @@ class DualFlowModule(LightningModule):
 
     @staticmethod
     def _validate_db_cfg_values(cfg: Mapping[str, float | int | str]) -> None:
-        schedule = str(cfg["sampling_temperature_schedule"])
-        if schedule not in _DB_SAMPLING_TEMPERATURE_SCHEDULES:
-            raise ValueError(
-                "db_cfg.sampling_temperature_schedule must be one of "
-                f"{sorted(_DB_SAMPLING_TEMPERATURE_SCHEDULES)}, got {schedule!r}."
-            )
-        if float(cfg["sampling_temperature"]) <= float(_ZERO):
-            raise ValueError("db_cfg.sampling_temperature must be > 0.")
-        if (
-            float(cfg["sampling_temperature_start"]) <= float(_ZERO)
-            or float(cfg["sampling_temperature_end"]) <= float(_ZERO)
-        ):
+        if float(cfg["sampling_temperature_start"]) <= float(_ZERO) or float(cfg["sampling_temperature_end"]) <= float(_ZERO):
             raise ValueError("db_cfg.sampling_temperature_start/end must be > 0.")
-        if schedule == "cosine" and float(cfg["sampling_temperature_start"]) < float(cfg["sampling_temperature_end"]):
+        if (
+            float(cfg["sampling_temperature_start"]) < float(cfg["sampling_temperature_end"])
+        ):
             raise ValueError("db_cfg.sampling_temperature_start must be >= sampling_temperature_end for cosine.")
         if float(cfg["pb_edge_dropout"]) < float(_ZERO) or float(cfg["pb_edge_dropout"]) >= float(_ONE):
             raise ValueError("db_cfg.pb_edge_dropout must satisfy 0 <= p < 1.")
@@ -1754,9 +1740,6 @@ class DualFlowModule(LightningModule):
 
     def _resolve_sampling_temperature(self) -> float:
         cfg = self._resolve_db_cfg()
-        schedule = str(cfg["sampling_temperature_schedule"])
-        if schedule == "constant":
-            return float(cfg["sampling_temperature"])
         start = float(cfg["sampling_temperature_start"])
         end = float(cfg["sampling_temperature_end"])
         progress = self._resolve_training_progress()
