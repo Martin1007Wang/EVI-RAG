@@ -585,29 +585,30 @@ def _flush_batch(
 ) -> int:
     messages_batch = [item.messages for item in batch_items]
     responses = backend.generate(messages_batch)
+    responses = [(response or "").strip() for response in responses]
+    parsed_list = [_parse_and_validate_response(response, prompt_spec, schema_spec) for response in responses]
+    retries = [0 for _ in batch_items]
+    if schema_spec.enabled and any(not parsed.schema_valid for parsed in parsed_list):
+        responses, parsed_list, retries = _retry_schema_batch(
+            backend=backend,
+            batch_items=batch_items,
+            responses=responses,
+            parsed_list=parsed_list,
+            prompt_spec=prompt_spec,
+            schema_spec=schema_spec,
+        )
     written = _ZERO
-    for request, response in zip(batch_items, responses):
-        raw_response = (response or "").strip()
-        parsed = _parse_and_validate_response(raw_response, prompt_spec, schema_spec)
-        retries = _ZERO
-        if schema_spec.enabled and not parsed.schema_valid:
-            raw_response, parsed, retries = _generate_with_schema_retry(
-                backend=backend,
-                messages=request.messages,
-                prompt_spec=prompt_spec,
-                schema_spec=schema_spec,
-                initial_response=raw_response,
-            )
+    for request, raw_response, parsed, retry_count in zip(batch_items, responses, parsed_list, retries):
         if schema_spec.enabled and not parsed.schema_valid:
             log_event(
                 log,
                 "llm_schema_invalid",
                 sample_id=request.sample_id,
-                retries=retries,
+                retries=retry_count,
             )
         schema_meta = {
             _FIELD_SCHEMA_VALID: bool(parsed.schema_valid),
-            _FIELD_SCHEMA_RETRIES: int(retries),
+            _FIELD_SCHEMA_RETRIES: int(retry_count),
         }
         extra = _build_output_extra(request, parsed.answer, raw_response, output_spec, schema_meta=schema_meta)
         _write_answer(f_out, request.sample_id, parsed.answer, prompt_spec.answer_key, extra=extra)
@@ -702,27 +703,34 @@ def _build_schema_retry_message(schema_spec: SchemaSpec, raw_response: str) -> s
         return schema_spec.retry_message
 
 
-def _generate_with_schema_retry(
+def _retry_schema_batch(
     *,
     backend: "_LLMBackend",
-    messages: List[Dict[str, str]],
+    batch_items: List[_LLMRequest],
+    responses: List[str],
+    parsed_list: List[_ParsedResponse],
     prompt_spec: PromptSpec,
     schema_spec: SchemaSpec,
-    initial_response: str,
-) -> Tuple[str, _ParsedResponse, int]:
-    retries = _ZERO
-    raw_response = (initial_response or "").strip()
-    parsed = _parse_and_validate_response(raw_response, prompt_spec, schema_spec)
-    if not schema_spec.enabled or parsed.schema_valid:
-        return raw_response, parsed, retries
-    current_messages = list(messages)
-    while retries < schema_spec.max_retries and not parsed.schema_valid:
-        retries += _ONE
-        retry_message = _build_schema_retry_message(schema_spec, raw_response)
-        current_messages = current_messages + [{"role": "user", "content": retry_message}]
-        raw_response = (backend.generate([current_messages])[0] or "").strip()
-        parsed = _parse_and_validate_response(raw_response, prompt_spec, schema_spec)
-    return raw_response, parsed, retries
+) -> Tuple[List[str], List[_ParsedResponse], List[int]]:
+    if not schema_spec.enabled or schema_spec.max_retries <= _ZERO:
+        return responses, parsed_list, [0 for _ in parsed_list]
+    retries = [0 for _ in parsed_list]
+    current_messages = [list(item.messages) for item in batch_items]
+    for _ in range(schema_spec.max_retries):
+        invalid_idx = [idx for idx, parsed in enumerate(parsed_list) if not parsed.schema_valid]
+        if not invalid_idx:
+            break
+        retry_messages: List[List[Dict[str, str]]] = []
+        for idx in invalid_idx:
+            retry_message = _build_schema_retry_message(schema_spec, responses[idx])
+            current_messages[idx] = current_messages[idx] + [{"role": "user", "content": retry_message}]
+            retry_messages.append(current_messages[idx])
+        retry_outputs = backend.generate(retry_messages)
+        for idx, output in zip(invalid_idx, retry_outputs):
+            responses[idx] = (output or "").strip()
+            parsed_list[idx] = _parse_and_validate_response(responses[idx], prompt_spec, schema_spec)
+            retries[idx] += _ONE
+    return responses, parsed_list, retries
 
 
 def _parse_json_payload(text: str) -> Optional[Any]:

@@ -172,6 +172,17 @@ class _BeamCandidates:
     cand_done: torch.Tensor
 
 
+@dataclass
+class _BeamCandidateMatrix:
+    scores: torch.Tensor
+    nodes: torch.Tensor
+    src_beam: torch.Tensor
+    edge_id: torch.Tensor
+    is_edge: torch.Tensor
+    done: torch.Tensor
+    counts: torch.Tensor
+
+
 @dataclass(frozen=True)
 class _RolloutResult:
     log_pf_sum: torch.Tensor
@@ -2762,6 +2773,248 @@ class DualFlowModule(LightningModule):
             cand_done=cand_done,
         )
 
+    @staticmethod
+    def _build_candidate_matrix(
+        candidates: _BeamCandidates,
+        *,
+        num_graphs: int,
+        neg_inf: float,
+    ) -> Optional[_BeamCandidateMatrix]:
+        cand_graph = candidates.cand_graph
+        if cand_graph.numel() == _ZERO:
+            return None
+        counts = torch.bincount(cand_graph, minlength=num_graphs)
+        max_count = int(counts.max().detach().tolist())
+        if max_count <= _ZERO:
+            return None
+        device = cand_graph.device
+        start = (counts.cumsum(0) - counts).index_select(0, cand_graph)
+        pos = torch.arange(cand_graph.numel(), device=device) - start
+        scores = torch.full((num_graphs, max_count), neg_inf, device=device, dtype=torch.float32)
+        nodes = torch.full((num_graphs, max_count), _NEG_ONE, device=device, dtype=torch.long)
+        src_beam = torch.full((num_graphs, max_count), _NEG_ONE, device=device, dtype=torch.long)
+        edge_id = torch.full((num_graphs, max_count), _NEG_ONE, device=device, dtype=torch.long)
+        is_edge = torch.zeros((num_graphs, max_count), device=device, dtype=torch.bool)
+        done = torch.zeros((num_graphs, max_count), device=device, dtype=torch.bool)
+        scores[cand_graph, pos] = candidates.cand_scores
+        nodes[cand_graph, pos] = candidates.cand_nodes
+        src_beam[cand_graph, pos] = candidates.cand_src_beam
+        edge_id[cand_graph, pos] = candidates.cand_edge_id
+        is_edge[cand_graph, pos] = candidates.cand_is_edge
+        done[cand_graph, pos] = candidates.cand_done
+        return _BeamCandidateMatrix(
+            scores=scores,
+            nodes=nodes,
+            src_beam=src_beam,
+            edge_id=edge_id,
+            is_edge=is_edge,
+            done=done,
+            counts=counts,
+        )
+
+    @staticmethod
+    def _build_diverse_keys(
+        *,
+        similarity: str,
+        nodes: torch.Tensor,
+        edge_id: torch.Tensor,
+        src_beam: torch.Tensor,
+        is_edge: torch.Tensor,
+    ) -> torch.Tensor:
+        if similarity == "tail":
+            return nodes.to(dtype=torch.long)
+        if similarity == "edge":
+            stay_keys = -src_beam.to(dtype=torch.long) - _TWO
+            edge_keys = edge_id.to(dtype=torch.long)
+            return torch.where(is_edge, edge_keys, stay_keys)
+        if similarity == "source":
+            return src_beam.to(dtype=torch.long)
+        raise ValueError(f"Unsupported diverse beam similarity: {similarity!r}.")
+
+    @staticmethod
+    def _compute_group_sizes(k_per_graph: torch.Tensor, groups: int, group_idx: int) -> torch.Tensor:
+        base = k_per_graph // groups
+        remainder = k_per_graph % groups
+        return base + (remainder > group_idx).to(dtype=base.dtype)
+
+    @staticmethod
+    def _apply_diverse_penalty(
+        scores: torch.Tensor,
+        keys: torch.Tensor,
+        *,
+        used_keys: torch.Tensor,
+        penalty: str,
+        penalty_lambda: float,
+        neg_inf: float,
+    ) -> torch.Tensor:
+        scores_adj = scores
+        used_valid = used_keys != _NEG_ONE
+        if not bool(used_valid.any().detach().tolist()):
+            return scores_adj
+        used_mask = (keys.unsqueeze(-1) == used_keys.unsqueeze(1)) & used_valid.unsqueeze(1)
+        used_mask = used_mask.any(dim=2)
+        if penalty == "hard":
+            return scores_adj.masked_fill(used_mask, neg_inf)
+        return scores_adj - penalty_lambda * used_mask.to(dtype=scores_adj.dtype)
+
+    @staticmethod
+    def _insert_group_selection(
+        *,
+        selected_pos: torch.Tensor,
+        used_keys: torch.Tensor,
+        selected_mask: torch.Tensor,
+        selected_count: torch.Tensor,
+        top_pos: torch.Tensor,
+        top_scores: torch.Tensor,
+        group_size: torch.Tensor,
+        keys: torch.Tensor,
+    ) -> torch.Tensor:
+        group_size_max = int(group_size.max().detach().tolist())
+        if group_size_max <= _ZERO:
+            return selected_count
+        range_pos = torch.arange(group_size_max, device=top_pos.device)
+        take_mask = range_pos.unsqueeze(0) < group_size.unsqueeze(1)
+        take_mask = take_mask & torch.isfinite(top_scores)
+        if not bool(take_mask.any().detach().tolist()):
+            return selected_count
+        rank = torch.cumsum(take_mask, dim=1) - _ONE
+        flat_rows, flat_cols = torch.nonzero(take_mask, as_tuple=True)
+        flat_rank = rank[flat_rows, flat_cols]
+        insert_pos = selected_count[flat_rows] + flat_rank
+        k = int(selected_pos.size(1))
+        linear = flat_rows * k + insert_pos
+        flat_pos = top_pos[flat_rows, flat_cols]
+        selected_pos.view(-1)[linear] = flat_pos
+        used_keys.view(-1)[linear] = keys[flat_rows, flat_pos]
+        selected_mask[flat_rows, flat_pos] = True
+        selected_count = selected_count + take_mask.sum(dim=1)
+        return selected_count
+
+    def _select_beam_positions(
+        self,
+        *,
+        scores: torch.Tensor,
+        keys: torch.Tensor,
+        counts: torch.Tensor,
+        beam_size: int,
+        diverse_cfg: Mapping[str, Any],
+        neg_inf: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_graphs, max_count = scores.size()
+        if beam_size <= _ZERO or max_count <= _ZERO or num_graphs <= _ZERO:
+            empty_pos = torch.full((num_graphs, beam_size), _NEG_ONE, device=scores.device, dtype=torch.long)
+            empty_scores = torch.full((num_graphs, beam_size), neg_inf, device=scores.device, dtype=torch.float32)
+            return empty_pos, empty_scores
+        k_per_graph = counts.clamp(max=beam_size)
+        range_beam = torch.arange(beam_size, device=scores.device).unsqueeze(0)
+        if not diverse_cfg["enabled"] or beam_size <= _ONE or diverse_cfg["groups"] <= _ONE:
+            k_top = min(int(beam_size), int(max_count))
+            if k_top <= _ZERO:
+                empty_pos = torch.full((num_graphs, beam_size), _NEG_ONE, device=scores.device, dtype=torch.long)
+                empty_scores = torch.full((num_graphs, beam_size), neg_inf, device=scores.device, dtype=torch.float32)
+                return empty_pos, empty_scores
+            top_scores, top_pos = torch.topk(scores, k_top, dim=1)
+            sel_pos = torch.full((num_graphs, beam_size), _NEG_ONE, device=scores.device, dtype=torch.long)
+            sel_scores = torch.full((num_graphs, beam_size), neg_inf, device=scores.device, dtype=torch.float32)
+            sel_pos[:, :k_top] = top_pos
+            sel_scores[:, :k_top] = top_scores
+            valid = range_beam < k_per_graph.unsqueeze(1)
+            sel_pos = torch.where(valid, sel_pos, torch.full_like(sel_pos, _NEG_ONE))
+            sel_scores = torch.where(valid, sel_scores, torch.full_like(sel_scores, neg_inf))
+            return sel_pos, sel_scores
+        sel_pos = self._diverse_select_positions(
+            scores=scores,
+            keys=keys,
+            counts=counts,
+            beam_size=beam_size,
+            groups=int(diverse_cfg["groups"]),
+            penalty=str(diverse_cfg["penalty"]),
+            penalty_lambda=float(diverse_cfg["lambda"]),
+            neg_inf=neg_inf,
+        )
+        pos_safe = sel_pos.clamp(min=_ZERO)
+        sel_scores = torch.gather(scores, 1, pos_safe)
+        valid = range_beam < k_per_graph.unsqueeze(1)
+        valid = valid & (sel_pos >= _ZERO)
+        sel_scores = torch.where(valid, sel_scores, torch.full_like(sel_scores, neg_inf))
+        sel_pos = torch.where(valid, sel_pos, torch.full_like(sel_pos, _NEG_ONE))
+        return sel_pos, sel_scores
+
+    def _diverse_select_positions(
+        self,
+        *,
+        scores: torch.Tensor,
+        keys: torch.Tensor,
+        counts: torch.Tensor,
+        beam_size: int,
+        groups: int,
+        penalty: str,
+        penalty_lambda: float,
+        neg_inf: float,
+    ) -> torch.Tensor:
+        num_graphs, max_count = scores.size()
+        sel_pos = torch.full((num_graphs, beam_size), _NEG_ONE, device=scores.device, dtype=torch.long)
+        selected_mask = torch.zeros((num_graphs, max_count), device=scores.device, dtype=torch.bool)
+        used_keys = torch.full((num_graphs, beam_size), _NEG_ONE, device=keys.device, dtype=keys.dtype)
+        selected_count = torch.zeros((num_graphs,), device=scores.device, dtype=torch.long)
+        range_count = torch.arange(max_count, device=scores.device).unsqueeze(0)
+        valid_mask = range_count < counts.unsqueeze(1)
+        valid_mask = valid_mask & torch.isfinite(scores)
+        k_per_graph = counts.clamp(max=beam_size)
+        groups = max(_ONE, min(int(groups), int(beam_size)))
+        for group_idx in range(groups):
+            group_size = self._compute_group_sizes(k_per_graph, groups, group_idx)
+            if int(group_size.max().detach().tolist()) <= _ZERO:
+                continue
+            scores_adj = scores.masked_fill(~valid_mask, neg_inf)
+            scores_adj = scores_adj.masked_fill(selected_mask, neg_inf)
+            scores_adj = self._apply_diverse_penalty(
+                scores_adj,
+                keys,
+                used_keys=used_keys,
+                penalty=penalty,
+                penalty_lambda=penalty_lambda,
+                neg_inf=neg_inf,
+            )
+            top_scores, top_pos = torch.topk(scores_adj, min(int(group_size.max().detach().tolist()), max_count), dim=1)
+            selected_count = self._insert_group_selection(
+                selected_pos=sel_pos,
+                used_keys=used_keys,
+                selected_mask=selected_mask,
+                selected_count=selected_count,
+                top_pos=top_pos,
+                top_scores=top_scores,
+                group_size=group_size,
+                keys=keys,
+            )
+        remaining = (k_per_graph - selected_count).clamp(min=_ZERO)
+        if int(remaining.max().detach().tolist()) <= _ZERO:
+            return sel_pos
+        scores_adj = scores.masked_fill(~valid_mask, neg_inf)
+        scores_adj = scores_adj.masked_fill(selected_mask, neg_inf)
+        scores_adj = self._apply_diverse_penalty(
+            scores_adj,
+            keys,
+            used_keys=used_keys,
+            penalty=penalty,
+            penalty_lambda=penalty_lambda,
+            neg_inf=neg_inf,
+        )
+        top_scores, top_pos = torch.topk(scores_adj, min(int(remaining.max().detach().tolist()), max_count), dim=1)
+        _ = top_scores
+        _ = top_pos
+        _ = self._insert_group_selection(
+            selected_pos=sel_pos,
+            used_keys=used_keys,
+            selected_mask=selected_mask,
+            selected_count=selected_count,
+            top_pos=top_pos,
+            top_scores=top_scores,
+            group_size=remaining,
+            keys=keys,
+        )
+        return sel_pos
+
     def _beam_update_from_candidates(
         self,
         *,
@@ -2771,77 +3024,75 @@ class DualFlowModule(LightningModule):
         diverse_cfg: Mapping[str, Any],
     ) -> _BeamState:
         order = torch.argsort(candidates.cand_graph)
-        cand_graph = candidates.cand_graph.index_select(0, order)
-        cand_scores = candidates.cand_scores.index_select(0, order)
-        cand_nodes = candidates.cand_nodes.index_select(0, order)
-        cand_src_beam = candidates.cand_src_beam.index_select(0, order)
-        cand_edge_id = candidates.cand_edge_id.index_select(0, order)
-        cand_is_edge = candidates.cand_is_edge.index_select(0, order)
-        cand_done = candidates.cand_done.index_select(0, order)
-
-        counts = torch.bincount(cand_graph, minlength=state.num_graphs)
-        offsets = counts.cumsum(0)
-        counts_cpu = counts.detach().cpu().tolist()
-        offsets_cpu = offsets.detach().cpu().tolist()
-
-        new_nodes = torch.full_like(state.beam_nodes, _NEG_ONE)
-        new_scores = torch.full_like(state.beam_scores, state.neg_inf)
-        new_paths = torch.full_like(state.beam_paths, _NEG_ONE)
-        new_lengths = torch.zeros_like(state.beam_lengths)
-        new_done = torch.zeros_like(state.beam_done)
-
-        for graph_idx in range(state.num_graphs):
-            count = counts_cpu[graph_idx]
-            if count <= _ZERO:
-                continue
-            end = offsets_cpu[graph_idx]
-            start = end - count
-            scores_g = cand_scores[start:end]
-            k = min(state.beam_size, count)
-            if diverse_cfg["enabled"] and k > _ONE and diverse_cfg["groups"] > _ONE:
-                keys_g = self._select_diverse_keys(
-                    similarity=diverse_cfg["similarity"],
-                    cand_nodes=cand_nodes[start:end],
-                    cand_edge_id=cand_edge_id[start:end],
-                    cand_src_beam=cand_src_beam[start:end],
-                    cand_is_edge=cand_is_edge[start:end],
-                )
-                top_idx = self._diverse_select_indices(
-                    scores=scores_g,
-                    keys=keys_g,
-                    k=k,
-                    groups=diverse_cfg["groups"],
-                    penalty=diverse_cfg["penalty"],
-                    penalty_lambda=diverse_cfg["lambda"],
-                    neg_inf=state.neg_inf,
-                )
-                sel_idx = top_idx + start
-                top_scores = scores_g.index_select(0, top_idx)
-            else:
-                top_scores, top_idx = torch.topk(scores_g, k)
-                sel_idx = top_idx + start
-            sel_nodes = cand_nodes.index_select(0, sel_idx)
-            sel_src = cand_src_beam.index_select(0, sel_idx)
-            sel_edge_id = cand_edge_id.index_select(0, sel_idx)
-            sel_is_edge = cand_is_edge.index_select(0, sel_idx)
-            sel_done = cand_done.index_select(0, sel_idx)
-            sel_paths = state.beam_paths[graph_idx].index_select(0, sel_src)
-            sel_lengths = state.beam_lengths[graph_idx].index_select(0, sel_src)
-            sel_paths = sel_paths.clone()
-            sel_paths[:, step] = torch.where(sel_is_edge, sel_edge_id, sel_paths[:, step])
-            sel_lengths = sel_lengths + sel_is_edge.to(dtype=sel_lengths.dtype)
-            new_nodes[graph_idx, :k] = sel_nodes
-            new_scores[graph_idx, :k] = top_scores
-            new_paths[graph_idx, :k] = sel_paths
-            new_lengths[graph_idx, :k] = sel_lengths
-            new_done[graph_idx, :k] = sel_done
-
+        sorted_candidates = _BeamCandidates(
+            cand_scores=candidates.cand_scores.index_select(0, order),
+            cand_nodes=candidates.cand_nodes.index_select(0, order),
+            cand_graph=candidates.cand_graph.index_select(0, order),
+            cand_src_beam=candidates.cand_src_beam.index_select(0, order),
+            cand_edge_id=candidates.cand_edge_id.index_select(0, order),
+            cand_is_edge=candidates.cand_is_edge.index_select(0, order),
+            cand_done=candidates.cand_done.index_select(0, order),
+        )
+        matrix = self._build_candidate_matrix(sorted_candidates, num_graphs=state.num_graphs, neg_inf=state.neg_inf)
+        if matrix is None:
+            return _BeamState(
+                beam_nodes=torch.full_like(state.beam_nodes, _NEG_ONE),
+                beam_scores=torch.full_like(state.beam_scores, state.neg_inf),
+                beam_paths=torch.full_like(state.beam_paths, _NEG_ONE),
+                beam_lengths=torch.zeros_like(state.beam_lengths),
+                beam_done=torch.zeros_like(state.beam_done),
+                flat_graph_ids=state.flat_graph_ids,
+                flat_beam_ids=state.flat_beam_ids,
+                beam_context=state.beam_context,
+                num_graphs=state.num_graphs,
+                beam_size=state.beam_size,
+                max_steps=state.max_steps,
+                neg_inf=state.neg_inf,
+            )
+        keys = self._build_diverse_keys(
+            similarity=str(diverse_cfg["similarity"]),
+            nodes=matrix.nodes,
+            edge_id=matrix.edge_id,
+            src_beam=matrix.src_beam,
+            is_edge=matrix.is_edge,
+        )
+        sel_pos, sel_scores = self._select_beam_positions(
+            scores=matrix.scores,
+            keys=keys,
+            counts=matrix.counts,
+            beam_size=state.beam_size,
+            diverse_cfg=diverse_cfg,
+            neg_inf=state.neg_inf,
+        )
+        pos_safe = sel_pos.clamp(min=_ZERO)
+        sel_nodes = torch.gather(matrix.nodes, 1, pos_safe)
+        sel_src = torch.gather(matrix.src_beam, 1, pos_safe)
+        sel_edge_id = torch.gather(matrix.edge_id, 1, pos_safe)
+        sel_is_edge = torch.gather(matrix.is_edge, 1, pos_safe)
+        sel_done = torch.gather(matrix.done, 1, pos_safe)
+        valid_sel = sel_pos >= _ZERO
+        sel_nodes = torch.where(valid_sel, sel_nodes, torch.full_like(sel_nodes, _NEG_ONE))
+        sel_src = torch.where(valid_sel, sel_src, torch.full_like(sel_src, _NEG_ONE))
+        sel_edge_id = torch.where(valid_sel, sel_edge_id, torch.full_like(sel_edge_id, _NEG_ONE))
+        sel_is_edge = torch.where(valid_sel, sel_is_edge, torch.zeros_like(sel_is_edge))
+        sel_done = torch.where(valid_sel, sel_done, torch.zeros_like(sel_done))
+        sel_scores = torch.where(valid_sel, sel_scores, torch.full_like(sel_scores, state.neg_inf))
+        batch_idx = torch.arange(state.num_graphs, device=state.beam_nodes.device).unsqueeze(1).expand_as(sel_src)
+        sel_src_safe = sel_src.clamp(min=_ZERO)
+        sel_paths = state.beam_paths[batch_idx, sel_src_safe]
+        sel_lengths = state.beam_lengths[batch_idx, sel_src_safe]
+        sel_paths = sel_paths.clone()
+        sel_paths[:, :, step] = torch.where(sel_is_edge, sel_edge_id, sel_paths[:, :, step])
+        sel_lengths = sel_lengths + sel_is_edge.to(dtype=sel_lengths.dtype)
+        sel_paths = torch.where(valid_sel.unsqueeze(-1), sel_paths, torch.full_like(sel_paths, _NEG_ONE))
+        sel_lengths = torch.where(valid_sel, sel_lengths, torch.zeros_like(sel_lengths))
+        sel_done = torch.where(valid_sel, sel_done, torch.zeros_like(sel_done))
         return _BeamState(
-            beam_nodes=new_nodes,
-            beam_scores=new_scores,
-            beam_paths=new_paths,
-            beam_lengths=new_lengths,
-            beam_done=new_done,
+            beam_nodes=sel_nodes,
+            beam_scores=sel_scores,
+            beam_paths=sel_paths,
+            beam_lengths=sel_lengths,
+            beam_done=sel_done,
             flat_graph_ids=state.flat_graph_ids,
             flat_beam_ids=state.flat_beam_ids,
             beam_context=state.beam_context,
@@ -3004,90 +3255,6 @@ class DualFlowModule(LightningModule):
         )
         metrics = self._reduce_eval_metrics(metrics, valid_mask=valid_mask)
         return metrics, valid_count
-
-    @staticmethod
-    def _select_diverse_keys(
-        *,
-        similarity: str,
-        cand_nodes: torch.Tensor,
-        cand_edge_id: torch.Tensor,
-        cand_src_beam: torch.Tensor,
-        cand_is_edge: torch.Tensor,
-    ) -> torch.Tensor:
-        if similarity == "tail":
-            return cand_nodes.to(dtype=torch.long)
-        if similarity == "edge":
-            cand_edge_id = cand_edge_id.to(dtype=torch.long)
-            cand_src_beam = cand_src_beam.to(dtype=torch.long)
-            cand_is_edge = cand_is_edge.to(dtype=torch.bool)
-            stay_keys = -cand_src_beam - _TWO
-            return torch.where(cand_is_edge, cand_edge_id, stay_keys)
-        if similarity == "source":
-            return cand_src_beam.to(dtype=torch.long)
-        raise ValueError(f"Unsupported diverse beam similarity: {similarity!r}.")
-
-    @staticmethod
-    def _diverse_select_indices(
-        *,
-        scores: torch.Tensor,
-        keys: torch.Tensor,
-        k: int,
-        groups: int,
-        penalty: str,
-        penalty_lambda: float,
-        neg_inf: float,
-    ) -> torch.Tensor:
-        if scores.numel() == _ZERO or k <= _ZERO:
-            return torch.zeros((_ZERO,), device=scores.device, dtype=torch.long)
-        total = int(scores.numel())
-        k = min(int(k), total)
-        groups = max(_ONE, min(int(groups), k))
-        base = k // groups
-        remainder = k % groups
-        group_sizes = [base + _ONE if idx < remainder else base for idx in range(groups)]
-        selected_mask = torch.zeros((total,), device=scores.device, dtype=torch.bool)
-        selected_indices = torch.zeros((_ZERO,), device=scores.device, dtype=torch.long)
-        used_keys = keys.new_empty((_ZERO,))
-        for group_size in group_sizes:
-            if group_size <= _ZERO:
-                continue
-            scores_adj = scores.clone()
-            scores_adj[selected_mask] = neg_inf
-            if used_keys.numel() > _ZERO:
-                used_mask = (keys.unsqueeze(1) == used_keys.unsqueeze(0)).any(dim=1)
-                if penalty == "hard":
-                    scores_adj = scores_adj.masked_fill(used_mask, neg_inf)
-                else:
-                    scores_adj = scores_adj - penalty_lambda * used_mask.to(dtype=scores_adj.dtype)
-            valid = torch.isfinite(scores_adj)
-            if not bool(valid.any().detach().tolist()):
-                break
-            group_k = min(int(group_size), int(valid.sum().detach().tolist()))
-            top_scores, top_idx = torch.topk(scores_adj, group_k)
-            _ = top_scores
-            selected_mask[top_idx] = True
-            selected_indices = torch.cat((selected_indices, top_idx), dim=0)
-            used_keys = torch.cat((used_keys, keys.index_select(0, top_idx)), dim=0)
-            if int(selected_indices.numel()) >= k:
-                break
-        if int(selected_indices.numel()) == _ZERO:
-            top_scores, top_idx = torch.topk(scores, k)
-            _ = top_scores
-            return top_idx
-        if int(selected_indices.numel()) < k:
-            remaining = k - int(selected_indices.numel())
-            scores_adj = scores.clone()
-            scores_adj[selected_mask] = neg_inf
-            if used_keys.numel() > _ZERO:
-                used_mask = (keys.unsqueeze(1) == used_keys.unsqueeze(0)).any(dim=1)
-                if penalty == "hard":
-                    scores_adj = scores_adj.masked_fill(used_mask, neg_inf)
-                else:
-                    scores_adj = scores_adj - penalty_lambda * used_mask.to(dtype=scores_adj.dtype)
-            extra_scores, extra_idx = torch.topk(scores_adj, remaining)
-            _ = extra_scores
-            selected_indices = torch.cat((selected_indices, extra_idx), dim=0)
-        return selected_indices
 
     @staticmethod
     def _reduce_eval_metrics(
