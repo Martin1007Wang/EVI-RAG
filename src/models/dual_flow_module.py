@@ -3484,6 +3484,8 @@ class DualFlowModule(LightningModule):
             "db_no_allowed_rate",
             "db_topo_violation_rate",
             "rollout_success_rate",
+            "rollout_length_mean",
+            "rollout_bwd_length_mean",
             "rollout_terminal_hit_rate",
             "rollout_terminal_dead_end_rate",
             "rollout_terminal_max_steps_rate",
