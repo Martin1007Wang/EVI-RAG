@@ -106,6 +106,25 @@ _DEFAULT_DIVERSE_BEAM_SIMILARITY = "tail"
 _DEFAULT_DIVERSE_BEAM_PENALTY = "hard"
 _DIVERSE_BEAM_SIMILARITIES = {"tail", "edge", "source"}
 _DIVERSE_BEAM_PENALTIES = {"hard", "soft"}
+_STANDARD_TRAIN_METRICS = {
+    "rollout_success_rate",
+    "rollout_length_mean",
+    "rollout_terminal_dead_end_rate",
+    "rollout_terminal_max_steps_rate",
+    "db_inv_edge_invalid_rate",
+    "db_no_allowed_rate",
+    "db_topo_violation_rate",
+    "logit_scale_max",
+}
+_STANDARD_EVAL_METRICS = {
+    "hit@beam",
+    "recall@beam",
+    "precision@beam",
+    "f1@beam",
+    "diversity@beam",
+    "length_mean",
+    "rollout_success_rate",
+}
 
 
 @dataclass(frozen=True)
@@ -581,6 +600,7 @@ class DualFlowModule(LightningModule):
         if not torch.isfinite(loss).all().item():
             raise ValueError("Non-finite loss detected.")
         metrics.update(self._collect_logit_scale_metrics())
+        metrics = self._filter_metrics(metrics, _STANDARD_TRAIN_METRICS)
         self.manual_backward(loss / accum)
         if self._should_step_optimizer(batch_idx):
             optimizer.step()
@@ -600,6 +620,7 @@ class DualFlowModule(LightningModule):
         metrics, batch_size = self._compute_eval_metrics(batch)
         if batch_size <= _ZERO:
             return
+        metrics = self._filter_metrics(metrics, _STANDARD_EVAL_METRICS)
         scope = self._resolve_dataset_scope()
         for name, value in metrics.items():
             scoped_name = f"val/{scope}/{name}"
@@ -613,6 +634,7 @@ class DualFlowModule(LightningModule):
         metrics, batch_size = self._compute_eval_metrics(batch)
         if batch_size <= _ZERO:
             return
+        metrics = self._filter_metrics(metrics, _STANDARD_EVAL_METRICS)
         scope = self._resolve_dataset_scope()
         for name, value in metrics.items():
             scoped_name = f"test/{scope}/{name}"
@@ -2611,6 +2633,12 @@ class DualFlowModule(LightningModule):
         if metrics:
             metrics["logit_scale_max"] = torch.stack(list(metrics.values())).max()
         return metrics
+
+    @staticmethod
+    def _filter_metrics(metrics: dict[str, torch.Tensor], keep: set[str]) -> dict[str, torch.Tensor]:
+        if not metrics:
+            return {}
+        return {name: value for name, value in metrics.items() if name in keep}
 
     # ------------------------- Eval -------------------------
 
