@@ -366,7 +366,7 @@ class DualFlowModule(LightningModule):
         extra_training = set(self.training_cfg.keys()) - allowed_training
         if extra_training:
             raise ValueError(f"Unsupported training_cfg keys: {sorted(extra_training)}")
-        allowed_eval = {"beam_size", "beam_sizes"}
+        allowed_eval = {"beam_size", "beam_sizes", "diverse_beam"}
         extra_eval = set(self.evaluation_cfg.keys()) - allowed_eval
         if extra_eval:
             raise ValueError(f"Unsupported evaluation_cfg keys: {sorted(extra_eval)}")
