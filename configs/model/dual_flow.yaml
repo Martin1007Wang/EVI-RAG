@@ -27,6 +27,7 @@ max_steps: ${dataset.max_steps}
 
 runtime_cfg:
   validate_edge_batch: false
+  avoid_revisit: true
   inverse_relation_suffix: "__inv"
   strict_inverse: true
 

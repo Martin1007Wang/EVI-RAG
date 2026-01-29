@@ -10,6 +10,8 @@ dataset_family: webqsp
 max_steps: 3
 hf_dataset: rmanluo/RoG-webqsp
 
+train_samples_per_epoch: 2048
+
 filter_missing_answer:
   train: false
   validation: false

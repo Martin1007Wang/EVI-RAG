@@ -51,6 +51,7 @@ class GRetrievalDataModule(LightningDataModule):
         pin_memory: bool = True,
         drop_last: bool = True,
         train_shuffle: bool = True,
+        train_samples_per_epoch: Optional[int] = None,
         prefetch_factor: int = 2,
         persistent_workers: bool = False,
         precompute_edge_batch: bool = False,
@@ -89,6 +90,7 @@ class GRetrievalDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.drop_last = drop_last
         self.train_shuffle = bool(train_shuffle)
+        self.train_samples_per_epoch = train_samples_per_epoch
         self.persistent_workers = persistent_workers
         self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
         self.precompute_edge_batch = bool(precompute_edge_batch)
@@ -183,7 +185,12 @@ class GRetrievalDataModule(LightningDataModule):
             )
 
     def train_dataloader(self):
-        return self._build_loader(self.train_dataset, shuffle=self.train_shuffle, drop_last=self.drop_last)
+        return self._build_loader(
+            self.train_dataset,
+            shuffle=self.train_shuffle,
+            drop_last=self.drop_last,
+            train_samples_per_epoch=self.train_samples_per_epoch,
+        )
 
     def val_dataloader(self):
         return self._build_loader(self.val_dataset, shuffle=False, drop_last=False)
@@ -245,6 +252,7 @@ class GRetrievalDataModule(LightningDataModule):
         *,
         shuffle: bool,
         drop_last: bool,
+        train_samples_per_epoch: Optional[int] = None,
     ) -> DataLoader:
         """
         Constructs the retrieval DataLoader using params injected via dataset_cfg.
@@ -264,6 +272,7 @@ class GRetrievalDataModule(LightningDataModule):
             precompute_edge_batch=self.precompute_edge_batch,
             validate_edge_batch=self.validate_edge_batch,
             random_seed=self.dataset_cfg.get("random_seed"),
+            train_samples_per_epoch=train_samples_per_epoch,
             expand_multi_answer=self.expand_multi_answer,
             filter_zero_hop=self.filter_zero_hop,
         )

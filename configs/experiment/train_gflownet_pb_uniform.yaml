@@ -10,7 +10,7 @@ defaults:
 
 task_name: "train/gflownet/pb_uniform"
 tags: ["dual_flow", "gflownet", "pb_uniform"]
-optimized_metric: "val/f1@beam"
+optimized_metric: "val/hit@beam"
 
 trainer:
   check_val_every_n_epoch: 5
@@ -19,7 +19,7 @@ trainer:
 model:
   scheduler_cfg:
     type: cosine
-    t_max: 10
+    t_max: 200
     eta_min: 1.0e-6
     interval: epoch
 
@@ -28,12 +28,12 @@ model:
 
 callbacks:
   model_checkpoint:
-    monitor: val/f1@beam
+    monitor: val/hit@beam
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/f1@beam
+    monitor: val/hit@beam
     mode: max
     patience: 50

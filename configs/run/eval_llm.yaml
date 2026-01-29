@@ -1,0 +1,10 @@
+name: eval_llm
+task_name: "eval/llm"
+tags: ["eval", "llm"]
+split: test
+run_all_splits: false
+splits: [train, validation, test]
+ckpt_path: null
+dataset_variants: null
+dataset_variant: null
+eval_mode: predict

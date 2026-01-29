@@ -44,6 +44,7 @@ from src.data.schema.types import (
     RelationLookup,
     RelationVocab,
     Sample,
+    SplitFilter,
     TimeRelationConfig,
 )
 from src.data.stages.step1_vocab import _partition_graph_edges, _resolve_split_filter, _should_keep_sample
@@ -67,6 +68,9 @@ class _WorkerState:
     inverse_relations_suffix: str
     time_relation_cfg: Optional[TimeRelationConfig]
     target_reachable_pruning: bool
+    train_filter: SplitFilter
+    eval_filter: SplitFilter
+    override_filters: Dict[str, SplitFilter]
 
 
 _WORKER_STATE: Optional[_WorkerState] = None
@@ -100,6 +104,8 @@ def _init_worker_state(state: _WorkerState) -> None:
 def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
     state = _WORKER_STATE
     graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
+    split_filter = _resolve_split_filter(sample.split, state.train_filter, state.eval_filter, state.override_filters)
+    apply_target_reachable_pruning = state.target_reachable_pruning and split_filter.skip_no_path
     return build_graph(
         sample,
         state.entity_lookup,
@@ -114,7 +120,7 @@ def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
         inverse_relations_key_map=state.inverse_relations_key_map,
         inverse_relations_suffix=state.inverse_relations_suffix,
         time_relation_cfg=state.time_relation_cfg,
-        target_reachable_pruning=state.target_reachable_pruning,
+        target_reachable_pruning=apply_target_reachable_pruning,
     )
 
 
@@ -495,14 +501,8 @@ def preprocess(ctx: StageContext) -> None:
     if emit_nonzero_positive_filter:
         raise ValueError("emit_nonzero_positive_filter is disabled in GFlowNet; remove this flag.")
 
-    if target_reachable_pruning:
-        if path_mode != _PATH_MODE_QA_DIRECTED:
-            raise ValueError("target_reachable_pruning requires path_mode=qa_directed.")
-        if not train_filter.skip_no_path or not eval_filter.skip_no_path:
-            raise ValueError("target_reachable_pruning requires filter.*.skip_no_path=true for all splits.")
-        for split_name, override in override_filters.items():
-            if not override.skip_no_path:
-                raise ValueError(f"target_reachable_pruning requires skip_no_path for split {split_name}.")
+    if target_reachable_pruning and path_mode != _PATH_MODE_QA_DIRECTED:
+        raise ValueError("target_reachable_pruning requires path_mode=qa_directed.")
     log_event(
         logger,
         "preprocess_start",
@@ -837,8 +837,11 @@ def preprocess(ctx: StageContext) -> None:
             if embedding_cfg and embedding_cfg.canonicalize_relations:
                 question_emb_norm_batch = _normalize_embeddings(question_emb_batch, embedding_cfg.cosine_eps)
         if executor is None:
-            graphs: List[Optional[GraphRecord]] = [
-                build_graph(
+            graphs: List[Optional[GraphRecord]] = []
+            for sample in samples:
+                split_filter = _resolve_split_filter(sample.split, train_filter, eval_filter, override_filters)
+                apply_target_reachable_pruning = target_reachable_pruning and split_filter.skip_no_path
+                graph = build_graph(
                     sample,
                     entity_vocab,
                     relation_lookup,
@@ -852,10 +855,9 @@ def preprocess(ctx: StageContext) -> None:
                     inverse_relations_key_map=inverse_relations_key_map,
                     inverse_relations_suffix=inverse_relations_suffix,
                     time_relation_cfg=time_relation_cfg,
-                    target_reachable_pruning=target_reachable_pruning,
+                    target_reachable_pruning=apply_target_reachable_pruning,
                 )
-                for sample in samples
-            ]
+                graphs.append(graph)
         else:
             graphs = list(executor.map(_build_graph_worker, samples))
         for idx, (sample, graph) in enumerate(zip(samples, graphs)):
@@ -995,6 +997,9 @@ def preprocess(ctx: StageContext) -> None:
             inverse_relations_suffix=inverse_relations_suffix,
             time_relation_cfg=time_relation_cfg,
             target_reachable_pruning=target_reachable_pruning,
+            train_filter=train_filter,
+            eval_filter=eval_filter,
+            override_filters=override_filters,
         )
         with ProcessPoolExecutor(
             max_workers=parquet_num_workers,

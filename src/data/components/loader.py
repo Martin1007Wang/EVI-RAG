@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .collate import BatchAugmenter, RetrievalCollater
+from .samplers import CycleSampler
 from ..g_retrieval_dataset import GRetrievalDataset
 from ...utils.logging_utils import get_logger, log_event
 
@@ -49,6 +50,7 @@ def build_retrieval_dataloader(
     drop_last: bool = True,
     num_workers: int = _DEFAULT_NUM_WORKERS,
     random_seed: Optional[int] = None,
+    train_samples_per_epoch: Optional[int] = None,
     prefetch_factor: Optional[int] = None,
     persistent_workers: bool = False,
     pin_memory: bool = True,
@@ -86,7 +88,17 @@ def build_retrieval_dataloader(
         base_seed=base_seed,
         user_init_fn=user_init_fn,
     )
-    if base_seed is not None:
+    sampler = None
+    if train_samples_per_epoch is not None:
+        epoch_size = int(train_samples_per_epoch)
+        sampler_gen = None
+        if base_seed is not None:
+            sampler_gen = torch.Generator()
+            sampler_gen.manual_seed(base_seed)
+        sampler = CycleSampler(dataset, epoch_size=epoch_size, shuffle=shuffle, generator=sampler_gen)
+        shuffle = False
+        kwargs["sampler"] = sampler
+    if base_seed is not None and sampler is None:
         generator = torch.Generator()
         generator.manual_seed(base_seed)
         kwargs.setdefault("generator", generator)
@@ -113,5 +125,6 @@ def build_retrieval_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        train_samples_per_epoch=int(train_samples_per_epoch) if train_samples_per_epoch is not None else None,
     )
     return loader

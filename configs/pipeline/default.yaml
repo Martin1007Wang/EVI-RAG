@@ -17,7 +17,9 @@ filter:
   train:
     skip_no_path: true
   eval:
-    skip_no_path: true
+    skip_no_path: false
+    skip_no_topic: true
+    skip_no_ans: false
 
 embeddings_out_dir: ${dataset.materialized_dir}/embeddings
 precompute_entities: true

@@ -46,3 +46,7 @@ column_map:
   q_entity_field: q_entity
   a_entity_field: a_entity
   graph_field: graph
+
+# Optional: shorten training "effective epoch" length (used by DataLoader sampler).
+# When set, each epoch trains on `train_samples_per_epoch` samples with cyclic no-replacement coverage.
+train_samples_per_epoch: null

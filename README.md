@@ -615,6 +615,10 @@ logger:
 - 训练（`experiment=`）：`train_gflownet`
 - 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_gflownet`, `export_gflownet`
 
+大训练集（如 CWQ）加速早停（更频繁更新 `val/hit@beam`）：
+- 设置 `data.train_samples_per_epoch=<N>` 缩短“有效 epoch”（无放回循环采样，跨多个 epoch 覆盖全量训练集）
+- 建议同时设 `trainer.check_val_every_n_epoch=1`（避免每 5/10 个 epoch 才跑一次 val）
+
 数据构建（g_retrieval）：
 - `scripts/build_retrieval_pipeline.py` 一步完成 normalized parquet + LMDB；以全图 PPR 采样得到 `g_retrieval`，仅保留图结构、问题 embedding、起点/答案节点索引与答案实体 ID。
 - 若已有旧缓存/旧 parquet，必须完整重建该流程，否则会 fail-fast。
@@ -637,6 +641,18 @@ python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/t
 # GFlowNet greedy 评估（temperature=0，单 rollout）
 python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt \
   model.evaluation_cfg.num_eval_rollouts=1 model.evaluation_cfg.rollout_temperature=0.0
+
+# LLM 评测：基于 eval_gflownet rollouts 生成最终答案（两种模式）
+#
+# (1) 本地 vLLM（需要安装 vllm，并可访问 GPU）
+python src/eval.py experiment=eval_llm dataset=webqsp llm.provider=vllm
+#
+# (2) OpenAI API（需要设置 OPENAI_API_KEY）
+OPENAI_API_KEY=... python src/eval.py experiment=eval_llm dataset=webqsp llm.provider=openai llm.batch_size=1
+
+# 输出：
+# - 预测：`${dataset.artifact_dir}/eval_llm/{split}_k{k}_{provider}.jsonl`
+# - 指标：`${dataset.artifact_dir}/eval_llm/{split}_k{k}_{provider}.metrics.json`（llm hit/micro_f1/macro_f1 + retrieval context 指标）
 ```
 
 </details>

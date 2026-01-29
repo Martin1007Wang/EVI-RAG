@@ -5,10 +5,13 @@ _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 32
+batch_size: 16
 num_workers: 8
 drop_last: false
 train_shuffle: true
+# 缩短“有效 epoch”长度：每个 epoch 仅训练 N 个样本（无放回循环采样，跨多个 epoch 覆盖全量训练集）。
+# 由 dataset.train_samples_per_epoch 控制；未设置时为 null（即使用全量训练集组成 epoch）。
+train_samples_per_epoch: ${dataset.train_samples_per_epoch}
 prefetch_factor: 4
 persistent_workers: true
 precompute_edge_batch: true

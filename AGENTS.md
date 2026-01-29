@@ -112,7 +112,7 @@
     * 起始实体与答案实体无任何联通路径 → 必须剔除。
 *   **Training Scope:** GFlowNet 的训练 **只能** 使用 `sub` 数据集。
 *   **Evaluation Scope:** GFlowNet 的评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行，并分别报告指标（建议 `full`/`sub` 作为显式前缀）。
-*   **LLM Evaluation:** LLM 评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行。
+*   **LLM Evaluation:** LLM 评估 **默认只在 `full`** 数据集上进行；如需对比，可额外运行 `sub`。
 *   **Runtime Contract:** 任何评估流程必须显式提供两套数据源（`full` 与 `sub`），不得隐式复用或覆盖。
 
 ### 4. Forbidden Patterns (反模式 - 此处即为红线)

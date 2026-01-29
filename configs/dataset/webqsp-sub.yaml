@@ -10,4 +10,6 @@ dataset_family: webqsp
 max_steps: 3
 hf_dataset: rmanluo/RoG-webqsp
 
+train_samples_per_epoch: 2048
+
 sample_filter_path: ${dataset.out_dir}/sub_filter.json

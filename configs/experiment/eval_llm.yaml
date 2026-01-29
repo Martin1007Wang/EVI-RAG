@@ -1,0 +1,57 @@
+# @package _global_
+#
+# Experiment: LLM inference over eval_gflownet rollouts.
+
+defaults:
+  - override /callbacks: default
+  - override /logger: none
+  - override /run: eval_llm
+  - override /trainer: predict
+  - _self_
+
+llm:
+  provider: vllm
+  providers: null
+  allow_sub: false
+  input_path: null
+  output_dir: null
+  input_subdir: eval_gflownet
+  output_subdir: eval_llm
+  output_filename_template: "{split}_k{k}_{provider}.jsonl"
+  compute_metrics: true
+  metrics_filename_template: "{split}_k{k}_{provider}.metrics.json"
+  topk_list: [10, 25, 50]
+  max_samples: null
+  batch_size: 8
+  resume: true
+  output:
+    include_question: true
+    include_trajectories: true
+    include_messages: true
+    include_raw_response: true
+    debug_only_on_empty: true
+  prompt:
+    system: "You are a KGQA assistant. Use only the provided trajectories. Output JSON only."
+    answer_key: "answer"
+    answer_separator: " | "
+    allow_empty: true
+  vllm:
+    model: Qwen/Qwen2.5-7B-Instruct
+    tensor_parallel_size: 1
+    max_model_len: 8192
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 256
+  openai:
+    model: gpt-4o
+    temperature: 0.0
+    max_tokens: 256
+    timeout_sec: 120
+    max_retries: 5
+    backoff_seconds: 5
+    backoff_base: 2
+    # API options (OpenAI-compatible)
+    # base_url: https://api.openai.com/v1
+    # api_key_env: OPENAI_API_KEY
+    # require_api_key: true
+    # chat_completions_path: /chat/completions

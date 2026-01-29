@@ -50,6 +50,7 @@ _TERMINAL_INVALID_START = 4
 
 _DEFAULT_BACKBONE_FINETUNE = True
 _DEFAULT_VALIDATE_EDGE_BATCH = False
+_DEFAULT_AVOID_REVISIT = True
 _DEFAULT_GNN_LAYERS = 2
 _DEFAULT_GNN_DROPOUT = 0.0
 _DEFAULT_EDGE_INTER_DIM = 256
@@ -180,6 +181,7 @@ class DualFlowModule(LightningModule):
         self.logging_cfg = logging_cfg or {}
 
         self._validate_edge_batch = bool(self.runtime_cfg.get("validate_edge_batch", _DEFAULT_VALIDATE_EDGE_BATCH))
+        self._avoid_revisit = bool(self.runtime_cfg.get("avoid_revisit", _DEFAULT_AVOID_REVISIT))
 
         self._init_backbone(
             emb_dim=emb_dim,
@@ -803,6 +805,7 @@ class DualFlowModule(LightningModule):
         edge_ids_by_head: torch.Tensor,
         edge_ptr_by_head: torch.Tensor,
         pb_cfg: dict[str, float | int | str],
+        visited_nodes: Optional[torch.Tensor] = None,
         edge_mask: Optional[torch.Tensor] = None,
         return_no_allowed: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -814,8 +817,13 @@ class DualFlowModule(LightningModule):
             edge_ptr_by_head=edge_ptr_by_head,
             active_mask=move_mask,
         )
-        if edge_mask is not None:
-            outgoing = self._apply_edge_mask_to_outgoing(outgoing, edge_mask=edge_mask, num_graphs=move_mask.numel())
+        outgoing = self._apply_action_constraints_to_outgoing(
+            outgoing,
+            num_graphs=move_mask.numel(),
+            edge_index=prepared.edge_index,
+            edge_mask=edge_mask,
+            visited_nodes=visited_nodes,
+        )
         if outgoing.edge_ids.numel() == _ZERO:
             zeros = torch.zeros_like(move_mask, dtype=torch.float32)
             if return_no_allowed:
@@ -918,6 +926,10 @@ class DualFlowModule(LightningModule):
             invalid_start, torch.full_like(stop_reason, _TERMINAL_INVALID_START), stop_reason
         )
         active = graph_mask & (curr_nodes >= _ZERO)
+        visited_nodes = None
+        if self._avoid_revisit:
+            visited_nodes = torch.zeros((prepared.node_batch.numel(),), device=device, dtype=torch.bool)
+            visited_nodes.index_fill_(0, curr_nodes[active], True)
         stop_nodes = torch.full((num_graphs,), _NEG_ONE, device=device, dtype=torch.long)
         actions = None
         log_pf_steps = None
@@ -936,8 +948,13 @@ class DualFlowModule(LightningModule):
                 edge_ptr_by_head=edge_ptr_by_head,
                 active_mask=active,
             )
-            if edge_mask is not None:
-                outgoing = self._apply_edge_mask_to_outgoing(outgoing, edge_mask=edge_mask, num_graphs=num_graphs)
+            outgoing = self._apply_action_constraints_to_outgoing(
+                outgoing,
+                num_graphs=num_graphs,
+                edge_index=prepared.edge_index,
+                edge_mask=edge_mask,
+                visited_nodes=visited_nodes,
+            )
             move_mask = active & outgoing.has_edge
             if outgoing.edge_ids.numel() > _ZERO:
                 chosen_edge, log_pf_step, has_allowed = self._sample_pb_edges(
@@ -952,6 +969,8 @@ class DualFlowModule(LightningModule):
                 chosen_edge = torch.where(move_mask, chosen_edge, torch.full_like(chosen_edge, _NEG_ONE))
                 chosen_tail = prepared.edge_index[_ONE].index_select(0, chosen_edge.clamp(min=_ZERO))
                 curr_nodes = torch.where(move_mask, chosen_tail, curr_nodes)
+                if visited_nodes is not None:
+                    visited_nodes.index_fill_(0, chosen_tail[move_mask], True)
                 log_pf_step = torch.where(move_mask, log_pf_step, torch.zeros_like(log_pf_step))
                 log_pf_sum = log_pf_sum + log_pf_step
                 num_moves = num_moves + move_mask.to(dtype=torch.long)
@@ -1615,6 +1634,7 @@ class DualFlowModule(LightningModule):
         edge_ptr_by_head: torch.Tensor,
         temperature: float,
         context_tokens: torch.Tensor,
+        visited_nodes: Optional[torch.Tensor] = None,
         edge_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if edge_mask is not None and edge_mask.numel() != prepared.edge_index.size(1):
@@ -1625,8 +1645,13 @@ class DualFlowModule(LightningModule):
             edge_ptr_by_head=edge_ptr_by_head,
             active_mask=move_mask,
         )
-        if edge_mask is not None:
-            outgoing = self._apply_edge_mask_to_outgoing(outgoing, edge_mask=edge_mask, num_graphs=move_mask.numel())
+        outgoing = self._apply_action_constraints_to_outgoing(
+            outgoing,
+            num_graphs=move_mask.numel(),
+            edge_index=prepared.edge_index,
+            edge_mask=edge_mask,
+            visited_nodes=visited_nodes,
+        )
         if outgoing.edge_ids.numel() == _ZERO:
             return torch.zeros_like(move_mask, dtype=torch.float32)
         edge_ids = outgoing.edge_ids.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
@@ -1681,6 +1706,10 @@ class DualFlowModule(LightningModule):
             invalid_start, torch.full_like(stop_reason, _TERMINAL_INVALID_START), stop_reason
         )
         active = graph_mask & (curr_nodes >= _ZERO)
+        visited_nodes = None
+        if self._avoid_revisit:
+            visited_nodes = torch.zeros((prepared.node_batch.numel(),), device=device, dtype=torch.bool)
+            visited_nodes.index_fill_(0, curr_nodes[active], True)
         stop_nodes = torch.full((num_graphs,), _NEG_ONE, device=device, dtype=torch.long)
         actions = None
         log_pf_steps = None
@@ -1699,8 +1728,13 @@ class DualFlowModule(LightningModule):
                 edge_ptr_by_head=edge_ptr_by_head,
                 active_mask=active,
             )
-            if edge_mask is not None:
-                outgoing = self._apply_edge_mask_to_outgoing(outgoing, edge_mask=edge_mask, num_graphs=num_graphs)
+            outgoing = self._apply_action_constraints_to_outgoing(
+                outgoing,
+                num_graphs=num_graphs,
+                edge_index=prepared.edge_index,
+                edge_mask=edge_mask,
+                visited_nodes=visited_nodes,
+            )
             move_mask = active & outgoing.has_edge
             if outgoing.edge_ids.numel() > _ZERO:
                 step_ids = self._build_step_ids(num_graphs=num_graphs, step=step, device=device)
@@ -1717,6 +1751,8 @@ class DualFlowModule(LightningModule):
                 chosen_edge = torch.where(outgoing.has_edge, chosen_edge, torch.full_like(chosen_edge, _NEG_ONE))
                 chosen_tail = prepared.edge_index[_ONE].index_select(0, chosen_edge.clamp(min=_ZERO))
                 curr_nodes = torch.where(move_mask, chosen_tail, curr_nodes)
+                if visited_nodes is not None:
+                    visited_nodes.index_fill_(0, chosen_tail[move_mask], True)
                 log_pf_step = torch.where(move_mask, log_pf_step, torch.zeros_like(log_pf_step))
                 log_pf_sum = log_pf_sum + log_pf_step
                 num_moves = num_moves + move_mask.to(dtype=torch.long)
@@ -1743,6 +1779,26 @@ class DualFlowModule(LightningModule):
             log_pf_steps=log_pf_steps,
         )
 
+    def _apply_action_constraints_to_outgoing(
+        self,
+        outgoing: OutgoingEdges,
+        *,
+        num_graphs: int,
+        edge_index: torch.Tensor,
+        edge_mask: Optional[torch.Tensor],
+        visited_nodes: Optional[torch.Tensor],
+    ) -> OutgoingEdges:
+        if edge_mask is not None:
+            outgoing = self._apply_edge_mask_to_outgoing(outgoing, edge_mask=edge_mask, num_graphs=num_graphs)
+        if visited_nodes is not None:
+            outgoing = self._apply_no_revisit_to_outgoing(
+                outgoing,
+                visited_nodes=visited_nodes,
+                edge_index=edge_index,
+                num_graphs=num_graphs,
+            )
+        return outgoing
+
     @staticmethod
     def _apply_edge_mask_to_outgoing(
         outgoing: OutgoingEdges,
@@ -1758,6 +1814,27 @@ class DualFlowModule(LightningModule):
         if edge_mask.numel() == _ZERO:
             return outgoing
         keep = edge_mask.index_select(0, edge_ids)
+        edge_ids = edge_ids[keep]
+        edge_batch = edge_batch[keep]
+        counts = torch.bincount(edge_batch, minlength=num_graphs).to(device=edge_ids.device, dtype=torch.long)
+        has_edge = counts > _ZERO
+        return OutgoingEdges(edge_ids=edge_ids, edge_batch=edge_batch, edge_counts=counts, has_edge=has_edge)
+
+    @staticmethod
+    def _apply_no_revisit_to_outgoing(
+        outgoing: OutgoingEdges,
+        *,
+        visited_nodes: torch.Tensor,
+        edge_index: torch.Tensor,
+        num_graphs: int,
+    ) -> OutgoingEdges:
+        edge_ids = outgoing.edge_ids
+        edge_batch = outgoing.edge_batch
+        if edge_ids.numel() == _ZERO:
+            return outgoing
+        visited_nodes = visited_nodes.to(device=edge_ids.device, dtype=torch.bool).view(-1)
+        tails = edge_index[_ONE].index_select(0, edge_ids)
+        keep = ~visited_nodes.index_select(0, tails)
         edge_ids = edge_ids[keep]
         edge_batch = edge_batch[keep]
         counts = torch.bincount(edge_batch, minlength=num_graphs).to(device=edge_ids.device, dtype=torch.long)
@@ -1809,6 +1886,17 @@ class DualFlowModule(LightningModule):
         inv_invalid_count = torch.zeros((), device=device, dtype=torch.float32)
         topo_violation_count = torch.zeros((), device=device, dtype=torch.float32)
         no_allowed_count = torch.zeros((), device=device, dtype=torch.float32)
+        visited_fwd = None
+        visited_bwd = None
+        if self._avoid_revisit:
+            num_nodes_total = int(prepared_fwd.node_batch.numel())
+            visited_fwd = torch.zeros((num_nodes_total,), device=device, dtype=torch.bool)
+            visited_bwd = torch.zeros((num_nodes_total,), device=device, dtype=torch.bool)
+            mask_all = edge_mask & graph_mask.view(-1, _ONE)
+            if bool(mask_all.any().detach().tolist()):
+                edges_taken = actions[mask_all].to(device=device, dtype=torch.long).clamp(min=_ZERO)
+                tails_taken = prepared_fwd.edge_index[_ONE].index_select(0, edges_taken)
+                visited_bwd.index_fill_(0, tails_taken, True)
         for step in range(max_steps):
             edge_ids = actions[:, step]
             move_mask = edge_mask[:, step] & graph_mask
@@ -1816,6 +1904,8 @@ class DualFlowModule(LightningModule):
             safe_edges = edge_ids.clamp(min=_ZERO)
             heads = prepared_fwd.edge_index[_ZERO].index_select(0, safe_edges)
             tails = prepared_fwd.edge_index[_ONE].index_select(0, safe_edges)
+            if visited_fwd is not None:
+                visited_fwd.index_fill_(0, heads[move_mask], True)
             step_ids = self._build_step_ids(num_graphs=num_graphs, step=step, device=device)
             next_step_ids = step_ids + _ONE
             log_z_u = self._compute_log_z_for_nodes(
@@ -1843,6 +1933,7 @@ class DualFlowModule(LightningModule):
                 edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_fwd,
                 temperature=sampling_temperature,
                 context_tokens=prepared_fwd.context_tokens,
+                visited_nodes=visited_fwd,
             )
             inv_edge = prepared_fwd.edge_inverse_map.index_select(0, safe_edges)
             inv_valid = inv_edge >= _ZERO
@@ -1862,6 +1953,7 @@ class DualFlowModule(LightningModule):
                     edge_ids_by_head=prepared_fwd.edge_ids_by_head_bwd,
                     edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_bwd,
                     pb_cfg=pb_cfg,
+                    visited_nodes=visited_bwd,
                     edge_mask=edge_mask_bwd,
                     return_no_allowed=True,
                 )
@@ -1878,6 +1970,7 @@ class DualFlowModule(LightningModule):
                     edge_ptr_by_head=prepared_bwd.edge_ptr_by_head_bwd,
                     temperature=float(_ONE),
                     context_tokens=prepared_bwd.context_tokens,
+                    visited_nodes=visited_bwd,
                     edge_mask=edge_mask_bwd,
                 )
             is_target = node_is_target.index_select(0, tails.clamp(min=_ZERO)) & move_mask
@@ -1912,6 +2005,9 @@ class DualFlowModule(LightningModule):
             step_weight = weight * valid.to(dtype=weight.dtype)
             total = total + (delta.pow(_TWO) * step_weight).sum()
             denom = denom + step_weight.sum()
+            if visited_fwd is not None and visited_bwd is not None:
+                visited_fwd.index_fill_(0, tails[move_mask], True)
+                visited_bwd.index_fill_(0, tails[move_mask], False)
         if float(denom.item()) <= float(_ZERO):
             zero = torch.zeros((), device=device, dtype=torch.float32)
             metrics = {
@@ -2092,6 +2188,7 @@ class DualFlowModule(LightningModule):
             actions=rollout_bwd.actions,
             edge_inverse_map=prepared_fwd.edge_inverse_map,
         )
+        actions_fwd = self._reverse_actions_by_length(actions=actions_fwd, lengths=rollout_bwd.num_moves)
         db_loss, db_metrics = self._compute_db_loss(
             prepared_fwd=prepared_fwd,
             prepared_bwd=prepared_bwd,
@@ -2186,6 +2283,19 @@ class DualFlowModule(LightningModule):
         if bool(invalid.any().detach().tolist()):
             raise ValueError("Backward rollout sampled edges without forward inverse.")
         return torch.where(actions >= _ZERO, mapped, actions)
+
+    @staticmethod
+    def _reverse_actions_by_length(*, actions: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        if actions.numel() == _ZERO:
+            return actions
+        lengths = lengths.to(device=actions.device, dtype=torch.long).view(-1)
+        num_graphs, max_steps = actions.shape
+        if lengths.numel() != num_graphs:
+            raise ValueError("lengths length mismatch with actions batch dimension.")
+        steps = torch.arange(max_steps, device=actions.device, dtype=torch.long).view(_ONE, -1)
+        lengths = lengths.clamp(min=_ZERO, max=max_steps).view(-1, _ONE)
+        idx = torch.where(steps < lengths, lengths - _ONE - steps, steps).expand(num_graphs, -1)
+        return actions.gather(1, idx)
 
     @staticmethod
     def _merge_rollout_metrics(

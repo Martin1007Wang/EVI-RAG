@@ -242,16 +242,17 @@ def _preflight_validate(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
-    variants = _resolve_dataset_variants(cfg)
-    if not variants:
-        raise ValueError("Evaluation requires run.dataset_variants with both full and sub datasets.")
-    scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
-    if scopes != {"full", "sub"}:
-        names = [label for label, _ in variants]
-        raise ValueError(
-            "Evaluation requires both full and sub scopes. "
-            f"Got scopes={sorted(scopes)} for variants={names}."
-        )
+    if run_name == "eval_gflownet":
+        variants = _resolve_dataset_variants(cfg)
+        if not variants:
+            raise ValueError("Evaluation requires run.dataset_variants with both full and sub datasets.")
+        scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
+        if scopes != {"full", "sub"}:
+            names = [label for label, _ in variants]
+            raise ValueError(
+                "Evaluation requires both full and sub scopes. "
+                f"Got scopes={sorted(scopes)} for variants={names}."
+            )
 
 
 def _run_eval_all_splits(cfg: DictConfig) -> None:
@@ -269,6 +270,24 @@ def _run_eval_all_splits(cfg: DictConfig) -> None:
             if cfg.run.get("allow_empty_answer") is None:
                 cfg.run.allow_empty_answer = split != "train"
         evaluate(cfg)
+
+
+def _run_llm_all_splits(cfg: DictConfig) -> None:
+    run_cfg = cfg.get("run") or {}
+    splits = run_cfg.get("splits") or ["train", "validation", "test"]
+    split_list = [str(s) for s in splits]
+    if not split_list:
+        raise ValueError("run.splits must be a non-empty list when run.run_all_splits=true.")
+
+    from src.llm import run_llm_eval
+
+    for split in split_list:
+        log.info("llm_eval: split=%s", split)
+        with open_dict(cfg):
+            cfg.run.split = split
+            if cfg.run.get("allow_empty_answer") is None:
+                cfg.run.allow_empty_answer = split != "train"
+        run_llm_eval(cfg)
 
 
 def _run_eval_all_datasets(cfg: DictConfig) -> None:
@@ -386,6 +405,15 @@ def main(cfg: DictConfig) -> None:
     _preflight_validate(cfg)
     extras(cfg)
     run_cfg = cfg.get("run") or {}
+    run_name = str(run_cfg.get("name", "")).strip()
+    if run_name == "eval_llm":
+        if bool(run_cfg.get("run_all_splits", False)):
+            _run_llm_all_splits(cfg)
+        else:
+            from src.llm import run_llm_eval
+
+            run_llm_eval(cfg)
+        return
     if run_cfg.get("dataset_variants"):
         _run_eval_all_datasets(cfg)
         return
