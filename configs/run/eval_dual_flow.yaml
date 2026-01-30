@@ -1,9 +1,9 @@
-name: eval_gflownet
-task_name: "eval/gflownet"
-tags: ["eval", "gflownet"]
+name: eval_dual_flow
+task_name: "eval/dual_flow"
+tags: ["eval", "dual_flow"]
 split: test
 eval_mode: predict
-ckpt_path: ${ckpt.gflownet}
+ckpt_path: ${ckpt.dual_flow}
 dataset_variants:
   - ${dataset.dataset_family}
   - ${dataset.dataset_family}-sub

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 
 _ZERO = 0
+_INVALID_EDGE_ID = -1
+_SELF_RELATION_ID = -1
 
 try:
     from torch import _dynamo as _torch_dynamo
@@ -194,9 +196,185 @@ def compute_qa_edge_mask(
     return node_mask[head_idx] | node_mask[tail_idx]
 
 
+def _coerce_edge_inverse_inputs(
+    *,
+    edge_index: torch.Tensor,
+    edge_relations: torch.Tensor,
+    inverse_map: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = edge_relations.device
+    if edge_index.device != device:
+        edge_index = edge_index.to(device=device)
+    if edge_index.dtype != torch.long:
+        edge_index = edge_index.to(dtype=torch.long)
+    if edge_relations.dtype != torch.long:
+        edge_relations = edge_relations.to(dtype=torch.long)
+    if inverse_map.device != device:
+        inverse_map = inverse_map.to(device=device)
+    if inverse_map.dtype != torch.long:
+        inverse_map = inverse_map.to(dtype=torch.long)
+    heads = edge_index[0].view(-1)
+    tails = edge_index[1].view(-1)
+    rel = edge_relations.view(-1)
+    return heads, tails, rel, inverse_map
+
+
+def _build_edge_keys(
+    *,
+    heads: torch.Tensor,
+    tails: torch.Tensor,
+    rel: torch.Tensor,
+    num_nodes_total: int,
+    num_relations: int,
+) -> torch.Tensor:
+    return (heads * num_nodes_total + tails) * num_relations + rel
+
+
+def _sorted_edge_keys(
+    *,
+    keys: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_idx = torch.nonzero(valid_mask, as_tuple=False).view(-1)
+    if valid_idx.numel() == 0:
+        return keys.new_empty((0,), dtype=keys.dtype), valid_idx
+    keys_valid = keys.index_select(0, valid_idx)
+    sorted_keys, order = torch.sort(keys_valid)
+    sorted_edge_idx = valid_idx.index_select(0, order)
+    if sorted_keys.numel() > 1:
+        dup = sorted_keys[1:] == sorted_keys[:-1]
+        torch._assert(~dup.any(), "Parallel edges detected: duplicate (head, tail, relation) entries.")
+    return sorted_keys, sorted_edge_idx
+
+
+def _assign_inverse_edges(
+    *,
+    inverse_edge: torch.Tensor,
+    sorted_keys: torch.Tensor,
+    sorted_edge_idx: torch.Tensor,
+    inv_keys: torch.Tensor,
+    valid_inv: torch.Tensor,
+) -> None:
+    if sorted_keys.numel() == 0:
+        return
+    inv_keys_valid = inv_keys[valid_inv]
+    pos = torch.searchsorted(sorted_keys, inv_keys_valid)
+    in_range = pos < sorted_keys.numel()
+    if in_range.any():
+        pos_safe = pos[in_range]
+        matches = sorted_keys.index_select(0, pos_safe) == inv_keys_valid[in_range]
+        if matches.any():
+            inverse_ids = sorted_edge_idx.index_select(0, pos_safe[matches])
+            inv_idx = torch.nonzero(valid_inv, as_tuple=False).view(-1)
+            inv_idx = inv_idx[in_range][matches]
+            inverse_edge[inv_idx] = inverse_ids
+
+
+def _compute_inverse_relations(
+    *,
+    rel: torch.Tensor,
+    inverse_map: torch.Tensor,
+    invalid_edge_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    valid_rel = rel >= 0
+    inv_rel = rel.new_full(rel.shape, invalid_edge_id)
+    if valid_rel.any():
+        inv_rel[valid_rel] = inverse_map.index_select(0, rel[valid_rel])
+    valid_inv = valid_rel & (inv_rel >= 0)
+    return valid_rel, inv_rel, valid_inv
+
+
+def _assign_inverse_edge_ids(
+    *,
+    inverse_edge: torch.Tensor,
+    heads: torch.Tensor,
+    tails: torch.Tensor,
+    rel: torch.Tensor,
+    inv_rel: torch.Tensor,
+    valid_rel: torch.Tensor,
+    valid_inv: torch.Tensor,
+    num_nodes_total: int,
+    num_relations: int,
+) -> None:
+    keys = _build_edge_keys(
+        heads=heads,
+        tails=tails,
+        rel=rel,
+        num_nodes_total=num_nodes_total,
+        num_relations=num_relations,
+    )
+    sorted_keys, sorted_edge_idx = _sorted_edge_keys(keys=keys, valid_mask=valid_rel)
+    if valid_inv.any():
+        inv_keys = _build_edge_keys(
+            heads=tails,
+            tails=heads,
+            rel=inv_rel,
+            num_nodes_total=num_nodes_total,
+            num_relations=num_relations,
+        )
+        _assign_inverse_edges(
+            inverse_edge=inverse_edge,
+            sorted_keys=sorted_keys,
+            sorted_edge_idx=sorted_edge_idx,
+            inv_keys=inv_keys,
+            valid_inv=valid_inv,
+        )
+
+
+def build_edge_inverse_map(
+    *,
+    edge_index: torch.Tensor,
+    edge_relations: torch.Tensor,
+    num_nodes_total: int,
+    inverse_map: torch.Tensor,
+    num_relations: int,
+    self_relation_id: int = _SELF_RELATION_ID,
+    invalid_edge_id: int = _INVALID_EDGE_ID,
+) -> torch.Tensor:
+    if edge_index.dim() != 2 or edge_index.size(0) != 2:
+        raise ValueError(f"edge_index must have shape [2, E], got {tuple(edge_index.shape)}")
+    num_edges = int(edge_relations.numel())
+    if num_edges == 0:
+        return edge_relations.new_zeros((0,), dtype=torch.long)
+    if num_nodes_total <= 0 or num_relations <= 0:
+        return edge_relations.new_full((num_edges,), invalid_edge_id, dtype=torch.long)
+
+    heads, tails, rel, inverse_map = _coerce_edge_inverse_inputs(
+        edge_index=edge_index,
+        edge_relations=edge_relations,
+        inverse_map=inverse_map,
+    )
+    inverse_edge = rel.new_full((num_edges,), invalid_edge_id, dtype=torch.long)
+    self_loop = (rel == self_relation_id) & (heads == tails)
+
+    valid_rel, inv_rel, valid_inv = _compute_inverse_relations(
+        rel=rel,
+        inverse_map=inverse_map,
+        invalid_edge_id=invalid_edge_id,
+    )
+    if valid_rel.any():
+        _assign_inverse_edge_ids(
+            inverse_edge=inverse_edge,
+            heads=heads,
+            tails=tails,
+            rel=rel,
+            inv_rel=inv_rel,
+            valid_rel=valid_rel,
+            valid_inv=valid_inv,
+            num_nodes_total=int(num_nodes_total),
+            num_relations=int(num_relations),
+        )
+
+    if self_loop.any():
+        self_ids = torch.arange(num_edges, device=rel.device, dtype=torch.long)
+        inverse_edge = torch.where(self_loop, self_ids, inverse_edge)
+    return inverse_edge
+
+
 __all__ = [
     "EdgeBatchDebugContext",
     "build_edge_batch_debug_context",
     "compute_edge_batch",
     "compute_qa_edge_mask",
+    "build_edge_inverse_map",
 ]

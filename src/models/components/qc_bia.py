@@ -62,8 +62,10 @@ class QCBiANetwork(nn.Module):
             if temperature_init <= float(_ZERO):
                 raise ValueError("temperature_init must be > 0 when use_spherical is true.")
             init_logit_scale = math.log(float(_ONE) / temperature_init)
+            self._logit_scale_init = float(init_logit_scale)
             self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale, dtype=torch.float32))
         else:
+            self._logit_scale_init = 0.0
             self.logit_scale = None
 
         self.W_q = nn.Linear(self.d_plm, self.d_kg)
@@ -90,6 +92,21 @@ class QCBiANetwork(nn.Module):
             raise RuntimeError("logit_scale is unavailable when use_spherical is false.")
         scale = self.logit_scale.exp()
         return scale.clamp(min=self.logit_scale_min, max=self.logit_scale_max)
+
+    def sanitize_logit_scale_(self) -> None:
+        if self.logit_scale is None:
+            return
+        log_min = math.log(self.logit_scale_min)
+        log_max = math.log(self.logit_scale_max)
+        with torch.no_grad():
+            data = torch.nan_to_num(
+                self.logit_scale.data,
+                nan=self._logit_scale_init,
+                posinf=log_max,
+                neginf=log_min,
+            )
+            data = data.clamp(min=log_min, max=log_max)
+            self.logit_scale.copy_(data)
 
     def forward(
         self,

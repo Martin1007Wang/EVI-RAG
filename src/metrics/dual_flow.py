@@ -362,7 +362,7 @@ def build_potential_metrics(
 
 
 @dataclass
-class GFlowNetEvalState:
+class DualFlowEvalState:
     num_samples: int = _ZERO
     num_rollouts: int = _ZERO
     answer_samples: int = _ZERO
@@ -509,7 +509,7 @@ def _prefix_rollout_stats(
 
 def _update_prefix_state(
     *,
-    state: GFlowNetEvalState,
+    state: DualFlowEvalState,
     k_pairs: List[Tuple[int, int]],
     prefix_nodes: List[set[int]],
     prefix_terminal: List[bool],
@@ -545,7 +545,7 @@ def _update_prefix_state(
             state.composite_score_sum[k_int] = state.composite_score_sum.get(k_int, _FLOAT_ZERO) + score
 
 
-class GFlowNetEvalAccumulator:
+class DualFlowEvalAccumulator:
     def __init__(
         self,
         *,
@@ -554,7 +554,7 @@ class GFlowNetEvalAccumulator:
     ) -> None:
         self.k_values = normalize_k_values(k_values, default=_DEFAULT_K_VALUES)
         self._composite_cfg = resolve_composite_score_cfg(composite_score_cfg)
-        self._state = GFlowNetEvalState(
+        self._state = DualFlowEvalState(
             terminal_hit_counts={int(k): _ZERO for k in self.k_values},
             context_recall_sum={int(k): _FLOAT_ZERO for k in self.k_values},
             context_precision_sum={int(k): _FLOAT_ZERO for k in self.k_values},
@@ -662,5 +662,5 @@ __all__ = [
     "compute_reward_gap",
     "compute_diag_metrics",
     "build_potential_metrics",
-    "GFlowNetEvalAccumulator",
+    "DualFlowEvalAccumulator",
 ]

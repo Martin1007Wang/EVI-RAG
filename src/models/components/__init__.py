@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from .gflownet_actor import GFlowNetActor, SinusoidalPositionalEncoding
-from .gflownet_layers import (
+from .backbone import (
     EmbeddingBackbone,
     LogZPredictor,
     CvtNodeInitializer,
+    SinusoidalPositionalEncoding,
 )
-from .qc_bia_network import QCBiANetwork
+from .qc_bia import QCBiANetwork
 
 __all__ = [
-    "GFlowNetActor",
     "SinusoidalPositionalEncoding",
     "EmbeddingBackbone",
     "CvtNodeInitializer",

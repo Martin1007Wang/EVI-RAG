@@ -1,11 +1,11 @@
-# Stream GFlowNet rollouts during predict().
+# Stream DualFlow rollouts during predict().
 
-gflownet_rollout_artifact_writer:
-  _target_: src.callbacks.gflownet_rollout_artifact_writer.GFlowNetRolloutArtifactWriter
-  output_dir: ${dataset.artifact_dir}/eval_gflownet
+dual_flow_rollout_artifact_writer:
+  _target_: src.callbacks.dual_flow_rollout_artifact_writer.DualFlowRolloutArtifactWriter
+  output_dir: ${dataset.artifact_dir}/eval_dual_flow
   split: ${run.split}
   enabled: true
-  artifact_name: eval_gflownet
+  artifact_name: eval_dual_flow
   schema_version: 1
   textualize: false
   entity_vocab_path: ${dataset.out_dir}/entity_vocab.parquet

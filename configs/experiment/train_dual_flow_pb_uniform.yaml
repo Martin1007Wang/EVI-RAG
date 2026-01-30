@@ -1,15 +1,15 @@
 # @package _global_
 #
-# GFlowNet training: PB-learned (learnable backward policy).
+# DualFlow training: PB-uniform (static uniform backward policy).
 
 defaults:
-  - override /model/db: learned
+  - override /model/db: uniform
   - override /callbacks: default
   - override /logger: wandb
   - override /trainer: gpu
 
-task_name: "train/gflownet/pb_learned"
-tags: ["dual_flow", "gflownet", "pb_learned"]
+task_name: "train/dual_flow/pb_uniform"
+tags: ["dual_flow", "pb_uniform"]
 optimized_metric: "val/hit@beam"
 
 trainer:

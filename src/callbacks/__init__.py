@@ -4,22 +4,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__all__ = ["GFlowNetEvalMetrics", "GFlowNetRolloutArtifactWriter"]
+__all__ = ["DualFlowEvalMetrics", "DualFlowRolloutArtifactWriter"]
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .gflownet_eval_metrics import GFlowNetEvalMetrics
-    from .gflownet_rollout_artifact_writer import GFlowNetRolloutArtifactWriter
+    from .dual_flow_eval_metrics import DualFlowEvalMetrics
+    from .dual_flow_rollout_artifact_writer import DualFlowRolloutArtifactWriter
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
-    if name == "GFlowNetEvalMetrics":
-        from .gflownet_eval_metrics import GFlowNetEvalMetrics
+    if name == "DualFlowEvalMetrics":
+        from .dual_flow_eval_metrics import DualFlowEvalMetrics
 
-        return GFlowNetEvalMetrics
-    if name == "GFlowNetRolloutArtifactWriter":
-        from .gflownet_rollout_artifact_writer import GFlowNetRolloutArtifactWriter
+        return DualFlowEvalMetrics
+    if name == "DualFlowRolloutArtifactWriter":
+        from .dual_flow_rollout_artifact_writer import DualFlowRolloutArtifactWriter
 
-        return GFlowNetRolloutArtifactWriter
+        return DualFlowRolloutArtifactWriter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

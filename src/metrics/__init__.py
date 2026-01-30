@@ -8,7 +8,7 @@ from .common import (
     compute_answer_hit,
     summarize_uncertainty,
 )
-from .gflownet import (
+from .dual_flow import (
     CompositeScoreConfig,
     resolve_composite_score_cfg,
     reduce_rollout_metrics,
@@ -19,7 +19,7 @@ from .gflownet import (
     compute_composite_score,
     compute_reward_gap,
     compute_diag_metrics,
-    GFlowNetEvalAccumulator,
+    DualFlowEvalAccumulator,
 )
 
 __all__ = [
@@ -39,5 +39,5 @@ __all__ = [
     "compute_composite_score",
     "compute_reward_gap",
     "compute_diag_metrics",
-    "GFlowNetEvalAccumulator",
+    "DualFlowEvalAccumulator",
 ]

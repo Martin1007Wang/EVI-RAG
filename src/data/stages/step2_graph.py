@@ -416,7 +416,7 @@ def _canonicalize_graph_edges(
     relation_embeddings_norm: torch.Tensor,
 ) -> None:
     raise ValueError(
-        "canonicalize_relations requires offline shortest-path labels; disable canonicalize_relations for GFlowNet."
+        "canonicalize_relations requires offline shortest-path labels; disable canonicalize_relations for DualFlow."
     )
 
 
@@ -450,7 +450,7 @@ def preprocess(ctx: StageContext) -> None:
     keep_start_adjacent_edges = bool(cfg.get("keep_start_adjacent_edges", False))
     embedding_cfg = ctx.embedding_cfg
     if embedding_cfg is not None and embedding_cfg.canonicalize_relations:
-        raise ValueError("canonicalize_relations requires offline labels; disable it for GFlowNet.")
+        raise ValueError("canonicalize_relations requires offline labels; disable it for DualFlow.")
     emit_sub_filter = bool(cfg.get("emit_sub_filter", False))
     sub_filter_filename = str(cfg.get("sub_filter_filename", "sub_filter.json"))
     emit_nonzero_positive_filter = bool(cfg.get("emit_nonzero_positive_filter", False))
@@ -499,7 +499,7 @@ def preprocess(ctx: StageContext) -> None:
     graphs_written_by_split = {split: _ZERO for split in splits}
     questions_written_by_split = {split: _ZERO for split in splits}
     if emit_nonzero_positive_filter:
-        raise ValueError("emit_nonzero_positive_filter is disabled in GFlowNet; remove this flag.")
+        raise ValueError("emit_nonzero_positive_filter is disabled in DualFlow; remove this flag.")
 
     if target_reachable_pruning and path_mode != _PATH_MODE_QA_DIRECTED:
         raise ValueError("target_reachable_pruning requires path_mode=qa_directed.")

@@ -9,6 +9,7 @@ _ZERO = 0
 _ONE = 1
 _TWO = 2
 _THREE = 3
+_FOUR = 4
 _LOGZ_OUTPUT_DIM = 1
 _DEFAULT_BACKBONE_FINETUNE = True
 _DEFAULT_GNN_LAYERS = 2
@@ -16,12 +17,38 @@ _DEFAULT_GNN_DROPOUT = 0.0
 _DEFAULT_ADAPTER_ENABLED = False
 _DEFAULT_ADAPTER_DIM_DIVISOR = 4
 _DEFAULT_ADAPTER_DROPOUT = 0.1
+_PNA_EPS = 1.0e-6
+_PNA_SCALERS = _THREE
+_PNA_AGGREGATORS = _FOUR
+_PNA_FEATURE_MULT = _PNA_SCALERS * _PNA_AGGREGATORS
 
 
 def _init_linear(layer: nn.Linear) -> None:
     nn.init.xavier_uniform_(layer.weight)
     if layer.bias is not None:
         nn.init.zeros_(layer.bias)
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        if self.dim <= _ZERO:
+            raise ValueError("dim must be > 0.")
+        half_dim = self.dim // _TWO
+        inv_freq = torch.exp(
+            -torch.arange(half_dim, dtype=torch.float32) * (torch.log(torch.tensor(10000.0)) / max(half_dim, _ONE))
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._has_odd = bool(self.dim % _TWO)
+
+    def forward(self, steps: torch.Tensor) -> torch.Tensor:
+        steps = steps.to(device=self.inv_freq.device, dtype=torch.float32).view(-1, _ONE)
+        freqs = steps * self.inv_freq.view(_ONE, -1)
+        emb = torch.cat((torch.sin(freqs), torch.cos(freqs)), dim=-1)
+        if self._has_odd:
+            emb = torch.nn.functional.pad(emb, (_ZERO, _ONE))
+        return emb
 
 
 class RelationalGNNLayer(nn.Module):
@@ -34,12 +61,74 @@ class RelationalGNNLayer(nn.Module):
         if self.dropout < float(_ZERO):
             raise ValueError("dropout must be >= 0.")
         self.msg_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.agg_proj = nn.Linear(self.hidden_dim * _PNA_FEATURE_MULT, self.hidden_dim)
         self.update_proj = nn.Linear(self.hidden_dim * _TWO, self.hidden_dim)
         self.norm = nn.LayerNorm(self.hidden_dim)
         self.act = nn.GELU()
         self.drop = nn.Dropout(self.dropout)
         _init_linear(self.msg_proj)
+        _init_linear(self.agg_proj)
         _init_linear(self.update_proj)
+
+    def _pna_stats(
+        self,
+        *,
+        messages: torch.Tensor,
+        tails: torch.Tensor,
+        num_nodes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_dim = int(messages.size(-1))
+        sums = torch.zeros((num_nodes, hidden_dim), device=messages.device, dtype=messages.dtype)
+        sums.index_add_(0, tails, messages)
+        sums_sq = torch.zeros((num_nodes, hidden_dim), device=messages.device, dtype=messages.dtype)
+        sums_sq.index_add_(0, tails, messages.square())
+        deg = torch.zeros((num_nodes,), device=messages.device, dtype=messages.dtype)
+        ones = torch.ones_like(tails, dtype=messages.dtype)
+        deg.index_add_(0, tails, ones)
+        deg_safe = deg.clamp(min=_ONE).unsqueeze(-1)
+        mean = sums / deg_safe
+        var = sums_sq / deg_safe - mean.square()
+        std = var.clamp(min=_PNA_EPS).sqrt()
+        tail_index = tails.view(-1, _ONE).expand(-1, hidden_dim)
+        finfo = torch.finfo(messages.dtype)
+        max_vals = torch.full((num_nodes, hidden_dim), finfo.min, device=messages.device, dtype=messages.dtype)
+        max_vals.scatter_reduce_(0, tail_index, messages, reduce="amax", include_self=True)
+        min_vals = torch.full((num_nodes, hidden_dim), finfo.max, device=messages.device, dtype=messages.dtype)
+        min_vals.scatter_reduce_(0, tail_index, messages, reduce="amin", include_self=True)
+        has_in = deg > float(_ZERO)
+        mask = has_in.unsqueeze(-1)
+        max_vals = torch.where(mask, max_vals, torch.zeros_like(max_vals))
+        min_vals = torch.where(mask, min_vals, torch.zeros_like(min_vals))
+        std = torch.where(mask, std, torch.zeros_like(std))
+        stats = torch.cat((sums, max_vals, min_vals, std), dim=-1)
+        return stats, deg, has_in
+
+    @staticmethod
+    def _pna_scales(*, degree: torch.Tensor, has_in: torch.Tensor) -> torch.Tensor:
+        deg = degree.to(dtype=torch.float32)
+        has_in_f = has_in.to(device=degree.device, dtype=torch.float32)
+        log_deg = torch.log(deg + float(_ONE))
+        denom = has_in_f.sum().clamp(min=float(_ONE))
+        avg_log_deg = (log_deg.mul(has_in_f).sum() / denom).clamp(min=float(_PNA_EPS))
+        log_deg_safe = log_deg.clamp(min=float(_PNA_EPS))
+        scale_identity = torch.ones_like(log_deg)
+        scale_amplify = log_deg / avg_log_deg
+        scale_attenuate = avg_log_deg / log_deg_safe
+        return torch.stack((scale_identity, scale_amplify, scale_attenuate), dim=-1)
+
+    def _pna_aggregate(
+        self,
+        *,
+        messages: torch.Tensor,
+        tails: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        stats, deg, has_in = self._pna_stats(messages=messages, tails=tails, num_nodes=num_nodes)
+        scales = self._pna_scales(degree=deg, has_in=has_in).to(device=messages.device, dtype=messages.dtype)
+        scaled = stats.unsqueeze(_ONE) * scales.unsqueeze(-1)
+        features = scaled.reshape(num_nodes, -1)
+        features = torch.where(has_in.unsqueeze(-1), features, torch.zeros_like(features))
+        return self.agg_proj(features)
 
     def forward(
         self,
@@ -64,12 +153,7 @@ class RelationalGNNLayer(nn.Module):
         tail = edge_index[_ONE].to(dtype=torch.long)
         msg = node_tokens.index_select(0, head) + relation_tokens
         msg = self.msg_proj(msg)
-        agg = torch.zeros((num_nodes, self.hidden_dim), device=node_tokens.device, dtype=node_tokens.dtype)
-        agg.index_add_(0, tail, msg)
-        deg = torch.zeros((num_nodes,), device=node_tokens.device, dtype=node_tokens.dtype)
-        ones = torch.ones_like(tail, dtype=node_tokens.dtype)
-        deg.index_add_(0, tail, ones)
-        agg = agg / deg.clamp(min=_ONE).unsqueeze(-1)
+        agg = self._pna_aggregate(messages=msg, tails=tail, num_nodes=num_nodes)
         update_in = torch.cat((node_tokens, agg), dim=-1)
         update = self.update_proj(update_in)
         out = node_tokens + self.drop(self.act(update))
@@ -101,7 +185,26 @@ class EmbeddingAdapter(nn.Module):
             return embeddings
         normalized = self.norm(embeddings)
         delta = self.drop(self.up(self.act(self.down(normalized))))
-        return embeddings + delta
+        out = embeddings + delta
+        return out
+
+    def reset_parameters(self) -> None:
+        self.norm.reset_parameters()
+        _init_linear(self.down)
+        nn.init.zeros_(self.up.weight)
+        if self.up.bias is not None:
+            nn.init.zeros_(self.up.bias)
+
+    def sanitize_parameters_(self) -> bool:
+        nonfinite = False
+        for param in self.parameters():
+            if not torch.isfinite(param).all():
+                nonfinite = True
+                break
+        if nonfinite:
+            with torch.no_grad():
+                self.reset_parameters()
+        return nonfinite
 
 
 class EmbeddingBackbone(nn.Module):
@@ -188,7 +291,8 @@ class EmbeddingBackbone(nn.Module):
         if self.node_adapter is not None:
             node_embeddings = self.node_adapter(node_embeddings)
         node_normed = self.node_norm(node_embeddings)
-        return self.node_proj(node_normed)
+        out = self.node_proj(node_normed)
+        return out
 
     def project_relation_embeddings(self, relation_embeddings: torch.Tensor) -> torch.Tensor:
         if self.rel_adapter is not None:
@@ -319,4 +423,5 @@ __all__ = [
     "CvtNodeInitializer",
     "RelationalGNNLayer",
     "LogZPredictor",
+    "SinusoidalPositionalEncoding",
 ]

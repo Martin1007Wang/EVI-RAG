@@ -21,12 +21,12 @@ from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_l
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _RUN_REQUIRES_CKPT_KIND = {
-    "eval_gflownet": "gflownet",
+    "eval_dual_flow": "dual_flow",
 }
 
 _DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"
 _DATASET_BASE_CONFIG = _DATASET_CONFIG_DIR / "base.yaml"
-_ALLOW_CPU_EVAL_ENV = "GFLOWNET_ALLOW_CPU_EVAL"
+_ALLOW_CPU_EVAL_ENV = "DUAL_FLOW_ALLOW_CPU_EVAL"
 _ALLOW_CPU_EVAL_ON = "1"
 _ALLOW_CPU_EVAL_OFF = "0"
 
@@ -222,7 +222,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_gflownet dataset=webqsp-sub ckpt.gflownet=/path/to/gflownet.ckpt\n"
+            "  python src/eval.py experiment=eval_dual_flow dataset=webqsp-sub ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
@@ -234,7 +234,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `run`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_gflownet dataset=webqsp-sub ckpt.gflownet=/path/to/gflownet.ckpt\n"
+            "  python src/eval.py experiment=eval_dual_flow dataset=webqsp-sub ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
         )
     required_kind = _RUN_REQUIRES_CKPT_KIND.get(run_name)
     if required_kind and cfg.get("ckpt_path") in (None, ""):
@@ -242,7 +242,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
-    if run_name == "eval_gflownet":
+    if run_name == "eval_dual_flow":
         variants = _resolve_dataset_variants(cfg)
         if not variants:
             raise ValueError("Evaluation requires run.dataset_variants with both full and sub datasets.")
@@ -326,7 +326,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if run_cfg is None:
         raise ValueError(
             "Missing required config group: `run`. Example: "
-            "`python src/eval.py experiment=eval_gflownet dataset=webqsp-sub`."
+            "`python src/eval.py experiment=eval_dual_flow dataset=webqsp-sub`."
         )
     split = str(run_cfg.get("split", "test"))
     if run_cfg.get("allow_empty_answer") is None:

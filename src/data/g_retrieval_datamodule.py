@@ -56,6 +56,8 @@ class GRetrievalDataModule(LightningDataModule):
         persistent_workers: bool = False,
         precompute_edge_batch: bool = False,
         validate_edge_batch: bool = False,
+        precompute_edge_inverse_map: bool = True,
+        inverse_relation_suffix: str | None = None,
         embeddings_device: str | None = None,
         splits: Optional[Dict[str, str]] = None,
         expand_multi_answer: bool = True,
@@ -95,6 +97,8 @@ class GRetrievalDataModule(LightningDataModule):
         self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
         self.precompute_edge_batch = bool(precompute_edge_batch)
         self.validate_edge_batch = bool(validate_edge_batch)
+        self.precompute_edge_inverse_map = bool(precompute_edge_inverse_map)
+        self.inverse_relation_suffix = None if inverse_relation_suffix is None else str(inverse_relation_suffix)
         self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
         self.expand_multi_answer = bool(expand_multi_answer)
         self.filter_zero_hop = bool(filter_zero_hop)
@@ -260,6 +264,13 @@ class GRetrievalDataModule(LightningDataModule):
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Did you run setup()?")
 
+        relation_inverse_map = None
+        if self.precompute_edge_inverse_map:
+            resources = self._shared_resources
+            if resources is None:
+                raise RuntimeError("shared_resources required to precompute edge_inverse_map.")
+            relation_inverse_map, _ = resources.relation_inverse_assets(suffix=self.inverse_relation_suffix)
+
         return build_retrieval_dataloader(
             dataset,
             batch_size=self.batch_size_per_device,
@@ -271,6 +282,8 @@ class GRetrievalDataModule(LightningDataModule):
             prefetch_factor=self.prefetch_factor,
             precompute_edge_batch=self.precompute_edge_batch,
             validate_edge_batch=self.validate_edge_batch,
+            precompute_edge_inverse_map=self.precompute_edge_inverse_map,
+            relation_inverse_map=relation_inverse_map,
             random_seed=self.dataset_cfg.get("random_seed"),
             train_samples_per_epoch=train_samples_per_epoch,
             expand_multi_answer=self.expand_multi_answer,

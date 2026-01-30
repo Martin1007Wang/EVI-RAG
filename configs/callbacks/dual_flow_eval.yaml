@@ -1,0 +1,4 @@
+defaults:
+  - dual_flow_rollout_artifact_writer
+  - dual_flow_eval_metrics
+  - _self_

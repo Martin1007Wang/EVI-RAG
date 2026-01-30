@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set
 
-from src.metrics.gflownet import GFlowNetEvalAccumulator
+from src.metrics.dual_flow import DualFlowEvalAccumulator
 
 _ZERO = 0
 _ONE = 1
@@ -67,7 +67,7 @@ def compute_llm_metrics(
 
     text_acc = _F1Accumulator()
     ent_acc = _F1Accumulator()
-    retrieval_acc = GFlowNetEvalAccumulator(k_values=[int(top_k)])
+    retrieval_acc = DualFlowEvalAccumulator(k_values=[int(top_k)])
     for record in _iter_jsonl(input_path):
         sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
         if not sample_id or sample_id not in pred_map:

@@ -433,10 +433,10 @@ pytest -k "not slow"
 Each experiment should be tagged in order to easily filter them across files or in logger UI:
 
 ```bash
-python train.py tags=["gflownet","experiment_X"]
+python train.py tags=["dual_flow","experiment_X"]
 ```
 
-> **Note**: You might need to escape the bracket characters in your shell with `python train.py tags=\["gflownet","experiment_X"\]`.
+> **Note**: You might need to escape the bracket characters in your shell with `python train.py tags=\["dual_flow","experiment_X"\]`.
 
 If no tags are provided, you will be asked to input them from command line:
 
@@ -497,7 +497,7 @@ This allows you to easily iterate over new models! Every time you create a new o
 Switch between models and datamodules with command line arguments:
 
 ```bash
-python train.py model=gflownet data=g_retrieval
+python train.py model=dual_flow data=g_retrieval
 ```
 
 Example pipeline managing the instantiation logic: [src/train.py](src/train.py).
@@ -520,7 +520,7 @@ defaults:
   - ckpt: default
   - dataset: null
   - data: g_retrieval
-  - model: gflownet
+  - model: dual_flow
   - callbacks: default
   - logger: null
   - trainer: default
@@ -581,14 +581,14 @@ For example, you can use them to version control best hyperparameters for each c
 defaults:
   - override /dataset: webqsp
   - override /data: g_retrieval
-  - override /model: gflownet
+  - override /model: dual_flow
   - override /callbacks: default
   - override /trainer: gpu
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-tags: ["gflownet"]
+tags: ["dual_flow"]
 
 seed: 12345
 
@@ -608,12 +608,12 @@ data:
 logger:
   wandb:
     tags: ${tags}
-    group: "gflownet"
+    group: "dual_flow"
 ```
 
 预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
-- 训练（`experiment=`）：`train_gflownet`
-- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_gflownet`, `export_gflownet`
+- 训练（`experiment=`）：`train_dual_flow`
+- 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_dual_flow`, `export_dual_flow`
 
 大训练集（如 CWQ）加速早停（更频繁更新 `val/hit@beam`）：
 - 设置 `data.train_samples_per_epoch=<N>` 缩短“有效 epoch”（无放回循环采样，跨多个 epoch 覆盖全量训练集）
@@ -624,9 +624,9 @@ logger:
 - 若已有旧缓存/旧 parquet，必须完整重建该流程，否则会 fail-fast。
 
 一致性设计要点：
-- 训练阶段仅消费 `g_retrieval`（LMDB）；评估/推理仅生成 `eval_gflownet` 缓存。
+- 训练阶段仅消费 `g_retrieval`（LMDB）；评估/推理仅生成 `eval_dual_flow` 缓存。
 - 假设 `g_retrieval` 覆盖完整证据，不可达样本视为数据错误并应剔除。
-- GFlowNet 动作空间通过随机采样 + 结构掩码构建，不再使用确定性 TopK。
+- DualFlow 动作空间通过随机采样 + 结构掩码构建，不再使用确定性 TopK。
 
 ```bash
 python scripts/build_retrieval_pipeline.py dataset=webqsp paths=default
@@ -635,14 +635,14 @@ python scripts/build_retrieval_pipeline.py dataset=webqsp paths=default
 评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：
 
 ```bash
-# GFlowNet 产物：eval_gflownet rollouts
-python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt
+# DualFlow 产物：eval_dual_flow rollouts
+python src/eval.py experiment=eval_dual_flow dataset=webqsp ckpt.dual_flow=/path/to/dual_flow.ckpt
 
-# GFlowNet greedy 评估（temperature=0，单 rollout）
-python src/eval.py experiment=eval_gflownet dataset=webqsp ckpt.gflownet=/path/to/gflownet.ckpt \
+# DualFlow greedy 评估（temperature=0，单 rollout）
+python src/eval.py experiment=eval_dual_flow dataset=webqsp ckpt.dual_flow=/path/to/dual_flow.ckpt \
   model.evaluation_cfg.num_eval_rollouts=1 model.evaluation_cfg.rollout_temperature=0.0
 
-# LLM 评测：基于 eval_gflownet rollouts 生成最终答案（两种模式）
+# LLM 评测：基于 eval_dual_flow rollouts 生成最终答案（两种模式）
 #
 # (1) 本地 vLLM（需要安装 vllm，并可访问 GPU）
 python src/eval.py experiment=eval_llm dataset=webqsp llm.provider=vllm
@@ -732,7 +732,7 @@ You can use many of them at once (see [configs/logger/many_loggers.yaml](configs
 
 You can also write your own logger.
 
-Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the GFlowNet example](src/models/dual_flow_module.py).
+Lightning provides convenient method for logging custom metrics from inside LightningModule. Read the [docs](https://pytorch-lightning.readthedocs.io/en/latest/extensions/logging.html#automatic-logging) or take a look at [the DualFlow example](src/models/dual_flow_module.py).
 
 <br>
 

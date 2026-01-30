@@ -3,7 +3,7 @@
 # Train/val on the validation split for fast verification.
 
 defaults:
-  - train_gflownet
+  - train_dual_flow
   - _self_
 
 data:

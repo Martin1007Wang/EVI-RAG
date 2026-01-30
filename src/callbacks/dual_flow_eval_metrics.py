@@ -5,11 +5,11 @@ from typing import Any, Optional, Sequence
 import torch
 from lightning.pytorch.callbacks import Callback
 
-from src.metrics.gflownet import GFlowNetEvalAccumulator
+from src.metrics.dual_flow import DualFlowEvalAccumulator
 
 
-class GFlowNetEvalMetrics(Callback):
-    """Aggregate GFlowNet rollout metrics during predict()."""
+class DualFlowEvalMetrics(Callback):
+    """Aggregate DualFlow rollout metrics during predict()."""
 
     def __init__(
         self,
@@ -20,7 +20,7 @@ class GFlowNetEvalMetrics(Callback):
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
-        self._accumulator = GFlowNetEvalAccumulator(
+        self._accumulator = DualFlowEvalAccumulator(
             k_values=k_values,
             composite_score_cfg=composite_score_cfg,
         )
@@ -50,4 +50,4 @@ class GFlowNetEvalMetrics(Callback):
             trainer.callback_metrics.update({k: torch.tensor(v) for k, v in metrics.items()})
 
 
-__all__ = ["GFlowNetEvalMetrics"]
+__all__ = ["DualFlowEvalMetrics"]

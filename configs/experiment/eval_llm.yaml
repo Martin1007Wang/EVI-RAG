@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Experiment: LLM inference over eval_gflownet rollouts.
+# Experiment: LLM inference over eval_dual_flow rollouts.
 
 defaults:
   - override /callbacks: default
@@ -15,12 +15,12 @@ llm:
   allow_sub: false
   input_path: null
   output_dir: null
-  input_subdir: eval_gflownet
+  input_subdir: eval_dual_flow
   output_subdir: eval_llm
   output_filename_template: "{split}_k{k}_{provider}.jsonl"
   compute_metrics: true
   metrics_filename_template: "{split}_k{k}_{provider}.metrics.json"
-  topk_list: [10, 25, 50]
+  topk_list: [1, 10, 25, 50, 100]
   max_samples: null
   batch_size: 8
   resume: true
@@ -40,6 +40,9 @@ llm:
     answer_key: "answer"
     answer_separator: " | "
     allow_empty: true
+    max_prompt_chars: 32000
+    max_trajectories: 100
+    max_candidates: 30
   vllm:
     model: Qwen/Qwen2.5-7B-Instruct
     tensor_parallel_size: 1

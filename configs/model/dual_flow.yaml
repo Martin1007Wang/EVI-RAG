@@ -1,5 +1,5 @@
 #
-# DualFlow model configuration (GFlowNet training/eval).
+# DualFlow model configuration (DualFlow training/eval).
 
 defaults:
   - _self_
@@ -35,6 +35,8 @@ runtime_cfg:
   avoid_revisit: true
   inverse_relation_suffix: "__inv"
   strict_inverse: true
+  predict_mode: full
+  answer_pooling: mean
 
 optimizer_cfg:
   type: adamw
@@ -51,6 +53,8 @@ scheduler_cfg:
 training_cfg:
   accumulate_grad_batches: 1
   num_rollouts: 5
+  start_temperature_start: 1.0
+  start_temperature_end: 1.0
 
 evaluation_cfg:
   beam_size: 50

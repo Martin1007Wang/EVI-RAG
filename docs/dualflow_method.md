@@ -1,4 +1,4 @@
-# DualFlow (Code-Exact): Off-Policy Detailed Balance GFlowNet for KGQA
+# DualFlow (Code-Exact): Off-Policy Detailed Balance DualFlow for KGQA
 
 This document is the single, canonical specification of the DualFlow algorithm **as implemented** in
 `src/models/dual_flow_module.py`. When in doubt, the code wins.
@@ -158,7 +158,7 @@ Code ref: `src/models/dual_flow_module.py` (`_compute_db_loss`).
 All PB settings live under `model.training_cfg.db_cfg.*` and are composed via:
 
 - `configs/model/db/{uniform,topo_semantic,learned}.yaml`
-- `configs/experiment/train_gflownet_pb_{uniform,topo_semantic,learned}.yaml`
+- `configs/experiment/train_dual_flow_pb_{uniform,topo_semantic,learned}.yaml`
 
 At a glance:
 

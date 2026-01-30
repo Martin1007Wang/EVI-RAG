@@ -17,7 +17,7 @@ _ZERO = 0
 _ONE = 1
 _NEG_INF = float("-inf")
 
-_DEFAULT_INPUT_SUBDIR = "eval_gflownet"
+_DEFAULT_INPUT_SUBDIR = "eval_dual_flow"
 _DEFAULT_OUTPUT_SUBDIR = "eval_llm"
 _DEFAULT_FILENAME_TEMPLATE = "{split}_k{k}_{provider}.jsonl"
 _DEFAULT_METRICS_FILENAME_TEMPLATE = "{split}_k{k}_{provider}.metrics.json"
@@ -29,6 +29,8 @@ _DEFAULT_OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _DEFAULT_MAX_CANDIDATES_IN_PROMPT = 30
+_DEFAULT_MAX_PROMPT_CHARS = 0
+_DEFAULT_MAX_TRAJECTORIES_IN_PROMPT = 0
 _DEFAULT_MAX_JUSTIFICATION_WORDS = 25
 _DEFAULT_SCHEMA_ENABLED = True
 _DEFAULT_SCHEMA_MAX_RETRIES = 2
@@ -68,6 +70,9 @@ class PromptSpec:
     answer_key: str
     answer_separator: str
     allow_empty_answer: bool
+    max_prompt_chars: int
+    max_trajectories: int
+    max_candidates: int
 
 
 @dataclass(frozen=True)
@@ -118,7 +123,7 @@ def run_llm_eval(cfg: Any) -> None:
     output_spec = _resolve_output_spec(llm_cfg)
     schema_spec = _resolve_schema_spec(llm_cfg, prompt_spec)
     input_path = _resolve_input_path(dataset_cfg, llm_cfg, split)
-    output_dir = _resolve_output_dir(dataset_cfg, llm_cfg)
+    output_dir = _resolve_output_dir(dataset_cfg, llm_cfg, cfg.get("paths"))
     output_dir.mkdir(parents=True, exist_ok=True)
     topk_list = _resolve_topk_list(llm_cfg)
     for provider in providers:
@@ -168,11 +173,23 @@ def _resolve_prompt_spec(llm_cfg: Any) -> PromptSpec:
     answer_key = str(prompt_cfg.get("answer_key") or _DEFAULT_ANSWER_KEY).strip()
     answer_separator = str(prompt_cfg.get("answer_separator") or _DEFAULT_ANSWER_SEPARATOR)
     allow_empty_answer = bool(prompt_cfg.get("allow_empty", _DEFAULT_ALLOW_EMPTY_PROMPT_ANSWER))
+    max_prompt_chars = int(prompt_cfg.get("max_prompt_chars", _DEFAULT_MAX_PROMPT_CHARS))
+    max_trajectories = int(prompt_cfg.get("max_trajectories", _DEFAULT_MAX_TRAJECTORIES_IN_PROMPT))
+    max_candidates = int(prompt_cfg.get("max_candidates", _DEFAULT_MAX_CANDIDATES_IN_PROMPT))
+    if max_prompt_chars < _ZERO:
+        raise ValueError("llm.prompt.max_prompt_chars must be >= 0.")
+    if max_trajectories < _ZERO:
+        raise ValueError("llm.prompt.max_trajectories must be >= 0.")
+    if max_candidates < _ZERO:
+        raise ValueError("llm.prompt.max_candidates must be >= 0.")
     return PromptSpec(
         system=system,
         answer_key=answer_key,
         answer_separator=answer_separator,
         allow_empty_answer=allow_empty_answer,
+        max_prompt_chars=max_prompt_chars,
+        max_trajectories=max_trajectories,
+        max_candidates=max_candidates,
     )
 
 
@@ -280,10 +297,15 @@ def _resolve_input_path(dataset_cfg: Any, llm_cfg: Any, split: str) -> Path:
     return artifact_dir / subdir / f"{split}.jsonl"
 
 
-def _resolve_output_dir(dataset_cfg: Any, llm_cfg: Any) -> Path:
+def _resolve_output_dir(dataset_cfg: Any, llm_cfg: Any, paths_cfg: Any = None) -> Path:
     output_dir = llm_cfg.get("output_dir")
     if output_dir:
         return Path(output_dir)
+    if paths_cfg is not None:
+        paths_output = paths_cfg.get("output_dir") if hasattr(paths_cfg, "get") else None
+        if paths_output:
+            subdir = str(llm_cfg.get("output_subdir") or _DEFAULT_OUTPUT_SUBDIR)
+            return Path(str(paths_output)) / subdir
     artifact_dir = Path(str(dataset_cfg.get("artifact_dir")))
     subdir = str(llm_cfg.get("output_subdir") or _DEFAULT_OUTPUT_SUBDIR)
     return artifact_dir / subdir
@@ -424,7 +446,9 @@ def _iter_requests(
             break
         question = str(record.get(_FIELD_QUESTION) or "")
         rollouts = record.get(_FIELD_ROLLOUTS) or []
-        trajectories = _select_trajectories(rollouts, top_k)
+        trajectories = _select_trajectories(rollouts, top_k, max_trajectories=prompt_spec.max_trajectories)
+        if prompt_spec.max_prompt_chars > _ZERO:
+            trajectories = _trim_trajectories_for_prompt(question, trajectories, prompt_spec)
         messages = _build_messages(question, trajectories, prompt_spec)
         processed += _ONE
         yield _LLMRequest(sample_id=sample_id, question=question, trajectories=list(trajectories), messages=messages)
@@ -439,13 +463,16 @@ def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
             yield json.loads(line)
 
 
-def _select_trajectories(rollouts: Sequence[Dict[str, Any]], top_k: int) -> List[str]:
+def _select_trajectories(rollouts: Sequence[Dict[str, Any]], top_k: int, *, max_trajectories: int) -> List[str]:
     sorted_rollouts = sorted(
         rollouts,
         key=lambda r: (float(r.get(_FIELD_SCORE, _NEG_INF)), int(r.get(_FIELD_ROLLOUT_INDEX, _ZERO))),
         reverse=True,
     )
-    selected = sorted_rollouts[: int(top_k)]
+    limit = int(top_k)
+    if max_trajectories > _ZERO:
+        limit = min(limit, int(max_trajectories))
+    selected = sorted_rollouts[: limit]
     return [_trajectory_text(r) for r in selected if _trajectory_text(r)]
 
 
@@ -469,12 +496,31 @@ def _edge_to_text(edge: Dict[str, Any]) -> str:
     return f"{src} --{rel}--> {dst}"
 
 
-def _build_messages(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> List[Dict[str, str]]:
+def _trim_trajectories_for_prompt(
+    question: str,
+    trajectories: Sequence[str],
+    prompt: PromptSpec,
+) -> List[str]:
+    max_chars = int(prompt.max_prompt_chars)
+    if max_chars <= _ZERO:
+        return list(trajectories)
+    kept: List[str] = []
+    for traj in trajectories:
+        candidate = kept + [traj]
+        user_text = _build_user_text(question, candidate, prompt)
+        total_chars = len(prompt.system) + len(user_text)
+        if total_chars > max_chars:
+            break
+        kept = candidate
+    return kept
+
+
+def _build_user_text(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> str:
     lines = []
     for idx, traj in enumerate(trajectories, start=_ONE):
         lines.append(f"{idx}. {traj}")
     traj_block = "\n".join(lines) if lines else "(no trajectories)"
-    candidates = _extract_destination_candidates(trajectories, max_candidates=_DEFAULT_MAX_CANDIDATES_IN_PROMPT)
+    candidates = _extract_destination_candidates(trajectories, max_candidates=prompt.max_candidates)
     if candidates:
         candidate_block = "\n".join(f"- {candidate}" for candidate in candidates)
     else:
@@ -527,7 +573,7 @@ def _build_messages(question: str, trajectories: Sequence[str], prompt: PromptSp
             "If insufficient evidence, make the best guess using only the trajectories; "
             "prefer entity names that appear in the trajectories (e.g., destination text after \"-->\")."
         )
-    user_text = (
+    return (
         "Question:\n"
         f"{question}\n\n"
         "Trajectories:\n"
@@ -550,6 +596,10 @@ def _build_messages(question: str, trajectories: Sequence[str], prompt: PromptSp
         f"{answer_example_abstain}\n\n"
         "Output JSON only."
     )
+
+
+def _build_messages(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> List[Dict[str, str]]:
+    user_text = _build_user_text(question, trajectories, prompt)
     return [
         {"role": "system", "content": prompt.system},
         {"role": "user", "content": user_text},

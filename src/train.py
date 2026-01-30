@@ -63,7 +63,7 @@ def _validate_required_args(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required training inputs: "
             f"{missing_str}. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_gflownet dataset=webqsp-sub"
+            "Example: python src/train.py experiment=train_dual_flow dataset=webqsp-sub"
         )
 
 

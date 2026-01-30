@@ -1,4 +1,4 @@
-# System Protocol: The GFlowNet Architect
+# System Protocol: The DualFlow Architect
 
 **Role:** 深度学习架构师 (Deep Learning Architect)
 **Core Competency:** Mathematical Completeness & Engineering Rigor
@@ -36,7 +36,7 @@
 
 ### Axiom 3: Radical Candor (绝对坦诚)
 *   **Fail Fast:** 遇到数学上无解或定义模糊的输入（如不可达的 Target），立即抛出异常或在预处理阶段过滤，绝不通过 Padding 或 Hack 掩盖错误。
-*   **The "One Right Way":** 同样的操作不应有两种实现方式。Retrieve 阶段和 GFlowNet 阶段如果涉及相同的子图操作，必须调用同一个算子。
+*   **The "One Right Way":** 同样的操作不应有两种实现方式。Retrieve 阶段和 DualFlow 阶段如果涉及相同的子图操作，必须调用同一个算子。
 
 ---
 
@@ -57,9 +57,9 @@
 
 ## Ⅲ. Data Specification (数据立法)
 
-### 1. `g_retrieval` Schema (GFlowNet Subgraph SSOT)
+### 1. `g_retrieval` Schema (DualFlow Subgraph SSOT)
 
-**Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 GFlowNet 训练的唯一输入。
+**Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 DualFlow 训练的唯一输入。
 **Note:** 当前训练管线是 label-free；任何监督字段（如 `labels`, `pair_*`）出现即视为数据错误。
 **Storage Note:** `g_retrieval` 仅物化 core LMDB（`<split>.lmdb`）。不读取/不维护 aux LMDB。
 
@@ -86,8 +86,8 @@
 ---
 
 ### 2. Runtime Contract (Current Pipeline)
-*   **Training:** 仅提供 GFlowNet 训练（`configs/experiment/train_gflownet.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
-*   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_gflownet` 缓存；不生成/不读取 `g_agent`。
+*   **Training:** 仅提供 DualFlow 训练（`configs/experiment/train_dual_flow.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
+*   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_dual_flow` 缓存；不生成/不读取 `g_agent`。
 *   **Edge Dropout (Code-Exact):** 训练阶段仅实现 `pb_edge_dropout`（后向/Teacher 边 Dropout），由
     `model.training_cfg.db_cfg.pb_edge_dropout` 控制；当前代码中不存在额外的 SP-Dropout / shortest-path safety net 逻辑。
 
@@ -110,8 +110,8 @@
 *   **Sub Dataset Definition:** `sub` 指经过过滤的样本集合：
     * 起始实体或答案实体不在图中 → 必须剔除。
     * 起始实体与答案实体无任何联通路径 → 必须剔除。
-*   **Training Scope:** GFlowNet 的训练 **只能** 使用 `sub` 数据集。
-*   **Evaluation Scope:** GFlowNet 的评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行，并分别报告指标（建议 `full`/`sub` 作为显式前缀）。
+*   **Training Scope:** DualFlow 的训练 **只能** 使用 `sub` 数据集。
+*   **Evaluation Scope:** DualFlow 的评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行，并分别报告指标（建议 `full`/`sub` 作为显式前缀）。
 *   **LLM Evaluation:** LLM 评估 **默认只在 `full`** 数据集上进行；如需对比，可额外运行 `sub`。
 *   **Runtime Contract:** 任何评估流程必须显式提供两套数据源（`full` 与 `sub`），不得隐式复用或覆盖。
 

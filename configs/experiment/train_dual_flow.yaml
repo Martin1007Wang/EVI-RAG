@@ -1,20 +1,20 @@
 # @package _global_
 #
-# GFlowNet training: PB-uniform (static uniform backward policy).
+# DualFlow training (base config).
 
 defaults:
-  - override /model/db: uniform
   - override /callbacks: default
   - override /logger: wandb
   - override /trainer: gpu
 
-task_name: "train/gflownet/pb_uniform"
-tags: ["dual_flow", "gflownet", "pb_uniform"]
+task_name: "train/dual_flow"
+tags: ["dual_flow"]
 optimized_metric: "val/hit@beam"
 
 trainer:
   check_val_every_n_epoch: 5
   precision: 32
+
 
 model:
   scheduler_cfg:

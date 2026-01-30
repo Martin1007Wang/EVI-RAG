@@ -13,13 +13,13 @@ _ZERO = 0
 _ONE = 1
 STOP_RELATION = -1
 _DEFAULT_SPLIT = "predict"
-_DEFAULT_ARTIFACT_NAME = "eval_gflownet"
+_DEFAULT_ARTIFACT_NAME = "eval_dual_flow"
 _DEFAULT_SCHEMA_VERSION = _ONE
 _WRITE_INTERVAL = "batch"
 
 
-class GFlowNetRolloutArtifactWriter(BasePredictionWriter):
-    """Persist GFlowNet rollout artifacts during predict()."""
+class DualFlowRolloutArtifactWriter(BasePredictionWriter):
+    """Persist DualFlow rollout artifacts during predict()."""
 
     def __init__(
         self,
@@ -106,7 +106,7 @@ class GFlowNetRolloutArtifactWriter(BasePredictionWriter):
         if not self.enabled or trainer.global_rank != _ZERO:
             return
         if self._manifest_path is None or self._output_path is None:
-            raise RuntimeError("GFlowNetRolloutArtifactWriter missing manifest/output path; on_predict_start was not called.")
+            raise RuntimeError("DualFlowRolloutArtifactWriter missing manifest/output path; on_predict_start was not called.")
         manifest = self._build_manifest(self._output_path.name)
         self._manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -117,7 +117,7 @@ class GFlowNetRolloutArtifactWriter(BasePredictionWriter):
 
     def _append_records(self, records: list[Dict[str, Any]]) -> None:
         if self._output_path is None:
-            raise RuntimeError("GFlowNetRolloutArtifactWriter missing output path; on_predict_start was not called.")
+            raise RuntimeError("DualFlowRolloutArtifactWriter missing output path; on_predict_start was not called.")
         with self._output_path.open("a", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -128,7 +128,7 @@ class GFlowNetRolloutArtifactWriter(BasePredictionWriter):
             "schema_version": self.schema_version,
             "file": file_name,
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "producer": "gflownet_rollout_artifact_writer",
+            "producer": "dual_flow_rollout_artifact_writer",
         }
 
     @staticmethod
@@ -290,4 +290,4 @@ class _RolloutArtifactProcessor:
                 rollout["trajectory_text"] = " ; ".join(parts)
 
 
-__all__ = ["GFlowNetRolloutArtifactWriter"]
+__all__ = ["DualFlowRolloutArtifactWriter"]
