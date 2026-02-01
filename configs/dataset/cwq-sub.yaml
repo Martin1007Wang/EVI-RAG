@@ -13,5 +13,3 @@ hf_dataset: rmanluo/RoG-cwq
 train_samples_per_epoch: 2048
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json
-sample_filter_paths:
-  train: ${dataset.out_dir}/structured_filter_train.json

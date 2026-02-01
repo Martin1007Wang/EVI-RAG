@@ -33,7 +33,6 @@ class _PreparedBatch:
     sample_ids: list[str]
     start_nodes_fwd: torch.Tensor
     start_tokens_fwd: torch.Tensor
-    start_tokens_bwd: torch.Tensor
     edge_ids_by_head_fwd: torch.Tensor
     edge_ptr_by_head_fwd: torch.Tensor
     edge_ids_by_tail_fwd: torch.Tensor
@@ -91,6 +90,7 @@ class _RolloutResult:
     stop_reason: torch.Tensor
     actions: Optional[torch.Tensor]
     log_pf_steps: Optional[torch.Tensor]
+    policy_metrics: Optional[dict[str, torch.Tensor]] = None
 
 
 __all__ = [

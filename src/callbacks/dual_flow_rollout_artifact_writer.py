@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,6 +212,68 @@ class _RolloutArtifactProcessor:
         rel_map = dict(zip(rel_df.relation_id.astype(int), rel_df.label.astype(str)))
         return ent_map, rel_map
 
+    @staticmethod
+    def _coerce_answer_texts(raw_answers: Any) -> list[str]:
+        if raw_answers is None:
+            return []
+
+        # pandas may store missing values as NaN / pd.NA.
+        try:
+            import pandas as pd
+
+            is_missing = pd.isna(raw_answers)
+            if isinstance(is_missing, bool) and is_missing:
+                return []
+        except Exception:
+            pass
+
+        if isinstance(raw_answers, str):
+            text = raw_answers.strip()
+            if not text:
+                return []
+            # Handle cases like a JSON list string or a python literal list string.
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, (list, tuple, set)):
+                    return [str(x) for x in parsed if str(x).strip()]
+
+                # Numpy array repr can look like: ['A' 'B' "C"] (no commas).
+                tokens: list[str] = []
+                for m in re.finditer(r"(?:'([^']*)'|\"([^\"]*)\")", text, flags=re.DOTALL):
+                    token = m.group(1) if m.group(1) is not None else m.group(2)
+                    token = str(token or "").replace("\\'", "'").replace('\\"', '"').strip()
+                    if token:
+                        tokens.append(token)
+                if tokens:
+                    return tokens
+
+                for parser in (ast.literal_eval,):
+                    try:
+                        parsed = parser(text)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, (list, tuple, set)):
+                        return [str(x) for x in parsed if str(x).strip()]
+            return [text]
+
+        if isinstance(raw_answers, (list, tuple, set)):
+            return [str(x) for x in raw_answers if str(x).strip()]
+
+        # Handle numpy arrays / pandas arrays without hard dependency on numpy.
+        tolist = getattr(raw_answers, "tolist", None)
+        if callable(tolist):
+            try:
+                parsed = tolist()
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(x) for x in parsed if str(x).strip()]
+
+        return [str(raw_answers)]
+
     def _resolve_question_map(self, cfg: Dict[str, Any]) -> Optional[Dict[str, Dict[str, Any]]]:
         questions_path = cfg.get("questions_path")
         if not questions_path:
@@ -233,13 +297,7 @@ class _RolloutArtifactProcessor:
             if not sample_id:
                 continue
             question = str(row.get("question") or "")
-            raw_answers = row.get("answer_texts")
-            if raw_answers is None:
-                answers = []
-            elif isinstance(raw_answers, (list, tuple)):
-                answers = [str(x) for x in raw_answers]
-            else:
-                answers = [str(raw_answers)]
+            answers = self._coerce_answer_texts(row.get("answer_texts"))
             question_map[sample_id] = {
                 "question_text": question,
                 "answer_texts": answers,

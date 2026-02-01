@@ -1,16 +1,14 @@
 # @package _global_
 #
-# DualFlow training: PB-uniform (static uniform backward policy).
+# Shared DualFlow training defaults.
 
 defaults:
-  - override /model/db: uniform
   - override /callbacks: default
   - override /logger: wandb
   - override /trainer: gpu
+  - _self_
 
-task_name: "train/dual_flow/pb_uniform"
-tags: ["dual_flow", "pb_uniform"]
-optimized_metric: "val/hit@beam"
+optimized_metric: "val/${dataset.dataset_scope}/hit@beam"
 
 trainer:
   check_val_every_n_epoch: 5
@@ -29,12 +27,12 @@ model:
 
 callbacks:
   model_checkpoint:
-    monitor: val/hit@beam
+    monitor: "val/${dataset.dataset_scope}/hit@beam"
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: val/hit@beam
+    monitor: "val/${dataset.dataset_scope}/hit@beam"
     mode: max
     patience: 50

@@ -20,6 +20,7 @@ from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
 from .io.lmdb_utils import _resolve_core_lmdb_paths
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"
+_ZERO = 0
 
 
 def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -180,12 +181,31 @@ class GRetrievalDataModule(LightningDataModule):
                 split_name=self.splits["validation"],
                 resources=self._shared_resources,
             )
+            self._validate_train_samples_per_epoch()
 
         if stage in (None, "test", "predict"):
             self.test_dataset = create_g_retrieval_dataset(
                 cfg=self.dataset_cfg,
                 split_name=self.splits["test"],
                 resources=self._shared_resources,
+            )
+
+    def _validate_train_samples_per_epoch(self) -> None:
+        if self.train_samples_per_epoch is None:
+            return
+        if self.train_dataset is None:
+            return
+        epoch_size = int(self.train_samples_per_epoch)
+        if epoch_size <= _ZERO:
+            raise ValueError("train_samples_per_epoch must be a positive integer.")
+        dataset_size = len(self.train_dataset)
+        if dataset_size <= _ZERO:
+            raise RuntimeError("Train dataset is empty after setup; please check dataset filters and paths.")
+        if epoch_size > dataset_size:
+            raise ValueError(
+                "train_samples_per_epoch must be <= the number of train samples. "
+                f"Got train_samples_per_epoch={epoch_size}, train_samples={dataset_size}. "
+                "Reduce dataset.train_samples_per_epoch or expand the train split."
             )
 
     def train_dataloader(self):

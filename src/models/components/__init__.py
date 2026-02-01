@@ -6,12 +6,12 @@ from .backbone import (
     CvtNodeInitializer,
     SinusoidalPositionalEncoding,
 )
-from .qc_bia import QCBiANetwork
+from .srm import SRM
 
 __all__ = [
     "SinusoidalPositionalEncoding",
     "EmbeddingBackbone",
     "CvtNodeInitializer",
     "LogZPredictor",
-    "QCBiANetwork",
+    "SRM",
 ]

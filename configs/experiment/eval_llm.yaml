@@ -27,29 +27,29 @@ llm:
   output:
     include_question: true
     include_trajectories: true
-    include_messages: true
+    include_messages: false
     include_raw_response: true
-    debug_only_on_empty: true
+    debug_only_on_empty: false
   schema:
     enabled: true
-    max_retries: 2
+    max_retries: 4
     allow_coerce: true
     max_retry_chars: 2000
   prompt:
-    system: "You are a KGQA assistant. Use only the provided trajectories. Output JSON only."
+    system: "You are a KGQA assistant. Use only the provided trajectories. Never refuse. Output JSON only."
     answer_key: "answer"
     answer_separator: " | "
-    allow_empty: true
+    allow_empty: false
     max_prompt_chars: 32000
     max_trajectories: 100
-    max_candidates: 30
+    max_candidates: 100
   vllm:
     model: Qwen/Qwen2.5-7B-Instruct
     tensor_parallel_size: 1
     max_model_len: 8192
     temperature: 0.0
     top_p: 1.0
-    max_tokens: 256
+    max_tokens: 512
   openai:
     model: gpt-4o
     temperature: 0.0

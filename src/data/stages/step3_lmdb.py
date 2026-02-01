@@ -37,7 +37,7 @@ from src.data.schema.constants import (
     _ONE,
     _ZERO,
 )
-from src.data.utils.config import _resolve_parquet_chunk_size
+from src.config.data_config import _resolve_parquet_chunk_size
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
 

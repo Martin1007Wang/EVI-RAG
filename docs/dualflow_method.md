@@ -36,12 +36,11 @@ Code refs: `src/models/dual_flow_module.py` (`_build_edge_inverse_mask`, `_build
 
 ## 2. Parameterization
 
-### 2.1 Dual backbones
+### 2.1 Single backbone
 
-Two independent `EmbeddingBackbone`s (no parameter sharing) produce node tokens:
+A single `EmbeddingBackbone` produces node tokens for all computations:
 
-- forward tokens: `prepared_fwd.node_tokens`
-- backward tokens: `prepared_bwd.node_tokens`
+- node tokens: `prepared.node_tokens`
 
 Optional CVT initialization is applied before the GNN (`cvt_init_cfg.enabled`).
 
@@ -55,25 +54,19 @@ Code refs: `src/models/dual_flow_module.py` (`_build_start_selector`, `_select_s
 ### 2.3 Context tokens
 
 - Forward context (always used):
-  - `c_fwd = forward_ctx_proj([question_tokens_fwd ; start_tokens_fwd])`
-- Backward context (only used when `pb_mode=learned`):
-  - built as `backward_ctx_proj([question_tokens_bwd ; start_tokens_bwd ; answer_tokens])`
-  - during training, `answer_tokens` is replaced by a **target roulette** anchor token (see Sec. 5.3).
+  - `c_fwd = forward_ctx_proj([question_tokens ; start_tokens])`
 
-Code refs: `src/models/dual_flow_module.py` (`_build_forward_context`, `_build_backward_context`, `_apply_target_roulette`).
+Code refs: `src/models/dual_flow_module.py` (`_build_forward_context`).
 
-### 2.4 Policies (QC-BiA)
+### 2.4 Policies (SRM)
 
-Forward policy is always trainable and uses `QCBiANetwork` over edges:
+Forward policy is trainable and uses `SRM` (Semantic Residual Module) over edges:
 
 - `policy_fwd(context, head, relation, tail) -> logits`
 
-Backward policy depends on `pb_mode`:
+Backward policy is **static uniform** over inverse outgoing edges; it does not use a network.
 
-- static (`uniform`, `topo_semantic`): no network; log-prob comes from a hand-crafted `P_B` (Sec. 5.1/5.2).
-- learned (`learned`): trainable `policy_bwd` with backward backbone + backward context (Sec. 5.3).
-
-Code ref: `src/models/components/qc_bia_network.py`.
+Code ref: `src/models/components/srm.py`.
 
 ### 2.5 LogZ predictor
 
@@ -99,8 +92,7 @@ Training samples two types of off-policy trajectories (both sampled under `torch
 - start: `a_seed ~ Uniform(a_local_indices)` (allow-empty; empty implies invalid start)
 - target set: `q_local_indices` (hit condition uses `node_is_start`)
 - transitions:
-  - static PB: sample from the chosen static `P_B` (Sec. 5.1/5.2)
-  - learned PB: sample from `policy_bwd` (temperature fixed to 1.0)
+  - static PB: sample from uniform `P_B`
 - edge dropout: a per-batch Bernoulli mask `pb_edge_dropout` is applied to backward outgoing edges for both rollout and
   DB evaluation
 
@@ -153,106 +145,25 @@ Code ref: `src/models/dual_flow_module.py` (`_compute_db_loss`).
 
 ---
 
-## 5. Our Three $P_B$ Strategies (Paper Focus)
+## 5. Static $P_B$ (Uniform)
 
-All PB settings live under `model.training_cfg.db_cfg.*` and are composed via:
-
-- `configs/model/db/{uniform,topo_semantic,learned}.yaml`
-- `configs/experiment/train_dual_flow_pb_{uniform,topo_semantic,learned}.yaml`
-
-At a glance:
-
-| `pb_mode` | Trainable? | Core idea | Key knobs |
-| --- | --- | --- | --- |
-| `uniform` | no | uniform over inverse outgoing edges | `pb_edge_dropout` |
-| `topo_semantic` | no | topo monotone (`dist` decreases) + semantic cosine bias | `pb_max_hops`, `pb_semantic_weight`, `pb_topo_penalty`, `pb_cosine_eps`, `pb_edge_dropout` |
-| `learned` | yes | QC-BiA over inverse edges with target roulette context | `pb_edge_dropout` |
-
-### 5.1 PB-Uniform (static)
-
-Config: `configs/model/db/uniform.yaml`
-
-Definition (code): for a backward state `v`, assign equal logit to every outgoing inverse edge:
+The backward policy is fixed **uniform** over inverse outgoing edges:
 
 - `logit_B(e) = 0` for all `e in Out_b(v)`
 - `P_B` is uniform over `Out_b(v)`; equivalently `log P_B = -log |Out_b(v)|`
 
-Implementation: `_compute_pb_logits(mode="uniform")`, `_compute_pb_log_prob`, `_rollout_pb`.
+The only PB-related knob is `pb_edge_dropout` (applied to backward edges for rollout + DB evaluation).
 
-### 5.2 PB-Topo-Semantic (static)
-
-Config: `configs/model/db/topo_semantic.yaml`
-
-This PB is a hand-crafted distribution over inverse edges combining:
-
-1. **Topology constraint** (distance-to-start monotonicity)
-2. **Semantic bias** (question-vs-relation cosine similarity in raw embedding space)
-
-Distance-to-start:
-
-- compute `dist_to_start[node]` as the BFS distance from any node in `q_local_indices` along **forward** edges `E_f`
-  up to `pb_max_hops` (defaults to `max_steps`)
-
-Allowed inverse edge:
-
-- for an inverse edge `e: v -> u`, it is **allowed** iff `dist_to_start[u] < dist_to_start[v]`
-
-PB logits (code):
-
-$$
-\\text{logit}_B(e)=
-\\underbrace{\\mathbf{1}[\\text{allowed}]\\cdot 0 + \\mathbf{1}[\\neg\\text{allowed}]\\cdot \\text{pb\\_topo\\_penalty}}_{\\text{topo term}}
-\\;+
-\\underbrace{\\text{pb\\_semantic\\_weight}\\cdot \\cos(q_{emb}, r_{emb})}_{\\text{semantic term}}
-$$
-
-Special handling (code):
-
-- if a state has **no allowed** outgoing edges, the step log-prob is set to `pb_topo_penalty` (tracked by
-  `db_no_allowed_rate`)
-- choosing a disallowed inverse edge is tracked as a topology violation (`db_topo_violation_rate`)
-
-Implementation: `_compute_distance_to_starts`, `_compute_pb_logits(mode="topo_semantic")`, `_compute_pb_log_prob`,
-`_rollout_pb`.
-
-### 5.3 PB-Learned (trainable)
-
-Config: `configs/model/db/learned.yaml`
-
-PB is parameterized by `policy_bwd` (QC-BiA) and trained jointly via DB.
-
-Target roulette (code-exact):
-
-- sample `a_seed ~ Uniform(a_local_indices)` (same node used as the start of the backward rollout)
-- build backward context using the **anchor token** of `a_seed` (not pooled `A`)
-
-Backward policy:
-
-$$
-P_B(e^{-1} \\mid v,t+1) = \\text{softmax}_{e'\\in Out_b(v)}(\\text{QCBiA}(c_{bwd}, h_v^B, h_{r^{-1}}^B, h_u^B))
-$$
-
-Regularization:
-
-- `pb_edge_dropout` randomly drops backward edges (mask shared between rollout and DB evaluation)
-
-Implementation: `_apply_target_roulette`, `_rollout_policy(policy_bwd, temp=1.0)`, `_compute_forward_log_prob` on
-inverse edges inside `_compute_db_loss`.
+Implementation: `_compute_pb_logits`, `_compute_pb_log_prob`, `_rollout_pb`.
 
 ---
 
 ## 6. Hyperparameters (What Actually Exists in Code)
 
-Key knobs under `model.training_cfg.db_cfg` (see `configs/model/db/base.yaml`):
+Key knobs under `model.training_cfg.db_cfg`:
 
-- `pb_mode`: `uniform | topo_semantic | learned`
 - `pb_edge_dropout`
-- `pb_semantic_weight` (topo_semantic only)
-- `pb_topo_penalty` (topo_semantic only; also used as fallback log-prob when no allowed edges)
-- `pb_cosine_eps`
-- `pb_max_hops` (<=0 means use `max_steps`)
-- `sampling_temperature_schedule`: `constant | cosine` (forward rollout temperature)
-- `sampling_temperature_start`, `sampling_temperature_end`, `sampling_temperature`
+- `sampling_temperature_start`, `sampling_temperature_end`
 - `dead_end_log_reward`, `dead_end_weight`
 
 Training:
@@ -267,4 +178,4 @@ Training:
 - Forward rollout: `src/models/dual_flow_module.py` (`_rollout_policy`)
 - Static PB rollout: `src/models/dual_flow_module.py` (`_rollout_pb`)
 - DB loss: `src/models/dual_flow_module.py` (`_compute_db_loss`)
-- PB static logic: `src/models/dual_flow_module.py` (`_compute_distance_to_starts`, `_compute_pb_logits`, `_compute_pb_log_prob`)
+- PB static logic: `src/models/dual_flow_module.py` (`_compute_pb_logits`, `_compute_pb_log_prob`)

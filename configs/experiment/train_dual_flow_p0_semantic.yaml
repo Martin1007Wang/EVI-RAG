@@ -1,0 +1,18 @@
+# @package _global_
+#
+# Residual GFlowNet (P0 semantic, residual enabled).
+
+defaults:
+  - train_dual_flow_base
+  - _self_
+
+task_name: "train/dual_flow/p0_semantic"
+tags: ["dual_flow", "p0_semantic"]
+
+model:
+  runtime_cfg:
+    p0_cfg:
+      mode: semantic
+      residual_enabled: true
+      temperature: 1.0
+      cosine_eps: 1.0e-6

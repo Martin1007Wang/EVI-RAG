@@ -7,7 +7,12 @@ from typing import Optional, Tuple
 
 from src.data.schema.constants import _MIN_CHUNK_SIZE
 from src.data.schema.types import EmbeddingConfig, EntityVocab, RelationVocab, SplitFilter
-from src.data.utils.config import build_embedding_cfg, build_split_filters, _resolve_parquet_chunk_size, _resolve_parquet_num_workers
+from src.config.data_config import (
+    build_embedding_cfg,
+    build_split_filters,
+    _resolve_parquet_chunk_size,
+    _resolve_parquet_num_workers,
+)
 
 
 @dataclass

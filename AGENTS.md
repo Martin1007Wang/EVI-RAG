@@ -127,9 +127,9 @@
 ### 1. Action Definition (动作定义)
 *   **Edge-Logit Policy (Code-Exact):** 当前实现不做 $P_R\\cdot P_E$ 的两阶段分解；策略直接对边 $(u,r,v)$ 打分：
     \[
-    \\text{logit}(u\\to v)=\\text{QCBiA}(c, h_u, h_r, h_v)
+    \\text{logit}(u\\to v)=\\text{SRM}(c, h_u, h_r, h_v)
     \]
-    其中 `QCBiANetwork` 为唯一策略头（`src/models/components/qc_bia_network.py`）。
+    其中 `SRM` 为唯一策略头（`src/models/components/srm.py`）。
 *   **Hard Rollout, Differentiable Eval:** 训练中的 rollout 采用 Gumbel-Max 硬采样（`torch.no_grad()`）；梯度通过 DB 损失里的
     $\\log P_F, \\log P_B, \\log Z$ 反传（代码路径：`src/models/dual_flow_module.py`）。
 
@@ -138,15 +138,9 @@
 *   **Reward Semantics:** 成功路径 $R=1$（$\log R=0$）；失败路径 $R=\epsilon$（$\log R \approx -C$）。
 
 ### 3. Backward Policy Contract (反向策略契约)
-*   **Three PB Strategies (Code-Exact):** 当前实现提供三种 $P_B$（由 `model.training_cfg.db_cfg.pb_mode` 控制）：
+*   **Single PB Strategy (Code-Exact):** 当前实现仅保留一种静态 $P_B$：
     * `uniform`（静态）：对每个状态的逆向出边做均匀分布，$\log P_B=-\\log |\\text{Out}_b(v)|$。
-    * `topo_semantic`（静态）：在 `uniform` 基础上加入
-      - 拓扑单调约束：逆边必须使 `dist_to_start` 严格下降（由 `pb_max_hops` 限步 BFS 计算）
-      - 语义偏置：$\\text{pb_semantic_weight}\\cdot \\cos(q_{emb}, r_{emb})$
-      并用 `pb_topo_penalty` 惩罚不可行边/无可行边情形。
-    * `learned`（可学习）：`policy_bwd`(QC-BiA) 直接建模 $P_B$，并在训练中通过 DB 损失更新。
 *   **Teacher Edge Dropout:** `pb_edge_dropout` 对逆向候选边做结构级 Dropout（同一掩码用于 backward rollout 与 DB 评估）。
-*   **Static vs Learned:** 当 `pb_mode in {uniform, topo_semantic}` 时，后向 backbone/policy/context 投影会被冻结（不训练）。
 
 ### 4. Multi-Start Handling (多起点处理)
 *   **Set Semantics:** `q_local_indices` 表示完整起点集合，严禁覆盖或互换。

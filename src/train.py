@@ -27,7 +27,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
-from src.data.utils.config import resolve_entity_vocab_path
+from src.config.data_config import resolve_entity_vocab_path
 from src.utils import (
     RankedLogger,
     extras,
@@ -63,7 +63,7 @@ def _validate_required_args(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required training inputs: "
             f"{missing_str}. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_dual_flow dataset=webqsp-sub"
+            "Example: python src/train.py experiment=train_dual_flow_p0_indegree dataset=webqsp-sub"
         )
 
 

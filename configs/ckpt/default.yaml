@@ -1,6 +1,6 @@
-# Placeholder checkpoint paths.
+# Default checkpoint references.
 #
-# This file must stay environment-agnostic: do NOT hardcode absolute paths here.
-# Override via CLI (recommended) or create `configs/local/default.yaml` (optional) to set your local defaults.
+# This config exists to satisfy Hydra's `ckpt: default` group and to
+# centralize checkpoint paths for evaluation runs.
 
 dual_flow: null

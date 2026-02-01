@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -36,9 +37,15 @@ _DEFAULT_SCHEMA_ENABLED = True
 _DEFAULT_SCHEMA_MAX_RETRIES = 2
 _DEFAULT_SCHEMA_ALLOW_COERCE = True
 _DEFAULT_SCHEMA_MAX_RETRY_CHARS = 2000
+_DEFAULT_MAX_EVIDENCE_IDS_PER_CANDIDATE = 8
+_DEFAULT_MAX_PROMPT_NODE_CHARS = 120
+_DEFAULT_MAX_PROMPT_REL_CHARS = 80
+_DEFAULT_MAX_PROMPT_LAST_DST_CHARS = 240
+_DEFAULT_MAX_PROMPT_CANDIDATE_CHARS = 240
+_DEFAULT_FALLBACK_ANSWER = "unknown"
 _DEFAULT_SCHEMA_RETRY_MESSAGE = (
     "Your previous response did not match the required JSON schema. "
-    "Return a corrected JSON object only.\n\n"
+    "Do not refuse. Return a corrected JSON object only.\n\n"
     "Schema:\n{schema}\n\n"
     "Previous response:\n{response}"
 )
@@ -62,6 +69,8 @@ _FIELD_SCHEMA_VALID = "schema_valid"
 _FIELD_SCHEMA_RETRIES = "schema_retries"
 
 _LOG_PROGRESS_EVERY = 200
+
+_FREEBASE_ID_RE = re.compile(r"^[mg]\\.[0-9a-z_]+$", flags=re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -251,10 +260,13 @@ def _resolve_schema_spec(llm_cfg: Any, prompt_spec: PromptSpec) -> SchemaSpec:
 
 
 def _build_llm_output_schema(prompt: PromptSpec) -> Dict[str, Any]:
+    answer_schema: Dict[str, Any] = {"type": "string"}
+    if not prompt.allow_empty_answer:
+        answer_schema["minLength"] = _ONE
     return {
         "type": "object",
         "properties": {
-            prompt.answer_key: {"type": "string"},
+            prompt.answer_key: answer_schema,
             _FIELD_EVIDENCE_TRAJECTORY_IDS: {"type": "array", "items": {"type": "integer"}},
             _FIELD_ABSTAIN_REASON: {"type": "string"},
             _FIELD_BEST_GUESS: {"type": "string"},
@@ -473,7 +485,23 @@ def _select_trajectories(rollouts: Sequence[Dict[str, Any]], top_k: int, *, max_
     if max_trajectories > _ZERO:
         limit = min(limit, int(max_trajectories))
     selected = sorted_rollouts[: limit]
-    return [_trajectory_text(r) for r in selected if _trajectory_text(r)]
+    out: List[str] = []
+    for rollout in selected:
+        traj = _trajectory_text(rollout)
+        if not traj:
+            continue
+        # Expose rollout score to the model: higher-scoring trajectories are generally more trustworthy.
+        score = rollout.get(_FIELD_SCORE)
+        if score is None:
+            out.append(traj)
+            continue
+        try:
+            score_val = float(score)
+        except Exception:
+            out.append(traj)
+            continue
+        out.append(f"[score={score_val:.6g}] {traj}")
+    return out
 
 
 def _trajectory_text(rollout: Dict[str, Any]) -> str:
@@ -482,7 +510,18 @@ def _trajectory_text(rollout: Dict[str, Any]) -> str:
         return text.strip()
     edges = rollout.get(_FIELD_EDGES)
     if not isinstance(edges, list) or not edges:
-        return ""
+        stop_node = rollout.get("stop_node_entity_id")
+        # Some rollouts terminate immediately (no edges). We still surface the terminal node so the LLM can
+        # pick a non-empty answer (numeric entity id) and metrics can score it.
+        if stop_node is None:
+            return ""
+        try:
+            stop_int = int(stop_node)
+        except Exception:
+            return ""
+        if stop_int < _ZERO:
+            return ""
+        return f"(no_edge) --STOP--> {stop_int}"
     parts = [_edge_to_text(edge) for edge in edges]
     return " ; ".join([p for p in parts if p])
 
@@ -510,7 +549,8 @@ def _trim_trajectories_for_prompt(
         user_text = _build_user_text(question, candidate, prompt)
         total_chars = len(prompt.system) + len(user_text)
         if total_chars > max_chars:
-            break
+            # Skip a single oversized trajectory instead of dropping all remaining ones.
+            continue
         kept = candidate
     return kept
 
@@ -518,9 +558,13 @@ def _trim_trajectories_for_prompt(
 def _build_user_text(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> str:
     lines = []
     for idx, traj in enumerate(trajectories, start=_ONE):
-        lines.append(f"{idx}. {traj}")
+        lines.append(f"{idx}. {_sanitize_trajectory_for_prompt(str(traj))}")
     traj_block = "\n".join(lines) if lines else "(no trajectories)"
-    candidates = _extract_destination_candidates(trajectories, max_candidates=prompt.max_candidates)
+    candidates = _extract_destination_candidates_with_evidence(
+        trajectories,
+        max_candidates=prompt.max_candidates,
+        max_ids_per_candidate=_DEFAULT_MAX_EVIDENCE_IDS_PER_CANDIDATE,
+    )
     if candidates:
         candidate_block = "\n".join(f"- {candidate}" for candidate in candidates)
     else:
@@ -552,48 +596,67 @@ def _build_user_text(question: str, trajectories: Sequence[str], prompt: PromptS
         f'"{_FIELD_JUSTIFICATION}": "Trajectories 1 and 2 support both answers."'
         "}"
     )
-    answer_example_abstain = (
-        "{"
-        f'"{prompt.answer_key}": "", '
-        f'"{_FIELD_EVIDENCE_TRAJECTORY_IDS}": [], '
-        f'"{_FIELD_ABSTAIN_REASON}": "no_supported_candidate", '
-        f'"{_FIELD_BEST_GUESS}": "Candidate X", '
-        f'"{_FIELD_JUSTIFICATION}": "Candidates are present but none answers the question."'
-        "}"
-    )
     if prompt.allow_empty_answer:
+        answer_example_abstain = (
+            "{"
+            f'"{prompt.answer_key}": "", '
+            f'"{_FIELD_EVIDENCE_TRAJECTORY_IDS}": [], '
+            f'"{_FIELD_ABSTAIN_REASON}": "no_supported_candidate", '
+            f'"{_FIELD_BEST_GUESS}": "Candidate X", '
+            f'"{_FIELD_JUSTIFICATION}": "Candidates are present but none answers the question."'
+            "}"
+        )
         empty_clause = (
             f'Only set "{prompt.answer_key}" to an empty string when there is no supported answer. '
             "Prefer selecting the best-supported candidate entity over returning an empty answer when at least one "
             "candidate is plausible."
         )
+        abstain_rule = (
+            f'- If you output an empty "{prompt.answer_key}", set "{_FIELD_ABSTAIN_REASON}" to a short reason string '
+            f'and fill "{_FIELD_BEST_GUESS}" with the closest candidate (or empty if none).\n'
+        )
+        examples = f"{answer_example_single}\n{answer_example_multi}\n{answer_example_abstain}\n\n"
     else:
+        answer_example_uncertain = (
+            "{"
+            f'"{prompt.answer_key}": "Candidate X", '
+            f'"{_FIELD_EVIDENCE_TRAJECTORY_IDS}": [3], '
+            f'"{_FIELD_ABSTAIN_REASON}": "insufficient_evidence", '
+            f'"{_FIELD_BEST_GUESS}": "Candidate X", '
+            f'"{_FIELD_JUSTIFICATION}": "Best-supported candidate from trajectory 3."'
+            "}"
+        )
         empty_clause = (
             f'Always return a non-empty string for "{prompt.answer_key}". '
-            "If insufficient evidence, make the best guess using only the trajectories; "
-            "prefer entity names that appear in the trajectories (e.g., destination text after \"-->\")."
+            "If insufficient evidence, set it to your best guess from the candidate list; "
+            f'if there are no candidates, output "{_DEFAULT_FALLBACK_ANSWER}".'
         )
+        abstain_rule = (
+            f'- If uncertain, keep "{prompt.answer_key}" non-empty (set it to "{_FIELD_BEST_GUESS}") and set '
+            f'"{_FIELD_ABSTAIN_REASON}" to a short reason string.\n'
+        )
+        examples = f"{answer_example_single}\n{answer_example_multi}\n{answer_example_uncertain}\n\n"
     return (
         "Question:\n"
         f"{question}\n\n"
         "Trajectories:\n"
         f"{traj_block}\n\n"
-        "Candidate answer entities (trajectory destinations):\n"
+        "Candidate answer entities (trajectory destinations; each line shows support count and evidence indices):\n"
         f"{candidate_block}\n\n"
         "Return a single JSON object with the following schema:\n"
         f"{answer_schema}\n\n"
         "Rules:\n"
         f'- The value of "{prompt.answer_key}" must be a string.\n'
         "- Use exact surface forms from the trajectories (or the candidate list).\n"
+        '- If selecting from the candidate list, output only the entity string before " (support:" (exclude the parentheses).\n'
+        "- Trajectories are prefixed with a numeric score; higher is generally more reliable.\n"
         f'- If multiple answers, join exactly with "{prompt.answer_separator}" (example below).\n'
         f'- "{_FIELD_EVIDENCE_TRAJECTORY_IDS}" must list 1-based trajectory indices that directly support the answer.\n'
         f'- "{_FIELD_JUSTIFICATION}" must be short (<= {_DEFAULT_MAX_JUSTIFICATION_WORDS} words).\n'
-        f'- If you output an empty "{prompt.answer_key}", set "{_FIELD_ABSTAIN_REASON}" to a short reason string and fill "{_FIELD_BEST_GUESS}" with the closest candidate (or empty if none).\n'
+        f"{abstain_rule}"
         f"- {empty_clause}\n\n"
         "Examples:\n"
-        f"{answer_example_single}\n"
-        f"{answer_example_multi}\n"
-        f"{answer_example_abstain}\n\n"
+        f"{examples}"
         "Output JSON only."
     )
 
@@ -616,13 +679,123 @@ def _extract_destination_candidates(trajectories: Sequence[str], *, max_candidat
         if arrow < _ZERO:
             continue
         candidate = traj[arrow + len("-->") :].strip()
-        if not candidate or candidate in seen:
+        if not candidate or candidate in seen or not _is_prompt_candidate_ok(candidate):
             continue
         seen.add(candidate)
         candidates.append(candidate)
         if len(candidates) >= max_candidates:
             break
     return candidates
+
+
+def _extract_destination_candidates_with_evidence(
+    trajectories: Sequence[str],
+    *,
+    max_candidates: int,
+    max_ids_per_candidate: int,
+) -> List[str]:
+    """Return `Candidate (evidence: i, j, ...)` lines for prompting.
+
+    This is intentionally prompt-oriented (string output) to keep the call site simple.
+    """
+
+    if max_candidates <= _ZERO:
+        return []
+    if max_ids_per_candidate <= _ZERO:
+        max_ids_per_candidate = _ONE
+
+    # Preserve first-seen order (rollouts are already score-sorted) and track support counts.
+    candidate_ids: Dict[str, List[int]] = {}
+    candidate_support: Dict[str, int] = {}
+    for idx, traj in enumerate(trajectories, start=_ONE):
+        if not isinstance(traj, str) or not traj.strip():
+            continue
+        arrow = traj.rfind("-->")
+        if arrow < _ZERO:
+            continue
+        candidate = traj[arrow + len("-->") :].strip()
+        if not candidate or not _is_prompt_candidate_ok(candidate):
+            continue
+        ids = candidate_ids.get(candidate)
+        if ids is not None:
+            candidate_support[candidate] = candidate_support.get(candidate, _ZERO) + _ONE
+            if len(ids) < max_ids_per_candidate:
+                ids.append(int(idx))
+            continue
+        if len(candidate_ids) >= max_candidates:
+            continue
+        candidate_ids[candidate] = [int(idx)]
+        candidate_support[candidate] = candidate_support.get(candidate, _ZERO) + _ONE
+
+    out: List[str] = []
+    for candidate, ids in candidate_ids.items():
+        support = int(candidate_support.get(candidate, len(ids)))
+        out.append(f"{candidate} (support: {support}, evidence: {', '.join(str(i) for i in ids)})")
+    return out
+
+
+def _is_prompt_candidate_ok(candidate: str) -> bool:
+    text = _normalize_prompt_text(str(candidate))
+    if not text:
+        return False
+    if len(text) > _DEFAULT_MAX_PROMPT_CANDIDATE_CHARS:
+        return False
+    # Avoid emitting opaque KB IDs as "answers" in forced fallback paths.
+    if _FREEBASE_ID_RE.match(text.strip()) is not None:
+        return False
+    return True
+
+
+def _sanitize_trajectory_for_prompt(traj: str) -> str:
+    raw = _normalize_prompt_text(str(traj))
+    if not raw:
+        return ""
+    segments = [s.strip() for s in raw.split(" ; ") if s.strip()]
+    if not segments:
+        return raw
+    out: List[str] = []
+    for i, seg in enumerate(segments):
+        is_last = i == (len(segments) - 1)
+        parsed = _try_parse_edge_segment(seg)
+        if parsed is None:
+            out.append(_truncate_text(seg, _DEFAULT_MAX_PROMPT_NODE_CHARS))
+            continue
+        src, rel, dst = parsed
+        src = _truncate_text(src, _DEFAULT_MAX_PROMPT_NODE_CHARS)
+        rel = _truncate_text(rel, _DEFAULT_MAX_PROMPT_REL_CHARS)
+        if is_last:
+            dst = _truncate_text(dst, _DEFAULT_MAX_PROMPT_LAST_DST_CHARS)
+        else:
+            dst = _truncate_text(dst, _DEFAULT_MAX_PROMPT_NODE_CHARS)
+        out.append(f"{src} --{rel}--> {dst}")
+    return " ; ".join(out)
+
+
+def _try_parse_edge_segment(seg: str) -> Optional[Tuple[str, str, str]]:
+    arrow = seg.rfind("-->")
+    if arrow < _ZERO:
+        return None
+    left = seg[:arrow].rstrip()
+    dst = seg[arrow + len("-->") :].strip()
+    sep = left.rfind(" --")
+    if sep < _ZERO:
+        return None
+    src = left[:sep].strip()
+    rel = left[sep + len(" --") :].strip()
+    if not src or not rel or not dst:
+        return None
+    return src, rel, dst
+
+
+def _normalize_prompt_text(text: str) -> str:
+    return " ".join(str(text or "").replace("\n", " ").replace("\r", " ").split())
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    cleaned = _normalize_prompt_text(text)
+    if max_chars <= _ZERO or len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "..."
 
 
 def _flush_batch(
@@ -656,12 +829,35 @@ def _flush_batch(
                 sample_id=request.sample_id,
                 retries=retry_count,
             )
+        answer_raw = (parsed.answer or "").strip()
+        answer_final = answer_raw
+        forced = False
+        if not prompt_spec.allow_empty_answer and not answer_final:
+            # Force a non-empty answer for downstream metric computation.
+            forced = True
+            if isinstance(parsed.payload, dict):
+                best_guess = str(parsed.payload.get(_FIELD_BEST_GUESS) or "").strip()
+                if best_guess:
+                    answer_final = best_guess
+            if not answer_final:
+                candidates = _extract_destination_candidates(request.trajectories, max_candidates=prompt_spec.max_candidates)
+                answer_final = candidates[0] if candidates else _DEFAULT_FALLBACK_ANSWER
+            log_event(
+                log,
+                "llm_forced_non_empty_answer",
+                sample_id=request.sample_id,
+                answer=answer_final,
+                schema_valid=bool(parsed.schema_valid),
+                retries=retry_count,
+            )
         schema_meta = {
             _FIELD_SCHEMA_VALID: bool(parsed.schema_valid),
             _FIELD_SCHEMA_RETRIES: int(retry_count),
         }
-        extra = _build_output_extra(request, parsed.answer, raw_response, output_spec, schema_meta=schema_meta)
-        _write_answer(f_out, request.sample_id, parsed.answer, prompt_spec.answer_key, extra=extra)
+        if forced:
+            schema_meta["forced_non_empty_answer"] = True
+        extra = _build_output_extra(request, answer_raw, raw_response, output_spec, schema_meta=schema_meta)
+        _write_answer(f_out, request.sample_id, answer_final, prompt_spec.answer_key, extra=extra)
         written += _ONE
     return written
 
@@ -714,6 +910,13 @@ def _normalize_payload(payload: Dict[str, Any], prompt: PromptSpec, *, allow_coe
         normalized[prompt.answer_key] = normalized.get(_DEFAULT_ANSWER_KEY)
     if allow_coerce:
         normalized = _coerce_payload(normalized)
+    # If empty answers are disallowed, salvage "answer" from best_guess to reduce retries.
+    if not prompt.allow_empty_answer:
+        answer = str(normalized.get(prompt.answer_key) or "").strip()
+        if not answer:
+            best_guess = str(normalized.get(_FIELD_BEST_GUESS) or "").strip()
+            if best_guess:
+                normalized[prompt.answer_key] = best_guess
     return normalized
 
 
@@ -865,9 +1068,13 @@ def _build_output_extra(
     *,
     schema_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    if spec.debug_only_on_empty and answer.strip():
-        return schema_meta or {}
+    # Always keep lightweight structured fields for auditing/analysis.
     extra: Dict[str, Any] = {}
+    if schema_meta:
+        extra.update(schema_meta)
+    extra.update(_extract_structured_model_fields(raw_response))
+    if spec.debug_only_on_empty and answer.strip():
+        return extra
     if spec.include_question:
         extra[_FIELD_QUESTION] = request.question
     if spec.include_trajectories:
@@ -876,9 +1083,6 @@ def _build_output_extra(
         extra[_FIELD_MESSAGES] = request.messages
     if spec.include_raw_response:
         extra[_FIELD_RAW_RESPONSE] = raw_response
-    if schema_meta:
-        extra.update(schema_meta)
-    extra.update(_extract_structured_model_fields(raw_response))
     return extra
 
 

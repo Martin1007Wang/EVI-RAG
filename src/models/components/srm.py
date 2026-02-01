@@ -16,7 +16,9 @@ _DEFAULT_LOGIT_SCALE_MIN = 1.0e-3
 _DEFAULT_LOGIT_SCALE_MAX = 100.0
 
 
-class QCBiANetwork(nn.Module):
+class SRM(nn.Module):
+    """Semantic Residual Module (SRM) for relation-aware edge scoring."""
+
     DEFAULT_USE_SPHERICAL = _DEFAULT_USE_SPHERICAL
     DEFAULT_TEMPERATURE_INIT = _DEFAULT_TEMPERATURE_INIT
     DEFAULT_NORM_EPS = _DEFAULT_NORM_EPS
@@ -219,4 +221,4 @@ class QCBiANetwork(nn.Module):
         return logits
 
 
-__all__ = ["QCBiANetwork"]
+__all__ = ["SRM"]

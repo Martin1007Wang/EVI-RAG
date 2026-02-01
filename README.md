@@ -612,7 +612,11 @@ logger:
 ```
 
 预置 alias 速查（均需 CLI 显式指定 `dataset=<name>`）：
-- 训练（`experiment=`）：`train_dual_flow`
+- 训练（`experiment=`）：`train_dual_flow_p0_indegree`（Residual, SOTA）
+- 基线（`experiment=`）：`train_dual_flow_p0_none`（Standard GFlowNet）
+- 变体（`experiment=`）：`train_dual_flow_p0_outdegree`（Residual + outdegree P0）
+- 变体（`experiment=`）：`train_dual_flow_p0_preferential`（Residual + preferential P0）
+- 变体（`experiment=`）：`train_dual_flow_p0_semantic`（Residual + semantic P0）
 - 评估（`experiment=`，统一入口 `python src/eval.py`）：`eval_dual_flow`, `export_dual_flow`
 
 大训练集（如 CWQ）加速早停（更频繁更新 `val/hit@beam`）：

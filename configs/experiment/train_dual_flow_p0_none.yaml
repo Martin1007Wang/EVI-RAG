@@ -1,0 +1,18 @@
+# @package _global_
+#
+# Standard GFlowNet baseline (logits from NN only).
+
+defaults:
+  - train_dual_flow_base
+  - _self_
+
+task_name: "train/dual_flow/p0_none"
+tags: ["dual_flow", "p0_none"]
+
+model:
+  runtime_cfg:
+    p0_cfg:
+      mode: none
+      residual_enabled: false
+      temperature: 1.0
+      cosine_eps: 1.0e-6
