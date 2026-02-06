@@ -55,7 +55,6 @@ def build_retrieval_dataloader(
     persistent_workers: bool = False,
     pin_memory: bool = True,
     precompute_edge_batch: bool = True,
-    validate_edge_batch: bool = False,
     precompute_edge_inverse_map: bool = True,
     relation_inverse_map: Optional[torch.Tensor] = None,
     follow_batch: Optional[list[str]] = None,
@@ -72,7 +71,6 @@ def build_retrieval_dataloader(
 
     augmenter = BatchAugmenter(
         precompute_edge_batch=precompute_edge_batch,
-        validate_edge_batch=validate_edge_batch,
         precompute_edge_inverse_map=precompute_edge_inverse_map,
         relation_inverse_map=relation_inverse_map,
     )

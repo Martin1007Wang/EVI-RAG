@@ -11,10 +11,8 @@ _TWO = 2
 _THREE = 3
 _FOUR = 4
 _LOGZ_OUTPUT_DIM = 1
-_DEFAULT_BACKBONE_FINETUNE = True
 _DEFAULT_GNN_LAYERS = 2
 _DEFAULT_GNN_DROPOUT = 0.0
-_DEFAULT_ADAPTER_ENABLED = False
 _DEFAULT_ADAPTER_DIM_DIVISOR = 4
 _DEFAULT_ADAPTER_DROPOUT = 0.1
 _PNA_EPS = 1.0e-6
@@ -213,7 +211,6 @@ class EmbeddingBackbone(nn.Module):
         *,
         emb_dim: int,
         hidden_dim: int,
-        finetune: bool = _DEFAULT_BACKBONE_FINETUNE,
         gnn_layers: int = _DEFAULT_GNN_LAYERS,
         gnn_dropout: float = _DEFAULT_GNN_DROPOUT,
         adapter_cfg: Optional[Mapping[str, Any]] = None,
@@ -221,7 +218,6 @@ class EmbeddingBackbone(nn.Module):
         super().__init__()
         self.emb_dim = int(emb_dim)
         self.hidden_dim = int(hidden_dim)
-        self.finetune = bool(finetune)
         self.gnn_layers_count = int(gnn_layers)
         if self.gnn_layers_count < _ZERO:
             raise ValueError("gnn_layers must be >= 0.")
@@ -244,22 +240,18 @@ class EmbeddingBackbone(nn.Module):
                 for _ in range(self.gnn_layers_count)
             ]
         )
-        if not self.finetune:
-            for module in (self.node_norm, self.rel_norm, self.node_proj, self.rel_proj, self.q_proj):
-                for param in module.parameters():
-                    param.requires_grad = False
+        for module in (self.node_norm, self.rel_norm, self.node_proj, self.rel_proj, self.q_proj):
+            for param in module.parameters():
+                param.requires_grad = False
 
     def _init_adapter(
         self,
         adapter_cfg: Optional[Mapping[str, Any]],
     ) -> tuple[Optional[EmbeddingAdapter], Optional[EmbeddingAdapter]]:
         cfg = adapter_cfg or {}
-        extra = set(cfg.keys()) - {"enabled", "adapter_dim", "dropout", "dim_divisor"}
+        extra = set(cfg.keys()) - {"adapter_dim", "dropout", "dim_divisor"}
         if extra:
             raise ValueError(f"Unsupported adapter_cfg keys: {sorted(extra)}")
-        enabled = bool(cfg.get("enabled", _DEFAULT_ADAPTER_ENABLED))
-        if not enabled:
-            return None, None
         dim_divisor = int(cfg.get("dim_divisor", _DEFAULT_ADAPTER_DIM_DIVISOR))
         if dim_divisor <= _ZERO:
             raise ValueError("adapter_cfg.dim_divisor must be > 0.")

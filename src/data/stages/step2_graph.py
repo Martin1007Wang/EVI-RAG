@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import json
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from collections import deque
 import torch
@@ -15,7 +16,7 @@ except ModuleNotFoundError:
 from src.data.io.lmdb_utils import ensure_dir
 from src.data.context import StageContext
 from src.data.io.parquet_io import ParquetDatasetWriter, write_embedding_vocab, write_entity_vocab, write_relation_vocab
-from src.data.io.raw_loader import build_cvt_entity_config, build_text_entity_config, build_time_relation_config, iter_samples
+from src.data.io.raw_loader import build_cvt_entity_config, build_text_entity_config, iter_samples
 from src.data.relation_cleaning_rules import (
     DEFAULT_RELATION_CLEANING_RULES,
     RELATION_ACTION_DROP,
@@ -37,18 +38,14 @@ from src.data.schema.constants import (
     _VALIDATE_GRAPH_EDGES_DEFAULT,
     _ZERO,
 )
-from src.data.schema.types import (
-    EntityLookup,
-    EntityVocab,
-    GraphRecord,
-    RelationLookup,
-    RelationVocab,
-    Sample,
-    SplitFilter,
-    TimeRelationConfig,
-)
+from src.data.schema.types import EntityLookup, EntityVocab, GraphRecord, RelationLookup, RelationVocab, Sample, SplitFilter
 from src.data.stages.step1_vocab import _partition_graph_edges, _resolve_split_filter, _should_keep_sample
 from src.data.utils.connectivity import _validate_path_mode, reachable_targets_by_index
+from src.data.utils.inverse_relations_embeddings import (
+    build_relation_id_map,
+    tie_inverse_relation_embeddings,
+)
+from src.data.utils.inverse_relations_llm import InverseRelationLLMError, generate_inverse_relations_llm
 from src.data.utils.stats import _init_split_counters, _safe_div, _sample_labels
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
@@ -64,9 +61,7 @@ class _WorkerState:
     relation_cleaning_enabled: bool
     keep_start_adjacent_edges: bool
     relation_cleaning_rules: RelationCleaningRules
-    inverse_relations_key_map: Optional[Dict[str, str]]
-    inverse_relations_suffix: str
-    time_relation_cfg: Optional[TimeRelationConfig]
+    inverse_relations_map: Optional[Dict[str, str]]
     target_reachable_pruning: bool
     train_filter: SplitFilter
     eval_filter: SplitFilter
@@ -79,14 +74,17 @@ _INVERSE_RELATIONS_CFG_KEY = "inverse_relations"
 _INVERSE_RELATIONS_ENABLED_KEY = "enabled"
 _INVERSE_RELATIONS_MAPPING_KEY = "mapping_path"
 _INVERSE_RELATIONS_SUFFIX_KEY = "kg_id_suffix"
+_INVERSE_RELATIONS_PREFIX_KEY = "kg_id_prefix"
 _INVERSE_RELATIONS_STRICT_KEY = "strict"
-_INVERSE_RELATIONS_FALLBACK_KEY = "fallback_template"
 _INVERSE_RELATIONS_GLOBAL_VOCAB_KEY = "global_vocab"
+_INVERSE_RELATIONS_LLM_KEY = "llm"
+_INVERSE_RELATIONS_TIE_EMB_KEY = "tie_embeddings"
 _INVERSE_RELATIONS_LIST_KEY = "inverse_relations"
 _INVERSE_RELATIONS_FORWARD_KEY = "forward"
 _INVERSE_RELATIONS_FORWARD_LABEL_KEY = "forward_label"
 _INVERSE_RELATIONS_FORWARD_TEXT_KEY = "forward_text"
 _INVERSE_RELATIONS_INVERSE_KEY = "inverse"
+_INVERSE_RELATIONS_INVERSE_REL_KEY = "inverse_relation"
 _INVERSE_RELATIONS_INVERSE_TEXT_KEY = "inverse_text"
 
 
@@ -94,6 +92,7 @@ _INVERSE_RELATIONS_INVERSE_TEXT_KEY = "inverse_text"
 class _RelationTextMap:
     forward_labels: Dict[str, str]
     inverse_labels: Dict[str, str]
+    inverse_relations: Dict[str, str]
 
 
 def _init_worker_state(state: _WorkerState) -> None:
@@ -117,10 +116,80 @@ def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
         relation_cleaning_enabled=state.relation_cleaning_enabled,
         keep_start_adjacent_edges=state.keep_start_adjacent_edges,
         relation_cleaning_rules=state.relation_cleaning_rules,
-        inverse_relations_key_map=state.inverse_relations_key_map,
-        inverse_relations_suffix=state.inverse_relations_suffix,
-        time_relation_cfg=state.time_relation_cfg,
+        inverse_relations_map=state.inverse_relations_map,
         target_reachable_pruning=apply_target_reachable_pruning,
+    )
+
+
+def _dedup_preserve_order(values: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _load_q_entity_blacklist(cfg) -> set[str]:
+    if cfg is None:
+        return set()
+    raw_list = cfg.get("q_entity_blacklist") or []
+    path = cfg.get("q_entity_blacklist_path")
+    entries: List[str] = []
+    if isinstance(raw_list, (list, tuple, set)):
+        entries.extend(str(x).strip() for x in raw_list if str(x).strip())
+    if path:
+        path = Path(str(path))
+        if not path.exists():
+            raise FileNotFoundError(f"q_entity_blacklist_path not found: {path}")
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                entries.extend(str(x).strip() for x in payload if str(x).strip())
+            else:
+                raise ValueError("q_entity_blacklist_path JSON must contain a list of entity ids.")
+        else:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                entries.append(line)
+    return {str(x) for x in entries if str(x)}
+
+
+def _apply_q_entity_blacklist(
+    sample: Sample,
+    blacklist: set[str],
+    stats: Optional[Dict[str, int]] = None,
+) -> Sample:
+    if not blacklist:
+        return sample
+    q_entities = list(sample.q_entity or [])
+    filtered = [ent for ent in q_entities if ent not in blacklist]
+    if stats is not None:
+        removed = len(q_entities) - len(filtered)
+        if removed > 0:
+            stats["blacklist_removed_entities"] += removed
+            stats["blacklist_reduced_samples"] += _ONE
+            if not filtered:
+                stats["blacklist_empty_samples"] += _ONE
+    if filtered == q_entities:
+        return sample
+    return Sample(
+        dataset=sample.dataset,
+        split=sample.split,
+        question_id=sample.question_id,
+        kb=sample.kb,
+        question=sample.question,
+        graph=sample.graph,
+        q_entity=filtered,
+        a_entity=sample.a_entity,
+        answer_texts=sample.answer_texts,
+        graph_iso_type=sample.graph_iso_type,
+        redundant=sample.redundant,
+        test_type=list(sample.test_type),
     )
 
 
@@ -195,10 +264,19 @@ def _compute_target_reachable_nodes(
     return {label for label, idx in node_index.items() if visited[idx]}
 
 
-def _build_inverse_relation_key(rel: str, suffix: str) -> str:
+def _build_inverse_relation_key(rel: str, *, prefix: str, suffix: str) -> str:
+    if prefix:
+        return f"{prefix}{rel}"
     if not suffix:
         raise ValueError("inverse_relations.kg_id_suffix must be non-empty.")
     return f"{rel}{suffix}"
+
+
+def _normalize_prefix(prefix: str) -> str:
+    prefix = str(prefix or "").strip()
+    if not prefix:
+        return ""
+    return prefix if prefix.endswith("/") else f"{prefix}/"
 
 
 def _resolve_forward_label(entry: Mapping[str, object], forward_key: str) -> str:
@@ -208,11 +286,18 @@ def _resolve_forward_label(entry: Mapping[str, object], forward_key: str) -> str
     return forward_key if forward_label is None else str(forward_label)
 
 
-def _resolve_inverse_label(entry: Mapping[str, object], *, context: str) -> str:
+def _resolve_inverse_label(
+    entry: Mapping[str, object],
+    *,
+    context: str,
+    allow_missing: bool,
+) -> Optional[str]:
     inverse_label = entry.get(_INVERSE_RELATIONS_INVERSE_KEY)
     if inverse_label is None:
         inverse_label = entry.get(_INVERSE_RELATIONS_INVERSE_TEXT_KEY)
     if not inverse_label:
+        if allow_missing:
+            return None
         raise ValueError(f"{context} entry missing inverse label.")
     return str(inverse_label)
 
@@ -222,21 +307,28 @@ def _update_relation_texts(
     *,
     forward_key: str,
     forward_label: str,
-    inverse_label: str,
+    inverse_label: Optional[str],
+    inverse_relation: Optional[str],
     context: str,
 ) -> None:
     existing_forward = mapping.forward_labels.get(forward_key)
     if existing_forward is not None and existing_forward != forward_label:
         raise ValueError(f"{context} duplicate mismatch for {forward_key!r} forward label.")
-    existing_inverse = mapping.inverse_labels.get(forward_key)
-    if existing_inverse is not None and existing_inverse != inverse_label:
-        raise ValueError(f"{context} duplicate mismatch for {forward_key!r} inverse label.")
+    if inverse_label is not None:
+        existing_inverse = mapping.inverse_labels.get(forward_key)
+        if existing_inverse is not None and existing_inverse != inverse_label:
+            raise ValueError(f"{context} duplicate mismatch for {forward_key!r} inverse label.")
+        mapping.inverse_labels[forward_key] = inverse_label
+    if inverse_relation:
+        existing_rel = mapping.inverse_relations.get(forward_key)
+        if existing_rel is not None and existing_rel != inverse_relation:
+            raise ValueError(f"{context} duplicate mismatch for {forward_key!r} inverse relation.")
+        mapping.inverse_relations[forward_key] = inverse_relation
     mapping.forward_labels[forward_key] = forward_label
-    mapping.inverse_labels[forward_key] = inverse_label
 
 
 def _parse_inverse_relations_list(items: Sequence[object], *, context: str) -> _RelationTextMap:
-    mapping = _RelationTextMap(forward_labels={}, inverse_labels={})
+    mapping = _RelationTextMap(forward_labels={}, inverse_labels={}, inverse_relations={})
     for idx, raw in enumerate(items):
         if not isinstance(raw, dict):
             raise ValueError(f"{context} entry {idx} must be a dict with forward/inverse fields.")
@@ -245,19 +337,29 @@ def _parse_inverse_relations_list(items: Sequence[object], *, context: str) -> _
             raise ValueError(f"{context} entry {idx} missing forward field.")
         forward_key = str(forward)
         forward_label = _resolve_forward_label(raw, forward_key)
-        inverse_label = _resolve_inverse_label(raw, context=f"{context} entry {idx}")
+        inverse_relation = raw.get(_INVERSE_RELATIONS_INVERSE_REL_KEY)
+        if inverse_relation is not None and inverse_relation != "":
+            inverse_relation = str(inverse_relation)
+        else:
+            inverse_relation = None
+        inverse_label = _resolve_inverse_label(
+            raw,
+            context=f"{context} entry {idx}",
+            allow_missing=bool(inverse_relation),
+        )
         _update_relation_texts(
             mapping,
             forward_key=forward_key,
             forward_label=forward_label,
             inverse_label=inverse_label,
+            inverse_relation=inverse_relation,
             context=context,
         )
     return mapping
 
 
 def _parse_inverse_relations_dict(mapping: Mapping[object, object], *, context: str) -> _RelationTextMap:
-    parsed = _RelationTextMap(forward_labels={}, inverse_labels={})
+    parsed = _RelationTextMap(forward_labels={}, inverse_labels={}, inverse_relations={})
     for raw_key, raw_val in mapping.items():
         forward_key = str(raw_key)
         if isinstance(raw_val, Mapping):
@@ -265,17 +367,28 @@ def _parse_inverse_relations_dict(mapping: Mapping[object, object], *, context: 
             if raw_forward is not None and str(raw_forward) != forward_key:
                 raise ValueError(f"{context} entry forward key mismatch for {forward_key!r}.")
             forward_label = _resolve_forward_label(raw_val, forward_key)
-            inverse_label = _resolve_inverse_label(raw_val, context=f"{context} entry {forward_key!r}")
+            inverse_relation = raw_val.get(_INVERSE_RELATIONS_INVERSE_REL_KEY)
+            if inverse_relation is not None and inverse_relation != "":
+                inverse_relation = str(inverse_relation)
+            else:
+                inverse_relation = None
+            inverse_label = _resolve_inverse_label(
+                raw_val,
+                context=f"{context} entry {forward_key!r}",
+                allow_missing=bool(inverse_relation),
+            )
         else:
             forward_label = forward_key
             if raw_val is None or raw_val == "":
                 raise ValueError(f"{context} entry {forward_key!r} missing inverse label.")
             inverse_label = str(raw_val)
+            inverse_relation = None
         _update_relation_texts(
             parsed,
             forward_key=forward_key,
             forward_label=forward_label,
             inverse_label=inverse_label,
+            inverse_relation=inverse_relation,
             context=context,
         )
     return parsed
@@ -293,15 +406,139 @@ def _parse_inverse_relations_payload(payload: object, *, context: str) -> _Relat
     raise ValueError(f"{context} must be a dict or list.")
 
 
-def _apply_inverse_relations_fallback(
-    mapping: _RelationTextMap,
-    missing: Sequence[str],
+def _require_inverse_relations_llm_cfg(inv_cfg: Mapping[str, object]) -> Mapping[str, object]:
+    llm_cfg = inv_cfg.get(_INVERSE_RELATIONS_LLM_KEY)
+    if not isinstance(llm_cfg, Mapping):
+        raise ValueError("inverse_relations.llm must be set for LLM auto-generation.")
+    return llm_cfg
+
+
+def _generate_inverse_relations_entries(
+    relations: Sequence[str],
+    inv_cfg: Mapping[str, object],
     *,
-    fallback: str,
-) -> None:
-    for rel in missing:
-        mapping.forward_labels.setdefault(rel, rel)
-        mapping.inverse_labels.setdefault(rel, fallback.format(relation=rel))
+    context: str,
+) -> List[Dict[str, str]]:
+    llm_cfg = _require_inverse_relations_llm_cfg(inv_cfg)
+    try:
+        return generate_inverse_relations_llm(relations=relations, llm_cfg=llm_cfg)
+    except InverseRelationLLMError as exc:
+        raise InverseRelationLLMError(f"{context} failed: {exc}") from exc
+
+
+def _inverse_relations_entries_from_payload(payload: object, *, context: str) -> List[Dict[str, str]]:
+    if isinstance(payload, dict):
+        inner = payload.get(_INVERSE_RELATIONS_LIST_KEY, payload)
+        if isinstance(inner, list):
+            return [dict(item) for item in inner if isinstance(item, Mapping)]
+        if isinstance(inner, Mapping):
+            entries: List[Dict[str, str]] = []
+            for raw_key, raw_val in inner.items():
+                entry: Dict[str, str] = {_INVERSE_RELATIONS_FORWARD_KEY: str(raw_key)}
+                if isinstance(raw_val, Mapping):
+                    for field in (
+                        _INVERSE_RELATIONS_FORWARD_LABEL_KEY,
+                        _INVERSE_RELATIONS_FORWARD_TEXT_KEY,
+                        _INVERSE_RELATIONS_INVERSE_KEY,
+                        _INVERSE_RELATIONS_INVERSE_REL_KEY,
+                        _INVERSE_RELATIONS_INVERSE_TEXT_KEY,
+                    ):
+                        if field in raw_val and raw_val[field] is not None:
+                            entry[field] = str(raw_val[field])
+                else:
+                    entry[_INVERSE_RELATIONS_INVERSE_KEY] = str(raw_val)
+                entries.append(entry)
+            return entries
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, Mapping)]
+    raise ValueError(f"{context} must be a dict or list.")
+
+
+def _merge_inverse_relations_entries(
+    base_entries: Sequence[Mapping[str, object]],
+    new_entries: Sequence[Mapping[str, object]],
+    *,
+    order: Sequence[str],
+) -> List[Dict[str, str]]:
+    merged: Dict[str, Dict[str, str]] = {}
+    for entry in list(base_entries) + list(new_entries):
+        if not isinstance(entry, Mapping):
+            continue
+        forward = entry.get(_INVERSE_RELATIONS_FORWARD_KEY)
+        if not forward:
+            continue
+        merged[str(forward)] = {str(k): str(v) for k, v in entry.items() if v is not None}
+    out: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    for rel in order:
+        entry = merged.get(rel)
+        if entry is None:
+            continue
+        out.append(entry)
+        seen.add(rel)
+    for rel, entry in merged.items():
+        if rel in seen:
+            continue
+        out.append(entry)
+    return out
+
+
+def _write_inverse_relations_payload(path: Path, entries: Sequence[Mapping[str, object]]) -> Dict[str, object]:
+    ensure_dir(path.parent)
+    payload = {_INVERSE_RELATIONS_LIST_KEY: list(entries)}
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return payload
+
+
+def _ensure_inverse_relations_payload(
+    *,
+    inv_cfg: Mapping[str, object],
+    ctx: StageContext,
+    dataset_rel_labels: Sequence[str],
+    path: Path,
+    strict: bool,
+) -> object:
+    if not path.exists():
+        if strict:
+            raise FileNotFoundError(f"inverse_relations mapping not found: {path}")
+        entries = _generate_inverse_relations_entries(
+            dataset_rel_labels,
+            inv_cfg,
+            context="inverse_relations LLM generation (missing mapping)",
+        )
+        payload = _write_inverse_relations_payload(path, entries)
+        log_event(
+            ctx.logger,
+            "inverse_relations_llm_generated",
+            path=str(path),
+            count=len(entries),
+            reason="mapping_missing",
+        )
+        return payload
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mapping = _parse_inverse_relations_payload(payload, context=str(path))
+    missing = [rel for rel in dataset_rel_labels if rel not in mapping.forward_labels]
+    if not missing:
+        return payload
+    if strict:
+        preview = ", ".join(missing[:5])
+        raise ValueError(f"inverse_relations missing {len(missing)} relations, examples: {preview}.")
+    entries = _generate_inverse_relations_entries(
+        missing,
+        inv_cfg,
+        context="inverse_relations LLM generation (missing relations)",
+    )
+    base_entries = _inverse_relations_entries_from_payload(payload, context=str(path))
+    merged = _merge_inverse_relations_entries(base_entries, entries, order=dataset_rel_labels)
+    payload = _write_inverse_relations_payload(path, merged)
+    log_event(
+        ctx.logger,
+        "inverse_relations_llm_filled",
+        path=str(path),
+        added=len(entries),
+        total=len(merged),
+    )
+    return payload
 
 
 def _resolve_relation_vocab_labels(
@@ -309,12 +546,11 @@ def _resolve_relation_vocab_labels(
     dataset_rel_labels: Sequence[str],
     *,
     strict: bool,
-    fallback: Optional[str],
     global_vocab: bool,
     context: str,
 ) -> List[str]:
     dataset_set = set(dataset_rel_labels)
-    mapping_keys = set(mapping.inverse_labels)
+    mapping_keys = set(mapping.forward_labels)
     if not global_vocab:
         unknown = [rel for rel in mapping_keys if rel not in dataset_set]
         if unknown:
@@ -322,13 +558,10 @@ def _resolve_relation_vocab_labels(
             raise ValueError(f"{context} includes unknown relations, examples: {preview}.")
     missing = [rel for rel in dataset_rel_labels if rel not in mapping_keys]
     if missing:
+        preview = ", ".join(missing[:5])
         if strict:
-            preview = ", ".join(missing[:5])
             raise ValueError(f"{context} missing {len(missing)} relations, examples: {preview}.")
-        if not isinstance(fallback, str):
-            raise ValueError("inverse_relations.fallback_template must be set when strict=false.")
-        _apply_inverse_relations_fallback(mapping, missing, fallback=fallback)
-        mapping_keys = set(mapping.inverse_labels)
+        raise ValueError(f"{context} missing {len(missing)} relations after LLM autofill, examples: {preview}.")
     if global_vocab:
         return sorted(mapping_keys)
     return sorted(dataset_rel_labels)
@@ -339,66 +572,74 @@ def _load_inverse_relations_map(
     ctx: StageContext,
     *,
     dataset_rel_labels: Sequence[str],
-) -> tuple[Optional[_RelationTextMap], str, List[str], bool]:
+) -> tuple[Optional[_RelationTextMap], Dict[str, str], List[str], Set[str], bool]:
     inv_cfg = cfg.get(_INVERSE_RELATIONS_CFG_KEY) if hasattr(cfg, "get") else None
     if not isinstance(inv_cfg, Mapping):
-        return None, _INVERSE_RELATION_SUFFIX_DEFAULT, sorted(dataset_rel_labels), False
+        return None, {}, sorted(dataset_rel_labels), set(), False
     if not bool(inv_cfg.get(_INVERSE_RELATIONS_ENABLED_KEY, False)):
-        return None, _INVERSE_RELATION_SUFFIX_DEFAULT, sorted(dataset_rel_labels), False
+        return None, {}, sorted(dataset_rel_labels), set(), False
     mapping_path = inv_cfg.get(_INVERSE_RELATIONS_MAPPING_KEY)
     if not mapping_path:
         raise ValueError("inverse_relations.mapping_path must be set when inverse_relations.enabled=true.")
-    path = ctx.resolve_path(mapping_path)
-    if not path.exists():
-        raise FileNotFoundError(f"inverse_relations mapping not found: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    mapping = _parse_inverse_relations_payload(payload, context=str(path))
     strict = bool(inv_cfg.get(_INVERSE_RELATIONS_STRICT_KEY, True))
-    fallback = inv_cfg.get(_INVERSE_RELATIONS_FALLBACK_KEY)
     global_vocab = bool(inv_cfg.get(_INVERSE_RELATIONS_GLOBAL_VOCAB_KEY, False))
+    prefix = _normalize_prefix(inv_cfg.get(_INVERSE_RELATIONS_PREFIX_KEY, ""))
+    suffix = str(inv_cfg.get(_INVERSE_RELATIONS_SUFFIX_KEY, _INVERSE_RELATION_SUFFIX_DEFAULT))
+    path = ctx.resolve_path(mapping_path)
+    payload = _ensure_inverse_relations_payload(
+        inv_cfg=inv_cfg,
+        ctx=ctx,
+        dataset_rel_labels=dataset_rel_labels,
+        path=path,
+        strict=strict,
+    )
+    mapping = _parse_inverse_relations_payload(payload, context=str(path))
     forward_rel_labels = _resolve_relation_vocab_labels(
         mapping,
         dataset_rel_labels,
         strict=strict,
-        fallback=fallback,
         global_vocab=global_vocab,
         context="inverse_relations",
     )
-    suffix = str(inv_cfg.get(_INVERSE_RELATIONS_SUFFIX_KEY, _INVERSE_RELATION_SUFFIX_DEFAULT))
-    return mapping, suffix, forward_rel_labels, global_vocab
-
-
-def _build_inverse_relation_key_map(
-    mapping: Dict[str, str],
-    *,
-    suffix: str,
-    forward_rel_labels: Sequence[str],
-) -> Dict[str, str]:
+    inverse_relations_map: Dict[str, str] = {}
+    generated_inverse_relations: Set[str] = set()
     forward_set = set(forward_rel_labels)
-    key_map: Dict[str, str] = {}
-    for rel, label in mapping.items():
-        inv_key = _build_inverse_relation_key(rel, suffix)
-        if inv_key in forward_set:
-            raise ValueError(f"inverse_relations key collision with forward relation: {inv_key!r}.")
-        if inv_key in key_map and key_map[inv_key] != label:
-            raise ValueError(f"inverse_relations duplicate key mismatch for {inv_key!r}.")
-        key_map[inv_key] = label
-    return key_map
+    for rel in forward_rel_labels:
+        inv_rel = mapping.inverse_relations.get(rel)
+        if inv_rel == rel:
+            inv_rel = None
+        if inv_rel:
+            inverse_relations_map[rel] = inv_rel
+            if inv_rel not in forward_set:
+                if prefix and not str(inv_rel).startswith(prefix):
+                    raise ValueError(
+                        f"inverse_relations generated inverse must use prefix {prefix!r}: {inv_rel!r}."
+                    )
+                if rel not in mapping.inverse_labels:
+                    raise ValueError(f"inverse_relations missing inverse label for {rel!r}.")
+                generated_inverse_relations.add(inv_rel)
+            continue
+        inv_rel = _build_inverse_relation_key(rel, prefix=prefix, suffix=suffix)
+        if inv_rel in forward_set:
+            raise ValueError(f"inverse_relations key collision with forward relation: {inv_rel!r}.")
+        if rel not in mapping.inverse_labels:
+            raise ValueError(f"inverse_relations missing inverse label for {rel!r}.")
+        inverse_relations_map[rel] = inv_rel
+        generated_inverse_relations.add(inv_rel)
+    return mapping, inverse_relations_map, forward_rel_labels, generated_inverse_relations, global_vocab
 
 
 def _expand_edges_with_inverse(
     edges: Sequence[Tuple[str, str, str]],
-    inverse_relations_key_map: Dict[str, str],
-    *,
-    suffix: str,
+    inverse_relations_map: Dict[str, str],
 ) -> List[Tuple[str, str, str]]:
     if not edges:
         return []
     expanded = list(edges)
     for head, rel, tail in edges:
-        inv_rel = _build_inverse_relation_key(rel, suffix)
-        if inv_rel not in inverse_relations_key_map:
-            raise ValueError(f"inverse_relations missing label for {rel!r}.")
+        inv_rel = inverse_relations_map.get(rel)
+        if not inv_rel:
+            raise ValueError(f"inverse_relations missing inverse mapping for {rel!r}.")
         expanded.append((tail, inv_rel, head))
     return expanded
 
@@ -430,7 +671,6 @@ def preprocess(ctx: StageContext) -> None:
     entity_normalization = cfg.entity_normalization
     text_cfg = build_text_entity_config(cfg)
     cvt_cfg = build_cvt_entity_config(cfg)
-    time_relation_cfg = build_time_relation_config(cfg)
     dataset_family = cfg.get("dataset_family")
     dataset_source = str(cfg.get("dataset_source", "hf")).strip().lower()
     hf_dataset = cfg.get("hf_dataset")
@@ -459,6 +699,7 @@ def preprocess(ctx: StageContext) -> None:
     parquet_chunk_size = ctx.parquet_chunk_size
     parquet_num_workers = ctx.parquet_num_workers
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
+    q_entity_blacklist = _load_q_entity_blacklist(cfg)
 
     ensure_dir(out_dir)
     entity_vocab = EntityVocab(kb=kb, text_cfg=text_cfg, cvt_cfg=cvt_cfg)
@@ -474,15 +715,45 @@ def preprocess(ctx: StageContext) -> None:
             "kept_samples": _ZERO,
             "missing_q_any_samples": _ZERO,
             "missing_q_all_samples": _ZERO,
+            "missing_q_partial_samples": _ZERO,
             "missing_a_any_samples": _ZERO,
             "missing_a_all_samples": _ZERO,
+            "missing_a_partial_samples": _ZERO,
             "unreachable_a_any_samples": _ZERO,
+            "unreachable_a_all_samples": _ZERO,
+            "unreachable_a_partial_samples": _ZERO,
             "no_path_samples": _ZERO,
             "missing_q_entities": _ZERO,
             "missing_a_entities": _ZERO,
             "reachable_a_entities": _ZERO,
             "unreachable_a_entities": _ZERO,
             "overlap_samples": {},
+        }
+        for split in splits
+    }
+    qa_clean_stats: Dict[str, Dict[str, int]] = {
+        split: {
+            "samples_total": _ZERO,
+            "q_total_before": _ZERO,
+            "q_total_after": _ZERO,
+            "q_samples_reduced": _ZERO,
+            "q_samples_empty": _ZERO,
+            "q_samples_all_present": _ZERO,
+            "q_samples_partial_missing": _ZERO,
+            "q_samples_all_missing": _ZERO,
+            "a_total_before": _ZERO,
+            "a_total_after": _ZERO,
+            "a_samples_reduced": _ZERO,
+            "a_samples_all_present": _ZERO,
+            "a_samples_partial_missing": _ZERO,
+            "a_samples_all_missing": _ZERO,
+            "reachable_all_samples": _ZERO,
+            "reachable_partial_samples": _ZERO,
+            "reachable_none_samples": _ZERO,
+            "reachable_na_samples": _ZERO,
+            "blacklist_removed_entities": _ZERO,
+            "blacklist_reduced_samples": _ZERO,
+            "blacklist_empty_samples": _ZERO,
         }
         for split in splits
     }
@@ -519,6 +790,13 @@ def preprocess(ctx: StageContext) -> None:
         parquet_chunk_size=parquet_chunk_size,
         parquet_num_workers=parquet_num_workers,
     )
+    if q_entity_blacklist:
+        log_event(
+            logger,
+            "q_entity_blacklist_loaded",
+            count=len(q_entity_blacklist),
+            examples=sorted(list(q_entity_blacklist))[:20],
+        )
     if relation_cleaning_enabled:
         log_event(
             logger,
@@ -530,14 +808,6 @@ def preprocess(ctx: StageContext) -> None:
             drop_prefixes=sorted(relation_cleaning_rules.drop_prefixes),
             drop_regexes=sorted(pattern.pattern for pattern in relation_cleaning_rules.drop_regexes),
         )
-    log_event(
-        logger,
-        "time_relation_filter",
-        mode=time_relation_cfg.mode,
-        relation_regex=None if time_relation_cfg.relation_regex is None else time_relation_cfg.relation_regex.pattern,
-        question_regex=None if time_relation_cfg.question_regex is None else time_relation_cfg.question_regex.pattern,
-    )
-
     log_event(logger, "vocab_start", stage="vocab")
     for sample in tqdm(
         iter_samples(
@@ -555,6 +825,7 @@ def preprocess(ctx: StageContext) -> None:
         ),
         desc=f"Vocab from {dataset}",
     ):
+        sample = _apply_q_entity_blacklist(sample, q_entity_blacklist)
         graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
         total_by_split[sample.split] = total_by_split.get(sample.split, 0) + 1
         kept_edges, type_edges = _partition_graph_edges(
@@ -562,8 +833,6 @@ def preprocess(ctx: StageContext) -> None:
             relation_cleaning_rules,
             remove_self_loops=remove_self_loops,
             relation_cleaning_enabled=relation_cleaning_enabled,
-            time_relation_cfg=time_relation_cfg,
-            question_text=sample.question,
             anchor_entities=sample.q_entity,
             keep_anchor_edges=keep_start_adjacent_edges,
         )
@@ -638,30 +907,41 @@ def preprocess(ctx: StageContext) -> None:
     entity_vocab.finalize()
     relation_vocab = RelationVocab(kb=kb)
     dataset_rel_labels = sorted(kept_rel_labels)
-    relation_texts, inverse_relations_suffix, forward_rel_labels, inverse_global_vocab = _load_inverse_relations_map(
+    inv_cfg = cfg.get(_INVERSE_RELATIONS_CFG_KEY) if hasattr(cfg, "get") else None
+    tie_inverse_embeddings = (
+        bool(inv_cfg.get(_INVERSE_RELATIONS_TIE_EMB_KEY, False)) if isinstance(inv_cfg, Mapping) else False
+    )
+    (
+        relation_texts,
+        inverse_relations_map,
+        forward_rel_labels,
+        generated_inverse_relations,
+        inverse_global_vocab,
+    ) = _load_inverse_relations_map(
         cfg,
         ctx,
         dataset_rel_labels=dataset_rel_labels,
     )
-    inverse_relations_key_map = None
     forward_label_map: Optional[Dict[str, str]] = None
+    inverse_label_map: Dict[str, str] = {}
     if relation_texts is not None:
-        inverse_relations_key_map = _build_inverse_relation_key_map(
-            relation_texts.inverse_labels,
-            suffix=inverse_relations_suffix,
-            forward_rel_labels=forward_rel_labels,
-        )
         forward_label_map = relation_texts.forward_labels
+        for rel, inv_rel in inverse_relations_map.items():
+            if inv_rel in generated_inverse_relations:
+                inv_label = relation_texts.inverse_labels.get(rel)
+                if inv_label is None:
+                    raise ValueError(f"inverse_relations missing inverse label for {rel!r}.")
+                inverse_label_map[inv_rel] = inv_label
+    else:
+        inverse_relations_map = None
     for rel in forward_rel_labels:
         label = rel if forward_label_map is None else forward_label_map.get(rel)
         if label is None:
             raise ValueError(f"inverse_relations missing forward label for {rel!r}.")
         relation_vocab.relation_id(rel, label=label)
-    if inverse_relations_key_map is not None:
-        for rel in forward_rel_labels:
-            inv_key = _build_inverse_relation_key(rel, inverse_relations_suffix)
-            inv_label = inverse_relations_key_map[inv_key]
-            relation_vocab.relation_id(inv_key, label=inv_label)
+    if inverse_label_map:
+        for inv_rel, inv_label in sorted(inverse_label_map.items()):
+            relation_vocab.relation_id(inv_rel, label=inv_label)
 
     relation_lookup = relation_vocab.to_lookup()
 
@@ -676,12 +956,12 @@ def preprocess(ctx: StageContext) -> None:
         non_text_entity_count=entity_count - text_entity_count,
         relation_count=relation_count,
     )
-    if inverse_relations_key_map is not None:
+    if relation_texts is not None:
         log_event(
             logger,
             "inverse_relations_loaded",
-            count=len(inverse_relations_key_map),
-            suffix=inverse_relations_suffix,
+            count=len(inverse_relations_map),
+            generated=len(generated_inverse_relations),
             global_vocab=inverse_global_vocab,
         )
     total_edges_raw = sum(edge_stats[split]["raw_edges"] for split in splits)
@@ -803,11 +1083,37 @@ def preprocess(ctx: StageContext) -> None:
                     show_progress=embedding_cfg.progress_bar,
                     desc="Relations",
                 )
-                if embedding_cfg.precompute_relations:
-                    torch.save(relation_emb, relation_emb_path)
             else:
                 log_event(logger, "preprocess_reuse_relation_embeddings", path=str(relation_emb_path))
                 relation_emb = torch.load(relation_emb_path, map_location="cpu")
+            if tie_inverse_embeddings and inverse_relations_map:
+                tie_map = {
+                    fwd: inv
+                    for fwd, inv in inverse_relations_map.items()
+                    if inv in generated_inverse_relations
+                }
+                if tie_map:
+                    rel_id_map = build_relation_id_map(
+                        [int(rec["relation_id"]) for rec in relation_vocab.records],
+                        [str(rec["kg_id"]) for rec in relation_vocab.records],
+                    )
+                    relation_emb, pairs, targets = tie_inverse_relation_embeddings(
+                        relation_emb,
+                        rel_id_map,
+                        tie_map,
+                    )
+                    log_event(
+                        logger,
+                        "inverse_relations_embeddings_tied",
+                        pairs=pairs,
+                        targets=targets,
+                        mode="generated_only",
+                        path=str(relation_emb_path),
+                    )
+                if embedding_cfg.precompute_relations or relation_emb_path.exists():
+                    torch.save(relation_emb, relation_emb_path)
+            elif embedding_cfg.precompute_relations:
+                torch.save(relation_emb, relation_emb_path)
             if embedding_cfg.canonicalize_relations:
                 relation_embeddings_norm = _normalize_embeddings(relation_emb, embedding_cfg.cosine_eps)
                 if relation_embeddings_norm.numel() == 0:
@@ -852,9 +1158,7 @@ def preprocess(ctx: StageContext) -> None:
                     relation_cleaning_enabled=relation_cleaning_enabled,
                     keep_start_adjacent_edges=keep_start_adjacent_edges,
                     relation_cleaning_rules=relation_cleaning_rules,
-                    inverse_relations_key_map=inverse_relations_key_map,
-                    inverse_relations_suffix=inverse_relations_suffix,
-                    time_relation_cfg=time_relation_cfg,
+                    inverse_relations_map=inverse_relations_map,
                     target_reachable_pruning=apply_target_reachable_pruning,
                 )
                 graphs.append(graph)
@@ -873,54 +1177,92 @@ def preprocess(ctx: StageContext) -> None:
                 if question_emb_batch is None:
                     raise RuntimeError("question_emb batch missing while precompute_questions is enabled.")
                 question_emb = question_emb_batch[idx].tolist()
-            question = build_question_record(sample, entity_vocab, graph.graph_id, question_emb=question_emb)
-            base_writer.append(graph, question)
-            graphs_written_by_split[sample.split] += 1
-            questions_written_by_split[sample.split] += 1
+            split_key = sample.split
+            stats_clean = qa_clean_stats[split_key]
+            label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
+            q_entities_raw = _dedup_preserve_order(sample.q_entity or [])
+            a_entities_raw = _dedup_preserve_order(sample.a_entity or [])
+            q_in_graph = [ent for ent in q_entities_raw if ent in label_to_idx]
+            a_in_graph = [ent for ent in a_entities_raw if ent in label_to_idx]
+            q_total = len(q_entities_raw)
+            a_total = len(a_entities_raw)
+            q_in_graph_count = len(q_in_graph)
+            a_in_graph_count = len(a_in_graph)
+            stats_clean["samples_total"] += _ONE
+            stats_clean["q_total_before"] += q_total
+            stats_clean["q_total_after"] += q_in_graph_count
+            stats_clean["a_total_before"] += a_total
+            stats_clean["a_total_after"] += a_in_graph_count
+            if q_in_graph_count < q_total:
+                stats_clean["q_samples_reduced"] += _ONE
+            if q_in_graph_count == _ZERO:
+                stats_clean["q_samples_empty"] += _ONE
+            if q_in_graph_count == q_total and q_total > _ZERO:
+                stats_clean["q_samples_all_present"] += _ONE
+            elif q_in_graph_count == _ZERO:
+                stats_clean["q_samples_all_missing"] += _ONE
+            else:
+                stats_clean["q_samples_partial_missing"] += _ONE
+            if a_in_graph_count < a_total:
+                stats_clean["a_samples_reduced"] += _ONE
+            if a_in_graph_count == _ZERO:
+                stats_clean["a_samples_all_missing"] += _ONE
+            elif a_in_graph_count == a_total and a_total > _ZERO:
+                stats_clean["a_samples_all_present"] += _ONE
+            else:
+                stats_clean["a_samples_partial_missing"] += _ONE
+            q_local = [label_to_idx[ent] for ent in q_in_graph]
+            a_local = [label_to_idx[ent] for ent in a_in_graph]
+            reachable_count = _ZERO
+            if q_in_graph_count > _ZERO and a_in_graph_count > _ZERO:
+                reachable_targets = reachable_targets_by_index(
+                    num_nodes=len(graph.node_labels),
+                    edge_src=graph.edge_src,
+                    edge_dst=graph.edge_dst,
+                    seeds=q_local,
+                    targets=a_local,
+                    path_mode=path_mode,
+                )
+                reachable_count = len(reachable_targets)
+                if reachable_count == a_in_graph_count:
+                    stats_clean["reachable_all_samples"] += _ONE
+                elif reachable_count == _ZERO:
+                    stats_clean["reachable_none_samples"] += _ONE
+                else:
+                    stats_clean["reachable_partial_samples"] += _ONE
+            else:
+                stats_clean["reachable_na_samples"] += _ONE
             if emit_sub_filter:
-                split_key = sample.split
                 stats = sub_filter_stats[split_key]
                 stats["total_samples"] += _ONE
-                label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
-                q_entities = set(sample.q_entity or [])
-                a_entities = set(sample.a_entity or [])
-                q_total = len(q_entities)
-                a_total = len(a_entities)
-                q_local = {label_to_idx[ent] for ent in q_entities if ent in label_to_idx}
-                a_local = {label_to_idx[ent] for ent in a_entities if ent in label_to_idx}
-                q_in_graph = len(q_local)
-                a_in_graph = len(a_local)
-                missing_q_entities = max(q_total - q_in_graph, _ZERO)
-                missing_a_entities = max(a_total - a_in_graph, _ZERO)
+                missing_q_entities = max(q_total - q_in_graph_count, _ZERO)
+                missing_a_entities = max(a_total - a_in_graph_count, _ZERO)
                 stats["missing_q_entities"] += missing_q_entities
                 stats["missing_a_entities"] += missing_a_entities
-                missing_q_any = (q_total == _ZERO) or (q_in_graph < q_total)
-                missing_a_any = (a_total == _ZERO) or (a_in_graph < a_total)
-                missing_q_all = q_in_graph == _ZERO
-                missing_a_all = a_in_graph == _ZERO
+                missing_q_any = (q_total == _ZERO) or (q_in_graph_count < q_total)
+                missing_a_any = (a_total == _ZERO) or (a_in_graph_count < a_total)
+                missing_q_all = q_in_graph_count == _ZERO
+                missing_a_all = a_in_graph_count == _ZERO
+                missing_q_partial = missing_q_any and not missing_q_all
+                missing_a_partial = missing_a_any and not missing_a_all
                 stats["missing_q_any_samples"] += _ONE if missing_q_any else _ZERO
                 stats["missing_q_all_samples"] += _ONE if missing_q_all else _ZERO
+                stats["missing_q_partial_samples"] += _ONE if missing_q_partial else _ZERO
                 stats["missing_a_any_samples"] += _ONE if missing_a_any else _ZERO
                 stats["missing_a_all_samples"] += _ONE if missing_a_all else _ZERO
-                reachable_count = _ZERO
-                if q_in_graph > _ZERO and a_in_graph > _ZERO:
-                    reachable_targets = reachable_targets_by_index(
-                        num_nodes=len(graph.node_labels),
-                        edge_src=graph.edge_src,
-                        edge_dst=graph.edge_dst,
-                        seeds=sorted(q_local),
-                        targets=sorted(a_local),
-                        path_mode=path_mode,
-                    )
-                    reachable_count = len(reachable_targets)
-                unreachable_count = a_in_graph - reachable_count
+                stats["missing_a_partial_samples"] += _ONE if missing_a_partial else _ZERO
+                unreachable_count = a_in_graph_count - reachable_count
                 if unreachable_count < _ZERO:
                     unreachable_count = _ZERO
                 stats["reachable_a_entities"] += reachable_count
                 stats["unreachable_a_entities"] += unreachable_count
-                unreachable_a_any = a_in_graph > _ZERO and reachable_count < a_in_graph
-                no_path = q_in_graph > _ZERO and a_in_graph > _ZERO and reachable_count == _ZERO
+                unreachable_a_any = a_in_graph_count > _ZERO and reachable_count < a_in_graph_count
+                unreachable_a_all = a_in_graph_count > _ZERO and reachable_count == _ZERO
+                unreachable_a_partial = a_in_graph_count > _ZERO and _ZERO < reachable_count < a_in_graph_count
+                no_path = q_in_graph_count > _ZERO and a_in_graph_count > _ZERO and reachable_count == _ZERO
                 stats["unreachable_a_any_samples"] += _ONE if unreachable_a_any else _ZERO
+                stats["unreachable_a_all_samples"] += _ONE if unreachable_a_all else _ZERO
+                stats["unreachable_a_partial_samples"] += _ONE if unreachable_a_partial else _ZERO
                 stats["no_path_samples"] += _ONE if no_path else _ZERO
                 overlap_flags: List[str] = []
                 if missing_q_any:
@@ -936,6 +1278,19 @@ def preprocess(ctx: StageContext) -> None:
                     sub_sample_ids.append(graph.graph_id)
                     sub_by_split[split_key] = sub_by_split.get(split_key, _ZERO) + _ONE
                     stats["kept_samples"] += _ONE
+            if q_in_graph_count == _ZERO:
+                continue
+            question = build_question_record(
+                sample,
+                entity_vocab,
+                graph.graph_id,
+                question_emb=question_emb,
+                q_entities=q_in_graph,
+                a_entities=a_in_graph,
+            )
+            base_writer.append(graph, question)
+            graphs_written_by_split[split_key] += 1
+            questions_written_by_split[split_key] += 1
             if len(base_writer.graphs) >= chunk_size or len(base_writer.questions) >= chunk_size:
                 base_writer.flush()
 
@@ -957,6 +1312,8 @@ def preprocess(ctx: StageContext) -> None:
             ),
             desc=f"Graphs from {dataset}",
         ):
+            q_entities_raw = list(sample.q_entity or [])
+            sample = _apply_q_entity_blacklist(sample, q_entity_blacklist)
             graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
             if graph_id in empty_graph_id_set:
                 continue
@@ -969,12 +1326,19 @@ def preprocess(ctx: StageContext) -> None:
                 remove_self_loops=remove_self_loops,
                 relation_cleaning_enabled=relation_cleaning_enabled,
                 relation_cleaning_rules=relation_cleaning_rules,
-                time_relation_cfg=time_relation_cfg,
                 anchor_entities=sample.q_entity,
                 keep_anchor_edges=keep_start_adjacent_edges,
             )
             if not outcome.keep:
                 continue
+            if q_entity_blacklist:
+                removed = len(q_entities_raw) - len(sample.q_entity or [])
+                if removed > 0:
+                    stats = qa_clean_stats[sample.split]
+                    stats["blacklist_removed_entities"] += int(removed)
+                    stats["blacklist_reduced_samples"] += _ONE
+                    if not sample.q_entity:
+                        stats["blacklist_empty_samples"] += _ONE
             pending_samples.append(sample)
             if len(pending_samples) >= chunk_size:
                 _process_sample_batch(pending_samples, executor)
@@ -993,9 +1357,7 @@ def preprocess(ctx: StageContext) -> None:
             relation_cleaning_enabled=relation_cleaning_enabled,
             keep_start_adjacent_edges=keep_start_adjacent_edges,
             relation_cleaning_rules=relation_cleaning_rules,
-            inverse_relations_key_map=inverse_relations_key_map,
-            inverse_relations_suffix=inverse_relations_suffix,
-            time_relation_cfg=time_relation_cfg,
+            inverse_relations_map=inverse_relations_map,
             target_reachable_pruning=target_reachable_pruning,
             train_filter=train_filter,
             eval_filter=eval_filter,
@@ -1051,15 +1413,52 @@ def preprocess(ctx: StageContext) -> None:
                 filtered=total - kept,
                 missing_q_any=int(stats["missing_q_any_samples"]),
                 missing_q_all=int(stats["missing_q_all_samples"]),
+                missing_q_partial=int(stats["missing_q_partial_samples"]),
                 missing_a_any=int(stats["missing_a_any_samples"]),
                 missing_a_all=int(stats["missing_a_all_samples"]),
+                missing_a_partial=int(stats["missing_a_partial_samples"]),
                 unreachable_a_any=int(stats["unreachable_a_any_samples"]),
+                unreachable_a_all=int(stats["unreachable_a_all_samples"]),
+                unreachable_a_partial=int(stats["unreachable_a_partial_samples"]),
                 no_path=int(stats["no_path_samples"]),
                 missing_q_entities=int(stats["missing_q_entities"]),
                 missing_a_entities=int(stats["missing_a_entities"]),
                 reachable_a_entities=int(stats["reachable_a_entities"]),
                 unreachable_a_entities=int(stats["unreachable_a_entities"]),
                 overlap=stats["overlap_samples"],
+            )
+        for split in splits:
+            stats = qa_clean_stats[split]
+            total = int(stats["samples_total"])
+            log_event(
+                logger,
+                "qa_entity_cleaning_stats",
+                split=split,
+                samples=total,
+                q_total_before=int(stats["q_total_before"]),
+                q_total_after=int(stats["q_total_after"]),
+                q_avg_before=_safe_div(int(stats["q_total_before"]), total),
+                q_avg_after=_safe_div(int(stats["q_total_after"]), total),
+                q_samples_reduced=int(stats["q_samples_reduced"]),
+                q_samples_empty=int(stats["q_samples_empty"]),
+                q_samples_all_present=int(stats["q_samples_all_present"]),
+                q_samples_partial_missing=int(stats["q_samples_partial_missing"]),
+                q_samples_all_missing=int(stats["q_samples_all_missing"]),
+                a_total_before=int(stats["a_total_before"]),
+                a_total_after=int(stats["a_total_after"]),
+                a_avg_before=_safe_div(int(stats["a_total_before"]), total),
+                a_avg_after=_safe_div(int(stats["a_total_after"]), total),
+                a_samples_reduced=int(stats["a_samples_reduced"]),
+                a_samples_all_present=int(stats["a_samples_all_present"]),
+                a_samples_partial_missing=int(stats["a_samples_partial_missing"]),
+                a_samples_all_missing=int(stats["a_samples_all_missing"]),
+                reachable_all=int(stats["reachable_all_samples"]),
+                reachable_partial=int(stats["reachable_partial_samples"]),
+                reachable_none=int(stats["reachable_none_samples"]),
+                reachable_na=int(stats["reachable_na_samples"]),
+                blacklist_removed_entities=int(stats["blacklist_removed_entities"]),
+                blacklist_reduced_samples=int(stats["blacklist_reduced_samples"]),
+                blacklist_empty_samples=int(stats["blacklist_empty_samples"]),
             )
 
 
@@ -1075,16 +1474,14 @@ def build_graph(
     relation_cleaning_enabled: bool = True,
     keep_start_adjacent_edges: bool = False,
     relation_cleaning_rules: RelationCleaningRules = DEFAULT_RELATION_CLEANING_RULES,
-    inverse_relations_key_map: Optional[Dict[str, str]] = None,
-    inverse_relations_suffix: str = _INVERSE_RELATION_SUFFIX_DEFAULT,
-    time_relation_cfg: Optional[TimeRelationConfig] = None,
+    inverse_relations_map: Optional[Dict[str, str]] = None,
     target_reachable_pruning: bool = False,
 ) -> Optional[GraphRecord]:
     dedup_edges = bool(dedup_edges)
     validate_graph_edges = bool(validate_graph_edges)
     remove_self_loops = bool(remove_self_loops)
     relation_cleaning_enabled = bool(relation_cleaning_enabled)
-    inverse_enabled = inverse_relations_key_map is not None
+    inverse_enabled = inverse_relations_map is not None
     node_index: Dict[str, int] = {}
     node_entity_ids: List[int] = []
     node_embedding_ids: List[int] = []
@@ -1110,8 +1507,6 @@ def build_graph(
         relation_cleaning_rules,
         remove_self_loops=remove_self_loops,
         relation_cleaning_enabled=relation_cleaning_enabled,
-        time_relation_cfg=time_relation_cfg,
-        question_text=sample.question,
         anchor_entities=sample.q_entity,
         keep_anchor_edges=keep_start_adjacent_edges,
     )
@@ -1129,8 +1524,7 @@ def build_graph(
     if inverse_enabled:
         kept_edges = _expand_edges_with_inverse(
             kept_edges,
-            inverse_relations_key_map,
-            suffix=inverse_relations_suffix,
+            inverse_relations_map,
         )
     for h, r, t in kept_edges:
         edge_key = (h, r, t)
@@ -1138,13 +1532,10 @@ def build_graph(
             continue
         src_idx = local_index(h)
         dst_idx = local_index(t)
-        label = None
-        if inverse_enabled and inverse_relations_key_map is not None:
-            label = inverse_relations_key_map.get(r)
         if isinstance(relation_vocab, RelationLookup):
             rel_idx = relation_vocab.relation_id(r)
         else:
-            rel_idx = relation_vocab.relation_id(r, label=label)
+            rel_idx = relation_vocab.relation_id(r)
         edge_src.append(src_idx)
         edge_dst.append(dst_idx)
         edge_relation_ids.append(rel_idx)
@@ -1171,9 +1562,13 @@ def build_question_record(
     graph_id: str,
     *,
     question_emb: Optional[Sequence[float]] = None,
+    q_entities: Optional[Sequence[str]] = None,
+    a_entities: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
-    seed_entity_ids = [entity_vocab.entity_id(ent) for ent in sample.q_entity]
-    answer_entity_ids = [entity_vocab.entity_id(ent) for ent in sample.a_entity]
+    q_entities = list(sample.q_entity) if q_entities is None else list(q_entities)
+    a_entities = list(sample.a_entity) if a_entities is None else list(a_entities)
+    seed_entity_ids = [entity_vocab.entity_id(ent) for ent in q_entities]
+    answer_entity_ids = [entity_vocab.entity_id(ent) for ent in a_entities]
     record = {
         "question_uid": graph_id,
         "dataset": sample.dataset,

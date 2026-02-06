@@ -1,0 +1,11 @@
+# @package _global_
+#
+# DualFlow training with fixed prior_weight = 1.0.
+
+defaults:
+  - train_dual_flow_base
+  - _self_
+
+model:
+  runtime_cfg:
+    prior_weight_override: 1.0

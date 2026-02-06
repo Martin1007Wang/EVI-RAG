@@ -42,7 +42,8 @@ from src.utils import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _DUAL_FLOW_MODEL_TARGET = "src.models.dual_flow_module.DualFlowModule"
-_SUPPORTED_MODEL_TARGETS = {_DUAL_FLOW_MODEL_TARGET}
+_EDGE_RETRIEVER_TARGET = "src.models.edge_retriever_module.EdgeRetrieverModule"
+_SUPPORTED_MODEL_TARGETS = {_DUAL_FLOW_MODEL_TARGET, _EDGE_RETRIEVER_TARGET}
 
 
 def _validate_required_args(cfg: DictConfig) -> None:
@@ -63,7 +64,7 @@ def _validate_required_args(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required training inputs: "
             f"{missing_str}. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_dual_flow_p0_indegree dataset=webqsp-sub"
+            "Example: python src/train.py experiment=train_dual_flow_base dataset=webqsp-sub"
         )
 
 
@@ -110,7 +111,7 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
         elif isinstance(dataset_cfg, dict):
             dataset_name = str(dataset_cfg.get("name", "") or "")
         raise ValueError(
-            "Training scope violation: DualFlow training must use sub datasets only. "
+            "Training scope violation: supported training targets must use sub datasets only. "
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
         )
 
@@ -118,11 +119,8 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
 def _validate_cvt_requirements(cfg: DictConfig) -> None:
     model_cfg = cfg.get("model") or {}
     model_target = str(model_cfg.get("_target_", "") or "")
-    if model_target not in _SUPPORTED_MODEL_TARGETS:
+    if model_target != _DUAL_FLOW_MODEL_TARGET:
         return
-    cvt_cfg = model_cfg.get("cvt_init_cfg") or {}
-    if not bool(cvt_cfg.get("enabled", True)):
-        raise ValueError("cvt_init_cfg.enabled must be true; CVT initialization is mandatory.")
     dataset_cfg = cfg.get("dataset") or {}
     data_cfg = cfg.get("data") or {}
     data_dataset_cfg = None

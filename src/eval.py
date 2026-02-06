@@ -22,6 +22,7 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 _RUN_REQUIRES_CKPT_KIND = {
     "eval_dual_flow": "dual_flow",
+    "eval_edge_retriever": "edge_retriever",
 }
 
 _DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"

@@ -19,6 +19,7 @@ dataset_source: hf
 hf_dataset: ${dataset.hf_dataset}
 hf_cache_dir: ${paths.hf_datasets_cache}
 hf_offline: true
+pipeline_stage: all
 
 # === Stage 1: normalize raw parquet into retrieval parquet ===
 dataset_name: ${dataset.name}

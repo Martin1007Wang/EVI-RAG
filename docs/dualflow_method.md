@@ -42,7 +42,7 @@ A single `EmbeddingBackbone` produces node tokens for all computations:
 
 - node tokens: `prepared.node_tokens`
 
-Optional CVT initialization is applied before the GNN (`cvt_init_cfg.enabled`).
+CVT initialization is always applied before the GNN.
 
 ### 2.2 Start selector (learnable)
 
@@ -58,15 +58,17 @@ Code refs: `src/models/dual_flow_module.py` (`_build_start_selector`, `_select_s
 
 Code refs: `src/models/dual_flow_module.py` (`_build_forward_context`).
 
-### 2.4 Policies (SRM)
+### 2.4 Policies (Explicit Potential Difference)
 
-Forward policy is trainable and uses `SRM` (Semantic Residual Module) over edges:
+Forward policy is trainable but parameterized via a **state potential**:
 
-- `policy_fwd(context, head, relation, tail) -> logits`
+\[
+\logit(u\to v)= -\log d_{in}(v) + \alpha\,(\log F(v) - \log F(u))
+\]
+
+where $\log F(\cdot)$ is produced by `z_predictor` and $\alpha=\exp(\text{logit_scale})$ is a learnable scale.
 
 Backward policy is **static uniform** over inverse outgoing edges; it does not use a network.
-
-Code ref: `src/models/components/srm.py`.
 
 ### 2.5 LogZ predictor
 
@@ -93,13 +95,10 @@ Training samples two types of off-policy trajectories (both sampled under `torch
 - target set: `q_local_indices` (hit condition uses `node_is_start`)
 - transitions:
   - static PB: sample from uniform `P_B`
-- edge dropout: a per-batch Bernoulli mask `pb_edge_dropout` is applied to backward outgoing edges for both rollout and
-  DB evaluation
 
 Backward actions are mapped back to forward-edge ids via `edge_inverse_map` before computing the DB loss.
 
-Code refs: `src/models/dual_flow_module.py` (`_rollout_policy`, `_rollout_pb`, `_map_inverse_actions`,
-`_sample_pb_edge_dropout_mask`).
+Code refs: `src/models/dual_flow_module.py` (`_rollout_policy`, `_rollout_pb`, `_map_inverse_actions`).
 
 ### 3.3 How training mixes them (code-exact)
 
@@ -152,8 +151,6 @@ The backward policy is fixed **uniform** over inverse outgoing edges:
 - `logit_B(e) = 0` for all `e in Out_b(v)`
 - `P_B` is uniform over `Out_b(v)`; equivalently `log P_B = -log |Out_b(v)|`
 
-The only PB-related knob is `pb_edge_dropout` (applied to backward edges for rollout + DB evaluation).
-
 Implementation: `_compute_pb_logits`, `_compute_pb_log_prob`, `_rollout_pb`.
 
 ---
@@ -162,7 +159,6 @@ Implementation: `_compute_pb_logits`, `_compute_pb_log_prob`, `_rollout_pb`.
 
 Key knobs under `model.training_cfg.db_cfg`:
 
-- `pb_edge_dropout`
 - `sampling_temperature_start`, `sampling_temperature_end`
 - `dead_end_log_reward`, `dead_end_weight`
 

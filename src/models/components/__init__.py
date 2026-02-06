@@ -6,12 +6,12 @@ from .backbone import (
     CvtNodeInitializer,
     SinusoidalPositionalEncoding,
 )
-from .srm import SRM
+from .bilinear_step_scorer import BilinearStepScorer
 
 __all__ = [
     "SinusoidalPositionalEncoding",
     "EmbeddingBackbone",
     "CvtNodeInitializer",
     "LogZPredictor",
-    "SRM",
+    "BilinearStepScorer",
 ]

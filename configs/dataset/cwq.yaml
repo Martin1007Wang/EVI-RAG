@@ -16,3 +16,14 @@ filter_missing_answer:
   train: false
   validation: false
   test: false
+
+q_entity_blacklist:
+  - Country
+  - US State
+  - College/University
+  - UK constituent country
+  - Film
+  - Male
+  - Marriage
+  - United States Senator
+  - United States Senate

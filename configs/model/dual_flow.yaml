@@ -9,71 +9,54 @@ _recursive_: true
 
 hidden_dim: 1024
 emb_dim: 1024
-backbone_finetune: false
 gnn_layers: 2
-gnn_dropout: 0.0
-cvt_init_cfg:
-  enabled: true
+gnn_dropout: 0.1
 embedding_adapter_cfg:
-  enabled: true
   adapter_dim: 256
   dropout: 0.1
-actor_cfg:
-  edge_inter_dim: 256
-  edge_dropout: 0.1
-  use_spherical: true
-  temperature_init: 0.1
-  norm_eps: 1.0e-6
-  logit_scale_min: 1.0e-3
-  logit_scale_max: 50.0
 
 max_steps: ${dataset.max_steps}
 
 runtime_cfg:
-  validate_edge_batch: false
-  avoid_revisit: true
-  inverse_relation_suffix: "__inv"
-  strict_inverse: true
-  predict_mode: full
-  p0_cfg:
-    mode: degree
-    residual_enabled: true
-    temperature: 1.0
-    cosine_eps: 1.0e-6
+  avoid_revisit: false
+  stop_min_steps: 1
 
 optimizer_cfg:
   type: adamw
-  lr: 5.0e-5
+  lr: 4.0e-4
   weight_decay: 1.0e-4
-  auto_param_groups: true
-  param_group_overrides:
-    - names: ["*.logit_scale"]
-      weight_decay: 0.0
 
 scheduler_cfg:
-  type: ""
+  type: onecycle
+  interval: step
+  max_lr: 1.0e-4
+  pct_start: 0.3
 
 training_cfg:
   accumulate_grad_batches: 1
-  num_rollouts: 5
+  # Reduce rollout count for training throughput.
+  num_rollouts: 4
   # Manual optimization uses explicit clipping (Trainer gradient_clip_val is disabled).
   grad_clip_norm: 1.0
-  start_temperature_start: 1.0
-  start_temperature_end: 1.0
   db_cfg:
-    sampling_temperature_start: 1.5
-    sampling_temperature_end: 0.8
+    sampling_temperature_start: 2.5
+    sampling_temperature_end: 1.2
     # Cosine anneal grounding from soft -> hard to stabilize cold-start training.
     dead_end_log_reward_start: -10.0
-    dead_end_log_reward: -100.0
-    dead_end_weight: 1.0
-    pb_edge_dropout: 0.0
+    dead_end_log_reward: -25.0
+    emit_log_reward: -30.0
+    dead_end_weight: 0.5
 
 evaluation_cfg:
-  beam_size: 50
+  beam_size: 200
   diverse_beam:
     enabled: true
     groups: 4
     penalty: hard
     similarity: tail
     lambda: 1.0
+  answer_gain_stop:
+    enabled: true
+    patience: 5
+    epsilon: 0.0
+    min_beam: 1

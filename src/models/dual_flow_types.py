@@ -54,6 +54,7 @@ class _BeamState:
     flat_graph_ids: torch.Tensor
     flat_beam_ids: torch.Tensor
     beam_context: torch.Tensor
+    beam_prev_rel: torch.Tensor
     num_graphs: int
     beam_size: int
     max_steps: int

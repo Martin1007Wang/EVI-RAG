@@ -1,0 +1,45 @@
+# @package _global_
+#
+# Smoke test: overfit on validation split to check fitting quickly.
+
+defaults:
+  - override /callbacks: default
+  - override /logger: none
+  - override /trainer: gpu
+  - _self_
+
+train: true
+test: false
+
+optimized_metric: "val/${dataset.dataset_scope}/hit@beam"
+
+trainer:
+  max_epochs: 2
+  min_epochs: 1
+  check_val_every_n_epoch: 1
+  precision: 32
+  limit_train_batches: 10
+  limit_val_batches: 4
+  limit_test_batches: 0
+  num_sanity_val_steps: 0
+
+data:
+  batch_size: 8
+  num_workers: 0
+  train_shuffle: true
+  train_samples_per_epoch: 128
+  splits:
+    train: validation
+    validation: validation
+    test: validation
+
+model:
+  training_cfg:
+    accumulate_grad_batches: 1
+    num_rollouts: 1
+  evaluation_cfg:
+    beam_size: 20
+    diverse_beam:
+      enabled: false
+    answer_gain_stop:
+      enabled: false

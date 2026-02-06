@@ -1,31 +1,28 @@
 from __future__ import annotations
 
 _NEG_ONE = -1
+_NEG_TWO = -2
 _ZERO = 0
 _ONE = 1
 _TWO = 2
 _THREE = 3
 _SELF_RELATION_ID = -1
 _INVALID_EDGE_ID = -1
-
-_DEFAULT_INVERSE_REL_SUFFIX = "__inv"
-_DEFAULT_STRICT_INVERSE = True
+_STOP_ACTION_ID = _NEG_TWO
 
 _TERMINAL_NONE = 0
 _TERMINAL_HIT = 1
 _TERMINAL_DEAD_END = 2
 _TERMINAL_MAX_STEPS = 3
 _TERMINAL_INVALID_START = 4
+_TERMINAL_EMIT = 5
 
-_DEFAULT_BACKBONE_FINETUNE = True
-_DEFAULT_VALIDATE_EDGE_BATCH = False
 _DEFAULT_AVOID_REVISIT = True
 _DEFAULT_GNN_LAYERS = 2
-_DEFAULT_GNN_DROPOUT = 0.0
-_DEFAULT_EDGE_INTER_DIM = 256
-_DEFAULT_EDGE_DROPOUT = 0.1
-_DEFAULT_START_TEMPERATURE_START = 1.0
-_DEFAULT_START_TEMPERATURE_END = 1.0
+_DEFAULT_GNN_DROPOUT = 0.1
+_DEFAULT_LOGIT_SCALE_INIT = 2.3
+_DEFAULT_PRIOR_WEIGHT_INIT = 0.0
+_DEFAULT_STOP_ENABLED = True
 
 _DEFAULT_TRAIN_ROLLOUTS = 1
 _DB_CFG_KEYS = {
@@ -33,12 +30,13 @@ _DB_CFG_KEYS = {
     "sampling_temperature_end",
     "dead_end_log_reward",
     "dead_end_weight",
-    "pb_edge_dropout",
 }
 _DB_CFG_OPTIONAL_KEYS = {
     # Optional cosine-annealing schedule for dead-end grounding:
     # effective_dead_end_log_reward(progress) goes from start -> dead_end_log_reward.
     "dead_end_log_reward_start",
+    # Optional stronger penalty for false STOP (emit).
+    "emit_log_reward",
 }
 
 
@@ -69,38 +67,19 @@ _DEFAULT_DIVERSE_BEAM_PENALTY = "hard"
 _DIVERSE_BEAM_SIMILARITIES = {"tail", "edge", "source"}
 _DIVERSE_BEAM_PENALTIES = {"hard", "soft"}
 
-_P0_MODE_NONE = "none"
-_P0_MODE_DEGREE = "degree"
-_P0_MODE_INDEGREE = "indegree"
-_P0_MODE_PREFERENTIAL = "preferential"
-_P0_MODE_SEMANTIC = "semantic"
-_P0_MODES = {_P0_MODE_NONE, _P0_MODE_DEGREE, _P0_MODE_INDEGREE, _P0_MODE_PREFERENTIAL, _P0_MODE_SEMANTIC}
-_DEFAULT_P0_MODE = _P0_MODE_DEGREE
-_DEFAULT_P0_RESIDUAL = True
-_DEFAULT_P0_TEMPERATURE = 1.0
-_DEFAULT_P0_COSINE_EPS = 1.0e-6
-
-
 _STANDARD_TRAIN_METRICS = {
+    "db_loss",
     "rollout_success_rate",
     "rollout_length_mean",
+    "rollout_terminal_hit_rate",
     "rollout_terminal_dead_end_rate",
+    "rollout_terminal_invalid_start_rate",
+    "rollout_terminal_emit_rate",
     "rollout_terminal_max_steps_rate",
     "db_inv_edge_invalid_rate",
     "db_no_allowed_rate",
     "db_valid_step_rate",
-    "db_finite_pf_rate",
-    "db_finite_pb_rate",
-    "db_finite_z_u_rate",
-    "db_finite_z_v_rate",
-    "db_delta_var",
-    "logit_scale_max",
-    "policy_drift_abs",
-    "policy_drift_rms",
-    "policy_kl_p0",
     "policy_out_degree_mean",
-    "log_z_mean",
-    "log_z_std",
 }
 _STANDARD_EVAL_METRICS = {
     "hit@beam",
@@ -108,32 +87,18 @@ _STANDARD_EVAL_METRICS = {
     "precision@beam",
     "f1@beam",
     "diversity@beam",
+    "beam_size_adaptive",
     "modes@beam",
     "length_mean",
     "coverage_rate",
-    "retrieval_failure_rate",
     "rollout_success_rate",
+    "rollout_terminal_hit_rate",
     "rollout_terminal_dead_end_rate",
+    "rollout_terminal_invalid_start_rate",
+    "rollout_terminal_emit_rate",
     "rollout_terminal_max_steps_rate",
-    "db_loss",
-    "db_log_pb_mean",
-    "db_log_pb_min",
-    "db_log_z_u_mean",
-    "db_log_z_v_mean",
-    "db_delta_var",
-    "db_inv_edge_invalid_rate",
-    "db_no_allowed_rate",
-    "db_valid_step_rate",
-    "db_finite_pf_rate",
-    "db_finite_pb_rate",
-    "db_finite_z_u_rate",
-    "db_finite_z_v_rate",
-    "policy_drift_abs",
-    "policy_drift_rms",
-    "policy_kl_p0",
     "policy_out_degree_mean",
-    "log_z_mean",
-    "log_z_std",
+    "policy_tail_in_degree_mean",
 }
 _STANDARD_METRICS = {
     "train": _STANDARD_TRAIN_METRICS,
@@ -143,28 +108,26 @@ _STANDARD_METRICS = {
 
 __all__ = [
     "_NEG_ONE",
+    "_NEG_TWO",
     "_ZERO",
     "_ONE",
     "_TWO",
     "_THREE",
     "_SELF_RELATION_ID",
     "_INVALID_EDGE_ID",
-    "_DEFAULT_INVERSE_REL_SUFFIX",
-    "_DEFAULT_STRICT_INVERSE",
+    "_STOP_ACTION_ID",
     "_TERMINAL_NONE",
     "_TERMINAL_HIT",
     "_TERMINAL_DEAD_END",
     "_TERMINAL_MAX_STEPS",
     "_TERMINAL_INVALID_START",
-    "_DEFAULT_BACKBONE_FINETUNE",
-    "_DEFAULT_VALIDATE_EDGE_BATCH",
+    "_TERMINAL_EMIT",
     "_DEFAULT_AVOID_REVISIT",
     "_DEFAULT_GNN_LAYERS",
     "_DEFAULT_GNN_DROPOUT",
-    "_DEFAULT_EDGE_INTER_DIM",
-    "_DEFAULT_EDGE_DROPOUT",
-    "_DEFAULT_START_TEMPERATURE_START",
-    "_DEFAULT_START_TEMPERATURE_END",
+    "_DEFAULT_LOGIT_SCALE_INIT",
+    "_DEFAULT_PRIOR_WEIGHT_INIT",
+    "_DEFAULT_STOP_ENABLED",
     "_DEFAULT_TRAIN_ROLLOUTS",
     "_DB_CFG_KEYS",
     "_DB_CFG_OPTIONAL_KEYS",
@@ -193,16 +156,6 @@ __all__ = [
     "_DEFAULT_DIVERSE_BEAM_PENALTY",
     "_DIVERSE_BEAM_SIMILARITIES",
     "_DIVERSE_BEAM_PENALTIES",
-    "_P0_MODE_NONE",
-    "_P0_MODE_DEGREE",
-    "_P0_MODE_INDEGREE",
-    "_P0_MODE_PREFERENTIAL",
-    "_P0_MODE_SEMANTIC",
-    "_P0_MODES",
-    "_DEFAULT_P0_MODE",
-    "_DEFAULT_P0_RESIDUAL",
-    "_DEFAULT_P0_TEMPERATURE",
-    "_DEFAULT_P0_COSINE_EPS",
     "_STANDARD_TRAIN_METRICS",
     "_STANDARD_EVAL_METRICS",
     "_STANDARD_METRICS",

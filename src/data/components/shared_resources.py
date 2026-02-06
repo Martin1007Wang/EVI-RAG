@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import json
 
 import torch
 
@@ -63,16 +64,37 @@ class SharedDataResources:
             self._cvt_mask = _load_cvt_mask(self.entity_vocab_path)
         return self._cvt_mask
 
-    def relation_inverse_assets(self, *, suffix: Optional[str] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def relation_inverse_assets(
+        self,
+        *,
+        suffix: Optional[str] = None,
+        mapping_path: Optional[Path] = None,
+        prefix: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         suffix_val = _INVERSE_RELATION_SUFFIX_DEFAULT if suffix is None else str(suffix)
         suffix_val = suffix_val.strip()
         if not suffix_val:
             raise ValueError("inverse_relation_suffix must be a non-empty string.")
-        cached = self._relation_inverse_cache.get(suffix_val)
+        map_path = mapping_path
+        if map_path is None:
+            candidate = self.relation_vocab_path.parent / "inverse_relations.json"
+            if candidate.exists():
+                map_path = candidate
+        prefix_val = "" if prefix is None else str(prefix).strip()
+        cache_key = (str(map_path) if map_path is not None else "", prefix_val, suffix_val)
+        cached = self._relation_inverse_cache.get(cache_key)
         if cached is not None:
             return cached
-        assets = _load_relation_inverse_assets(self.relation_vocab_path, suffix=suffix_val)
-        self._relation_inverse_cache[suffix_val] = assets
+        if map_path is not None and map_path.exists():
+            assets = _load_relation_inverse_assets_from_mapping(
+                self.relation_vocab_path,
+                mapping_path=map_path,
+                prefix=prefix_val,
+                suffix=suffix_val,
+            )
+        else:
+            assets = _load_relation_inverse_assets(self.relation_vocab_path, suffix=suffix_val)
+        self._relation_inverse_cache[cache_key] = assets
         return assets
 
     def clear(self) -> None:
@@ -165,4 +187,107 @@ def _load_relation_inverse_assets(path: Path, *, suffix: str) -> tuple[torch.Ten
             inverse_map[int(rel_id)] = int(inv_id)
         if kg_id.endswith(suffix_val):
             inverse_mask[int(rel_id)] = True
+    return inverse_map, inverse_mask
+
+
+def _load_relation_inverse_assets_from_mapping(
+    relation_vocab_path: Path,
+    *,
+    mapping_path: Path,
+    prefix: str,
+    suffix: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not relation_vocab_path.exists():
+        raise FileNotFoundError(f"relation_vocab.parquet not found: {relation_vocab_path}")
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"inverse_relations.json not found: {mapping_path}")
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("pyarrow is required to load relation_vocab.parquet.") from exc
+    table = pq.read_table(relation_vocab_path, columns=["relation_id", "kg_id"])
+    relation_ids = torch.as_tensor(table.column("relation_id").to_numpy(), dtype=torch.long)
+    kg_ids = [str(val) for val in table.column("kg_id").to_pylist()]
+    if relation_ids.numel() == _ZERO:
+        raise ValueError("relation_vocab.parquet is empty.")
+    max_id = int(relation_ids.max().detach().tolist())
+    if max_id < _ZERO:
+        raise ValueError("relation_vocab.parquet contains negative relation_id values.")
+    vocab_size = max_id + _ONE
+    id_lookup = {kg_id: int(rel_id) for rel_id, kg_id in zip(relation_ids.tolist(), kg_ids)}
+
+    payload = json.loads(mapping_path.read_text(encoding="utf-8"))
+    inner = payload.get("inverse_relations", payload)
+    entries: list[dict[str, str]] = []
+    if isinstance(inner, list):
+        for item in inner:
+            if isinstance(item, dict) and item.get("forward") and item.get("inverse_relation"):
+                entries.append(
+                    {
+                        "forward": str(item["forward"]),
+                        "inverse_relation": str(item["inverse_relation"]),
+                    }
+                )
+    elif isinstance(inner, dict):
+        for key, value in inner.items():
+            if isinstance(value, dict):
+                inv = value.get("inverse_relation")
+                if inv:
+                    entries.append({"forward": str(key), "inverse_relation": str(inv)})
+    else:
+        raise ValueError("inverse_relations payload must be a dict or list.")
+    if not entries:
+        raise ValueError("inverse_relations mapping is empty.")
+
+    forward_set = {entry["forward"] for entry in entries}
+    kg_id_set = set(kg_ids)
+
+    inverse_map = torch.full((vocab_size,), _INVALID_RELATION_ID, dtype=torch.long)
+    inverse_mask = torch.zeros((vocab_size,), dtype=torch.bool)
+
+    pair_seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        fwd = entry["forward"]
+        inv = entry["inverse_relation"]
+        if inv == fwd:
+            candidate = f"{prefix}{fwd}" if prefix else None
+            if candidate and candidate in kg_id_set:
+                inv = candidate
+            else:
+                matches = [
+                    kg for kg in kg_id_set if kg != fwd and kg.endswith(fwd) and (not prefix or kg.startswith(prefix))
+                ]
+                if len(matches) == 1:
+                    inv = matches[0]
+                else:
+                    continue
+        f_id = id_lookup.get(fwd)
+        inv_id = id_lookup.get(inv)
+        if f_id is None or inv_id is None:
+            candidate = f"{prefix}{fwd}" if prefix else None
+            if candidate and candidate in id_lookup:
+                inv = candidate
+                inv_id = id_lookup.get(inv)
+            if f_id is None or inv_id is None:
+                raise ValueError(f"inverse_relations mapping not found in relation_vocab: {fwd!r} -> {inv!r}")
+        if int(f_id) == int(inv_id):
+            continue
+        if inverse_map[int(f_id)] not in (_INVALID_RELATION_ID, int(inv_id)):
+            raise ValueError(f"inverse_relations conflict for {fwd!r}.")
+        if inverse_map[int(inv_id)] not in (_INVALID_RELATION_ID, int(f_id)):
+            raise ValueError(f"inverse_relations conflict for {inv!r}.")
+        inverse_map[int(f_id)] = int(inv_id)
+        inverse_map[int(inv_id)] = int(f_id)
+        if inv not in forward_set:
+            inverse_mask[int(inv_id)] = True
+            continue
+        a, b = (fwd, inv) if fwd < inv else (inv, fwd)
+        if (a, b) in pair_seen:
+            continue
+        pair_seen.add((a, b))
+        inverse_choice = b
+        inv_choice_id = id_lookup.get(inverse_choice)
+        if inv_choice_id is not None:
+            inverse_mask[int(inv_choice_id)] = True
+
     return inverse_map, inverse_mask

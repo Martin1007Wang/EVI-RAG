@@ -646,7 +646,7 @@ python src/eval.py experiment=eval_dual_flow dataset=webqsp ckpt.dual_flow=/path
 python src/eval.py experiment=eval_dual_flow dataset=webqsp ckpt.dual_flow=/path/to/dual_flow.ckpt \
   model.evaluation_cfg.num_eval_rollouts=1 model.evaluation_cfg.rollout_temperature=0.0
 
-# LLM 评测：基于 eval_dual_flow rollouts 生成最终答案（两种模式）
+# LLM 评测（SubgraphRAG 对齐）：基于 eval_dual_flow rollouts 生成最终答案（ICL + dc；输出 SubgraphRAG 风格指标 llm/subgraphrag/*）
 #
 # (1) 本地 vLLM（需要安装 vllm，并可访问 GPU）
 python src/eval.py experiment=eval_llm dataset=webqsp llm.provider=vllm
@@ -655,8 +655,8 @@ python src/eval.py experiment=eval_llm dataset=webqsp llm.provider=vllm
 OPENAI_API_KEY=... python src/eval.py experiment=eval_llm dataset=webqsp llm.provider=openai llm.batch_size=1
 
 # 输出：
-# - 预测：`${dataset.artifact_dir}/eval_llm/{split}_k{k}_{provider}.jsonl`
-# - 指标：`${dataset.artifact_dir}/eval_llm/{split}_k{k}_{provider}.metrics.json`（llm hit/micro_f1/macro_f1 + retrieval context 指标）
+# - 预测：`${paths.output_dir}/eval_llm/${llm.input_subdir}/{split}_k{k}_{provider}.jsonl`
+# - 指标：`${paths.output_dir}/eval_llm/${llm.input_subdir}/{split}_k{k}_{provider}.metrics.json`（llm/subgraphrag/full/* 与 llm/subgraphrag/sub/*，对齐 SubgraphRAG/reason/main.py）
 ```
 
 </details>

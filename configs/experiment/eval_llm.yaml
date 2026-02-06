@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Experiment: LLM inference over eval_dual_flow rollouts.
+# Experiment: SubgraphRAG-aligned LLM reasoning over eval_dual_flow rollouts.
 
 defaults:
   - override /callbacks: default
@@ -16,7 +16,8 @@ llm:
   input_path: null
   output_dir: null
   input_subdir: eval_dual_flow
-  output_subdir: eval_llm
+  # Separate outputs by retrieval source (e.g., eval_dual_flow vs eval_edge_retriever).
+  output_subdir: eval_llm/${llm.input_subdir}
   output_filename_template: "{split}_k{k}_{provider}.jsonl"
   compute_metrics: true
   metrics_filename_template: "{split}_k{k}_{provider}.metrics.json"
@@ -31,16 +32,25 @@ llm:
     include_raw_response: true
     debug_only_on_empty: false
   schema:
-    enabled: true
-    max_retries: 4
+    # Disabled: SubgraphRAG-style prompts do not return JSON.
+    enabled: false
+    max_retries: 0
     allow_coerce: true
     max_retry_chars: 2000
   prompt:
-    system: "You are a KGQA assistant. Use only the provided trajectories. Never refuse. Output JSON only."
+    # SubgraphRAG-style: ICL + double-check retry, expects "ans:" lines.
+    mode: subgraphrag_icl_dc
+    # Use built-in SubgraphRAG ICL prompts when null.
+    system: null
+    cot_prompt: null
+    icl_user_prompt: null
+    icl_assistant_prompt: null
     answer_key: "answer"
     answer_separator: " | "
     allow_empty: false
     max_prompt_chars: 32000
+    # Retrieval window size. For DualFlow this is the number of *paths* (trajectories);
+    # for edge retriever this is the number of *triples* (each trajectory is a single edge).
     max_trajectories: 100
     max_candidates: 100
   vllm:

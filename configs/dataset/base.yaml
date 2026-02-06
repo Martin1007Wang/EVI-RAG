@@ -35,9 +35,9 @@ text_regex: "^(?!m\\.|g\\.).*"
 cvt_entity_mode: prefix_allowlist
 cvt_prefixes: ["m.", "g."]
 cvt_regex: null
-time_relation_mode: question_gated
-time_relation_regex: '(?:^|\\.)time(?:\\.|$)|(?:^|\\.)date(?:\\.|$)|(?:^|\\.)year(?:\\.|$)'
-time_question_regex: '\\bwhen\\b|\\bwhat\\s+year\\b|\\bwhich\\s+year\\b|\\bwhat\\s+date\\b|\\bwhich\\s+date\\b|\\bhow\\s+old\\b|\\bborn\\b|\\bbirth\\b|\\bdied\\b|\\bfounded\\b|\\bestablished\\b|\\breleased\\b|\\bpremiered\\b|\\byear\\b|\\bdate\\b|\\btime\\b'
+time_relation_mode: keep
+time_relation_regex: null
+time_question_regex: null
 
 column_map:
   question_id_field: id

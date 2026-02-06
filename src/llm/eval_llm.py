@@ -67,14 +67,19 @@ _FIELD_BEST_GUESS = "best_guess"
 _FIELD_JUSTIFICATION = "justification"
 _FIELD_SCHEMA_VALID = "schema_valid"
 _FIELD_SCHEMA_RETRIES = "schema_retries"
+_FIELD_DC_RETRIES = "dc_retries"
 
 _LOG_PROGRESS_EVERY = 200
 
 _FREEBASE_ID_RE = re.compile(r"^[mg]\\.[0-9a-z_]+$", flags=re.IGNORECASE)
 
+_PROMPT_MODE_JSON_SCHEMA = "json_schema"
+_PROMPT_MODE_SUBGRAPHRAG_ICL_DC = "subgraphrag_icl_dc"
+
 
 @dataclass(frozen=True)
 class PromptSpec:
+    mode: str
     system: str
     answer_key: str
     answer_separator: str
@@ -82,6 +87,9 @@ class PromptSpec:
     max_prompt_chars: int
     max_trajectories: int
     max_candidates: int
+    icl_user_prompt: str
+    icl_assistant_prompt: str
+    cot_prompt: str
 
 
 @dataclass(frozen=True)
@@ -176,7 +184,14 @@ def _resolve_provider_list(llm_cfg: Any) -> List[str]:
 
 def _resolve_prompt_spec(llm_cfg: Any) -> PromptSpec:
     prompt_cfg = llm_cfg.get("prompt") or {}
+    mode = str(prompt_cfg.get("mode") or _PROMPT_MODE_JSON_SCHEMA).strip()
+    if mode not in {_PROMPT_MODE_JSON_SCHEMA, _PROMPT_MODE_SUBGRAPHRAG_ICL_DC}:
+        raise ValueError(f"Unsupported llm.prompt.mode: {mode}")
     system = str(prompt_cfg.get("system") or "").strip()
+    if not system and mode == _PROMPT_MODE_SUBGRAPHRAG_ICL_DC:
+        from src.llm.subgraphrag_prompts import DEFAULT_SUBGRAPHRAG_ICL_SYSTEM
+
+        system = DEFAULT_SUBGRAPHRAG_ICL_SYSTEM
     if not system:
         raise ValueError("llm.prompt.system must be a non-empty string.")
     answer_key = str(prompt_cfg.get("answer_key") or _DEFAULT_ANSWER_KEY).strip()
@@ -191,7 +206,25 @@ def _resolve_prompt_spec(llm_cfg: Any) -> PromptSpec:
         raise ValueError("llm.prompt.max_trajectories must be >= 0.")
     if max_candidates < _ZERO:
         raise ValueError("llm.prompt.max_candidates must be >= 0.")
+
+    icl_user_prompt = str(prompt_cfg.get("icl_user_prompt") or "").strip()
+    icl_assistant_prompt = str(prompt_cfg.get("icl_assistant_prompt") or "").strip()
+    cot_prompt = str(prompt_cfg.get("cot_prompt") or "").strip()
+    if mode == _PROMPT_MODE_SUBGRAPHRAG_ICL_DC:
+        from src.llm.subgraphrag_prompts import (
+            DEFAULT_SUBGRAPHRAG_ICL_ASSISTANT,
+            DEFAULT_SUBGRAPHRAG_ICL_COT,
+            DEFAULT_SUBGRAPHRAG_ICL_USER,
+        )
+
+        if not icl_user_prompt:
+            icl_user_prompt = DEFAULT_SUBGRAPHRAG_ICL_USER
+        if not icl_assistant_prompt:
+            icl_assistant_prompt = DEFAULT_SUBGRAPHRAG_ICL_ASSISTANT
+        if not cot_prompt:
+            cot_prompt = DEFAULT_SUBGRAPHRAG_ICL_COT
     return PromptSpec(
+        mode=mode,
         system=system,
         answer_key=answer_key,
         answer_separator=answer_separator,
@@ -199,6 +232,9 @@ def _resolve_prompt_spec(llm_cfg: Any) -> PromptSpec:
         max_prompt_chars=max_prompt_chars,
         max_trajectories=max_trajectories,
         max_candidates=max_candidates,
+        icl_user_prompt=icl_user_prompt,
+        icl_assistant_prompt=icl_assistant_prompt,
+        cot_prompt=cot_prompt,
     )
 
 
@@ -229,6 +265,19 @@ def _resolve_schema_spec(llm_cfg: Any, prompt_spec: PromptSpec) -> SchemaSpec:
         raise ValueError("llm.schema.max_retries must be >= 0.")
     if max_retry_chars < _ZERO:
         raise ValueError("llm.schema.max_retry_chars must be >= 0.")
+    if prompt_spec.mode != _PROMPT_MODE_JSON_SCHEMA:
+        if enabled:
+            log_event(log, "llm_schema_disabled_for_prompt_mode", prompt_mode=prompt_spec.mode)
+        return SchemaSpec(
+            enabled=False,
+            max_retries=max_retries,
+            allow_coerce=allow_coerce,
+            max_retry_chars=max_retry_chars,
+            retry_message=retry_message,
+            schema=None,
+            schema_json="",
+            validator=None,
+        )
     if not enabled:
         return SchemaSpec(
             enabled=False,
@@ -458,9 +507,14 @@ def _iter_requests(
             break
         question = str(record.get(_FIELD_QUESTION) or "")
         rollouts = record.get(_FIELD_ROLLOUTS) or []
-        trajectories = _select_trajectories(rollouts, top_k, max_trajectories=prompt_spec.max_trajectories)
+        trajectories = _select_trajectories(
+            rollouts,
+            top_k,
+            max_trajectories=prompt_spec.max_trajectories,
+            include_score=(prompt_spec.mode == _PROMPT_MODE_JSON_SCHEMA),
+        )
         if prompt_spec.max_prompt_chars > _ZERO:
-            trajectories = _trim_trajectories_for_prompt(question, trajectories, prompt_spec)
+            trajectories = _trim_context_for_prompt(question, trajectories, prompt_spec)
         messages = _build_messages(question, trajectories, prompt_spec)
         processed += _ONE
         yield _LLMRequest(sample_id=sample_id, question=question, trajectories=list(trajectories), messages=messages)
@@ -475,7 +529,13 @@ def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
             yield json.loads(line)
 
 
-def _select_trajectories(rollouts: Sequence[Dict[str, Any]], top_k: int, *, max_trajectories: int) -> List[str]:
+def _select_trajectories(
+    rollouts: Sequence[Dict[str, Any]],
+    top_k: int,
+    *,
+    max_trajectories: int,
+    include_score: bool,
+) -> List[str]:
     sorted_rollouts = sorted(
         rollouts,
         key=lambda r: (float(r.get(_FIELD_SCORE, _NEG_INF)), int(r.get(_FIELD_ROLLOUT_INDEX, _ZERO))),
@@ -490,17 +550,20 @@ def _select_trajectories(rollouts: Sequence[Dict[str, Any]], top_k: int, *, max_
         traj = _trajectory_text(rollout)
         if not traj:
             continue
-        # Expose rollout score to the model: higher-scoring trajectories are generally more trustworthy.
-        score = rollout.get(_FIELD_SCORE)
-        if score is None:
+        if include_score:
+            # Expose rollout score to the model: higher-scoring trajectories are generally more trustworthy.
+            score = rollout.get(_FIELD_SCORE)
+            if score is None:
+                out.append(traj)
+                continue
+            try:
+                score_val = float(score)
+            except Exception:
+                out.append(traj)
+                continue
+            out.append(f"[score={score_val:.6g}] {traj}")
+        else:
             out.append(traj)
-            continue
-        try:
-            score_val = float(score)
-        except Exception:
-            out.append(traj)
-            continue
-        out.append(f"[score={score_val:.6g}] {traj}")
     return out
 
 
@@ -535,6 +598,12 @@ def _edge_to_text(edge: Dict[str, Any]) -> str:
     return f"{src} --{rel}--> {dst}"
 
 
+def _trim_context_for_prompt(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> List[str]:
+    if prompt.mode == _PROMPT_MODE_SUBGRAPHRAG_ICL_DC:
+        return _trim_trajectories_for_subgraphrag_prompt(question, trajectories, prompt)
+    return _trim_trajectories_for_prompt(question, trajectories, prompt)
+
+
 def _trim_trajectories_for_prompt(
     question: str,
     trajectories: Sequence[str],
@@ -550,6 +619,26 @@ def _trim_trajectories_for_prompt(
         total_chars = len(prompt.system) + len(user_text)
         if total_chars > max_chars:
             # Skip a single oversized trajectory instead of dropping all remaining ones.
+            continue
+        kept = candidate
+    return kept
+
+
+def _trim_trajectories_for_subgraphrag_prompt(
+    question: str,
+    trajectories: Sequence[str],
+    prompt: PromptSpec,
+) -> List[str]:
+    max_chars = int(prompt.max_prompt_chars)
+    if max_chars <= _ZERO:
+        return list(trajectories)
+    kept: List[str] = []
+    base_chars = len(prompt.system) + len(prompt.icl_user_prompt) + len(prompt.icl_assistant_prompt) + len(prompt.cot_prompt)
+    for traj in trajectories:
+        candidate = kept + [traj]
+        user_text = _build_subgraphrag_user_text(question, candidate, prompt)
+        total_chars = int(base_chars) + len(user_text)
+        if total_chars > max_chars:
             continue
         kept = candidate
     return kept
@@ -662,11 +751,77 @@ def _build_user_text(question: str, trajectories: Sequence[str], prompt: PromptS
 
 
 def _build_messages(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> List[Dict[str, str]]:
+    if prompt.mode == _PROMPT_MODE_SUBGRAPHRAG_ICL_DC:
+        return _build_subgraphrag_messages(question, trajectories, prompt)
+    return _build_json_messages(question, trajectories, prompt)
+
+
+def _build_json_messages(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> List[Dict[str, str]]:
     user_text = _build_user_text(question, trajectories, prompt)
+    return [{"role": "system", "content": prompt.system}, {"role": "user", "content": user_text}]
+
+
+def _build_subgraphrag_messages(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> List[Dict[str, str]]:
+    user_text = _build_subgraphrag_user_text(question, trajectories, prompt)
     return [
         {"role": "system", "content": prompt.system},
+        {"role": "user", "content": prompt.icl_user_prompt},
+        {"role": "assistant", "content": prompt.icl_assistant_prompt},
         {"role": "user", "content": user_text},
     ]
+
+
+def _build_subgraphrag_user_text(question: str, trajectories: Sequence[str], prompt: PromptSpec) -> str:
+    triplet_lines = _extract_subgraphrag_triplet_lines_from_trajectories(trajectories)
+    lines = ["Triplets:"]
+    if triplet_lines:
+        lines.extend(triplet_lines)
+    else:
+        lines.append("(none)")
+    lines.extend(["", "", "Question:", str(question or "").strip()])
+    return "\n".join(lines)
+
+
+def _extract_subgraphrag_triplet_lines_from_trajectories(trajectories: Sequence[str]) -> List[str]:
+    """Extract SubgraphRAG-style `(h,r,t)` lines from retrieval elements.
+
+    Important: retrieval elements are *paths* for DualFlow and *triples* for edge retriever.
+    We therefore group triplets by trajectory and insert a blank line between elements so that
+    later token-budget trimming can drop whole retrieval elements without cutting inside a path.
+    """
+
+    out: List[str] = []
+    for traj in trajectories:
+        cleaned = _strip_score_prefix(str(traj or ""))
+        sanitized = _sanitize_trajectory_for_prompt(cleaned)
+        segments = [s.strip() for s in sanitized.split(" ; ") if s.strip()]
+        group_lines: List[str] = []
+        for seg in segments:
+            parsed = _try_parse_edge_segment(seg)
+            if parsed is None:
+                continue
+            src, rel, dst = parsed
+            if str(rel).strip().upper() in {"SELF", "STOP"}:
+                continue
+            if str(src).strip() == "(no_edge)":
+                continue
+            group_lines.append(f"({src},{rel},{dst})")
+        if group_lines:
+            out.extend(group_lines)
+            out.append("")
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def _strip_score_prefix(text: str) -> str:
+    raw = str(text or "").lstrip()
+    if not raw.startswith("[score="):
+        return raw
+    end = raw.find("] ")
+    if end < _ZERO:
+        return raw
+    return raw[end + len("] ") :].lstrip()
 
 
 def _extract_destination_candidates(trajectories: Sequence[str], *, max_candidates: int) -> List[str]:
@@ -806,6 +961,15 @@ def _flush_batch(
     output_spec: OutputSpec,
     schema_spec: SchemaSpec,
 ) -> int:
+    if prompt_spec.mode == _PROMPT_MODE_SUBGRAPHRAG_ICL_DC:
+        return _flush_batch_subgraphrag(
+            backend=backend,
+            batch_items=batch_items,
+            f_out=f_out,
+            prompt_spec=prompt_spec,
+            output_spec=output_spec,
+            schema_spec=schema_spec,
+        )
     messages_batch = [item.messages for item in batch_items]
     responses = backend.generate(messages_batch)
     responses = [(response or "").strip() for response in responses]
@@ -862,10 +1026,58 @@ def _flush_batch(
     return written
 
 
+def _flush_batch_subgraphrag(
+    *,
+    backend: "_LLMBackend",
+    batch_items: List[_LLMRequest],
+    f_out,
+    prompt_spec: PromptSpec,
+    output_spec: OutputSpec,
+    schema_spec: SchemaSpec,
+) -> int:
+    messages_batch = [item.messages for item in batch_items]
+    responses = backend.generate(messages_batch)
+    responses = [(response or "").strip() for response in responses]
+    dc_retries = [0 for _ in batch_items]
+    retry_idx = [idx for idx, resp in enumerate(responses) if _needs_subgraphrag_dc_retry(resp)]
+    if retry_idx and prompt_spec.cot_prompt.strip():
+        retry_messages = [
+            batch_items[idx].messages + [{"role": "user", "content": prompt_spec.cot_prompt}] for idx in retry_idx
+        ]
+        retry_outputs = backend.generate(retry_messages)
+        for idx, output in zip(retry_idx, retry_outputs):
+            responses[idx] = (output or "").strip()
+            dc_retries[idx] = _ONE
+
+    parsed_list = [_parse_and_validate_response(response, prompt_spec, schema_spec) for response in responses]
+    written = _ZERO
+    for request, raw_response, parsed, retries in zip(batch_items, responses, parsed_list, dc_retries):
+        answer_raw = (parsed.answer or "").strip()
+        extra = _build_output_extra(request, answer_raw, raw_response, output_spec, schema_meta={_FIELD_DC_RETRIES: retries})
+        _write_answer(f_out, request.sample_id, answer_raw, prompt_spec.answer_key, extra=extra)
+        written += _ONE
+    return written
+
+
+def _needs_subgraphrag_dc_retry(response: str) -> bool:
+    raw = str(response or "").strip().lower()
+    if not raw:
+        return True
+    if "ans:" not in raw:
+        return True
+    if "ans: not available" in raw:
+        return True
+    if "ans: no information available" in raw:
+        return True
+    return False
+
+
 def _parse_response(response: str, prompt: PromptSpec) -> str:
     raw = (response or "").strip()
     if not raw:
         return ""
+    if prompt.mode == _PROMPT_MODE_SUBGRAPHRAG_ICL_DC:
+        return _parse_subgraphrag_answer(raw, prompt)
     payload = _parse_json_payload(raw)
     if payload is not None:
         return _extract_answer_from_payload(payload, prompt, raw)
@@ -875,6 +1087,44 @@ def _parse_response(response: str, prompt: PromptSpec) -> str:
         return _extract_answer_from_payload(fragment, prompt, raw)
 
     return raw
+
+
+def _parse_subgraphrag_answer(response: str, prompt: PromptSpec) -> str:
+    lines = _subgraphrag_get_pred_lines(str(response or ""))
+    if not lines:
+        return ""
+    answers: List[str] = []
+    for line in lines:
+        lower = line.lower()
+        idx = lower.find("ans:")
+        token = line[idx + len("ans:") :] if idx >= _ZERO else line
+        token = token.strip()
+        if token:
+            answers.append(token)
+    return prompt.answer_separator.join(answers)
+
+
+def _subgraphrag_get_pred_lines(prediction: str) -> List[str]:
+    raw = str(prediction or "")
+    candidates = [p for p in raw.split("\n") if "ans:" in p and "none" not in p.lower()]
+    if candidates:
+        candidates = [
+            p
+            for p in candidates
+            if "ans: not available" not in p.lower() and "ans: no information available" not in p.lower()
+        ]
+    return _remove_duplicates_preserve_order(candidates)
+
+
+def _remove_duplicates_preserve_order(values: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def _parse_and_validate_response(
@@ -1147,6 +1397,219 @@ def _build_backend(provider: str, provider_cfg: Any, llm_cfg: Any) -> _LLMBacken
     raise ValueError(f"Unsupported provider: {provider}")
 
 
+_VLLM_PROMPT_TOO_LONG_MARKERS = ("longer than the maximum model length", "maximum model length")
+
+
+def _is_vllm_prompt_too_long_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    if not text:
+        return False
+    if "prompt" not in text:
+        return False
+    return any(marker in text for marker in _VLLM_PROMPT_TOO_LONG_MARKERS)
+
+
+def _infer_vllm_max_model_len(llm: Any) -> Optional[int]:
+    engine = getattr(llm, "llm_engine", None)
+    cfg = getattr(engine, "model_config", None) if engine is not None else None
+    value = getattr(cfg, "max_model_len", None) if cfg is not None else None
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _count_vllm_chat_tokens(tokenizer: Any, messages: List[Dict[str, str]]) -> Optional[int]:
+    if tokenizer is None:
+        return None
+    try:
+        tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    except Exception:
+        try:
+            rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            return None
+        try:
+            tokens = tokenizer.encode(rendered)
+        except Exception:
+            return None
+    if hasattr(tokens, "shape"):
+        try:
+            return int(tokens.shape[-1])
+        except Exception:
+            return None
+    try:
+        return int(len(tokens))
+    except Exception:
+        return None
+
+
+def _find_last_user_message(messages: Sequence[Dict[str, str]]) -> Optional[int]:
+    for idx in range(len(messages) - 1, -1, -1):
+        role = str(messages[idx].get("role") or "").strip().lower()
+        if role == "user":
+            return idx
+    return None
+
+
+def _parse_subgraphrag_user_content(content: str) -> Optional[Tuple[List[str], str]]:
+    lines = [str(line) for line in str(content or "").splitlines()]
+    try:
+        triplets_idx = lines.index("Triplets:")
+    except ValueError:
+        return None
+    try:
+        question_idx = lines.index("Question:")
+    except ValueError:
+        return None
+    if question_idx <= triplets_idx:
+        return None
+    raw_triplets = lines[triplets_idx + 1 : question_idx]
+    triplets: List[str] = []
+    for line in raw_triplets:
+        stripped = str(line or "").strip()
+        if stripped == "(none)":
+            continue
+        if not stripped:
+            # Preserve a single blank-line separator between retrieval elements.
+            if triplets and triplets[-1] != "":
+                triplets.append("")
+            continue
+        triplets.append(stripped)
+    while triplets and triplets[-1] == "":
+        triplets.pop()
+    question = lines[question_idx + 1].strip() if question_idx + 1 < len(lines) else ""
+    return triplets, question
+
+
+def _format_subgraphrag_user_content(triplets: Sequence[str], question: str) -> str:
+    triplet_lines = list(triplets) if triplets else ["(none)"]
+    lines = ["Triplets:", *triplet_lines, "", "", "Question:", str(question or "").strip()]
+    return "\n".join(lines)
+
+
+def _replace_message_content(messages: Sequence[Dict[str, str]], idx: int, content: str) -> List[Dict[str, str]]:
+    out = [dict(m) for m in messages]
+    out[idx] = dict(out[idx])
+    out[idx]["content"] = content
+    return out
+
+
+def _trim_subgraphrag_messages_to_budget(
+    messages: Sequence[Dict[str, str]],
+    *,
+    user_idx: int,
+    triplets: List[str],
+    question: str,
+    tokenizer: Any,
+    budget: int,
+) -> List[Dict[str, str]]:
+    if budget <= _ZERO:
+        return [dict(m) for m in messages]
+
+    def _split_groups(lines: Sequence[str]) -> List[List[str]]:
+        groups: List[List[str]] = []
+        current: List[str] = []
+        for line in lines:
+            if not str(line).strip():
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
+            current.append(str(line))
+        if current:
+            groups.append(current)
+        return groups
+
+    def _flatten_groups(groups: Sequence[Sequence[str]]) -> List[str]:
+        flattened: List[str] = []
+        for idx, group in enumerate(groups):
+            flattened.extend([str(x) for x in group if str(x).strip()])
+            if idx < len(groups) - 1:
+                flattened.append("")
+        return flattened
+
+    groups = _split_groups(triplets)
+    lo = 0
+    hi = len(groups)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        content = _format_subgraphrag_user_content(_flatten_groups(groups[:mid]), question)
+        candidate = _replace_message_content(messages, user_idx, content)
+        tokens = _count_vllm_chat_tokens(tokenizer, candidate)
+        if tokens is not None and tokens <= budget:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    final_content = _format_subgraphrag_user_content(_flatten_groups(groups[:best]), question)
+    return _replace_message_content(messages, user_idx, final_content)
+
+
+def _trim_last_user_suffix_to_budget(
+    messages: Sequence[Dict[str, str]],
+    *,
+    user_idx: int,
+    tokenizer: Any,
+    budget: int,
+) -> List[Dict[str, str]]:
+    if budget <= _ZERO:
+        return [dict(m) for m in messages]
+    original = str(messages[user_idx].get("content") or "")
+    if not original:
+        return [dict(m) for m in messages]
+    lo = 1
+    hi = len(original)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        suffix = original[-mid:]
+        candidate = _replace_message_content(messages, user_idx, suffix)
+        tokens = _count_vllm_chat_tokens(tokenizer, candidate)
+        if tokens is not None and tokens <= budget:
+            best = suffix
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if not best:
+        best = original[-1:]
+    return _replace_message_content(messages, user_idx, best)
+
+
+def _trim_messages_to_vllm_budget(
+    messages: Sequence[Dict[str, str]],
+    *,
+    tokenizer: Any,
+    budget: int,
+) -> List[Dict[str, str]]:
+    copied = [dict(m) for m in messages]
+    current_tokens = _count_vllm_chat_tokens(tokenizer, copied)
+    if current_tokens is None or current_tokens <= budget:
+        return copied
+    user_idx = _find_last_user_message(copied)
+    if user_idx is None:
+        return copied
+    parsed = _parse_subgraphrag_user_content(str(copied[user_idx].get("content") or ""))
+    if parsed is None:
+        return _trim_last_user_suffix_to_budget(copied, user_idx=user_idx, tokenizer=tokenizer, budget=budget)
+    triplets, question = parsed
+    trimmed = _trim_subgraphrag_messages_to_budget(
+        copied,
+        user_idx=user_idx,
+        triplets=triplets,
+        question=question,
+        tokenizer=tokenizer,
+        budget=budget,
+    )
+    tokens = _count_vllm_chat_tokens(tokenizer, trimmed)
+    if tokens is None or tokens <= budget:
+        return trimmed
+    return _trim_last_user_suffix_to_budget(trimmed, user_idx=user_idx, tokenizer=tokenizer, budget=budget)
+
+
 def _build_vllm_generate(provider_cfg: Any):
     try:
         from vllm import LLM, SamplingParams
@@ -1157,15 +1620,33 @@ def _build_vllm_generate(provider_cfg: Any):
         raise ValueError("llm.vllm.model must be set.")
     tensor_parallel_size = int(provider_cfg.get("tensor_parallel_size") or _ONE)
     max_model_len = provider_cfg.get("max_model_len")
-    llm = LLM(model=model, tensor_parallel_size=tensor_parallel_size, max_model_len=max_model_len)
+    max_model_len_int = int(max_model_len) if max_model_len is not None else None
+    llm = LLM(model=model, tensor_parallel_size=tensor_parallel_size, max_model_len=max_model_len_int)
+    if max_model_len_int is None:
+        max_model_len_int = _infer_vllm_max_model_len(llm)
+    tokenizer = None
+    try:
+        tokenizer = llm.get_tokenizer()
+    except Exception:
+        tokenizer = None
+    max_tokens = int(provider_cfg.get("max_tokens") or _ONE)
     sampling_params = SamplingParams(
         temperature=float(provider_cfg.get("temperature", _ZERO)),
-        max_tokens=int(provider_cfg.get("max_tokens") or _ONE),
+        max_tokens=max_tokens,
         top_p=float(provider_cfg.get("top_p", _ONE)),
     )
 
     def _generate(messages_batch: List[List[Dict[str, str]]]) -> List[str]:
-        outputs = llm.chat(messages_batch, sampling_params=sampling_params, use_tqdm=False)
+        try:
+            outputs = llm.chat(messages_batch, sampling_params=sampling_params, use_tqdm=False)
+        except ValueError as exc:
+            if tokenizer is None or max_model_len_int is None or not _is_vllm_prompt_too_long_error(exc):
+                raise
+            budget = int(max_model_len_int) - int(max_tokens)
+            trimmed_batch = [
+                _trim_messages_to_vllm_budget(messages, tokenizer=tokenizer, budget=budget) for messages in messages_batch
+            ]
+            outputs = llm.chat(trimmed_batch, sampling_params=sampling_params, use_tqdm=False)
         return [out.outputs[0].text if out.outputs else "" for out in outputs]
 
     return _generate

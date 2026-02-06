@@ -6,14 +6,15 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from src.metrics.common import extract_sample_ids
 from src.models.components import (
     CvtNodeInitializer,
     EmbeddingBackbone,
     LogZPredictor,
-    SRM,
     SinusoidalPositionalEncoding,
 )
 from src.models.components.graph_ops import (
@@ -25,13 +26,11 @@ from src.models.components.graph_ops import (
     segment_logsumexp_1d,
     segment_max,
 )
-from src.utils import log_metric, setup_optimizer
+from src.utils import log_metric
 from src.utils.batch_ops import (
     build_dummy_mask,
     build_node_batch,
     build_node_mask,
-    edge_reorder_perm,
-    reorder_edge_inverse_map,
 )
 from src.utils.config_utils import require_cfg_mapping, validate_cfg_keys
 from src.utils.logging_utils import get_logger, log_event
@@ -40,21 +39,13 @@ from src.models.dual_flow_constants import (
     _DB_CFG_KEYS,
     _DB_CFG_OPTIONAL_KEYS,
     _DEFAULT_AVOID_REVISIT,
-    _DEFAULT_BACKBONE_FINETUNE,
     _DEFAULT_DIVERSE_BEAM_ENABLED,
     _DEFAULT_DIVERSE_BEAM_GROUPS,
     _DEFAULT_DIVERSE_BEAM_LAMBDA,
     _DEFAULT_DIVERSE_BEAM_PENALTY,
     _DEFAULT_DIVERSE_BEAM_SIMILARITY,
-    _DEFAULT_EDGE_DROPOUT,
-    _DEFAULT_EDGE_INTER_DIM,
     _DEFAULT_GNN_DROPOUT,
     _DEFAULT_GNN_LAYERS,
-    _DEFAULT_INVERSE_REL_SUFFIX,
-    _DEFAULT_P0_COSINE_EPS,
-    _DEFAULT_P0_MODE,
-    _DEFAULT_P0_RESIDUAL,
-    _DEFAULT_P0_TEMPERATURE,
     _DEFAULT_ONECYCLE_ANNEAL,
     _DEFAULT_ONECYCLE_BASE_MOMENTUM,
     _DEFAULT_ONECYCLE_CYCLE_MOMENTUM,
@@ -67,21 +58,12 @@ from src.models.dual_flow_constants import (
     _DEFAULT_SCHED_T0,
     _DEFAULT_SCHED_T_MAX,
     _DEFAULT_SCHED_T_MULT,
-    _DEFAULT_START_TEMPERATURE_END,
-    _DEFAULT_START_TEMPERATURE_START,
-    _DEFAULT_STRICT_INVERSE,
+    _STOP_ACTION_ID,
     _DEFAULT_TRAIN_ROLLOUTS,
-    _DEFAULT_VALIDATE_EDGE_BATCH,
     _DIVERSE_BEAM_PENALTIES,
     _DIVERSE_BEAM_SIMILARITIES,
     _NEG_ONE,
     _ONE,
-    _P0_MODE_DEGREE,
-    _P0_MODE_INDEGREE,
-    _P0_MODE_NONE,
-    _P0_MODE_PREFERENTIAL,
-    _P0_MODE_SEMANTIC,
-    _P0_MODES,
     _SCHED_INTERVAL_EPOCH,
     _SCHED_INTERVAL_STEP,
     _SCHED_INTERVALS,
@@ -91,6 +73,7 @@ from src.models.dual_flow_constants import (
     _SELF_RELATION_ID,
     _STANDARD_METRICS,
     _TERMINAL_DEAD_END,
+    _TERMINAL_EMIT,
     _TERMINAL_HIT,
     _TERMINAL_INVALID_START,
     _TERMINAL_MAX_STEPS,
@@ -115,10 +98,8 @@ class DualFlowModule(LightningModule):
         hidden_dim: int,
         max_steps: int,
         emb_dim: int,
-        backbone_finetune: bool = _DEFAULT_BACKBONE_FINETUNE,
         gnn_layers: int = _DEFAULT_GNN_LAYERS,
         gnn_dropout: float = _DEFAULT_GNN_DROPOUT,
-        cvt_init_cfg: Optional[Mapping[str, Any]] = None,
         embedding_adapter_cfg: Optional[Mapping[str, Any]] = None,
         actor_cfg: Optional[Mapping[str, Any]] = None,
         training_cfg: Mapping[str, Any] = None,
@@ -139,7 +120,6 @@ class DualFlowModule(LightningModule):
 
         self.training_cfg = training_cfg or {}
         self.evaluation_cfg = evaluation_cfg or {}
-        self.cvt_init_cfg = cvt_init_cfg or {}
         self.embedding_adapter_cfg = embedding_adapter_cfg or {}
         self.actor_cfg = actor_cfg or {}
         self.runtime_cfg = runtime_cfg or {}
@@ -148,12 +128,14 @@ class DualFlowModule(LightningModule):
         self.logging_cfg = logging_cfg or {}
         self._onecycle_checked = False
 
-        self._validate_edge_batch = bool(self.runtime_cfg.get("validate_edge_batch", _DEFAULT_VALIDATE_EDGE_BATCH))
         self._avoid_revisit = bool(self.runtime_cfg.get("avoid_revisit", _DEFAULT_AVOID_REVISIT))
+        self.register_buffer("prior_weight", torch.tensor(float(_ONE)))
+        prior_override = self.runtime_cfg.get("prior_weight_override", None)
+        if prior_override is not None:
+            self.prior_weight.fill_(float(prior_override))
 
         self._init_backbone(
             emb_dim=emb_dim,
-            finetune=backbone_finetune,
             gnn_layers=gnn_layers,
             gnn_dropout=gnn_dropout,
         )
@@ -161,7 +143,9 @@ class DualFlowModule(LightningModule):
         self._init_actor()
         self._validate_cfg_contract()
         self._save_serializable_hparams()
-        self._p0_cfg = self._resolve_p0_cfg()
+        self.null_relation_emb = torch.nn.Parameter(torch.zeros((1, self.hidden_dim), dtype=torch.float32))
+        torch.nn.init.xavier_uniform_(self.null_relation_emb)
+        self.path_gru = torch.nn.GRU(self.hidden_dim, self.hidden_dim, batch_first=True)
 
         self._cvt_mask = None
         self._relation_inverse_map = None
@@ -174,16 +158,18 @@ class DualFlowModule(LightningModule):
             "db_cfg",
             "grad_clip_norm",
             "num_rollouts",
-            "start_temperature_start",
-            "start_temperature_end",
         }
         extra_training = set(self.training_cfg.keys()) - allowed_training
         if extra_training:
             raise ValueError(f"Unsupported training_cfg keys: {sorted(extra_training)}")
-        allowed_eval = {"beam_size", "diverse_beam"}
+        allowed_eval = {"beam_size", "diverse_beam", "answer_gain_stop"}
         extra_eval = set(self.evaluation_cfg.keys()) - allowed_eval
         if extra_eval:
             raise ValueError(f"Unsupported evaluation_cfg keys: {sorted(extra_eval)}")
+        allowed_actor: set[str] = set()
+        extra_actor = set((self.actor_cfg or {}).keys()) - allowed_actor
+        if extra_actor:
+            raise ValueError(f"Unsupported actor_cfg keys: {sorted(extra_actor)}")
 
     def _save_serializable_hparams(self) -> None:
         self.save_hyperparameters(
@@ -191,13 +177,12 @@ class DualFlowModule(LightningModule):
             ignore=[
                 "backbone_fwd",
                 "cvt_init_fwd",
-                "policy_fwd",
                 "forward_ctx_proj",
                 "z_time_encoder",
                 "z_predictor",
+                "stop_predictor",
                 "training_cfg",
                 "evaluation_cfg",
-                "cvt_init_cfg",
                 "embedding_adapter_cfg",
                 "actor_cfg",
                 "runtime_cfg",
@@ -207,48 +192,6 @@ class DualFlowModule(LightningModule):
             ],
         )
 
-    def _resolve_actor_cfg(self) -> dict[str, float | int | bool]:
-        raw = self.actor_cfg or {}
-        extra = set(raw.keys()) - {
-            "edge_inter_dim",
-            "edge_dropout",
-            "use_spherical",
-            "temperature_init",
-            "norm_eps",
-            "logit_scale_min",
-            "logit_scale_max",
-        }
-        if extra:
-            raise ValueError(f"Unsupported actor_cfg keys: {sorted(extra)}")
-        edge_inter_dim = int(raw.get("edge_inter_dim", _DEFAULT_EDGE_INTER_DIM))
-        edge_dropout = float(raw.get("edge_dropout", _DEFAULT_EDGE_DROPOUT))
-        use_spherical = bool(raw.get("use_spherical", SRM.DEFAULT_USE_SPHERICAL))
-        temperature_init = float(raw.get("temperature_init", SRM.DEFAULT_TEMPERATURE_INIT))
-        norm_eps = float(raw.get("norm_eps", SRM.DEFAULT_NORM_EPS))
-        logit_scale_min = float(raw.get("logit_scale_min", SRM.DEFAULT_LOGIT_SCALE_MIN))
-        logit_scale_max = float(raw.get("logit_scale_max", SRM.DEFAULT_LOGIT_SCALE_MAX))
-        if edge_inter_dim <= _ZERO:
-            raise ValueError("actor_cfg.edge_inter_dim must be > 0.")
-        if edge_dropout < float(_ZERO):
-            raise ValueError("actor_cfg.edge_dropout must be >= 0.")
-        if temperature_init <= float(_ZERO):
-            raise ValueError("actor_cfg.temperature_init must be > 0.")
-        if norm_eps <= float(_ZERO):
-            raise ValueError("actor_cfg.norm_eps must be > 0.")
-        if logit_scale_min <= float(_ZERO):
-            raise ValueError("actor_cfg.logit_scale_min must be > 0.")
-        if logit_scale_max <= logit_scale_min:
-            raise ValueError("actor_cfg.logit_scale_max must be > logit_scale_min.")
-        return {
-            "edge_inter_dim": edge_inter_dim,
-            "edge_dropout": edge_dropout,
-            "use_spherical": use_spherical,
-            "temperature_init": temperature_init,
-            "norm_eps": norm_eps,
-            "logit_scale_min": logit_scale_min,
-            "logit_scale_max": logit_scale_max,
-        }
-
     @staticmethod
     def _coerce_db_cfg(raw: Mapping[str, Any]) -> dict[str, float | int | str]:
         cfg: dict[str, float | int | str] = {
@@ -256,10 +199,11 @@ class DualFlowModule(LightningModule):
             "sampling_temperature_end": float(raw["sampling_temperature_end"]),
             "dead_end_log_reward": float(raw["dead_end_log_reward"]),
             "dead_end_weight": float(raw["dead_end_weight"]),
-            "pb_edge_dropout": float(raw["pb_edge_dropout"]),
         }
         if "dead_end_log_reward_start" in raw and raw.get("dead_end_log_reward_start") is not None:
             cfg["dead_end_log_reward_start"] = float(raw["dead_end_log_reward_start"])
+        if "emit_log_reward" in raw and raw.get("emit_log_reward") is not None:
+            cfg["emit_log_reward"] = float(raw["emit_log_reward"])
         return cfg
 
     @staticmethod
@@ -270,10 +214,11 @@ class DualFlowModule(LightningModule):
             raise ValueError("db_cfg.sampling_temperature_start/end must be > 0.")
         if float(cfg["sampling_temperature_start"]) < float(cfg["sampling_temperature_end"]):
             raise ValueError("db_cfg.sampling_temperature_start must be >= sampling_temperature_end for cosine.")
-        if float(cfg["pb_edge_dropout"]) < float(_ZERO) or float(cfg["pb_edge_dropout"]) >= float(_ONE):
-            raise ValueError("db_cfg.pb_edge_dropout must satisfy 0 <= p < 1.")
         if float(cfg["dead_end_weight"]) < float(_ZERO):
             raise ValueError("db_cfg.dead_end_weight must be >= 0.")
+        emit_reward = cfg.get("emit_log_reward", None)
+        if emit_reward is not None and float(emit_reward) > float(_ZERO):
+            raise ValueError("db_cfg.emit_log_reward must be <= 0.")
 
     def _resolve_db_cfg(self) -> dict[str, float | int | str]:
         raw = require_cfg_mapping(self.training_cfg.get("db_cfg"), "training_cfg.db_cfg")
@@ -335,52 +280,19 @@ class DualFlowModule(LightningModule):
         return num_rollouts
 
     def _resolve_start_temperature(self) -> float:
-        start = float(self.training_cfg.get("start_temperature_start", _DEFAULT_START_TEMPERATURE_START))
-        end = float(self.training_cfg.get("start_temperature_end", _DEFAULT_START_TEMPERATURE_END))
-        if start <= float(_ZERO) or end <= float(_ZERO):
-            raise ValueError("training_cfg.start_temperature_start/end must be > 0.")
-        progress = self._resolve_training_progress()
-        half = float(_ONE) / float(_TWO)
-        cosine = half * (float(_ONE) + math.cos(math.pi * progress))
-        return end + (start - end) * cosine
+        return self._resolve_sampling_temperature()
 
-    def _resolve_p0_cfg(self) -> dict[str, float | str | bool]:
-        raw = self.runtime_cfg.get("p0_cfg")
-        if raw is None:
-            raw = {}
-        raw = require_cfg_mapping(raw, "runtime_cfg.p0_cfg")
-        mode = str(raw.get("mode", _DEFAULT_P0_MODE) or _DEFAULT_P0_MODE).strip().lower()
-        if mode not in _P0_MODES:
-            raise ValueError(f"runtime_cfg.p0_cfg.mode must be one of {sorted(_P0_MODES)}, got {mode!r}.")
-        residual_enabled = bool(raw.get("residual_enabled", _DEFAULT_P0_RESIDUAL))
-        temperature = float(raw.get("temperature", _DEFAULT_P0_TEMPERATURE))
-        if temperature <= float(_ZERO):
-            raise ValueError("runtime_cfg.p0_cfg.temperature must be > 0.")
-        cosine_eps = float(raw.get("cosine_eps", _DEFAULT_P0_COSINE_EPS))
-        if cosine_eps <= float(_ZERO):
-            raise ValueError("runtime_cfg.p0_cfg.cosine_eps must be > 0.")
-        return {
-            "mode": mode,
-            "residual_enabled": residual_enabled,
-            "temperature": temperature,
-            "cosine_eps": cosine_eps,
-        }
+    def _stop_enabled(self) -> bool:
+        return True
 
-    def _p0_enabled(self) -> bool:
-        cfg = self._p0_cfg
-        return bool(cfg.get("residual_enabled")) and str(cfg.get("mode")) != _P0_MODE_NONE
-
-    def _resolve_inverse_suffix(self) -> str:
-        raw = self.runtime_cfg.get("inverse_relation_suffix") if isinstance(self.runtime_cfg, Mapping) else None
-        suffix = str(raw or _DEFAULT_INVERSE_REL_SUFFIX).strip()
-        if not suffix:
-            raise ValueError("inverse_relation_suffix must be a non-empty string.")
-        return suffix
-
-    def _resolve_strict_inverse(self) -> bool:
-        if isinstance(self.runtime_cfg, Mapping) and "strict_inverse" in self.runtime_cfg:
-            return bool(self.runtime_cfg.get("strict_inverse"))
-        return _DEFAULT_STRICT_INVERSE
+    def _resolve_stop_min_steps(self) -> int:
+        raw = 0
+        if isinstance(self.runtime_cfg, Mapping):
+            raw = self.runtime_cfg.get("stop_min_steps", 0)
+        min_steps = int(raw)
+        if min_steps < 0:
+            raise ValueError("runtime_cfg.stop_min_steps must be >= 0.")
+        return min_steps
 
     def _resolve_dataset_scope(self) -> str:
         datamodule = getattr(self.trainer, "datamodule", None)
@@ -432,48 +344,139 @@ class DualFlowModule(LightningModule):
             "max_candidates_per_graph": max_candidates,
         }
 
+    def _resolve_answer_gain_cfg(self) -> dict[str, Any]:
+        raw = self.evaluation_cfg.get("answer_gain_stop", None)
+        if raw is None:
+            return {"enabled": False, "patience": _ZERO, "epsilon": 0.0, "min_beam": _ONE}
+        raw = require_cfg_mapping(raw, "evaluation_cfg.answer_gain_stop")
+        extra = set(raw.keys()) - {"enabled", "patience", "epsilon", "min_beam"}
+        if extra:
+            raise ValueError(f"Unsupported evaluation_cfg.answer_gain_stop keys: {sorted(extra)}")
+        enabled = bool(raw.get("enabled", False))
+        patience = int(raw.get("patience", _ZERO))
+        epsilon = float(raw.get("epsilon", 0.0))
+        min_beam = int(raw.get("min_beam", _ONE))
+        if patience < _ZERO:
+            raise ValueError("evaluation_cfg.answer_gain_stop.patience must be >= 0.")
+        if epsilon < float(_ZERO):
+            raise ValueError("evaluation_cfg.answer_gain_stop.epsilon must be >= 0.")
+        if min_beam <= _ZERO:
+            raise ValueError("evaluation_cfg.answer_gain_stop.min_beam must be > 0.")
+        return {
+            "enabled": enabled,
+            "patience": patience,
+            "epsilon": epsilon,
+            "min_beam": min_beam,
+        }
+
     def _resolve_beam_size(self) -> int:
         return self._resolve_beam_size_value()
+
+    @staticmethod
+    def _apply_answer_dedup(
+        *,
+        beam_nodes: torch.Tensor,
+        beam_scores: torch.Tensor,
+        beam_hits: torch.Tensor,
+        beam_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        num_graphs, beam_size = beam_nodes.shape
+        if beam_size <= _ONE:
+            return beam_valid
+        keep = beam_valid.clone()
+        beam_nodes_cpu = beam_nodes.detach().cpu()
+        beam_scores_cpu = beam_scores.detach().cpu()
+        beam_hits_cpu = beam_hits.detach().cpu()
+        for g in range(num_graphs):
+            best: dict[int, tuple[float, int]] = {}
+            for idx in range(beam_size):
+                if not bool(beam_hits_cpu[g, idx]):
+                    continue
+                node_id = int(beam_nodes_cpu[g, idx].item())
+                if node_id < _ZERO:
+                    continue
+                score = float(beam_scores_cpu[g, idx].item())
+                prev = best.get(node_id)
+                if prev is None:
+                    best[node_id] = (score, idx)
+                    continue
+                prev_score, prev_idx = prev
+                if score > prev_score:
+                    keep[g, prev_idx] = False
+                    best[node_id] = (score, idx)
+                else:
+                    keep[g, idx] = False
+        return keep
+
+    @staticmethod
+    def _apply_answer_gain_stop(
+        *,
+        beam_nodes: torch.Tensor,
+        beam_hits: torch.Tensor,
+        patience: int,
+        epsilon: float,
+        min_beam: int,
+    ) -> torch.Tensor:
+        num_graphs, beam_size = beam_nodes.shape
+        if beam_size <= 0 or patience <= 0:
+            return torch.full((num_graphs,), beam_size, device=beam_nodes.device, dtype=torch.long)
+        cutoffs = torch.full((num_graphs,), beam_size, device=beam_nodes.device, dtype=torch.long)
+        beam_nodes_cpu = beam_nodes.detach().cpu()
+        beam_hits_cpu = beam_hits.detach().cpu()
+        for g in range(num_graphs):
+            seen: set[int] = set()
+            consec = _ZERO
+            cutoff = beam_size
+            for idx in range(beam_size):
+                node_id = int(beam_nodes_cpu[g, idx].item())
+                gain = _ZERO
+                if node_id >= 0 and bool(beam_hits_cpu[g, idx].item()):
+                    if node_id not in seen:
+                        seen.add(node_id)
+                        gain = _ONE
+                if float(gain) <= float(epsilon):
+                    consec += _ONE
+                else:
+                    consec = _ZERO
+                if idx + _ONE >= min_beam and consec >= patience:
+                    cutoff = idx + _ONE
+                    break
+            cutoffs[g] = int(cutoff)
+        return cutoffs
 
     def _init_backbone(
         self,
         *,
         emb_dim: int,
-        finetune: bool,
         gnn_layers: int,
         gnn_dropout: float,
     ) -> None:
         self.backbone_fwd = EmbeddingBackbone(
             emb_dim=emb_dim,
             hidden_dim=self.hidden_dim,
-            finetune=finetune,
             gnn_layers=gnn_layers,
             gnn_dropout=gnn_dropout,
             adapter_cfg=self.embedding_adapter_cfg,
         )
 
     def _init_cvt_init(self) -> None:
-        enabled = bool(self.cvt_init_cfg.get("enabled", True))
-        self._cvt_enabled = enabled
+        self._cvt_enabled = True
         self.cvt_init_fwd = CvtNodeInitializer()
 
     def _init_actor(self) -> None:
-        actor_cfg = self._resolve_actor_cfg()
-        self.policy_fwd = SRM(
-            d_plm=self.hidden_dim,
-            d_kg=self.hidden_dim,
-            d_inter=actor_cfg["edge_inter_dim"],
-            dropout=actor_cfg["edge_dropout"],
-            use_spherical=actor_cfg["use_spherical"],
-            temperature_init=actor_cfg["temperature_init"],
-            norm_eps=actor_cfg["norm_eps"],
-            logit_scale_min=actor_cfg["logit_scale_min"],
-            logit_scale_max=actor_cfg["logit_scale_max"],
-        )
         self.forward_ctx_proj = self._build_context_mlp(in_dim=self.hidden_dim * _TWO)
         self.start_selector = self._build_start_selector()
         self.z_time_encoder = SinusoidalPositionalEncoding(self.hidden_dim)
         self.z_predictor = LogZPredictor(hidden_dim=self.hidden_dim, context_dim=self.hidden_dim)
+        self.stop_predictor = LogZPredictor(hidden_dim=self.hidden_dim, context_dim=self.hidden_dim)
+        last_linear = None
+        for layer in reversed(self.stop_predictor.net):
+            if isinstance(layer, torch.nn.Linear):
+                last_linear = layer
+                break
+        if last_linear is None:
+            raise RuntimeError("stop_predictor missing linear layer for residual init.")
+        self._zero_init_linear(last_linear)
 
     def _build_context_mlp(self, *, in_dim: int) -> torch.nn.Module:
         return torch.nn.Sequential(
@@ -513,8 +516,7 @@ class DualFlowModule(LightningModule):
         if resources is None:
             raise RuntimeError("datamodule.shared_resources is required to initialize CVT assets.")
         self._cvt_mask = resources.cvt_mask
-        inverse_suffix = self._resolve_inverse_suffix()
-        inverse_map, inverse_mask = resources.relation_inverse_assets(suffix=inverse_suffix)
+        inverse_map, inverse_mask = resources.relation_inverse_assets()
         self._relation_inverse_map = inverse_map
         self._relation_inverse_mask = inverse_mask
         self._relation_vocab_size = int(inverse_map.numel())
@@ -592,6 +594,65 @@ class DualFlowModule(LightningModule):
     @staticmethod
     def _build_step_ids(*, num_graphs: int, step: int, device: torch.device) -> torch.Tensor:
         return torch.full((num_graphs,), step, device=device, dtype=torch.long)
+
+    def _init_prev_relation(self, *, num_graphs: int, device: torch.device) -> torch.Tensor:
+        return self.null_relation_emb.to(device=device).expand(num_graphs, -1)
+
+    def _update_prev_state(
+        self,
+        *,
+        prev_state: torch.Tensor,
+        rel_emb: torch.Tensor,
+        update_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        prev_state = prev_state.to(device=rel_emb.device, dtype=rel_emb.dtype)
+        if prev_state.size(-1) != self.hidden_dim or rel_emb.size(-1) != self.hidden_dim:
+            raise ValueError("prev_state/rel_emb must match hidden_dim.")
+        orig_shape = prev_state.shape
+        flat_prev = prev_state.reshape(-1, self.hidden_dim).contiguous()
+        flat_rel = rel_emb.reshape(-1, self.hidden_dim).contiguous()
+        _, flat_new = self.path_gru(flat_rel.unsqueeze(1), flat_prev.unsqueeze(0).contiguous())
+        new_state = flat_new.squeeze(0).view(*orig_shape)
+        if update_mask is None:
+            return new_state
+        update_mask = update_mask.to(device=new_state.device, dtype=torch.bool)
+        new_state = torch.where(update_mask.unsqueeze(-1), new_state, prev_state)
+        return new_state
+
+    def _compute_prev_rel_sequences(
+        self,
+        *,
+        rel_tokens: torch.Tensor,
+        num_moves: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_graphs, max_steps, hidden_dim = rel_tokens.shape
+        device = rel_tokens.device
+        dtype = rel_tokens.dtype
+        num_moves = num_moves.to(device=device, dtype=torch.long).clamp(min=_ZERO, max=max_steps)
+        h0 = self.null_relation_emb.to(device=device, dtype=dtype).expand(num_graphs, -1).contiguous()
+        if max_steps == _ZERO:
+            empty = torch.zeros((num_graphs, _ZERO, hidden_dim), device=device, dtype=dtype)
+            return empty, empty
+        lengths = num_moves.clamp(min=_ONE).cpu()
+        packed = pack_padded_sequence(rel_tokens, lengths, batch_first=True, enforce_sorted=False)
+        packed_out, h_n = self.path_gru(packed, h0.unsqueeze(0))
+        out, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=max_steps)
+        last = h_n.squeeze(0)
+        zero_mask = num_moves == _ZERO
+        if zero_mask.numel() > 0:
+            zero_mask_exp = zero_mask.unsqueeze(1).unsqueeze(-1)
+            out = torch.where(zero_mask_exp, torch.zeros_like(out), out)
+            last = torch.where(zero_mask.unsqueeze(-1), h0, last)
+        step_ids = torch.arange(max_steps, device=device, dtype=torch.long).unsqueeze(0)
+        pad_mask = step_ids >= num_moves.unsqueeze(1)
+        out = torch.where(pad_mask.unsqueeze(-1), last.unsqueeze(1), out)
+        h_all = torch.cat((h0.unsqueeze(1), out), dim=1)
+        steps = step_ids.expand(num_graphs, max_steps)
+        idx = torch.minimum(steps, num_moves.unsqueeze(1))
+        prev_rel = h_all.gather(1, idx.unsqueeze(-1).expand(-1, -1, hidden_dim))
+        idx_next = torch.minimum(steps + _ONE, num_moves.unsqueeze(1))
+        prev_rel_next = h_all.gather(1, idx_next.unsqueeze(-1).expand(-1, -1, hidden_dim))
+        return prev_rel, prev_rel_next
 
     def _select_start_nodes(
         self,
@@ -775,19 +836,6 @@ class DualFlowModule(LightningModule):
             )
         if edge_embeddings.size(0) != edge_index.size(1):
             raise ValueError("edge_embeddings length must match edge_index.")
-        perm = edge_reorder_perm(
-            edge_index=edge_index,
-            edge_batch=edge_batch,
-            edge_relations=edge_relations,
-            node_ptr=node_ptr,
-            num_edges_before=edge_index.size(1),
-        )
-        if perm is not None:
-            edge_index = edge_index.index_select(1, perm)
-            edge_batch = edge_batch.index_select(0, perm)
-            edge_relations = edge_relations.index_select(0, perm)
-            edge_embeddings = edge_embeddings.index_select(0, perm)
-        edge_inverse_map = reorder_edge_inverse_map(edge_inverse_map=edge_inverse_map, perm=perm)
         node_tokens = self.backbone_fwd.project_node_embeddings(node_embeddings)
         relation_tokens = self.backbone_fwd.project_relation_embeddings(edge_embeddings)
         node_tokens = self.backbone_fwd.encode_graph(
@@ -853,29 +901,9 @@ class DualFlowModule(LightningModule):
             num_nodes_total=num_nodes_total,
             device=self.device,
         )
-        self._validate_edge_csr(
-            edge_index=edge_index,
-            edge_mask=edge_mask_fwd,
-            edge_ids_by_head=edge_ids_by_head_fwd,
-            edge_ptr_by_head=edge_ptr_by_head_fwd,
-            edge_ids_by_tail=edge_ids_by_tail_fwd,
-            edge_ptr_by_tail=edge_ptr_by_tail_fwd,
-            num_nodes_total=num_nodes_total,
-        )
-        self._validate_edge_csr(
-            edge_index=edge_index,
-            edge_mask=edge_mask_bwd,
-            edge_ids_by_head=edge_ids_by_head_bwd,
-            edge_ptr_by_head=edge_ptr_by_head_bwd,
-            edge_ids_by_tail=edge_ids_by_tail_bwd,
-            edge_ptr_by_tail=edge_ptr_by_tail_bwd,
-            num_nodes_total=num_nodes_total,
-        )
-        strict_inverse = self._resolve_strict_inverse()
         self._validate_edge_inverse_map(
             edge_inverse_map=edge_inverse_map,
             edge_relations=edge_relations,
-            strict=strict_inverse,
         )
         sample_ids = extract_sample_ids(batch)
         if len(sample_ids) != num_graphs:
@@ -983,10 +1011,7 @@ class DualFlowModule(LightningModule):
         *,
         edge_inverse_map: torch.Tensor,
         edge_relations: torch.Tensor,
-        strict: bool,
     ) -> None:
-        if not strict:
-            return
         if edge_inverse_map.numel() == 0:
             return
         edge_inverse_map = edge_inverse_map.view(-1)
@@ -1010,6 +1035,7 @@ class DualFlowModule(LightningModule):
         node_batch: torch.Tensor,
         steps: torch.Tensor,
         node_ids: Optional[torch.Tensor],
+        prev_rel_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         context_tokens = self._resolve_context_tokens(context_tokens)
         if node_ids is None:
@@ -1017,85 +1043,216 @@ class DualFlowModule(LightningModule):
             node_batch_sel = node_batch
         else:
             node_ids = node_ids.to(device=node_tokens.device, dtype=torch.long).view(-1)
+            num_nodes_total = int(node_tokens.size(0))
+            if num_nodes_total <= _ZERO:
+                raise ValueError("node_tokens must be non-empty when node_ids is provided.")
             node_tokens_sel = node_tokens.index_select(0, node_ids)
             node_batch_sel = node_batch.index_select(0, node_ids)
         steps = steps.to(device=node_tokens_sel.device, dtype=torch.long).view(-1)
-        max_batch = node_batch_sel.max()
-        steps_num = torch.tensor(steps.numel(), device=max_batch.device)
-        torch._assert(steps_num > max_batch, "steps length must cover max node batch index.")
-        time_emb = self.z_time_encoder(steps).index_select(0, node_batch_sel)
+        if steps.numel() == node_tokens_sel.size(0):
+            time_emb = self.z_time_encoder(steps)
+        else:
+            max_batch = node_batch_sel.max()
+            steps_num = torch.tensor(steps.numel(), device=max_batch.device)
+            torch._assert(steps_num > max_batch, "steps length must cover max node batch index.")
+            time_emb = self.z_time_encoder(steps).index_select(0, node_batch_sel)
         node_tokens_sel = node_tokens_sel + time_emb
+        if prev_rel_emb is not None:
+            prev_rel_emb = prev_rel_emb.to(device=node_tokens_sel.device, dtype=node_tokens_sel.dtype)
+            if prev_rel_emb.dim() != _TWO:
+                raise ValueError("prev_rel_emb must be [num_graphs, hidden_dim] or [num_nodes, hidden_dim].")
+            if prev_rel_emb.size(0) == node_tokens_sel.size(0):
+                prev_rel_sel = prev_rel_emb
+            else:
+                prev_rel_sel = prev_rel_emb.index_select(0, node_batch_sel)
+            node_tokens_sel = node_tokens_sel + prev_rel_sel
         return self.z_predictor(
             node_tokens=node_tokens_sel,
             question_tokens=context_tokens,
             node_batch=node_batch_sel,
         )
 
-    def _compute_log_p0(
+    def _compute_log_z_for_edges(
         self,
         *,
         prepared: _PreparedBatch,
-        edge_ids: torch.Tensor,
+        node_ids: torch.Tensor,
         edge_batch: torch.Tensor,
-        num_decisions: int,
-        decision_graph_ids: Optional[torch.Tensor],
+        steps: torch.Tensor,
+        context_tokens: torch.Tensor,
+        prev_rel_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cfg = self._p0_cfg
-        mode = str(cfg["mode"])
-        if mode == _P0_MODE_NONE:
-            return torch.zeros_like(edge_batch, dtype=torch.float32)
-        if num_decisions <= _ZERO:
-            return torch.zeros_like(edge_batch, dtype=torch.float32)
-        if mode == _P0_MODE_DEGREE:
-            counts = torch.bincount(edge_batch, minlength=num_decisions).clamp(min=_ONE)
-            log_p0 = -torch.log(counts.to(dtype=torch.float32)).index_select(0, edge_batch)
-            return log_p0.detach()
-        if mode == _P0_MODE_INDEGREE:
-            tails = prepared.edge_index[_ONE].index_select(0, edge_ids)
-            indegree = prepared.edge_ptr_by_tail_fwd[1:] - prepared.edge_ptr_by_tail_fwd[:-1]
-            indegree = indegree.to(device=edge_ids.device, dtype=torch.float32)
-            counts = indegree.index_select(0, tails.clamp(min=_ZERO)).clamp(min=float(_ONE))
-            log_p0 = -torch.log(counts)
-            return log_p0.detach()
-        if mode == _P0_MODE_PREFERENTIAL:
-            tails = prepared.edge_index[_ONE].index_select(0, edge_ids)
-            indegree = prepared.edge_ptr_by_tail_fwd[1:] - prepared.edge_ptr_by_tail_fwd[:-1]
-            indegree = indegree.to(device=edge_ids.device, dtype=torch.float32)
-            counts = indegree.index_select(0, tails.clamp(min=_ZERO)).clamp(min=float(_ONE))
-            log_p0 = torch.log(counts)
-            return log_p0.detach()
-        if mode == _P0_MODE_SEMANTIC:
-            tails = prepared.edge_index[_ONE].index_select(0, edge_ids)
-            tail_emb = prepared.node_embeddings.index_select(0, tails)
-            question_emb = self._resolve_context_tokens(prepared.question_emb_raw)
-            if decision_graph_ids is not None:
-                decision_graph_ids = decision_graph_ids.to(device=edge_batch.device, dtype=torch.long).view(-1)
-                graph_ids = decision_graph_ids.index_select(0, edge_batch)
+        node_ids = node_ids.to(device=prepared.node_tokens.device, dtype=torch.long).view(-1)
+        edge_batch = edge_batch.to(device=node_ids.device, dtype=torch.long).view(-1)
+        context_tokens = self._resolve_context_tokens(context_tokens)
+        if edge_batch.numel() > _ZERO:
+            max_batch = edge_batch.max()
+            context_len = torch.tensor(context_tokens.size(0), device=max_batch.device)
+            torch._assert(context_len > max_batch, "context_tokens length must cover max edge batch index.")
+        steps = steps.to(device=node_ids.device, dtype=torch.long).view(-1)
+        node_tokens_sel = prepared.node_tokens.index_select(0, node_ids)
+        if steps.numel() == node_tokens_sel.size(0):
+            time_emb = self.z_time_encoder(steps)
+        else:
+            max_batch = edge_batch.max()
+            steps_num = torch.tensor(steps.numel(), device=max_batch.device)
+            torch._assert(steps_num > max_batch, "steps length must cover max edge batch index.")
+            time_emb = self.z_time_encoder(steps).index_select(0, edge_batch)
+        node_tokens_sel = node_tokens_sel + time_emb
+        if prev_rel_emb is not None:
+            prev_rel_emb = prev_rel_emb.to(device=node_tokens_sel.device, dtype=node_tokens_sel.dtype)
+            if prev_rel_emb.dim() != _TWO:
+                raise ValueError("prev_rel_emb must be [num_edges, hidden_dim] or [num_graphs, hidden_dim].")
+            if prev_rel_emb.size(0) == node_tokens_sel.size(0):
+                prev_rel_sel = prev_rel_emb
             else:
-                graph_ids = edge_batch
-            query = question_emb.index_select(0, graph_ids)
-            cosine_eps = float(cfg["cosine_eps"])
-            sim = self._cosine_similarity(tail_emb, query, eps=cosine_eps)
-            temperature = float(cfg["temperature"])
-            base = sim / temperature
-            log_denom = self._compute_log_denom(logits=base, edge_batch=edge_batch, num_graphs=num_decisions)
-            log_p0 = base - log_denom.index_select(0, edge_batch)
-            return log_p0.detach()
-        raise ValueError(f"Unsupported p0 mode: {mode!r}.")
+                prev_rel_sel = prev_rel_emb.index_select(0, edge_batch)
+            node_tokens_sel = node_tokens_sel + prev_rel_sel
+        return self.z_predictor(
+            node_tokens=node_tokens_sel,
+            question_tokens=context_tokens,
+            node_batch=edge_batch,
+        )
+
+    def _compute_log_r_delta_for_nodes(
+        self,
+        *,
+        node_tokens: torch.Tensor,
+        context_tokens: torch.Tensor,
+        node_batch: torch.Tensor,
+        steps: torch.Tensor,
+        node_ids: Optional[torch.Tensor],
+        prev_rel_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        context_tokens = self._resolve_context_tokens(context_tokens)
+        if node_ids is None:
+            node_tokens_sel = node_tokens
+            node_batch_sel = node_batch
+        else:
+            node_ids = node_ids.to(device=node_tokens.device, dtype=torch.long).view(-1)
+            num_nodes_total = int(node_tokens.size(0))
+            if num_nodes_total <= _ZERO:
+                raise ValueError("node_tokens must be non-empty when node_ids is provided.")
+            node_tokens_sel = node_tokens.index_select(0, node_ids)
+            node_batch_sel = node_batch.index_select(0, node_ids)
+        steps = steps.to(device=node_tokens_sel.device, dtype=torch.long).view(-1)
+        if steps.numel() == node_tokens_sel.size(0):
+            time_emb = self.z_time_encoder(steps)
+        else:
+            max_batch = node_batch_sel.max()
+            steps_num = torch.tensor(steps.numel(), device=max_batch.device)
+            torch._assert(steps_num > max_batch, "steps length must cover max node batch index.")
+            time_emb = self.z_time_encoder(steps).index_select(0, node_batch_sel)
+        node_tokens_sel = node_tokens_sel + time_emb
+        if prev_rel_emb is not None:
+            prev_rel_emb = prev_rel_emb.to(device=node_tokens_sel.device, dtype=node_tokens_sel.dtype)
+            if prev_rel_emb.dim() != _TWO:
+                raise ValueError("prev_rel_emb must be [num_graphs, hidden_dim] or [num_nodes, hidden_dim].")
+            if prev_rel_emb.size(0) == node_tokens_sel.size(0):
+                prev_rel_sel = prev_rel_emb
+            else:
+                prev_rel_sel = prev_rel_emb.index_select(0, node_batch_sel)
+            node_tokens_sel = node_tokens_sel + prev_rel_sel
+        return self.stop_predictor(
+            node_tokens=node_tokens_sel,
+            question_tokens=context_tokens,
+            node_batch=node_batch_sel,
+        )
+
+    def _compute_stop_logit(
+        self,
+        *,
+        prepared: _PreparedBatch,
+        node_ids: torch.Tensor,
+        steps: torch.Tensor,
+        context_tokens: torch.Tensor,
+        prev_rel_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        log_r_delta = self._compute_log_r_delta_for_nodes(
+            node_tokens=prepared.node_tokens,
+            context_tokens=context_tokens,
+            node_batch=prepared.node_batch,
+            steps=steps,
+            node_ids=node_ids,
+            prev_rel_emb=prev_rel_emb,
+        )
+        min_steps = self._resolve_stop_min_steps()
+        if min_steps > 0:
+            steps = steps.to(device=log_r_delta.device, dtype=torch.long).view(-1)
+            early = steps < min_steps
+            neg_inf = torch.finfo(log_r_delta.dtype).min
+            log_r_delta = torch.where(early, torch.full_like(log_r_delta, neg_inf), log_r_delta)
+        return log_r_delta
+
+    def _compute_stop_logit_for_beams(
+        self,
+        *,
+        prepared: _PreparedBatch,
+        node_ids: torch.Tensor,
+        steps: torch.Tensor,
+        beam_context: torch.Tensor,
+        prev_rel_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        node_ids = node_ids.to(device=prepared.node_tokens.device, dtype=torch.long).view(-1)
+        beam_context = self._resolve_context_tokens(beam_context)
+        if beam_context.size(0) != node_ids.numel():
+            raise ValueError("beam_context length mismatch with node_ids.")
+        steps = steps.to(device=node_ids.device, dtype=torch.long).view(-1)
+        node_tokens_sel = prepared.node_tokens.index_select(0, node_ids)
+        time_emb = self.z_time_encoder(steps)
+        node_tokens_sel = node_tokens_sel + time_emb
+        if prev_rel_emb is not None:
+            prev_rel_emb = prev_rel_emb.to(device=node_tokens_sel.device, dtype=node_tokens_sel.dtype)
+            if prev_rel_emb.dim() != _TWO or prev_rel_emb.size(0) != node_tokens_sel.size(0):
+                raise ValueError("prev_rel_emb must be [num_beams, hidden_dim].")
+            node_tokens_sel = node_tokens_sel + prev_rel_emb
+        node_batch = torch.arange(node_ids.numel(), device=node_ids.device, dtype=torch.long)
+        log_r_delta = self.stop_predictor(
+            node_tokens=node_tokens_sel,
+            question_tokens=beam_context,
+            node_batch=node_batch,
+        )
+        min_steps = self._resolve_stop_min_steps()
+        if min_steps > 0:
+            early = steps < min_steps
+            neg_inf = torch.finfo(log_r_delta.dtype).min
+            log_r_delta = torch.where(early, torch.full_like(log_r_delta, neg_inf), log_r_delta)
+        return log_r_delta
+
+    @staticmethod
+    def _compute_log_denom_with_stop(
+        *,
+        edge_logits: torch.Tensor,
+        edge_batch: torch.Tensor,
+        num_graphs: int,
+        stop_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        edge_lse = segment_logsumexp_1d(edge_logits, edge_batch, num_graphs)
+        return torch.logaddexp(edge_lse, stop_logits)
+
+    @staticmethod
+    def _compute_log_indegree_bias(
+        *,
+        prepared: _PreparedBatch,
+        edge_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        tails = prepared.edge_index[_ONE].index_select(0, edge_ids)
+        indegree = prepared.edge_ptr_by_tail_fwd[1:] - prepared.edge_ptr_by_tail_fwd[:-1]
+        indegree = indegree.to(device=edge_ids.device, dtype=torch.float32)
+        counts = indegree.index_select(0, tails.clamp(min=_ZERO)).clamp(min=float(_ONE))
+        log_bias = -torch.log(counts)
+        return log_bias.detach()
 
     def _compute_edge_logits_components(
         self,
         *,
-        policy: SRM,
         prepared: _PreparedBatch,
         edge_ids: torch.Tensor,
         edge_batch: torch.Tensor,
         steps: torch.Tensor,
         temperature: float,
         context_tokens: torch.Tensor,
-        apply_p0: bool,
-        compute_p0: bool,
-        decision_graph_ids: Optional[torch.Tensor],
+        prev_rel_emb: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if edge_ids.numel() == _ZERO:
             empty = torch.zeros((_ZERO,), device=edge_ids.device, dtype=torch.float32)
@@ -1104,66 +1261,78 @@ class DualFlowModule(LightningModule):
         edge_batch = edge_batch.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
         heads = prepared.edge_index[_ZERO].index_select(0, edge_ids)
         tails = prepared.edge_index[_ONE].index_select(0, edge_ids)
-        head_tokens = prepared.node_tokens.index_select(0, heads)
-        tail_tokens = prepared.node_tokens.index_select(0, tails)
         relation_tokens = prepared.relation_tokens.index_select(0, edge_ids)
-        steps = steps.to(device=head_tokens.device, dtype=torch.long).view(-1)
-        time_emb = self.z_time_encoder(steps).index_select(0, edge_batch)
-        head_tokens = head_tokens + time_emb
-        context_tokens = self._resolve_context_tokens(context_tokens)
-        context_edge = context_tokens.index_select(0, edge_batch)
-        nn_logits = policy(context_edge, head_tokens, relation_tokens, tail_tokens, None)
-        log_p0 = torch.zeros_like(nn_logits, dtype=torch.float32)
-        if compute_p0 and str(self._p0_cfg["mode"]) != _P0_MODE_NONE:
-            num_decisions = int(steps.numel())
-            log_p0 = self._compute_log_p0(
-                prepared=prepared,
-                edge_ids=edge_ids,
-                edge_batch=edge_batch,
-                num_decisions=num_decisions,
-                decision_graph_ids=decision_graph_ids,
-            ).to(dtype=nn_logits.dtype)
-        logits = nn_logits
-        if apply_p0 and self._p0_enabled():
-            logits = logits + log_p0
+        steps = steps.to(device=prepared.node_tokens.device, dtype=torch.long).view(-1)
+        if steps.numel() == edge_ids.numel():
+            steps_edge = steps
+        else:
+            max_batch = edge_batch.max()
+            steps_num = torch.tensor(steps.numel(), device=max_batch.device)
+            torch._assert(steps_num > max_batch, "steps length must cover max edge batch index.")
+            steps_edge = steps.index_select(0, edge_batch)
+        prev_rel_edge = None
+        if prev_rel_emb is not None:
+            prev_rel_emb = prev_rel_emb.to(device=relation_tokens.device, dtype=relation_tokens.dtype)
+            if prev_rel_emb.dim() != _TWO:
+                raise ValueError("prev_rel_emb must be [num_graphs, hidden_dim] or [num_edges, hidden_dim].")
+            if prev_rel_emb.size(0) == edge_ids.numel():
+                prev_rel_edge = prev_rel_emb
+            else:
+                prev_rel_edge = prev_rel_emb.index_select(0, edge_batch)
+        if prev_rel_edge is None:
+            prev_rel_next_edge = None
+        else:
+            prev_rel_next_edge = self._update_prev_state(
+                prev_state=prev_rel_edge,
+                rel_emb=relation_tokens,
+                update_mask=None,
+            )
+        log_z_head = self._compute_log_z_for_edges(
+            prepared=prepared,
+            node_ids=heads,
+            edge_batch=edge_batch,
+            steps=steps_edge,
+            context_tokens=context_tokens,
+            prev_rel_emb=prev_rel_edge,
+        )
+        log_z_tail = self._compute_log_z_for_edges(
+            prepared=prepared,
+            node_ids=tails,
+            edge_batch=edge_batch,
+            steps=steps_edge + _ONE,
+            context_tokens=context_tokens,
+            prev_rel_emb=prev_rel_next_edge,
+        )
+        nn_logits = log_z_tail - log_z_head
+        log_bias = self._compute_log_indegree_bias(prepared=prepared, edge_ids=edge_ids)
+        log_bias = log_bias.to(device=nn_logits.device, dtype=nn_logits.dtype)
+        prior_weight = self.prior_weight.to(device=nn_logits.device, dtype=nn_logits.dtype)
+        logits = nn_logits + prior_weight * log_bias
         if temperature != float(_ONE):
             logits = logits / float(temperature)
-        return nn_logits, log_p0, logits
+        return nn_logits, log_bias, logits
 
     def _compute_edge_logits(
         self,
         *,
-        policy: SRM,
         prepared: _PreparedBatch,
         edge_ids: torch.Tensor,
         edge_batch: torch.Tensor,
         steps: torch.Tensor,
         temperature: float,
         context_tokens: torch.Tensor,
-        apply_p0: bool = False,
-        decision_graph_ids: Optional[torch.Tensor] = None,
+        prev_rel_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         _, _, logits = self._compute_edge_logits_components(
-            policy=policy,
             prepared=prepared,
             edge_ids=edge_ids,
             edge_batch=edge_batch,
             steps=steps,
             temperature=temperature,
             context_tokens=context_tokens,
-            apply_p0=apply_p0,
-            compute_p0=apply_p0,
-            decision_graph_ids=decision_graph_ids,
+            prev_rel_emb=prev_rel_emb,
         )
         return logits
-
-    @staticmethod
-    def _cosine_similarity(x: torch.Tensor, y: torch.Tensor, *, eps: float) -> torch.Tensor:
-        x = x.to(dtype=torch.float32)
-        y = y.to(dtype=torch.float32)
-        x_norm = x / x.norm(dim=-1, keepdim=True).clamp(min=eps)
-        y_norm = y / y.norm(dim=-1, keepdim=True).clamp(min=eps)
-        return (x_norm * y_norm).sum(dim=-1)
 
     def _compute_pb_logits(
         self,
@@ -1220,7 +1389,7 @@ class DualFlowModule(LightningModule):
         )
         num_graphs = move_mask.numel()
         # NOTE: We normalize PB over the full candidate set after applying static masks.
-        # Dynamic constraints (e.g., avoid_revisit / pb_edge_dropout) are treated as an
+        # Dynamic constraints (e.g., avoid_revisit) are treated as an
         # approximation to keep training efficient; the residual absorbs the mismatch.
         log_denom = self._compute_log_denom(logits=logits, edge_batch=edge_batch, num_graphs=num_graphs)
         chosen_edge_safe = chosen_edge.clamp(min=_ZERO)
@@ -1295,6 +1464,7 @@ class DualFlowModule(LightningModule):
             invalid_start, torch.full_like(stop_reason, _TERMINAL_INVALID_START), stop_reason
         )
         active = graph_mask & (curr_nodes >= _ZERO)
+        prev_rel = self._init_prev_relation(num_graphs=num_graphs, device=device)
         visited_nodes = None
         if self._avoid_revisit:
             visited_nodes = torch.zeros((prepared.node_batch.numel(),), device=device, dtype=torch.bool)
@@ -1364,20 +1534,9 @@ class DualFlowModule(LightningModule):
             log_pf_steps=log_pf_steps,
         )
 
-    def _sample_pb_edge_dropout_mask(self, *, edge_index: torch.Tensor) -> Optional[torch.Tensor]:
-        drop_prob = float(self._resolve_db_cfg()["pb_edge_dropout"])
-        if drop_prob <= float(_ZERO):
-            return None
-        num_edges = int(edge_index.size(1))
-        if num_edges <= _ZERO:
-            return None
-        keep = torch.rand((num_edges,), device=edge_index.device) >= drop_prob
-        return keep
-
     def _sample_edges(
         self,
         *,
-        policy: SRM,
         prepared: _PreparedBatch,
         edge_ids: torch.Tensor,
         edge_batch: torch.Tensor,
@@ -1385,68 +1544,94 @@ class DualFlowModule(LightningModule):
         steps: torch.Tensor,
         temperature: float,
         context_tokens: torch.Tensor,
-        apply_p0: bool,
         collect_policy_metrics: bool = False,
+        stop_logits: Optional[torch.Tensor] = None,
+        prev_rel_emb: Optional[torch.Tensor] = None,
+        force_stop_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict[str, torch.Tensor]]]:
         edge_ids = edge_ids.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
         edge_batch = edge_batch.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
         if edge_ids.numel() == _ZERO:
             zeros = torch.zeros((num_graphs,), device=prepared.edge_index.device, dtype=torch.float32)
+            if stop_logits is None:
+                return (
+                    torch.full((num_graphs,), _NEG_ONE, device=prepared.edge_index.device, dtype=torch.long),
+                    zeros,
+                    zeros,
+                    None,
+                )
+            stop_logits = stop_logits.to(device=zeros.device, dtype=zeros.dtype).view(-1)
+            stop_logits = torch.where(torch.isfinite(stop_logits), stop_logits, zeros)
+            if temperature != float(_ONE):
+                stop_logits = stop_logits / float(temperature)
             return (
-                torch.full((num_graphs,), _NEG_ONE, device=prepared.edge_index.device, dtype=torch.long),
+                torch.full((num_graphs,), _STOP_ACTION_ID, device=prepared.edge_index.device, dtype=torch.long),
                 zeros,
-                zeros,
+                stop_logits,
                 None,
             )
-        compute_p0 = collect_policy_metrics and str(self._p0_cfg["mode"]) != _P0_MODE_NONE
-        nn_logits, log_p0, logits = self._compute_edge_logits_components(
-            policy=policy,
+        nn_logits, _, logits = self._compute_edge_logits_components(
             prepared=prepared,
             edge_ids=edge_ids,
             edge_batch=edge_batch,
-            steps=steps + _ONE,
+            steps=steps,
             temperature=temperature,
             context_tokens=context_tokens,
-            apply_p0=apply_p0,
-            compute_p0=compute_p0,
-            decision_graph_ids=None,
+            prev_rel_emb=prev_rel_emb,
         )
-        log_denom = self._compute_log_denom(logits=logits, edge_batch=edge_batch, num_graphs=num_graphs)
-        log_probs = logits - log_denom.index_select(0, edge_batch)
-        scores = log_probs + gumbel_noise_like(log_probs)
-        _, argmax = segment_max(scores, edge_batch, num_graphs)
-        chosen_edge = edge_ids.index_select(0, argmax)
-        log_prob_chosen = log_probs.index_select(0, argmax)
+        if force_stop_mask is not None:
+            force_stop_mask = force_stop_mask.to(device=logits.device, dtype=torch.bool).view(-1)
+            if force_stop_mask.numel() != num_graphs:
+                raise ValueError("force_stop_mask length mismatch with num_graphs.")
+            force_edge = force_stop_mask.index_select(0, edge_batch)
+            neg_inf = torch.finfo(logits.dtype).min
+            logits = torch.where(force_edge, torch.full_like(logits, neg_inf), logits)
+            if stop_logits is not None:
+                stop_logits = torch.where(force_stop_mask, torch.zeros_like(stop_logits), stop_logits)
+        if stop_logits is None:
+            log_denom = self._compute_log_denom(logits=logits, edge_batch=edge_batch, num_graphs=num_graphs)
+            log_probs = logits - log_denom.index_select(0, edge_batch)
+            scores = log_probs + gumbel_noise_like(log_probs)
+            _, argmax = segment_max(scores, edge_batch, num_graphs)
+            chosen_edge = edge_ids.index_select(0, argmax)
+            log_prob_chosen = log_probs.index_select(0, argmax)
+            stop_mask = torch.zeros((num_graphs,), device=logits.device, dtype=torch.bool)
+        else:
+            stop_logits = stop_logits.to(device=logits.device, dtype=logits.dtype).view(-1)
+            if temperature != float(_ONE):
+                stop_logits = stop_logits / float(temperature)
+            log_denom = self._compute_log_denom_with_stop(
+                edge_logits=logits,
+                edge_batch=edge_batch,
+                num_graphs=num_graphs,
+                stop_logits=stop_logits,
+            )
+            log_probs = logits - log_denom.index_select(0, edge_batch)
+            edge_scores = log_probs + gumbel_noise_like(log_probs)
+            edge_best, argmax = segment_max(edge_scores, edge_batch, num_graphs)
+            stop_log_prob = stop_logits - log_denom
+            stop_scores = stop_log_prob + gumbel_noise_like(stop_log_prob)
+            stop_mask = stop_scores >= edge_best
+            chosen_edge = edge_ids.index_select(0, argmax)
+            log_prob_edge = log_probs.index_select(0, argmax)
+            log_prob_stop = stop_log_prob
+            log_prob_chosen = torch.where(stop_mask, log_prob_stop, log_prob_edge)
+            chosen_edge = torch.where(stop_mask, torch.full_like(chosen_edge, _STOP_ACTION_ID), chosen_edge)
         policy_metrics = None
         if collect_policy_metrics:
             edge_count = torch.tensor(nn_logits.numel(), device=nn_logits.device, dtype=torch.float32)
             drift_abs_sum = nn_logits.abs().sum()
             drift_sq_sum = (nn_logits * nn_logits).sum()
-            kl_sum = torch.zeros((), device=nn_logits.device, dtype=torch.float32)
-            kl_count = torch.zeros((), device=nn_logits.device, dtype=torch.float32)
-            if compute_p0:
-                pi = torch.exp(log_probs)
-                kl_edges = pi * (log_probs - log_p0.to(dtype=log_probs.dtype))
-                kl_per_decision = torch.zeros((num_graphs,), device=nn_logits.device, dtype=torch.float32)
-                kl_per_decision.index_add_(0, edge_batch, kl_edges.to(dtype=torch.float32))
-                counts = torch.bincount(edge_batch, minlength=num_graphs)
-                has_edge = counts > _ZERO
-                if bool(has_edge.any().detach().tolist()):
-                    kl_sum = kl_per_decision[has_edge].sum()
-                    kl_count = has_edge.to(dtype=torch.float32).sum()
             policy_metrics = {
                 "drift_abs_sum": drift_abs_sum,
                 "drift_sq_sum": drift_sq_sum,
                 "edge_count": edge_count,
-                "kl_sum": kl_sum,
-                "kl_count": kl_count,
             }
         return chosen_edge, log_prob_chosen, log_denom, policy_metrics
 
     def _compute_forward_log_prob(
         self,
         *,
-        policy: SRM,
         prepared: _PreparedBatch,
         chosen_edge: torch.Tensor,
         parent_nodes: torch.Tensor,
@@ -1456,7 +1641,8 @@ class DualFlowModule(LightningModule):
         edge_ptr_by_head: torch.Tensor,
         temperature: float,
         context_tokens: torch.Tensor,
-        apply_p0: bool,
+        context_tokens_edge: Optional[torch.Tensor] = None,
+        prev_rel_emb: Optional[torch.Tensor] = None,
         visited_nodes: Optional[torch.Tensor] = None,
         edge_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1479,17 +1665,34 @@ class DualFlowModule(LightningModule):
             return torch.zeros_like(move_mask, dtype=torch.float32)
         edge_ids = outgoing.edge_ids.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
         edge_batch = outgoing.edge_batch.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
+        edge_context = context_tokens_edge if context_tokens_edge is not None else context_tokens
         logits = self._compute_edge_logits(
-            policy=policy,
             prepared=prepared,
             edge_ids=edge_ids,
             edge_batch=edge_batch,
-            steps=steps + _ONE,
+            steps=steps,
             temperature=temperature,
-            context_tokens=context_tokens,
-            apply_p0=apply_p0,
+            context_tokens=edge_context,
+            prev_rel_emb=prev_rel_emb,
         )
-        log_denom = self._compute_log_denom(logits=logits, edge_batch=edge_batch, num_graphs=move_mask.numel())
+        if self._stop_enabled():
+            stop_logits = self._compute_stop_logit(
+                prepared=prepared,
+                node_ids=parent_nodes,
+                steps=steps,
+                context_tokens=context_tokens,
+                prev_rel_emb=prev_rel_emb,
+            )
+            if temperature != float(_ONE):
+                stop_logits = stop_logits / float(temperature)
+            log_denom = self._compute_log_denom_with_stop(
+                edge_logits=logits,
+                edge_batch=edge_batch,
+                num_graphs=move_mask.numel(),
+                stop_logits=stop_logits,
+            )
+        else:
+            log_denom = self._compute_log_denom(logits=logits, edge_batch=edge_batch, num_graphs=move_mask.numel())
         chosen_edge_safe = chosen_edge.clamp(min=_ZERO)
         chosen_for_edge = chosen_edge_safe.index_select(0, edge_batch)
         match = edge_ids == chosen_for_edge
@@ -1502,10 +1705,84 @@ class DualFlowModule(LightningModule):
         log_pf_step = torch.where(move_mask & has_edge, log_pf_edge, torch.zeros_like(log_pf_edge))
         return log_pf_step
 
+    def _compute_stop_log_prob(
+        self,
+        *,
+        prepared: _PreparedBatch,
+        parent_nodes: torch.Tensor,
+        move_mask: torch.Tensor,
+        steps: torch.Tensor,
+        edge_ids_by_head: torch.Tensor,
+        edge_ptr_by_head: torch.Tensor,
+        temperature: float,
+        context_tokens: torch.Tensor,
+        prev_rel_emb: Optional[torch.Tensor] = None,
+        visited_nodes: Optional[torch.Tensor] = None,
+        edge_mask: Optional[torch.Tensor] = None,
+        force_stop_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not self._stop_enabled():
+            return torch.zeros_like(move_mask, dtype=torch.float32)
+        if edge_mask is not None and edge_mask.numel() != prepared.edge_index.size(1):
+            raise ValueError("edge_mask length must match edge_index for stop log prob.")
+        outgoing = gather_outgoing_edges(
+            curr_nodes=parent_nodes,
+            edge_ids_by_head=edge_ids_by_head,
+            edge_ptr_by_head=edge_ptr_by_head,
+            active_mask=move_mask,
+        )
+        outgoing = self._apply_action_constraints_to_outgoing(
+            outgoing,
+            num_graphs=move_mask.numel(),
+            edge_index=prepared.edge_index,
+            edge_mask=edge_mask,
+            visited_nodes=visited_nodes,
+        )
+        if outgoing.edge_ids.numel() == _ZERO:
+            return torch.zeros_like(move_mask, dtype=torch.float32)
+        edge_ids = outgoing.edge_ids.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
+        edge_batch = outgoing.edge_batch.to(device=prepared.edge_index.device, dtype=torch.long).view(-1)
+        logits = self._compute_edge_logits(
+            prepared=prepared,
+            edge_ids=edge_ids,
+            edge_batch=edge_batch,
+            steps=steps,
+            temperature=temperature,
+            context_tokens=context_tokens,
+            prev_rel_emb=prev_rel_emb,
+        )
+        if force_stop_mask is not None:
+            force_stop_mask = force_stop_mask.to(device=logits.device, dtype=torch.bool).view(-1)
+            if force_stop_mask.numel() != move_mask.numel():
+                raise ValueError("force_stop_mask length mismatch with move_mask.")
+            force_edge = force_stop_mask.index_select(0, edge_batch)
+            neg_inf = torch.finfo(logits.dtype).min
+            logits = torch.where(force_edge, torch.full_like(logits, neg_inf), logits)
+        safe_nodes = torch.where(move_mask, parent_nodes, torch.zeros_like(parent_nodes)).clamp(min=_ZERO)
+        stop_logits = self._compute_stop_logit(
+            prepared=prepared,
+            node_ids=safe_nodes,
+            steps=steps,
+            context_tokens=context_tokens,
+            prev_rel_emb=prev_rel_emb,
+        )
+        if force_stop_mask is not None:
+            stop_logits = torch.where(force_stop_mask, torch.zeros_like(stop_logits), stop_logits)
+        if temperature != float(_ONE):
+            stop_logits = stop_logits / float(temperature)
+        log_denom = self._compute_log_denom_with_stop(
+            edge_logits=logits,
+            edge_batch=edge_batch,
+            num_graphs=move_mask.numel(),
+            stop_logits=stop_logits,
+        )
+        log_pf_stop = stop_logits - log_denom
+        log_pf_stop = torch.where(move_mask, log_pf_stop, torch.zeros_like(log_pf_stop))
+        return log_pf_stop
+
     def _rollout_policy(
         self,
         *,
-        policy: SRM,
         prepared: _PreparedBatch,
         graph_mask: torch.Tensor,
         start_nodes: torch.Tensor,
@@ -1516,7 +1793,6 @@ class DualFlowModule(LightningModule):
         record_log_pf: bool,
         temperature: float,
         context_tokens: torch.Tensor,
-        apply_p0: bool,
         collect_policy_metrics: bool = False,
         edge_mask: Optional[torch.Tensor] = None,
     ) -> _RolloutResult:
@@ -1534,6 +1810,7 @@ class DualFlowModule(LightningModule):
             invalid_start, torch.full_like(stop_reason, _TERMINAL_INVALID_START), stop_reason
         )
         active = graph_mask & (curr_nodes >= _ZERO)
+        prev_rel = self._init_prev_relation(num_graphs=num_graphs, device=device)
         visited_nodes = None
         if self._avoid_revisit:
             visited_nodes = torch.zeros((prepared.node_batch.numel(),), device=device, dtype=torch.bool)
@@ -1543,26 +1820,30 @@ class DualFlowModule(LightningModule):
         log_pf_steps = None
         policy_accum = None
         out_degree = None
+        in_degree = None
         if collect_policy_metrics:
             policy_accum = {
                 "drift_abs_sum": torch.zeros((), device=device, dtype=torch.float32),
                 "drift_sq_sum": torch.zeros((), device=device, dtype=torch.float32),
                 "edge_count": torch.zeros((), device=device, dtype=torch.float32),
-                "kl_sum": torch.zeros((), device=device, dtype=torch.float32),
-                "kl_count": torch.zeros((), device=device, dtype=torch.float32),
                 "deg_sum": torch.zeros((), device=device, dtype=torch.float32),
                 "deg_count": torch.zeros((), device=device, dtype=torch.float32),
+                "tail_deg_sum": torch.zeros((), device=device, dtype=torch.float32),
+                "tail_deg_count": torch.zeros((), device=device, dtype=torch.float32),
             }
             out_degree = (edge_ptr_by_head[1:] - edge_ptr_by_head[:-1]).to(device=device, dtype=torch.float32)
+            in_degree = (prepared.edge_ptr_by_tail_fwd[1:] - prepared.edge_ptr_by_tail_fwd[:-1]).to(
+                device=device, dtype=torch.float32
+            )
         if record_actions:
             actions = torch.full((num_graphs, self.max_steps), _NEG_ONE, device=device, dtype=torch.long)
         if record_log_pf:
             log_pf_steps = torch.zeros((num_graphs, self.max_steps), device=device, dtype=torch.float32)
+        min_steps = self._resolve_stop_min_steps()
         for step in range(int(self.max_steps)):
             at_target = node_is_target.index_select(0, curr_nodes.clamp(min=_ZERO)) & active
-            stop_nodes = torch.where(at_target, curr_nodes, stop_nodes)
-            stop_reason = torch.where(at_target, torch.full_like(stop_reason, _TERMINAL_HIT), stop_reason)
-            active = active & ~at_target
+            force_last = active & (step >= (self.max_steps - 1))
+            force_stop_mask = force_last | (at_target & (step >= min_steps))
             outgoing = gather_outgoing_edges(
                 curr_nodes=curr_nodes,
                 edge_ids_by_head=edge_ids_by_head,
@@ -1577,16 +1858,26 @@ class DualFlowModule(LightningModule):
                 visited_nodes=visited_nodes,
             )
             move_mask = active & outgoing.has_edge
+            step_ids = self._build_step_ids(num_graphs=num_graphs, step=step, device=device)
+            stop_logits = None
+            if self._stop_enabled():
+                stop_logits = self._compute_stop_logit(
+                    prepared=prepared,
+                    node_ids=curr_nodes,
+                    steps=step_ids,
+                    context_tokens=context_tokens,
+                    prev_rel_emb=prev_rel,
+                )
+                neg_inf = torch.finfo(stop_logits.dtype).min
+                stop_logits = torch.where(active, stop_logits, torch.full_like(stop_logits, neg_inf))
+                stop_logits = torch.where(force_stop_mask, torch.zeros_like(stop_logits), stop_logits)
             if collect_policy_metrics and policy_accum is not None and out_degree is not None:
-                if bool(move_mask.any().detach().tolist()):
-                    head_nodes = curr_nodes[move_mask].clamp(min=_ZERO)
-                    deg_sum = out_degree.index_select(0, head_nodes).sum()
-                    policy_accum["deg_sum"] = policy_accum["deg_sum"] + deg_sum
-                    policy_accum["deg_count"] = policy_accum["deg_count"] + move_mask.to(dtype=torch.float32).sum()
-            if outgoing.edge_ids.numel() > _ZERO:
-                step_ids = self._build_step_ids(num_graphs=num_graphs, step=step, device=device)
+                head_nodes = curr_nodes[move_mask].clamp(min=_ZERO)
+                deg_sum = out_degree.index_select(0, head_nodes).sum()
+                policy_accum["deg_sum"] = policy_accum["deg_sum"] + deg_sum
+                policy_accum["deg_count"] = policy_accum["deg_count"] + move_mask.to(dtype=torch.float32).sum()
+            if outgoing.edge_ids.numel() > _ZERO or stop_logits is not None:
                 chosen_edge, log_pf_step, _, step_metrics = self._sample_edges(
-                    policy=policy,
                     prepared=prepared,
                     edge_ids=outgoing.edge_ids,
                     edge_batch=outgoing.edge_batch,
@@ -1594,58 +1885,91 @@ class DualFlowModule(LightningModule):
                     steps=step_ids,
                     temperature=temperature,
                     context_tokens=context_tokens,
-                    apply_p0=apply_p0,
                     collect_policy_metrics=collect_policy_metrics,
+                    stop_logits=stop_logits,
+                    prev_rel_emb=prev_rel,
+                    force_stop_mask=force_stop_mask,
                 )
                 if collect_policy_metrics and policy_accum is not None and step_metrics is not None:
                     for key, value in step_metrics.items():
                         policy_accum[key] = policy_accum[key] + value.to(device=device)
-                chosen_edge = torch.where(outgoing.has_edge, chosen_edge, torch.full_like(chosen_edge, _NEG_ONE))
+                stop_mask = (chosen_edge == _STOP_ACTION_ID) & active
+                stop_mask = stop_mask | force_stop_mask
+                stop_nodes = torch.where(stop_mask, curr_nodes, stop_nodes)
+                stop_hits = node_is_target.index_select(0, curr_nodes.clamp(min=_ZERO)) & stop_mask
+                stop_reason = torch.where(stop_hits, torch.full_like(stop_reason, _TERMINAL_HIT), stop_reason)
+                stop_reason = torch.where(
+                    stop_mask & ~stop_hits, torch.full_like(stop_reason, _TERMINAL_EMIT), stop_reason
+                )
+                move_mask = active & ~stop_mask & outgoing.has_edge
+                chosen_edge = torch.where(move_mask, chosen_edge, torch.full_like(chosen_edge, _NEG_ONE))
                 chosen_tail = prepared.edge_index[_ONE].index_select(0, chosen_edge.clamp(min=_ZERO))
                 curr_nodes = torch.where(move_mask, chosen_tail, curr_nodes)
                 if visited_nodes is not None:
                     visited_nodes.index_fill_(0, chosen_tail[move_mask], True)
-                log_pf_step = torch.where(move_mask, log_pf_step, torch.zeros_like(log_pf_step))
+                if collect_policy_metrics and policy_accum is not None and in_degree is not None:
+                    tail_nodes = chosen_tail[move_mask].clamp(min=_ZERO)
+                    tail_deg_sum = in_degree.index_select(0, tail_nodes).sum()
+                    policy_accum["tail_deg_sum"] = policy_accum["tail_deg_sum"] + tail_deg_sum
+                    policy_accum["tail_deg_count"] = policy_accum["tail_deg_count"] + move_mask.to(
+                        dtype=torch.float32
+                    ).sum()
+                chosen_rel = prepared.relation_tokens.index_select(0, chosen_edge.clamp(min=_ZERO))
+                prev_rel = self._update_prev_state(prev_state=prev_rel, rel_emb=chosen_rel, update_mask=move_mask)
+                log_pf_step = torch.where(active, log_pf_step, torch.zeros_like(log_pf_step))
                 log_pf_sum = log_pf_sum + log_pf_step
                 num_moves = num_moves + move_mask.to(dtype=torch.long)
                 if record_actions and actions is not None:
-                    actions[:, step] = torch.where(move_mask, chosen_edge, actions[:, step])
+                    actions[:, step] = torch.where(active, chosen_edge, actions[:, step])
                 if record_log_pf and log_pf_steps is not None:
-                    log_pf_steps[:, step] = log_pf_step
-            no_edge = active & ~outgoing.has_edge
-            stop_nodes = torch.where(no_edge, curr_nodes, stop_nodes)
-            stop_reason = torch.where(no_edge, torch.full_like(stop_reason, _TERMINAL_DEAD_END), stop_reason)
-            active = active & outgoing.has_edge
+                    log_pf_steps[:, step] = torch.where(active, log_pf_step, log_pf_steps[:, step])
+                active = active & ~stop_mask & move_mask
+            else:
+                no_edge = active & ~outgoing.has_edge
+                stop_nodes = torch.where(no_edge, curr_nodes, stop_nodes)
+                stop_reason = torch.where(no_edge, torch.full_like(stop_reason, _TERMINAL_DEAD_END), stop_reason)
+                active = active & outgoing.has_edge
         stop_nodes = torch.where(
             stop_nodes >= _ZERO,
             stop_nodes,
             torch.where(active, curr_nodes, torch.full_like(curr_nodes, _NEG_ONE)),
         )
-        stop_reason = torch.where(active, torch.full_like(stop_reason, _TERMINAL_MAX_STEPS), stop_reason)
+        if self._stop_enabled():
+            stop_reason = torch.where(active, torch.full_like(stop_reason, _TERMINAL_MAX_STEPS), stop_reason)
+        else:
+            at_target = node_is_target.index_select(0, curr_nodes.clamp(min=_ZERO)) & active
+            stop_reason = torch.where(at_target, torch.full_like(stop_reason, _TERMINAL_HIT), stop_reason)
+            stop_reason = torch.where(active & ~at_target, torch.full_like(stop_reason, _TERMINAL_MAX_STEPS), stop_reason)
         policy_metrics = None
         if collect_policy_metrics and policy_accum is not None:
             edge_count = policy_accum["edge_count"]
-            if edge_count > float(_ZERO):
-                drift_abs_mean = policy_accum["drift_abs_sum"] / edge_count
-                drift_rms = torch.sqrt(policy_accum["drift_sq_sum"] / edge_count)
-            else:
-                drift_abs_mean = torch.zeros((), device=device, dtype=torch.float32)
-                drift_rms = torch.zeros((), device=device, dtype=torch.float32)
-            kl_count = policy_accum["kl_count"]
-            if kl_count > float(_ZERO):
-                kl_mean = policy_accum["kl_sum"] / kl_count
-            else:
-                kl_mean = torch.zeros((), device=device, dtype=torch.float32)
+            drift_abs_mean = torch.where(
+                edge_count > float(_ZERO),
+                policy_accum["drift_abs_sum"] / edge_count,
+                torch.zeros((), device=device, dtype=torch.float32),
+            )
+            drift_rms = torch.where(
+                edge_count > float(_ZERO),
+                torch.sqrt(policy_accum["drift_sq_sum"] / edge_count),
+                torch.zeros((), device=device, dtype=torch.float32),
+            )
             deg_count = policy_accum["deg_count"]
-            if deg_count > float(_ZERO):
-                degree_mean = policy_accum["deg_sum"] / deg_count
-            else:
-                degree_mean = torch.zeros((), device=device, dtype=torch.float32)
+            degree_mean = torch.where(
+                deg_count > float(_ZERO),
+                policy_accum["deg_sum"] / deg_count,
+                torch.zeros((), device=device, dtype=torch.float32),
+            )
+            tail_deg_count = policy_accum["tail_deg_count"]
+            tail_degree_mean = torch.where(
+                tail_deg_count > float(_ZERO),
+                policy_accum["tail_deg_sum"] / tail_deg_count,
+                torch.zeros((), device=device, dtype=torch.float32),
+            )
             policy_metrics = {
                 "policy_drift_abs": drift_abs_mean.detach(),
                 "policy_drift_rms": drift_rms.detach(),
-                "policy_kl_p0": kl_mean.detach(),
                 "policy_out_degree_mean": degree_mean.detach(),
+                "policy_tail_in_degree_mean": tail_degree_mean.detach(),
             }
         return _RolloutResult(
             log_pf_sum=log_pf_sum,
@@ -1727,147 +2051,185 @@ class DualFlowModule(LightningModule):
         graph_mask: torch.Tensor,
         traj_lengths: torch.Tensor,
         stop_reason: torch.Tensor,
-        node_is_target: torch.Tensor,
+        stop_nodes: torch.Tensor,
         sampling_temperature: float,
-        edge_mask_bwd: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         device = prepared_fwd.node_ptr.device
         graph_mask = graph_mask.to(device=device, dtype=torch.bool)
+        actions = actions.to(device=device, dtype=torch.long)
+        traj_lengths = traj_lengths.to(device=device, dtype=torch.long).view(-1)
+        stop_reason = stop_reason.to(device=device, dtype=torch.long).view(-1)
+        stop_nodes = stop_nodes.to(device=device, dtype=torch.long).view(-1)
         num_graphs, max_steps = actions.shape
+        num_edges = int(prepared_fwd.edge_index.size(1))
+        if num_edges <= _ZERO:
+            raise ValueError("edge_index is empty for this batch; check dataset filtering.")
         if max_steps == _ZERO:
             zero = torch.zeros((), device=device, dtype=torch.float32)
             return self._ensure_loss_requires_grad(zero), {"db_loss": zero.detach()}
+        if self._avoid_revisit:
+            raise RuntimeError("avoid_revisit=True is not supported in vectorized DB loss.")
 
         db_cfg = self._resolve_db_cfg()
         dead_end_log_reward = float(self._resolve_dead_end_log_reward(cfg=db_cfg))
         dead_end_weight = float(db_cfg["dead_end_weight"])
         edge_mask = actions >= _ZERO
+        stop_mask = actions == _STOP_ACTION_ID
+        has_stop = stop_mask.any(dim=1)
         failure_mask = (stop_reason != _TERMINAL_HIT) & graph_mask
         weight = torch.ones((num_graphs,), device=device, dtype=torch.float32)
         if dead_end_weight != float(_ONE):
             weight = torch.where(failure_mask, weight * dead_end_weight, weight)
-        accum = self._init_db_accumulators(device=device)
-        total = accum["total"]
-        denom = accum["denom"]
-        valid_count = accum["valid_count"]
-        move_count = accum["move_count"]
-        log_pb_sum = accum["log_pb_sum"]
-        log_pb_min = accum["log_pb_min"]
-        log_z_u_sum = accum["log_z_u_sum"]
-        log_z_v_sum = accum["log_z_v_sum"]
-        delta_sum = accum["delta_sum"]
-        delta_sq_sum = accum["delta_sq_sum"]
-        delta_count = accum["delta_count"]
-        inv_invalid_count = accum["inv_invalid_count"]
-        no_allowed_count = accum["no_allowed_count"]
-        finite_pf_count = accum["finite_pf_count"]
-        finite_pb_count = accum["finite_pb_count"]
-        finite_z_u_count = accum["finite_z_u_count"]
-        finite_z_v_count = accum["finite_z_v_count"]
-        visited_fwd = None
-        visited_bwd = None
-        if self._avoid_revisit:
-            num_nodes_total = int(prepared_fwd.node_batch.numel())
-            visited_fwd = torch.zeros((num_nodes_total,), device=device, dtype=torch.bool)
-            visited_bwd = torch.zeros((num_nodes_total,), device=device, dtype=torch.bool)
-            mask_all = edge_mask & graph_mask.view(-1, _ONE)
-            edges_taken = actions[mask_all].to(device=device, dtype=torch.long).clamp(min=_ZERO)
-            tails_taken = prepared_fwd.edge_index[_ONE].index_select(0, edges_taken)
-            visited_bwd.index_fill_(0, tails_taken, True)
-        for step in range(max_steps):
-            edge_ids = actions[:, step]
-            move_mask = edge_mask[:, step] & graph_mask
-            move_count = move_count + move_mask.to(dtype=torch.float32).sum()
-            safe_edges = edge_ids.clamp(min=_ZERO)
-            heads = prepared_fwd.edge_index[_ZERO].index_select(0, safe_edges)
-            tails = prepared_fwd.edge_index[_ONE].index_select(0, safe_edges)
-            if visited_fwd is not None:
-                visited_fwd.index_fill_(0, heads[move_mask], True)
-            step_ids = self._build_step_ids(num_graphs=num_graphs, step=step, device=device)
-            next_step_ids = step_ids + _ONE
-            log_z_u = self._compute_log_z_for_nodes(
+
+        move_mask = edge_mask & graph_mask.view(-1, _ONE)
+        safe_edges = actions.clamp(min=_ZERO)
+        heads = prepared_fwd.edge_index[_ZERO].index_select(0, safe_edges.reshape(-1)).reshape(num_graphs, max_steps)
+        tails = prepared_fwd.edge_index[_ONE].index_select(0, safe_edges.reshape(-1)).reshape(num_graphs, max_steps)
+        rel_tokens = prepared_fwd.relation_tokens.index_select(0, safe_edges.reshape(-1)).reshape(
+            num_graphs, max_steps, -1
+        )
+        prev_rel, prev_rel_next = self._compute_prev_rel_sequences(rel_tokens=rel_tokens, num_moves=traj_lengths)
+        steps = torch.arange(max_steps, device=device, dtype=torch.long).view(1, -1).expand(num_graphs, max_steps)
+
+        flat_size = num_graphs * max_steps
+        heads_flat = heads.reshape(flat_size)
+        tails_flat = tails.reshape(flat_size)
+        steps_flat = steps.reshape(flat_size)
+        move_mask_flat = move_mask.reshape(flat_size)
+        prev_rel_flat = prev_rel.reshape(flat_size, -1)
+        prev_rel_next_flat = prev_rel_next.reshape(flat_size, -1)
+
+        log_z_u = self._compute_log_z_for_nodes(
+            node_tokens=prepared_fwd.node_tokens,
+            context_tokens=prepared_fwd.context_tokens,
+            node_batch=prepared_fwd.node_batch,
+            steps=steps_flat,
+            node_ids=heads_flat,
+            prev_rel_emb=prev_rel_flat,
+        ).reshape(num_graphs, max_steps)
+        log_z_v = self._compute_log_z_for_nodes(
+            node_tokens=prepared_fwd.node_tokens,
+            context_tokens=prepared_fwd.context_tokens,
+            node_batch=prepared_fwd.node_batch,
+            steps=steps_flat + _ONE,
+            node_ids=tails_flat,
+            prev_rel_emb=prev_rel_next_flat,
+        ).reshape(num_graphs, max_steps)
+        log_pf = self._compute_forward_log_prob(
+            prepared=prepared_fwd,
+            chosen_edge=actions.reshape(-1),
+            parent_nodes=heads_flat,
+            move_mask=move_mask_flat,
+            steps=steps_flat,
+            edge_ids_by_head=prepared_fwd.edge_ids_by_head_fwd,
+            edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_fwd,
+            temperature=sampling_temperature,
+            context_tokens=prepared_fwd.context_tokens,
+            context_tokens_edge=self._resolve_context_tokens(prepared_fwd.context_tokens).repeat_interleave(
+                max_steps, dim=0
+            ),
+            prev_rel_emb=prev_rel_flat,
+        ).reshape(num_graphs, max_steps)
+
+        inv_edge = prepared_fwd.edge_inverse_map.index_select(0, safe_edges.reshape(-1)).reshape(num_graphs, max_steps)
+        inv_valid = inv_edge >= _ZERO
+        inv_edge = torch.where(inv_valid, inv_edge, torch.full_like(inv_edge, _NEG_ONE))
+        active_bwd = move_mask & inv_valid
+        log_pb, no_allowed = self._compute_pb_log_prob(
+            prepared=prepared_fwd,
+            chosen_edge=inv_edge.reshape(-1),
+            parent_nodes=tails_flat,
+            move_mask=active_bwd.reshape(-1),
+            edge_ids_by_head=prepared_fwd.edge_ids_by_head_bwd,
+            edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_bwd,
+            return_no_allowed=True,
+        )
+        log_pb = log_pb.reshape(num_graphs, max_steps)
+
+        is_terminal = (traj_lengths.view(-1, _ONE) == (steps + _ONE)) & ~has_stop.view(-1, _ONE)
+        terminal_hit = is_terminal & (stop_reason == _TERMINAL_HIT).view(-1, _ONE) & graph_mask.view(-1, _ONE)
+        terminal_fail = is_terminal & failure_mask.view(-1, _ONE)
+        log_z_v = torch.where(terminal_hit, torch.zeros_like(log_z_v), log_z_v)
+        log_z_v = torch.where(terminal_fail, torch.full_like(log_z_v, dead_end_log_reward), log_z_v)
+
+        finite_pf = torch.isfinite(log_pf) & move_mask
+        finite_pb = torch.isfinite(log_pb) & move_mask
+        finite_z_u = torch.isfinite(log_z_u) & move_mask
+        finite_z_v = torch.isfinite(log_z_v) & move_mask
+        finite_all = finite_pf & finite_pb & finite_z_u & finite_z_v
+        valid = move_mask & inv_valid & finite_all
+
+        valid_f = valid.to(dtype=torch.float32)
+        log_pb_sum = (log_pb * valid_f).sum()
+        log_z_u_sum = (log_z_u * valid_f).sum()
+        log_z_v_sum = (log_z_v * valid_f).sum()
+        pb_for_min = torch.where(valid, log_pb, torch.full_like(log_pb, float("inf")))
+        log_pb_min = pb_for_min.min()
+        delta = (log_z_u + log_pf) - (log_z_v + log_pb)
+        delta = torch.where(valid, delta, torch.zeros_like(delta))
+        step_weight = weight.view(-1, _ONE) * valid.to(dtype=weight.dtype)
+        total = (delta.pow(_TWO) * step_weight).sum()
+        denom = step_weight.sum()
+        delta_sum = delta[valid].sum()
+        delta_sq_sum = (delta[valid] * delta[valid]).sum()
+        delta_count = valid.to(dtype=torch.float32).sum()
+
+        valid_count = valid_f.sum()
+        move_count = move_mask.to(dtype=torch.float32).sum()
+        inv_invalid_count = (move_mask & ~inv_valid).to(dtype=torch.float32).sum()
+        no_allowed_count = (no_allowed & active_bwd.reshape(-1)).to(dtype=torch.float32).sum()
+        finite_pf_count = finite_pf.to(dtype=torch.float32).sum()
+        finite_pb_count = finite_pb.to(dtype=torch.float32).sum()
+        finite_z_u_count = finite_z_u.to(dtype=torch.float32).sum()
+        finite_z_v_count = finite_z_v.to(dtype=torch.float32).sum()
+
+        if self._stop_enabled():
+            stop_active = has_stop & graph_mask
+            emit_log_reward = float(db_cfg.get("emit_log_reward", dead_end_log_reward))
+            stop_steps = traj_lengths.clamp(min=_ZERO, max=max_steps - 1)
+            force_stop_mask = stop_active & (stop_steps >= (self.max_steps - 1))
+            safe_stop_nodes = torch.where(stop_active, stop_nodes, torch.zeros_like(stop_nodes)).clamp(min=_ZERO)
+            hidden_dim = prev_rel.size(-1)
+            prev_rel_stop = prev_rel.gather(1, stop_steps.view(-1, 1, 1).expand(-1, 1, hidden_dim)).squeeze(1)
+            log_z_stop = self._compute_log_z_for_nodes(
                 node_tokens=prepared_fwd.node_tokens,
                 context_tokens=prepared_fwd.context_tokens,
                 node_batch=prepared_fwd.node_batch,
-                steps=step_ids,
-                node_ids=heads,
+                steps=stop_steps,
+                node_ids=safe_stop_nodes,
+                prev_rel_emb=prev_rel_stop,
             )
-            log_z_v = self._compute_log_z_for_nodes(
-                node_tokens=prepared_fwd.node_tokens,
-                context_tokens=prepared_fwd.context_tokens,
-                node_batch=prepared_fwd.node_batch,
-                steps=next_step_ids,
-                node_ids=tails,
-            )
-            log_pf = self._compute_forward_log_prob(
-                policy=self.policy_fwd,
+            log_pf_stop = self._compute_stop_log_prob(
                 prepared=prepared_fwd,
-                chosen_edge=edge_ids,
-                parent_nodes=heads,
-                move_mask=move_mask,
-                steps=step_ids,
+                parent_nodes=safe_stop_nodes,
+                move_mask=stop_active,
+                steps=stop_steps,
                 edge_ids_by_head=prepared_fwd.edge_ids_by_head_fwd,
                 edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_fwd,
                 temperature=sampling_temperature,
                 context_tokens=prepared_fwd.context_tokens,
-                apply_p0=self._p0_enabled(),
-                visited_nodes=visited_fwd,
+                prev_rel_emb=prev_rel_stop,
+                force_stop_mask=force_stop_mask,
             )
-            inv_edge = prepared_fwd.edge_inverse_map.index_select(0, safe_edges)
-            inv_valid = inv_edge >= _ZERO
-            inv_edge = torch.where(inv_valid, inv_edge, torch.full_like(inv_edge, _NEG_ONE))
-            active_bwd = move_mask & inv_valid
-            log_pb, no_allowed = self._compute_pb_log_prob(
-                prepared=prepared_fwd,
-                chosen_edge=inv_edge,
-                parent_nodes=tails,
-                move_mask=active_bwd,
-                edge_ids_by_head=prepared_fwd.edge_ids_by_head_bwd,
-                edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_bwd,
-                visited_nodes=visited_bwd,
-                edge_mask=edge_mask_bwd,
-                return_no_allowed=True,
+            log_reward = torch.where(
+                stop_reason == _TERMINAL_HIT,
+                torch.zeros_like(log_z_stop),
+                torch.where(
+                    stop_reason == _TERMINAL_EMIT,
+                    torch.full_like(log_z_stop, emit_log_reward),
+                    torch.full_like(log_z_stop, dead_end_log_reward),
+                ),
             )
-            no_allowed_count = no_allowed_count + (no_allowed & active_bwd).to(dtype=torch.float32).sum()
-            is_target = node_is_target.index_select(0, tails.clamp(min=_ZERO)) & move_mask
-            log_z_v = torch.where(is_target, torch.zeros_like(log_z_v), log_z_v)
-            is_terminal = traj_lengths == (step + _ONE)
-            dead_end = is_terminal & failure_mask
-            log_z_v = torch.where(
-                dead_end,
-                torch.full_like(log_z_v, dead_end_log_reward),
-                log_z_v,
-            )
-            inv_invalid_count = inv_invalid_count + (move_mask & ~inv_valid).to(dtype=torch.float32).sum()
-            finite_pf = torch.isfinite(log_pf) & move_mask
-            finite_pb = torch.isfinite(log_pb) & move_mask
-            finite_z_u = torch.isfinite(log_z_u) & move_mask
-            finite_z_v = torch.isfinite(log_z_v) & move_mask
-            finite_pf_count = finite_pf_count + finite_pf.to(dtype=torch.float32).sum()
-            finite_pb_count = finite_pb_count + finite_pb.to(dtype=torch.float32).sum()
-            finite_z_u_count = finite_z_u_count + finite_z_u.to(dtype=torch.float32).sum()
-            finite_z_v_count = finite_z_v_count + finite_z_v.to(dtype=torch.float32).sum()
-            finite_all = finite_pf & finite_pb & finite_z_u & finite_z_v
-            valid = move_mask & inv_valid & finite_all
-            valid_f = valid.to(dtype=torch.float32)
-            valid_count = valid_count + valid_f.sum()
-            log_pb_sum = log_pb_sum + (log_pb * valid_f).sum()
-            log_z_u_sum = log_z_u_sum + (log_z_u * valid_f).sum()
-            log_z_v_sum = log_z_v_sum + (log_z_v * valid_f).sum()
-            pb_for_min = torch.where(valid, log_pb, torch.full_like(log_pb, float("inf")))
-            log_pb_min = torch.minimum(log_pb_min, pb_for_min.min())
-            delta = (log_z_u + log_pf) - (log_z_v + log_pb)
-            delta = torch.where(valid, delta, torch.zeros_like(delta))
-            step_weight = weight * valid.to(dtype=weight.dtype)
-            if bool(valid.any().detach().tolist()):
-                delta_sum = delta_sum + delta[valid].sum()
-                delta_sq_sum = delta_sq_sum + (delta[valid] * delta[valid]).sum()
-                delta_count = delta_count + valid.to(dtype=torch.float32).sum()
-            total = total + (delta.pow(_TWO) * step_weight).sum()
-            denom = denom + step_weight.sum()
-            if visited_fwd is not None and visited_bwd is not None:
-                visited_fwd.index_fill_(0, tails[move_mask], True)
-                visited_bwd.index_fill_(0, tails[move_mask], False)
+            finite_stop = torch.isfinite(log_z_stop) & torch.isfinite(log_pf_stop) & stop_active
+            delta_stop = log_z_stop + log_pf_stop - log_reward
+            delta_stop = torch.where(finite_stop, delta_stop, torch.zeros_like(delta_stop))
+            stop_weight = weight * finite_stop.to(dtype=weight.dtype)
+            total = total + (delta_stop.pow(_TWO) * stop_weight).sum()
+            denom = denom + stop_weight.sum()
+            finite_stop_f = finite_stop.to(dtype=delta_stop.dtype)
+            delta_sum = delta_sum + (delta_stop * finite_stop_f).sum()
+            delta_sq_sum = delta_sq_sum + (delta_stop * delta_stop * finite_stop_f).sum()
+            delta_count = delta_count + finite_stop.to(dtype=torch.float32).sum()
         loss, metrics = self._finalize_db_metrics(
             total=total,
             denom=denom,
@@ -1992,12 +2354,14 @@ class DualFlowModule(LightningModule):
         dead = ((stop_reason == _TERMINAL_DEAD_END) & graph_mask).to(dtype=torch.float32).sum() / denom
         max_steps = ((stop_reason == _TERMINAL_MAX_STEPS) & graph_mask).to(dtype=torch.float32).sum() / denom
         invalid = ((stop_reason == _TERMINAL_INVALID_START) & graph_mask).to(dtype=torch.float32).sum() / denom
+        emit = ((stop_reason == _TERMINAL_EMIT) & graph_mask).to(dtype=torch.float32).sum() / denom
         other = ((stop_reason == _TERMINAL_NONE) & graph_mask).to(dtype=torch.float32).sum() / denom
         return {
             f"{prefix}_terminal_hit_rate": hit,
             f"{prefix}_terminal_dead_end_rate": dead,
             f"{prefix}_terminal_max_steps_rate": max_steps,
             f"{prefix}_terminal_invalid_start_rate": invalid,
+            f"{prefix}_terminal_emit_rate": emit,
             f"{prefix}_terminal_other_rate": other,
         }
 
@@ -2020,7 +2384,6 @@ class DualFlowModule(LightningModule):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         with torch.no_grad():
             rollout_fwd = self._rollout_policy(
-                policy=self.policy_fwd,
                 prepared=prepared_fwd,
                 graph_mask=graph_mask,
                 start_nodes=prepared_fwd.start_nodes_fwd,
@@ -2031,7 +2394,6 @@ class DualFlowModule(LightningModule):
                 record_log_pf=False,
                 temperature=sampling_temperature,
                 context_tokens=prepared_fwd.context_tokens,
-                apply_p0=self._p0_enabled(),
                 collect_policy_metrics=True,
             )
         if rollout_fwd.actions is None:
@@ -2042,7 +2404,7 @@ class DualFlowModule(LightningModule):
             graph_mask=graph_mask,
             traj_lengths=rollout_fwd.num_moves,
             stop_reason=rollout_fwd.stop_reason,
-            node_is_target=node_is_target,
+            stop_nodes=rollout_fwd.stop_nodes,
             sampling_temperature=sampling_temperature,
         )
         success = (rollout_fwd.stop_reason == _TERMINAL_HIT) & graph_mask
@@ -2070,13 +2432,10 @@ class DualFlowModule(LightningModule):
         *,
         prepared_fwd: _PreparedBatch,
         graph_mask: torch.Tensor,
-        node_is_target: torch.Tensor,
         node_is_start: torch.Tensor,
         start_nodes_bwd: torch.Tensor,
         sampling_temperature: float,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        edge_index_for_dropout = prepared_fwd.edge_index
-        edge_mask_bwd = self._sample_pb_edge_dropout_mask(edge_index=edge_index_for_dropout)
         with torch.no_grad():
             rollout_bwd = self._rollout_pb(
                 prepared=prepared_fwd,
@@ -2087,7 +2446,6 @@ class DualFlowModule(LightningModule):
                 edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_bwd,
                 record_actions=True,
                 record_log_pf=False,
-                edge_mask=edge_mask_bwd,
             )
         if rollout_bwd.actions is None:
             raise RuntimeError("Backward rollout actions are required for detailed balance training.")
@@ -2102,9 +2460,8 @@ class DualFlowModule(LightningModule):
             graph_mask=graph_mask,
             traj_lengths=rollout_bwd.num_moves,
             stop_reason=rollout_bwd.stop_reason,
-            node_is_target=node_is_target,
+            stop_nodes=rollout_bwd.stop_nodes,
             sampling_temperature=sampling_temperature,
-            edge_mask_bwd=edge_mask_bwd,
         )
         success = (rollout_bwd.stop_reason == _TERMINAL_HIT) & graph_mask
         lengths = rollout_bwd.num_moves.to(dtype=torch.float32)
@@ -2149,7 +2506,6 @@ class DualFlowModule(LightningModule):
             db_loss_bwd, metrics_bwd = self._run_backward_rollout(
                 prepared_fwd=prepared_fwd,
                 graph_mask=graph_mask,
-                node_is_target=node_is_target,
                 node_is_start=node_is_start,
                 start_nodes_bwd=start_nodes_bwd,
                 sampling_temperature=sampling_temperature,
@@ -2239,7 +2595,6 @@ class DualFlowModule(LightningModule):
             sampling_temperature=sampling_temperature,
             num_rollouts=num_rollouts,
         )
-        metrics.update(self._compute_log_z_metrics(prepared_fwd=prepared_fwd, graph_mask=graph_mask))
         return loss, metrics
 
     def _compute_log_z_metrics(
@@ -2251,9 +2606,6 @@ class DualFlowModule(LightningModule):
         graph_mask = graph_mask.to(device=prepared_fwd.node_ptr.device, dtype=torch.bool)
         start_nodes = prepared_fwd.start_nodes_fwd.to(device=prepared_fwd.node_ptr.device, dtype=torch.long)
         valid = graph_mask & (start_nodes >= _ZERO)
-        if not bool(valid.any().detach().tolist()):
-            zero = torch.zeros((), device=prepared_fwd.node_ptr.device, dtype=torch.float32)
-            return {"log_z_mean": zero, "log_z_std": zero}
         safe_start = torch.where(valid, start_nodes, torch.zeros_like(start_nodes))
         step_ids = torch.zeros((prepared_fwd.num_graphs,), device=prepared_fwd.node_ptr.device, dtype=torch.long)
         log_z = self._compute_log_z_for_nodes(
@@ -2262,10 +2614,17 @@ class DualFlowModule(LightningModule):
             node_batch=prepared_fwd.node_batch,
             steps=step_ids,
             node_ids=safe_start,
+            prev_rel_emb=self._init_prev_relation(num_graphs=prepared_fwd.num_graphs, device=prepared_fwd.node_ptr.device),
         )
-        log_z = log_z[valid]
-        mean = log_z.mean()
-        std = log_z.std(unbiased=False) if log_z.numel() > _ONE else torch.zeros_like(mean)
+        valid_f = valid.to(dtype=log_z.dtype)
+        denom = valid_f.sum().clamp(min=_ONE)
+        masked = log_z * valid_f
+        mean = masked.sum() / denom
+        var = ((masked - mean) * valid_f).pow(_TWO).sum() / denom
+        std = torch.sqrt(var)
+        empty = valid_f.sum() <= float(_ZERO)
+        mean = torch.where(empty, torch.zeros_like(mean), mean)
+        std = torch.where(empty, torch.zeros_like(std), std)
         return {"log_z_mean": mean.detach(), "log_z_std": std.detach()}
 
     @staticmethod
@@ -2273,17 +2632,6 @@ class DualFlowModule(LightningModule):
         if loss.requires_grad:
             return loss
         return loss + torch.zeros((), device=loss.device, dtype=loss.dtype, requires_grad=True)
-
-    def _collect_logit_scale_metrics(self) -> dict[str, torch.Tensor]:
-        metrics: dict[str, torch.Tensor] = {}
-        logit_scale = getattr(self.policy_fwd, "logit_scale", None)
-        if logit_scale is not None:
-            scale = logit_scale.exp()
-            scale = scale.clamp(min=self.policy_fwd.logit_scale_min, max=self.policy_fwd.logit_scale_max)
-            metrics["logit_scale_fwd"] = scale.detach()
-        if metrics:
-            metrics["logit_scale_max"] = torch.stack(list(metrics.values())).max()
-        return metrics
 
 
 
@@ -2533,14 +2881,157 @@ class DualFlowModule(LightningModule):
             cand_done_stay=cand_done_stay,
         )
 
-    def _beam_search_state(
+    def _build_eval_start_expansion(
+        self,
+        *,
+        prepared: _PreparedBatch,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        counts = (prepared.q_ptr[1:] - prepared.q_ptr[:-1]).clamp(min=0)
+        num_graphs = counts.numel()
+        if num_graphs <= 0:
+            return None
+        total = int(counts.sum().item())
+        if total <= 0:
+            return None
+        start_nodes = prepared.q_local_indices.to(device=prepared.node_ptr.device, dtype=torch.long).view(-1)
+        graph_ids = torch.repeat_interleave(torch.arange(num_graphs, device=start_nodes.device), counts)
+        if graph_ids.numel() != start_nodes.numel():
+            raise ValueError("q_local_indices length mismatch with q_ptr.")
+        question_tokens = self._resolve_context_tokens(
+            self.backbone_fwd.project_question_embeddings(prepared.question_emb_raw)
+        )
+        question_sel = question_tokens.index_select(0, graph_ids)
+        start_tokens = prepared.node_tokens.index_select(0, start_nodes)
+        context_tokens = self._build_forward_context(question_tokens=question_sel, start_tokens=start_tokens)
+        return start_nodes, context_tokens, graph_ids, counts
+
+    def _merge_start_beams(
+        self,
+        *,
+        beam_state: _BeamState,
+        start_graph_ids: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> _BeamState:
+        num_graphs = int(counts.numel())
+        if num_graphs <= 0 or start_graph_ids.numel() == 0:
+            return _BeamState(
+                beam_nodes=torch.zeros((num_graphs, 0), device=beam_state.beam_nodes.device, dtype=torch.long),
+                beam_scores=torch.zeros((num_graphs, 0), device=beam_state.beam_nodes.device, dtype=torch.float32),
+                beam_paths=torch.zeros((num_graphs, 0, 0), device=beam_state.beam_nodes.device, dtype=torch.long),
+                beam_lengths=torch.zeros((num_graphs, 0), device=beam_state.beam_nodes.device, dtype=torch.long),
+                beam_done=torch.zeros((num_graphs, 0), device=beam_state.beam_nodes.device, dtype=torch.bool),
+                flat_graph_ids=torch.zeros((0,), device=beam_state.beam_nodes.device, dtype=torch.long),
+                flat_beam_ids=torch.zeros((0,), device=beam_state.beam_nodes.device, dtype=torch.long),
+                beam_context=beam_state.beam_context[:0],
+                beam_prev_rel=torch.zeros((num_graphs, 0, self.hidden_dim), device=beam_state.beam_nodes.device, dtype=beam_state.beam_context.dtype),
+                num_graphs=num_graphs,
+                beam_size=0,
+                max_steps=beam_state.max_steps,
+                neg_inf=beam_state.neg_inf,
+            )
+        device = beam_state.beam_nodes.device
+        counts = counts.to(device=device, dtype=torch.long).view(-1)
+        start_graph_ids = start_graph_ids.to(device=device, dtype=torch.long).view(-1)
+        max_starts = int(counts.max().item()) if counts.numel() > 0 else 0
+        total_beam = int(beam_state.beam_size) * max_starts
+        if total_beam <= 0:
+            return _BeamState(
+                beam_nodes=torch.zeros((num_graphs, 0), device=device, dtype=torch.long),
+                beam_scores=torch.zeros((num_graphs, 0), device=device, dtype=torch.float32),
+                beam_paths=torch.zeros((num_graphs, 0, 0), device=device, dtype=torch.long),
+                beam_lengths=torch.zeros((num_graphs, 0), device=device, dtype=torch.long),
+                beam_done=torch.zeros((num_graphs, 0), device=device, dtype=torch.bool),
+                flat_graph_ids=torch.zeros((0,), device=device, dtype=torch.long),
+                flat_beam_ids=torch.zeros((0,), device=device, dtype=torch.long),
+                beam_context=beam_state.beam_context[:0],
+                beam_prev_rel=torch.zeros((num_graphs, 0, self.hidden_dim), device=device, dtype=beam_state.beam_context.dtype),
+                num_graphs=num_graphs,
+                beam_size=0,
+                max_steps=beam_state.max_steps,
+                neg_inf=beam_state.neg_inf,
+            )
+        neg_inf = beam_state.neg_inf
+        max_steps = int(beam_state.max_steps)
+        beam_nodes = torch.full((num_graphs, total_beam), _NEG_ONE, device=device, dtype=torch.long)
+        beam_scores = torch.full((num_graphs, total_beam), neg_inf, device=device, dtype=beam_state.beam_scores.dtype)
+        beam_lengths = torch.zeros((num_graphs, total_beam), device=device, dtype=beam_state.beam_lengths.dtype)
+        beam_done = torch.zeros((num_graphs, total_beam), device=device, dtype=beam_state.beam_done.dtype)
+        beam_paths = torch.full((num_graphs, total_beam, max_steps), _NEG_ONE, device=device, dtype=beam_state.beam_paths.dtype)
+        start_offsets = (counts.cumsum(0) - counts).index_select(0, start_graph_ids)
+        start_pos = torch.arange(start_graph_ids.numel(), device=device, dtype=torch.long) - start_offsets
+        beam_size = int(beam_state.beam_size)
+        pos = start_pos.unsqueeze(1) * beam_size + torch.arange(beam_size, device=device).unsqueeze(0)
+        flat_pos = pos.reshape(-1)
+        flat_graph = start_graph_ids.unsqueeze(1).expand_as(pos).reshape(-1)
+        linear = flat_graph * total_beam + flat_pos
+        beam_nodes.view(-1).index_copy_(0, linear, beam_state.beam_nodes.reshape(-1))
+        beam_scores.view(-1).index_copy_(0, linear, beam_state.beam_scores.reshape(-1))
+        beam_lengths.view(-1).index_copy_(0, linear, beam_state.beam_lengths.reshape(-1))
+        beam_done.view(-1).index_copy_(0, linear, beam_state.beam_done.reshape(-1))
+        beam_paths.view(-1, max_steps).index_copy_(0, linear, beam_state.beam_paths.reshape(-1, max_steps))
+        sort_scores, sort_idx = torch.sort(beam_scores, dim=1, descending=True)
+        beam_scores = sort_scores
+        beam_nodes = beam_nodes.gather(1, sort_idx)
+        beam_lengths = beam_lengths.gather(1, sort_idx)
+        beam_done = beam_done.gather(1, sort_idx)
+        path_idx = sort_idx.unsqueeze(-1).expand(-1, -1, max_steps)
+        beam_paths = beam_paths.gather(1, path_idx)
+        flat_graph_ids = torch.arange(num_graphs, device=device).repeat_interleave(total_beam)
+        flat_beam_ids = torch.arange(total_beam, device=device).repeat(num_graphs)
+        beam_prev_rel = torch.zeros((num_graphs, total_beam, self.hidden_dim), device=device, dtype=beam_state.beam_context.dtype)
+        return _BeamState(
+            beam_nodes=beam_nodes,
+            beam_scores=beam_scores,
+            beam_paths=beam_paths,
+            beam_lengths=beam_lengths,
+            beam_done=beam_done,
+            flat_graph_ids=flat_graph_ids,
+            flat_beam_ids=flat_beam_ids,
+            beam_context=beam_state.beam_context[:0],
+            beam_prev_rel=beam_prev_rel,
+            num_graphs=num_graphs,
+            beam_size=total_beam,
+            max_steps=max_steps,
+            neg_inf=neg_inf,
+        )
+
+    def _beam_search_multi_start_state(
         self,
         *,
         prepared: _PreparedBatch,
         beam_size: int,
         node_is_target: torch.Tensor,
     ) -> _BeamState:
-        num_graphs = int(prepared.num_graphs)
+        bundle = self._build_eval_start_expansion(prepared=prepared)
+        if bundle is None:
+            return self._beam_search_state(prepared=prepared, beam_size=0, node_is_target=node_is_target)
+        start_nodes, context_tokens, start_graph_ids, counts = bundle
+        num_starts = int(start_nodes.numel())
+        state = self._beam_search_state(
+            prepared=prepared,
+            beam_size=beam_size,
+            node_is_target=node_is_target,
+            start_nodes=start_nodes,
+            context_tokens=context_tokens,
+            num_graphs_override=num_starts,
+        )
+        return self._merge_start_beams(
+            beam_state=state,
+            start_graph_ids=start_graph_ids,
+            counts=counts,
+        )
+
+    def _beam_search_state(
+        self,
+        *,
+        prepared: _PreparedBatch,
+        beam_size: int,
+        node_is_target: torch.Tensor,
+        start_nodes: Optional[torch.Tensor] = None,
+        context_tokens: Optional[torch.Tensor] = None,
+        num_graphs_override: Optional[int] = None,
+    ) -> _BeamState:
+        num_graphs = int(num_graphs_override) if num_graphs_override is not None else int(prepared.num_graphs)
         if num_graphs <= 0:
             return _BeamState(
                 beam_nodes=torch.zeros((0, 0), device=prepared.node_ptr.device, dtype=torch.long),
@@ -2551,6 +3042,7 @@ class DualFlowModule(LightningModule):
                 flat_graph_ids=torch.zeros((0,), device=prepared.node_ptr.device, dtype=torch.long),
                 flat_beam_ids=torch.zeros((0,), device=prepared.node_ptr.device, dtype=torch.long),
                 beam_context=torch.zeros((0, prepared.context_tokens.size(-1)), device=prepared.node_ptr.device, dtype=prepared.context_tokens.dtype),
+                beam_prev_rel=torch.zeros((0, 0, self.hidden_dim), device=prepared.node_ptr.device, dtype=prepared.context_tokens.dtype),
                 num_graphs=0,
                 beam_size=0,
                 max_steps=int(self.max_steps),
@@ -2566,12 +3058,20 @@ class DualFlowModule(LightningModule):
                 flat_graph_ids=torch.zeros((0,), device=prepared.node_ptr.device, dtype=torch.long),
                 flat_beam_ids=torch.zeros((0,), device=prepared.node_ptr.device, dtype=torch.long),
                 beam_context=prepared.context_tokens[:0],
+                beam_prev_rel=torch.zeros((num_graphs, 0, self.hidden_dim), device=prepared.node_ptr.device, dtype=prepared.context_tokens.dtype),
                 num_graphs=num_graphs,
                 beam_size=0,
                 max_steps=int(self.max_steps),
                 neg_inf=float("-inf"),
             )
-        state = self._init_beam_state(prepared=prepared, beam_size=beam_size, node_is_target=node_is_target)
+        state = self._init_beam_state(
+            prepared=prepared,
+            beam_size=beam_size,
+            node_is_target=node_is_target,
+            start_nodes=start_nodes,
+            context_tokens=context_tokens,
+            num_graphs_override=num_graphs,
+        )
         diverse_cfg = self._resolve_diverse_beam_cfg()
         for step in range(state.max_steps):
             candidates = self._beam_expand_candidates(
@@ -2587,6 +3087,7 @@ class DualFlowModule(LightningModule):
                 candidates=candidates,
                 step=step,
                 diverse_cfg=diverse_cfg,
+                relation_tokens=prepared.relation_tokens,
             )
         return state
 
@@ -2600,7 +3101,7 @@ class DualFlowModule(LightningModule):
         state = self._beam_search_state(prepared=prepared, beam_size=beam_size, node_is_target=node_is_target)
         if state.beam_nodes.numel() == 0:
             return []
-        return self._beam_finalize(state)
+        return self._beam_finalize(state, require_done=self._stop_enabled())
 
     def _init_beam_state(
         self,
@@ -2608,12 +3109,19 @@ class DualFlowModule(LightningModule):
         prepared: _PreparedBatch,
         beam_size: int,
         node_is_target: torch.Tensor,
+        start_nodes: Optional[torch.Tensor] = None,
+        context_tokens: Optional[torch.Tensor] = None,
+        num_graphs_override: Optional[int] = None,
     ) -> _BeamState:
-        num_graphs = int(prepared.num_graphs)
+        num_graphs = int(num_graphs_override) if num_graphs_override is not None else int(prepared.num_graphs)
         device = prepared.node_ptr.device
         max_steps = int(self.max_steps)
         neg_inf = float("-inf")
-        start_nodes = prepared.start_nodes_fwd.to(device=device, dtype=torch.long)
+        if start_nodes is None:
+            start_nodes = prepared.start_nodes_fwd
+        start_nodes = start_nodes.to(device=device, dtype=torch.long).view(-1)
+        if start_nodes.numel() != num_graphs:
+            raise ValueError("start_nodes length mismatch with num_graphs.")
         beam_nodes = torch.full((num_graphs, beam_size), _NEG_ONE, device=device, dtype=torch.long)
         beam_scores = torch.full((num_graphs, beam_size), neg_inf, device=device, dtype=torch.float32)
         beam_paths = torch.full((num_graphs, beam_size, max_steps), _NEG_ONE, device=device, dtype=torch.long)
@@ -2621,12 +3129,17 @@ class DualFlowModule(LightningModule):
         valid_start = start_nodes >= 0
         beam_nodes[:, 0] = start_nodes
         beam_scores[:, 0] = torch.where(valid_start, torch.zeros_like(beam_scores[:, 0]), beam_scores[:, 0])
-        start_target = node_is_target.index_select(0, start_nodes.clamp(min=0))
         beam_done = torch.zeros((num_graphs, beam_size), device=device, dtype=torch.bool)
-        beam_done[:, 0] = valid_start & start_target
         flat_graph_ids = torch.arange(num_graphs, device=device).repeat_interleave(beam_size)
         flat_beam_ids = torch.arange(beam_size, device=device).repeat(num_graphs)
-        beam_context = prepared.context_tokens.index_select(0, flat_graph_ids)
+        if context_tokens is None:
+            context_tokens = prepared.context_tokens
+        context_tokens = self._resolve_context_tokens(context_tokens)
+        if context_tokens.size(0) != num_graphs:
+            raise ValueError("context_tokens length mismatch with num_graphs.")
+        beam_context = context_tokens.index_select(0, flat_graph_ids)
+        prev_rel = self._init_prev_relation(num_graphs=num_graphs, device=device)
+        beam_prev_rel = prev_rel.unsqueeze(1).expand(num_graphs, beam_size, -1)
         return _BeamState(
             beam_nodes=beam_nodes,
             beam_scores=beam_scores,
@@ -2636,6 +3149,7 @@ class DualFlowModule(LightningModule):
             flat_graph_ids=flat_graph_ids,
             flat_beam_ids=flat_beam_ids,
             beam_context=beam_context,
+            beam_prev_rel=beam_prev_rel,
             num_graphs=num_graphs,
             beam_size=beam_size,
             max_steps=max_steps,
@@ -2653,8 +3167,11 @@ class DualFlowModule(LightningModule):
         flat_nodes = state.beam_nodes.view(-1)
         flat_scores = state.beam_scores.view(-1)
         flat_done = state.beam_done.view(-1)
+        prev_rel_flat = state.beam_prev_rel.reshape(-1, state.beam_prev_rel.size(-1))
         flat_valid = flat_nodes >= 0
         expand_mask = flat_valid & ~flat_done
+        safe_nodes = flat_nodes.clamp(min=_ZERO)
+        at_target = node_is_target.index_select(0, safe_nodes) & expand_mask
         outgoing = gather_outgoing_edges(
             curr_nodes=flat_nodes,
             edge_ids_by_head=prepared.edge_ids_by_head_fwd,
@@ -2664,23 +3181,58 @@ class DualFlowModule(LightningModule):
         empty_long = torch.zeros((0,), device=flat_nodes.device, dtype=torch.long)
         empty_bool = torch.zeros((0,), device=flat_nodes.device, dtype=torch.bool)
         empty_float = torch.zeros((0,), device=flat_nodes.device, dtype=torch.float32)
+        step_ids = torch.full(
+            (state.num_graphs * state.beam_size,),
+            step,
+            device=flat_nodes.device,
+            dtype=torch.long,
+        )
+        min_steps = self._resolve_stop_min_steps()
+        stop_logits = None
+        if self._stop_enabled():
+            stop_logits = self._compute_stop_logit_for_beams(
+                prepared=prepared,
+                node_ids=safe_nodes,
+                steps=step_ids,
+                beam_context=state.beam_context,
+                prev_rel_emb=prev_rel_flat,
+            )
+            neg_inf = torch.finfo(stop_logits.dtype).min
+            stop_logits = torch.where(expand_mask, stop_logits, torch.full_like(stop_logits, neg_inf))
+            force_last = expand_mask & (step >= (state.max_steps - 1))
+            force_mask = force_last | (at_target & (step >= min_steps))
+            if force_mask.any():
+                stop_logits = torch.where(force_mask, torch.zeros_like(stop_logits), stop_logits)
 
+        log_denom = None
         if outgoing.edge_ids.numel() > 0:
-            step_ids = torch.full((state.num_graphs * state.beam_size,), step, device=flat_nodes.device, dtype=torch.long)
             logits = self._compute_edge_logits(
-                policy=self.policy_fwd,
                 prepared=prepared,
                 edge_ids=outgoing.edge_ids,
                 edge_batch=outgoing.edge_batch,
-                steps=step_ids + 1,
+                steps=step_ids,
                 temperature=1.0,
                 context_tokens=state.beam_context,
-                apply_p0=self._p0_enabled(),
-                decision_graph_ids=state.flat_graph_ids,
+                prev_rel_emb=prev_rel_flat,
             )
-            log_denom = self._compute_log_denom(
-                logits=logits, edge_batch=outgoing.edge_batch, num_graphs=state.num_graphs * state.beam_size
-            )
+            if self._stop_enabled():
+                force_last = expand_mask & (step >= (state.max_steps - 1))
+                force_mask = force_last | (at_target & (step >= min_steps))
+                if force_mask.any():
+                    force_edge = force_mask.index_select(0, outgoing.edge_batch)
+                    neg_inf = torch.finfo(logits.dtype).min
+                    logits = torch.where(force_edge, torch.full_like(logits, neg_inf), logits)
+            if stop_logits is None:
+                log_denom = self._compute_log_denom(
+                    logits=logits, edge_batch=outgoing.edge_batch, num_graphs=state.num_graphs * state.beam_size
+                )
+            else:
+                log_denom = self._compute_log_denom_with_stop(
+                    edge_logits=logits,
+                    edge_batch=outgoing.edge_batch,
+                    num_graphs=state.num_graphs * state.beam_size,
+                    stop_logits=stop_logits,
+                )
             log_probs = logits - log_denom.index_select(0, outgoing.edge_batch)
             cand_scores_edge = flat_scores.index_select(0, outgoing.edge_batch) + log_probs
             cand_nodes_edge = prepared.edge_index[1].index_select(0, outgoing.edge_ids)
@@ -2688,7 +3240,10 @@ class DualFlowModule(LightningModule):
             cand_src_beam_edge = state.flat_beam_ids.index_select(0, outgoing.edge_batch)
             cand_edge_id_edge = outgoing.edge_ids
             cand_is_edge_edge = torch.ones_like(cand_scores_edge, dtype=torch.bool)
-            cand_done_edge = node_is_target.index_select(0, cand_nodes_edge)
+            if stop_logits is None:
+                cand_done_edge = node_is_target.index_select(0, cand_nodes_edge)
+            else:
+                cand_done_edge = torch.zeros_like(cand_scores_edge, dtype=torch.bool)
         else:
             cand_scores_edge = empty_float
             cand_nodes_edge = empty_long
@@ -2698,7 +3253,30 @@ class DualFlowModule(LightningModule):
             cand_is_edge_edge = empty_bool
             cand_done_edge = empty_bool
 
-        stay_mask = flat_valid & (flat_done | ~outgoing.has_edge)
+        cand_scores_stop = empty_float
+        cand_nodes_stop = empty_long
+        cand_graph_stop = empty_long
+        cand_src_beam_stop = empty_long
+        cand_edge_id_stop = empty_long
+        cand_is_edge_stop = empty_bool
+        cand_done_stop = empty_bool
+        if stop_logits is not None:
+            log_denom_stop = stop_logits if log_denom is None else log_denom
+            log_prob_stop = stop_logits - log_denom_stop
+            stop_mask = expand_mask
+            if stop_mask.any():
+                cand_scores_stop = flat_scores[stop_mask] + log_prob_stop[stop_mask]
+                cand_nodes_stop = flat_nodes[stop_mask]
+                cand_graph_stop = state.flat_graph_ids[stop_mask]
+                cand_src_beam_stop = state.flat_beam_ids[stop_mask]
+                cand_edge_id_stop = torch.full_like(cand_nodes_stop, _NEG_ONE)
+                cand_is_edge_stop = torch.zeros_like(cand_scores_stop, dtype=torch.bool)
+                cand_done_stop = torch.ones_like(cand_scores_stop, dtype=torch.bool)
+
+        allow_stay = flat_done
+        if stop_logits is None:
+            allow_stay = allow_stay | ~outgoing.has_edge
+        stay_mask = flat_valid & allow_stay
         cand_scores_stay = flat_scores[stay_mask]
         cand_nodes_stay = flat_nodes[stay_mask]
         cand_graph_stay = state.flat_graph_ids[stay_mask]
@@ -2706,6 +3284,15 @@ class DualFlowModule(LightningModule):
         cand_edge_id_stay = torch.full_like(cand_nodes_stay, _NEG_ONE)
         cand_is_edge_stay = torch.zeros_like(cand_scores_stay, dtype=torch.bool)
         cand_done_stay = torch.ones_like(cand_scores_stay, dtype=torch.bool)
+
+        if cand_scores_stop.numel() > 0:
+            cand_scores_stay = torch.cat((cand_scores_stay, cand_scores_stop), dim=0)
+            cand_nodes_stay = torch.cat((cand_nodes_stay, cand_nodes_stop), dim=0)
+            cand_graph_stay = torch.cat((cand_graph_stay, cand_graph_stop), dim=0)
+            cand_src_beam_stay = torch.cat((cand_src_beam_stay, cand_src_beam_stop), dim=0)
+            cand_edge_id_stay = torch.cat((cand_edge_id_stay, cand_edge_id_stop), dim=0)
+            cand_is_edge_stay = torch.cat((cand_is_edge_stay, cand_is_edge_stop), dim=0)
+            cand_done_stay = torch.cat((cand_done_stay, cand_done_stop), dim=0)
 
         if cand_scores_edge.numel() + cand_scores_stay.numel() == 0:
             return None
@@ -2953,6 +3540,7 @@ class DualFlowModule(LightningModule):
         candidates: _BeamCandidates,
         step: int,
         diverse_cfg: dict[str, Any],
+        relation_tokens: torch.Tensor,
     ) -> _BeamState:
         max_candidates = diverse_cfg.get("max_candidates_per_graph")
         if max_candidates is None:
@@ -2980,6 +3568,7 @@ class DualFlowModule(LightningModule):
                 flat_graph_ids=state.flat_graph_ids,
                 flat_beam_ids=state.flat_beam_ids,
                 beam_context=state.beam_context,
+                beam_prev_rel=torch.zeros_like(state.beam_prev_rel),
                 num_graphs=state.num_graphs,
                 beam_size=state.beam_size,
                 max_steps=state.max_steps,
@@ -3017,12 +3606,18 @@ class DualFlowModule(LightningModule):
         sel_src_safe = sel_src.clamp(min=0)
         sel_paths = state.beam_paths[batch_idx, sel_src_safe]
         sel_lengths = state.beam_lengths[batch_idx, sel_src_safe]
+        sel_prev_rel = state.beam_prev_rel[batch_idx, sel_src_safe]
         sel_paths = sel_paths.clone()
         sel_paths[:, :, step] = torch.where(sel_is_edge, sel_edge_id, sel_paths[:, :, step])
         sel_lengths = sel_lengths + sel_is_edge.to(dtype=sel_lengths.dtype)
         sel_paths = torch.where(valid_sel.unsqueeze(-1), sel_paths, torch.full_like(sel_paths, _NEG_ONE))
         sel_lengths = torch.where(valid_sel, sel_lengths, torch.zeros_like(sel_lengths))
         sel_done = torch.where(valid_sel, sel_done, torch.zeros_like(sel_done))
+        rel_tokens = relation_tokens.index_select(0, sel_edge_id.clamp(min=_ZERO).view(-1))
+        rel_tokens = rel_tokens.view(sel_edge_id.size(0), sel_edge_id.size(1), -1)
+        sel_prev_rel = self._update_prev_state(prev_state=sel_prev_rel, rel_emb=rel_tokens, update_mask=sel_is_edge)
+        null_rel = self.null_relation_emb.to(device=sel_prev_rel.device, dtype=sel_prev_rel.dtype)
+        sel_prev_rel = torch.where(valid_sel.unsqueeze(-1), sel_prev_rel, null_rel)
         return _BeamState(
             beam_nodes=sel_nodes,
             beam_scores=sel_scores,
@@ -3032,6 +3627,7 @@ class DualFlowModule(LightningModule):
             flat_graph_ids=state.flat_graph_ids,
             flat_beam_ids=state.flat_beam_ids,
             beam_context=state.beam_context,
+            beam_prev_rel=sel_prev_rel,
             num_graphs=state.num_graphs,
             beam_size=state.beam_size,
             max_steps=state.max_steps,
@@ -3039,16 +3635,19 @@ class DualFlowModule(LightningModule):
         )
 
     @staticmethod
-    def _beam_finalize(state: _BeamState) -> list[list[tuple[int, float, list[int]]]]:
+    def _beam_finalize(state: _BeamState, *, require_done: bool) -> list[list[tuple[int, float, list[int]]]]:
         beam_nodes_np = state.beam_nodes.detach().cpu().numpy()
         beam_scores_np = state.beam_scores.detach().cpu().numpy()
         beam_paths_np = state.beam_paths.detach().cpu().numpy()
         beam_lengths_np = state.beam_lengths.detach().cpu().numpy()
+        beam_done_np = state.beam_done.detach().cpu().numpy()
         beams: list[list[tuple[int, float, list[int]]]] = []
         for graph_idx in range(state.num_graphs):
             graph_beams: list[tuple[int, float, list[int]]] = []
             for beam_idx in range(state.beam_size):
                 node_id = int(beam_nodes_np[graph_idx, beam_idx])
+                if require_done and not bool(beam_done_np[graph_idx, beam_idx]):
+                    continue
                 if node_id < 0:
                     continue
                 score = float(beam_scores_np[graph_idx, beam_idx])
@@ -3085,17 +3684,45 @@ class DualFlowModule(LightningModule):
         num_nodes_total = int(prepared_fwd.num_nodes_total)
         node_is_target_all = build_node_mask(num_nodes_total, prepared_fwd.a_local_indices)
         beam_size = self._resolve_beam_size()
-        beam_state = self._beam_search_state(
+        beam_state = self._beam_search_multi_start_state(
             prepared=prepared_fwd, beam_size=beam_size, node_is_target=node_is_target_all
         )
         beam_nodes = beam_state.beam_nodes
         beam_lengths = beam_state.beam_lengths
         if beam_nodes.numel() == _ZERO:
             return {}, _ZERO
+        beam_done = beam_state.beam_done
+        beam_nodes = torch.where(beam_done, beam_nodes, torch.full_like(beam_nodes, _NEG_ONE))
+        beam_lengths = torch.where(beam_done, beam_lengths, torch.zeros_like(beam_lengths))
         beam_valid = beam_nodes >= _ZERO
         beam_nodes_safe = beam_nodes.clamp(min=_ZERO)
         beam_hits = node_is_target_all.index_select(0, beam_nodes_safe.view(-1)).view(num_graphs, -1)
         beam_hits = beam_hits & beam_valid
+        beam_keep = self._apply_answer_dedup(
+            beam_nodes=beam_nodes,
+            beam_scores=beam_state.beam_scores,
+            beam_hits=beam_hits,
+            beam_valid=beam_valid,
+        )
+        beam_valid = beam_valid & beam_keep
+        beam_hits = beam_hits & beam_valid
+        beam_nodes = torch.where(beam_valid, beam_nodes, torch.full_like(beam_nodes, _NEG_ONE))
+        beam_lengths = torch.where(beam_valid, beam_lengths, torch.zeros_like(beam_lengths))
+        answer_gain_cfg = self._resolve_answer_gain_cfg()
+        if answer_gain_cfg["enabled"]:
+            cutoffs = self._apply_answer_gain_stop(
+                beam_nodes=beam_nodes,
+                beam_hits=beam_hits,
+                patience=int(answer_gain_cfg["patience"]),
+                epsilon=float(answer_gain_cfg["epsilon"]),
+                min_beam=int(answer_gain_cfg["min_beam"]),
+            )
+            idx = torch.arange(beam_nodes.size(1), device=beam_nodes.device).unsqueeze(0)
+            beam_keep = idx < cutoffs.unsqueeze(1)
+            beam_valid = beam_valid & beam_keep
+            beam_hits = beam_hits & beam_keep
+            beam_nodes = torch.where(beam_valid, beam_nodes, torch.full_like(beam_nodes, _NEG_ONE))
+            beam_lengths = torch.where(beam_keep, beam_lengths, torch.zeros_like(beam_lengths))
         hit_hits = beam_hits.any(dim=1).to(dtype=torch.float32)
         sorted_nodes, _ = torch.sort(beam_nodes, dim=1)
         sorted_valid = sorted_nodes >= _ZERO
@@ -3114,7 +3741,18 @@ class DualFlowModule(LightningModule):
         f1_scores = torch.where(denom > float(_ZERO), (float(_TWO) * recall_scores * precision_scores / denom), torch.zeros_like(denom))
         beam_valid_counts = beam_valid.sum(dim=1).to(dtype=torch.float32)
         diversity_scores = unique_pred_counts / beam_valid_counts.clamp(min=_ONE)
-        length = beam_lengths[:, _ZERO].to(dtype=torch.float32)
+        beam_size_eval = beam_lengths.size(1)
+        if beam_size_eval <= 0:
+            length = torch.zeros((beam_lengths.size(0),), device=beam_lengths.device, dtype=torch.float32)
+        else:
+            idx = torch.arange(beam_size_eval, device=beam_lengths.device).unsqueeze(0)
+            idx = idx.expand_as(beam_valid)
+            idx_masked = torch.where(beam_valid, idx, torch.full_like(idx, beam_size_eval))
+            first_idx = idx_masked.min(dim=1).values
+            has_valid = first_idx < beam_size_eval
+            first_idx = first_idx.clamp(max=beam_size_eval - 1)
+            length = beam_lengths.gather(1, first_idx.unsqueeze(1)).squeeze(1).to(dtype=torch.float32)
+            length = torch.where(has_valid, length, torch.zeros_like(length))
         modes_per_graph = None
         if beam_state.beam_paths.numel() > 0 and beam_state.beam_lengths.numel() > 0:
             beam_hits_cpu = beam_hits.detach().cpu().numpy()
@@ -3141,15 +3779,15 @@ class DualFlowModule(LightningModule):
             "f1@beam": f1_scores,
             "diversity@beam": diversity_scores,
         }
-        # Coverage-style diagnostics (used to separate retrieval failure from reasoning failure).
-        metrics["coverage_rate"] = (~prepared_fwd.dummy_mask).to(dtype=torch.float32)
-        metrics["retrieval_failure_rate"] = prepared_fwd.dummy_mask.to(dtype=torch.float32)
+        if answer_gain_cfg["enabled"]:
+            metrics["beam_size_adaptive"] = beam_valid_counts
+        # Coverage-style diagnostics for answer presence in subgraph.
+        metrics["coverage_rate"] = (answer_counts > _ZERO).to(dtype=torch.float32)
         metrics["length_mean"] = length
         if modes_per_graph is not None:
             metrics["modes@beam"] = modes_per_graph
         eval_temperature = float(_ONE)
         rollout_fwd = self._rollout_policy(
-            policy=self.policy_fwd,
             prepared=prepared_fwd,
             graph_mask=graph_mask,
             start_nodes=prepared_fwd.start_nodes_fwd,
@@ -3160,7 +3798,6 @@ class DualFlowModule(LightningModule):
             record_log_pf=False,
             temperature=eval_temperature,
             context_tokens=prepared_fwd.context_tokens,
-            apply_p0=self._p0_enabled(),
             collect_policy_metrics=True,
         )
         fwd_actions = rollout_fwd.actions
@@ -3172,14 +3809,13 @@ class DualFlowModule(LightningModule):
             graph_mask=graph_mask,
             traj_lengths=rollout_fwd.num_moves,
             stop_reason=rollout_fwd.stop_reason,
-            node_is_target=node_is_target_all,
+            stop_nodes=rollout_fwd.stop_nodes,
             sampling_temperature=eval_temperature,
         )
         success = (rollout_fwd.stop_reason == _TERMINAL_HIT) & graph_mask
         metrics.update(db_metrics)
         if rollout_fwd.policy_metrics:
             metrics.update(rollout_fwd.policy_metrics)
-        metrics.update(self._compute_log_z_metrics(prepared_fwd=prepared_fwd, graph_mask=graph_mask))
         metrics["rollout_success_rate"] = success.to(dtype=torch.float32).mean()
         metrics.update(
             self._build_terminal_metrics(
@@ -3232,10 +3868,92 @@ class DualFlowModule(LightningModule):
             raise ValueError(f"Unsupported metrics stage: {stage!r}.")
         return _STANDARD_METRICS[key]
 
+    @staticmethod
+    def _resolve_optimizer_class(name: str):
+        name = name.lower()
+        optimizers = {
+            "adam": torch.optim.Adam,
+            "adamw": torch.optim.AdamW,
+            "adamax": torch.optim.Adamax,
+            "sgd": torch.optim.SGD,
+            "adagrad": torch.optim.Adagrad,
+            "adadelta": torch.optim.Adadelta,
+            "rmsprop": torch.optim.RMSprop,
+            "nadam": getattr(torch.optim, "NAdam", torch.optim.Adam),
+            "lbfgs": torch.optim.LBFGS,
+        }
+        if name in optimizers:
+            return optimizers[name]
+        if name in {"muon", "singledevicemuon", "single_device_muon", "distributedmuon", "muon_distributed"}:
+            force_single = name in {"singledevicemuon", "single_device_muon"}
+            force_distributed = name in {"distributedmuon", "muon_distributed"}
+
+            def _factory(params, **cfg):
+                try:
+                    from muon import Muon, SingleDeviceMuon  # type: ignore
+                except ImportError as exc:  # pragma: no cover
+                    raise ImportError(
+                        "Muon optimizer requested but the 'muon-optimizer' package is not installed. "
+                        "Install it via `pip install git+https://github.com/KellerJordan/Muon`."
+                    ) from exc
+
+                if force_single and force_distributed:
+                    raise ValueError("Cannot force both distributed and single-device Muon modes.")
+                if force_distributed and not torch.distributed.is_available():
+                    raise RuntimeError("Distributed Muon requested but torch.distributed is unavailable.")
+                if force_distributed:
+                    return Muon(params, **cfg)
+                return SingleDeviceMuon(params, **cfg)
+
+            return _factory
+        for attr in dir(torch.optim):
+            cls = getattr(torch.optim, attr)
+            if isinstance(cls, type) and issubclass(cls, torch.optim.Optimizer) and attr.lower() == name:
+                return cls
+        raise ValueError(f"Unsupported optimizer type '{name}'.")
+
+    def _build_optimizer_param_groups(self, *, weight_decay: float) -> list[dict[str, Any]]:
+        no_decay: set[str] = set()
+        for module_name, module in self.named_modules():
+            if isinstance(
+                module,
+                (torch.nn.LayerNorm, torch.nn.Embedding, torch.nn.modules.batchnorm._BatchNorm),
+            ):
+                for param_name, _ in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{param_name}" if module_name else param_name
+                    no_decay.add(full_name)
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.endswith(".bias") or name in no_decay:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+        if not decay_params and not no_decay_params:
+            raise ValueError("No trainable parameters found for optimizer.")
+        param_groups: list[dict[str, Any]] = []
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": float(_ZERO)})
+        return param_groups
+
 
 
     def configure_optimizers(self):
-        optimizer = setup_optimizer(self, self.optimizer_cfg)
+        cfg = require_cfg_mapping(self.optimizer_cfg, "optimizer_cfg") if self.optimizer_cfg is not None else {}
+        cfg = dict(cfg)
+        if any(key in cfg for key in ("auto_param_groups", "param_group_overrides", "param_groups")):
+            raise ValueError("optimizer_cfg parameter groups are fixed in code; remove param group keys from config.")
+        opt_type = str(cfg.pop("type", cfg.pop("name", "adamw"))).lower()
+        weight_decay = cfg.pop("weight_decay", None)
+        if weight_decay is None:
+            raise ValueError("optimizer_cfg.weight_decay must be set.")
+        params = self._build_optimizer_param_groups(weight_decay=float(weight_decay))
+        optimizer_cls = self._resolve_optimizer_class(opt_type)
+        optimizer = optimizer_cls(params, **cfg)
         scheduler = self._build_scheduler(optimizer)
         if scheduler is None:
             return optimizer
@@ -3394,7 +4112,6 @@ class DualFlowModule(LightningModule):
         if self._should_zero_grad(batch_idx):
             optimizer.zero_grad(set_to_none=True)
         loss, metrics = self._compute_training_loss(batch)
-        metrics.update(self._collect_logit_scale_metrics())
         metrics = self._filter_metrics(metrics, self._get_standard_metrics("train"))
         self.manual_backward(loss / accum)
         if self._should_step_optimizer(batch_idx):
@@ -3465,93 +4182,62 @@ class DualFlowModule(LightningModule):
         if len(sample_ids) != num_graphs:
             raise ValueError("sample_id length mismatch with batch graph count.")
 
-        predict_mode = str(self.runtime_cfg.get("predict_mode", "full")).strip().lower()
-        lite_mode = predict_mode in {"lite", "light", "summary", "fast"}
-        beams = None
-        beam_state = None
-        if lite_mode:
-            beam_state = self._beam_search_state(
-                prepared=prepared_fwd, beam_size=beam_size, node_is_target=node_is_target
-            )
-        else:
-            beams = self._beam_search(prepared=prepared_fwd, beam_size=beam_size, node_is_target=node_is_target)
+        beam_state = self._beam_search_multi_start_state(
+            prepared=prepared_fwd, beam_size=beam_size, node_is_target=node_is_target
+        )
+        if beam_state.beam_nodes.numel() == _ZERO:
+            return []
+        beams = self._beam_finalize(beam_state, require_done=True)
         rollouts_per_graph: list[list[dict[str, Any]]] = [[] for _ in range(num_graphs)]
         node_global_cpu = prepared_fwd.node_global_ids.detach().cpu()
         node_is_target_cpu = node_is_target.detach().cpu()
         node_global_np = node_global_cpu.numpy()
         node_is_target_np = node_is_target_cpu.numpy()
-        edge_index_np = None
-        edge_rel_np = None
-        if lite_mode and beam_state is not None:
-            beam_nodes_np = beam_state.beam_nodes.detach().cpu().numpy()
-            beam_scores_np = beam_state.beam_scores.detach().cpu().numpy()
-            beam_paths_np = beam_state.beam_paths.detach().cpu().numpy()
-            beam_lengths_np = beam_state.beam_lengths.detach().cpu().numpy()
-            for graph_idx in range(num_graphs):
-                for beam_idx in range(beam_state.beam_size):
-                    stop_node = int(beam_nodes_np[graph_idx, beam_idx])
-                    if stop_node < _ZERO:
-                        continue
-                    score = float(beam_scores_np[graph_idx, beam_idx])
-                    length = int(beam_lengths_np[graph_idx, beam_idx])
-                    if length <= _ZERO:
-                        path = []
-                    else:
-                        path = beam_paths_np[graph_idx, beam_idx, :length].tolist()
-                    success = bool(node_is_target_np[stop_node]) if stop_node >= _ZERO else False
-                    rollouts_per_graph[graph_idx].append(
+        edge_index_cpu = prepared_fwd.edge_index.detach().cpu()
+        edge_rel_cpu = prepared_fwd.edge_relations.detach().cpu()
+        edge_index_np = edge_index_cpu.numpy()
+        edge_rel_np = edge_rel_cpu.numpy()
+        for graph_idx in range(num_graphs):
+            beam = beams[graph_idx]
+            for beam_idx, (stop_node, score, path) in enumerate(beam):
+                edges_list: list[dict[str, Any]] = []
+                for edge_id in path:
+                    head = int(edge_index_np[_ZERO, edge_id])
+                    tail = int(edge_index_np[_ONE, edge_id])
+                    rel = int(edge_rel_np[edge_id])
+                    head_ent = int(node_global_np[head])
+                    tail_ent = int(node_global_np[tail])
+                    edges_list.append(
                         {
-                            "rollout_index": beam_idx,
-                            "score": score,
-                            "path_edge_ids": path,
-                            "stop_node_id": stop_node,
-                            "reach_success": success,
+                            "src_entity_id": head_ent,
+                            "dst_entity_id": tail_ent,
+                            "head_entity_id": head_ent,
+                            "tail_entity_id": tail_ent,
+                            "relation_id": rel,
                         }
                     )
-        else:
-            edge_index_cpu = prepared_fwd.edge_index.detach().cpu()
-            edge_rel_cpu = prepared_fwd.edge_relations.detach().cpu()
-            edge_index_np = edge_index_cpu.numpy()
-            edge_rel_np = edge_rel_cpu.numpy()
-            for graph_idx in range(num_graphs):
-                beam = beams[graph_idx]
-                for beam_idx, (stop_node, score, path) in enumerate(beam):
-                    edges_list: list[dict[str, Any]] = []
-                    for edge_id in path:
-                        head = int(edge_index_np[_ZERO, edge_id])
-                        tail = int(edge_index_np[_ONE, edge_id])
-                        rel = int(edge_rel_np[edge_id])
-                        head_ent = int(node_global_np[head])
-                        tail_ent = int(node_global_np[tail])
-                        edges_list.append(
-                            {
-                                "src_entity_id": head_ent,
-                                "dst_entity_id": tail_ent,
-                                "head_entity_id": head_ent,
-                                "tail_entity_id": tail_ent,
-                                "relation_id": rel,
-                            }
-                        )
-                    stop_entity = int(node_global_np[stop_node]) if stop_node >= _ZERO else None
-                    success = bool(node_is_target_np[stop_node]) if stop_node >= _ZERO else False
-                    rollouts_per_graph[graph_idx].append(
-                        {
-                            "rollout_index": beam_idx,
-                            "score": float(score),
-                            "edges": edges_list,
-                            "stop_node_entity_id": stop_entity,
-                            "reach_success": success,
-                        }
-                    )
+                stop_entity = int(node_global_np[stop_node]) if stop_node >= _ZERO else None
+                success = bool(node_is_target_np[stop_node]) if stop_node >= _ZERO else False
+                rollouts_per_graph[graph_idx].append(
+                    {
+                        "rollout_index": beam_idx,
+                        "score": float(score),
+                        "edges": edges_list,
+                        "stop_node_entity_id": stop_entity,
+                        "reach_success": success,
+                    }
+                )
 
         node_ptr_cpu = prepared_fwd.node_ptr.detach().cpu()
         q_ptr_cpu = prepared_fwd.q_ptr.detach().cpu()
-        a_ptr_cpu = prepared_fwd.answer_ptr.detach().cpu()
+        a_local_ptr_cpu = prepared_fwd.a_ptr.detach().cpu()
+        answer_ptr_cpu = prepared_fwd.answer_ptr.detach().cpu()
         q_local_cpu = prepared_fwd.q_local_indices.detach().cpu()
         answer_ids_cpu = prepared_fwd.answer_entity_ids.detach().cpu()
         node_ptr_np = node_ptr_cpu.numpy()
         q_ptr_np = q_ptr_cpu.numpy()
-        a_ptr_np = a_ptr_cpu.numpy()
+        a_local_ptr_np = a_local_ptr_cpu.numpy()
+        answer_ptr_np = answer_ptr_cpu.numpy()
         answer_ids_np = answer_ids_cpu.numpy()
         records: list[dict[str, Any]] = []
         for graph_idx in range(num_graphs):
@@ -3573,13 +4259,17 @@ class DualFlowModule(LightningModule):
                 if not in_graph.all():
                     raise ValueError(f"q_local_indices mismatch node_ptr for sample_id={sample_ids[graph_idx]!r}.")
                 start_entity_ids = node_global_np[start_indices_np].tolist()
-            a_start = int(a_ptr_np[graph_idx])
-            a_end = int(a_ptr_np[graph_idx + _ONE])
+            a_start = int(answer_ptr_np[graph_idx])
+            a_end = int(answer_ptr_np[graph_idx + _ONE])
             answer_ids = answer_ids_np[a_start:a_end].tolist() if a_end > a_start else []
+            a_local_start = int(a_local_ptr_np[graph_idx])
+            a_local_end = int(a_local_ptr_np[graph_idx + _ONE])
+            a_entity_in_graph = a_local_end > a_local_start
             record = {
                 "sample_id": sample_ids[graph_idx],
                 "start_entity_ids": start_entity_ids,
                 "answer_entity_ids": answer_ids,
+                "a_entity_in_graph": bool(a_entity_in_graph),
                 "rollouts": rollouts_per_graph[graph_idx],
             }
             question_text = getattr(batch, "question", None)

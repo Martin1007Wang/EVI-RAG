@@ -3,19 +3,71 @@ from __future__ import annotations
 import ast
 import json
 import re
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from src.metrics.dual_flow import DualFlowEvalAccumulator
-
 _ZERO = 0
 _ONE = 1
-_NEG_INF = float("-inf")
+_TWO = 2.0
+_PERCENT = 100.0
+_HAL_BAD_OUT_GRAPH_PENALTY = -1.5
+_HAL_BAD_IN_GRAPH_PENALTY = -1.0
+_HAL_GOOD_CORRECT_REWARD = 1.0
+_HAL_GOOD_WRONG_PENALTY = -1.0
+_HAL_BAD_NO_ANS_REWARD = 1.0
+_HAL_SCORE_SHIFT = 1.5
+_HAL_SCORE_SCALE = 1.0 + _HAL_SCORE_SHIFT
+_NO_ANS_MARKERS = ("ans: not available", "ans: no information available")
 
 _FIELD_SAMPLE_ID = "sample_id"
-_FIELD_SCORE = "score"
-_FIELD_ROLLOUT_INDEX = "rollout_index"
+_FIELD_RAW_RESPONSE = "raw_response"
+
+
+@dataclass(frozen=True)
+class _EvalSample:
+    sample_id: str
+    question: str
+    answers: List[str]
+    pred_text: str
+    pred_lines: List[str]
+    double_check: bool
+    a_entity_in_graph: Optional[bool]
+    rollouts: Optional[List[Dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class _EvalResult:
+    hit_at_1: float
+    hit: float
+    f1: float
+    precision: float
+    recall: float
+    exact_match: bool
+    totally_wrong: bool
+    matched: int
+    num_pred: int
+    num_answer: int
+    no_ans: bool
+
+
+@dataclass
+class _EvalAccumulator:
+    samples: int = 0
+    hit_at_1_sum: float = float(_ZERO)
+    hit_sum: float = float(_ZERO)
+    f1_sum: float = float(_ZERO)
+    precision_sum: float = float(_ZERO)
+    recall_sum: float = float(_ZERO)
+    exact_match_count: int = 0
+    totally_wrong_count: int = 0
+    total_pred: int = 0
+    total_answer: int = 0
+    total_match: int = 0
+    no_ans_count: int = 0
+    hal_score_sum: float = float(_ZERO)
+    hal_stats: Optional[Dict[str, int]] = None
 
 
 def write_llm_metrics(
@@ -55,7 +107,8 @@ def compute_llm_metrics(
     answer_key: str,
     answer_separator: str,
 ) -> Dict[str, Any]:
-    pred_map, output_meta = _load_predictions_and_meta(output_path, answer_key=answer_key)
+    pred_map = _load_predictions(output_path, answer_key=answer_key)
+    raw_response_map = _load_raw_responses(output_path)
     metrics: Dict[str, Any] = {
         "split": split,
         "provider": provider,
@@ -64,94 +117,23 @@ def compute_llm_metrics(
         "output": str(output_path),
         "llm/num_predictions": float(len(pred_map)),
     }
-    metrics.update(output_meta)
-    if not pred_map:
+    if not pred_map and not raw_response_map:
         return metrics
 
-    sub_filter_ids = _maybe_load_sub_filter_ids(input_path)
-    if sub_filter_ids is not None:
-        metrics["sub_filter/path"] = str(_resolve_sub_filter_path(input_path))
-        metrics["sub_filter/size"] = float(len(sub_filter_ids))
-
-    text_acc = _F1Accumulator()
-    ent_acc = _F1Accumulator()
-    retrieval_acc = DualFlowEvalAccumulator(k_values=[int(top_k)])
-
-    # Subset A (SubgraphRAG-style): answer entity appears anywhere in the retrieved context (a_entity_in_graph).
-    text_acc_ingraph = _F1Accumulator()
-    ent_acc_ingraph = _F1Accumulator()
-    retrieval_acc_ingraph = DualFlowEvalAccumulator(k_values=[int(top_k)])
-    ingraph_eval_samples = 0
-
-    text_acc_sub = _F1Accumulator()
-    ent_acc_sub = _F1Accumulator()
-    retrieval_acc_sub = DualFlowEvalAccumulator(k_values=[int(top_k)])
-    sub_eval_samples = 0
-    full_eval_samples = 0
-
+    full_acc = _EvalAccumulator(hal_stats=_init_hal_stats())
+    sub_acc = _EvalAccumulator()
     for record in _iter_jsonl(input_path):
-        sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
-        if not sample_id or sample_id not in pred_map:
+        sample = _build_eval_sample(record, pred_map, raw_response_map, answer_separator=answer_separator)
+        if sample is None:
             continue
-        full_eval_samples += 1
-        pred_text = pred_map.get(sample_id, "")
-        pred_text_set = _parse_answer_set(pred_text, answer_separator=answer_separator)
-
-        gold_texts = _resolve_gold_answer_texts(record, answer_separator=answer_separator)
-        gold_text_set = _parse_answer_set_from_list(gold_texts)
-        if gold_text_set:
-            text_acc.update(pred=pred_text_set, gold=gold_text_set)
-
-        gold_ent_set = _parse_gold_entity_ids(record)
-        if gold_ent_set:
-            pred_ent_set = _parse_pred_entity_ids(record, pred_text_set=pred_text_set, top_k=top_k)
-            ent_acc.update(pred=pred_ent_set, gold=gold_ent_set)
-
-        retrieval_acc.update_from_records([record])
-
-        ingraph = bool(gold_ent_set) and _answer_in_retrieved_context(record, answer_set=gold_ent_set, top_k=top_k)
-        if ingraph:
-            ingraph_eval_samples += 1
-            if gold_text_set:
-                text_acc_ingraph.update(pred=pred_text_set, gold=gold_text_set)
-            if gold_ent_set:
-                ent_acc_ingraph.update(pred=pred_ent_set, gold=gold_ent_set)
-            retrieval_acc_ingraph.update_from_records([record])
-
-        in_sub = sub_filter_ids is not None and sample_id in sub_filter_ids
-        if in_sub:
-            sub_eval_samples += 1
-            if gold_text_set:
-                text_acc_sub.update(pred=pred_text_set, gold=gold_text_set)
-            if gold_ent_set:
-                ent_acc_sub.update(pred=pred_ent_set, gold=gold_ent_set)
-            retrieval_acc_sub.update_from_records([record])
-
-    metrics.update(_finalize_f1(text_acc, prefix="llm/text"))
-    metrics.update(_finalize_f1(ent_acc, prefix="llm/entity"))
-    for key, value in retrieval_acc.finalize().items():
-        metrics[f"retrieval/{key}"] = float(value)
-
-    if ingraph_eval_samples > 0:
-        metrics["ingraph/eval_samples"] = float(ingraph_eval_samples)
-        metrics["ingraph/eval_ratio"] = float(ingraph_eval_samples) / float(max(full_eval_samples, 1))
-        metrics.update(_finalize_f1(text_acc_ingraph, prefix="llm/ingraph/text"))
-        metrics.update(_finalize_f1(ent_acc_ingraph, prefix="llm/ingraph/entity"))
-        for key, value in retrieval_acc_ingraph.finalize().items():
-            metrics[f"retrieval/ingraph/{key}"] = float(value)
-
-    if sub_filter_ids is not None:
-        metrics["sub_filter/eval_samples"] = float(sub_eval_samples)
-        metrics["sub_filter/eval_ratio"] = float(sub_eval_samples) / float(max(full_eval_samples, 1))
-        # Backward-compatible prefixes (historical).
-        metrics.update(_finalize_f1(text_acc_sub, prefix="llm/sub/text"))
-        metrics.update(_finalize_f1(ent_acc_sub, prefix="llm/sub/entity"))
-        # Clearer alias: this "sub" is the dataset-level sub_filter, not the a_entity_in_graph subset.
-        metrics.update(_finalize_f1(text_acc_sub, prefix="llm/sub_filter/text"))
-        metrics.update(_finalize_f1(ent_acc_sub, prefix="llm/sub_filter/entity"))
-        for key, value in retrieval_acc_sub.finalize().items():
-            metrics[f"retrieval/sub/{key}"] = float(value)
-            metrics[f"retrieval/sub_filter/{key}"] = float(value)
+        result = _evaluate_sample(sample)
+        _accumulate(full_acc, sample, result, include_hal=True)
+        if sample.a_entity_in_graph is True:
+            _accumulate(sub_acc, sample, result, include_hal=False)
+    metrics.update(_finalize_scope(full_acc, prefix="llm/subgraphrag/full"))
+    metrics.update(_finalize_scope(sub_acc, prefix="llm/subgraphrag/sub"))
+    if full_acc.hal_stats is not None:
+        metrics.update(_format_hal_stats(full_acc.hal_stats, prefix="llm/subgraphrag/full/stats"))
     return metrics
 
 
@@ -176,115 +158,170 @@ def _load_predictions(path: Path, *, answer_key: str) -> Dict[str, str]:
     return out
 
 
-def _load_predictions_and_meta(path: Path, *, answer_key: str) -> tuple[Dict[str, str], Dict[str, float]]:
+def _load_raw_responses(path: Path) -> Dict[str, str]:
     if not path.exists():
-        return {}, {}
+        return {}
     out: Dict[str, str] = {}
-    num = 0
-    empty = 0
-    schema_total = 0
-    schema_valid = 0
-    retries_sum = 0
-    forced_non_empty = 0
-    abstain = 0
     for record in _iter_jsonl(path):
         sample_id = record.get(_FIELD_SAMPLE_ID)
         if not sample_id:
             continue
-        num += 1
-        answer = str(record.get(answer_key) or "")
-        out[str(sample_id)] = answer
-        if not answer.strip():
-            empty += 1
-        schema_flag = record.get("schema_valid")
-        if isinstance(schema_flag, bool):
-            schema_total += 1
-            if schema_flag:
-                schema_valid += 1
-        retry = record.get("schema_retries")
-        if retry is not None:
-            try:
-                retries_sum += int(retry)
-            except Exception:
-                pass
-        if bool(record.get("forced_non_empty_answer", False)):
-            forced_non_empty += 1
-        abstain_reason = str(record.get("abstain_reason") or "").strip()
-        if abstain_reason:
-            abstain += 1
-
-    meta: Dict[str, float] = {}
-    denom = float(max(num, 1))
-    meta["llm/empty_rate"] = float(empty) / denom
-    meta["llm/forced_non_empty_rate"] = float(forced_non_empty) / denom
-    meta["llm/abstain_rate"] = float(abstain) / denom
-    if schema_total > 0:
-        meta["llm/schema_invalid_rate"] = float(schema_total - schema_valid) / float(schema_total)
-        meta["llm/schema_retries_mean"] = float(retries_sum) / float(schema_total)
-    return out, meta
+        raw = record.get(_FIELD_RAW_RESPONSE)
+        if isinstance(raw, str) and raw.strip():
+            out[str(sample_id)] = raw
+    return out
 
 
-def _resolve_sub_filter_path(input_path: Path) -> Path:
-    parts = input_path.resolve().parts
-    # Expected layout:
-    #   .../retrieval_dataset/<dataset_family>/artifacts/<dataset_name>/eval_dual_flow/<split>.jsonl
-    family = None
-    for idx, part in enumerate(parts):
-        if part == "retrieval_dataset" and idx + 1 < len(parts):
-            family = parts[idx + 1]
-            break
-    if not family:
-        raise ValueError(f"Cannot infer dataset_family from input_path: {input_path}")
-    base = Path(*parts[: parts.index("retrieval_dataset") + 2])  # .../retrieval_dataset/<family>
-    return base / "normalized" / "sub_filter.json"
-
-
-def _maybe_load_sub_filter_ids(input_path: Path) -> Optional[Set[str]]:
-    try:
-        path = _resolve_sub_filter_path(input_path)
-    except Exception:
+def _build_eval_sample(
+    record: Dict[str, Any],
+    pred_map: Dict[str, str],
+    raw_response_map: Dict[str, str],
+    *,
+    answer_separator: str,
+) -> Optional[_EvalSample]:
+    sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
+    if not sample_id:
         return None
-    if not path.exists():
+    if sample_id not in pred_map and sample_id not in raw_response_map:
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    question = str(record.get("question_text") or record.get("question") or "")
+    answers = _resolve_gold_answer_texts(record, answer_separator=answer_separator)
+    if not answers:
         return None
-    if not isinstance(payload, dict):
-        return None
-    sample_ids = payload.get("sample_ids")
-    if not isinstance(sample_ids, list):
-        return None
-    return {str(x) for x in sample_ids if str(x).strip()}
+    answers = _remove_duplicates_preserve_order(answers)
+    answers = sorted(answers, key=len, reverse=True)
+    answers = _subgraphrag_year_fix(answers, question)
+    pred_text = raw_response_map.get(sample_id, "") or pred_map.get(sample_id, "") or ""
+    pred_lines = _subgraphrag_get_pred_lines(pred_text)
+    double_check = _subgraphrag_is_double_check(question)
+    a_entity_in_graph = _resolve_a_entity_in_graph(record)
+    rollouts = record.get("rollouts")
+    rollouts = rollouts if isinstance(rollouts, list) else None
+    return _EvalSample(
+        sample_id=sample_id,
+        question=question,
+        answers=answers,
+        pred_text=str(pred_text or ""),
+        pred_lines=pred_lines,
+        double_check=double_check,
+        a_entity_in_graph=a_entity_in_graph,
+        rollouts=rollouts,
+    )
 
 
-def _answer_in_retrieved_context(record: Dict[str, Any], *, answer_set: Set[int], top_k: int) -> bool:
-    if not answer_set:
-        return False
-    rollouts = record.get("rollouts") or []
-    if not isinstance(rollouts, list) or not rollouts:
-        return False
-    selected = _select_rollouts(rollouts, top_k=int(top_k))
-    context_nodes: set[int] = set()
-    for rollout in selected:
-        edges = rollout.get("edges") or []
-        if isinstance(edges, list):
-            for edge in edges:
-                for key in ("src_entity_id", "dst_entity_id", "head_entity_id", "tail_entity_id"):
-                    val = edge.get(key)
-                    if val is None:
-                        continue
-                    try:
-                        context_nodes.add(int(val))
-                    except (TypeError, ValueError):
-                        continue
-        stop_node = rollout.get("stop_node_entity_id")
-        if stop_node is not None:
-            try:
-                context_nodes.add(int(stop_node))
-            except (TypeError, ValueError):
-                pass
-    return bool(context_nodes & answer_set)
+def _resolve_a_entity_in_graph(record: Dict[str, Any]) -> Optional[bool]:
+    value = record.get("a_entity_in_graph")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _evaluate_sample(sample: _EvalSample) -> _EvalResult:
+    hit_at_1 = float(_subgraphrag_hit_at_1(sample.pred_lines, sample.answers, sample.double_check))
+    hit = float(_subgraphrag_eval_hit(sample.pred_text, sample.answers, sample.double_check))
+    matched, num_pred, num_answer = _subgraphrag_match_count(sample.pred_lines, sample.answers, sample.double_check)
+    precision = float(matched) / float(num_pred) if num_pred > _ZERO else float(_ZERO)
+    recall = float(matched) / float(num_answer) if num_answer > _ZERO else float(_ZERO)
+    f1 = _safe_f1(precision, recall)
+    no_ans = _subgraphrag_no_answer(sample.pred_text, sample.pred_lines)
+    return _EvalResult(
+        hit_at_1=hit_at_1,
+        hit=hit,
+        f1=f1,
+        precision=precision,
+        recall=recall,
+        exact_match=f1 == float(_ONE),
+        totally_wrong=recall == float(_ZERO),
+        matched=matched,
+        num_pred=num_pred,
+        num_answer=num_answer,
+        no_ans=no_ans,
+    )
+
+
+def _accumulate(
+    acc: _EvalAccumulator,
+    sample: _EvalSample,
+    result: _EvalResult,
+    *,
+    include_hal: bool,
+) -> None:
+    acc.samples += _ONE
+    acc.hit_at_1_sum += result.hit_at_1
+    acc.hit_sum += result.hit
+    acc.f1_sum += result.f1
+    acc.precision_sum += result.precision
+    acc.recall_sum += result.recall
+    acc.total_pred += int(result.num_pred)
+    acc.total_answer += int(result.num_answer)
+    acc.total_match += int(result.matched)
+    if result.exact_match:
+        acc.exact_match_count += _ONE
+    if result.totally_wrong:
+        acc.totally_wrong_count += _ONE
+    if result.no_ans:
+        acc.no_ans_count += _ONE
+    if include_hal:
+        if acc.hal_stats is None:
+            acc.hal_stats = _init_hal_stats()
+        entities = _extract_retrieved_entities(sample.rollouts)
+        hal_score, stats = _subgraphrag_hal_score(
+            predictions=sample.pred_lines,
+            answers=sample.answers,
+            double_check=sample.double_check,
+            good_sample=bool(sample.a_entity_in_graph),
+            no_ans=result.no_ans,
+            subgraph_entities=entities,
+            stats=acc.hal_stats,
+        )
+        acc.hal_score_sum += float(hal_score)
+        acc.hal_stats = stats
+
+
+def _finalize_scope(acc: _EvalAccumulator, *, prefix: str) -> Dict[str, Any]:
+    if acc.samples <= _ZERO:
+        return {
+            f"{prefix}/hit@1": float(_ZERO),
+            f"{prefix}/hit": float(_ZERO),
+            f"{prefix}/macro_f1": float(_ZERO),
+            f"{prefix}/macro_precision": float(_ZERO),
+            f"{prefix}/macro_recall": float(_ZERO),
+            f"{prefix}/exact_match": float(_ZERO),
+            f"{prefix}/totally_wrong": float(_ZERO),
+            f"{prefix}/micro_f1": float(_ZERO),
+            f"{prefix}/micro_precision": float(_ZERO),
+            f"{prefix}/micro_recall": float(_ZERO),
+            f"{prefix}/total_cnt": 0,
+            f"{prefix}/no_ans_cnt": 0,
+            f"{prefix}/no_ans_ratio": float(_ZERO),
+            f"{prefix}/hal_score": float(_ZERO),
+        }
+    denom = float(acc.samples)
+    micro_precision = float(acc.total_match) / float(acc.total_pred) if acc.total_pred > _ZERO else float(_ZERO)
+    micro_recall = float(acc.total_match) / float(acc.total_answer) if acc.total_answer > _ZERO else float(_ZERO)
+    micro_f1 = _safe_f1(micro_precision, micro_recall)
+    hal_avg = float(acc.hal_score_sum) / denom
+    hal_scaled = ((hal_avg + _HAL_SCORE_SHIFT) / _HAL_SCORE_SCALE) * _PERCENT
+    return {
+        f"{prefix}/hit@1": (acc.hit_at_1_sum * _PERCENT) / denom,
+        f"{prefix}/hit": (acc.hit_sum * _PERCENT) / denom,
+        f"{prefix}/macro_f1": (acc.f1_sum * _PERCENT) / denom,
+        f"{prefix}/macro_precision": (acc.precision_sum * _PERCENT) / denom,
+        f"{prefix}/macro_recall": (acc.recall_sum * _PERCENT) / denom,
+        f"{prefix}/exact_match": (float(acc.exact_match_count) * _PERCENT) / denom,
+        f"{prefix}/totally_wrong": (float(acc.totally_wrong_count) * _PERCENT) / denom,
+        f"{prefix}/micro_f1": micro_f1,
+        f"{prefix}/micro_precision": micro_precision,
+        f"{prefix}/micro_recall": micro_recall,
+        f"{prefix}/total_cnt": int(acc.samples),
+        f"{prefix}/no_ans_cnt": int(acc.no_ans_count),
+        f"{prefix}/no_ans_ratio": float(acc.no_ans_count) / denom,
+        f"{prefix}/hal_score": float(hal_scaled),
+    }
+
+
+def _format_hal_stats(stats: Dict[str, int], *, prefix: str) -> Dict[str, Any]:
+    return {f"{prefix}/{key}": float(value) for key, value in stats.items()}
 
 
 def _resolve_gold_answer_texts(record: Dict[str, Any], *, answer_separator: str) -> List[str]:
@@ -333,44 +370,6 @@ def _parse_answer_set(text: str, *, answer_separator: str) -> Set[str]:
     return {t for t in (_normalize_answer_token(p) for p in parts) if t}
 
 
-def _parse_answer_set_from_list(values: List[str]) -> Set[str]:
-    return {t for t in (_normalize_answer_token(v) for v in values) if t}
-
-
-def _parse_gold_entity_ids(record: Dict[str, Any]) -> Set[int]:
-    raw = record.get("answer_entity_ids") or []
-    if not isinstance(raw, list):
-        return set()
-    out: set[int] = set()
-    for val in raw:
-        try:
-            out.add(int(val))
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def _parse_pred_entity_ids(record: Dict[str, Any], *, pred_text_set: Set[str], top_k: int) -> Set[int]:
-    label_map = _build_candidate_label_map(record, top_k=top_k)
-    out: set[int] = set()
-    for token in pred_text_set:
-        if not token:
-            continue
-        # Numeric answers (e.g., zip codes, years) are often entity *labels* rather than entity IDs.
-        # Prefer matching against the candidate label map first.
-        if token in label_map:
-            out.update(label_map.get(token, set()))
-            continue
-        if token.isdigit() or (token.startswith("-") and token[1:].isdigit()):
-            try:
-                out.add(int(token))
-            except ValueError:
-                pass
-            continue
-        out.update(label_map.get(token, set()))
-    return out
-
-
 _BRACKETED_ARRAY_RE = re.compile(r"^(\s*\[)(.*)(\]\s*)$", flags=re.DOTALL)
 _QUOTED_TOKEN_RE = re.compile(r"(?:'([^']*)'|\"([^\"]*)\")", flags=re.DOTALL)
 
@@ -417,87 +416,320 @@ def _maybe_parse_bracketed_answers(text: str) -> List[str]:
     return []
 
 
-def _build_candidate_label_map(record: Dict[str, Any], *, top_k: int) -> Dict[str, Set[int]]:
-    rollouts = record.get("rollouts") or []
-    if not isinstance(rollouts, list) or not rollouts:
-        return {}
-    selected = _select_rollouts(rollouts, top_k=top_k)
-    out: Dict[str, Set[int]] = {}
-    for rollout in selected:
-        edges = rollout.get("edges") or []
-        if not isinstance(edges, list):
-            continue
-        for edge in edges:
-            _update_label_map(out, edge.get("src_text"), edge.get("src_entity_id"))
-            _update_label_map(out, edge.get("dst_text"), edge.get("dst_entity_id"))
-            _update_label_map(out, edge.get("head_text"), edge.get("head_entity_id"))
-            _update_label_map(out, edge.get("tail_text"), edge.get("tail_entity_id"))
+_SUBGRAPHRAG_ARTICLES_RE = re.compile(r"\b(a|an|the)\b", flags=re.IGNORECASE)
+_SUBGRAPHRAG_PAD_RE = re.compile(r"\b(<pad>)\b", flags=re.IGNORECASE)
+_SUBGRAPHRAG_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+_SUBGRAPHRAG_DOUBLE_CHECK_KEYWORDS = (
+    "when",
+    "what year",
+    "which year",
+    "where",
+    "sport",
+    "what countr",
+    "language",
+    "nba finals",
+    "world series",
+)
+
+
+def _subgraphrag_normalize(text: str) -> str:
+    s = str(text or "").lower()
+    s = s.translate(_SUBGRAPHRAG_PUNCT_TABLE)
+    s = _SUBGRAPHRAG_ARTICLES_RE.sub(" ", s)
+    s = _SUBGRAPHRAG_PAD_RE.sub(" ", s)
+    return " ".join(s.split())
+
+
+def _subgraphrag_match(s1: str, s2: str) -> bool:
+    left = _subgraphrag_normalize(s1)
+    right = _subgraphrag_normalize(s2)
+    return bool(right) and right in left
+
+
+def _subgraphrag_get_pred_lines(prediction: str) -> List[str]:
+    raw = str(prediction or "")
+    candidates = [p for p in raw.split("\n") if "ans:" in p and "none" not in p.lower()]
+    if candidates:
+        lowered = [p.lower() for p in candidates]
+        candidates = [p for p, lo in zip(candidates, lowered) if all(marker not in lo for marker in _NO_ANS_MARKERS)]
+    return _remove_duplicates_preserve_order(candidates)
+
+
+def _subgraphrag_year_fix(gold: List[str], question: str) -> List[str]:
+    q = str(question or "").lower()
+    if "when" not in q and "what year" not in q:
+        return gold
+    out: List[str] = []
+    for answer in gold:
+        raw = str(answer or "").strip()
+        if "-" in raw:
+            head = raw.split("-", 1)[0]
+            if head.isdigit():
+                raw = head
+        if raw:
+            out.append(raw)
     return out
 
 
-def _update_label_map(out: Dict[str, Set[int]], text: Any, entity_id: Any) -> None:
-    token = _normalize_answer_token(str(text or ""))
-    if not token:
-        return
-    try:
-        ent = int(entity_id)
-    except (TypeError, ValueError):
-        return
-    out.setdefault(token, set()).add(ent)
+def _subgraphrag_is_double_check(question: str) -> bool:
+    q = str(question or "").lower()
+    return any(keyword in q for keyword in _SUBGRAPHRAG_DOUBLE_CHECK_KEYWORDS)
 
 
-def _select_rollouts(rollouts: Sequence[Dict[str, Any]], *, top_k: int) -> List[Dict[str, Any]]:
-    sorted_rollouts = sorted(
-        rollouts,
-        key=lambda r: (float(r.get(_FIELD_SCORE, _NEG_INF)), int(r.get(_FIELD_ROLLOUT_INDEX, _ZERO))),
-        reverse=True,
-    )
-    return sorted_rollouts[: int(top_k)]
+def _safe_f1(precision: float, recall: float) -> float:
+    denom = precision + recall
+    if denom == float(_ZERO):
+        return float(_ZERO)
+    return (_TWO * precision * recall) / denom
 
 
-@dataclass
-class _F1Accumulator:
-    samples: int = 0
-    hit_samples: int = 0
-    tp: int = 0
-    fp: int = 0
-    fn: int = 0
-    sum_f1: float = 0.0
-
-    def update(self, *, pred: Set[Any], gold: Set[Any]) -> None:
-        self.samples += 1
-        overlap = pred & gold
-        tp = len(overlap)
-        fp = len(pred - gold)
-        fn = len(gold - pred)
-        self.tp += tp
-        self.fp += fp
-        self.fn += fn
-        if tp > 0:
-            self.hit_samples += 1
-        precision = float(tp) / float(len(pred)) if pred else 0.0
-        recall = float(tp) / float(len(gold)) if gold else 0.0
-        denom = precision + recall
-        f1 = (2.0 * precision * recall / denom) if denom > 0.0 else 0.0
-        self.sum_f1 += float(f1)
+def _subgraphrag_no_answer(prediction: str, pred_lines: Sequence[str]) -> bool:
+    if not pred_lines:
+        return True
+    lowered = str(prediction or "").lower()
+    if "ans:" not in lowered:
+        return True
+    return any(marker in lowered for marker in _NO_ANS_MARKERS)
 
 
-def _finalize_f1(acc: _F1Accumulator, *, prefix: str) -> Dict[str, float]:
-    if acc.samples <= 0:
-        return {f"{prefix}/samples": 0.0, f"{prefix}/hit": 0.0, f"{prefix}/micro_f1": 0.0, f"{prefix}/macro_f1": 0.0}
-    tp = float(acc.tp)
-    fp = float(acc.fp)
-    fn = float(acc.fn)
-    denom = (2.0 * tp) + fp + fn
-    micro_f1 = (2.0 * tp / denom) if denom > 0.0 else 0.0
-    macro_f1 = float(acc.sum_f1) / float(max(acc.samples, 1))
-    hit_rate = float(acc.hit_samples) / float(max(acc.samples, 1))
+def _subgraphrag_hit_at_1(prediction: Sequence[str], answer: List[str], double_check: bool) -> int:
+    if not prediction:
+        return 0
+    top = str(prediction[0])
+    for a in answer:
+        if _subgraphrag_match(top, a):
+            return 1
+        if double_check and _subgraphrag_match(a, top.split("ans:")[-1].strip()):
+            return 1
+    return 0
+
+
+def _subgraphrag_match_count(
+    prediction: Sequence[str],
+    answer: List[str],
+    double_check: bool,
+) -> Tuple[int, int, int]:
+    prediction_sorted = sorted([str(p) for p in prediction], key=len, reverse=True)
+    matched = 0
+    for a in answer:
+        for pred in list(prediction_sorted):
+            if _subgraphrag_pred_matches(pred, a, double_check):
+                matched += 1
+                prediction_sorted.remove(pred)
+                break
+    return matched, len(prediction), len(answer)
+
+
+def _subgraphrag_pred_matches(pred: str, answer: str, double_check: bool) -> bool:
+    if _subgraphrag_match(pred, answer):
+        return True
+    if not double_check:
+        return False
+    tail = pred.split("ans:")[-1].strip()
+    return _subgraphrag_match(answer, tail) or _subgraphrag_match(answer, pred)
+
+
+def _init_hal_stats() -> Dict[str, int]:
     return {
-        f"{prefix}/samples": float(acc.samples),
-        f"{prefix}/hit": float(hit_rate),
-        f"{prefix}/micro_f1": float(micro_f1),
-        f"{prefix}/macro_f1": float(macro_f1),
+        "g_no_ans": 0,
+        "g_c": 0,
+        "g_w": 0,
+        "b_no_ans": 0,
+        "b_in_graph": 0,
+        "b_out_graph_c": 0,
+        "b_out_graph_w": 0,
+        "total_ans": 0,
+        "total_g_samples": 0,
+        "total_b_samples": 0,
+        "total_samples": 0,
+        "total_g_ans": 0,
+        "total_b_ans": 0,
+        "g_c_out_graph": 0,
+        "g_w_out_graph": 0,
+        "g_c_in_graph": 0,
+        "g_w_in_graph": 0,
     }
+
+
+def _extract_retrieved_entities(rollouts: Optional[List[Dict[str, Any]]]) -> List[str]:
+    if not rollouts:
+        return []
+    entities: List[str] = []
+    for rollout in rollouts:
+        edges = rollout.get("edges")
+        if not isinstance(edges, list):
+            continue
+        for edge in edges:
+            src = _resolve_edge_value(edge, ("src_text", "head_text", "src_entity_id", "head_entity_id"))
+            dst = _resolve_edge_value(edge, ("dst_text", "tail_text", "dst_entity_id", "tail_entity_id"))
+            if src:
+                entities.append(str(src))
+            if dst:
+                entities.append(str(dst))
+    return _remove_duplicates_preserve_order(entities)
+
+
+def _resolve_edge_value(edge: Dict[str, Any], keys: Sequence[str]) -> Optional[str]:
+    for key in keys:
+        value = edge.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _pred_in_entities(pred: str, subgraph_entities: Sequence[str]) -> bool:
+    pred_lower = str(pred or "").lower()
+    tail = pred_lower.split("ans:")[-1].strip()
+    for ent in subgraph_entities:
+        ent_lower = str(ent or "").lower()
+        if tail and tail in ent_lower:
+            return True
+        if ent_lower and ent_lower in pred_lower:
+            return True
+    return False
+
+
+def _subgraphrag_hal_score(
+    *,
+    predictions: Sequence[str],
+    answers: List[str],
+    double_check: bool,
+    good_sample: bool,
+    no_ans: bool,
+    subgraph_entities: Sequence[str],
+    stats: Dict[str, int],
+) -> Tuple[float, Dict[str, int]]:
+    stats["total_samples"] += _ONE
+    if good_sample:
+        return _subgraphrag_hal_score_good(
+            predictions=predictions,
+            answers=answers,
+            double_check=double_check,
+            no_ans=no_ans,
+            subgraph_entities=subgraph_entities,
+            stats=stats,
+        )
+    return _subgraphrag_hal_score_bad(
+        predictions=predictions,
+        answers=answers,
+        double_check=double_check,
+        no_ans=no_ans,
+        subgraph_entities=subgraph_entities,
+        stats=stats,
+    )
+
+
+def _subgraphrag_hal_score_good(
+    *,
+    predictions: Sequence[str],
+    answers: List[str],
+    double_check: bool,
+    no_ans: bool,
+    subgraph_entities: Sequence[str],
+    stats: Dict[str, int],
+) -> Tuple[float, Dict[str, int]]:
+    stats["total_g_samples"] += _ONE
+    if no_ans:
+        stats["g_no_ans"] += _ONE
+        return float(_ZERO), stats
+    answer_pool = list(answers)
+    score = float(_ZERO)
+    for pred in predictions:
+        stats["total_ans"] += _ONE
+        stats["total_g_ans"] += _ONE
+        matched = False
+        for ans in list(answer_pool):
+            if _subgraphrag_pred_matches(str(pred), ans, double_check):
+                score += _HAL_GOOD_CORRECT_REWARD
+                stats["g_c"] += _ONE
+                matched = True
+                answer_pool.remove(ans)
+                if _pred_in_entities(str(pred), subgraph_entities):
+                    stats["g_c_in_graph"] += _ONE
+                else:
+                    stats["g_c_out_graph"] += _ONE
+                break
+        if not matched:
+            score += _HAL_GOOD_WRONG_PENALTY
+            stats["g_w"] += _ONE
+            if _pred_in_entities(str(pred), subgraph_entities):
+                stats["g_w_in_graph"] += _ONE
+            else:
+                stats["g_w_out_graph"] += _ONE
+    denom = float(len(predictions)) if predictions else float(_ONE)
+    return score / denom, stats
+
+
+def _subgraphrag_hal_score_bad(
+    *,
+    predictions: Sequence[str],
+    answers: List[str],
+    double_check: bool,
+    no_ans: bool,
+    subgraph_entities: Sequence[str],
+    stats: Dict[str, int],
+) -> Tuple[float, Dict[str, int]]:
+    stats["total_b_samples"] += _ONE
+    if no_ans:
+        stats["b_no_ans"] += _ONE
+        return _HAL_BAD_NO_ANS_REWARD, stats
+    answer_pool = list(answers)
+    score = float(_ZERO)
+    for pred in predictions:
+        stats["total_ans"] += _ONE
+        stats["total_b_ans"] += _ONE
+        if _pred_in_entities(str(pred), subgraph_entities):
+            score += _HAL_BAD_IN_GRAPH_PENALTY
+            stats["b_in_graph"] += _ONE
+            continue
+        score += _HAL_BAD_OUT_GRAPH_PENALTY
+        matched = False
+        for ans in list(answer_pool):
+            if _subgraphrag_pred_matches(str(pred), ans, double_check):
+                stats["b_out_graph_c"] += _ONE
+                matched = True
+                answer_pool.remove(ans)
+                break
+        if not matched:
+            stats["b_out_graph_w"] += _ONE
+    denom = float(len(predictions)) if predictions else float(_ONE)
+    return score / denom, stats
+
+
+def _subgraphrag_eval_hit(prediction: str, answer: List[str], double_check: bool) -> int:
+    """SubgraphRAG's Hit metric (see SubgraphRAG/reason/metrics/evaluate_results.py)."""
+
+    pred_text = str(prediction or "")
+    for a in answer:
+        if "ans:" in pred_text:
+            all_pred = _subgraphrag_get_pred_lines(pred_text)
+            for each_pred in all_pred:
+                if _subgraphrag_match(each_pred, a):
+                    return 1
+                if double_check and _subgraphrag_match(a, each_pred.split("ans:")[-1].strip()):
+                    return 1
+        else:
+            if _subgraphrag_match(pred_text, a):
+                return 1
+            if double_check:
+                for each_pred in pred_text.split("\n"):
+                    if _subgraphrag_match(a, each_pred):
+                        return 1
+    return 0
+
+
+def _remove_duplicates_preserve_order(values: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 __all__ = ["compute_llm_metrics", "write_llm_metrics"]

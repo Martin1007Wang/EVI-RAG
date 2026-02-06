@@ -1,0 +1,15 @@
+# Build strict shortest-path labels (SubgraphRAG-style) for edge-iid retriever training.
+
+defaults:
+  - _self_
+  - dataset: null
+  - paths: default
+  - hydra: default
+
+task_name: "build_edge_retriever_labels"
+
+splits: [train, validation, test]
+
+# Default output location: `${dataset.artifact_dir}/edge_retriever_labels`
+output_dir: null
+overwrite: false

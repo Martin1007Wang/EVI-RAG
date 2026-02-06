@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 if "TOKENIZERS_PARALLELISM" not in os.environ:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -21,6 +22,27 @@ from src.data.pipeline_main import build_pipeline
 from src.utils.logging_utils import get_logger, init_logging, log_event
 
 LOGGER = get_logger(__name__)
+
+_STAGE_ALIASES = {
+    "build_parquet": "parquet",
+    "build_lmdb": "lmdb",
+    "build_inverse_detect": "inverse_detect",
+    "build_inverse_resolve": "inverse_resolve",
+    "build_inverse_describe": "inverse_describe",
+    "build_inverse_relations": "inverse_relations",
+    "build_all": "all",
+}
+
+
+def _apply_stage_aliases(argv: list[str]) -> None:
+    stages = [arg for arg in argv if arg in _STAGE_ALIASES]
+    if not stages:
+        return
+    if len(stages) > 1:
+        raise ValueError(f"Multiple stage aliases provided: {stages}. Use only one.")
+    stage = _STAGE_ALIASES[stages[0]]
+    argv.remove(stages[0])
+    argv.append(f"pipeline_stage={stage}")
 
 
 if hydra is not None:
@@ -52,4 +74,5 @@ else:  # pragma: no cover
 
 
 if __name__ == "__main__":
+    _apply_stage_aliases(sys.argv)
     main()

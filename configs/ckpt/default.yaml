@@ -4,3 +4,4 @@
 # centralize checkpoint paths for evaluation runs.
 
 dual_flow: null
+edge_retriever: null

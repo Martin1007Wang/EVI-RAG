@@ -112,11 +112,7 @@ class GRetrievalDataset(Dataset):
 
         q_local_indices = raw["q_local_indices"]
         a_local_indices = raw["a_local_indices"]
-        retrieval_flag = raw.get("retrieval_failure", False)
-        if torch.is_tensor(retrieval_flag):
-            retrieval_failure = bool(retrieval_flag.detach().tolist())
-        else:
-            retrieval_failure = bool(retrieval_flag)
+        a_entity_in_graph = bool(torch.as_tensor(a_local_indices).numel() > 0)
         data_kwargs: Dict[str, Any] = {
             "num_nodes": num_nodes,
             "edge_index": edge_index,
@@ -128,7 +124,7 @@ class GRetrievalDataset(Dataset):
             "a_local_indices": a_local_indices,
             "answer_entity_ids": answer_ids,
             "sample_id": sample_id,
-            "retrieval_failure": retrieval_failure,
+            "a_entity_in_graph": a_entity_in_graph,
         }
         question_text = raw.get("question")
         if question_text is not None:

@@ -32,6 +32,7 @@
 
 ### Axiom 2: Tensor-First Semantics (张量优先语义)
 *   **Vectorization is Mandatory:** 禁止在数据流路径中使用 Python `for` 循环。所有操作必须映射为 Tensor 的广播（Broadcasting）、索引（Indexing）或矩阵运算。
+*   **Sequential Rollout Exception:** 仅限 `torch.no_grad()` 的采样/环境交互/解码与 Monte Carlo 统计可使用顺序循环；所有可微损失/评估必须向量化或使用 RNN 批处理。
 *   **Strict Typing:** 类型提示不仅是文档，是契约。使用 `jaxtyping` 风格的思维：`Float[Tensor, "batch dim"]`。
 
 ### Axiom 3: Radical Candor (绝对坦诚)
@@ -88,8 +89,7 @@
 ### 2. Runtime Contract (Current Pipeline)
 *   **Training:** 仅提供 DualFlow 训练（`configs/experiment/train_dual_flow.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
 *   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_dual_flow` 缓存；不生成/不读取 `g_agent`。
-*   **Edge Dropout (Code-Exact):** 训练阶段仅实现 `pb_edge_dropout`（后向/Teacher 边 Dropout），由
-    `model.training_cfg.db_cfg.pb_edge_dropout` 控制；当前代码中不存在额外的 SP-Dropout / shortest-path safety net 逻辑。
+*   **Edge Dropout (Code-Exact):** 当前实现未启用任何训练时 edge dropout。
 
 ---
 
@@ -125,22 +125,23 @@
 ## Ⅴ. Policy Semantics (行动语义)
 
 ### 1. Action Definition (动作定义)
-*   **Edge-Logit Policy (Code-Exact):** 当前实现不做 $P_R\\cdot P_E$ 的两阶段分解；策略直接对边 $(u,r,v)$ 打分：
+*   **Edge-Logit Policy (Code-Exact):** 当前实现使用显式势能差：
     \[
-    \\text{logit}(u\\to v)=\\text{SRM}(c, h_u, h_r, h_v)
+    \\text{logit}(u\\to v)= -\\log d_{in}(v) + \\alpha\\, (\\log F(v) - \\log F(u))
     \]
-    其中 `SRM` 为唯一策略头（`src/models/components/srm.py`）。
+    其中 $\\log F(\\cdot)$ 由 `z_predictor` 给出，$\\alpha=\\exp(\\text{logit_scale})$ 为可学习尺度。
 *   **Hard Rollout, Differentiable Eval:** 训练中的 rollout 采用 Gumbel-Max 硬采样（`torch.no_grad()`）；梯度通过 DB 损失里的
     $\\log P_F, \\log P_B, \\log Z$ 反传（代码路径：`src/models/dual_flow_module.py`）。
 
 ### 2. Termination Rule (终止规则)
-*   **No Explicit STOP Action:** 终止由条件触发：命中答案、无出边或达到最大步数。
-*   **Reward Semantics:** 成功路径 $R=1$（$\log R=0$）；失败路径 $R=\epsilon$（$\log R \approx -C$）。
+*   **Explicit STOP Action (Code-Exact):** 轨迹以显式 STOP 动作终止；命中答案节点时强制 STOP；达到最大步数亦强制 STOP。
+*   **Min-Step Constraint (Code-Exact):** `runtime_cfg.stop_min_steps` 指定最小步数，`t < min_steps` 时禁止 STOP（训练/评估一致）。
+*   **Reward Semantics:** STOP 前一步所在实体命中答案则 $R=1$（$\log R=0$），否则 $R=\epsilon$（$\log R \approx -C$）。
 
 ### 3. Backward Policy Contract (反向策略契约)
 *   **Single PB Strategy (Code-Exact):** 当前实现仅保留一种静态 $P_B$：
     * `uniform`（静态）：对每个状态的逆向出边做均匀分布，$\log P_B=-\\log |\\text{Out}_b(v)|$。
-*   **Teacher Edge Dropout:** `pb_edge_dropout` 对逆向候选边做结构级 Dropout（同一掩码用于 backward rollout 与 DB 评估）。
+*   **Teacher Edge Dropout:** 当前实现未启用。
 
 ### 4. Multi-Start Handling (多起点处理)
 *   **Set Semantics:** `q_local_indices` 表示完整起点集合，严禁覆盖或互换。

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import uuid
+from typing import Dict
 
 from src.data.context import StageContext
 from src.data.io.lmdb_utils import ensure_dir
+from src.data.stages.inverse_relations_stage import (
+    build_inverse_relations_all,
+    build_inverse_relations_describe,
+    build_inverse_relations_detect,
+    build_inverse_relations_resolve,
+)
 from src.data.stages.step2_graph import preprocess
 from src.data.stages.step3_lmdb import build_dataset
 from src.utils.logging_utils import get_logger, log_event
@@ -24,8 +31,10 @@ def _validate_pipeline_cfg(ctx: StageContext) -> None:
     _ = ctx.parquet_chunk_size
     _ = ctx.parquet_num_workers
 
-    if skip_parquet_stage or skip_lmdb_stage:
-        raise ValueError("skip_parquet_stage/skip_lmdb_stage are disabled; run the unified parquet+LMDB pipeline.")
+    if skip_parquet_stage and skip_lmdb_stage:
+        stage = str(cfg.get("pipeline_stage", "all")).strip().lower()
+        if not stage.startswith("inverse"):
+            raise ValueError("Both skip_parquet_stage and skip_lmdb_stage are true; nothing to run.")
 
     if use_precomputed_embeddings and not precompute_embeddings and not skip_parquet_stage and not reuse_embeddings_if_exists:
         raise ValueError(
@@ -39,11 +48,91 @@ def _validate_pipeline_cfg(ctx: StageContext) -> None:
     parquet_dir_cfg = cfg.get("parquet_dir")
     out_dir_cfg = cfg.get("out_dir")
     if parquet_dir_cfg and out_dir_cfg:
-        if ctx.parquet_dir.resolve() != ctx.out_dir.resolve():
+        if not skip_parquet_stage and not skip_lmdb_stage and ctx.parquet_dir.resolve() != ctx.out_dir.resolve():
             raise ValueError(
                 "parquet_dir must match out_dir in the unified pipeline. "
                 f"Got parquet_dir={ctx.parquet_dir} vs out_dir={ctx.out_dir}."
             )
+
+
+def _apply_pipeline_stage(ctx: StageContext) -> str:
+    cfg = ctx.cfg
+    stage = str(cfg.get("pipeline_stage", "all")).strip().lower()
+    if not stage:
+        stage = "all"
+    if stage not in (
+        "all",
+        "parquet",
+        "lmdb",
+        "inverse_detect",
+        "inverse_resolve",
+        "inverse_describe",
+        "inverse_relations",
+    ):
+        raise ValueError(
+            "pipeline_stage must be one of: all, parquet, lmdb, "
+            "inverse_detect, inverse_resolve, inverse_describe, inverse_relations "
+            f"(got {stage!r})."
+        )
+    if stage.startswith("inverse"):
+        cfg["skip_parquet_stage"] = True
+        cfg["skip_lmdb_stage"] = True
+        log_event(
+            ctx.logger,
+            "pipeline_stage_applied",
+            stage=stage,
+            overrides={"skip_parquet_stage": True, "skip_lmdb_stage": True},
+        )
+        return stage
+    desired = {
+        "skip_parquet_stage": stage == "lmdb",
+        "skip_lmdb_stage": stage == "parquet",
+    }
+    changed: Dict[str, object] = {}
+    for key, value in desired.items():
+        if cfg.get(key) != value:
+            cfg[key] = value
+            changed[key] = value
+    if changed:
+        log_event(ctx.logger, "pipeline_stage_applied", stage=stage, overrides=changed)
+    if stage == "parquet":
+        inv_cfg = cfg.get("inverse_relations") if hasattr(cfg, "get") else None
+        if isinstance(inv_cfg, dict) or hasattr(inv_cfg, "get"):
+            enabled = bool(inv_cfg.get("enabled", False))
+            mapping_path = inv_cfg.get("mapping_path")
+            if enabled and mapping_path:
+                path = ctx.resolve_path(mapping_path)
+                if not path.exists():
+                    inv_cfg["enabled"] = False
+                    log_event(
+                        ctx.logger,
+                        "pipeline_stage_applied",
+                        stage=stage,
+                        overrides={"inverse_relations.enabled": False},
+                        reason="inverse_relations_missing",
+                    )
+    return stage
+
+
+def _apply_stage_overrides(ctx: StageContext) -> None:
+    cfg = ctx.cfg
+    if not bool(cfg.get("skip_lmdb_stage", False)):
+        return
+    overrides = {
+        "precompute_entities": False,
+        "precompute_relations": False,
+        "precompute_questions": False,
+        "canonicalize_relations": False,
+        "use_precomputed_embeddings": False,
+        "use_precomputed_questions": False,
+    }
+    changed: Dict[str, object] = {}
+    for key, value in overrides.items():
+        if cfg.get(key) != value:
+            cfg[key] = value
+            changed[key] = value
+    if changed:
+        log_event(ctx.logger, "pipeline_overrides", reason="skip_lmdb_stage", overrides=changed)
 
 def _run_parquet_stage(ctx: StageContext) -> None:
     log_event(
@@ -74,7 +163,23 @@ def _ensure_pipeline_dirs(ctx: StageContext) -> None:
 def build_pipeline(cfg) -> None:
     run_id = str(cfg.get("run_id") or uuid.uuid4().hex)
     ctx = StageContext(cfg=cfg, logger=LOGGER, run_id=run_id)
+    stage = _apply_pipeline_stage(ctx)
     _validate_pipeline_cfg(ctx)
+    _apply_stage_overrides(ctx)
     _ensure_pipeline_dirs(ctx)
-    _run_parquet_stage(ctx)
-    build_dataset(ctx)
+    if stage == "inverse_detect":
+        build_inverse_relations_detect(ctx)
+        return
+    if stage == "inverse_resolve":
+        build_inverse_relations_resolve(ctx)
+        return
+    if stage == "inverse_describe":
+        build_inverse_relations_describe(ctx)
+        return
+    if stage == "inverse_relations":
+        build_inverse_relations_all(ctx)
+        return
+    if not bool(cfg.get("skip_parquet_stage", False)):
+        _run_parquet_stage(ctx)
+    if not bool(cfg.get("skip_lmdb_stage", False)):
+        build_dataset(ctx)

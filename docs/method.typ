@@ -3,9 +3,9 @@
 
 = 方法 <sec:methodology>
 我们提出 GFlowRAG，一种基于生成流网络（GFlowNet）的生成式推理方法。为避免在稀疏且长程依赖的图搜索空间中“从零学习”
-整套策略分布，我们采用*结构化残差学习（Structured Residual Learning）*：固定拓扑先验作为推理的物理坐标系，
-让神经网络仅学习相对于该坐标系的语义增量（Semantic Residual）。该设计与 ResNet 的思想一致：将已知结构通过恒等映射直接传递，
-把学习容量集中到“偏离结构”的部分，从而减少用参数去记忆图连通性的浪费。在线阶段，我们在固定跳数 $T$ 与固定采样/beam
+整套策略分布，我们采用*显式势能差分学习（Explicit Potential Difference）*：固定拓扑先验作为推理的物理坐标系，
+并直接用可学习势能函数 $log F(s)$ 生成策略的语义倾向（以势能差形式出现）。该设计保留 Doob-$h$ 的严格结构，
+把学习容量集中到“相对于自然游走的偏离”，从而减少用参数去记忆图连通性的浪费。在线阶段，我们在固定跳数 $T$ 与固定采样/beam
 预算下生成多条高概率、多样化的推理路径，作为后续阅读器的结构化证据。
 
 *在线复杂度声明（严格口径）.* 对每个查询，我们首先对检索子图 $G_"sub"(q)$ 做一次图编码（开销与子图规模线性相关，
@@ -43,7 +43,7 @@ $S = cal(V)_q times {0, dots, T}$ 上必然无环（无法回到同一 $(v, t)$�
 若工程上额外启用 no-revisit 约束（不允许访问已访问节点），则在扩展状态
 $tilde(s)_t = (v_t, t, q, V_"visited"(t))$ 上同样无环，且动作约束更强；这属于实现层面的加速/稳定化手段，不作为理论推导的必要前提。
 
-== Doob $h$-变换与残差分解 <sec:theoretical-framework>
+== Doob $h$-变换与势能差分 <sec:theoretical-framework>
 
 我们将“无语义时的自然推理”刻画为参考过程 $P_0$：在任意状态 $s_t$，参考过程执行出度均匀随机游走：
 $ P_0(s_(t+1) | s_t) = frac(1, d_"out"(v_t)), quad forall (v_t, v_(t+1)) in cal(E). $
@@ -58,6 +58,11 @@ $ Z(s_t) P_F(s_(t+1)|s_t) = Z(s_(t+1)) P_B(s_t|s_(t+1)). $
 由此可得到一个等价的 logits 形式（$P_F$ 由对 logits 的 softmax 给出；每个状态的归一化常数会被 softmax 吸收）：
 $ "Logits"(s_(t+1)|s_t) = underbrace(log P_B(s_t|s_(t+1)), "Backward Prior") + underbrace([log Z(s_(t+1)) - log Z(s_t)], "Value Residual"). $ <eq:db-logit>
 
+*实现口径（势能差分）.* 式 <eq:db-logit> 表明 Doob-$h$ 的自然参数化即“拓扑先验 + 势能差分”。
+在实现中我们直接令
+$ psi_theta(u,r,v,q,t) := log Z_theta(s_(t+1)) - log Z_theta(s_t) $
+从而使前向策略与势能函数严格一致。
+
 关键在于如何选择 $P_B$ 以严格对齐 $P_0$ 的时间反演，而不是“拍脑袋近似”。为此我们采用一个在共同基线数据集中成立、且实现会显式强制的假设：
 对每条边 $(u, r, v)$，子图中包含其唯一逆边 $(v, r^(-1), u)$（逆关系通过固定后缀生成，并在训练前做一致性校验）。
 在该“带逆边的有向多重图”上，我们将参考过程 $P_0$ 定义为*对出边（edge）均匀*的随机游走：
@@ -70,20 +75,14 @@ $ P_"rev"(u|v) = frac(1, d_"in"(v)). $
 我们将后向策略锚定为该时间反演先验（实现为对逆向候选边的静态均匀分布），因此有
 $ log P_B(s_t|s_(t+1)) = -log(d_"in"(s_(t+1))). $ <eq:pb-indegree>
 
-== 残差流网络：InDegree Prior + SRM <sec:architecture>
+== 势能流网络：InDegree Prior + Potential Difference <sec:architecture>
 
-在多关系图中，仅用节点级的 $Delta log Z$ 会导致“关系致盲”。为此，我们使用一个关系感知的语义残差模块
-SRM（Semantic Residual Module）$psi_theta$ 来参数化残差项。最终策略的 logits 采用严格的加性结构：
-$ "Logits"(u, r, v | q, t) = underbrace(-log(d_"in"(v)), "Topological Bias") + underbrace(psi_theta(u, r, v, q, t), "Semantic Residual"). $ <eq:final-logits>
+Doob-$h$ 的核心信息是：策略并非从零学习，而是对参考过程的 *multiplicative tilt*。在 log 空间中，这一结论等价为“先验项 + 势能差分”。
+因此我们将 <eq:pb-indegree> 给出的拓扑先验固定为一个不可学习的偏置项，并直接用势能差分生成前向 logits。
 
-当 $psi_theta approx 0$ 时，策略退化为一个以 $d_"in"(v)$ 为偏置的结构化随机游走（而非端到端黑盒策略），从而具备可控的冷启动行为。
-
-SRM 的实现遵循“只学残差”的计算图（与代码一致）：
-- 将查询向量、节点向量、关系向量投影到同一表示空间；
-- 用查询条件化地产生仿射调制参数 $(gamma, beta)$，对关系表示做语义形变 $r' = (1+gamma) odot r + beta$；
-- 将时间编码注入当前节点表示，并通过 $(u odot r') dot v$ 的双线性交互为每条候选边输出一个标量残差分数（关系 $r$ 显式参与）。
-*尺度约束（回应“残差可被抵消”的质疑）.* 我们在 SRM 中使用球面归一化（unit-normalized dot product）并对可学习的 logit scale 做区间裁剪，
-因此残差分数 $psi_theta$ 的幅值被显式限制在一个可控范围内；同时门控层零初始化使得训练初期 $psi_theta approx 0$，策略自然回退到拓扑先验主导的行为。
+*势能差分（策略定义）.* 对候选边 $e=(u,r,v)$、时间步 $t$，前向 step logits 定义为
+$ "Logits"(u, r, v | q, t) = underbrace(-log(d_"in"(v)), "Topological Bias") + underbrace(alpha * (log Z_theta(s_(t+1)) - log Z_theta(s_t)), "Potential Difference"). $ <eq:final-logits>
+其中 $alpha>0$ 是可学习尺度，用于匹配势能差与拓扑先验的数值尺度。
 
 == 训练目标：有限视界接地的 DB 残差 <sec:finite-horizon-grounding>
 

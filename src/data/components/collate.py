@@ -5,11 +5,7 @@ from typing import Any, Optional
 import torch
 from torch_geometric.loader.dataloader import Collater
 
-from src.utils.graph import (
-    build_edge_batch_debug_context,
-    build_edge_inverse_map,
-    compute_edge_batch,
-)
+from src.utils.graph import build_edge_inverse_map, compute_edge_batch
 _ZERO = 0
 _ONE = 1
 
@@ -98,7 +94,7 @@ def _attach_graph_stats(batch: Any) -> None:
     batch.num_nodes_total = num_nodes_total
 
 
-def _attach_edge_batch(batch: Any, *, validate: bool) -> None:
+def _attach_edge_batch(batch: Any) -> None:
     edge_index = getattr(batch, "edge_index", None)
     node_ptr = getattr(batch, "ptr", None)
     if edge_index is None or node_ptr is None:
@@ -108,14 +104,12 @@ def _attach_edge_batch(batch: Any, *, validate: bool) -> None:
     num_graphs = int(node_ptr.numel() - _ONE)
     if num_graphs <= _ZERO:
         raise ValueError("ptr must encode at least one graph when precomputing edge_batch.")
-    debug_context = build_edge_batch_debug_context(batch) if validate else None
     edge_batch, edge_ptr = compute_edge_batch(
         edge_index,
         node_ptr=node_ptr,
         num_graphs=num_graphs,
         device=edge_index.device,
-        debug_context=debug_context,
-        validate=validate,
+        validate=False,
     )
     batch.edge_batch = edge_batch
     batch.edge_ptr = edge_ptr
@@ -153,12 +147,10 @@ class BatchAugmenter:
         self,
         *,
         precompute_edge_batch: bool,
-        validate_edge_batch: bool,
         precompute_edge_inverse_map: bool,
         relation_inverse_map: Optional[torch.Tensor],
     ) -> None:
         self._precompute_edge_batch = bool(precompute_edge_batch)
-        self._validate_edge_batch = bool(validate_edge_batch)
         self._precompute_edge_inverse_map = bool(precompute_edge_inverse_map)
         self._relation_inverse_map = None
         if relation_inverse_map is not None:
@@ -172,7 +164,7 @@ class BatchAugmenter:
         _attach_graph_stats(batch)
         _attach_answer_ids(batch)
         if self._precompute_edge_batch:
-            _attach_edge_batch(batch, validate=self._validate_edge_batch)
+            _attach_edge_batch(batch)
         if self._precompute_edge_inverse_map:
             _attach_edge_inverse_map(batch, inverse_map=self._relation_inverse_map)
         return batch

@@ -1,0 +1,22 @@
+# @package _global_
+#
+# Train edge-iid supervised retriever (strict shortest-path labels).
+
+defaults:
+  - override /data: g_retrieval_edge_retriever
+  - override /model: edge_retriever
+  - override /callbacks: edge_retriever_train
+  - override /logger: none
+  - _self_
+
+task_name: "train/edge_retriever"
+tags: ["baseline", "edge_retriever"]
+
+# The retriever module does not implement test_step; keep training focused.
+test: false
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 1
+  accelerator: gpu
+  devices: 1

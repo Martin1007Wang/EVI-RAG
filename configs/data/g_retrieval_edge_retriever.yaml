@@ -1,0 +1,24 @@
+# DataLoader settings for SubgraphRAG-style retriever training.
+
+_target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
+
+dataset_cfg: ${dataset}
+
+batch_size: 1
+num_workers: 8
+pin_memory: true
+drop_last: false
+train_shuffle: true
+train_samples_per_epoch: ${dataset.train_samples_per_epoch}
+prefetch_factor: 4
+persistent_workers: true
+
+precompute_edge_batch: false
+precompute_edge_inverse_map: false
+
+embeddings_device: cpu
+
+expand_multi_answer: false
+# Avoid DataLoader hard-failing on zero-hop samples (q in A). For SubgraphRAG-style
+# `skip_no_path=true`, we skip these samples in the LightningModule instead.
+filter_zero_hop: false
