@@ -6,6 +6,7 @@ _ZERO = 0
 _ONE = 1
 _TWO = 2
 _THREE = 3
+_FOUR = 4
 _SELF_RELATION_ID = -1
 _INVALID_EDGE_ID = -1
 _STOP_ACTION_ID = _NEG_TWO
@@ -17,26 +18,20 @@ _TERMINAL_MAX_STEPS = 3
 _TERMINAL_INVALID_START = 4
 _TERMINAL_EMIT = 5
 
-_DEFAULT_AVOID_REVISIT = True
 _DEFAULT_GNN_LAYERS = 2
 _DEFAULT_GNN_DROPOUT = 0.1
 _DEFAULT_LOGIT_SCALE_INIT = 2.3
 _DEFAULT_PRIOR_WEIGHT_INIT = 0.0
 _DEFAULT_STOP_ENABLED = True
+_DEFAULT_DEGREE_BUCKETS = 64
+_DEFAULT_MAX_LOG_DEG = 8.0
 
 _DEFAULT_TRAIN_ROLLOUTS = 1
 _DB_CFG_KEYS = {
     "sampling_temperature_start",
     "sampling_temperature_end",
-    "dead_end_log_reward",
-    "dead_end_weight",
 }
 _DB_CFG_OPTIONAL_KEYS = {
-    # Optional cosine-annealing schedule for dead-end grounding:
-    # effective_dead_end_log_reward(progress) goes from start -> dead_end_log_reward.
-    "dead_end_log_reward_start",
-    # Optional stronger penalty for false STOP (emit).
-    "emit_log_reward",
 }
 
 
@@ -68,7 +63,7 @@ _DIVERSE_BEAM_SIMILARITIES = {"tail", "edge", "source"}
 _DIVERSE_BEAM_PENALTIES = {"hard", "soft"}
 
 _STANDARD_TRAIN_METRICS = {
-    "db_loss",
+    "tb_loss",
     "rollout_success_rate",
     "rollout_length_mean",
     "rollout_terminal_hit_rate",
@@ -76,9 +71,9 @@ _STANDARD_TRAIN_METRICS = {
     "rollout_terminal_invalid_start_rate",
     "rollout_terminal_emit_rate",
     "rollout_terminal_max_steps_rate",
-    "db_inv_edge_invalid_rate",
-    "db_no_allowed_rate",
-    "db_valid_step_rate",
+    "tb_inv_edge_invalid_rate",
+    "tb_no_allowed_rate",
+    "tb_delta_var",
     "policy_out_degree_mean",
 }
 _STANDARD_EVAL_METRICS = {
@@ -97,8 +92,17 @@ _STANDARD_EVAL_METRICS = {
     "rollout_terminal_invalid_start_rate",
     "rollout_terminal_emit_rate",
     "rollout_terminal_max_steps_rate",
+    "tb_loss",
+    "tb_delta_var",
+    "tb_inv_edge_invalid_rate",
+    "tb_no_allowed_rate",
     "policy_out_degree_mean",
     "policy_tail_in_degree_mean",
+    "policy_log_deg_mean",
+    "policy_log_deg_std",
+    "policy_log_deg_w_eff",
+    "policy_log_deg_tail_mean",
+    "policy_log_deg_bias",
 }
 _STANDARD_METRICS = {
     "train": _STANDARD_TRAIN_METRICS,
@@ -113,6 +117,7 @@ __all__ = [
     "_ONE",
     "_TWO",
     "_THREE",
+    "_FOUR",
     "_SELF_RELATION_ID",
     "_INVALID_EDGE_ID",
     "_STOP_ACTION_ID",
@@ -122,12 +127,13 @@ __all__ = [
     "_TERMINAL_MAX_STEPS",
     "_TERMINAL_INVALID_START",
     "_TERMINAL_EMIT",
-    "_DEFAULT_AVOID_REVISIT",
     "_DEFAULT_GNN_LAYERS",
     "_DEFAULT_GNN_DROPOUT",
     "_DEFAULT_LOGIT_SCALE_INIT",
     "_DEFAULT_PRIOR_WEIGHT_INIT",
     "_DEFAULT_STOP_ENABLED",
+    "_DEFAULT_DEGREE_BUCKETS",
+    "_DEFAULT_MAX_LOG_DEG",
     "_DEFAULT_TRAIN_ROLLOUTS",
     "_DB_CFG_KEYS",
     "_DB_CFG_OPTIONAL_KEYS",

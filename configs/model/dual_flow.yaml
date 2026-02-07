@@ -14,16 +14,20 @@ gnn_dropout: 0.1
 embedding_adapter_cfg:
   adapter_dim: 256
   dropout: 0.1
+degree_bucket_cfg:
+  num_buckets: 64
+  # max_log_deg computed from webqsp (train/val/test) forward degrees; update when cwq stats available.
+  max_log_deg: 8.0
 
 max_steps: ${dataset.max_steps}
 
 runtime_cfg:
-  avoid_revisit: false
   stop_min_steps: 1
+  # Pure-A: no topology prior in forward logits.
 
 optimizer_cfg:
   type: adamw
-  lr: 4.0e-4
+  lr: 1.0e-4
   weight_decay: 1.0e-4
 
 scheduler_cfg:
@@ -41,11 +45,6 @@ training_cfg:
   db_cfg:
     sampling_temperature_start: 2.5
     sampling_temperature_end: 1.2
-    # Cosine anneal grounding from soft -> hard to stabilize cold-start training.
-    dead_end_log_reward_start: -10.0
-    dead_end_log_reward: -25.0
-    emit_log_reward: -30.0
-    dead_end_weight: 0.5
 
 evaluation_cfg:
   beam_size: 200
