@@ -2689,6 +2689,7 @@ class DualFlowModule(LightningModule):
         stop_reason: torch.Tensor,
         stop_nodes: torch.Tensor,
         log_pf_sum: torch.Tensor,
+        sampling_temperature: float,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         device = prepared_fwd.node_ptr.device
         graph_mask = graph_mask.to(device=device, dtype=torch.bool)
@@ -2705,7 +2706,7 @@ class DualFlowModule(LightningModule):
         valid_start = (start_nodes >= _ZERO) & graph_mask
         safe_start = torch.where(valid_start, start_nodes, torch.zeros_like(start_nodes))
         step_ids = torch.zeros((num_graphs,), device=device, dtype=torch.long)
-        log_z_start = self._compute_log_z_for_nodes(
+        log_f_start = self._compute_log_z_for_nodes(
             node_tokens=prepared_fwd.node_tokens,
             context_tokens=prepared_fwd.context_tokens,
             node_batch=prepared_fwd.node_batch,
@@ -2713,6 +2714,35 @@ class DualFlowModule(LightningModule):
             node_ids=safe_start,
             prev_rel_emb=None,
         )
+        log_f_start = torch.where(valid_start, log_f_start, torch.zeros_like(log_f_start))
+        outgoing = gather_outgoing_edges(
+            curr_nodes=safe_start,
+            edge_ids_by_head=prepared_fwd.edge_ids_by_head_fwd,
+            edge_ptr_by_head=prepared_fwd.edge_ptr_by_head_fwd,
+            active_mask=valid_start,
+        )
+        outgoing = self._apply_action_constraints_to_outgoing(
+            outgoing,
+            num_graphs=num_graphs,
+            edge_mask=None,
+        )
+        if outgoing.edge_ids.numel() > _ZERO:
+            hier_start = self._compute_hierarchical_log_probs(
+                prepared=prepared_fwd,
+                edge_ids=outgoing.edge_ids,
+                edge_batch=outgoing.edge_batch,
+                parent_nodes=safe_start,
+                steps=step_ids,
+                temperature=sampling_temperature,
+                context_tokens=prepared_fwd.context_tokens,
+                node_is_target=None,
+                num_graphs=num_graphs,
+            )
+            log_sum_z_start = hier_start.relation_lse
+        else:
+            neg_inf = torch.finfo(log_f_start.dtype).min
+            log_sum_z_start = torch.full((num_graphs,), neg_inf, device=device, dtype=log_f_start.dtype)
+        log_z_start = torch.logaddexp(log_sum_z_start, log_f_start)
         log_z_start = torch.where(valid_start, log_z_start, torch.zeros_like(log_z_start))
         log_eps = self._compute_log_eps_for_graphs(prepared=prepared_fwd).to(
             device=device, dtype=log_z_start.dtype
@@ -3067,6 +3097,7 @@ class DualFlowModule(LightningModule):
             stop_reason=rollout_fwd.stop_reason,
             stop_nodes=rollout_fwd.stop_nodes,
             log_pf_sum=log_pf_sum,
+            sampling_temperature=sampling_temperature,
         )
         lengths = rollout_fwd.num_moves.to(dtype=torch.float32)
         denom = graph_mask.to(dtype=lengths.dtype).sum().clamp(min=_ONE)
@@ -4539,6 +4570,7 @@ class DualFlowModule(LightningModule):
             stop_reason=rollout_fwd.stop_reason,
             stop_nodes=rollout_fwd.stop_nodes,
             log_pf_sum=log_pf_sum,
+            sampling_temperature=eval_temperature,
         )
         lengths = rollout_fwd.num_moves.to(dtype=torch.float32)
         denom = graph_mask.to(dtype=lengths.dtype).sum().clamp(min=_ONE)
