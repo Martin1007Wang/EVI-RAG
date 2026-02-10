@@ -8,10 +8,10 @@ defaults:
 
 # Shared encoder settings (used by both parquet + LMDB stages).
 encoder: "Alibaba-NLP/gte-large-en-v1.5"
-device: "cuda"
-batch_size: 16
-parquet_chunk_size: 2000
-parquet_num_workers: 0
+device: "cpu"
+batch_size: 32
+parquet_chunk_size: 4000
+parquet_num_workers: 8
 progress_bar: true
 fp16: false
 pipeline_log_path: null

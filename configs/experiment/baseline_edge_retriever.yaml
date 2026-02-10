@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Train edge-iid supervised retriever (strict shortest-path labels).
+# Baseline: edge-iid supervised retriever (shortest-path labels).
 
 defaults:
   - override /data: g_retrieval_edge_retriever
@@ -9,7 +9,7 @@ defaults:
   - override /logger: none
   - _self_
 
-task_name: "train/edge_retriever"
+task_name: "train/baseline_edge_retriever"
 tags: ["baseline", "edge_retriever"]
 
 # The retriever module does not implement test_step; keep training focused.

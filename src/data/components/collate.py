@@ -5,7 +5,7 @@ from typing import Any, Optional
 import torch
 from torch_geometric.loader.dataloader import Collater
 
-from src.utils.graph import build_edge_inverse_map, compute_edge_batch
+from src.utils.graph import compute_edge_batch
 _ZERO = 0
 _ONE = 1
 
@@ -115,31 +115,6 @@ def _attach_edge_batch(batch: Any) -> None:
     batch.edge_ptr = edge_ptr
 
 
-def _attach_edge_inverse_map(batch: Any, *, inverse_map: torch.Tensor) -> None:
-    edge_index = getattr(batch, "edge_index", None)
-    edge_attr = getattr(batch, "edge_attr", None)
-    num_nodes_total = getattr(batch, "num_nodes_total", None)
-    if edge_index is None or edge_attr is None:
-        raise AttributeError("Batch missing edge_index/edge_attr; cannot precompute edge_inverse_map.")
-    if num_nodes_total is None:
-        raise AttributeError("Batch missing num_nodes_total; call _attach_graph_stats first.")
-    if edge_index.device.type != "cpu":
-        edge_index = edge_index.to(device="cpu")
-    edge_relations = edge_attr
-    if edge_relations.device.type != "cpu":
-        edge_relations = edge_relations.to(device="cpu")
-    if inverse_map.device.type != "cpu":
-        inverse_map = inverse_map.to(device="cpu")
-    edge_inverse_map = build_edge_inverse_map(
-        edge_index=edge_index,
-        edge_relations=edge_relations,
-        num_nodes_total=int(num_nodes_total),
-        inverse_map=inverse_map,
-        num_relations=int(inverse_map.numel()),
-    )
-    batch.edge_inverse_map = edge_inverse_map
-
-
 class BatchAugmenter:
     """Attach derived fields to a PyG batch."""
 
@@ -147,16 +122,8 @@ class BatchAugmenter:
         self,
         *,
         precompute_edge_batch: bool,
-        precompute_edge_inverse_map: bool,
-        relation_inverse_map: Optional[torch.Tensor],
     ) -> None:
         self._precompute_edge_batch = bool(precompute_edge_batch)
-        self._precompute_edge_inverse_map = bool(precompute_edge_inverse_map)
-        self._relation_inverse_map = None
-        if relation_inverse_map is not None:
-            self._relation_inverse_map = torch.as_tensor(relation_inverse_map, dtype=torch.long, device="cpu")
-        if self._precompute_edge_inverse_map and self._relation_inverse_map is None:
-            raise ValueError("precompute_edge_inverse_map=True requires relation_inverse_map.")
 
     def __call__(self, batch: Any) -> Any:
         if isinstance(batch, list):
@@ -165,8 +132,6 @@ class BatchAugmenter:
         _attach_answer_ids(batch)
         if self._precompute_edge_batch:
             _attach_edge_batch(batch)
-        if self._precompute_edge_inverse_map:
-            _attach_edge_inverse_map(batch, inverse_map=self._relation_inverse_map)
         return batch
 
 

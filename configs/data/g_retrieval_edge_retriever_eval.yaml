@@ -13,7 +13,6 @@ prefetch_factor: 4
 persistent_workers: true
 
 precompute_edge_batch: false
-precompute_edge_inverse_map: false
 
 embeddings_device: cpu
 

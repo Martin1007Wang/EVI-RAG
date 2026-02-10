@@ -26,10 +26,6 @@ LOGGER = get_logger(__name__)
 _STAGE_ALIASES = {
     "build_parquet": "parquet",
     "build_lmdb": "lmdb",
-    "build_inverse_detect": "inverse_detect",
-    "build_inverse_resolve": "inverse_resolve",
-    "build_inverse_describe": "inverse_describe",
-    "build_inverse_relations": "inverse_relations",
     "build_all": "all",
 }
 

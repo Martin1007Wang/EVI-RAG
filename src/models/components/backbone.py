@@ -317,13 +317,18 @@ class EmbeddingBackbone(nn.Module):
 
 
 class CvtNodeInitializer(nn.Module):
-    """Zero-shot CVT initialization via neighbor + relation averaging."""
+    """Zero-shot CVT initialization via neighbor + relation averaging.
+
+    We treat edges as *incident* (incoming or outgoing) when computing the mean.
+    This avoids failing on CVT nodes that only appear as heads in the retrieved
+    subgraph.
+    """
 
     def __init__(self) -> None:
         super().__init__()
 
     @staticmethod
-    def _aggregate_incoming_mean(
+    def _aggregate_incident_mean(
         *,
         relation_embeddings: torch.Tensor,
         node_embeddings: torch.Tensor,
@@ -332,12 +337,15 @@ class CvtNodeInitializer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         heads = edge_index[_ZERO]
         tails = edge_index[_ONE]
-        msg = node_embeddings.index_select(0, heads) + relation_embeddings
-        sums = torch.zeros((num_nodes, msg.size(-1)), device=msg.device, dtype=msg.dtype)
-        sums.index_add_(0, tails, msg)
-        counts = torch.zeros((num_nodes,), device=msg.device, dtype=msg.dtype)
-        ones = torch.ones_like(tails, dtype=msg.dtype)
+        msg_to_tail = node_embeddings.index_select(0, heads) + relation_embeddings
+        msg_to_head = node_embeddings.index_select(0, tails) + relation_embeddings
+        sums = torch.zeros((num_nodes, msg_to_tail.size(-1)), device=msg_to_tail.device, dtype=msg_to_tail.dtype)
+        sums.index_add_(0, tails, msg_to_tail)
+        sums.index_add_(0, heads, msg_to_head)
+        counts = torch.zeros((num_nodes,), device=msg_to_tail.device, dtype=msg_to_tail.dtype)
+        ones = torch.ones_like(tails, dtype=msg_to_tail.dtype)
         counts.index_add_(0, tails, ones)
+        counts.index_add_(0, heads, ones)
         return sums, counts
 
     def forward(
@@ -352,17 +360,17 @@ class CvtNodeInitializer(nn.Module):
         if not bool(cvt_mask.any().detach().tolist()):
             return node_embeddings
         num_nodes = int(node_embeddings.size(0))
-        sums, counts = self._aggregate_incoming_mean(
+        sums, counts = self._aggregate_incident_mean(
             relation_embeddings=relation_embeddings,
             node_embeddings=node_embeddings,
             edge_index=edge_index,
             num_nodes=num_nodes,
         )
-        has_in = counts > float(_ZERO)
-        missing = cvt_mask & (~has_in.to(dtype=torch.bool, device=cvt_mask.device))
+        has_edges = counts > float(_ZERO)
+        missing = cvt_mask & (~has_edges.to(dtype=torch.bool, device=cvt_mask.device))
         if bool(missing.any().detach().tolist()):
-            raise ValueError("CVT nodes missing incoming edges; cannot compute head+relation mean.")
-        mean = sums / counts.unsqueeze(-1)
+            raise ValueError("CVT nodes missing incident edges; cannot compute neighbor+relation mean.")
+        mean = sums / counts.clamp(min=float(_ONE)).unsqueeze(-1)
         return torch.where(cvt_mask.unsqueeze(-1), mean, node_embeddings)
 
 

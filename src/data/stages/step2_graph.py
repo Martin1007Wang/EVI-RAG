@@ -4,7 +4,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 from collections import deque
 import torch
 from tqdm import tqdm
@@ -29,7 +29,6 @@ from src.data.schema.constants import (
     _EDGE_INDEX_MIN,
     _EDGE_STAT_KEYS,
     _FILTER_STAT_KEYS,
-    _INVERSE_RELATION_SUFFIX_DEFAULT,
     _ONE,
     _PATH_MODE_QA_DIRECTED,
     _PATH_MODE_UNDIRECTED,
@@ -41,11 +40,6 @@ from src.data.schema.constants import (
 from src.data.schema.types import EntityLookup, EntityVocab, GraphRecord, RelationLookup, RelationVocab, Sample, SplitFilter
 from src.data.stages.step1_vocab import _partition_graph_edges, _resolve_split_filter, _should_keep_sample
 from src.data.utils.connectivity import _validate_path_mode, reachable_targets_by_index
-from src.data.utils.inverse_relations_embeddings import (
-    build_relation_id_map,
-    tie_inverse_relation_embeddings,
-)
-from src.data.utils.inverse_relations_llm import InverseRelationLLMError, generate_inverse_relations_llm
 from src.data.utils.stats import _init_split_counters, _safe_div, _sample_labels
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
@@ -61,7 +55,6 @@ class _WorkerState:
     relation_cleaning_enabled: bool
     keep_start_adjacent_edges: bool
     relation_cleaning_rules: RelationCleaningRules
-    inverse_relations_map: Optional[Dict[str, str]]
     target_reachable_pruning: bool
     train_filter: SplitFilter
     eval_filter: SplitFilter
@@ -69,30 +62,6 @@ class _WorkerState:
 
 
 _WORKER_STATE: Optional[_WorkerState] = None
-
-_INVERSE_RELATIONS_CFG_KEY = "inverse_relations"
-_INVERSE_RELATIONS_ENABLED_KEY = "enabled"
-_INVERSE_RELATIONS_MAPPING_KEY = "mapping_path"
-_INVERSE_RELATIONS_SUFFIX_KEY = "kg_id_suffix"
-_INVERSE_RELATIONS_PREFIX_KEY = "kg_id_prefix"
-_INVERSE_RELATIONS_STRICT_KEY = "strict"
-_INVERSE_RELATIONS_GLOBAL_VOCAB_KEY = "global_vocab"
-_INVERSE_RELATIONS_LLM_KEY = "llm"
-_INVERSE_RELATIONS_TIE_EMB_KEY = "tie_embeddings"
-_INVERSE_RELATIONS_LIST_KEY = "inverse_relations"
-_INVERSE_RELATIONS_FORWARD_KEY = "forward"
-_INVERSE_RELATIONS_FORWARD_LABEL_KEY = "forward_label"
-_INVERSE_RELATIONS_FORWARD_TEXT_KEY = "forward_text"
-_INVERSE_RELATIONS_INVERSE_KEY = "inverse"
-_INVERSE_RELATIONS_INVERSE_REL_KEY = "inverse_relation"
-_INVERSE_RELATIONS_INVERSE_TEXT_KEY = "inverse_text"
-
-
-@dataclass(frozen=True)
-class _RelationTextMap:
-    forward_labels: Dict[str, str]
-    inverse_labels: Dict[str, str]
-    inverse_relations: Dict[str, str]
 
 
 def _init_worker_state(state: _WorkerState) -> None:
@@ -116,7 +85,6 @@ def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
         relation_cleaning_enabled=state.relation_cleaning_enabled,
         keep_start_adjacent_edges=state.keep_start_adjacent_edges,
         relation_cleaning_rules=state.relation_cleaning_rules,
-        inverse_relations_map=state.inverse_relations_map,
         target_reachable_pruning=apply_target_reachable_pruning,
     )
 
@@ -262,386 +230,6 @@ def _compute_target_reachable_nodes(
             visited[nbr] = True
             q.append(nbr)
     return {label for label, idx in node_index.items() if visited[idx]}
-
-
-def _build_inverse_relation_key(rel: str, *, prefix: str, suffix: str) -> str:
-    if prefix:
-        return f"{prefix}{rel}"
-    if not suffix:
-        raise ValueError("inverse_relations.kg_id_suffix must be non-empty.")
-    return f"{rel}{suffix}"
-
-
-def _normalize_prefix(prefix: str) -> str:
-    prefix = str(prefix or "").strip()
-    if not prefix:
-        return ""
-    return prefix if prefix.endswith("/") else f"{prefix}/"
-
-
-def _resolve_forward_label(entry: Mapping[str, object], forward_key: str) -> str:
-    forward_label = entry.get(_INVERSE_RELATIONS_FORWARD_LABEL_KEY)
-    if forward_label is None:
-        forward_label = entry.get(_INVERSE_RELATIONS_FORWARD_TEXT_KEY)
-    return forward_key if forward_label is None else str(forward_label)
-
-
-def _resolve_inverse_label(
-    entry: Mapping[str, object],
-    *,
-    context: str,
-    allow_missing: bool,
-) -> Optional[str]:
-    inverse_label = entry.get(_INVERSE_RELATIONS_INVERSE_KEY)
-    if inverse_label is None:
-        inverse_label = entry.get(_INVERSE_RELATIONS_INVERSE_TEXT_KEY)
-    if not inverse_label:
-        if allow_missing:
-            return None
-        raise ValueError(f"{context} entry missing inverse label.")
-    return str(inverse_label)
-
-
-def _update_relation_texts(
-    mapping: _RelationTextMap,
-    *,
-    forward_key: str,
-    forward_label: str,
-    inverse_label: Optional[str],
-    inverse_relation: Optional[str],
-    context: str,
-) -> None:
-    existing_forward = mapping.forward_labels.get(forward_key)
-    if existing_forward is not None and existing_forward != forward_label:
-        raise ValueError(f"{context} duplicate mismatch for {forward_key!r} forward label.")
-    if inverse_label is not None:
-        existing_inverse = mapping.inverse_labels.get(forward_key)
-        if existing_inverse is not None and existing_inverse != inverse_label:
-            raise ValueError(f"{context} duplicate mismatch for {forward_key!r} inverse label.")
-        mapping.inverse_labels[forward_key] = inverse_label
-    if inverse_relation:
-        existing_rel = mapping.inverse_relations.get(forward_key)
-        if existing_rel is not None and existing_rel != inverse_relation:
-            raise ValueError(f"{context} duplicate mismatch for {forward_key!r} inverse relation.")
-        mapping.inverse_relations[forward_key] = inverse_relation
-    mapping.forward_labels[forward_key] = forward_label
-
-
-def _parse_inverse_relations_list(items: Sequence[object], *, context: str) -> _RelationTextMap:
-    mapping = _RelationTextMap(forward_labels={}, inverse_labels={}, inverse_relations={})
-    for idx, raw in enumerate(items):
-        if not isinstance(raw, dict):
-            raise ValueError(f"{context} entry {idx} must be a dict with forward/inverse fields.")
-        forward = raw.get(_INVERSE_RELATIONS_FORWARD_KEY)
-        if not forward:
-            raise ValueError(f"{context} entry {idx} missing forward field.")
-        forward_key = str(forward)
-        forward_label = _resolve_forward_label(raw, forward_key)
-        inverse_relation = raw.get(_INVERSE_RELATIONS_INVERSE_REL_KEY)
-        if inverse_relation is not None and inverse_relation != "":
-            inverse_relation = str(inverse_relation)
-        else:
-            inverse_relation = None
-        inverse_label = _resolve_inverse_label(
-            raw,
-            context=f"{context} entry {idx}",
-            allow_missing=bool(inverse_relation),
-        )
-        _update_relation_texts(
-            mapping,
-            forward_key=forward_key,
-            forward_label=forward_label,
-            inverse_label=inverse_label,
-            inverse_relation=inverse_relation,
-            context=context,
-        )
-    return mapping
-
-
-def _parse_inverse_relations_dict(mapping: Mapping[object, object], *, context: str) -> _RelationTextMap:
-    parsed = _RelationTextMap(forward_labels={}, inverse_labels={}, inverse_relations={})
-    for raw_key, raw_val in mapping.items():
-        forward_key = str(raw_key)
-        if isinstance(raw_val, Mapping):
-            raw_forward = raw_val.get(_INVERSE_RELATIONS_FORWARD_KEY)
-            if raw_forward is not None and str(raw_forward) != forward_key:
-                raise ValueError(f"{context} entry forward key mismatch for {forward_key!r}.")
-            forward_label = _resolve_forward_label(raw_val, forward_key)
-            inverse_relation = raw_val.get(_INVERSE_RELATIONS_INVERSE_REL_KEY)
-            if inverse_relation is not None and inverse_relation != "":
-                inverse_relation = str(inverse_relation)
-            else:
-                inverse_relation = None
-            inverse_label = _resolve_inverse_label(
-                raw_val,
-                context=f"{context} entry {forward_key!r}",
-                allow_missing=bool(inverse_relation),
-            )
-        else:
-            forward_label = forward_key
-            if raw_val is None or raw_val == "":
-                raise ValueError(f"{context} entry {forward_key!r} missing inverse label.")
-            inverse_label = str(raw_val)
-            inverse_relation = None
-        _update_relation_texts(
-            parsed,
-            forward_key=forward_key,
-            forward_label=forward_label,
-            inverse_label=inverse_label,
-            inverse_relation=inverse_relation,
-            context=context,
-        )
-    return parsed
-
-
-def _parse_inverse_relations_payload(payload: object, *, context: str) -> _RelationTextMap:
-    if isinstance(payload, dict):
-        inner = payload.get(_INVERSE_RELATIONS_LIST_KEY, payload)
-        if isinstance(inner, dict):
-            return _parse_inverse_relations_dict(inner, context=context)
-        if isinstance(inner, list):
-            return _parse_inverse_relations_list(inner, context=context)
-    if isinstance(payload, list):
-        return _parse_inverse_relations_list(payload, context=context)
-    raise ValueError(f"{context} must be a dict or list.")
-
-
-def _require_inverse_relations_llm_cfg(inv_cfg: Mapping[str, object]) -> Mapping[str, object]:
-    llm_cfg = inv_cfg.get(_INVERSE_RELATIONS_LLM_KEY)
-    if not isinstance(llm_cfg, Mapping):
-        raise ValueError("inverse_relations.llm must be set for LLM auto-generation.")
-    return llm_cfg
-
-
-def _generate_inverse_relations_entries(
-    relations: Sequence[str],
-    inv_cfg: Mapping[str, object],
-    *,
-    context: str,
-) -> List[Dict[str, str]]:
-    llm_cfg = _require_inverse_relations_llm_cfg(inv_cfg)
-    try:
-        return generate_inverse_relations_llm(relations=relations, llm_cfg=llm_cfg)
-    except InverseRelationLLMError as exc:
-        raise InverseRelationLLMError(f"{context} failed: {exc}") from exc
-
-
-def _inverse_relations_entries_from_payload(payload: object, *, context: str) -> List[Dict[str, str]]:
-    if isinstance(payload, dict):
-        inner = payload.get(_INVERSE_RELATIONS_LIST_KEY, payload)
-        if isinstance(inner, list):
-            return [dict(item) for item in inner if isinstance(item, Mapping)]
-        if isinstance(inner, Mapping):
-            entries: List[Dict[str, str]] = []
-            for raw_key, raw_val in inner.items():
-                entry: Dict[str, str] = {_INVERSE_RELATIONS_FORWARD_KEY: str(raw_key)}
-                if isinstance(raw_val, Mapping):
-                    for field in (
-                        _INVERSE_RELATIONS_FORWARD_LABEL_KEY,
-                        _INVERSE_RELATIONS_FORWARD_TEXT_KEY,
-                        _INVERSE_RELATIONS_INVERSE_KEY,
-                        _INVERSE_RELATIONS_INVERSE_REL_KEY,
-                        _INVERSE_RELATIONS_INVERSE_TEXT_KEY,
-                    ):
-                        if field in raw_val and raw_val[field] is not None:
-                            entry[field] = str(raw_val[field])
-                else:
-                    entry[_INVERSE_RELATIONS_INVERSE_KEY] = str(raw_val)
-                entries.append(entry)
-            return entries
-    if isinstance(payload, list):
-        return [dict(item) for item in payload if isinstance(item, Mapping)]
-    raise ValueError(f"{context} must be a dict or list.")
-
-
-def _merge_inverse_relations_entries(
-    base_entries: Sequence[Mapping[str, object]],
-    new_entries: Sequence[Mapping[str, object]],
-    *,
-    order: Sequence[str],
-) -> List[Dict[str, str]]:
-    merged: Dict[str, Dict[str, str]] = {}
-    for entry in list(base_entries) + list(new_entries):
-        if not isinstance(entry, Mapping):
-            continue
-        forward = entry.get(_INVERSE_RELATIONS_FORWARD_KEY)
-        if not forward:
-            continue
-        merged[str(forward)] = {str(k): str(v) for k, v in entry.items() if v is not None}
-    out: List[Dict[str, str]] = []
-    seen: Set[str] = set()
-    for rel in order:
-        entry = merged.get(rel)
-        if entry is None:
-            continue
-        out.append(entry)
-        seen.add(rel)
-    for rel, entry in merged.items():
-        if rel in seen:
-            continue
-        out.append(entry)
-    return out
-
-
-def _write_inverse_relations_payload(path: Path, entries: Sequence[Mapping[str, object]]) -> Dict[str, object]:
-    ensure_dir(path.parent)
-    payload = {_INVERSE_RELATIONS_LIST_KEY: list(entries)}
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-    return payload
-
-
-def _ensure_inverse_relations_payload(
-    *,
-    inv_cfg: Mapping[str, object],
-    ctx: StageContext,
-    dataset_rel_labels: Sequence[str],
-    path: Path,
-    strict: bool,
-) -> object:
-    if not path.exists():
-        if strict:
-            raise FileNotFoundError(f"inverse_relations mapping not found: {path}")
-        entries = _generate_inverse_relations_entries(
-            dataset_rel_labels,
-            inv_cfg,
-            context="inverse_relations LLM generation (missing mapping)",
-        )
-        payload = _write_inverse_relations_payload(path, entries)
-        log_event(
-            ctx.logger,
-            "inverse_relations_llm_generated",
-            path=str(path),
-            count=len(entries),
-            reason="mapping_missing",
-        )
-        return payload
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    mapping = _parse_inverse_relations_payload(payload, context=str(path))
-    missing = [rel for rel in dataset_rel_labels if rel not in mapping.forward_labels]
-    if not missing:
-        return payload
-    if strict:
-        preview = ", ".join(missing[:5])
-        raise ValueError(f"inverse_relations missing {len(missing)} relations, examples: {preview}.")
-    entries = _generate_inverse_relations_entries(
-        missing,
-        inv_cfg,
-        context="inverse_relations LLM generation (missing relations)",
-    )
-    base_entries = _inverse_relations_entries_from_payload(payload, context=str(path))
-    merged = _merge_inverse_relations_entries(base_entries, entries, order=dataset_rel_labels)
-    payload = _write_inverse_relations_payload(path, merged)
-    log_event(
-        ctx.logger,
-        "inverse_relations_llm_filled",
-        path=str(path),
-        added=len(entries),
-        total=len(merged),
-    )
-    return payload
-
-
-def _resolve_relation_vocab_labels(
-    mapping: _RelationTextMap,
-    dataset_rel_labels: Sequence[str],
-    *,
-    strict: bool,
-    global_vocab: bool,
-    context: str,
-) -> List[str]:
-    dataset_set = set(dataset_rel_labels)
-    mapping_keys = set(mapping.forward_labels)
-    if not global_vocab:
-        unknown = [rel for rel in mapping_keys if rel not in dataset_set]
-        if unknown:
-            preview = ", ".join(unknown[:5])
-            raise ValueError(f"{context} includes unknown relations, examples: {preview}.")
-    missing = [rel for rel in dataset_rel_labels if rel not in mapping_keys]
-    if missing:
-        preview = ", ".join(missing[:5])
-        if strict:
-            raise ValueError(f"{context} missing {len(missing)} relations, examples: {preview}.")
-        raise ValueError(f"{context} missing {len(missing)} relations after LLM autofill, examples: {preview}.")
-    if global_vocab:
-        return sorted(mapping_keys)
-    return sorted(dataset_rel_labels)
-
-
-def _load_inverse_relations_map(
-    cfg: object,
-    ctx: StageContext,
-    *,
-    dataset_rel_labels: Sequence[str],
-) -> tuple[Optional[_RelationTextMap], Dict[str, str], List[str], Set[str], bool]:
-    inv_cfg = cfg.get(_INVERSE_RELATIONS_CFG_KEY) if hasattr(cfg, "get") else None
-    if not isinstance(inv_cfg, Mapping):
-        return None, {}, sorted(dataset_rel_labels), set(), False
-    if not bool(inv_cfg.get(_INVERSE_RELATIONS_ENABLED_KEY, False)):
-        return None, {}, sorted(dataset_rel_labels), set(), False
-    mapping_path = inv_cfg.get(_INVERSE_RELATIONS_MAPPING_KEY)
-    if not mapping_path:
-        raise ValueError("inverse_relations.mapping_path must be set when inverse_relations.enabled=true.")
-    strict = bool(inv_cfg.get(_INVERSE_RELATIONS_STRICT_KEY, True))
-    global_vocab = bool(inv_cfg.get(_INVERSE_RELATIONS_GLOBAL_VOCAB_KEY, False))
-    prefix = _normalize_prefix(inv_cfg.get(_INVERSE_RELATIONS_PREFIX_KEY, ""))
-    suffix = str(inv_cfg.get(_INVERSE_RELATIONS_SUFFIX_KEY, _INVERSE_RELATION_SUFFIX_DEFAULT))
-    path = ctx.resolve_path(mapping_path)
-    payload = _ensure_inverse_relations_payload(
-        inv_cfg=inv_cfg,
-        ctx=ctx,
-        dataset_rel_labels=dataset_rel_labels,
-        path=path,
-        strict=strict,
-    )
-    mapping = _parse_inverse_relations_payload(payload, context=str(path))
-    forward_rel_labels = _resolve_relation_vocab_labels(
-        mapping,
-        dataset_rel_labels,
-        strict=strict,
-        global_vocab=global_vocab,
-        context="inverse_relations",
-    )
-    inverse_relations_map: Dict[str, str] = {}
-    generated_inverse_relations: Set[str] = set()
-    forward_set = set(forward_rel_labels)
-    for rel in forward_rel_labels:
-        inv_rel = mapping.inverse_relations.get(rel)
-        if inv_rel == rel:
-            inv_rel = None
-        if inv_rel:
-            inverse_relations_map[rel] = inv_rel
-            if inv_rel not in forward_set:
-                if prefix and not str(inv_rel).startswith(prefix):
-                    raise ValueError(
-                        f"inverse_relations generated inverse must use prefix {prefix!r}: {inv_rel!r}."
-                    )
-                if rel not in mapping.inverse_labels:
-                    raise ValueError(f"inverse_relations missing inverse label for {rel!r}.")
-                generated_inverse_relations.add(inv_rel)
-            continue
-        inv_rel = _build_inverse_relation_key(rel, prefix=prefix, suffix=suffix)
-        if inv_rel in forward_set:
-            raise ValueError(f"inverse_relations key collision with forward relation: {inv_rel!r}.")
-        if rel not in mapping.inverse_labels:
-            raise ValueError(f"inverse_relations missing inverse label for {rel!r}.")
-        inverse_relations_map[rel] = inv_rel
-        generated_inverse_relations.add(inv_rel)
-    return mapping, inverse_relations_map, forward_rel_labels, generated_inverse_relations, global_vocab
-
-
-def _expand_edges_with_inverse(
-    edges: Sequence[Tuple[str, str, str]],
-    inverse_relations_map: Dict[str, str],
-) -> List[Tuple[str, str, str]]:
-    if not edges:
-        return []
-    expanded = list(edges)
-    for head, rel, tail in edges:
-        inv_rel = inverse_relations_map.get(rel)
-        if not inv_rel:
-            raise ValueError(f"inverse_relations missing inverse mapping for {rel!r}.")
-        expanded.append((tail, inv_rel, head))
-    return expanded
 
 
 def _normalize_embeddings(embeddings: torch.Tensor, eps: float) -> torch.Tensor:
@@ -907,41 +495,8 @@ def preprocess(ctx: StageContext) -> None:
     entity_vocab.finalize()
     relation_vocab = RelationVocab(kb=kb)
     dataset_rel_labels = sorted(kept_rel_labels)
-    inv_cfg = cfg.get(_INVERSE_RELATIONS_CFG_KEY) if hasattr(cfg, "get") else None
-    tie_inverse_embeddings = (
-        bool(inv_cfg.get(_INVERSE_RELATIONS_TIE_EMB_KEY, False)) if isinstance(inv_cfg, Mapping) else False
-    )
-    (
-        relation_texts,
-        inverse_relations_map,
-        forward_rel_labels,
-        generated_inverse_relations,
-        inverse_global_vocab,
-    ) = _load_inverse_relations_map(
-        cfg,
-        ctx,
-        dataset_rel_labels=dataset_rel_labels,
-    )
-    forward_label_map: Optional[Dict[str, str]] = None
-    inverse_label_map: Dict[str, str] = {}
-    if relation_texts is not None:
-        forward_label_map = relation_texts.forward_labels
-        for rel, inv_rel in inverse_relations_map.items():
-            if inv_rel in generated_inverse_relations:
-                inv_label = relation_texts.inverse_labels.get(rel)
-                if inv_label is None:
-                    raise ValueError(f"inverse_relations missing inverse label for {rel!r}.")
-                inverse_label_map[inv_rel] = inv_label
-    else:
-        inverse_relations_map = None
-    for rel in forward_rel_labels:
-        label = rel if forward_label_map is None else forward_label_map.get(rel)
-        if label is None:
-            raise ValueError(f"inverse_relations missing forward label for {rel!r}.")
-        relation_vocab.relation_id(rel, label=label)
-    if inverse_label_map:
-        for inv_rel, inv_label in sorted(inverse_label_map.items()):
-            relation_vocab.relation_id(inv_rel, label=inv_label)
+    for rel in dataset_rel_labels:
+        relation_vocab.relation_id(rel, label=rel)
 
     relation_lookup = relation_vocab.to_lookup()
 
@@ -956,14 +511,6 @@ def preprocess(ctx: StageContext) -> None:
         non_text_entity_count=entity_count - text_entity_count,
         relation_count=relation_count,
     )
-    if relation_texts is not None:
-        log_event(
-            logger,
-            "inverse_relations_loaded",
-            count=len(inverse_relations_map),
-            generated=len(generated_inverse_relations),
-            global_vocab=inverse_global_vocab,
-        )
     total_edges_raw = sum(edge_stats[split]["raw_edges"] for split in splits)
     total_edges_kept = sum(edge_stats[split]["kept_edges"] for split in splits)
     total_edges_type = sum(edge_stats[split]["type_edges"] for split in splits)
@@ -1031,99 +578,62 @@ def preprocess(ctx: StageContext) -> None:
         embeddings_out_dir = embedding_cfg.embeddings_out_dir
         entity_emb_path = embeddings_out_dir / "entity_embeddings.pt"
         relation_emb_path = embeddings_out_dir / "relation_embeddings.pt"
-        need_entity_encode = embedding_cfg.precompute_entities and not (
-            reuse_embeddings_if_exists and entity_emb_path.exists()
+        need_entity_encode = not (reuse_embeddings_if_exists and entity_emb_path.exists())
+        need_relation_encode = not (reuse_embeddings_if_exists and relation_emb_path.exists())
+        encoder = TextEncoder(
+            embedding_cfg.encoder,
+            embedding_cfg.device,
+            embedding_cfg.fp16,
+            embedding_cfg.progress_bar,
         )
-        need_relation_encode = (embedding_cfg.precompute_relations or embedding_cfg.canonicalize_relations) and not (
-            reuse_embeddings_if_exists and relation_emb_path.exists()
-        )
-        need_question_encode = embedding_cfg.precompute_questions or embedding_cfg.canonicalize_relations
-        need_encoder = need_entity_encode or need_relation_encode or need_question_encode
-        if need_encoder:
-            encoder = TextEncoder(
-                embedding_cfg.encoder,
-                embedding_cfg.device,
-                embedding_cfg.fp16,
-                embedding_cfg.progress_bar,
+        ensure_dir(embeddings_out_dir)
+        if not need_entity_encode:
+            log_event(logger, "preprocess_reuse_entity_embeddings", path=str(entity_emb_path))
+        else:
+            emb_rows = sorted(
+                ((rec["embedding_id"], rec.get("label", "")) for rec in entity_vocab.embedding_records),
+                key=lambda x: x[0],
             )
-        if embedding_cfg.precompute_entities or embedding_cfg.precompute_relations:
-            ensure_dir(embeddings_out_dir)
-        if embedding_cfg.precompute_entities:
-            if not need_entity_encode:
-                log_event(logger, "preprocess_reuse_entity_embeddings", path=str(entity_emb_path))
-            else:
-                emb_rows = sorted(
-                    ((rec["embedding_id"], rec.get("label", "")) for rec in entity_vocab.embedding_records),
-                    key=lambda x: x[0],
-                )
-                text_labels = [str(label) for _, label in emb_rows]
-                text_ids = [int(eid) for eid, _ in emb_rows]
-                struct_records = entity_vocab.struct_records
-                max_embedding_id = max((int(rec["embedding_id"]) for rec in struct_records), default=0)
-                encode_to_memmap(
-                    encoder=encoder,
-                    texts=text_labels,
-                    emb_ids=text_ids,
-                    batch_size=embedding_cfg.batch_size,
-                    max_embedding_id=max_embedding_id,
-                    out_path=entity_emb_path,
-                    desc="Entities",
-                    show_progress=embedding_cfg.progress_bar,
-                )
-        if embedding_cfg.precompute_relations or embedding_cfg.canonicalize_relations:
-            if need_relation_encode:
-                relation_rows = sorted(
-                    ((rec["relation_id"], rec.get("label", "")) for rec in relation_vocab.records),
-                    key=lambda x: x[0],
-                )
-                relation_labels = [str(label) for _, label in relation_rows]
-                relation_emb = encoder.encode(
-                    relation_labels,
-                    embedding_cfg.batch_size,
-                    show_progress=embedding_cfg.progress_bar,
-                    desc="Relations",
-                )
-            else:
-                log_event(logger, "preprocess_reuse_relation_embeddings", path=str(relation_emb_path))
-                relation_emb = torch.load(relation_emb_path, map_location="cpu")
-            if tie_inverse_embeddings and inverse_relations_map:
-                tie_map = {
-                    fwd: inv
-                    for fwd, inv in inverse_relations_map.items()
-                    if inv in generated_inverse_relations
-                }
-                if tie_map:
-                    rel_id_map = build_relation_id_map(
-                        [int(rec["relation_id"]) for rec in relation_vocab.records],
-                        [str(rec["kg_id"]) for rec in relation_vocab.records],
-                    )
-                    relation_emb, pairs, targets = tie_inverse_relation_embeddings(
-                        relation_emb,
-                        rel_id_map,
-                        tie_map,
-                    )
-                    log_event(
-                        logger,
-                        "inverse_relations_embeddings_tied",
-                        pairs=pairs,
-                        targets=targets,
-                        mode="generated_only",
-                        path=str(relation_emb_path),
-                    )
-                if embedding_cfg.precompute_relations or relation_emb_path.exists():
-                    torch.save(relation_emb, relation_emb_path)
-            elif embedding_cfg.precompute_relations:
-                torch.save(relation_emb, relation_emb_path)
-            if embedding_cfg.canonicalize_relations:
-                relation_embeddings_norm = _normalize_embeddings(relation_emb, embedding_cfg.cosine_eps)
-                if relation_embeddings_norm.numel() == 0:
-                    raise ValueError("relation_embeddings are empty; cannot canonicalize positives.")
+            text_labels = [str(label) for _, label in emb_rows]
+            text_ids = [int(eid) for eid, _ in emb_rows]
+            struct_records = entity_vocab.struct_records
+            max_embedding_id = max((int(rec["embedding_id"]) for rec in struct_records), default=0)
+            encode_to_memmap(
+                encoder=encoder,
+                texts=text_labels,
+                emb_ids=text_ids,
+                batch_size=embedding_cfg.batch_size,
+                max_embedding_id=max_embedding_id,
+                out_path=entity_emb_path,
+                desc="Entities",
+                show_progress=embedding_cfg.progress_bar,
+            )
+        if need_relation_encode:
+            relation_rows = sorted(
+                ((rec["relation_id"], rec.get("label", "")) for rec in relation_vocab.records),
+                key=lambda x: x[0],
+            )
+            relation_labels = [str(label) for _, label in relation_rows]
+            relation_emb = encoder.encode(
+                relation_labels,
+                embedding_cfg.batch_size,
+                show_progress=embedding_cfg.progress_bar,
+                desc="Relations",
+            )
+            torch.save(relation_emb, relation_emb_path)
+        else:
+            log_event(logger, "preprocess_reuse_relation_embeddings", path=str(relation_emb_path))
+            relation_emb = torch.load(relation_emb_path, map_location="cpu")
+        if embedding_cfg.canonicalize_relations:
+            relation_embeddings_norm = _normalize_embeddings(relation_emb, embedding_cfg.cosine_eps)
+            if relation_embeddings_norm.numel() == 0:
+                raise ValueError("relation_embeddings are empty; cannot canonicalize positives.")
 
     log_event(logger, "graphs_questions_start", stage="graphs_questions")
     chunk_size = parquet_chunk_size
-    include_question_emb = bool(embedding_cfg and embedding_cfg.precompute_questions)
+    include_question_emb = bool(embedding_cfg)
     base_writer = ParquetDatasetWriter(out_dir=out_dir, include_question_emb=include_question_emb)
-    need_question_emb = bool(embedding_cfg and (embedding_cfg.precompute_questions or embedding_cfg.canonicalize_relations))
+    need_question_emb = bool(embedding_cfg)
 
     def _process_sample_batch(samples: List[Sample], executor: Optional[ProcessPoolExecutor]) -> None:
         if not samples:
@@ -1158,7 +668,6 @@ def preprocess(ctx: StageContext) -> None:
                     relation_cleaning_enabled=relation_cleaning_enabled,
                     keep_start_adjacent_edges=keep_start_adjacent_edges,
                     relation_cleaning_rules=relation_cleaning_rules,
-                    inverse_relations_map=inverse_relations_map,
                     target_reachable_pruning=apply_target_reachable_pruning,
                 )
                 graphs.append(graph)
@@ -1173,9 +682,9 @@ def preprocess(ctx: StageContext) -> None:
                     raise RuntimeError("Canonicalization requested but embeddings are missing.")
                 _canonicalize_graph_edges(graph, question_emb_norm_batch[idx], relation_embeddings_norm)
             question_emb = None
-            if embedding_cfg and embedding_cfg.precompute_questions:
+            if embedding_cfg:
                 if question_emb_batch is None:
-                    raise RuntimeError("question_emb batch missing while precompute_questions is enabled.")
+                    raise RuntimeError("question_emb batch missing during question embedding encode.")
                 question_emb = question_emb_batch[idx].tolist()
             split_key = sample.split
             stats_clean = qa_clean_stats[split_key]
@@ -1357,7 +866,6 @@ def preprocess(ctx: StageContext) -> None:
             relation_cleaning_enabled=relation_cleaning_enabled,
             keep_start_adjacent_edges=keep_start_adjacent_edges,
             relation_cleaning_rules=relation_cleaning_rules,
-            inverse_relations_map=inverse_relations_map,
             target_reachable_pruning=target_reachable_pruning,
             train_filter=train_filter,
             eval_filter=eval_filter,
@@ -1474,14 +982,12 @@ def build_graph(
     relation_cleaning_enabled: bool = True,
     keep_start_adjacent_edges: bool = False,
     relation_cleaning_rules: RelationCleaningRules = DEFAULT_RELATION_CLEANING_RULES,
-    inverse_relations_map: Optional[Dict[str, str]] = None,
     target_reachable_pruning: bool = False,
 ) -> Optional[GraphRecord]:
     dedup_edges = bool(dedup_edges)
     validate_graph_edges = bool(validate_graph_edges)
     remove_self_loops = bool(remove_self_loops)
     relation_cleaning_enabled = bool(relation_cleaning_enabled)
-    inverse_enabled = inverse_relations_map is not None
     node_index: Dict[str, int] = {}
     node_entity_ids: List[int] = []
     node_embedding_ids: List[int] = []
@@ -1521,11 +1027,6 @@ def build_graph(
         kept_edges = [edge for edge in kept_edges if edge[0] in reachable_nodes and edge[2] in reachable_nodes]
         if not kept_edges:
             return None
-    if inverse_enabled:
-        kept_edges = _expand_edges_with_inverse(
-            kept_edges,
-            inverse_relations_map,
-        )
     for h, r, t in kept_edges:
         edge_key = (h, r, t)
         if dedup_edges and edge_key in edge_key_to_indices:

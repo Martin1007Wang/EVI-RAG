@@ -1,0 +1,14 @@
+# @package _global_
+#
+# H-GFN with semantic P0.
+
+defaults:
+  - dual_flow_hgfn_base
+  - _self_
+
+task_name: "train/dual_flow_hgfn_semantic"
+tags: ["hgfn", "semantic"]
+
+model:
+  runtime_cfg:
+    p0_mode: semantic

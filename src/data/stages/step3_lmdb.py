@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, List, Optional
 from collections import deque
 
 import json
@@ -31,11 +31,6 @@ from src.data.io.lmdb_utils import (
 )
 from src.data.io.parquet_io import _load_parquet
 from src.data.edge_retriever_labels import compute_shortest_path_labels
-from src.data.utils.inverse_relations_embeddings import (
-    build_generated_inverse_pairs,
-    build_relation_id_map,
-    tie_inverse_relation_embeddings,
-)
 from src.data.schema.constants import (
     _BYTES_PER_GB,
     _FILTER_MISSING_ANSWER_FILENAME,
@@ -47,12 +42,6 @@ from src.data.schema.constants import (
 from src.config.data_config import _resolve_parquet_chunk_size
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
-
-_INVERSE_RELATIONS_CFG_KEY = "inverse_relations"
-_INVERSE_RELATIONS_MAPPING_KEY = "mapping_path"
-_INVERSE_RELATIONS_SUFFIX_KEY = "kg_id_suffix"
-_INVERSE_RELATIONS_PREFIX_KEY = "kg_id_prefix"
-_INVERSE_RELATIONS_TIE_EMB_KEY = "tie_embeddings"
 
 
 def _format_core_path(base_dir: Path, split: str, shard_id: int, num_shards: int) -> Path:
@@ -152,29 +141,6 @@ def build_dataset(ctx: StageContext) -> None:
 
     relation_rows = sorted(zip(relation_vocab["relation_id"], relation_vocab["label"]), key=lambda x: x[0])
     relation_labels: List[str] = [str(label) for _, label in relation_rows]
-    inv_cfg = cfg.get(_INVERSE_RELATIONS_CFG_KEY) if hasattr(cfg, "get") else None
-    tie_inverse_embeddings = (
-        bool(inv_cfg.get(_INVERSE_RELATIONS_TIE_EMB_KEY, False)) if isinstance(inv_cfg, Mapping) else False
-    )
-    inverse_pairs: Dict[str, str] = {}
-    relation_id_map: Optional[Dict[str, int]] = None
-    if tie_inverse_embeddings:
-        mapping_path = inv_cfg.get(_INVERSE_RELATIONS_MAPPING_KEY) if isinstance(inv_cfg, Mapping) else None
-        if not mapping_path:
-            raise ValueError("inverse_relations.mapping_path must be set when tie_embeddings is enabled.")
-        mapping_path = ctx.resolve_path(mapping_path)
-        if not mapping_path.exists():
-            raise FileNotFoundError(f"inverse_relations mapping not found: {mapping_path}")
-        payload = json.loads(mapping_path.read_text(encoding="utf-8"))
-        prefix = str(inv_cfg.get(_INVERSE_RELATIONS_PREFIX_KEY, "") if isinstance(inv_cfg, Mapping) else "")
-        if prefix and not prefix.endswith("/"):
-            prefix = f"{prefix}/"
-        suffix = str(
-            inv_cfg.get(_INVERSE_RELATIONS_SUFFIX_KEY, "__inv") if isinstance(inv_cfg, Mapping) else "__inv"
-        )
-        inverse_pairs = build_generated_inverse_pairs(payload, prefix=prefix, suffix=suffix)
-        relation_id_map = build_relation_id_map(relation_vocab["relation_id"], relation_vocab["kg_id"])
-
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
@@ -220,36 +186,7 @@ def build_dataset(ctx: StageContext) -> None:
                 show_progress=cfg.progress_bar,
                 desc="Relations",
             )
-            if tie_inverse_embeddings and inverse_pairs and relation_id_map is not None:
-                relation_emb, pairs, targets = tie_inverse_relation_embeddings(
-                    relation_emb,
-                    relation_id_map,
-                    inverse_pairs,
-                )
-                log_event(
-                    logger,
-                    "inverse_relations_embeddings_tied",
-                    pairs=pairs,
-                    targets=targets,
-                    mode="generated_only",
-                    path=str(relation_emb_path),
-                )
             torch.save(relation_emb, relation_emb_path)
-        elif tie_inverse_embeddings and inverse_pairs and relation_id_map is not None:
-            relation_emb, pairs, targets = tie_inverse_relation_embeddings(
-                relation_emb,
-                relation_id_map,
-                inverse_pairs,
-            )
-            torch.save(relation_emb, relation_emb_path)
-            log_event(
-                logger,
-                "inverse_relations_embeddings_tied",
-                pairs=pairs,
-                targets=targets,
-                mode="generated_only",
-                path=str(relation_emb_path),
-            )
     else:
         encoder = _get_encoder()
         emb_rows = sorted(zip(embedding_vocab["embedding_id"], embedding_vocab["label"]), key=lambda x: x[0])
@@ -269,20 +206,6 @@ def build_dataset(ctx: StageContext) -> None:
         )
         log_event(logger, "lmdb_encode_relation_embeddings", count=len(relation_labels))
         relation_emb = encoder.encode(relation_labels, cfg.batch_size, show_progress=cfg.progress_bar, desc="Relations")
-        if tie_inverse_embeddings and inverse_pairs and relation_id_map is not None:
-            relation_emb, pairs, targets = tie_inverse_relation_embeddings(
-                relation_emb,
-                relation_id_map,
-                inverse_pairs,
-            )
-            log_event(
-                logger,
-                "inverse_relations_embeddings_tied",
-                pairs=pairs,
-                targets=targets,
-                mode="generated_only",
-                path=str(relation_emb_path),
-            )
         torch.save(relation_emb, relation_emb_path)
 
     graphs_table = _load_parquet(ctx.parquet_dir / "graphs.parquet")

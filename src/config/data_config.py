@@ -35,32 +35,25 @@ def _resolve_parquet_num_workers(cfg) -> int:
 
 
 def build_embedding_cfg(cfg) -> Optional[EmbeddingConfig]:
-    embed_flags = {
-        "precompute_entities": bool(cfg.get("precompute_entities", False)),
-        "precompute_relations": bool(cfg.get("precompute_relations", False)),
-        "precompute_questions": bool(cfg.get("precompute_questions", False)),
-        "canonicalize_relations": bool(cfg.get("canonicalize_relations", False)),
-    }
-    if not any(embed_flags.values()):
+    encoder = str(cfg.get("encoder", "")).strip()
+    if not encoder:
         return None
+    canonicalize_relations = bool(cfg.get("canonicalize_relations", False))
     embeddings_out_dir_cfg = cfg.get("embeddings_out_dir")
     if not embeddings_out_dir_cfg:
-        raise ValueError("embeddings_out_dir must be set when embedding precompute is enabled.")
+        raise ValueError("embeddings_out_dir must be set when embedding encoding is enabled.")
     try:
         import hydra
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise ModuleNotFoundError("hydra-core is required to resolve embeddings_out_dir.") from exc
     return EmbeddingConfig(
-        encoder=str(cfg.get("encoder", "")),
+        encoder=encoder,
         device=str(cfg.get("device", "cuda")),
         batch_size=int(cfg.get("batch_size", _DEFAULT_BATCH_SIZE)),
         fp16=bool(cfg.get("fp16", False)),
         progress_bar=bool(cfg.get("progress_bar", True)),
         embeddings_out_dir=Path(hydra.utils.to_absolute_path(embeddings_out_dir_cfg)),
-        precompute_entities=embed_flags["precompute_entities"],
-        precompute_relations=embed_flags["precompute_relations"],
-        precompute_questions=embed_flags["precompute_questions"],
-        canonicalize_relations=embed_flags["canonicalize_relations"],
+        canonicalize_relations=canonicalize_relations,
         cosine_eps=float(cfg.get("cosine_eps", _DEFAULT_COSINE_EPS)),
     )
 

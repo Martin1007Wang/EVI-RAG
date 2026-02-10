@@ -1,0 +1,15 @@
+# @package _global_
+#
+# Shared H-GFN training defaults.
+
+defaults:
+  - train_dual_flow_base
+  - _self_
+
+task_name: "train/dual_flow_hgfn"
+tags: ["hgfn"]
+
+model:
+  runtime_cfg:
+    stop_reward_mode: uniform_node
+    stop_reward_epsilon: 1.0e-6

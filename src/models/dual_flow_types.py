@@ -44,6 +44,21 @@ class _PreparedBatch:
     edge_inverse_map: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _HierLogProbs:
+    edge_log_prob: torch.Tensor
+    edge_log_prob_cond: torch.Tensor
+    relation_log_prob: torch.Tensor
+    relation_graph: torch.Tensor
+    relation_id: torch.Tensor
+    relation_inv: torch.Tensor
+    stop_log_prob: Optional[torch.Tensor]
+    relation_batch: torch.Tensor
+    relation_lse: torch.Tensor
+    log_z: Optional[torch.Tensor] = None
+    log_sum_z: Optional[torch.Tensor] = None
+
+
 @dataclass
 class _BeamState:
     beam_nodes: torch.Tensor
@@ -95,6 +110,7 @@ class _RolloutResult:
 
 
 __all__ = [
+    "_HierLogProbs",
     "_PreparedBatch",
     "_BeamState",
     "_BeamCandidates",

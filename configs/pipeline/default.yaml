@@ -11,58 +11,24 @@ dedup_edges: true
 remove_self_loops: true
 relation_cleaning: true
 keep_start_adjacent_edges: true
-target_reachable_pruning: true
+target_reachable_pruning: false
 
 filter:
   train:
-    skip_no_path: true
-  eval:
-    skip_no_path: false
     skip_no_topic: true
     skip_no_ans: false
+    skip_no_path: false
+  eval:
+    skip_no_topic: true
+    skip_no_ans: false
+    skip_no_path: false
 
 q_entity_blacklist: []
 q_entity_blacklist_path: null
 
 embeddings_out_dir: ${dataset.materialized_dir}/embeddings
-precompute_entities: true
-precompute_relations: true
-precompute_questions: true
 canonicalize_relations: false
 cosine_eps: 1e-6
-
-inverse_relations:
-  enabled: true
-  mapping_path: ${dataset.out_dir}/inverse_relations.json
-  kg_id_prefix: "inverse/"
-  kg_id_suffix: "__inv"
-  strict: false
-  global_vocab: true
-  tie_embeddings: true
-  build:
-    detect_path: ${dataset.out_dir}/inverse_relations.detect.json
-    resolved_path: ${dataset.out_dir}/inverse_relations.resolved.json
-    min_support: 5
-    min_ratio: 1.0
-    topk_candidates: 3
-    sample_per_relation: 5
-    resolve_with_llm: false
-  llm:
-    model: Qwen/Qwen2.5-7B-Instruct
-    batch_size: 16
-    temperature: 0.1
-    top_p: 0.9
-    max_tokens: 256
-    max_retries: 4
-    example_limit: 3
-    use_chat: true
-    per_relation_prompt: true
-    show_progress: true
-    tensor_parallel_size: 1
-    max_model_len: null
-    dtype: null
-    trust_remote_code: false
-    system_prompt: null
 
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json

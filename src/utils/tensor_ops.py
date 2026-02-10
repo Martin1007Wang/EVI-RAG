@@ -25,6 +25,12 @@ def segment_max(src: torch.Tensor, segment_ids: torch.Tensor, num_segments: int 
         argmax = torch.zeros((num_segments,), device=src.device, dtype=torch.long)
         return max_per, argmax
 
+    src = src.view(-1)
+    if not torch.isfinite(src).all():
+        neg_inf = neg_inf_value(src)
+        finfo = torch.finfo(src.dtype)
+        src = torch.nan_to_num(src, nan=neg_inf, posinf=float(finfo.max), neginf=neg_inf)
+
     segment_ids = segment_ids.to(device=src.device, dtype=torch.long).view(-1)
     max_per = torch.full((num_segments,), neg_inf_value(src), device=src.device, dtype=src.dtype)
     max_per.scatter_reduce_(0, segment_ids, src, reduce="amax", include_self=True)

@@ -23,9 +23,6 @@ class EmbeddingConfig:
     fp16: bool
     progress_bar: bool
     embeddings_out_dir: Path
-    precompute_entities: bool
-    precompute_relations: bool
-    precompute_questions: bool
     canonicalize_relations: bool
     cosine_eps: float
 

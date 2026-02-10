@@ -14,7 +14,7 @@ test: false
 optimized_metric: "val/${dataset.dataset_scope}/hit@beam"
 
 trainer:
-  max_epochs: 2
+  max_epochs: 1000
   min_epochs: 1
   check_val_every_n_epoch: 1
   precision: 32
@@ -43,3 +43,7 @@ model:
       enabled: false
     answer_gain_stop:
       enabled: false
+
+callbacks:
+  early_stopping:
+    patience: 10
