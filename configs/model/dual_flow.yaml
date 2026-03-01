@@ -12,7 +12,6 @@ env_cfg:
   prior:
     _target_: src.models.configs.environment.PriorConfig
     pb_mode: uniform_in_degree
-    logit_scale_init: 0.0
   stop:
     _target_: src.models.configs.environment.StopConfig
     enabled: true
@@ -46,13 +45,17 @@ policy_cfg:
     num_layers: 2
     dropout: 0.0
     qcbia_alpha_init: 1.0
-  action_head:
-    _target_: src.models.configs.policy.ActionHeadConfig
+  priority_head:
+    _target_: src.models.configs.policy.PriorityHeadConfig
     hidden_dim: 256
-    num_layers: 1
+    num_layers: 2
     dropout: 0.0
-  flow_lookahead_mode: mlp_action
   stop_bias_init: -10.0
+  topk_prune_train_k: 0
+  topk_prune_train_k_final: 256
+  topk_prune_warmup_steps: 2000
+  topk_prune_anneal_steps: 8000
+  topk_prune_eval_k: 256
 
 sampling_cfg:
   _target_: src.models.configs.search.RolloutConfig
@@ -81,6 +84,12 @@ subtb_cfg:
   detach_end_flow: true
   boundary_weight: 0.2
   miss_length_penalty: 0.0
+  ranking_weight: 0.2
+  ranking_listwise_weight: 0.5
+  ranking_bce_weight: 1.0
+  ranking_hard_negative_k: 64
+  ranking_margin: 0.1
+  ranking_temperature: 1.0
 
 training_cfg:
   _target_: src.models.configs.training.TrainingConfig

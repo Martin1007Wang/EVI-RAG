@@ -479,12 +479,12 @@ def _rollout_hit_stats(
     rollouts_sorted: List[Dict[str, Any]],
     answer_set: set[int],
 ) -> Tuple[List[bool], List[bool], List[set[int]]]:
-    pass_hits = [bool(r.get("reach_success", False)) for r in rollouts_sorted]
+    rollout_nodes = [_rollout_nodes(r) for r in rollouts_sorted]
+    pass_hits = [bool(nodes & answer_set) for nodes in rollout_nodes]
     terminal_hits = [
         bool(r.get("stop_node_entity_id") in answer_set) if r.get("stop_node_entity_id") is not None else False
         for r in rollouts_sorted
     ]
-    rollout_nodes = [_rollout_nodes(r) for r in rollouts_sorted]
     return pass_hits, terminal_hits, rollout_nodes
 
 

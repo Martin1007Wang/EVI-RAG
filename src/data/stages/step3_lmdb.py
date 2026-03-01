@@ -41,6 +41,7 @@ from src.data.schema.constants import (
 )
 from src.config.data_config import _resolve_parquet_chunk_size
 from src.data.utils.validation import _validate_split_names
+from src.utils.replay_oracle import enumerate_oracle_trajectories, pack_oracle_trajectories
 from src.utils.logging_utils import log_event
 
 
@@ -108,6 +109,28 @@ def _count_reachable_any_direction(
     return reachable
 
 
+def _resolve_replay_oracle_cfg(cfg) -> dict[str, object]:
+    replay_cfg = cfg.get("replay_oracle") or {}
+    max_paths_per_pair = int(replay_cfg.get("max_paths_per_pair", 24))
+    max_paths_per_graph = int(replay_cfg.get("max_paths_per_graph", 256))
+    max_shortest_paths_per_pair = int(replay_cfg.get("max_shortest_paths_per_pair", 4))
+    max_dfs_paths_per_pair = int(replay_cfg.get("max_dfs_paths_per_pair", 12))
+    max_depth = int(replay_cfg.get("max_depth", 0))
+    allow_cycles = bool(replay_cfg.get("allow_cycles", True))
+    max_node_visits = int(replay_cfg.get("max_node_visits", 2))
+    if max_node_visits <= 0:
+        raise ValueError("replay_oracle.max_node_visits must be a positive integer.")
+    return {
+        "max_paths_per_pair": max_paths_per_pair,
+        "max_paths_per_graph": max_paths_per_graph,
+        "max_shortest_paths_per_pair": max_shortest_paths_per_pair,
+        "max_dfs_paths_per_pair": max_dfs_paths_per_pair,
+        "max_depth": max_depth,
+        "allow_cycles": allow_cycles,
+        "max_node_visits": max_node_visits,
+    }
+
+
 def build_dataset(ctx: StageContext) -> None:
     cfg = ctx.cfg
     logger = ctx.logger
@@ -115,6 +138,8 @@ def build_dataset(ctx: StageContext) -> None:
     dataset_name = str(dataset_cfg.get("name", "") or "")
     dataset_scope = str(dataset_cfg.get("dataset_scope", "") or "").strip().lower()
     emit_edge_retriever_labels = bool(cfg.get("emit_edge_retriever_labels", False))
+    emit_replay_oracle_paths = bool(cfg.get("emit_replay_oracle_paths", False))
+    replay_oracle_cfg = _resolve_replay_oracle_cfg(cfg) if emit_replay_oracle_paths else None
     labels_dir_cfg = cfg.get("edge_retriever_labels_dir")
     log_event(
         logger,
@@ -248,6 +273,12 @@ def build_dataset(ctx: StageContext) -> None:
     all_splits = questions_table.column("split").unique().to_pylist()
     all_splits = _validate_split_names(all_splits, context="questions.parquet")
     lmdb_stats = {str(split): {"samples": _ZERO, "nodes": _ZERO, "edges": _ZERO} for split in all_splits}
+    replay_stats = None
+    if emit_replay_oracle_paths:
+        replay_stats = {
+            str(split): {"graphs": _ZERO, "graphs_with_paths": _ZERO, "paths": _ZERO, "path_edges": _ZERO}
+            for split in all_splits
+        }
     label_entries = None
     label_stats = None
     labels_dir: Optional[Path] = None
@@ -439,6 +470,35 @@ def build_dataset(ctx: StageContext) -> None:
                     "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
                     "answer_entity_ids": answer_entity_ids,
                 }
+                if emit_replay_oracle_paths:
+                    if replay_oracle_cfg is None:
+                        raise RuntimeError("emit_replay_oracle_paths enabled but replay_oracle_cfg is missing.")
+                    trajectories = enumerate_oracle_trajectories(
+                        num_nodes=int(num_nodes),
+                        edge_src=edge_src,
+                        edge_dst=edge_dst,
+                        start_nodes=q_local,
+                        target_nodes=a_local,
+                        max_paths_per_pair=int(replay_oracle_cfg["max_paths_per_pair"]),
+                        max_paths_per_graph=int(replay_oracle_cfg["max_paths_per_graph"]),
+                        max_shortest_paths_per_pair=int(replay_oracle_cfg["max_shortest_paths_per_pair"]),
+                        max_dfs_paths_per_pair=int(replay_oracle_cfg["max_dfs_paths_per_pair"]),
+                        max_depth=int(replay_oracle_cfg["max_depth"]),
+                        allow_cycles=bool(replay_oracle_cfg["allow_cycles"]),
+                        max_node_visits=int(replay_oracle_cfg["max_node_visits"]),
+                    )
+                    replay_start_local, replay_path_lengths, replay_edge_local_ids = pack_oracle_trajectories(
+                        trajectories
+                    )
+                    core_sample["replay_start_local"] = replay_start_local
+                    core_sample["replay_path_lengths"] = replay_path_lengths
+                    core_sample["replay_edge_local_ids"] = replay_edge_local_ids
+                    if replay_stats is not None:
+                        replay_stats[split_key]["graphs"] += _ONE
+                        replay_stats[split_key]["paths"] += int(replay_path_lengths.numel())
+                        replay_stats[split_key]["path_edges"] += int(replay_edge_local_ids.numel())
+                        if int(replay_path_lengths.numel()) > 0:
+                            replay_stats[split_key]["graphs_with_paths"] += _ONE
 
                 sample_key = graph_id.encode("utf-8")
                 shard_id = _assign_lmdb_shard(sample_key, lmdb_shards)
@@ -522,6 +582,23 @@ def build_dataset(ctx: StageContext) -> None:
                     avg_nodes=stats["nodes"] / stats["samples"] if stats["samples"] else 0.0,
                     avg_edges=stats["edges"] / stats["samples"] if stats["samples"] else 0.0,
                 )
+            if replay_stats is not None:
+                for split_key, stats in replay_stats.items():
+                    graphs = int(stats["graphs"])
+                    graphs_with_paths = int(stats["graphs_with_paths"])
+                    paths = int(stats["paths"])
+                    path_edges = int(stats["path_edges"])
+                    log_event(
+                        logger,
+                        "replay_oracle_summary_split",
+                        split=split_key,
+                        graphs=graphs,
+                        graphs_with_paths=graphs_with_paths,
+                        paths=paths,
+                        path_edges=path_edges,
+                        avg_paths_per_graph=(paths / graphs) if graphs > 0 else 0.0,
+                        avg_path_edges_per_graph=(path_edges / graphs) if graphs > 0 else 0.0,
+                    )
             processed_dir = ctx.output_dir / "processed"
             ensure_dir(processed_dir)
             _write_sample_filter(

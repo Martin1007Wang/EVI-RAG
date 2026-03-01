@@ -28,14 +28,19 @@ class SharedDataResources:
         relation_vocab_path: Path,
         embeddings_dir: Path,
         embeddings_device: Optional[str] = None,
+        heuristic_log_v_path: Optional[Path] = None,
     ) -> None:
         self.entity_vocab_path = Path(entity_vocab_path).expanduser().resolve()
         self.relation_vocab_path = Path(relation_vocab_path).expanduser().resolve()
         self.embeddings_dir = Path(embeddings_dir).expanduser().resolve()
         self.embeddings_device = None if embeddings_device is None else str(embeddings_device)
+        self.heuristic_log_v_path = (
+            None if heuristic_log_v_path is None else Path(heuristic_log_v_path).expanduser().resolve()
+        )
         self._global_embeddings: Optional[GlobalEmbeddingStore] = None
         self._entity_embedding_map: Optional[torch.Tensor] = None
         self._cvt_mask: Optional[torch.Tensor] = None
+        self._heuristic_log_v: Optional[torch.Tensor] = None
 
     @property
     def global_embeddings(self) -> GlobalEmbeddingStore:
@@ -59,6 +64,14 @@ class SharedDataResources:
             self._cvt_mask = _load_cvt_mask(self.entity_vocab_path)
         return self._cvt_mask
 
+    @property
+    def heuristic_log_v(self) -> Optional[torch.Tensor]:
+        if self.heuristic_log_v_path is None:
+            return None
+        if self._heuristic_log_v is None:
+            self._heuristic_log_v = _load_heuristic_log_v(self.heuristic_log_v_path)
+        return self._heuristic_log_v
+
     def clear(self) -> None:
         """Drop cached stores so new configs can be applied safely."""
 
@@ -67,6 +80,7 @@ class SharedDataResources:
         self._global_embeddings = None
         self._entity_embedding_map = None
         self._cvt_mask = None
+        self._heuristic_log_v = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -118,3 +132,15 @@ def _load_cvt_mask(path: Path) -> torch.Tensor:
     mask[entity_ids] = is_cvt
     return mask
 
+
+def _load_heuristic_log_v(path: Path) -> torch.Tensor:
+    if not path.exists():
+        raise FileNotFoundError(f"heuristic_log_v tensor not found: {path}")
+    tensor = torch.load(path, map_location="cpu")
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"heuristic_log_v must be a torch.Tensor, got {type(tensor)!r}")
+    if tensor.dim() != 1:
+        raise ValueError("heuristic_log_v must be a 1D tensor.")
+    if not torch.is_floating_point(tensor):
+        raise TypeError(f"heuristic_log_v must be floating point, got {tensor.dtype}")
+    return tensor

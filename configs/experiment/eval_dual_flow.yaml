@@ -1,24 +1,16 @@
 # @package _global_
 #
-# Experiment: DualFlow evaluation (predict + metrics + rollouts).
+# Evaluate DualFlow checkpoint on test split (full + sub) with one command.
+# Usage:
+#   python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt
 
 defaults:
+  - override /run: eval_dual_flow
+  - override /dataset: webqsp
+  - override /data: g_retrieval
+  - override /model: dual_flow
   - override /callbacks: dual_flow_eval
   - override /logger: none
-  - override /run: eval_dual_flow
   - override /trainer: predict
+  - _self_
 
-ckpt:
-  dual_flow: ${oc.env:DUAL_FLOW_CKPT,null}
-
-callbacks:
-  dual_flow_rollout_artifact_writer:
-    textualize: true
-
-data:
-  splits:
-    test: ${run.split}
-
-model:
-  evaluation_cfg:
-    beam_size: 100

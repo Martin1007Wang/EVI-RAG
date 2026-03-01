@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import types
-
 import torch
 
 from src.models.components.high_energy_replay import HighEnergyReplayBuffer
 from src.models.components.sampler import RolloutSampler
+from src.models.configs.search import RolloutConfig
+from src.models.configs.training import ReplayBufferConfig
 from src.models.environment.contracts import CsrAdjacency, DynamicAgentState, GraphEnvContext
 
 
@@ -186,7 +186,7 @@ def _make_super_source_context() -> GraphEnvContext:
 
 def test_high_energy_replay_buffer_sampling_and_forced_eval() -> None:
     context = _make_context()
-    replay_cfg = types.SimpleNamespace(
+    replay_cfg = ReplayBufferConfig(
         enabled=True,
         max_paths_per_pair=8,
         max_paths_per_graph=32,
@@ -210,10 +210,11 @@ def test_high_energy_replay_buffer_sampling_and_forced_eval() -> None:
     assert bool((batch.path_lengths > 0).all().item())
 
     sampler = RolloutSampler(
-        types.SimpleNamespace(
+        RolloutConfig(
             num_rollouts=2,
             max_steps=3,
             stop_min_steps=1,
+            backward_prior_mode="uniform_in_degree",
             sampling_temperature=1.0,
             sampling_mode="gumbel",
             eval_sampling_temperature=0.5,
@@ -248,7 +249,7 @@ def test_high_energy_replay_buffer_uses_precomputed_oracle_when_online_disabled(
             "replay_edge_ptr": torch.tensor([0, 2], dtype=torch.long),
         }
     )
-    replay_cfg = types.SimpleNamespace(
+    replay_cfg = ReplayBufferConfig(
         enabled=True,
         max_paths_per_pair=8,
         max_paths_per_graph=32,
@@ -284,7 +285,7 @@ def test_high_energy_replay_buffer_promotes_precomputed_q_paths_with_super_sourc
             "replay_edge_ptr": torch.tensor([0, 2], dtype=torch.long),
         }
     )
-    replay_cfg = types.SimpleNamespace(
+    replay_cfg = ReplayBufferConfig(
         enabled=True,
         max_paths_per_pair=8,
         max_paths_per_graph=32,

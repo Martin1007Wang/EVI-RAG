@@ -6,8 +6,19 @@ import torch
 from torch_geometric.loader.dataloader import Collater
 
 from src.utils.graph import compute_edge_batch
-_ZERO = 0
-_ONE = 1
+
+
+def _as_1d_long(value: Any, *, device: Optional[torch.device] = None) -> torch.Tensor:
+    if not torch.is_tensor(value):
+        tensor = torch.as_tensor(value, dtype=torch.long, device=device)
+        return tensor.view(-1)
+    tensor = value
+    target_device = tensor.device if device is None else device
+    if tensor.device != target_device:
+        tensor = tensor.to(device=target_device)
+    if tensor.dtype != torch.long:
+        tensor = tensor.to(dtype=torch.long)
+    return tensor.view(-1)
 
 
 def _expand_answer_samples(
@@ -42,20 +53,20 @@ def _expand_answer_samples(
         if a_vals.numel() != answer_vals.numel():
             if node_global_ids is None:
                 raise AttributeError("Batch missing node_global_ids required to align answers.")
-            if a_vals.numel() == _ZERO:
-                answer_vals = a_vals.new_empty((_ZERO,))
+            if a_vals.numel() == 0:
+                answer_vals = a_vals.new_empty((0,))
             else:
                 answer_vals = node_global_ids.view(-1).index_select(0, a_vals)
         a_candidates: list[tuple[torch.Tensor, torch.Tensor, int | None]] = []
-        if not expand_multi_answer or a_vals.numel() <= _ONE:
+        if not expand_multi_answer or a_vals.numel() <= 1:
             a_candidates = [(a_vals, answer_vals, None)]
         else:
             a_candidates = [
-                (a_vals[idx].view(_ONE), answer_vals[idx].view(_ONE), idx) for idx in range(a_vals.numel())
+                (a_vals[idx].view(1), answer_vals[idx].view(1), idx) for idx in range(a_vals.numel())
             ]
         base_id = str(getattr(data, "sample_id", ""))
         for a_val, ans_val, a_idx in a_candidates:
-            if filter_zero_hop and q_vals.numel() > _ZERO and a_val.numel() > _ZERO:
+            if filter_zero_hop and q_vals.numel() > 0 and a_val.numel() > 0:
                 if bool((q_vals.view(-1, 1) == a_val.view(1, -1)).any().item()):
                     continue
             clone = data.clone()
@@ -72,26 +83,78 @@ def _expand_answer_samples(
 def _attach_answer_ids(batch: Any) -> None:
     if not hasattr(batch, "answer_entity_ids"):
         raise AttributeError("Batch missing answer_entity_ids required for metrics.")
-    batch.answer_entity_ids = torch.as_tensor(batch.answer_entity_ids, dtype=torch.long, device="cpu")
+    batch.answer_entity_ids = _as_1d_long(batch.answer_entity_ids, device=torch.device("cpu"))
     answer_ptr = getattr(batch, "answer_entity_ids_ptr", None)
     if answer_ptr is None and hasattr(batch, "_slice_dict"):
         answer_ptr = batch._slice_dict.get("answer_entity_ids")
     if answer_ptr is None:
         raise AttributeError("Batch missing answer_entity_ids_ptr; PyG collate may have failed.")
-    batch.answer_entity_ids_ptr = torch.as_tensor(answer_ptr, dtype=torch.long, device="cpu")
+    batch.answer_entity_ids_ptr = _as_1d_long(answer_ptr, device=torch.device("cpu"))
+    batch.answer_ptr = batch.answer_entity_ids_ptr
     answer_counts = batch.answer_entity_ids_ptr[1:] - batch.answer_entity_ids_ptr[:-1]
-    batch.num_valid_graphs = int((answer_counts > _ZERO).sum().item())
+    batch.num_valid_graphs = int((answer_counts > 0).sum().item())
+    batch.dummy_mask = answer_counts <= 0
+
+
+def _attach_qa_ptrs(batch: Any) -> None:
+    slice_dict = getattr(batch, "_slice_dict", None)
+    if not isinstance(slice_dict, dict):
+        raise AttributeError("Batch missing _slice_dict required for q_ptr/a_ptr.")
+    q_ptr = slice_dict.get("q_local_indices")
+    a_ptr = slice_dict.get("a_local_indices")
+    if q_ptr is None or a_ptr is None:
+        raise AttributeError("Batch _slice_dict missing q_local_indices/a_local_indices pointers.")
+    batch.q_ptr = _as_1d_long(q_ptr, device=torch.device("cpu"))
+    batch.a_ptr = _as_1d_long(a_ptr, device=torch.device("cpu"))
+
+
+def _attach_local_indices(batch: Any) -> None:
+    if not hasattr(batch, "q_local_indices"):
+        raise AttributeError("Batch missing q_local_indices required for graph alignment.")
+    if not hasattr(batch, "a_local_indices"):
+        raise AttributeError("Batch missing a_local_indices required for graph alignment.")
+    batch.q_local_indices = _as_1d_long(batch.q_local_indices, device=torch.device("cpu"))
+    batch.a_local_indices = _as_1d_long(batch.a_local_indices, device=torch.device("cpu"))
+
+
+def _attach_optional_replay_oracle(batch: Any) -> None:
+    field_names = ("replay_start_local", "replay_path_lengths", "replay_edge_local_ids")
+    has_any = any(getattr(batch, field, None) is not None for field in field_names)
+    if not has_any:
+        return
+    missing = [field for field in field_names if getattr(batch, field, None) is None]
+    if missing:
+        raise AttributeError(f"Replay oracle fields must be complete when present; missing={missing}.")
+    slice_dict = getattr(batch, "_slice_dict", None)
+    if not isinstance(slice_dict, dict):
+        raise AttributeError("Batch missing _slice_dict required for replay oracle pointers.")
+    replay_path_ptr = slice_dict.get("replay_start_local")
+    replay_length_ptr = slice_dict.get("replay_path_lengths")
+    replay_edge_ptr = slice_dict.get("replay_edge_local_ids")
+    if replay_path_ptr is None or replay_length_ptr is None or replay_edge_ptr is None:
+        raise AttributeError("Batch _slice_dict missing replay oracle pointers.")
+    replay_path_ptr = _as_1d_long(replay_path_ptr, device=torch.device("cpu"))
+    replay_length_ptr = _as_1d_long(replay_length_ptr, device=torch.device("cpu"))
+    replay_edge_ptr = _as_1d_long(replay_edge_ptr, device=torch.device("cpu"))
+    if not torch.equal(replay_path_ptr, replay_length_ptr):
+        raise ValueError("Replay oracle start/path pointers mismatch in collate.")
+    batch.replay_start_local = _as_1d_long(batch.replay_start_local, device=torch.device("cpu"))
+    batch.replay_path_lengths = _as_1d_long(batch.replay_path_lengths, device=torch.device("cpu"))
+    batch.replay_edge_local_ids = _as_1d_long(batch.replay_edge_local_ids, device=torch.device("cpu"))
+    batch.replay_path_ptr = replay_path_ptr
+    batch.replay_edge_ptr = replay_edge_ptr
 
 
 def _attach_graph_stats(batch: Any) -> None:
     node_ptr = getattr(batch, "ptr", None)
     if node_ptr is None:
         raise AttributeError("Batch missing ptr; cannot infer graph counts.")
-    node_ptr = torch.as_tensor(node_ptr, dtype=torch.long, device="cpu").view(-1)
-    num_graphs = int(node_ptr.numel() - _ONE)
-    num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > _ZERO else _ZERO
+    node_ptr = _as_1d_long(node_ptr, device=torch.device("cpu"))
+    num_graphs = int(node_ptr.numel() - 1)
+    num_nodes_total = int(node_ptr[-1].item()) if node_ptr.numel() > 0 else 0
     batch.num_graphs = num_graphs
     batch.num_nodes_total = num_nodes_total
+    batch.node_ptr = node_ptr
 
 
 def _attach_edge_batch(batch: Any) -> None:
@@ -99,10 +162,13 @@ def _attach_edge_batch(batch: Any) -> None:
     node_ptr = getattr(batch, "ptr", None)
     if edge_index is None or node_ptr is None:
         raise AttributeError("Batch missing edge_index/ptr; cannot precompute edge_batch.")
-    edge_index = edge_index.to(device="cpu")
-    node_ptr = node_ptr.to(device="cpu")
-    num_graphs = int(node_ptr.numel() - _ONE)
-    if num_graphs <= _ZERO:
+    if not torch.is_tensor(edge_index):
+        edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+    elif edge_index.dtype != torch.long:
+        edge_index = edge_index.to(dtype=torch.long)
+    node_ptr = _as_1d_long(node_ptr, device=edge_index.device)
+    num_graphs = int(node_ptr.numel() - 1)
+    if num_graphs <= 0:
         raise ValueError("ptr must encode at least one graph when precomputing edge_batch.")
     edge_batch, edge_ptr = compute_edge_batch(
         edge_index,
@@ -113,6 +179,70 @@ def _attach_edge_batch(batch: Any) -> None:
     )
     batch.edge_batch = edge_batch
     batch.edge_ptr = edge_ptr
+
+
+def _validate_ptrs(batch: Any) -> None:
+    num_graphs = getattr(batch, "num_graphs", None)
+    if not isinstance(num_graphs, int) or num_graphs <= 0:
+        raise ValueError("Batch missing valid num_graphs; cannot validate ptrs.")
+    q_ptr = getattr(batch, "q_ptr", None)
+    a_ptr = getattr(batch, "a_ptr", None)
+    answer_ptr = getattr(batch, "answer_ptr", None)
+    if q_ptr is None or a_ptr is None or answer_ptr is None:
+        raise AttributeError("Batch missing q_ptr/a_ptr/answer_ptr required for validation.")
+    if q_ptr.numel() != num_graphs + 1:
+        raise ValueError("q_ptr length mismatch with num_graphs.")
+    if a_ptr.numel() != num_graphs + 1:
+        raise ValueError("a_ptr length mismatch with num_graphs.")
+    if answer_ptr.numel() != num_graphs + 1:
+        raise ValueError("answer_ptr length mismatch with num_graphs.")
+    if int(q_ptr[-1].item()) != int(batch.q_local_indices.numel()):
+        raise ValueError("q_ptr[-1] mismatch q_local_indices length.")
+    if int(a_ptr[-1].item()) != int(batch.a_local_indices.numel()):
+        raise ValueError("a_ptr[-1] mismatch a_local_indices length.")
+    if int(answer_ptr[-1].item()) != int(batch.answer_entity_ids.numel()):
+        raise ValueError("answer_ptr[-1] mismatch answer_entity_ids length.")
+    if not hasattr(batch, "dummy_mask"):
+        raise AttributeError("Batch missing dummy_mask derived from answer_ptr.")
+    if batch.dummy_mask.numel() != num_graphs:
+        raise ValueError("dummy_mask length mismatch with num_graphs.")
+    replay_start_local = getattr(batch, "replay_start_local", None)
+    replay_path_lengths = getattr(batch, "replay_path_lengths", None)
+    replay_edge_local_ids = getattr(batch, "replay_edge_local_ids", None)
+    replay_path_ptr = getattr(batch, "replay_path_ptr", None)
+    replay_edge_ptr = getattr(batch, "replay_edge_ptr", None)
+    if replay_start_local is None:
+        return
+    if replay_path_lengths is None or replay_edge_local_ids is None:
+        raise AttributeError("Replay oracle tensors are incomplete on batch.")
+    if replay_path_ptr is None or replay_edge_ptr is None:
+        raise AttributeError("Replay oracle pointers are incomplete on batch.")
+    if replay_path_ptr.numel() != num_graphs + 1:
+        raise ValueError("replay_path_ptr length mismatch with num_graphs.")
+    if replay_edge_ptr.numel() != num_graphs + 1:
+        raise ValueError("replay_edge_ptr length mismatch with num_graphs.")
+    if int(replay_start_local.numel()) != int(replay_path_lengths.numel()):
+        raise ValueError("replay_start_local length mismatch replay_path_lengths.")
+    if int(replay_path_ptr[-1].item()) != int(replay_start_local.numel()):
+        raise ValueError("replay_path_ptr[-1] mismatch replay_start_local length.")
+    if int(replay_edge_ptr[-1].item()) != int(replay_edge_local_ids.numel()):
+        raise ValueError("replay_edge_ptr[-1] mismatch replay_edge_local_ids length.")
+    if int(replay_path_lengths.sum().item()) != int(replay_edge_local_ids.numel()):
+        raise ValueError("sum(replay_path_lengths) mismatch replay_edge_local_ids length.")
+    path_counts = (replay_path_ptr[1:] - replay_path_ptr[:-1]).clamp(min=0)
+    if int(path_counts.sum().item()) != int(replay_path_lengths.numel()):
+        raise ValueError("replay_path_ptr segments mismatch replay_path_lengths length.")
+    if int(replay_path_lengths.numel()) == 0:
+        expected_edge_counts = torch.zeros((num_graphs,), dtype=torch.long, device=replay_path_lengths.device)
+    else:
+        graph_ids = torch.arange(num_graphs, device=replay_path_lengths.device, dtype=torch.long).repeat_interleave(
+            path_counts
+        )
+        expected_edge_counts = torch.zeros((num_graphs,), dtype=torch.long, device=replay_path_lengths.device)
+        expected_edge_counts.scatter_add_(0, graph_ids, replay_path_lengths)
+    actual_edge_counts = (replay_edge_ptr[1:] - replay_edge_ptr[:-1]).clamp(min=0)
+    if not torch.equal(expected_edge_counts, actual_edge_counts):
+        raise ValueError("Replay oracle per-graph edge spans mismatch replay_edge_ptr.")
 
 
 class BatchAugmenter:
@@ -129,9 +259,13 @@ class BatchAugmenter:
         if isinstance(batch, list):
             raise TypeError("RetrievalCollater received a list batch; dataset must return GraphData.")
         _attach_graph_stats(batch)
+        _attach_local_indices(batch)
+        _attach_qa_ptrs(batch)
         _attach_answer_ids(batch)
+        _attach_optional_replay_oracle(batch)
         if self._precompute_edge_batch:
             _attach_edge_batch(batch)
+        _validate_ptrs(batch)
         return batch
 
 

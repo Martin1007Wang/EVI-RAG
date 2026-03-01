@@ -103,8 +103,10 @@
 ### 2. Implementation Rules (实现法则)
 *   **The 50-Line Rule:** 任何函数超过 50 行必须重构。复杂性必须被模块化（Modularity）。
 *   **No Magic Numbers:** 代码中禁止出现裸露的数字（如 `0.5`, `10`）。必须定义为常量或配置项。
+*   **No Numeric Alias Constants:** 严禁声明 `_ZERO = 0`、`_ONE = 1`、`_TWO = 2`、`_EPSILON_DEFAULT = 1e-4` 这类“数字别名常量”；`0/1/-1` 等基础标量直接写，超参数统一进配置。
 *   **Explicit Batching:** 严禁依赖 PyG 的隐式 `batch` 属性。在 DataLoader 中显式处理 `follow_batch`，并在 Model 中显式使用 `batch_idx`。
 *   **Logging Protocol:** 必须使用 `src/utils/logging_utils.py` 统一记录。直接调用 `wandb.log` 或 `self.log` 是被禁止的，因为这会破坏分布式环境下的 Batch Size 统计一致性。
+*   **Lightning Optimization Contract:** 默认使用 PyTorch Lightning 自动优化（`automatic_optimization=True`）；禁止在模型中手写 `manual_backward/optimizer.step/scheduler.step` 训练环，除非有明确实验设计文档与基准证明。
 
 ### 3. Dataset Visibility Protocol (数据可见性协议)
 *   **Sub Dataset Definition:** `sub` 指经过过滤的样本集合：

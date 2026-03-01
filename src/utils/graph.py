@@ -43,7 +43,7 @@ def build_edge_batch_debug_context(debug_batch: object) -> EdgeBatchDebugContext
         return None
     if not torch.is_tensor(edge_ptr):
         edge_ptr = torch.as_tensor(edge_ptr, dtype=torch.long)
-    edge_ptr = edge_ptr.detach().to(device="cpu")
+    edge_ptr = edge_ptr.to(device="cpu")
     if edge_ptr.numel() < _EDGE_PTR_MIN_LEN:
         return None
     return EdgeBatchDebugContext(sample_ids=[str(sid) for sid in sample_ids], edge_ptr=edge_ptr)
@@ -53,7 +53,7 @@ def _preview_sample_ids(debug_context: EdgeBatchDebugContext, edge_positions: to
     edge_ptr = debug_context.edge_ptr
     if edge_ptr.numel() < _EDGE_PTR_MIN_LEN:
         return []
-    edge_positions = edge_positions.detach().to(device="cpu")
+    edge_positions = edge_positions.to(device="cpu")
     graph_ids = torch.bucketize(edge_positions, edge_ptr[1:], right=False)
     unique_graphs = sorted(set(graph_ids.tolist()))
     preview: list[str] = []
@@ -84,11 +84,11 @@ def compute_edge_batch(
         tail_batch = torch.bucketize(edge_index[1], node_ptr[1:], right=True)
     if validate:
         if edge_batch.numel() > 0:
-            min_idx = int(edge_batch.min().detach().tolist())
-            max_idx = int(edge_batch.max().detach().tolist())
+            min_idx = int(edge_batch.min().item())
+            max_idx = int(edge_batch.max().item())
             if min_idx < _EDGE_BATCH_MIN or max_idx >= num_graphs:
                 invalid = torch.nonzero(edge_batch >= num_graphs, as_tuple=False).view(-1)
-                preview = invalid[:_EDGE_BATCH_POS_PREVIEW].detach().to(device="cpu").tolist()
+                preview = invalid[:_EDGE_BATCH_POS_PREVIEW].to(device="cpu").tolist()
                 sample_preview = _preview_sample_ids(debug_context, invalid) if debug_context is not None else []
                 detail = f"min={min_idx} max={max_idx} num_graphs={num_graphs}"
                 if preview:
@@ -98,7 +98,7 @@ def compute_edge_batch(
                 raise ValueError(f"edge_batch contains out-of-range indices; {detail}.")
         if tail_batch is not None and not torch.equal(edge_batch, tail_batch):
             mismatch = torch.nonzero(edge_batch != tail_batch, as_tuple=False).view(-1)
-            preview = mismatch[:_EDGE_BATCH_MISMATCH_PREVIEW].detach().to(device="cpu").tolist()
+            preview = mismatch[:_EDGE_BATCH_MISMATCH_PREVIEW].to(device="cpu").tolist()
             sample_preview = _preview_sample_ids(debug_context, mismatch) if debug_context is not None else []
             detail = f"first_mismatches={preview}"
             if sample_preview:
@@ -107,9 +107,9 @@ def compute_edge_batch(
                 "edge_index crosses graph boundaries; head/tail graph assignments differ. "
                 f"{detail}"
             )
-        if edge_batch.numel() > 1 and not bool((edge_batch[:-1] <= edge_batch[1:]).all().detach().tolist()):
+        if edge_batch.numel() > 1 and not bool((edge_batch[:-1] <= edge_batch[1:]).all().item()):
             inv = torch.nonzero(edge_batch[:-1] > edge_batch[1:], as_tuple=False).view(-1)
-            preview = inv[:_EDGE_BATCH_INVERSION_PREVIEW].detach().to(device="cpu").tolist()
+            preview = inv[:_EDGE_BATCH_INVERSION_PREVIEW].to(device="cpu").tolist()
             sample_preview = _preview_sample_ids(debug_context, inv) if debug_context is not None else []
             detail = f"first_inversions={preview}"
             if sample_preview:
@@ -137,10 +137,10 @@ def compute_invalid_nodes(
         heads = edge_index[0]
         tails = edge_index[1]
         start_heads = node_is_start[heads]
-        if bool(start_heads.any().detach().tolist()):
+        if bool(start_heads.any().item()):
             neighbors[tails[start_heads]] = True
         start_tails = node_is_start[tails]
-        if bool(start_tails.any().detach().tolist()):
+        if bool(start_tails.any().item()):
             neighbors[heads[start_tails]] = True
     return (node_is_start | neighbors) & (~node_is_target)
 

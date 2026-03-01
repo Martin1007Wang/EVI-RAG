@@ -14,6 +14,8 @@ llm:
   providers: null
   allow_sub: false
   input_path: null
+  # Optional gold-label sidecar. Defaults to "<input_path stem>.labels.jsonl" when present.
+  input_labels_path: null
   output_dir: null
   input_subdir: eval_dual_flow
   # Separate outputs by retrieval source (e.g., eval_dual_flow vs eval_edge_retriever).
@@ -21,7 +23,7 @@ llm:
   output_filename_template: "{split}_k{k}_{provider}.jsonl"
   compute_metrics: true
   metrics_filename_template: "{split}_k{k}_{provider}.metrics.json"
-  topk_list: [1, 10, 25, 50, 100]
+  topk_list: [1, 10, 25, 50]
   max_samples: null
   batch_size: 8
   resume: true
@@ -48,6 +50,11 @@ llm:
     answer_key: "answer"
     answer_separator: " | "
     allow_empty: false
+    constrain_to_candidates: true
+    # Candidate construction strategy:
+    # - stop_only: only trajectory endpoint nodes (legacy behavior)
+    # - trajectory_nodes: all nodes touched by trajectories (higher oracle coverage)
+    candidate_source: trajectory_nodes
     max_prompt_chars: 32000
     # Retrieval window size. For DualFlow this is the number of *paths* (trajectories);
     # for edge retriever this is the number of *triples* (each trajectory is a single edge).
@@ -57,6 +64,9 @@ llm:
     model: Qwen/Qwen2.5-7B-Instruct
     tensor_parallel_size: 1
     max_model_len: 8192
+    seed: 42
+    pretrim_to_budget: true
+    budget_margin: 64
     temperature: 0.0
     top_p: 1.0
     max_tokens: 512

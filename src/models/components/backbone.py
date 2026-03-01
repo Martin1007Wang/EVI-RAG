@@ -1,296 +1,128 @@
+# src/models/components/backbone.py
+"""
+[系统实体] 策略网络 Backbone
+"""
 from __future__ import annotations
-
-from typing import Any, Mapping, Optional
-
 import torch
 from torch import nn
 
-_ZERO = 0
-_ONE = 1
-_TWO = 2
-_THREE = 3
-_FOUR = 4
-_LOGZ_OUTPUT_DIM = 1
-_DEFAULT_GNN_LAYERS = 2
-_DEFAULT_GNN_DROPOUT = 0.0
-_DEFAULT_ADAPTER_DIM_DIVISOR = 4
-_DEFAULT_ADAPTER_DROPOUT = 0.1
-_PNA_EPS = 1.0e-6
-_PNA_SCALERS = _THREE
-_PNA_AGGREGATORS = _FOUR
-_PNA_FEATURE_MULT = _PNA_SCALERS * _PNA_AGGREGATORS
+from src.models.configs.policy import BackboneConfig
+from .gnn import RelationalGNNLayer
 
 
 def _init_linear(layer: nn.Linear) -> None:
+    """Xavier 均匀初始化，防止梯度弥散"""
     nn.init.xavier_uniform_(layer.weight)
     if layer.bias is not None:
         nn.init.zeros_(layer.bias)
 
 
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.dim = int(dim)
-        if self.dim <= _ZERO:
-            raise ValueError("dim must be > 0.")
-        half_dim = self.dim // _TWO
-        inv_freq = torch.exp(
-            -torch.arange(half_dim, dtype=torch.float32) * (torch.log(torch.tensor(10000.0)) / max(half_dim, _ONE))
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._has_odd = bool(self.dim % _TWO)
-
-    def forward(self, steps: torch.Tensor) -> torch.Tensor:
-        steps = steps.to(device=self.inv_freq.device, dtype=torch.float32).view(-1, _ONE)
-        freqs = steps * self.inv_freq.view(_ONE, -1)
-        emb = torch.cat((torch.sin(freqs), torch.cos(freqs)), dim=-1)
-        if self._has_odd:
-            emb = torch.nn.functional.pad(emb, (_ZERO, _ONE))
-        return emb
-
-
-class RelationalGNNLayer(nn.Module):
-    def __init__(self, *, hidden_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        if self.hidden_dim <= _ZERO:
-            raise ValueError("hidden_dim must be > 0.")
-        self.dropout = float(dropout)
-        if self.dropout < float(_ZERO):
-            raise ValueError("dropout must be >= 0.")
-        self.msg_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.agg_proj = nn.Linear(self.hidden_dim * _PNA_FEATURE_MULT, self.hidden_dim)
-        self.update_proj = nn.Linear(self.hidden_dim * _TWO, self.hidden_dim)
-        self.norm = nn.LayerNorm(self.hidden_dim)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(self.dropout)
-        _init_linear(self.msg_proj)
-        _init_linear(self.agg_proj)
-        _init_linear(self.update_proj)
-
-    def _pna_stats(
-        self,
-        *,
-        messages: torch.Tensor,
-        tails: torch.Tensor,
-        num_nodes: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_dim = int(messages.size(-1))
-        sums = torch.zeros((num_nodes, hidden_dim), device=messages.device, dtype=messages.dtype)
-        sums.index_add_(0, tails, messages)
-        sums_sq = torch.zeros((num_nodes, hidden_dim), device=messages.device, dtype=messages.dtype)
-        sums_sq.index_add_(0, tails, messages.square())
-        deg = torch.zeros((num_nodes,), device=messages.device, dtype=messages.dtype)
-        ones = torch.ones_like(tails, dtype=messages.dtype)
-        deg.index_add_(0, tails, ones)
-        deg_safe = deg.clamp(min=_ONE).unsqueeze(-1)
-        mean = sums / deg_safe
-        var = sums_sq / deg_safe - mean.square()
-        std = var.clamp(min=_PNA_EPS).sqrt()
-        tail_index = tails.view(-1, _ONE).expand(-1, hidden_dim)
-        finfo = torch.finfo(messages.dtype)
-        max_vals = torch.full((num_nodes, hidden_dim), finfo.min, device=messages.device, dtype=messages.dtype)
-        max_vals.scatter_reduce_(0, tail_index, messages, reduce="amax", include_self=True)
-        min_vals = torch.full((num_nodes, hidden_dim), finfo.max, device=messages.device, dtype=messages.dtype)
-        min_vals.scatter_reduce_(0, tail_index, messages, reduce="amin", include_self=True)
-        has_in = deg > float(_ZERO)
-        mask = has_in.unsqueeze(-1)
-        max_vals = torch.where(mask, max_vals, torch.zeros_like(max_vals))
-        min_vals = torch.where(mask, min_vals, torch.zeros_like(min_vals))
-        std = torch.where(mask, std, torch.zeros_like(std))
-        stats = torch.cat((sums, max_vals, min_vals, std), dim=-1)
-        return stats, deg, has_in
-
-    @staticmethod
-    def _pna_scales(*, degree: torch.Tensor, has_in: torch.Tensor) -> torch.Tensor:
-        deg = degree.to(dtype=torch.float32)
-        has_in_f = has_in.to(device=degree.device, dtype=torch.float32)
-        log_deg = torch.log(deg + float(_ONE))
-        denom = has_in_f.sum().clamp(min=float(_ONE))
-        avg_log_deg = (log_deg.mul(has_in_f).sum() / denom).clamp(min=float(_PNA_EPS))
-        log_deg_safe = log_deg.clamp(min=float(_PNA_EPS))
-        scale_identity = torch.ones_like(log_deg)
-        scale_amplify = log_deg / avg_log_deg
-        scale_attenuate = avg_log_deg / log_deg_safe
-        return torch.stack((scale_identity, scale_amplify, scale_attenuate), dim=-1)
-
-    def _pna_aggregate(
-        self,
-        *,
-        messages: torch.Tensor,
-        tails: torch.Tensor,
-        num_nodes: int,
-    ) -> torch.Tensor:
-        stats, deg, has_in = self._pna_stats(messages=messages, tails=tails, num_nodes=num_nodes)
-        scales = self._pna_scales(degree=deg, has_in=has_in).to(device=messages.device, dtype=messages.dtype)
-        scaled = stats.unsqueeze(_ONE) * scales.unsqueeze(-1)
-        features = scaled.reshape(num_nodes, -1)
-        features = torch.where(has_in.unsqueeze(-1), features, torch.zeros_like(features))
-        return self.agg_proj(features)
-
-    def forward(
-        self,
-        *,
-        node_tokens: torch.Tensor,
-        relation_tokens: torch.Tensor,
-        edge_index: torch.Tensor,
-        num_nodes: int,
-    ) -> torch.Tensor:
-        if node_tokens.numel() == _ZERO:
-            return node_tokens
-        num_nodes = int(num_nodes)
-        if num_nodes <= _ZERO:
-            return node_tokens
-        if node_tokens.size(0) != num_nodes:
-            raise ValueError("num_nodes must match node_tokens length.")
-        if edge_index.numel() == _ZERO:
-            return node_tokens
-        if relation_tokens.size(0) != edge_index.size(1):
-            raise ValueError("relation_tokens must align with edge_index.")
-        head = edge_index[_ZERO].to(dtype=torch.long)
-        tail = edge_index[_ONE].to(dtype=torch.long)
-        msg = node_tokens.index_select(0, head) + relation_tokens
-        msg = self.msg_proj(msg)
-        agg = self._pna_aggregate(messages=msg, tails=tail, num_nodes=num_nodes)
-        update_in = torch.cat((node_tokens, agg), dim=-1)
-        update = self.update_proj(update_in)
-        out = node_tokens + self.drop(self.act(update))
-        return self.norm(out)
-
-
 class EmbeddingAdapter(nn.Module):
+    """
+    嵌入适配器 (低秩残差注入)
+    数学本质：x' = x + W_up(GELU(W_down(Norm(x))))
+    保证微调后的特征依然停留在原有的预训练流形空间中。
+    """
+
     def __init__(self, *, emb_dim: int, adapter_dim: int, dropout: float) -> None:
         super().__init__()
-        self.emb_dim = int(emb_dim)
-        self.adapter_dim = int(adapter_dim)
-        if self.emb_dim <= _ZERO or self.adapter_dim <= _ZERO:
-            raise ValueError("emb_dim and adapter_dim must be > 0.")
-        self.dropout = float(dropout)
-        if self.dropout < float(_ZERO):
-            raise ValueError("dropout must be >= 0.")
-        self.norm = nn.LayerNorm(self.emb_dim)
-        self.down = nn.Linear(self.emb_dim, self.adapter_dim)
-        self.up = nn.Linear(self.adapter_dim, self.emb_dim)
+        self.norm = nn.LayerNorm(emb_dim)
+        self.down = nn.Linear(emb_dim, adapter_dim)
+        self.up = nn.Linear(adapter_dim, emb_dim)
         self.act = nn.GELU()
-        self.drop = nn.Dropout(self.dropout)
+        self.drop = nn.Dropout(dropout)
+
         _init_linear(self.down)
+        # 向上投影初始化为 0，确保训练初期表现等价于恒等映射 (Identity)
         nn.init.zeros_(self.up.weight)
         if self.up.bias is not None:
             nn.init.zeros_(self.up.bias)
 
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
-        if embeddings.numel() == _ZERO:
+        if embeddings.numel() == 0:
             return embeddings
-        normalized = self.norm(embeddings)
-        delta = self.drop(self.up(self.act(self.down(normalized))))
-        out = embeddings + delta
-        return out
-
-    def reset_parameters(self) -> None:
-        self.norm.reset_parameters()
-        _init_linear(self.down)
-        nn.init.zeros_(self.up.weight)
-        if self.up.bias is not None:
-            nn.init.zeros_(self.up.bias)
-
-    def sanitize_parameters_(self) -> bool:
-        nonfinite = False
-        for param in self.parameters():
-            if not torch.isfinite(param).all():
-                nonfinite = True
-                break
-        if nonfinite:
-            with torch.no_grad():
-                self.reset_parameters()
-        return nonfinite
+        # 预归一化残差流
+        delta = self.drop(self.up(self.act(self.down(self.norm(embeddings)))))
+        return embeddings + delta
 
 
 class EmbeddingBackbone(nn.Module):
-    def __init__(
-        self,
-        *,
-        emb_dim: int,
-        hidden_dim: int,
-        gnn_layers: int = _DEFAULT_GNN_LAYERS,
-        gnn_dropout: float = _DEFAULT_GNN_DROPOUT,
-        adapter_cfg: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        super().__init__()
-        self.emb_dim = int(emb_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.gnn_layers_count = int(gnn_layers)
-        if self.gnn_layers_count < _ZERO:
-            raise ValueError("gnn_layers must be >= 0.")
-        self.gnn_dropout = float(gnn_dropout)
-        if self.gnn_dropout < float(_ZERO):
-            raise ValueError("gnn_dropout must be >= 0.")
+    """
+    嵌入 Backbone
+    职责：
+    1. 注入 Adapter 微调信号 (同流形微调)
+    2. 投影到隐空间 (跨空间映射，严格保证投影矩阵可导)
+    3. 执行关系驱动的 GNN 编码
+    """
 
-        self.node_adapter, self.rel_adapter = self._init_adapter(adapter_cfg)
-        self.node_norm = nn.LayerNorm(self.emb_dim)
-        self.rel_norm = nn.LayerNorm(self.emb_dim)
-        self.node_proj = nn.Linear(self.emb_dim, self.hidden_dim)
-        self.rel_proj = nn.Linear(self.emb_dim, self.hidden_dim)
-        self.q_proj = nn.Linear(self.emb_dim, self.hidden_dim)
-        _init_linear(self.node_proj)
-        _init_linear(self.rel_proj)
-        _init_linear(self.q_proj)
+    def __init__(self, config: BackboneConfig) -> None:
+        super().__init__()
+        self.emb_dim = config.embedding_dim
+        self.hidden_dim = config.hidden_dim
+        self.num_gnn_layers = config.gnn_layers
+        self.use_adapter = config.use_adapter
+        self.use_film = bool(config.use_film)
+        if self.use_adapter:
+            self.node_adapter = EmbeddingAdapter(
+                emb_dim=self.emb_dim, adapter_dim=config.adapter_dim, dropout=config.adapter_dropout
+            )
+            self.rel_adapter = EmbeddingAdapter(
+                emb_dim=self.emb_dim, adapter_dim=config.adapter_dim, dropout=config.adapter_dropout
+            )
+        else:
+            self.node_adapter = self.rel_adapter = None
+
+        if self.emb_dim == self.hidden_dim:
+            self.node_proj = nn.Identity()
+            self.rel_proj = nn.Identity()
+            self.q_proj = nn.Identity()
+            self.node_norm = nn.LayerNorm(self.emb_dim)
+            self.rel_norm = nn.LayerNorm(self.emb_dim)
+        else:
+            self.node_norm = nn.LayerNorm(self.emb_dim)
+            self.rel_norm = nn.LayerNorm(self.emb_dim)
+            self.node_proj = nn.Linear(self.emb_dim, self.hidden_dim)
+            self.rel_proj = nn.Linear(self.emb_dim, self.hidden_dim)
+            self.q_proj = nn.Linear(self.emb_dim, self.hidden_dim)
+            _init_linear(self.node_proj)
+            _init_linear(self.rel_proj)
+            _init_linear(self.q_proj)
+
         self.gnn_layers = nn.ModuleList(
             [
-                RelationalGNNLayer(hidden_dim=self.hidden_dim, dropout=self.gnn_dropout)
-                for _ in range(self.gnn_layers_count)
+                RelationalGNNLayer(hidden_dim=self.hidden_dim, dropout=config.gnn_dropout)
+                for _ in range(self.num_gnn_layers)
             ]
         )
-        for module in (self.node_norm, self.rel_norm, self.node_proj, self.rel_proj, self.q_proj):
-            for param in module.parameters():
-                param.requires_grad = False
-
-    def _init_adapter(
-        self,
-        adapter_cfg: Optional[Mapping[str, Any]],
-    ) -> tuple[Optional[EmbeddingAdapter], Optional[EmbeddingAdapter]]:
-        cfg = adapter_cfg or {}
-        extra = set(cfg.keys()) - {"adapter_dim", "dropout", "dim_divisor"}
-        if extra:
-            raise ValueError(f"Unsupported adapter_cfg keys: {sorted(extra)}")
-        dim_divisor = int(cfg.get("dim_divisor", _DEFAULT_ADAPTER_DIM_DIVISOR))
-        if dim_divisor <= _ZERO:
-            raise ValueError("adapter_cfg.dim_divisor must be > 0.")
-        adapter_dim = cfg.get("adapter_dim", None)
-        if adapter_dim is None:
-            adapter_dim = max(_ONE, self.emb_dim // dim_divisor)
-        adapter_dim = int(adapter_dim)
-        if adapter_dim <= _ZERO:
-            raise ValueError("adapter_cfg.adapter_dim must be > 0.")
-        dropout = float(cfg.get("dropout", _DEFAULT_ADAPTER_DROPOUT))
-        if dropout < float(_ZERO):
-            raise ValueError("adapter_cfg.dropout must be >= 0.")
-        return (
-            EmbeddingAdapter(emb_dim=self.emb_dim, adapter_dim=adapter_dim, dropout=dropout),
-            EmbeddingAdapter(emb_dim=self.emb_dim, adapter_dim=adapter_dim, dropout=dropout),
-        )
-
-    def forward(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = next(self.parameters()).device
-        question_emb = batch.question_emb.to(device=device, non_blocking=True)
-        node_embeddings = batch.node_embeddings.to(device=device, non_blocking=True)
-        edge_embeddings = batch.edge_embeddings.to(device=device, non_blocking=True)
-        question_tokens = self.project_question_embeddings(question_emb)
-        node_tokens = self.project_node_embeddings(node_embeddings)
-        relation_tokens = self.project_relation_embeddings(edge_embeddings)
-        return node_tokens, relation_tokens, question_tokens
+        if self.use_film and self.num_gnn_layers > 0:
+            self.film_norms = nn.ModuleList(
+                [nn.LayerNorm(self.hidden_dim) for _ in range(self.num_gnn_layers)]
+            )
+            self.film_gamma = nn.ModuleList(
+                [nn.Linear(self.hidden_dim, self.hidden_dim) for _ in range(self.num_gnn_layers)]
+            )
+            self.film_beta = nn.ModuleList(
+                [nn.Linear(self.hidden_dim, self.hidden_dim) for _ in range(self.num_gnn_layers)]
+            )
+            for gamma, beta in zip(self.film_gamma, self.film_beta):
+                nn.init.zeros_(gamma.weight)
+                nn.init.ones_(gamma.bias)
+                nn.init.zeros_(beta.weight)
+                nn.init.zeros_(beta.bias)
+        else:
+            self.film_norms = None
+            self.film_gamma = None
+            self.film_beta = None
 
     def project_node_embeddings(self, node_embeddings: torch.Tensor) -> torch.Tensor:
         if self.node_adapter is not None:
             node_embeddings = self.node_adapter(node_embeddings)
-        node_normed = self.node_norm(node_embeddings)
-        out = self.node_proj(node_normed)
-        return out
+        return self.node_proj(self.node_norm(node_embeddings))
 
     def project_relation_embeddings(self, relation_embeddings: torch.Tensor) -> torch.Tensor:
         if self.rel_adapter is not None:
             relation_embeddings = self.rel_adapter(relation_embeddings)
-        rel_normed = self.rel_norm(relation_embeddings)
-        return self.rel_proj(rel_normed)
+        return self.rel_proj(self.rel_norm(relation_embeddings))
 
     def project_question_embeddings(self, question_emb: torch.Tensor) -> torch.Tensor:
         return self.q_proj(question_emb)
@@ -301,127 +133,38 @@ class EmbeddingBackbone(nn.Module):
         node_tokens: torch.Tensor,
         relation_tokens: torch.Tensor,
         edge_index: torch.Tensor,
+        edge_relations: torch.Tensor,  # <-- 物理链路修补：必须传入关系 ID
         num_nodes: int,
+        question_tokens: torch.Tensor | None = None,
+        node_batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.gnn_layers_count == _ZERO:
+        """
+        [数学实体] 图消息传递流
+        """
+        # [系统级修正] 使用数值变量进行逻辑判断
+        if self.num_gnn_layers == 0:
             return node_tokens
+        if self.use_film:
+            if question_tokens is None or node_batch is None:
+                raise ValueError("FiLM conditioning requires question_tokens and node_batch.")
+            q_node = question_tokens.index_select(0, node_batch)
+        else:
+            q_node = None
+
         out = node_tokens
-        for layer in self.gnn_layers:
+        for idx, layer in enumerate(self.gnn_layers):
             out = layer(
                 node_tokens=out,
                 relation_tokens=relation_tokens,
                 edge_index=edge_index,
+                edge_relations=edge_relations,  # 传递给底层 GNN 进行异构计算
                 num_nodes=num_nodes,
             )
+            if self.use_film and q_node is not None:
+                gamma = self.film_gamma[idx](q_node)
+                beta = self.film_beta[idx](q_node)
+                out = gamma * self.film_norms[idx](out) + beta
         return out
 
 
-class CvtNodeInitializer(nn.Module):
-    """Zero-shot CVT initialization via neighbor + relation averaging.
-
-    We treat edges as *incident* (incoming or outgoing) when computing the mean.
-    This avoids failing on CVT nodes that only appear as heads in the retrieved
-    subgraph.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    @staticmethod
-    def _aggregate_incident_mean(
-        *,
-        relation_embeddings: torch.Tensor,
-        node_embeddings: torch.Tensor,
-        edge_index: torch.Tensor,
-        num_nodes: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        heads = edge_index[_ZERO]
-        tails = edge_index[_ONE]
-        msg_to_tail = node_embeddings.index_select(0, heads) + relation_embeddings
-        msg_to_head = node_embeddings.index_select(0, tails) + relation_embeddings
-        sums = torch.zeros((num_nodes, msg_to_tail.size(-1)), device=msg_to_tail.device, dtype=msg_to_tail.dtype)
-        sums.index_add_(0, tails, msg_to_tail)
-        sums.index_add_(0, heads, msg_to_head)
-        counts = torch.zeros((num_nodes,), device=msg_to_tail.device, dtype=msg_to_tail.dtype)
-        ones = torch.ones_like(tails, dtype=msg_to_tail.dtype)
-        counts.index_add_(0, tails, ones)
-        counts.index_add_(0, heads, ones)
-        return sums, counts
-
-    def forward(
-        self,
-        *,
-        node_embeddings: torch.Tensor,
-        relation_embeddings: torch.Tensor,
-        edge_index: torch.Tensor,
-        node_is_cvt: torch.Tensor,
-    ) -> torch.Tensor:
-        cvt_mask = node_is_cvt.to(dtype=torch.bool, device=node_embeddings.device)
-        if not bool(cvt_mask.any().detach().tolist()):
-            return node_embeddings
-        num_nodes = int(node_embeddings.size(0))
-        sums, counts = self._aggregate_incident_mean(
-            relation_embeddings=relation_embeddings,
-            node_embeddings=node_embeddings,
-            edge_index=edge_index,
-            num_nodes=num_nodes,
-        )
-        has_edges = counts > float(_ZERO)
-        missing = cvt_mask & (~has_edges.to(dtype=torch.bool, device=cvt_mask.device))
-        if bool(missing.any().detach().tolist()):
-            raise ValueError("CVT nodes missing incident edges; cannot compute neighbor+relation mean.")
-        mean = sums / counts.clamp(min=float(_ONE)).unsqueeze(-1)
-        return torch.where(cvt_mask.unsqueeze(-1), mean, node_embeddings)
-
-
-class LogZPredictor(nn.Module):
-    def __init__(self, *, hidden_dim: int, context_dim: int) -> None:
-        super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        self.context_dim = int(context_dim)
-        input_dim = self.hidden_dim + self.context_dim
-        self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, _LOGZ_OUTPUT_DIM),
-        )
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                _init_linear(layer)
-
-    def forward(
-        self,
-        *,
-        node_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        node_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        if question_tokens.dim() == _THREE and question_tokens.size(1) == _ONE:
-            question_tokens = question_tokens.squeeze(1)
-        if question_tokens.dim() != _TWO:
-            raise ValueError("question_tokens must be [num_graphs, hidden_dim].")
-        node_batch = node_batch.to(device=node_tokens.device, dtype=torch.long).view(-1)
-        context = question_tokens.index_select(0, node_batch)
-        fused = torch.cat((node_tokens, context), dim=-1)
-        return self.net(fused).squeeze(-1)
-
-    def set_output_bias(self, bias: float) -> None:
-        last_linear = None
-        for layer in reversed(self.net):
-            if isinstance(layer, nn.Linear):
-                last_linear = layer
-                break
-        if last_linear is None or last_linear.bias is None:
-            raise RuntimeError("LogZPredictor missing output bias for initialization.")
-        with torch.no_grad():
-            last_linear.bias.fill_(float(bias))
-
-
-__all__ = [
-    "EmbeddingBackbone",
-    "CvtNodeInitializer",
-    "RelationalGNNLayer",
-    "LogZPredictor",
-    "SinusoidalPositionalEncoding",
-]
+__all__ = ["EmbeddingBackbone", "EmbeddingAdapter"]

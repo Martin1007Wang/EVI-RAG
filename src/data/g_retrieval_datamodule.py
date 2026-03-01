@@ -159,6 +159,11 @@ class GRetrievalDataModule(LightningDataModule):
                 relation_vocab_path=Path(paths["relation_vocab"]),
                 embeddings_dir=Path(paths["embeddings"]),
                 embeddings_device=self.embeddings_device,
+                heuristic_log_v_path=(
+                    Path(paths["heuristic_log_v"]).expanduser().resolve()
+                    if isinstance(paths, dict) and paths.get("heuristic_log_v")
+                    else None
+                ),
             )
 
         # 3. Instantiate Datasets
@@ -224,7 +229,7 @@ class GRetrievalDataModule(LightningDataModule):
         _ = dataloader_idx
         resources = self._shared_resources
         if resources is None:
-            return batch
+            return batch.to(device, non_blocking=True)
         if not hasattr(batch, "node_embeddings") or not hasattr(batch, "edge_embeddings"):
             target_device = self.embeddings_device
             if target_device is None:
@@ -234,9 +239,7 @@ class GRetrievalDataModule(LightningDataModule):
                 global_embeddings=resources.global_embeddings,
                 embeddings_device=target_device,
             )
-        # Keep the (potentially huge) PyG batch on CPU; the model moves only
-        # the required tensors to device in `_prepare_batch`.
-        return batch
+        return batch.to(device, non_blocking=True)
 
     def train_eval_dataloader(self) -> DataLoader:
         """

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PriorConfig:
     pb_mode: str = "uniform_in_degree"
-    logit_scale_init: float = 2.3
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ _target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 32
+batch_size: 8
 num_workers: 16
 drop_last: false
 train_shuffle: true

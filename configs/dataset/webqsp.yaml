@@ -7,7 +7,7 @@ defaults:
 name: webqsp
 dataset_scope: full
 dataset_family: webqsp
-max_steps: 3
+max_steps: 4
 hf_dataset: rmanluo/RoG-webqsp
 
 train_samples_per_epoch: 2048

@@ -11,7 +11,7 @@ defaults:
 task_name: "train/dual_flow"
 tags: ["dual_flow", "subtb", "forward"]
 
-optimized_metric: "val/${dataset.dataset_scope}/hit@beam"
+optimized_metric: "val/sub/hit@beam"
 
 trainer:
   # Keep max_epochs as a hard ceiling in trainer/default.yaml; enforce wall-clock budget here.
@@ -23,13 +23,13 @@ trainer:
 
 callbacks:
   model_checkpoint:
-    monitor: "val/${dataset.dataset_scope}/hit@beam"
+    monitor: "val/sub/hit@beam"
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: "val/${dataset.dataset_scope}/hit@beam"
+    monitor: "val/sub/hit@beam"
     mode: max
     patience: 10
     min_delta: 0.002

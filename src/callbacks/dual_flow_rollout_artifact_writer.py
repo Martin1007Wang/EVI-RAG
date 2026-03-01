@@ -18,6 +18,9 @@ _DEFAULT_SPLIT = "predict"
 _DEFAULT_ARTIFACT_NAME = "eval_dual_flow"
 _DEFAULT_SCHEMA_VERSION = _ONE
 _WRITE_INTERVAL = "batch"
+_SUPER_SOURCE_ENTITY_ID = -1
+_LABELS_SUFFIX = ".labels.jsonl"
+_FIELD_SAMPLE_ID = "sample_id"
 
 
 class DualFlowRolloutArtifactWriter(BasePredictionWriter):
@@ -54,6 +57,7 @@ class DualFlowRolloutArtifactWriter(BasePredictionWriter):
         self.overwrite = bool(overwrite)
         self._processor: Optional[_RolloutArtifactProcessor] = None
         self._output_path: Optional[Path] = None
+        self._labels_path: Optional[Path] = None
         self._manifest_path: Optional[Path] = None
 
     def on_predict_start(self, trainer, pl_module) -> None:
@@ -61,9 +65,11 @@ class DualFlowRolloutArtifactWriter(BasePredictionWriter):
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._output_path = self.output_dir / f"{self.split}.jsonl"
+        self._labels_path = self.output_dir / f"{self.split}{_LABELS_SUFFIX}"
         self._manifest_path = self.output_dir / f"{self.split}.manifest.json"
         if self.overwrite and trainer.global_rank == _ZERO:
             self._output_path.write_text("", encoding="utf-8")
+            self._labels_path.write_text("", encoding="utf-8")
         if self.textualize:
             self._processor = _RolloutArtifactProcessor(
                 {
@@ -107,9 +113,9 @@ class DualFlowRolloutArtifactWriter(BasePredictionWriter):
     def on_predict_end(self, trainer, pl_module) -> None:
         if not self.enabled or trainer.global_rank != _ZERO:
             return
-        if self._manifest_path is None or self._output_path is None:
+        if self._manifest_path is None or self._output_path is None or self._labels_path is None:
             raise RuntimeError("DualFlowRolloutArtifactWriter missing manifest/output path; on_predict_start was not called.")
-        manifest = self._build_manifest(self._output_path.name)
+        manifest = self._build_manifest(self._output_path.name, self._labels_path.name)
         self._manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def _apply_processor(self, records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -118,20 +124,86 @@ class DualFlowRolloutArtifactWriter(BasePredictionWriter):
         return self._processor.process(records)
 
     def _append_records(self, records: list[Dict[str, Any]]) -> None:
-        if self._output_path is None:
+        if self._output_path is None or self._labels_path is None:
             raise RuntimeError("DualFlowRolloutArtifactWriter missing output path; on_predict_start was not called.")
-        with self._output_path.open("a", encoding="utf-8") as f:
-            for rec in records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        prompt_records, label_records = self._split_records(records)
+        with self._output_path.open("a", encoding="utf-8") as f_main:
+            for rec in prompt_records:
+                f_main.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with self._labels_path.open("a", encoding="utf-8") as f_labels:
+            for rec in label_records:
+                f_labels.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def _build_manifest(self, file_name: str) -> Dict[str, Any]:
+    def _build_manifest(self, file_name: str, labels_file_name: str) -> Dict[str, Any]:
         return {
             "artifact": self.artifact_name,
             "schema_version": self.schema_version,
             "file": file_name,
+            "labels_file": labels_file_name,
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "producer": "dual_flow_rollout_artifact_writer",
         }
+
+    @staticmethod
+    def _coerce_int_list(raw: Any) -> list[int]:
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple, set)):
+            out: list[int] = []
+            for item in raw:
+                try:
+                    out.append(int(item))
+                except Exception:
+                    continue
+            return out
+        try:
+            return [int(raw)]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _coerce_bool(raw: Any) -> Optional[bool]:
+        if isinstance(raw, bool):
+            return raw
+        return None
+
+    def _split_records(self, records: list[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+        prompt_records: list[Dict[str, Any]] = []
+        label_records: list[Dict[str, Any]] = []
+        for sample in records:
+            sample_id = str(sample.get(_FIELD_SAMPLE_ID) or "")
+            if not sample_id:
+                continue
+            rollouts = sample.get("rollouts")
+            if not isinstance(rollouts, list):
+                rollouts = []
+            question = str(sample.get("question") or sample.get("question_text") or "")
+            prompt_records.append(
+                {
+                    _FIELD_SAMPLE_ID: sample_id,
+                    "question": question,
+                    "rollouts": rollouts,
+                }
+            )
+
+            answer_texts = _RolloutArtifactProcessor._coerce_answer_texts(sample.get("answer_texts"))
+            answer_text = str(sample.get("answer_text") or "")
+            if not answer_text:
+                answer_text = _RolloutArtifactProcessor._coerce_answer_text(answer_texts)
+            label: Dict[str, Any] = {
+                _FIELD_SAMPLE_ID: sample_id,
+                "question": question,
+                "question_text": question,
+                "start_entity_ids": self._coerce_int_list(sample.get("start_entity_ids")),
+                "answer_entity_ids": self._coerce_int_list(sample.get("answer_entity_ids")),
+                "answer_texts": answer_texts,
+                "answer_text": answer_text,
+            }
+            a_entity_in_graph = self._coerce_bool(sample.get("a_entity_in_graph"))
+            if a_entity_in_graph is not None:
+                label["a_entity_in_graph"] = a_entity_in_graph
+            label_records.append(label)
+        return prompt_records, label_records
 
     @staticmethod
     def _gather_records(records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -339,6 +411,8 @@ class _RolloutArtifactProcessor:
                     continue
                 parts: list[str] = []
                 for edge in edges:
+                    if self._is_super_source_edge(edge):
+                        continue
                     src = edge.get("src_text") or edge.get("src_entity_id")
                     rel = edge.get("relation_text") or edge.get("relation_id")
                     dst = edge.get("dst_text") or edge.get("dst_entity_id")
@@ -346,6 +420,18 @@ class _RolloutArtifactProcessor:
                         rel = "SELF"
                     parts.append(f"{src} --{rel}--> {dst}")
                 rollout["trajectory_text"] = " ; ".join(parts)
+
+    @staticmethod
+    def _is_super_source_edge(edge: Dict[str, Any]) -> bool:
+        for key in ("src_entity_id", "head_entity_id"):
+            value = edge.get(key)
+            try:
+                if int(value) == _SUPER_SOURCE_ENTITY_ID:
+                    return True
+            except Exception:
+                continue
+        src_text = str(edge.get("src_text") or "").strip()
+        return src_text == str(_SUPER_SOURCE_ENTITY_ID)
 
 
 __all__ = ["DualFlowRolloutArtifactWriter"]

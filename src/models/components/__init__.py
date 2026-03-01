@@ -1,17 +1,17 @@
-from __future__ import annotations
+# src/models/components/__init__.py
+"""
+[系统模块] 策略网络组件
+"""
+from .backbone import EmbeddingBackbone, EmbeddingAdapter
+from .gnn import RelationalGNNLayer
+from .policy import DualFlowPolicy
+from .positional_encoding import SinusoidalPositionalEncoding
 
-from .backbone import (
-    EmbeddingBackbone,
-    LogZPredictor,
-    CvtNodeInitializer,
-    SinusoidalPositionalEncoding,
-)
-from .bilinear_step_scorer import BilinearStepScorer
 
 __all__ = [
-    "SinusoidalPositionalEncoding",
+    "DualFlowPolicy",
     "EmbeddingBackbone",
-    "CvtNodeInitializer",
-    "LogZPredictor",
-    "BilinearStepScorer",
+    "EmbeddingAdapter",
+    "RelationalGNNLayer",
+    "SinusoidalPositionalEncoding",
 ]

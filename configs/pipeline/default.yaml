@@ -38,6 +38,15 @@ nonzero_positive_filter_splits: ["train"]
 
 emit_edge_retriever_labels: true
 edge_retriever_labels_dir: null
+emit_replay_oracle_paths: true
+replay_oracle:
+  max_paths_per_pair: 24
+  max_paths_per_graph: 256
+  max_shortest_paths_per_pair: 4
+  max_dfs_paths_per_pair: 12
+  max_depth: ${dataset.max_steps}
+  allow_cycles: true
+  max_node_visits: 2
 
 parquet_dir: ${dataset.out_dir}
 output_dir: ${dataset.materialized_dir}

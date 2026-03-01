@@ -15,6 +15,7 @@ from .policy import (
     PolicyConfig,
     BackboneConfig,
     FlowHeadConfig,
+    PriorityHeadConfig,
 )
 from .search import (
     RolloutConfig,
@@ -37,6 +38,7 @@ __all__ = [
     "PolicyConfig",
     "BackboneConfig",
     "FlowHeadConfig",
+    "PriorityHeadConfig",
     "RolloutConfig",
     "BeamSearchConfig",
     "TrainingConfig",

@@ -20,9 +20,9 @@ _HAL_BAD_NO_ANS_REWARD = 1.0
 _HAL_SCORE_SHIFT = 1.5
 _HAL_SCORE_SCALE = 1.0 + _HAL_SCORE_SHIFT
 _NO_ANS_MARKERS = ("ans: not available", "ans: no information available")
+_MAX_ERROR_IDS_TO_SHOW = 5
 
 _FIELD_SAMPLE_ID = "sample_id"
-_FIELD_RAW_RESPONSE = "raw_response"
 
 
 @dataclass(frozen=True)
@@ -81,11 +81,13 @@ def write_llm_metrics(
     answer_key: str,
     answer_separator: str,
     metrics_filename_template: Optional[str] = None,
+    input_labels_path: Optional[Path] = None,
 ) -> Path:
     template = str(metrics_filename_template or "{split}_k{k}_{provider}.metrics.json")
     metrics_path = output_dir / template.format(split=split, k=int(top_k), provider=provider)
     metrics = compute_llm_metrics(
         input_path=input_path,
+        input_labels_path=input_labels_path,
         output_path=output_path,
         split=split,
         provider=provider,
@@ -106,30 +108,52 @@ def compute_llm_metrics(
     top_k: int,
     answer_key: str,
     answer_separator: str,
+    input_labels_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     pred_map = _load_predictions(output_path, answer_key=answer_key)
-    raw_response_map = _load_raw_responses(output_path)
+    label_map = _load_label_records(input_labels_path)
     metrics: Dict[str, Any] = {
         "split": split,
         "provider": provider,
         "top_k": int(top_k),
         "input": str(input_path),
+        "input_labels": str(input_labels_path) if input_labels_path is not None else "",
         "output": str(output_path),
         "llm/num_predictions": float(len(pred_map)),
     }
-    if not pred_map and not raw_response_map:
+    if not pred_map:
         return metrics
 
     full_acc = _EvalAccumulator(hal_stats=_init_hal_stats())
-    sub_acc = _EvalAccumulator()
+    sub_acc = _EvalAccumulator(hal_stats=_init_hal_stats())
+    input_sample_ids: Set[str] = set()
     for record in _iter_jsonl(input_path):
-        sample = _build_eval_sample(record, pred_map, raw_response_map, answer_separator=answer_separator)
-        if sample is None:
+        sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
+        if not sample_id:
+            raise ValueError(f"Input JSONL record missing sample_id in {input_path}.")
+        if sample_id in input_sample_ids:
+            raise ValueError(f"Duplicate sample_id in input JSONL {input_path}: {sample_id!r}")
+        input_sample_ids.add(sample_id)
+        if sample_id not in pred_map:
             continue
+        merged = _merge_with_label_record(record, label_map)
+        sample = _build_eval_sample(merged, pred_map, answer_separator=answer_separator)
+        if sample is None:
+            raise ValueError(
+                "Missing or invalid gold labels for predicted sample_id="
+                f"{sample_id!r}. Provide a valid labels sidecar via llm.input_labels_path."
+            )
         result = _evaluate_sample(sample)
         _accumulate(full_acc, sample, result, include_hal=True)
         if sample.a_entity_in_graph is True:
-            _accumulate(sub_acc, sample, result, include_hal=False)
+            _accumulate(sub_acc, sample, result, include_hal=True)
+    unknown_pred_ids = sorted(set(pred_map.keys()) - input_sample_ids)
+    if unknown_pred_ids:
+        preview = unknown_pred_ids[:_MAX_ERROR_IDS_TO_SHOW]
+        raise ValueError(
+            f"Predictions contain sample_id values not found in input JSONL {input_path}: "
+            f"{preview} (showing up to {_MAX_ERROR_IDS_TO_SHOW})."
+        )
     metrics.update(_finalize_scope(full_acc, prefix="llm/subgraphrag/full"))
     metrics.update(_finalize_scope(sub_acc, prefix="llm/subgraphrag/sub"))
     if full_acc.hal_stats is not None:
@@ -151,38 +175,56 @@ def _load_predictions(path: Path, *, answer_key: str) -> Dict[str, str]:
         return {}
     out: Dict[str, str] = {}
     for record in _iter_jsonl(path):
-        sample_id = record.get(_FIELD_SAMPLE_ID)
+        sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
         if not sample_id:
-            continue
-        out[str(sample_id)] = str(record.get(answer_key) or "")
+            raise ValueError(f"Prediction record missing sample_id in {path}.")
+        if sample_id in out:
+            raise ValueError(f"Duplicate sample_id in prediction JSONL {path}: {sample_id!r}")
+        out[sample_id] = str(record.get(answer_key) or "")
     return out
 
 
-def _load_raw_responses(path: Path) -> Dict[str, str]:
-    if not path.exists():
+def _load_label_records(path: Optional[Path]) -> Dict[str, Dict[str, Any]]:
+    if path is None or not path.exists():
         return {}
-    out: Dict[str, str] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for record in _iter_jsonl(path):
-        sample_id = record.get(_FIELD_SAMPLE_ID)
+        sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
         if not sample_id:
-            continue
-        raw = record.get(_FIELD_RAW_RESPONSE)
-        if isinstance(raw, str) and raw.strip():
-            out[str(sample_id)] = raw
+            raise ValueError(f"Label record missing sample_id in {path}.")
+        if sample_id in out:
+            raise ValueError(f"Duplicate sample_id in label JSONL {path}: {sample_id!r}")
+        out[sample_id] = dict(record)
     return out
+
+
+def _merge_with_label_record(record: Dict[str, Any], labels: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
+    if not sample_id:
+        return record
+    label_record = labels.get(sample_id)
+    if label_record is None:
+        return record
+    merged = dict(record)
+    for key, value in label_record.items():
+        if key == _FIELD_SAMPLE_ID:
+            continue
+        if key == "rollouts":
+            continue
+        merged[key] = value
+    return merged
 
 
 def _build_eval_sample(
     record: Dict[str, Any],
     pred_map: Dict[str, str],
-    raw_response_map: Dict[str, str],
     *,
     answer_separator: str,
 ) -> Optional[_EvalSample]:
     sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
     if not sample_id:
         return None
-    if sample_id not in pred_map and sample_id not in raw_response_map:
+    if sample_id not in pred_map:
         return None
     question = str(record.get("question_text") or record.get("question") or "")
     answers = _resolve_gold_answer_texts(record, answer_separator=answer_separator)
@@ -191,8 +233,10 @@ def _build_eval_sample(
     answers = _remove_duplicates_preserve_order(answers)
     answers = sorted(answers, key=len, reverse=True)
     answers = _subgraphrag_year_fix(answers, question)
-    pred_text = raw_response_map.get(sample_id, "") or pred_map.get(sample_id, "") or ""
+    pred_text = pred_map.get(sample_id, "") or ""
     pred_lines = _subgraphrag_get_pred_lines(pred_text)
+    if not pred_lines:
+        pred_lines = _subgraphrag_get_pred_lines_from_answer(pred_text, answer_separator=answer_separator)
     double_check = _subgraphrag_is_double_check(question)
     a_entity_in_graph = _resolve_a_entity_in_graph(record)
     rollouts = record.get("rollouts")
@@ -300,8 +344,11 @@ def _finalize_scope(acc: _EvalAccumulator, *, prefix: str) -> Dict[str, Any]:
     micro_precision = float(acc.total_match) / float(acc.total_pred) if acc.total_pred > _ZERO else float(_ZERO)
     micro_recall = float(acc.total_match) / float(acc.total_answer) if acc.total_answer > _ZERO else float(_ZERO)
     micro_f1 = _safe_f1(micro_precision, micro_recall)
-    hal_avg = float(acc.hal_score_sum) / denom
-    hal_scaled = ((hal_avg + _HAL_SCORE_SHIFT) / _HAL_SCORE_SCALE) * _PERCENT
+    if acc.hal_stats is None:
+        hal_scaled = float(_ZERO)
+    else:
+        hal_avg = float(acc.hal_score_sum) / denom
+        hal_scaled = ((hal_avg + _HAL_SCORE_SHIFT) / _HAL_SCORE_SCALE) * _PERCENT
     return {
         f"{prefix}/hit@1": (acc.hit_at_1_sum * _PERCENT) / denom,
         f"{prefix}/hit": (acc.hit_sum * _PERCENT) / denom,
@@ -455,6 +502,37 @@ def _subgraphrag_get_pred_lines(prediction: str) -> List[str]:
     return _remove_duplicates_preserve_order(candidates)
 
 
+def _subgraphrag_get_pred_lines_from_answer(answer: str, *, answer_separator: str) -> List[str]:
+    tokens = _split_prediction_tokens(answer, answer_separator=answer_separator)
+    return [f"ans: {token}" for token in tokens]
+
+
+def _split_prediction_tokens(prediction: str, *, answer_separator: str) -> List[str]:
+    raw = str(prediction or "").strip()
+    if not raw:
+        return []
+    sep = str(answer_separator or "")
+    if sep and sep in raw:
+        parts = raw.split(sep)
+    elif "\n" in raw:
+        parts = raw.splitlines()
+    else:
+        parts = [raw]
+    tokens: List[str] = []
+    for part in parts:
+        token = str(part or "").strip()
+        if not token:
+            continue
+        lower = token.lower()
+        idx = lower.find("ans:")
+        if idx >= _ZERO:
+            token = token[idx + len("ans:") :].strip()
+        if not token or _is_no_ans_token(token):
+            continue
+        tokens.append(token)
+    return _remove_duplicates_preserve_order(tokens)
+
+
 def _subgraphrag_year_fix(gold: List[str], question: str) -> List[str]:
     q = str(question or "").lower()
     if "when" not in q and "what year" not in q:
@@ -483,13 +561,35 @@ def _safe_f1(precision: float, recall: float) -> float:
     return (_TWO * precision * recall) / denom
 
 
+def _extract_ans_tokens(prediction: str) -> List[str]:
+    tokens: List[str] = []
+    for line in str(prediction or "").splitlines():
+        lower = line.lower()
+        idx = lower.find("ans:")
+        if idx < _ZERO:
+            continue
+        token = line[idx + len("ans:") :].strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _is_no_ans_token(token: str) -> bool:
+    lowered = str(token or "").strip().lower()
+    if not lowered:
+        return True
+    if lowered in {"none", "n/a", "na"}:
+        return True
+    return any(marker in f"ans: {lowered}" for marker in _NO_ANS_MARKERS)
+
+
 def _subgraphrag_no_answer(prediction: str, pred_lines: Sequence[str]) -> bool:
-    if not pred_lines:
+    if pred_lines:
+        return False
+    tokens = _extract_ans_tokens(prediction)
+    if not tokens:
         return True
-    lowered = str(prediction or "").lower()
-    if "ans:" not in lowered:
-        return True
-    return any(marker in lowered for marker in _NO_ANS_MARKERS)
+    return all(_is_no_ans_token(token) for token in tokens)
 
 
 def _subgraphrag_hit_at_1(prediction: Sequence[str], answer: List[str], double_check: bool) -> int:

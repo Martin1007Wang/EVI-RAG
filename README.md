@@ -639,11 +639,11 @@ python scripts/build_retrieval_pipeline.py dataset=webqsp paths=default
 评估推荐流程（以 `webqsp` 为例；产物默认写入 `${dataset.materialized_dir}`）：
 
 ```bash
-# DualFlow 产物：eval_dual_flow rollouts
-python src/eval.py experiment=eval_dual_flow dataset=webqsp ckpt.dual_flow=/path/to/dual_flow.ckpt
+# DualFlow 产物：eval_dual_flow rollouts（默认评估 webqsp 的 full+sub 测试集）
+python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt
 
 # DualFlow greedy 评估（temperature=0，单 rollout）
-python src/eval.py experiment=eval_dual_flow dataset=webqsp ckpt.dual_flow=/path/to/dual_flow.ckpt \
+python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt \
   model.evaluation_cfg.num_eval_rollouts=1 model.evaluation_cfg.rollout_temperature=0.0
 
 # LLM 评测（SubgraphRAG 对齐）：基于 eval_dual_flow rollouts 生成最终答案（ICL + dc；输出 SubgraphRAG 风格指标 llm/subgraphrag/*）

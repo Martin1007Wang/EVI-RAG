@@ -19,8 +19,8 @@ accumulate_grad_batches: 1
 # cudnn autotune for stable input shapes (disable if shapes vary wildly)
 benchmark: true
 
-# disable automatic clipping for manual optimization (model handles it)
-gradient_clip_val: null
+# automatic clipping handled by Lightning optimization loop
+gradient_clip_val: 1.0
 
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 10

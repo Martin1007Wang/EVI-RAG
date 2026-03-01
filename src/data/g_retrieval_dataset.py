@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover
     OmegaConf = None  # type: ignore[assignment]
 
 from .components import EmbeddingStore, GlobalEmbeddingStore, SharedDataResources
-from .components.shared_resources import _load_entity_embedding_map
+from .components.shared_resources import _load_entity_embedding_map, _load_heuristic_log_v
 from .io.lmdb_utils import _apply_filter_intersection, _assign_lmdb_shard, _resolve_core_lmdb_paths
 from src.data.schema.constants import _FILTER_MISSING_ANSWER_FILENAME, _FILTER_MISSING_START_FILENAME
 from src.utils.logging_utils import get_logger, log_event
@@ -35,7 +35,7 @@ _REMOVED_DATASET_KEYS = (
 class GRetrievalData(GraphData):
     def __inc__(self, key: str, value: Any, *args, **kwargs) -> int:
         if key in {"q_local_indices", "a_local_indices"}:
-            return int(self.num_nodes)
+            return 0
         return super().__inc__(key, value, *args, **kwargs)
 
 
@@ -48,6 +48,7 @@ class GRetrievalDataset(Dataset):
         embeddings_dir: Path,
         split_name: str = "train",
         resources: Optional[SharedDataResources] = None,
+        heuristic_log_v_path: Optional[Path] = None,
         sample_limit: Optional[int] = None,
         sample_filter_path: Optional[Union[Path, Sequence[Path]]] = None,
         random_seed: Optional[int] = None,
@@ -63,6 +64,8 @@ class GRetrievalDataset(Dataset):
         self._global_embeddings: Optional[GlobalEmbeddingStore] = None
         self._sample_stores: Optional[List[EmbeddingStore]] = None
         self._entity_embedding_map: Optional[torch.Tensor] = None
+        self._heuristic_log_v_path = None if heuristic_log_v_path is None else Path(heuristic_log_v_path)
+        self._heuristic_log_v: Optional[torch.Tensor] = None
         self._lmdb_readahead = bool(lmdb_readahead)
 
         self._init_sample_ids()
@@ -112,6 +115,9 @@ class GRetrievalDataset(Dataset):
 
         q_local_indices = raw["q_local_indices"]
         a_local_indices = raw["a_local_indices"]
+        replay_start_local = raw.get("replay_start_local")
+        replay_path_lengths = raw.get("replay_path_lengths")
+        replay_edge_local_ids = raw.get("replay_edge_local_ids")
         a_entity_in_graph = bool(torch.as_tensor(a_local_indices).numel() > 0)
         data_kwargs: Dict[str, Any] = {
             "num_nodes": num_nodes,
@@ -126,6 +132,29 @@ class GRetrievalDataset(Dataset):
             "sample_id": sample_id,
             "a_entity_in_graph": a_entity_in_graph,
         }
+        if replay_start_local is not None or replay_path_lengths is not None or replay_edge_local_ids is not None:
+            if replay_start_local is None or replay_path_lengths is None or replay_edge_local_ids is None:
+                raise ValueError(
+                    "Replay oracle fields must be all present or all absent in LMDB sample "
+                    f"(sample_id={sample_id})."
+                )
+            data_kwargs["replay_start_local"] = replay_start_local
+            data_kwargs["replay_path_lengths"] = replay_path_lengths
+            data_kwargs["replay_edge_local_ids"] = replay_edge_local_ids
+        heuristic_log_v = self.heuristic_log_v
+        if heuristic_log_v is not None:
+            node_ids = torch.as_tensor(node_global_ids, dtype=torch.long).view(-1)
+            if node_ids.numel() > 0:
+                min_id = int(node_ids.min().detach().tolist())
+                max_id = int(node_ids.max().detach().tolist())
+                if min_id < 0:
+                    raise ValueError(f"node_global_ids contains negative values (sample_id={sample_id}).")
+                if max_id >= int(heuristic_log_v.numel()):
+                    raise ValueError(
+                        f"heuristic_log_v out of range for sample_id={sample_id}; "
+                        f"max_id={max_id} size={heuristic_log_v.numel()}"
+                    )
+            data_kwargs["heuristic_log_v"] = heuristic_log_v.index_select(0, node_ids)
         question_text = raw.get("question")
         if question_text is not None:
             data_kwargs["question"] = question_text
@@ -225,11 +254,22 @@ class GRetrievalDataset(Dataset):
             self._entity_embedding_map = _load_entity_embedding_map(self._entity_vocab_path)
         return self._entity_embedding_map
 
+    @property
+    def heuristic_log_v(self) -> Optional[torch.Tensor]:
+        if self._shared_resources is not None:
+            return self._shared_resources.heuristic_log_v
+        if self._heuristic_log_v_path is None:
+            return None
+        if self._heuristic_log_v is None:
+            self._heuristic_log_v = _load_heuristic_log_v(self._heuristic_log_v_path)
+        return self._heuristic_log_v
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_global_embeddings"] = None
         state["_sample_stores"] = None
         state["_entity_embedding_map"] = None
+        state["_heuristic_log_v"] = None
         return state
 
     # ------------------------------------------------------------------ #
@@ -281,6 +321,9 @@ def create_g_retrieval_dataset(
     _assert_no_removed_dataset_keys(cfg)
     split_name = _assert_allowed_split_name(split_name)
     emb_root = Path(cfg["paths"]["embeddings"])
+    heuristic_log_v_path = None
+    if isinstance(cfg.get("paths"), dict):
+        heuristic_log_v_path = cfg["paths"].get("heuristic_log_v")
     sample_limit = _resolve_sample_limit(cfg, split_name)
     filter_missing_start = _resolve_split_bool(cfg, split_name, "filter_missing_start", True)
     filter_missing_answer = _resolve_split_bool(cfg, split_name, "filter_missing_answer", True)
@@ -304,6 +347,7 @@ def create_g_retrieval_dataset(
         embeddings_dir=emb_root,
         split_name=split_name,
         resources=resources,
+        heuristic_log_v_path=heuristic_log_v_path,
         sample_limit=sample_limit,
         sample_filter_path=filter_paths if filter_paths else None,
         random_seed=cfg.get("random_seed"),

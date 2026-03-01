@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import is_dataclass, replace as dataclass_replace
 import inspect
 import os
 import json
@@ -215,6 +216,32 @@ def _resolve_eval_mode(run_cfg: DictConfig | Dict[str, Any]) -> str:
     raise ValueError("run.eval_mode must be one of {'predict', 'test'}.")
 
 
+def _configure_dual_flow_eval_sampling(model: LightningModule, run_cfg: DictConfig | Dict[str, Any]) -> None:
+    if not hasattr(model, "sampler"):
+        return
+    sampler = getattr(model, "sampler")
+    sampler_cfg = getattr(sampler, "config", None)
+    if sampler_cfg is None or not is_dataclass(sampler_cfg):
+        return
+    has_temp = hasattr(sampler_cfg, "eval_sampling_temperature")
+    has_unique = hasattr(sampler_cfg, "eval_sample_without_replacement")
+    if not (has_temp or has_unique):
+        return
+
+    temp_override = run_cfg.get("eval_sampling_temperature") if hasattr(run_cfg, "get") else None
+    unique_override = run_cfg.get("eval_sample_without_replacement") if hasattr(run_cfg, "get") else None
+    updates: Dict[str, Any] = {}
+    if has_temp and temp_override is not None:
+        temp_value = float(temp_override)
+        if temp_value <= 0:
+            raise ValueError("run.eval_sampling_temperature must be > 0.")
+        updates["eval_sampling_temperature"] = temp_value
+    if has_unique and unique_override is not None:
+        updates["eval_sample_without_replacement"] = bool(unique_override)
+    if updates:
+        sampler.config = dataclass_replace(sampler_cfg, **updates)
+
+
 
 def _preflight_validate(cfg: DictConfig) -> None:
     """Fail-fast on missing Hydra groups to avoid confusing OmegaConf interpolation errors."""
@@ -223,7 +250,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_dual_flow dataset=webqsp-sub ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
+            "  python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
@@ -235,7 +262,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `run`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_dual_flow dataset=webqsp-sub ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
+            "  python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
         )
     required_kind = _RUN_REQUIRES_CKPT_KIND.get(run_name)
     if required_kind and cfg.get("ckpt_path") in (None, ""):
@@ -327,7 +354,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if run_cfg is None:
         raise ValueError(
             "Missing required config group: `run`. Example: "
-            "`python src/eval.py experiment=eval_dual_flow dataset=webqsp-sub`."
+            "`python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt`."
         )
     split = str(run_cfg.get("split", "test"))
     if run_cfg.get("allow_empty_answer") is None:
@@ -342,6 +369,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
+    _configure_dual_flow_eval_sampling(model, run_cfg)
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))

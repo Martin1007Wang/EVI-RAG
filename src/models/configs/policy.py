@@ -30,11 +30,11 @@ class FlowHeadConfig:
 
 
 @dataclass(frozen=True)
-class ActionHeadConfig:
-    """动作打分头配置"""
+class PriorityHeadConfig:
+    """节点优先级打分头配置（用于答案排序辅助监督与可选 Top-K 剪枝）"""
 
     hidden_dim: int = 256
-    num_layers: int = 1
+    num_layers: int = 2
     dropout: float = 0.0
 
 
@@ -44,6 +44,10 @@ class PolicyConfig:
 
     backbone: BackboneConfig = BackboneConfig()
     flow_head: FlowHeadConfig = FlowHeadConfig()
-    action_head: ActionHeadConfig = ActionHeadConfig()
-    flow_lookahead_mode: str = "mlp_action"
+    priority_head: PriorityHeadConfig = PriorityHeadConfig()
     stop_bias_init: float = -10.0
+    topk_prune_train_k: int = 0
+    topk_prune_train_k_final: int = 0
+    topk_prune_warmup_steps: int = 0
+    topk_prune_anneal_steps: int = 0
+    topk_prune_eval_k: int = 0

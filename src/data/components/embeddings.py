@@ -135,7 +135,7 @@ class GlobalEmbeddingStore:
             if target_device == table_device:
                 return out
             return out.to(target_device, non_blocking=True)
-        cpu_ids = entity_ids if entity_ids.device.type == "cpu" else entity_ids.detach().to("cpu", non_blocking=True)
+        cpu_ids = entity_ids if entity_ids.device.type == "cpu" else entity_ids.to("cpu", non_blocking=True)
         if cpu_ids.dtype != torch.long:
             cpu_ids = cpu_ids.to(dtype=torch.long)
         if target_device.type == "cpu":
@@ -169,7 +169,7 @@ class GlobalEmbeddingStore:
             if target_device == table_device:
                 return out
             return out.to(target_device, non_blocking=True)
-        cpu_ids = relation_ids if relation_ids.device.type == "cpu" else relation_ids.detach().to("cpu", non_blocking=True)
+        cpu_ids = relation_ids if relation_ids.device.type == "cpu" else relation_ids.to("cpu", non_blocking=True)
         if cpu_ids.dtype != torch.long:
             cpu_ids = cpu_ids.to(dtype=torch.long)
         if target_device.type == "cpu":
@@ -208,14 +208,14 @@ def attach_embeddings_to_batch(
     entity_rows = int(global_embeddings.entity_embeddings.size(0))
     rel_rows = int(global_embeddings.relation_embeddings.size(0))
     if node_embedding_ids.numel() > 0:
-        if node_embedding_ids.min().detach().tolist() < 0 or node_embedding_ids.max().detach().tolist() >= entity_rows:
+        if node_embedding_ids.min().item() < 0 or node_embedding_ids.max().item() >= entity_rows:
             sample_id = getattr(batch, "sample_id", None)
             raise ValueError(
                 f"node_embedding_ids out of range for batch (sample_id={sample_id}); "
                 f"valid [0, {entity_rows - 1}]"
             )
     if relation_ids.numel() > 0:
-        if relation_ids.min().detach().tolist() < 0 or relation_ids.max().detach().tolist() >= rel_rows:
+        if relation_ids.min().item() < 0 or relation_ids.max().item() >= rel_rows:
             sample_id = getattr(batch, "sample_id", None)
             raise ValueError(
                 f"edge_attr relation ids out of range for batch (sample_id={sample_id}); "
