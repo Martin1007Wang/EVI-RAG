@@ -229,6 +229,7 @@ class RolloutSampler:
         path_lengths: torch.Tensor,
         collect_traces: bool = True,
         use_visited_mask: bool = False,
+        encoded_context: EncodedPolicyContext | None = None,
     ) -> RolloutResult:
         return self.offline_engine.evaluate_forced_paths(
             env_context,
@@ -238,6 +239,7 @@ class RolloutSampler:
             path_lengths=path_lengths,
             collect_traces=collect_traces,
             use_visited_mask=use_visited_mask,
+            encoded_context=encoded_context,
         )
 
     def beam_search_forward(

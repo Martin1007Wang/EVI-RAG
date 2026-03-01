@@ -159,3 +159,37 @@ def test_policy_logits_do_not_depend_on_answer_labels() -> None:
     assert torch.allclose(out_a["edge_logits"], out_b["edge_logits"], atol=1.0e-7)
     assert torch.allclose(out_a["stop_logits"], out_b["stop_logits"], atol=1.0e-7)
     assert bool(torch.isfinite(out_a["edge_logits"]).all().item())
+
+
+def test_policy_action_cache_is_behavior_equivalent() -> None:
+    torch.manual_seed(13)
+    policy = _build_policy()
+    context = _build_context(a_local_indices=torch.tensor([2], dtype=torch.long))
+    state = _make_agent_state(hidden_dim=4, num_nodes=3)
+    node_tokens, relation_tokens, question_tokens = policy.encode_context(context)
+
+    out_direct = policy.compute_action_scores(
+        env_context=context,
+        agent_state=state,
+        node_tokens=node_tokens,
+        question_tokens=question_tokens,
+        relation_tokens=relation_tokens,
+    )
+    action_cache = policy.build_action_cache(
+        env_context=context,
+        node_tokens=node_tokens,
+        question_tokens=question_tokens,
+    )
+    out_cached = policy.compute_action_scores(
+        env_context=context,
+        agent_state=state,
+        node_tokens=node_tokens,
+        question_tokens=question_tokens,
+        relation_tokens=relation_tokens,
+        action_cache=action_cache,
+    )
+
+    assert torch.equal(out_direct["edge_ids"], out_cached["edge_ids"])
+    assert torch.equal(out_direct["target_nodes"], out_cached["target_nodes"])
+    assert torch.allclose(out_direct["edge_logits"], out_cached["edge_logits"], atol=1.0e-7)
+    assert torch.allclose(out_direct["stop_logits"], out_cached["stop_logits"], atol=1.0e-7)

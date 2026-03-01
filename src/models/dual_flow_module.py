@@ -90,6 +90,7 @@ class DualFlowModule(LightningModule):
         self,
         *,
         base_context: GraphEnvContext,
+        encoded_context: EncodedPolicyContext,
         online_rollout: RolloutResult,
         rewards_online_raw: torch.Tensor,
         hit_mask_online: torch.Tensor,
@@ -164,6 +165,7 @@ class DualFlowModule(LightningModule):
             path_lengths=replay_batch.path_lengths,
             collect_traces=True,
             use_visited_mask=bool(replay_cfg.track_visited_mask),
+            encoded_context=encoded_context,
         )
         if replay_rollout.valid_mask is not None:
             replay_valid_mask = replay_rollout.valid_mask.to(device=self.device, dtype=torch.bool)
@@ -428,6 +430,7 @@ class DualFlowModule(LightningModule):
             replay_oracle_graph_ratio,
         ) = self._apply_replay_rollout_mix(
             base_context=base_context,
+            encoded_context=encoded_context,
             online_rollout=online_rollout,
             rewards_online_raw=rewards_online_raw,
             hit_mask_online=hit_mask_online,

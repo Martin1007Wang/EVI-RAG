@@ -253,6 +253,32 @@ class DualFlowPolicy(nn.Module):
         node_questions = question_tokens.index_select(0, node_graph_ids)
         return self.node_priority_head(node_tokens, node_questions)
 
+    def build_action_cache(
+        self,
+        *,
+        env_context: GraphEnvContext,
+        node_tokens: torch.Tensor,
+        question_tokens: torch.Tensor,
+    ) -> dict[str, torch.Tensor | None]:
+        topk_prune_k = self._resolve_topk_prune_k()
+        node_priority_keep_mask: torch.Tensor | None = None
+        vector_flow = self._predict_vector_flow_from_nodes(node_tokens)
+        if topk_prune_k > 0:
+            node_priority_scores = self.compute_node_priority_scores(
+                env_context=env_context,
+                node_tokens=node_tokens,
+                question_tokens=question_tokens,
+            )
+            node_priority_keep_mask = self._build_topk_node_keep_mask(
+                node_ptr=env_context.node_ptr,
+                node_scores=node_priority_scores,
+                topk_k=topk_prune_k,
+            )
+        return {
+            "vector_flow": vector_flow,
+            "node_priority_keep_mask": node_priority_keep_mask,
+        }
+
     def _compute_edge_logits(
         self,
         *,
@@ -380,26 +406,26 @@ class DualFlowPolicy(nn.Module):
         node_tokens: torch.Tensor,
         question_tokens: torch.Tensor,
         relation_tokens: torch.Tensor,
+        action_cache: dict[str, torch.Tensor | None] | None = None,
     ) -> dict[str, torch.Tensor]:
         B, num_agents = agent_state.current_nodes.shape
         flat_curr_nodes = agent_state.current_nodes.view(-1)
         flat_active_mask = ~agent_state.done_mask.view(-1)
         active_nodes = torch.where(flat_active_mask, flat_curr_nodes, torch.zeros_like(flat_curr_nodes))
 
-        topk_prune_k = self._resolve_topk_prune_k()
-        node_priority_keep_mask: torch.Tensor | None = None
-        vector_flow = self._predict_vector_flow_from_nodes(node_tokens)
-        if topk_prune_k > 0:
-            node_priority_scores = self.compute_node_priority_scores(
+        if action_cache is None:
+            resolved_cache = self.build_action_cache(
                 env_context=env_context,
                 node_tokens=node_tokens,
                 question_tokens=question_tokens,
             )
-            node_priority_keep_mask = self._build_topk_node_keep_mask(
-                node_ptr=env_context.node_ptr,
-                node_scores=node_priority_scores,
-                topk_k=topk_prune_k,
-            )
+            vector_flow = resolved_cache["vector_flow"]
+            node_priority_keep_mask = resolved_cache["node_priority_keep_mask"]
+        else:
+            vector_flow = action_cache.get("vector_flow")
+            node_priority_keep_mask = action_cache.get("node_priority_keep_mask")
+            if vector_flow is None:
+                raise ValueError("action_cache must provide `vector_flow`.")
 
         edge_ids, target_nodes, out_degrees = self._gather_actions_from_csr_lock_free(
             env_context.adj_t_fwd,

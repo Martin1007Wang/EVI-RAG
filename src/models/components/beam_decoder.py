@@ -210,6 +210,14 @@ class BeamDecoderEngine:
                 node_tokens, relation_tokens, question_tokens = policy.encode_context(env_context)
             else:
                 node_tokens, relation_tokens, question_tokens = encoded_context
+            build_cache_fn = getattr(policy, "build_action_cache", None)
+            action_cache: dict[str, torch.Tensor | None] | None = None
+            if callable(build_cache_fn):
+                action_cache = build_cache_fn(
+                    env_context=env_context,
+                    node_tokens=node_tokens,
+                    question_tokens=question_tokens,
+                )
             for step in range(max_steps):
                 if done_mask.all():
                     break
@@ -221,13 +229,23 @@ class BeamDecoderEngine:
                     cumulative_rewards=torch.zeros((num_graphs, beam_size), device=device),
                     done_mask=done_mask,
                 )
-                policy_out = policy.compute_action_scores(
-                    env_context=env_context,
-                    agent_state=eval_state,
-                    node_tokens=node_tokens,
-                    question_tokens=question_tokens,
-                    relation_tokens=relation_tokens,
-                )
+                if action_cache is None:
+                    policy_out = policy.compute_action_scores(
+                        env_context=env_context,
+                        agent_state=eval_state,
+                        node_tokens=node_tokens,
+                        question_tokens=question_tokens,
+                        relation_tokens=relation_tokens,
+                    )
+                else:
+                    policy_out = policy.compute_action_scores(
+                        env_context=env_context,
+                        agent_state=eval_state,
+                        node_tokens=node_tokens,
+                        question_tokens=question_tokens,
+                        relation_tokens=relation_tokens,
+                        action_cache=action_cache,
+                    )
                 out_degrees_flat = policy_out["out_degrees"].view(-1)
                 edge_logits = policy_out["edge_logits"]
                 edge_ids = policy_out["edge_ids"]

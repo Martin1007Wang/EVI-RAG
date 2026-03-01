@@ -19,7 +19,7 @@ trainer:
   # Align optimizer schedule with an 8h CWQ-sub budget (~55k steps observed).
   max_steps: 56000
   check_val_every_n_epoch: 5
-  precision: 32
+  precision: bf16-mixed
 
 callbacks:
   model_checkpoint:

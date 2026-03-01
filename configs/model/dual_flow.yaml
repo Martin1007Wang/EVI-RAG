@@ -45,7 +45,7 @@ policy_cfg:
     num_layers: 2
     dropout: 0.0
     flow_projection_eps: 1.0e-8
-    relation_low_rank: 64
+    relation_low_rank: 16
   priority_head:
     _target_: src.models.configs.policy.PriorityHeadConfig
     hidden_dim: 256

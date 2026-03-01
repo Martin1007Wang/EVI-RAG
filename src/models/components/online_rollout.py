@@ -189,6 +189,14 @@ class OnlineRolloutEngine:
             node_tokens, relation_tokens, question_tokens = policy.encode_context(env_context)
         else:
             node_tokens, relation_tokens, question_tokens = encoded_context
+        build_cache_fn = getattr(policy, "build_action_cache", None)
+        action_cache: dict[str, torch.Tensor | None] | None = None
+        if callable(build_cache_fn):
+            action_cache = build_cache_fn(
+                env_context=env_context,
+                node_tokens=node_tokens,
+                question_tokens=question_tokens,
+            )
 
         for step in range(max_steps):
             if agent_state.done_mask.all():
@@ -196,13 +204,23 @@ class OnlineRolloutEngine:
             active_mask = ~agent_state.done_mask
             active_flat = active_mask.view(-1)
 
-            policy_out = policy.compute_action_scores(
-                env_context=env_context,
-                agent_state=agent_state,
-                node_tokens=node_tokens,
-                question_tokens=question_tokens,
-                relation_tokens=relation_tokens,
-            )
+            if action_cache is None:
+                policy_out = policy.compute_action_scores(
+                    env_context=env_context,
+                    agent_state=agent_state,
+                    node_tokens=node_tokens,
+                    question_tokens=question_tokens,
+                    relation_tokens=relation_tokens,
+                )
+            else:
+                policy_out = policy.compute_action_scores(
+                    env_context=env_context,
+                    agent_state=agent_state,
+                    node_tokens=node_tokens,
+                    question_tokens=question_tokens,
+                    relation_tokens=relation_tokens,
+                    action_cache=action_cache,
+                )
             out_degrees_flat = policy_out["out_degrees"].view(-1)
             if step < stop_min_steps:
                 policy_out = self._mask_stop_logits_for_min_steps(

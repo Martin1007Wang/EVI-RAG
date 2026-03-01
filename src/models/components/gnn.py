@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -103,14 +104,22 @@ class RelationalGNNLayer(nn.Module):
         scale_identity = torch.ones_like(log_deg)
         scale_amplify = log_deg / self.delta
         scale_attenuate = self.delta / log_deg
-        # scales: [N, 3]
-        scales = torch.stack((scale_identity, scale_amplify, scale_attenuate), dim=-1)
-        # [N, 1, D*4] * [N, 3, 1] -> [N, 3, D*4]
-        scaled = stats.unsqueeze(1) * scales.unsqueeze(-1)
-        # 展平为 [N, 12 * D]
-        features = scaled.reshape(num_nodes, -1)
-        features = torch.where(has_in.unsqueeze(-1), features, torch.zeros_like(features))
-        return self.agg_proj(features)
+        stats_dim = int(self.hidden_dim * 4)
+        # 避免显式构造 [N, 3, 4D] / [N, 12D] 大中间张量：
+        # Linear(concat(s_i * stats)) == Σ_i s_i * Linear_i(stats)
+        w_id, w_amp, w_att = self.agg_proj.weight.split(stats_dim, dim=1)
+        proj_id = F.linear(stats, w_id, bias=None)
+        proj_amp = F.linear(stats, w_amp, bias=None)
+        proj_att = F.linear(stats, w_att, bias=None)
+        output = (
+            proj_id * scale_identity.unsqueeze(-1)
+            + proj_amp * scale_amplify.unsqueeze(-1)
+            + proj_att * scale_attenuate.unsqueeze(-1)
+        )
+        if self.agg_proj.bias is not None:
+            output = output + self.agg_proj.bias
+        output = torch.where(has_in.unsqueeze(-1), output, torch.zeros_like(output))
+        return output
 
     def forward(
         self,

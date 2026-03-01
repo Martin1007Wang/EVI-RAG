@@ -27,7 +27,7 @@ class FlowHeadConfig:
     num_layers: int = 2
     dropout: float = 0.0
     flow_projection_eps: float = 1.0e-8
-    relation_low_rank: int = 64
+    relation_low_rank: int = 16
 
 
 @dataclass(frozen=True)
