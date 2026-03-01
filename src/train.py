@@ -64,7 +64,7 @@ def _validate_required_args(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required training inputs: "
             f"{missing_str}. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_dual_flow_base dataset=webqsp-sub"
+            "Example: python src/train.py experiment=train_dual_flow dataset=webqsp-sub"
         )
 
 
@@ -147,6 +147,25 @@ def _validate_cvt_requirements(cfg: DictConfig) -> None:
             )
         if not entity_vocab_path.exists():
             raise FileNotFoundError(f"{source_name} entity_vocab.parquet not found: {entity_vocab_path}")
+
+
+def _enforce_min_rollouts(cfg: DictConfig) -> None:
+    model_cfg = cfg.get("model") or {}
+    model_target = str(model_cfg.get("_target_", "") or "")
+    if model_target != _DUAL_FLOW_MODEL_TARGET:
+        return
+    sampling_cfg = model_cfg.get("sampling_cfg") if isinstance(model_cfg, (dict, DictConfig)) else None
+    if sampling_cfg is None:
+        raise ValueError("DualFlow training requires model.sampling_cfg.")
+    num_rollouts_raw = sampling_cfg.get("num_rollouts") if hasattr(sampling_cfg, "get") else None
+    if num_rollouts_raw is None:
+        raise ValueError("DualFlow training requires model.sampling_cfg.num_rollouts.")
+    num_rollouts = int(num_rollouts_raw)
+    if num_rollouts < 4:
+        raise ValueError(
+            "DualFlow SubTB requires multi-rollout training with num_rollouts >= 4. "
+            f"Got model.sampling_cfg.num_rollouts={num_rollouts}."
+        )
 
 
 @task_wrapper
@@ -247,6 +266,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     _enforce_supported_training_models(cfg)
     _enforce_sub_training_scope(cfg)
     _validate_cvt_requirements(cfg)
+    _enforce_min_rollouts(cfg)
     extras(cfg)
 
     # train the model

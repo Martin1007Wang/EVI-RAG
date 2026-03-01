@@ -1,0 +1,75 @@
+# @package _global_
+#
+# Forward-only DualFlow (SubTB, deterministic backward policy).
+
+defaults:
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /trainer: gpu
+  - _self_
+
+task_name: "train/dual_flow"
+tags: ["dual_flow", "subtb", "forward"]
+
+optimized_metric: "val/${dataset.dataset_scope}/hit@beam"
+
+trainer:
+  # Keep max_epochs as a hard ceiling in trainer/default.yaml; enforce wall-clock budget here.
+  max_time: "00:08:00:00"
+  # Align optimizer schedule with an 8h CWQ-sub budget (~55k steps observed).
+  max_steps: 56000
+  check_val_every_n_epoch: 5
+  precision: 32
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/${dataset.dataset_scope}/hit@beam"
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: "val/${dataset.dataset_scope}/hit@beam"
+    mode: max
+    patience: 10
+    min_delta: 0.002
+
+model:
+  env_cfg:
+    stop:
+      reward_epsilon: 1.0e-6
+      reward_beta_init: 0.6
+      reward_beta_max: 0.8
+      reward_beta_anneal_steps: 20000
+    prior:
+      pb_mode: uniform_in_degree
+
+  sampling_cfg:
+    train_oracle_force_stop: false
+    sampling_temperature: 1.0
+
+  subtb_cfg:
+    lambda_weight: 0.9
+    normalize: true
+    detach_end_flow: true
+    miss_length_penalty: 0.0
+
+  training_cfg:
+    replay_cfg:
+      enabled: true
+      alpha_init: 0.35
+      alpha_final: 0.2
+      alpha_anneal_epochs: 50
+      track_visited_mask: true
+      path_sampling_temperature: 1.0
+      shortest_gap_weight: 1.0
+      revisit_penalty_weight: 0.5
+
+  optimizer_cfg:
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+
+  scheduler_cfg:
+    type: onecycle
+    interval: step
+    t_max: ${trainer.max_steps}
