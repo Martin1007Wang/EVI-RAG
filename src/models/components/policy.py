@@ -92,6 +92,9 @@ class DualFlowPolicy(nn.Module):
         self.flow_projection_eps = float(config.flow_head.flow_projection_eps)
         if self.flow_projection_eps <= 0.0:
             raise ValueError("flow_head.flow_projection_eps must be > 0.")
+        self.relation_low_rank = int(config.flow_head.relation_low_rank)
+        if self.relation_low_rank <= 0:
+            raise ValueError("flow_head.relation_low_rank must be >= 1.")
 
         if config.backbone.use_positional_encoding:
             self.pos_encoder = SinusoidalPositionalEncoding(dim=config.backbone.hidden_dim)
@@ -108,8 +111,10 @@ class DualFlowPolicy(nn.Module):
             num_layers=config.flow_head.num_layers,
             dropout=config.flow_head.dropout,
         )
-        self.query_projection_head = nn.Linear(config.backbone.hidden_dim, config.backbone.hidden_dim, bias=False)
-        self.relation_projection_head = nn.Linear(config.backbone.hidden_dim, config.backbone.hidden_dim, bias=False)
+        hidden_dim = int(config.backbone.hidden_dim)
+        self.query_projection_head = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.relation_low_rank_left = nn.Linear(hidden_dim, hidden_dim * self.relation_low_rank, bias=False)
+        self.relation_low_rank_right = nn.Linear(hidden_dim, self.relation_low_rank * hidden_dim, bias=False)
         self.node_priority_head = NodePriorityHead(
             node_dim=config.backbone.hidden_dim,
             question_dim=config.backbone.hidden_dim,
@@ -165,6 +170,35 @@ class DualFlowPolicy(nn.Module):
 
     def _predict_vector_flow_from_nodes(self, node_features: torch.Tensor) -> torch.Tensor:
         return self.flow_head(node_features)
+
+    def _apply_relation_low_rank_transform(
+        self,
+        *,
+        relation_features: torch.Tensor,
+        vector_flow: torch.Tensor,
+    ) -> torch.Tensor:
+        if relation_features.dim() != 2 or vector_flow.dim() != 2:
+            raise ValueError(
+                "relation_features and vector_flow must be 2D tensors: "
+                f"got relation={tuple(relation_features.shape)}, flow={tuple(vector_flow.shape)}."
+            )
+        if relation_features.size(0) != vector_flow.size(0):
+            raise ValueError(
+                "relation_features and vector_flow batch size mismatch: "
+                f"relation={tuple(relation_features.shape)}, flow={tuple(vector_flow.shape)}."
+            )
+
+        edge_count = int(vector_flow.size(0))
+        hidden_dim = int(vector_flow.size(1))
+        rank = self.relation_low_rank
+
+        # W_r = I + U_r V_r, where U_r ∈ R^{d x k}, V_r ∈ R^{k x d}.
+        left = self.relation_low_rank_left(relation_features).view(edge_count, hidden_dim, rank)
+        right = self.relation_low_rank_right(relation_features).view(edge_count, rank, hidden_dim)
+        vector_col = vector_flow.unsqueeze(-1)
+        low_rank_delta = torch.bmm(left, torch.bmm(right, vector_col)).squeeze(-1)
+        transformed = vector_flow + low_rank_delta
+        return F.softplus(transformed)
 
     @staticmethod
     def _build_topk_node_keep_mask(
@@ -248,8 +282,10 @@ class DualFlowPolicy(nn.Module):
         question_gate = torch.softmax(self.query_projection_head(next_question), dim=-1)
         next_vector_flow = vector_flow.index_select(0, target_nodes)
         edge_rel_features = relation_tokens.index_select(0, edge_relations)
-        relation_scale = F.softplus(self.relation_projection_head(edge_rel_features))
-        transformed_next = next_vector_flow * relation_scale
+        transformed_next = self._apply_relation_low_rank_transform(
+            relation_features=edge_rel_features,
+            vector_flow=next_vector_flow,
+        )
         projected_flow = (question_gate * transformed_next).sum(dim=-1)
         projected_flow = projected_flow.clamp(min=self.flow_projection_eps)
 
