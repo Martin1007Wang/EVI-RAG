@@ -222,7 +222,6 @@ class DualFlowModule(LightningModule):
         current_beta: float,
     ) -> dict[str, torch.Tensor]:
         return {
-            "train/qcbia_alpha": self.policy.current_qcbia_alpha(device=loss.device, dtype=loss.dtype),
             "train/reward_beta": torch.tensor(current_beta, device=loss.device, dtype=loss.dtype),
             "train/replay_alpha": torch.tensor(replay_alpha, device=loss.device, dtype=loss.dtype),
             "train/replay_offline_ratio": replay_offline_ratio.to(device=loss.device, dtype=loss.dtype),

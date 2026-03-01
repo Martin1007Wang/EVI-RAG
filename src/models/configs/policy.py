@@ -26,7 +26,7 @@ class FlowHeadConfig:
     hidden_dim: int = 256
     num_layers: int = 2
     dropout: float = 0.0
-    qcbia_alpha_init: float = 1.0
+    flow_projection_eps: float = 1.0e-8
 
 
 @dataclass(frozen=True)

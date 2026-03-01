@@ -44,7 +44,7 @@ policy_cfg:
     hidden_dim: 512
     num_layers: 2
     dropout: 0.0
-    qcbia_alpha_init: 1.0
+    flow_projection_eps: 1.0e-8
   priority_head:
     _target_: src.models.configs.policy.PriorityHeadConfig
     hidden_dim: 256

@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from src.models.configs.policy import PolicyConfig
@@ -21,26 +22,19 @@ from .positional_encoding import SinusoidalPositionalEncoding
 
 
 class FlowHead(nn.Module):
-    """状态流预测头: log F(s_t) = alpha * (q^T W h_v) + residual(h_v)"""
+    """向量流预测头: 生成节点语义流向量 vecF(v) ∈ R_+^d。"""
 
     def __init__(
         self,
         *,
         node_dim: int,
-        question_dim: int,
         hidden_dim: int,
         num_layers: int,
         dropout: float,
-        qcbia_alpha_init: float,
     ) -> None:
         super().__init__()
         if num_layers < 1:
             raise ValueError("flow_head.num_layers must be >= 1.")
-        if qcbia_alpha_init <= 0:
-            raise ValueError("flow_head.qcbia_alpha_init must be > 0.")
-
-        self.qcbia_proj = nn.Linear(node_dim, question_dim, bias=False)
-        self.qcbia_log_alpha = nn.Parameter(torch.tensor(math.log(float(qcbia_alpha_init)), dtype=torch.float32))
 
         layers: list[nn.Module] = []
         in_dim = int(node_dim)
@@ -50,21 +44,12 @@ class FlowHead(nn.Module):
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, 1))
-        self.residual = nn.Sequential(*layers)
+        layers.append(nn.Linear(in_dim, node_dim))
+        self.net = nn.Sequential(*layers)
 
-    def forward(self, node_features: torch.Tensor, question_features: torch.Tensor) -> torch.Tensor:
-        # 【核心修复 1】：引入缩放点积，消除 1024 维带来的方差爆炸
-        qcbia_score = (question_features * self.qcbia_proj(node_features)).sum(dim=-1)
-        scale = math.sqrt(question_features.size(-1))
-        qcbia_score = qcbia_score / scale
-
-        alpha = torch.exp(self.qcbia_log_alpha).to(device=node_features.device, dtype=node_features.dtype)
-        residual = self.residual(node_features).squeeze(-1)
-        return alpha * qcbia_score + residual
-
-    def qcbia_alpha(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return torch.exp(self.qcbia_log_alpha).to(device=device, dtype=dtype)
+    def forward(self, node_features: torch.Tensor) -> torch.Tensor:
+        # 使用 softplus 确保向量流为正值，便于 log/概率映射。
+        return F.softplus(self.net(node_features))
 
 
 class NodePriorityHead(nn.Module):
@@ -104,6 +89,9 @@ class DualFlowPolicy(nn.Module):
         self.config = config
         self.backbone = EmbeddingBackbone(config.backbone)
         self.backward_prior = StructuralBackwardPrior(mode=backward_prior_mode)
+        self.flow_projection_eps = float(config.flow_head.flow_projection_eps)
+        if self.flow_projection_eps <= 0.0:
+            raise ValueError("flow_head.flow_projection_eps must be > 0.")
 
         if config.backbone.use_positional_encoding:
             self.pos_encoder = SinusoidalPositionalEncoding(dim=config.backbone.hidden_dim)
@@ -116,12 +104,12 @@ class DualFlowPolicy(nn.Module):
         )
         self.flow_head = FlowHead(
             node_dim=config.backbone.hidden_dim,
-            question_dim=config.backbone.hidden_dim,
             hidden_dim=config.flow_head.hidden_dim,
             num_layers=config.flow_head.num_layers,
             dropout=config.flow_head.dropout,
-            qcbia_alpha_init=config.flow_head.qcbia_alpha_init,
         )
+        self.query_projection_head = nn.Linear(config.backbone.hidden_dim, config.backbone.hidden_dim, bias=False)
+        self.relation_projection_head = nn.Linear(config.backbone.hidden_dim, config.backbone.hidden_dim, bias=False)
         self.node_priority_head = NodePriorityHead(
             node_dim=config.backbone.hidden_dim,
             question_dim=config.backbone.hidden_dim,
@@ -149,9 +137,6 @@ class DualFlowPolicy(nn.Module):
             raise ValueError("policy_cfg.topk_prune_eval_k must be >= 0.")
         self._train_step = 0
 
-    def current_qcbia_alpha(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return self.flow_head.qcbia_alpha(device=device, dtype=dtype)
-
     def encode_context(self, context: GraphEnvContext) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         静态环境编码
@@ -178,8 +163,8 @@ class DualFlowPolicy(nn.Module):
         step_tensor = torch.full((hidden.size(0),), step_t, device=hidden.device)
         return hidden + self.pos_encoder(step_tensor)
 
-    def _predict_log_f_from_node(self, node_features: torch.Tensor, question_features: torch.Tensor) -> torch.Tensor:
-        return self.flow_head(node_features, question_features)
+    def _predict_vector_flow_from_nodes(self, node_features: torch.Tensor) -> torch.Tensor:
+        return self.flow_head(node_features)
 
     @staticmethod
     def _build_topk_node_keep_mask(
@@ -243,6 +228,9 @@ class DualFlowPolicy(nn.Module):
         question_tokens: torch.Tensor,
         target_nodes: torch.Tensor,
         out_degrees: torch.Tensor,
+        edge_relations: torch.Tensor,
+        relation_tokens: torch.Tensor,
+        vector_flow: torch.Tensor,
         node_priority_keep_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, num_agents = agent_state.current_nodes.shape
@@ -254,20 +242,25 @@ class DualFlowPolicy(nn.Module):
         edge_graph_ids = agent_batch.index_select(0, edge_agent_batch)
         source_nodes = flat_curr_nodes.index_select(0, edge_agent_batch)
 
-        # Strict lookahead policy:
-        # logit(u->v) = log P_B(u|v) + log F(v)
+        # 向量流策略：
+        # logit(u->v,r;q) = log P_B(u|v) + log <g(q), W_r vecF(v)>
         next_question = question_tokens.index_select(0, edge_graph_ids)
-        next_node_features = node_tokens.index_select(0, target_nodes)
-        log_f_next = self._predict_log_f_from_node(next_node_features, next_question)
+        question_gate = torch.softmax(self.query_projection_head(next_question), dim=-1)
+        next_vector_flow = vector_flow.index_select(0, target_nodes)
+        edge_rel_features = relation_tokens.index_select(0, edge_relations)
+        relation_scale = F.softplus(self.relation_projection_head(edge_rel_features))
+        transformed_next = next_vector_flow * relation_scale
+        projected_flow = (question_gate * transformed_next).sum(dim=-1)
+        projected_flow = projected_flow.clamp(min=self.flow_projection_eps)
 
         log_pb_prior = self.backward_prior.log_prob_edges(
             env_context=env_context,
             source_nodes=source_nodes,
             target_nodes=target_nodes,
             edge_graph_ids=edge_graph_ids,
-            dtype=log_f_next.dtype,
+            dtype=node_tokens.dtype,
         )
-        edge_logits = log_pb_prior + log_f_next
+        edge_logits = log_pb_prior + torch.log(projected_flow)
 
         visited = agent_state.visited_mask
         if visited.dim() == 1:
@@ -312,20 +305,6 @@ class DualFlowPolicy(nn.Module):
 
         return stop_logits
 
-    def compute_state_flow(
-        self,
-        agent_state: DynamicAgentState,
-        question_tokens: torch.Tensor,
-        node_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        B, num_agents = agent_state.current_nodes.shape
-        current_nodes = agent_state.current_nodes.view(-1).clamp(min=0)
-        agent_batch = torch.arange(B, device=current_nodes.device).repeat_interleave(num_agents)
-        q_features = question_tokens.index_select(0, agent_batch)
-        node_features = node_tokens.index_select(0, current_nodes)
-        log_f = self._predict_log_f_from_node(node_features, q_features)
-        return log_f.view(B, num_agents)
-
     def _gather_actions_from_csr_lock_free(
         self,
         adj_t: torch.Tensor,
@@ -366,7 +345,6 @@ class DualFlowPolicy(nn.Module):
         question_tokens: torch.Tensor,
         relation_tokens: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        del relation_tokens
         B, num_agents = agent_state.current_nodes.shape
         flat_curr_nodes = agent_state.current_nodes.view(-1)
         flat_active_mask = ~agent_state.done_mask.view(-1)
@@ -374,6 +352,7 @@ class DualFlowPolicy(nn.Module):
 
         topk_prune_k = self._resolve_topk_prune_k()
         node_priority_keep_mask: torch.Tensor | None = None
+        vector_flow = self._predict_vector_flow_from_nodes(node_tokens)
         if topk_prune_k > 0:
             node_priority_scores = self.compute_node_priority_scores(
                 env_context=env_context,
@@ -400,6 +379,9 @@ class DualFlowPolicy(nn.Module):
             question_tokens=question_tokens,
             target_nodes=target_nodes,
             out_degrees=out_degrees,
+            edge_relations=env_context.edge_relations.index_select(0, edge_ids.clamp(min=0)),
+            relation_tokens=relation_tokens,
+            vector_flow=vector_flow,
             node_priority_keep_mask=node_priority_keep_mask,
         )
 
