@@ -67,7 +67,9 @@ class RelationalGNNLayer(nn.Module):
         # 3. 数值安全的 Std (避免 catastrophic cancellation)
         # 计算 (x_i - mean_j)^2，然后再聚合求均值开根号
         mean_gathered = mean.index_select(0, tails)
-        diff_sq = (messages - mean_gathered).square()
+        # In mixed precision, square can be promoted to fp32 while var_sum keeps fp16/bf16.
+        # Force dtype alignment for scatter_add_ to avoid runtime dtype mismatch.
+        diff_sq = (messages - mean_gathered).square().to(dtype=dtype)
         var_sum = torch.zeros((num_nodes, hidden_dim), device=device, dtype=dtype)
         var_sum.scatter_add_(0, tails.unsqueeze(-1).expand(-1, hidden_dim), diff_sq)
         var = var_sum / deg_safe
