@@ -20,6 +20,7 @@ trainer:
   max_steps: 56000
   check_val_every_n_epoch: 5
   precision: bf16-mixed
+  gradient_clip_val: 0.5
 
 callbacks:
   model_checkpoint:
@@ -37,39 +38,40 @@ callbacks:
 model:
   env_cfg:
     stop:
-      reward_epsilon: 1.0e-6
+      reward_epsilon: 1.0e-5
+      distance_reward_gamma: 0.8
       reward_beta_init: 0.6
-      reward_beta_max: 0.8
-      reward_beta_anneal_steps: 20000
+      reward_beta_max: 1.0
+      reward_beta_anneal_steps: 12000
+      reward_beta_anneal_start_step: 1000
+      reward_beta_schedule: linear
     prior:
       pb_mode: uniform_in_degree
 
   sampling_cfg:
+    num_rollouts: 4
+    stop_min_steps: 1
     train_oracle_force_stop: false
     sampling_temperature: 1.0
 
+  eval_cfg:
+    beam_size: 8
+
   subtb_cfg:
-    lambda_weight: 0.9
+    lambda_weight: 0.8
     normalize: true
     detach_end_flow: true
     miss_length_penalty: 0.0
-
-  training_cfg:
-    replay_cfg:
-      enabled: true
-      alpha_init: 0.35
-      alpha_final: 0.2
-      alpha_anneal_epochs: 50
-      track_visited_mask: true
-      path_sampling_temperature: 1.0
-      shortest_gap_weight: 1.0
-      revisit_penalty_weight: 0.5
+    ranking_weight: 0.0
+    ranking_temperature: 1.0
+    backward_weight: 0.3
 
   optimizer_cfg:
-    lr: 1.0e-4
+    lr: 5.0e-5
     weight_decay: 1.0e-4
 
   scheduler_cfg:
-    type: onecycle
+    type: cosine
     interval: step
     t_max: ${trainer.max_steps}
+    eta_min: 1.0e-6

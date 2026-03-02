@@ -12,6 +12,7 @@ class StopConfig:
     enabled: bool = True
     reward_base: float = 1.0
     reward_epsilon: float = 1e-6
+    distance_reward_gamma: float = 0.8
     reward_beta_init: float = 0.6
     reward_beta_max: float = 1.0
     reward_beta_anneal_steps: int = 8000

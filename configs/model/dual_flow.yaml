@@ -17,9 +17,10 @@ env_cfg:
     enabled: true
     reward_base: 1.0
     reward_epsilon: 1.0e-4
+    distance_reward_gamma: 0.8
     reward_beta_init: 0.6
-    reward_beta_max: 1.0
-    reward_beta_anneal_steps: 8000
+    reward_beta_max: 0.6
+    reward_beta_anneal_steps: 0
     reward_beta_anneal_start_step: 0
     reward_beta_schedule: linear
     degree_penalty_alpha: 0.0
@@ -44,19 +45,16 @@ policy_cfg:
     hidden_dim: 512
     num_layers: 2
     dropout: 0.0
-    flow_projection_eps: 1.0e-8
     relation_low_rank: 16
+    relation_low_rank_edge_chunk_size: 8192
   priority_head:
     _target_: src.models.configs.policy.PriorityHeadConfig
     hidden_dim: 256
     num_layers: 2
     dropout: 0.0
-  stop_bias_init: -10.0
-  topk_prune_train_k: 0
-  topk_prune_train_k_final: 256
-  topk_prune_warmup_steps: 2000
-  topk_prune_anneal_steps: 8000
-  topk_prune_eval_k: 256
+  stop_bias_init: -1.5
+  stop_delta_scale: 2.0
+  stop_delta_temperature: 1.0
 
 sampling_cfg:
   _target_: src.models.configs.search.RolloutConfig
@@ -83,34 +81,13 @@ subtb_cfg:
   lambda_weight: 0.9
   normalize: true
   detach_end_flow: true
-  boundary_weight: 0.2
   miss_length_penalty: 0.0
-  ranking_weight: 0.2
-  ranking_listwise_weight: 0.5
-  ranking_bce_weight: 1.0
-  ranking_hard_negative_k: 64
-  ranking_margin: 0.1
+  ranking_weight: 0.0
   ranking_temperature: 1.0
+  backward_weight: 0.0
 
 training_cfg:
   _target_: src.models.configs.training.TrainingConfig
-  replay_cfg:
-    _target_: src.models.configs.training.ReplayBufferConfig
-    enabled: true
-    alpha_init: 0.35
-    alpha_final: 0.1
-    alpha_anneal_epochs: 20
-    max_paths_per_pair: 24
-    max_paths_per_graph: 256
-    max_shortest_paths_per_pair: 4
-    max_dfs_paths_per_pair: 12
-    max_depth: ${dataset.max_steps}
-    allow_cycles: true
-    max_node_visits: 2
-    track_visited_mask: true
-    path_sampling_temperature: 1.0
-    shortest_gap_weight: 1.0
-    revisit_penalty_weight: 0.5
 
 optimizer_cfg:
   _target_: src.models.configs.training.OptimizerConfig

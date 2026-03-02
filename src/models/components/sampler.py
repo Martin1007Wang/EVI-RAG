@@ -29,6 +29,28 @@ class ActionSampler(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
+    @staticmethod
+    def _sanitize_logits(
+        *,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if logits.dim() != 2:
+            raise ValueError(f"logits must be 2D [num_rows, num_actions], got {tuple(logits.shape)}")
+        if int(logits.size(1)) == 0:
+            raise ValueError("logits must contain at least one action column.")
+        has_finite = torch.isfinite(logits).any(dim=1)
+        has_nan = torch.isnan(logits).any(dim=1)
+        has_pos_inf = torch.isposinf(logits).any(dim=1)
+        invalid_rows = has_nan | has_pos_inf | (~has_finite)
+        if not bool(invalid_rows.any().item()):
+            return logits
+        safe_logits = logits.clone()
+        neg_inf = torch.tensor(float("-inf"), device=logits.device, dtype=logits.dtype)
+        stop_index = int(logits.size(1)) - 1
+        safe_logits[invalid_rows] = neg_inf
+        safe_logits[invalid_rows, stop_index] = 0.0
+        return safe_logits
+
     def forward(
         self,
         policy_output: dict[str, torch.Tensor],
@@ -62,6 +84,7 @@ class ActionSampler(nn.Module):
             padded_logits[mask] = edge_logits
 
         final_logits = torch.cat([padded_logits, stop_logits], dim=-1)
+        final_logits = self._sanitize_logits(logits=final_logits)
         log_partition = torch.logsumexp(final_logits, dim=-1)
 
         if temperature is not None:
@@ -81,7 +104,7 @@ class ActionSampler(nn.Module):
             action_idx = final_logits.argmax(dim=-1)
         else:
             scaled_logits = final_logits / actual_temp
-            dist = torch.distributions.Categorical(logits=scaled_logits)
+            dist = torch.distributions.Categorical(logits=scaled_logits, validate_args=False)
             if not is_training and eval_sample_without_replacement:
                 action_idx = self._sample_eval_actions_without_replacement(
                     final_logits=scaled_logits,
@@ -113,7 +136,7 @@ class ActionSampler(nn.Module):
         chosen_edge_ids = torch.where(is_stop, torch.full_like(chosen_edge_ids, -1), chosen_edge_ids)
         chosen_target_nodes = torch.where(is_stop, torch.zeros_like(chosen_target_nodes), chosen_target_nodes)
 
-        true_dist = torch.distributions.Categorical(logits=final_logits)
+        true_dist = torch.distributions.Categorical(logits=final_logits, validate_args=False)
         return {
             "is_stop": is_stop,
             "chosen_edge_ids": chosen_edge_ids,
@@ -151,7 +174,10 @@ class ActionSampler(nn.Module):
             return action_idx
 
         if not enable_grouped_without_replacement or agent_graph_ids is None or source_nodes is None:
-            sampled = torch.distributions.Categorical(logits=final_logits.index_select(0, active_rows)).sample()
+            sampled = torch.distributions.Categorical(
+                logits=final_logits.index_select(0, active_rows),
+                validate_args=False,
+            ).sample()
             action_idx[active_rows] = sampled
             return action_idx
 

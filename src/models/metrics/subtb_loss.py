@@ -1,7 +1,7 @@
 # src/models/metrics/subtb_loss.py
 """
 [系统实体] Sub-Trajectory Balance Loss
-线性时间版本，显式约束子轨迹残差并附加边界锚定项。
+线性时间版本，显式约束子轨迹残差。
 """
 from __future__ import annotations
 import torch
@@ -243,39 +243,18 @@ class SubTrajectoryBalanceLoss(nn.Module):
             std_x = rollout_tb_mean[valid_mask].std(unbiased=False)
         else:
             std_x = rollout_tb_mean.new_zeros(())
-        valid_float = valid_mask.to(dtype=rollout_tb_mean.dtype)
-        valid_count = valid_float.sum(dim=1)
-        graph_valid = valid_count > 0
 
-        # Boundary anchor: enforce x_0 \approx x_T in addition to variance minimization.
-        end_idx = terminal_indices.clamp(min=0, max=x_values.size(-1) - 1).unsqueeze(-1)
-        x_start = x_values[..., 0]
-        x_end = x_values.gather(dim=-1, index=end_idx).squeeze(-1)
-        boundary_residual = torch.where(valid_mask, x_end - x_start, torch.zeros_like(x_start))
-        if bool(valid_mask.any().item()):
-            boundary_loss = boundary_residual[valid_mask].square().mean()
-            boundary_abs = boundary_residual[valid_mask].abs().mean()
-        else:
-            boundary_loss = rollout_tb_mean.new_zeros(())
-            boundary_abs = rollout_tb_mean.new_zeros(())
-
-        boundary_weight = float(self.config.boundary_weight)
-        loss = var_loss + boundary_weight * boundary_loss
+        loss = var_loss
         if not torch.isfinite(loss):
             raise RuntimeError("Non-finite loss detected in SubTB. Check log_f/log_pf/log_pb.")
         metrics = {
             "subtb/loss": loss.detach(),
             "subtb/var_loss": var_loss.detach(),
             "subtb/subtraj_residual_abs": residual_abs.detach(),
-            "subtb/boundary_loss": boundary_loss.detach(),
-            "subtb/boundary_abs": boundary_abs.detach(),
             "subtb/log_r_mean": log_r[valid_mask].mean().detach(),
             "subtb/tb_diff_mean": rollout_tb_mean[valid_mask].mean().detach(),
             "subtb/tb_diff_std": std_x.detach(),
             "rollout/num_moves_mean": move_lengths[valid_mask].float().mean().detach(),
-            "rollout/valid_ratio": (valid_mask.sum().float() / valid_mask.numel()).detach(),
-            "rollout/per_graph_valid_ratio": graph_valid.float().mean().detach(),
-            "rollout/num_rollouts": torch.tensor(float(lengths.size(1)), device=device),
         }
         return loss, metrics
 

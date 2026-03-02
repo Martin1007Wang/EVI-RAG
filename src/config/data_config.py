@@ -39,6 +39,9 @@ def build_embedding_cfg(cfg) -> Optional[EmbeddingConfig]:
     if not encoder:
         return None
     canonicalize_relations = bool(cfg.get("canonicalize_relations", False))
+    question_ctx_max_tokens = int(cfg.get("question_ctx_max_tokens", 0))
+    if question_ctx_max_tokens < 0:
+        raise ValueError(f"question_ctx_max_tokens must be >= 0, got {question_ctx_max_tokens}.")
     embeddings_out_dir_cfg = cfg.get("embeddings_out_dir")
     if not embeddings_out_dir_cfg:
         raise ValueError("embeddings_out_dir must be set when embedding encoding is enabled.")
@@ -55,6 +58,7 @@ def build_embedding_cfg(cfg) -> Optional[EmbeddingConfig]:
         embeddings_out_dir=Path(hydra.utils.to_absolute_path(embeddings_out_dir_cfg)),
         canonicalize_relations=canonicalize_relations,
         cosine_eps=float(cfg.get("cosine_eps", _DEFAULT_COSINE_EPS)),
+        question_ctx_max_tokens=question_ctx_max_tokens,
     )
 
 

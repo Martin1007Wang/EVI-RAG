@@ -110,14 +110,13 @@ class GRetrievalDataset(Dataset):
         node_global_ids = raw["node_global_ids"]
         node_embedding_ids = raw["node_embedding_ids"]
         question_emb = raw["question_emb"]
+        question_ctx = raw.get("question_ctx")
+        question_ctx_mask = raw.get("question_ctx_mask")
 
         answer_ids = raw["answer_entity_ids"]
 
         q_local_indices = raw["q_local_indices"]
         a_local_indices = raw["a_local_indices"]
-        replay_start_local = raw.get("replay_start_local")
-        replay_path_lengths = raw.get("replay_path_lengths")
-        replay_edge_local_ids = raw.get("replay_edge_local_ids")
         a_entity_in_graph = bool(torch.as_tensor(a_local_indices).numel() > 0)
         data_kwargs: Dict[str, Any] = {
             "num_nodes": num_nodes,
@@ -132,15 +131,10 @@ class GRetrievalDataset(Dataset):
             "sample_id": sample_id,
             "a_entity_in_graph": a_entity_in_graph,
         }
-        if replay_start_local is not None or replay_path_lengths is not None or replay_edge_local_ids is not None:
-            if replay_start_local is None or replay_path_lengths is None or replay_edge_local_ids is None:
-                raise ValueError(
-                    "Replay oracle fields must be all present or all absent in LMDB sample "
-                    f"(sample_id={sample_id})."
-                )
-            data_kwargs["replay_start_local"] = replay_start_local
-            data_kwargs["replay_path_lengths"] = replay_path_lengths
-            data_kwargs["replay_edge_local_ids"] = replay_edge_local_ids
+        if question_ctx is not None:
+            data_kwargs["question_ctx"] = question_ctx
+        if question_ctx_mask is not None:
+            data_kwargs["question_ctx_mask"] = question_ctx_mask
         heuristic_log_v = self.heuristic_log_v
         if heuristic_log_v is not None:
             node_ids = torch.as_tensor(node_global_ids, dtype=torch.long).view(-1)

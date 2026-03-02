@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from lightning import LightningModule
 
 from src.models.batch_adapter import DualFlowBatchAdapter
-from src.models.components.high_energy_replay import HighEnergyReplayBuffer
 from src.models.components.policy import DualFlowPolicy
 from src.models.components.sampler import RolloutResult, RolloutSampler
 from src.models.configs.dual_flow_cfg import DualFlowConfig
@@ -63,7 +61,6 @@ class DualFlowModule(LightningModule):
             backward_prior_mode=self.cfg.sampling_cfg.backward_prior_mode,
         )
         self.sampler = RolloutSampler(self.cfg.sampling_cfg)
-        self.replay_buffer = HighEnergyReplayBuffer(self.cfg.training_cfg.replay_cfg)
         self.subtb_loss_fn = SubTrajectoryBalanceLoss(self.cfg.subtb_cfg)
         self.batch_adapter = DualFlowBatchAdapter(super_source_enabled=bool(self.cfg.env_cfg.super_source_enabled))
         self.reward_engine = DualFlowRewardEngine(stop_cfg=self.cfg.env_cfg.stop)
@@ -86,149 +83,152 @@ class DualFlowModule(LightningModule):
         hit_mask_online = self.compute_hit_mask(online_rollout.stop_nodes, base_context)
         return online_rollout, rewards_online_raw, hit_mask_online, reward_metrics_online, encoded_context
 
-    def _apply_replay_rollout_mix(
+    @staticmethod
+    def _prefix_metric_namespace(
+        metrics: dict[str, torch.Tensor],
+        *,
+        namespace: str,
+    ) -> dict[str, torch.Tensor]:
+        return {f"{namespace}/{key}": value for key, value in metrics.items()}
+
+    @staticmethod
+    def _sample_uniform_start_nodes(
+        *,
+        local_indices: torch.Tensor,
+        ptr: torch.Tensor,
+        num_graphs: int,
+        device: torch.device,
+        field_name: str,
+        require_non_empty: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if ptr.dim() != 1 or int(ptr.numel()) != num_graphs + 1:
+            raise ValueError(f"{field_name}_ptr must have shape [B+1], got {tuple(ptr.shape)} for B={num_graphs}.")
+        counts = (ptr[1:] - ptr[:-1]).to(device=device, dtype=torch.long)
+        valid_graph = counts > 0
+        if require_non_empty and bool((~valid_graph).any().item()):
+            raise ValueError(f"{field_name} must be non-empty for every graph when backward_weight > 0.")
+        starts = torch.zeros((num_graphs,), dtype=torch.long, device=device)
+        if int(local_indices.numel()) == 0:
+            return starts, valid_graph
+        safe_counts = counts.clamp(min=1)
+        rand = torch.rand((num_graphs,), device=device, dtype=torch.float32)
+        offsets = torch.floor(rand * safe_counts.to(dtype=torch.float32)).to(dtype=torch.long)
+        base = ptr[:-1].to(device=device, dtype=torch.long)
+        flat_idx = (base + offsets).clamp(min=0, max=int(local_indices.numel()) - 1)
+        gathered = local_indices.to(device=device, dtype=torch.long).index_select(0, flat_idx)
+        starts = torch.where(valid_graph, gathered, starts)
+        return starts, valid_graph
+
+    def _sample_backward_rollout(
         self,
         *,
         base_context: GraphEnvContext,
         encoded_context: EncodedPolicyContext,
-        online_rollout: RolloutResult,
-        rewards_online_raw: torch.Tensor,
-        hit_mask_online: torch.Tensor,
-        reward_metrics_online: dict[str, torch.Tensor],
-        replay_alpha: float,
-    ) -> tuple[
-        RolloutResult,
-        torch.Tensor,
-        torch.Tensor,
-        dict[str, torch.Tensor],
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        replay_offline_ratio = torch.tensor(0.0, device=self.device)
-        replay_invalid_ratio = torch.tensor(0.0, device=self.device)
-        replay_oracle_graph_ratio = torch.tensor(0.0, device=self.device)
-        mixed_rollout = online_rollout
-        rewards_raw = rewards_online_raw
-        hit_mask = hit_mask_online
-        reward_metrics: dict[str, torch.Tensor] = {}
-        for key, value in reward_metrics_online.items():
-            reward_metrics[f"train/online/{key}"] = value
-
-        # Keep train/reward/* aligned with the rollout used for the training loss.
-        def attach_final_metrics(final_metrics: dict[str, torch.Tensor]) -> None:
-            for key, value in final_metrics.items():
-                reward_metrics[key] = value
-                reward_metrics[f"train/final/{key}"] = value
-
-        attach_final_metrics(reward_metrics_online)
-
-        replay_cfg = self.cfg.training_cfg.replay_cfg
-        if not bool(replay_cfg.enabled):
-            return (
-                mixed_rollout,
-                rewards_raw,
-                hit_mask,
-                reward_metrics,
-                replay_offline_ratio,
-                replay_invalid_ratio,
-                replay_oracle_graph_ratio,
-            )
-
-        replay_batch = self.replay_buffer.build_and_sample(
-            context=base_context,
-            num_rollouts=int(self.cfg.sampling_cfg.num_rollouts),
-            max_steps=int(self.cfg.sampling_cfg.max_steps),
-            alpha=replay_alpha,
-            stop_min_steps=int(self.cfg.sampling_cfg.stop_min_steps),
+        current_beta: float,
+    ) -> tuple[RolloutResult, torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        num_graphs = int(base_context.num_graphs)
+        a_counts = (base_context.a_ptr[1:] - base_context.a_ptr[:-1]).to(device=self.device, dtype=torch.long)
+        valid_start_graph = a_counts > 0
+        if bool((~valid_start_graph).any().item()):
+            raise ValueError("a_local_indices must be non-empty for every graph when backward_weight > 0.")
+        start_local_bwd, valid_start_graph = self._sample_uniform_start_nodes(
+            local_indices=base_context.a_local_indices,
+            ptr=base_context.a_ptr,
+            num_graphs=num_graphs,
             device=self.device,
+            field_name="a_local_indices",
+            require_non_empty=True,
         )
-        replay_mask_raw = replay_batch.use_offline_mask.to(device=self.device, dtype=torch.bool)
-        replay_mask = replay_mask_raw
-        replay_oracle_graph_ratio = replay_batch.graph_has_oracle.float().mean()
-        if not bool(replay_mask_raw.any().item()):
-            return (
-                mixed_rollout,
-                rewards_raw,
-                hit_mask,
-                reward_metrics,
-                replay_offline_ratio,
-                replay_invalid_ratio,
-                replay_oracle_graph_ratio,
-            )
-
-        replay_rollout = self.sampler.evaluate_forced_paths(
-            env_context=base_context,
-            policy=self.policy,
-            start_local_indices=replay_batch.start_local_indices,
-            forced_edge_ids=replay_batch.edge_ids,
-            path_lengths=replay_batch.path_lengths,
-            collect_traces=True,
-            use_visited_mask=bool(replay_cfg.track_visited_mask),
+        _, valid_target_graph = self._sample_uniform_start_nodes(
+            local_indices=base_context.q_local_indices,
+            ptr=base_context.q_ptr,
+            num_graphs=num_graphs,
+            device=self.device,
+            field_name="q_local_indices",
+            require_non_empty=True,
+        )
+        valid_graph = valid_start_graph & valid_target_graph
+        # Backward rollout must walk reversed graph edges (adj_t_bwd as rollout topology).
+        bwd_context = replace(
+            base_context,
+            start_local_indices=start_local_bwd,
+            adj_t_fwd=base_context.adj_t_bwd,
+            adj_t_bwd=base_context.adj_t_fwd,
+        )
+        bwd_rollout = self.sampler.sample_forward(
+            bwd_context,
+            self.policy,
+            deterministic=False,
             encoded_context=encoded_context,
         )
-        if replay_rollout.valid_mask is not None:
-            replay_valid_mask = replay_rollout.valid_mask.to(device=self.device, dtype=torch.bool)
-            if tuple(replay_valid_mask.shape) != tuple(replay_mask_raw.shape):
-                raise ValueError(
-                    "Replay valid_mask shape mismatch: "
-                    f"got={tuple(replay_valid_mask.shape)} expected={tuple(replay_mask_raw.shape)}."
-                )
-            replay_mask = replay_mask_raw & replay_valid_mask
-            replay_invalid_ratio = (replay_mask_raw & (~replay_valid_mask)).float().mean()
-        replay_offline_ratio = replay_mask.float().mean()
-        if not bool(replay_mask.any().item()):
-            return (
-                mixed_rollout,
-                rewards_raw,
-                hit_mask,
-                reward_metrics,
-                replay_offline_ratio,
-                replay_invalid_ratio,
-                replay_oracle_graph_ratio,
-            )
+        num_rollouts = int(bwd_rollout.stop_nodes.size(1))
+        valid_by_graph = valid_graph.view(num_graphs, 1).expand(num_graphs, num_rollouts)
+        if bwd_rollout.valid_mask is None:
+            bwd_valid_mask = valid_by_graph
+        else:
+            bwd_valid_mask = bwd_rollout.valid_mask.to(device=self.device, dtype=torch.bool) & valid_by_graph
+        bwd_rollout = replace(bwd_rollout, valid_mask=bwd_valid_mask)
+        bwd_rewards_raw, bwd_reward_metrics = self.compute_rewards(
+            stop_nodes_abs=bwd_rollout.stop_nodes,
+            context=base_context,
+            reward_beta=current_beta,
+            target_local_indices=base_context.q_local_indices,
+            target_ptr=base_context.q_ptr,
+            target_field_name="q_local_indices",
+        )
+        bwd_hit_mask = self.compute_hit_mask(
+            bwd_rollout.stop_nodes,
+            base_context,
+            target_local_indices=base_context.q_local_indices,
+            target_ptr=base_context.q_ptr,
+            target_field_name="q_local_indices",
+        )
+        bwd_valid_ratio = bwd_valid_mask.float().mean()
+        return bwd_rollout, bwd_rewards_raw, bwd_hit_mask, bwd_reward_metrics, bwd_valid_ratio
 
-        self.validate_rollout_merge_inputs(
-            base_rollout=online_rollout,
-            replay_rollout=replay_rollout,
-            replay_mask=replay_mask,
+    def _compute_backward_subtb_loss(
+        self,
+        *,
+        context: GraphEnvContext,
+        encoded_context: EncodedPolicyContext,
+        current_beta: float,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        backward_weight = float(self.cfg.subtb_cfg.backward_weight)
+        zero = torch.zeros((), device=self.device, dtype=torch.float32)
+        if backward_weight <= 0.0:
+            return zero, {"subtb/backward_weight": zero}
+        bwd_rollout, bwd_rewards_raw, bwd_hit_mask, bwd_reward_metrics, bwd_valid_ratio = self._sample_backward_rollout(
+            base_context=context,
+            encoded_context=encoded_context,
+            current_beta=current_beta,
         )
-        mixed_rollout = self.merge_rollouts(
-            base_rollout=online_rollout,
-            replay_rollout=replay_rollout,
-            replay_mask=replay_mask,
+        bwd_loss_raw, bwd_loss_metrics = self.subtb_loss_fn(
+            fwd_rollout=bwd_rollout,
+            rewards=bwd_rewards_raw,
+            reward_beta=current_beta,
+            hit_mask=bwd_hit_mask,
         )
-        rewards_raw, reward_metrics_mixed = self.compute_rewards(mixed_rollout.stop_nodes, base_context)
-        hit_mask = self.compute_hit_mask(mixed_rollout.stop_nodes, base_context)
-        for key, value in reward_metrics_mixed.items():
-            reward_metrics[f"train/mixed/{key}"] = value
-        attach_final_metrics(reward_metrics_mixed)
-        return (
-            mixed_rollout,
-            rewards_raw,
-            hit_mask,
-            reward_metrics,
-            replay_offline_ratio,
-            replay_invalid_ratio,
-            replay_oracle_graph_ratio,
-        )
+        if not torch.isfinite(bwd_loss_raw):
+            raise RuntimeError("Non-finite backward SubTB loss in DualFlowModule.")
+        bwd_loss_weighted = bwd_loss_raw * backward_weight
+        metrics = {
+            "subtb/backward_weight": torch.tensor(backward_weight, device=self.device, dtype=torch.float32),
+            "subtb/backward_loss_raw": bwd_loss_raw.detach(),
+            "subtb/backward_loss_weighted": bwd_loss_weighted.detach(),
+            "subtb/backward_valid_ratio": bwd_valid_ratio.detach(),
+        }
+        metrics.update(self._prefix_metric_namespace(bwd_loss_metrics, namespace="bwd"))
+        metrics.update(self._prefix_metric_namespace(bwd_reward_metrics, namespace="bwd"))
+        return bwd_loss_weighted, metrics
 
     def _build_train_scalar_metrics(
         self,
         *,
         loss: torch.Tensor,
-        replay_alpha: float,
-        replay_offline_ratio: torch.Tensor,
-        replay_invalid_ratio: torch.Tensor,
-        replay_oracle_graph_ratio: torch.Tensor,
         current_beta: float,
     ) -> dict[str, torch.Tensor]:
         return {
             "train/reward_beta": torch.tensor(current_beta, device=loss.device, dtype=loss.dtype),
-            "train/replay_alpha": torch.tensor(replay_alpha, device=loss.device, dtype=loss.dtype),
-            "train/replay_offline_ratio": replay_offline_ratio.to(device=loss.device, dtype=loss.dtype),
-            "train/replay_invalid_ratio": replay_invalid_ratio.to(device=loss.device, dtype=loss.dtype),
-            "train/replay_oracle_graph_ratio": replay_oracle_graph_ratio.to(device=loss.device, dtype=loss.dtype),
         }
 
     def _compute_training_loss(
@@ -239,32 +239,31 @@ class DualFlowModule(LightningModule):
         hit_mask: torch.Tensor,
         context: GraphEnvContext,
         encoded_context: EncodedPolicyContext,
-        replay_alpha: float,
-        replay_offline_ratio: torch.Tensor,
-        replay_invalid_ratio: torch.Tensor,
-        replay_oracle_graph_ratio: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         current_beta = self.current_reward_beta()
-        loss, loss_metrics = self.subtb_loss_fn(
+        forward_subtb_loss, loss_metrics = self.subtb_loss_fn(
             fwd_rollout=rollout,
             rewards=rewards_raw,
             reward_beta=current_beta,
             hit_mask=hit_mask,
         )
-        if not torch.isfinite(loss):
+        if not torch.isfinite(forward_subtb_loss):
             raise RuntimeError("Non-finite training loss in DualFlowModule.")
+        backward_subtb_loss, backward_metrics = self._compute_backward_subtb_loss(
+            context=context,
+            encoded_context=encoded_context,
+            current_beta=current_beta,
+        )
         ranking_loss, ranking_metrics = self._compute_ranking_aux_loss(
             context=context,
             encoded_context=encoded_context,
         )
-        loss = loss + ranking_loss
+        loss = forward_subtb_loss + backward_subtb_loss + ranking_loss
+        loss_metrics["subtb/forward_loss_raw"] = forward_subtb_loss.detach()
+        loss_metrics.update(backward_metrics)
         loss_metrics.update(
             self._build_train_scalar_metrics(
                 loss=loss,
-                replay_alpha=replay_alpha,
-                replay_offline_ratio=replay_offline_ratio,
-                replay_invalid_ratio=replay_invalid_ratio,
-                replay_oracle_graph_ratio=replay_oracle_graph_ratio,
                 current_beta=current_beta,
             )
         )
@@ -277,20 +276,47 @@ class DualFlowModule(LightningModule):
         context: GraphEnvContext,
         encoded_context: EncodedPolicyContext,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        weight = float(self.cfg.subtb_cfg.ranking_weight)
         node_tokens, _, question_tokens = encoded_context
+        zero = torch.zeros((), device=node_tokens.device, dtype=torch.float32)
+        if weight <= 0.0:
+            metrics = {
+                "subtb/ranking_raw": zero.detach(),
+                "subtb/ranking_weighted": zero.detach(),
+                "subtb/ranking_listwise": zero.detach(),
+                "subtb/ranking_bce": zero.detach(),
+                "subtb/ranking_margin": zero.detach(),
+                "subtb/ranking_pos_mean": zero.detach(),
+                "subtb/ranking_neg_mean": zero.detach(),
+                "subtb/ranking_answer_mass": zero.detach(),
+            }
+            return zero, metrics
+
         node_scores_raw = self.policy.compute_node_priority_scores(
             env_context=context,
             node_tokens=node_tokens,
             question_tokens=question_tokens,
         )
-        weight = float(self.cfg.subtb_cfg.ranking_weight)
-        listwise_weight = float(self.cfg.subtb_cfg.ranking_listwise_weight)
-        bce_weight = float(self.cfg.subtb_cfg.ranking_bce_weight)
-        temperature = float(self.cfg.subtb_cfg.ranking_temperature)
-        margin = float(self.cfg.subtb_cfg.ranking_margin)
-        hard_negative_k = int(self.cfg.subtb_cfg.ranking_hard_negative_k)
+        node_scores = (node_scores_raw / float(self.cfg.subtb_cfg.ranking_temperature)).to(dtype=torch.float32)
+        if node_scores.dim() != 1 or int(node_scores.numel()) != int(context.num_nodes_total):
+            raise ValueError(
+                "Node priority scores must be 1D with num_nodes_total entries, "
+                f"got shape={tuple(node_scores.shape)}, num_nodes_total={context.num_nodes_total}."
+            )
 
-        node_scores = node_scores_raw / temperature
+        node_graph_ids = context.node_batch.to(device=node_scores.device, dtype=torch.long)
+        if int(node_graph_ids.numel()) != int(node_scores.numel()):
+            raise ValueError(
+                "node_batch length mismatch with node_scores in ranking auxiliary loss: "
+                f"node_batch={int(node_graph_ids.numel())}, node_scores={int(node_scores.numel())}."
+            )
+        num_graphs = int(context.num_graphs)
+        all_logsumexp = self._segment_logsumexp(
+            values=node_scores,
+            segment_ids=node_graph_ids,
+            num_segments=num_graphs,
+        )
+
         answer_mask = build_graph_node_membership_mask(
             local_indices=context.a_local_indices,
             ptr=context.a_ptr,
@@ -299,143 +325,113 @@ class DualFlowModule(LightningModule):
             device=node_scores.device,
             field_name="a_local_indices",
         )
+        if int(answer_mask.numel()) != int(node_scores.numel()):
+            raise ValueError(
+                "Answer mask length mismatch with node scores in ranking auxiliary loss: "
+                f"answer_mask={int(answer_mask.numel())}, node_scores={int(node_scores.numel())}."
+            )
+
         has_positive = bool(answer_mask.any().item())
         has_negative = bool((~answer_mask).any().item())
-        if (not has_positive) or (not has_negative) or weight <= 0.0:
-            zero = node_scores.new_zeros(())
-            pos_mean = node_scores[answer_mask].mean() if has_positive else zero
-            neg_mean = node_scores[~answer_mask].mean() if has_negative else zero
-            metrics = {
-                "subtb/ranking_weight": torch.tensor(weight, device=zero.device, dtype=zero.dtype),
-                "subtb/ranking_listwise_weight": torch.tensor(listwise_weight, device=zero.device, dtype=zero.dtype),
-                "subtb/ranking_bce_weight": torch.tensor(bce_weight, device=zero.device, dtype=zero.dtype),
-                "subtb/ranking_raw": zero.detach(),
-                "subtb/ranking_weighted": zero.detach(),
-                "subtb/ranking_listwise": zero.detach(),
-                "subtb/ranking_bce": zero.detach(),
-                "subtb/ranking_margin": zero.detach(),
-                "subtb/ranking_pos_mean": pos_mean.detach(),
-                "subtb/ranking_neg_mean": neg_mean.detach(),
-            }
-            return zero, metrics
+        pos_mean = node_scores[answer_mask].mean() if has_positive else zero
+        neg_mean = node_scores[~answer_mask].mean() if has_negative else zero
 
-        listwise_terms: list[torch.Tensor] = []
-        bce_terms: list[torch.Tensor] = []
-        margin_terms: list[torch.Tensor] = []
-        num_graphs = int(context.num_graphs)
-        for graph_idx in range(num_graphs):
-            node_start = int(context.node_ptr[graph_idx].item())
-            node_end = int(context.node_ptr[graph_idx + 1].item())
-            if node_end <= node_start:
-                continue
-            answer_start = int(context.a_ptr[graph_idx].item())
-            answer_end = int(context.a_ptr[graph_idx + 1].item())
-            if answer_end <= answer_start:
-                continue
-            graph_scores = node_scores[node_start:node_end]
-            local_answers = context.a_local_indices[answer_start:answer_end].to(device=node_scores.device, dtype=torch.long)
-            if bool((local_answers < 0).any().item()) or bool((local_answers >= int(graph_scores.numel())).any().item()):
-                raise ValueError("a_local_indices out of range in ranking auxiliary loss.")
-            positive_local = torch.zeros((int(graph_scores.numel()),), dtype=torch.bool, device=node_scores.device)
-            positive_local.scatter_(0, local_answers, True)
-            pos_scores = graph_scores[positive_local]
-            neg_scores = graph_scores[~positive_local]
-            if int(pos_scores.numel()) == 0 or int(neg_scores.numel()) == 0:
-                continue
+        if has_positive:
+            answer_scores = node_scores[answer_mask]
+            answer_graph_ids = node_graph_ids[answer_mask]
+            pos_logsumexp = self._segment_logsumexp(
+                values=answer_scores,
+                segment_ids=answer_graph_ids,
+                num_segments=num_graphs,
+            )
+        else:
+            pos_logsumexp = torch.full(
+                (num_graphs,),
+                fill_value=float("-inf"),
+                device=node_scores.device,
+                dtype=torch.float32,
+            )
 
-            if listwise_weight > 0.0:
-                listwise = -(torch.logsumexp(pos_scores, dim=0) - torch.logsumexp(graph_scores, dim=0))
-                listwise_terms.append(listwise)
-
-            if bce_weight > 0.0:
-                pos_bce = F.binary_cross_entropy_with_logits(pos_scores, torch.ones_like(pos_scores))
-                neg_bce = F.binary_cross_entropy_with_logits(neg_scores, torch.zeros_like(neg_scores))
-                bce_terms.append((pos_bce + neg_bce) * 0.5)
-
-            if margin > 0.0 and hard_negative_k > 0:
-                topk = min(hard_negative_k, int(neg_scores.numel()))
-                hardest = torch.topk(neg_scores, k=topk, dim=0).values
-                pos_anchor = pos_scores.mean()
-                margin_term = torch.relu(margin + hardest - pos_anchor).mean()
-                margin_terms.append(margin_term)
-
-        if len(listwise_terms) == 0 and len(bce_terms) == 0 and len(margin_terms) == 0:
-            zero = node_scores.new_zeros(())
-            metrics = {
-                "subtb/ranking_weight": torch.tensor(weight, device=zero.device, dtype=zero.dtype),
-                "subtb/ranking_listwise_weight": torch.tensor(listwise_weight, device=zero.device, dtype=zero.dtype),
-                "subtb/ranking_bce_weight": torch.tensor(bce_weight, device=zero.device, dtype=zero.dtype),
-                "subtb/ranking_raw": zero.detach(),
-                "subtb/ranking_weighted": zero.detach(),
-                "subtb/ranking_listwise": zero.detach(),
-                "subtb/ranking_bce": zero.detach(),
-                "subtb/ranking_margin": zero.detach(),
-                "subtb/ranking_pos_mean": node_scores[answer_mask].mean().detach(),
-                "subtb/ranking_neg_mean": node_scores[~answer_mask].mean().detach(),
-            }
-            return zero, metrics
-
-        zero = node_scores.new_zeros(())
-        listwise_loss = torch.stack(listwise_terms).mean() if len(listwise_terms) > 0 else zero
-        bce_loss = torch.stack(bce_terms).mean() if len(bce_terms) > 0 else zero
-        margin_loss = torch.stack(margin_terms).mean() if len(margin_terms) > 0 else node_scores.new_zeros(())
-        ranking_raw = listwise_weight * listwise_loss + bce_weight * bce_loss + margin_loss
+        valid_graph = (~context.dummy_mask.to(device=node_scores.device, dtype=torch.bool)) & torch.isfinite(all_logsumexp)
+        valid_graph = valid_graph & torch.isfinite(pos_logsumexp)
+        if bool(valid_graph.any().item()):
+            log_answer_mass = pos_logsumexp - all_logsumexp
+            ranking_raw = (-log_answer_mass[valid_graph]).mean()
+            answer_mass_mean = torch.exp(log_answer_mass[valid_graph]).mean()
+        else:
+            ranking_raw = zero
+            answer_mass_mean = zero
         ranking_weighted = ranking_raw * weight
+
         metrics = {
-            "subtb/ranking_weight": torch.tensor(weight, device=node_scores.device, dtype=node_scores.dtype),
-            "subtb/ranking_listwise_weight": torch.tensor(
-                listwise_weight,
-                device=node_scores.device,
-                dtype=node_scores.dtype,
-            ),
-            "subtb/ranking_bce_weight": torch.tensor(
-                bce_weight,
-                device=node_scores.device,
-                dtype=node_scores.dtype,
-            ),
             "subtb/ranking_raw": ranking_raw.detach(),
             "subtb/ranking_weighted": ranking_weighted.detach(),
-            "subtb/ranking_listwise": listwise_loss.detach(),
-            "subtb/ranking_bce": bce_loss.detach(),
-            "subtb/ranking_margin": margin_loss.detach(),
-            "subtb/ranking_pos_mean": node_scores[answer_mask].mean().detach(),
-            "subtb/ranking_neg_mean": node_scores[~answer_mask].mean().detach(),
+            "subtb/ranking_listwise": ranking_raw.detach(),
+            "subtb/ranking_bce": zero.detach(),
+            "subtb/ranking_margin": zero.detach(),
+            "subtb/ranking_pos_mean": pos_mean.detach(),
+            "subtb/ranking_neg_mean": neg_mean.detach(),
+            "subtb/ranking_answer_mass": answer_mass_mean.detach(),
         }
         return ranking_weighted, metrics
+
+    @staticmethod
+    def _segment_logsumexp(
+        *,
+        values: torch.Tensor,
+        segment_ids: torch.Tensor,
+        num_segments: int,
+    ) -> torch.Tensor:
+        if values.dim() != 1:
+            raise ValueError(f"values must be 1D for segment_logsumexp, got {tuple(values.shape)}")
+        if segment_ids.dim() != 1:
+            raise ValueError(f"segment_ids must be 1D for segment_logsumexp, got {tuple(segment_ids.shape)}")
+        if int(values.numel()) != int(segment_ids.numel()):
+            raise ValueError(
+                "segment_logsumexp size mismatch between values and segment_ids: "
+                f"values={int(values.numel())}, segment_ids={int(segment_ids.numel())}."
+            )
+        if num_segments < 0:
+            raise ValueError(f"num_segments must be >= 0, got {num_segments}.")
+        if num_segments == 0:
+            return torch.empty((0,), device=values.device, dtype=torch.float32)
+
+        ids = segment_ids.to(device=values.device, dtype=torch.long)
+        if int(ids.numel()) == 0:
+            return torch.full((num_segments,), fill_value=float("-inf"), device=values.device, dtype=torch.float32)
+        if bool((ids < 0).any().item()) or bool((ids >= num_segments).any().item()):
+            raise ValueError("segment_ids contains out-of-range values in segment_logsumexp.")
+
+        values_fp32 = values.to(dtype=torch.float32)
+        max_per_segment = torch.full(
+            (num_segments,),
+            fill_value=float("-inf"),
+            device=values.device,
+            dtype=torch.float32,
+        )
+        max_per_segment.scatter_reduce_(0, ids, values_fp32, reduce="amax", include_self=True)
+        has_values = torch.zeros((num_segments,), dtype=torch.bool, device=values.device)
+        has_values.scatter_(0, ids, True)
+        safe_max = torch.where(has_values, max_per_segment, torch.zeros_like(max_per_segment))
+
+        shifted = torch.exp(values_fp32 - safe_max.index_select(0, ids))
+        sum_per_segment = torch.zeros((num_segments,), device=values.device, dtype=torch.float32)
+        sum_per_segment.scatter_add_(0, ids, shifted)
+        lse = safe_max + torch.log(sum_per_segment.clamp(min=torch.finfo(torch.float32).tiny))
+        return torch.where(
+            has_values,
+            lse,
+            torch.full((num_segments,), fill_value=float("-inf"), device=values.device, dtype=torch.float32),
+        )
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         del batch_idx
         if int(self.cfg.sampling_cfg.num_rollouts) < 4:
             raise ValueError("sampling_cfg.num_rollouts must be >= 4 for SubTB multi-rollout training.")
-        self.policy.set_training_step(int(self.global_step))
 
         base_context, _ = self.build_context(batch)
-        replay_alpha = self.current_replay_alpha()
-        (
-            online_rollout,
-            rewards_online_raw,
-            hit_mask_online,
-            reward_metrics_online,
-            encoded_context,
-        ) = self._sample_online_rollout(
+        fwd_rollout, rewards_raw, hit_mask, reward_metrics, encoded_context = self._sample_online_rollout(
             base_context=base_context
-        )
-        (
-            fwd_rollout,
-            rewards_raw,
-            hit_mask,
-            reward_metrics,
-            replay_offline_ratio,
-            replay_invalid_ratio,
-            replay_oracle_graph_ratio,
-        ) = self._apply_replay_rollout_mix(
-            base_context=base_context,
-            encoded_context=encoded_context,
-            online_rollout=online_rollout,
-            rewards_online_raw=rewards_online_raw,
-            hit_mask_online=hit_mask_online,
-            reward_metrics_online=reward_metrics_online,
-            replay_alpha=replay_alpha,
         )
         loss, loss_metrics = self._compute_training_loss(
             rollout=fwd_rollout,
@@ -443,10 +439,6 @@ class DualFlowModule(LightningModule):
             hit_mask=hit_mask,
             context=base_context,
             encoded_context=encoded_context,
-            replay_alpha=replay_alpha,
-            replay_offline_ratio=replay_offline_ratio,
-            replay_invalid_ratio=replay_invalid_ratio,
-            replay_oracle_graph_ratio=replay_oracle_graph_ratio,
         )
         self.log_train_metrics(loss, loss_metrics, reward_metrics, base_context.num_graphs)
         return loss
@@ -534,130 +526,41 @@ class DualFlowModule(LightningModule):
             return math.exp(math.log(beta_init) + (math.log(beta_max) - math.log(beta_init)) * progress)
         raise ValueError("stop.reward_beta_schedule must be one of {'linear', 'exponential'}.")
 
-    def current_replay_alpha(self) -> float:
-        replay_cfg = self.cfg.training_cfg.replay_cfg
-        if not bool(replay_cfg.enabled):
-            return 0.0
-        alpha_init = float(replay_cfg.alpha_init)
-        alpha_final = float(replay_cfg.alpha_final)
-        anneal_epochs = int(replay_cfg.alpha_anneal_epochs)
-        if anneal_epochs <= 0:
-            return max(min(alpha_final, 1.0), 0.0)
-        progress = min(max(float(self.current_epoch), 0.0) / float(anneal_epochs), 1.0)
-        alpha = alpha_init + (alpha_final - alpha_init) * progress
-        return max(min(alpha, 1.0), 0.0)
-
-    @staticmethod
-    def validate_rollout_merge_inputs(
-        *,
-        base_rollout: RolloutResult,
-        replay_rollout: RolloutResult,
-        replay_mask: torch.Tensor,
-    ) -> None:
-        if replay_mask.dim() != 2:
-            raise ValueError(f"replay_mask must be [B, K], got shape={tuple(replay_mask.shape)}")
-        expected_shape = tuple(replay_mask.shape)
-        required_dense_fields = (
-            "log_pf_sum",
-            "stop_nodes",
-            "num_moves",
-            "num_steps",
-            "stop_reason",
-        )
-        for field_name in required_dense_fields:
-            base_value = getattr(base_rollout, field_name)
-            replay_value = getattr(replay_rollout, field_name)
-            if base_value is None or replay_value is None:
-                raise ValueError(f"Rollout merge requires `{field_name}` on both base and replay rollouts.")
-            if tuple(base_value.shape) != expected_shape or tuple(replay_value.shape) != expected_shape:
-                raise ValueError(
-                    f"Rollout merge shape mismatch for `{field_name}`: "
-                    f"base={tuple(base_value.shape)} replay={tuple(replay_value.shape)} expected={expected_shape}."
-                )
-        required_trace_fields = ("log_pf_steps", "log_pb_steps", "log_f_steps")
-        for field_name in required_trace_fields:
-            base_value = getattr(base_rollout, field_name)
-            replay_value = getattr(replay_rollout, field_name)
-            if base_value is None or replay_value is None:
-                raise ValueError(f"Rollout merge requires `{field_name}` traces on both rollouts.")
-            if base_value.dim() != 3 or replay_value.dim() != 3:
-                raise ValueError(
-                    f"Rollout trace `{field_name}` must be 3D [B,K,T], "
-                    f"got base={tuple(base_value.shape)} replay={tuple(replay_value.shape)}."
-                )
-            if tuple(base_value.shape[:2]) != expected_shape or tuple(replay_value.shape[:2]) != expected_shape:
-                raise ValueError(
-                    f"Rollout trace shape mismatch for `{field_name}`: "
-                    f"base={tuple(base_value.shape)} replay={tuple(replay_value.shape)} expected_prefix={expected_shape}."
-                )
-            if int(base_value.size(-1)) != int(replay_value.size(-1)):
-                raise ValueError(
-                    f"Rollout trace horizon mismatch for `{field_name}`: "
-                    f"base_T={int(base_value.size(-1))} replay_T={int(replay_value.size(-1))}."
-                )
-        optional_mask_fields = ("valid_mask",)
-        for field_name in optional_mask_fields:
-            base_value = getattr(base_rollout, field_name)
-            replay_value = getattr(replay_rollout, field_name)
-            if base_value is not None and tuple(base_value.shape) != expected_shape:
-                raise ValueError(
-                    f"Rollout optional mask `{field_name}` has invalid base shape: "
-                    f"{tuple(base_value.shape)} expected={expected_shape}."
-                )
-            if replay_value is not None and tuple(replay_value.shape) != expected_shape:
-                raise ValueError(
-                    f"Rollout optional mask `{field_name}` has invalid replay shape: "
-                    f"{tuple(replay_value.shape)} expected={expected_shape}."
-                )
-
-    @staticmethod
-    def merge_rollouts(
-        *,
-        base_rollout: RolloutResult,
-        replay_rollout: RolloutResult,
-        replay_mask: torch.Tensor,
-    ) -> RolloutResult:
-        if replay_mask.dim() != 2:
-            raise ValueError(f"replay_mask must be [B, K], got shape={tuple(replay_mask.shape)}")
-        mask = replay_mask.to(dtype=torch.bool)
-
-        def pick_required(base: torch.Tensor, replay: torch.Tensor) -> torch.Tensor:
-            local_mask = mask
-            while local_mask.dim() < base.dim():
-                local_mask = local_mask.unsqueeze(-1)
-            return torch.where(local_mask, replay, base)
-
-        def pick_optional(base: torch.Tensor | None, replay: torch.Tensor | None) -> torch.Tensor | None:
-            if base is None or replay is None:
-                return base
-            return pick_required(base, replay)
-
-        return RolloutResult(
-            log_pf_sum=pick_required(base_rollout.log_pf_sum, replay_rollout.log_pf_sum),
-            stop_nodes=pick_required(base_rollout.stop_nodes, replay_rollout.stop_nodes),
-            num_moves=pick_required(base_rollout.num_moves, replay_rollout.num_moves),
-            num_steps=pick_required(base_rollout.num_steps, replay_rollout.num_steps),
-            stop_reason=pick_required(base_rollout.stop_reason, replay_rollout.stop_reason),
-            actions=pick_optional(base_rollout.actions, replay_rollout.actions),
-            log_pf_steps=pick_optional(base_rollout.log_pf_steps, replay_rollout.log_pf_steps),
-            log_pb_steps=pick_optional(base_rollout.log_pb_steps, replay_rollout.log_pb_steps),
-            log_f_steps=pick_optional(base_rollout.log_f_steps, replay_rollout.log_f_steps),
-            log_pb_sum=pick_optional(base_rollout.log_pb_sum, replay_rollout.log_pb_sum),
-            valid_mask=pick_optional(base_rollout.valid_mask, replay_rollout.valid_mask),
-            policy_metrics=base_rollout.policy_metrics,
-        )
-
     def compute_rewards(
-        self, stop_nodes_abs: torch.Tensor, context: GraphEnvContext
+        self,
+        stop_nodes_abs: torch.Tensor,
+        context: GraphEnvContext,
+        *,
+        reward_beta: float | None = None,
+        target_local_indices: torch.Tensor | None = None,
+        target_ptr: torch.Tensor | None = None,
+        target_field_name: str = "a_local_indices",
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         return self.reward_engine.compute_rewards(
             stop_nodes_abs=stop_nodes_abs,
             context=context,
-            reward_beta=self.current_reward_beta(),
+            reward_beta=self.current_reward_beta() if reward_beta is None else float(reward_beta),
+            target_local_indices=target_local_indices,
+            target_ptr=target_ptr,
+            target_field_name=target_field_name,
         )
 
-    def compute_hit_mask(self, stop_nodes_abs: torch.Tensor, context: GraphEnvContext) -> torch.Tensor:
-        return self.reward_engine.compute_hit_mask(stop_nodes_abs, context)
+    def compute_hit_mask(
+        self,
+        stop_nodes_abs: torch.Tensor,
+        context: GraphEnvContext,
+        *,
+        target_local_indices: torch.Tensor | None = None,
+        target_ptr: torch.Tensor | None = None,
+        target_field_name: str = "a_local_indices",
+    ) -> torch.Tensor:
+        return self.reward_engine.compute_hit_mask(
+            stop_nodes_abs,
+            context,
+            target_local_indices=target_local_indices,
+            target_ptr=target_ptr,
+            target_field_name=target_field_name,
+        )
 
     def log_train_metrics(
         self,
@@ -671,7 +574,7 @@ class DualFlowModule(LightningModule):
             "train/loss",
             loss,
             batch_size=batch_size,
-            on_step=True,
+            on_step=False,
             on_epoch=True,
             prog_bar=True,
             sync_dist=True,
@@ -683,7 +586,7 @@ class DualFlowModule(LightningModule):
                 metric_name,
                 value,
                 batch_size=batch_size,
-                on_step=True,
+                on_step=False,
                 on_epoch=True,
                 sync_dist=True,
             )

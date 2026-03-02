@@ -25,6 +25,7 @@ class EmbeddingConfig:
     embeddings_out_dir: Path
     canonicalize_relations: bool
     cosine_eps: float
+    question_ctx_max_tokens: int
 
 
 @dataclass(frozen=True)

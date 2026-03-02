@@ -87,6 +87,60 @@ class TextEncoder:
 
         return torch.cat(all_embeds, dim=0)
 
+    @torch.no_grad()
+    def encode_with_context(
+        self,
+        texts: Sequence[str],
+        batch_size: int,
+        *,
+        max_tokens: int,
+        show_progress: Optional[bool] = None,
+        desc: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be > 0, got {max_tokens}.")
+        if not texts:
+            empty_pooled = torch.empty((0, 0), dtype=torch.float32)
+            empty_context = torch.empty((0, 0, 0), dtype=torch.float32)
+            empty_mask = torch.empty((0, 0), dtype=torch.bool)
+            return empty_pooled, empty_context, empty_mask
+
+        pooled_chunks: List[torch.Tensor] = []
+        context_chunks: List[torch.Tensor] = []
+        mask_chunks: List[torch.Tensor] = []
+
+        iterator = _iter_batches(len(texts), batch_size)
+        use_progress = self.progress if show_progress is None else show_progress
+        if use_progress:
+            total = (len(texts) + batch_size - 1) // batch_size
+            iterator = tqdm(iterator, total=total, desc=desc or "EncodingContext", leave=False)
+
+        for start, end in iterator:
+            chunk = list(texts[start:end])
+            inputs = self.tokenizer(
+                chunk,
+                padding="max_length",
+                truncation=True,
+                max_length=max_tokens,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            outputs = self.model(**inputs)
+            hidden = outputs.last_hidden_state.to(self.dtype)
+            mask = inputs["attention_mask"].to(self.dtype)
+            mask_expanded = mask.unsqueeze(-1)
+            summed = (hidden * mask_expanded).sum(dim=1)
+            denom = mask_expanded.sum(dim=1).clamp(min=ENCODER_EPS)
+            pooled = summed / denom
+            pooled_chunks.append(pooled.to("cpu", dtype=torch.float32))
+            context_chunks.append(hidden.to("cpu", dtype=torch.float32))
+            mask_chunks.append(inputs["attention_mask"].to("cpu", dtype=torch.bool))
+
+        pooled_all = torch.cat(pooled_chunks, dim=0)
+        context_all = torch.cat(context_chunks, dim=0)
+        mask_all = torch.cat(mask_chunks, dim=0)
+        return pooled_all, context_all, mask_all
+
 
 def encode_to_memmap(
     encoder: TextEncoder,

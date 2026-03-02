@@ -104,6 +104,8 @@ class GraphEnvironmentBuilder:
             node_tokens=batch["node_tokens"],
             relation_tokens=batch["relation_tokens"],
             question_emb=batch["question_emb"],
+            question_ctx=batch.get("question_ctx"),
+            question_ctx_mask=batch.get("question_ctx_mask"),
             q_local_indices=batch["q_local_indices"],
             a_local_indices=batch["a_local_indices"],
             q_ptr=batch["q_ptr"],
@@ -115,11 +117,7 @@ class GraphEnvironmentBuilder:
             sample_ids=batch.get("sample_ids", [f"sample_{i}" for i in range(num_graphs)]),
             heuristic_log_v=batch.get("heuristic_log_v"),
             start_local_indices=batch.get("start_local_indices"),
-            replay_start_local=batch.get("replay_start_local"),
-            replay_path_lengths=batch.get("replay_path_lengths"),
-            replay_edge_local_ids=batch.get("replay_edge_local_ids"),
-            replay_path_ptr=batch.get("replay_path_ptr"),
-            replay_edge_ptr=batch.get("replay_edge_ptr"),
+            backward_start_local_indices=batch.get("backward_start_local_indices"),
         )
 
     def initialize_state(self, context: GraphEnvContext, num_agents: int = 1) -> DynamicAgentState:
@@ -128,12 +126,27 @@ class GraphEnvironmentBuilder:
         """
         device = context.node_ptr.device  # 修正了先前的 devices 拼写错误
         B = context.num_graphs
+        if context.start_local_indices is not None:
+            if context.start_local_indices.dim() != 1 or int(context.start_local_indices.numel()) != B:
+                raise ValueError(
+                    "start_local_indices must be [B] in initialize_state when provided: "
+                    f"got shape={tuple(context.start_local_indices.shape)} B={B}."
+                )
+            start_local = context.start_local_indices.to(device=device, dtype=torch.long)
+        else:
+            q_counts = (context.q_ptr[1:] - context.q_ptr[:-1]).clamp(min=0)
+            if bool((q_counts <= 0).any().item()):
+                raise ValueError("q_local_indices has empty groups in initialize_state.")
+            start_local = context.q_local_indices.index_select(0, context.q_ptr[:-1].to(device=device, dtype=torch.long))
         # 计算绝对起始坐标：local_index + node_ptr
-        start_nodes_absolute = context.q_local_indices + context.node_ptr[:-1]
+        start_nodes_absolute = start_local + context.node_ptr[:-1]
         # 扩展为多智能体视角 [B, num_agents]
         current_nodes = start_nodes_absolute.unsqueeze(1).expand(B, num_agents).clone()
         # 初始化隐藏状态为问题向量 [B, num_agents, d]
         hidden_states = context.question_emb.unsqueeze(1).expand(B, num_agents, -1).clone()
+        path_token_ids = current_nodes.unsqueeze(-1).clone()
+        path_token_types = torch.zeros_like(path_token_ids, dtype=torch.bool)
+        path_lengths = torch.ones((B, num_agents), dtype=torch.long, device=device)
         # 初始化访问遮罩
         visited_mask = torch.zeros((context.num_nodes_total,), dtype=torch.bool, device=device)
         visited_mask.scatter_(0, start_nodes_absolute, True)
@@ -144,6 +157,9 @@ class GraphEnvironmentBuilder:
             visited_mask=visited_mask,
             cumulative_rewards=torch.zeros((B, num_agents), dtype=torch.float, device=device),
             done_mask=torch.zeros((B, num_agents), dtype=torch.bool, device=device),
+            path_token_ids=path_token_ids,
+            path_token_types=path_token_types,
+            path_lengths=path_lengths,
         )
 
 

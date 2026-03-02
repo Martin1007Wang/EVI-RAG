@@ -26,13 +26,13 @@ class FlowHeadConfig:
     hidden_dim: int = 256
     num_layers: int = 2
     dropout: float = 0.0
-    flow_projection_eps: float = 1.0e-8
     relation_low_rank: int = 16
+    relation_low_rank_edge_chunk_size: int = 8192
 
 
 @dataclass(frozen=True)
 class PriorityHeadConfig:
-    """节点优先级打分头配置（用于答案排序辅助监督与可选 Top-K 剪枝）"""
+    """节点优先级打分头配置（用于答案排序辅助监督）"""
 
     hidden_dim: int = 256
     num_layers: int = 2
@@ -46,9 +46,12 @@ class PolicyConfig:
     backbone: BackboneConfig = BackboneConfig()
     flow_head: FlowHeadConfig = FlowHeadConfig()
     priority_head: PriorityHeadConfig = PriorityHeadConfig()
-    stop_bias_init: float = -10.0
-    topk_prune_train_k: int = 0
-    topk_prune_train_k_final: int = 0
-    topk_prune_warmup_steps: int = 0
-    topk_prune_anneal_steps: int = 0
-    topk_prune_eval_k: int = 0
+    stop_bias_init: float = -1.5
+    stop_delta_scale: float = 2.0
+    stop_delta_temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.stop_delta_scale <= 0.0:
+            raise ValueError("stop_delta_scale must be > 0.")
+        if self.stop_delta_temperature <= 0.0:
+            raise ValueError("stop_delta_temperature must be > 0.")

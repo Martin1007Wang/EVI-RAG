@@ -632,24 +632,41 @@ def preprocess(ctx: StageContext) -> None:
     log_event(logger, "graphs_questions_start", stage="graphs_questions")
     chunk_size = parquet_chunk_size
     include_question_emb = bool(embedding_cfg)
-    base_writer = ParquetDatasetWriter(out_dir=out_dir, include_question_emb=include_question_emb)
+    include_question_ctx = bool(embedding_cfg) and int(embedding_cfg.question_ctx_max_tokens) > 0
+    base_writer = ParquetDatasetWriter(
+        out_dir=out_dir,
+        include_question_emb=include_question_emb,
+        include_question_ctx=include_question_ctx,
+    )
     need_question_emb = bool(embedding_cfg)
+    need_question_ctx = bool(embedding_cfg) and int(embedding_cfg.question_ctx_max_tokens) > 0
 
     def _process_sample_batch(samples: List[Sample], executor: Optional[ProcessPoolExecutor]) -> None:
         if not samples:
             return
         question_emb_batch = None
         question_emb_norm_batch = None
+        question_ctx_batch = None
+        question_ctx_mask_batch = None
         if need_question_emb:
             if encoder is None:
                 raise RuntimeError("Question embeddings requested but encoder is not configured.")
             question_texts = [sample.question for sample in samples]
-            question_emb_batch = encoder.encode(
-                question_texts,
-                embedding_cfg.batch_size,
-                show_progress=False,
-                desc="Questions",
-            )
+            if need_question_ctx:
+                question_emb_batch, question_ctx_batch, question_ctx_mask_batch = encoder.encode_with_context(
+                    question_texts,
+                    embedding_cfg.batch_size,
+                    max_tokens=int(embedding_cfg.question_ctx_max_tokens),
+                    show_progress=False,
+                    desc="QuestionsWithContext",
+                )
+            else:
+                question_emb_batch = encoder.encode(
+                    question_texts,
+                    embedding_cfg.batch_size,
+                    show_progress=False,
+                    desc="Questions",
+                )
             if embedding_cfg and embedding_cfg.canonicalize_relations:
                 question_emb_norm_batch = _normalize_embeddings(question_emb_batch, embedding_cfg.cosine_eps)
         if executor is None:
@@ -682,10 +699,17 @@ def preprocess(ctx: StageContext) -> None:
                     raise RuntimeError("Canonicalization requested but embeddings are missing.")
                 _canonicalize_graph_edges(graph, question_emb_norm_batch[idx], relation_embeddings_norm)
             question_emb = None
+            question_ctx = None
+            question_ctx_mask = None
             if embedding_cfg:
                 if question_emb_batch is None:
                     raise RuntimeError("question_emb batch missing during question embedding encode.")
                 question_emb = question_emb_batch[idx].tolist()
+                if need_question_ctx:
+                    if question_ctx_batch is None or question_ctx_mask_batch is None:
+                        raise RuntimeError("question_ctx batch missing during question context encode.")
+                    question_ctx = question_ctx_batch[idx].tolist()
+                    question_ctx_mask = question_ctx_mask_batch[idx].tolist()
             split_key = sample.split
             stats_clean = qa_clean_stats[split_key]
             label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
@@ -794,6 +818,8 @@ def preprocess(ctx: StageContext) -> None:
                 entity_vocab,
                 graph.graph_id,
                 question_emb=question_emb,
+                question_ctx=question_ctx,
+                question_ctx_mask=question_ctx_mask,
                 q_entities=q_in_graph,
                 a_entities=a_in_graph,
             )
@@ -1063,6 +1089,8 @@ def build_question_record(
     graph_id: str,
     *,
     question_emb: Optional[Sequence[float]] = None,
+    question_ctx: Optional[Sequence[Sequence[float]]] = None,
+    question_ctx_mask: Optional[Sequence[bool]] = None,
     q_entities: Optional[Sequence[str]] = None,
     a_entities: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
@@ -1083,4 +1111,14 @@ def build_question_record(
     }
     if question_emb is not None:
         record["question_emb"] = list(question_emb)
+    if question_ctx is not None or question_ctx_mask is not None:
+        if question_ctx is None or question_ctx_mask is None:
+            raise ValueError("question_ctx and question_ctx_mask must be provided together.")
+        if len(question_ctx) != len(question_ctx_mask):
+            raise ValueError(
+                "question_ctx length must equal question_ctx_mask length: "
+                f"ctx={len(question_ctx)} mask={len(question_ctx_mask)}."
+            )
+        record["question_ctx"] = [list(token) for token in question_ctx]
+        record["question_ctx_mask"] = [bool(flag) for flag in question_ctx_mask]
     return record

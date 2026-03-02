@@ -118,7 +118,6 @@ def _build_policy() -> DualFlowPolicy:
             hidden_dim=8,
             num_layers=2,
             dropout=0.0,
-            flow_projection_eps=1.0e-8,
             relation_low_rank=2,
         ),
         priority_head=PriorityHeadConfig(hidden_dim=8, num_layers=2, dropout=0.0),

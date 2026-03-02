@@ -3,15 +3,14 @@
 [系统实体] 双流策略网络 (Dual Flow Policy)
 职责：
 1. 静态图编码：基于 GraphEnvContext 执行异构图流形投影。
-2. 动态动作提取：无锁 O(1) 提取当前智能体的可选拓扑动作。
-3. 状态不可变演进：利用 GRU 进行状态转移，严防计算图撕裂与越界崩溃。
+2. 动态动作提取：并行提取当前智能体可选拓扑动作。
+3. 状态不可变演进：基于路径 token 历史做因果自注意力状态更新。
 """
 from __future__ import annotations
 
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from src.models.configs.policy import PolicyConfig
@@ -19,37 +18,6 @@ from src.models.environment import DynamicAgentState, GraphEnvContext
 from .backward_prior import StructuralBackwardPrior
 from .backbone import EmbeddingBackbone
 from .positional_encoding import SinusoidalPositionalEncoding
-
-
-class FlowHead(nn.Module):
-    """向量流预测头: 生成节点语义流向量 vecF(v) ∈ R_+^d。"""
-
-    def __init__(
-        self,
-        *,
-        node_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError("flow_head.num_layers must be >= 1.")
-
-        layers: list[nn.Module] = []
-        in_dim = int(node_dim)
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.GELU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, node_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, node_features: torch.Tensor) -> torch.Tensor:
-        # 使用 softplus 确保向量流为正值，便于 log/概率映射。
-        return F.softplus(self.net(node_features))
 
 
 class NodePriorityHead(nn.Module):
@@ -81,7 +49,7 @@ class NodePriorityHead(nn.Module):
 class DualFlowPolicy(nn.Module):
     """
     双流策略网络
-    严格贯彻“动静分离”与“不可变状态转移”的强化学习基座
+    使用路径因果自注意力 + 问题跨注意力提取状态势能向量 vecF(s_t | q)。
     """
 
     def __init__(self, config: PolicyConfig, *, backward_prior_mode: str = "uniform_in_degree") -> None:
@@ -89,58 +57,62 @@ class DualFlowPolicy(nn.Module):
         self.config = config
         self.backbone = EmbeddingBackbone(config.backbone)
         self.backward_prior = StructuralBackwardPrior(mode=backward_prior_mode)
-        self.flow_projection_eps = float(config.flow_head.flow_projection_eps)
-        if self.flow_projection_eps <= 0.0:
-            raise ValueError("flow_head.flow_projection_eps must be > 0.")
-        self.relation_low_rank = int(config.flow_head.relation_low_rank)
-        if self.relation_low_rank <= 0:
-            raise ValueError("flow_head.relation_low_rank must be >= 1.")
+        # Theoretical contract: structural backward prior enters edge energy with fixed unit coefficient.
+        self.edge_logit_pb_weight = 1.0
+        self.stop_delta_scale = float(config.stop_delta_scale)
+        self.stop_delta_temperature = float(config.stop_delta_temperature)
+        if self.stop_delta_scale <= 0.0:
+            raise ValueError("stop_delta_scale must be > 0.")
+        if self.stop_delta_temperature <= 0.0:
+            raise ValueError("stop_delta_temperature must be > 0.")
+
+        hidden_dim = int(config.backbone.hidden_dim)
+        if hidden_dim <= 0:
+            raise ValueError("backbone.hidden_dim must be > 0.")
+        dropout = float(config.flow_head.dropout)
 
         if config.backbone.use_positional_encoding:
-            self.pos_encoder = SinusoidalPositionalEncoding(dim=config.backbone.hidden_dim)
+            self.pos_encoder = SinusoidalPositionalEncoding(dim=hidden_dim)
         else:
             self.pos_encoder = None
 
-        self.memory_tracker = nn.GRUCell(
-            input_size=config.backbone.hidden_dim * 2,
-            hidden_size=config.backbone.hidden_dim,
+        # Path encoder: h_t = SelfAttention(path_tokens)[:, -1, :]
+        self.path_self_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=1,
+            dropout=dropout,
+            batch_first=True,
         )
-        self.flow_head = FlowHead(
-            node_dim=config.backbone.hidden_dim,
-            hidden_dim=config.flow_head.hidden_dim,
-            num_layers=config.flow_head.num_layers,
-            dropout=config.flow_head.dropout,
+        self.path_self_attention_norm = nn.LayerNorm(hidden_dim)
+
+        # Potential extractor: vecF = CrossAttention(Query=h_t, Keys/Values=C_q)
+        self.question_cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=1,
+            dropout=dropout,
+            batch_first=True,
         )
-        hidden_dim = int(config.backbone.hidden_dim)
-        self.query_projection_head = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.relation_low_rank_left = nn.Linear(hidden_dim, hidden_dim * self.relation_low_rank, bias=False)
-        self.relation_low_rank_right = nn.Linear(hidden_dim, self.relation_low_rank * hidden_dim, bias=False)
+        self.question_cross_attention_norm = nn.LayerNorm(hidden_dim)
+
+        # Action encoder: E_e = MLP([rel_embed || target_node_embed])
+        self.edge_action_encoder = nn.Sequential(
+            nn.Linear(hidden_dim * 2, int(config.flow_head.hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(int(config.flow_head.hidden_dim), hidden_dim),
+        )
+        self.edge_action_norm = nn.LayerNorm(hidden_dim)
+
         self.node_priority_head = NodePriorityHead(
-            node_dim=config.backbone.hidden_dim,
-            question_dim=config.backbone.hidden_dim,
+            node_dim=hidden_dim,
+            question_dim=hidden_dim,
             hidden_dim=config.priority_head.hidden_dim,
             num_layers=config.priority_head.num_layers,
             dropout=config.priority_head.dropout,
         )
-        self.stop_head = nn.Linear(config.backbone.hidden_dim, 1)
+        self.stop_head = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.stop_head.weight)
         nn.init.constant_(self.stop_head.bias, float(config.stop_bias_init))
-        self.topk_prune_train_k = int(config.topk_prune_train_k)
-        self.topk_prune_train_k_final = int(config.topk_prune_train_k_final)
-        self.topk_prune_warmup_steps = int(config.topk_prune_warmup_steps)
-        self.topk_prune_anneal_steps = int(config.topk_prune_anneal_steps)
-        self.topk_prune_eval_k = int(config.topk_prune_eval_k)
-        if self.topk_prune_train_k < 0:
-            raise ValueError("policy_cfg.topk_prune_train_k must be >= 0.")
-        if self.topk_prune_train_k_final < 0:
-            raise ValueError("policy_cfg.topk_prune_train_k_final must be >= 0.")
-        if self.topk_prune_warmup_steps < 0:
-            raise ValueError("policy_cfg.topk_prune_warmup_steps must be >= 0.")
-        if self.topk_prune_anneal_steps < 0:
-            raise ValueError("policy_cfg.topk_prune_anneal_steps must be >= 0.")
-        if self.topk_prune_eval_k < 0:
-            raise ValueError("policy_cfg.topk_prune_eval_k must be >= 0.")
-        self._train_step = 0
 
     def encode_context(self, context: GraphEnvContext) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -162,85 +134,56 @@ class DualFlowPolicy(nn.Module):
         )
         return node_tokens, relation_tokens, question_tokens
 
-    def _encode_hidden_with_time(self, hidden: torch.Tensor, step_t: int) -> torch.Tensor:
-        if self.pos_encoder is None:
-            return hidden
-        step_tensor = torch.full((hidden.size(0),), step_t, device=hidden.device)
-        return hidden + self.pos_encoder(step_tensor)
-
-    def _predict_vector_flow_from_nodes(self, node_features: torch.Tensor) -> torch.Tensor:
-        return self.flow_head(node_features)
-
-    def _apply_relation_low_rank_transform(
+    def _build_question_context_tokens(
         self,
         *,
-        relation_features: torch.Tensor,
-        vector_flow: torch.Tensor,
+        env_context: GraphEnvContext,
+        question_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        if relation_features.dim() != 2 or vector_flow.dim() != 2:
+        question_ctx = env_context.question_ctx
+        if question_ctx is None:
+            return question_tokens.unsqueeze(1)
+        if question_ctx.dim() != 3:
+            raise ValueError(f"question_ctx must be 3D [B, L, d], got shape={tuple(question_ctx.shape)}.")
+        if int(question_ctx.size(0)) != int(env_context.num_graphs):
             raise ValueError(
-                "relation_features and vector_flow must be 2D tensors: "
-                f"got relation={tuple(relation_features.shape)}, flow={tuple(vector_flow.shape)}."
+                "question_ctx batch mismatch with num_graphs: "
+                f"question_ctx={int(question_ctx.size(0))}, num_graphs={int(env_context.num_graphs)}."
             )
-        if relation_features.size(0) != vector_flow.size(0):
+        if int(question_ctx.size(1)) <= 0:
+            raise ValueError("question_ctx length L must be > 0 when provided.")
+        hidden_dim = int(question_tokens.size(-1))
+        if int(question_ctx.size(-1)) == hidden_dim:
+            return question_ctx.to(device=question_tokens.device, dtype=question_tokens.dtype)
+        embedding_dim = int(self.config.backbone.embedding_dim)
+        if int(question_ctx.size(-1)) != embedding_dim:
             raise ValueError(
-                "relation_features and vector_flow batch size mismatch: "
-                f"relation={tuple(relation_features.shape)}, flow={tuple(vector_flow.shape)}."
+                "question_ctx last dim mismatch with backbone dims: "
+                f"question_ctx={int(question_ctx.size(-1))}, embedding_dim={embedding_dim}, hidden_dim={hidden_dim}."
             )
-
-        edge_count = int(vector_flow.size(0))
-        hidden_dim = int(vector_flow.size(1))
-        rank = self.relation_low_rank
-
-        # W_r = I + U_r V_r, where U_r ∈ R^{d x k}, V_r ∈ R^{k x d}.
-        left = self.relation_low_rank_left(relation_features).view(edge_count, hidden_dim, rank)
-        right = self.relation_low_rank_right(relation_features).view(edge_count, rank, hidden_dim)
-        vector_col = vector_flow.unsqueeze(-1)
-        low_rank_delta = torch.bmm(left, torch.bmm(right, vector_col)).squeeze(-1)
-        transformed = vector_flow + low_rank_delta
-        return F.softplus(transformed)
+        return self.backbone.project_question_embeddings(question_ctx.to(device=question_tokens.device))
 
     @staticmethod
-    def _build_topk_node_keep_mask(
+    def _build_question_padding_mask(
         *,
-        node_ptr: torch.Tensor,
-        node_scores: torch.Tensor,
-        topk_k: int,
-    ) -> torch.Tensor:
-        num_graphs = int(node_ptr.numel()) - 1
-        keep_mask = torch.zeros_like(node_scores, dtype=torch.bool)
-        for graph_idx in range(num_graphs):
-            start = int(node_ptr[graph_idx].item())
-            end = int(node_ptr[graph_idx + 1].item())
-            if end <= start:
-                continue
-            graph_scores = node_scores[start:end]
-            graph_k = min(topk_k, int(graph_scores.numel()))
-            if graph_k <= 0:
-                continue
-            if graph_k == int(graph_scores.numel()):
-                keep_mask[start:end] = True
-                continue
-            topk_local = torch.topk(graph_scores, k=graph_k, dim=0).indices + start
-            keep_mask[topk_local] = True
-        return keep_mask
-
-    def set_training_step(self, step: int) -> None:
-        self._train_step = max(int(step), 0)
-
-    def _resolve_topk_prune_k(self) -> int:
-        if not self.training:
-            return self.topk_prune_eval_k
-        if self.topk_prune_anneal_steps <= 0:
-            return self.topk_prune_train_k
-        if self.topk_prune_train_k == self.topk_prune_train_k_final:
-            return self.topk_prune_train_k
-        effective_step = max(self._train_step - self.topk_prune_warmup_steps, 0)
-        progress = min(float(effective_step) / float(self.topk_prune_anneal_steps), 1.0)
-        k_float = float(self.topk_prune_train_k) + (
-            float(self.topk_prune_train_k_final - self.topk_prune_train_k) * progress
-        )
-        return max(int(round(k_float)), 0)
+        env_context: GraphEnvContext,
+        question_context_tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        raw_mask = env_context.question_ctx_mask
+        if raw_mask is None:
+            return None
+        if raw_mask.dim() != 2:
+            raise ValueError(f"question_ctx_mask must be 2D [B, L], got shape={tuple(raw_mask.shape)}.")
+        expected_shape = question_context_tokens.shape[:2]
+        if tuple(raw_mask.shape) != tuple(expected_shape):
+            raise ValueError(
+                "question_ctx_mask shape mismatch with question_context_tokens: "
+                f"mask={tuple(raw_mask.shape)}, context={tuple(expected_shape)}."
+            )
+        valid_mask = raw_mask.to(device=question_context_tokens.device, dtype=torch.bool)
+        if bool((~valid_mask).all(dim=1).any().item()):
+            raise ValueError("question_ctx_mask contains rows with zero valid tokens.")
+        return ~valid_mask
 
     def compute_node_priority_scores(
         self,
@@ -259,61 +202,205 @@ class DualFlowPolicy(nn.Module):
         env_context: GraphEnvContext,
         node_tokens: torch.Tensor,
         question_tokens: torch.Tensor,
-    ) -> dict[str, torch.Tensor | None]:
-        topk_prune_k = self._resolve_topk_prune_k()
-        node_priority_keep_mask: torch.Tensor | None = None
-        vector_flow = self._predict_vector_flow_from_nodes(node_tokens)
-        if topk_prune_k > 0:
-            node_priority_scores = self.compute_node_priority_scores(
+    ) -> dict[str, torch.Tensor]:
+        del node_tokens
+        question_context_tokens = self._build_question_context_tokens(
+            env_context=env_context,
+            question_tokens=question_tokens,
+        )
+        question_padding_mask = self._build_question_padding_mask(
+            env_context=env_context,
+            question_context_tokens=question_context_tokens,
+        )
+        cache = {"question_context_tokens": question_context_tokens}
+        if question_padding_mask is not None:
+            cache["question_padding_mask"] = question_padding_mask
+        return cache
+
+    @staticmethod
+    def _resolve_path_state(agent_state: DynamicAgentState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, num_agents = agent_state.current_nodes.shape
+        total_agents = B * num_agents
+        path_ids = agent_state.path_token_ids
+        path_types = agent_state.path_token_types
+        path_lengths = agent_state.path_lengths
+
+        if path_ids is None and path_types is None and path_lengths is None:
+            default_ids = agent_state.current_nodes.view(total_agents, 1).clone()
+            default_types = torch.zeros_like(default_ids, dtype=torch.bool)
+            default_lengths = torch.ones((total_agents,), dtype=torch.long, device=default_ids.device)
+            return default_ids, default_types, default_lengths
+        if path_ids is None or path_types is None or path_lengths is None:
+            raise ValueError("path_token_ids/path_token_types/path_lengths must be all provided or all omitted.")
+        if path_ids.dim() != 3 or path_types.dim() != 3:
+            raise ValueError(
+                "path_token_ids and path_token_types must be 3D [B, num_agents, T], "
+                f"got ids={tuple(path_ids.shape)}, types={tuple(path_types.shape)}."
+            )
+        if path_lengths.dim() != 2:
+            raise ValueError(f"path_lengths must be 2D [B, num_agents], got shape={tuple(path_lengths.shape)}.")
+        if tuple(path_ids.shape) != tuple(path_types.shape):
+            raise ValueError(
+                "path_token_ids/path_token_types shape mismatch: "
+                f"ids={tuple(path_ids.shape)}, types={tuple(path_types.shape)}."
+            )
+        if int(path_ids.size(0)) != B or int(path_ids.size(1)) != num_agents:
+            raise ValueError(
+                "path_token_ids leading dims mismatch with current_nodes: "
+                f"path={tuple(path_ids.shape[:2])}, current_nodes={(B, num_agents)}."
+            )
+        if tuple(path_lengths.shape) != (B, num_agents):
+            raise ValueError(
+                "path_lengths shape mismatch with current_nodes: "
+                f"path_lengths={tuple(path_lengths.shape)}, current_nodes={(B, num_agents)}."
+            )
+        flat_ids = path_ids.reshape(total_agents, path_ids.size(-1))
+        flat_types = path_types.reshape(total_agents, path_types.size(-1)).to(dtype=torch.bool)
+        flat_lengths = path_lengths.reshape(total_agents).to(device=flat_ids.device, dtype=torch.long)
+        if int(flat_ids.size(-1)) <= 0:
+            raise ValueError("path_token_ids must have T > 0.")
+        if bool((flat_lengths <= 0).any().item()):
+            raise ValueError("path_lengths must be > 0 for every agent.")
+        if bool((flat_lengths > flat_ids.size(-1)).any().item()):
+            raise ValueError(
+                "path_lengths exceeds path_token_ids width: "
+                f"max_len={int(flat_lengths.max().item())}, width={int(flat_ids.size(-1))}."
+            )
+        return flat_ids, flat_types, flat_lengths
+
+    def _build_path_token_embeddings(
+        self,
+        *,
+        path_token_ids: torch.Tensor,
+        path_token_types: torch.Tensor,
+        node_tokens: torch.Tensor,
+        relation_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        if node_tokens.dim() != 2:
+            raise ValueError(f"node_tokens must be 2D [N, d], got shape={tuple(node_tokens.shape)}.")
+        if relation_tokens.dim() != 2:
+            raise ValueError(f"relation_tokens must be 2D [R, d], got shape={tuple(relation_tokens.shape)}.")
+        if int(node_tokens.size(0)) <= 0:
+            raise ValueError("node_tokens must contain at least one node.")
+        total_agents, token_len = path_token_ids.shape
+        hidden_dim = int(node_tokens.size(-1))
+        safe_node_ids = path_token_ids.clamp(min=0, max=int(node_tokens.size(0)) - 1)
+        node_part = node_tokens.index_select(0, safe_node_ids.reshape(-1)).view(total_agents, token_len, hidden_dim)
+        if int(relation_tokens.size(0)) == 0:
+            if bool(path_token_types.any().item()):
+                raise ValueError("path_token_types contains relation tokens but relation_tokens is empty.")
+            relation_part = torch.zeros_like(node_part)
+        else:
+            safe_rel_ids = path_token_ids.clamp(min=0, max=int(relation_tokens.size(0)) - 1)
+            relation_part = relation_tokens.index_select(0, safe_rel_ids.reshape(-1)).view(
+                total_agents,
+                token_len,
+                hidden_dim,
+            )
+        path_tokens = torch.where(path_token_types.unsqueeze(-1), relation_part, node_part)
+        if self.pos_encoder is not None:
+            token_positions = torch.arange(token_len, device=path_tokens.device, dtype=torch.long)
+            pos = self.pos_encoder(token_positions).to(device=path_tokens.device, dtype=path_tokens.dtype)
+            path_tokens = path_tokens + pos.unsqueeze(0)
+        return path_tokens
+
+    def _encode_path_history(
+        self,
+        *,
+        path_tokens: torch.Tensor,
+        path_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        total_agents, token_len, hidden_dim = path_tokens.shape
+        key_padding_mask = torch.arange(token_len, device=path_tokens.device, dtype=torch.long).unsqueeze(0)
+        key_padding_mask = key_padding_mask >= path_lengths.unsqueeze(1)
+        causal_mask = torch.triu(
+            torch.ones((token_len, token_len), device=path_tokens.device, dtype=torch.bool),
+            diagonal=1,
+        )
+
+        path_tokens_fp32 = path_tokens.to(dtype=torch.float32)
+        attn_out, _ = self.path_self_attention(
+            path_tokens_fp32,
+            path_tokens_fp32,
+            path_tokens_fp32,
+            attn_mask=causal_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        encoded = self.path_self_attention_norm(path_tokens_fp32 + attn_out)
+        last_idx = (path_lengths - 1).clamp(min=0)
+        row_idx = torch.arange(total_agents, device=path_tokens.device, dtype=torch.long)
+        last_hidden = encoded[row_idx, last_idx]
+        last_hidden = torch.where(torch.isfinite(last_hidden), last_hidden, torch.zeros_like(last_hidden))
+        return last_hidden.to(dtype=path_tokens.dtype).view(total_agents, hidden_dim)
+
+    def _compute_agent_potentials(
+        self,
+        *,
+        env_context: GraphEnvContext,
+        question_tokens: torch.Tensor,
+        agent_history: torch.Tensor,
+        num_agents: int,
+        question_context_tokens: torch.Tensor | None = None,
+        question_padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B = int(env_context.num_graphs)
+        total_agents = B * int(num_agents)
+        if question_context_tokens is None:
+            question_context_tokens = self._build_question_context_tokens(
                 env_context=env_context,
-                node_tokens=node_tokens,
                 question_tokens=question_tokens,
             )
-            node_priority_keep_mask = self._build_topk_node_keep_mask(
-                node_ptr=env_context.node_ptr,
-                node_scores=node_priority_scores,
-                topk_k=topk_prune_k,
+        if question_padding_mask is None:
+            question_padding_mask = self._build_question_padding_mask(
+                env_context=env_context,
+                question_context_tokens=question_context_tokens,
             )
-        return {
-            "vector_flow": vector_flow,
-            "node_priority_keep_mask": node_priority_keep_mask,
-        }
+        agent_graph_ids = torch.arange(B, device=question_tokens.device, dtype=torch.long).repeat_interleave(num_agents)
+        if int(agent_graph_ids.numel()) != total_agents:
+            raise ValueError("agent_graph_ids shape mismatch in potential computation.")
+        agent_question_context = question_context_tokens.index_select(0, agent_graph_ids)
+        key_padding_mask = None
+        if question_padding_mask is not None:
+            key_padding_mask = question_padding_mask.index_select(0, agent_graph_ids).to(dtype=torch.bool)
+            if bool(key_padding_mask.all(dim=1).any().item()):
+                raise ValueError("question_padding_mask contains all-masked rows after agent expansion.")
+
+        query = agent_history.unsqueeze(1).to(dtype=torch.float32)
+        context_fp32 = agent_question_context.to(dtype=torch.float32)
+        cross_out, _ = self.question_cross_attention(
+            query,
+            context_fp32,
+            context_fp32,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        vec_f = self.question_cross_attention_norm(query.squeeze(1) + cross_out.squeeze(1))
+        vec_f = torch.where(torch.isfinite(vec_f), vec_f, torch.zeros_like(vec_f))
+        return vec_f.to(dtype=agent_history.dtype), agent_graph_ids
 
     def _compute_edge_logits(
         self,
         *,
         env_context: GraphEnvContext,
-        agent_state: DynamicAgentState,
+        current_nodes: torch.Tensor,
         node_tokens: torch.Tensor,
-        question_tokens: torch.Tensor,
-        target_nodes: torch.Tensor,
-        out_degrees: torch.Tensor,
-        edge_relations: torch.Tensor,
         relation_tokens: torch.Tensor,
-        vector_flow: torch.Tensor,
-        node_priority_keep_mask: torch.Tensor | None,
+        edge_agent_batch: torch.Tensor,
+        target_nodes: torch.Tensor,
+        edge_relations: torch.Tensor,
+        agent_potential: torch.Tensor,
+        agent_graph_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, num_agents = agent_state.current_nodes.shape
-        agent_indices = torch.arange(B * num_agents, device=target_nodes.device)
-        edge_agent_batch = agent_indices.repeat_interleave(out_degrees)
-
-        flat_curr_nodes = agent_state.current_nodes.view(-1).clamp(min=0)
-        agent_batch = torch.arange(B, device=target_nodes.device).repeat_interleave(num_agents)
-        edge_graph_ids = agent_batch.index_select(0, edge_agent_batch)
-        source_nodes = flat_curr_nodes.index_select(0, edge_agent_batch)
-
-        # 向量流策略：
-        # logit(u->v,r;q) = log P_B(u|v) + log <g(q), W_r vecF(v)>
-        next_question = question_tokens.index_select(0, edge_graph_ids)
-        question_gate = torch.softmax(self.query_projection_head(next_question), dim=-1)
-        next_vector_flow = vector_flow.index_select(0, target_nodes)
-        edge_rel_features = relation_tokens.index_select(0, edge_relations)
-        transformed_next = self._apply_relation_low_rank_transform(
-            relation_features=edge_rel_features,
-            vector_flow=next_vector_flow,
-        )
-        projected_flow = (question_gate * transformed_next).sum(dim=-1)
-        projected_flow = projected_flow.clamp(min=self.flow_projection_eps)
+        source_nodes = current_nodes.index_select(0, edge_agent_batch)
+        edge_graph_ids = agent_graph_ids.index_select(0, edge_agent_batch)
+        state_vec = agent_potential.index_select(0, edge_agent_batch).to(dtype=torch.float32)
+        edge_rel_features = relation_tokens.index_select(0, edge_relations.clamp(min=0)).to(dtype=torch.float32)
+        target_features = node_tokens.index_select(0, target_nodes.clamp(min=0)).to(dtype=torch.float32)
+        edge_action = self.edge_action_encoder(torch.cat((edge_rel_features, target_features), dim=-1))
+        edge_action = self.edge_action_norm(edge_action)
+        dot_logits = (state_vec * edge_action).sum(dim=-1) / math.sqrt(float(state_vec.size(-1)))
+        dot_logits = torch.where(torch.isfinite(dot_logits), dot_logits, torch.zeros_like(dot_logits))
 
         log_pb_prior = self.backward_prior.log_prob_edges(
             env_context=env_context,
@@ -322,36 +409,103 @@ class DualFlowPolicy(nn.Module):
             edge_graph_ids=edge_graph_ids,
             dtype=node_tokens.dtype,
         )
-        edge_logits = log_pb_prior + torch.log(projected_flow)
-
-        visited = agent_state.visited_mask
-        if visited.dim() == 1:
-            is_visited = visited[target_nodes]
-        elif visited.dim() == 2:
-            is_visited = visited[edge_agent_batch, target_nodes]
-        else:
-            raise ValueError(f"visited_mask must be 1D or 2D, got shape={tuple(visited.shape)}")
-
+        edge_logits = dot_logits + self.edge_logit_pb_weight * log_pb_prior.to(dtype=torch.float32)
         neg_inf = torch.tensor(float("-inf"), device=edge_logits.device, dtype=edge_logits.dtype)
-        edge_logits = edge_logits.masked_fill(is_visited, neg_inf)
-        if node_priority_keep_mask is not None:
-            keep_targets = node_priority_keep_mask.index_select(0, target_nodes.clamp(min=0))
-            edge_logits = edge_logits.masked_fill(~keep_targets, neg_inf)
-        return edge_logits, edge_agent_batch
+        edge_logits = torch.where(torch.isfinite(edge_logits), edge_logits, neg_inf)
+        return edge_logits.to(dtype=node_tokens.dtype), edge_agent_batch
+
+    @staticmethod
+    def _segment_logsumexp(
+        *,
+        values: torch.Tensor,
+        segment_ids: torch.Tensor,
+        num_segments: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if num_segments < 0:
+            raise ValueError(f"num_segments must be >= 0, got {num_segments}.")
+        if num_segments == 0:
+            empty = torch.empty((0,), device=values.device, dtype=dtype)
+            return empty, torch.empty((0,), device=values.device, dtype=torch.bool)
+        out = torch.zeros((num_segments,), device=values.device, dtype=torch.float32)
+        has_finite = torch.zeros((num_segments,), device=values.device, dtype=torch.bool)
+        if int(values.numel()) == 0:
+            return out.to(dtype=dtype), has_finite
+        if values.dim() != 1 or segment_ids.dim() != 1:
+            raise ValueError("segment_logsumexp expects 1D values and segment_ids.")
+        if int(values.numel()) != int(segment_ids.numel()):
+            raise ValueError(
+                "segment_logsumexp size mismatch between values and segment_ids: "
+                f"values={int(values.numel())}, segment_ids={int(segment_ids.numel())}."
+            )
+        if bool((segment_ids < 0).any().item()) or bool((segment_ids >= num_segments).any().item()):
+            raise ValueError("segment_ids out of range in segment_logsumexp.")
+
+        finite_mask = torch.isfinite(values)
+        if not bool(finite_mask.any().item()):
+            return out.to(dtype=dtype), has_finite
+        finite_ids = segment_ids[finite_mask].to(device=values.device, dtype=torch.long)
+        finite_vals = values[finite_mask].to(dtype=torch.float32)
+        has_finite.scatter_(0, finite_ids, True)
+
+        neg_inf = torch.tensor(float("-inf"), device=values.device, dtype=torch.float32)
+        max_per_segment = torch.full((num_segments,), fill_value=neg_inf, device=values.device, dtype=torch.float32)
+        max_per_segment.scatter_reduce_(0, finite_ids, finite_vals, reduce="amax", include_self=True)
+        safe_max = torch.where(has_finite, max_per_segment, torch.zeros_like(max_per_segment))
+        shifted = torch.exp(finite_vals - safe_max.index_select(0, finite_ids))
+        sum_per_segment = torch.zeros((num_segments,), device=values.device, dtype=torch.float32)
+        sum_per_segment.scatter_add_(0, finite_ids, shifted)
+        lse = safe_max + torch.log(sum_per_segment.clamp(min=torch.finfo(torch.float32).tiny))
+        out = torch.where(has_finite, lse, torch.zeros_like(lse))
+        return out.to(dtype=dtype), has_finite
+
+    def _compute_stop_delta(
+        self,
+        *,
+        agent_potential: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        raw_stop = self.stop_head(agent_potential.to(dtype=torch.float32)).squeeze(-1)
+        raw_stop = torch.where(torch.isfinite(raw_stop), raw_stop, torch.zeros_like(raw_stop))
+        normalized = raw_stop / self.stop_delta_temperature
+        bounded_delta = self.stop_delta_scale * torch.tanh(normalized)
+        return bounded_delta.to(dtype=dtype)
 
     def _compute_stop_logits(
         self,
         *,
         env_context: GraphEnvContext,
         agent_state: DynamicAgentState,
+        stop_delta: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        edge_logits: torch.Tensor | None = None,
+        edge_agent_batch: torch.Tensor | None = None,
+        total_agents: int | None = None,
     ) -> torch.Tensor:
         B, num_agents = agent_state.current_nodes.shape
-        flat_hidden = agent_state.hidden_states.view(B * num_agents, -1)
-        flat_hidden = self._encode_hidden_with_time(flat_hidden, agent_state.step_t)
-
-        stop_logits = self.stop_head(flat_hidden).squeeze(-1).to(dtype=dtype)
+        expected_total_agents = B * num_agents
+        total_agents = expected_total_agents if total_agents is None else int(total_agents)
+        if total_agents != expected_total_agents:
+            raise ValueError(
+                "total_agents mismatch in stop-logit computation: "
+                f"expected={expected_total_agents}, got={total_agents}."
+            )
+        if int(stop_delta.numel()) != total_agents:
+            raise ValueError(
+                "stop_delta size mismatch with total_agents: "
+                f"stop_delta={int(stop_delta.numel())}, total_agents={total_agents}."
+            )
+        if edge_logits is not None and edge_agent_batch is not None:
+            edge_lse, has_finite_edge = self._segment_logsumexp(
+                values=edge_logits.to(dtype=torch.float32),
+                segment_ids=edge_agent_batch.to(device=device, dtype=torch.long),
+                num_segments=total_agents,
+                dtype=dtype,
+            )
+            stop_logits = torch.where(has_finite_edge, edge_lse + stop_delta, stop_delta)
+        else:
+            stop_logits = stop_delta
 
         # Keep super-source anti-early-stop rule.
         if env_context.start_local_indices is not None:
@@ -369,7 +523,7 @@ class DualFlowPolicy(nn.Module):
 
     def _gather_actions_from_csr_lock_free(
         self,
-        adj_t: torch.Tensor,
+        adj_t,
         active_nodes: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -406,12 +560,12 @@ class DualFlowPolicy(nn.Module):
         node_tokens: torch.Tensor,
         question_tokens: torch.Tensor,
         relation_tokens: torch.Tensor,
-        action_cache: dict[str, torch.Tensor | None] | None = None,
+        action_cache: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         B, num_agents = agent_state.current_nodes.shape
+        total_agents = B * num_agents
         flat_curr_nodes = agent_state.current_nodes.view(-1)
         flat_active_mask = ~agent_state.done_mask.view(-1)
-        active_nodes = torch.where(flat_active_mask, flat_curr_nodes, torch.zeros_like(flat_curr_nodes))
 
         if action_cache is None:
             resolved_cache = self.build_action_cache(
@@ -419,39 +573,146 @@ class DualFlowPolicy(nn.Module):
                 node_tokens=node_tokens,
                 question_tokens=question_tokens,
             )
-            vector_flow = resolved_cache["vector_flow"]
-            node_priority_keep_mask = resolved_cache["node_priority_keep_mask"]
         else:
-            vector_flow = action_cache.get("vector_flow")
-            node_priority_keep_mask = action_cache.get("node_priority_keep_mask")
-            if vector_flow is None:
-                raise ValueError("action_cache must provide `vector_flow`.")
+            resolved_cache = action_cache
+        question_context_tokens = resolved_cache.get("question_context_tokens")
+        if question_context_tokens is None:
+            raise ValueError("action_cache must provide `question_context_tokens`.")
+        question_padding_mask = resolved_cache.get("question_padding_mask")
 
+        path_token_ids, path_token_types, path_lengths = self._resolve_path_state(agent_state)
+        path_embeddings = self._build_path_token_embeddings(
+            path_token_ids=path_token_ids,
+            path_token_types=path_token_types,
+            node_tokens=node_tokens,
+            relation_tokens=relation_tokens,
+        )
+        agent_history = self._encode_path_history(
+            path_tokens=path_embeddings,
+            path_lengths=path_lengths,
+        )
+        agent_potential, agent_graph_ids = self._compute_agent_potentials(
+            env_context=env_context,
+            question_tokens=question_tokens,
+            agent_history=agent_history,
+            num_agents=num_agents,
+            question_context_tokens=question_context_tokens,
+            question_padding_mask=question_padding_mask,
+        )
+        stop_delta = self._compute_stop_delta(agent_potential=agent_potential, dtype=node_tokens.dtype)
+
+        active_nodes = torch.where(flat_active_mask, flat_curr_nodes, torch.zeros_like(flat_curr_nodes))
         edge_ids, target_nodes, out_degrees = self._gather_actions_from_csr_lock_free(
             env_context.adj_t_fwd,
             active_nodes,
         )
-        if edge_ids.numel() == 0:
-            return self._build_empty_output(B, num_agents, node_tokens.device)
+        if int(edge_ids.numel()) == 0:
+            stop_logits = self._compute_stop_logits(
+                env_context=env_context,
+                agent_state=agent_state,
+                stop_delta=stop_delta,
+                device=node_tokens.device,
+                dtype=node_tokens.dtype,
+                total_agents=total_agents,
+            )
+            return self._build_empty_output(
+                B=B,
+                num_agents=num_agents,
+                device=node_tokens.device,
+                dtype=node_tokens.dtype,
+                stop_logits=stop_logits.view(B, num_agents),
+            )
+
+        all_agent_rows = torch.arange(total_agents, device=target_nodes.device, dtype=torch.long)
+        edge_agent_batch_full = all_agent_rows.repeat_interleave(out_degrees)
+        edge_active_mask = flat_active_mask.index_select(0, edge_agent_batch_full)
+        if not bool(edge_active_mask.all().item()):
+            edge_ids = edge_ids[edge_active_mask]
+            target_nodes = target_nodes[edge_active_mask]
+            edge_agent_batch_full = edge_agent_batch_full[edge_active_mask]
+            out_degrees_active = torch.zeros((total_agents,), dtype=torch.long, device=node_tokens.device)
+            if int(edge_agent_batch_full.numel()) > 0:
+                out_degrees_active.scatter_add_(
+                    0,
+                    edge_agent_batch_full,
+                    torch.ones_like(edge_agent_batch_full, dtype=torch.long, device=node_tokens.device),
+                )
+            out_degrees = out_degrees_active
+        if int(edge_ids.numel()) == 0:
+            stop_logits = self._compute_stop_logits(
+                env_context=env_context,
+                agent_state=agent_state,
+                stop_delta=stop_delta,
+                device=node_tokens.device,
+                dtype=node_tokens.dtype,
+                total_agents=total_agents,
+            )
+            return self._build_empty_output(
+                B=B,
+                num_agents=num_agents,
+                device=node_tokens.device,
+                dtype=node_tokens.dtype,
+                stop_logits=stop_logits.view(B, num_agents),
+            )
+
+        visited = agent_state.visited_mask
+        if visited.dim() == 1:
+            is_visited = visited[target_nodes]
+        elif visited.dim() == 2:
+            is_visited = visited[edge_agent_batch_full, target_nodes]
+        else:
+            raise ValueError(f"visited_mask must be 1D or 2D, got shape={tuple(visited.shape)}")
+
+        keep_edge = ~is_visited
+        if not bool(keep_edge.any().item()):
+            stop_logits = self._compute_stop_logits(
+                env_context=env_context,
+                agent_state=agent_state,
+                stop_delta=stop_delta,
+                device=node_tokens.device,
+                dtype=node_tokens.dtype,
+                total_agents=total_agents,
+            )
+            return {
+                "edge_logits": torch.empty(0, device=node_tokens.device, dtype=node_tokens.dtype),
+                "edge_agent_batch": torch.empty(0, dtype=torch.long, device=node_tokens.device),
+                "stop_logits": stop_logits.view(B, num_agents),
+                "edge_ids": torch.empty(0, dtype=torch.long, device=node_tokens.device),
+                "target_nodes": torch.empty(0, dtype=torch.long, device=node_tokens.device),
+                "out_degrees": torch.zeros((B, num_agents), dtype=torch.long, device=node_tokens.device),
+            }
+
+        edge_ids = edge_ids[keep_edge]
+        target_nodes = target_nodes[keep_edge]
+        edge_agent_batch = edge_agent_batch_full[keep_edge]
+        out_degrees_filtered = torch.zeros((total_agents,), dtype=torch.long, device=node_tokens.device)
+        out_degrees_filtered.scatter_add_(
+            0,
+            edge_agent_batch,
+            torch.ones_like(edge_agent_batch, dtype=torch.long, device=node_tokens.device),
+        )
 
         edge_logits, edge_agent_batch = self._compute_edge_logits(
             env_context=env_context,
-            agent_state=agent_state,
+            current_nodes=flat_curr_nodes.clamp(min=0),
             node_tokens=node_tokens,
-            question_tokens=question_tokens,
-            target_nodes=target_nodes,
-            out_degrees=out_degrees,
-            edge_relations=env_context.edge_relations.index_select(0, edge_ids.clamp(min=0)),
             relation_tokens=relation_tokens,
-            vector_flow=vector_flow,
-            node_priority_keep_mask=node_priority_keep_mask,
+            edge_agent_batch=edge_agent_batch,
+            target_nodes=target_nodes,
+            edge_relations=env_context.edge_relations.index_select(0, edge_ids.clamp(min=0)),
+            agent_potential=agent_potential,
+            agent_graph_ids=agent_graph_ids,
         )
 
         stop_logits = self._compute_stop_logits(
             env_context=env_context,
             agent_state=agent_state,
+            stop_delta=stop_delta,
             device=node_tokens.device,
             dtype=node_tokens.dtype,
+            edge_logits=edge_logits,
+            edge_agent_batch=edge_agent_batch,
+            total_agents=total_agents,
         )
 
         return {
@@ -460,15 +721,23 @@ class DualFlowPolicy(nn.Module):
             "stop_logits": stop_logits.view(B, num_agents),
             "edge_ids": edge_ids,
             "target_nodes": target_nodes,
-            "out_degrees": out_degrees.view(B, num_agents),
+            "out_degrees": out_degrees_filtered.view(B, num_agents),
         }
 
-    def _build_empty_output(self, B: int, num_agents: int, device: torch.device) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _build_empty_output(
+        *,
+        B: int,
+        num_agents: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        stop_logits: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         """防崩溃的安全网兜底输出"""
         return {
-            "edge_logits": torch.empty(0, device=device),
+            "edge_logits": torch.empty(0, device=device, dtype=dtype),
             "edge_agent_batch": torch.empty(0, dtype=torch.long, device=device),
-            "stop_logits": torch.zeros((B, num_agents), device=device),
+            "stop_logits": stop_logits,
             "edge_ids": torch.empty(0, dtype=torch.long, device=device),
             "target_nodes": torch.empty(0, dtype=torch.long, device=device),
             "out_degrees": torch.zeros((B, num_agents), dtype=torch.long, device=device),
@@ -484,25 +753,28 @@ class DualFlowPolicy(nn.Module):
         is_stop: torch.Tensor,
     ) -> DynamicAgentState:
         """
-        [系统实体] 记忆更新与严格不可变的状态转移
-        严防 CUDA 内存越界 (Index Out of Bounds) 和计算图原地修改破坏。
+        [系统实体] 严格不可变的状态转移
+        轨迹历史采用 token 序列维护，不依赖 GRU 递归隐状态。
         """
+        del relation_tokens
         B, num_agents = agent_state.current_nodes.shape
-        flat_hidden = agent_state.hidden_states.view(-1, self.config.backbone.hidden_dim)
+        total_agents = B * num_agents
 
         safe_target_nodes = torch.where(is_stop, torch.zeros_like(chosen_target_nodes), chosen_target_nodes)
         safe_edge_relations = torch.where(is_stop, torch.zeros_like(chosen_edge_relations), chosen_edge_relations)
 
-        new_node_emb = node_tokens.index_select(0, safe_target_nodes)
-        new_rel_emb = relation_tokens.index_select(0, safe_edge_relations)
-
-        gru_input = torch.cat([new_node_emb, new_rel_emb], dim=-1)
-        next_hidden = self.memory_tracker(gru_input, flat_hidden)
-        next_hidden = torch.where(is_stop.unsqueeze(-1), flat_hidden, next_hidden)
+        flat_hidden = agent_state.hidden_states.view(total_agents, -1)
+        if int(flat_hidden.size(-1)) == int(node_tokens.size(-1)):
+            moved_hidden = node_tokens.index_select(0, safe_target_nodes.clamp(min=0)).to(dtype=flat_hidden.dtype)
+            next_hidden = torch.where(is_stop.unsqueeze(-1), flat_hidden, moved_hidden)
+        else:
+            next_hidden = flat_hidden
 
         new_visited_mask = agent_state.visited_mask.clone()
         if new_visited_mask.dim() == 1:
-            new_visited_mask.scatter_(0, safe_target_nodes, True)
+            active_move = ~is_stop
+            if bool(active_move.any().item()):
+                new_visited_mask.scatter_(0, safe_target_nodes[active_move], True)
         elif new_visited_mask.dim() == 2:
             active_move = ~is_stop
             if bool(active_move.any().item()):
@@ -512,19 +784,44 @@ class DualFlowPolicy(nn.Module):
         else:
             raise ValueError(f"visited_mask must be 1D or 2D, got shape={tuple(new_visited_mask.shape)}")
 
-        new_current_nodes = torch.where(
-            is_stop.view(B, num_agents),
-            agent_state.current_nodes,
-            safe_target_nodes.view(B, num_agents),
-        )
+        current_nodes = agent_state.current_nodes.view(total_agents)
+        next_current_flat = torch.where(is_stop, current_nodes, safe_target_nodes)
+        next_current_nodes = next_current_flat.view(B, num_agents)
+
+        path_token_ids, path_token_types, path_lengths = self._resolve_path_state(agent_state)
+        move_mask = ~is_stop
+        next_lengths = path_lengths + move_mask.to(dtype=torch.long) * 2
+        old_width = int(path_token_ids.size(1))
+        next_width = max(old_width, int(next_lengths.max().item()))
+        if next_width > old_width:
+            next_path_ids = torch.zeros((total_agents, next_width), dtype=path_token_ids.dtype, device=path_token_ids.device)
+            next_path_types = torch.zeros((total_agents, next_width), dtype=torch.bool, device=path_token_types.device)
+            next_path_ids[:, :old_width] = path_token_ids
+            next_path_types[:, :old_width] = path_token_types
+        else:
+            next_path_ids = path_token_ids.clone()
+            next_path_types = path_token_types.clone()
+        if bool(move_mask.any().item()):
+            move_rows = torch.where(move_mask)[0]
+            rel_pos = path_lengths.index_select(0, move_rows)
+            node_pos = rel_pos + 1
+            move_rel = safe_edge_relations.index_select(0, move_rows).to(dtype=next_path_ids.dtype)
+            move_nodes = safe_target_nodes.index_select(0, move_rows).to(dtype=next_path_ids.dtype)
+            next_path_ids[move_rows, rel_pos] = move_rel
+            next_path_types[move_rows, rel_pos] = True
+            next_path_ids[move_rows, node_pos] = move_nodes
+            next_path_types[move_rows, node_pos] = False
 
         return DynamicAgentState(
             step_t=agent_state.step_t + 1,
-            current_nodes=new_current_nodes,
+            current_nodes=next_current_nodes,
             hidden_states=next_hidden.view(B, num_agents, -1),
             visited_mask=new_visited_mask,
             cumulative_rewards=agent_state.cumulative_rewards,
             done_mask=agent_state.done_mask | is_stop.view(B, num_agents),
+            path_token_ids=next_path_ids.view(B, num_agents, next_width),
+            path_token_types=next_path_types.view(B, num_agents, next_width),
+            path_lengths=next_lengths.view(B, num_agents),
         )
 
     def forward(

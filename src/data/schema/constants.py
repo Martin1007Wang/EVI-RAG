@@ -83,6 +83,8 @@ class QuestionFields:
     ANSWER_TEXTS = "answer_texts"
     GRAPH_ID = "graph_id"
     QUESTION_EMB = "question_emb"
+    QUESTION_CTX = "question_ctx"
+    QUESTION_CTX_MASK = "question_ctx_mask"
 
 
 class EntityVocabFields:
@@ -130,10 +132,14 @@ _QUESTION_PARQUET_FIELDS = (
     QuestionFields.ANSWER_TEXTS,
     QuestionFields.GRAPH_ID,
     QuestionFields.QUESTION_EMB,
+    QuestionFields.QUESTION_CTX,
+    QuestionFields.QUESTION_CTX_MASK,
 )
 
 _QUESTION_PARQUET_REQUIRED_FIELDS = tuple(
-    field for field in _QUESTION_PARQUET_FIELDS if field != QuestionFields.QUESTION_EMB
+    field
+    for field in _QUESTION_PARQUET_FIELDS
+    if field not in (QuestionFields.QUESTION_EMB, QuestionFields.QUESTION_CTX, QuestionFields.QUESTION_CTX_MASK)
 )
 
 _ENTITY_VOCAB_FIELDS = (

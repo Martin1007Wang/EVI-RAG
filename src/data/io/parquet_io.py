@@ -45,7 +45,12 @@ def _validate_row_fields(rows: List[Dict[str, object]], *, allowed_fields: List[
             raise ValueError(f"{context} row {idx} contains unexpected fields: {extra}")
 
 
-def _validate_question_rows(rows: List[Dict[str, object]], *, include_question_emb: bool) -> None:
+def _validate_question_rows(
+    rows: List[Dict[str, object]],
+    *,
+    include_question_emb: bool,
+    include_question_ctx: bool,
+) -> None:
     _validate_row_fields(rows, allowed_fields=list(_QUESTION_PARQUET_FIELDS), context="questions")
     if not rows:
         return
@@ -55,12 +60,39 @@ def _validate_question_rows(rows: List[Dict[str, object]], *, include_question_e
         if missing:
             raise ValueError(f"questions row {idx} missing required fields: {missing}")
     has_emb = [QuestionFields.QUESTION_EMB in row for row in rows]
+    has_ctx = [QuestionFields.QUESTION_CTX in row for row in rows]
+    has_ctx_mask = [QuestionFields.QUESTION_CTX_MASK in row for row in rows]
     if include_question_emb:
         if not all(has_emb):
             raise ValueError("question_emb missing in questions while include_question_emb is enabled.")
     else:
         if any(has_emb):
             raise ValueError("question_emb present in questions while include_question_emb is disabled.")
+    if include_question_ctx:
+        if not all(has_ctx):
+            raise ValueError("question_ctx missing in questions while include_question_ctx is enabled.")
+        if not all(has_ctx_mask):
+            raise ValueError("question_ctx_mask missing in questions while include_question_ctx is enabled.")
+    else:
+        if any(has_ctx) or any(has_ctx_mask):
+            raise ValueError(
+                "question_ctx/question_ctx_mask present in questions while include_question_ctx is disabled."
+            )
+    for idx, row in enumerate(rows):
+        has_ctx_i = QuestionFields.QUESTION_CTX in row
+        has_mask_i = QuestionFields.QUESTION_CTX_MASK in row
+        if has_ctx_i != has_mask_i:
+            raise ValueError(f"questions row {idx} must include question_ctx and question_ctx_mask together.")
+        if has_ctx_i:
+            ctx = row[QuestionFields.QUESTION_CTX]
+            mask = row[QuestionFields.QUESTION_CTX_MASK]
+            if not isinstance(ctx, list) or not isinstance(mask, list):
+                raise ValueError(f"questions row {idx} question_ctx/question_ctx_mask must be list types.")
+            if len(ctx) != len(mask):
+                raise ValueError(
+                    f"questions row {idx} question_ctx/question_ctx_mask length mismatch: "
+                    f"ctx={len(ctx)} mask={len(mask)}."
+                )
 
 
 def _validate_vocab_rows(rows: List[Dict[str, object]], *, allowed_fields: List[str], context: str) -> None:
@@ -75,6 +107,7 @@ class ParquetDatasetWriter:
     graph_writer: pq.ParquetWriter | None = None
     question_writer: pq.ParquetWriter | None = None
     include_question_emb: bool = False
+    include_question_ctx: bool = False
 
     def append(self, graph: GraphRecord, question: Dict[str, object]) -> None:
         self.graphs.append(graph)
@@ -104,7 +137,11 @@ class ParquetDatasetWriter:
             self.graphs = []
 
         if self.questions:
-            _validate_question_rows(self.questions, include_question_emb=self.include_question_emb)
+            _validate_question_rows(
+                self.questions,
+                include_question_emb=self.include_question_emb,
+                include_question_ctx=self.include_question_ctx,
+            )
             table_q_data = {
                 QuestionFields.QUESTION_UID: pa.array(
                     [row[QuestionFields.QUESTION_UID] for row in self.questions], type=pa.string()
@@ -133,6 +170,11 @@ class ParquetDatasetWriter:
             if self.include_question_emb:
                 question_embs = [row[QuestionFields.QUESTION_EMB] for row in self.questions]
                 table_q_data[QuestionFields.QUESTION_EMB] = pa.array(question_embs, type=pa.list_(pa.float32()))
+            if self.include_question_ctx:
+                question_ctx = [row[QuestionFields.QUESTION_CTX] for row in self.questions]
+                question_ctx_mask = [row[QuestionFields.QUESTION_CTX_MASK] for row in self.questions]
+                table_q_data[QuestionFields.QUESTION_CTX] = pa.array(question_ctx, type=pa.list_(pa.list_(pa.float32())))
+                table_q_data[QuestionFields.QUESTION_CTX_MASK] = pa.array(question_ctx_mask, type=pa.list_(pa.bool_()))
             table_q = pa.table(table_q_data)
             if self.question_writer is None:
                 self.question_writer = pq.ParquetWriter(
@@ -167,8 +209,15 @@ def write_graphs(graphs: List[GraphRecord], output_path: Path) -> None:
 
 def write_questions(rows: List[Dict[str, object]], output_path: Path) -> None:
     has_emb = [QuestionFields.QUESTION_EMB in row for row in rows]
+    has_ctx = [QuestionFields.QUESTION_CTX in row for row in rows]
+    has_ctx_mask = [QuestionFields.QUESTION_CTX_MASK in row for row in rows]
     include_question_emb = any(has_emb)
-    _validate_question_rows(rows, include_question_emb=include_question_emb)
+    include_question_ctx = any(has_ctx) or any(has_ctx_mask)
+    _validate_question_rows(
+        rows,
+        include_question_emb=include_question_emb,
+        include_question_ctx=include_question_ctx,
+    )
     table_data = {
         QuestionFields.QUESTION_UID: pa.array([row[QuestionFields.QUESTION_UID] for row in rows], type=pa.string()),
         QuestionFields.DATASET: pa.array([row[QuestionFields.DATASET] for row in rows], type=pa.string()),
@@ -189,6 +238,13 @@ def write_questions(rows: List[Dict[str, object]], output_path: Path) -> None:
     if include_question_emb:
         table_data[QuestionFields.QUESTION_EMB] = pa.array(
             [row[QuestionFields.QUESTION_EMB] for row in rows], type=pa.list_(pa.float32())
+        )
+    if include_question_ctx:
+        table_data[QuestionFields.QUESTION_CTX] = pa.array(
+            [row[QuestionFields.QUESTION_CTX] for row in rows], type=pa.list_(pa.list_(pa.float32()))
+        )
+        table_data[QuestionFields.QUESTION_CTX_MASK] = pa.array(
+            [row[QuestionFields.QUESTION_CTX_MASK] for row in rows], type=pa.list_(pa.bool_())
         )
     table = pa.table(table_data)
     pq.write_table(table, output_path, compression="zstd")

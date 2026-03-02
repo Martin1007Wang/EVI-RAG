@@ -69,6 +69,32 @@ class OnlineRolloutEngine:
         return patched
 
     @staticmethod
+    def _compute_min_required_moves(
+        *,
+        env_context: GraphEnvContext,
+        start_nodes_abs: torch.Tensor,
+        base_stop_min_steps: int,
+    ) -> torch.Tensor:
+        if base_stop_min_steps < 0:
+            raise ValueError("sampling.stop_min_steps must be >= 0.")
+        start_nodes_flat = start_nodes_abs.view(-1).to(dtype=torch.long)
+        if int(start_nodes_flat.numel()) == 0:
+            return start_nodes_flat
+        node_global_ids = env_context.node_global_ids.to(
+            device=start_nodes_flat.device,
+            dtype=torch.long,
+        )
+        if int(node_global_ids.numel()) != int(env_context.num_nodes_total):
+            raise ValueError(
+                "node_global_ids length mismatch with num_nodes_total in stop_min_steps guard: "
+                f"node_global_ids={int(node_global_ids.numel())}, num_nodes_total={int(env_context.num_nodes_total)}."
+            )
+        start_global_ids = node_global_ids.index_select(0, start_nodes_flat)
+        start_is_virtual = start_global_ids < 0
+        required = torch.full_like(start_nodes_flat, fill_value=base_stop_min_steps, dtype=torch.long)
+        return required + start_is_virtual.to(dtype=torch.long)
+
+    @staticmethod
     def _expand_grouped_start_nodes(
         *,
         q_local_indices: torch.Tensor,
@@ -104,15 +130,35 @@ class OnlineRolloutEngine:
     ) -> DynamicAgentState:
         device = env_context.node_embeddings.device
         num_graphs = int(env_context.num_graphs)
-        start_local = OnlineRolloutEngine._expand_grouped_start_nodes(
-            q_local_indices=env_context.q_local_indices,
-            q_ptr=env_context.q_ptr,
-            num_agents=num_agents,
-            deterministic=deterministic,
-        )
+        if env_context.start_local_indices is not None:
+            if env_context.start_local_indices.dim() != 1:
+                raise ValueError(
+                    "start_local_indices must be 1D [B] when provided, "
+                    f"got shape={tuple(env_context.start_local_indices.shape)}."
+                )
+            if int(env_context.start_local_indices.numel()) != num_graphs:
+                raise ValueError(
+                    "start_local_indices length mismatch with num_graphs: "
+                    f"start={int(env_context.start_local_indices.numel())} graphs={num_graphs}."
+                )
+            start_local_base = env_context.start_local_indices.to(device=device, dtype=torch.long)
+            node_counts = (env_context.node_ptr[1:] - env_context.node_ptr[:-1]).to(device=device, dtype=torch.long)
+            if bool((start_local_base < 0).any().item()) or bool((start_local_base >= node_counts).any().item()):
+                raise ValueError("start_local_indices out of per-graph node range in rollout initialization.")
+            start_local = start_local_base.unsqueeze(1).expand(num_graphs, num_agents)
+        else:
+            start_local = OnlineRolloutEngine._expand_grouped_start_nodes(
+                q_local_indices=env_context.q_local_indices,
+                q_ptr=env_context.q_ptr,
+                num_agents=num_agents,
+                deterministic=deterministic,
+            )
         start_nodes_absolute = start_local + env_context.node_ptr[:-1].unsqueeze(1)
         current_nodes = start_nodes_absolute.clone()
         hidden_states = env_context.question_emb.unsqueeze(1).expand(num_graphs, num_agents, -1).clone()
+        path_token_ids = current_nodes.unsqueeze(-1).clone()
+        path_token_types = torch.zeros_like(path_token_ids, dtype=torch.bool)
+        path_lengths = torch.ones((num_graphs, num_agents), dtype=torch.long, device=device)
         visited_mask = torch.zeros(
             (num_graphs * num_agents, env_context.num_nodes_total),
             dtype=torch.bool,
@@ -128,6 +174,9 @@ class OnlineRolloutEngine:
             visited_mask=visited_mask,
             cumulative_rewards=torch.zeros((num_graphs, num_agents), device=device),
             done_mask=torch.zeros((num_graphs, num_agents), dtype=torch.bool, device=device),
+            path_token_ids=path_token_ids,
+            path_token_types=path_token_types,
+            path_lengths=path_lengths,
         )
 
     def _compute_log_pb(
@@ -173,6 +222,11 @@ class OnlineRolloutEngine:
             num_agents=num_agents,
             deterministic=deterministic,
         )
+        min_required_moves_flat = self._compute_min_required_moves(
+            env_context=env_context,
+            start_nodes_abs=agent_state.current_nodes,
+            base_stop_min_steps=stop_min_steps,
+        )
         agent_graph_ids = torch.arange(num_graphs, device=device, dtype=torch.long).repeat_interleave(num_agents)
 
         log_pf_sum = torch.zeros((num_graphs, num_agents), device=device)
@@ -190,7 +244,7 @@ class OnlineRolloutEngine:
         else:
             node_tokens, relation_tokens, question_tokens = encoded_context
         build_cache_fn = getattr(policy, "build_action_cache", None)
-        action_cache: dict[str, torch.Tensor | None] | None = None
+        action_cache: dict[str, torch.Tensor] | None = None
         if callable(build_cache_fn):
             action_cache = build_cache_fn(
                 env_context=env_context,
@@ -222,10 +276,13 @@ class OnlineRolloutEngine:
                     action_cache=action_cache,
                 )
             out_degrees_flat = policy_out["out_degrees"].view(-1)
-            if step < stop_min_steps:
+            num_moves_flat = num_moves.view(-1)
+            need_more_moves = num_moves_flat < min_required_moves_flat
+            stop_guard_active = active_flat & need_more_moves
+            if bool(stop_guard_active.any().item()):
                 policy_out = self._mask_stop_logits_for_min_steps(
                     policy_out=policy_out,
-                    active_flat=active_flat,
+                    active_flat=stop_guard_active,
                 )
 
             action_info = self.action_sampler(
@@ -298,7 +355,10 @@ class OnlineRolloutEngine:
                 )
                 log_pb_steps[:, :, step] = log_pb.view(num_graphs, num_agents)
             safe_edge_ids = chosen_edge_ids.clamp(min=0)
-            chosen_edge_relations = env_context.edge_relations[safe_edge_ids]
+            if int(env_context.edge_relations.numel()) == 0:
+                chosen_edge_relations = torch.zeros_like(safe_edge_ids)
+            else:
+                chosen_edge_relations = env_context.edge_relations[safe_edge_ids]
             agent_state = policy.evolve_state(
                 agent_state=agent_state,
                 chosen_target_nodes=chosen_target_nodes,

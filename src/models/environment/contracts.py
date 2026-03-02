@@ -58,13 +58,11 @@ class GraphEnvContext:
     node_global_ids: torch.Tensor  # [N]
     dummy_mask: torch.Tensor  # [B]
     sample_ids: list[str]  # [B]
+    question_ctx: torch.Tensor | None = None  # [B, L, d] or [B, L, emb_dim], optional question token context
+    question_ctx_mask: torch.Tensor | None = None  # [B, L] bool mask where True denotes valid token
     heuristic_log_v: torch.Tensor | None = None  # [N], optional frozen guidance
     start_local_indices: torch.Tensor | None = None  # [B], optional explicit per-graph start override
-    replay_start_local: torch.Tensor | None = None  # [sum paths], optional replay oracle starts (local node ids)
-    replay_path_lengths: torch.Tensor | None = None  # [sum paths], optional replay oracle path lengths
-    replay_edge_local_ids: torch.Tensor | None = None  # [sum edges], optional replay oracle local edge ids
-    replay_path_ptr: torch.Tensor | None = None  # [B+1], optional graph ptr for replay_path_lengths/starts
-    replay_edge_ptr: torch.Tensor | None = None  # [B+1], optional graph ptr for replay_edge_local_ids
+    backward_start_local_indices: torch.Tensor | None = None  # [B], optional backward start override
 
 
 @dataclass
@@ -84,6 +82,11 @@ class DynamicAgentState:
     # 轨迹记录与结算
     cumulative_rewards: torch.Tensor  # [B, num_agents_per_graph]
     done_mask: torch.Tensor  # [B, num_agents_per_graph], 命中或超步数标记
+    # 轨迹 token 历史，采用 (node, relation, node, ...) 序列语义。
+    # path_token_types: False=node token, True=relation token
+    path_token_ids: torch.Tensor | None = None  # [B, num_agents_per_graph, T]
+    path_token_types: torch.Tensor | None = None  # [B, num_agents_per_graph, T]
+    path_lengths: torch.Tensor | None = None  # [B, num_agents_per_graph]
 
 
 __all__ = [

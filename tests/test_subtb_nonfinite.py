@@ -86,7 +86,6 @@ def test_subtb_subtrajectory_loss_detects_mid_trajectory_drift() -> None:
             lambda_weight=0.9,
             normalize=True,
             detach_end_flow=True,
-            boundary_weight=0.0,
             miss_length_penalty=0.0,
         )
     )
@@ -117,7 +116,6 @@ def test_subtb_reward_is_aligned_to_true_terminal_index_not_horizon_tail() -> No
             lambda_weight=1.0,
             normalize=False,
             detach_end_flow=False,
-            boundary_weight=0.0,
             miss_length_penalty=0.0,
         )
     )
@@ -153,7 +151,6 @@ def test_subtb_includes_explicit_stop_step_in_delta_prefix() -> None:
             lambda_weight=1.0,
             normalize=False,
             detach_end_flow=False,
-            boundary_weight=0.0,
             miss_length_penalty=0.0,
         )
     )
@@ -184,7 +181,6 @@ def test_subtb_zero_step_rollout_still_anchors_start_flow_to_reward() -> None:
             lambda_weight=1.0,
             normalize=False,
             detach_end_flow=False,
-            boundary_weight=0.0,
             miss_length_penalty=0.0,
         )
     )

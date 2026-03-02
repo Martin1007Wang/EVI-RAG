@@ -13,7 +13,7 @@ EncodedPolicyContext = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 class OfflineForcedEvalEngine:
-    """Forced-path evaluator used by offline replay mixing."""
+    """Forced-path evaluator for offline trajectory scoring."""
 
     def __init__(self, *, config: RolloutConfig, backward_prior: StructuralBackwardPrior) -> None:
         self.config = config
@@ -59,6 +59,32 @@ class OfflineForcedEvalEngine:
         patched = dict(policy_out)
         patched["stop_logits"] = masked_stop.view_as(policy_out["stop_logits"])
         return patched
+
+    @staticmethod
+    def _compute_min_required_moves(
+        *,
+        env_context: GraphEnvContext,
+        start_nodes_abs: torch.Tensor,
+        base_stop_min_steps: int,
+    ) -> torch.Tensor:
+        if base_stop_min_steps < 0:
+            raise ValueError("sampling.stop_min_steps must be >= 0.")
+        start_nodes_flat = start_nodes_abs.view(-1).to(dtype=torch.long)
+        if int(start_nodes_flat.numel()) == 0:
+            return start_nodes_flat
+        node_global_ids = env_context.node_global_ids.to(
+            device=start_nodes_flat.device,
+            dtype=torch.long,
+        )
+        if int(node_global_ids.numel()) != int(env_context.num_nodes_total):
+            raise ValueError(
+                "node_global_ids length mismatch with num_nodes_total in stop_min_steps guard: "
+                f"node_global_ids={int(node_global_ids.numel())}, num_nodes_total={int(env_context.num_nodes_total)}."
+            )
+        start_global_ids = node_global_ids.index_select(0, start_nodes_flat)
+        start_is_virtual = start_global_ids < 0
+        required = torch.full_like(start_nodes_flat, fill_value=base_stop_min_steps, dtype=torch.long)
+        return required + start_is_virtual.to(dtype=torch.long)
 
     def _compute_log_pb(
         self,
@@ -120,6 +146,9 @@ class OfflineForcedEvalEngine:
         node_offsets = env_context.node_ptr[:-1].to(device=device).view(num_graphs, 1)
         current_nodes = start_local + node_offsets
         hidden_states = env_context.question_emb.unsqueeze(1).expand(num_graphs, num_agents, -1).clone()
+        path_token_ids = current_nodes.unsqueeze(-1).clone()
+        path_token_types = torch.zeros_like(path_token_ids, dtype=torch.bool)
+        path_history_lengths = torch.ones((num_graphs, num_agents), dtype=torch.long, device=device)
         visited_mask = torch.zeros(
             (num_graphs * num_agents, env_context.num_nodes_total),
             dtype=torch.bool,
@@ -136,6 +165,9 @@ class OfflineForcedEvalEngine:
             visited_mask=visited_mask,
             cumulative_rewards=torch.zeros((num_graphs, num_agents), device=device),
             done_mask=torch.zeros((num_graphs, num_agents), dtype=torch.bool, device=device),
+            path_token_ids=path_token_ids,
+            path_token_types=path_token_types,
+            path_lengths=path_history_lengths,
         )
 
         log_pf_sum = torch.zeros((num_graphs, num_agents), device=device)
@@ -149,13 +181,18 @@ class OfflineForcedEvalEngine:
 
         forced_edge_ids = forced_edge_ids.to(device=device, dtype=torch.long)
         path_lengths = path_lengths.to(device=device, dtype=torch.long).clamp(min=0, max=max_steps)
+        min_required_moves_flat = self._compute_min_required_moves(
+            env_context=env_context,
+            start_nodes_abs=current_nodes,
+            base_stop_min_steps=stop_min_steps,
+        )
 
         if encoded_context is None:
             node_tokens, relation_tokens, question_tokens = policy.encode_context(env_context)
         else:
             node_tokens, relation_tokens, question_tokens = encoded_context
         build_cache_fn = getattr(policy, "build_action_cache", None)
-        action_cache: dict[str, torch.Tensor | None] | None = None
+        action_cache: dict[str, torch.Tensor] | None = None
         if callable(build_cache_fn):
             action_cache = build_cache_fn(
                 env_context=env_context,
@@ -185,10 +222,13 @@ class OfflineForcedEvalEngine:
                     relation_tokens=relation_tokens,
                     action_cache=action_cache,
                 )
-            if step < stop_min_steps:
+            num_moves_flat = num_moves.view(-1)
+            need_more_moves = num_moves_flat < min_required_moves_flat
+            stop_guard_active = active_flat & need_more_moves
+            if bool(stop_guard_active.any().item()):
                 policy_out = self._mask_stop_logits_for_min_steps(
                     policy_out=policy_out,
-                    active_flat=active_flat,
+                    active_flat=stop_guard_active,
                 )
 
             out_degrees_flat = policy_out["out_degrees"].view(-1)
@@ -209,12 +249,6 @@ class OfflineForcedEvalEngine:
             else:
                 edge_valid = torch.empty((total_agents, 0), dtype=torch.bool, device=device)
 
-            final_logits = torch.cat([edge_logits_dense, stop_logits.to(dtype=edge_logits_dense.dtype)], dim=1)
-            if collect_traces:
-                if log_f_steps is None:
-                    raise RuntimeError("collect_traces=True requires log_f_steps tensor in evaluate_forced_paths.")
-                log_f = torch.logsumexp(final_logits, dim=1).view(num_graphs, num_agents)
-                log_f_steps[:, :, step] = torch.where(active_mask, log_f, torch.zeros_like(log_f))
             stop_action_idx = max_deg
 
             forced_len_flat = path_lengths.view(-1)
@@ -223,8 +257,28 @@ class OfflineForcedEvalEngine:
             chosen_edge_flat = forced_edge_ids[:, :, step].reshape(-1)
             invalid_flat = torch.zeros((total_agents,), dtype=torch.bool, device=device)
 
+            stop_logits = stop_logits.to(dtype=edge_logits_dense.dtype)
+            final_logits = torch.cat([edge_logits_dense, stop_logits], dim=1)
+            has_finite_candidate = torch.isfinite(final_logits).any(dim=1)
+            has_nan_candidate = torch.isnan(final_logits).any(dim=1)
+            has_pos_inf_candidate = torch.isposinf(final_logits).any(dim=1)
+            invalid_logits_rows = active_flat & (has_nan_candidate | has_pos_inf_candidate | (~has_finite_candidate))
+            if bool(invalid_logits_rows.any().item()):
+                safe_logits = final_logits.clone()
+                safe_logits[invalid_logits_rows] = neg_inf
+                safe_logits[invalid_logits_rows, stop_action_idx] = 0.0
+                final_logits = safe_logits
+                invalid_flat[invalid_logits_rows] = True
+                rollout_valid_mask.view(-1)[invalid_logits_rows] = False
+
+            if collect_traces:
+                if log_f_steps is None:
+                    raise RuntimeError("collect_traces=True requires log_f_steps tensor in evaluate_forced_paths.")
+                log_f = torch.logsumexp(final_logits, dim=1).view(num_graphs, num_agents)
+                log_f_steps[:, :, step] = torch.where(active_mask, log_f, torch.zeros_like(log_f))
+
             action_idx = torch.full((total_agents,), fill_value=stop_action_idx, dtype=torch.long, device=device)
-            move_rows = torch.where(forced_move_flat)[0]
+            move_rows = torch.where(forced_move_flat & (~invalid_flat))[0]
             if int(move_rows.numel()) > 0:
                 move_edges = chosen_edge_flat.index_select(0, move_rows)
                 row_edge_ids = edge_ids_dense.index_select(0, move_rows)
@@ -244,7 +298,7 @@ class OfflineForcedEvalEngine:
 
             active_effective_flat = active_flat & (~invalid_flat)
 
-            true_dist = torch.distributions.Categorical(logits=final_logits)
+            true_dist = torch.distributions.Categorical(logits=final_logits, validate_args=False)
             log_prob_flat = true_dist.log_prob(action_idx)
             log_prob_flat = torch.where(active_effective_flat, log_prob_flat, torch.zeros_like(log_prob_flat))
             log_prob = log_prob_flat.view(num_graphs, num_agents)
@@ -281,7 +335,10 @@ class OfflineForcedEvalEngine:
                 )
                 log_pb_steps[:, :, step] = log_pb.view(num_graphs, num_agents)
 
-            chosen_edge_rel = env_context.edge_relations.index_select(0, safe_edge_ids)
+            if int(env_context.edge_relations.numel()) == 0:
+                chosen_edge_rel = torch.zeros_like(safe_edge_ids)
+            else:
+                chosen_edge_rel = env_context.edge_relations.index_select(0, safe_edge_ids)
             agent_state = policy.evolve_state(
                 agent_state=agent_state,
                 chosen_target_nodes=chosen_target_nodes,

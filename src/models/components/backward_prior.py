@@ -80,7 +80,9 @@ class StructuralBackwardPrior:
         crow = env_context.adj_t_bwd.crow_indices()
         target = target_nodes.clamp(min=0)
         in_deg = (crow[target + 1] - crow[target]).to(dtype=dtype)
-        log_pb = -torch.log(in_deg + 1.0)
+        if bool((in_deg <= 0).any().item()):
+            raise ValueError("uniform_in_degree backward prior encountered non-positive in-degree on sampled moves.")
+        log_pb = -torch.log(in_deg)
 
         if env_context.start_local_indices is None:
             return log_pb

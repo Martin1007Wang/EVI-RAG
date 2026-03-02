@@ -57,15 +57,35 @@ class BeamDecoderEngine:
     ) -> DynamicAgentState:
         device = env_context.node_embeddings.device
         num_graphs = int(env_context.num_graphs)
-        start_local = BeamDecoderEngine._expand_grouped_start_nodes(
-            q_local_indices=env_context.q_local_indices,
-            q_ptr=env_context.q_ptr,
-            num_agents=num_agents,
-            deterministic=deterministic,
-        )
+        if env_context.start_local_indices is not None:
+            if env_context.start_local_indices.dim() != 1:
+                raise ValueError(
+                    "start_local_indices must be 1D [B] when provided, "
+                    f"got shape={tuple(env_context.start_local_indices.shape)}."
+                )
+            if int(env_context.start_local_indices.numel()) != num_graphs:
+                raise ValueError(
+                    "start_local_indices length mismatch with num_graphs: "
+                    f"start={int(env_context.start_local_indices.numel())} graphs={num_graphs}."
+                )
+            start_local_base = env_context.start_local_indices.to(device=device, dtype=torch.long)
+            node_counts = (env_context.node_ptr[1:] - env_context.node_ptr[:-1]).to(device=device, dtype=torch.long)
+            if bool((start_local_base < 0).any().item()) or bool((start_local_base >= node_counts).any().item()):
+                raise ValueError("start_local_indices out of per-graph node range in beam initialization.")
+            start_local = start_local_base.unsqueeze(1).expand(num_graphs, num_agents)
+        else:
+            start_local = BeamDecoderEngine._expand_grouped_start_nodes(
+                q_local_indices=env_context.q_local_indices,
+                q_ptr=env_context.q_ptr,
+                num_agents=num_agents,
+                deterministic=deterministic,
+            )
         start_nodes_absolute = start_local + env_context.node_ptr[:-1].unsqueeze(1)
         current_nodes = start_nodes_absolute.clone()
         hidden_states = env_context.question_emb.unsqueeze(1).expand(num_graphs, num_agents, -1).clone()
+        path_token_ids = current_nodes.unsqueeze(-1).clone()
+        path_token_types = torch.zeros_like(path_token_ids, dtype=torch.bool)
+        path_lengths = torch.ones((num_graphs, num_agents), dtype=torch.long, device=device)
         visited_mask = torch.zeros(
             (num_graphs * num_agents, env_context.num_nodes_total),
             dtype=torch.bool,
@@ -81,7 +101,37 @@ class BeamDecoderEngine:
             visited_mask=visited_mask,
             cumulative_rewards=torch.zeros((num_graphs, num_agents), device=device),
             done_mask=torch.zeros((num_graphs, num_agents), dtype=torch.bool, device=device),
+            path_token_ids=path_token_ids,
+            path_token_types=path_token_types,
+            path_lengths=path_lengths,
         )
+
+    @staticmethod
+    def _compute_min_required_moves(
+        *,
+        env_context: GraphEnvContext,
+        start_nodes_abs: torch.Tensor,
+        base_stop_min_steps: int,
+    ) -> torch.Tensor:
+        if base_stop_min_steps < 0:
+            raise ValueError("sampling.stop_min_steps must be >= 0.")
+        start_nodes_flat = start_nodes_abs.view(-1).to(dtype=torch.long)
+        if int(start_nodes_flat.numel()) == 0:
+            return start_nodes_abs.new_zeros(start_nodes_abs.shape, dtype=torch.long)
+        node_global_ids = env_context.node_global_ids.to(
+            device=start_nodes_flat.device,
+            dtype=torch.long,
+        )
+        if int(node_global_ids.numel()) != int(env_context.num_nodes_total):
+            raise ValueError(
+                "node_global_ids length mismatch with num_nodes_total in stop_min_steps guard: "
+                f"node_global_ids={int(node_global_ids.numel())}, num_nodes_total={int(env_context.num_nodes_total)}."
+            )
+        start_global_ids = node_global_ids.index_select(0, start_nodes_flat)
+        start_is_virtual = start_global_ids < 0
+        required_flat = torch.full_like(start_nodes_flat, fill_value=base_stop_min_steps, dtype=torch.long)
+        required_flat = required_flat + start_is_virtual.to(dtype=torch.long)
+        return required_flat.view_as(start_nodes_abs)
 
     @staticmethod
     def _seed_trace_hash(current_nodes: torch.Tensor) -> torch.Tensor:
@@ -199,6 +249,16 @@ class BeamDecoderEngine:
         hidden_states = agent_state.hidden_states
         visited_mask = agent_state.visited_mask
         done_mask = agent_state.done_mask
+        path_token_ids = agent_state.path_token_ids
+        path_token_types = agent_state.path_token_types
+        path_lengths = agent_state.path_lengths
+        if path_token_ids is None or path_token_types is None or path_lengths is None:
+            raise ValueError("Beam decoder initialization must provide path token state.")
+        min_required_moves = self._compute_min_required_moves(
+            env_context=env_context,
+            start_nodes_abs=current_nodes,
+            base_stop_min_steps=stop_min_steps,
+        )
         trace_hash = self._seed_trace_hash(current_nodes)
         log_pf_sum = torch.zeros((num_graphs, beam_size), device=device)
         num_moves = torch.zeros((num_graphs, beam_size), dtype=torch.long, device=device)
@@ -210,8 +270,10 @@ class BeamDecoderEngine:
                 node_tokens, relation_tokens, question_tokens = policy.encode_context(env_context)
             else:
                 node_tokens, relation_tokens, question_tokens = encoded_context
+            if hidden_states.dtype != node_tokens.dtype:
+                hidden_states = hidden_states.to(dtype=node_tokens.dtype)
             build_cache_fn = getattr(policy, "build_action_cache", None)
-            action_cache: dict[str, torch.Tensor | None] | None = None
+            action_cache: dict[str, torch.Tensor] | None = None
             if callable(build_cache_fn):
                 action_cache = build_cache_fn(
                     env_context=env_context,
@@ -228,6 +290,9 @@ class BeamDecoderEngine:
                     visited_mask=visited_mask,
                     cumulative_rewards=torch.zeros((num_graphs, beam_size), device=device),
                     done_mask=done_mask,
+                    path_token_ids=path_token_ids,
+                    path_token_types=path_token_types,
+                    path_lengths=path_lengths,
                 )
                 if action_cache is None:
                     policy_out = policy.compute_action_scores(
@@ -275,9 +340,10 @@ class BeamDecoderEngine:
                     edge_valid = torch.empty((total_agents, 0), dtype=torch.bool, device=device)
 
                 finite_move_exists = (torch.isfinite(edge_logits_dense) & edge_valid).any(dim=1)
-                allow_stop = torch.ones((total_agents,), dtype=torch.bool, device=device)
-                if step < stop_min_steps:
-                    allow_stop = ~((out_degrees_flat > 0) & finite_move_exists)
+                num_moves_flat = num_moves.view(-1)
+                min_required_flat = min_required_moves.view(-1)
+                need_more_moves = num_moves_flat < min_required_flat
+                allow_stop = ~((out_degrees_flat > 0) & finite_move_exists & need_more_moves)
                 stop_valid = allow_stop & (~done_flat)
 
                 candidate_logits = torch.cat([edge_logits_dense, stop_logits.to(dtype=log_pf_sum.dtype).unsqueeze(1)], dim=1)
@@ -405,35 +471,48 @@ class BeamDecoderEngine:
                 graph_offsets = torch.arange(num_graphs, device=device, dtype=torch.long).unsqueeze(1) * beam_size
                 parent_rows = (sel_parents + graph_offsets).reshape(-1)
 
-                selected_visited = visited_mask.index_select(0, parent_rows).clone()
-                move_mask_flat = (~sel_is_stop).reshape(-1)
-                if bool(move_mask_flat.any().item()):
-                    row_ids = torch.where(move_mask_flat)[0]
-                    col_ids = sel_targets.reshape(-1).index_select(0, row_ids)
-                    selected_visited[row_ids, col_ids] = True
-
-                sel_parent_nodes = current_nodes.gather(1, sel_parents)
-                next_current = torch.where(sel_is_stop, sel_parent_nodes, sel_targets)
-
                 hidden_dim = int(hidden_states.size(-1))
+                token_width = int(path_token_ids.size(-1))
+                sel_parent_nodes = current_nodes.gather(1, sel_parents)
                 sel_parent_hidden = hidden_states.view(-1, hidden_dim).index_select(0, parent_rows)
-                next_hidden = sel_parent_hidden.view(num_graphs, beam_size, hidden_dim).clone()
-                if bool(move_mask_flat.any().item()):
-                    flat_next_hidden = next_hidden.view(-1, hidden_dim)
-                    move_targets = sel_targets.reshape(-1)[move_mask_flat]
-                    move_edges = sel_edges.reshape(-1)[move_mask_flat].clamp(min=0)
-                    move_rel = env_context.edge_relations.index_select(0, move_edges)
-                    move_node_emb = node_tokens.index_select(0, move_targets)
-                    move_rel_emb = relation_tokens.index_select(0, move_rel)
-                    gru_input = torch.cat([move_node_emb, move_rel_emb], dim=-1)
-                    move_rows = torch.where(move_mask_flat)[0]
-                    move_hidden = flat_next_hidden.index_select(0, move_rows)
-                    flat_next_hidden[move_rows] = policy.memory_tracker(gru_input, move_hidden)
-                    next_hidden = flat_next_hidden.view(num_graphs, beam_size, hidden_dim)
-
+                sel_parent_path_ids = (
+                    path_token_ids.view(-1, token_width).index_select(0, parent_rows).view(num_graphs, beam_size, token_width)
+                )
+                sel_parent_path_types = (
+                    path_token_types.view(-1, token_width).index_select(0, parent_rows).view(num_graphs, beam_size, token_width)
+                )
+                sel_parent_path_lengths = path_lengths.view(-1).index_select(0, parent_rows).view(num_graphs, beam_size)
+                selected_visited = visited_mask.index_select(0, parent_rows)
                 sel_parent_done = done_mask.gather(1, sel_parents)
                 sel_parent_reason = stop_reason.gather(1, sel_parents)
-                next_done = sel_parent_done | sel_is_stop
+                sel_parent_min_required = min_required_moves.gather(1, sel_parents)
+
+                parent_state = DynamicAgentState(
+                    step_t=step,
+                    current_nodes=sel_parent_nodes,
+                    hidden_states=sel_parent_hidden.view(num_graphs, beam_size, hidden_dim),
+                    visited_mask=selected_visited,
+                    cumulative_rewards=torch.zeros((num_graphs, beam_size), device=device),
+                    done_mask=sel_parent_done,
+                    path_token_ids=sel_parent_path_ids,
+                    path_token_types=sel_parent_path_types,
+                    path_lengths=sel_parent_path_lengths,
+                )
+                chosen_edge_flat = sel_edges.reshape(-1).clamp(min=0)
+                if int(env_context.edge_relations.numel()) == 0:
+                    chosen_rel = torch.zeros_like(chosen_edge_flat)
+                else:
+                    chosen_rel = env_context.edge_relations.index_select(0, chosen_edge_flat)
+                next_state = policy.evolve_state(
+                    agent_state=parent_state,
+                    chosen_target_nodes=sel_targets.reshape(-1),
+                    chosen_edge_relations=chosen_rel,
+                    node_tokens=node_tokens,
+                    relation_tokens=relation_tokens,
+                    is_stop=sel_is_stop.reshape(-1),
+                )
+
+                next_done = next_state.done_mask
                 next_stop_reason = torch.where(sel_parent_done, sel_parent_reason, sel_reasons)
                 transitioned_trace = self._transition_trace_hash(sel_parent_trace, sel_edges, sel_is_stop)
                 next_trace_hash = torch.where(sel_is_stop, sel_parent_trace, transitioned_trace)
@@ -446,14 +525,23 @@ class BeamDecoderEngine:
                 step_increment = (~sel_parent_done).to(dtype=torch.long)
                 next_num_steps = sel_parent_steps + step_increment
 
-                current_nodes = next_current
-                hidden_states = next_hidden
+                current_nodes = next_state.current_nodes
+                hidden_states = next_state.hidden_states
                 done_mask = next_done
                 log_pf_sum = sel_true_scores
                 num_moves = next_num_moves
                 num_steps = next_num_steps
                 stop_reason = next_stop_reason
-                visited_mask = selected_visited
+                min_required_moves = sel_parent_min_required
+                visited_mask = next_state.visited_mask
+                if next_state.path_token_ids is None or next_state.path_token_types is None or next_state.path_lengths is None:
+                    path_token_ids = next_state.current_nodes.unsqueeze(-1).clone()
+                    path_token_types = torch.zeros_like(path_token_ids, dtype=torch.bool)
+                    path_lengths = torch.ones_like(next_state.current_nodes, dtype=torch.long)
+                else:
+                    path_token_ids = next_state.path_token_ids
+                    path_token_types = next_state.path_token_types
+                    path_lengths = next_state.path_lengths
                 trace_hash = next_trace_hash
 
         unfinished = ~done_mask

@@ -25,7 +25,6 @@ from .training import (
     TrainingConfig,
     OptimizerConfig,
     SchedulerConfig,
-    ReplayBufferConfig,
 )
 
 
@@ -44,5 +43,4 @@ __all__ = [
     "TrainingConfig",
     "OptimizerConfig",
     "SchedulerConfig",
-    "ReplayBufferConfig",
 ]

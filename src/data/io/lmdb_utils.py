@@ -155,7 +155,7 @@ def _next_lmdb_map_size_bytes(
     return next_size
 
 
-def _replay_pending_with_growth(
+def _retry_pending_with_growth(
     *,
     env: lmdb.Environment,
     pending_payloads: List[Tuple[bytes, bytes]],

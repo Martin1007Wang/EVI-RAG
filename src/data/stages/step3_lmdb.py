@@ -22,7 +22,7 @@ from src.data.io.lmdb_utils import (
     _format_lmdb_path,
     _local_indices,
     _prepare_lmdb_dir,
-    _replay_pending_with_growth,
+    _retry_pending_with_growth,
     _resolve_lmdb_map_config,
     _resolve_lmdb_shards,
     _serialize_sample,
@@ -41,7 +41,6 @@ from src.data.schema.constants import (
 )
 from src.config.data_config import _resolve_parquet_chunk_size
 from src.data.utils.validation import _validate_split_names
-from src.utils.replay_oracle import enumerate_oracle_trajectories, pack_oracle_trajectories
 from src.utils.logging_utils import log_event
 
 
@@ -109,28 +108,6 @@ def _count_reachable_any_direction(
     return reachable
 
 
-def _resolve_replay_oracle_cfg(cfg) -> dict[str, object]:
-    replay_cfg = cfg.get("replay_oracle") or {}
-    max_paths_per_pair = int(replay_cfg.get("max_paths_per_pair", 24))
-    max_paths_per_graph = int(replay_cfg.get("max_paths_per_graph", 256))
-    max_shortest_paths_per_pair = int(replay_cfg.get("max_shortest_paths_per_pair", 4))
-    max_dfs_paths_per_pair = int(replay_cfg.get("max_dfs_paths_per_pair", 12))
-    max_depth = int(replay_cfg.get("max_depth", 0))
-    allow_cycles = bool(replay_cfg.get("allow_cycles", True))
-    max_node_visits = int(replay_cfg.get("max_node_visits", 2))
-    if max_node_visits <= 0:
-        raise ValueError("replay_oracle.max_node_visits must be a positive integer.")
-    return {
-        "max_paths_per_pair": max_paths_per_pair,
-        "max_paths_per_graph": max_paths_per_graph,
-        "max_shortest_paths_per_pair": max_shortest_paths_per_pair,
-        "max_dfs_paths_per_pair": max_dfs_paths_per_pair,
-        "max_depth": max_depth,
-        "allow_cycles": allow_cycles,
-        "max_node_visits": max_node_visits,
-    }
-
-
 def build_dataset(ctx: StageContext) -> None:
     cfg = ctx.cfg
     logger = ctx.logger
@@ -138,8 +115,6 @@ def build_dataset(ctx: StageContext) -> None:
     dataset_name = str(dataset_cfg.get("name", "") or "")
     dataset_scope = str(dataset_cfg.get("dataset_scope", "") or "").strip().lower()
     emit_edge_retriever_labels = bool(cfg.get("emit_edge_retriever_labels", False))
-    emit_replay_oracle_paths = bool(cfg.get("emit_replay_oracle_paths", False))
-    replay_oracle_cfg = _resolve_replay_oracle_cfg(cfg) if emit_replay_oracle_paths else None
     labels_dir_cfg = cfg.get("edge_retriever_labels_dir")
     log_event(
         logger,
@@ -169,6 +144,10 @@ def build_dataset(ctx: StageContext) -> None:
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
+    question_ctx_max_tokens = int(cfg.get("question_ctx_max_tokens", 0))
+    if question_ctx_max_tokens < 0:
+        raise ValueError(f"question_ctx_max_tokens must be >= 0, got {question_ctx_max_tokens}.")
+    need_question_ctx = question_ctx_max_tokens > 0
 
     emb_dir = ctx.embeddings_dir
     ensure_dir(emb_dir)
@@ -236,6 +215,10 @@ def build_dataset(ctx: StageContext) -> None:
     graphs_table = _load_parquet(ctx.parquet_dir / "graphs.parquet")
     questions_table = _load_parquet(ctx.parquet_dir / "questions.parquet")
     questions_have_emb = "question_emb" in questions_table.schema.names
+    questions_have_ctx = "question_ctx" in questions_table.schema.names
+    questions_have_ctx_mask = "question_ctx_mask" in questions_table.schema.names
+    if questions_have_ctx != questions_have_ctx_mask:
+        raise RuntimeError("questions.parquet must contain question_ctx and question_ctx_mask together.")
     if dataset_name and "dataset" in questions_table.schema.names:
         dataset_values = {str(val) for val in questions_table.column("dataset").unique().to_pylist() if val is not None}
         if len(dataset_values) > 1:
@@ -273,12 +256,6 @@ def build_dataset(ctx: StageContext) -> None:
     all_splits = questions_table.column("split").unique().to_pylist()
     all_splits = _validate_split_names(all_splits, context="questions.parquet")
     lmdb_stats = {str(split): {"samples": _ZERO, "nodes": _ZERO, "edges": _ZERO} for split in all_splits}
-    replay_stats = None
-    if emit_replay_oracle_paths:
-        replay_stats = {
-            str(split): {"graphs": _ZERO, "graphs_with_paths": _ZERO, "paths": _ZERO, "path_edges": _ZERO}
-            for split in all_splits
-        }
     label_entries = None
     label_stats = None
     labels_dir: Optional[Path] = None
@@ -351,6 +328,8 @@ def build_dataset(ctx: StageContext) -> None:
 
         for q_batch in pbar:
             q_batch_dict = q_batch.to_pydict()
+            q_batch_ctx = None
+            q_batch_ctx_mask = None
             if use_precomputed_questions:
                 q_batch_emb_list = q_batch_dict.get("question_emb")
                 if q_batch_emb_list is None:
@@ -358,9 +337,57 @@ def build_dataset(ctx: StageContext) -> None:
                 if any(emb is None for emb in q_batch_emb_list):
                     raise ValueError("question_emb contains null entries; rebuild with precomputed embeddings.")
                 q_batch_emb = torch.tensor(q_batch_emb_list, dtype=torch.float32)
+                if need_question_ctx:
+                    if questions_have_ctx:
+                        q_batch_ctx_list = q_batch_dict.get("question_ctx")
+                        q_batch_ctx_mask_list = q_batch_dict.get("question_ctx_mask")
+                        if q_batch_ctx_list is None or q_batch_ctx_mask_list is None:
+                            raise RuntimeError(
+                                "questions.parquet missing required columns "
+                                "`question_ctx`/`question_ctx_mask` for token-level question context."
+                            )
+                        if any(ctx is None for ctx in q_batch_ctx_list):
+                            raise ValueError("question_ctx contains null entries; rebuild with complete context.")
+                        if any(mask is None for mask in q_batch_ctx_mask_list):
+                            raise ValueError("question_ctx_mask contains null entries; rebuild with complete context.")
+                        q_batch_ctx = torch.tensor(q_batch_ctx_list, dtype=torch.float32)
+                        q_batch_ctx_mask = torch.tensor(q_batch_ctx_mask_list, dtype=torch.bool)
+                        if q_batch_ctx.dim() != 3:
+                            raise ValueError(
+                                "question_ctx must be 3D [B, L, d], "
+                                f"got shape={tuple(q_batch_ctx.shape)}."
+                            )
+                        if q_batch_ctx_mask.dim() != 2:
+                            raise ValueError(
+                                "question_ctx_mask must be 2D [B, L], "
+                                f"got shape={tuple(q_batch_ctx_mask.shape)}."
+                            )
+                        if tuple(q_batch_ctx_mask.shape) != tuple(q_batch_ctx.shape[:2]):
+                            raise ValueError(
+                                "question_ctx_mask shape mismatch with question_ctx: "
+                                f"mask={tuple(q_batch_ctx_mask.shape)}, ctx={tuple(q_batch_ctx.shape[:2])}."
+                            )
+                    else:
+                        q_batch_texts = [str(q) for q in q_batch_dict["question"]]
+                        _, q_batch_ctx, q_batch_ctx_mask = _get_encoder().encode_with_context(
+                            q_batch_texts,
+                            cfg.batch_size,
+                            max_tokens=question_ctx_max_tokens,
+                            show_progress=False,
+                            desc="QuestionsWithContext",
+                        )
             else:
                 q_batch_texts = [str(q) for q in q_batch_dict["question"]]
-                q_batch_emb = _get_encoder().encode(q_batch_texts, cfg.batch_size, show_progress=False)
+                if need_question_ctx:
+                    q_batch_emb, q_batch_ctx, q_batch_ctx_mask = _get_encoder().encode_with_context(
+                        q_batch_texts,
+                        cfg.batch_size,
+                        max_tokens=question_ctx_max_tokens,
+                        show_progress=False,
+                        desc="QuestionsWithContext",
+                    )
+                else:
+                    q_batch_emb = _get_encoder().encode(q_batch_texts, cfg.batch_size, show_progress=False)
 
             graph_ids_batch = q_batch_dict["graph_id"]
             graph_row_indices: List[int] = []
@@ -470,35 +497,11 @@ def build_dataset(ctx: StageContext) -> None:
                     "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
                     "answer_entity_ids": answer_entity_ids,
                 }
-                if emit_replay_oracle_paths:
-                    if replay_oracle_cfg is None:
-                        raise RuntimeError("emit_replay_oracle_paths enabled but replay_oracle_cfg is missing.")
-                    trajectories = enumerate_oracle_trajectories(
-                        num_nodes=int(num_nodes),
-                        edge_src=edge_src,
-                        edge_dst=edge_dst,
-                        start_nodes=q_local,
-                        target_nodes=a_local,
-                        max_paths_per_pair=int(replay_oracle_cfg["max_paths_per_pair"]),
-                        max_paths_per_graph=int(replay_oracle_cfg["max_paths_per_graph"]),
-                        max_shortest_paths_per_pair=int(replay_oracle_cfg["max_shortest_paths_per_pair"]),
-                        max_dfs_paths_per_pair=int(replay_oracle_cfg["max_dfs_paths_per_pair"]),
-                        max_depth=int(replay_oracle_cfg["max_depth"]),
-                        allow_cycles=bool(replay_oracle_cfg["allow_cycles"]),
-                        max_node_visits=int(replay_oracle_cfg["max_node_visits"]),
-                    )
-                    replay_start_local, replay_path_lengths, replay_edge_local_ids = pack_oracle_trajectories(
-                        trajectories
-                    )
-                    core_sample["replay_start_local"] = replay_start_local
-                    core_sample["replay_path_lengths"] = replay_path_lengths
-                    core_sample["replay_edge_local_ids"] = replay_edge_local_ids
-                    if replay_stats is not None:
-                        replay_stats[split_key]["graphs"] += _ONE
-                        replay_stats[split_key]["paths"] += int(replay_path_lengths.numel())
-                        replay_stats[split_key]["path_edges"] += int(replay_edge_local_ids.numel())
-                        if int(replay_path_lengths.numel()) > 0:
-                            replay_stats[split_key]["graphs_with_paths"] += _ONE
+                if need_question_ctx:
+                    if q_batch_ctx is None or q_batch_ctx_mask is None:
+                        raise RuntimeError("question_ctx generation failed while question_ctx_max_tokens > 0.")
+                    core_sample["question_ctx"] = q_batch_ctx[i].unsqueeze(0)
+                    core_sample["question_ctx_mask"] = q_batch_ctx_mask[i].unsqueeze(0)
 
                 sample_key = graph_id.encode("utf-8")
                 shard_id = _assign_lmdb_shard(sample_key, lmdb_shards)
@@ -509,7 +512,7 @@ def build_dataset(ctx: StageContext) -> None:
                     _write_sample(txn, sample_key, core_payload)
                 except lmdb.MapFullError:
                     txn.abort()
-                    txn, map_sizes[split][shard_id] = _replay_pending_with_growth(
+                    txn, map_sizes[split][shard_id] = _retry_pending_with_growth(
                         env=envs[split][shard_id],
                         pending_payloads=pending_payloads[split][shard_id],
                         map_size_bytes=map_sizes[split][shard_id],
@@ -582,23 +585,6 @@ def build_dataset(ctx: StageContext) -> None:
                     avg_nodes=stats["nodes"] / stats["samples"] if stats["samples"] else 0.0,
                     avg_edges=stats["edges"] / stats["samples"] if stats["samples"] else 0.0,
                 )
-            if replay_stats is not None:
-                for split_key, stats in replay_stats.items():
-                    graphs = int(stats["graphs"])
-                    graphs_with_paths = int(stats["graphs_with_paths"])
-                    paths = int(stats["paths"])
-                    path_edges = int(stats["path_edges"])
-                    log_event(
-                        logger,
-                        "replay_oracle_summary_split",
-                        split=split_key,
-                        graphs=graphs,
-                        graphs_with_paths=graphs_with_paths,
-                        paths=paths,
-                        path_edges=path_edges,
-                        avg_paths_per_graph=(paths / graphs) if graphs > 0 else 0.0,
-                        avg_path_edges_per_graph=(path_edges / graphs) if graphs > 0 else 0.0,
-                    )
             processed_dir = ctx.output_dir / "processed"
             ensure_dir(processed_dir)
             _write_sample_filter(
