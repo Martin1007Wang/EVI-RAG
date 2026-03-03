@@ -1,6 +1,6 @@
 # DataLoader settings for SubgraphRAG-style retriever training.
 
-_target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
+_target_: src.datasets.g_retrieval_datamodule.GRetrievalDataModule
 
 dataset_cfg: ${dataset}
 
@@ -9,7 +9,6 @@ num_workers: 8
 pin_memory: true
 drop_last: false
 train_shuffle: true
-train_samples_per_epoch: ${dataset.train_samples_per_epoch}
 prefetch_factor: 4
 persistent_workers: true
 

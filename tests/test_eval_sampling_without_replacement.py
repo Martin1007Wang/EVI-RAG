@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.models.components.sampler import ActionSampler
+from src.models.rollout import ActionSampler
 
 
 def test_eval_sampling_without_replacement_diversifies_same_state_group() -> None:
@@ -15,7 +15,9 @@ def test_eval_sampling_without_replacement_diversifies_same_state_group() -> Non
         ),
         "out_degrees": torch.tensor([[3, 3, 3]], dtype=torch.long),
         "stop_logits": torch.tensor([[neg_inf, neg_inf, neg_inf]], dtype=torch.float32),
-        "edge_ids": torch.tensor([10, 11, 12, 20, 21, 22, 30, 31, 32], dtype=torch.long),
+        "edge_ids": torch.tensor(
+            [10, 11, 12, 20, 21, 22, 30, 31, 32], dtype=torch.long
+        ),
         "target_nodes": torch.tensor([1, 2, 3, 1, 2, 3, 1, 2, 3], dtype=torch.long),
     }
 

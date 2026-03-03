@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin CLI wrapper for the retrieval preprocessing pipeline."""
+"""Thin CLI wrapper for the retrieval preprocess pipeline."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     hydra = None  # type: ignore[assignment]
 
-from src.data.pipeline_main import build_pipeline
+from src.data.preprocess.main import run_preprocess_pipeline
 from src.utils.logging_utils import get_logger, init_logging, log_event
 
 LOGGER = get_logger(__name__)
@@ -43,7 +43,11 @@ def _apply_stage_aliases(argv: list[str]) -> None:
 
 if hydra is not None:
 
-    @hydra.main(version_base=None, config_path="../configs", config_name="build_retrieval_pipeline")
+    @hydra.main(
+        version_base=None,
+        config_path="../configs",
+        config_name="build_retrieval_pipeline",
+    )
     def main(cfg):
         log_path_cfg = cfg.get("pipeline_log_path")
         log_path = None
@@ -60,13 +64,15 @@ if hydra is not None:
             output_dir=str(cfg.get("output_dir")),
             parquet_dir=str(cfg.get("parquet_dir")),
         )
-        build_pipeline(cfg)
+        run_preprocess_pipeline(cfg)
         log_event(LOGGER, "pipeline_done")
 
 else:  # pragma: no cover
 
     def main(cfg):
-        raise ModuleNotFoundError("hydra-core is required to run scripts/build_retrieval_pipeline.py")
+        raise ModuleNotFoundError(
+            "hydra-core is required to run scripts/build_retrieval_pipeline.py"
+        )
 
 
 if __name__ == "__main__":

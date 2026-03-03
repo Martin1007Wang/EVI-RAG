@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from .common import (
-    normalize_k_values,
+from .base import normalize_k_values, summarize_uncertainty
+from .dual_flow import (
     extract_sample_ids,
     extract_answer_entity_ids,
     compute_answer_recall,
     compute_answer_hit,
-    summarize_uncertainty,
-)
-from .dual_flow import (
     CompositeScoreConfig,
     resolve_composite_score_cfg,
     reduce_rollout_metrics,
@@ -19,7 +16,11 @@ from .dual_flow import (
     compute_composite_score,
     compute_reward_gap,
     compute_diag_metrics,
-    DualFlowEvalAccumulator,
+    build_potential_metrics,
+    DualFlowRolloutMetrics,
+    DualFlowRolloutExporter,
+    GraphExportInputs,
+    RolloutExportInputs,
 )
 
 __all__ = [
@@ -39,5 +40,9 @@ __all__ = [
     "compute_composite_score",
     "compute_reward_gap",
     "compute_diag_metrics",
-    "DualFlowEvalAccumulator",
+    "build_potential_metrics",
+    "DualFlowRolloutMetrics",
+    "DualFlowRolloutExporter",
+    "GraphExportInputs",
+    "RolloutExportInputs",
 ]

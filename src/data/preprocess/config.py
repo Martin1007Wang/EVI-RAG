@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional, Tuple
+
+try:  # pragma: no cover - optional dependency guard
+    from omegaconf import DictConfig, OmegaConf  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    DictConfig = ()  # type: ignore[assignment]
+    OmegaConf = None  # type: ignore[assignment]
+
+from src.data.schema.constants import (
+    _DEFAULT_BATCH_SIZE,
+    _DEFAULT_COSINE_EPS,
+    _DISABLE_PARALLEL_WORKERS,
+    _MIN_CHUNK_SIZE,
+)
+from src.data.schema.types import EmbeddingConfig, SplitFilter
+
+
+def _resolve_parquet_chunk_size(cfg, *, fallback: int) -> int:
+    chunk_cfg = cfg.get("parquet_chunk_size")
+    chunk_size = fallback if chunk_cfg is None else int(chunk_cfg)
+    if chunk_size < _MIN_CHUNK_SIZE:
+        raise ValueError(
+            f"parquet_chunk_size must be >= {_MIN_CHUNK_SIZE}, got {chunk_size}"
+        )
+    return chunk_size
+
+
+def _resolve_parquet_num_workers(cfg) -> int:
+    workers_cfg = cfg.get("parquet_num_workers", _DISABLE_PARALLEL_WORKERS)
+    num_workers = int(workers_cfg)
+    if num_workers < _DISABLE_PARALLEL_WORKERS:
+        raise ValueError(
+            f"parquet_num_workers must be >= {_DISABLE_PARALLEL_WORKERS}, got {num_workers}"
+        )
+    return num_workers
+
+
+def build_embedding_cfg(cfg) -> Optional[EmbeddingConfig]:
+    encoder = str(cfg.get("encoder", "")).strip()
+    if not encoder:
+        return None
+    canonicalize_relations = bool(cfg.get("canonicalize_relations", False))
+    question_ctx_max_tokens = int(cfg.get("question_ctx_max_tokens", 0))
+    if question_ctx_max_tokens < 0:
+        raise ValueError(
+            f"question_ctx_max_tokens must be >= 0, got {question_ctx_max_tokens}."
+        )
+    embeddings_out_dir_cfg = cfg.get("embeddings_out_dir")
+    if not embeddings_out_dir_cfg:
+        raise ValueError(
+            "embeddings_out_dir must be set when embedding encoding is enabled."
+        )
+    try:
+        import hydra
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "hydra-core is required to resolve embeddings_out_dir."
+        ) from exc
+    return EmbeddingConfig(
+        encoder=encoder,
+        device=str(cfg.get("device", "cuda")),
+        batch_size=int(cfg.get("batch_size", _DEFAULT_BATCH_SIZE)),
+        fp16=bool(cfg.get("fp16", False)),
+        progress_bar=bool(cfg.get("progress_bar", True)),
+        embeddings_out_dir=Path(hydra.utils.to_absolute_path(embeddings_out_dir_cfg)),
+        canonicalize_relations=canonicalize_relations,
+        cosine_eps=float(cfg.get("cosine_eps", _DEFAULT_COSINE_EPS)),
+        question_ctx_max_tokens=question_ctx_max_tokens,
+    )
+
+
+def build_split_filters(cfg) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitFilter]]:
+    default_filter = SplitFilter(
+        skip_no_topic=False, skip_no_ans=False, skip_no_path=False
+    )
+    filter_cfg = cfg.get("filter")
+    if filter_cfg is None:
+        return default_filter, default_filter, {}
+    train_section = filter_cfg.get("train")
+    eval_section = filter_cfg.get("eval")
+    train_filter = SplitFilter(
+        skip_no_topic=bool(train_section.get("skip_no_topic", False))
+        if train_section is not None
+        else False,
+        skip_no_ans=bool(train_section.get("skip_no_ans", False))
+        if train_section is not None
+        else False,
+        skip_no_path=bool(train_section.get("skip_no_path", False))
+        if train_section is not None
+        else False,
+    )
+    eval_filter = SplitFilter(
+        skip_no_topic=bool(eval_section.get("skip_no_topic", False))
+        if eval_section is not None
+        else False,
+        skip_no_ans=bool(eval_section.get("skip_no_ans", False))
+        if eval_section is not None
+        else False,
+        skip_no_path=bool(eval_section.get("skip_no_path", False))
+        if eval_section is not None
+        else False,
+    )
+    overrides = {}
+    for key in filter_cfg.keys():
+        if key in {"train", "eval"}:
+            continue
+        section = filter_cfg.get(key)
+        overrides[str(key)] = SplitFilter(
+            skip_no_topic=bool(section.get("skip_no_topic", False)),
+            skip_no_ans=bool(section.get("skip_no_ans", False)),
+            skip_no_path=bool(section.get("skip_no_path", False)),
+        )
+    return train_filter, eval_filter, overrides
+
+
+_ENTITY_VOCAB_FILENAME = "entity_vocab.parquet"
+
+
+def resolve_entity_vocab_path(cfg: Any) -> Optional[Path]:
+    """Resolve entity_vocab.parquet from dataset cfg or fall back to out_dir."""
+    if OmegaConf is not None and isinstance(cfg, DictConfig):
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(cfg, dict):
+        return None
+    paths_cfg = cfg.get("paths")
+    if OmegaConf is not None and isinstance(paths_cfg, DictConfig):
+        paths_cfg = OmegaConf.to_container(paths_cfg, resolve=True)
+    if isinstance(paths_cfg, dict):
+        entity_vocab = paths_cfg.get("entity_vocab")
+        if entity_vocab:
+            return Path(entity_vocab)
+    out_dir = cfg.get("out_dir")
+    if out_dir:
+        return Path(out_dir) / _ENTITY_VOCAB_FILENAME
+    return None
+
+
+__all__ = [
+    "_resolve_parquet_chunk_size",
+    "_resolve_parquet_num_workers",
+    "build_embedding_cfg",
+    "build_split_filters",
+    "resolve_entity_vocab_path",
+]

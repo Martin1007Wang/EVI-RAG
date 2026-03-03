@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import is_dataclass, replace as dataclass_replace
-import inspect
 import os
 import json
 from pathlib import Path
@@ -17,7 +16,14 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.utils import RankedLogger, extras, instantiate_callbacks, instantiate_loggers, log_hyperparameters, task_wrapper
+from src.utils import (
+    RankedLogger,
+    extras,
+    instantiate_callbacks,
+    instantiate_loggers,
+    log_hyperparameters,
+    task_wrapper,
+)
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -83,41 +89,9 @@ def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
         )
 
 
-def _load_checkpoint_strict(model: LightningModule, ckpt_path: Optional[str]) -> None:
-    if ckpt_path in (None, ""):
-        return
-    def _strip_torch_compile_prefix(state: Dict[str, Any]) -> Dict[str, Any]:
-        if not state:
-            return state
-        if not any("._orig_mod." in key or key.startswith("_orig_mod.") for key in state):
-            return state
-        stripped: Dict[str, Any] = {}
-        for key, value in state.items():
-            if key.startswith("_orig_mod."):
-                new_key = key.replace("_orig_mod.", "", 1)
-            else:
-                new_key = key.replace("._orig_mod.", ".", 1)
-            stripped[new_key] = value
-        return stripped
-    load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
-    # NOTE: Lightning `.ckpt` is not guaranteed to be `weights_only`-safe under torch>=2.6.
-    # We explicitly load with `weights_only=False` for compatibility (assumes checkpoint is trusted).
-    if "weights_only" in inspect.signature(torch.load).parameters:
-        load_kwargs["weights_only"] = False
-    checkpoint = torch.load(str(ckpt_path), **load_kwargs)
-    if isinstance(checkpoint, dict):
-        try:
-            model.on_load_checkpoint(checkpoint)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to apply checkpoint metadata before strict load: {exc}") from exc
-    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"Checkpoint at {ckpt_path} must be a state_dict mapping, got {type(state_dict)!r}")
-    state_dict = _strip_torch_compile_prefix(state_dict)
-    model.load_state_dict(state_dict, strict=True)
-
-
-def _save_metrics(cfg: DictConfig, metrics: Dict[str, Any], *, filename: str = "metrics.json") -> Path:
+def _save_metrics(
+    cfg: DictConfig, metrics: Dict[str, Any], *, filename: str = "metrics.json"
+) -> Path:
     """Persist metrics to ${paths.output_dir}/<filename> (rank0-only logic handled upstream)."""
 
     def _to_python(value: Any) -> Any:
@@ -136,7 +110,9 @@ def _save_metrics(cfg: DictConfig, metrics: Dict[str, Any], *, filename: str = "
 
 
 def _normalize_dataset_scope(dataset_cfg: DictConfig | Dict[str, Any]) -> str:
-    scope_raw = dataset_cfg.get("dataset_scope") if hasattr(dataset_cfg, "get") else None
+    scope_raw = (
+        dataset_cfg.get("dataset_scope") if hasattr(dataset_cfg, "get") else None
+    )
     scope = str(scope_raw or "").strip().lower()
     if scope in {"full", "sub"}:
         return scope
@@ -161,7 +137,9 @@ def _load_dataset_config_by_name(name: str, paths_cfg: DictConfig) -> DictConfig
 
     defaults = raw_cfg.get("defaults") if isinstance(raw_cfg, DictConfig) else None
     use_base = False
-    if defaults is not None and (OmegaConf.is_list(defaults) or isinstance(defaults, (list, tuple))):
+    if defaults is not None and (
+        OmegaConf.is_list(defaults) or isinstance(defaults, (list, tuple))
+    ):
         for entry in list(defaults):
             if entry == "base":
                 use_base = True
@@ -171,7 +149,9 @@ def _load_dataset_config_by_name(name: str, paths_cfg: DictConfig) -> DictConfig
                 break
     if use_base:
         if not _DATASET_BASE_CONFIG.exists():
-            raise FileNotFoundError(f"Dataset base config not found: {_DATASET_BASE_CONFIG}")
+            raise FileNotFoundError(
+                f"Dataset base config not found: {_DATASET_BASE_CONFIG}"
+            )
         base_cfg = OmegaConf.load(_DATASET_BASE_CONFIG)
         raw_cfg = _strip_defaults(raw_cfg)
         raw_cfg = OmegaConf.merge(base_cfg, raw_cfg)
@@ -216,7 +196,9 @@ def _resolve_eval_mode(run_cfg: DictConfig | Dict[str, Any]) -> str:
     raise ValueError("run.eval_mode must be one of {'predict', 'test'}.")
 
 
-def _configure_dual_flow_eval_sampling(model: LightningModule, run_cfg: DictConfig | Dict[str, Any]) -> None:
+def _configure_dual_flow_eval_sampling(
+    model: LightningModule, run_cfg: DictConfig | Dict[str, Any]
+) -> None:
     if not hasattr(model, "sampler"):
         return
     sampler = getattr(model, "sampler")
@@ -228,8 +210,14 @@ def _configure_dual_flow_eval_sampling(model: LightningModule, run_cfg: DictConf
     if not (has_temp or has_unique):
         return
 
-    temp_override = run_cfg.get("eval_sampling_temperature") if hasattr(run_cfg, "get") else None
-    unique_override = run_cfg.get("eval_sample_without_replacement") if hasattr(run_cfg, "get") else None
+    temp_override = (
+        run_cfg.get("eval_sampling_temperature") if hasattr(run_cfg, "get") else None
+    )
+    unique_override = (
+        run_cfg.get("eval_sample_without_replacement")
+        if hasattr(run_cfg, "get")
+        else None
+    )
     updates: Dict[str, Any] = {}
     if has_temp and temp_override is not None:
         temp_value = float(temp_override)
@@ -240,7 +228,6 @@ def _configure_dual_flow_eval_sampling(model: LightningModule, run_cfg: DictConf
         updates["eval_sample_without_replacement"] = bool(unique_override)
     if updates:
         sampler.config = dataclass_replace(sampler_cfg, **updates)
-
 
 
 def _preflight_validate(cfg: DictConfig) -> None:
@@ -273,7 +260,9 @@ def _preflight_validate(cfg: DictConfig) -> None:
     if run_name == "eval_dual_flow":
         variants = _resolve_dataset_variants(cfg)
         if not variants:
-            raise ValueError("Evaluation requires run.dataset_variants with both full and sub datasets.")
+            raise ValueError(
+                "Evaluation requires run.dataset_variants with both full and sub datasets."
+            )
         scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
         if scopes != {"full", "sub"}:
             names = [label for label, _ in variants]
@@ -288,7 +277,9 @@ def _run_eval_all_splits(cfg: DictConfig) -> None:
     splits = run_cfg.get("splits") or ["train", "validation", "test"]
     split_list = [str(s) for s in splits]
     if not split_list:
-        raise ValueError("run.splits must be a non-empty list when run.run_all_splits=true.")
+        raise ValueError(
+            "run.splits must be a non-empty list when run.run_all_splits=true."
+        )
 
     for split in split_list:
         log.info("eval: split=%s", split)
@@ -305,7 +296,9 @@ def _run_llm_all_splits(cfg: DictConfig) -> None:
     splits = run_cfg.get("splits") or ["train", "validation", "test"]
     split_list = [str(s) for s in splits]
     if not split_list:
-        raise ValueError("run.splits must be a non-empty list when run.run_all_splits=true.")
+        raise ValueError(
+            "run.splits must be a non-empty list when run.run_all_splits=true."
+        )
 
     from src.llm import run_llm_eval
 
@@ -322,7 +315,9 @@ def _run_eval_all_datasets(cfg: DictConfig) -> None:
     run_cfg = cfg.get("run") or {}
     variants = _resolve_dataset_variants(cfg)
     if not variants:
-        raise ValueError("run.dataset_variants must be a non-empty list when evaluating multiple datasets.")
+        raise ValueError(
+            "run.dataset_variants must be a non-empty list when evaluating multiple datasets."
+        )
 
     scopes = {_normalize_dataset_scope(ds_cfg) for _, ds_cfg in variants}
     if scopes != {"full", "sub"}:
@@ -378,9 +373,9 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
-
-    _load_checkpoint_strict(model, cfg.get("ckpt_path"))
+    trainer: Trainer = hydra.utils.instantiate(
+        cfg.trainer, callbacks=callbacks, logger=logger
+    )
 
     object_dict = {
         "cfg": cfg,
@@ -396,12 +391,23 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log_hyperparameters(object_dict)
 
     eval_mode = _resolve_eval_mode(cfg.get("run") or {})
+    ckpt_path = cfg.get("ckpt_path")
     if eval_mode == "test":
         log.info("Running trainer.test()...")
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=None, verbose=False)
+        trainer.test(
+            model=model,
+            datamodule=datamodule,
+            ckpt_path=ckpt_path,
+            verbose=False,
+        )
     else:
         log.info("Running trainer.predict()...")
-        trainer.predict(model=model, datamodule=datamodule, ckpt_path=None, return_predictions=True)
+        trainer.predict(
+            model=model,
+            datamodule=datamodule,
+            ckpt_path=ckpt_path,
+            return_predictions=False,
+        )
 
     metric_dict = trainer.callback_metrics
     if not metric_dict and hasattr(model, "predict_metrics"):
@@ -418,11 +424,12 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         metrics_filename = "metrics.json"
         split = run_cfg.get("split")
         dataset_variant = run_cfg.get("dataset_variant")
+        scope = None
         if dataset_variant:
             scope = _normalize_dataset_scope(cfg.dataset)
             metrics_filename = f"metrics_{scope}.json"
         if bool(run_cfg.get("run_all_splits", False)) and split not in (None, ""):
-            prefix = f"metrics_{scope}_" if dataset_variant else "metrics_"
+            prefix = f"metrics_{scope}_" if scope else "metrics_"
             metrics_filename = f"{prefix}{split}.json"
         metrics_path = _save_metrics(cfg, metric_dict, filename=metrics_filename)
         log.info("Metrics saved to %s", metrics_path)

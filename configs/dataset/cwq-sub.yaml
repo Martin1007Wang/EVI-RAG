@@ -10,6 +10,5 @@ dataset_family: cwq
 max_steps: 10
 hf_dataset: rmanluo/RoG-cwq
 
-train_samples_per_epoch: 2048
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json

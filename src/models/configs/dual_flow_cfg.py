@@ -4,7 +4,7 @@ from .environment import EnvironmentConfig
 from .policy import PolicyConfig
 from .search import RolloutConfig, BeamSearchConfig
 from .objective import SubTBConfig
-from .training import TrainingConfig, OptimizerConfig, SchedulerConfig
+from .training import OptimizerConfig, SchedulerConfig
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,5 @@ class DualFlowConfig:
     sampling_cfg: RolloutConfig
     eval_cfg: BeamSearchConfig
     subtb_cfg: SubTBConfig
-    training_cfg: TrainingConfig
     optimizer_cfg: OptimizerConfig
     scheduler_cfg: SchedulerConfig

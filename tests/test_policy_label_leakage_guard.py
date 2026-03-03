@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import torch
 
-from src.models.components.policy import DualFlowPolicy
-from src.models.configs.policy import BackboneConfig, FlowHeadConfig, PolicyConfig, PriorityHeadConfig
-from src.models.environment.contracts import CsrAdjacency, DynamicAgentState, GraphEnvContext
+from src.models.policy import DualFlowPolicy
+from src.models.configs.policy import (
+    BackboneConfig,
+    FlowHeadConfig,
+    PolicyConfig,
+    PriorityHeadConfig,
+)
+from src.models.environment import CsrAdjacency, DynamicAgentState, GraphEnvContext
 
 
-def _build_csr(*, row: torch.Tensor, col: torch.Tensor, edge_ids: torch.Tensor, num_nodes: int) -> CsrAdjacency:
+def _build_csr(
+    *, row: torch.Tensor, col: torch.Tensor, edge_ids: torch.Tensor, num_nodes: int
+) -> CsrAdjacency:
     if int(row.numel()) == 0:
         return CsrAdjacency(
             crow=torch.zeros((num_nodes + 1,), dtype=torch.long),
@@ -46,8 +53,12 @@ def _build_context(*, a_local_indices: torch.Tensor) -> GraphEnvContext:
     col_fwd = edge_index[1]
     row_bwd = edge_index[1]
     col_bwd = edge_index[0]
-    adj_t_fwd = _build_csr(row=row_fwd, col=col_fwd, edge_ids=edge_ids, num_nodes=num_nodes)
-    adj_t_bwd = _build_csr(row=row_bwd, col=col_bwd, edge_ids=edge_ids, num_nodes=num_nodes)
+    adj_t_fwd = _build_csr(
+        row=row_fwd, col=col_fwd, edge_ids=edge_ids, num_nodes=num_nodes
+    )
+    adj_t_bwd = _build_csr(
+        row=row_bwd, col=col_bwd, edge_ids=edge_ids, num_nodes=num_nodes
+    )
     edge_rel = torch.tensor([0, 1, 0], dtype=torch.long)
     a_ptr = torch.tensor([0, int(a_local_indices.numel())], dtype=torch.long)
     return GraphEnvContext(
@@ -78,6 +89,16 @@ def _build_context(*, a_local_indices: torch.Tensor) -> GraphEnvContext:
             dtype=torch.float32,
         ),
         question_emb=torch.tensor([[0.20, 0.10, 0.10, 0.40]], dtype=torch.float32),
+        question_ctx=torch.tensor(
+            [
+                [
+                    [0.20, 0.10, 0.10, 0.40],
+                    [0.10, 0.30, 0.20, 0.10],
+                ]
+            ],
+            dtype=torch.float32,
+        ),
+        question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=a_local_indices,
         q_ptr=torch.tensor([0, 1], dtype=torch.long),
@@ -94,10 +115,12 @@ def _make_agent_state(*, hidden_dim: int, num_nodes: int) -> DynamicAgentState:
     return DynamicAgentState(
         step_t=0,
         current_nodes=torch.tensor([[0]], dtype=torch.long),
+        flow_direction="forward",
         hidden_states=torch.zeros((1, 1, hidden_dim), dtype=torch.float32),
         visited_mask=torch.zeros((1, num_nodes), dtype=torch.bool),
         cumulative_rewards=torch.zeros((1, 1), dtype=torch.float32),
         done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_moves=torch.zeros((1, 1), dtype=torch.long),
     )
 
 
@@ -135,7 +158,9 @@ def test_policy_logits_do_not_depend_on_answer_labels() -> None:
     context_b = _build_context(a_local_indices=torch.tensor([1], dtype=torch.long))
     state = _make_agent_state(hidden_dim=4, num_nodes=3)
 
-    node_tokens_a, relation_tokens_a, question_tokens_a = policy.encode_context(context_a)
+    node_tokens_a, relation_tokens_a, question_tokens_a = policy.encode_context(
+        context_a
+    )
     out_a = policy.compute_action_scores(
         env_context=context_a,
         agent_state=state,
@@ -144,7 +169,9 @@ def test_policy_logits_do_not_depend_on_answer_labels() -> None:
         relation_tokens=relation_tokens_a,
     )
 
-    node_tokens_b, relation_tokens_b, question_tokens_b = policy.encode_context(context_b)
+    node_tokens_b, relation_tokens_b, question_tokens_b = policy.encode_context(
+        context_b
+    )
     out_b = policy.compute_action_scores(
         env_context=context_b,
         agent_state=state,
@@ -190,5 +217,9 @@ def test_policy_action_cache_is_behavior_equivalent() -> None:
 
     assert torch.equal(out_direct["edge_ids"], out_cached["edge_ids"])
     assert torch.equal(out_direct["target_nodes"], out_cached["target_nodes"])
-    assert torch.allclose(out_direct["edge_logits"], out_cached["edge_logits"], atol=1.0e-7)
-    assert torch.allclose(out_direct["stop_logits"], out_cached["stop_logits"], atol=1.0e-7)
+    assert torch.allclose(
+        out_direct["edge_logits"], out_cached["edge_logits"], atol=1.0e-7
+    )
+    assert torch.allclose(
+        out_direct["stop_logits"], out_cached["stop_logits"], atol=1.0e-7
+    )

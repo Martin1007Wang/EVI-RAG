@@ -5,12 +5,19 @@ import math
 import pytest
 import torch
 
-from src.models.components.policy import DualFlowPolicy
-from src.models.configs.policy import BackboneConfig, FlowHeadConfig, PolicyConfig, PriorityHeadConfig
-from src.models.environment.contracts import CsrAdjacency, DynamicAgentState, GraphEnvContext
+from src.models.policy import DualFlowPolicy
+from src.models.configs.policy import (
+    BackboneConfig,
+    FlowHeadConfig,
+    PolicyConfig,
+    PriorityHeadConfig,
+)
+from src.models.environment import CsrAdjacency, DynamicAgentState, GraphEnvContext
 
 
-def _build_csr(*, row: torch.Tensor, col: torch.Tensor, edge_ids: torch.Tensor, num_nodes: int) -> CsrAdjacency:
+def _build_csr(
+    *, row: torch.Tensor, col: torch.Tensor, edge_ids: torch.Tensor, num_nodes: int
+) -> CsrAdjacency:
     if int(row.numel()) == 0:
         return CsrAdjacency(
             crow=torch.zeros((num_nodes + 1,), dtype=torch.long),
@@ -39,8 +46,12 @@ def _build_context() -> GraphEnvContext:
     num_nodes = 3
     edge_index = torch.tensor([[0, 0], [1, 2]], dtype=torch.long)
     edge_ids = torch.arange(edge_index.size(1), dtype=torch.long)
-    adj_t_fwd = _build_csr(row=edge_index[0], col=edge_index[1], edge_ids=edge_ids, num_nodes=num_nodes)
-    adj_t_bwd = _build_csr(row=edge_index[1], col=edge_index[0], edge_ids=edge_ids, num_nodes=num_nodes)
+    adj_t_fwd = _build_csr(
+        row=edge_index[0], col=edge_index[1], edge_ids=edge_ids, num_nodes=num_nodes
+    )
+    adj_t_bwd = _build_csr(
+        row=edge_index[1], col=edge_index[0], edge_ids=edge_ids, num_nodes=num_nodes
+    )
     edge_rel = torch.tensor([0, 1], dtype=torch.long)
     return GraphEnvContext(
         num_graphs=1,
@@ -70,6 +81,16 @@ def _build_context() -> GraphEnvContext:
             dtype=torch.float32,
         ),
         question_emb=torch.tensor([[0.20, 0.10, 0.10, 0.20]], dtype=torch.float32),
+        question_ctx=torch.tensor(
+            [
+                [
+                    [0.20, 0.10, 0.10, 0.20],
+                    [0.10, 0.20, 0.10, 0.20],
+                ]
+            ],
+            dtype=torch.float32,
+        ),
+        question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         q_ptr=torch.tensor([0, 1], dtype=torch.long),
@@ -112,10 +133,12 @@ def test_stop_logit_is_calibrated_to_edge_partition_mass() -> None:
     state = DynamicAgentState(
         step_t=0,
         current_nodes=torch.tensor([[0]], dtype=torch.long),
+        flow_direction="forward",
         hidden_states=torch.zeros((1, 1, 4), dtype=torch.float32),
         visited_mask=torch.zeros((1, context.num_nodes_total), dtype=torch.bool),
         cumulative_rewards=torch.zeros((1, 1), dtype=torch.float32),
         done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_moves=torch.zeros((1, 1), dtype=torch.long),
     )
 
     node_tokens, relation_tokens, question_tokens = policy.encode_context(context)
@@ -133,11 +156,15 @@ def test_stop_logit_is_calibrated_to_edge_partition_mass() -> None:
 
     edge_lse = torch.logsumexp(edge_logits, dim=0)
     delta = stop_logit - edge_lse
-    expected_delta = cfg.stop_delta_scale * math.tanh(cfg.stop_bias_init / cfg.stop_delta_temperature)
+    expected_delta = cfg.stop_delta_scale * math.tanh(
+        cfg.stop_bias_init / cfg.stop_delta_temperature
+    )
     assert float(delta.item()) == pytest.approx(expected_delta, rel=1e-6, abs=1e-6)
     assert abs(float(delta.item())) <= cfg.stop_delta_scale + 1.0e-6
 
     final_logits = torch.cat([edge_logits, stop_logit.view(1)], dim=0)
     probs = torch.softmax(final_logits, dim=0)
     stop_prob = probs[-1]
-    assert float(stop_prob.item()) == pytest.approx(torch.sigmoid(delta).item(), rel=1e-6, abs=1e-6)
+    assert float(stop_prob.item()) == pytest.approx(
+        torch.sigmoid(delta).item(), rel=1e-6, abs=1e-6
+    )

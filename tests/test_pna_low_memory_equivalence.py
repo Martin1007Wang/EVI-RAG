@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.models.components.gnn import RelationalGNNLayer
+from src.models.backbone import RelationalGNNLayer
 
 
 def test_pna_aggregate_matches_dense_reference() -> None:
@@ -14,9 +14,13 @@ def test_pna_aggregate_matches_dense_reference() -> None:
     messages = torch.randn((num_edges, hidden_dim), dtype=torch.float32)
     tails = torch.randint(low=0, high=num_nodes, size=(num_edges,), dtype=torch.long)
 
-    optimized = layer._pna_aggregate(messages=messages, tails=tails, num_nodes=num_nodes)
+    optimized = layer._pna_aggregate(
+        messages=messages, tails=tails, num_nodes=num_nodes
+    )
 
-    stats, deg, has_in = layer._safe_pna_stats(messages=messages, tails=tails, num_nodes=num_nodes)
+    stats, deg, has_in = layer._safe_pna_stats(
+        messages=messages, tails=tails, num_nodes=num_nodes
+    )
     log_deg = torch.log(deg + 1.0).clamp(min=1.0e-6)
     scales = torch.stack(
         (

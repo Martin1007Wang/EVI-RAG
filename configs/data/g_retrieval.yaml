@@ -1,6 +1,6 @@
 # configs/data/g_retrieval.yaml
 
-_target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
+_target_: src.datasets.g_retrieval_datamodule.GRetrievalDataModule
 
 dataset_cfg: ${dataset}
 
@@ -9,14 +9,14 @@ batch_size: 8
 num_workers: 16
 drop_last: false
 train_shuffle: true
-# 缩短“有效 epoch”长度：每个 epoch 仅训练 N 个样本（无放回循环采样，跨多个 epoch 覆盖全量训练集）。
-# 由 dataset.train_samples_per_epoch 控制；未设置时为 null（即使用全量训练集组成 epoch）。
-train_samples_per_epoch: ${dataset.train_samples_per_epoch}
+# 如需缩短训练，优先使用 Trainer 的 `limit_train_batches` / `max_steps`。
 prefetch_factor: 4
 persistent_workers: true
 precompute_edge_batch: true
 embeddings_device: cpu
+# Mirror model env config to keep runtime batch adaptation consistent.
+super_source_enabled: ${model.env_cfg.super_source_enabled}
 # 多答案由模型/奖励处理；DataLoader 不展开。
 expand_multi_answer: false
-# Zero-hop (q in A) 允许保留，交由模型处理原地 STOP。
-filter_zero_hop: false
+# Zero-hop (q in A) 过滤掉，避免与 stop_min_steps=1 的最小步数约束冲突。
+filter_zero_hop: true

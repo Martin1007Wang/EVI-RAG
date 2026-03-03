@@ -25,6 +25,6 @@ export_top_k: 100
 skip_no_path: true
 
 # Label store for supervised training. This should be generated via:
-#   python -m src.data.build_edge_retriever_labels dataset=<name>-sub
+#   python -m src.datasets.build_edge_retriever_labels dataset=<name>-sub
 label_store_dir: ${dataset.artifact_dir}/edge_retriever_labels
 label_store_template: "{split}.pt"

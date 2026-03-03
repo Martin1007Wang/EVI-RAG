@@ -7,7 +7,7 @@ class BackboneConfig:
     """策略 Backbone 黄金基准配置"""
 
     embedding_dim: int = 1024
-    hidden_dim: int = 256  # 强化学习的决策空间，256 足矣，避免维度灾难
+    hidden_dim: int = 512  # 图编码瓶颈维度：1024 -> 512 压缩后做 GNN 消息传递
     gnn_layers: int = 2  # 2跳足够，避免图节点的过度平滑 (Oversmoothing)
     gnn_dropout: float = 0.1  # 必须是 float，轻微正则化防止 Hub Nodes 过拟合
 
@@ -23,7 +23,7 @@ class BackboneConfig:
 class FlowHeadConfig:
     """状态流量预测头配置"""
 
-    hidden_dim: int = 256
+    hidden_dim: int = 512
     num_layers: int = 2
     dropout: float = 0.0
     relation_low_rank: int = 16
@@ -49,9 +49,15 @@ class PolicyConfig:
     stop_bias_init: float = -1.5
     stop_delta_scale: float = 2.0
     stop_delta_temperature: float = 1.0
+    doob_h_alpha: float = 1.0
+    doob_h_node_temperature: float = 1.0
 
     def __post_init__(self) -> None:
         if self.stop_delta_scale <= 0.0:
             raise ValueError("stop_delta_scale must be > 0.")
         if self.stop_delta_temperature <= 0.0:
             raise ValueError("stop_delta_temperature must be > 0.")
+        if self.doob_h_alpha < 0.0:
+            raise ValueError("doob_h_alpha must be >= 0.")
+        if self.doob_h_node_temperature <= 0.0:
+            raise ValueError("doob_h_node_temperature must be > 0.")

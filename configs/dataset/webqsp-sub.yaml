@@ -7,9 +7,9 @@ defaults:
 name: webqsp-sub
 dataset_scope: sub
 dataset_family: webqsp
-max_steps: 4
+# Real-hop budget (excluding super-source first hop).
+max_steps: 2
 hf_dataset: rmanluo/RoG-webqsp
 
-train_samples_per_epoch: 2048
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json

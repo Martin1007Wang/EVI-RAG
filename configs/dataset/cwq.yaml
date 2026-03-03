@@ -10,7 +10,6 @@ dataset_family: cwq
 max_steps: 10
 hf_dataset: rmanluo/RoG-cwq
 
-train_samples_per_epoch: 2048
 
 filter_missing_answer:
   train: false

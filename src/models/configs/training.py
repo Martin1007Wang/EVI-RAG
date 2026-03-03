@@ -20,9 +20,3 @@ class SchedulerConfig:
     interval: str = "step"  # step, epoch
     t_max: int = 10
     eta_min: float = 0.0
-    warmup_steps: int = 0
-
-@dataclass(frozen=True)
-class TrainingConfig:
-    """训练流程配置"""
-    pass

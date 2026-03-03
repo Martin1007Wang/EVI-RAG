@@ -21,6 +21,12 @@
 
 ---
 
+## 0.1 Environment Setup (开发环境)
+
+*   **Conda Env:** 使用本仓库时请先执行 `conda activate pog`，以保证 `torch`/`lightning` 等依赖被正确解析，避免工具/LSP 报错。
+
+---
+
 ## Ⅰ. The Axiomatic System (公理系统)
 
 我们不编写“功能”，我们实现“定义”。所有代码必须遵循以下三大公理：

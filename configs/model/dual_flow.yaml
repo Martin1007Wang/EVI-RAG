@@ -9,22 +9,15 @@ _recursive_: true
 
 env_cfg:
   _target_: src.models.configs.environment.EnvironmentConfig
-  prior:
-    _target_: src.models.configs.environment.PriorConfig
-    pb_mode: uniform_in_degree
   stop:
     _target_: src.models.configs.environment.StopConfig
-    enabled: true
     reward_base: 1.0
-    reward_epsilon: 1.0e-4
-    distance_reward_gamma: 0.8
-    reward_beta_init: 0.6
-    reward_beta_max: 0.6
+    reward_epsilon: 1.0e-3
+    reward_beta_init: 1.0
+    reward_beta_max: 1.0
     reward_beta_anneal_steps: 0
     reward_beta_anneal_start_step: 0
     reward_beta_schedule: linear
-    degree_penalty_alpha: 0.0
-    degree_penalty_min_degree: 1.0
   super_source_enabled: true
 
 policy_cfg:
@@ -32,14 +25,14 @@ policy_cfg:
   backbone:
     _target_: src.models.configs.policy.BackboneConfig
     embedding_dim: 1024
-    hidden_dim: 1024
+    hidden_dim: 512
     gnn_layers: 2
     gnn_dropout: 0.1
     use_adapter: true
     adapter_dim: 256
     adapter_dropout: 0.1
     use_positional_encoding: true
-    use_film: true
+    use_film: false
   flow_head:
     _target_: src.models.configs.policy.FlowHeadConfig
     hidden_dim: 512
@@ -52,16 +45,20 @@ policy_cfg:
     hidden_dim: 256
     num_layers: 2
     dropout: 0.0
-  stop_bias_init: -1.5
+  stop_bias_init: -0.7
   stop_delta_scale: 2.0
   stop_delta_temperature: 1.0
+  doob_h_alpha: 1.0
+  doob_h_node_temperature: 1.0
 
 sampling_cfg:
   _target_: src.models.configs.search.RolloutConfig
-  num_rollouts: 4
+  num_rollouts: 8
+  # Real-hop budget in KG space (excluding virtual super-source first hop).
   max_steps: ${dataset.max_steps}
+  # Minimum real hops before STOP is allowed (excluding virtual super-source first hop).
   stop_min_steps: 1
-  backward_prior_mode: ${model.env_cfg.prior.pb_mode}
+  backward_prior_mode: uniform_in_degree
   train_oracle_force_stop: false
   sampling_temperature: 1.0
   sampling_mode: gumbel
@@ -70,9 +67,11 @@ sampling_cfg:
 
 eval_cfg:
   _target_: src.models.configs.search.BeamSearchConfig
-  beam_size: 50
+  beam_size: 32
+  # Real-hop budget in KG space (excluding virtual super-source first hop).
   max_steps: ${dataset.max_steps}
   diverse_penalty: 0.0
+  candidate_expansion_factor: 8
   require_done: true
   rollout_metrics_every_n_batches: 0
 
@@ -80,14 +79,12 @@ subtb_cfg:
   _target_: src.models.configs.objective.SubTBConfig
   lambda_weight: 0.9
   normalize: true
-  detach_end_flow: true
+  detach_end_flow: false
   miss_length_penalty: 0.0
   ranking_weight: 0.0
   ranking_temperature: 1.0
   backward_weight: 0.0
-
-training_cfg:
-  _target_: src.models.configs.training.TrainingConfig
+  doob_h_weight: 1.0
 
 optimizer_cfg:
   _target_: src.models.configs.training.OptimizerConfig
@@ -102,4 +99,3 @@ scheduler_cfg:
   interval: step
   t_max: 10
   eta_min: 0.0
-  warmup_steps: 0

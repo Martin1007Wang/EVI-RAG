@@ -2,12 +2,9 @@
 """
 [系统模块] 配置定义
 """
+
 from .dual_flow_cfg import DualFlowConfig
-from .environment import (
-    EnvironmentConfig,
-    PriorConfig,
-    StopConfig,
-)
+from .environment import EnvironmentConfig, StopConfig
 from .objective import (
     SubTBConfig,
 )
@@ -21,17 +18,12 @@ from .search import (
     RolloutConfig,
     BeamSearchConfig,
 )
-from .training import (
-    TrainingConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-)
+from .training import OptimizerConfig, SchedulerConfig
 
 
 __all__ = [
     "DualFlowConfig",
     "EnvironmentConfig",
-    "PriorConfig",
     "StopConfig",
     "SubTBConfig",
     "PolicyConfig",
@@ -40,7 +32,6 @@ __all__ = [
     "PriorityHeadConfig",
     "RolloutConfig",
     "BeamSearchConfig",
-    "TrainingConfig",
     "OptimizerConfig",
     "SchedulerConfig",
 ]

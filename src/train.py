@@ -27,7 +27,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
-from src.config.data_config import resolve_entity_vocab_path
+from src.data.preprocess.config import resolve_entity_vocab_path
 from src.utils import (
     RankedLogger,
     extras,
@@ -138,7 +138,10 @@ def _validate_cvt_requirements(cfg: DictConfig) -> None:
                 f"for CVT initialization. dataset={dataset_entity_vocab} data.dataset_cfg={data_entity_vocab}"
             )
 
-    for source_name, source_cfg in (("dataset", dataset_cfg), ("data.dataset_cfg", data_dataset_cfg)):
+    for source_name, source_cfg in (
+        ("dataset", dataset_cfg),
+        ("data.dataset_cfg", data_dataset_cfg),
+    ):
         entity_vocab_path = resolve_entity_vocab_path(source_cfg)
         if entity_vocab_path is None:
             raise ValueError(
@@ -146,7 +149,9 @@ def _validate_cvt_requirements(cfg: DictConfig) -> None:
                 f"Missing path in {source_name}; set `{source_name}.paths.entity_vocab` or `{source_name}.out_dir`."
             )
         if not entity_vocab_path.exists():
-            raise FileNotFoundError(f"{source_name} entity_vocab.parquet not found: {entity_vocab_path}")
+            raise FileNotFoundError(
+                f"{source_name} entity_vocab.parquet not found: {entity_vocab_path}"
+            )
 
 
 def _enforce_min_rollouts(cfg: DictConfig) -> None:
@@ -154,10 +159,16 @@ def _enforce_min_rollouts(cfg: DictConfig) -> None:
     model_target = str(model_cfg.get("_target_", "") or "")
     if model_target != _DUAL_FLOW_MODEL_TARGET:
         return
-    sampling_cfg = model_cfg.get("sampling_cfg") if isinstance(model_cfg, (dict, DictConfig)) else None
+    sampling_cfg = (
+        model_cfg.get("sampling_cfg")
+        if isinstance(model_cfg, (dict, DictConfig))
+        else None
+    )
     if sampling_cfg is None:
         raise ValueError("DualFlow training requires model.sampling_cfg.")
-    num_rollouts_raw = sampling_cfg.get("num_rollouts") if hasattr(sampling_cfg, "get") else None
+    num_rollouts_raw = (
+        sampling_cfg.get("num_rollouts") if hasattr(sampling_cfg, "get") else None
+    )
     if num_rollouts_raw is None:
         raise ValueError("DualFlow training requires model.sampling_cfg.num_rollouts.")
     num_rollouts = int(num_rollouts_raw)
@@ -199,7 +210,9 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
+    trainer: Trainer = hydra.utils.instantiate(
+        cfg.trainer, callbacks=callbacks, logger=logger
+    )
 
     object_dict = {
         "cfg": cfg,
@@ -235,7 +248,9 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             ckpt_path = checkpoint_callback.best_model_path
             if ckpt_path == "":
                 if cfg.get("allow_test_without_checkpoint", False):
-                    log.warning("Best ckpt not found! Using current weights for testing...")
+                    log.warning(
+                        "Best ckpt not found! Using current weights for testing..."
+                    )
                     ckpt_path = None
                 else:
                     raise RuntimeError(
@@ -273,7 +288,9 @@ def main(cfg: DictConfig) -> Optional[float]:
     metric_dict, _ = train(cfg)
 
     # safely retrieve metric value for hydra-based hyperparameter optimization
-    return get_metric_value(metric_dict=metric_dict, metric_name=cfg.get("optimized_metric"))
+    return get_metric_value(
+        metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
+    )
 
 
 if __name__ == "__main__":

@@ -16,8 +16,6 @@ from src.data.schema.constants import (
     _LMDB_GROWTH_GB_MIN,
     _LMDB_MAP_SIZE_GB_MIN,
     _LMDB_SHARDS_MIN,
-    _ONE,
-    _ZERO,
 )
 
 
@@ -31,7 +29,9 @@ def _serialize_sample(sample: dict) -> bytes:
     tensors: Dict[str, torch.Tensor] = {}
     for key, value in sample.items():
         if not torch.is_tensor(value):
-            raise TypeError(f"LMDB sample field {key!r} must be a torch.Tensor, got {type(value)!r}")
+            raise TypeError(
+                f"LMDB sample field {key!r} must be a torch.Tensor, got {type(value)!r}"
+            )
         tensor = value.detach()
         if tensor.device.type != "cpu":
             tensor = tensor.to(device="cpu")
@@ -65,15 +65,25 @@ def _resolve_lmdb_map_config(cfg: DictConfig) -> Tuple[int, int, float, Optional
         raise ValueError("map_size_gb must be set for LMDB materialization.")
     map_size_gb = int(map_size_gb_cfg)
     growth_gb_cfg = cfg.get("map_growth_gb")
-    growth_gb = _DEFAULT_LMDB_MAP_GROWTH_GB if growth_gb_cfg is None else int(growth_gb_cfg)
+    growth_gb = (
+        _DEFAULT_LMDB_MAP_GROWTH_GB if growth_gb_cfg is None else int(growth_gb_cfg)
+    )
     growth_factor_cfg = cfg.get("map_growth_factor")
-    growth_factor = _DEFAULT_LMDB_MAP_GROWTH_FACTOR if growth_factor_cfg is None else float(growth_factor_cfg)
+    growth_factor = (
+        _DEFAULT_LMDB_MAP_GROWTH_FACTOR
+        if growth_factor_cfg is None
+        else float(growth_factor_cfg)
+    )
     max_gb_cfg = cfg.get("map_max_gb")
     max_map_size_bytes = None if max_gb_cfg is None else int(max_gb_cfg) * _BYTES_PER_GB
     if map_size_gb < _LMDB_MAP_SIZE_GB_MIN:
-        raise ValueError(f"map_size_gb must be >= {_LMDB_MAP_SIZE_GB_MIN}, got {map_size_gb}")
+        raise ValueError(
+            f"map_size_gb must be >= {_LMDB_MAP_SIZE_GB_MIN}, got {map_size_gb}"
+        )
     if growth_gb <= _LMDB_GROWTH_GB_MIN and growth_factor <= _LMDB_GROWTH_FACTOR_MIN:
-        raise ValueError("LMDB map growth disabled; set map_growth_gb > 0 or map_growth_factor > 1.0.")
+        raise ValueError(
+            "LMDB map growth disabled; set map_growth_gb > 0 or map_growth_factor > 1.0."
+        )
     map_size_bytes = map_size_gb * _BYTES_PER_GB
     growth_bytes = growth_gb * _BYTES_PER_GB
     if max_map_size_bytes is not None and max_map_size_bytes < map_size_bytes:
@@ -94,7 +104,9 @@ def _lmdb_shard_suffix(shard_id: int, num_shards: int) -> str:
     return f".shard{int(shard_id):03d}"
 
 
-def _format_lmdb_path(base_dir: Path, split: str, shard_id: int, num_shards: int, *, suffix: str) -> Path:
+def _format_lmdb_path(
+    base_dir: Path, split: str, shard_id: int, num_shards: int, *, suffix: str
+) -> Path:
     shard_suffix = _lmdb_shard_suffix(shard_id, num_shards)
     return base_dir / f"{split}{shard_suffix}{suffix}"
 
@@ -105,17 +117,21 @@ def _resolve_core_lmdb_paths(embeddings_dir: Path, split: str) -> List[Path]:
     shard_paths = sorted(embeddings_dir.glob(f"{split}.shard*.lmdb"))
     if base_path.exists():
         if shard_paths:
-            raise ValueError(f"Both sharded and unsharded LMDBs found under {embeddings_dir}.")
+            raise ValueError(
+                f"Both sharded and unsharded LMDBs found under {embeddings_dir}."
+            )
         return [base_path]
     if not shard_paths:
-        raise FileNotFoundError(f"Core LMDB not found for split={split} under {embeddings_dir}")
+        raise FileNotFoundError(
+            f"Core LMDB not found for split={split} under {embeddings_dir}"
+        )
     shard_map: Dict[int, Path] = {}
     token = f"{split}.shard"
     for path in shard_paths:
         stem = path.stem
         if not stem.startswith(token):
             raise ValueError(f"Unexpected LMDB shard name: {path.name}")
-        shard_text = stem[len(token):]
+        shard_text = stem[len(token) :]
         if not shard_text.isdigit():
             raise ValueError(f"Invalid shard id in LMDB shard {path.name}")
         shard_id = int(shard_text)
@@ -125,7 +141,7 @@ def _resolve_core_lmdb_paths(embeddings_dir: Path, split: str) -> List[Path]:
     shard_ids = sorted(shard_map)
     if not shard_ids:
         raise FileNotFoundError(f"No LMDB shards found for {split}.")
-    expected = list(range(shard_ids[-1] + _ONE))
+    expected = list(range(shard_ids[-1] + 1))
     if shard_ids != expected:
         raise ValueError(f"LMDB shards must be contiguous from 0; found {shard_ids}.")
     return [shard_map[shard_id] for shard_id in expected]
@@ -151,7 +167,9 @@ def _next_lmdb_map_size_bytes(
     if max_size is not None:
         next_size = min(next_size, max_size)
     if next_size <= current_size:
-        raise RuntimeError("LMDB map size limit reached; increase map_max_gb to continue.")
+        raise RuntimeError(
+            "LMDB map size limit reached; increase map_max_gb to continue."
+        )
     return next_size
 
 
@@ -219,7 +237,9 @@ def _prepare_lmdb_dir(path: Path, *, overwrite: bool) -> Path:
     if tmp_path.exists():
         shutil.rmtree(tmp_path)
     if path.exists() and not overwrite:
-        raise FileExistsError(f"LMDB already exists at {path}; set overwrite_lmdb=true to rebuild deterministically.")
+        raise FileExistsError(
+            f"LMDB already exists at {path}; set overwrite_lmdb=true to rebuild deterministically."
+        )
     ensure_dir(tmp_path)
     return tmp_path
 
@@ -229,7 +249,9 @@ def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> 
         raise FileNotFoundError(f"Temporary LMDB dir missing: {tmp_path}")
     if final_path.exists():
         if not overwrite:
-            raise FileExistsError(f"Refusing to overwrite existing LMDB at {final_path}")
+            raise FileExistsError(
+                f"Refusing to overwrite existing LMDB at {final_path}"
+            )
         shutil.rmtree(final_path)
     tmp_path.rename(final_path)
 
@@ -255,7 +277,9 @@ def _load_filter_ids_from_path(path: Path) -> set[str]:
     raise ValueError(f"Filter JSON must be list or dict: {path}")
 
 
-def _apply_filter_intersection(sample_ids: Sequence[str], filter_paths: Sequence[Path]) -> List[str]:
+def _apply_filter_intersection(
+    sample_ids: Sequence[str], filter_paths: Sequence[Path]
+) -> List[str]:
     if not filter_paths:
         return list(sample_ids)
     keep_ids: Optional[set[str]] = None

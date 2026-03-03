@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.components.rollout_types import RolloutResult
+from src.models.rollout import RolloutResult
 from src.models.configs.objective import SubTBConfig
-from src.models.metrics.subtb_loss import SubTrajectoryBalanceLoss
+from src.models.objectives.subtb_loss import SubTrajectoryBalanceLoss
 
 
 def _make_rollout(
@@ -37,9 +37,13 @@ def _make_rollout(
 def test_subtb_loss_masks_invalid_graph_nonfinite_values() -> None:
     loss_fn = SubTrajectoryBalanceLoss(config=SubTBConfig())
     fwd_rollout = _make_rollout(
-        log_pf_steps=torch.tensor([[[0.0, 0.0]], [[float("inf"), 0.0]]], dtype=torch.float32),
+        log_pf_steps=torch.tensor(
+            [[[0.0, 0.0]], [[float("inf"), 0.0]]], dtype=torch.float32
+        ),
         log_pb_steps=torch.zeros((2, 1, 2), dtype=torch.float32),
-        log_f_steps=torch.tensor([[[0.0, 0.0]], [[float("inf"), 0.0]]], dtype=torch.float32),
+        log_f_steps=torch.tensor(
+            [[[0.0, 0.0]], [[float("inf"), 0.0]]], dtype=torch.float32
+        ),
         num_moves=torch.tensor([[1], [0]], dtype=torch.long),
         num_steps=torch.tensor([[1], [0]], dtype=torch.long),
         valid_mask=torch.tensor([[True], [False]], dtype=torch.bool),
@@ -85,7 +89,7 @@ def test_subtb_subtrajectory_loss_detects_mid_trajectory_drift() -> None:
         config=SubTBConfig(
             lambda_weight=0.9,
             normalize=True,
-            detach_end_flow=True,
+            detach_end_flow=False,
             miss_length_penalty=0.0,
         )
     )
@@ -160,7 +164,9 @@ def test_subtb_includes_explicit_stop_step_in_delta_prefix() -> None:
         log_pb_steps=torch.zeros((1, 1, 4), dtype=torch.float32),
         log_f_steps=torch.zeros((1, 1, 4), dtype=torch.float32),
         num_moves=torch.tensor([[2]], dtype=torch.long),
-        num_steps=torch.tensor([[3]], dtype=torch.long),  # includes stop decision at step index 2
+        num_steps=torch.tensor(
+            [[3]], dtype=torch.long
+        ),  # includes stop decision at step index 2
     )
     loss, _ = loss_fn(
         fwd_rollout=fwd_rollout,
@@ -203,3 +209,18 @@ def test_subtb_zero_step_rollout_still_anchors_start_flow_to_reward() -> None:
     assert torch.isfinite(loss)
     assert log_f_steps.grad is not None
     assert float(log_f_steps.grad[0, 0, 0].item()) != 0.0
+
+
+def test_subtb_forward_looking_rejects_detach_end_flow_flag() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(config=SubTBConfig(detach_end_flow=True))
+    fwd_rollout = _make_rollout(
+        log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        num_moves=torch.tensor([[1]], dtype=torch.long),
+        num_steps=torch.tensor([[1]], dtype=torch.long),
+    )
+    rewards = torch.ones((1, 1), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Forward-Looking SubTB"):
+        _ = loss_fn(fwd_rollout=fwd_rollout, rewards=rewards)

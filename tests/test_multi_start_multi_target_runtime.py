@@ -3,12 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.components.beam_decoder import BeamDecoderEngine
-from src.models.components.offline_forced_eval import OfflineForcedEvalEngine
-from src.models.components.online_rollout import OnlineRolloutEngine
-from src.models.components.sampler import RolloutSampler
+from src.models.rollout import STOP_REASON_ACTION, RolloutSampler
+from src.models.rollout.beam_decoder import BeamDecoderEngine
+from src.models.rollout.offline_forced import OfflineForcedEvalEngine
+from src.models.rollout.online_engine import OnlineRolloutEngine
+from src.models.rollout.init import initialize_agent_state
 from src.models.configs.search import RolloutConfig
-from src.models.environment.contracts import CsrAdjacency, DynamicAgentState, GraphEnvContext
+from src.models.environment import CsrAdjacency, DynamicAgentState, GraphEnvContext
 
 
 def _extract_policy_edges(
@@ -33,9 +34,9 @@ def _extract_policy_edges(
     gather_idx = base + increments
     edge_ids = vals.index_select(0, gather_idx)
     target_nodes = col.index_select(0, gather_idx)
-    edge_agent_batch = torch.arange(current_nodes.numel(), device=current_nodes.device, dtype=torch.long).repeat_interleave(
-        out_degrees
-    )
+    edge_agent_batch = torch.arange(
+        current_nodes.numel(), device=current_nodes.device, dtype=torch.long
+    ).repeat_interleave(out_degrees)
     return out_degrees, edge_ids, target_nodes, edge_agent_batch
 
 
@@ -44,8 +45,14 @@ class _PathPolicy:
         self.training = False
         self.memory_tracker = torch.nn.GRUCell(input_size=8, hidden_size=4)
 
-    def encode_context(self, env_context: GraphEnvContext) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return env_context.node_embeddings, env_context.relation_tokens, env_context.question_emb
+    def encode_context(
+        self, env_context: GraphEnvContext
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            env_context.node_embeddings,
+            env_context.relation_tokens,
+            env_context.question_emb,
+        )
 
     def compute_state_flow(
         self,
@@ -73,8 +80,15 @@ class _PathPolicy:
             env_context=env_context,
             current_nodes=current,
         )
-        edge_logits = torch.full((edge_ids.numel(),), 6.0, device=current.device, dtype=torch.float32)
-        stop_logits = torch.full((num_graphs, num_agents), -6.0, device=current.device, dtype=torch.float32)
+        edge_logits = torch.full(
+            (edge_ids.numel(),), 6.0, device=current.device, dtype=torch.float32
+        )
+        stop_logits = torch.full(
+            (num_graphs, num_agents), -6.0, device=current.device, dtype=torch.float32
+        )
+        state_log_flows = torch.zeros(
+            (num_graphs, num_agents), device=current.device, dtype=torch.float32
+        )
         return {
             "edge_logits": edge_logits,
             "edge_agent_batch": edge_agent_batch,
@@ -82,6 +96,7 @@ class _PathPolicy:
             "edge_ids": edge_ids,
             "target_nodes": target_nodes,
             "out_degrees": out_degrees.view(num_graphs, num_agents),
+            "state_log_flows": state_log_flows,
         }
 
     def evolve_state(
@@ -104,10 +119,15 @@ class _PathPolicy:
         return DynamicAgentState(
             step_t=agent_state.step_t + 1,
             current_nodes=next_nodes,
+            flow_direction=agent_state.flow_direction,
             hidden_states=agent_state.hidden_states,
             visited_mask=agent_state.visited_mask,
             cumulative_rewards=agent_state.cumulative_rewards,
             done_mask=agent_state.done_mask | is_stop.view(num_graphs, num_agents),
+            num_moves=agent_state.num_moves
+            + ((~is_stop.view(num_graphs, num_agents)) & (~agent_state.done_mask)).to(
+                dtype=torch.long
+            ),
         )
 
 
@@ -117,11 +137,13 @@ class _StaticLogitPolicy(_PathPolicy):
         *,
         default_edge_logit: float,
         stop_logit: float,
+        state_log_flow: float = 0.0,
         edge_logit_overrides: dict[int, float] | None = None,
     ) -> None:
         super().__init__()
         self.default_edge_logit = float(default_edge_logit)
         self.stop_logit = float(stop_logit)
+        self.state_log_flow = float(state_log_flow)
         self.edge_logit_overrides = edge_logit_overrides or {}
 
     def compute_action_scores(
@@ -158,6 +180,12 @@ class _StaticLogitPolicy(_PathPolicy):
             device=current.device,
             dtype=torch.float32,
         )
+        state_log_flows = torch.full(
+            (num_graphs, num_agents),
+            self.state_log_flow,
+            device=current.device,
+            dtype=torch.float32,
+        )
         return {
             "edge_logits": edge_logits,
             "edge_agent_batch": edge_agent_batch,
@@ -165,6 +193,7 @@ class _StaticLogitPolicy(_PathPolicy):
             "edge_ids": edge_ids,
             "target_nodes": target_nodes,
             "out_degrees": out_degrees.view(num_graphs, num_agents),
+            "state_log_flows": state_log_flows,
         }
 
 
@@ -197,6 +226,9 @@ class _NonFiniteLogitPolicy(_PathPolicy):
             device=current.device,
             dtype=torch.float32,
         )
+        state_log_flows = torch.zeros(
+            (num_graphs, num_agents), device=current.device, dtype=torch.float32
+        )
         return {
             "edge_logits": edge_logits,
             "edge_agent_batch": edge_agent_batch,
@@ -204,10 +236,13 @@ class _NonFiniteLogitPolicy(_PathPolicy):
             "edge_ids": edge_ids,
             "target_nodes": target_nodes,
             "out_degrees": out_degrees.view(num_graphs, num_agents),
+            "state_log_flows": state_log_flows,
         }
 
 
-def _build_csr(*, row: torch.Tensor, col: torch.Tensor, edge_ids: torch.Tensor, num_nodes: int) -> CsrAdjacency:
+def _build_csr(
+    *, row: torch.Tensor, col: torch.Tensor, edge_ids: torch.Tensor, num_nodes: int
+) -> CsrAdjacency:
     if int(row.numel()) == 0:
         return CsrAdjacency(
             crow=torch.zeros((num_nodes + 1,), dtype=torch.long),
@@ -240,7 +275,6 @@ def _build_context(
     q_ptr: torch.Tensor,
     a_local_indices: torch.Tensor,
     a_ptr: torch.Tensor,
-    start_local_indices: torch.Tensor | None = None,
     node_global_ids: torch.Tensor | None = None,
 ) -> GraphEnvContext:
     edge_ids = torch.arange(edge_index.size(1), dtype=torch.long)
@@ -248,8 +282,12 @@ def _build_context(
     col_fwd = edge_index[1]
     row_bwd = edge_index[1]
     col_bwd = edge_index[0]
-    adj_t_fwd = _build_csr(row=row_fwd, col=col_fwd, edge_ids=edge_ids, num_nodes=num_nodes)
-    adj_t_bwd = _build_csr(row=row_bwd, col=col_bwd, edge_ids=edge_ids, num_nodes=num_nodes)
+    adj_t_fwd = _build_csr(
+        row=row_fwd, col=col_fwd, edge_ids=edge_ids, num_nodes=num_nodes
+    )
+    adj_t_bwd = _build_csr(
+        row=row_bwd, col=col_bwd, edge_ids=edge_ids, num_nodes=num_nodes
+    )
     if node_global_ids is None:
         node_global_ids = torch.arange(num_nodes, dtype=torch.long)
     if node_global_ids.dim() != 1 or int(node_global_ids.numel()) != num_nodes:
@@ -281,7 +319,6 @@ def _build_context(
         node_global_ids=node_global_ids,
         dummy_mask=torch.tensor([False]),
         sample_ids=["sample_0"],
-        start_local_indices=start_local_indices,
     )
 
 
@@ -310,30 +347,23 @@ def _make_multi_start_context() -> GraphEnvContext:
 
 
 def _make_super_start_context() -> GraphEnvContext:
-    edge_index = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+    # local real nodes: 0,1,2 ; forward super: 3 ; backward super: 4
+    # forward path: 3 -> 1 -> 2
+    # backward hook: 4 -> 2
+    edge_index = torch.tensor([[3, 1, 4], [1, 2, 2]], dtype=torch.long)
     return _build_context(
-        num_nodes=3,
+        num_nodes=5,
         edge_index=edge_index,
         q_local_indices=torch.tensor([1], dtype=torch.long),
         q_ptr=torch.tensor([0, 1], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         a_ptr=torch.tensor([0, 1], dtype=torch.long),
-        start_local_indices=torch.tensor([0], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102, -1, -2], dtype=torch.long),
     )
 
 
 def _make_virtual_start_context() -> GraphEnvContext:
-    edge_index = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
-    return _build_context(
-        num_nodes=3,
-        edge_index=edge_index,
-        q_local_indices=torch.tensor([1], dtype=torch.long),
-        q_ptr=torch.tensor([0, 1], dtype=torch.long),
-        a_local_indices=torch.tensor([2], dtype=torch.long),
-        a_ptr=torch.tensor([0, 1], dtype=torch.long),
-        start_local_indices=torch.tensor([0], dtype=torch.long),
-        node_global_ids=torch.tensor([-1, 101, 102], dtype=torch.long),
-    )
+    return _make_super_start_context()
 
 
 def _make_zero_hop_context() -> GraphEnvContext:
@@ -356,6 +386,18 @@ def _make_parallel_edge_context() -> GraphEnvContext:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         q_ptr=torch.tensor([0, 1], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
+        a_ptr=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+
+def _make_long_chain_context() -> GraphEnvContext:
+    edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    return _build_context(
+        num_nodes=4,
+        edge_index=edge_index,
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        q_ptr=torch.tensor([0, 1], dtype=torch.long),
+        a_local_indices=torch.tensor([3], dtype=torch.long),
         a_ptr=torch.tensor([0, 1], dtype=torch.long),
     )
 
@@ -383,7 +425,9 @@ def test_rollout_sampler_exposes_split_engines() -> None:
 
 def test_online_rollout_smoke_path() -> None:
     sampler = _make_sampler()
-    rollout = sampler.sample_forward(_make_context(), _PathPolicy(), deterministic=True, collect_traces=True)
+    rollout = sampler.sample_forward(
+        _make_context(), _PathPolicy(), deterministic=True, collect_traces=True
+    )
     assert rollout.log_pf_steps is not None
     assert rollout.log_pb_steps is not None
     assert rollout.log_f_steps is not None
@@ -442,30 +486,44 @@ def test_beam_decode_smoke_path() -> None:
 
 def test_beam_init_uses_multi_start_round_robin() -> None:
     context = _make_multi_start_context()
-    agent_state = BeamDecoderEngine._init_agent_state(
+    agent_state = initialize_agent_state(
         env_context=context,
         num_agents=4,
         deterministic=True,
+        flow_direction="forward",
+        backward_without_super_error=(
+            "Backward beam decoding requires super-source layout to start from backward super."
+        ),
     )
-    assert torch.equal(agent_state.current_nodes, torch.tensor([[0, 2, 0, 2]], dtype=torch.long))
+    assert torch.equal(
+        agent_state.current_nodes, torch.tensor([[0, 2, 0, 2]], dtype=torch.long)
+    )
 
 
-def test_beam_init_prefers_explicit_start_override() -> None:
+def test_beam_init_uses_forward_super_start_when_layout_present() -> None:
     context = _make_super_start_context()
-    agent_state = BeamDecoderEngine._init_agent_state(
+    agent_state = initialize_agent_state(
         env_context=context,
         num_agents=4,
         deterministic=True,
+        flow_direction="forward",
+        backward_without_super_error=(
+            "Backward beam decoding requires super-source layout to start from backward super."
+        ),
     )
-    assert torch.equal(agent_state.current_nodes, torch.tensor([[0, 0, 0, 0]], dtype=torch.long))
+    assert torch.equal(
+        agent_state.current_nodes, torch.tensor([[3, 3, 3, 3]], dtype=torch.long)
+    )
 
 
-def test_online_and_beam_start_from_explicit_start_override() -> None:
+def test_online_and_beam_start_from_forward_super() -> None:
     sampler = _make_sampler(stop_min_steps=0, num_rollouts=1)
     policy = _PathPolicy()
     context = _make_super_start_context()
 
-    online_rollout = sampler.sample_forward(context, policy, deterministic=True, collect_traces=False)
+    online_rollout = sampler.sample_forward(
+        context, policy, deterministic=True, collect_traces=False
+    )
     assert torch.equal(online_rollout.stop_nodes, torch.tensor([[2]], dtype=torch.long))
     assert torch.equal(online_rollout.num_moves, torch.tensor([[2]], dtype=torch.long))
 
@@ -496,7 +554,9 @@ def test_zero_hop_respects_stop_min_steps_without_answer_override() -> None:
     assert torch.equal(beam_rollout.stop_nodes, torch.tensor([[1]], dtype=torch.long))
     assert torch.equal(beam_rollout.num_moves, torch.tensor([[1]], dtype=torch.long))
 
-    online_rollout = sampler.sample_forward(context, policy, deterministic=True, collect_traces=False)
+    online_rollout = sampler.sample_forward(
+        context, policy, deterministic=True, collect_traces=False
+    )
     assert torch.equal(online_rollout.stop_nodes, torch.tensor([[1]], dtype=torch.long))
     assert torch.equal(online_rollout.num_moves, torch.tensor([[1]], dtype=torch.long))
 
@@ -506,7 +566,9 @@ def test_stop_min_steps_ignores_virtual_start_hop() -> None:
     policy = _StaticLogitPolicy(default_edge_logit=0.0, stop_logit=10.0)
     context = _make_virtual_start_context()
 
-    online_rollout = sampler.sample_forward(context, policy, deterministic=True, collect_traces=False)
+    online_rollout = sampler.sample_forward(
+        context, policy, deterministic=True, collect_traces=False
+    )
     assert torch.equal(online_rollout.stop_nodes, torch.tensor([[2]], dtype=torch.long))
     assert torch.equal(online_rollout.num_moves, torch.tensor([[2]], dtype=torch.long))
 
@@ -538,7 +600,9 @@ def test_online_rollout_rejects_oracle_force_stop_for_leakage_compliance() -> No
     )
     policy = _StaticLogitPolicy(default_edge_logit=0.0, stop_logit=0.0)
     with pytest.raises(ValueError, match="forbidden to prevent label leakage"):
-        _ = sampler.sample_forward(_make_context(), policy, deterministic=True, collect_traces=False)
+        _ = sampler.sample_forward(
+            _make_context(), policy, deterministic=True, collect_traces=False
+        )
 
 
 def test_beam_dedup_keeps_distinct_targets_for_same_parent_trace() -> None:
@@ -556,13 +620,76 @@ def test_beam_dedup_keeps_distinct_targets_for_same_parent_trace() -> None:
         require_done=False,
         diverse_penalty=0.0,
     )
-    assert torch.equal(rollout.stop_nodes.sort(dim=1).values, torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(
+        rollout.stop_nodes.sort(dim=1).values, torch.tensor([[1, 2]], dtype=torch.long)
+    )
 
 
-def test_online_rollout_log_f_steps_tracks_policy_partition() -> None:
+def test_online_rollout_log_f_steps_tracks_independent_state_flow() -> None:
     sampler = _make_sampler(stop_min_steps=0, num_rollouts=1)
-    policy = _StaticLogitPolicy(default_edge_logit=2.0, stop_logit=0.0)
-    rollout = sampler.sample_forward(_make_zero_hop_context(), policy, deterministic=True, collect_traces=True)
+    policy = _StaticLogitPolicy(
+        default_edge_logit=2.0, stop_logit=0.0, state_log_flow=3.5
+    )
+    rollout = sampler.sample_forward(
+        _make_zero_hop_context(), policy, deterministic=True, collect_traces=True
+    )
     assert rollout.log_f_steps is not None
-    expected = torch.logsumexp(torch.tensor([2.0, 0.0], dtype=torch.float32), dim=0)
+    assert rollout.stop_logprob_steps is not None
+    assert rollout.state_nodes_steps is not None
+    assert rollout.continue_valid_steps is not None
+    assert rollout.stop_valid_steps is not None
+    expected = torch.tensor(3.5, dtype=torch.float32)
     assert torch.allclose(rollout.log_f_steps[0, 0, 0], expected, atol=1.0e-6)
+
+
+def test_online_rollout_enforces_hard_max_move_budget() -> None:
+    sampler = RolloutSampler(
+        RolloutConfig(
+            num_rollouts=1,
+            max_steps=2,
+            stop_min_steps=0,
+            sampling_temperature=1.0,
+            sampling_mode="greedy",
+            eval_sampling_temperature=0.5,
+            eval_sample_without_replacement=True,
+            backward_prior_mode="uniform",
+        )
+    )
+    policy = _PathPolicy()
+    rollout = sampler.sample_forward(
+        _make_long_chain_context(), policy, deterministic=True, collect_traces=False
+    )
+    assert torch.equal(rollout.stop_nodes, torch.tensor([[2]], dtype=torch.long))
+    assert torch.equal(rollout.num_moves, torch.tensor([[2]], dtype=torch.long))
+    assert torch.equal(
+        rollout.stop_reason, torch.tensor([[STOP_REASON_ACTION]], dtype=torch.long)
+    )
+
+
+def test_beam_decoder_enforces_hard_max_move_budget() -> None:
+    sampler = RolloutSampler(
+        RolloutConfig(
+            num_rollouts=1,
+            max_steps=2,
+            stop_min_steps=0,
+            sampling_temperature=1.0,
+            sampling_mode="greedy",
+            eval_sampling_temperature=0.5,
+            eval_sample_without_replacement=True,
+            backward_prior_mode="uniform",
+        )
+    )
+    policy = _PathPolicy()
+    rollout = sampler.beam_search_forward(
+        _make_long_chain_context(),
+        policy,
+        beam_size=1,
+        max_steps=2,
+        require_done=True,
+        diverse_penalty=0.0,
+    )
+    assert torch.equal(rollout.stop_nodes, torch.tensor([[2]], dtype=torch.long))
+    assert torch.equal(rollout.num_moves, torch.tensor([[2]], dtype=torch.long))
+    assert torch.equal(
+        rollout.stop_reason, torch.tensor([[STOP_REASON_ACTION]], dtype=torch.long)
+    )

@@ -668,7 +668,7 @@ OPENAI_API_KEY=... python src/eval.py experiment=eval_llm dataset=webqsp llm.pro
 **Basic workflow**
 
 1. Write your PyTorch Lightning module (see [models/dual_flow_module.py](src/models/dual_flow_module.py) for example)
-2. Write your PyTorch Lightning datamodule (see [data/g_retrieval_datamodule.py](src/data/g_retrieval_datamodule.py) for example)
+2. Write your PyTorch Lightning datamodule (see [datasets/g_retrieval_datamodule.py](src/datasets/g_retrieval_datamodule.py) for example)
 3. Write your experiment config, containing paths to model and datamodule
 4. Run training with chosen experiment config:
    ```bash
@@ -1133,7 +1133,7 @@ So any file can be easily imported into any other file like so:
 
 ```python
 from project_name.models.dual_flow_module import DualFlowModule
-from project_name.data.g_retrieval_datamodule import GRetrievalDataModule
+from project_name.datasets.g_retrieval_datamodule import GRetrievalDataModule
 ```
 
 </details>

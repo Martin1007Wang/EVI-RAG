@@ -7,10 +7,12 @@ import torch
 from torch.nn import Parameter
 from torch.optim.lr_scheduler import OneCycleLR
 
-from src.models.optimizers import build_optimizer_and_scheduler
+from src.models.dual_flow_module import build_optimizer_and_scheduler
 
 
-def _build_linear_named_parameters() -> tuple[torch.nn.Module, Iterator[tuple[str, Parameter]]]:
+def _build_linear_named_parameters() -> tuple[
+    torch.nn.Module, Iterator[tuple[str, Parameter]]
+]:
     model = torch.nn.Linear(8, 4)
     return model, model.named_parameters()
 

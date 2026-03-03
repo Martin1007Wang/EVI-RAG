@@ -1,6 +1,6 @@
 # DataLoader settings for SubgraphRAG-style retriever export/eval.
 
-_target_: src.data.g_retrieval_datamodule.GRetrievalDataModule
+_target_: src.datasets.g_retrieval_datamodule.GRetrievalDataModule
 
 dataset_cfg: ${dataset}
 
