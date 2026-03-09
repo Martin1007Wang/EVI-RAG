@@ -10,7 +10,7 @@ defaults:
 task_name: "train/trajectory_gfn"
 tags: ["trajectory_gfn", "trajectory", "gflownet"]
 
-optimized_metric: "val/sub/hit@10"
+optimized_metric: "val/sub/covered_gold_mass@90"
 
 trainer:
   max_time: "00:08:00:00"
@@ -24,21 +24,21 @@ trainer:
 
 callbacks:
   model_checkpoint:
-    monitor: "val/sub/hit@10"
+    monitor: "val/sub/covered_gold_mass@90"
     mode: max
     filename: "epoch_{epoch:03d}"
     auto_insert_metric_name: False
     save_weights_only: True
   early_stopping:
-    monitor: "val/sub/hit@10"
+    monitor: "val/sub/covered_gold_mass@90"
     mode: max
     patience: 10
     min_delta: 0.002
 
 model:
   inference_cfg:
-    mode: sampled_rank_only
-    compute_support_windows: false
+    mode: sampled
+    compute_support_windows: true
     max_rollouts: 64
     rollout_chunk_size: 16
   scheduler_cfg:

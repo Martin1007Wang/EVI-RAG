@@ -32,9 +32,11 @@ class AdaptivePosteriorInference:
         rollout_chunk_size: int,
         max_rollouts: int,
         answer_top_ks: tuple[int, ...],
+        support_path_overlap_penalty: float = 0.25,
     ) -> None:
         self.answer_mass_threshold = float(answer_mass_threshold)
         self.support_mass_threshold = float(support_mass_threshold)
+        self.support_path_overlap_penalty = float(support_path_overlap_penalty)
         self.rollout_chunk_size = int(rollout_chunk_size)
         self.max_rollouts = int(max_rollouts)
         self.answer_top_ks = tuple(int(k) for k in answer_top_ks)
@@ -95,6 +97,7 @@ class AdaptivePosteriorInference:
             inference_mode="sampled",
             answer_mass_threshold=self.answer_mass_threshold,
             support_mass_threshold=self.support_mass_threshold,
+            support_path_overlap_penalty=self.support_path_overlap_penalty,
             probe_count=probe_count,
             remaining_mass_upper=max(1.0 - discovered_mass, 0.0),
             stop_reason=stop_reason,

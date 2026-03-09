@@ -12,7 +12,6 @@ from .policy import (
 )
 from .trajectory_gfn import (
     HorizonConfig,
-    TrajectoryAnalyzerConfig,
     TrajectoryInferenceConfig,
     TrajectoryTrainingConfig,
 )
@@ -29,7 +28,6 @@ __all__ = [
     "HorizonConfig",
     "TrajectoryTrainingConfig",
     "TrajectoryInferenceConfig",
-    "TrajectoryAnalyzerConfig",
     "OptimizerConfig",
     "SchedulerConfig",
 ]

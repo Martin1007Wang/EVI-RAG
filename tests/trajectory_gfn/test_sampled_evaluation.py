@@ -33,7 +33,6 @@ def _make_sample_batch(
         start_log_probs=torch.zeros((1, 1), dtype=torch.float32),
         start_state_log_f=torch.zeros((1, 1), dtype=torch.float32),
         log_pf_steps=torch.tensor([[[math.log(prob), 0.0]]], dtype=torch.float32),
-        log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         chosen_edge_ids_steps=torch.tensor([[[edge_id, -1]]], dtype=torch.long),

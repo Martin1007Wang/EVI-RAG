@@ -22,7 +22,6 @@ class TrajectorySampleBatch:
     start_log_probs: torch.Tensor
     start_state_log_f: torch.Tensor
     log_pf_steps: torch.Tensor
-    log_pb_steps: torch.Tensor
     state_log_f_steps: torch.Tensor
     next_state_log_f_steps: torch.Tensor
     chosen_edge_ids_steps: torch.Tensor
@@ -32,6 +31,10 @@ class TrajectorySampleBatch:
     hit_mask: torch.Tensor
     terminal_rewards: torch.Tensor
     terminal_log_rewards: torch.Tensor
+
+    @property
+    def log_pb_steps(self) -> torch.Tensor:
+        return torch.zeros_like(self.log_pf_steps)
 
 
 class ForwardRolloutSampler:
@@ -94,7 +97,6 @@ class ForwardRolloutSampler:
             device=batch.node_ptr.device,
             dtype=torch.float32,
         )
-        log_pb_steps = torch.zeros_like(log_pf_steps)
         state_log_f_steps = torch.zeros_like(log_pf_steps)
         next_state_log_f_steps = torch.zeros_like(log_pf_steps)
         chosen_edge_ids_steps = torch.full(
@@ -146,11 +148,6 @@ class ForwardRolloutSampler:
             next_log_f = policy.compute_log_flow(context, next_state).to(
                 dtype=torch.float32
             )
-            log_pb = torch.zeros(
-                (num_graphs * num_rollouts,),
-                device=batch.node_ptr.device,
-                dtype=torch.float32,
-            )
             log_pf = (
                 action_info["log_prob"]
                 .view(num_graphs, num_rollouts)
@@ -159,7 +156,6 @@ class ForwardRolloutSampler:
             log_pf_steps[:, :, step_idx] = torch.where(
                 active_mask, log_pf, torch.zeros_like(log_pf)
             )
-            log_pb_steps[:, :, step_idx] = log_pb.view(num_graphs, num_rollouts)
             state_log_f_steps[:, :, step_idx] = torch.where(
                 active_mask,
                 current_log_f,
@@ -189,7 +185,6 @@ class ForwardRolloutSampler:
             start_log_probs=start_log_probs.to(dtype=torch.float32),
             start_state_log_f=start_state_log_f.to(dtype=torch.float32),
             log_pf_steps=log_pf_steps,
-            log_pb_steps=log_pb_steps,
             state_log_f_steps=state_log_f_steps,
             next_state_log_f_steps=next_state_log_f_steps,
             chosen_edge_ids_steps=chosen_edge_ids_steps,

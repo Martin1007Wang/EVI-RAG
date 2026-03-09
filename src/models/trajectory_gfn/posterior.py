@@ -112,6 +112,57 @@ def support_targets(
     }
 
 
+def _path_edge_overlap(lhs: DiscoveredTrajectory, rhs: DiscoveredTrajectory) -> float:
+    if lhs.edge_ids == rhs.edge_ids:
+        return 1.0
+    if not lhs.edge_ids or not rhs.edge_ids:
+        return 0.0
+    lhs_edges = set(lhs.edge_ids)
+    rhs_edges = set(rhs.edge_ids)
+    overlap = len(lhs_edges & rhs_edges)
+    if overlap == 0:
+        return 0.0
+    denom = max(len(lhs_edges), len(rhs_edges))
+    return float(overlap) / float(denom)
+
+
+def _select_support_paths_for_answer(
+    *,
+    answer_paths: list[DiscoveredTrajectory],
+    target_mass: float,
+    overlap_penalty: float,
+) -> tuple[list[DiscoveredTrajectory], float]:
+    if target_mass <= 0.0 or not answer_paths:
+        return [], 0.0
+    selected: list[DiscoveredTrajectory] = []
+    remaining = list(answer_paths)
+    accumulated_mass = 0.0
+    while remaining and accumulated_mass + _MASS_TOLERANCE < target_mass:
+        if not selected or overlap_penalty <= 0.0:
+            best_idx = max(
+                range(len(remaining)),
+                key=lambda idx: (remaining[idx].prob, -len(remaining[idx].edge_ids)),
+            )
+        else:
+            best_idx = max(
+                range(len(remaining)),
+                key=lambda idx: (
+                    math.log(max(remaining[idx].prob, _MASS_TOLERANCE))
+                    - overlap_penalty
+                    * max(
+                        _path_edge_overlap(remaining[idx], chosen)
+                        for chosen in selected
+                    ),
+                    remaining[idx].prob,
+                    -len(remaining[idx].edge_ids),
+                ),
+            )
+        chosen = remaining.pop(best_idx)
+        selected.append(chosen)
+        accumulated_mass += chosen.prob
+    return selected, accumulated_mass
+
+
 def build_window_result(
     *,
     batch: TrajectoryBatch,
@@ -120,6 +171,7 @@ def build_window_result(
     inference_mode: str,
     answer_mass_threshold: float,
     support_mass_threshold: float,
+    support_path_overlap_penalty: float,
     probe_count: int,
     remaining_mass_upper: float,
     stop_reason: str,
@@ -137,6 +189,7 @@ def build_window_result(
         answer_records=answer_records,
         selected_set=selected_set,
         support_mass_threshold=support_mass_threshold,
+        support_path_overlap_penalty=support_path_overlap_penalty,
     )
     covered_mass = sum(path.prob for path in emitted_paths)
     covered_gold_mass = sum(path.prob for path in emitted_paths if path.is_gold)
@@ -293,6 +346,7 @@ def _build_support_outputs(
     answer_records: list[AnswerPosteriorRecord],
     selected_set: set[int],
     support_mass_threshold: float,
+    support_path_overlap_penalty: float,
 ) -> tuple[list[TrajectoryRecord], list[AnswerPosteriorRecord]]:
     answer_mass = {
         record.answer_entity_id: float(record.prob) for record in answer_records
@@ -311,10 +365,15 @@ def _build_support_outputs(
             key=lambda item: (-item.prob, item.answer_entity_id, item.edge_ids)
         )
         target_mass = float(support_mass_threshold) * answer_mass.get(answer_id, 0.0)
-        cumulative_mass = 0.0
+        selected_paths, cumulative_mass = _select_support_paths_for_answer(
+            answer_paths=answer_paths,
+            target_mass=target_mass,
+            overlap_penalty=float(support_path_overlap_penalty),
+        )
         kept_count = 0
-        for support_rank, path in enumerate(answer_paths, start=1):
-            cumulative_mass += path.prob
+        cumulative_selected_mass = 0.0
+        for support_rank, path in enumerate(selected_paths, start=1):
+            cumulative_selected_mass += path.prob
             support_paths.append(
                 TrajectoryRecord(
                     sample_id=batch.sample_ids[0],
@@ -334,15 +393,13 @@ def _build_support_outputs(
                         else 0.0
                     ),
                     conditional_cumulative_mass=(
-                        cumulative_mass / answer_mass[answer_id]
+                        cumulative_selected_mass / answer_mass[answer_id]
                         if answer_mass.get(answer_id, 0.0) > 0.0
                         else 0.0
                     ),
                 )
             )
             kept_count = support_rank
-            if cumulative_mass + _MASS_TOLERANCE >= target_mass:
-                break
         support_summary[answer_id] = (cumulative_mass, kept_count)
     support_paths.sort(
         key=lambda record: (

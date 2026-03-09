@@ -11,7 +11,6 @@ from src.models.configs.policy import (
 from src.models.configs.training import OptimizerConfig, SchedulerConfig
 from src.models.configs.trajectory_gfn import (
     HorizonConfig,
-    TrajectoryAnalyzerConfig,
     TrajectoryInferenceConfig,
     TrajectoryTrainingConfig,
 )
@@ -56,7 +55,6 @@ def _make_module() -> TrajectoryGFlowNetModule:
             max_expansions=32,
             max_frontier_size=32,
         ),
-        analyzer_cfg=TrajectoryAnalyzerConfig(),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
     )

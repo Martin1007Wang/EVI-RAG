@@ -58,6 +58,11 @@ def _has_simple_path_of_length(*, adj_t, start_node: int, min_stop_steps: int) -
     return _dfs(int(start_node), int(min_stop_steps), {int(start_node)})
 
 
+def _out_degree_for_nodes(*, adj_t, nodes: torch.Tensor) -> torch.Tensor:
+    crow = adj_t.crow_indices()
+    return crow[nodes + 1] - crow[nodes]
+
+
 def _compute_valid_start_candidates(
     *,
     context: TrajectoryPolicyContext,
@@ -66,6 +71,14 @@ def _compute_valid_start_candidates(
 ) -> torch.Tensor:
     if min_stop_steps <= 0:
         return torch.ones_like(candidate_nodes_abs, dtype=torch.bool)
+    if min_stop_steps == 1:
+        return (
+            _out_degree_for_nodes(
+                adj_t=context.env_context.adj_t_fwd,
+                nodes=candidate_nodes_abs,
+            )
+            > 0
+        )
     valid = []
     adj_t = context.env_context.adj_t_fwd
     for node in candidate_nodes_abs.tolist():
@@ -435,11 +448,7 @@ class TrajectoryPolicy(nn.Module):
     def _compute_stop_scores(
         self, *, agent_potential: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
-        scores = self.stop_delta_head.stop_head(
-            agent_potential.to(dtype=torch.float32)
-        ).squeeze(-1)
-        scores = torch.where(torch.isfinite(scores), scores, torch.zeros_like(scores))
-        return scores.to(dtype=dtype)
+        return self.stop_delta_head(agent_potential=agent_potential, dtype=dtype)
 
     def _compute_log_flow_from_flat_features(
         self,
@@ -647,37 +656,6 @@ class TrajectoryPolicy(nn.Module):
             parent_edge_ids=parent_edge_ids,
             parent_nodes=parent_nodes,
         )
-
-    @staticmethod
-    def select_backward_log_probs(
-        distribution: BackwardActionDistribution,
-        *,
-        chosen_edge_ids: torch.Tensor,
-        active_move: torch.Tensor,
-    ) -> torch.Tensor:
-        total_agents = int(chosen_edge_ids.numel())
-        out = torch.zeros(
-            (total_agents,), device=chosen_edge_ids.device, dtype=torch.float32
-        )
-        if int(distribution.parent_edge_ids.numel()) == 0:
-            if bool(active_move.any().item()):
-                raise ValueError("Backward distribution is empty for active move rows.")
-            return out
-        chosen_rows = torch.arange(
-            total_agents, device=chosen_edge_ids.device, dtype=torch.long
-        )
-        active_rows = chosen_rows[active_move]
-        for row in active_rows.tolist():
-            row_mask = distribution.edge_agent_batch == row
-            row_edges = distribution.parent_edge_ids[row_mask]
-            row_log_probs = distribution.parent_log_probs[row_mask]
-            match = row_edges == int(chosen_edge_ids[row].item())
-            if not bool(match.any().item()):
-                raise ValueError(
-                    f"Chosen edge is missing from backward distribution for row {row}."
-                )
-            out[row] = row_log_probs[match][0]
-        return out
 
     @staticmethod
     def compute_forward_log_probs(

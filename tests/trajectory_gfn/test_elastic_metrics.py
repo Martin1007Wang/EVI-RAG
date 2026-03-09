@@ -62,3 +62,4 @@ def test_elastic_metrics_compute_expected_fields() -> None:
     assert metrics["elastic_mass"] == 0.9
     assert metrics["missed_gold_mass"] == 0.1
     assert "path_entropy@90" in metrics
+    assert "support_path_diversity@90" in metrics

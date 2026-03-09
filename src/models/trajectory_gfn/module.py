@@ -11,7 +11,6 @@ from src.models.algorithms.base import build_optimizer_and_scheduler
 from src.models.configs.policy import PolicyConfig
 from src.models.configs.trajectory_gfn import (
     HorizonConfig,
-    TrajectoryAnalyzerConfig,
     TrajectoryInferenceConfig,
     TrajectoryTrainingConfig,
 )
@@ -41,7 +40,6 @@ class TrajectoryGFlowNetConfig:
     policy_cfg: PolicyConfig
     training_cfg: TrajectoryTrainingConfig
     inference_cfg: TrajectoryInferenceConfig
-    analyzer_cfg: TrajectoryAnalyzerConfig
     optimizer_cfg: OptimizerConfig
     scheduler_cfg: SchedulerConfig
 
@@ -54,7 +52,6 @@ class TrajectoryGFlowNetModule(LightningModule):
         policy_cfg: PolicyConfig,
         training_cfg: TrajectoryTrainingConfig,
         inference_cfg: TrajectoryInferenceConfig,
-        analyzer_cfg: TrajectoryAnalyzerConfig,
         optimizer_cfg: OptimizerConfig,
         scheduler_cfg: SchedulerConfig,
     ) -> None:
@@ -64,7 +61,6 @@ class TrajectoryGFlowNetModule(LightningModule):
             policy_cfg=policy_cfg,
             training_cfg=training_cfg,
             inference_cfg=inference_cfg,
-            analyzer_cfg=analyzer_cfg,
             optimizer_cfg=optimizer_cfg,
             scheduler_cfg=scheduler_cfg,
         )
@@ -87,6 +83,9 @@ class TrajectoryGFlowNetModule(LightningModule):
         self.posterior_inference = AdaptivePosteriorInference(
             answer_mass_threshold=float(inference_cfg.answer_mass_threshold),
             support_mass_threshold=float(inference_cfg.support_mass_threshold),
+            support_path_overlap_penalty=float(
+                inference_cfg.support_path_overlap_penalty
+            ),
             rollout_chunk_size=int(inference_cfg.rollout_chunk_size),
             max_rollouts=int(inference_cfg.max_rollouts),
             answer_top_ks=tuple(int(k) for k in inference_cfg.answer_top_ks),
@@ -186,6 +185,9 @@ class TrajectoryGFlowNetModule(LightningModule):
             ),
             answer_mass_threshold=float(self.cfg.inference_cfg.answer_mass_threshold),
             support_mass_threshold=float(self.cfg.inference_cfg.support_mass_threshold),
+            support_path_overlap_penalty=float(
+                self.cfg.inference_cfg.support_path_overlap_penalty
+            ),
             probe_count=0,
             remaining_mass_upper=1.0,
             stop_reason=_INVALID_START_STOP_REASON,
@@ -223,6 +225,9 @@ class TrajectoryGFlowNetModule(LightningModule):
                     support_mass_threshold=float(
                         self.cfg.inference_cfg.support_mass_threshold
                     ),
+                    support_path_overlap_penalty=float(
+                        self.cfg.inference_cfg.support_path_overlap_penalty
+                    ),
                     probe_count=0,
                     remaining_mass_upper=1.0,
                     stop_reason="rank_only",
@@ -252,7 +257,7 @@ class TrajectoryGFlowNetModule(LightningModule):
         loss_output = self.loss_fn.compute(sample_batch)
         metrics = {
             "loss": loss_output.loss.detach(),
-            "db_start": loss_output.start_loss,
+            "db_root": loss_output.root_loss,
             "db_move": loss_output.move_loss,
             "db_stop": loss_output.stop_loss,
             "rollout_hit": loss_output.hit_rate,
@@ -306,7 +311,7 @@ class TrajectoryGFlowNetModule(LightningModule):
             )
         db_metrics = {
             "db_loss": loss_output.loss.detach(),
-            "db_start": loss_output.start_loss,
+            "db_root": loss_output.root_loss,
             "db_move": loss_output.move_loss,
             "db_stop": loss_output.stop_loss,
             "rollout_hit": loss_output.hit_rate,

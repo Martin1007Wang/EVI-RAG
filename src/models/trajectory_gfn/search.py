@@ -116,6 +116,9 @@ class MassAdaptiveTrajectorySearch:
             inference_mode="exact",
             answer_mass_threshold=float(self.inference_cfg.answer_mass_threshold),
             support_mass_threshold=float(self.inference_cfg.support_mass_threshold),
+            support_path_overlap_penalty=float(
+                self.inference_cfg.support_path_overlap_penalty
+            ),
             probe_count=int(expansions),
             remaining_mass_upper=self._remaining_mass(frontier),
             stop_reason="support_mass_reached",

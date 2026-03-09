@@ -54,6 +54,7 @@ class TrajectoryInferenceConfig:
     mode: str = "sampled"
     answer_mass_threshold: float = 0.9
     support_mass_threshold: float = 0.9
+    support_path_overlap_penalty: float = 0.25
     compute_support_windows: bool = True
     rollout_chunk_size: int = 16
     max_rollouts: int = 256
@@ -70,6 +71,8 @@ class TrajectoryInferenceConfig:
             raise ValueError("inference.answer_mass_threshold must be in (0, 1].")
         if not 0.0 < self.support_mass_threshold <= 1.0:
             raise ValueError("inference.support_mass_threshold must be in (0, 1].")
+        if self.support_path_overlap_penalty < 0.0:
+            raise ValueError("inference.support_path_overlap_penalty must be >= 0.")
         if self.rollout_chunk_size < 1:
             raise ValueError("inference.rollout_chunk_size must be >= 1.")
         if self.max_rollouts < self.rollout_chunk_size:
@@ -84,9 +87,3 @@ class TrajectoryInferenceConfig:
             raise ValueError("inference.max_expansions must be >= 1.")
         if self.max_frontier_size < 1:
             raise ValueError("inference.max_frontier_size must be >= 1.")
-
-
-@dataclass(frozen=True)
-class TrajectoryAnalyzerConfig:
-    compute_gold_mass: bool = True
-    compute_entity_marginals: bool = True

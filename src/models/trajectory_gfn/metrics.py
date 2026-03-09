@@ -53,6 +53,30 @@ def _context_stats(result: ElasticWindowResult) -> tuple[float, float, float, fl
     return recall, precision, f1, hit
 
 
+def _support_path_diversity(result: ElasticWindowResult) -> float:
+    per_answer_paths: dict[int, list[set[int]]] = {}
+    for trajectory in result.trajectories:
+        per_answer_paths.setdefault(int(trajectory.terminal_entity_id), []).append(
+            {int(edge.edge_id) for edge in trajectory.edges}
+        )
+    if not per_answer_paths:
+        return 0.0
+    per_answer_diversity: list[float] = []
+    for edge_sets in per_answer_paths.values():
+        if len(edge_sets) <= 1:
+            per_answer_diversity.append(1.0)
+            continue
+        pairwise_overlap: list[float] = []
+        for left_idx in range(len(edge_sets)):
+            for right_idx in range(left_idx + 1, len(edge_sets)):
+                left = edge_sets[left_idx]
+                right = edge_sets[right_idx]
+                denom = max(len(left), len(right), 1)
+                pairwise_overlap.append(float(len(left & right)) / float(denom))
+        per_answer_diversity.append(1.0 - _safe_mean(pairwise_overlap))
+    return _safe_mean(per_answer_diversity)
+
+
 def compute_elastic_metrics(eval_batch: ElasticEvalBatch) -> dict[str, float]:
     results = eval_batch.results
     if not results:
@@ -77,6 +101,7 @@ def compute_elastic_metrics(eval_batch: ElasticEvalBatch) -> dict[str, float]:
     selected_answer_count = []
     support_conditioned_mass_min = []
     support_conditioned_mass_mean = []
+    support_path_diversity = []
     probe_count = []
     emit_path_count = []
     remaining_mass_upper = []
@@ -127,6 +152,7 @@ def compute_elastic_metrics(eval_batch: ElasticEvalBatch) -> dict[str, float]:
         ]
         support_conditioned_mass_min.append(min(conditioned) if conditioned else 0.0)
         support_conditioned_mass_mean.append(_safe_mean(conditioned))
+        support_path_diversity.append(_support_path_diversity(result))
         probe_count.append(float(result.probe_count))
         emit_path_count.append(float(result.emit_path_count))
         remaining_mass_upper.append(float(result.remaining_mass_upper))
@@ -161,6 +187,7 @@ def compute_elastic_metrics(eval_batch: ElasticEvalBatch) -> dict[str, float]:
         f"support_conditioned_mass_mean@{rho_tag}": _safe_mean(
             support_conditioned_mass_mean
         ),
+        f"support_path_diversity@{rho_tag}": _safe_mean(support_path_diversity),
         f"probe_count@{rho_tag}": _safe_mean(probe_count),
         f"emit_path_count@{rho_tag}": _safe_mean(emit_path_count),
         f"remaining_mass_upper@{rho_tag}": _safe_mean(remaining_mass_upper),
@@ -189,6 +216,7 @@ def compute_elastic_metrics(eval_batch: ElasticEvalBatch) -> dict[str, float]:
     metrics["support_conditioned_mass_mean"] = metrics[
         f"support_conditioned_mass_mean@{rho_tag}"
     ]
+    metrics["support_path_diversity"] = metrics[f"support_path_diversity@{rho_tag}"]
     metrics["probe_count"] = metrics[f"probe_count@{rho_tag}"]
     metrics["emit_path_count"] = metrics[f"emit_path_count@{rho_tag}"]
     metrics["remaining_mass_upper"] = metrics[f"remaining_mass_upper@{rho_tag}"]

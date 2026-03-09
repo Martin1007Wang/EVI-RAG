@@ -53,16 +53,12 @@ inference_cfg:
   mode: sampled
   answer_mass_threshold: 0.90
   support_mass_threshold: 0.90
+  support_path_overlap_penalty: 0.25
   rollout_chunk_size: 16
   max_rollouts: 256
   answer_top_ks: [1, 5, 10]
   max_expansions: 20000
   max_frontier_size: 4096
-
-analyzer_cfg:
-  _target_: src.models.configs.trajectory_gfn.TrajectoryAnalyzerConfig
-  compute_gold_mass: true
-  compute_entity_marginals: true
 
 optimizer_cfg:
   _target_: src.models.configs.training.OptimizerConfig

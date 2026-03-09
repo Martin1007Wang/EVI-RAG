@@ -10,10 +10,14 @@ from src.models.configs.trajectory_gfn import TrajectoryTrainingConfig
 @dataclass(frozen=True)
 class DetailedBalanceLossOutput:
     loss: torch.Tensor
-    start_loss: torch.Tensor
+    root_loss: torch.Tensor
     move_loss: torch.Tensor
     stop_loss: torch.Tensor
     hit_rate: torch.Tensor
+
+    @property
+    def start_loss(self) -> torch.Tensor:
+        return self.root_loss
 
 
 class StepwiseDetailedBalanceLoss:
@@ -27,20 +31,18 @@ class StepwiseDetailedBalanceLoss:
         return values[mask].mean()
 
     def compute(self, sample_batch) -> DetailedBalanceLossOutput:
-        start_residual = (
+        root_residual = (
             sample_batch.graph_log_z.unsqueeze(1)
             + sample_batch.start_log_probs
             - sample_batch.start_state_log_f
         )
-        start_sq = start_residual.square()
-        start_loss = start_sq.mean()
+        root_loss = root_residual.square().mean()
 
         move_mask = sample_batch.active_steps & (~sample_batch.is_stop_steps)
         move_residual = (
             sample_batch.state_log_f_steps
             + sample_batch.log_pf_steps
             - sample_batch.next_state_log_f_steps
-            - sample_batch.log_pb_steps
         )
         move_loss = self._masked_mean(move_residual.square(), move_mask)
 
@@ -53,13 +55,13 @@ class StepwiseDetailedBalanceLoss:
         stop_loss = self._masked_mean(stop_residual.square(), stop_mask)
 
         loss = (
-            self.config.lambda_start * start_loss
+            self.config.lambda_start * root_loss
             + self.config.lambda_move * move_loss
             + self.config.lambda_stop * stop_loss
         )
         return DetailedBalanceLossOutput(
             loss=loss,
-            start_loss=start_loss.detach(),
+            root_loss=root_loss.detach(),
             move_loss=move_loss.detach(),
             stop_loss=stop_loss.detach(),
             hit_rate=sample_batch.hit_mask.to(dtype=torch.float32).mean().detach(),
