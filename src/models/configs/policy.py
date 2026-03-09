@@ -12,11 +12,10 @@ class BackboneConfig:
     gnn_dropout: float = 0.1  # 必须是 float，轻微正则化防止 Hub Nodes 过拟合
 
     use_adapter: bool = True
-    adapter_dim: int = 128  # [系统级修正] 强制低秩瓶颈 (通常为 embedding_dim 的 1/8 或 1/4)
+    adapter_dim: int = (
+        128  # [系统级修正] 强制低秩瓶颈 (通常为 embedding_dim 的 1/8 或 1/4)
+    )
     adapter_dropout: float = 0.1
-
-    use_positional_encoding: bool = True
-    use_film: bool = False
 
 
 @dataclass(frozen=True)
@@ -24,10 +23,8 @@ class FlowHeadConfig:
     """状态流量预测头配置"""
 
     hidden_dim: int = 512
-    num_layers: int = 2
     dropout: float = 0.0
     relation_low_rank: int = 16
-    relation_low_rank_edge_chunk_size: int = 8192
 
 
 @dataclass(frozen=True)

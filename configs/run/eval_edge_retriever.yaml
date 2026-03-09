@@ -1,7 +1,0 @@
-name: eval_edge_retriever
-task_name: "eval/edge_retriever"
-tags: ["eval", "baseline", "edge_retriever"]
-split: test
-eval_mode: predict
-ckpt_path: ${ckpt.edge_retriever}
-dataset_variants: null

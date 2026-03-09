@@ -1,9 +1,0 @@
-# Aggregate DualFlow rollout metrics during predict().
-
-dual_flow_eval_metrics:
-  _target_: src.callbacks.dual_flow_eval_metrics.DualFlowEvalMetrics
-  enabled: true
-  metrics:
-    rollout:
-      _target_: src.metrics.dual_flow.rollout_metrics.DualFlowRolloutMetrics
-      k_values: [1, 10, 25, 50, 100]

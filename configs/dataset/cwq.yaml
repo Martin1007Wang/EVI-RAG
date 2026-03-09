@@ -7,8 +7,12 @@ defaults:
 name: cwq
 dataset_scope: full
 dataset_family: cwq
-max_steps: 10
+max_steps: 4
 hf_dataset: rmanluo/RoG-cwq
+
+# Train LMDB has 27,631 samples with batch_size=16 (train_steps=1727).
+# Step-based validation interval tuned for cross-dataset parity.
+val_check_interval: 512
 
 
 filter_missing_answer:

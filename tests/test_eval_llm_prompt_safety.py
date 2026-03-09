@@ -17,24 +17,24 @@ from src.llm.eval_llm import (
 
 
 def test_trajectory_text_filters_super_source_edges_in_fallback() -> None:
-    rollout = {
+    trajectory = {
         "edges": [
             {"src_entity_id": -1, "relation_id": 7, "dst_entity_id": 11},
             {"src_entity_id": 11, "relation_id": 9, "dst_entity_id": 13},
         ],
-        "stop_node_entity_id": 13,
+        "terminal_entity_id": 13,
     }
-    assert _trajectory_text(rollout) == "11 --9--> 13"
+    assert _trajectory_text(trajectory) == "11 --9--> 13"
 
 
 def test_trajectory_text_uses_stop_node_when_only_super_source_edges() -> None:
-    rollout = {
+    trajectory = {
         "edges": [
             {"src_entity_id": -1, "relation_id": 7, "dst_entity_id": 11},
         ],
-        "stop_node_entity_id": 11,
+        "terminal_entity_id": 11,
     }
-    assert _trajectory_text(rollout) == "(no_edge) --STOP--> 11"
+    assert _trajectory_text(trajectory) == "(no_edge) --STOP--> 11"
 
 
 def test_enforce_candidate_answers_drops_non_candidate_predictions() -> None:
@@ -70,12 +70,16 @@ def test_enforce_candidate_answers_uses_fuzzy_match_for_parenthetical_output() -
     assert constrained is False
 
 
-def test_extract_destination_candidates_filters_numeric_ids_for_non_numeric_questions() -> None:
+def test_extract_destination_candidates_filters_numeric_ids_for_non_numeric_questions() -> (
+    None
+):
     trajectories = [
         "A --related_to--> 123456",
         "A --related_to--> Paris",
     ]
-    candidates = _extract_destination_candidates(trajectories, max_candidates=10, question="Where was A born?")
+    candidates = _extract_destination_candidates(
+        trajectories, max_candidates=10, question="Where was A born?"
+    )
     assert candidates == ["Paris"]
 
 
@@ -132,11 +136,17 @@ def test_iter_requests_supports_question_field_alias(tmp_path) -> None:
     record = {
         "sample_id": "s1",
         "question": "Where was X born?",
-        "rollouts": [{"rollout_index": 0, "score": 1.0, "trajectory_text": "A --r--> B"}],
+        "trajectories": [
+            {"rollout_rank": 1, "prob": 1.0, "trajectory_text": "A --r--> B"}
+        ],
     }
     input_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     prompt_spec = _resolve_prompt_spec({"prompt": {"system": "You are a test model."}})
-    requests = list(_iter_requests(input_path, set(), top_k=1, prompt_spec=prompt_spec, max_samples=None))
+    requests = list(
+        _iter_requests(
+            input_path, set(), top_k=1, prompt_spec=prompt_spec, max_samples=None
+        )
+    )
     assert len(requests) == 1
     assert requests[0].question == "Where was X born?"
 
@@ -145,8 +155,12 @@ def test_resolve_input_labels_path_requires_sidecar_when_enabled(tmp_path) -> No
     input_path = tmp_path / "predict.jsonl"
     input_path.write_text("", encoding="utf-8")
 
-    with pytest.raises(FileNotFoundError, match="Input labels JSONL not found for metrics"):
-        _resolve_input_labels_path(input_path=input_path, llm_cfg={}, require_labels=True)
+    with pytest.raises(
+        FileNotFoundError, match="Input labels JSONL not found for metrics"
+    ):
+        _resolve_input_labels_path(
+            input_path=input_path, llm_cfg={}, require_labels=True
+        )
 
 
 def test_run_llm_eval_fails_fast_when_sidecar_missing(tmp_path) -> None:
@@ -164,11 +178,17 @@ def test_run_llm_eval_fails_fast_when_sidecar_missing(tmp_path) -> None:
             "schema": {"enabled": False},
         },
     }
-    with pytest.raises(FileNotFoundError, match="Input labels JSONL not found for metrics"):
+    with pytest.raises(
+        FileNotFoundError, match="Input labels JSONL not found for metrics"
+    ):
         run_llm_eval(cfg)
 
 
 def test_validate_topk_against_prompt_limits_fails_on_implicit_clip() -> None:
-    prompt_spec = _resolve_prompt_spec({"prompt": {"system": "You are a test model.", "max_trajectories": 5}})
-    with pytest.raises(ValueError, match="llm.topk_list must be <= llm.prompt.max_trajectories"):
+    prompt_spec = _resolve_prompt_spec(
+        {"prompt": {"system": "You are a test model.", "max_trajectories": 5}}
+    )
+    with pytest.raises(
+        ValueError, match="llm.topk_list must be <= llm.prompt.max_trajectories"
+    ):
         _validate_topk_against_prompt_limits(topk_list=[1, 10], prompt_spec=prompt_spec)

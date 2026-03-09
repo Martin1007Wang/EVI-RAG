@@ -4,27 +4,25 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__all__ = ["DualFlowEvalMetrics", "DualFlowRolloutArtifactWriter", "LocalMetricsWriter"]
+__all__ = [
+    "LocalMetricsWriter",
+    "StepEarlyStopping",
+]
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .dual_flow_eval_metrics import DualFlowEvalMetrics
-    from .dual_flow_rollout_artifact_writer import DualFlowRolloutArtifactWriter
     from .local_metrics_writer import LocalMetricsWriter
+    from .step_early_stopping import StepEarlyStopping
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
-    if name == "DualFlowEvalMetrics":
-        from .dual_flow_eval_metrics import DualFlowEvalMetrics
-
-        return DualFlowEvalMetrics
-    if name == "DualFlowRolloutArtifactWriter":
-        from .dual_flow_rollout_artifact_writer import DualFlowRolloutArtifactWriter
-
-        return DualFlowRolloutArtifactWriter
     if name == "LocalMetricsWriter":
         from .local_metrics_writer import LocalMetricsWriter
 
         return LocalMetricsWriter
+    if name == "StepEarlyStopping":
+        from .step_early_stopping import StepEarlyStopping
+
+        return StepEarlyStopping
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

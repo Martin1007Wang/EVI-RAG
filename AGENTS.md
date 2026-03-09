@@ -112,6 +112,7 @@
 *   **No Numeric Alias Constants:** 严禁声明 `_ZERO = 0`、`_ONE = 1`、`_TWO = 2`、`_EPSILON_DEFAULT = 1e-4` 这类“数字别名常量”；`0/1/-1` 等基础标量直接写，超参数统一进配置。
 *   **Explicit Batching:** 严禁依赖 PyG 的隐式 `batch` 属性。在 DataLoader 中显式处理 `follow_batch`，并在 Model 中显式使用 `batch_idx`。
 *   **Logging Protocol:** 必须使用 `src/utils/logging_utils.py` 统一记录。直接调用 `wandb.log` 或 `self.log` 是被禁止的，因为这会破坏分布式环境下的 Batch Size 统计一致性。
+    *   **Step SSOT (Local JSONL):** `metrics/*.jsonl` 以 `global_step` 为唯一时间轴；`train` 指标写入为**之前** `callbacks.local_metrics_writer.train_window_size` 步的滑动平均（不写当前 step 的瞬时值），`val/test` 指标在验证/测试结束时聚合写入；不使用 epoch 语义。
 *   **Lightning Optimization Contract:** 默认使用 PyTorch Lightning 自动优化（`automatic_optimization=True`）；禁止在模型中手写 `manual_backward/optimizer.step/scheduler.step` 训练环，除非有明确实验设计文档与基准证明。
 
 ### 3. Dataset Visibility Protocol (数据可见性协议)
@@ -144,11 +145,12 @@
 ### 2. Termination Rule (终止规则)
 *   **Explicit STOP Action (Code-Exact):** 轨迹以显式 STOP 动作终止；命中答案节点时强制 STOP；达到最大步数亦强制 STOP。
 *   **Min-Step Constraint (Code-Exact):** `runtime_cfg.stop_min_steps` 指定最小步数，`t < min_steps` 时禁止 STOP（训练/评估一致）。
+*   **Step Semantics (Code-Exact):** `max_steps`/`stop_min_steps` 计数仅包含真实边数，不包含 START/STOP super dummy edges。
+*   **Eval at Max Steps (Code-Exact):** 达到最大步数的轨迹也必须参与评估；若 STOP 计为一步，则 `t = max_steps - 1` 时必须允许 STOP，禁止因未显式 STOP 而丢弃 max-steps 终止轨迹。
 *   **Reward Semantics:** STOP 前一步所在实体命中答案则 $R=1$（$\log R=0$），否则 $R=\epsilon$（$\log R \approx -C$）。
 
 ### 3. Backward Policy Contract (反向策略契约)
-*   **Single PB Strategy (Code-Exact):** 当前实现仅保留一种静态 $P_B$：
-    * `uniform`（静态）：对每个状态的逆向出边做均匀分布，$\log P_B=-\\log |\\text{Out}_b(v)|$。
+*   **Symmetric Backward Policy (Code-Exact):** 反向流与正向流对称，取消静态 $P_B$ 的 backward prior。
 *   **Teacher Edge Dropout:** 当前实现未启用。
 
 ### 4. Multi-Start Handling (多起点处理)

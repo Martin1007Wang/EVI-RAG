@@ -64,8 +64,8 @@ def infer_super_source_absolute_indices(
         raise ValueError(
             "Each graph must contain at least two nodes when super source is enabled."
         )
-    forward_abs = node_ptr_long[1:] - 2
-    backward_abs = node_ptr_long[1:] - 1
+    question_super_abs = node_ptr_long[1:] - 2
+    answer_super_abs = node_ptr_long[1:] - 1
     super_mask = node_global_long < 0
     num_graphs = int(node_ptr_long.numel()) - 1
     if int(super_mask.sum().item()) != 2 * num_graphs:
@@ -73,13 +73,13 @@ def infer_super_source_absolute_indices(
             "Super-source layout invariant violated: expected exactly two virtual nodes per graph "
             f"(got {int(super_mask.sum().item())} negatives for {num_graphs} graphs)."
         )
-    forward_ok = bool(super_mask.index_select(0, forward_abs).all().item())
-    backward_ok = bool(super_mask.index_select(0, backward_abs).all().item())
-    if not (forward_ok and backward_ok):
+    question_ok = bool(super_mask.index_select(0, question_super_abs).all().item())
+    answer_ok = bool(super_mask.index_select(0, answer_super_abs).all().item())
+    if not (question_ok and answer_ok):
         raise ValueError(
             "Super-source layout invariant violated: trailing per-graph nodes are not both virtual."
         )
-    return forward_abs, backward_abs
+    return question_super_abs, answer_super_abs
 
 
 def has_super_source_layout(
@@ -109,16 +109,16 @@ def resolve_super_source_absolute_indices(
     direction: FlowDirection,
     device: torch.device,
 ) -> torch.Tensor:
-    forward_abs, backward_abs = infer_super_source_absolute_indices(
+    question_super_abs, answer_super_abs = infer_super_source_absolute_indices(
         node_ptr=node_ptr,
         node_global_ids=node_global_ids,
         num_nodes_total=num_nodes_total,
         device=device,
     )
     if direction == "forward":
-        return forward_abs
+        return question_super_abs
     if direction == "backward":
-        return backward_abs
+        return answer_super_abs
     raise ValueError(f"Unsupported flow direction: {direction!r}")
 
 

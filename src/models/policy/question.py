@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 
@@ -76,6 +78,20 @@ def build_question_padding_mask(
     return ~valid_mask
 
 
+def build_question_lexical_tokens(
+    *,
+    question_context_tokens: torch.Tensor,
+    question_lexical_proj: nn.Module,
+) -> torch.Tensor:
+    if question_context_tokens.dim() != 3:
+        raise ValueError(
+            "question_context_tokens must be 3D [B, L, d] for lexical projection, "
+            f"got shape={tuple(question_context_tokens.shape)}."
+        )
+    context_fp32 = question_context_tokens.to(dtype=torch.float32)
+    return question_lexical_proj(context_fp32)
+
+
 def compute_question_token_pool(
     *,
     question_token_scorer: nn.Module,
@@ -124,6 +140,7 @@ def compute_agent_potentials(
     question_cross_attention_norm: nn.LayerNorm,
     question_token_scorer: nn.Module,
     question_global_proj: nn.Module,
+    lexical_question_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B = int(env_context.num_graphs)
     total_agents = B * int(num_agents)
@@ -136,11 +153,21 @@ def compute_agent_potentials(
             embedding_dim=embedding_dim,
             path_to_policy=path_to_policy,
         )
+    if question_context_tokens is None:
+        raise ValueError(
+            "question_context_tokens must be resolved for potential computation."
+        )
+    assert question_context_tokens is not None
     if question_padding_mask is None:
         question_padding_mask = build_question_padding_mask(
             env_context=env_context,
             question_context_tokens=question_context_tokens,
         )
+    if question_padding_mask is None:
+        raise ValueError(
+            "question_padding_mask must be resolved for potential computation."
+        )
+    assert question_padding_mask is not None
     agent_graph_ids = torch.arange(
         B, device=question_tokens.device, dtype=torch.long
     ).repeat_interleave(num_agents)
@@ -157,7 +184,30 @@ def compute_agent_potentials(
 
     query = path_to_policy(agent_history).unsqueeze(1).to(dtype=torch.float32)
     context_fp32 = agent_question_context.to(dtype=torch.float32)
-    lexical_question_tokens = question_lexical_proj(context_fp32)
+    if lexical_question_tokens is None:
+        lexical_question_tokens = question_lexical_proj(context_fp32)
+    else:
+        if lexical_question_tokens.dim() != 3:
+            raise ValueError(
+                "lexical_question_tokens must be 3D [B, L, r] when provided, "
+                f"got shape={tuple(lexical_question_tokens.shape)}."
+            )
+        if int(lexical_question_tokens.size(0)) != B:
+            raise ValueError(
+                "lexical_question_tokens batch mismatch with num_graphs: "
+                f"lexical={int(lexical_question_tokens.size(0))}, num_graphs={B}."
+            )
+        if int(lexical_question_tokens.size(1)) != int(agent_question_context.size(1)):
+            raise ValueError(
+                "lexical_question_tokens length mismatch with question context: "
+                f"lexical={int(lexical_question_tokens.size(1))}, "
+                f"context={int(agent_question_context.size(1))}."
+            )
+        lexical_tokens = cast(torch.Tensor, lexical_question_tokens)
+        lexical_tokens = lexical_tokens.to(
+            device=context_fp32.device, dtype=torch.float32
+        )
+        lexical_question_tokens = lexical_tokens.index_select(0, agent_graph_ids)
     cross_out, _ = question_cross_attention(
         query,
         context_fp32,
@@ -186,6 +236,7 @@ def compute_agent_potentials(
 __all__ = [
     "build_question_context_tokens",
     "build_question_padding_mask",
+    "build_question_lexical_tokens",
     "compute_agent_potentials",
     "compute_question_token_pool",
 ]

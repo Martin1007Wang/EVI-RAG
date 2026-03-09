@@ -3,6 +3,7 @@
 name: ???
 dataset_family: ???
 dataset_scope: ???
+# Total step budget (real edges only; super edges are internal).
 max_steps: ???
 hf_dataset: ???
 kb: freebase

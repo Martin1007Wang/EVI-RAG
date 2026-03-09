@@ -5,7 +5,7 @@ _target_: src.datasets.g_retrieval_datamodule.GRetrievalDataModule
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
-batch_size: 8
+batch_size: 16
 num_workers: 16
 drop_last: false
 train_shuffle: true
@@ -14,9 +14,7 @@ prefetch_factor: 4
 persistent_workers: true
 precompute_edge_batch: true
 embeddings_device: cpu
-# Mirror model env config to keep runtime batch adaptation consistent.
-super_source_enabled: ${model.env_cfg.super_source_enabled}
 # 多答案由模型/奖励处理；DataLoader 不展开。
 expand_multi_answer: false
-# Zero-hop (q in A) 过滤掉，避免与 stop_min_steps=1 的最小步数约束冲突。
-filter_zero_hop: true
+# Zero-hop (q in A) 保留；需配合 stop_min_steps=1（真实步数语义）。
+filter_zero_hop: false

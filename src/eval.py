@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import is_dataclass, replace as dataclass_replace
 import os
 import json
 from pathlib import Path
@@ -16,20 +15,14 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.utils import (
-    RankedLogger,
-    extras,
-    instantiate_callbacks,
-    instantiate_loggers,
-    log_hyperparameters,
-    task_wrapper,
-)
+from src.utils.hydra_utils import extras, instantiate_callbacks, instantiate_loggers
+from src.utils.logging_utils import RankedLogger, log_hyperparameters
+from src.utils.task_utils import task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _RUN_REQUIRES_CKPT_KIND = {
-    "eval_dual_flow": "dual_flow",
-    "eval_edge_retriever": "edge_retriever",
+    "eval_trajectory_gfn": "trajectory_gfn",
 }
 
 _DATASET_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "dataset"
@@ -196,38 +189,68 @@ def _resolve_eval_mode(run_cfg: DictConfig | Dict[str, Any]) -> str:
     raise ValueError("run.eval_mode must be one of {'predict', 'test'}.")
 
 
-def _configure_dual_flow_eval_sampling(
-    model: LightningModule, run_cfg: DictConfig | Dict[str, Any]
-) -> None:
-    if not hasattr(model, "sampler"):
-        return
-    sampler = getattr(model, "sampler")
-    sampler_cfg = getattr(sampler, "config", None)
-    if sampler_cfg is None or not is_dataclass(sampler_cfg):
-        return
-    has_temp = hasattr(sampler_cfg, "eval_sampling_temperature")
-    has_unique = hasattr(sampler_cfg, "eval_sample_without_replacement")
-    if not (has_temp or has_unique):
-        return
+def _resolve_trajectory_questions_path(
+    dataset_cfg: DictConfig | Dict[str, Any],
+    run_cfg: DictConfig | Dict[str, Any],
+) -> Optional[Path]:
+    explicit = run_cfg.get("questions_path") if hasattr(run_cfg, "get") else None
+    if explicit not in (None, ""):
+        path = Path(str(explicit))
+        return path if path.exists() else None
+    out_dir = dataset_cfg.get("out_dir") if hasattr(dataset_cfg, "get") else None
+    if out_dir in (None, ""):
+        return None
+    candidate = Path(str(out_dir)) / "questions.parquet"
+    return candidate if candidate.exists() else None
 
-    temp_override = (
-        run_cfg.get("eval_sampling_temperature") if hasattr(run_cfg, "get") else None
+
+def _maybe_write_trajectory_artifacts(
+    cfg: DictConfig,
+    model: LightningModule,
+) -> Optional[dict[str, Path]]:
+    run_cfg = cfg.get("run") or {}
+    if str(run_cfg.get("name", "")).strip() != "eval_trajectory_gfn":
+        return None
+    if _resolve_eval_mode(run_cfg) != "predict":
+        return None
+    if not bool(run_cfg.get("write_artifacts", True)):
+        return None
+    results = getattr(model, "predict_results", None)
+    labels = getattr(model, "predict_labels", None)
+    if not isinstance(results, list) or not results:
+        log.warning("No trajectory results were produced; skipping artifact export.")
+        return None
+    if not isinstance(labels, list):
+        labels = []
+    dataset_cfg = cfg.get("dataset") or {}
+    artifact_root = Path(str(dataset_cfg.get("artifact_dir")))
+    artifact_subdir = str(run_cfg.get("artifact_subdir", "eval_trajectory_gfn"))
+    dataset_variant = str(run_cfg.get("dataset_variant", "") or "")
+    dataset_scope = _normalize_dataset_scope(dataset_cfg)
+    artifact_dir = artifact_root / artifact_subdir
+    if dataset_variant:
+        artifact_dir = artifact_dir / dataset_variant
+    else:
+        artifact_dir = artifact_dir / dataset_scope
+    paths_cfg = dataset_cfg.get("paths") if hasattr(dataset_cfg, "get") else {}
+    entity_vocab_path = None if paths_cfg is None else paths_cfg.get("entity_vocab")
+    relation_vocab_path = None if paths_cfg is None else paths_cfg.get("relation_vocab")
+    questions_path = _resolve_trajectory_questions_path(dataset_cfg, run_cfg)
+    from src.models.trajectory_gfn.artifacts import ElasticWindowArtifactWriter
+
+    writer = ElasticWindowArtifactWriter(
+        output_dir=artifact_dir,
+        split=str(run_cfg.get("split", "test")),
+        artifact_name=str(run_cfg.get("artifact_name", "eval_trajectory_gfn")),
+        schema_version=int(run_cfg.get("artifact_schema_version", 1)),
+        entity_vocab_path=entity_vocab_path,
+        relation_vocab_path=relation_vocab_path,
+        questions_path=questions_path,
+        overwrite=bool(run_cfg.get("artifact_overwrite", True)),
     )
-    unique_override = (
-        run_cfg.get("eval_sample_without_replacement")
-        if hasattr(run_cfg, "get")
-        else None
-    )
-    updates: Dict[str, Any] = {}
-    if has_temp and temp_override is not None:
-        temp_value = float(temp_override)
-        if temp_value <= 0:
-            raise ValueError("run.eval_sampling_temperature must be > 0.")
-        updates["eval_sampling_temperature"] = temp_value
-    if has_unique and unique_override is not None:
-        updates["eval_sample_without_replacement"] = bool(unique_override)
-    if updates:
-        sampler.config = dataclass_replace(sampler_cfg, **updates)
+    paths = writer.write(results=results, labels=labels)
+    log.info("Trajectory artifacts written to %s", paths["prompt_path"])
+    return paths
 
 
 def _preflight_validate(cfg: DictConfig) -> None:
@@ -237,7 +260,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
+            "  python src/eval.py experiment=eval_trajectory_gfn ckpt.trajectory_gfn=/path/to/model.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
@@ -249,7 +272,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `run`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt\n"
+            "  python src/eval.py experiment=eval_trajectory_gfn ckpt.trajectory_gfn=/path/to/model.ckpt\n"
         )
     required_kind = _RUN_REQUIRES_CKPT_KIND.get(run_name)
     if required_kind and cfg.get("ckpt_path") in (None, ""):
@@ -257,7 +280,7 @@ def _preflight_validate(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
-    if run_name == "eval_dual_flow":
+    if run_name == "eval_trajectory_gfn":
         variants = _resolve_dataset_variants(cfg)
         if not variants:
             raise ValueError(
@@ -349,7 +372,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if run_cfg is None:
         raise ValueError(
             "Missing required config group: `run`. Example: "
-            "`python src/eval.py experiment=eval_dual_flow ckpt.dual_flow=/path/to/dual_flow.ckpt`."
+            "`python src/eval.py experiment=eval_trajectory_gfn ckpt.trajectory_gfn=/path/to/model.ckpt`."
         )
     split = str(run_cfg.get("split", "test"))
     if run_cfg.get("allow_empty_answer") is None:
@@ -364,7 +387,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
-    _configure_dual_flow_eval_sampling(model, run_cfg)
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
@@ -408,6 +430,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             ckpt_path=ckpt_path,
             return_predictions=False,
         )
+        _maybe_write_trajectory_artifacts(cfg, model)
 
     metric_dict = trainer.callback_metrics
     if not metric_dict and hasattr(model, "predict_metrics"):

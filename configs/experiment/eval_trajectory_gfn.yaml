@@ -1,0 +1,21 @@
+# @package _global_
+#
+# Evaluate Trajectory GFlowNet checkpoint on test split (full + sub) with one command.
+# Usage:
+#   python src/eval.py experiment=eval_trajectory_gfn ckpt.trajectory_gfn=/path/to/model.ckpt
+
+defaults:
+  - override /run: eval_trajectory_gfn
+  - override /dataset: webqsp
+  - override /data: g_retrieval
+  - override /model: trajectory_gfn
+  - override /callbacks: default
+  - override /logger: none
+  - override /trainer: predict
+  - _self_
+
+model:
+  inference_cfg:
+    mode: exact
+    max_expansions: 500000
+    max_frontier_size: 65536

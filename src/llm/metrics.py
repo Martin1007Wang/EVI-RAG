@@ -34,7 +34,7 @@ class _EvalSample:
     pred_lines: List[str]
     double_check: bool
     a_entity_in_graph: Optional[bool]
-    rollouts: Optional[List[Dict[str, Any]]]
+    trajectories: Optional[List[Dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -82,9 +82,11 @@ def write_llm_metrics(
     answer_separator: str,
     metrics_filename_template: Optional[str] = None,
     input_labels_path: Optional[Path] = None,
-) -> Path:
+) -> tuple[Path, Dict[str, Any]]:
     template = str(metrics_filename_template or "{split}_k{k}_{provider}.metrics.json")
-    metrics_path = output_dir / template.format(split=split, k=int(top_k), provider=provider)
+    metrics_path = output_dir / template.format(
+        split=split, k=int(top_k), provider=provider
+    )
     metrics = compute_llm_metrics(
         input_path=input_path,
         input_labels_path=input_labels_path,
@@ -96,7 +98,7 @@ def write_llm_metrics(
         answer_separator=answer_separator,
     )
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    return metrics_path
+    return metrics_path, metrics
 
 
 def compute_llm_metrics(
@@ -120,6 +122,7 @@ def compute_llm_metrics(
         "input_labels": str(input_labels_path) if input_labels_path is not None else "",
         "output": str(output_path),
         "llm/num_predictions": float(len(pred_map)),
+        "llm/run/top_k": int(top_k),
     }
     if not pred_map:
         return metrics
@@ -127,12 +130,17 @@ def compute_llm_metrics(
     full_acc = _EvalAccumulator(hal_stats=_init_hal_stats())
     sub_acc = _EvalAccumulator(hal_stats=_init_hal_stats())
     input_sample_ids: Set[str] = set()
+    trajectory_count_sum = 0
+    trajectory_count_min: Optional[int] = None
+    trajectory_count_max = 0
     for record in _iter_jsonl(input_path):
         sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
         if not sample_id:
             raise ValueError(f"Input JSONL record missing sample_id in {input_path}.")
         if sample_id in input_sample_ids:
-            raise ValueError(f"Duplicate sample_id in input JSONL {input_path}: {sample_id!r}")
+            raise ValueError(
+                f"Duplicate sample_id in input JSONL {input_path}: {sample_id!r}"
+            )
         input_sample_ids.add(sample_id)
         if sample_id not in pred_map:
             continue
@@ -144,6 +152,13 @@ def compute_llm_metrics(
                 f"{sample_id!r}. Provide a valid labels sidecar via llm.input_labels_path."
             )
         result = _evaluate_sample(sample)
+        trajectory_count = len(sample.trajectories or [])
+        trajectory_count_sum += trajectory_count
+        trajectory_count_max = max(trajectory_count_max, trajectory_count)
+        if trajectory_count_min is None:
+            trajectory_count_min = trajectory_count
+        else:
+            trajectory_count_min = min(trajectory_count_min, trajectory_count)
         _accumulate(full_acc, sample, result, include_hal=True)
         if sample.a_entity_in_graph is True:
             _accumulate(sub_acc, sample, result, include_hal=True)
@@ -156,8 +171,20 @@ def compute_llm_metrics(
         )
     metrics.update(_finalize_scope(full_acc, prefix="llm/subgraphrag/full"))
     metrics.update(_finalize_scope(sub_acc, prefix="llm/subgraphrag/sub"))
+    if full_acc.samples > _ZERO:
+        metrics["llm/input/trajectory_count_mean"] = float(
+            trajectory_count_sum
+        ) / float(full_acc.samples)
+        metrics["llm/input/trajectory_count_min"] = int(trajectory_count_min or 0)
+        metrics["llm/input/trajectory_count_max"] = int(trajectory_count_max)
     if full_acc.hal_stats is not None:
-        metrics.update(_format_hal_stats(full_acc.hal_stats, prefix="llm/subgraphrag/full/stats"))
+        metrics.update(
+            _format_hal_stats(full_acc.hal_stats, prefix="llm/subgraphrag/full/stats")
+        )
+    if sub_acc.hal_stats is not None:
+        metrics.update(
+            _format_hal_stats(sub_acc.hal_stats, prefix="llm/subgraphrag/sub/stats")
+        )
     return metrics
 
 
@@ -179,7 +206,9 @@ def _load_predictions(path: Path, *, answer_key: str) -> Dict[str, str]:
         if not sample_id:
             raise ValueError(f"Prediction record missing sample_id in {path}.")
         if sample_id in out:
-            raise ValueError(f"Duplicate sample_id in prediction JSONL {path}: {sample_id!r}")
+            raise ValueError(
+                f"Duplicate sample_id in prediction JSONL {path}: {sample_id!r}"
+            )
         out[sample_id] = str(record.get(answer_key) or "")
     return out
 
@@ -193,12 +222,16 @@ def _load_label_records(path: Optional[Path]) -> Dict[str, Dict[str, Any]]:
         if not sample_id:
             raise ValueError(f"Label record missing sample_id in {path}.")
         if sample_id in out:
-            raise ValueError(f"Duplicate sample_id in label JSONL {path}: {sample_id!r}")
+            raise ValueError(
+                f"Duplicate sample_id in label JSONL {path}: {sample_id!r}"
+            )
         out[sample_id] = dict(record)
     return out
 
 
-def _merge_with_label_record(record: Dict[str, Any], labels: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def _merge_with_label_record(
+    record: Dict[str, Any], labels: Dict[str, Dict[str, Any]]
+) -> Dict[str, Any]:
     sample_id = str(record.get(_FIELD_SAMPLE_ID) or "")
     if not sample_id:
         return record
@@ -209,7 +242,7 @@ def _merge_with_label_record(record: Dict[str, Any], labels: Dict[str, Dict[str,
     for key, value in label_record.items():
         if key == _FIELD_SAMPLE_ID:
             continue
-        if key == "rollouts":
+        if key == "trajectories":
             continue
         merged[key] = value
     return merged
@@ -236,11 +269,13 @@ def _build_eval_sample(
     pred_text = pred_map.get(sample_id, "") or ""
     pred_lines = _subgraphrag_get_pred_lines(pred_text)
     if not pred_lines:
-        pred_lines = _subgraphrag_get_pred_lines_from_answer(pred_text, answer_separator=answer_separator)
+        pred_lines = _subgraphrag_get_pred_lines_from_answer(
+            pred_text, answer_separator=answer_separator
+        )
     double_check = _subgraphrag_is_double_check(question)
     a_entity_in_graph = _resolve_a_entity_in_graph(record)
-    rollouts = record.get("rollouts")
-    rollouts = rollouts if isinstance(rollouts, list) else None
+    trajectories = record.get("trajectories")
+    trajectories = trajectories if isinstance(trajectories, list) else None
     return _EvalSample(
         sample_id=sample_id,
         question=question,
@@ -249,7 +284,7 @@ def _build_eval_sample(
         pred_lines=pred_lines,
         double_check=double_check,
         a_entity_in_graph=a_entity_in_graph,
-        rollouts=rollouts,
+        trajectories=trajectories,
     )
 
 
@@ -261,9 +296,15 @@ def _resolve_a_entity_in_graph(record: Dict[str, Any]) -> Optional[bool]:
 
 
 def _evaluate_sample(sample: _EvalSample) -> _EvalResult:
-    hit_at_1 = float(_subgraphrag_hit_at_1(sample.pred_lines, sample.answers, sample.double_check))
-    hit = float(_subgraphrag_eval_hit(sample.pred_text, sample.answers, sample.double_check))
-    matched, num_pred, num_answer = _subgraphrag_match_count(sample.pred_lines, sample.answers, sample.double_check)
+    hit_at_1 = float(
+        _subgraphrag_hit_at_1(sample.pred_lines, sample.answers, sample.double_check)
+    )
+    hit = float(
+        _subgraphrag_eval_hit(sample.pred_text, sample.answers, sample.double_check)
+    )
+    matched, num_pred, num_answer = _subgraphrag_match_count(
+        sample.pred_lines, sample.answers, sample.double_check
+    )
     precision = float(matched) / float(num_pred) if num_pred > _ZERO else float(_ZERO)
     recall = float(matched) / float(num_answer) if num_answer > _ZERO else float(_ZERO)
     f1 = _safe_f1(precision, recall)
@@ -308,7 +349,7 @@ def _accumulate(
     if include_hal:
         if acc.hal_stats is None:
             acc.hal_stats = _init_hal_stats()
-        entities = _extract_retrieved_entities(sample.rollouts)
+        entities = _extract_retrieved_entities(sample.trajectories)
         hal_score, stats = _subgraphrag_hal_score(
             predictions=sample.pred_lines,
             answers=sample.answers,
@@ -341,8 +382,16 @@ def _finalize_scope(acc: _EvalAccumulator, *, prefix: str) -> Dict[str, Any]:
             f"{prefix}/hal_score": float(_ZERO),
         }
     denom = float(acc.samples)
-    micro_precision = float(acc.total_match) / float(acc.total_pred) if acc.total_pred > _ZERO else float(_ZERO)
-    micro_recall = float(acc.total_match) / float(acc.total_answer) if acc.total_answer > _ZERO else float(_ZERO)
+    micro_precision = (
+        float(acc.total_match) / float(acc.total_pred)
+        if acc.total_pred > _ZERO
+        else float(_ZERO)
+    )
+    micro_recall = (
+        float(acc.total_match) / float(acc.total_answer)
+        if acc.total_answer > _ZERO
+        else float(_ZERO)
+    )
     micro_f1 = _safe_f1(micro_precision, micro_recall)
     if acc.hal_stats is None:
         hal_scaled = float(_ZERO)
@@ -371,7 +420,9 @@ def _format_hal_stats(stats: Dict[str, int], *, prefix: str) -> Dict[str, Any]:
     return {f"{prefix}/{key}": float(value) for key, value in stats.items()}
 
 
-def _resolve_gold_answer_texts(record: Dict[str, Any], *, answer_separator: str) -> List[str]:
+def _resolve_gold_answer_texts(
+    record: Dict[str, Any], *, answer_separator: str
+) -> List[str]:
     raw = record.get("answer_texts")
     if isinstance(raw, list):
         answers = [str(x) for x in raw if str(x).strip()]
@@ -390,7 +441,9 @@ def _normalize_answer_token(text: str) -> str:
     token = str(text or "").strip()
     if not token:
         return ""
-    if (token.startswith('"') and token.endswith('"')) or (token.startswith("'") and token.endswith("'")):
+    if (token.startswith('"') and token.endswith('"')) or (
+        token.startswith("'") and token.endswith("'")
+    ):
         token = token[1:-1].strip()
     # Robustness: some prompts annotate candidates like `Entity (support: k, evidence: ...)`.
     # If the model mistakenly copies the parenthetical metadata, strip it for matching.
@@ -498,11 +551,17 @@ def _subgraphrag_get_pred_lines(prediction: str) -> List[str]:
     candidates = [p for p in raw.split("\n") if "ans:" in p and "none" not in p.lower()]
     if candidates:
         lowered = [p.lower() for p in candidates]
-        candidates = [p for p, lo in zip(candidates, lowered) if all(marker not in lo for marker in _NO_ANS_MARKERS)]
+        candidates = [
+            p
+            for p, lo in zip(candidates, lowered)
+            if all(marker not in lo for marker in _NO_ANS_MARKERS)
+        ]
     return _remove_duplicates_preserve_order(candidates)
 
 
-def _subgraphrag_get_pred_lines_from_answer(answer: str, *, answer_separator: str) -> List[str]:
+def _subgraphrag_get_pred_lines_from_answer(
+    answer: str, *, answer_separator: str
+) -> List[str]:
     tokens = _split_prediction_tokens(answer, answer_separator=answer_separator)
     return [f"ans: {token}" for token in tokens]
 
@@ -592,7 +651,9 @@ def _subgraphrag_no_answer(prediction: str, pred_lines: Sequence[str]) -> bool:
     return all(_is_no_ans_token(token) for token in tokens)
 
 
-def _subgraphrag_hit_at_1(prediction: Sequence[str], answer: List[str], double_check: bool) -> int:
+def _subgraphrag_hit_at_1(
+    prediction: Sequence[str], answer: List[str], double_check: bool
+) -> int:
     if not prediction:
         return 0
     top = str(prediction[0])
@@ -651,17 +712,23 @@ def _init_hal_stats() -> Dict[str, int]:
     }
 
 
-def _extract_retrieved_entities(rollouts: Optional[List[Dict[str, Any]]]) -> List[str]:
-    if not rollouts:
+def _extract_retrieved_entities(
+    trajectories: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    if not trajectories:
         return []
     entities: List[str] = []
-    for rollout in rollouts:
-        edges = rollout.get("edges")
+    for trajectory in trajectories:
+        edges = trajectory.get("edges")
         if not isinstance(edges, list):
             continue
         for edge in edges:
-            src = _resolve_edge_value(edge, ("src_text", "head_text", "src_entity_id", "head_entity_id"))
-            dst = _resolve_edge_value(edge, ("dst_text", "tail_text", "dst_entity_id", "tail_entity_id"))
+            src = _resolve_edge_value(
+                edge, ("src_text", "head_text", "src_entity_id", "head_entity_id")
+            )
+            dst = _resolve_edge_value(
+                edge, ("dst_text", "tail_text", "dst_entity_id", "tail_entity_id")
+            )
             if src:
                 entities.append(str(src))
             if dst:
@@ -799,7 +866,9 @@ def _subgraphrag_hal_score_bad(
     return score / denom, stats
 
 
-def _subgraphrag_eval_hit(prediction: str, answer: List[str], double_check: bool) -> int:
+def _subgraphrag_eval_hit(
+    prediction: str, answer: List[str], double_check: bool
+) -> int:
     """SubgraphRAG's Hit metric (see SubgraphRAG/reason/metrics/evaluate_results.py)."""
 
     pred_text = str(prediction or "")
@@ -809,7 +878,9 @@ def _subgraphrag_eval_hit(prediction: str, answer: List[str], double_check: bool
             for each_pred in all_pred:
                 if _subgraphrag_match(each_pred, a):
                     return 1
-                if double_check and _subgraphrag_match(a, each_pred.split("ans:")[-1].strip()):
+                if double_check and _subgraphrag_match(
+                    a, each_pred.split("ans:")[-1].strip()
+                ):
                     return 1
         else:
             if _subgraphrag_match(pred_text, a):

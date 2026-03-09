@@ -7,8 +7,12 @@ defaults:
 name: cwq-sub
 dataset_scope: sub
 dataset_family: cwq
-max_steps: 10
+max_steps: 4
 hf_dataset: rmanluo/RoG-cwq
+
+# Train LMDB (sub filter) has 21,103 samples with batch_size=16 (train_steps=1319).
+# Step-based validation interval tuned for cross-dataset parity.
+val_check_interval: 512
 
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json

@@ -3,5 +3,4 @@
 # This config exists to satisfy Hydra's `ckpt: default` group and to
 # centralize checkpoint paths for evaluation runs.
 
-dual_flow: null
-edge_retriever: null
+trajectory_gfn: null

@@ -38,8 +38,6 @@ emit_nonzero_positive_filter: false
 nonzero_positive_filter_filename: nonzero_positive_filter.json
 nonzero_positive_filter_splits: ["train"]
 
-emit_edge_retriever_labels: true
-edge_retriever_labels_dir: null
 
 parquet_dir: ${dataset.out_dir}
 output_dir: ${dataset.materialized_dir}

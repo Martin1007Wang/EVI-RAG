@@ -79,9 +79,12 @@ def build_optimizer_and_scheduler(
                     f"t_max={cycle_steps} estimated_steps={int(estimated_stepping_batches)}. "
                     "Set trainer.max_steps and scheduler t_max consistently."
                 )
+            scheduler_lr = scheduler_cfg.get("lr")
+            if scheduler_lr is None:
+                scheduler_lr = optimizer_cfg.get("lr", 1.0e-4)
             scheduler = OneCycleLR(
                 optimizer,
-                max_lr=float(scheduler_cfg.get("lr", optimizer_cfg.get("lr", 1.0e-4))),
+                max_lr=float(scheduler_lr),
                 total_steps=cycle_steps,
                 pct_start=float(scheduler_cfg.get("pct_start", 0.3)),
                 anneal_strategy=str(scheduler_cfg.get("anneal", "cos")),

@@ -7,7 +7,7 @@ import torch
 from torch.nn import Parameter
 from torch.optim.lr_scheduler import OneCycleLR
 
-from src.models.dual_flow_module import build_optimizer_and_scheduler
+from src.models.algorithms.base import build_optimizer_and_scheduler
 
 
 def _build_linear_named_parameters() -> tuple[

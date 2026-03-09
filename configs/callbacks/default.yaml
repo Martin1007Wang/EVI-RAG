@@ -2,8 +2,7 @@ model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch_{epoch:03d}"
-  # Always monitor scoped metrics to avoid mixing full/sub evaluation.
-  monitor: "val/${dataset.dataset_scope}/hit@beam"
+  monitor: "val/${dataset.dataset_scope}/elastic_hit"
   verbose: False
   save_last: True
   save_top_k: 1
@@ -16,9 +15,8 @@ model_checkpoint:
   save_on_train_epoch_end: null
 
 early_stopping:
-  _target_: lightning.pytorch.callbacks.EarlyStopping
-  # Always monitor scoped metrics to avoid mixing full/sub evaluation.
-  monitor: "val/${dataset.dataset_scope}/hit@beam"
+  _target_: src.callbacks.step_early_stopping.StepEarlyStopping
+  monitor: "val/${dataset.dataset_scope}/elastic_hit"
   min_delta: 0.0
   patience: 10
   verbose: False
@@ -27,7 +25,7 @@ early_stopping:
   check_finite: True
   stopping_threshold: null
   divergence_threshold: null
-  check_on_train_epoch_end: null
+  check_on_train_epoch_end: false
 
 model_summary:
   _target_: lightning.pytorch.callbacks.RichModelSummary
@@ -40,3 +38,4 @@ local_metrics_writer:
   _target_: src.callbacks.local_metrics_writer.LocalMetricsWriter
   output_dir: ${paths.output_dir}/metrics
   enabled: true
+  train_window_size: 256

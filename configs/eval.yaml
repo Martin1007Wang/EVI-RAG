@@ -6,7 +6,7 @@ defaults:
   - run: default
   - dataset: null
   - data: g_retrieval
-  - model: dual_flow
+  - model: trajectory_gfn
   - callbacks: default
   - logger: null
   - trainer: predict

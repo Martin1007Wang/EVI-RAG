@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Experiment: SubgraphRAG-aligned LLM reasoning over eval_dual_flow rollouts.
+# Experiment: SubgraphRAG-aligned LLM reasoning over elastic trajectory windows.
 
 defaults:
   - override /callbacks: default
@@ -17,12 +17,14 @@ llm:
   # Optional gold-label sidecar. Defaults to "<input_path stem>.labels.jsonl" when present.
   input_labels_path: null
   output_dir: null
-  input_subdir: eval_dual_flow
-  # Separate outputs by retrieval source (e.g., eval_dual_flow vs eval_edge_retriever).
+  input_subdir: eval_trajectory_gfn
+  # Separate outputs by retrieval source (e.g., eval_trajectory_gfn).
   output_subdir: eval_llm/${llm.input_subdir}
   output_filename_template: "{split}_k{k}_{provider}.jsonl"
   compute_metrics: true
   metrics_filename_template: "{split}_k{k}_{provider}.metrics.json"
+  metrics_log_dir: ${paths.output_dir}/metrics
+  metrics_jsonl_name: llm.jsonl
   topk_list: [1, 10, 25, 50]
   max_samples: null
   batch_size: 8
@@ -56,8 +58,7 @@ llm:
     # - trajectory_nodes: all nodes touched by trajectories (higher oracle coverage)
     candidate_source: trajectory_nodes
     max_prompt_chars: 32000
-    # Retrieval window size. For DualFlow this is the number of *paths* (trajectories);
-    # for edge retriever this is the number of *triples* (each trajectory is a single edge).
+    # Retrieval window size. This is the number of trajectory records surfaced to the LLM.
     max_trajectories: 100
     max_candidates: 100
   vllm:

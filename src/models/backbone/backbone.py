@@ -56,10 +56,6 @@ class EmbeddingBackbone(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.num_gnn_layers = config.gnn_layers
         self.use_adapter = config.use_adapter
-        if bool(config.use_film):
-            raise ValueError(
-                "FiLM conditioning has been removed; set backbone.use_film=false."
-            )
         if self.use_adapter:
             self.node_adapter = EmbeddingAdapter(
                 emb_dim=self.emb_dim,

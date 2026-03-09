@@ -28,22 +28,21 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
 
 from src.data.preprocess.config import resolve_entity_vocab_path
-from src.utils import (
-    RankedLogger,
+from src.utils.hydra_utils import (
+    apply_run_name,
     extras,
-    get_metric_value,
     instantiate_callbacks,
     instantiate_loggers,
-    log_hyperparameters,
-    task_wrapper,
-    apply_run_name,
 )
+from src.utils.logging_utils import RankedLogger, log_hyperparameters
+from src.utils.task_utils import get_metric_value, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
-_DUAL_FLOW_MODEL_TARGET = "src.models.dual_flow_module.DualFlowModule"
-_EDGE_RETRIEVER_TARGET = "src.models.edge_retriever_module.EdgeRetrieverModule"
-_SUPPORTED_MODEL_TARGETS = {_DUAL_FLOW_MODEL_TARGET, _EDGE_RETRIEVER_TARGET}
+_TRAJECTORY_GFN_MODEL_TARGET = (
+    "src.models.trajectory_gfn.module.TrajectoryGFlowNetModule"
+)
+_SUPPORTED_MODEL_TARGETS = {_TRAJECTORY_GFN_MODEL_TARGET}
 
 
 def _validate_required_args(cfg: DictConfig) -> None:
@@ -64,7 +63,7 @@ def _validate_required_args(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required training inputs: "
             f"{missing_str}. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_dual_flow dataset=webqsp-sub"
+            "Example: python src/train.py experiment=train_trajectory_gfn dataset=webqsp-sub"
         )
 
 
@@ -113,69 +112,6 @@ def _enforce_sub_training_scope(cfg: DictConfig) -> None:
         raise ValueError(
             "Training scope violation: supported training targets must use sub datasets only. "
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
-        )
-
-
-def _validate_cvt_requirements(cfg: DictConfig) -> None:
-    model_cfg = cfg.get("model") or {}
-    model_target = str(model_cfg.get("_target_", "") or "")
-    if model_target != _DUAL_FLOW_MODEL_TARGET:
-        return
-    dataset_cfg = cfg.get("dataset") or {}
-    data_cfg = cfg.get("data") or {}
-    data_dataset_cfg = None
-    if isinstance(data_cfg, DictConfig):
-        data_dataset_cfg = data_cfg.get("dataset_cfg")
-    elif isinstance(data_cfg, dict):
-        data_dataset_cfg = data_cfg.get("dataset_cfg")
-
-    dataset_entity_vocab = resolve_entity_vocab_path(dataset_cfg)
-    data_entity_vocab = resolve_entity_vocab_path(data_dataset_cfg)
-    if dataset_entity_vocab is not None and data_entity_vocab is not None:
-        if dataset_entity_vocab != data_entity_vocab:
-            raise ValueError(
-                "dataset and data.dataset_cfg must resolve the same entity_vocab.parquet "
-                f"for CVT initialization. dataset={dataset_entity_vocab} data.dataset_cfg={data_entity_vocab}"
-            )
-
-    for source_name, source_cfg in (
-        ("dataset", dataset_cfg),
-        ("data.dataset_cfg", data_dataset_cfg),
-    ):
-        entity_vocab_path = resolve_entity_vocab_path(source_cfg)
-        if entity_vocab_path is None:
-            raise ValueError(
-                "CVT initialization requires entity_vocab.parquet. "
-                f"Missing path in {source_name}; set `{source_name}.paths.entity_vocab` or `{source_name}.out_dir`."
-            )
-        if not entity_vocab_path.exists():
-            raise FileNotFoundError(
-                f"{source_name} entity_vocab.parquet not found: {entity_vocab_path}"
-            )
-
-
-def _enforce_min_rollouts(cfg: DictConfig) -> None:
-    model_cfg = cfg.get("model") or {}
-    model_target = str(model_cfg.get("_target_", "") or "")
-    if model_target != _DUAL_FLOW_MODEL_TARGET:
-        return
-    sampling_cfg = (
-        model_cfg.get("sampling_cfg")
-        if isinstance(model_cfg, (dict, DictConfig))
-        else None
-    )
-    if sampling_cfg is None:
-        raise ValueError("DualFlow training requires model.sampling_cfg.")
-    num_rollouts_raw = (
-        sampling_cfg.get("num_rollouts") if hasattr(sampling_cfg, "get") else None
-    )
-    if num_rollouts_raw is None:
-        raise ValueError("DualFlow training requires model.sampling_cfg.num_rollouts.")
-    num_rollouts = int(num_rollouts_raw)
-    if num_rollouts < 4:
-        raise ValueError(
-            "DualFlow SubTB requires multi-rollout training with num_rollouts >= 4. "
-            f"Got model.sampling_cfg.num_rollouts={num_rollouts}."
         )
 
 
@@ -280,8 +216,6 @@ def main(cfg: DictConfig) -> Optional[float]:
     _validate_required_args(cfg)
     _enforce_supported_training_models(cfg)
     _enforce_sub_training_scope(cfg)
-    _validate_cvt_requirements(cfg)
-    _enforce_min_rollouts(cfg)
     extras(cfg)
 
     # train the model

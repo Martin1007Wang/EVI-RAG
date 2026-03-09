@@ -13,12 +13,12 @@ except ModuleNotFoundError:  # pragma: no cover
     OmegaConf = None  # type: ignore[assignment]
 from torch.utils.data import DataLoader
 
-from .batch_adapter import DualFlowBatchAdapter
 from .components import SharedDataResources
 from .components.embeddings import attach_embeddings_to_batch
 from .g_retrieval_collate import build_retrieval_dataloader
 from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
 from src.data.io.lmdb_utils import _resolve_core_lmdb_paths
+from src.models.trajectory_gfn.batch import TrajectoryBatch
 
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"
@@ -87,7 +87,6 @@ class GRetrievalDataModule(LightningDataModule):
         persistent_workers: bool = False,
         precompute_edge_batch: bool = False,
         embeddings_device: str | None = None,
-        super_source_enabled: bool = False,
         splits: Optional[Dict[str, str]] = None,
         expand_multi_answer: bool = True,
         filter_zero_hop: bool = True,
@@ -110,7 +109,6 @@ class GRetrievalDataModule(LightningDataModule):
         )
         self._init_runtime_state(
             embeddings_device=embeddings_device,
-            super_source_enabled=super_source_enabled,
             splits=splits,
             expand_multi_answer=expand_multi_answer,
             filter_zero_hop=filter_zero_hop,
@@ -141,7 +139,6 @@ class GRetrievalDataModule(LightningDataModule):
         self,
         *,
         embeddings_device: str | None,
-        super_source_enabled: bool,
         splits: Optional[Dict[str, str]],
         expand_multi_answer: bool,
         filter_zero_hop: bool,
@@ -151,10 +148,6 @@ class GRetrievalDataModule(LightningDataModule):
         )
         self.expand_multi_answer = bool(expand_multi_answer)
         self.filter_zero_hop = bool(filter_zero_hop)
-        self.super_source_enabled = bool(super_source_enabled)
-        self.batch_adapter = DualFlowBatchAdapter(
-            super_source_enabled=self.super_source_enabled
-        )
         self.dataset_scope = _resolve_dataset_scope(self.dataset_cfg)
         self.splits = splits or {
             "train": "train",
@@ -285,13 +278,31 @@ class GRetrievalDataModule(LightningDataModule):
 
     def on_after_batch_transfer(self, batch: Any, dataloader_idx: int) -> Any:
         _ = dataloader_idx
+        if isinstance(batch, TrajectoryBatch):
+            return batch
         device = _infer_batch_device(batch)
-        prepared, metadata = self.batch_adapter.prepare_batch(
-            batch=batch, device=device
+        return TrajectoryBatch.from_pyg_batch(
+            batch,
+            device=device,
+            dataset_scope=self.dataset_scope,
         )
-        metadata = dict(metadata)
-        metadata["dataset_scope"] = self.dataset_scope
-        return {"inputs": prepared, "metadata": metadata}
+
+    def transfer_batch_to_device(
+        self,
+        batch: Any,
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> Any:
+        _ = dataloader_idx
+        if isinstance(batch, TrajectoryBatch):
+            return batch.to(device)
+        if hasattr(batch, "to"):
+            batch = batch.to(device)
+        return TrajectoryBatch.from_pyg_batch(
+            batch,
+            device=device,
+            dataset_scope=self.dataset_scope,
+        )
 
     def train_eval_dataloader(self) -> DataLoader:
         """

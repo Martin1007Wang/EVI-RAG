@@ -70,8 +70,6 @@ def mask_stop_logits_for_min_steps(
         out_degrees=out_degrees_flat,
     )
     ban_stop = active_flat & (out_degrees_flat > 0) & has_finite_edges
-    if not bool(ban_stop.any().item()):
-        return policy_out
     stop_logits_flat = policy_out["stop_logits"].view(-1)
     masked_stop = stop_logits_flat.masked_fill(
         ban_stop,
@@ -166,7 +164,7 @@ def segment_logsumexp_1d(
     considered_values = values[considered_mask].to(dtype=torch.float32)
     has_values.scatter_(0, considered_ids, True)
 
-    neg_inf = torch.tensor(float("-inf"), device=values.device, dtype=torch.float32)
+    neg_inf = float("-inf")
     max_per_segment = torch.full(
         (num_segments,), fill_value=neg_inf, device=values.device, dtype=torch.float32
     )

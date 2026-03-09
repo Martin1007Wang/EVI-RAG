@@ -5,7 +5,7 @@ from typing import Any
 import torch
 from src.models.configs.environment import EnvironmentConfig
 from .context import CsrAdjacency, GraphEnvContext
-from .state import DynamicAgentState
+from .state import DynamicAgentState, RECENT_NODE_WINDOW
 from .ops import has_super_source_layout, infer_super_source_absolute_indices
 
 
@@ -161,17 +161,14 @@ class GraphEnvironmentBuilder:
             num_nodes_total=context.num_nodes_total,
             device=device,
         ):
-            raise ValueError(
-                "initialize_state requires dual super-source layout; enable super_source_enabled "
-                "or use rollout_init utilities for non-super starts."
-            )
-        forward_super_abs, backward_super_abs = infer_super_source_absolute_indices(
+            raise ValueError("initialize_state requires dual super-source layout.")
+        question_super_abs, _ = infer_super_source_absolute_indices(
             node_ptr=context.node_ptr,
             node_global_ids=context.node_global_ids,
             num_nodes_total=context.num_nodes_total,
             device=device,
         )
-        start_nodes_absolute = forward_super_abs
+        start_nodes_absolute = question_super_abs
         # 扩展为多智能体视角 [B, num_agents]
         current_nodes = start_nodes_absolute.unsqueeze(1).expand(B, num_agents).clone()
         # 初始化隐藏状态为问题向量 [B, num_agents, d]
@@ -182,20 +179,13 @@ class GraphEnvironmentBuilder:
         path_token_types = torch.zeros_like(path_token_ids, dtype=torch.bool)
         path_lengths = torch.ones((B, num_agents), dtype=torch.long, device=device)
         # 初始化访问遮罩
-        visited_mask = torch.zeros(
-            (B * num_agents, context.num_nodes_total),
-            dtype=torch.bool,
+        visited_mask = torch.full(
+            (B * num_agents, RECENT_NODE_WINDOW),
+            fill_value=-1,
+            dtype=torch.long,
             device=device,
         )
-        row_ids = torch.arange(B * num_agents, device=device, dtype=torch.long)
-        visited_mask[row_ids, current_nodes.view(-1)] = True
-        super_cols = (
-            torch.stack((forward_super_abs, backward_super_abs), dim=1)
-            .unsqueeze(1)
-            .expand(B, num_agents, 2)
-            .reshape(-1, 2)
-        )
-        visited_mask[row_ids.unsqueeze(1), super_cols] = True
+        visited_mask[:, 0] = current_nodes.view(-1)
         return DynamicAgentState(
             step_t=0,
             current_nodes=current_nodes,

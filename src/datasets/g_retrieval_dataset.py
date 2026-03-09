@@ -127,6 +127,11 @@ class GRetrievalDataset(Dataset):
         question_emb = raw["question_emb"]
         question_ctx = raw.get("question_ctx")
         question_ctx_mask = raw.get("question_ctx_mask")
+        if question_ctx is None or question_ctx_mask is None:
+            raise ValueError(
+                "question_ctx/question_ctx_mask are required fields in LMDB samples "
+                f"(sample_id={sample_id})."
+            )
 
         answer_ids = raw["answer_entity_ids"]
 
@@ -146,10 +151,8 @@ class GRetrievalDataset(Dataset):
             "sample_id": sample_id,
             "a_entity_in_graph": a_entity_in_graph,
         }
-        if question_ctx is not None:
-            data_kwargs["question_ctx"] = question_ctx
-        if question_ctx_mask is not None:
-            data_kwargs["question_ctx_mask"] = question_ctx_mask
+        data_kwargs["question_ctx"] = question_ctx
+        data_kwargs["question_ctx_mask"] = question_ctx_mask
         heuristic_log_v = self.heuristic_log_v
         if heuristic_log_v is not None:
             node_ids = torch.as_tensor(node_global_ids, dtype=torch.long).view(-1)

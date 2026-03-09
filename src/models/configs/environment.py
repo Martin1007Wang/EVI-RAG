@@ -18,4 +18,3 @@ class EnvironmentConfig:
     """纯净的环境配置：只包含先验物理法则与停止奖励，不含任何神经网络参数"""
 
     stop: StopConfig = StopConfig()
-    super_source_enabled: bool = False

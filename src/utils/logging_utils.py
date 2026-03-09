@@ -5,7 +5,7 @@ import logging
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING, cast
 
 _DEFAULT_LOG_LEVEL = logging.INFO
 _DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
@@ -148,7 +148,10 @@ def _resolve_cfg_container(cfg: Any) -> Dict[str, Any]:
         raise ModuleNotFoundError(
             "OmegaConf is required for log_hyperparameters."
         ) from exc
-    return OmegaConf.to_container(cfg)
+    container = OmegaConf.to_container(cfg)
+    if not isinstance(container, dict):
+        raise TypeError("log_hyperparameters expects cfg to resolve to a dict")
+    return cast(Dict[str, Any], container)
 
 
 def _collect_cfg_sections(cfg: Dict[str, Any]) -> Dict[str, Any]:
