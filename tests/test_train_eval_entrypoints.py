@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from src.eval import _enforce_single_gpu_eval
+from src.eval import _configure_eval_split, _enforce_single_gpu_eval
 from src.train import _maybe_load_model_weights
 from src.utils.entrypoint_contracts import (
     validate_eval_entry_contract,
@@ -28,6 +28,28 @@ def test_enforce_single_gpu_eval_accepts_single_gpu_auto_strategy() -> None:
     )
 
     _enforce_single_gpu_eval(trainer_cfg)
+
+
+def test_configure_eval_split_updates_datamodule_when_supported() -> None:
+    seen: dict[str, str] = {}
+
+    class _DummyDataModule:
+        def set_eval_split(self, split: str) -> None:
+            seen["split"] = split
+
+    split = _configure_eval_split(
+        _DummyDataModule(),
+        OmegaConf.create({"split": "validation"}),
+    )
+
+    assert split == "validation"
+    assert seen == {"split": "validation"}
+
+
+def test_configure_eval_split_defaults_to_test_when_missing() -> None:
+    split = _configure_eval_split(object(), OmegaConf.create({}))
+
+    assert split == "test"
 
 
 def test_maybe_load_model_weights_uses_state_dict_payload(monkeypatch) -> None:

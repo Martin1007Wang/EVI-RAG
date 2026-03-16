@@ -23,6 +23,8 @@ persistent_workers: true
 precompute_edge_batch: true
 # Node/question embedding tensors are prepared on CPU and moved with the batch.
 embeddings_device: cpu
+# Eval runners may replay train/validation/test by mutating `run.split`.
+eval_split: ${oc.select:run.split,test}
 # 多答案由模型/奖励处理；DataLoader 不展开。
 expand_multi_answer: false
 # Zero-hop (q in A) 保留；需配合 stop_min_steps=1（真实步数语义）。

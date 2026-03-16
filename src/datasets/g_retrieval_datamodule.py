@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from lightning import LightningDataModule
 import torch
@@ -52,9 +52,19 @@ def _normalize_embeddings_device(embeddings_device: str | None) -> str | None:
     return normalized
 
 
-def _resolve_dataset_cfg(
-    dataset_cfg: DictConfig | Dict[str, Any],
-) -> Dict[str, Any]:
+def _normalize_split_key(split: str | None) -> str:
+    normalized = str(split or "test").strip().lower()
+    if normalized == "val":
+        return "validation"
+    if normalized in {"train", "validation", "test"}:
+        return normalized
+    raise ValueError(
+        "eval_split must be one of {'train', 'validation', 'test'} "
+        "(legacy alias: 'val')."
+    )
+
+
+def _resolve_dataset_cfg(dataset_cfg: Any) -> Dict[str, Any]:
     if OmegaConf is not None and isinstance(dataset_cfg, DictConfig):
         cfg = OmegaConf.to_container(dataset_cfg, resolve=True)  # type: ignore[arg-type]
     else:
@@ -77,7 +87,7 @@ class GRetrievalDataModule(LightningDataModule):
     def __init__(
         self,
         *,
-        dataset_cfg: DictConfig | Dict[str, Any],
+        dataset_cfg: Any,
         batch_size: int,
         num_workers: int,
         pin_memory: bool = True,
@@ -87,6 +97,7 @@ class GRetrievalDataModule(LightningDataModule):
         persistent_workers: bool = False,
         precompute_edge_batch: bool = False,
         embeddings_device: str | None = None,
+        eval_split: str = "test",
         splits: Optional[Dict[str, str]] = None,
         expand_multi_answer: bool = True,
         filter_zero_hop: bool = True,
@@ -109,6 +120,7 @@ class GRetrievalDataModule(LightningDataModule):
         )
         self._init_runtime_state(
             embeddings_device=embeddings_device,
+            eval_split=eval_split,
             splits=splits,
             expand_multi_answer=expand_multi_answer,
             filter_zero_hop=filter_zero_hop,
@@ -139,6 +151,7 @@ class GRetrievalDataModule(LightningDataModule):
         self,
         *,
         embeddings_device: str | None,
+        eval_split: str,
         splits: Optional[Dict[str, str]],
         expand_multi_answer: bool,
         filter_zero_hop: bool,
@@ -146,6 +159,7 @@ class GRetrievalDataModule(LightningDataModule):
         self.embeddings_device = (
             None if embeddings_device is None else str(embeddings_device)
         )
+        self.eval_split = _normalize_split_key(eval_split)
         self.expand_multi_answer = bool(expand_multi_answer)
         self.filter_zero_hop = bool(filter_zero_hop)
         self.dataset_scope = _resolve_dataset_scope(self.dataset_cfg)
@@ -157,12 +171,16 @@ class GRetrievalDataModule(LightningDataModule):
         self.train_dataset: Optional[GRetrievalDataset] = None
         self.val_dataset: Optional[GRetrievalDataset] = None
         self.test_dataset: Optional[GRetrievalDataset] = None
+        self.eval_dataset: Optional[GRetrievalDataset] = None
         self.batch_size_per_device = self.batch_size
         self._shared_resources: Optional[SharedDataResources] = None
 
     @property
     def shared_resources(self) -> Optional[SharedDataResources]:
         return self._shared_resources
+
+    def set_eval_split(self, split: str) -> None:
+        self.eval_split = _normalize_split_key(split)
 
     def prepare_data(self) -> None:
         """
@@ -208,41 +226,14 @@ class GRetrievalDataModule(LightningDataModule):
         # 1. Batch size is defined per device; keep as-is for DDP.
         self.batch_size_per_device = self.batch_size
 
-        # 2. Initialize Shared Resources (One-time load)
-        if self._shared_resources is None:
-            paths = self.dataset_cfg["paths"]
-            self._shared_resources = SharedDataResources(
-                entity_vocab_path=Path(paths["entity_vocab"]),
-                relation_vocab_path=Path(paths["relation_vocab"]),
-                embeddings_dir=Path(paths["embeddings"]),
-                embeddings_device=self.embeddings_device,
-                heuristic_log_v_path=(
-                    Path(paths["heuristic_log_v"]).expanduser().resolve()
-                    if isinstance(paths, dict) and paths.get("heuristic_log_v")
-                    else None
-                ),
-            )
-
-        # 3. Instantiate Datasets
-        # We pass the WHOLE config + the specific split name
-        # The factory `create_g_retrieval_dataset` should handle the rest
+        # Eval runners can replay multiple splits by mutating `run.split` between
+        # fresh datamodule instantiations. Cache canonical datasets by split key,
+        # then expose the requested eval split through `eval_dataset`.
         if stage in (None, "fit"):
-            self.train_dataset = create_g_retrieval_dataset(
-                cfg=self.dataset_cfg,
-                split_name=self.splits["train"],
-                resources=self._shared_resources,
-            )
-            self.val_dataset = create_g_retrieval_dataset(
-                cfg=self.dataset_cfg,
-                split_name=self.splits["validation"],
-                resources=self._shared_resources,
-            )
+            self.train_dataset = self._ensure_split_dataset("train")
+            self.val_dataset = self._ensure_split_dataset("validation")
         if stage in (None, "test", "predict"):
-            self.test_dataset = create_g_retrieval_dataset(
-                cfg=self.dataset_cfg,
-                split_name=self.splits["test"],
-                resources=self._shared_resources,
-            )
+            self.eval_dataset = self._ensure_split_dataset(self.eval_split)
 
     def train_dataloader(self):
         return self._build_loader(
@@ -255,11 +246,18 @@ class GRetrievalDataModule(LightningDataModule):
         return self._build_loader(self.val_dataset, shuffle=False, drop_last=False)
 
     def test_dataloader(self):
-        return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
+        return self._build_loader(
+            self._resolve_eval_dataset(),
+            shuffle=False,
+            drop_last=False,
+        )
 
     def predict_dataloader(self) -> DataLoader:
-        # Predict reuses the test split.
-        return self._build_loader(self.test_dataset, shuffle=False, drop_last=False)
+        return self._build_loader(
+            self._resolve_eval_dataset(),
+            shuffle=False,
+            drop_last=False,
+        )
 
     def on_before_batch_transfer(self, batch: Any, dataloader_idx: int) -> Any:
         _ = dataloader_idx
@@ -311,24 +309,87 @@ class GRetrievalDataModule(LightningDataModule):
         return self._build_loader(self.train_dataset, shuffle=False, drop_last=False)
 
     def get_split_dataloader(self, split: str) -> DataLoader:
-        if split == "train":
-            return self.train_eval_dataloader()
-        if split in ("val", "validation"):
-            return self.val_dataloader()
-        if split == "test":
-            return self.test_dataloader()
-        raise ValueError(f"Unsupported split: {split}")
+        split_key = _normalize_split_key(split)
+        dataset = self._ensure_split_dataset(split_key)
+        return self._build_loader(dataset, shuffle=False, drop_last=False)
 
     def teardown(self, stage: Optional[str] = None) -> None:
-        for dataset in (self.train_dataset, self.val_dataset, self.test_dataset):
-            if dataset is not None:
-                dataset.close()
+        del stage
+        seen_dataset_ids: set[int] = set()
+        for dataset in (
+            self.train_dataset,
+            self.val_dataset,
+            self.test_dataset,
+            self.eval_dataset,
+        ):
+            if dataset is None:
+                continue
+            dataset_id = id(dataset)
+            if dataset_id in seen_dataset_ids:
+                continue
+            dataset.close()
+            seen_dataset_ids.add(dataset_id)
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+        self.eval_dataset = None
         if self._shared_resources is not None:
             self._shared_resources.clear()
         self._shared_resources = None
+
+    def _ensure_shared_resources(self) -> SharedDataResources:
+        if self._shared_resources is None:
+            paths = self.dataset_cfg["paths"]
+            self._shared_resources = SharedDataResources(
+                entity_vocab_path=Path(paths["entity_vocab"]),
+                relation_vocab_path=Path(paths["relation_vocab"]),
+                embeddings_dir=Path(paths["embeddings"]),
+                embeddings_device=self.embeddings_device,
+                heuristic_log_v_path=(
+                    Path(paths["heuristic_log_v"]).expanduser().resolve()
+                    if isinstance(paths, dict) and paths.get("heuristic_log_v")
+                    else None
+                ),
+            )
+        return self._shared_resources
+
+    @staticmethod
+    def _dataset_attr_name(split_key: str) -> str:
+        return {
+            "train": "train_dataset",
+            "validation": "val_dataset",
+            "test": "test_dataset",
+        }[_normalize_split_key(split_key)]
+
+    def _resolve_split_name(self, split_key: str) -> str:
+        canonical_split = _normalize_split_key(split_key)
+        split_name = self.splits.get(canonical_split)
+        if split_name in (None, ""):
+            raise ValueError(
+                "splits must define mappings for train/validation/test. "
+                f"Missing split={canonical_split!r}."
+            )
+        return str(split_name)
+
+    def _ensure_split_dataset(self, split_key: str) -> GRetrievalDataset:
+        canonical_split = _normalize_split_key(split_key)
+        dataset_attr = self._dataset_attr_name(canonical_split)
+        dataset = getattr(self, dataset_attr)
+        if dataset is not None:
+            return dataset
+        dataset = create_g_retrieval_dataset(
+            cfg=self.dataset_cfg,
+            split_name=self._resolve_split_name(canonical_split),
+            resources=self._ensure_shared_resources(),
+        )
+        setattr(self, dataset_attr, dataset)
+        return dataset
+
+    def _resolve_eval_dataset(self) -> GRetrievalDataset:
+        if self.eval_dataset is not None:
+            return self.eval_dataset
+        self.eval_dataset = self._ensure_split_dataset(self.eval_split)
+        return self.eval_dataset
 
     def _build_loader(
         self,
@@ -371,5 +432,5 @@ def _infer_batch_device(batch: Any) -> torch.device:
     for attr in ("edge_index", "node_embeddings", "edge_attr", "question_emb"):
         value = getattr(batch, attr, None)
         if torch.is_tensor(value):
-            return value.device
+            return cast(torch.Tensor, value).device
     return torch.device("cpu")

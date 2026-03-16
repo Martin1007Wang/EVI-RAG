@@ -87,6 +87,14 @@ def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
         )
 
 
+def _configure_eval_split(datamodule: Any, run_cfg: DictConfig) -> str:
+    split = str(run_cfg.get("split") or "test").strip() or "test"
+    setter = getattr(datamodule, "set_eval_split", None)
+    if callable(setter):
+        setter(split)
+    return split
+
+
 @task_wrapper
 def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed") is not None:
@@ -109,9 +117,10 @@ def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     object_dict = objects.as_dict()
 
     execution_mode = resolve_execution_mode(run_cfg)
+    split = _configure_eval_split(datamodule, run_cfg)
     ckpt_path = cfg.get("ckpt_path")
     if execution_mode == "test":
-        log.info("Running trainer.test()...")
+        log.info("Running trainer.test() on split=%s...", split)
         trainer.test(
             model=model,
             datamodule=datamodule,
@@ -119,7 +128,7 @@ def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             verbose=False,
         )
     else:
-        log.info("Running trainer.predict()...")
+        log.info("Running trainer.predict() on split=%s...", split)
         trainer.predict(
             model=model,
             datamodule=datamodule,
