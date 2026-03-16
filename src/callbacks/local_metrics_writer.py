@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import json
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+
 from lightning.pytorch.callbacks import Callback
 
-from src.rollout.io import to_serializable
-
-_DEFAULT_STAGE_FILES = {
-    "train": "train.jsonl",
-    "val": "val.jsonl",
-    "test": "test.jsonl",
-    "predict": "predict.jsonl",
-}
+from src.utils.metrics_io import to_serializable
+from src.utils.output_sinks import StageMetricsSettings, append_stage_metrics
 
 _WEIGHT_SUFFIX_PRIORITY = (
     "num_valid_graphs",
@@ -88,7 +81,12 @@ class LocalMetricsWriter(Callback):
         self._write_stage(trainer, stage="test")
 
     def on_predict_end(self, trainer, pl_module) -> None:
-        _ = pl_module
+        if not self.enabled:
+            return
+        payload = self._collect_model_predict_metrics(pl_module)
+        if payload:
+            self._write_stage_payload(trainer, stage="predict", payload=payload)
+            return
         self._write_stage(trainer, stage="predict", include_all_metrics=True)
 
     def _should_log_step(self, trainer, *, stage: str) -> bool:
@@ -141,17 +139,14 @@ class LocalMetricsWriter(Callback):
         if not payload:
             return
         output_dir = self._ensure_output_dir(trainer)
-        file_name = _DEFAULT_STAGE_FILES.get(stage, f"{stage}.jsonl")
-        path = output_dir / file_name
-        record = {
-            "stage": stage,
-            "epoch": None,
-            "step": int(getattr(trainer, "global_step", 0)),
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "metrics": payload,
-        }
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=True) + "\n")
+        append_stage_metrics(
+            metrics=payload,
+            settings=StageMetricsSettings(
+                output_dir=output_dir,
+                stage=stage,
+                step=int(getattr(trainer, "global_step", 0)),
+            ),
+        )
 
     def _accumulate_stage(self, trainer, *, stage: str) -> None:
         metrics = self._collect_metrics(trainer)
@@ -261,6 +256,19 @@ class LocalMetricsWriter(Callback):
                 if key not in merged:
                     merged[key] = value
         return merged
+
+    @staticmethod
+    def _collect_model_predict_metrics(pl_module) -> Dict[str, Any]:
+        getter = getattr(pl_module, "get_predict_metrics", None)
+        if not callable(getter):
+            return {}
+        metrics = getter()
+        if not isinstance(metrics, dict):
+            return {}
+        return {
+            str(name): LocalMetricsWriter._to_serializable(value)
+            for name, value in metrics.items()
+        }
 
     @staticmethod
     def _build_weight_map(payload: Dict[str, Any]) -> Dict[str, float]:

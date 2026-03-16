@@ -8,6 +8,7 @@ from src.llm.metrics import (
     _subgraphrag_get_pred_lines,
     _subgraphrag_no_answer,
     compute_llm_metrics,
+    write_llm_metrics_artifacts,
 )
 
 
@@ -185,3 +186,56 @@ def test_metrics_fail_fast_on_duplicate_label_sample_id(tmp_path) -> None:
             answer_key="answer",
             answer_separator=" | ",
         )
+
+
+def test_metrics_artifacts_keep_json_and_jsonl_together(tmp_path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    output_dir = tmp_path / "metrics"
+    metrics_log_dir = tmp_path / "logs"
+    input_record = {
+        "sample_id": "s1",
+        "question_text": "Where was X born?",
+        "answer_texts": ["Paris"],
+        "a_entity_in_graph": True,
+        "trajectories": [],
+    }
+    output_record = {"sample_id": "s1", "answer": "Paris"}
+    input_path.write_text(json.dumps(input_record) + "\n", encoding="utf-8")
+    output_path.write_text(json.dumps(output_record) + "\n", encoding="utf-8")
+
+    metrics_path, metrics = write_llm_metrics_artifacts(
+        input_path=input_path,
+        output_path=output_path,
+        output_dir=output_dir,
+        split="test",
+        provider="unit",
+        top_k=1,
+        answer_key="answer",
+        answer_separator=" | ",
+        metrics_log_dir=metrics_log_dir,
+        metrics_jsonl_name="llm_eval.jsonl",
+        dataset_name="webqsp",
+        dataset_scope="full",
+    )
+
+    assert metrics_path.exists()
+    assert metrics["llm/subgraphrag/full/hit@1"] == pytest.approx(100.0)
+
+    log_path = metrics_log_dir / "llm_eval.jsonl"
+    records = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["stage"] == "llm"
+    assert records[0]["metadata"] == {
+        "dataset_name": "webqsp",
+        "dataset_scope": "full",
+        "split": "test",
+        "provider": "unit",
+        "top_k": 1,
+        "input_path": str(input_path),
+        "input_labels_path": "",
+        "output_path": str(output_path),
+    }
+    assert records[0]["metrics"]["llm/subgraphrag/full/hit@1"] == pytest.approx(100.0)

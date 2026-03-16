@@ -1,10 +1,9 @@
 import json
 
-from src.llm.eval_llm import (
-    _LLMRequest,
+from src.llm.eval_llm import _LLMRequest, _resolve_prompt_spec, _resolve_schema_spec
+from src.llm.response_parsing import (
+    _extract_structured_model_fields,
     _parse_and_validate_response,
-    _resolve_prompt_spec,
-    _resolve_schema_spec,
     _retry_schema_batch,
 )
 
@@ -51,11 +50,23 @@ def test_schema_retry_batch():
     schema_spec = _resolve_schema_spec(llm_cfg, prompt_spec)
 
     requests = [
-        _LLMRequest(sample_id="s1", question="q1", trajectories=[], messages=[{"role": "user", "content": "x"}]),
-        _LLMRequest(sample_id="s2", question="q2", trajectories=[], messages=[{"role": "user", "content": "y"}]),
+        _LLMRequest(
+            sample_id="s1",
+            question="q1",
+            trajectories=[],
+            messages=[{"role": "user", "content": "x"}],
+        ),
+        _LLMRequest(
+            sample_id="s2",
+            question="q2",
+            trajectories=[],
+            messages=[{"role": "user", "content": "y"}],
+        ),
     ]
     responses = ["not json", "still bad"]
-    parsed = [_parse_and_validate_response(r, prompt_spec, schema_spec) for r in responses]
+    parsed = [
+        _parse_and_validate_response(r, prompt_spec, schema_spec) for r in responses
+    ]
 
     backend = DummyBackend(
         [
@@ -78,3 +89,24 @@ def test_schema_retry_batch():
     assert parsed[1].schema_valid is True
     assert parsed[0].answer == "A"
     assert parsed[1].answer == "B"
+
+
+def test_extract_structured_model_fields_coerces_evidence_ids() -> None:
+    fields = _extract_structured_model_fields(
+        json.dumps(
+            {
+                "answer": "Paris",
+                "evidence_trajectory_ids": ["1", "x", 3],
+                "abstain_reason": "",
+                "best_guess": "Paris",
+                "justification": "supported",
+            }
+        )
+    )
+
+    assert fields == {
+        "evidence_trajectory_ids": [1, 3],
+        "abstain_reason": "",
+        "best_guess": "Paris",
+        "justification": "supported",
+    }

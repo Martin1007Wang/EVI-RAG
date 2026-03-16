@@ -1,0 +1,16 @@
+# Generic train run for local iteration.
+# Contract: use with `python src/train.py ...` and set `/dataset` explicitly.
+_target_: src.runs.answer_reachability.AnswerReachabilityTrainRunner
+name: train
+task_name: "train"
+tags: ["dev"]
+contract:
+  entrypoint: train
+  required_groups: [dataset]
+  recommended_experiment: train_answer_reachability
+train: true
+test: ${oc.select:dataset.run_test_after_fit,false}
+test_ckpt_path: null
+allow_test_without_checkpoint: false
+ckpt_path: null
+init_ckpt_path: null

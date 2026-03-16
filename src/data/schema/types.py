@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from src.data.schema.constants import _NON_TEXT_EMBEDDING_ID
 
@@ -137,7 +137,12 @@ class RelationLookup:
 class EntityVocab:
     """Assign structural IDs and embedding IDs; separate text vs non-text."""
 
-    def __init__(self, kb: str, text_cfg: TextEntityConfig, cvt_cfg: Optional[CvtEntityConfig] = None) -> None:
+    def __init__(
+        self,
+        kb: str,
+        text_cfg: TextEntityConfig,
+        cvt_cfg: Optional[CvtEntityConfig] = None,
+    ) -> None:
         self.kb = kb
         self._text_cfg = text_cfg
         self._cvt_cfg = cvt_cfg
@@ -165,7 +170,8 @@ class EntityVocab:
         self._text_entities = sorted(self._text_entities)
         text_embedding_offset = 1
         text_embedding_ids: Dict[str, int] = {
-            ent: text_embedding_offset + idx for idx, ent in enumerate(self._text_entities)
+            ent: text_embedding_offset + idx
+            for idx, ent in enumerate(self._text_entities)
         }
         for ent in sorted(self._entity_to_struct, key=self._entity_to_struct.get):
             struct_id = self._entity_to_struct[ent]
@@ -212,7 +218,11 @@ class EntityVocab:
         return self._entity_to_struct[ent]
 
     def embedding_id(self, ent: str) -> int:
-        return _NON_TEXT_EMBEDDING_ID if not self._text_cfg.is_text(ent) else self._embedding_id_for_text(ent)
+        return (
+            _NON_TEXT_EMBEDDING_ID
+            if not self._text_cfg.is_text(ent)
+            else self._embedding_id_for_text(ent)
+        )
 
     def _embedding_id_for_text(self, ent: str) -> int:
         if not self._finalized:

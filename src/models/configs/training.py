@@ -18,7 +18,7 @@ class SchedulerConfig:
 
     type: str = "cosine"  # cosine, cosine_warm_restarts, onecycle
     interval: str = "step"  # step, epoch
-    t_max: int = 10
+    t_max: int | None = None
     t_mult: int = 1
     eta_min: float = 0.0
     pct_start: float = 0.3

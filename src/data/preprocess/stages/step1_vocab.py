@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from src.data.preprocess.cleaning.relation_rules import (
-    RELATION_ACTION_DROP,
     RELATION_ACTION_KEEP,
     RELATION_ACTION_TYPE,
     RelationCleaningRules,
@@ -11,7 +10,7 @@ from src.data.preprocess.cleaning.relation_rules import (
 )
 from src.data.schema.constants import _PATH_MODE_UNDIRECTED
 from src.data.schema.types import Sample, SampleFilterOutcome, SplitFilter
-from src.data.utils.connectivity import _validate_path_mode, has_connectivity
+from src.data.utils.connectivity import has_connectivity
 
 
 def _resolve_split_filter(

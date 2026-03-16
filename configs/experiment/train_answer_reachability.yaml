@@ -1,0 +1,64 @@
+# @package _global_
+#
+# Canonical training bundle for answer reachability.
+# Usage:
+#   python src/train.py experiment=train_answer_reachability dataset=webqsp-sub
+#
+# Contract:
+# - overrides `/run`, `/trainer`, `/model`, `/callbacks`, `/logger`
+# - still requires the caller to choose `/dataset`
+
+defaults:
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /run: train_answer_reachability
+  - override /trainer: gpu
+  - override /model: gflownet
+  - _self_
+
+optimized_metric: "val/sub/answer/gold_mass"
+
+data:
+  batch_size: 32
+
+trainer:
+  max_time: "00:08:00:00"
+  max_steps: 56000
+  check_val_every_n_epoch: null
+  val_check_interval: ${dataset.val_check_interval}
+  log_every_n_steps: 1
+  precision: bf16-mixed
+  gradient_clip_val: 0.5
+  limit_val_batches: null
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/sub/answer/gold_mass"
+    mode: max
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: "val/sub/answer/gold_mass"
+    mode: max
+    patience: 10
+    min_delta: 0.002
+
+model:
+  heuristic_cfg:
+    kind: topology
+    beta: 1.0
+  inference_cfg:
+    # Training-time validation only needs answer-ranking metrics; full window search is reserved for final eval.
+    strict_search: true
+    eval_profile: rank_only
+    max_expansions: 100000
+    max_frontier_size: 32768
+  scheduler_cfg:
+    type: cosine
+    interval: step
+    t_max: ${trainer.max_steps}
+    eta_min: 1.0e-6
+  optimizer_cfg:
+    lr: 5.0e-5
+    weight_decay: 1.0e-4

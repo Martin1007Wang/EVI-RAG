@@ -5,14 +5,18 @@ import json
 import pytest
 
 from src.llm.eval_llm import (
-    _enforce_candidate_answers,
-    _extract_destination_candidates,
     _iter_requests,
     _resolve_input_labels_path,
     _resolve_prompt_spec,
     _validate_topk_against_prompt_limits,
-    _trajectory_text,
     run_llm_eval,
+)
+from src.llm.prompting import (
+    _enforce_candidate_answers,
+    _extract_destination_candidates,
+    _extract_subgraphrag_triplet_lines_from_trajectories,
+    _select_trajectories,
+    _trajectory_text,
 )
 
 
@@ -34,7 +38,22 @@ def test_trajectory_text_uses_stop_node_when_only_super_source_edges() -> None:
         ],
         "terminal_entity_id": 11,
     }
-    assert _trajectory_text(trajectory) == "(no_edge) --STOP--> 11"
+    assert _trajectory_text(trajectory) == "(start_only) 11"
+
+
+def test_select_trajectories_breaks_probability_ties_with_path_rank() -> None:
+    trajectories = [
+        {"trajectory_text": "A --r--> B", "prob": 0.9, "path_rank": 2},
+        {"trajectory_text": "A --r--> C", "prob": 0.9, "path_rank": 1},
+        {"trajectory_text": "A --r--> D", "prob": 0.1, "path_rank": 1},
+    ]
+    selected = _select_trajectories(
+        trajectories,
+        top_k=2,
+        max_trajectories=0,
+        include_score=False,
+    )
+    assert selected == ["A --r--> C", "A --r--> B"]
 
 
 def test_enforce_candidate_answers_drops_non_candidate_predictions() -> None:
@@ -114,11 +133,11 @@ def test_extract_destination_candidates_can_include_intermediate_nodes() -> None
     trajectories = [
         "A --r1--> Gold Answer ; Gold Answer --r2--> Distractor",
     ]
-    stop_only = _extract_destination_candidates(
+    endpoints_only = _extract_destination_candidates(
         trajectories,
         max_candidates=10,
         question="Who is the correct answer?",
-        candidate_source="stop_only",
+        candidate_source="endpoints_only",
     )
     trajectory_nodes = _extract_destination_candidates(
         trajectories,
@@ -126,9 +145,29 @@ def test_extract_destination_candidates_can_include_intermediate_nodes() -> None
         question="Who is the correct answer?",
         candidate_source="trajectory_nodes",
     )
-    assert stop_only == ["Distractor"]
+    assert endpoints_only == ["Distractor"]
     assert "Gold Answer" in trajectory_nodes
     assert "Distractor" in trajectory_nodes
+
+
+def test_extract_destination_candidates_supports_start_only_trajectory_nodes() -> None:
+    candidates = _extract_destination_candidates(
+        ["(start_only) Paris"],
+        max_candidates=10,
+        question="Where was A born?",
+        candidate_source="trajectory_nodes",
+    )
+    assert candidates == ["Paris"]
+
+
+def test_extract_subgraphrag_triplet_lines_filter_virtual_edges() -> None:
+    lines = _extract_subgraphrag_triplet_lines_from_trajectories(
+        [
+            "[prob=0.9] super_source --from_question--> A ; "
+            "A --SELF--> A ; A --born_in--> Paris ; Paris --STOP--> Paris"
+        ]
+    )
+    assert lines == ["(A,born_in,Paris)"]
 
 
 def test_iter_requests_supports_question_field_alias(tmp_path) -> None:
@@ -137,7 +176,7 @@ def test_iter_requests_supports_question_field_alias(tmp_path) -> None:
         "sample_id": "s1",
         "question": "Where was X born?",
         "trajectories": [
-            {"rollout_rank": 1, "prob": 1.0, "trajectory_text": "A --r--> B"}
+            {"path_rank": 1, "prob": 1.0, "trajectory_text": "A --r--> B"}
         ],
     }
     input_path.write_text(json.dumps(record) + "\n", encoding="utf-8")

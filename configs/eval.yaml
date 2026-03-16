@@ -1,4 +1,9 @@
-# configs/eval.yaml
+# Entrypoint contract for `python src/eval.py ...`
+# - `/run` must be an eval-oriented run config (`run.name` cannot be `train_*`).
+# - Dataset requirements are run-specific:
+#   - `run=eval_answer_reachability` requires `/dataset` and a checkpoint.
+#   - `run=eval_llm` does not require `/dataset`, but it does require `/llm`.
+# - Prefer `experiment=...` so `/run`, `/trainer`, and any task-specific groups move together.
 
 defaults:
   - _self_
@@ -6,7 +11,7 @@ defaults:
   - run: default
   - dataset: null
   - data: g_retrieval
-  - model: trajectory_gfn
+  - model: gflownet
   - callbacks: default
   - logger: null
   - trainer: predict
@@ -18,7 +23,7 @@ defaults:
 task_name: ${run.task_name}
 tags: ${run.tags}
 
-# seed for reproducibility; keep configurable via CLI override
+# Seed for reproducibility; keep configurable via CLI override.
 seed: 42
 
 # Run-driven checkpoint (set explicitly in experiment configs).

@@ -60,7 +60,6 @@ from src.data.preprocess.stages.step1_vocab import (
 )
 from src.data.utils.connectivity import _validate_path_mode, reachable_targets_by_index
 from src.data.utils.stats import _init_split_counters, _safe_div, _sample_labels
-from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
 
 

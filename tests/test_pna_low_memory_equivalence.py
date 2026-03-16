@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.models.backbone import RelationalGNNLayer
+from src.models.components.gnn import RelationalGNNLayer
 
 
 def test_pna_aggregate_matches_dense_reference() -> None:

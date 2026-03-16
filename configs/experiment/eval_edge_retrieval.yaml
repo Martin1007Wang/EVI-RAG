@@ -1,0 +1,37 @@
+# @package _global_
+#
+# Evaluate an answer-reachability checkpoint with edge-retrieval metrics.
+# Usage:
+#   python src/eval.py experiment=eval_edge_retrieval ckpt.answer_reachability=/path/to/model.ckpt
+#
+# Contract:
+# - inherits the answer-reachability eval runner and dataset family expansion
+# - only changes the inference view/profile and artifact naming
+
+defaults:
+  - override /run: eval_answer_reachability
+  - override /dataset: webqsp
+  - override /data: g_retrieval
+  - override /model: gflownet
+  - override /callbacks: default
+  - override /logger: none
+  - override /trainer: predict
+  - _self_
+
+model:
+  metric_runtime_factory:
+    _target_: src.metrics.answer_reachability.runtime.AnswerReachabilityMetricRuntimeFactory
+  heuristic_cfg:
+    kind: topology
+    beta: 1.0
+  inference_cfg:
+    _target_: src.models.configs.gflownet.AnswerReachabilityInferenceConfig
+    eval_view: edge_retrieval
+    eval_profile: rank_only
+    edge_top_ks: [1, 5, 10, 25, 50]
+    edge_emit_top_k: 25
+
+run:
+  artifact_subdir: eval_edge_retrieval
+  artifact_name: eval_edge_retrieval
+  tags: [eval, edge_retrieval]

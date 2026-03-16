@@ -1,6 +1,13 @@
 # @package _global_
 #
-# Experiment: SubgraphRAG-aligned LLM reasoning over elastic trajectory windows.
+# Experiment: SubgraphRAG-aligned LLM reasoning over support windows.
+# Usage:
+#   python src/eval.py experiment=eval_llm llm.input_path=/path/to/test.jsonl
+#
+# Contract:
+# - overrides `/run`, `/trainer`, `/logger`, `/callbacks`
+# - does not require `/dataset`
+# - does require `/llm`, typically supplied entirely by this experiment bundle
 
 defaults:
   - override /callbacks: default
@@ -17,15 +24,15 @@ llm:
   # Optional gold-label sidecar. Defaults to "<input_path stem>.labels.jsonl" when present.
   input_labels_path: null
   output_dir: null
-  input_subdir: eval_trajectory_gfn
-  # Separate outputs by retrieval source (e.g., eval_trajectory_gfn).
+  input_subdir: eval_answer_reachability
+  # Separate outputs by retrieval source (e.g., eval_answer_reachability).
   output_subdir: eval_llm/${llm.input_subdir}
   output_filename_template: "{split}_k{k}_{provider}.jsonl"
   compute_metrics: true
   metrics_filename_template: "{split}_k{k}_{provider}.metrics.json"
   metrics_log_dir: ${paths.output_dir}/metrics
   metrics_jsonl_name: llm.jsonl
-  topk_list: [1, 10, 25, 50]
+  topk_list: [1, 10, 25, 50, 100]
   max_samples: null
   batch_size: 8
   resume: true
@@ -54,7 +61,7 @@ llm:
     allow_empty: false
     constrain_to_candidates: true
     # Candidate construction strategy:
-    # - stop_only: only trajectory endpoint nodes (legacy behavior)
+    # - endpoints_only: only trajectory endpoint nodes
     # - trajectory_nodes: all nodes touched by trajectories (higher oracle coverage)
     candidate_source: trajectory_nodes
     max_prompt_chars: 32000

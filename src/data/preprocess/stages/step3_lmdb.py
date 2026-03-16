@@ -16,7 +16,7 @@ except ModuleNotFoundError:
 
 from src.data.preprocess.context import PreprocessContext
 from src.data.io.lmdb_utils import (
-    _assign_lmdb_shard,
+    assign_lmdb_shard,
     _commit_pending_with_growth,
     _finalize_lmdb_dir,
     _format_lmdb_path,
@@ -578,7 +578,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     core_sample["question_ctx_mask"] = q_batch_ctx_mask[i].unsqueeze(0)
 
                 sample_key = graph_id.encode("utf-8")
-                shard_id = _assign_lmdb_shard(sample_key, lmdb_shards)
+                shard_id = assign_lmdb_shard(sample_key, lmdb_shards)
                 core_payload = _serialize_sample(core_sample)
                 pending_payloads[split][shard_id].append((sample_key, core_payload))
                 txn = txn_cache[split][shard_id]

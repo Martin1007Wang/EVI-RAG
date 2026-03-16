@@ -1,174 +1,147 @@
-# System Protocol: The DualFlow Architect
+# EVI-RAG Agent Guide
 
-**Role:** 深度学习架构师 (Deep Learning Architect)
-**Core Competency:** Mathematical Completeness & Engineering Rigor
-**Mantra:** "Code is the executable projection of mathematical truth."
+This file is for coding agents working in `/mnt/wangjingxiong/EVI-RAG`.
+It is intentionally repo-specific and should be preferred over generic Python advice.
+If repo behavior and this file disagree, follow the source files and update this document.
 
----
+## Scope and rule files
 
-## 0. Anchor Semantics (QA vs Flow)
+- Repository type: Python ML/research codebase built around Hydra, Lightning, PyTorch, and pytest.
+- Main runtime entrypoints live in `src/train.py`, `src/eval.py`, and `src/datasets/build_edge_retriever_labels.py`.
+- Config composition is centralized in `configs/`.
+- Tests live in `tests/` and `tests/answer_reachability/`.
+- No existing top-level `AGENTS.md`, `.cursorrules`, `.cursor/rules/`, or `.github/copilot-instructions.md` were found when this file was created.
+- There is no Ruff, mypy, or pyright configuration in the repo today.
 
-*   **Data SSOT:** `q_local_indices` / `a_local_indices`（及其 ptr）仅表示**问题/答案实体集合**，是数据层唯一真相，严禁被覆盖或互换。
-*   **Flow-Derived (Code-Exact):**
-    * `start_nodes_fwd`: 每图单一起点，由 `q_local_indices` 经 **StartSelector** 采样得到（运行时存在，不落盘）。
-    * `start_nodes_bwd`: 每图单一后向起点，由 `a_local_indices` 均匀采样得到（运行时存在，不落盘）。
-    * `node_is_target` / `node_is_start`: 分别由 `a_local_indices` / `q_local_indices` 构造的集合掩码，用于 hit 判断。
-*   **Direction Mapping:** `forward`: start = q, target = a；`backward`: start = a, target = q。
-*   **No Swapping:** 禁止通过交换 `q/a` 实现反向流；必须通过显式的 flow 映射/override。
-*   **Mask Semantics (Code-Exact):**
-    * `dummy_mask` 仅由 `answer_entity_ids_ptr` 推导（data-level answer 是否为空）。
-    * `node_is_target` 必须由 `a_local_indices`（flow target in-subgraph）计算；`node_is_start` 必须由 `q_local_indices` 计算。
+## Environment and setup
 
----
+- Preferred local Python from `environment.yaml` is Python 3.10.
+- Default conda environment for this repo is `pog`; when running Python commands, assume `conda activate pog` unless the user says otherwise.
+- CI runs tests on Python 3.8, 3.9, and 3.10, so avoid using syntax newer than Python 3.8 without checking compatibility.
+- `pyupgrade --py38-plus` is part of pre-commit, so Python 3.8+ idioms are acceptable.
+- CI bootstrap: `python -m pip install --upgrade pip` then `pip install -r requirements.txt`.
+- Conda bootstrap: `conda env create -f environment.yaml` then `conda activate myenv`.
+- Editable install is optional: `pip install -e .` adds `train_command` and `eval_command` from `setup.py`.
+- The repo contains a local `rootutils` stub for tests; do not replace it casually.
+- `.env` exists at repo root; treat it as sensitive and do not commit or rewrite it unless explicitly asked.
 
-## 0.1 Environment Setup (开发环境)
+## Build, lint, format, and test commands
 
-*   **Conda Env:** 使用本仓库时请先执行 `conda activate pog`，以保证 `torch`/`lightning` 等依赖被正确解析，避免工具/LSP 报错。
+- There is no dedicated package build command or PEP 517 build backend configured.
+- For most work, treat install + tests + Hydra entrypoints as the relevant execution surface.
+- Discover Make targets with `make help`; cleanup commands are `make clean` and `make clean-logs`.
+- Run repo-wide formatting/lint with `make format` (`pre-commit run -a`).
+- Run hooks on changed files with `pre-commit run --files path/to/file.py`.
+- Run a single hook with `pre-commit run black --files path/to/file.py`, `pre-commit run isort --files ...`, or `pre-commit run flake8 --files ...`.
+- Fast tests: `make test` or `pytest -k "not slow"`.
+- Full tests: `make test-full` or `pytest -v`.
+- Coverage: `pytest --cov src`.
+- Single file: `pytest tests/test_question_context_preprocessing.py`.
+- Single test: `pytest tests/test_question_context_preprocessing.py::test_write_questions_with_token_context_roundtrip`.
+- One trajectory test: `pytest tests/answer_reachability/test_search_exactness.py::test_search_exact_top_order`.
+- Keyword subset: `pytest tests/answer_reachability -k normalization`.
+- Slow-only runs: `pytest -m slow`.
+- Pytest defaults already enable `--strict-markers`, `--doctest-modules`, `--durations=0`, and `log_cli=True`.
+- Because doctests are enabled, broken examples in docstrings can fail test runs.
 
----
+## CI expectations
 
-## Ⅰ. The Axiomatic System (公理系统)
+- PR code-quality checks run `pre-commit` on changed files only.
+- Main-branch code-quality checks run `pre-commit` across the repo.
+- Test CI runs on Ubuntu, macOS, and Windows.
+- Test CI covers Python 3.8, 3.9, and 3.10.
+- Coverage CI uses `pytest --cov src`.
 
-我们不编写“功能”，我们实现“定义”。所有代码必须遵循以下三大公理：
+## Hydra and runtime commands
 
-### Axiom 1: Orthogonality & Parsimony (正交性与简约性)
-*   **Single Source of Truth (SSOT):** 任何信息在系统中只能存在一份定义。如果 $B = f(A)$，则只存储 $A$，且 $f$ 必须是确定性的向量化操作。
-*   **Minimal State:** 状态空间 $\mathcal{S}$ 必须是最小完备集。冗余字段（如预计算的 path list）不仅是浪费，更是数据不一致的温床。**拒绝存储，改为计算。**
-*   **Config as Hyperplane:** `configs/*.yaml` 定义了超参数的几何平面。代码逻辑 $f(x; \theta)$ 应当对所有合法的配置保持数学形式的不变性（Invariance）。
+- When training or evaluation needs GPU, first attach the existing tmux session with `tmux attach -t train` and run the command inside that session.
+- Do not launch GPU training/eval jobs from a fresh shell when the `train` tmux session is available; use that session as the default execution context.
+- Train via Hydra: `python src/train.py experiment=train_answer_reachability dataset=webqsp-sub`.
+- Evaluate an answer-reachability checkpoint: `python src/eval.py experiment=eval_answer_reachability ckpt.answer_reachability=/path/to/model.ckpt`.
+- Build edge retriever labels: `python src/datasets/build_edge_retriever_labels.py dataset=webqsp-sub`.
+- `make train` runs `python src/train.py` with the default config.
+- Training expects an explicit `dataset=<name>` for supported training models.
+- Training currently uses the single mainline `src.models.gflownet_module.GFlowNetModule`, and only on `-sub` datasets.
+- Evaluation defaults to single-GPU predict mode via `configs/trainer/predict.yaml`.
+- `src/eval.py` rejects CPU eval and multi-GPU eval unless you intentionally override behavior.
+- CPU eval escape hatch for debugging only: `DUAL_FLOW_ALLOW_CPU_EVAL=1 python src/eval.py ...`.
+- Hydra config mutation should use `open_dict`, not raw attribute writes on frozen/structured configs.
+- `configs/extras/default.yaml` has `enforce_tags: True` and `print_config: True`; for non-interactive scripted runs, pass tags or disable the prompt explicitly.
 
-### Axiom 2: Tensor-First Semantics (张量优先语义)
-*   **Vectorization is Mandatory:** 禁止在数据流路径中使用 Python `for` 循环。所有操作必须映射为 Tensor 的广播（Broadcasting）、索引（Indexing）或矩阵运算。
-*   **Sequential Rollout Exception:** 仅限 `torch.no_grad()` 的采样/环境交互/解码与 Monte Carlo 统计可使用顺序循环；所有可微损失/评估必须向量化或使用 RNN 批处理。
-*   **Strict Typing:** 类型提示不仅是文档，是契约。使用 `jaxtyping` 风格的思维：`Float[Tensor, "batch dim"]`。
+## Formatting and import rules
 
-### Axiom 3: Radical Candor (绝对坦诚)
-*   **Fail Fast:** 遇到数学上无解或定义模糊的输入（如不可达的 Target），立即抛出异常或在预处理阶段过滤，绝不通过 Padding 或 Hack 掩盖错误。
-*   **The "One Right Way":** 同样的操作不应有两种实现方式。Retrieve 阶段和 DualFlow 阶段如果涉及相同的子图操作，必须调用同一个算子。
+- Formatting is enforced by Black with a 99 character line length.
+- Import sorting is enforced by isort with `--profile black`.
+- Keep imports grouped as standard library, third-party, then local `src` imports.
+- Preserve blank lines between import groups and let isort settle exact ordering.
+- `flake8` ignores `E402`, and that is intentional for entrypoints.
+- In entry scripts, call `rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)` before importing `src.*` modules.
+- Do not "fix" entrypoint import order by moving local imports above `rootutils.setup_root(...)`.
+- `flake8` also ignores `E203`, `E501`, `F401`, and `F841`; still prefer clean imports and no dead code.
+- Markdown, YAML, shell, notebooks, spelling, and security checks also run through pre-commit.
 
----
+## Typing and data modeling
 
-## Ⅱ. Mathematical Notation (符号定义)
+- Newer modules usually start with `from __future__ import annotations`; prefer that in new files.
+- Prefer built-in generics in new code, for example `list[str]`, `dict[str, Any]`, and `Path | None`.
+- Match the surrounding file if it still uses `typing.List`, `typing.Dict`, or `Optional`.
+- Use `TYPE_CHECKING` blocks for type-only imports when a runtime import would be heavy or optional.
+- Optional third-party imports are often wrapped in `_require_*` helpers or guarded `try/except ModuleNotFoundError` blocks.
+- Frozen dataclasses are common for configs and immutable runtime records.
+- Validate dataclass inputs in `__post_init__` with explicit constraints.
+- Tensor-heavy structures often encode shape contracts in type names and runtime validation.
+- When mutating Hydra configs, convert or resolve carefully; `OmegaConf.to_container(...)` is common at module boundaries.
+- Avoid silently passing through invalid configs; this repo prefers explicit validation.
 
-在阅读 Schema 前，必须对齐以下数学符号：
+## Naming conventions and structure
 
-*   $\mathcal{G} = (\mathcal{V}, \mathcal{E})$: 全局知识图谱 (The Universe, `g_raw`)。
-*   $G_{sub} \subset \mathcal{G}$: 采样得到的子图 (Retrieval Context, `g_retrieval`)。
-*   $G_{env} \subseteq G_{sub}$: 代理交互的封闭环境（运行时从 `g_retrieval` 派生，不落盘）。
-*   $s \in \mathcal{V}$: 起点 (Start Node)。
-*   $a \in \mathcal{V}$: 答案/终点 (Answer Node)。
-*   $\tau$: 轨迹/路径 (Trajectory)。
-*   $\mathcal{P}_{min}(s, a)$: 从 $s$ 到 $a$ 的所有**最短**路径集合。
-*   $\text{CSR}$: Compressed Sparse Row 格式，此处特指利用 `counts` 和 `cumsum` 实现的变长数据存储。
+- Use `snake_case` for functions, variables, and test names.
+- Use `PascalCase` for classes.
+- Use `UPPER_SNAKE_CASE` for module constants.
+- Prefix private helpers with `_`; this repo has many `_resolve_*`, `_normalize_*`, `_validate_*`, and `_require_*` helpers.
+- Config dataclasses usually end in `Config`.
+- Runtime orchestration functions are thin and often named `train`, `evaluate`, or `main`; keep business logic in helpers, utility modules, or model/data modules.
+- Use `__all__` where a module intentionally exposes a curated public surface.
+- Metric names commonly use slash-separated namespaces like `train/loss`, `val/sub/...`, and `llm/subgraphrag/full/hit@1`.
 
----
+## Error handling, logging, and side effects
 
-## Ⅲ. Data Specification (数据立法)
+- Fail fast with specific exception types.
+- Use `ValueError` for invalid config values, unsupported modes, or malformed user inputs.
+- Use `TypeError` for contract violations on object shape or type.
+- Use `RuntimeError` for invalid runtime state, missing trainable params, or impossible execution conditions.
+- Use `FileNotFoundError` for required data/config artifacts that are missing.
+- Error messages should be actionable, usually include the bad value, and often include a fix hint or example Hydra command.
+- Avoid swallowing exceptions.
+- Broad exception handling is mostly limited to top-level wrappers that log and re-raise.
+- Prefer repo helpers like `get_logger`, `RankedLogger`, `log_event`, and `log_metric` from `src.utils.logging_utils`.
+- Prefer structured log events with stable field names over ad hoc `print(...)` calls.
 
-### 1. `g_retrieval` Schema (DualFlow Subgraph SSOT)
+## Testing conventions
 
-**Definition:** $G_{sub}$ 是以 $s$ 为中心的 PPR 采样结果。它是 DualFlow 训练的唯一输入。
-**Note:** 当前训练管线是 label-free；任何监督字段（如 `labels`, `pair_*`）出现即视为数据错误。
-**Storage Note:** `g_retrieval` 仅物化 core LMDB（`<split>.lmdb`）。不读取/不维护 aux LMDB。
+- Tests are written with plain pytest functions, not unittest classes.
+- Small deterministic builders in `tests/answer_reachability/conftest.py` are the preferred style for tensor fixtures.
+- Direct tests of underscore-prefixed helpers are acceptable when those helpers are part of a stable internal contract.
+- Use `pytest.raises(..., match=...)` for failure cases; exact error text matters in this repo.
+- Use `pytest.approx(...)` for floating-point invariants.
+- Keep test data minimal and explicit; many tests build tiny manual graphs or JSON payloads inline.
+- When adding a helper with important validation logic, add a focused unit test near similar files instead of only integration coverage.
+- Prefer targeted test runs while iterating, then run `make test` or `pytest` before finishing.
 
-#### A. Topology (流形结构)
-*   `sample_id`: `str`. Unique Identifier.
-*   `num_nodes`: `int` ($N$).
-*   `edge_index`: `Long[2, E]`. Local indices $u \to v$.
-*   `edge_attr`: `Long[E]`. Global Relation IDs.
-*   `node_global_ids`: `Long[N]`. Map local $i \to$ Global ID.
-*   `node_embedding_ids`: `Long[N]`. Embedding lookup table index.
-*   `node_type_counts`: `Long[N]`. Per-node type counts (CSR header).
-*   `node_type_ids`: `Long[sum(node_type_counts)]`. Flattened type ids.
+## Repo-specific content style
 
-#### B. Semantics & Condition (语义与条件)
-*   `question_emb`: `Float[1, D]`. Dense query representation.
-*   `q_local_indices`: `Long[K_q]`. $s$ 在 $G_{sub}$ 中的索引。
-*   `a_local_indices`: `Long[K_a]`. $a$ 在 $G_{sub}$ 中的索引。
-*   `answer_entity_ids`: `Long[K_a]`. Global Answer IDs (用于 Metrics).
-*   `question`: `Optional[str]`. 仅用于日志/可视化；可缺省。
+- Preserve mixed English and Chinese comments/messages when editing nearby code; that mix already exists in configs and model modules.
+- Keep comments brief and high-signal.
+- Favor architecture comments that explain why a constraint exists, not line-by-line narration.
+- Keep data/config files as the source of truth for paths and defaults; Python should validate, adapt, and orchestrate.
+- When working near Hydra configs, preserve the `defaults:` ordering because override order matters.
+- When editing docs or Markdown, expect `mdformat` to normalize numbering and tables.
 
-#### C. Forbidden Legacy Fields (禁止出现)
-*   `labels`, `pair_*`, `answer_subgraph`, `topic_pe`, `node_topic_dist` 等历史字段必须在预处理阶段剔除。
+## Practical agent checklist
 
----
-
-### 2. Runtime Contract (Current Pipeline)
-*   **Training:** 仅提供 DualFlow 训练（`configs/experiment/train_dual_flow.yaml`，`override /data: g_retrieval`）；训练阶段仅消费 `g_retrieval`（LMDB）。
-*   **Evaluation/Reasoning:** 评估/推理产物仅使用 `eval_dual_flow` 缓存；不生成/不读取 `g_agent`。
-*   **Edge Dropout (Code-Exact):** 当前实现未启用任何训练时 edge dropout。
-
----
-
-## Ⅳ. Engineering Guidelines (工程守则)
-
-### 1. File Topology (代码拓扑)
-*   `src/data`: **ETL Only.** 负责将 Raw Data 转换为符合 Schema 的 `Batch`。
-*   `src/models`: **Stateless Functions.** $f_\theta(\text{Batch}) \to \text{Flows/Logits}$.
-*   `configs`: **Hyperparameter Space.** 所有的 $K$, $\alpha$, $T$ 必须在此定义。
-
-### 2. Implementation Rules (实现法则)
-*   **The 50-Line Rule:** 任何函数超过 50 行必须重构。复杂性必须被模块化（Modularity）。
-*   **No Magic Numbers:** 代码中禁止出现裸露的数字（如 `0.5`, `10`）。必须定义为常量或配置项。
-*   **No Numeric Alias Constants:** 严禁声明 `_ZERO = 0`、`_ONE = 1`、`_TWO = 2`、`_EPSILON_DEFAULT = 1e-4` 这类“数字别名常量”；`0/1/-1` 等基础标量直接写，超参数统一进配置。
-*   **Explicit Batching:** 严禁依赖 PyG 的隐式 `batch` 属性。在 DataLoader 中显式处理 `follow_batch`，并在 Model 中显式使用 `batch_idx`。
-*   **Logging Protocol:** 必须使用 `src/utils/logging_utils.py` 统一记录。直接调用 `wandb.log` 或 `self.log` 是被禁止的，因为这会破坏分布式环境下的 Batch Size 统计一致性。
-    *   **Step SSOT (Local JSONL):** `metrics/*.jsonl` 以 `global_step` 为唯一时间轴；`train` 指标写入为**之前** `callbacks.local_metrics_writer.train_window_size` 步的滑动平均（不写当前 step 的瞬时值），`val/test` 指标在验证/测试结束时聚合写入；不使用 epoch 语义。
-*   **Lightning Optimization Contract:** 默认使用 PyTorch Lightning 自动优化（`automatic_optimization=True`）；禁止在模型中手写 `manual_backward/optimizer.step/scheduler.step` 训练环，除非有明确实验设计文档与基准证明。
-
-### 3. Dataset Visibility Protocol (数据可见性协议)
-*   **Sub Dataset Definition:** `sub` 指经过过滤的样本集合：
-    * 起始实体或答案实体不在图中 → 必须剔除。
-    * 起始实体与答案实体无任何联通路径 → 必须剔除。
-*   **Training Scope:** DualFlow 的训练 **只能** 使用 `sub` 数据集。
-*   **Evaluation Scope:** DualFlow 的评估 **必须同时** 在 `full` 与 `sub` 两套数据集上进行，并分别报告指标（建议 `full`/`sub` 作为显式前缀）。
-*   **LLM Evaluation:** LLM 评估 **默认只在 `full`** 数据集上进行；如需对比，可额外运行 `sub`。
-*   **Runtime Contract:** 任何评估流程必须显式提供两套数据源（`full` 与 `sub`），不得隐式复用或覆盖。
-
-### 4. Forbidden Patterns (反模式 - 此处即为红线)
-*   ❌ **Hardcoding Special Cases:** 不要写 `if dataset == 'fq': ...`。应当将差异抽象为配置参数。
-*   ❌ **Pre-computing Embeddings in Forward:** 预处理逻辑属于 Dataset，不属于 Model Forward。
-*   ❌ **Python Loops for Graph Logic:** 使用 `scatter`, `gather`, `index_select` 代替循环。
-
----
-
-## Ⅴ. Policy Semantics (行动语义)
-
-### 1. Action Definition (动作定义)
-*   **Edge-Logit Policy (Code-Exact):** 当前实现使用显式势能差：
-    \[
-    \\text{logit}(u\\to v)= -\\log d_{in}(v) + \\alpha\\, (\\log F(v) - \\log F(u))
-    \]
-    其中 $\\log F(\\cdot)$ 由 `z_predictor` 给出，$\\alpha=\\exp(\\text{logit_scale})$ 为可学习尺度。
-*   **Hard Rollout, Differentiable Eval:** 训练中的 rollout 采用 Gumbel-Max 硬采样（`torch.no_grad()`）；梯度通过 DB 损失里的
-    $\\log P_F, \\log P_B, \\log Z$ 反传（代码路径：`src/models/dual_flow_module.py`）。
-
-### 2. Termination Rule (终止规则)
-*   **Explicit STOP Action (Code-Exact):** 轨迹以显式 STOP 动作终止；命中答案节点时强制 STOP；达到最大步数亦强制 STOP。
-*   **Min-Step Constraint (Code-Exact):** `runtime_cfg.stop_min_steps` 指定最小步数，`t < min_steps` 时禁止 STOP（训练/评估一致）。
-*   **Step Semantics (Code-Exact):** `max_steps`/`stop_min_steps` 计数仅包含真实边数，不包含 START/STOP super dummy edges。
-*   **Eval at Max Steps (Code-Exact):** 达到最大步数的轨迹也必须参与评估；若 STOP 计为一步，则 `t = max_steps - 1` 时必须允许 STOP，禁止因未显式 STOP 而丢弃 max-steps 终止轨迹。
-*   **Reward Semantics:** STOP 前一步所在实体命中答案则 $R=1$（$\log R=0$），否则 $R=\epsilon$（$\log R \approx -C$）。
-
-### 3. Backward Policy Contract (反向策略契约)
-*   **Symmetric Backward Policy (Code-Exact):** 反向流与正向流对称，取消静态 $P_B$ 的 backward prior。
-*   **Teacher Edge Dropout:** 当前实现未启用。
-
-### 4. Multi-Start Handling (多起点处理)
-*   **Set Semantics:** `q_local_indices` 表示完整起点集合，严禁覆盖或互换。
-*   **Single-Start Trajectory (Code-Exact):** 每条轨迹仅选择一个起点；当前实现使用可学习 StartSelector 在 `q_local_indices`
-    上采样（末层零初始化使得初始分布等价于均匀）。
-*   **Fail Fast:** 若未解析出有效起点，立即抛错。
-
-### 5. Replay Invariance (回放不变性)
-*   **Note (Current Code):** 当前实现未引入 RL replay buffer；若未来加入回放，必须以 per-graph local edge id 存储并通过
-    `edge_ptr` 映射，避免跨图混淆。
-
-### 6. Multi-Endpoint Reality (多终点现实)
-*   **Multi-Start & Multi-Target:** 数据可能同时包含多个起点与多个终点；在反向流中亦然。
-*   **No Pairwise Connectivity Guarantee:** 起点与终点两两配对不保证连通；可达性必须由数据过滤或奖励函数显式处理，模型不得隐式假设全连通。
-
----
-
-## Ⅵ. Known Limitation (已知局限)
-
-*   **Subgraph-bounded supervision:** 当前训练/评估均在 `g_retrieval` 子图上进行（动作空间由采样与掩码裁剪），最短路监督与奖励都定义在该裁剪子图内，而非全图最短路。**原因**：$G_{raw}$ 极其庞大，$G_{sub}$ 也很大（平均约 10k 条边），直接在该规模上训练/推理不可行；因此必须裁剪动作空间。若需要第一性“全图”语义，必须改变构图策略或在全图上计算监督。
+- Read the relevant Hydra config before changing training or evaluation behavior.
+- Check `Makefile`, `pyproject.toml`, and `.pre-commit-config.yaml` before inventing commands.
+- Prefer unit tests under `tests/` over expensive end-to-end training runs.
+- Be careful with data paths in `configs/paths/default.yaml`; they point to absolute `/mnt/data/...` locations.
+- Do not assume CPU eval is valid just because Lightning supports it; this repo intentionally blocks most CPU eval flows.
+- If you add a new workflow rule file later, update this `AGENTS.md` so future agents see it immediately.

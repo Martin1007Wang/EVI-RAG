@@ -2,7 +2,7 @@ model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch_{epoch:03d}"
-  monitor: "val/${dataset.dataset_scope}/elastic_hit"
+  monitor: "val/${dataset.dataset_scope}/answer/gold_mass"
   verbose: False
   save_last: True
   save_top_k: 1
@@ -16,7 +16,7 @@ model_checkpoint:
 
 early_stopping:
   _target_: src.callbacks.step_early_stopping.StepEarlyStopping
-  monitor: "val/${dataset.dataset_scope}/elastic_hit"
+  monitor: "val/${dataset.dataset_scope}/answer/gold_mass"
   min_delta: 0.0
   patience: 10
   verbose: False
@@ -39,3 +39,20 @@ local_metrics_writer:
   output_dir: ${paths.output_dir}/metrics
   enabled: true
   train_window_size: 256
+
+prediction_artifacts_writer:
+  _target_: src.callbacks.prediction_artifacts_writer.PredictionArtifactsWriter
+  enabled: ${oc.select:run.write_artifacts,false}
+  execution_mode: ${oc.select:run.execution_mode,${oc.select:run.eval_mode,predict}}
+  output_root: ${oc.select:dataset.artifact_dir,null}
+  artifact_subdir: ${oc.select:run.artifact_subdir,eval_answer_reachability}
+  artifact_name: ${oc.select:run.artifact_name,eval_answer_reachability}
+  schema_version: ${oc.select:run.artifact_schema_version,1}
+  split: ${oc.select:run.split,test}
+  dataset_scope: ${oc.select:dataset.dataset_scope,null}
+  dataset_variant: ${oc.select:run.dataset_variant,null}
+  entity_vocab_path: ${oc.select:dataset.paths.entity_vocab,null}
+  relation_vocab_path: ${oc.select:dataset.paths.relation_vocab,null}
+  questions_path: ${oc.select:run.questions_path,null}
+  dataset_out_dir: ${oc.select:dataset.out_dir,null}
+  overwrite: ${oc.select:run.artifact_overwrite,true}

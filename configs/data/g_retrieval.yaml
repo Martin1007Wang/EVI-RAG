@@ -2,6 +2,14 @@
 
 _target_: src.datasets.g_retrieval_datamodule.GRetrievalDataModule
 
+# Data contract metadata. This block is stripped before hydra instantiation.
+contract:
+  requires_dataset_cfg: true
+  intended_entrypoints: [train, eval]
+  expand_multi_answer: false
+  retains_zero_hop: true
+  embeddings_device_default: cpu
+
 dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
@@ -13,6 +21,7 @@ train_shuffle: true
 prefetch_factor: 4
 persistent_workers: true
 precompute_edge_batch: true
+# Node/question embedding tensors are prepared on CPU and moved with the batch.
 embeddings_device: cpu
 # 多答案由模型/奖励处理；DataLoader 不展开。
 expand_multi_answer: false

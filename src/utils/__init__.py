@@ -12,6 +12,8 @@ from .hydra_utils import (
     resolve_run_name,
 )
 from .logging_utils import RankedLogger, log_hyperparameters, log_metric
+from .metric_utils import normalize_k_values, summarize_uncertainty
+from .metrics_io import to_serializable, write_metrics_json, write_metrics_jsonl
 from .task_utils import get_metric_value, task_wrapper
 
 __all__ = [
@@ -25,6 +27,11 @@ __all__ = [
     "RankedLogger",
     "log_hyperparameters",
     "log_metric",
+    "normalize_k_values",
+    "summarize_uncertainty",
+    "to_serializable",
+    "write_metrics_json",
+    "write_metrics_jsonl",
     "get_metric_value",
     "task_wrapper",
 ]

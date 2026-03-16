@@ -18,9 +18,9 @@ from .components.shared_resources import (
     _load_heuristic_log_v,
 )
 from src.data.io.lmdb_utils import (
-    _apply_filter_intersection,
-    _assign_lmdb_shard,
-    _resolve_core_lmdb_paths,
+    apply_filter_intersection,
+    assign_lmdb_shard,
+    resolve_core_lmdb_paths,
 )
 from src.data.schema.constants import (
     _FILTER_MISSING_ANSWER_FILENAME,
@@ -67,7 +67,7 @@ class GRetrievalDataset(Dataset):
         self.split = str(split_name)
         self._entity_vocab_path = Path(entity_vocab_path)
         self._embeddings_dir = Path(embeddings_dir)
-        self._split_paths = _resolve_core_lmdb_paths(self._embeddings_dir, self.split)
+        self._split_paths = resolve_core_lmdb_paths(self._embeddings_dir, self.split)
         self._num_shards = len(self._split_paths)
         self._shared_resources = resources
         self._global_embeddings: Optional[GlobalEmbeddingStore] = None
@@ -194,7 +194,7 @@ class GRetrievalDataset(Dataset):
         return self._sample_stores[shard_id]
 
     def _select_shard_id(self, sample_id: str) -> int:
-        return _assign_lmdb_shard(sample_id, self._num_shards)
+        return assign_lmdb_shard(sample_id, self._num_shards)
 
     def _group_sample_ids_by_shard(
         self, sample_ids: Sequence[str]
@@ -242,7 +242,7 @@ class GRetrievalDataset(Dataset):
         if sample_filter_path:
             filter_paths = self._coerce_filter_paths(sample_filter_path)
             before = len(self.sample_ids)
-            self.sample_ids = _apply_filter_intersection(self.sample_ids, filter_paths)
+            self.sample_ids = apply_filter_intersection(self.sample_ids, filter_paths)
             log_event(
                 logger,
                 "sample_filter_applied",

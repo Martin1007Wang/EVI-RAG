@@ -1,11 +1,11 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple, cast
 
-import hydra
 import lightning as L
+import hydra
 import rootutils
+import torch
 
-from lightning import Callback, LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.loggers import Logger
+from lightning import LightningModule
 from omegaconf import DictConfig
 
 
@@ -27,96 +27,60 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
-from src.data.preprocess.config import resolve_entity_vocab_path
-from src.utils.hydra_utils import (
-    apply_run_name,
-    extras,
-    instantiate_callbacks,
-    instantiate_loggers,
+from src.utils.entrypoint_utils import (
+    instantiate_lightning_task_objects,
+    instantiate_task_runner,
+    require_run_target_config,
 )
-from src.utils.logging_utils import RankedLogger, log_hyperparameters
+from src.utils.entrypoint_contracts import validate_train_entry_contract
+from src.utils.hydra_utils import apply_run_name, extras
+from src.utils.logging_utils import RankedLogger
 from src.utils.task_utils import get_metric_value, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
-_TRAJECTORY_GFN_MODEL_TARGET = (
-    "src.models.trajectory_gfn.module.TrajectoryGFlowNetModule"
-)
-_SUPPORTED_MODEL_TARGETS = {_TRAJECTORY_GFN_MODEL_TARGET}
+
+TrainModelFn = Callable[[DictConfig], Tuple[Dict[str, Any], Dict[str, Any]]]
 
 
-def _validate_required_args(cfg: DictConfig) -> None:
-    model_cfg = cfg.get("model")
-    data_cfg = cfg.get("data")
-    model_target = model_cfg.get("_target_") if model_cfg else ""
-    data_target = data_cfg.get("_target_") if data_cfg else ""
-    requires_dataset = model_target in _SUPPORTED_MODEL_TARGETS
-    if not requires_dataset:
+class TrainRunnerProtocol(Protocol):
+    def validate(self, cfg: DictConfig) -> None: ...
+
+    def run(
+        self,
+        *,
+        cfg: DictConfig,
+        train_model: TrainModelFn,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]: ...
+
+
+def _maybe_load_model_weights(model: LightningModule, cfg: DictConfig) -> None:
+    init_ckpt_path = cfg.get("init_ckpt_path")
+    if init_ckpt_path in (None, ""):
         return
-
-    missing = []
-    if cfg.get("dataset") is None:
-        missing.append("dataset")
-
+    checkpoint = torch.load(str(init_ckpt_path), map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            "init_ckpt_path must point to a checkpoint containing a `state_dict`."
+        )
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = sorted(incompatible.missing_keys)
+    unexpected = sorted(incompatible.unexpected_keys)
+    log.info(
+        "Loaded initial model weights from checkpoint: %s (missing=%d, unexpected=%d)",
+        init_ckpt_path,
+        len(missing),
+        len(unexpected),
+    )
     if missing:
-        missing_str = ", ".join(missing)
-        raise ValueError(
-            "Missing required training inputs: "
-            f"{missing_str}. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_trajectory_gfn dataset=webqsp-sub"
-        )
-
-
-def _enforce_supported_training_models(cfg: DictConfig) -> None:
-    model_cfg = cfg.get("model") or {}
-    model_target = str(model_cfg.get("_target_", "") or "")
-    if model_target not in _SUPPORTED_MODEL_TARGETS:
-        supported = ", ".join(sorted(_SUPPORTED_MODEL_TARGETS))
-        raise ValueError(
-            "Unsupported model target for training. "
-            f"Got model._target_={model_target!r}. "
-            f"Supported targets: {supported}."
-        )
-
-
-def _normalize_dataset_scope(dataset_cfg: DictConfig | Dict[str, Any]) -> str:
-    scope_raw = None
-    if isinstance(dataset_cfg, DictConfig):
-        scope_raw = dataset_cfg.get("dataset_scope")
-    elif isinstance(dataset_cfg, dict):
-        scope_raw = dataset_cfg.get("dataset_scope")
-    scope = str(scope_raw or "").strip().lower()
-    if scope in {"full", "sub"}:
-        return scope
-    name_raw = ""
-    if isinstance(dataset_cfg, DictConfig):
-        name_raw = str(dataset_cfg.get("name", "") or "")
-    elif isinstance(dataset_cfg, dict):
-        name_raw = str(dataset_cfg.get("name", "") or "")
-    if name_raw.endswith("-sub"):
-        return "sub"
-    return "full"
-
-
-def _enforce_sub_training_scope(cfg: DictConfig) -> None:
-    dataset_cfg = cfg.get("dataset") or {}
-    scope = _normalize_dataset_scope(dataset_cfg)
-    model_cfg = cfg.get("model") or {}
-    model_target = str(model_cfg.get("_target_", ""))
-    if model_target in _SUPPORTED_MODEL_TARGETS and scope != "sub":
-        dataset_name = ""
-        if isinstance(dataset_cfg, DictConfig):
-            dataset_name = str(dataset_cfg.get("name", "") or "")
-        elif isinstance(dataset_cfg, dict):
-            dataset_name = str(dataset_cfg.get("name", "") or "")
-        raise ValueError(
-            "Training scope violation: supported training targets must use sub datasets only. "
-            f"Got dataset={dataset_name!r} (dataset_scope={scope})."
-        )
+        log.warning("Missing keys when loading init_ckpt_path: %s", missing)
+    if unexpected:
+        log.warning("Unexpected keys when loading init_ckpt_path: %s", unexpected)
 
 
 @task_wrapper
-def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
     training.
 
@@ -133,45 +97,29 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     resolved_run_name = apply_run_name(cfg)
     log.info(f"Resolved run name: {resolved_run_name}")
 
-    log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
-
-    log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
-
-    log.info("Instantiating callbacks...")
-    callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
-
-    log.info("Instantiating loggers...")
-    logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
-
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer: Trainer = hydra.utils.instantiate(
-        cfg.trainer, callbacks=callbacks, logger=logger
+    objects = instantiate_lightning_task_objects(
+        cfg,
+        log=log,
+        on_model_instantiated=lambda model: _maybe_load_model_weights(
+            model=model, cfg=cfg
+        ),
     )
+    datamodule = objects.datamodule
+    model = cast(LightningModule, objects.model)
+    trainer = objects.trainer
+    object_dict = objects.as_dict()
 
-    object_dict = {
-        "cfg": cfg,
-        "datamodule": datamodule,
-        "model": model,
-        "callbacks": callbacks,
-        "logger": logger,
-        "trainer": trainer,
-    }
+    run_cfg = cfg.get("run") or {}
 
-    if logger:
-        log.info("Logging hyperparameters!")
-        log_hyperparameters(object_dict)
-
-    if cfg.get("train"):
+    if bool(run_cfg.get("train", True)):
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
 
     train_metrics = trainer.callback_metrics
 
-    if cfg.get("test"):
+    if bool(run_cfg.get("test", False)):
         log.info("Starting testing!")
-        test_ckpt_path: Optional[str] = cfg.get("test_ckpt_path")
+        test_ckpt_path: Optional[str] = run_cfg.get("test_ckpt_path")
         if test_ckpt_path not in (None, ""):
             ckpt_path = test_ckpt_path
         else:
@@ -183,7 +131,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 )
             ckpt_path = checkpoint_callback.best_model_path
             if ckpt_path == "":
-                if cfg.get("allow_test_without_checkpoint", False):
+                if bool(run_cfg.get("allow_test_without_checkpoint", False)):
                     log.warning(
                         "Best ckpt not found! Using current weights for testing..."
                     )
@@ -213,13 +161,26 @@ def main(cfg: DictConfig) -> Optional[float]:
     """
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
-    _validate_required_args(cfg)
-    _enforce_supported_training_models(cfg)
-    _enforce_sub_training_scope(cfg)
+    require_run_target_config(
+        cfg,
+        missing_run_message=(
+            "Missing required config group: `run`. "
+            "Fix: use a train config that sets `/run`, for example `experiment=train_answer_reachability`."
+        ),
+        missing_target_message=(
+            "Missing required run target: `run._target_`. "
+            "Fix: use a concrete run config such as `run=train_answer_reachability`."
+        ),
+    )
+    validate_train_entry_contract(cfg)
     extras(cfg)
+    runner = cast(
+        TrainRunnerProtocol,
+        instantiate_task_runner(cfg.run, run_signature="run(cfg=..., train_model=...)"),
+    )
+    runner.validate(cfg)
 
-    # train the model
-    metric_dict, _ = train(cfg)
+    metric_dict, _ = runner.run(cfg=cfg, train_model=train_model)
 
     # safely retrieve metric value for hydra-based hyperparameter optimization
     return get_metric_value(
@@ -228,4 +189,4 @@ def main(cfg: DictConfig) -> Optional[float]:
 
 
 if __name__ == "__main__":
-    main()
+    main()  # type: ignore[call-arg]

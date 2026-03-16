@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from importlib.util import find_spec
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .logging_utils import RankedLogger
 

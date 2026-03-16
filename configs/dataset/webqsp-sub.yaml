@@ -11,9 +11,9 @@ dataset_family: webqsp
 max_steps: 4
 hf_dataset: rmanluo/RoG-webqsp
 
-# Train LMDB (sub filter) has 2,607 samples with batch_size=16 (train_steps=163).
-# Step-based validation interval tuned for cross-dataset parity.
-val_check_interval: 512
+# Train LMDB (sub filter) has 2,607 samples; with batch_size=32 this is ~82 steps/epoch.
+# Validate roughly every ~3 train epochs.
+val_check_interval: 256
 
 
 sample_filter_path: ${dataset.out_dir}/sub_filter.json

@@ -1,55 +1,85 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Callable
 
-import torch
+from src.graph_runtime import TrajectoryBatch
+from src.models.training import ForwardTrajectoryGFNSampler
 
-_DEFAULT_QUANTILE = 0.95
-
-
-def _to_iterable(raw: Any) -> Iterable[Any]:
-    if raw is None:
-        return []
-    if isinstance(raw, (list, tuple, set, range)):
-        return raw
-    if isinstance(raw, str):
-        return [raw]
-    try:
-        return list(raw)
-    except TypeError:
-        return [raw]
+from .protocol import MetricEvaluationOutput
 
 
-def normalize_k_values(
-    raw_values: Any, default: Optional[Sequence[int]] = None
-) -> List[int]:
-    normalized: List[int] = []
-    seen = set()
-    for item in _to_iterable(raw_values):
-        try:
-            k = int(item)
-        except (TypeError, ValueError):
-            continue
-        if k <= 0 or k in seen:
-            continue
-        normalized.append(k)
-        seen.add(k)
-    if not normalized and default is not None:
-        return normalize_k_values(default, default=None)
-    normalized.sort()
-    return normalized
+class BaseMetricRuntime(ABC):
+    sampler: ForwardTrajectoryGFNSampler | None = None
+    search: Any = None
+
+    @abstractmethod
+    def evaluate_batch(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        metrics_profile: str,
+        include_answer_support: bool,
+        on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
+    ) -> MetricEvaluationOutput:
+        raise NotImplementedError
+
+    @abstractmethod
+    def predict_batch(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        metrics_profile: str,
+        include_answer_support: bool,
+        on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
+    ) -> list[Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def build_predict_labels(
+        self,
+        batch: TrajectoryBatch,
+        outputs: list[Any],
+    ) -> list[Any]:
+        raise NotImplementedError
+
+    def summarize_predict_epoch(
+        self,
+        *,
+        predict_results: list[Any],
+        metrics_profile: str,
+    ) -> dict[str, Any]:
+        del predict_results, metrics_profile
+        return {}
+
+    def write_prediction_artifacts(
+        self,
+        *,
+        results: list[Any],
+        labels: list[Any],
+        output_dir: str | Path,
+        split: str,
+        artifact_name: str,
+        schema_version: int,
+        entity_vocab_path: str | Path | None,
+        relation_vocab_path: str | Path | None,
+        questions_path: str | Path | None,
+        overwrite: bool,
+    ) -> dict[str, Path] | None:
+        del (
+            results,
+            labels,
+            output_dir,
+            split,
+            artifact_name,
+            schema_version,
+            entity_vocab_path,
+            relation_vocab_path,
+            questions_path,
+            overwrite,
+        )
+        return None
 
 
-def summarize_uncertainty(
-    values: Iterable[torch.Tensor], quantile: float = _DEFAULT_QUANTILE
-) -> Tuple[float, float]:
-    tensors = [v for v in values if isinstance(v, torch.Tensor) and v.numel() > 0]
-    if not tensors:
-        return 0.0, 0.0
-    concat = torch.cat(tensors)
-    mean = float(concat.mean().detach().tolist())
-    quant = float(concat.quantile(quantile).detach().tolist())
-    return mean, quant
-
-
-__all__ = ["normalize_k_values", "summarize_uncertainty"]
+__all__ = ["BaseMetricRuntime"]

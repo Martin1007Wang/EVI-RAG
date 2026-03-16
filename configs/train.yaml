@@ -1,13 +1,20 @@
 # @package _global_
 
-# specify here default configuration
-# order of defaults determines the order in which configs override each other
+# Entrypoint contract for `python src/train.py ...`
+# - `/run` must be a train-oriented run config (`run.name` cannot be `eval_*`).
+# - Current training flows in this repo require `/dataset`; the canonical CLI is
+#   `python src/train.py experiment=train_answer_reachability dataset=webqsp-sub`.
+# - Prefer `experiment=...` over ad hoc `/run + /trainer + /model` overrides so the
+#   full training bundle stays aligned.
+#
+# Order of defaults determines the order in which configs override each other.
 defaults:
   - _self_
   - ckpt: default
+  - run: train_answer_reachability
   - dataset: null
   - data: g_retrieval
-  - model: trajectory_gfn
+  - model: gflownet
   - callbacks: default
   - logger: null
   - trainer: default
@@ -16,29 +23,13 @@ defaults:
   - hydra: default
   - experiment: null 
 
-# task name, determines output directory path
-task_name: "train"
+# Task name and tags are run-driven, matching the eval entrypoint structure.
+task_name: ${run.task_name}
+tags: ${run.tags}
 
-# tags to help you identify your experiments
-# you can overwrite this in experiment configs
-# overwrite from command line with `python train.py tags="[first_tag, second_tag]"`
-tags: ["dev"]
+# Run-driven checkpoints.
+ckpt_path: ${run.ckpt_path}
+init_ckpt_path: ${run.init_ckpt_path}
 
-# set False to skip model training
-train: True
-
-# evaluate on test set, using best model weights achieved during training
-# lightning chooses best weights based on the metric specified in checkpoint callback
-test: True
-
-# explicitly set checkpoint for testing; defaults to best checkpoint from callback
-test_ckpt_path: null
-
-# enforce explicit intent before falling back to current weights during testing
-allow_test_without_checkpoint: False
-
-# simply provide checkpoint path to resume training
-ckpt_path: null
-
-# seed for random number generators in pytorch, numpy and python.random
+# Seed for random number generators in pytorch, numpy and python.random.
 seed: 42

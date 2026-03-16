@@ -17,8 +17,8 @@ from .components import SharedDataResources
 from .components.embeddings import attach_embeddings_to_batch
 from .g_retrieval_collate import build_retrieval_dataloader
 from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
-from src.data.io.lmdb_utils import _resolve_core_lmdb_paths
-from src.models.trajectory_gfn.batch import TrajectoryBatch
+from src.data.io.lmdb_utils import resolve_core_lmdb_paths
+from src.graph_runtime import TrajectoryBatch
 
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"
@@ -202,7 +202,7 @@ class GRetrievalDataModule(LightningDataModule):
                 + "\nPlease check 'configs/dataset/YOUR_DATASET.yaml'."
             )
         for split_name in sorted(set(self.splits.values())):
-            _resolve_core_lmdb_paths(emb_dir, split_name)
+            resolve_core_lmdb_paths(emb_dir, split_name)
 
     def setup(self, stage: Optional[str] = None) -> None:
         # 1. Batch size is defined per device; keep as-is for DDP.

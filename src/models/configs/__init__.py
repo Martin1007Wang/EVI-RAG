@@ -3,31 +3,34 @@
 [系统模块] 配置定义
 """
 
-from .environment import EnvironmentConfig, StopConfig
-from .policy import (
-    PolicyConfig,
-    BackboneConfig,
-    FlowHeadConfig,
-    PriorityHeadConfig,
-)
-from .trajectory_gfn import (
+from .backbone import BackboneConfig
+from .gflownet import (
+    AnswerReachabilityInferenceConfig,
+    GFlowNetTrainingConfig,
+    HeuristicConfig,
     HorizonConfig,
-    TrajectoryInferenceConfig,
-    TrajectoryTrainingConfig,
+    SubTrajectoryBalanceConfig,
+)
+from .policy import (
+    GraphLogZHeadConfig,
+    PolicyConfig,
+    StartHeadConfig,
+    StateScoreHeadConfig,
 )
 from .training import OptimizerConfig, SchedulerConfig
 
 
 __all__ = [
-    "EnvironmentConfig",
-    "StopConfig",
     "PolicyConfig",
     "BackboneConfig",
-    "FlowHeadConfig",
-    "PriorityHeadConfig",
+    "StateScoreHeadConfig",
+    "StartHeadConfig",
+    "GraphLogZHeadConfig",
+    "HeuristicConfig",
+    "GFlowNetTrainingConfig",
+    "SubTrajectoryBalanceConfig",
     "HorizonConfig",
-    "TrajectoryTrainingConfig",
-    "TrajectoryInferenceConfig",
+    "AnswerReachabilityInferenceConfig",
     "OptimizerConfig",
     "SchedulerConfig",
 ]

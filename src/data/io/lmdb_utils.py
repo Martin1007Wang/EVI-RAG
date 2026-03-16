@@ -292,3 +292,17 @@ def _apply_filter_intersection(
     if keep_ids is None:
         return list(sample_ids)
     return [sid for sid in sample_ids if sid in keep_ids]
+
+
+def resolve_core_lmdb_paths(embeddings_dir: Path, split: str) -> List[Path]:
+    return _resolve_core_lmdb_paths(embeddings_dir, split)
+
+
+def assign_lmdb_shard(sample_key: str | bytes, num_shards: int) -> int:
+    return _assign_lmdb_shard(sample_key, num_shards)
+
+
+def apply_filter_intersection(
+    sample_ids: Sequence[str], filter_paths: Sequence[Path]
+) -> List[str]:
+    return _apply_filter_intersection(sample_ids, filter_paths)
