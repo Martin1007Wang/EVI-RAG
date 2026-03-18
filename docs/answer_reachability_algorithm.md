@@ -2,6 +2,10 @@
 
 本文描述当前 answer-reachability 主线的训练、验证、测试与指标语义。
 
+如果你希望先看当前实现对应的数学推导，请先读：
+
+- `docs/answer_reachability_math_derivation.md`
+
 ## 1. 任务定义
 
 给定问题节点集合 `Q`、图 `G`、答案实体集合 `A`，模型学习一个从起点到终点的
