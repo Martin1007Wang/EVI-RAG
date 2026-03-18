@@ -11,7 +11,7 @@ from src.graph_runtime import TrajectoryBatch
 from .sampler import (
     TrajectoryGFNSampleBatch,
     TrajectoryRolloutSupervisorProtocol,
-    _compute_uniform_backward_log_probs,
+    _select_edge_log_probs,
 )
 from .transitions import compute_constrained_policy_step
 from .types import GFlowNetPolicyProtocol, PreparedGFlowNetBatch, SearchState
@@ -273,10 +273,6 @@ def build_replay_sample_batch(
     )
     start_state_log_f = start_log_flows.to(dtype=torch.float32)
     terminal_target_mask = trajectory_supervisor.build_terminal_target_mask(batch=batch)
-    incoming_edge_counts = torch.bincount(
-        prepared_batch.topology.edge_index[1],
-        minlength=int(prepared_batch.topology.num_nodes),
-    ).to(device=device, dtype=torch.long)
 
     log_pf_steps = torch.zeros(
         (batch.num_graphs, num_rollouts, max_steps),
@@ -328,41 +324,15 @@ def build_replay_sample_batch(
         )
         chosen_log_pb = torch.zeros_like(chosen_log_probs)
 
-        move_log_probs, _, _ = policy.compute_move_log_probs(step.distribution)
-        active_indices = torch.nonzero(flat_active, as_tuple=False).view(-1).tolist()
-        for agent_idx in active_indices:
-            edge_id = int(chosen_edge_ids[agent_idx].item())
-            if edge_id < 0:
-                raise ValueError(
-                    "Replay trajectory is missing an edge id for an active step. "
-                    f"step={step_idx} agent_idx={agent_idx}."
-                )
-            edge_mask = (step.distribution.edge_agent_batch == agent_idx) & (
-                step.distribution.edge_ids == edge_id
-            )
-            if int(edge_mask.sum().item()) != 1:
-                raise ValueError(
-                    "Replay trajectory edge is invalid under the current constrained policy state. "
-                    f"step={step_idx} agent_idx={agent_idx} edge_id={edge_id}."
-                )
-            edge_position = int(torch.nonzero(edge_mask, as_tuple=False)[0].item())
-            chosen_target_nodes[agent_idx] = int(
-                step.distribution.target_nodes[edge_position].item()
-            )
-            chosen_log_probs[agent_idx] = move_log_probs[edge_position]
-
-        if active_indices:
-            active_tensor = torch.tensor(
-                active_indices, device=device, dtype=torch.long
-            )
-            chosen_log_pb.index_copy_(
-                0,
-                active_tensor,
-                _compute_uniform_backward_log_probs(
-                    target_nodes=chosen_target_nodes.index_select(0, active_tensor),
-                    incoming_edge_counts=incoming_edge_counts,
-                ),
-            )
+        selected_nodes, selected_log_probs = _select_edge_log_probs(
+            distribution=step.distribution,
+            selected_edge_ids=chosen_edge_ids,
+            active_mask=flat_active,
+            policy=policy,
+            error_prefix=(f"Replay trajectory step={step_idx}"),
+        )
+        chosen_target_nodes[flat_active] = selected_nodes[flat_active]
+        chosen_log_probs[flat_active] = selected_log_probs[flat_active]
 
         next_nodes = flat_current_nodes.clone()
         next_nodes[flat_active] = chosen_target_nodes[flat_active]
@@ -376,6 +346,18 @@ def build_replay_sample_batch(
             num_steps=next_num_steps.view_as(num_steps),
         )
         next_log_f = policy.compute_log_state_scores(prepared_batch, next_state)
+        backward_distribution = policy.compute_backward_distribution(
+            prepared_batch,
+            next_state,
+        )
+        _, selected_log_pb = _select_edge_log_probs(
+            distribution=backward_distribution,
+            selected_edge_ids=chosen_edge_ids,
+            active_mask=flat_active,
+            policy=policy,
+            error_prefix=(f"Replay trajectory backward reconstruction step={step_idx}"),
+        )
+        chosen_log_pb[flat_active] = selected_log_pb[flat_active]
 
         log_pf_steps[:, :, step_idx] = chosen_log_probs.view_as(current_nodes)
         log_pb_steps[:, :, step_idx] = chosen_log_pb.view_as(current_nodes)

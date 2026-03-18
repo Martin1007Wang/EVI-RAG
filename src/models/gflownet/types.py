@@ -33,6 +33,7 @@ class PreparedSearchBatch:
     topology: GraphTopology
     observation: GraphObservation
     node_tokens: torch.Tensor
+    relation_tokens: torch.Tensor
     question_tokens: torch.Tensor
 
 
@@ -159,6 +160,12 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
     ) -> StartDistribution: ...
 
     def compute_behavior_forward_distribution(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        state: SearchState,
+    ) -> ForwardActionDistribution: ...
+
+    def compute_backward_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,

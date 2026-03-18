@@ -263,6 +263,10 @@ def build_graph_batch(
             edge_index=tensors["edge_index"],
             num_nodes_total=num_nodes,
         ),
+        reverse_adjacency=_build_csr_with_edge_ids(
+            edge_index=tensors["edge_index"].flip(0),
+            num_nodes_total=num_nodes,
+        ),
     )
     observation = GraphObservation(
         node_features=tensors["node_embeddings"],

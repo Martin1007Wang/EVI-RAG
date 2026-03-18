@@ -8,6 +8,7 @@ import torch
 from src.graph_runtime import TrajectoryBatch
 from .transitions import apply_forward_constraints
 from .types import (
+    ForwardActionDistribution,
     GFlowNetPolicyProtocol,
     PreparedGFlowNetBatch,
     SearchState,
@@ -120,6 +121,43 @@ def _sample_edges(
     return chosen_edge_ids, chosen_target_nodes, chosen_log_probs
 
 
+def _select_edge_log_probs(
+    *,
+    distribution: ForwardActionDistribution,
+    selected_edge_ids: torch.Tensor,
+    active_mask: torch.Tensor,
+    policy: GFlowNetPolicyProtocol,
+    error_prefix: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    selected_nodes = torch.zeros_like(selected_edge_ids)
+    selected_log_probs = torch.zeros(
+        selected_edge_ids.shape,
+        device=distribution.edge_logits.device,
+        dtype=torch.float32,
+    )
+    move_log_probs, _, _ = policy.compute_move_log_probs(distribution)
+    active_indices = torch.nonzero(active_mask, as_tuple=False).view(-1).tolist()
+    for agent_idx in active_indices:
+        edge_id = int(selected_edge_ids[agent_idx].item())
+        if edge_id < 0:
+            raise ValueError(
+                f"{error_prefix} is missing an edge id for an active step. "
+                f"agent_idx={agent_idx}."
+            )
+        edge_mask = (distribution.edge_agent_batch == agent_idx) & (
+            distribution.edge_ids == edge_id
+        )
+        if int(edge_mask.sum().item()) != 1:
+            raise ValueError(
+                f"{error_prefix} edge is invalid under the current policy state. "
+                f"agent_idx={agent_idx} edge_id={edge_id}."
+            )
+        edge_position = int(torch.nonzero(edge_mask, as_tuple=False)[0].item())
+        selected_nodes[agent_idx] = int(distribution.target_nodes[edge_position].item())
+        selected_log_probs[agent_idx] = move_log_probs[edge_position]
+    return selected_nodes, selected_log_probs
+
+
 def _resolve_selected_start_values(
     *,
     prepared_batch: PreparedGFlowNetBatch,
@@ -193,10 +231,6 @@ def _rebuild_target_sample_batch(
         start_nodes=start_nodes,
     )
     terminal_target_mask = trajectory_supervisor.build_terminal_target_mask(batch=batch)
-    incoming_edge_counts = torch.bincount(
-        prepared_batch.topology.edge_index[1],
-        minlength=int(prepared_batch.topology.num_nodes),
-    ).to(device=batch.node_ptr.device, dtype=torch.long)
 
     log_pf_steps = torch.zeros(
         (batch.num_graphs, int(start_nodes.size(1)), max_steps),
@@ -242,43 +276,15 @@ def _rebuild_target_sample_batch(
         )
         chosen_log_pb = torch.zeros_like(chosen_log_probs)
 
-        move_log_probs, _, _ = policy.compute_move_log_probs(distribution)
-        active_indices = torch.nonzero(flat_active, as_tuple=False).view(-1).tolist()
-        for agent_idx in active_indices:
-            edge_id = int(chosen_edge_ids[agent_idx].item())
-            if edge_id < 0:
-                raise ValueError(
-                    "Sampled trajectory is missing an edge id for an active step. "
-                    f"step={step_idx} agent_idx={agent_idx}."
-                )
-            edge_mask = (distribution.edge_agent_batch == agent_idx) & (
-                distribution.edge_ids == edge_id
-            )
-            if int(edge_mask.sum().item()) != 1:
-                raise ValueError(
-                    "Behavior-sampled edge is invalid under the current target policy state. "
-                    f"step={step_idx} agent_idx={agent_idx} edge_id={edge_id}."
-                )
-            edge_position = int(torch.nonzero(edge_mask, as_tuple=False)[0].item())
-            chosen_target_nodes[agent_idx] = int(
-                distribution.target_nodes[edge_position].item()
-            )
-            chosen_log_probs[agent_idx] = move_log_probs[edge_position]
-
-        if active_indices:
-            active_tensor = torch.tensor(
-                active_indices,
-                device=batch.node_ptr.device,
-                dtype=torch.long,
-            )
-            chosen_log_pb.index_copy_(
-                0,
-                active_tensor,
-                _compute_uniform_backward_log_probs(
-                    target_nodes=chosen_target_nodes.index_select(0, active_tensor),
-                    incoming_edge_counts=incoming_edge_counts,
-                ),
-            )
+        selected_nodes, selected_log_probs = _select_edge_log_probs(
+            distribution=distribution,
+            selected_edge_ids=chosen_edge_ids,
+            active_mask=flat_active,
+            policy=policy,
+            error_prefix=(f"Sampled trajectory step={step_idx}"),
+        )
+        chosen_target_nodes[flat_active] = selected_nodes[flat_active]
+        chosen_log_probs[flat_active] = selected_log_probs[flat_active]
 
         next_nodes = flat_current_nodes.clone()
         next_nodes[flat_active] = chosen_target_nodes[flat_active]
@@ -292,6 +298,20 @@ def _rebuild_target_sample_batch(
             num_steps=next_num_steps.view_as(num_steps),
         )
         next_log_f = policy.compute_log_state_scores(prepared_batch, next_state)
+        backward_distribution = policy.compute_backward_distribution(
+            prepared_batch,
+            next_state,
+        )
+        _, selected_log_pb = _select_edge_log_probs(
+            distribution=backward_distribution,
+            selected_edge_ids=chosen_edge_ids,
+            active_mask=flat_active,
+            policy=policy,
+            error_prefix=(
+                f"Sampled trajectory backward reconstruction step={step_idx}"
+            ),
+        )
+        chosen_log_pb[flat_active] = selected_log_pb[flat_active]
 
         log_pf_steps[:, :, step_idx] = chosen_log_probs.view_as(current_nodes)
         log_pb_steps[:, :, step_idx] = chosen_log_pb.view_as(current_nodes)
@@ -342,17 +362,6 @@ def _rebuild_target_sample_batch(
         terminal_log_rewards=terminal_log_rewards,
         success_mask=success_mask,
     )
-
-
-def _compute_uniform_backward_log_probs(
-    *,
-    target_nodes: torch.Tensor,
-    incoming_edge_counts: torch.Tensor,
-) -> torch.Tensor:
-    if int(target_nodes.numel()) == 0:
-        return torch.empty((0,), device=target_nodes.device, dtype=torch.float32)
-    parent_counts = incoming_edge_counts.index_select(0, target_nodes).clamp_min(1)
-    return -parent_counts.to(dtype=torch.float32).log()
 
 
 @dataclass(frozen=True)

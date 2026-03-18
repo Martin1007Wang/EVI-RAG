@@ -118,6 +118,7 @@ def _make_search_fixture() -> tuple[
         topology=topology,
         observation=observation,
         node_tokens=torch.empty((0, 0), dtype=torch.float32),
+        relation_tokens=torch.empty((0, 0), dtype=torch.float32),
         question_tokens=torch.empty((0, 0), dtype=torch.float32),
     )
     policy = _ManualPolicy()

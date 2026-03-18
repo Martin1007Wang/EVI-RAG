@@ -5,7 +5,6 @@
 
 from .backbone import BackboneConfig
 from .gflownet import (
-    ExactAnswerObjectiveConfig,
     GFlowNetTrainingConfig,
     HeuristicConfig,
     HorizonConfig,
@@ -14,7 +13,11 @@ from .gflownet import (
     SuccessfulTrajectoryReplayConfig,
     SubTrajectoryBalanceConfig,
 )
-from .policy import PolicyConfig, StateScoreHeadConfig
+from .policy import (
+    PolicyConfig,
+    StateScoreHeadConfig,
+    TransitionPolicyHeadConfig,
+)
 from .training import OptimizerConfig, SchedulerConfig
 
 
@@ -22,8 +25,8 @@ __all__ = [
     "PolicyConfig",
     "BackboneConfig",
     "StateScoreHeadConfig",
+    "TransitionPolicyHeadConfig",
     "HeuristicConfig",
-    "ExactAnswerObjectiveConfig",
     "GFlowNetTrainingConfig",
     "SamplingTemperatureScheduleConfig",
     "SuccessfulTrajectoryReplayConfig",

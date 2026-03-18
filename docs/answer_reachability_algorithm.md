@@ -11,27 +11,30 @@
 给定问题节点集合 `Q`、图 `G`、答案实体集合 `A`，模型学习一个从起点到终点的
 trajectory policy。当前主线把多起点集合建模成一个隐式虚拟源 `s_emptyset` 指向
 `Q` 上真实起点状态的 root-flow decomposition：起点分布由起点状态流归一化得到，
-`log Z` 则由所有起点状态流的 `logsumexp` 给出。训练时采样轨迹并优化 GFlowNet/
-SubTB 目标；评估时用 exact analysis 和 guided search 分析答案概率与 support
-window。
+`log Z` 则由所有起点状态流的 `logsumexp` 给出。训练时采样轨迹并优化解耦三头
+GFlowNet 的 `SubTB` 目标；评估时用 exact analysis 和 guided search 分析答案概率与
+support window。
 
 ## 2. 训练逻辑
 
 训练主链在：
 
 - `src/models/gflownet_module.py`
-- `src/models/training/sampler.py`
-- `src/models/training/answer_reachability.py`
-- `src/models/training/losses.py`
+- `src/models/gflownet/sampler.py`
+- `src/models/gflownet/replay.py`
+- `src/models/gflownet/losses.py`
 
 步骤如下：
 
 1. `BaseSearchPolicy` 或 `GFlowNetPolicy` 先编码图与问题。
 2. `ForwardTrajectoryGFNSampler` 先在隐式虚拟源下构造 start distribution，随后从中
-   采样真实起点，并按 forward distribution rollout。
+   采样真实起点，并按独立 forward-policy head rollout。
 3. `AnswerReachabilityTrajectorySupervisor` 决定哪些 terminal node 算成功，并为成败
    轨迹提供 reward / log_reward。
-4. `SubTrajectoryBalanceLoss` 用 sampled trajectories 计算 SubTB 残差并回传梯度。
+4. `SubTrajectoryBalanceLoss` 用 target `log F / log P_F / log P_B` 计算 decoupled
+   `SubTB` 残差并回传梯度。
+5. 如果开启 replay，buffer 中缓存的成功离散路径会在当前参数下重新打分，并与
+   on-policy loss 按轨迹数加权平均。
 
 训练期默认不会跑昂贵的 support-window search；只保留 answer ranking 所需的轻量验证。
 

@@ -50,22 +50,18 @@ class SubTrajectoryBalanceLoss:
     @staticmethod
     def _build_prefix_terms(
         *,
-        start_log_probs: torch.Tensor,
         log_pf_steps: torch.Tensor,
         log_pb_steps: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_rollouts, max_steps = log_pf_steps.shape
-        sequence_horizon = max_steps + 2
+        state_horizon = max_steps + 1
         forward_prefix = log_pf_steps.new_zeros(
-            (batch_size, num_rollouts, sequence_horizon)
+            (batch_size, num_rollouts, state_horizon)
         )
         backward_prefix = torch.zeros_like(forward_prefix)
-        forward_prefix[:, :, 1] = start_log_probs
         if max_steps > 0:
-            forward_prefix[:, :, 2:] = start_log_probs.unsqueeze(-1) + torch.cumsum(
-                log_pf_steps, dim=-1
-            )
-            backward_prefix[:, :, 2:] = torch.cumsum(log_pb_steps, dim=-1)
+            forward_prefix[:, :, 1:] = torch.cumsum(log_pf_steps, dim=-1)
+            backward_prefix[:, :, 1:] = torch.cumsum(log_pb_steps, dim=-1)
         return forward_prefix, backward_prefix
 
     def compute(
@@ -81,29 +77,26 @@ class SubTrajectoryBalanceLoss:
             )
 
         batch_size, num_rollouts, max_steps = log_pf_steps.shape
-        sequence_horizon = max_steps + 2
+        sequence_horizon = max_steps + 1
         graph_log_z_values = sample_batch.graph_log_z.to(dtype=torch.float32)
-        start_log_probs = sample_batch.start_log_probs.to(dtype=torch.float32)
 
         state_values = log_pf_steps.new_zeros(
             (batch_size, num_rollouts, sequence_horizon)
         )
-        state_values[:, :, 0] = graph_log_z_values.unsqueeze(1).expand(-1, num_rollouts)
-        state_values[:, :, 1] = sample_batch.start_state_log_f.to(dtype=torch.float32)
+        state_values[:, :, 0] = sample_batch.start_state_log_f.to(dtype=torch.float32)
         if max_steps > 0:
-            state_values[:, :, 2:] = sample_batch.next_state_log_f_steps.to(
+            state_values[:, :, 1:] = sample_batch.next_state_log_f_steps.to(
                 dtype=torch.float32
             )
 
         forward_prefix, backward_prefix = self._build_prefix_terms(
-            start_log_probs=start_log_probs,
             log_pf_steps=log_pf_steps,
             log_pb_steps=log_pb_steps,
         )
         trajectory_values = state_values - forward_prefix + backward_prefix
 
-        terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long) + 1
-        if bool((terminal_index < 1).any().item()) or bool(
+        terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long)
+        if bool((terminal_index < 0).any().item()) or bool(
             (terminal_index >= sequence_horizon).any().item()
         ):
             raise ValueError(

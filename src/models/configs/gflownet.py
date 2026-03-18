@@ -184,31 +184,6 @@ class SuccessfulTrajectoryReplayConfig:
 
 
 @dataclass(frozen=True)
-class ExactAnswerObjectiveConfig:
-    enabled: bool = False
-    success_weight: float = 0.0
-    coverage_weight: float = 0.0
-    warmup_passes: float = 1.0
-    interval_steps: int = 1
-    max_graphs_per_batch: int = 1
-    eps: float = 1.0e-8
-
-    def __post_init__(self) -> None:
-        if self.success_weight < 0.0:
-            raise ValueError("training.exact_aux.success_weight must be >= 0.")
-        if self.coverage_weight < 0.0:
-            raise ValueError("training.exact_aux.coverage_weight must be >= 0.")
-        if self.warmup_passes < 0.0:
-            raise ValueError("training.exact_aux.warmup_passes must be >= 0.")
-        if self.interval_steps < 1:
-            raise ValueError("training.exact_aux.interval_steps must be >= 1.")
-        if self.max_graphs_per_batch < 1:
-            raise ValueError("training.exact_aux.max_graphs_per_batch must be >= 1.")
-        if self.eps <= 0.0:
-            raise ValueError("training.exact_aux.eps must be > 0.")
-
-
-@dataclass(frozen=True)
 class GFlowNetTrainingConfig:
     rollout_batch_size: int = 8
     reward_epsilon: float = 1.0e-3
@@ -219,9 +194,6 @@ class GFlowNetTrainingConfig:
     )
     success_replay: SuccessfulTrajectoryReplayConfig = field(
         default_factory=SuccessfulTrajectoryReplayConfig
-    )
-    exact_aux: ExactAnswerObjectiveConfig = field(
-        default_factory=ExactAnswerObjectiveConfig
     )
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
@@ -241,7 +213,6 @@ class GFlowNetTrainingConfig:
 
 
 __all__ = [
-    "ExactAnswerObjectiveConfig",
     "GFlowNetTrainingConfig",
     "HeuristicConfig",
     "HorizonConfig",

@@ -7,6 +7,7 @@ from src.graph_runtime import build_graph_batch
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
+    TransitionPolicyHead,
 )
 from src.models.components.embedding import BackboneInput
 from src.models.configs import HeuristicConfig, PolicyConfig
@@ -25,19 +26,6 @@ from .types import (
 def _mask_nonfinite_scores(values: torch.Tensor) -> torch.Tensor:
     neg_inf = torch.full_like(values, float("-inf"))
     return torch.where(torch.isfinite(values), values, neg_inf)
-
-
-def _compute_uniform_backward_log_probs(
-    *, topology, target_nodes: torch.Tensor
-) -> torch.Tensor:
-    if int(target_nodes.numel()) == 0:
-        return torch.empty((0,), device=target_nodes.device, dtype=torch.float32)
-    incoming_edge_counts = torch.bincount(
-        topology.edge_index[1],
-        minlength=int(topology.num_nodes),
-    ).to(device=target_nodes.device, dtype=torch.long)
-    parent_counts = incoming_edge_counts.index_select(0, target_nodes).clamp_min(1)
-    return -parent_counts.to(dtype=torch.float32).log()
 
 
 class StartDistributionError(ValueError):
@@ -122,6 +110,8 @@ class BaseSearchPolicy(nn.Module):
         max_steps: int,
         backbone: EmbeddingBackbone,
         state_score_head: NodeFlowHead,
+        forward_policy_head: TransitionPolicyHead,
+        backward_policy_head: TransitionPolicyHead,
     ) -> None:
         super().__init__()
         self.config = config
@@ -130,7 +120,10 @@ class BaseSearchPolicy(nn.Module):
             raise ValueError("max_steps must be >= 1.")
 
         graph_hidden_dim = int(config.backbone.hidden_dim)
-        self.state_score_head = state_score_head
+        self.state_flow_head = state_score_head
+        self.state_score_head = self.state_flow_head
+        self.forward_policy_head = forward_policy_head
+        self.backward_policy_head = backward_policy_head
         self.step_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
         self.remaining_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
         self.state_feature_norm = nn.LayerNorm(graph_hidden_dim)
@@ -152,6 +145,7 @@ class BaseSearchPolicy(nn.Module):
             topology=topology,
             observation=observation,
             node_tokens=encoded.node_tokens,
+            relation_tokens=encoded.relation_tokens,
             question_tokens=encoded.question_tokens,
         )
 
@@ -267,9 +261,30 @@ class BaseSearchPolicy(nn.Module):
         graph_ids: torch.Tensor,
     ) -> torch.Tensor:
         question_features = prepared_batch.question_tokens.index_select(0, graph_ids)
-        scores = self.state_score_head(flat_state_features, question_features)
+        scores = self.state_flow_head(flat_state_features, question_features)
         scores = scores.to(dtype=torch.float32)
         return _mask_nonfinite_scores(scores)
+
+    def _compute_transition_logits(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        current_state_features: torch.Tensor,
+        candidate_state_features: torch.Tensor,
+        edge_ids: torch.Tensor,
+        graph_ids: torch.Tensor,
+        head: TransitionPolicyHead,
+    ) -> torch.Tensor:
+        relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
+        relation_features = prepared_batch.relation_tokens.index_select(0, relation_ids)
+        question_features = prepared_batch.question_tokens.index_select(0, graph_ids)
+        logits = head(
+            current_state_features.to(dtype=torch.float32),
+            candidate_state_features.to(dtype=torch.float32),
+            relation_features.to(dtype=torch.float32),
+            question_features.to(dtype=torch.float32),
+        )
+        return _mask_nonfinite_scores(logits.to(dtype=torch.float32))
 
     def _gather_forward_candidates(
         self,
@@ -320,6 +335,38 @@ class BaseSearchPolicy(nn.Module):
             num_rollouts,
         )
 
+    def _gather_backward_candidates(
+        self,
+        state: SearchState,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            total_agents,
+            flat_current_nodes,
+            active_mask,
+            flat_num_steps,
+            batch_size,
+            num_rollouts,
+        ) = self._prepare_agent_state(state)
+        del total_agents
+        backward_active_mask = active_mask & (flat_num_steps > 0)
+        edge_ids, source_nodes, edge_agent_batch, in_degrees = (
+            state.topology.gather_incoming_edges(
+                current_nodes=flat_current_nodes,
+                active_mask=backward_active_mask,
+            )
+        )
+        if int(edge_ids.numel()) > 0:
+            parent_num_steps = flat_num_steps.index_select(0, edge_agent_batch) - 1
+        else:
+            parent_num_steps = flat_num_steps.new_empty((0,))
+        return (
+            edge_ids,
+            source_nodes,
+            edge_agent_batch,
+            in_degrees.view(batch_size, num_rollouts),
+            parent_num_steps,
+        )
+
     def compute_forward_distribution(
         self,
         prepared_batch: PreparedSearchBatch,
@@ -332,18 +379,26 @@ class BaseSearchPolicy(nn.Module):
             (0,), device=state.current_nodes.device, dtype=torch.float32
         )
         if int(edge_ids.numel()) > 0:
-            child_graph_ids = state.topology.graph_index_from_nodes(target_nodes)
-            child_done_mask = torch.zeros_like(child_num_steps, dtype=torch.bool)
+            current_state_features = self._build_flat_state_features(
+                prepared_batch,
+                flat_nodes=state.flatten_current_nodes(),
+                flat_num_steps=state.flatten_num_steps(),
+                flat_done_mask=state.flatten_done_mask(),
+            ).index_select(0, edge_agent_batch)
             child_state_features = self._build_flat_state_features(
                 prepared_batch,
                 flat_nodes=target_nodes,
                 flat_num_steps=child_num_steps,
-                flat_done_mask=child_done_mask,
+                flat_done_mask=torch.zeros_like(child_num_steps, dtype=torch.bool),
             )
-            edge_logits = self._compute_log_state_scores_from_flat_features(
+            graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
+            edge_logits = self._compute_transition_logits(
                 prepared_batch=prepared_batch,
-                flat_state_features=child_state_features,
-                graph_ids=child_graph_ids,
+                current_state_features=current_state_features,
+                candidate_state_features=child_state_features,
+                edge_ids=edge_ids,
+                graph_ids=graph_ids,
+                head=self.forward_policy_head,
             )
         return ForwardActionDistribution(
             edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
@@ -351,6 +406,47 @@ class BaseSearchPolicy(nn.Module):
             edge_ids=edge_ids,
             target_nodes=target_nodes,
             out_degrees=out_degrees,
+        )
+
+    def compute_backward_distribution(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+    ) -> ForwardActionDistribution:
+        edge_ids, source_nodes, edge_agent_batch, in_degrees, parent_num_steps = (
+            self._gather_backward_candidates(state)
+        )
+        edge_logits = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.float32
+        )
+        if int(edge_ids.numel()) > 0:
+            current_state_features = self._build_flat_state_features(
+                prepared_batch,
+                flat_nodes=state.flatten_current_nodes(),
+                flat_num_steps=state.flatten_num_steps(),
+                flat_done_mask=state.flatten_done_mask(),
+            ).index_select(0, edge_agent_batch)
+            parent_state_features = self._build_flat_state_features(
+                prepared_batch,
+                flat_nodes=source_nodes,
+                flat_num_steps=parent_num_steps,
+                flat_done_mask=torch.zeros_like(parent_num_steps, dtype=torch.bool),
+            )
+            graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
+            edge_logits = self._compute_transition_logits(
+                prepared_batch=prepared_batch,
+                current_state_features=current_state_features,
+                candidate_state_features=parent_state_features,
+                edge_ids=edge_ids,
+                graph_ids=graph_ids,
+                head=self.backward_policy_head,
+            )
+        return ForwardActionDistribution(
+            edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
+            edge_agent_batch=edge_agent_batch,
+            edge_ids=edge_ids,
+            target_nodes=source_nodes,
+            out_degrees=in_degrees,
         )
 
     @staticmethod
@@ -410,6 +506,7 @@ class GFlowNetPolicy(nn.Module):
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
             node_tokens=prepared_batch.node_tokens,
+            relation_tokens=prepared_batch.relation_tokens,
             question_tokens=prepared_batch.question_tokens,
             heuristic_cache=heuristic_cache,
         )
@@ -455,35 +552,31 @@ class GFlowNetPolicy(nn.Module):
             build_state_features=self.base_policy.build_state_features,
         ).to(dtype=torch.float32)
 
-    def _compute_child_logits(
+    def _compute_behavior_forward_logits(
         self,
         *,
         prepared_batch: PreparedGFlowNetBatch,
-        target_nodes: torch.Tensor,
-        child_num_steps: torch.Tensor,
-        use_behavior_bias: bool,
+        state: SearchState,
+        distribution: ForwardActionDistribution,
     ) -> torch.Tensor:
+        edge_logits = distribution.edge_logits.to(dtype=torch.float32)
+        if int(edge_logits.numel()) == 0 or float(self.heuristic_cfg.beta) == 0.0:
+            return edge_logits
+        child_num_steps = (
+            state.flatten_num_steps().index_select(0, distribution.edge_agent_batch) + 1
+        )
         child_state = self._build_state_from_nodes(
             prepared_batch=prepared_batch,
-            nodes=target_nodes,
+            nodes=distribution.target_nodes,
             num_steps=child_num_steps,
         )
-        child_log_flows = self.compute_log_state_scores(
-            prepared_batch,
-            child_state,
+        child_bias = self._compute_state_bias(
+            prepared_batch=prepared_batch,
+            state=child_state,
         ).view(-1)
-        if use_behavior_bias:
-            child_log_flows = child_log_flows + float(
-                self.heuristic_cfg.beta
-            ) * self._compute_state_bias(
-                prepared_batch=prepared_batch,
-                state=child_state,
-            ).view(-1)
-        child_log_pb = _compute_uniform_backward_log_probs(
-            topology=prepared_batch.topology,
-            target_nodes=target_nodes,
+        return _mask_nonfinite_scores(
+            edge_logits + float(self.heuristic_cfg.beta) * child_bias
         )
-        return _mask_nonfinite_scores(child_log_flows + child_log_pb)
 
     def compute_start_distribution(
         self,
@@ -599,30 +692,19 @@ class GFlowNetPolicy(nn.Module):
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
     ) -> ForwardActionDistribution:
-        edge_ids, target_nodes, edge_agent_batch, out_degrees, child_num_steps = (
-            self.base_policy._gather_forward_candidates(state)
+        return self.base_policy.compute_forward_distribution(
+            prepared_batch,
+            state,
         )
-        if int(edge_ids.numel()) == 0:
-            return ForwardActionDistribution(
-                edge_logits=torch.empty(
-                    (0,), device=state.current_nodes.device, dtype=torch.float32
-                ),
-                edge_agent_batch=edge_agent_batch,
-                edge_ids=edge_ids,
-                target_nodes=target_nodes,
-                out_degrees=out_degrees,
-            )
-        return ForwardActionDistribution(
-            edge_logits=self._compute_child_logits(
-                prepared_batch=prepared_batch,
-                target_nodes=target_nodes,
-                child_num_steps=child_num_steps,
-                use_behavior_bias=False,
-            ),
-            edge_agent_batch=edge_agent_batch,
-            edge_ids=edge_ids,
-            target_nodes=target_nodes,
-            out_degrees=out_degrees,
+
+    def compute_backward_distribution(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        state: SearchState,
+    ) -> ForwardActionDistribution:
+        return self.base_policy.compute_backward_distribution(
+            prepared_batch,
+            state,
         )
 
     def compute_behavior_forward_distribution(
@@ -630,30 +712,20 @@ class GFlowNetPolicy(nn.Module):
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
     ) -> ForwardActionDistribution:
-        edge_ids, target_nodes, edge_agent_batch, out_degrees, child_num_steps = (
-            self.base_policy._gather_forward_candidates(state)
+        distribution = self.base_policy.compute_forward_distribution(
+            prepared_batch,
+            state,
         )
-        if int(edge_ids.numel()) == 0:
-            return ForwardActionDistribution(
-                edge_logits=torch.empty(
-                    (0,), device=state.current_nodes.device, dtype=torch.float32
-                ),
-                edge_agent_batch=edge_agent_batch,
-                edge_ids=edge_ids,
-                target_nodes=target_nodes,
-                out_degrees=out_degrees,
-            )
         return ForwardActionDistribution(
-            edge_logits=self._compute_child_logits(
+            edge_logits=self._compute_behavior_forward_logits(
                 prepared_batch=prepared_batch,
-                target_nodes=target_nodes,
-                child_num_steps=child_num_steps,
-                use_behavior_bias=True,
+                state=state,
+                distribution=distribution,
             ),
-            edge_agent_batch=edge_agent_batch,
-            edge_ids=edge_ids,
-            target_nodes=target_nodes,
-            out_degrees=out_degrees,
+            edge_agent_batch=distribution.edge_agent_batch,
+            edge_ids=distribution.edge_ids,
+            target_nodes=distribution.target_nodes,
+            out_degrees=distribution.out_degrees,
         )
 
     @staticmethod

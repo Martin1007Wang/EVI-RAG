@@ -8,7 +8,6 @@ import torch
 
 import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
-    ExactAnswerObjectiveConfig,
     SearchEvalConfig,
     BackboneConfig,
     GFlowNetTrainingConfig,
@@ -23,14 +22,13 @@ from src.models.configs import (
 )
 from src.models.gflownet import (
     SearchState,
+    SubTrajectoryBalanceLossOutput,
     TrainingScheduleContext,
     compute_embedding_log_heuristic,
     compute_topology_log_heuristic,
 )
 from src.graph_runtime import TrajectoryBatch, build_graph_batch
-from src.metrics.answer_reachability.exact_analysis import ExactDynamicProgramResult
 from src.models.gflownet_module import (
-    AuxiliaryLossResult,
     GFlowNetModule,
     PredictionArtifactWriteConfig,
 )
@@ -466,7 +464,7 @@ def test_target_policy_ignores_behavior_heuristic_beta() -> None:
     )
 
 
-def test_gflownet_training_step_logs_exact_auxiliary_metrics() -> None:
+def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     module = _make_module_with_training_cfg(
         "topology",
         beta=0.5,
@@ -475,14 +473,6 @@ def test_gflownet_training_step_logs_exact_auxiliary_metrics() -> None:
             reward_epsilon=1.0e-3,
             failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
-            exact_aux=ExactAnswerObjectiveConfig(
-                enabled=True,
-                success_weight=0.1,
-                coverage_weight=0.2,
-                warmup_passes=0.0,
-                interval_steps=1,
-                max_graphs_per_batch=1,
-            ),
         ),
     )
     captured_metrics: dict[str, object] = {}
@@ -496,67 +486,10 @@ def test_gflownet_training_step_logs_exact_auxiliary_metrics() -> None:
     loss = module.training_step(make_toy_batch(), batch_idx=0)
 
     assert loss.ndim == 0
-    assert "exact_aux_loss" in captured_metrics
-    assert "exact_aux_success_loss" in captured_metrics
-    assert "exact_aux_coverage_loss" in captured_metrics
-
-
-def test_aggregate_entity_log_mass_handles_duplicate_entity_ids() -> None:
-    aggregated = GFlowNetModule._aggregate_entity_log_mass(
-        node_entity_ids=torch.tensor([4, 5, 4, 7], dtype=torch.long),
-        log_node_mass=torch.log(
-            torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)
-        ),
-        entity_ids=torch.tensor([7, 4, 6, 4], dtype=torch.long),
-    )
-
-    assert torch.allclose(
-        aggregated[torch.isfinite(aggregated)].exp(),
-        torch.tensor([0.4, 0.4, 0.4], dtype=torch.float32),
-        atol=1.0e-6,
-    )
-    assert bool(torch.isneginf(aggregated[2]).item()) is True
-
-
-def test_exact_auxiliary_loss_uses_log_space_mass() -> None:
-    module = _make_module_with_training_cfg(
-        "topology",
-        training_cfg=GFlowNetTrainingConfig(
-            exact_aux=ExactAnswerObjectiveConfig(
-                enabled=True,
-                success_weight=1.0,
-                coverage_weight=0.0,
-                warmup_passes=0.0,
-                interval_steps=1,
-                max_graphs_per_batch=1,
-            )
-        ),
-    )
-    batch = make_toy_batch()
-
-    module.training_exact_analyzer.compute_dynamic_program = (  # type: ignore[method-assign]
-        lambda **kwargs: ExactDynamicProgramResult(
-            log_terminal_mass=torch.tensor(
-                [float("-inf"), float("-inf"), -120.0], dtype=torch.float32
-            ),
-            log_retrieval_terminal_mass=torch.tensor(
-                [float("-inf"), float("-inf"), -120.0], dtype=torch.float32
-            ),
-            log_success_by_step=torch.full((3, 3), fill_value=float("-inf")),
-            log_gold_mass=torch.tensor(-120.0, dtype=torch.float32),
-            log_gold_mass_by_graph=torch.tensor([-120.0], dtype=torch.float32),
-            log_edge_success_mass=torch.full(
-                (int(batch.edge_index.size(1)),), fill_value=float("-inf")
-            ),
-        )
-    )
-
-    result = module._compute_exact_auxiliary_loss(batch=batch)
-
-    assert result is not None
-    assert float(result.metrics["exact_aux_success_loss"].item()) == pytest.approx(
-        120.0, rel=1.0e-5
-    )
+    assert "subtb_loss" in captured_metrics
+    assert "subtb_residual" in captured_metrics
+    assert "subtb_root" in captured_metrics
+    assert not any(str(key).startswith("exact_aux") for key in captured_metrics)
 
 
 def test_success_replay_rollout_resolution_rejects_invalid_ratio() -> None:
@@ -598,53 +531,16 @@ def test_success_replay_rollout_resolution_matches_target_fraction() -> None:
     assert module._resolve_success_replay_rollouts_per_graph() == 1
 
 
-def test_exact_auxiliary_loss_prepares_shared_batch_once() -> None:
-    module = _make_module_with_training_cfg(
-        "topology",
-        training_cfg=GFlowNetTrainingConfig(
-            exact_aux=ExactAnswerObjectiveConfig(
-                enabled=True,
-                success_weight=1.0,
-                coverage_weight=0.0,
-                warmup_passes=0.0,
-                interval_steps=1,
-                max_graphs_per_batch=2,
-            )
-        ),
-    )
-    batch = TrajectoryBatch.concatenate([make_toy_batch(), make_toy_batch()])
-    prepare_calls = 0
-    dp_calls = 0
-    original_prepare_batch = module.policy.prepare_batch
-    original_compute_dynamic_program = (
-        module.training_exact_analyzer.compute_dynamic_program
-    )
-
-    def _count_prepare(batch_arg: TrajectoryBatch):
-        nonlocal prepare_calls
-        prepare_calls += 1
-        return original_prepare_batch(batch_arg)
-
-    def _count_dynamic_program(**kwargs):  # type: ignore[no-untyped-def]
-        nonlocal dp_calls
-        dp_calls += 1
-        return original_compute_dynamic_program(**kwargs)
-
-    module.policy.prepare_batch = _count_prepare  # type: ignore[method-assign]
-    module.training_exact_analyzer.compute_dynamic_program = _count_dynamic_program  # type: ignore[method-assign]
-
-    result = module._compute_exact_auxiliary_loss(batch=batch)
-
-    assert result is not None
-    assert prepare_calls == 1
-    assert dp_calls == 1
-
-
 def test_gflownet_training_step_raises_on_nonfinite_loss() -> None:
     module = _make_module("topology")
-    module._compute_exact_auxiliary_loss = lambda **kwargs: AuxiliaryLossResult(  # type: ignore[method-assign]
+    module.loss_fn.compute = lambda *args, **kwargs: SubTrajectoryBalanceLossOutput(  # type: ignore[method-assign]
         loss=torch.tensor(float("nan")),
-        metrics={},
+        subtb_loss=torch.tensor(float("nan")),
+        residual_abs=torch.tensor(0.0),
+        root_abs=torch.tensor(0.0),
+        success_rate=torch.tensor(0.0),
+        log_z_mean=torch.tensor(0.0),
+        log_z_variance=torch.tensor(0.0),
     )
 
     with pytest.raises(RuntimeError, match="Non-finite training loss detected"):
@@ -722,6 +618,16 @@ def test_sampler_emits_uniform_backward_log_probs_for_multi_parent_state() -> No
     )
     prepared_batch = module.policy.prepare_batch(batch)
     assert module.sampler is not None
+    module.policy.base_policy.backward_policy_head.forward = (  # type: ignore[method-assign]
+        lambda current_state_features,
+        candidate_state_features,
+        relation_features,
+        question_features: torch.zeros(
+            (int(current_state_features.size(0)),),
+            device=current_state_features.device,
+            dtype=torch.float32,
+        )
+    )
 
     sample_batch = module.sampler.sample(
         batch=batch,
@@ -734,18 +640,9 @@ def test_sampler_emits_uniform_backward_log_probs_for_multi_parent_state() -> No
     assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(-math.log(2.0))
 
 
-def test_forward_distribution_uses_effective_child_flows_plus_backward() -> None:
+def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:
     module = _make_module("topology")
-    batch = make_batch_from_graph(
-        num_nodes=3,
-        edge_index=torch.tensor([[0, 1], [2, 2]], dtype=torch.long),
-        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
-        q_local_indices=torch.tensor([0], dtype=torch.long),
-        a_local_indices=torch.tensor([2], dtype=torch.long),
-        answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
-        sample_id="forward-effective-flow",
-    )
+    batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
     state = SearchState(
         topology=prepared_batch.topology,
@@ -753,6 +650,25 @@ def test_forward_distribution_uses_effective_child_flows_plus_backward() -> None
         current_nodes=torch.tensor([[0]], dtype=torch.long),
         done_mask=torch.zeros((1, 1), dtype=torch.bool),
         num_steps=torch.tensor([[0]], dtype=torch.long),
+    )
+
+    module.policy.base_policy.forward_policy_head.forward = (  # type: ignore[method-assign]
+        lambda current_state_features,
+        candidate_state_features,
+        relation_features,
+        question_features: torch.zeros(
+            (int(current_state_features.size(0)),),
+            device=current_state_features.device,
+            dtype=torch.float32,
+        )
+    )
+    module.policy.base_policy.state_score_head.forward = (  # type: ignore[method-assign]
+        lambda node_features, question_features: torch.arange(
+            int(node_features.size(0)),
+            device=node_features.device,
+            dtype=torch.float32,
+        )
+        + 10.0
     )
 
     distribution = module.policy.compute_forward_distribution(prepared_batch, state)
@@ -771,12 +687,12 @@ def test_forward_distribution_uses_effective_child_flows_plus_backward() -> None
         prepared_batch,
         child_state,
     ).view(-1)
-    expected_log_pb = torch.full_like(expected_child_log_flows, -math.log(2.0))
 
     assert torch.allclose(
-        distribution.edge_logits.to(dtype=torch.float32),
-        expected_child_log_flows + expected_log_pb,
-        atol=1.0e-6,
+        distribution.edge_logits.to(dtype=torch.float32), torch.zeros(2)
+    )
+    assert not torch.allclose(
+        distribution.edge_logits.to(dtype=torch.float32), expected_child_log_flows
     )
 
 

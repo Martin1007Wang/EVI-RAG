@@ -18,6 +18,7 @@ from torch.optim.lr_scheduler import (
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
+    TransitionPolicyHead,
 )
 from src.models.components.heuristic_heads import LearnedHeuristicHead
 from src.models.configs import (
@@ -30,14 +31,9 @@ from src.models.configs import (
     SchedulerConfig,
 )
 from src.graph_runtime import TrajectoryBatch
-from src.metrics.answer_reachability.exact_analysis import (
-    ExactReachabilityAnalyzer,
-    aggregate_selected_log_masses,
-)
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeFactoryProtocol
 from src.utils.fit_schedule import ResolvedPassFitSchedule
 from src.utils.logging_utils import get_logger, log_event, log_metric
-from src.utils.segment_ops import segment_logsumexp_1d
 
 from .evaluation_controller import (
     MetricRuntimeController,
@@ -74,12 +70,6 @@ class GFlowNetConfig:
 
 
 @dataclass(frozen=True)
-class AuxiliaryLossResult:
-    loss: torch.Tensor
-    metrics: dict[str, torch.Tensor]
-
-
-@dataclass(frozen=True)
 class ReplayLossResult:
     loss_output: SubTrajectoryBalanceLossOutput
     num_trajectories: int
@@ -108,11 +98,29 @@ class GFlowNetPolicyFactory:
             num_layers=int(policy_cfg.state_score_head.num_layers),
             dropout=float(policy_cfg.state_score_head.dropout),
         )
+        forward_policy_head = TransitionPolicyHead(
+            state_dim=graph_hidden_dim,
+            relation_dim=graph_hidden_dim,
+            question_dim=graph_hidden_dim,
+            hidden_dim=int(policy_cfg.forward_policy_head.hidden_dim),
+            num_layers=int(policy_cfg.forward_policy_head.num_layers),
+            dropout=float(policy_cfg.forward_policy_head.dropout),
+        )
+        backward_policy_head = TransitionPolicyHead(
+            state_dim=graph_hidden_dim,
+            relation_dim=graph_hidden_dim,
+            question_dim=graph_hidden_dim,
+            hidden_dim=int(policy_cfg.backward_policy_head.hidden_dim),
+            num_layers=int(policy_cfg.backward_policy_head.num_layers),
+            dropout=float(policy_cfg.backward_policy_head.dropout),
+        )
         return BaseSearchPolicy(
             config=policy_cfg,
             max_steps=max_steps,
             backbone=backbone,
             state_score_head=state_score_head,
+            forward_policy_head=forward_policy_head,
+            backward_policy_head=backward_policy_head,
         )
 
     @staticmethod
@@ -285,9 +293,6 @@ class GFlowNetModule(LightningModule):
             metrics_profile=str(self.cfg.eval_cfg.metrics_profile),
             on_invalid_start=self._log_invalid_start,
         )
-        self.training_exact_analyzer = ExactReachabilityAnalyzer(
-            max_steps=horizon_cfg.max_steps
-        )
         self.sampler = self.runtime_controller.sampler
         self.loss_fn = SubTrajectoryBalanceLoss(config=training_cfg.subtb)
         self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
@@ -397,305 +402,6 @@ class GFlowNetModule(LightningModule):
         replay_rollouts = int(round((total_rollouts * ratio) / (1.0 - ratio)))
         return max(replay_rollouts, 0)
 
-    def _exact_aux_enabled(self) -> bool:
-        exact_cfg = self.cfg.training_cfg.exact_aux
-        return exact_cfg.enabled and (
-            exact_cfg.success_weight > 0.0 or exact_cfg.coverage_weight > 0.0
-        )
-
-    def _exact_aux_interval_reached(self) -> bool:
-        return (
-            int(self.global_step) % self.cfg.training_cfg.exact_aux.interval_steps == 0
-        )
-
-    def _exact_aux_warmup_done(self) -> bool:
-        return self._warmup_passes_completed(
-            required_passes=self.cfg.training_cfg.exact_aux.warmup_passes
-        )
-
-    def _exact_aux_is_ready(self) -> bool:
-        return (
-            self._exact_aux_enabled()
-            and self._exact_aux_interval_reached()
-            and self._exact_aux_warmup_done()
-        )
-
-    @staticmethod
-    def _aggregate_entity_log_mass(
-        *,
-        node_entity_ids: torch.Tensor,
-        log_node_mass: torch.Tensor,
-        entity_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        return aggregate_selected_log_masses(
-            node_entity_ids=node_entity_ids,
-            log_node_mass=log_node_mass,
-            entity_ids=entity_ids,
-        )
-
-    def _compute_exact_auxiliary_loss(
-        self,
-        *,
-        batch: TrajectoryBatch,
-    ) -> AuxiliaryLossResult | None:
-        if not self._exact_aux_is_ready():
-            return None
-        exact_cfg = self.cfg.training_cfg.exact_aux
-        num_selected = min(batch.num_graphs, exact_cfg.max_graphs_per_batch)
-        if num_selected < 1:
-            return None
-        success_weight = exact_cfg.success_weight
-        coverage_weight = exact_cfg.coverage_weight
-        selected_batch = self._select_prefix_graph_batch(
-            batch=batch, num_graphs=num_selected
-        )
-        prepared_batch = self.policy.prepare_batch(selected_batch)
-        dp_result = self.training_exact_analyzer.compute_dynamic_program(
-            batch=selected_batch,
-            policy=self.policy,
-            prepared_batch=prepared_batch,
-        )
-
-        loss = torch.zeros((), device=self.device, dtype=torch.float32)
-        metrics: dict[str, torch.Tensor] = {
-            "exact_aux_graphs": torch.tensor(float(num_selected), device=self.device)
-        }
-        if success_weight > 0.0:
-            success_log_mass = dp_result.log_gold_mass_by_graph
-            success_loss = -success_log_mass.mean()
-            loss = loss + success_weight * success_loss
-            metrics["exact_aux_success_loss"] = success_loss.detach()
-            metrics["exact_aux_success_mass"] = dp_result.gold_mass_by_graph.mean()
-        if coverage_weight > 0.0:
-            coverage_stats = self._compute_exact_aux_coverage_stats(
-                batch=selected_batch,
-                log_retrieval_terminal_mass=dp_result.log_retrieval_terminal_mass,
-            )
-            if coverage_stats is not None:
-                coverage_loss, coverage_mass = coverage_stats
-            else:
-                coverage_loss = None
-                coverage_mass = None
-        else:
-            coverage_loss = None
-            coverage_mass = None
-        if coverage_loss is not None and coverage_mass is not None:
-            loss = loss + coverage_weight * coverage_loss
-            metrics["exact_aux_coverage_loss"] = coverage_loss.detach()
-            metrics["exact_aux_coverage_mass"] = coverage_mass.detach()
-        metrics["exact_aux_loss"] = loss.detach()
-        return AuxiliaryLossResult(loss=loss, metrics=metrics)
-
-    @staticmethod
-    def _select_prefix_graph_batch(
-        *,
-        batch: TrajectoryBatch,
-        num_graphs: int,
-    ) -> TrajectoryBatch:
-        if num_graphs < 1 or num_graphs > batch.num_graphs:
-            raise ValueError(
-                f"num_graphs must be in [1, {batch.num_graphs}], got {num_graphs}."
-            )
-        if num_graphs == batch.num_graphs:
-            return batch
-        node_end = int(batch.node_ptr[num_graphs].item())
-        edge_mask = batch.edge_batch < num_graphs
-        q_end = int(batch.q_ptr[num_graphs].item())
-        a_end = int(batch.a_ptr[num_graphs].item())
-        answer_end = int(batch.answer_ptr[num_graphs].item())
-        heuristic_log_v = None
-        if batch.heuristic_log_v is not None:
-            heuristic_log_v = batch.heuristic_log_v[:node_end]
-        selected_batch = TrajectoryBatch(
-            num_graphs=num_graphs,
-            node_ptr=batch.node_ptr[: num_graphs + 1].clone(),
-            edge_index=batch.edge_index[:, edge_mask],
-            edge_rel_global=batch.edge_rel_global[edge_mask],
-            edge_batch=batch.edge_batch[edge_mask],
-            node_batch=batch.node_batch[:node_end],
-            node_embeddings=batch.node_embeddings[:node_end],
-            edge_embeddings=batch.edge_embeddings[edge_mask],
-            question_emb=batch.question_emb[:num_graphs],
-            question_ctx=batch.question_ctx[:num_graphs],
-            question_ctx_mask=batch.question_ctx_mask[:num_graphs],
-            q_local_indices=batch.q_local_indices[:q_end],
-            q_ptr=batch.q_ptr[: num_graphs + 1].clone(),
-            a_local_indices=batch.a_local_indices[:a_end],
-            a_ptr=batch.a_ptr[: num_graphs + 1].clone(),
-            answer_entity_ids=batch.answer_entity_ids[:answer_end],
-            answer_ptr=batch.answer_ptr[: num_graphs + 1].clone(),
-            node_global_ids=batch.node_global_ids[:node_end],
-            sample_ids=batch.sample_ids[:num_graphs],
-            questions=batch.questions[:num_graphs],
-            dataset_scope=batch.dataset_scope,
-            heuristic_log_v=heuristic_log_v,
-        )
-        selected_batch.validate()
-        return selected_batch
-
-    @staticmethod
-    def _expand_graph_ids_from_ptr(
-        *, ptr: torch.Tensor, device: torch.device
-    ) -> torch.Tensor:
-        counts = (ptr[1:] - ptr[:-1]).to(device=device, dtype=torch.long)
-        if int(counts.numel()) == 0:
-            return torch.empty((0,), device=device, dtype=torch.long)
-        return torch.arange(
-            int(counts.numel()), device=device, dtype=torch.long
-        ).repeat_interleave(counts)
-
-    @staticmethod
-    def _segment_mean_with_nonfinite_zero(
-        *,
-        values: torch.Tensor,
-        segment_ids: torch.Tensor,
-        num_segments: int,
-    ) -> torch.Tensor:
-        out = torch.zeros((num_segments,), device=values.device, dtype=torch.float32)
-        if int(values.numel()) == 0:
-            return out
-        counts = torch.zeros((num_segments,), device=values.device, dtype=torch.float32)
-        counts.scatter_add_(
-            0, segment_ids, torch.ones_like(values, dtype=torch.float32)
-        )
-        out.scatter_add_(0, segment_ids, values.to(dtype=torch.float32))
-        return torch.where(counts > 0, out / counts, torch.zeros_like(out))
-
-    @staticmethod
-    def _segment_mean_preserving_neg_inf(
-        *,
-        values: torch.Tensor,
-        segment_ids: torch.Tensor,
-        num_segments: int,
-    ) -> torch.Tensor:
-        out = torch.full(
-            (num_segments,),
-            fill_value=float("-inf"),
-            device=values.device,
-            dtype=torch.float32,
-        )
-        if int(values.numel()) == 0:
-            return out
-        counts = torch.zeros((num_segments,), device=values.device, dtype=torch.float32)
-        counts.scatter_add_(
-            0, segment_ids, torch.ones_like(values, dtype=torch.float32)
-        )
-        finite_mask = torch.isfinite(values)
-        finite_sum = torch.zeros(
-            (num_segments,), device=values.device, dtype=torch.float32
-        )
-        if bool(finite_mask.any().item()):
-            finite_sum.scatter_add_(
-                0,
-                segment_ids[finite_mask],
-                values[finite_mask].to(dtype=torch.float32),
-            )
-        has_nonfinite = torch.zeros(
-            (num_segments,), device=values.device, dtype=torch.int32
-        )
-        if bool((~finite_mask).any().item()):
-            has_nonfinite.scatter_reduce_(
-                0,
-                segment_ids[~finite_mask],
-                torch.ones_like(segment_ids[~finite_mask], dtype=torch.int32),
-                reduce="amax",
-                include_self=True,
-            )
-        mean = torch.where(counts > 0, finite_sum / counts.clamp(min=1.0), out)
-        mean = torch.where(has_nonfinite > 0, out, mean)
-        return mean
-
-    @classmethod
-    def _aggregate_graph_entity_log_mass(
-        cls,
-        *,
-        batch: TrajectoryBatch,
-        log_node_mass: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if int(batch.answer_entity_ids.numel()) == 0:
-            return None
-        device = log_node_mass.device
-        answer_graph_ids = cls._expand_graph_ids_from_ptr(
-            ptr=batch.answer_ptr,
-            device=device,
-        )
-        query_pairs = torch.stack(
-            (
-                answer_graph_ids,
-                batch.answer_entity_ids.to(device=device, dtype=torch.long),
-            ),
-            dim=1,
-        )
-        unique_query_pairs = torch.unique(query_pairs, dim=0, sorted=True)
-        if int(unique_query_pairs.size(0)) == 0:
-            return None
-        node_pairs = torch.stack(
-            (
-                batch.node_batch.to(device=device, dtype=torch.long),
-                batch.node_global_ids.to(device=device, dtype=torch.long),
-            ),
-            dim=1,
-        )
-        all_pairs = torch.cat((unique_query_pairs, node_pairs), dim=0)
-        _, inverse = torch.unique(all_pairs, dim=0, sorted=True, return_inverse=True)
-        num_unique_pairs = int(inverse.max().item()) + 1
-        query_pair_ids = inverse[: int(unique_query_pairs.size(0))]
-        node_pair_ids = inverse[int(unique_query_pairs.size(0)) :]
-        pair_log_mass, _ = segment_logsumexp_1d(
-            values=log_node_mass,
-            segment_ids=node_pair_ids,
-            num_segments=num_unique_pairs,
-            dtype=torch.float32,
-            ignore_non_finite=True,
-            empty_value=float("-inf"),
-        )
-        return unique_query_pairs[:, 0], pair_log_mass.index_select(0, query_pair_ids)
-
-    @classmethod
-    def _compute_exact_aux_coverage_stats(
-        cls,
-        *,
-        batch: TrajectoryBatch,
-        log_retrieval_terminal_mass: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        aggregated = cls._aggregate_graph_entity_log_mass(
-            batch=batch,
-            log_node_mass=log_retrieval_terminal_mass,
-        )
-        if aggregated is None:
-            return None
-        query_graph_ids, query_log_mass = aggregated
-        num_graphs = batch.num_graphs
-        coverage_loss_by_graph = cls._segment_mean_preserving_neg_inf(
-            values=query_log_mass,
-            segment_ids=query_graph_ids,
-            num_segments=num_graphs,
-        )
-        coverage_mass_by_graph = cls._segment_mean_with_nonfinite_zero(
-            values=torch.where(
-                torch.isfinite(query_log_mass),
-                query_log_mass.exp(),
-                torch.zeros_like(query_log_mass),
-            ),
-            segment_ids=query_graph_ids,
-            num_segments=num_graphs,
-        )
-        graph_counts = torch.zeros(
-            (num_graphs,), device=query_log_mass.device, dtype=torch.float32
-        )
-        graph_counts.scatter_add_(
-            0,
-            query_graph_ids,
-            torch.ones_like(query_log_mass, dtype=torch.float32),
-        )
-        valid_graphs = graph_counts > 0
-        if not bool(valid_graphs.any().item()):
-            return None
-        return (
-            -coverage_loss_by_graph[valid_graphs].mean(),
-            coverage_mass_by_graph[valid_graphs].mean(),
-        )
-
     def _success_replay_enabled(self) -> bool:
         replay_cfg = self.cfg.training_cfg.success_replay
         return replay_cfg.enabled and self.success_replay_buffer is not None
@@ -767,7 +473,6 @@ class GFlowNetModule(LightningModule):
         *,
         loss_output: SubTrajectoryBalanceLossOutput,
         replay_result: ReplayLossResult | None,
-        exact_aux_result: AuxiliaryLossResult | None,
         on_policy_trajectories: int,
     ) -> TrainingLossAggregation:
         total_loss = loss_output.loss
@@ -777,8 +482,6 @@ class GFlowNetModule(LightningModule):
                 loss_output.loss * float(on_policy_trajectories)
                 + replay_result.loss_output.loss * float(replay_result.num_trajectories)
             ) / float(total_trajectories)
-        if exact_aux_result is not None:
-            total_loss = total_loss + exact_aux_result.loss
         return TrainingLossAggregation(
             total_loss=total_loss, replay_result=replay_result
         )
@@ -788,7 +491,6 @@ class GFlowNetModule(LightningModule):
         *,
         loss_output: SubTrajectoryBalanceLossOutput,
         loss_aggregation: TrainingLossAggregation,
-        exact_aux_result: AuxiliaryLossResult | None,
         sampling_temperature: float,
         on_policy_trajectories: int,
     ) -> dict[str, Any]:
@@ -802,8 +504,6 @@ class GFlowNetModule(LightningModule):
             "log_z_variance": loss_output.log_z_variance,
             "sampling_temperature": sampling_temperature,
         }
-        if exact_aux_result is not None:
-            metrics.update(exact_aux_result.metrics)
         replay_result = loss_aggregation.replay_result
         if self.success_replay_buffer is not None:
             metrics["success_replay_buffer_size"] = float(
@@ -848,7 +548,7 @@ class GFlowNetModule(LightningModule):
             sample_ids=sample_ids,
         )
         raise RuntimeError(
-            "Non-finite training loss detected. Check SubTB, replay, exact auxiliary, and reward inputs."
+            "Non-finite training loss detected. Check SubTB, replay, and reward inputs."
         )
 
     def transfer_batch_to_device(
@@ -965,14 +665,12 @@ class GFlowNetModule(LightningModule):
             batch=trajectory_batch,
             replay_rollouts_per_graph=replay_rollouts_per_graph,
         )
-        exact_aux_result = self._compute_exact_auxiliary_loss(batch=trajectory_batch)
         on_policy_trajectories = (
             trajectory_batch.num_graphs * self.cfg.training_cfg.rollout_batch_size
         )
         loss_aggregation = self._aggregate_total_loss(
             loss_output=loss_output,
             replay_result=replay_result,
-            exact_aux_result=exact_aux_result,
             on_policy_trajectories=on_policy_trajectories,
         )
         self._raise_on_nonfinite_training_loss(
@@ -987,7 +685,6 @@ class GFlowNetModule(LightningModule):
         metrics = self._build_training_metrics(
             loss_output=loss_output,
             loss_aggregation=loss_aggregation,
-            exact_aux_result=exact_aux_result,
             sampling_temperature=sampling_temperature,
             on_policy_trajectories=on_policy_trajectories,
         )

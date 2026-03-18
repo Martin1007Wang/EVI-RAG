@@ -21,8 +21,7 @@ src/archive/policy/
 - `src/eval.py`: 评估入口；负责 checkpoint 评估、split 选择、predict/test 调度。
 - `src/runs/`: 任务级 runner；封装 train/eval contract、dataset variant、split replay、输出落盘。
 - `src/models/gflownet_module.py`: 主线 LightningModule；负责组装 policy、sampler、loss、metric runtime。
-- `src/models/policy/`: 前向策略本体；包括 backbone、start distribution、forward distribution、heuristic bias。
-- `src/models/training/`: 训练期 rollout supervisor、sampler、SubTB loss。
+- `src/models/gflownet/`: 当前 GFlowNet 主体；包括共享 encoder、三头 policy、sampler、replay、SubTB loss。
 - `src/metrics/answer_reachability/`: 验证/测试/预测逻辑；包括 exact analysis、search、posterior、metrics、artifact writer。
 - `src/graph_runtime/`: 图批处理运行时表示；把 DataLoader/PyG batch 转为统一 `TrajectoryBatch`。
 - `src/archive/policy/`: 历史 policy 实验代码，仅保留兼容/追溯用途，不属于当前主线。
@@ -35,7 +34,7 @@ src/archive/policy/
    - `policy.prepare_batch()` 编码图与问题；
    - `ForwardTrajectoryGFNSampler.sample()` 采样 rollout；
    - `AnswerReachabilityTrajectorySupervisor` 给出 terminal target/reward；
-   - `SubTrajectoryBalanceLoss.compute()` 计算 SubTB 目标。
+   - `SubTrajectoryBalanceLoss.compute()` 用解耦 `log F / log P_F / log P_B` 计算 SubTB 目标。
 4. Lightning 负责优化器、scheduler、日志、checkpoint。
 
 训练期验证默认走低成本 `rank_only`，只看 answer posterior，不跑 support-window
@@ -70,9 +69,9 @@ search。相关默认值见 `configs/experiment/train_answer_reachability.yaml`�
 4. `src/eval.py`
 5. `src/runs/answer_reachability.py`
 6. `src/models/gflownet_module.py`
-7. `src/models/policy/base_policy.py`
-8. `src/models/training/sampler.py`
-9. `src/models/training/losses.py`
+7. `src/models/gflownet/policy.py`
+8. `src/models/gflownet/sampler.py`
+9. `src/models/gflownet/losses.py`
 10. `src/metrics/answer_reachability/runtime.py`
 11. `src/metrics/answer_reachability/batch_evaluator.py`
 12. `src/metrics/answer_reachability/support_search.py`
@@ -82,8 +81,8 @@ search。相关默认值见 `configs/experiment/train_answer_reachability.yaml`�
 旧文档中的以下路径已经迁移：
 
 - `src/models/trajectory_gfn/module.py` -> `src/models/gflownet_module.py`
-- `src/models/trajectory_gfn/sampler.py` -> `src/models/training/sampler.py`
-- `src/models/trajectory_gfn/losses.py` -> `src/models/training/losses.py`
+- `src/models/trajectory_gfn/sampler.py` -> `src/models/gflownet/sampler.py`
+- `src/models/trajectory_gfn/losses.py` -> `src/models/gflownet/losses.py`
 - `src/tasks/answer_reachability/execution.py` -> `src/metrics/answer_reachability/batch_evaluator.py`
 - `src/tasks/answer_reachability/metrics.py` -> `src/metrics/answer_reachability/metrics.py`
 - `src/tasks/answer_reachability/posterior.py` -> `src/metrics/answer_reachability/posterior.py`

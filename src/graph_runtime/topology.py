@@ -61,6 +61,7 @@ class GraphTopology:
     edge_type: torch.Tensor
     _graph_node_offsets: torch.Tensor
     adjacency: CsrAdjacency
+    reverse_adjacency: CsrAdjacency
 
     @property
     def graph_node_offsets(self) -> torch.Tensor:
@@ -147,6 +148,60 @@ class GraphTopology:
             or bool((self.adjacency.col >= int(self.num_nodes)).any().item())
         ):
             raise ValueError("GraphTopology.adjacency.col contains out-of-range nodes.")
+        if (
+            self.reverse_adjacency.crow.dtype != torch.long
+            or self.reverse_adjacency.crow.dim() != 1
+        ):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.crow must be 1D torch.long."
+            )
+        if int(self.reverse_adjacency.crow.numel()) != int(self.num_nodes) + 1:
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.crow length mismatch with num_nodes."
+            )
+        if int(self.reverse_adjacency.crow[0].item()) != 0:
+            raise ValueError("GraphTopology.reverse_adjacency.crow must start at 0.")
+        if bool(
+            (self.reverse_adjacency.crow[1:] < self.reverse_adjacency.crow[:-1])
+            .any()
+            .item()
+        ):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.crow must be non-decreasing."
+            )
+        if int(self.reverse_adjacency.crow[-1].item()) != int(self.edge_index.size(1)):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.crow does not end at edge count."
+            )
+        if (
+            self.reverse_adjacency.col.dtype != torch.long
+            or self.reverse_adjacency.col.dim() != 1
+        ):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.col must be 1D torch.long."
+            )
+        if (
+            self.reverse_adjacency.edge_ids.dtype != torch.long
+            or self.reverse_adjacency.edge_ids.dim() != 1
+        ):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.edge_ids must be 1D torch.long."
+            )
+        if int(self.reverse_adjacency.col.numel()) != int(self.edge_index.size(1)):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.col length mismatch with edge count."
+            )
+        if int(self.reverse_adjacency.edge_ids.numel()) != int(self.edge_index.size(1)):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.edge_ids length mismatch with edge count."
+            )
+        if int(self.reverse_adjacency.col.numel()) > 0 and (
+            bool((self.reverse_adjacency.col < 0).any().item())
+            or bool((self.reverse_adjacency.col >= int(self.num_nodes)).any().item())
+        ):
+            raise ValueError(
+                "GraphTopology.reverse_adjacency.col contains out-of-range nodes."
+            )
 
     def graph_index_from_nodes(self, node_index: torch.Tensor) -> torch.Tensor:
         offsets = self._graph_node_offsets[1:].to(
@@ -283,6 +338,50 @@ class GraphTopology:
                 torch.ones_like(edge_agent_index, dtype=torch.long),
             )
         return edge_ids, target_nodes, edge_agent_index, filtered_out_degrees
+
+    def gather_incoming_edges(
+        self,
+        *,
+        current_nodes: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_agents = int(current_nodes.numel())
+        active_nodes = torch.where(
+            active_mask,
+            current_nodes,
+            torch.zeros_like(current_nodes),
+        )
+        edge_ids, source_nodes, in_degrees = _gather_actions_from_csr(
+            adjacency=self.reverse_adjacency,
+            nodes=active_nodes,
+        )
+        edge_agent_index = torch.empty(
+            (0,),
+            device=current_nodes.device,
+            dtype=torch.long,
+        )
+        if int(edge_ids.numel()) == 0:
+            return edge_ids, source_nodes, edge_agent_index, in_degrees
+
+        agent_index = torch.arange(
+            total_agents,
+            device=current_nodes.device,
+            dtype=torch.long,
+        )
+        edge_agent_full = agent_index.repeat_interleave(in_degrees)
+        edge_active_mask = active_mask.index_select(0, edge_agent_full)
+        edge_ids = edge_ids[edge_active_mask]
+        source_nodes = source_nodes[edge_active_mask]
+        edge_agent_index = edge_agent_full[edge_active_mask]
+
+        filtered_in_degrees = torch.zeros_like(in_degrees)
+        if int(edge_agent_index.numel()) > 0:
+            filtered_in_degrees.scatter_add_(
+                0,
+                edge_agent_index,
+                torch.ones_like(edge_agent_index, dtype=torch.long),
+            )
+        return edge_ids, source_nodes, edge_agent_index, filtered_in_degrees
 
     def graph_index_from_edges(self, edge_ids: torch.Tensor) -> torch.Tensor:
         safe_edge_ids = edge_ids.clamp(
