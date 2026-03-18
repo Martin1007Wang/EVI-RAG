@@ -6,6 +6,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
     ExactAnswerObjectiveConfig,
     SearchEvalConfig,
@@ -18,14 +19,21 @@ from src.models.configs import (
     SamplingTemperatureScheduleConfig,
     SchedulerConfig,
     StateScoreHeadConfig,
+    SuccessfulTrajectoryReplayConfig,
 )
 from src.models.gflownet import (
     SearchState,
+    TrainingScheduleContext,
     compute_embedding_log_heuristic,
     compute_topology_log_heuristic,
 )
-from src.graph_runtime import build_graph_batch
-from src.models.gflownet_module import GFlowNetModule
+from src.graph_runtime import TrajectoryBatch, build_graph_batch
+from src.metrics.answer_reachability.exact_analysis import ExactDynamicProgramResult
+from src.models.gflownet_module import (
+    AuxiliaryLossResult,
+    GFlowNetModule,
+    PredictionArtifactWriteConfig,
+)
 from src.metrics.answer_reachability.runtime import (
     SearchMetricRuntimeFactory,
 )
@@ -173,9 +181,11 @@ def test_gflownet_module_exposes_eval_settings() -> None:
 
 def test_predict_epoch_start_resets_prediction_state() -> None:
     module = _make_module("topology")
-    module.predict_results = cast(Any, ["stale"])
-    module.predict_labels = cast(Any, ["label"])
-    module.predict_metrics = {"answer/hit@1": 0.5}
+    module.replace_prediction_state(
+        results=cast(Any, ["stale"]),
+        labels=cast(Any, ["label"]),
+        metrics={"answer/hit@1": 0.5},
+    )
 
     module.on_predict_epoch_start()
 
@@ -184,9 +194,29 @@ def test_predict_epoch_start_resets_prediction_state() -> None:
     assert module.predict_metrics == {}
 
 
+def test_predict_state_accessors_return_copies() -> None:
+    module = _make_module("topology")
+    module.replace_prediction_state(
+        results=cast(Any, ["result"]),
+        labels=cast(Any, ["label"]),
+        metrics={"answer/hit@1": 0.5},
+    )
+
+    results = module.predict_results
+    labels = module.predict_labels
+    metrics = module.predict_metrics
+    results.append(cast(Any, "mutated"))
+    labels.append(cast(Any, "mutated"))
+    metrics["mutated"] = 1.0
+
+    assert module.predict_results == ["result"]
+    assert module.predict_labels == ["label"]
+    assert module.predict_metrics == {"answer/hit@1": 0.5}
+
+
 def test_predict_epoch_end_summarizes_prediction_metrics() -> None:
     module = _make_module("topology")
-    module.predict_results = cast(Any, ["result"])
+    module.replace_prediction_state(results=cast(Any, ["result"]))
     module.metric_runtime.summarize_predict_epoch = lambda **kwargs: {  # type: ignore[method-assign]
         "answer/hit@1": 0.25
     }
@@ -196,10 +226,22 @@ def test_predict_epoch_end_summarizes_prediction_metrics() -> None:
     assert module.get_predict_metrics() == {"answer/hit@1": 0.25}
 
 
+def test_on_predict_batch_end_ignores_none_outputs() -> None:
+    module = _make_module("topology")
+    module.on_predict_epoch_start()
+
+    module.on_predict_batch_end(None, make_toy_batch(), batch_idx=0)
+
+    assert module.predict_results == []
+    assert module.predict_labels == []
+
+
 def test_write_prediction_artifacts_uses_prediction_state(tmp_path) -> None:
     module = _make_module("topology")
-    module.predict_results = cast(Any, ["result"])
-    module.predict_labels = cast(Any, ["label"])
+    module.replace_prediction_state(
+        results=cast(Any, ["result"]),
+        labels=cast(Any, ["label"]),
+    )
     captured: dict[str, object] = {}
 
     def _write_prediction_artifacts(**kwargs):  # type: ignore[no-untyped-def]
@@ -212,6 +254,33 @@ def test_write_prediction_artifacts_uses_prediction_state(tmp_path) -> None:
         output_dir=tmp_path,
         split="test",
         artifact_name="rankflow",
+    )
+
+    assert captured["results"] == ["result"]
+    assert captured["labels"] == ["label"]
+    assert paths == {"prompt_path": tmp_path / "test.jsonl"}
+
+
+def test_write_prediction_artifacts_accepts_write_config(tmp_path) -> None:
+    module = _make_module("topology")
+    module.replace_prediction_state(
+        results=cast(Any, ["result"]),
+        labels=cast(Any, ["label"]),
+    )
+    captured: dict[str, object] = {}
+
+    def _write_prediction_artifacts(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"prompt_path": tmp_path / "test.jsonl"}
+
+    module.metric_runtime.write_prediction_artifacts = _write_prediction_artifacts  # type: ignore[method-assign]
+
+    paths = module.write_prediction_artifacts(
+        write_config=PredictionArtifactWriteConfig(
+            output_dir=tmp_path,
+            split="test",
+            artifact_name="rankflow",
+        )
     )
 
     assert captured["results"] == ["result"]
@@ -246,6 +315,49 @@ def test_log_metric_bundle_syncs_only_epoch_metrics() -> None:
 
     assert logged_calls[0] == ("train/loss", False)
     assert logged_calls[1] == ("val/webqsp-sub/hit@1", True)
+
+
+def test_cfg_to_dict_rejects_dataclass_type_objects() -> None:
+    with pytest.raises(TypeError, match="Expected dataclass or dict config"):
+        GFlowNetModule._cfg_to_dict(GFlowNetTrainingConfig)
+
+
+def test_training_schedule_context_override_is_used() -> None:
+    module = _make_module("topology")
+    module.set_training_schedule_context(
+        TrainingScheduleContext(estimated_stepping_batches=7, trainer_max_steps=11)
+    )
+
+    schedule_context = module._trainer_schedule_context()
+
+    assert schedule_context.estimated_stepping_batches == 7
+    assert schedule_context.trainer_max_steps == 11
+
+
+def test_transfer_batch_to_device_rejects_unexpected_batch_types() -> None:
+    module = _make_module("topology")
+
+    with pytest.raises(TypeError, match="expects TrajectoryBatch inputs"):
+        module.transfer_batch_to_device(
+            batch={"bad": "batch"}, device=torch.device("cpu"), dataloader_idx=0
+        )
+
+
+def test_log_invalid_start_tracks_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _make_module("topology")
+    logged_events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        gflownet_module_impl,
+        "log_event",
+        lambda *args, **kwargs: logged_events.append(kwargs),
+    )
+
+    module._log_invalid_start(make_toy_batch())
+    module._log_invalid_start(make_toy_batch())
+
+    assert module._invalid_start_count == 2
+    assert logged_events[-1]["invalid_start_count"] == 2
 
 
 def test_gflownet_training_step_logs_log_z_statistics() -> None:
@@ -387,6 +499,156 @@ def test_gflownet_training_step_logs_exact_auxiliary_metrics() -> None:
     assert "exact_aux_loss" in captured_metrics
     assert "exact_aux_success_loss" in captured_metrics
     assert "exact_aux_coverage_loss" in captured_metrics
+
+
+def test_aggregate_entity_log_mass_handles_duplicate_entity_ids() -> None:
+    aggregated = GFlowNetModule._aggregate_entity_log_mass(
+        node_entity_ids=torch.tensor([4, 5, 4, 7], dtype=torch.long),
+        log_node_mass=torch.log(
+            torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)
+        ),
+        entity_ids=torch.tensor([7, 4, 6, 4], dtype=torch.long),
+    )
+
+    assert torch.allclose(
+        aggregated[torch.isfinite(aggregated)].exp(),
+        torch.tensor([0.4, 0.4, 0.4], dtype=torch.float32),
+        atol=1.0e-6,
+    )
+    assert bool(torch.isneginf(aggregated[2]).item()) is True
+
+
+def test_exact_auxiliary_loss_uses_log_space_mass() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            exact_aux=ExactAnswerObjectiveConfig(
+                enabled=True,
+                success_weight=1.0,
+                coverage_weight=0.0,
+                warmup_passes=0.0,
+                interval_steps=1,
+                max_graphs_per_batch=1,
+            )
+        ),
+    )
+    batch = make_toy_batch()
+
+    module.training_exact_analyzer.compute_dynamic_program = (  # type: ignore[method-assign]
+        lambda **kwargs: ExactDynamicProgramResult(
+            log_terminal_mass=torch.tensor(
+                [float("-inf"), float("-inf"), -120.0], dtype=torch.float32
+            ),
+            log_retrieval_terminal_mass=torch.tensor(
+                [float("-inf"), float("-inf"), -120.0], dtype=torch.float32
+            ),
+            log_success_by_step=torch.full((3, 3), fill_value=float("-inf")),
+            log_gold_mass=torch.tensor(-120.0, dtype=torch.float32),
+            log_gold_mass_by_graph=torch.tensor([-120.0], dtype=torch.float32),
+            log_edge_success_mass=torch.full(
+                (int(batch.edge_index.size(1)),), fill_value=float("-inf")
+            ),
+        )
+    )
+
+    result = module._compute_exact_auxiliary_loss(batch=batch)
+
+    assert result is not None
+    assert float(result.metrics["exact_aux_success_loss"].item()) == pytest.approx(
+        120.0, rel=1.0e-5
+    )
+
+
+def test_success_replay_rollout_resolution_rejects_invalid_ratio() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            success_replay=SuccessfulTrajectoryReplayConfig(
+                enabled=True,
+                ratio=0.25,
+                warmup_passes=0.0,
+                min_buffer_size=1,
+                max_buffer_size=8,
+                max_trajectories_per_sample=2,
+            )
+        ),
+    )
+    object.__setattr__(module.cfg.training_cfg.success_replay, "ratio", 1.1)
+
+    with pytest.raises(ValueError, match="training.success_replay.ratio"):
+        module._resolve_success_replay_rollouts_per_graph()
+
+
+def test_success_replay_rollout_resolution_matches_target_fraction() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=3,
+            success_replay=SuccessfulTrajectoryReplayConfig(
+                enabled=True,
+                ratio=0.25,
+                warmup_passes=0.0,
+                min_buffer_size=1,
+                max_buffer_size=8,
+                max_trajectories_per_sample=2,
+            ),
+        ),
+    )
+
+    assert module._resolve_success_replay_rollouts_per_graph() == 1
+
+
+def test_exact_auxiliary_loss_prepares_shared_batch_once() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            exact_aux=ExactAnswerObjectiveConfig(
+                enabled=True,
+                success_weight=1.0,
+                coverage_weight=0.0,
+                warmup_passes=0.0,
+                interval_steps=1,
+                max_graphs_per_batch=2,
+            )
+        ),
+    )
+    batch = TrajectoryBatch.concatenate([make_toy_batch(), make_toy_batch()])
+    prepare_calls = 0
+    dp_calls = 0
+    original_prepare_batch = module.policy.prepare_batch
+    original_compute_dynamic_program = (
+        module.training_exact_analyzer.compute_dynamic_program
+    )
+
+    def _count_prepare(batch_arg: TrajectoryBatch):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare_batch(batch_arg)
+
+    def _count_dynamic_program(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal dp_calls
+        dp_calls += 1
+        return original_compute_dynamic_program(**kwargs)
+
+    module.policy.prepare_batch = _count_prepare  # type: ignore[method-assign]
+    module.training_exact_analyzer.compute_dynamic_program = _count_dynamic_program  # type: ignore[method-assign]
+
+    result = module._compute_exact_auxiliary_loss(batch=batch)
+
+    assert result is not None
+    assert prepare_calls == 1
+    assert dp_calls == 1
+
+
+def test_gflownet_training_step_raises_on_nonfinite_loss() -> None:
+    module = _make_module("topology")
+    module._compute_exact_auxiliary_loss = lambda **kwargs: AuxiliaryLossResult(  # type: ignore[method-assign]
+        loss=torch.tensor(float("nan")),
+        metrics={},
+    )
+
+    with pytest.raises(RuntimeError, match="Non-finite training loss detected"):
+        module.training_step(make_toy_batch(), batch_idx=0)
 
 
 def test_gflownet_training_step_logs_effective_pass_when_schedule_is_set() -> None:

@@ -333,6 +333,15 @@ class ExactSupportSearch:
         current_node: int,
         num_moves: int,
     ) -> float:
+        if analysis.log_success_by_step is not None:
+            if num_moves >= int(analysis.log_success_by_step.size(0)):
+                return float("-inf")
+            suffix_log_success = float(
+                analysis.log_success_by_step[num_moves, current_node].item()
+            )
+            if not math.isfinite(suffix_log_success):
+                return float("-inf")
+            return float(log_prob + suffix_log_success)
         if analysis.success_by_step is None:
             return float(log_prob)
         if num_moves >= int(analysis.success_by_step.size(0)):

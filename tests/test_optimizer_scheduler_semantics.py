@@ -29,9 +29,11 @@ def _build_optimizer_config(
         model_parameters=model_parameters,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
-        estimated_stepping_batches=estimated_stepping_batches,
-        trainer_max_steps=trainer_max_steps,
-        trainer_max_epochs=trainer_max_epochs,
+        schedule_context=TrainingScheduleContext(
+            estimated_stepping_batches=estimated_stepping_batches,
+            trainer_max_steps=trainer_max_steps,
+            trainer_max_epochs=trainer_max_epochs,
+        ),
     )
 
 

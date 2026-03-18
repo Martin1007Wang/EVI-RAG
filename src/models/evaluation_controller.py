@@ -44,6 +44,32 @@ class PredictionEpochState:
     def finalize(self, metrics: dict[str, float]) -> None:
         self.metrics = dict(metrics)
 
+    def replace(
+        self,
+        *,
+        results: list[PredictionResult] | None = None,
+        labels: list[PredictionLabel] | None = None,
+        metrics: dict[str, float] | None = None,
+    ) -> None:
+        if results is not None:
+            self.results = list(results)
+        if labels is not None:
+            self.labels = list(labels)
+        if metrics is not None:
+            self.metrics = dict(metrics)
+
+
+@dataclass(frozen=True)
+class PredictionArtifactWriteConfig:
+    output_dir: str | Path
+    split: str
+    artifact_name: str = "rankflow"
+    schema_version: int = 1
+    entity_vocab_path: str | Path | None = None
+    relation_vocab_path: str | Path | None = None
+    questions_path: str | Path | None = None
+    overwrite: bool = True
+
 
 class MetricRuntimeController:
     def __init__(
@@ -56,7 +82,7 @@ class MetricRuntimeController:
         self.metric_runtime = metric_runtime
         self.metrics_profile = str(metrics_profile)
         self.on_invalid_start = on_invalid_start
-        self.prediction_state = PredictionEpochState()
+        self._prediction_state = PredictionEpochState()
 
     @property
     def sampler(self) -> TrajectorySamplerProtocol | None:
@@ -102,7 +128,22 @@ class MetricRuntimeController:
         )
 
     def reset_prediction_state(self) -> None:
-        self.prediction_state.reset()
+        self._prediction_state.reset()
+
+    def replace_prediction_state(
+        self,
+        *,
+        results: list[PredictionResult] | None = None,
+        labels: list[PredictionLabel] | None = None,
+        metrics: dict[str, float] | None = None,
+    ) -> None:
+        self._prediction_state.replace(results=results, labels=labels, metrics=metrics)
+
+    def get_predict_results(self) -> list[PredictionResult]:
+        return list(self._prediction_state.results)
+
+    def get_predict_labels(self) -> list[PredictionLabel]:
+        return list(self._prediction_state.labels)
 
     def predict_batch(self, *, batch: TrajectoryBatch) -> list[PredictionResult]:
         return cast(
@@ -123,7 +164,7 @@ class MetricRuntimeController:
     ) -> None:
         if not outputs:
             return
-        self.prediction_state.record_batch(
+        self._prediction_state.record_batch(
             results=list(outputs),
             labels=cast(
                 list[PredictionLabel],
@@ -132,44 +173,38 @@ class MetricRuntimeController:
         )
 
     def finalize_prediction_epoch(self) -> None:
-        self.prediction_state.finalize(
+        self._prediction_state.finalize(
             self.metric_runtime.summarize_predict_epoch(
-                predict_results=self.prediction_state.results,
+                predict_results=self._prediction_state.results,
                 metrics_profile=self.metrics_profile,
             )
         )
 
     def get_predict_metrics(self) -> dict[str, float]:
-        return dict(self.prediction_state.metrics)
+        return dict(self._prediction_state.metrics)
 
     def write_prediction_artifacts(
         self,
         *,
-        output_dir: str | Path,
-        split: str,
-        artifact_name: str,
-        schema_version: int,
-        entity_vocab_path: str | Path | None,
-        relation_vocab_path: str | Path | None,
-        questions_path: str | Path | None,
-        overwrite: bool,
+        settings: PredictionArtifactWriteConfig,
     ) -> dict[str, Path] | None:
         return self.metric_runtime.write_prediction_artifacts(
-            results=self.prediction_state.results,
-            labels=self.prediction_state.labels,
-            output_dir=output_dir,
-            split=split,
-            artifact_name=artifact_name,
-            schema_version=schema_version,
-            entity_vocab_path=entity_vocab_path,
-            relation_vocab_path=relation_vocab_path,
-            questions_path=questions_path,
-            overwrite=overwrite,
+            results=self._prediction_state.results,
+            labels=self._prediction_state.labels,
+            output_dir=settings.output_dir,
+            split=settings.split,
+            artifact_name=settings.artifact_name,
+            schema_version=settings.schema_version,
+            entity_vocab_path=settings.entity_vocab_path,
+            relation_vocab_path=settings.relation_vocab_path,
+            questions_path=settings.questions_path,
+            overwrite=settings.overwrite,
         )
 
 
 __all__ = [
     "MetricRuntimeController",
+    "PredictionArtifactWriteConfig",
     "PredictionEpochState",
     "PredictionLabel",
     "PredictionResult",

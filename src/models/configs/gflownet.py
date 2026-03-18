@@ -151,6 +151,12 @@ class SamplingTemperatureScheduleConfig:
 
 @dataclass(frozen=True)
 class SuccessfulTrajectoryReplayConfig:
+    """Replay settings.
+
+    `ratio` targets the realized replay fraction `replay / (on_policy + replay)`
+    per graph after replay trajectories are added to the on-policy batch.
+    """
+
     enabled: bool = False
     ratio: float = 0.25
     warmup_passes: float = 1.0

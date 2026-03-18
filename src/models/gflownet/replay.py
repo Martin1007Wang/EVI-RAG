@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Sequence
 
 import torch
@@ -47,12 +48,14 @@ class SuccessfulTrajectoryReplayBuffer:
     ) -> None:
         self.max_buffer_size = int(max_buffer_size)
         self.max_trajectories_per_sample = int(max_trajectories_per_sample)
+        self._lock = RLock()
         self._records_by_sample: dict[str, list[SuccessfulTrajectoryRecord]] = {}
         self._fifo: list[tuple[str, SuccessfulTrajectoryRecord]] = []
         self._size = 0
 
     def __len__(self) -> int:
-        return self._size
+        with self._lock:
+            return self._size
 
     def _append_record(self, record: SuccessfulTrajectoryRecord) -> bool:
         records = self._records_by_sample.setdefault(record.sample_id, [])
@@ -93,27 +96,30 @@ class SuccessfulTrajectoryReplayBuffer:
         edge_offsets = _edge_offsets(batch)
         added = 0
         success_positions = torch.nonzero(sample_batch.success_mask, as_tuple=False)
-        for graph_rollout in success_positions.tolist():
-            graph_idx, rollout_idx = int(graph_rollout[0]), int(graph_rollout[1])
-            sample_id = str(batch.sample_ids[graph_idx])
-            start_local_node = int(
-                sample_batch.start_nodes[graph_idx, rollout_idx].item()
-                - node_offsets[graph_idx].item()
-            )
-            num_steps = int(
-                sample_batch.terminal_num_steps[graph_idx, rollout_idx].item()
-            )
-            edge_ids = sample_batch.trace_edge_ids[graph_idx, rollout_idx, :num_steps]
-            local_edge_ids = tuple(
-                int(edge_id.item() - edge_offsets[graph_idx].item())
-                for edge_id in edge_ids
-            )
-            record = SuccessfulTrajectoryRecord(
-                sample_id=sample_id,
-                start_local_node=start_local_node,
-                local_edge_ids=local_edge_ids,
-            )
-            added += int(self._append_record(record))
+        with self._lock:
+            for graph_rollout in success_positions.tolist():
+                graph_idx, rollout_idx = int(graph_rollout[0]), int(graph_rollout[1])
+                sample_id = str(batch.sample_ids[graph_idx])
+                start_local_node = int(
+                    sample_batch.start_nodes[graph_idx, rollout_idx].item()
+                    - node_offsets[graph_idx].item()
+                )
+                num_steps = int(
+                    sample_batch.terminal_num_steps[graph_idx, rollout_idx].item()
+                )
+                edge_ids = sample_batch.trace_edge_ids[
+                    graph_idx, rollout_idx, :num_steps
+                ]
+                local_edge_ids = tuple(
+                    int(edge_id.item() - edge_offsets[graph_idx].item())
+                    for edge_id in edge_ids
+                )
+                record = SuccessfulTrajectoryRecord(
+                    sample_id=sample_id,
+                    start_local_node=start_local_node,
+                    local_edge_ids=local_edge_ids,
+                )
+                added += int(self._append_record(record))
         return added
 
     def plan_for_batch(
@@ -122,25 +128,28 @@ class SuccessfulTrajectoryReplayBuffer:
         batch: TrajectoryBatch,
         replay_rollouts_per_graph: int,
     ) -> BatchReplayPlan | None:
-        if replay_rollouts_per_graph < 1 or self._size < 1:
-            return None
+        with self._lock:
+            if replay_rollouts_per_graph < 1 or self._size < 1:
+                return None
 
-        graph_indices: list[int] = []
-        records_by_graph: list[tuple[SuccessfulTrajectoryRecord, ...]] = []
-        for graph_idx, sample_id in enumerate(batch.sample_ids):
-            records = self._records_by_sample.get(str(sample_id))
-            if not records:
-                continue
-            if len(records) >= replay_rollouts_per_graph:
-                perm = torch.randperm(len(records))[:replay_rollouts_per_graph].tolist()
-                chosen = tuple(records[idx] for idx in perm)
-            else:
-                chosen = tuple(
-                    records[int(torch.randint(len(records), (1,)).item())]
-                    for _ in range(replay_rollouts_per_graph)
-                )
-            graph_indices.append(int(graph_idx))
-            records_by_graph.append(chosen)
+            graph_indices: list[int] = []
+            records_by_graph: list[tuple[SuccessfulTrajectoryRecord, ...]] = []
+            for graph_idx, sample_id in enumerate(batch.sample_ids):
+                records = self._records_by_sample.get(str(sample_id))
+                if not records:
+                    continue
+                if len(records) >= replay_rollouts_per_graph:
+                    perm = torch.randperm(len(records))[
+                        :replay_rollouts_per_graph
+                    ].tolist()
+                    chosen = tuple(records[idx] for idx in perm)
+                else:
+                    chosen = tuple(
+                        records[int(torch.randint(len(records), (1,)).item())]
+                        for _ in range(replay_rollouts_per_graph)
+                    )
+                graph_indices.append(int(graph_idx))
+                records_by_graph.append(chosen)
 
         if not graph_indices:
             return None

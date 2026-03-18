@@ -50,16 +50,31 @@ def build_answer_posterior(
     total_mass_reference: float | None = None,
 ) -> tuple[list[AnswerPosteriorRecord], list[int]]:
     answer_ids = [int(value) for value in analysis.answer_entity_ids.tolist()]
-    answer_probs = [float(value) for value in analysis.answer_probs.tolist()]
-    total_mass = float(sum(answer_probs))
+    if analysis.log_answer_probs is not None and int(
+        analysis.log_answer_probs.numel()
+    ) == len(answer_ids):
+        answer_log_probs = [
+            float(value) for value in analysis.log_answer_probs.tolist()
+        ]
+        answer_probs = [
+            0.0 if not math.isfinite(value) else float(math.exp(value))
+            for value in answer_log_probs
+        ]
+        order = sorted(
+            range(len(answer_ids)),
+            key=lambda idx: (-answer_log_probs[idx], answer_ids[idx]),
+        )
+    else:
+        answer_probs = [float(value) for value in analysis.answer_probs.tolist()]
+        order = sorted(
+            range(len(answer_ids)),
+            key=lambda idx: (-answer_probs[idx], answer_ids[idx]),
+        )
+    total_mass = float(math.fsum(answer_probs))
     reference_mass = (
         float(total_mass_reference)
         if total_mass_reference is not None
         else float(total_mass)
-    )
-    order = sorted(
-        range(len(answer_ids)),
-        key=lambda idx: (-answer_probs[idx], answer_ids[idx]),
     )
     cumulative = 0.0
     records: list[AnswerPosteriorRecord] = []
@@ -290,6 +305,11 @@ def build_rank_only_result(
             retrieval_answer_entity_ids=retrieval_answer_entity_ids,
             retrieval_answer_probs=retrieval_answer_probs,
             success_by_step=analysis.success_by_step,
+            log_terminal_mass=analysis.log_terminal_mass,
+            log_answer_probs=analysis.log_retrieval_answer_probs,
+            log_gold_total_mass=analysis.log_gold_total_mass,
+            log_retrieval_answer_probs=analysis.log_retrieval_answer_probs,
+            log_success_by_step=analysis.log_success_by_step,
         ),
         gold_answers=gold_answers,
         answer_mass_threshold=answer_mass_threshold,
