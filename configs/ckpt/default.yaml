@@ -3,4 +3,4 @@
 # This config exists to satisfy Hydra's `ckpt: default` group and to
 # centralize checkpoint paths for evaluation runs.
 
-answer_reachability: null
+gflownet: null

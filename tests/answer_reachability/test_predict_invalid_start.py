@@ -4,20 +4,18 @@ import torch
 
 from src.models.configs import (
     BackboneConfig,
-    AnswerReachabilityInferenceConfig,
+    SearchEvalConfig,
     GFlowNetTrainingConfig,
-    GraphLogZHeadConfig,
     HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
     SchedulerConfig,
-    StartHeadConfig,
     StateScoreHeadConfig,
 )
 from src.models.gflownet_module import GFlowNetModule
 from src.metrics.answer_reachability.runtime import (
-    AnswerReachabilityMetricRuntimeFactory,
+    SearchMetricRuntimeFactory,
 )
 
 from .conftest import make_batch_from_graph
@@ -43,10 +41,8 @@ def _make_module() -> GFlowNetModule:
                 num_layers=2,
                 dropout=0.0,
             ),
-            start_head=StartHeadConfig(hidden_dim=16, dropout=0.0),
-            graph_log_z_head=GraphLogZHeadConfig(hidden_dim=16, dropout=0.0),
         ),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
@@ -55,7 +51,7 @@ def _make_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
-        metric_runtime_factory=AnswerReachabilityMetricRuntimeFactory(),
+        metric_runtime_factory=SearchMetricRuntimeFactory(),
     )
 
 

@@ -2,28 +2,46 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from src.graph_runtime import TrajectoryBatch
+from src.metrics.answer_reachability.edge_eval import (
+    EdgeRetrievalLabelRecord,
+    EdgeRetrievalResult,
+)
+from src.metrics.answer_reachability.schema import (
+    SupportWindowLabelRecord,
+    SupportWindowResult,
+)
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeProtocol
+from src.models.gflownet import TrajectorySamplerProtocol
+
+
+PredictionResult = SupportWindowResult | EdgeRetrievalResult
+PredictionLabel = SupportWindowLabelRecord | EdgeRetrievalLabelRecord
 
 
 @dataclass
 class PredictionEpochState:
-    results: list[Any] = field(default_factory=list)
-    labels: list[Any] = field(default_factory=list)
-    metrics: dict[str, Any] = field(default_factory=dict)
+    results: list[PredictionResult] = field(default_factory=list)
+    labels: list[PredictionLabel] = field(default_factory=list)
+    metrics: dict[str, float] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.results.clear()
         self.labels.clear()
         self.metrics.clear()
 
-    def record_batch(self, *, results: list[Any], labels: list[Any]) -> None:
+    def record_batch(
+        self,
+        *,
+        results: list[PredictionResult],
+        labels: list[PredictionLabel],
+    ) -> None:
         self.results.extend(results)
         self.labels.extend(labels)
 
-    def finalize(self, metrics: dict[str, Any]) -> None:
+    def finalize(self, metrics: dict[str, float]) -> None:
         self.metrics = dict(metrics)
 
 
@@ -41,7 +59,7 @@ class MetricRuntimeController:
         self.prediction_state = PredictionEpochState()
 
     @property
-    def sampler(self) -> Any:
+    def sampler(self) -> TrajectorySamplerProtocol | None:
         return self.metric_runtime.sampler
 
     @property
@@ -66,14 +84,19 @@ class MetricRuntimeController:
         *,
         batch: TrajectoryBatch,
         include_answer_support: bool = False,
-    ) -> tuple[dict[str, float], list[Any], dict[str, Any], dict[str, float]]:
+    ) -> tuple[
+        dict[str, float],
+        list[PredictionResult],
+        dict[str, float],
+        dict[str, float],
+    ]:
         outputs = self.evaluate_batch_output(
             batch=batch,
             include_answer_support=include_answer_support,
         )
         return (
             outputs.primary_metrics,
-            outputs.results,
+            cast(list[PredictionResult], outputs.results),
             outputs.model_metrics,
             outputs.secondary_metrics,
         )
@@ -81,25 +104,31 @@ class MetricRuntimeController:
     def reset_prediction_state(self) -> None:
         self.prediction_state.reset()
 
-    def predict_batch(self, *, batch: TrajectoryBatch) -> list[Any]:
-        return self.metric_runtime.predict_batch(
-            batch=batch,
-            metrics_profile=self.metrics_profile,
-            include_answer_support=self.metrics_profile != "rank_only",
-            on_invalid_start=self.on_invalid_start,
+    def predict_batch(self, *, batch: TrajectoryBatch) -> list[PredictionResult]:
+        return cast(
+            list[PredictionResult],
+            self.metric_runtime.predict_batch(
+                batch=batch,
+                metrics_profile=self.metrics_profile,
+                include_answer_support=self.metrics_profile != "rank_only",
+                on_invalid_start=self.on_invalid_start,
+            ),
         )
 
     def record_prediction_batch(
         self,
         *,
         batch: TrajectoryBatch,
-        outputs: list[Any] | None,
+        outputs: list[PredictionResult] | None,
     ) -> None:
         if not outputs:
             return
         self.prediction_state.record_batch(
             results=list(outputs),
-            labels=self.metric_runtime.build_predict_labels(batch, outputs),
+            labels=cast(
+                list[PredictionLabel],
+                self.metric_runtime.build_predict_labels(batch, outputs),
+            ),
         )
 
     def finalize_prediction_epoch(self) -> None:
@@ -110,7 +139,7 @@ class MetricRuntimeController:
             )
         )
 
-    def get_predict_metrics(self) -> dict[str, Any]:
+    def get_predict_metrics(self) -> dict[str, float]:
         return dict(self.prediction_state.metrics)
 
     def write_prediction_artifacts(
@@ -139,4 +168,9 @@ class MetricRuntimeController:
         )
 
 
-__all__ = ["MetricRuntimeController", "PredictionEpochState"]
+__all__ = [
+    "MetricRuntimeController",
+    "PredictionEpochState",
+    "PredictionLabel",
+    "PredictionResult",
+]

@@ -1,19 +1,16 @@
 # @package _global_
 # Core pipeline invariants and performance defaults.
 
-skip_parquet_stage: false
-skip_lmdb_stage: false
 reuse_embeddings_if_exists: false
 validate_graph_edges: true
 
 path_mode: qa_directed
 dedup_edges: true
 remove_self_loops: true
-relation_cleaning: true
-keep_start_adjacent_edges: true
 target_reachable_pruning: false
 
-filter:
+# Preprocess-time sample retention rules before parquet/LMDB materialization.
+preprocess_filter:
   train:
     skip_no_topic: true
     skip_no_ans: false
@@ -27,19 +24,13 @@ q_entity_blacklist: []
 q_entity_blacklist_path: null
 
 embeddings_out_dir: ${dataset.materialized_dir}/embeddings
-canonicalize_relations: false
-cosine_eps: 1e-6
 # Mainline uses token-level question context; set 0 to disable and fall back to pooled question_emb only.
 question_ctx_max_tokens: 64
 
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json
-emit_nonzero_positive_filter: false
-nonzero_positive_filter_filename: nonzero_positive_filter.json
-nonzero_positive_filter_splits: ["train"]
 
 
-parquet_dir: ${dataset.out_dir}
 output_dir: ${dataset.materialized_dir}
 use_precomputed_embeddings: true
 use_precomputed_questions: true

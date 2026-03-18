@@ -310,6 +310,122 @@ class TrajectoryBatch:
         trajectory_batch.validate()
         return trajectory_batch
 
+    @classmethod
+    def concatenate(cls, batches: list["TrajectoryBatch"]) -> "TrajectoryBatch":
+        if not batches:
+            raise ValueError("TrajectoryBatch.concatenate requires at least one batch.")
+        if len(batches) == 1:
+            return batches[0]
+
+        device = batches[0].node_ptr.device
+        dataset_scope = str(batches[0].dataset_scope)
+        has_heuristic = batches[0].heuristic_log_v is not None
+
+        num_graphs = 0
+        node_offset = 0
+        node_ptr_values = [0]
+        q_ptr_values = [0]
+        a_ptr_values = [0]
+        answer_ptr_values = [0]
+
+        edge_index_parts: list[torch.Tensor] = []
+        edge_rel_parts: list[torch.Tensor] = []
+        edge_batch_parts: list[torch.Tensor] = []
+        node_batch_parts: list[torch.Tensor] = []
+        node_embedding_parts: list[torch.Tensor] = []
+        edge_embedding_parts: list[torch.Tensor] = []
+        question_emb_parts: list[torch.Tensor] = []
+        question_ctx_parts: list[torch.Tensor] = []
+        question_ctx_mask_parts: list[torch.Tensor] = []
+        q_local_parts: list[torch.Tensor] = []
+        a_local_parts: list[torch.Tensor] = []
+        answer_entity_parts: list[torch.Tensor] = []
+        node_global_parts: list[torch.Tensor] = []
+        heuristic_parts: list[torch.Tensor] = []
+        sample_ids: list[str] = []
+        questions: list[str] = []
+
+        for batch in batches:
+            batch.validate()
+            if batch.node_ptr.device != device:
+                raise ValueError(
+                    "All TrajectoryBatch instances must share the same device."
+                )
+            if str(batch.dataset_scope) != dataset_scope:
+                raise ValueError(
+                    "All TrajectoryBatch instances must share dataset_scope."
+                )
+            if (batch.heuristic_log_v is not None) != has_heuristic:
+                raise ValueError(
+                    "All TrajectoryBatch instances must either all include heuristic_log_v or all omit it."
+                )
+
+            node_counts = (batch.node_ptr[1:] - batch.node_ptr[:-1]).tolist()
+            q_counts = (batch.q_ptr[1:] - batch.q_ptr[:-1]).tolist()
+            a_counts = (batch.a_ptr[1:] - batch.a_ptr[:-1]).tolist()
+            answer_counts = (batch.answer_ptr[1:] - batch.answer_ptr[:-1]).tolist()
+
+            for count in node_counts:
+                node_ptr_values.append(node_ptr_values[-1] + int(count))
+            for count in q_counts:
+                q_ptr_values.append(q_ptr_values[-1] + int(count))
+            for count in a_counts:
+                a_ptr_values.append(a_ptr_values[-1] + int(count))
+            for count in answer_counts:
+                answer_ptr_values.append(answer_ptr_values[-1] + int(count))
+
+            edge_index_parts.append(batch.edge_index + int(node_offset))
+            edge_rel_parts.append(batch.edge_rel_global)
+            edge_batch_parts.append(batch.edge_batch + int(num_graphs))
+            node_batch_parts.append(batch.node_batch + int(num_graphs))
+            node_embedding_parts.append(batch.node_embeddings)
+            edge_embedding_parts.append(batch.edge_embeddings)
+            question_emb_parts.append(batch.question_emb)
+            question_ctx_parts.append(batch.question_ctx)
+            question_ctx_mask_parts.append(batch.question_ctx_mask)
+            q_local_parts.append(batch.q_local_indices)
+            a_local_parts.append(batch.a_local_indices)
+            answer_entity_parts.append(batch.answer_entity_ids)
+            node_global_parts.append(batch.node_global_ids)
+            if has_heuristic and batch.heuristic_log_v is not None:
+                heuristic_parts.append(batch.heuristic_log_v)
+
+            sample_ids.extend(batch.sample_ids)
+            questions.extend(batch.questions)
+            node_offset += batch.num_nodes_total
+            num_graphs += int(batch.num_graphs)
+
+        heuristic_log_v = None
+        if has_heuristic:
+            heuristic_log_v = torch.cat(heuristic_parts, dim=0)
+
+        concatenated = cls(
+            num_graphs=num_graphs,
+            node_ptr=torch.tensor(node_ptr_values, device=device, dtype=torch.long),
+            edge_index=torch.cat(edge_index_parts, dim=1),
+            edge_rel_global=torch.cat(edge_rel_parts, dim=0),
+            edge_batch=torch.cat(edge_batch_parts, dim=0),
+            node_batch=torch.cat(node_batch_parts, dim=0),
+            node_embeddings=torch.cat(node_embedding_parts, dim=0),
+            edge_embeddings=torch.cat(edge_embedding_parts, dim=0),
+            question_emb=torch.cat(question_emb_parts, dim=0),
+            question_ctx=torch.cat(question_ctx_parts, dim=0),
+            question_ctx_mask=torch.cat(question_ctx_mask_parts, dim=0),
+            q_local_indices=torch.cat(q_local_parts, dim=0),
+            q_ptr=torch.tensor(q_ptr_values, device=device, dtype=torch.long),
+            a_local_indices=torch.cat(a_local_parts, dim=0),
+            a_ptr=torch.tensor(a_ptr_values, device=device, dtype=torch.long),
+            answer_entity_ids=torch.cat(answer_entity_parts, dim=0),
+            answer_ptr=torch.tensor(answer_ptr_values, device=device, dtype=torch.long),
+            node_global_ids=torch.cat(node_global_parts, dim=0),
+            sample_ids=sample_ids,
+            questions=questions,
+            dataset_scope=dataset_scope,
+            heuristic_log_v=heuristic_log_v,
+        )
+        concatenated.validate()
+        return concatenated
+
     def select_graph(self, graph_idx: int) -> "TrajectoryBatch":
         if graph_idx < 0 or graph_idx >= self.num_graphs:
             raise IndexError(f"graph_idx out of range: {graph_idx}.")

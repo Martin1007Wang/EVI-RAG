@@ -217,11 +217,9 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
     assert label_record == {
         "sample_id": "s1",
         "question": "Where was X born?",
-        "question_text": "Where was X born?",
         "start_entity_ids": [1],
         "answer_entity_ids": [2],
         "answer_texts": [],
-        "answer_text": "",
         "a_entity_in_graph": True,
     }
 

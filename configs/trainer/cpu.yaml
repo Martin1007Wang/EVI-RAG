@@ -2,8 +2,9 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-min_epochs: 50 # prevents early stopping
-max_epochs: 9999
+min_epochs: 0
+max_epochs: -1
+max_steps: 100000
 
 # force CPU execution
 accelerator: cpu
@@ -22,8 +23,12 @@ benchmark: false
 # disable automatic clipping for manual optimization (model handles it)
 gradient_clip_val: null
 
-# perform a validation loop every N training epochs
-check_val_every_n_epoch: 10
+# Keep validation on a fixed optimizer-step cadence.
+val_check_interval: 1000
+check_val_every_n_epoch: null
+
+# Custom train sampler handles DDP-aware step-driven sampling.
+use_distributed_sampler: false
 
 # skip sanity validation to avoid cold-start stalls on large datasets
 num_sanity_val_steps: 0
@@ -33,8 +38,8 @@ limit_train_batches: null
 limit_val_batches: null
 limit_test_batches: null
 
-# log interval (steps); set small to avoid skipping logs when epoch has few batches
-log_every_n_steps: 1
+# log interval (steps)
+log_every_n_steps: 50
 
 # set True to to ensure deterministic results
 # makes training slower but gives more reproducibility than just setting seeds

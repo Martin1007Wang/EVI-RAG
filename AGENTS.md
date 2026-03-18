@@ -7,7 +7,7 @@ If repo behavior and this file disagree, follow the source files and update this
 ## Scope and rule files
 
 - Repository type: Python ML/research codebase built around Hydra, Lightning, PyTorch, and pytest.
-- Main runtime entrypoints live in `src/train.py`, `src/eval.py`, and `src/datasets/build_edge_retriever_labels.py`.
+- Main runtime entrypoints live in `src/train.py`, `src/eval.py`, `src/preprocess.py`, and `src/datasets/build_edge_retrieval_labels.py`.
 - Config composition is centralized in `configs/`.
 - Tests live in `tests/` and `tests/answer_reachability/`.
 - No existing top-level `AGENTS.md`, `.cursorrules`, `.cursor/rules/`, or `.github/copilot-instructions.md` were found when this file was created.
@@ -56,9 +56,10 @@ If repo behavior and this file disagree, follow the source files and update this
 
 - When training or evaluation needs GPU, first attach the existing tmux session with `tmux attach -t train` and run the command inside that session.
 - Do not launch GPU training/eval jobs from a fresh shell when the `train` tmux session is available; use that session as the default execution context.
-- Train via Hydra: `python src/train.py experiment=train_answer_reachability dataset=webqsp-sub`.
-- Evaluate an answer-reachability checkpoint: `python src/eval.py experiment=eval_answer_reachability ckpt.answer_reachability=/path/to/model.ckpt`.
-- Build edge retriever labels: `python src/datasets/build_edge_retriever_labels.py dataset=webqsp-sub`.
+- Train via Hydra: `python src/train.py experiment=train_rankflow dataset=webqsp-sub`.
+- Evaluate a RankFlow checkpoint: `python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt`.
+- Rebuild retrieval preprocess outputs: `python src/preprocess.py dataset=webqsp`.
+- Build edge retriever labels: `python src/datasets/build_edge_retrieval_labels.py dataset=webqsp-sub`.
 - `make train` runs `python src/train.py` with the default config.
 - Training expects an explicit `dataset=<name>` for supported training models.
 - Training currently uses the single mainline `src.models.gflownet_module.GFlowNetModule`, and only on `-sub` datasets.

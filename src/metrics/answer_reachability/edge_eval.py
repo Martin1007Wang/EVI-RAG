@@ -7,15 +7,15 @@ from typing import Callable, Iterable
 
 import torch
 
-from src.data.preprocess.labels.edge_retriever import compute_shortest_path_labels
+from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labels
 from src.graph_runtime import TrajectoryBatch
-from src.models.configs import AnswerReachabilityInferenceConfig
+from src.models.configs import SearchEvalConfig
+from src.models.gflownet import StartDistributionError
+from src.models.gflownet import SearchPolicyProtocol
 from src.metrics.protocol import MetricEvaluationOutput
-from src.models.policy.protocol import SearchPolicyProtocol
-from src.models.policy.trajectory_policy import StartDistributionError
 from src.utils.metrics_io import to_serializable
 
-from .exact import ExactEdgeSupportAnalysis, ExactReachabilityAnalyzer
+from .exact_analysis import ExactEdgeSupportAnalysis, ExactReachabilityAnalyzer
 
 
 @dataclass(frozen=True)
@@ -126,11 +126,11 @@ class EdgeRetrievalEvaluator:
     def __init__(
         self,
         *,
-        inference_cfg: AnswerReachabilityInferenceConfig,
+        eval_cfg: SearchEvalConfig,
         policy: SearchPolicyProtocol,
         analyzer: ExactReachabilityAnalyzer,
     ) -> None:
-        self.inference_cfg = inference_cfg
+        self.eval_cfg = eval_cfg
         self.policy = policy
         self.analyzer = analyzer
 
@@ -216,7 +216,7 @@ class EdgeRetrievalEvaluator:
             ),
             None,
         )
-        emit_top_k = min(int(self.inference_cfg.edge_emit_top_k), len(ranked_ids))
+        emit_top_k = min(int(self.eval_cfg.edge_emit_top_k), len(ranked_ids))
         ranked_edges = [
             EdgePredictionRecord(
                 edge_id=edge_id,
@@ -278,7 +278,7 @@ class EdgeRetrievalEvaluator:
             },
             primary_metrics=compute_edge_metrics(
                 results=results,
-                edge_top_ks=tuple(int(k) for k in self.inference_cfg.edge_top_ks),
+                edge_top_ks=tuple(int(k) for k in self.eval_cfg.edge_top_ks),
             ),
             secondary_metrics={},
             results=results,
@@ -336,7 +336,7 @@ class EdgeRetrievalEvaluator:
         del metrics_profile
         return compute_edge_metrics(
             results=predict_results,
-            edge_top_ks=tuple(int(k) for k in self.inference_cfg.edge_top_ks),
+            edge_top_ks=tuple(int(k) for k in self.eval_cfg.edge_top_ks),
         )
 
     def write_prediction_artifacts(

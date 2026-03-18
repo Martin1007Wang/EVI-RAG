@@ -5,14 +5,6 @@ import os
 _PATH_MODE_UNDIRECTED = "undirected"
 _PATH_MODE_QA_DIRECTED = "qa_directed"
 _PATH_MODES = (_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)
-_TIME_RELATION_MODE_KEEP = "keep"
-_TIME_RELATION_MODE_DROP = "drop"
-_TIME_RELATION_MODE_QUESTION = "question_gated"
-_TIME_RELATION_MODES = (
-    _TIME_RELATION_MODE_KEEP,
-    _TIME_RELATION_MODE_DROP,
-    _TIME_RELATION_MODE_QUESTION,
-)
 _ALLOWED_SPLITS = ("train", "validation", "test")
 _NON_TEXT_EMBEDDING_ID = 0
 _DIST_UNREACHABLE = -1
@@ -26,14 +18,11 @@ _DISTANCE_DEFAULT_CHUNK_SIZE = 8
 _DISTANCE_DEFAULT_PROGRESS_INTERVAL = 0
 _REL_LABEL_SAMPLE_LIMIT = 20
 _DEFAULT_BATCH_SIZE = 64
-_DEFAULT_COSINE_EPS = 1e-6
 _EDGE_STAT_KEYS = (
     "raw_edges",
     "kept_edges",
-    "type_edges",
     "dropped_edges",
     "self_loop_edges",
-    "type_orphan_edges",
     "raw_nodes",
     "kept_nodes",
 )
@@ -74,7 +63,6 @@ class GraphFields:
 
 
 class QuestionFields:
-    QUESTION_UID = "question_uid"
     DATASET = "dataset"
     SPLIT = "split"
     KB = "kb"
@@ -123,7 +111,6 @@ _GRAPH_PARQUET_FIELDS = (
 )
 
 _QUESTION_PARQUET_FIELDS = (
-    QuestionFields.QUESTION_UID,
     QuestionFields.DATASET,
     QuestionFields.SPLIT,
     QuestionFields.KB,

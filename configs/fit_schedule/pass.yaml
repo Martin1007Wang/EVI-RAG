@@ -1,0 +1,16 @@
+# Pass-based fit schedule for step-driven training.
+#
+# The trainer still runs with Lightning's step/batch controls, but those values
+# are derived from filtered train-set size so experiments across datasets share
+# the same notion of progress.
+
+mode: pass_based
+
+# Total train-set passes to allow before the Trainer hard-stop fires.
+max_passes: 120.0
+
+# Run validation after approximately this many train-set passes.
+val_every_passes: 2.0
+
+# Early stopping patience expressed in train-set passes instead of raw val checks.
+early_stopping_patience_passes: 24.0

@@ -170,7 +170,7 @@ def test_extract_subgraphrag_triplet_lines_filter_virtual_edges() -> None:
     assert lines == ["(A,born_in,Paris)"]
 
 
-def test_iter_requests_supports_question_field_alias(tmp_path) -> None:
+def test_iter_requests_reads_canonical_question_field(tmp_path) -> None:
     input_path = tmp_path / "input.jsonl"
     record = {
         "sample_id": "s1",
@@ -209,7 +209,7 @@ def test_run_llm_eval_fails_fast_when_sidecar_missing(tmp_path) -> None:
         "dataset": {"name": "webqsp", "artifact_dir": str(tmp_path)},
         "run": {"split": "test"},
         "llm": {
-            "provider": "openai",
+            "providers": ["openai"],
             "topk_list": [1],
             "compute_metrics": True,
             "input_path": str(input_path),

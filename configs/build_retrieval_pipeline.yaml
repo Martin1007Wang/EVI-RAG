@@ -3,17 +3,20 @@ defaults:
   - paths: default
   - dataset: null
   - pipeline: default
+  - hydra: default
 
 # Explicitly provide `dataset=<name>` via CLI override (paths default to configs/paths/default.yaml).
 
+task_name: preprocess
+
 # Shared encoder settings (used by both parquet + LMDB stages).
 encoder: "Alibaba-NLP/gte-large-en-v1.5"
-device: "cpu"
-batch_size: 32
+device: auto
+batch_size: null
 parquet_chunk_size: 4000
 parquet_num_workers: 8
 progress_bar: true
-fp16: false
+fp16: null
 pipeline_log_path: null
 dataset_source: hf
 hf_dataset: ${dataset.hf_dataset}
@@ -22,7 +25,6 @@ hf_offline: true
 pipeline_stage: all
 
 # === Stage 1: normalize raw parquet into retrieval parquet ===
-dataset_name: ${dataset.name}
 kb: ${dataset.kb}
 out_dir: ${dataset.out_dir}
 column_map: ${dataset.column_map}
@@ -33,6 +35,3 @@ text_regex: ${dataset.text_regex}
 cvt_entity_mode: ${dataset.cvt_entity_mode}
 cvt_prefixes: ${dataset.cvt_prefixes}
 cvt_regex: ${dataset.cvt_regex}
-time_relation_mode: ${dataset.time_relation_mode}
-time_relation_regex: ${dataset.time_relation_regex}
-time_question_regex: ${dataset.time_question_regex}

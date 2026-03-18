@@ -1,5 +1,5 @@
 # Abstract eval run base.
-# Use a concrete run such as `run=eval_answer_reachability` or `run=eval_llm`.
+# Use a concrete run such as `run=rankflow` or `run=eval_llm`.
 _target_: null
 name: null
 task_name: "eval"

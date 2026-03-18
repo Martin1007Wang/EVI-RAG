@@ -6,6 +6,11 @@
 - 训练：sampled rollouts + `SubTB`
 - 评估：exact answer reachability analysis
 
+如果需要更细地看“当前流量是怎么被估计出来的”，尤其是隐式虚拟源、起点 flow、
+根流量 `log Z` 和 SubTB 锚点之间的关系，请结合阅读：
+
+- `docs/answer_reachability_flow_estimation_derivation.md`
+
 它不再讨论已经删除的 `trajectory_policy`、`guidance_cfg` 或多损失混训结构。
 
 ## 1. 状态与策略
@@ -23,14 +28,25 @@ s_t = (v_t, t)
 
 问题实体集合记为 `Q(x)`，gold answer 节点集合记为 `A(x)`。
 
-## 2. 起点分布
+## 2. 起点分布与隐式虚拟源
 
-起点只允许从 `Q(x)` 中采样。
-
-设起点 head 给出的打分为：
+起点只允许从 `Q(x)` 中采样，但当前实现不再把它理解成一个外部 categorical
+selector，而是引入一个隐式虚拟源：
 
 ```text
-u_start(v; x)
+s_emptyset
+```
+
+所有真实起点状态都位于：
+
+```text
+S_start(x) = {(v, 0): v in Q(x)}
+```
+
+设 bare state flow 在起点状态 `(v,0)` 处的取值为：
+
+```text
+f_theta(v, 0; x)
 ```
 
 如果启用了 trajectory heuristic，记它在起点上的 bias 为：
@@ -39,12 +55,31 @@ u_start(v; x)
 b_start(v; x) = beta * log h(v, x)
 ```
 
-则最终起点分布为：
+则起点状态的有效 log-flow 为：
+
+```text
+V_start(v; x) = f_theta(v, 0; x) + b_start(v; x)
+```
+
+隐式虚拟源的总流定义为：
+
+```text
+Z_theta(x) = F_theta(s_emptyset | x)
+          = sum_{q in Q(x)} exp(V_start(q; x))
+```
+
+因此起点分布不再额外学习独立的 graph-level root head，而是直接由起点状态流归一化：
 
 ```text
 P_theta(s_0 = v | x)
-= exp(u_start(v; x) + b_start(v; x))
-  / sum_{q in Q(x)} exp(u_start(q; x) + b_start(q; x))
+= P_theta((v,0) | s_emptyset, x)
+= exp(V_start(v; x)) / Z_theta(x)
+```
+
+等价地：
+
+```text
+log Z_theta(x) = logsumexp_{q in Q(x)} V_start(q; x)
 ```
 
 这里的 `h` 可能来自：
@@ -53,26 +88,31 @@ P_theta(s_0 = v | x)
 - `embedding`
 - `learned`
 
-但它们都只是 bias 源，不改变训练目标定义。
+但它们都只是 start/transition bias 源，不改变训练目标定义。
 
 ## 3. 前向 move 分布
 
 对任意非终止状态 `s_t`，策略先枚举合法 child state `c in Child(s_t)`。
 
-基础 state score 记为：
+基础 bare state flow 记为：
 
 ```text
 f_theta(c) = log F_theta(c)
 ```
 
-若启用 trajectory heuristic，则 child state 的最终 edge logit 是：
+若启用 trajectory heuristic，则先定义有效状态值：
 
 ```text
-u_theta(s_t -> c)
-= f_theta(c) + beta * log h(c, x)
+V_theta(c) = f_theta(c) + beta * log h(c, x)
 ```
 
-于是 move-only 前向分布为：
+当前 backward 为固定项 `P_B(s_t | c, x)`，于是前向 edge logit 是：
+
+```text
+u_theta(s_t -> c) = V_theta(c) + log P_B(s_t | c, x)
+```
+
+于是前向分布为：
 
 ```text
 P_theta(c | s_t, x)
@@ -83,22 +123,24 @@ P_theta(c | s_t, x)
 代码里对应：
 
 - `GFlowNetPolicy.compute_forward_distribution(...)`
-- `TrajectoryPolicy.compute_move_log_probs(...)`
+- `BaseSearchPolicy.compute_move_log_probs(...)`
 
 ## 4. 根边界量 `log Z(x)`
 
-主线训练还额外学习一个 graph-level 标量：
+当前 `log Z_theta(x)` 不是独立 head 回归出来的 graph scalar，而是由起点状态流做
+`logsumexp` 得到：
 
 ```text
-log Z_theta(x)
+log Z_theta(x) = logsumexp_{q in Q(x)} V_start(q; x)
 ```
 
-它不是动作概率的一部分，而是 SubTB 根边界项的一部分。
+它仍然不是动作概率的一部分，而是 SubTB 根边界项的一部分。
 
 可以把它理解为：
 
+- 隐式虚拟源 `s_emptyset` 的总 log-flow
 - rollout 轨迹在根部的归一化锚点
-- 与 `log F(s_0)` 和起点概率一起进入子轨迹平衡残差
+- 与起点状态流和起点概率一起进入子轨迹平衡残差
 
 ## 5. 终止与奖励
 
@@ -131,10 +173,10 @@ R(tau, x) = epsilon_x,         otherwise
 
 ```text
 X_0 = log Z_theta(x)
-X_1 = log F_theta(s_0) - log P_theta(s_0 | x)
-X_2 = log F_theta(s_1) - log P_theta(s_0, s_1 | x)
+X_1 = V_theta(s_0) - log P_theta(s_0 | x)
+X_2 = V_theta(s_1) - log P_theta(s_0, s_1 | x)
 ...
-X_k = log F_theta(s_{k-1}) - log P_theta(prefix_{k-1} | x)
+X_k = V_theta(s_{k-1}) - log P_theta(prefix_{k-1} | x)
 ```
 
 终止位置会被 reward anchor 覆盖成：
@@ -142,6 +184,14 @@ X_k = log F_theta(s_{k-1}) - log P_theta(prefix_{k-1} | x)
 ```text
 X_end = log R(tau, x) - log P_theta(prefix_end | x)
 ```
+
+由于当前起点分布直接由起点状态流归一化得到，因此对于任意被采样到的起点 `s_0`，有：
+
+```text
+X_1 = V_theta(s_0) - log P_theta(s_0 | x) = log Z_theta(x) = X_0
+```
+
+也就是说，根边界和起点边界在参数化上是严格一致的，而不是两个松耦合的独立头。
 
 当前 `SubTB` 做的事情不是再单独拆 root / move / terminal 三种 loss，而是直接最小化：
 
@@ -168,8 +218,8 @@ L_subtb = Mean_tau L_subtb(tau)
 
 当前主线里：
 
-- `trajectory heuristic` 只改 logits
-- `log Z` 只进入 SubTB 边界项
+- `trajectory heuristic` 已并入有效状态值 `V_theta`
+- `log Z` 由起点有效流量的 `logsumexp` 给出
 - reward 只提供终止锚点
 
 但真正被优化的目标只有：

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.models.configs import (
-    AnswerReachabilityInferenceConfig,
+    SearchEvalConfig,
     GFlowNetTrainingConfig,
     HeuristicConfig,
     HorizonConfig,
@@ -13,7 +13,7 @@ from src.models.configs import (
 from src.models.gflownet_module import GFlowNetModule
 from src.metrics.answer_reachability import compute_edge_retrieval_labels
 from src.metrics.answer_reachability.runtime import (
-    AnswerReachabilityMetricRuntimeFactory,
+    SearchMetricRuntimeFactory,
 )
 
 from .conftest import make_policy_config, make_toy_batch
@@ -30,15 +30,15 @@ def _make_edge_retrieval_module() -> GFlowNetModule:
         ),
         heuristic_cfg=HeuristicConfig(kind="topology", beta=0.5),
         policy_cfg=make_policy_config(),
-        inference_cfg=AnswerReachabilityInferenceConfig(
-            eval_view="edge_retrieval",
-            eval_profile="rank_only",
+        eval_cfg=SearchEvalConfig(
+            task="edge_retrieval",
+            metrics_profile="rank_only",
             edge_top_ks=(1, 2, 3),
             edge_emit_top_k=3,
         ),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
-        metric_runtime_factory=AnswerReachabilityMetricRuntimeFactory(),
+        metric_runtime_factory=SearchMetricRuntimeFactory(),
     )
 
 

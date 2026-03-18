@@ -3,7 +3,7 @@
 # Entrypoint contract for `python src/train.py ...`
 # - `/run` must be a train-oriented run config (`run.name` cannot be `eval_*`).
 # - Current training flows in this repo require `/dataset`; the canonical CLI is
-#   `python src/train.py experiment=train_answer_reachability dataset=webqsp-sub`.
+#   `python src/train.py experiment=train_rankflow dataset=webqsp-sub`.
 # - Prefer `experiment=...` over ad hoc `/run + /trainer + /model` overrides so the
 #   full training bundle stays aligned.
 #
@@ -11,13 +11,14 @@
 defaults:
   - _self_
   - ckpt: default
-  - run: train_answer_reachability
+  - run: train_rankflow
   - dataset: null
-  - data: g_retrieval
+  - data: graph_retrieval
   - model: gflownet
   - callbacks: default
   - logger: null
   - trainer: default
+  - fit_schedule: pass
   - paths: default
   - extras: default
   - hydra: default

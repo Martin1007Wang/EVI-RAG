@@ -44,45 +44,4 @@ class NodeFlowHead(nn.Module):
         return bilinear + residual
 
 
-class StartLogitHead(nn.Module):
-    """Score candidate start nodes inside `q_local_indices` sets."""
-
-    def __init__(self, *, policy_dim: int, hidden_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(policy_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(
-        self, *, node_features: torch.Tensor, question_features: torch.Tensor
-    ) -> torch.Tensor:
-        feats = torch.cat((node_features, question_features), dim=-1)
-        return self.mlp(feats).squeeze(-1)
-
-
-class GraphLogZHead(nn.Module):
-    def __init__(self, *, feature_dim: int, hidden_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(feature_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(
-        self,
-        *,
-        question_features: torch.Tensor,
-        start_summary: torch.Tensor,
-    ) -> torch.Tensor:
-        logits = self.mlp(
-            torch.cat((question_features, start_summary), dim=-1)
-        ).squeeze(-1)
-        return torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
-
-
-__all__ = ["GraphLogZHead", "NodeFlowHead", "StartLogitHead"]
+__all__ = ["NodeFlowHead"]

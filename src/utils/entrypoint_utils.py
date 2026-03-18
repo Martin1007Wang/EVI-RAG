@@ -31,9 +31,11 @@ class LightningTaskObjects:
 
 
 def _strip_instantiate_metadata(cfg_node: DictConfig) -> DictConfig:
-    if not isinstance(cfg_node, DictConfig) or "contract" not in cfg_node:
+    if not isinstance(cfg_node, DictConfig):
         return cfg_node
-    container = OmegaConf.to_container(cfg_node, resolve=False)
+    # Keep root-level interpolations like `${dataset}` and `${run.split}` intact by
+    # resolving while the node is still attached to the composed config tree.
+    container = OmegaConf.to_container(cfg_node, resolve=True)
     if not isinstance(container, dict):
         return cfg_node
     container.pop("contract", None)
@@ -75,14 +77,17 @@ def instantiate_lightning_task_objects(
     cfg: DictConfig,
     *,
     log: Any,
+    on_datamodule_instantiated: Callable[[Any], None] | None = None,
     on_model_instantiated: Callable[[Any], None] | None = None,
 ) -> LightningTaskObjects:
     data_cfg = _strip_instantiate_metadata(cfg.data)
-    model_cfg = _strip_instantiate_metadata(cfg.model)
 
     log.info(f"Instantiating datamodule <{data_cfg._target_}>")
     datamodule = hydra.utils.instantiate(data_cfg)
+    if on_datamodule_instantiated is not None:
+        on_datamodule_instantiated(datamodule)
 
+    model_cfg = _strip_instantiate_metadata(cfg.model)
     log.info(f"Instantiating model <{model_cfg._target_}>")
     model = hydra.utils.instantiate(model_cfg)
     if on_model_instantiated is not None:

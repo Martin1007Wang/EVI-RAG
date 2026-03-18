@@ -17,15 +17,14 @@ defaults:
   - _self_
 
 llm:
-  provider: vllm
-  providers: null
+  providers: [vllm]
   allow_sub: false
   input_path: null
   # Optional gold-label sidecar. Defaults to "<input_path stem>.labels.jsonl" when present.
   input_labels_path: null
   output_dir: null
-  input_subdir: eval_answer_reachability
-  # Separate outputs by retrieval source (e.g., eval_answer_reachability).
+  input_subdir: rankflow
+  # Separate outputs by retrieval source (e.g., rankflow).
   output_subdir: eval_llm/${llm.input_subdir}
   output_filename_template: "{split}_k{k}_{provider}.jsonl"
   compute_metrics: true

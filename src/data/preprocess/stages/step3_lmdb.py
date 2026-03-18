@@ -30,13 +30,17 @@ from src.data.io.lmdb_utils import (
     ensure_dir,
 )
 from src.data.io.parquet_io import _load_parquet
-from src.data.preprocess.labels.edge_retriever import compute_shortest_path_labels
+from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labels
 from src.data.schema.constants import (
     _FILTER_MISSING_ANSWER_FILENAME,
     _FILTER_MISSING_START_FILENAME,
-    _MIN_CHUNK_SIZE,
 )
-from src.data.preprocess.config import _resolve_parquet_chunk_size
+from src.data.preprocess.config import (
+    _resolve_parquet_chunk_size,
+    resolve_embedding_batch_size,
+    resolve_embedding_device,
+    resolve_embedding_fp16,
+)
 from src.data.utils.validation import _validate_split_names
 from src.utils.logging_utils import log_event
 
@@ -115,14 +119,14 @@ def build_dataset(ctx: PreprocessContext) -> None:
     dataset_cfg = cfg.get("dataset") if hasattr(cfg, "get") else {}
     dataset_name = str(dataset_cfg.get("name", "") or "")
     dataset_scope = str(dataset_cfg.get("dataset_scope", "") or "").strip().lower()
-    emit_edge_retriever_labels = bool(cfg.get("emit_edge_retriever_labels", False))
-    labels_dir_cfg = cfg.get("edge_retriever_labels_dir")
+    emit_edge_retrieval_labels = bool(cfg.get("emit_edge_retrieval_labels", False))
+    labels_dir_cfg = cfg.get("edge_retrieval_labels_dir")
     log_event(
         logger,
         "lmdb_start",
         dataset=dataset_name,
         output_dir=str(ctx.output_dir),
-        parquet_dir=str(ctx.parquet_dir),
+        out_dir=str(ctx.out_dir),
     )
     if dataset_scope == "sub" or dataset_name.endswith("-sub"):
         raise ValueError(
@@ -136,13 +140,9 @@ def build_dataset(ctx: PreprocessContext) -> None:
     if cfg.get("deterministic", False):
         torch.use_deterministic_algorithms(True)
 
-    entity_vocab = _load_parquet(ctx.parquet_dir / "entity_vocab.parquet").to_pydict()
-    embedding_vocab = _load_parquet(
-        ctx.parquet_dir / "embedding_vocab.parquet"
-    ).to_pydict()
-    relation_vocab = _load_parquet(
-        ctx.parquet_dir / "relation_vocab.parquet"
-    ).to_pydict()
+    entity_vocab = _load_parquet(ctx.out_dir / "entity_vocab.parquet").to_pydict()
+    embedding_vocab = _load_parquet(ctx.out_dir / "embedding_vocab.parquet").to_pydict()
+    relation_vocab = _load_parquet(ctx.out_dir / "relation_vocab.parquet").to_pydict()
 
     relation_rows = sorted(
         zip(relation_vocab["relation_id"], relation_vocab["label"]), key=lambda x: x[0]
@@ -157,6 +157,16 @@ def build_dataset(ctx: PreprocessContext) -> None:
             f"question_ctx_max_tokens must be >= 0, got {question_ctx_max_tokens}."
         )
     need_question_ctx = question_ctx_max_tokens > 0
+    embedding_device = resolve_embedding_device(cfg.get("device"))
+    embedding_batch_size = resolve_embedding_batch_size(cfg, device=embedding_device)
+    embedding_fp16 = resolve_embedding_fp16(cfg, device=embedding_device)
+    log_event(
+        logger,
+        "embedding_runtime",
+        device=embedding_device,
+        batch_size=embedding_batch_size,
+        fp16=embedding_fp16,
+    )
 
     emb_dir = ctx.embeddings_dir
     ensure_dir(emb_dir)
@@ -168,7 +178,12 @@ def build_dataset(ctx: PreprocessContext) -> None:
     def _get_encoder() -> TextEncoder:
         nonlocal encoder
         if encoder is None:
-            encoder = TextEncoder(cfg.encoder, cfg.device, cfg.fp16, cfg.progress_bar)
+            encoder = TextEncoder(
+                cfg.encoder,
+                embedding_device,
+                embedding_fp16,
+                cfg.progress_bar,
+            )
         return encoder
 
     if not use_precomputed_embeddings and reuse_embeddings_if_exists:
@@ -199,7 +214,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
             )
             relation_emb = encoder.encode(
                 relation_labels,
-                cfg.batch_size,
+                embedding_batch_size,
                 show_progress=cfg.progress_bar,
                 desc="Relations",
             )
@@ -220,7 +235,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
             encoder=encoder,
             texts=text_labels,
             emb_ids=text_ids,
-            batch_size=cfg.batch_size,
+            batch_size=embedding_batch_size,
             max_embedding_id=max_embedding_id,
             out_path=entity_emb_path,
             desc="Entities",
@@ -229,14 +244,14 @@ def build_dataset(ctx: PreprocessContext) -> None:
         log_event(logger, "lmdb_encode_relation_embeddings", count=len(relation_labels))
         relation_emb = encoder.encode(
             relation_labels,
-            cfg.batch_size,
+            embedding_batch_size,
             show_progress=cfg.progress_bar,
             desc="Relations",
         )
         torch.save(relation_emb, relation_emb_path)
 
-    graphs_table = _load_parquet(ctx.parquet_dir / "graphs.parquet")
-    questions_table = _load_parquet(ctx.parquet_dir / "questions.parquet")
+    graphs_table = _load_parquet(ctx.out_dir / "graphs.parquet")
+    questions_table = _load_parquet(ctx.out_dir / "questions.parquet")
     questions_have_emb = "question_emb" in questions_table.schema.names
     questions_have_ctx = "question_ctx" in questions_table.schema.names
     questions_have_ctx_mask = "question_ctx_mask" in questions_table.schema.names
@@ -299,16 +314,16 @@ def build_dataset(ctx: PreprocessContext) -> None:
     label_entries = None
     label_stats = None
     labels_dir: Optional[Path] = None
-    if emit_edge_retriever_labels:
+    if emit_edge_retrieval_labels:
         if labels_dir_cfg:
             labels_dir = Path(str(labels_dir_cfg))
         else:
             artifact_dir = dataset_cfg.get("artifact_dir")
             if not artifact_dir:
                 raise ValueError(
-                    "edge_retriever_labels_dir or dataset.artifact_dir is required when emitting labels."
+                    "edge_retrieval_labels_dir or dataset.artifact_dir is required when emitting labels."
                 )
-            labels_dir = Path(str(artifact_dir)) / "edge_retriever_labels"
+            labels_dir = Path(str(artifact_dir)) / "edge_retrieval_labels"
         labels_dir.mkdir(parents=True, exist_ok=True)
         label_entries = {str(split): {} for split in all_splits}
         label_stats = {
@@ -359,7 +374,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                 pending_payloads[split_key][shard_id] = []
 
         parquet_chunk_size = _resolve_parquet_chunk_size(
-            cfg, fallback=int(cfg.get("batch_size", _MIN_CHUNK_SIZE))
+            cfg, fallback=embedding_batch_size
         )
         question_batches = questions_table.to_batches(max_chunksize=parquet_chunk_size)
         total_batches = questions_table.num_rows / parquet_chunk_size
@@ -432,7 +447,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                         _, q_batch_ctx, q_batch_ctx_mask = (
                             _get_encoder().encode_with_context(
                                 q_batch_texts,
-                                cfg.batch_size,
+                                embedding_batch_size,
                                 max_tokens=question_ctx_max_tokens,
                                 show_progress=False,
                                 desc="QuestionsWithContext",
@@ -444,7 +459,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     q_batch_emb, q_batch_ctx, q_batch_ctx_mask = (
                         _get_encoder().encode_with_context(
                             q_batch_texts,
-                            cfg.batch_size,
+                            embedding_batch_size,
                             max_tokens=question_ctx_max_tokens,
                             show_progress=False,
                             desc="QuestionsWithContext",
@@ -452,7 +467,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     )
                 else:
                     q_batch_emb = _get_encoder().encode(
-                        q_batch_texts, cfg.batch_size, show_progress=False
+                        q_batch_texts, embedding_batch_size, show_progress=False
                     )
 
             graph_ids_batch = q_batch_dict["graph_id"]
@@ -512,7 +527,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     keep_answer_ids.append(graph_id)
                 answer_entity_ids = torch.as_tensor(a_entities, dtype=torch.long)
                 if (
-                    emit_edge_retriever_labels
+                    emit_edge_retrieval_labels
                     and label_entries is not None
                     and label_stats is not None
                 ):
@@ -691,7 +706,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                 path=str(processed_dir),
             )
             if (
-                emit_edge_retriever_labels
+                emit_edge_retrieval_labels
                 and labels_dir is not None
                 and label_entries is not None
                 and label_stats is not None
@@ -705,7 +720,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     stats = label_stats.get(split_key, {})
                     payload = {
                         "meta": {
-                            "algo": "edge_retriever_shortest_paths_strict_v1",
+                            "algo": "edge_retrieval_shortest_paths_strict_v1",
                             "split": split_key,
                             "num_samples": int(stats.get("num_samples", 0)),
                             "no_path_samples": int(stats.get("no_path_samples", 0)),
@@ -731,7 +746,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                 )
                 log_event(
                     logger,
-                    "edge_retriever_labels_written",
+                    "edge_retrieval_labels_written",
                     path=str(labels_dir),
                     splits=list(label_entries.keys()),
                     stats=label_stats,

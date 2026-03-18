@@ -18,7 +18,6 @@ from src.llm.prompting import (
     _FIELD_EVIDENCE_TRAJECTORY_IDS,
     _FIELD_JUSTIFICATION,
     _FIELD_QUESTION,
-    _FIELD_QUESTION_ALT,
     _FIELD_TRAJECTORIES,
     _PROMPT_MODE_JSON_SCHEMA,
     _PROMPT_MODE_SUBGRAPHRAG_ICL_DC,
@@ -44,7 +43,7 @@ _ZERO = 0
 _ONE = 1
 _NEG_INF = float("-inf")
 
-_DEFAULT_INPUT_SUBDIR = "eval_answer_reachability"
+_DEFAULT_INPUT_SUBDIR = "rankflow"
 _DEFAULT_OUTPUT_SUBDIR = "eval_llm"
 _DEFAULT_INPUT_LABELS_SUFFIX = ".labels.jsonl"
 _DEFAULT_FILENAME_TEMPLATE = "{split}_k{k}_{provider}.jsonl"
@@ -157,10 +156,7 @@ def _resolve_provider_list(llm_cfg: Any) -> List[str]:
         if isinstance(providers, (list, tuple)):
             return [str(p) for p in providers]
         return [str(providers)]
-    provider = llm_cfg.get("provider")
-    if provider:
-        return [str(provider)]
-    raise ValueError("llm.provider or llm.providers must be set.")
+    raise ValueError("llm.providers must be set.")
 
 
 def _resolve_prompt_spec(llm_cfg: Any) -> PromptSpec:
@@ -639,9 +635,7 @@ def _iter_requests(
             continue
         if max_samples is not None and processed >= max_samples:
             break
-        question = str(
-            record.get(_FIELD_QUESTION) or record.get(_FIELD_QUESTION_ALT) or ""
-        )
+        question = str(record.get(_FIELD_QUESTION) or "")
         trajectory_records = record.get(_FIELD_TRAJECTORIES) or []
         trajectories = _select_trajectories(
             trajectory_records,

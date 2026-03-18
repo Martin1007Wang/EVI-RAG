@@ -1,0 +1,17 @@
+# Canonical RankFlow training run.
+# Contract: use with `python src/train.py ...`; requires a `-sub` dataset and is
+# usually selected via `experiment=train_rankflow dataset=webqsp-sub`.
+_target_: src.runs.answer_reachability.AnswerReachabilityTrainRunner
+name: train_rankflow
+task_name: "train/rankflow"
+tags: ["rankflow", "gflownet", "guided"]
+contract:
+  entrypoint: train
+  required_groups: [dataset]
+  recommended_experiment: train_rankflow
+train: true
+test: ${dataset.run_test_after_fit}
+test_ckpt_path: null
+allow_test_without_checkpoint: false
+ckpt_path: null
+init_ckpt_path: null

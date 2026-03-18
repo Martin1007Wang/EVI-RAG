@@ -1,6 +1,6 @@
 """Labeling utilities for preprocess pipeline."""
 
-from .edge_retriever import (
+from .edge_retrieval import (
     EdgeLabelEntry,
     EdgeLabelStore,
     ShortestPathLabels,

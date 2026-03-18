@@ -15,7 +15,7 @@ def test_eval_reporter_persists_metrics_snapshot(tmp_path: Path) -> None:
         {
             "paths": {"output_dir": str(tmp_path)},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
-            "run": {"name": "eval_answer_reachability", "split": "test"},
+            "run": {"name": "rankflow", "split": "test"},
         }
     )
     reporter = AnswerReachabilityEvalReporter()
@@ -39,7 +39,7 @@ def test_eval_reporter_serializes_tensor_metrics(tmp_path: Path) -> None:
         {
             "paths": {"output_dir": str(tmp_path)},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
-            "run": {"name": "eval_answer_reachability", "split": "test"},
+            "run": {"name": "rankflow", "split": "test"},
         }
     )
     reporter = AnswerReachabilityEvalReporter()
@@ -85,12 +85,12 @@ def test_eval_reporter_writes_prediction_artifacts_when_enabled(tmp_path: Path) 
                 },
             },
             "run": {
-                "name": "eval_answer_reachability",
+                "name": "rankflow",
                 "split": "test",
                 "execution_mode": "predict",
                 "write_artifacts": True,
-                "artifact_subdir": "eval_answer_reachability",
-                "artifact_name": "eval_answer_reachability",
+                "artifact_subdir": "rankflow",
+                "artifact_name": "rankflow",
             },
         }
     )
@@ -117,8 +117,8 @@ def test_eval_reporter_writes_prediction_artifacts_when_enabled(tmp_path: Path) 
         ),
     )
 
-    assert captured["output_dir"] == artifact_root / "eval_answer_reachability" / "sub"
+    assert captured["output_dir"] == artifact_root / "rankflow" / "sub"
     assert captured["questions_path"] == questions_path
     assert getattr(model, "predict_artifact_paths") == {
-        "prompt_path": artifact_root / "eval_answer_reachability" / "sub" / "test.jsonl"
+        "prompt_path": artifact_root / "rankflow" / "sub" / "test.jsonl"
     }

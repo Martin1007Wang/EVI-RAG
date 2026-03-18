@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from .embedding import EmbeddingBackbone
-from .scoring import GraphLogZHead, NodeFlowHead, StartLogitHead
+from .scoring import NodeFlowHead
 
 __all__ = [
     "EmbeddingBackbone",
-    "GraphLogZHead",
     "NodeFlowHead",
-    "StartLogitHead",
 ]

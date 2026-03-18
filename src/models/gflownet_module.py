@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,7 @@ from torch.optim.lr_scheduler import (
 
 from src.models.components import (
     EmbeddingBackbone,
-    GraphLogZHead,
     NodeFlowHead,
-    StartLogitHead,
 )
 from src.models.components.heuristic_heads import LearnedHeuristicHead
 from src.models.configs import (
@@ -27,16 +26,30 @@ from src.models.configs import (
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
+    SearchEvalConfig,
     SchedulerConfig,
 )
 from src.graph_runtime import TrajectoryBatch
-from src.metrics.protocol import MetricRuntimeFactoryProtocol
+from src.metrics.answer_reachability.exact_analysis import ExactReachabilityAnalyzer
+from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeFactoryProtocol
+from src.utils.fit_schedule import ResolvedPassFitSchedule
 from src.utils.logging_utils import get_logger, log_event, log_metric
 
-from .evaluation_controller import MetricRuntimeController
-from .policy import GFlowNetPolicy, TrajectoryHeuristic, TrajectoryPolicy
-from .training import (
+from .evaluation_controller import (
+    MetricRuntimeController,
+    PredictionLabel,
+    PredictionResult,
+)
+from .gflownet import (
+    BaseSearchPolicy,
+    GFlowNetPolicy,
+    SamplingTemperatureScheduler,
+    SearchHeuristic,
+    SuccessfulTrajectoryReplayBuffer,
     SubTrajectoryBalanceLoss,
+    TrainingScheduleContext,
+    build_replay_sample_batch,
+    normalize_scheduler_interval,
 )
 
 
@@ -49,9 +62,15 @@ class GFlowNetConfig:
     training_cfg: GFlowNetTrainingConfig
     heuristic_cfg: HeuristicConfig
     policy_cfg: PolicyConfig
-    inference_cfg: Any
+    eval_cfg: SearchEvalConfig
     optimizer_cfg: OptimizerConfig
     scheduler_cfg: SchedulerConfig
+
+
+@dataclass(frozen=True)
+class AuxiliaryLossResult:
+    loss: torch.Tensor
+    metrics: dict[str, torch.Tensor]
 
 
 class GFlowNetModule(LightningModule):
@@ -60,7 +79,7 @@ class GFlowNetModule(LightningModule):
         *,
         policy_cfg: PolicyConfig,
         max_steps: int,
-    ) -> TrajectoryPolicy:
+    ) -> BaseSearchPolicy:
         graph_hidden_dim = int(policy_cfg.backbone.hidden_dim)
         backbone = EmbeddingBackbone(policy_cfg.backbone)
         state_score_head = NodeFlowHead(
@@ -70,33 +89,27 @@ class GFlowNetModule(LightningModule):
             num_layers=int(policy_cfg.state_score_head.num_layers),
             dropout=float(policy_cfg.state_score_head.dropout),
         )
-        start_head = StartLogitHead(
-            policy_dim=graph_hidden_dim,
-            hidden_dim=int(policy_cfg.start_head.hidden_dim),
-            dropout=float(policy_cfg.start_head.dropout),
-        )
-        return TrajectoryPolicy(
+        return BaseSearchPolicy(
             config=policy_cfg,
             max_steps=max_steps,
             backbone=backbone,
             state_score_head=state_score_head,
-            start_head=start_head,
         )
 
     @staticmethod
-    def _build_trajectory_heuristic(
+    def _build_search_heuristic(
         *,
         heuristic_cfg: HeuristicConfig,
         graph_hidden_dim: int,
-    ) -> TrajectoryHeuristic:
+    ) -> SearchHeuristic:
         learned_head = None
-        if heuristic_cfg.canonical_kind == "learned":
+        if heuristic_cfg.kind == "learned":
             learned_head = LearnedHeuristicHead(
-                hidden_dim=int(heuristic_cfg.critic_hidden_dim),
-                dropout=float(heuristic_cfg.critic_dropout),
+                hidden_dim=int(heuristic_cfg.learned_hidden_dim),
+                dropout=float(heuristic_cfg.learned_dropout),
                 feature_dim=graph_hidden_dim,
             )
-        return TrajectoryHeuristic(
+        return SearchHeuristic(
             config=heuristic_cfg,
             learned_head=learned_head,
         )
@@ -113,20 +126,14 @@ class GFlowNetModule(LightningModule):
             policy_cfg=policy_cfg,
             max_steps=max_steps,
         )
-        trajectory_heuristic = GFlowNetModule._build_trajectory_heuristic(
+        search_heuristic = GFlowNetModule._build_search_heuristic(
             heuristic_cfg=heuristic_cfg,
             graph_hidden_dim=graph_hidden_dim,
-        )
-        graph_log_z_head = GraphLogZHead(
-            feature_dim=graph_hidden_dim,
-            hidden_dim=int(policy_cfg.graph_log_z_head.hidden_dim),
-            dropout=float(policy_cfg.graph_log_z_head.dropout),
         )
         return GFlowNetPolicy(
             base_policy=base_policy,
             heuristic_cfg=heuristic_cfg,
-            graph_log_z_head=graph_log_z_head,
-            trajectory_heuristic=trajectory_heuristic,
+            search_heuristic=search_heuristic,
         )
 
     @staticmethod
@@ -137,50 +144,22 @@ class GFlowNetModule(LightningModule):
             return dict(cfg)
         raise TypeError(f"Expected dataclass or dict config, got {type(cfg)!r}.")
 
-    @staticmethod
-    def _normalize_scheduler_interval(scheduler_cfg: dict[str, Any]) -> str:
-        interval = str(scheduler_cfg.get("interval", "step")).lower()
-        if interval not in {"step", "epoch"}:
-            raise ValueError(
-                f"Unsupported scheduler interval: {interval!r}. Expected 'step' or 'epoch'."
-            )
-        return interval
-
-    @staticmethod
-    def _resolve_schedule_horizon(
-        *,
-        scheduler_cfg: dict[str, Any],
-        interval: str,
-        estimated_stepping_batches: int | None,
-        trainer_max_epochs: int | None,
-    ) -> int | None:
-        explicit_t_max = scheduler_cfg.get("t_max")
-        if explicit_t_max is not None:
-            horizon = int(explicit_t_max)
-            if horizon <= 0:
-                raise ValueError(f"scheduler requires t_max > 0, got {horizon}.")
-        elif interval == "step":
-            if estimated_stepping_batches is None:
-                return None
-            horizon = int(estimated_stepping_batches)
-        else:
-            if trainer_max_epochs is None:
-                return None
-            horizon = int(trainer_max_epochs)
-        if horizon <= 0:
-            raise ValueError(f"Scheduler horizon must be > 0, got {horizon}.")
-        return horizon
-
     @classmethod
     def _build_optimizer_and_scheduler(
         cls,
         *,
-        model_parameters: list[tuple[str, torch.nn.Parameter]] | Any,
+        model_parameters: Iterable[tuple[str, torch.nn.Parameter]],
         optimizer_cfg: dict[str, Any],
         scheduler_cfg: dict[str, Any],
         estimated_stepping_batches: int | None,
+        trainer_max_steps: int | None = None,
         trainer_max_epochs: int | None = None,
     ) -> dict[str, Any]:
+        schedule_context = TrainingScheduleContext(
+            estimated_stepping_batches=estimated_stepping_batches,
+            trainer_max_steps=trainer_max_steps,
+            trainer_max_epochs=trainer_max_epochs,
+        )
         trainable_params = [
             parameter for _, parameter in model_parameters if parameter.requires_grad
         ]
@@ -198,12 +177,15 @@ class GFlowNetModule(LightningModule):
         )
         scheduler = None
         scheduler_type = str(scheduler_cfg.get("type", "cosine")).lower()
-        interval = cls._normalize_scheduler_interval(scheduler_cfg)
-        schedule_horizon = cls._resolve_schedule_horizon(
-            scheduler_cfg=scheduler_cfg,
+        interval = normalize_scheduler_interval(scheduler_cfg)
+        explicit_t_max = (
+            int(scheduler_cfg["t_max"])
+            if scheduler_cfg.get("t_max") is not None
+            else None
+        )
+        schedule_horizon = schedule_context.resolve_horizon(
+            explicit_horizon=explicit_t_max,
             interval=interval,
-            estimated_stepping_batches=estimated_stepping_batches,
-            trainer_max_epochs=trainer_max_epochs,
         )
         if schedule_horizon is not None:
             eta_min = float(scheduler_cfg.get("eta_min", 0.0))
@@ -225,12 +207,14 @@ class GFlowNetModule(LightningModule):
                     raise ValueError(
                         "onecycle scheduler requires interval='step' because it must advance per optimizer step."
                     )
-                if estimated_stepping_batches is not None and schedule_horizon < int(
-                    estimated_stepping_batches
+                configured_training_steps = schedule_context.configured_training_steps()
+                if (
+                    configured_training_steps is not None
+                    and schedule_horizon < configured_training_steps
                 ):
                     raise ValueError(
                         "onecycle scheduler would exhaust before training ends: "
-                        f"t_max={schedule_horizon} estimated_steps={int(estimated_stepping_batches)}. "
+                        f"t_max={schedule_horizon} configured_steps={configured_training_steps}. "
                         "Set trainer.max_steps and scheduler t_max consistently."
                     )
                 scheduler_lr = scheduler_cfg.get("lr", optimizer_cfg.get("lr", 1.0e-4))
@@ -254,7 +238,7 @@ class GFlowNetModule(LightningModule):
         horizon_cfg: HorizonConfig,
         training_cfg: GFlowNetTrainingConfig,
         policy_cfg: PolicyConfig,
-        inference_cfg: Any,
+        eval_cfg: SearchEvalConfig,
         optimizer_cfg: OptimizerConfig,
         scheduler_cfg: SchedulerConfig,
         metric_runtime_factory: MetricRuntimeFactoryProtocol,
@@ -266,7 +250,7 @@ class GFlowNetModule(LightningModule):
             training_cfg=training_cfg,
             heuristic_cfg=heuristic_cfg,
             policy_cfg=policy_cfg,
-            inference_cfg=inference_cfg,
+            eval_cfg=eval_cfg,
             optimizer_cfg=optimizer_cfg,
             scheduler_cfg=scheduler_cfg,
         )
@@ -279,75 +263,337 @@ class GFlowNetModule(LightningModule):
         self.metric_runtime = metric_runtime_factory.build_runtime(
             horizon_cfg=horizon_cfg,
             training_cfg=training_cfg,
-            inference_cfg=inference_cfg,
+            eval_cfg=eval_cfg,
             policy=self.policy,
         )
         self.runtime_controller = MetricRuntimeController(
             metric_runtime=self.metric_runtime,
-            metrics_profile=str(self.cfg.inference_cfg.metrics_profile),
+            metrics_profile=str(self.cfg.eval_cfg.metrics_profile),
             on_invalid_start=self._log_invalid_start,
+        )
+        self.training_exact_analyzer = ExactReachabilityAnalyzer(
+            max_steps=int(horizon_cfg.max_steps)
         )
         self.sampler = self.runtime_controller.sampler
         self.loss_fn = SubTrajectoryBalanceLoss(config=training_cfg.subtb)
+        self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
+            base_temperature=float(training_cfg.sampling_temperature),
+            config=training_cfg.sampling_temperature_schedule,
+        )
         self.search = self.runtime_controller.search
+        self._fit_schedule: ResolvedPassFitSchedule | None = None
+        self.success_replay_buffer: SuccessfulTrajectoryReplayBuffer | None = None
+        replay_cfg = self.cfg.training_cfg.success_replay
+        if bool(replay_cfg.enabled):
+            if self.sampler is None or not hasattr(
+                self.sampler, "trajectory_supervisor"
+            ):
+                raise RuntimeError(
+                    "Successful trajectory replay requires a sampler with a trajectory_supervisor."
+                )
+            self.success_replay_buffer = SuccessfulTrajectoryReplayBuffer(
+                max_buffer_size=int(replay_cfg.max_buffer_size),
+                max_trajectories_per_sample=int(replay_cfg.max_trajectories_per_sample),
+            )
 
     @property
     def metrics_profile(self) -> str:
         return str(self.runtime_controller.metrics_profile)
 
     @property
-    def task_view(self) -> str:
-        return str(self.cfg.inference_cfg.task_view)
+    def evaluation_task(self) -> str:
+        return str(self.cfg.eval_cfg.task)
 
     @property
-    def predict_results(self) -> list[Any]:
+    def predict_results(self) -> list[PredictionResult]:
         return self.runtime_controller.prediction_state.results
 
     @predict_results.setter
-    def predict_results(self, value: list[Any]) -> None:
+    def predict_results(self, value: list[PredictionResult]) -> None:
         self.runtime_controller.prediction_state.results = list(value)
 
     @property
-    def predict_labels(self) -> list[Any]:
+    def predict_labels(self) -> list[PredictionLabel]:
         return self.runtime_controller.prediction_state.labels
 
     @predict_labels.setter
-    def predict_labels(self, value: list[Any]) -> None:
+    def predict_labels(self, value: list[PredictionLabel]) -> None:
         self.runtime_controller.prediction_state.labels = list(value)
 
     @property
-    def predict_metrics(self) -> dict[str, Any]:
+    def predict_metrics(self) -> dict[str, float]:
         return self.runtime_controller.prediction_state.metrics
 
     @predict_metrics.setter
-    def predict_metrics(self, value: dict[str, Any]) -> None:
+    def predict_metrics(self, value: dict[str, float]) -> None:
         self.runtime_controller.prediction_state.metrics = dict(value)
 
-    def _ensure_batch(self, batch: Any) -> TrajectoryBatch:
+    @staticmethod
+    def _require_trajectory_batch(batch: object) -> TrajectoryBatch:
         if not isinstance(batch, TrajectoryBatch):
             raise TypeError(
                 "GFlowNetModule expects TrajectoryBatch inputs from the datamodule."
             )
-        model_device = next(self.parameters()).device
-        if batch.node_embeddings.device != model_device:
-            return batch.to(model_device)
         return batch
 
+    def set_fit_schedule(self, schedule: ResolvedPassFitSchedule) -> None:
+        self._fit_schedule = schedule
+
+    def _resolve_effective_pass(self, *, after_current_step: bool) -> float | None:
+        if self._fit_schedule is None:
+            return None
+        current_step = int(self.global_step)
+        if after_current_step:
+            current_step += 1
+        return self._fit_schedule.effective_pass(global_step=current_step)
+
+    def _resolve_success_replay_rollouts_per_graph(self) -> int:
+        replay_cfg = self.cfg.training_cfg.success_replay
+        if not bool(replay_cfg.enabled):
+            return 0
+        total_rollouts = int(self.cfg.training_cfg.rollout_batch_size)
+        if total_rollouts < 1:
+            return 0
+        replay_rollouts = int(round(total_rollouts * float(replay_cfg.ratio)))
+        return max(replay_rollouts, 0)
+
+    def _exact_aux_is_ready(self) -> bool:
+        exact_cfg = self.cfg.training_cfg.exact_aux
+        if not bool(exact_cfg.enabled):
+            return False
+        if (
+            float(exact_cfg.success_weight) <= 0.0
+            and float(exact_cfg.coverage_weight) <= 0.0
+        ):
+            return False
+        current_step = int(self.global_step)
+        if current_step % int(exact_cfg.interval_steps) != 0:
+            return False
+        effective_pass = self._resolve_effective_pass(after_current_step=False)
+        if effective_pass is None:
+            return float(exact_cfg.warmup_passes) <= 0.0
+        return float(effective_pass) >= float(exact_cfg.warmup_passes)
+
+    @staticmethod
+    def _aggregate_entity_mass(
+        *,
+        node_entity_ids: torch.Tensor,
+        node_mass: torch.Tensor,
+        entity_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if int(entity_ids.numel()) == 0:
+            return node_mass.new_empty((0,))
+        matches = node_entity_ids.unsqueeze(1) == entity_ids.unsqueeze(0)
+        return (node_mass.unsqueeze(1) * matches.to(dtype=node_mass.dtype)).sum(dim=0)
+
+    def _compute_exact_auxiliary_loss(
+        self,
+        *,
+        batch: TrajectoryBatch,
+    ) -> AuxiliaryLossResult | None:
+        if not self._exact_aux_is_ready():
+            return None
+        exact_cfg = self.cfg.training_cfg.exact_aux
+        num_selected = min(int(batch.num_graphs), int(exact_cfg.max_graphs_per_batch))
+        if num_selected < 1:
+            return None
+
+        success_losses: list[torch.Tensor] = []
+        coverage_losses: list[torch.Tensor] = []
+        success_masses: list[torch.Tensor] = []
+        coverage_masses: list[torch.Tensor] = []
+        for graph_idx in range(num_selected):
+            single_batch = batch.select_graph(graph_idx)
+            single_prepared = self.policy.prepare_batch(single_batch)
+            dp_result = self.training_exact_analyzer._run_dynamic_program(
+                batch=single_batch,
+                policy=self.policy,
+                prepared_batch=single_prepared,
+            )
+            if float(exact_cfg.success_weight) > 0.0:
+                success_mass = dp_result.terminal_mass.sum()
+                success_losses.append(
+                    -torch.log(success_mass.clamp_min(float(exact_cfg.eps)))
+                )
+                success_masses.append(success_mass.detach())
+            if float(exact_cfg.coverage_weight) > 0.0:
+                gold_entity_ids = torch.unique(single_batch.answer_entity_ids)
+                if int(gold_entity_ids.numel()) > 0:
+                    gold_retrieval_mass = self._aggregate_entity_mass(
+                        node_entity_ids=single_batch.node_global_ids,
+                        node_mass=dp_result.retrieval_terminal_mass,
+                        entity_ids=gold_entity_ids,
+                    )
+                    coverage_losses.append(
+                        -torch.log(
+                            gold_retrieval_mass.clamp_min(float(exact_cfg.eps))
+                        ).mean()
+                    )
+                    coverage_masses.append(gold_retrieval_mass.detach().mean())
+
+        if not success_losses and not coverage_losses:
+            return None
+
+        loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        metrics: dict[str, torch.Tensor] = {
+            "exact_aux_graphs": torch.tensor(float(num_selected), device=self.device)
+        }
+        if success_losses:
+            success_loss = torch.stack(success_losses).mean()
+            loss = loss + float(exact_cfg.success_weight) * success_loss
+            metrics["exact_aux_success_loss"] = success_loss.detach()
+            metrics["exact_aux_success_mass"] = torch.stack(success_masses).mean()
+        if coverage_losses:
+            coverage_loss = torch.stack(coverage_losses).mean()
+            loss = loss + float(exact_cfg.coverage_weight) * coverage_loss
+            metrics["exact_aux_coverage_loss"] = coverage_loss.detach()
+            metrics["exact_aux_coverage_mass"] = torch.stack(coverage_masses).mean()
+        metrics["exact_aux_loss"] = loss.detach()
+        return AuxiliaryLossResult(loss=loss, metrics=metrics)
+
+    def _compute_contrastive_auxiliary_loss(
+        self,
+        *,
+        sample_batch,
+    ) -> AuxiliaryLossResult | None:
+        contrastive_cfg = self.cfg.training_cfg.contrastive
+        if not bool(contrastive_cfg.enabled) or float(contrastive_cfg.weight) <= 0.0:
+            return None
+        move_counts = sample_batch.move_mask.to(dtype=torch.float32).sum(dim=-1)
+        denom = 1.0 + move_counts + float(contrastive_cfg.terminal_weight)
+        trajectory_scores = (
+            sample_batch.start_state_log_f.to(dtype=torch.float32)
+            + sample_batch.next_state_log_f_steps.to(dtype=torch.float32)
+            .mul(sample_batch.move_mask.to(dtype=torch.float32))
+            .sum(dim=-1)
+            + float(contrastive_cfg.terminal_weight)
+            * sample_batch.terminal_state_log_f.to(dtype=torch.float32)
+        ) / denom.clamp_min(1.0)
+        per_graph_losses: list[torch.Tensor] = []
+        for graph_idx in range(int(trajectory_scores.size(0))):
+            success_mask = sample_batch.success_mask[graph_idx]
+            failure_mask = ~success_mask
+            if int(success_mask.sum().item()) < int(contrastive_cfg.min_successes):
+                continue
+            if int(failure_mask.sum().item()) < int(contrastive_cfg.min_failures):
+                continue
+            logits = trajectory_scores[graph_idx] / float(contrastive_cfg.temperature)
+            log_denom = torch.logsumexp(logits, dim=0)
+            per_graph_losses.append(-(logits[success_mask] - log_denom).mean())
+        if not per_graph_losses:
+            return None
+        raw_loss = torch.stack(per_graph_losses).mean()
+        loss = float(contrastive_cfg.weight) * raw_loss
+        return AuxiliaryLossResult(
+            loss=loss,
+            metrics={
+                "contrastive_loss": raw_loss.detach(),
+                "contrastive_graphs": torch.tensor(
+                    float(len(per_graph_losses)), device=raw_loss.device
+                ),
+                "contrastive_mean_score": trajectory_scores.detach().mean(),
+            },
+        )
+
+    def _success_replay_is_ready(self) -> bool:
+        replay_cfg = self.cfg.training_cfg.success_replay
+        if not bool(replay_cfg.enabled) or self.success_replay_buffer is None:
+            return False
+        if len(self.success_replay_buffer) < int(replay_cfg.min_buffer_size):
+            return False
+        effective_pass = self._resolve_effective_pass(after_current_step=False)
+        if effective_pass is None:
+            return float(replay_cfg.warmup_passes) <= 0.0
+        return float(effective_pass) >= float(replay_cfg.warmup_passes)
+
+    def _compute_success_replay_loss(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        replay_rollouts_per_graph: int,
+    ) -> tuple[Any, int, int] | None:
+        if (
+            replay_rollouts_per_graph < 1
+            or self.success_replay_buffer is None
+            or not self._success_replay_is_ready()
+        ):
+            return None
+        plan = self.success_replay_buffer.plan_for_batch(
+            batch=batch,
+            replay_rollouts_per_graph=replay_rollouts_per_graph,
+        )
+        if plan is None:
+            return None
+        trajectory_supervisor = getattr(self.sampler, "trajectory_supervisor", None)
+        if trajectory_supervisor is None:
+            raise RuntimeError(
+                "Successful trajectory replay requires sampler.trajectory_supervisor."
+            )
+        replay_batch = TrajectoryBatch.concatenate(
+            [batch.select_graph(graph_idx) for graph_idx in plan.graph_indices]
+        )
+        replay_prepared_batch = self.policy.prepare_batch(replay_batch)
+        replay_sample_batch = build_replay_sample_batch(
+            batch=replay_batch,
+            policy=self.policy,
+            prepared_batch=replay_prepared_batch,
+            trajectory_supervisor=trajectory_supervisor,
+            replay_records=plan.records_by_graph,
+            max_steps=int(self.cfg.horizon_cfg.max_steps),
+        )
+        replay_loss_output = self.loss_fn.compute(replay_sample_batch)
+        return replay_loss_output, int(plan.num_trajectories), len(plan.graph_indices)
+
+    def transfer_batch_to_device(
+        self,
+        batch: Any,
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> Any:
+        if isinstance(batch, TrajectoryBatch):
+            if batch.node_embeddings.device == device:
+                return batch
+            return batch.to(device)
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
+
+    def _trainer_schedule_context(self) -> TrainingScheduleContext:
+        trainer = getattr(self, "_trainer", None)
+        if trainer is None:
+            return TrainingScheduleContext(estimated_stepping_batches=None)
+        estimated_stepping_batches = None
+        if trainer.estimated_stepping_batches is not None:
+            estimated_stepping_batches = int(trainer.estimated_stepping_batches)
+        trainer_max_steps = (
+            int(trainer.max_steps) if int(trainer.max_steps) > 0 else None
+        )
+        trainer_max_epochs = (
+            int(trainer.max_epochs) if int(trainer.max_epochs) > 0 else None
+        )
+        return TrainingScheduleContext(
+            estimated_stepping_batches=estimated_stepping_batches,
+            trainer_max_steps=trainer_max_steps,
+            trainer_max_epochs=trainer_max_epochs,
+        )
+
+    def _resolve_sampling_temperature(self, *, global_step: int | None = None) -> float:
+        trainer = getattr(self, "_trainer", None)
+        current_step = 0 if trainer is None else int(trainer.global_step)
+        if global_step is not None:
+            current_step = int(global_step)
+        return self.sampling_temperature_scheduler.value(
+            global_step=current_step,
+            schedule_context=self._trainer_schedule_context(),
+        )
+
     def configure_optimizers(self) -> dict[str, Any]:
+        schedule_context = self._trainer_schedule_context()
         return self._build_optimizer_and_scheduler(
             model_parameters=self.named_parameters(),
             optimizer_cfg=self._cfg_to_dict(self.cfg.optimizer_cfg),
             scheduler_cfg=self._cfg_to_dict(self.cfg.scheduler_cfg),
-            estimated_stepping_batches=(
-                int(self.trainer.estimated_stepping_batches)
-                if self.trainer is not None
-                else None
-            ),
-            trainer_max_epochs=(
-                int(self.trainer.max_epochs)
-                if self.trainer is not None and int(self.trainer.max_epochs) > 0
-                else None
-            ),
+            estimated_stepping_batches=schedule_context.estimated_stepping_batches,
+            trainer_max_steps=schedule_context.trainer_max_steps,
+            trainer_max_epochs=schedule_context.trainer_max_epochs,
         )
 
     def _log_metric_bundle(
@@ -375,7 +621,7 @@ class GFlowNetModule(LightningModule):
                 on_step=on_step,
                 on_epoch=on_epoch,
                 prog_bar=(key == prog_bar_key),
-                sync_dist=True,
+                sync_dist=on_epoch,
             )
 
     def _log_invalid_start(self, batch: TrajectoryBatch) -> None:
@@ -389,27 +635,85 @@ class GFlowNetModule(LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         del batch_idx
-        trajectory_batch = self._ensure_batch(batch)
+        trajectory_batch = self._require_trajectory_batch(batch)
         if self.sampler is None:
             raise RuntimeError(
                 "Current metric runtime does not define a training sampler; this model cannot train with the configured metric_runtime_factory."
             )
         prepared_batch = self.policy.prepare_batch(trajectory_batch)
+        sampling_temperature = self._resolve_sampling_temperature()
+        replay_rollouts_per_graph = self._resolve_success_replay_rollouts_per_graph()
         sample_batch = self.sampler.sample(
             batch=trajectory_batch,
             policy=self.policy,
             prepared_batch=prepared_batch,
             rollout_batch_size=int(self.cfg.training_cfg.rollout_batch_size),
-            temperature=float(self.cfg.training_cfg.sampling_temperature),
+            temperature=sampling_temperature,
         )
         loss_output = self.loss_fn.compute(sample_batch)
+        replay_result = self._compute_success_replay_loss(
+            batch=trajectory_batch,
+            replay_rollouts_per_graph=replay_rollouts_per_graph,
+        )
+        replay_loss_output = None
+        replay_trajectories = 0
+        replay_graphs = 0
+        total_loss = loss_output.loss
+        exact_aux_result = self._compute_exact_auxiliary_loss(batch=trajectory_batch)
+        contrastive_aux_result = self._compute_contrastive_auxiliary_loss(
+            sample_batch=sample_batch
+        )
+        on_policy_trajectories = int(trajectory_batch.num_graphs) * int(
+            self.cfg.training_cfg.rollout_batch_size
+        )
+        if replay_result is not None:
+            replay_loss_output, replay_trajectories, replay_graphs = replay_result
+            total_trajectories = on_policy_trajectories + replay_trajectories
+            total_loss = (
+                loss_output.loss * float(on_policy_trajectories)
+                + replay_loss_output.loss * float(replay_trajectories)
+            ) / float(total_trajectories)
+        if exact_aux_result is not None:
+            total_loss = total_loss + exact_aux_result.loss
+        if contrastive_aux_result is not None:
+            total_loss = total_loss + contrastive_aux_result.loss
+        if self.success_replay_buffer is not None:
+            self.success_replay_buffer.add_successes(
+                batch=trajectory_batch,
+                sample_batch=sample_batch,
+            )
         metrics: dict[str, Any] = {
-            "loss": loss_output.loss.detach(),
+            "loss": total_loss.detach(),
             "subtb_loss": loss_output.subtb_loss,
             "subtb_residual": loss_output.residual_abs,
             "subtb_root": loss_output.root_abs,
             "rollout_success": loss_output.success_rate,
+            "log_z_mean": loss_output.log_z_mean,
+            "log_z_variance": loss_output.log_z_variance,
+            "sampling_temperature": sampling_temperature,
         }
+        if exact_aux_result is not None:
+            metrics.update(exact_aux_result.metrics)
+        if contrastive_aux_result is not None:
+            metrics.update(contrastive_aux_result.metrics)
+        if self.success_replay_buffer is not None:
+            metrics["success_replay_buffer_size"] = float(
+                len(self.success_replay_buffer)
+            )
+            metrics["success_replay_ratio"] = (
+                float(replay_trajectories)
+                / float(on_policy_trajectories + replay_trajectories)
+                if replay_trajectories > 0
+                else 0.0
+            )
+            metrics["success_replay_trajectories"] = float(replay_trajectories)
+            metrics["success_replay_graphs"] = float(replay_graphs)
+        if replay_loss_output is not None:
+            metrics["on_policy_loss"] = loss_output.loss.detach()
+            metrics["success_replay_loss"] = replay_loss_output.loss.detach()
+        effective_pass = self._resolve_effective_pass(after_current_step=True)
+        if effective_pass is not None:
+            metrics["effective_pass"] = effective_pass
         self._log_metric_bundle(
             metrics=metrics,
             prefix="train",
@@ -418,9 +722,11 @@ class GFlowNetModule(LightningModule):
             on_epoch=False,
             prog_bar_key="train/loss",
         )
-        return loss_output.loss
+        return total_loss
 
-    def _evaluate_batch_output(self, *, batch: TrajectoryBatch) -> Any:
+    def _evaluate_batch_output(
+        self, *, batch: TrajectoryBatch
+    ) -> MetricEvaluationOutput:
         return self.runtime_controller.evaluate_batch_output(
             batch=batch,
             include_answer_support=False,
@@ -432,8 +738,8 @@ class GFlowNetModule(LightningModule):
         batch: TrajectoryBatch,
     ) -> tuple[
         dict[str, float],
-        list[Any],
-        dict[str, torch.Tensor],
+        list[PredictionResult],
+        dict[str, float],
         dict[str, float],
     ]:
         return self.runtime_controller.evaluate_batch(
@@ -446,10 +752,11 @@ class GFlowNetModule(LightningModule):
         *,
         stage: str,
         batch: TrajectoryBatch,
-        outputs: Any,
+        outputs: MetricEvaluationOutput,
     ) -> None:
         prefix = f"{stage}/{batch.dataset_scope}"
         batch_size = int(batch.num_graphs)
+        effective_pass = self._resolve_effective_pass(after_current_step=False)
         for metrics in (
             outputs.model_metrics,
             outputs.secondary_metrics,
@@ -462,16 +769,24 @@ class GFlowNetModule(LightningModule):
                 on_step=False,
                 on_epoch=True,
             )
+        if effective_pass is not None:
+            self._log_metric_bundle(
+                metrics={"effective_pass": effective_pass},
+                prefix=prefix,
+                batch_size=batch_size,
+                on_step=False,
+                on_epoch=True,
+            )
 
     def validation_step(self, batch: Any, batch_idx: int) -> None:
         del batch_idx
-        trajectory_batch = self._ensure_batch(batch)
+        trajectory_batch = self._require_trajectory_batch(batch)
         outputs = self._evaluate_batch_output(batch=trajectory_batch)
         self._log_eval_outputs(stage="val", batch=trajectory_batch, outputs=outputs)
 
     def test_step(self, batch: Any, batch_idx: int) -> None:
         del batch_idx
-        trajectory_batch = self._ensure_batch(batch)
+        trajectory_batch = self._require_trajectory_batch(batch)
         outputs = self._evaluate_batch_output(batch=trajectory_batch)
         self._log_eval_outputs(stage="test", batch=trajectory_batch, outputs=outputs)
 
@@ -480,22 +795,22 @@ class GFlowNetModule(LightningModule):
 
     def predict_step(
         self, batch: Any, batch_idx: int, dataloader_idx: int = 0
-    ) -> list[Any]:
+    ) -> list[PredictionResult]:
         del batch_idx, dataloader_idx
-        trajectory_batch = self._ensure_batch(batch)
+        trajectory_batch = self._require_trajectory_batch(batch)
         return self.runtime_controller.predict_batch(
             batch=trajectory_batch,
         )
 
     def on_predict_batch_end(
         self,
-        outputs: list[Any] | None,
+        outputs: list[PredictionResult] | None,
         batch: Any,
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
         del batch_idx, dataloader_idx
-        trajectory_batch = self._ensure_batch(batch)
+        trajectory_batch = self._require_trajectory_batch(batch)
         self.runtime_controller.record_prediction_batch(
             batch=trajectory_batch,
             outputs=outputs,
@@ -504,7 +819,7 @@ class GFlowNetModule(LightningModule):
     def on_predict_epoch_end(self) -> None:
         self.runtime_controller.finalize_prediction_epoch()
 
-    def get_predict_metrics(self) -> dict[str, Any]:
+    def get_predict_metrics(self) -> dict[str, float]:
         return self.runtime_controller.get_predict_metrics()
 
     def write_prediction_artifacts(
@@ -512,7 +827,7 @@ class GFlowNetModule(LightningModule):
         *,
         output_dir: str | Path,
         split: str,
-        artifact_name: str = "eval_answer_reachability",
+        artifact_name: str = "rankflow",
         schema_version: int = 1,
         entity_vocab_path: str | Path | None = None,
         relation_vocab_path: str | Path | None = None,

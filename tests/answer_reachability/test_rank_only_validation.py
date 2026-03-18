@@ -1,23 +1,27 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
+from src.metrics.answer_reachability.exact_analysis import ExactReachabilityAnalysis
+from src.metrics.answer_reachability.posterior import (
+    build_rank_only_result,
+    compute_rank_metrics,
+)
 from src.models.configs import (
     BackboneConfig,
-    AnswerReachabilityInferenceConfig,
+    SearchEvalConfig,
     GFlowNetTrainingConfig,
-    GraphLogZHeadConfig,
     HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
     SchedulerConfig,
-    StartHeadConfig,
     StateScoreHeadConfig,
 )
 from src.models.gflownet_module import GFlowNetModule
 from src.metrics.answer_reachability.runtime import (
-    AnswerReachabilityMetricRuntimeFactory,
+    SearchMetricRuntimeFactory,
 )
 
 from .conftest import make_batch_from_graph
@@ -43,11 +47,9 @@ def _make_module() -> GFlowNetModule:
                 num_layers=2,
                 dropout=0.0,
             ),
-            start_head=StartHeadConfig(hidden_dim=16, dropout=0.0),
-            graph_log_z_head=GraphLogZHeadConfig(hidden_dim=16, dropout=0.0),
         ),
-        inference_cfg=AnswerReachabilityInferenceConfig(
-            eval_profile="rank_only",
+        eval_cfg=SearchEvalConfig(
+            metrics_profile="rank_only",
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
@@ -56,7 +58,7 @@ def _make_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
-        metric_runtime_factory=AnswerReachabilityMetricRuntimeFactory(),
+        metric_runtime_factory=SearchMetricRuntimeFactory(),
     )
 
 
@@ -126,3 +128,52 @@ def test_rank_only_predict_skips_support_search_and_support_metrics() -> None:
     assert outputs[0].support_mass_reference == "skipped"
     assert "answer/hit@1" in module.predict_metrics
     assert "window/adaptive/hit" not in module.predict_metrics
+
+
+def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
+    batch = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        sample_id="rank-only-retrieval",
+    )
+    analysis = ExactReachabilityAnalysis(
+        terminal_mass=torch.tensor([0.0, 0.0, 0.4], dtype=torch.float32),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        answer_probs=torch.tensor([0.4], dtype=torch.float32),
+        gold_total_mass=0.4,
+        retrieval_answer_entity_ids=torch.tensor([101, 102], dtype=torch.long),
+        retrieval_answer_probs=torch.tensor([0.6, 0.4], dtype=torch.float32),
+    )
+
+    result = build_rank_only_result(
+        batch=batch,
+        analysis=analysis,
+        inference_mode="exact",
+        answer_mass_threshold=0.9,
+        support_mass_threshold=0.9,
+        probe_count=0,
+        remaining_mass_upper=0.0,
+        stop_reason="rank_only_exact",
+        coverage_certified=True,
+        answer_mass_reference="exact",
+        answer_mass_reference_total=1.0,
+    )
+    metrics = compute_rank_metrics(
+        answer_records=result.answer_posterior, answer_top_ks=(1, 2)
+    )
+
+    assert [record.answer_entity_id for record in result.answer_posterior] == [101, 102]
+    assert metrics["answer/gold_mass"] == pytest.approx(0.4)
+    assert metrics["answer/hit@1"] == 0.0
+    assert metrics["answer/recall@1"] == 0.0
+    assert metrics["answer/precision@1"] == 0.0
+    assert metrics["answer/f1@1"] == 0.0
+    assert metrics["answer/hit@2"] == 1.0
+    assert metrics["answer/recall@2"] == 1.0
+    assert metrics["answer/precision@2"] == 0.5
+    assert metrics["answer/f1@2"] == 2.0 / 3.0

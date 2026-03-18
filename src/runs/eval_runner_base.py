@@ -24,7 +24,6 @@ class BaseEvalRunner(ABC):
     dataset_variants: Any = None
     dataset_variant: str | None = None
     execution_mode: str = "predict"
-    eval_mode: str | None = None
 
     def run(self, *, cfg: DictConfig, evaluate_model: EvaluateModelFn) -> None:
         if self.dataset_variants:

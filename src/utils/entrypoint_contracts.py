@@ -41,17 +41,17 @@ def _resolve_run_contract(run_cfg: DictConfig | dict[str, Any]) -> dict[str, Any
     run_name = _normalize_choice(
         run_cfg.get("name") if hasattr(run_cfg, "get") else None
     )
-    if run_name in {"train", "train_answer_reachability"}:
+    if run_name in {"train_rankflow", "train_answer_reachability"}:
         return {
             "entrypoint": "train",
             "required_groups": ["dataset"],
-            "recommended_experiment": "train_answer_reachability",
+            "recommended_experiment": "train_rankflow",
         }
-    if run_name == "eval_answer_reachability":
+    if run_name in {"rankflow", "answer_reachability"}:
         return {
             "entrypoint": "eval",
             "required_groups": ["dataset"],
-            "recommended_experiment": "eval_answer_reachability",
+            "recommended_experiment": "rankflow",
         }
     if run_name == "eval_llm":
         return {

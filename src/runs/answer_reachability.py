@@ -21,11 +21,18 @@ from src.utils.output_sinks import (
 )
 
 
-ANSWER_REACHABILITY_MODEL_TARGET = "src.models.gflownet_module.GFlowNetModule"
-ANSWER_REACHABILITY_EVAL_RUN = "eval_answer_reachability"
+RANKFLOW_MODEL_TARGET = "src.models.gflownet_module.GFlowNetModule"
+ANSWER_REACHABILITY_MODEL_TARGET = RANKFLOW_MODEL_TARGET
+RANKFLOW_EVAL_RUN = "rankflow"
+ANSWER_REACHABILITY_EVAL_RUN = "answer_reachability"
+RANKFLOW_TRAIN_RUN = "train_rankflow"
 ANSWER_REACHABILITY_TRAIN_RUN = "train_answer_reachability"
-SUPPORTED_TRAINING_MODEL_TARGETS = {ANSWER_REACHABILITY_MODEL_TARGET}
-RUN_REQUIRES_CKPT_KIND = {ANSWER_REACHABILITY_EVAL_RUN: "answer_reachability"}
+RANKFLOW_EVAL_RUN_ALIASES = {RANKFLOW_EVAL_RUN, ANSWER_REACHABILITY_EVAL_RUN}
+RANKFLOW_TRAIN_RUN_ALIASES = {RANKFLOW_TRAIN_RUN, ANSWER_REACHABILITY_TRAIN_RUN}
+SUPPORTED_TRAINING_MODEL_TARGETS = {RANKFLOW_MODEL_TARGET}
+RUN_REQUIRES_CKPT_KIND = {
+    run_name: "gflownet" for run_name in RANKFLOW_EVAL_RUN_ALIASES
+}
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -82,12 +89,8 @@ class AnswerReachabilityEvalReporter:
             enabled=bool(run_cfg.get("write_artifacts", False)),
             execution_mode=resolve_execution_mode(run_cfg),
             output_root=dataset_cfg.get("artifact_dir"),
-            artifact_subdir=str(
-                run_cfg.get("artifact_subdir") or ANSWER_REACHABILITY_EVAL_RUN
-            ),
-            artifact_name=str(
-                run_cfg.get("artifact_name") or ANSWER_REACHABILITY_EVAL_RUN
-            ),
+            artifact_subdir=str(run_cfg.get("artifact_subdir") or RANKFLOW_EVAL_RUN),
+            artifact_name=str(run_cfg.get("artifact_name") or RANKFLOW_EVAL_RUN),
             schema_version=int(run_cfg.get("artifact_schema_version", 1) or 1),
             split=str(run_cfg.get("split") or "test"),
             dataset_scope=normalize_dataset_scope(dataset_cfg),
@@ -151,7 +154,7 @@ def validate_train_config(cfg: DictConfig) -> None:
     if cfg.get("dataset") is None:
         raise ValueError(
             "Missing required training inputs: dataset. Please specify `dataset=<name>` for training. "
-            "Example: python src/train.py experiment=train_answer_reachability dataset=webqsp-sub"
+            "Example: python src/train.py experiment=train_rankflow dataset=webqsp-sub"
         )
 
     dataset_cfg = cfg.get("dataset") or {}
@@ -163,13 +166,20 @@ def validate_train_config(cfg: DictConfig) -> None:
             f"Got dataset={dataset_name!r} (dataset_scope={scope})."
         )
 
+    run_cfg = cfg.get("run") or {}
+    if bool(run_cfg.get("train", True)) and cfg.get("fit_schedule") is None:
+        raise ValueError(
+            "Training requires `fit_schedule` so progress is defined in train-set passes. "
+            "Fix: use the default train config or pass `fit_schedule=pass`."
+        )
+
 
 def validate_eval_config(cfg: DictConfig) -> None:
     if cfg.get("dataset") is None:
         raise ValueError(
             "Missing required config group: `dataset`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_answer_reachability ckpt.answer_reachability=/path/to/model.ckpt\n"
+            "  python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt\n"
             "Optional (recommended): set a default dataset in `configs/local/default.yaml` (gitignored), e.g.\n"
             "  defaults:\n"
             "    - override /dataset: webqsp"
@@ -181,7 +191,7 @@ def validate_eval_config(cfg: DictConfig) -> None:
         raise ValueError(
             "Missing required config group: `run`.\n"
             "Fix:\n"
-            "  python src/eval.py experiment=eval_answer_reachability ckpt.answer_reachability=/path/to/model.ckpt"
+            "  python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt"
         )
     required_kind = RUN_REQUIRES_CKPT_KIND.get(run_name)
     if required_kind and cfg.get("ckpt_path") in (None, ""):
@@ -189,7 +199,7 @@ def validate_eval_config(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
-    if run_name != ANSWER_REACHABILITY_EVAL_RUN:
+    if run_name not in RANKFLOW_EVAL_RUN_ALIASES:
         return
 
     variants = resolve_dataset_variants(cfg)
@@ -208,8 +218,8 @@ def validate_eval_config(cfg: DictConfig) -> None:
 
 @dataclass
 class AnswerReachabilityEvalRunner(BaseEvalRunner):
-    name: str = ANSWER_REACHABILITY_EVAL_RUN
-    task_name: str = "eval/answer_reachability"
+    name: str = RANKFLOW_EVAL_RUN
+    task_name: str = "eval/rankflow"
     tags: tuple[str, ...] = ()
     split: str = "test"
     run_all_splits: bool = False
@@ -218,10 +228,9 @@ class AnswerReachabilityEvalRunner(BaseEvalRunner):
     dataset_variants: Any = None
     dataset_variant: str | None = None
     execution_mode: str = "predict"
-    eval_mode: str | None = None
     write_artifacts: bool = True
-    artifact_subdir: str = ANSWER_REACHABILITY_EVAL_RUN
-    artifact_name: str = ANSWER_REACHABILITY_EVAL_RUN
+    artifact_subdir: str = RANKFLOW_EVAL_RUN
+    artifact_name: str = RANKFLOW_EVAL_RUN
     artifact_schema_version: int = 1
     artifact_overwrite: bool = True
     questions_path: str | None = None
@@ -263,8 +272,8 @@ class AnswerReachabilityEvalRunner(BaseEvalRunner):
 
 @dataclass
 class AnswerReachabilityTrainRunner:
-    name: str = ANSWER_REACHABILITY_TRAIN_RUN
-    task_name: str = "train/answer_reachability"
+    name: str = RANKFLOW_TRAIN_RUN
+    task_name: str = "train/rankflow"
     tags: tuple[str, ...] = ()
     contract: dict[str, Any] | None = None
     train: bool = True
@@ -337,6 +346,9 @@ __all__ = [
     "ANSWER_REACHABILITY_EVAL_RUN",
     "ANSWER_REACHABILITY_MODEL_TARGET",
     "ANSWER_REACHABILITY_TRAIN_RUN",
+    "RANKFLOW_EVAL_RUN",
+    "RANKFLOW_MODEL_TARGET",
+    "RANKFLOW_TRAIN_RUN",
     "RUN_REQUIRES_CKPT_KIND",
     "SUPPORTED_TRAINING_MODEL_TARGETS",
     "AnswerReachabilityEvalReporter",

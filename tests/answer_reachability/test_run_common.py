@@ -87,11 +87,47 @@ def test_resolve_dataset_variants_applies_dataset_and_run_overrides(
     }
 
 
-def test_train_defaults_target_answer_reachability_run() -> None:
+def test_resolve_dataset_variants_rejects_removed_name_key(tmp_path: Path) -> None:
+    cfg = OmegaConf.create(
+        {
+            "paths": {"data_dir": str(tmp_path)},
+            "run": {"dataset_variants": [{"name": "webqsp"}]},
+        }
+    )
+
+    with pytest.raises(ValueError, match="use `dataset`, not the removed `name` key"):
+        resolve_dataset_variants(cfg)
+
+
+def test_resolve_dataset_variants_rejects_removed_compose_overrides_key(
+    tmp_path: Path,
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "paths": {"data_dir": str(tmp_path)},
+            "run": {
+                "dataset_variants": [
+                    {
+                        "dataset": "webqsp",
+                        "compose_overrides": ["dataset.out_dir=/tmp/normalized"],
+                    }
+                ]
+            },
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="use `overrides`, not the removed `compose_overrides` key",
+    ):
+        resolve_dataset_variants(cfg)
+
+
+def test_train_defaults_target_rankflow_run() -> None:
     cfg = OmegaConf.load(Path(__file__).resolve().parents[2] / "configs" / "train.yaml")
     defaults = OmegaConf.to_container(cfg.defaults, resolve=False)
 
-    assert {"run": "train_answer_reachability"} in defaults
+    assert {"run": "train_rankflow"} in defaults
 
 
 def test_default_callbacks_monitor_current_rank_metric() -> None:
@@ -102,22 +138,21 @@ def test_default_callbacks_monitor_current_rank_metric() -> None:
 
     assert (
         callbacks_dict["model_checkpoint"]["monitor"]
-        == "val/${dataset.dataset_scope}/answer/gold_mass"
+        == "val/${dataset.dataset_scope}/answer/recall@10"
     )
     assert (
         callbacks_dict["early_stopping"]["monitor"]
-        == "val/${dataset.dataset_scope}/answer/gold_mass"
+        == "val/${dataset.dataset_scope}/answer/recall@10"
     )
 
 
-def test_resolve_execution_mode_accepts_new_key_and_legacy_alias() -> None:
+def test_resolve_execution_mode_accepts_execution_mode_key() -> None:
     assert resolve_execution_mode({"execution_mode": "test"}) == "test"
-    assert resolve_execution_mode({"eval_mode": "predict"}) == "predict"
 
 
-def test_resolve_execution_mode_rejects_conflicting_aliases() -> None:
-    with pytest.raises(ValueError, match="disagree"):
-        resolve_execution_mode({"execution_mode": "predict", "eval_mode": "test"})
+def test_resolve_execution_mode_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError, match="run.execution_mode"):
+        resolve_execution_mode({"execution_mode": "invalid"})
 
 
 def test_temporary_cfg_overrides_restores_original_nodes() -> None:

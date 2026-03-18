@@ -23,8 +23,8 @@ def test_prediction_artifacts_writer_delegates_to_model_method(tmp_path: Path) -
         enabled=True,
         execution_mode="predict",
         output_root=tmp_path,
-        artifact_subdir="eval_answer_reachability",
-        artifact_name="eval_answer_reachability",
+        artifact_subdir="rankflow",
+        artifact_name="rankflow",
         schema_version=1,
         split="test",
         dataset_scope="sub",
@@ -36,10 +36,10 @@ def test_prediction_artifacts_writer_delegates_to_model_method(tmp_path: Path) -
     callback.on_predict_end(SimpleNamespace(is_global_zero=True), model)
 
     assert captured["split"] == "test"
-    assert captured["output_dir"] == tmp_path / "eval_answer_reachability" / "sub"
+    assert captured["output_dir"] == tmp_path / "rankflow" / "sub"
     assert captured["questions_path"] == questions_path
     assert getattr(model, "predict_artifact_paths") == {
-        "prompt_path": tmp_path / "eval_answer_reachability" / "sub" / "test.jsonl"
+        "prompt_path": tmp_path / "rankflow" / "sub" / "test.jsonl"
     }
 
 
@@ -58,17 +58,16 @@ def test_local_metrics_writer_uses_model_predict_metrics(tmp_path: Path) -> None
     assert record["metrics"] == {"answer/hit@1": 0.75}
 
 
-def test_prediction_artifacts_writer_rejects_conflicting_mode_aliases(
+def test_prediction_artifacts_writer_rejects_unknown_execution_mode(
     tmp_path: Path,
 ) -> None:
     try:
         PredictionArtifactsWriter(
             enabled=True,
-            execution_mode="predict",
-            eval_mode="test",
+            execution_mode="invalid",
             output_root=tmp_path,
         )
     except ValueError as exc:
-        assert "conflicting execution_mode/eval_mode" in str(exc)
+        assert "execution mode" in str(exc)
     else:
-        raise AssertionError("expected conflicting execution modes to be rejected")
+        raise AssertionError("expected invalid execution mode to be rejected")

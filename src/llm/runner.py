@@ -25,7 +25,6 @@ class LlmEvalRunner(BaseEvalRunner):
     dataset_variants: Any = None
     dataset_variant: str | None = None
     execution_mode: str = "predict"
-    eval_mode: str | None = None
 
     def validate(self, cfg: DictConfig) -> None:
         if cfg.get("llm") is None:

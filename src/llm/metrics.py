@@ -351,7 +351,7 @@ def _build_eval_sample(
         return None
     if sample_id not in pred_map:
         return None
-    question = str(record.get("question_text") or record.get("question") or "")
+    question = str(record.get("question") or "")
     answers = _resolve_gold_answer_texts(record, answer_separator=answer_separator)
     if not answers:
         return None
@@ -523,10 +523,7 @@ def _resolve_gold_answer_texts(
             if parsed:
                 return parsed
         return answers
-    text = str(record.get("answer_text") or "").strip()
-    if not text:
-        return []
-    return list(_parse_answer_set(text, answer_separator=answer_separator))
+    return []
 
 
 def _normalize_answer_token(text: str) -> str:

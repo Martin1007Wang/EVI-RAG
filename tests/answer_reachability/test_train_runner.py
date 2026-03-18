@@ -10,7 +10,8 @@ def test_train_runner_delegates_to_train_model() -> None:
         {
             "model": {"_target_": "src.models.gflownet_module.GFlowNetModule"},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
-            "run": {"name": "train_answer_reachability", "train": True},
+            "run": {"name": "train_rankflow", "train": True},
+            "fit_schedule": {"max_passes": 1.0},
         }
     )
     runner = AnswerReachabilityTrainRunner()

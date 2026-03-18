@@ -1,0 +1,78 @@
+# @package _global_
+#
+# Canonical RankFlow training bundle for answer ranking.
+# Usage:
+#   python src/train.py experiment=train_rankflow dataset=webqsp-sub
+#
+# Contract:
+# - overrides `/run`, `/trainer`, `/model`, `/callbacks`, `/logger`
+# - still requires the caller to choose `/dataset`
+
+defaults:
+  - override /callbacks: default
+  - override /logger: wandb
+  - override /run: train_rankflow
+  - override /trainer: gpu
+  - override /model: gflownet
+  - _self_
+
+optimized_metric: "val/sub/answer/recall@10"
+
+data:
+  batch_size: 32
+
+trainer:
+  min_epochs: 0
+  max_epochs: -1
+  max_time: "00:08:00:00"
+  check_val_every_n_epoch: null
+  log_every_n_steps: 50
+  precision: bf16-mixed
+  gradient_clip_val: 0.5
+  limit_val_batches: null
+
+fit_schedule:
+  max_passes: 120.0
+  val_every_passes: 2.0
+  early_stopping_patience_passes: 24.0
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/sub/answer/recall@10"
+    mode: max
+    filename: "step_{step:07d}"
+    auto_insert_metric_name: False
+    save_weights_only: True
+  early_stopping:
+    monitor: "val/sub/answer/recall@10"
+    mode: max
+    # Runtime rewrites this from `fit_schedule.early_stopping_patience_passes`.
+    patience: 12
+    min_delta: 0.002
+
+model:
+  training_cfg:
+    success_replay:
+      enabled: true
+      ratio: 0.25
+      warmup_passes: 1.0
+      min_buffer_size: 256
+      max_buffer_size: 50000
+      max_trajectories_per_sample: 8
+  heuristic_cfg:
+    kind: topology
+    beta: 1.0
+  eval_cfg:
+    # Training-time validation only needs answer-ranking metrics; full window search is reserved for final eval.
+    strict_search: true
+    metrics_profile: rank_only
+    max_expansions: 100000
+    max_frontier_size: 32768
+  scheduler_cfg:
+    type: cosine
+    interval: step
+    t_max: ${trainer.max_steps}
+    eta_min: 1.0e-6
+  optimizer_cfg:
+    lr: 5.0e-5
+    weight_decay: 1.0e-4

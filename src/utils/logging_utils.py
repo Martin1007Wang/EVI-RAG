@@ -159,6 +159,7 @@ def _collect_cfg_sections(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "model": cfg.get("model"),
         "data": cfg.get("data"),
         "trainer": cfg.get("trainer"),
+        "fit_schedule": cfg.get("fit_schedule"),
         "callbacks": cfg.get("callbacks"),
         "extras": cfg.get("extras"),
         "task_name": cfg.get("task_name"),

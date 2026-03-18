@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Dict
+from typing import Iterable
 
 from src.data.preprocess.context import PreprocessContext
 from src.data.io.lmdb_utils import ensure_dir
@@ -11,41 +11,61 @@ from src.utils.logging_utils import get_logger, log_event
 
 LOGGER = get_logger(__name__)
 
+_REMOVED_PREPROCESS_KEYS = (
+    "skip_parquet_stage",
+    "skip_lmdb_stage",
+    "filter",
+    "keep_start_adjacent_edges",
+    "canonicalize_relations",
+    "cosine_eps",
+    "emit_nonzero_positive_filter",
+    "nonzero_positive_filter_filename",
+    "nonzero_positive_filter_splits",
+)
+_REMOVED_DATASET_PREPROCESS_KEYS = (
+    "time_relation_mode",
+    "time_relation_regex",
+    "time_question_regex",
+)
+
+
+def _assert_no_removed_keys(
+    cfg_section, *, keys: Iterable[str], section_name: str
+) -> None:
+    if cfg_section is None or not hasattr(cfg_section, "get"):
+        return
+    removed = [key for key in keys if cfg_section.get(key) not in (None, "")]
+    if removed:
+        raise ValueError(
+            f"Removed {section_name} config keys detected: {removed}. "
+            "Delete these overrides and rerun preprocess."
+        )
+
 
 def _validate_preprocess_cfg(ctx: PreprocessContext) -> None:
     cfg = ctx.cfg
-    use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
-    use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
-    skip_parquet_stage = bool(cfg.get("skip_parquet_stage", False))
-    skip_lmdb_stage = bool(cfg.get("skip_lmdb_stage", False))
-    reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
 
     _ = ctx.parquet_chunk_size
     _ = ctx.parquet_num_workers
 
-    if skip_parquet_stage and skip_lmdb_stage:
-        raise ValueError(
-            "Both skip_parquet_stage and skip_lmdb_stage are true; nothing to run."
-        )
+    if cfg.get("parquet_dir") not in (None, ""):
+        raise ValueError("`parquet_dir` was removed; use `out_dir` instead.")
+    if cfg.get("dataset_name") not in (None, ""):
+        raise ValueError("`dataset_name` was removed; use `dataset.name` instead.")
 
-    _ = use_precomputed_embeddings
-    _ = use_precomputed_questions
-    parquet_dir_cfg = cfg.get("parquet_dir")
-    out_dir_cfg = cfg.get("out_dir")
-    if parquet_dir_cfg and out_dir_cfg:
-        if (
-            not skip_parquet_stage
-            and not skip_lmdb_stage
-            and ctx.parquet_dir.resolve() != ctx.out_dir.resolve()
-        ):
-            raise ValueError(
-                "parquet_dir must match out_dir in the unified pipeline. "
-                f"Got parquet_dir={ctx.parquet_dir} vs out_dir={ctx.out_dir}."
-            )
+    _assert_no_removed_keys(
+        cfg,
+        keys=_REMOVED_PREPROCESS_KEYS,
+        section_name="preprocess",
+    )
+    _assert_no_removed_keys(
+        cfg.get("dataset"),
+        keys=_REMOVED_DATASET_PREPROCESS_KEYS,
+        section_name="dataset preprocess",
+    )
 
 
-def _apply_preprocess_stage(ctx: PreprocessContext) -> str:
-    cfg = ctx.cfg
+def _resolve_preprocess_stage(cfg) -> str:
     stage = str(cfg.get("pipeline_stage", "all")).strip().lower()
     if not stage:
         stage = "all"
@@ -53,41 +73,7 @@ def _apply_preprocess_stage(ctx: PreprocessContext) -> str:
         raise ValueError(
             f"pipeline_stage must be one of: all, parquet, lmdb (got {stage!r})."
         )
-    desired = {
-        "skip_parquet_stage": stage == "lmdb",
-        "skip_lmdb_stage": stage == "parquet",
-    }
-    changed: Dict[str, object] = {}
-    for key, value in desired.items():
-        if cfg.get(key) != value:
-            cfg[key] = value
-            changed[key] = value
-    if changed:
-        log_event(ctx.logger, "pipeline_stage_applied", stage=stage, overrides=changed)
     return stage
-
-
-def _apply_preprocess_overrides(ctx: PreprocessContext) -> None:
-    cfg = ctx.cfg
-    if not bool(cfg.get("skip_lmdb_stage", False)):
-        return
-    overrides = {
-        "canonicalize_relations": False,
-        "use_precomputed_embeddings": False,
-        "use_precomputed_questions": False,
-    }
-    changed: Dict[str, object] = {}
-    for key, value in overrides.items():
-        if cfg.get(key) != value:
-            cfg[key] = value
-            changed[key] = value
-    if changed:
-        log_event(
-            ctx.logger,
-            "pipeline_overrides",
-            reason="skip_lmdb_stage",
-            overrides=changed,
-        )
 
 
 def _run_parquet_stage(ctx: PreprocessContext) -> None:
@@ -119,11 +105,10 @@ def _ensure_preprocess_dirs(ctx: PreprocessContext) -> None:
 def run_preprocess_pipeline(cfg) -> None:
     run_id = str(cfg.get("run_id") or uuid.uuid4().hex)
     ctx = PreprocessContext(cfg=cfg, logger=LOGGER, run_id=run_id)
-    stage = _apply_preprocess_stage(ctx)
+    stage = _resolve_preprocess_stage(cfg)
     _validate_preprocess_cfg(ctx)
-    _apply_preprocess_overrides(ctx)
     _ensure_preprocess_dirs(ctx)
-    if not bool(cfg.get("skip_parquet_stage", False)):
+    if stage in {"all", "parquet"}:
         _run_parquet_stage(ctx)
-    if not bool(cfg.get("skip_lmdb_stage", False)):
+    if stage in {"all", "lmdb"}:
         build_dataset(ctx)

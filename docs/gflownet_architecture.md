@@ -48,12 +48,12 @@ search。相关默认值见 `configs/experiment/train_answer_reachability.yaml`�
    - `run.split`
    - `run.run_all_splits`
    - `run.dataset_variants`
-3. `GRetrievalDataModule.set_eval_split()` 接收 runner 当前请求的 split。
+3. `GraphRetrievalDataModule.set_eval_split()` 接收 runner 当前请求的 split。
 4. `GFlowNetModule` 把评估委托给 `EvaluationController` 和 metric runtime。
 5. `src/metrics/answer_reachability/runtime.py` 决定当前任务视图：
    - `answer_reachability`
    - `edge_retrieval`
-6. `AnswerReachabilityExecution` 负责：
+6. `ReachabilityBatchEvaluator` 负责：
    - exact reachability analysis
    - rank-only result 构造
    - support-window search
@@ -65,17 +65,17 @@ search。相关默认值见 `configs/experiment/train_answer_reachability.yaml`�
 如果你第一次进仓库，建议按下面顺序读：
 
 1. `configs/experiment/train_answer_reachability.yaml`
-2. `configs/experiment/eval_answer_reachability.yaml`
+2. `configs/experiment/answer_reachability.yaml`
 3. `src/train.py`
 4. `src/eval.py`
 5. `src/runs/answer_reachability.py`
 6. `src/models/gflownet_module.py`
-7. `src/models/policy/trajectory_policy.py`
+7. `src/models/policy/base_policy.py`
 8. `src/models/training/sampler.py`
 9. `src/models/training/losses.py`
 10. `src/metrics/answer_reachability/runtime.py`
-11. `src/metrics/answer_reachability/execution.py`
-12. `src/metrics/answer_reachability/search.py`
+11. `src/metrics/answer_reachability/batch_evaluator.py`
+12. `src/metrics/answer_reachability/support_search.py`
 
 ## 5. 历史路径映射
 
@@ -84,10 +84,10 @@ search。相关默认值见 `configs/experiment/train_answer_reachability.yaml`�
 - `src/models/trajectory_gfn/module.py` -> `src/models/gflownet_module.py`
 - `src/models/trajectory_gfn/sampler.py` -> `src/models/training/sampler.py`
 - `src/models/trajectory_gfn/losses.py` -> `src/models/training/losses.py`
-- `src/tasks/answer_reachability/execution.py` -> `src/metrics/answer_reachability/execution.py`
+- `src/tasks/answer_reachability/execution.py` -> `src/metrics/answer_reachability/batch_evaluator.py`
 - `src/tasks/answer_reachability/metrics.py` -> `src/metrics/answer_reachability/metrics.py`
 - `src/tasks/answer_reachability/posterior.py` -> `src/metrics/answer_reachability/posterior.py`
-- `src/tasks/answer_reachability/search.py` -> `src/metrics/answer_reachability/search.py`
-- `src/tasks/answer_reachability/exact_reachability.py` -> `src/metrics/answer_reachability/exact.py`
+- `src/tasks/answer_reachability/search.py` -> `src/metrics/answer_reachability/support_search.py`
+- `src/tasks/answer_reachability/exact_reachability.py` -> `src/metrics/answer_reachability/exact_analysis.py`
 
 如果你看到旧路径，请优先以上面的当前实现为准。

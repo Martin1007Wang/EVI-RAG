@@ -17,7 +17,7 @@ def test_llm_runner_replays_all_requested_splits(monkeypatch) -> None:
                 "run_all_splits": True,
                 "splits": ["validation", "test"],
             },
-            "llm": {"provider": "openai"},
+            "llm": {"providers": ["openai"]},
         }
     )
     runner = LlmEvalRunner(run_all_splits=True, splits=("validation", "test"))

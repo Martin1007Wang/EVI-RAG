@@ -3,15 +3,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.policy.trajectory_policy import TrajectoryPolicy
-from src.models.policy.state import SearchState
-from src.models.policy.transition import apply_forward_constraints
 from src.metrics.answer_reachability import ExactReachabilityAnalyzer
+from src.models.gflownet import BaseSearchPolicy
+from src.models.gflownet import apply_forward_constraints
+from src.models.gflownet import SearchState
 
 from .conftest import make_batch_from_graph, make_policy
 
 
-def _make_policy(*, max_steps: int) -> TrajectoryPolicy:
+def _make_policy(*, max_steps: int) -> BaseSearchPolicy:
     return make_policy(max_steps=max_steps)
 
 

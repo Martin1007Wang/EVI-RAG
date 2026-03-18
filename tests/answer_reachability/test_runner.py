@@ -5,10 +5,15 @@ from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
-from src.runs.answer_reachability import AnswerReachabilityEvalRunner
+import pytest
+
+from src.runs.answer_reachability import (
+    AnswerReachabilityEvalRunner,
+    validate_train_config,
+)
 
 
-def test_answer_reachability_runner_sets_split_specific_allow_empty_answer(
+def test_rankflow_runner_sets_split_specific_allow_empty_answer(
     tmp_path: Path,
 ) -> None:
     cfg = OmegaConf.create(
@@ -16,7 +21,7 @@ def test_answer_reachability_runner_sets_split_specific_allow_empty_answer(
             "paths": {"output_dir": str(tmp_path)},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
             "run": {
-                "name": "eval_answer_reachability",
+                "name": "rankflow",
                 "split": "test",
                 "run_all_splits": True,
                 "splits": ["train", "validation"],
@@ -45,7 +50,7 @@ def test_answer_reachability_runner_sets_split_specific_allow_empty_answer(
     assert (tmp_path / "metrics_validation.json").exists()
 
 
-def test_answer_reachability_runner_applies_variant_run_overrides(
+def test_rankflow_runner_applies_variant_run_overrides(
     tmp_path: Path,
 ) -> None:
     cfg = OmegaConf.create(
@@ -53,7 +58,7 @@ def test_answer_reachability_runner_applies_variant_run_overrides(
             "paths": {"output_dir": str(tmp_path), "data_dir": str(tmp_path)},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
             "run": {
-                "name": "eval_answer_reachability",
+                "name": "rankflow",
                 "split": "test",
                 "dataset_variants": [
                     {
@@ -94,3 +99,17 @@ def test_answer_reachability_runner_applies_variant_run_overrides(
         ("full_eval", "validation", "full_eval_outputs"),
         ("sub_eval", "test", None),
     ]
+
+
+def test_validate_train_config_requires_fit_schedule_for_training() -> None:
+    cfg = OmegaConf.create(
+        {
+            "model": {"_target_": "src.models.gflownet_module.GFlowNetModule"},
+            "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
+            "run": {"train": True},
+            "fit_schedule": None,
+        }
+    )
+
+    with pytest.raises(ValueError, match="fit_schedule"):
+        validate_train_config(cfg)

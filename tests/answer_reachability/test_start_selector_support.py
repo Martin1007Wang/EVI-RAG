@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.policy.trajectory_policy import InvalidStartCandidatesError
+from src.models.gflownet import InvalidStartCandidatesError
 
 from .conftest import make_batch_from_graph, make_policy
 
@@ -44,15 +44,15 @@ def test_start_distribution_rejects_all_nonfinite_start_logits() -> None:
     policy = make_policy()
     prepared_batch = policy.prepare_batch(batch)
 
-    def _nan_start_logits(
-        *, node_features: torch.Tensor, question_features: torch.Tensor
+    def _nan_state_scores(
+        node_features: torch.Tensor, question_features: torch.Tensor
     ) -> torch.Tensor:
         del question_features
         return torch.full(
             (node_features.size(0),), float("nan"), device=node_features.device
         )
 
-    policy.start_head.forward = _nan_start_logits  # type: ignore[method-assign]
+    policy.state_score_head.forward = _nan_state_scores  # type: ignore[method-assign]
 
     with pytest.raises(InvalidStartCandidatesError, match="finite start candidate"):
         policy.compute_start_distribution(prepared_batch)

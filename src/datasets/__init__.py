@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
-    "GRetrievalDataset",
-    "create_g_retrieval_dataset",
-    "GRetrievalDataModule",
+    "GraphRetrievalDataset",
+    "create_graph_retrieval_dataset",
+    "GraphRetrievalDataModule",
     "EmbeddingStore",
     "GlobalEmbeddingStore",
     "SharedDataResources",
@@ -15,8 +15,8 @@ __all__ = [
 
 if TYPE_CHECKING:  # pragma: no cover
     from .components import EmbeddingStore, GlobalEmbeddingStore, SharedDataResources
-    from .g_retrieval_datamodule import GRetrievalDataModule
-    from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
+    from .graph_retrieval_datamodule import GraphRetrievalDataModule
+    from .graph_retrieval_dataset import GraphRetrievalDataset, create_graph_retrieval_dataset
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
@@ -33,18 +33,18 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
             "GlobalEmbeddingStore": GlobalEmbeddingStore,
         }[name]
 
-    if name in ("GRetrievalDataset", "create_g_retrieval_dataset"):
-        from .g_retrieval_dataset import GRetrievalDataset, create_g_retrieval_dataset
+    if name in ("GraphRetrievalDataset", "create_graph_retrieval_dataset"):
+        from .graph_retrieval_dataset import GraphRetrievalDataset, create_graph_retrieval_dataset
 
         return {
-            "GRetrievalDataset": GRetrievalDataset,
-            "create_g_retrieval_dataset": create_g_retrieval_dataset,
+            "GraphRetrievalDataset": GraphRetrievalDataset,
+            "create_graph_retrieval_dataset": create_graph_retrieval_dataset,
         }[name]
 
-    if name == "GRetrievalDataModule":
-        from .g_retrieval_datamodule import GRetrievalDataModule
+    if name == "GraphRetrievalDataModule":
+        from .graph_retrieval_datamodule import GraphRetrievalDataModule
 
-        return GRetrievalDataModule
+        return GraphRetrievalDataModule
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

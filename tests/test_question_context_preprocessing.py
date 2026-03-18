@@ -11,7 +11,6 @@ from src.data.schema.constants import QuestionFields
 
 def _base_question_row() -> dict[str, object]:
     return {
-        QuestionFields.QUESTION_UID: "q_0",
         QuestionFields.DATASET: "unit",
         QuestionFields.SPLIT: "train",
         QuestionFields.KB: "kb",
@@ -33,6 +32,7 @@ def test_write_questions_with_token_context_roundtrip(tmp_path: Path) -> None:
     write_questions([row], out_path)
 
     table = pq.read_table(out_path)
+    assert "question_uid" not in table.schema.names
     assert QuestionFields.QUESTION_CTX in table.schema.names
     assert QuestionFields.QUESTION_CTX_MASK in table.schema.names
     payload = table.to_pylist()[0]
@@ -45,7 +45,10 @@ def test_write_questions_rejects_unpaired_context_mask(tmp_path: Path) -> None:
     row = _base_question_row()
     row[QuestionFields.QUESTION_CTX] = [[0.1, 0.0], [0.0, 0.1]]
 
-    with pytest.raises(ValueError, match="question_ctx_mask missing in questions while include_question_ctx is enabled"):
+    with pytest.raises(
+        ValueError,
+        match="question_ctx_mask missing in questions while include_question_ctx is enabled",
+    ):
         write_questions([row], out_path)
 
 
@@ -55,5 +58,7 @@ def test_write_questions_rejects_context_mask_length_mismatch(tmp_path: Path) ->
     row[QuestionFields.QUESTION_CTX] = [[0.1, 0.0], [0.0, 0.1]]
     row[QuestionFields.QUESTION_CTX_MASK] = [True]
 
-    with pytest.raises(ValueError, match="question_ctx/question_ctx_mask length mismatch"):
+    with pytest.raises(
+        ValueError, match="question_ctx/question_ctx_mask length mismatch"
+    ):
         write_questions([row], out_path)

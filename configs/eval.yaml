@@ -1,7 +1,7 @@
 # Entrypoint contract for `python src/eval.py ...`
 # - `/run` must be an eval-oriented run config (`run.name` cannot be `train_*`).
 # - Dataset requirements are run-specific:
-#   - `run=eval_answer_reachability` requires `/dataset` and a checkpoint.
+#   - `run=rankflow` requires `/dataset` and a checkpoint.
 #   - `run=eval_llm` does not require `/dataset`, but it does require `/llm`.
 # - Prefer `experiment=...` so `/run`, `/trainer`, and any task-specific groups move together.
 
@@ -10,7 +10,7 @@ defaults:
   - ckpt: default
   - run: default
   - dataset: null
-  - data: g_retrieval
+  - data: graph_retrieval
   - model: gflownet
   - callbacks: default
   - logger: null

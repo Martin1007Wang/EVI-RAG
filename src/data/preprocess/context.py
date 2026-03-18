@@ -14,9 +14,10 @@ from src.data.schema.types import (
 )
 from src.data.preprocess.config import (
     build_embedding_cfg,
-    build_split_filters,
+    build_preprocess_filters,
     _resolve_parquet_chunk_size,
     _resolve_parquet_num_workers,
+    resolve_embedding_batch_size,
 )
 
 
@@ -32,7 +33,7 @@ class PreprocessContext:
 
     def __post_init__(self) -> None:
         if self.base_dir is None:
-            base = self.cfg.get("out_dir") or self.cfg.get("parquet_dir") or "."
+            base = self.cfg.get("out_dir") or "."
             self.base_dir = self._to_abs_path(base)
 
     def _to_abs_path(self, value: str | Path) -> Path:
@@ -60,13 +61,6 @@ class PreprocessContext:
         return self._to_abs_path(out_dir)
 
     @cached_property
-    def parquet_dir(self) -> Path:
-        parquet_dir = self.cfg.get("parquet_dir") or self.cfg.get("out_dir")
-        if not parquet_dir:
-            raise ValueError("parquet_dir or out_dir must be set in config.")
-        return self._to_abs_path(parquet_dir)
-
-    @cached_property
     def output_dir(self) -> Path:
         output_dir = self.cfg.get("output_dir")
         if not output_dir:
@@ -82,20 +76,28 @@ class PreprocessContext:
 
     @cached_property
     def dataset_name(self) -> str:
-        return str(self.cfg.get("dataset_name") or self.cfg.get("dataset") or "dataset")
+        dataset_cfg = self.cfg.get("dataset")
+        if hasattr(dataset_cfg, "get"):
+            name = dataset_cfg.get("name")
+            if name:
+                return str(name)
+        raise ValueError("dataset.name must be set in config.")
 
     @cached_property
     def embedding_cfg(self) -> Optional[EmbeddingConfig]:
         return build_embedding_cfg(self.cfg)
 
     @cached_property
-    def split_filters(self) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitFilter]]:
-        return build_split_filters(self.cfg)
+    def preprocess_filters(
+        self,
+    ) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitFilter]]:
+        return build_preprocess_filters(self.cfg)
 
     @cached_property
     def parquet_chunk_size(self) -> int:
         return _resolve_parquet_chunk_size(
-            self.cfg, fallback=int(self.cfg.get("batch_size", _MIN_CHUNK_SIZE))
+            self.cfg,
+            fallback=resolve_embedding_batch_size(self.cfg),
         )
 
     @cached_property

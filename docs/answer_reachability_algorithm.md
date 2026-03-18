@@ -5,8 +5,11 @@
 ## 1. 任务定义
 
 给定问题节点集合 `Q`、图 `G`、答案实体集合 `A`，模型学习一个从起点到终点的
-trajectory policy。训练时采样轨迹并优化 GFlowNet/SubTB 目标；评估时用 exact
-analysis 和 guided search 分析答案概率与 support window。
+trajectory policy。当前主线把多起点集合建模成一个隐式虚拟源 `s_emptyset` 指向
+`Q` 上真实起点状态的 root-flow decomposition：起点分布由起点状态流归一化得到，
+`log Z` 则由所有起点状态流的 `logsumexp` 给出。训练时采样轨迹并优化 GFlowNet/
+SubTB 目标；评估时用 exact analysis 和 guided search 分析答案概率与 support
+window。
 
 ## 2. 训练逻辑
 
@@ -19,9 +22,9 @@ analysis 和 guided search 分析答案概率与 support window。
 
 步骤如下：
 
-1. `TrajectoryPolicy` 或 `GFlowNetPolicy` 先编码图与问题。
-2. `ForwardTrajectoryGFNSampler` 从 start distribution 采样起点，并按 forward
-   distribution rollout。
+1. `BaseSearchPolicy` 或 `GFlowNetPolicy` 先编码图与问题。
+2. `ForwardTrajectoryGFNSampler` 先在隐式虚拟源下构造 start distribution，随后从中
+   采样真实起点，并按 forward distribution rollout。
 3. `AnswerReachabilityTrajectorySupervisor` 决定哪些 terminal node 算成功，并为成败
    轨迹提供 reward / log_reward。
 4. `SubTrajectoryBalanceLoss` 用 sampled trajectories 计算 SubTB 残差并回传梯度。
@@ -33,9 +36,9 @@ analysis 和 guided search 分析答案概率与 support window。
 验证与测试主链在：
 
 - `src/metrics/answer_reachability/runtime.py`
-- `src/metrics/answer_reachability/execution.py`
-- `src/metrics/answer_reachability/exact.py`
-- `src/metrics/answer_reachability/search.py`
+- `src/metrics/answer_reachability/batch_evaluator.py`
+- `src/metrics/answer_reachability/exact_analysis.py`
+- `src/metrics/answer_reachability/support_search.py`
 - `src/metrics/answer_reachability/posterior.py`
 - `src/metrics/answer_reachability/metrics.py`
 
@@ -55,7 +58,7 @@ analysis 和 guided search 分析答案概率与 support window。
 `metrics_profile=full` 时：
 
 - 先做 exact reachability analysis，得到 gold mass 和 answer posterior。
-- 再用 `ReachabilityGuidedSearch` 生成 support window。
+- 再用 `ExactSupportSearch` 生成 support window。
 - 最终同时输出：
   - `answer/*`
   - `window/*`
@@ -110,7 +113,7 @@ analysis 和 guided search 分析答案概率与 support window。
 ### 5.2 `run.split`
 
 当前评估 split 由 `run.split` 控制，`src/eval.py` 会显式把它传给
-`GRetrievalDataModule.set_eval_split()`。
+`GraphRetrievalDataModule.set_eval_split()`。
 
 ### 5.3 `run.run_all_splits`
 
@@ -126,12 +129,11 @@ answer-reachability 正式评估通常会同时跑 `full` 和 `sub` 两个 datas
 
 主要配置位于 `src/models/configs/gflownet.py`：
 
-- `eval_profile`: `full` 或 `rank_only`
-- `eval_view`: `answer_reachability` 或 `edge_retrieval`
+- `metrics_profile`: `full` 或 `rank_only`
+- `task`: `answer_reachability` 或 `edge_retrieval`
 - `answer_mass_threshold`: answer posterior 截断阈值
 - `support_mass_threshold`: support window 目标阈值
 - `support_path_overlap_penalty`: 多条 support path 的重叠惩罚
 - `max_expansions`, `max_frontier_size`, `strict_search`: search 预算与严格性
 
-内部代码统一优先使用别名 `metrics_profile` 与 `task_view`，但 Hydra 对外仍保持
-`eval_profile` / `eval_view` 兼容。
+代码与 Hydra 配置统一使用 `metrics_profile` 与 `task`，不再保留旧别名。

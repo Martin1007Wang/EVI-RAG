@@ -74,27 +74,19 @@ def _load_question_map(path: str | Path | None) -> dict[str, dict[str, Any]] | N
     import pandas as pd
 
     frame = pd.read_parquet(resolved)
-    id_column = "graph_id" if "graph_id" in frame.columns else "question_uid"
+    id_column = "graph_id"
     if id_column not in frame.columns:
-        raise ValueError("questions.parquet missing graph_id/question_uid column.")
+        raise ValueError("questions.parquet missing graph_id column.")
     out: dict[str, dict[str, Any]] = {}
     for _, row in frame.iterrows():
         sample_id = str(row.get(id_column) or "")
         if not sample_id:
             continue
         out[sample_id] = {
-            "question_text": str(row.get("question") or ""),
+            "question": str(row.get("question") or ""),
             "answer_texts": _coerce_answer_texts(row.get("answer_texts")),
         }
     return out
-
-
-def _join_answer_texts(answer_texts: Sequence[str]) -> str:
-    if not answer_texts:
-        return ""
-    if len(answer_texts) == 1:
-        return str(answer_texts[0])
-    return " | ".join(str(item) for item in answer_texts)
 
 
 def _edge_to_dict(
@@ -241,7 +233,7 @@ class SupportWindowArtifactWriter:
         *,
         output_dir: str | Path,
         split: str,
-        artifact_name: str = "eval_answer_reachability",
+        artifact_name: str = "rankflow",
         schema_version: int = 1,
         entity_vocab_path: str | Path | None = None,
         relation_vocab_path: str | Path | None = None,
@@ -296,7 +288,7 @@ class SupportWindowArtifactWriter:
             "file": prompt_path.name,
             "labels_file": labels_path.name,
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "producer": "answer_reachability_artifact_writer",
+            "producer": "rankflow_artifact_writer",
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return {
@@ -311,13 +303,10 @@ class SupportWindowArtifactWriter:
         label: SupportWindowLabelRecord | None,
     ) -> dict[str, Any]:
         fallback_question = "" if label is None else label.question
-        question_text = self._question_text(
-            result.sample_id, fallback=fallback_question
-        )
+        question = self._question(result.sample_id, fallback=fallback_question)
         return {
             "sample_id": result.sample_id,
-            "question": question_text,
-            "question_text": question_text,
+            "question": question,
             "dataset_scope": result.dataset_scope,
             "mass_threshold": float(result.mass_threshold),
             "inference_mode": result.inference_mode,
@@ -364,9 +353,7 @@ class SupportWindowArtifactWriter:
         label: SupportWindowLabelRecord | None,
     ) -> dict[str, Any]:
         fallback_question = "" if label is None else label.question
-        question_text = self._question_text(
-            result.sample_id, fallback=fallback_question
-        )
+        question = self._question(result.sample_id, fallback=fallback_question)
         answer_texts = self._answer_texts(result.sample_id)
         start_entity_ids = (
             result.start_entity_ids if label is None else label.start_entity_ids
@@ -376,24 +363,22 @@ class SupportWindowArtifactWriter:
         )
         record = {
             "sample_id": result.sample_id,
-            "question": question_text,
-            "question_text": question_text,
+            "question": question,
             "start_entity_ids": [int(value) for value in start_entity_ids],
             "answer_entity_ids": [int(value) for value in answer_entity_ids],
             "answer_texts": answer_texts,
-            "answer_text": _join_answer_texts(answer_texts),
         }
         if label is not None:
             record["a_entity_in_graph"] = bool(label.a_entity_in_graph)
         return record
 
-    def _question_text(self, sample_id: str, *, fallback: str) -> str:
+    def _question(self, sample_id: str, *, fallback: str) -> str:
         if self.question_map is None:
             return str(fallback or "")
         meta = self.question_map.get(sample_id)
         if meta is None:
             return str(fallback or "")
-        return str(meta.get("question_text") or fallback or "")
+        return str(meta.get("question") or fallback or "")
 
     def _answer_texts(self, sample_id: str) -> list[str]:
         if self.question_map is None:

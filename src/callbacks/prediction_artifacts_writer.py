@@ -18,16 +18,8 @@ log = RankedLogger(__name__, rank_zero_only=True)
 def _resolve_execution_mode(
     *,
     execution_mode: str | None,
-    eval_mode: str | None,
 ) -> str:
-    if execution_mode not in (None, "") and eval_mode not in (None, ""):
-        if str(execution_mode).strip().lower() != str(eval_mode).strip().lower():
-            raise ValueError(
-                "PredictionArtifactsWriter received conflicting execution_mode/eval_mode values. "
-                f"Got execution_mode={execution_mode!r} eval_mode={eval_mode!r}."
-            )
-    raw_mode = execution_mode if execution_mode not in (None, "") else eval_mode
-    mode = str(raw_mode or "predict").strip().lower()
+    mode = str(execution_mode or "predict").strip().lower()
     if mode not in {"predict", "test"}:
         raise ValueError(
             "PredictionArtifactsWriter execution mode must be one of {'predict', 'test'}."
@@ -43,10 +35,9 @@ class PredictionArtifactsWriter(Callback):
         *,
         enabled: bool = False,
         execution_mode: str = "predict",
-        eval_mode: str | None = None,
         output_root: str | Path | None = None,
-        artifact_subdir: str = "eval_answer_reachability",
-        artifact_name: str = "eval_answer_reachability",
+        artifact_subdir: str = "rankflow",
+        artifact_name: str = "rankflow",
         schema_version: int = 1,
         split: str = "test",
         dataset_scope: str | None = None,
@@ -59,10 +50,7 @@ class PredictionArtifactsWriter(Callback):
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
-        self.execution_mode = _resolve_execution_mode(
-            execution_mode=execution_mode,
-            eval_mode=eval_mode,
-        )
+        self.execution_mode = _resolve_execution_mode(execution_mode=execution_mode)
         self.output_root = normalize_optional_path(output_root)
         self.artifact_subdir = str(artifact_subdir)
         self.artifact_name = str(artifact_name)

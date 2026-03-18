@@ -77,24 +77,26 @@ def test_maybe_load_model_weights_uses_state_dict_payload(monkeypatch) -> None:
 def test_validate_train_entry_contract_rejects_eval_experiment() -> None:
     cfg = OmegaConf.create(
         {
-            "run": {"name": "train_answer_reachability"},
+            "run": {"name": "train_rankflow"},
             "dataset": {"name": "webqsp-sub"},
         }
     )
 
     with pytest.raises(ValueError, match="eval experiment"):
-        validate_train_entry_contract(cfg, experiment_choice="eval_answer_reachability")
+        validate_train_entry_contract(cfg, experiment_choice="eval_llm")
 
 
 def test_validate_train_entry_contract_requires_dataset_for_train_run() -> None:
-    cfg = OmegaConf.create({"run": {"name": "train_answer_reachability"}})
+    cfg = OmegaConf.create({"run": {"name": "train_rankflow"}})
 
     with pytest.raises(ValueError, match="requires `/dataset`"):
         validate_train_entry_contract(cfg)
 
 
 def test_validate_eval_entry_contract_accepts_eval_llm_without_dataset() -> None:
-    cfg = OmegaConf.create({"run": {"name": "eval_llm"}, "llm": {"provider": "vllm"}})
+    cfg = OmegaConf.create(
+        {"run": {"name": "eval_llm"}, "llm": {"providers": ["vllm"]}}
+    )
 
     validate_eval_entry_contract(cfg)
 
@@ -107,16 +109,14 @@ def test_validate_eval_entry_contract_requires_llm_for_eval_llm() -> None:
 
 
 def test_validate_eval_entry_contract_rejects_train_run_on_eval_entrypoint() -> None:
-    cfg = OmegaConf.create({"run": {"name": "train_answer_reachability"}})
+    cfg = OmegaConf.create({"run": {"name": "train_rankflow"}})
 
     with pytest.raises(ValueError, match="requires an eval run config"):
         validate_eval_entry_contract(cfg)
 
 
-def test_validate_eval_entry_contract_requires_dataset_for_answer_reachability() -> (
-    None
-):
-    cfg = OmegaConf.create({"run": {"name": "eval_answer_reachability"}})
+def test_validate_eval_entry_contract_requires_dataset_for_rankflow() -> None:
+    cfg = OmegaConf.create({"run": {"name": "rankflow"}})
 
     with pytest.raises(ValueError, match="requires `/dataset`"):
         validate_eval_entry_contract(cfg)
@@ -130,11 +130,11 @@ def test_validate_eval_entry_contract_uses_run_contract_metadata() -> None:
                 "contract": {
                     "entrypoint": "eval",
                     "required_groups": ["dataset"],
-                    "recommended_experiment": "eval_answer_reachability",
+                    "recommended_experiment": "rankflow",
                 },
             }
         }
     )
 
-    with pytest.raises(ValueError, match="experiment=eval_answer_reachability"):
+    with pytest.raises(ValueError, match="experiment=rankflow"):
         validate_eval_entry_contract(cfg)

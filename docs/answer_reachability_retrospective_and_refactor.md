@@ -25,10 +25,10 @@
 - `src/models/trajectory_gfn/losses.py` -> `src/models/training/losses.py`
 - `src/models/trajectory_gfn/reward.py` -> `src/models/training/answer_reachability.py`
 - `src/models/trajectory_gfn/batch.py` -> `src/graph_runtime/__init__.py`
-- `src/tasks/answer_reachability/execution.py` -> `src/metrics/answer_reachability/execution.py`
+- `src/tasks/answer_reachability/execution.py` -> `src/metrics/answer_reachability/batch_evaluator.py`
 - `src/tasks/answer_reachability/posterior.py` -> `src/metrics/answer_reachability/posterior.py`
 - `src/tasks/answer_reachability/metrics.py` -> `src/metrics/answer_reachability/metrics.py`
-- `src/tasks/answer_reachability/search.py` -> `src/metrics/answer_reachability/search.py`
+- `src/tasks/answer_reachability/search.py` -> `src/metrics/answer_reachability/support_search.py`
 
 ## 4. 当前仍保留的约束
 

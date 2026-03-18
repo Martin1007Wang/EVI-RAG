@@ -5,7 +5,7 @@ import math
 
 from src.graph_runtime import TrajectoryBatch
 
-from .exact import ExactReachabilityAnalysis
+from .exact_analysis import ExactReachabilityAnalysis
 from .schema import (
     AnswerPosteriorRecord,
     AnswerSupportRecord,
@@ -271,8 +271,26 @@ def build_rank_only_result(
     answer_mass_reference_total: float | None = None,
 ) -> SupportWindowResult:
     gold_answers = graph_gold_answers(batch=batch)
+    retrieval_answer_entity_ids = (
+        analysis.retrieval_answer_entity_ids
+        if analysis.retrieval_answer_entity_ids is not None
+        else analysis.answer_entity_ids
+    )
+    retrieval_answer_probs = (
+        analysis.retrieval_answer_probs
+        if analysis.retrieval_answer_probs is not None
+        else analysis.answer_probs
+    )
     answer_records, selected_answer_ids = build_answer_posterior(
-        analysis=analysis,
+        analysis=ExactReachabilityAnalysis(
+            terminal_mass=analysis.terminal_mass,
+            answer_entity_ids=retrieval_answer_entity_ids,
+            answer_probs=retrieval_answer_probs,
+            gold_total_mass=analysis.gold_total_mass,
+            retrieval_answer_entity_ids=retrieval_answer_entity_ids,
+            retrieval_answer_probs=retrieval_answer_probs,
+            success_by_step=analysis.success_by_step,
+        ),
         gold_answers=gold_answers,
         answer_mass_threshold=answer_mass_threshold,
         total_mass_reference=answer_mass_reference_total,
@@ -309,7 +327,10 @@ def build_rank_only_result(
 
 
 def compute_rank_metrics(
-    *, answer_records: list[AnswerPosteriorRecord], answer_top_ks: tuple[int, ...]
+    *,
+    answer_records: list[AnswerPosteriorRecord],
+    answer_top_ks: tuple[int, ...],
+    gold_mass: float | None = None,
 ) -> dict[str, float]:
     gold_answers = {
         int(record.answer_entity_id)
@@ -318,8 +339,16 @@ def compute_rank_metrics(
     }
     ordered_answer_ids = [int(record.answer_entity_id) for record in answer_records]
     metrics: dict[str, float] = {
-        "answer/gold_mass": float(
-            sum(float(record.prob) for record in answer_records if bool(record.is_gold))
+        "answer/gold_mass": (
+            float(gold_mass)
+            if gold_mass is not None
+            else float(
+                sum(
+                    float(record.prob)
+                    for record in answer_records
+                    if bool(record.is_gold)
+                )
+            )
         ),
         "answer/selected_mass": float(
             sum(
@@ -330,11 +359,22 @@ def compute_rank_metrics(
         ),
     }
     for top_k in answer_top_ks:
-        top_answers = set(ordered_answer_ids[: int(top_k)])
+        top_answer_list = ordered_answer_ids[: int(top_k)]
+        top_answers = set(top_answer_list)
+        retrieved_count = len(top_answer_list)
+        hit_count = len(top_answers & gold_answers)
         metrics[f"answer/hit@{top_k}"] = 1.0 if top_answers & gold_answers else 0.0
         metrics[f"answer/recall@{top_k}"] = (
-            float(len(top_answers & gold_answers)) / float(len(gold_answers))
-            if gold_answers
+            float(hit_count) / float(len(gold_answers)) if gold_answers else 0.0
+        )
+        metrics[f"answer/precision@{top_k}"] = (
+            float(hit_count) / float(retrieved_count) if retrieved_count > 0 else 0.0
+        )
+        precision = metrics[f"answer/precision@{top_k}"]
+        recall = metrics[f"answer/recall@{top_k}"]
+        metrics[f"answer/f1@{top_k}"] = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall > 0.0
             else 0.0
         )
     return metrics
@@ -352,6 +392,7 @@ def aggregate_rank_metrics(
         compute_rank_metrics(
             answer_records=result.answer_posterior,
             answer_top_ks=answer_top_ks,
+            gold_mass=float(result.gold_total_mass),
         )
         for result in results
     ]

@@ -29,33 +29,11 @@ def resolve_execution_mode(run_cfg: dict[str, Any] | Any) -> str:
     raw_execution_mode = (
         run_cfg.get("execution_mode") if hasattr(run_cfg, "get") else None
     )
-    raw_eval_mode = run_cfg.get("eval_mode") if hasattr(run_cfg, "get") else None
-    if (
-        raw_execution_mode not in _MISSING_MODE_VALUES
-        and raw_eval_mode not in _MISSING_MODE_VALUES
-        and str(raw_execution_mode).strip().lower()
-        != str(raw_eval_mode).strip().lower()
-    ):
-        raise ValueError(
-            "run.execution_mode and run.eval_mode disagree. "
-            f"Got execution_mode={raw_execution_mode!r} eval_mode={raw_eval_mode!r}."
-        )
-    raw = (
-        raw_execution_mode
-        if raw_execution_mode not in _MISSING_MODE_VALUES
-        else raw_eval_mode
-    )
+    raw = None if raw_execution_mode in _MISSING_MODE_VALUES else raw_execution_mode
     mode = str(raw or "predict").strip().lower()
     if mode in {"predict", "test"}:
         return mode
-    raise ValueError(
-        "run.execution_mode must be one of {'predict', 'test'} "
-        "(legacy alias: run.eval_mode)."
-    )
-
-
-def resolve_eval_mode(run_cfg: dict[str, Any] | Any) -> str:
-    return resolve_execution_mode(run_cfg)
+    raise ValueError("run.execution_mode must be one of {'predict', 'test'}.")
 
 
 def resolve_splits(raw_splits: Sequence[str]) -> list[str]:
@@ -152,10 +130,18 @@ def resolve_dataset_variants(cfg: DictConfig) -> list[DatasetVariantSpec]:
     variants: list[DatasetVariantSpec] = []
     for item in items:
         if hasattr(item, "get"):
-            dataset_name = str(item.get("dataset") or item.get("name") or "").strip()
+            if item.get("name") not in (None, ""):
+                raise ValueError(
+                    "dataset_variants entries must use `dataset`, not the removed `name` key."
+                )
+            if item.get("compose_overrides") not in (None, []):
+                raise ValueError(
+                    "dataset_variants entries must use `overrides`, not the removed `compose_overrides` key."
+                )
+            dataset_name = str(item.get("dataset") or "").strip()
             label = str(item.get("label") or dataset_name).strip()
             compose_overrides = _normalize_override_list(
-                item.get("overrides") or item.get("compose_overrides"),
+                item.get("overrides"),
                 field_name="dataset_variants.overrides",
             )
             dataset_overrides = _normalize_override_mapping(
@@ -259,7 +245,6 @@ __all__ = [
     "normalize_dataset_scope",
     "resolve_dataset_variants",
     "resolve_execution_mode",
-    "resolve_eval_mode",
     "resolve_splits",
     "save_metrics_snapshot",
     "temporary_cfg_overrides",

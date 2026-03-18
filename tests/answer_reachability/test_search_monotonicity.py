@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from src.metrics.answer_reachability import ExactReachabilityAnalyzer
-from src.metrics.answer_reachability.search import ReachabilityGuidedSearch
-from src.models.configs import AnswerReachabilityInferenceConfig, HorizonConfig
+from src.metrics.answer_reachability.support_search import ExactSupportSearch
+from src.models.configs import SearchEvalConfig, HorizonConfig
 
 from .conftest import make_policy, make_toy_batch
 
@@ -12,9 +12,9 @@ def test_search_monotonicity() -> None:
     policy = make_policy()
     prepared_batch = policy.prepare_batch(batch)
     analyzer = ExactReachabilityAnalyzer(max_steps=2)
-    search_lo = ReachabilityGuidedSearch(
+    search_lo = ExactSupportSearch(
         horizon_cfg=HorizonConfig(max_steps=2),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=0.5,
             support_mass_threshold=1.0,
             max_expansions=128,
@@ -22,9 +22,9 @@ def test_search_monotonicity() -> None:
         ),
         analyzer=analyzer,
     )
-    search_hi = ReachabilityGuidedSearch(
+    search_hi = ExactSupportSearch(
         horizon_cfg=HorizonConfig(max_steps=2),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=0.9,
             support_mass_threshold=1.0,
             max_expansions=128,

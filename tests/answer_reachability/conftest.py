@@ -5,17 +5,14 @@ import torch
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
-    StartLogitHead,
 )
 from src.models.configs import (
     BackboneConfig,
-    GraphLogZHeadConfig,
     PolicyConfig,
-    StartHeadConfig,
     StateScoreHeadConfig,
 )
 from src.graph_runtime import TrajectoryBatch
-from src.models.policy.trajectory_policy import TrajectoryPolicy
+from src.models.gflownet import BaseSearchPolicy
 
 
 def make_batch_from_graph(
@@ -96,12 +93,10 @@ def make_policy_config() -> PolicyConfig:
             adapter_dropout=0.0,
         ),
         state_score_head=StateScoreHeadConfig(hidden_dim=8, num_layers=2, dropout=0.0),
-        start_head=StartHeadConfig(hidden_dim=16, dropout=0.0),
-        graph_log_z_head=GraphLogZHeadConfig(hidden_dim=16, dropout=0.0),
     )
 
 
-def make_policy(*, max_steps: int = 2) -> TrajectoryPolicy:
+def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
     cfg = make_policy_config()
     graph_hidden_dim = int(cfg.backbone.hidden_dim)
     backbone = EmbeddingBackbone(cfg.backbone)
@@ -112,15 +107,9 @@ def make_policy(*, max_steps: int = 2) -> TrajectoryPolicy:
         num_layers=int(cfg.state_score_head.num_layers),
         dropout=float(cfg.state_score_head.dropout),
     )
-    start_head = StartLogitHead(
-        policy_dim=graph_hidden_dim,
-        hidden_dim=int(cfg.start_head.hidden_dim),
-        dropout=float(cfg.start_head.dropout),
-    )
-    return TrajectoryPolicy(
+    return BaseSearchPolicy(
         cfg,
         max_steps=max_steps,
         backbone=backbone,
         state_score_head=state_score_head,
-        start_head=start_head,
     )

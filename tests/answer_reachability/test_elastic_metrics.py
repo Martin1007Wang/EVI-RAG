@@ -97,4 +97,6 @@ def test_elastic_metrics_compute_expected_fields() -> None:
     rank_metrics = aggregate_rank_metrics(results=[result], answer_top_ks=(1, 2))
     assert rank_metrics["answer/hit@1"] == 1.0
     assert rank_metrics["answer/recall@2"] == 1.0
+    assert rank_metrics["answer/precision@2"] == 0.5
+    assert rank_metrics["answer/f1@2"] == 2.0 / 3.0
     assert "pass@1" not in rank_metrics

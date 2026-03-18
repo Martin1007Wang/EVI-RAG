@@ -6,7 +6,7 @@ _recursive_: true
 
 # Model contract metadata. This block is stripped before hydra instantiation.
 contract:
-  task_family: answer_reachability
+  task_family: answer_ranking
   train_dataset_scope: sub_only
   eval_entrypoint: eval
   train_entrypoint: train
@@ -16,7 +16,7 @@ contract:
   single_gpu_eval_only: true
 
 metric_runtime_factory:
-  _target_: src.metrics.answer_reachability.runtime.AnswerReachabilityMetricRuntimeFactory
+  _target_: src.metrics.answer_reachability.runtime.SearchMetricRuntimeFactory
 
 horizon_cfg:
   _target_: src.models.configs.gflownet.HorizonConfig
@@ -28,6 +28,34 @@ training_cfg:
   reward_epsilon: 1.0e-3
   failure_reward_mode: graph_normalized
   sampling_temperature: 1.0
+  sampling_temperature_schedule:
+    _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
+    type: constant
+  success_replay:
+    _target_: src.models.configs.gflownet.SuccessfulTrajectoryReplayConfig
+    enabled: false
+    ratio: 0.25
+    warmup_passes: 1.0
+    min_buffer_size: 256
+    max_buffer_size: 50000
+    max_trajectories_per_sample: 8
+  exact_aux:
+    _target_: src.models.configs.gflownet.ExactAnswerObjectiveConfig
+    enabled: false
+    success_weight: 0.0
+    coverage_weight: 0.0
+    warmup_passes: 1.0
+    interval_steps: 8
+    max_graphs_per_batch: 2
+    eps: 1.0e-8
+  contrastive:
+    _target_: src.models.configs.gflownet.ContrastiveAuxConfig
+    enabled: false
+    weight: 0.0
+    temperature: 0.2
+    min_successes: 1
+    min_failures: 1
+    terminal_weight: 2.0
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
     lambda_weight: 1.0
@@ -41,10 +69,8 @@ heuristic_cfg:
   topology_num_iters: 8
   topology_eps: 1.0e-8
   embedding_temperature: 1.0
-  critic_hidden_dim: 256
-  critic_dropout: 0.0
-  critic_loss_weight: 0.0
-  critic_target_floor: 1.0e-3
+  learned_hidden_dim: 256
+  learned_dropout: 0.0
 
 policy_cfg:
   _target_: src.models.configs.policy.PolicyConfig
@@ -62,21 +88,13 @@ policy_cfg:
     hidden_dim: 256
     num_layers: 2
     dropout: 0.0
-  start_head:
-    _target_: src.models.configs.policy.StartHeadConfig
-    hidden_dim: 512
-    dropout: 0.0
-  graph_log_z_head:
-    _target_: src.models.configs.policy.GraphLogZHeadConfig
-    hidden_dim: 512
-    dropout: 0.0
 
-inference_cfg:
-  _target_: src.models.configs.gflownet.AnswerReachabilityInferenceConfig
+eval_cfg:
+  _target_: src.models.configs.gflownet.SearchEvalConfig
   # Base model defaults are eval-oriented; training experiments override to rank_only
   # validation so the search budget stays cheap inside the fit loop.
   strict_search: true
-  eval_profile: full
+  metrics_profile: full
   answer_mass_threshold: 0.90
   support_mass_threshold: 0.90
   support_path_overlap_penalty: 0.25
@@ -96,4 +114,5 @@ scheduler_cfg:
   _target_: src.models.configs.training.SchedulerConfig
   type: cosine
   interval: step
+  t_max: ${oc.select:trainer.max_steps,null}
   eta_min: 1.0e-6

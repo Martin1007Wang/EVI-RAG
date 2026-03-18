@@ -104,7 +104,7 @@ def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if run_cfg is None:
         raise ValueError(
             "Missing required config group: `run`. Example: "
-            "`python src/eval.py experiment=eval_answer_reachability ckpt.answer_reachability=/path/to/model.ckpt`."
+            "`python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt`."
         )
     log.info("Run: %s", run_cfg.get("name"))
 
@@ -149,7 +149,7 @@ def main(cfg: DictConfig) -> None:
         ),
         missing_target_message=(
             "Missing required run target: `run._target_`. "
-            "Fix: use a concrete run config such as `run=eval_answer_reachability` or `run=eval_llm`."
+            "Fix: use a concrete run config such as `run=rankflow` or `run=eval_llm`."
         ),
     )
     validate_eval_entry_contract(cfg)

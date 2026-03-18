@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from src.models.policy.state import SearchState
-from src.models.policy.transition import compute_constrained_forward_step
+from src.models.gflownet import compute_constrained_policy_step
+from src.models.gflownet import SearchState
 
 from .conftest import make_batch_from_graph, make_policy, make_toy_batch
 
@@ -20,7 +20,7 @@ def test_compute_constrained_forward_step_normalizes_per_agent() -> None:
         num_steps=torch.zeros((1, 2), dtype=torch.long),
     )
 
-    step = compute_constrained_forward_step(
+    step = compute_constrained_policy_step(
         policy=policy,
         prepared_batch=prepared_batch,
         state=state,
@@ -56,7 +56,7 @@ def test_compute_constrained_forward_step_masks_horizon_agents() -> None:
         num_steps=torch.full((1, 1), 2, dtype=torch.long),
     )
 
-    step = compute_constrained_forward_step(
+    step = compute_constrained_policy_step(
         policy=policy,
         prepared_batch=prepared_batch,
         state=state,

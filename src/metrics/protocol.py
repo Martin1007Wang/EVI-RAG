@@ -5,21 +5,21 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from src.graph_runtime import TrajectoryBatch
-from src.models.configs import GFlowNetTrainingConfig, HorizonConfig
-from src.models.policy.protocol import SearchPolicyProtocol
-from src.models.training import ForwardTrajectoryGFNSampler
+from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEvalConfig
+from src.models.gflownet import TrajectorySamplerProtocol
+from src.models.gflownet import SearchPolicyProtocol
 
 
 @dataclass(frozen=True)
 class MetricEvaluationOutput:
-    model_metrics: dict[str, Any] = field(default_factory=dict)
-    primary_metrics: dict[str, Any] = field(default_factory=dict)
-    secondary_metrics: dict[str, Any] = field(default_factory=dict)
+    model_metrics: dict[str, float] = field(default_factory=dict)
+    primary_metrics: dict[str, float] = field(default_factory=dict)
+    secondary_metrics: dict[str, float] = field(default_factory=dict)
     results: list[Any] = field(default_factory=list)
 
 
 class MetricRuntimeProtocol(Protocol):
-    sampler: ForwardTrajectoryGFNSampler | None
+    sampler: TrajectorySamplerProtocol | None
     search: Any
 
     def evaluate_batch(
@@ -51,7 +51,7 @@ class MetricRuntimeProtocol(Protocol):
         *,
         predict_results: list[Any],
         metrics_profile: str,
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, float]: ...
 
     def write_prediction_artifacts(
         self,
@@ -75,7 +75,7 @@ class MetricRuntimeFactoryProtocol(Protocol):
         *,
         horizon_cfg: HorizonConfig,
         training_cfg: GFlowNetTrainingConfig,
-        inference_cfg: Any,
+        eval_cfg: SearchEvalConfig,
         policy: SearchPolicyProtocol,
     ) -> MetricRuntimeProtocol: ...
 

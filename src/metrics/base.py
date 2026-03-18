@@ -5,13 +5,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.graph_runtime import TrajectoryBatch
-from src.models.training import ForwardTrajectoryGFNSampler
+from src.models.gflownet import TrajectorySamplerProtocol
 
 from .protocol import MetricEvaluationOutput
 
 
 class BaseMetricRuntime(ABC):
-    sampler: ForwardTrajectoryGFNSampler | None = None
+    sampler: TrajectorySamplerProtocol | None = None
     search: Any = None
 
     @abstractmethod
@@ -49,7 +49,7 @@ class BaseMetricRuntime(ABC):
         *,
         predict_results: list[Any],
         metrics_profile: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, float]:
         del predict_results, metrics_profile
         return {}
 

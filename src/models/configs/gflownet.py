@@ -13,16 +13,16 @@ class HorizonConfig:
 
 
 @dataclass(frozen=True)
-class AnswerReachabilityInferenceConfig:
-    """Inference settings for answer-reachability style evaluation.
+class SearchEvalConfig:
+    """Evaluation settings for graph-search tasks.
 
-    The public Hydra field names remain `eval_profile` / `eval_view` for backward
-    compatibility. Internally, prefer the clearer aliases `metrics_profile` and
-    `task_view` when consuming this config.
+    The same search policy supports both answer-reachability and edge-retrieval
+    reporting, so this config owns the task selector together with the metrics
+    budget.
     """
 
-    eval_profile: str = "full"
-    eval_view: str = "answer_reachability"
+    metrics_profile: str = "full"
+    task: str = "answer_ranking"
     answer_mass_threshold: float = 0.9
     support_mass_threshold: float = 0.9
     support_path_overlap_penalty: float = 0.25
@@ -34,61 +34,48 @@ class AnswerReachabilityInferenceConfig:
     max_frontier_size: int = 4096
     strict_search: bool = True
 
-    @property
-    def metrics_profile(self) -> str:
-        return str(self.eval_profile)
-
-    @property
-    def task_view(self) -> str:
-        return str(self.eval_view)
-
     def __post_init__(self) -> None:
         if self.metrics_profile not in {"full", "rank_only"}:
             raise ValueError(
-                "inference.eval_profile must be one of {'full', 'rank_only'}."
+                "eval_cfg.metrics_profile must be one of {'full', 'rank_only'}."
             )
-        if self.task_view not in {"answer_reachability", "edge_retrieval"}:
+        if self.task not in {"answer_ranking", "answer_reachability", "edge_retrieval"}:
             raise ValueError(
-                "inference.eval_view must be one of {'answer_reachability', 'edge_retrieval'}."
+                "eval_cfg.task must be one of {'answer_ranking', 'answer_reachability', 'edge_retrieval'}."
             )
-        if self.task_view == "edge_retrieval" and self.metrics_profile != "rank_only":
+        if self.task == "edge_retrieval" and self.metrics_profile != "rank_only":
             raise ValueError(
-                "edge_retrieval view only supports inference.eval_profile='rank_only'."
+                "edge_retrieval only supports eval_cfg.metrics_profile='rank_only'."
             )
         if not 0.0 < self.answer_mass_threshold <= 1.0:
-            raise ValueError("inference.answer_mass_threshold must be in (0, 1].")
+            raise ValueError("eval_cfg.answer_mass_threshold must be in (0, 1].")
         if not 0.0 < self.support_mass_threshold <= 1.0:
-            raise ValueError("inference.support_mass_threshold must be in (0, 1].")
+            raise ValueError("eval_cfg.support_mass_threshold must be in (0, 1].")
         if self.support_path_overlap_penalty < 0.0:
-            raise ValueError("inference.support_path_overlap_penalty must be >= 0.")
+            raise ValueError("eval_cfg.support_path_overlap_penalty must be >= 0.")
         if len(self.window_top_ks) == 0:
-            raise ValueError("inference.window_top_ks must be non-empty.")
+            raise ValueError("eval_cfg.window_top_ks must be non-empty.")
         if any(int(k) < 1 for k in self.window_top_ks):
-            raise ValueError("inference.window_top_ks values must be >= 1.")
+            raise ValueError("eval_cfg.window_top_ks values must be >= 1.")
         if len(self.answer_top_ks) == 0:
-            raise ValueError("inference.answer_top_ks must be non-empty.")
+            raise ValueError("eval_cfg.answer_top_ks must be non-empty.")
         if any(int(k) < 1 for k in self.answer_top_ks):
-            raise ValueError("inference.answer_top_ks values must be >= 1.")
+            raise ValueError("eval_cfg.answer_top_ks values must be >= 1.")
         if len(self.edge_top_ks) == 0:
-            raise ValueError("inference.edge_top_ks must be non-empty.")
+            raise ValueError("eval_cfg.edge_top_ks must be non-empty.")
         if any(int(k) < 1 for k in self.edge_top_ks):
-            raise ValueError("inference.edge_top_ks values must be >= 1.")
+            raise ValueError("eval_cfg.edge_top_ks values must be >= 1.")
         if self.edge_emit_top_k < 1:
-            raise ValueError("inference.edge_emit_top_k must be >= 1.")
+            raise ValueError("eval_cfg.edge_emit_top_k must be >= 1.")
         if self.max_expansions < 1:
-            raise ValueError("inference.max_expansions must be >= 1.")
+            raise ValueError("eval_cfg.max_expansions must be >= 1.")
         if self.max_frontier_size < 1:
-            raise ValueError("inference.max_frontier_size must be >= 1.")
+            raise ValueError("eval_cfg.max_frontier_size must be >= 1.")
 
 
 @dataclass(frozen=True)
 class HeuristicConfig:
-    """Configuration for the supported trajectory-heuristic variants.
-
-    `critic` is kept as a compatibility alias for the learned heuristic.
-    The auxiliary critic-specific loss is intentionally retired; only the
-    heuristic itself remains as a variant selector.
-    """
+    """Configuration for the supported search-heuristic variants."""
 
     kind: str = "topology"
     beta: float = 1.0
@@ -96,20 +83,13 @@ class HeuristicConfig:
     topology_num_iters: int = 8
     topology_eps: float = 1.0e-8
     embedding_temperature: float = 1.0
-    critic_hidden_dim: int = 128
-    critic_dropout: float = 0.0
-    critic_loss_weight: float = 0.0
-    critic_target_floor: float = 1.0e-3
-
-    @property
-    def canonical_kind(self) -> str:
-        return "learned" if self.kind == "critic" else self.kind
+    learned_hidden_dim: int = 128
+    learned_dropout: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.kind not in {"topology", "embedding", "learned", "critic"}:
+        if self.kind not in {"topology", "embedding", "learned"}:
             raise ValueError(
-                "heuristic.kind must be one of {'topology', 'embedding', 'learned'} "
-                "(legacy alias: 'critic')."
+                "heuristic.kind must be one of {'topology', 'embedding', 'learned'}."
             )
         if self.beta < 0.0:
             raise ValueError("heuristic.beta must be >= 0.")
@@ -121,14 +101,10 @@ class HeuristicConfig:
             raise ValueError("heuristic.topology_eps must be > 0.")
         if self.embedding_temperature <= 0.0:
             raise ValueError("heuristic.embedding_temperature must be > 0.")
-        if self.critic_hidden_dim < 1:
+        if self.learned_hidden_dim < 1:
             raise ValueError("heuristic.learned_hidden_dim must be >= 1.")
-        if self.critic_dropout < 0.0 or self.critic_dropout >= 1.0:
+        if self.learned_dropout < 0.0 or self.learned_dropout >= 1.0:
             raise ValueError("heuristic.learned_dropout must be in [0, 1).")
-        if self.critic_loss_weight < 0.0:
-            raise ValueError("heuristic.critic_loss_weight must be >= 0.")
-        if not 0.0 < self.critic_target_floor < 1.0:
-            raise ValueError("heuristic.critic_target_floor must be in (0, 1).")
 
 
 @dataclass(frozen=True)
@@ -142,18 +118,131 @@ class SubTrajectoryBalanceConfig:
 
 
 @dataclass(frozen=True)
+class SamplingTemperatureScheduleConfig:
+    type: str = "constant"
+    initial_temperature: float | None = None
+    final_temperature: float | None = None
+    total_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.type not in {"constant", "linear", "cosine"}:
+            raise ValueError(
+                "training.sampling_temperature_schedule.type must be one of "
+                "{'constant', 'linear', 'cosine'}."
+            )
+        if self.initial_temperature is not None and self.initial_temperature <= 0.0:
+            raise ValueError(
+                "training.sampling_temperature_schedule.initial_temperature must be > 0."
+            )
+        if self.final_temperature is not None and self.final_temperature <= 0.0:
+            raise ValueError(
+                "training.sampling_temperature_schedule.final_temperature must be > 0."
+            )
+        if self.total_steps is not None and self.total_steps < 1:
+            raise ValueError(
+                "training.sampling_temperature_schedule.total_steps must be >= 1."
+            )
+        if self.type != "constant" and self.final_temperature is None:
+            raise ValueError(
+                "training.sampling_temperature_schedule.final_temperature must be set "
+                "for annealed schedules."
+            )
+
+
+@dataclass(frozen=True)
+class SuccessfulTrajectoryReplayConfig:
+    enabled: bool = False
+    ratio: float = 0.25
+    warmup_passes: float = 1.0
+    min_buffer_size: int = 256
+    max_buffer_size: int = 50000
+    max_trajectories_per_sample: int = 8
+
+    def __post_init__(self) -> None:
+        if self.ratio < 0.0 or self.ratio >= 1.0:
+            raise ValueError("training.success_replay.ratio must be in [0, 1).")
+        if self.warmup_passes < 0.0:
+            raise ValueError("training.success_replay.warmup_passes must be >= 0.")
+        if self.min_buffer_size < 1:
+            raise ValueError("training.success_replay.min_buffer_size must be >= 1.")
+        if self.max_buffer_size < 1:
+            raise ValueError("training.success_replay.max_buffer_size must be >= 1.")
+        if self.min_buffer_size > self.max_buffer_size:
+            raise ValueError(
+                "training.success_replay.min_buffer_size must be <= max_buffer_size."
+            )
+        if self.max_trajectories_per_sample < 1:
+            raise ValueError(
+                "training.success_replay.max_trajectories_per_sample must be >= 1."
+            )
+
+
+@dataclass(frozen=True)
+class ExactAnswerObjectiveConfig:
+    enabled: bool = False
+    success_weight: float = 0.0
+    coverage_weight: float = 0.0
+    warmup_passes: float = 1.0
+    interval_steps: int = 1
+    max_graphs_per_batch: int = 1
+    eps: float = 1.0e-8
+
+    def __post_init__(self) -> None:
+        if self.success_weight < 0.0:
+            raise ValueError("training.exact_aux.success_weight must be >= 0.")
+        if self.coverage_weight < 0.0:
+            raise ValueError("training.exact_aux.coverage_weight must be >= 0.")
+        if self.warmup_passes < 0.0:
+            raise ValueError("training.exact_aux.warmup_passes must be >= 0.")
+        if self.interval_steps < 1:
+            raise ValueError("training.exact_aux.interval_steps must be >= 1.")
+        if self.max_graphs_per_batch < 1:
+            raise ValueError("training.exact_aux.max_graphs_per_batch must be >= 1.")
+        if self.eps <= 0.0:
+            raise ValueError("training.exact_aux.eps must be > 0.")
+
+
+@dataclass(frozen=True)
+class ContrastiveAuxConfig:
+    enabled: bool = False
+    weight: float = 0.0
+    temperature: float = 0.2
+    min_successes: int = 1
+    min_failures: int = 1
+    terminal_weight: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.weight < 0.0:
+            raise ValueError("training.contrastive.weight must be >= 0.")
+        if self.temperature <= 0.0:
+            raise ValueError("training.contrastive.temperature must be > 0.")
+        if self.min_successes < 1:
+            raise ValueError("training.contrastive.min_successes must be >= 1.")
+        if self.min_failures < 1:
+            raise ValueError("training.contrastive.min_failures must be >= 1.")
+        if self.terminal_weight < 0.0:
+            raise ValueError("training.contrastive.terminal_weight must be >= 0.")
+
+
+@dataclass(frozen=True)
 class GFlowNetTrainingConfig:
     rollout_batch_size: int = 8
     reward_epsilon: float = 1.0e-3
     failure_reward_mode: str = "graph_normalized"
     sampling_temperature: float = 1.0
+    sampling_temperature_schedule: SamplingTemperatureScheduleConfig = field(
+        default_factory=SamplingTemperatureScheduleConfig
+    )
+    success_replay: SuccessfulTrajectoryReplayConfig = field(
+        default_factory=SuccessfulTrajectoryReplayConfig
+    )
+    exact_aux: ExactAnswerObjectiveConfig = field(
+        default_factory=ExactAnswerObjectiveConfig
+    )
+    contrastive: ContrastiveAuxConfig = field(default_factory=ContrastiveAuxConfig)
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
     )
-    # Deprecated compatibility fields. The active objective is always SubTB.
-    root_loss_weight: float = 1.0
-    move_loss_weight: float = 1.0
-    terminal_loss_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if self.rollout_batch_size < 1:
@@ -166,18 +255,16 @@ class GFlowNetTrainingConfig:
             )
         if self.sampling_temperature <= 0.0:
             raise ValueError("training.sampling_temperature must be > 0.")
-        if (
-            self.root_loss_weight < 0.0
-            or self.move_loss_weight < 0.0
-            or self.terminal_loss_weight < 0.0
-        ):
-            raise ValueError("Deprecated compatibility loss weights must be >= 0.")
 
 
 __all__ = [
-    "AnswerReachabilityInferenceConfig",
+    "ContrastiveAuxConfig",
+    "ExactAnswerObjectiveConfig",
     "GFlowNetTrainingConfig",
     "HeuristicConfig",
     "HorizonConfig",
+    "SamplingTemperatureScheduleConfig",
+    "SearchEvalConfig",
+    "SuccessfulTrajectoryReplayConfig",
     "SubTrajectoryBalanceConfig",
 ]

@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - train_rankflow
+  - _self_
+
+optimized_metric: "val/sub/answer/recall@10"
+
+model:
+  training_cfg:
+    contrastive:
+      enabled: true
+      weight: 0.1
+      temperature: 0.2
+      min_successes: 1
+      min_failures: 1
+      terminal_weight: 2.0

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from src.models.components import NodeFlowHead, StartLogitHead
+from src.models.components import NodeFlowHead
 from src.graph_runtime import GraphObservation
 
 from .edge import compute_edge_logits as compute_edge_logits_helper
@@ -255,5 +255,4 @@ __all__ = [
     "NodeFlowHead",
     "QuestionContextModule",
     "EdgeScoreModule",
-    "StartLogitHead",
 ]

@@ -33,6 +33,11 @@ from src.utils.entrypoint_utils import (
     require_run_target_config,
 )
 from src.utils.entrypoint_contracts import validate_train_entry_contract
+from src.utils.fit_schedule import (
+    ResolvedPassFitSchedule,
+    apply_resolved_pass_fit_schedule,
+    resolve_pass_fit_schedule,
+)
 from src.utils.hydra_utils import apply_run_name, extras
 from src.utils.logging_utils import RankedLogger
 from src.utils.task_utils import get_metric_value, task_wrapper
@@ -79,6 +84,50 @@ def _maybe_load_model_weights(model: LightningModule, cfg: DictConfig) -> None:
         log.warning("Unexpected keys when loading init_ckpt_path: %s", unexpected)
 
 
+def _configure_pass_fit_schedule(
+    cfg: DictConfig,
+    *,
+    datamodule: Any,
+) -> ResolvedPassFitSchedule:
+    dataset_cfg = cfg.get("dataset") or {}
+    if dataset_cfg.get("val_check_interval") not in (None, ""):
+        raise ValueError(
+            "dataset.val_check_interval has been removed. "
+            "Use `fit_schedule.val_every_passes` instead so validation cadence scales with train-set size."
+        )
+
+    datamodule.setup(stage="fit")
+    train_dataset = getattr(datamodule, "train_dataset", None)
+    if train_dataset is None:
+        raise RuntimeError(
+            "Datamodule did not materialize `train_dataset` during setup('fit'); "
+            "cannot derive pass-based schedule."
+        )
+    per_device_batch_size = int(
+        getattr(
+            datamodule, "batch_size_per_device", getattr(datamodule, "batch_size", 0)
+        )
+    )
+    resolved = resolve_pass_fit_schedule(
+        fit_schedule_cfg=cfg.get("fit_schedule"),
+        trainer_cfg=cfg.trainer,
+        train_size=len(train_dataset),
+        per_device_batch_size=per_device_batch_size,
+    )
+    apply_resolved_pass_fit_schedule(cfg, resolved)
+    log.info(
+        "Resolved pass-based fit schedule: train_size=%d max_steps=%d val_check_interval=%d "
+        "patience_checks=%d max_passes=%.2f val_every_passes=%.2f",
+        resolved.train_size,
+        resolved.max_steps,
+        resolved.val_check_interval_batches,
+        resolved.early_stopping_patience_checks,
+        resolved.max_passes,
+        resolved.val_every_passes,
+    )
+    return resolved
+
+
 @task_wrapper
 def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
@@ -97,19 +146,35 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     resolved_run_name = apply_run_name(cfg)
     log.info(f"Resolved run name: {resolved_run_name}")
 
+    run_cfg = cfg.get("run") or {}
+    resolved_fit_schedule: ResolvedPassFitSchedule | None = None
+
+    def _on_datamodule_instantiated(datamodule: Any) -> None:
+        nonlocal resolved_fit_schedule
+        if bool(run_cfg.get("train", True)):
+            resolved_fit_schedule = _configure_pass_fit_schedule(
+                cfg,
+                datamodule=datamodule,
+            )
+
+    def _on_model_instantiated(model: Any) -> None:
+        _maybe_load_model_weights(model=model, cfg=cfg)
+        if resolved_fit_schedule is None:
+            return
+        setter = getattr(model, "set_fit_schedule", None)
+        if callable(setter):
+            setter(resolved_fit_schedule)
+
     objects = instantiate_lightning_task_objects(
         cfg,
         log=log,
-        on_model_instantiated=lambda model: _maybe_load_model_weights(
-            model=model, cfg=cfg
-        ),
+        on_datamodule_instantiated=_on_datamodule_instantiated,
+        on_model_instantiated=_on_model_instantiated,
     )
     datamodule = objects.datamodule
     model = cast(LightningModule, objects.model)
     trainer = objects.trainer
     object_dict = objects.as_dict()
-
-    run_cfg = cfg.get("run") or {}
 
     if bool(run_cfg.get("train", True)):
         log.info("Starting training!")
@@ -165,11 +230,11 @@ def main(cfg: DictConfig) -> Optional[float]:
         cfg,
         missing_run_message=(
             "Missing required config group: `run`. "
-            "Fix: use a train config that sets `/run`, for example `experiment=train_answer_reachability`."
+            "Fix: use a train config that sets `/run`, for example `experiment=train_rankflow`."
         ),
         missing_target_message=(
             "Missing required run target: `run._target_`. "
-            "Fix: use a concrete run config such as `run=train_answer_reachability`."
+            "Fix: use a concrete run config such as `run=train_rankflow`."
         ),
     )
     validate_train_entry_contract(cfg)

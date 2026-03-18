@@ -10,12 +10,7 @@ dataset_family: cwq
 max_steps: 4
 hf_dataset: rmanluo/RoG-cwq
 
-# Train LMDB has 27,631 samples; with batch_size=32 this is ~864 steps/epoch.
-# Full validation is much heavier here, so validate roughly every ~2-3 train epochs.
-val_check_interval: 2048
-
-
-filter_missing_answer:
+runtime_filter_missing_answer:
   train: false
   validation: false
   test: false

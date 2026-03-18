@@ -48,7 +48,7 @@ def test_run_output_orchestrator_persists_metrics_and_artifacts(tmp_path: Path) 
     assert result.metrics == {"answer/hit@1": 0.75}
     assert result.metrics_path == tmp_path / "metrics.json"
     assert result.artifact_paths == {
-        "prompt_path": tmp_path / "eval_answer_reachability" / "sub" / "test.jsonl"
+        "prompt_path": tmp_path / "rankflow" / "sub" / "test.jsonl"
     }
     assert captured["split"] == "test"
 

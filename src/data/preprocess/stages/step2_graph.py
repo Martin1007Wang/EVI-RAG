@@ -26,12 +26,6 @@ from src.data.io.raw_loader import (
     build_text_entity_config,
     iter_samples,
 )
-from src.data.preprocess.cleaning.relation_rules import (
-    DEFAULT_RELATION_CLEANING_RULES,
-    RELATION_ACTION_DROP,
-    RelationCleaningRules,
-    relation_action,
-)
 from src.data.schema.constants import (
     _ALLOWED_SPLITS,
     _DISABLE_PARALLEL_WORKERS,
@@ -70,9 +64,6 @@ class _WorkerState:
     dedup_edges: bool
     validate_graph_edges: bool
     remove_self_loops: bool
-    relation_cleaning_enabled: bool
-    keep_start_adjacent_edges: bool
-    relation_cleaning_rules: RelationCleaningRules
     target_reachable_pruning: bool
     train_filter: SplitFilter
     eval_filter: SplitFilter
@@ -104,9 +95,6 @@ def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
         dedup_edges=state.dedup_edges,
         validate_graph_edges=state.validate_graph_edges,
         remove_self_loops=state.remove_self_loops,
-        relation_cleaning_enabled=state.relation_cleaning_enabled,
-        keep_start_adjacent_edges=state.keep_start_adjacent_edges,
-        relation_cleaning_rules=state.relation_cleaning_rules,
         target_reachable_pruning=apply_target_reachable_pruning,
     )
 
@@ -260,23 +248,6 @@ def _compute_target_reachable_nodes(
     return {label for label, idx in node_index.items() if visited[idx]}
 
 
-def _normalize_embeddings(embeddings: torch.Tensor, eps: float) -> torch.Tensor:
-    if embeddings.numel() == 0:
-        return embeddings
-    denom = embeddings.norm(dim=-1, keepdim=True).clamp(min=eps)
-    return embeddings / denom
-
-
-def _canonicalize_graph_edges(
-    graph: GraphRecord,
-    question_embedding_norm: torch.Tensor,
-    relation_embeddings_norm: torch.Tensor,
-) -> None:
-    raise ValueError(
-        "canonicalize_relations requires offline shortest-path labels; disable canonicalize_relations for DualFlow."
-    )
-
-
 def preprocess(ctx: PreprocessContext) -> None:
     cfg = ctx.cfg
     logger = ctx.logger
@@ -297,7 +268,7 @@ def preprocess(ctx: PreprocessContext) -> None:
         raise ValueError(
             "dataset_source must be 'hf'; raw parquet ingestion is disabled."
         )
-    train_filter, eval_filter, override_filters = ctx.split_filters
+    train_filter, eval_filter, override_filters = ctx.preprocess_filters
     path_mode = _validate_path_mode(str(cfg.get("path_mode", _PATH_MODE_UNDIRECTED)))
     target_reachable_pruning = bool(cfg.get("target_reachable_pruning", False))
     dedup_edges = bool(cfg.get("dedup_edges", True))
@@ -305,21 +276,9 @@ def preprocess(ctx: PreprocessContext) -> None:
         cfg.get("validate_graph_edges", _VALIDATE_GRAPH_EDGES_DEFAULT)
     )
     remove_self_loops = bool(cfg.get("remove_self_loops", _REMOVE_SELF_LOOPS_DEFAULT))
-    relation_cleaning_enabled = bool(cfg.get("relation_cleaning", True))
-    relation_cleaning_rules = DEFAULT_RELATION_CLEANING_RULES
-    keep_start_adjacent_edges = bool(cfg.get("keep_start_adjacent_edges", False))
     embedding_cfg = ctx.embedding_cfg
-    if embedding_cfg is not None and embedding_cfg.canonicalize_relations:
-        raise ValueError(
-            "canonicalize_relations requires offline labels; disable it for DualFlow."
-        )
     emit_sub_filter = bool(cfg.get("emit_sub_filter", False))
     sub_filter_filename = str(cfg.get("sub_filter_filename", "sub_filter.json"))
-    emit_nonzero_positive_filter = bool(cfg.get("emit_nonzero_positive_filter", False))
-    nonzero_positive_filter_filename = str(
-        cfg.get("nonzero_positive_filter_filename", "nonzero_positive_filter.json")
-    )
-    nonzero_positive_filter_splits = cfg.get("nonzero_positive_filter_splits")
     parquet_chunk_size = ctx.parquet_chunk_size
     parquet_num_workers = ctx.parquet_num_workers
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
@@ -389,14 +348,8 @@ def preprocess(ctx: PreprocessContext) -> None:
     edge_stats = _init_split_counters(splits, _EDGE_STAT_KEYS)
     filter_stats = _init_split_counters(splits, _FILTER_STAT_KEYS)
     kept_rel_labels: Set[str] = set()
-    type_rel_labels: Set[str] = set()
-    dropped_rel_labels: Set[str] = set()
     graphs_written_by_split = {split: 0 for split in splits}
     questions_written_by_split = {split: 0 for split in splits}
-    if emit_nonzero_positive_filter:
-        raise ValueError(
-            "emit_nonzero_positive_filter is disabled in DualFlow; remove this flag."
-        )
 
     if target_reachable_pruning and path_mode != _PATH_MODE_QA_DIRECTED:
         raise ValueError("target_reachable_pruning requires path_mode=qa_directed.")
@@ -412,7 +365,6 @@ def preprocess(ctx: PreprocessContext) -> None:
         target_reachable_pruning=target_reachable_pruning,
         dedup_edges=dedup_edges,
         remove_self_loops=remove_self_loops,
-        relation_cleaning=relation_cleaning_enabled,
         parquet_chunk_size=parquet_chunk_size,
         parquet_num_workers=parquet_num_workers,
     )
@@ -422,21 +374,6 @@ def preprocess(ctx: PreprocessContext) -> None:
             "q_entity_blacklist_loaded",
             count=len(q_entity_blacklist),
             examples=sorted(list(q_entity_blacklist))[:20],
-        )
-    if relation_cleaning_enabled:
-        log_event(
-            logger,
-            "relation_cleaning_rules",
-            type_exact=sorted(relation_cleaning_rules.type_exact),
-            type_prefixes=sorted(relation_cleaning_rules.type_prefixes),
-            type_regexes=sorted(
-                pattern.pattern for pattern in relation_cleaning_rules.type_regexes
-            ),
-            drop_exact=sorted(relation_cleaning_rules.drop_exact),
-            drop_prefixes=sorted(relation_cleaning_rules.drop_prefixes),
-            drop_regexes=sorted(
-                pattern.pattern for pattern in relation_cleaning_rules.drop_regexes
-            ),
         )
     log_event(logger, "vocab_start", stage="vocab")
     for sample in tqdm(
@@ -458,13 +395,9 @@ def preprocess(ctx: PreprocessContext) -> None:
         sample = _apply_q_entity_blacklist(sample, q_entity_blacklist)
         graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
         total_by_split[sample.split] = total_by_split.get(sample.split, 0) + 1
-        kept_edges, type_edges = _partition_graph_edges(
+        kept_edges = _partition_graph_edges(
             sample.graph,
-            relation_cleaning_rules,
             remove_self_loops=remove_self_loops,
-            relation_cleaning_enabled=relation_cleaning_enabled,
-            anchor_entities=sample.q_entity,
-            keep_anchor_edges=keep_start_adjacent_edges,
         )
         kept_edges = _dedup_directed_edges(kept_edges)
         split_key = sample.split
@@ -473,38 +406,20 @@ def preprocess(ctx: PreprocessContext) -> None:
         if remove_self_loops:
             self_loop_edges = sum(1 for h, _, t in sample.graph if h == t)
         kept_edges_count = len(kept_edges)
-        type_edges_count = len(type_edges)
-        dropped_edges = (
-            raw_edges - self_loop_edges - kept_edges_count - type_edges_count
-        )
+        dropped_edges = raw_edges - self_loop_edges - kept_edges_count
         raw_nodes = len(
             {h for h, _, _ in sample.graph} | {t for _, _, t in sample.graph}
         )
         kept_node_set = {h for h, _, _ in kept_edges} | {t for _, _, t in kept_edges}
         kept_nodes = len(kept_node_set)
-        type_orphan_edges = sum(1 for h, _, _ in type_edges if h not in kept_node_set)
         edge_stats[split_key]["raw_edges"] += raw_edges
         edge_stats[split_key]["self_loop_edges"] += self_loop_edges
         edge_stats[split_key]["kept_edges"] += kept_edges_count
-        edge_stats[split_key]["type_edges"] += type_edges_count
         edge_stats[split_key]["dropped_edges"] += dropped_edges
         edge_stats[split_key]["raw_nodes"] += raw_nodes
         edge_stats[split_key]["kept_nodes"] += kept_nodes
-        edge_stats[split_key]["type_orphan_edges"] += type_orphan_edges
         for _, rel, _ in kept_edges:
             kept_rel_labels.add(rel)
-        for _, rel, _ in type_edges:
-            type_rel_labels.add(rel)
-        for h, rel, t in sample.graph:
-            if remove_self_loops and h == t:
-                continue
-            if (
-                relation_action(
-                    rel, relation_cleaning_rules, enabled=relation_cleaning_enabled
-                )
-                == RELATION_ACTION_DROP
-            ):
-                dropped_rel_labels.add(rel)
         if not kept_edges:
             empty_graph_by_split[sample.split] = (
                 empty_graph_by_split.get(sample.split, 0) + 1
@@ -514,9 +429,6 @@ def preprocess(ctx: PreprocessContext) -> None:
                 empty_graph_ids.append(graph_id)
             continue
         for h, r, t in kept_edges:
-            entity_vocab.add_entity(h)
-            entity_vocab.add_entity(t)
-        for h, _, t in type_edges:
             entity_vocab.add_entity(h)
             entity_vocab.add_entity(t)
         for ent in sample.q_entity + sample.a_entity:
@@ -531,11 +443,7 @@ def preprocess(ctx: PreprocessContext) -> None:
             connectivity_cache,
             path_mode=path_mode,
             remove_self_loops=remove_self_loops,
-            relation_cleaning_enabled=relation_cleaning_enabled,
-            relation_cleaning_rules=relation_cleaning_rules,
             kept_edges=kept_edges,
-            anchor_entities=sample.q_entity,
-            keep_anchor_edges=keep_start_adjacent_edges,
         )
         if outcome.keep:
             kept_by_split[sample.split] = kept_by_split.get(sample.split, 0) + 1
@@ -568,19 +476,15 @@ def preprocess(ctx: PreprocessContext) -> None:
     )
     total_edges_raw = sum(edge_stats[split]["raw_edges"] for split in splits)
     total_edges_kept = sum(edge_stats[split]["kept_edges"] for split in splits)
-    total_edges_type = sum(edge_stats[split]["type_edges"] for split in splits)
     total_edges_drop = sum(edge_stats[split]["dropped_edges"] for split in splits)
     total_edges_self = sum(edge_stats[split]["self_loop_edges"] for split in splits)
-    total_type_orphan = sum(edge_stats[split]["type_orphan_edges"] for split in splits)
     log_event(
         logger,
         "edge_summary_total",
         raw_edges=total_edges_raw,
         kept_edges=total_edges_kept,
-        type_edges=total_edges_type,
         dropped_edges=total_edges_drop,
         self_loop_edges=total_edges_self,
-        type_orphan_edges=total_type_orphan,
     )
     for split in splits:
         split_total = total_by_split.get(split, 0)
@@ -596,13 +500,10 @@ def preprocess(ctx: PreprocessContext) -> None:
             dropped_no_path=filter_stats[split]["dropped_no_path"],
             raw_edges=edge_stats[split]["raw_edges"],
             kept_edges=edge_stats[split]["kept_edges"],
-            type_edges=edge_stats[split]["type_edges"],
             dropped_edges=edge_stats[split]["dropped_edges"],
             self_loop_edges=edge_stats[split]["self_loop_edges"],
-            type_orphan_edges=edge_stats[split]["type_orphan_edges"],
             avg_raw_edges=_safe_div(edge_stats[split]["raw_edges"], split_total),
             avg_kept_edges=_safe_div(edge_stats[split]["kept_edges"], split_total),
-            avg_type_edges=_safe_div(edge_stats[split]["type_edges"], split_total),
             avg_raw_nodes=_safe_div(edge_stats[split]["raw_nodes"], split_total),
             avg_kept_nodes=_safe_div(edge_stats[split]["kept_nodes"], split_total),
         )
@@ -610,16 +511,8 @@ def preprocess(ctx: PreprocessContext) -> None:
         logger,
         "relation_label_stats",
         kept_relation_types=len(kept_rel_labels),
-        type_relation_types=len(type_rel_labels),
-        dropped_relation_types=len(dropped_rel_labels),
         kept_relation_examples=_sample_labels(
             kept_rel_labels, limit=_REL_LABEL_SAMPLE_LIMIT
-        ),
-        type_relation_examples=_sample_labels(
-            type_rel_labels, limit=_REL_LABEL_SAMPLE_LIMIT
-        ),
-        dropped_relation_examples=_sample_labels(
-            dropped_rel_labels, limit=_REL_LABEL_SAMPLE_LIMIT
         ),
     )
 
@@ -636,8 +529,14 @@ def preprocess(ctx: PreprocessContext) -> None:
             log_event(logger, "empty_graph_examples", examples=empty_graph_ids)
 
     encoder: Optional[TextEncoder] = None
-    relation_embeddings_norm: Optional[torch.Tensor] = None
     if embedding_cfg is not None:
+        log_event(
+            logger,
+            "embedding_runtime",
+            device=embedding_cfg.device,
+            batch_size=embedding_cfg.batch_size,
+            fp16=embedding_cfg.fp16,
+        )
         embeddings_out_dir = embedding_cfg.embeddings_out_dir
         entity_emb_path = embeddings_out_dir / "entity_embeddings.pt"
         relation_emb_path = embeddings_out_dir / "relation_embeddings.pt"
@@ -704,16 +603,6 @@ def preprocess(ctx: PreprocessContext) -> None:
                 "preprocess_reuse_relation_embeddings",
                 path=str(relation_emb_path),
             )
-            relation_emb = torch.load(relation_emb_path, map_location="cpu")
-        if embedding_cfg.canonicalize_relations:
-            relation_embeddings_norm = _normalize_embeddings(
-                relation_emb, embedding_cfg.cosine_eps
-            )
-            if relation_embeddings_norm.numel() == 0:
-                raise ValueError(
-                    "relation_embeddings are empty; cannot canonicalize positives."
-                )
-
     log_event(logger, "graphs_questions_start", stage="graphs_questions")
     chunk_size = parquet_chunk_size
     include_question_emb = bool(embedding_cfg)
@@ -736,7 +625,6 @@ def preprocess(ctx: PreprocessContext) -> None:
         if not samples:
             return
         question_emb_batch = None
-        question_emb_norm_batch = None
         question_ctx_batch = None
         question_ctx_mask_batch = None
         if need_question_emb:
@@ -762,10 +650,6 @@ def preprocess(ctx: PreprocessContext) -> None:
                     show_progress=False,
                     desc="Questions",
                 )
-            if embedding_cfg and embedding_cfg.canonicalize_relations:
-                question_emb_norm_batch = _normalize_embeddings(
-                    question_emb_batch, embedding_cfg.cosine_eps
-                )
         if executor is None:
             graphs: List[Optional[GraphRecord]] = []
             for sample in samples:
@@ -783,9 +667,6 @@ def preprocess(ctx: PreprocessContext) -> None:
                     dedup_edges=dedup_edges,
                     validate_graph_edges=validate_graph_edges,
                     remove_self_loops=remove_self_loops,
-                    relation_cleaning_enabled=relation_cleaning_enabled,
-                    keep_start_adjacent_edges=keep_start_adjacent_edges,
-                    relation_cleaning_rules=relation_cleaning_rules,
                     target_reachable_pruning=apply_target_reachable_pruning,
                 )
                 graphs.append(graph)
@@ -797,14 +678,6 @@ def preprocess(ctx: PreprocessContext) -> None:
                     pruned_drop_by_split.get(sample.split, 0) + 1
                 )
                 continue
-            if embedding_cfg and embedding_cfg.canonicalize_relations:
-                if relation_embeddings_norm is None or question_emb_norm_batch is None:
-                    raise RuntimeError(
-                        "Canonicalization requested but embeddings are missing."
-                    )
-                _canonicalize_graph_edges(
-                    graph, question_emb_norm_batch[idx], relation_embeddings_norm
-                )
             question_emb = None
             question_ctx = None
             question_ctx_mask = None
@@ -985,10 +858,6 @@ def preprocess(ctx: PreprocessContext) -> None:
                 connectivity_cache,
                 path_mode=path_mode,
                 remove_self_loops=remove_self_loops,
-                relation_cleaning_enabled=relation_cleaning_enabled,
-                relation_cleaning_rules=relation_cleaning_rules,
-                anchor_entities=sample.q_entity,
-                keep_anchor_edges=keep_start_adjacent_edges,
             )
             if not outcome.keep:
                 continue
@@ -1015,9 +884,6 @@ def preprocess(ctx: PreprocessContext) -> None:
             dedup_edges=dedup_edges,
             validate_graph_edges=validate_graph_edges,
             remove_self_loops=remove_self_loops,
-            relation_cleaning_enabled=relation_cleaning_enabled,
-            keep_start_adjacent_edges=keep_start_adjacent_edges,
-            relation_cleaning_rules=relation_cleaning_rules,
             target_reachable_pruning=target_reachable_pruning,
             train_filter=train_filter,
             eval_filter=eval_filter,
@@ -1142,15 +1008,11 @@ def build_graph(
     dedup_edges: bool = True,
     validate_graph_edges: bool = _VALIDATE_GRAPH_EDGES_DEFAULT,
     remove_self_loops: bool = _REMOVE_SELF_LOOPS_DEFAULT,
-    relation_cleaning_enabled: bool = True,
-    keep_start_adjacent_edges: bool = False,
-    relation_cleaning_rules: RelationCleaningRules = DEFAULT_RELATION_CLEANING_RULES,
     target_reachable_pruning: bool = False,
 ) -> Optional[GraphRecord]:
     dedup_edges = bool(dedup_edges)
     validate_graph_edges = bool(validate_graph_edges)
     remove_self_loops = bool(remove_self_loops)
-    relation_cleaning_enabled = bool(relation_cleaning_enabled)
     node_index: Dict[str, int] = {}
     node_entity_ids: List[int] = []
     node_embedding_ids: List[int] = []
@@ -1171,13 +1033,9 @@ def build_graph(
 
     # sample.graph must be derived only from q_entity (e.g., PPR on the full graph) with no answer-conditioned steps,
     # per prior work by rmanluo.
-    kept_edges, _ = _partition_graph_edges(
+    kept_edges = _partition_graph_edges(
         sample.graph,
-        relation_cleaning_rules,
         remove_self_loops=remove_self_loops,
-        relation_cleaning_enabled=relation_cleaning_enabled,
-        anchor_entities=sample.q_entity,
-        keep_anchor_edges=keep_start_adjacent_edges,
     )
     kept_edges = _dedup_directed_edges(kept_edges)
     if target_reachable_pruning:
@@ -1240,7 +1098,6 @@ def build_question_record(
     seed_entity_ids = [entity_vocab.entity_id(ent) for ent in q_entities]
     answer_entity_ids = [entity_vocab.entity_id(ent) for ent in a_entities]
     record = {
-        "question_uid": graph_id,
         "dataset": sample.dataset,
         "split": sample.split,
         "kb": sample.kb,

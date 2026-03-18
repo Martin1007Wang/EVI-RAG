@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+import torch
+
 try:  # pragma: no cover - optional dependency guard
     from omegaconf import DictConfig, OmegaConf  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
@@ -11,11 +13,55 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from src.data.schema.constants import (
     _DEFAULT_BATCH_SIZE,
-    _DEFAULT_COSINE_EPS,
     _DISABLE_PARALLEL_WORKERS,
     _MIN_CHUNK_SIZE,
 )
 from src.data.schema.types import EmbeddingConfig, SplitFilter
+
+_AUTO_EMBEDDING_DEVICE = "auto"
+_DEFAULT_GPU_BATCH_SIZE = 256
+
+
+def resolve_embedding_device(raw_device: Any) -> str:
+    device = str(raw_device or _AUTO_EMBEDDING_DEVICE).strip().lower()
+    if device in {"", _AUTO_EMBEDDING_DEVICE}:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "gpu":
+        device = "cuda"
+    if device == "cpu":
+        return device
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("device=cuda requested but CUDA is not available.")
+        return device
+    raise ValueError(
+        "device must be one of {'auto', 'cpu', 'cuda', 'cuda:N', 'gpu'}, "
+        f"got {raw_device!r}."
+    )
+
+
+def resolve_embedding_batch_size(cfg: Any, *, device: str | None = None) -> int:
+    device = resolve_embedding_device(cfg.get("device")) if device is None else device
+    raw_batch_size = cfg.get("batch_size")
+    if raw_batch_size in (None, ""):
+        batch_size = (
+            _DEFAULT_GPU_BATCH_SIZE
+            if device.startswith("cuda")
+            else _DEFAULT_BATCH_SIZE
+        )
+    else:
+        batch_size = int(raw_batch_size)
+    if batch_size < _MIN_CHUNK_SIZE:
+        raise ValueError(f"batch_size must be >= {_MIN_CHUNK_SIZE}, got {batch_size}.")
+    return batch_size
+
+
+def resolve_embedding_fp16(cfg: Any, *, device: str | None = None) -> bool:
+    device = resolve_embedding_device(cfg.get("device")) if device is None else device
+    raw_fp16 = cfg.get("fp16")
+    if raw_fp16 in (None, ""):
+        return device.startswith("cuda")
+    return bool(raw_fp16)
 
 
 def _resolve_parquet_chunk_size(cfg, *, fallback: int) -> int:
@@ -42,7 +88,6 @@ def build_embedding_cfg(cfg) -> Optional[EmbeddingConfig]:
     encoder = str(cfg.get("encoder", "")).strip()
     if not encoder:
         return None
-    canonicalize_relations = bool(cfg.get("canonicalize_relations", False))
     question_ctx_max_tokens = int(cfg.get("question_ctx_max_tokens", 0))
     if question_ctx_max_tokens < 0:
         raise ValueError(
@@ -59,24 +104,25 @@ def build_embedding_cfg(cfg) -> Optional[EmbeddingConfig]:
         raise ModuleNotFoundError(
             "hydra-core is required to resolve embeddings_out_dir."
         ) from exc
+    device = resolve_embedding_device(cfg.get("device"))
     return EmbeddingConfig(
         encoder=encoder,
-        device=str(cfg.get("device", "cuda")),
-        batch_size=int(cfg.get("batch_size", _DEFAULT_BATCH_SIZE)),
-        fp16=bool(cfg.get("fp16", False)),
+        device=device,
+        batch_size=resolve_embedding_batch_size(cfg, device=device),
+        fp16=resolve_embedding_fp16(cfg, device=device),
         progress_bar=bool(cfg.get("progress_bar", True)),
         embeddings_out_dir=Path(hydra.utils.to_absolute_path(embeddings_out_dir_cfg)),
-        canonicalize_relations=canonicalize_relations,
-        cosine_eps=float(cfg.get("cosine_eps", _DEFAULT_COSINE_EPS)),
         question_ctx_max_tokens=question_ctx_max_tokens,
     )
 
 
-def build_split_filters(cfg) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitFilter]]:
+def build_preprocess_filters(
+    cfg,
+) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitFilter]]:
     default_filter = SplitFilter(
         skip_no_topic=False, skip_no_ans=False, skip_no_path=False
     )
-    filter_cfg = cfg.get("filter")
+    filter_cfg = cfg.get("preprocess_filter")
     if filter_cfg is None:
         return default_filter, default_filter, {}
     train_section = filter_cfg.get("train")
@@ -142,6 +188,9 @@ __all__ = [
     "_resolve_parquet_chunk_size",
     "_resolve_parquet_num_workers",
     "build_embedding_cfg",
-    "build_split_filters",
+    "build_preprocess_filters",
+    "resolve_embedding_batch_size",
+    "resolve_embedding_device",
+    "resolve_embedding_fp16",
     "resolve_entity_vocab_path",
 ]

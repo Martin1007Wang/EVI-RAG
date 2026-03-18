@@ -50,8 +50,8 @@ class PredictionArtifactSettings:
     enabled: bool = False
     execution_mode: str = "predict"
     output_root: str | Path | None = None
-    artifact_subdir: str = "eval_answer_reachability"
-    artifact_name: str = "eval_answer_reachability"
+    artifact_subdir: str = "rankflow"
+    artifact_name: str = "rankflow"
     schema_version: int = 1
     split: str = "test"
     dataset_scope: str | None = None
@@ -138,6 +138,8 @@ def write_prediction_artifacts(
         questions_path=settings.resolve_questions_path(),
         overwrite=bool(settings.overwrite),
     )
+    if not isinstance(paths, dict):
+        return None
     setattr(model, "predict_artifact_paths", paths)
     return paths
 

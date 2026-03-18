@@ -5,52 +5,56 @@ from typing import Any, Callable
 
 from src.graph_runtime import TrajectoryBatch
 from src.models.configs import (
-    AnswerReachabilityInferenceConfig,
+    SearchEvalConfig,
     GFlowNetTrainingConfig,
     HorizonConfig,
 )
-from src.models.policy.protocol import SearchPolicyProtocol
-from src.metrics.base import BaseMetricRuntime
-from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeProtocol
-from src.models.training import (
+from src.models.gflownet import (
     AnswerReachabilityTrajectorySupervisor,
     ForwardTrajectoryGFNSampler,
+    TrajectorySamplerProtocol,
 )
+from src.models.gflownet import SearchPolicyProtocol
+from src.metrics.base import BaseMetricRuntime
+from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeProtocol
 
 from .artifacts import SupportWindowArtifactWriter
-from .edge_eval import EdgeRetrievalEvaluator
-from .exact import ExactReachabilityAnalyzer
-from .execution import (
+from .batch_evaluator import (
     INVALID_START_REASON,
-    AnswerReachabilityExecution,
+    ReachabilityBatchEvaluator,
 )
+from .edge_eval import EdgeRetrievalEvaluator
+from .exact_analysis import ExactReachabilityAnalyzer
 from .metrics import compute_support_metrics
 from .posterior import aggregate_rank_metrics
-from .schema import (
-    SupportWindowEvalBatch,
-    SupportWindowLabelRecord,
-    SupportWindowResult,
-)
-from .search import ReachabilityGuidedSearch
+from .schema import SupportWindowEvalBatch
+from .support_search import ExactSupportSearch
 
 
-class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
-    sampler: ForwardTrajectoryGFNSampler | None
+class SearchMetricRuntime(BaseMetricRuntime):
+    sampler: TrajectorySamplerProtocol | None
 
     def __init__(
         self,
         *,
-        inference_cfg: AnswerReachabilityInferenceConfig,
-        execution: AnswerReachabilityExecution,
+        eval_cfg: SearchEvalConfig,
+        reachability_evaluator: ReachabilityBatchEvaluator,
         edge_evaluator: EdgeRetrievalEvaluator,
-        sampler: ForwardTrajectoryGFNSampler,
-        search: ReachabilityGuidedSearch,
+        sampler: TrajectorySamplerProtocol,
+        support_search: ExactSupportSearch,
     ) -> None:
-        self.inference_cfg = inference_cfg
-        self.execution = execution
+        self.eval_cfg = eval_cfg
+        self.reachability_evaluator = reachability_evaluator
         self.edge_evaluator = edge_evaluator
         self.sampler = sampler
-        self.search = search
+        self.support_search = support_search
+
+    @property
+    def search(self) -> ExactSupportSearch:
+        return self.support_search
+
+    def _uses_edge_retrieval_task(self) -> bool:
+        return self.eval_cfg.task == "edge_retrieval"
 
     def evaluate_batch(
         self,
@@ -60,14 +64,14 @@ class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> MetricEvaluationOutput:
-        if self.inference_cfg.task_view == "edge_retrieval":
+        if self._uses_edge_retrieval_task():
             return self.edge_evaluator.evaluate_batch(
                 batch=batch,
                 metrics_profile=metrics_profile,
                 include_answer_support=include_answer_support,
                 on_invalid_start=on_invalid_start,
             )
-        output = self.execution.evaluate_batch(
+        output = self.reachability_evaluator.evaluate_batch(
             batch=batch,
             metrics_profile=metrics_profile,
             include_answer_support=include_answer_support,
@@ -88,14 +92,14 @@ class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> list[Any]:
-        if self.inference_cfg.task_view == "edge_retrieval":
+        if self._uses_edge_retrieval_task():
             return self.edge_evaluator.predict_batch(
                 batch=batch,
                 metrics_profile=metrics_profile,
                 include_answer_support=include_answer_support,
                 on_invalid_start=on_invalid_start,
             )
-        return self.execution.predict_batch(
+        return self.reachability_evaluator.predict_batch(
             batch=batch,
             metrics_profile=metrics_profile,
             include_answer_support=include_answer_support,
@@ -107,17 +111,17 @@ class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
         batch: TrajectoryBatch,
         outputs: list[Any],
     ) -> list[Any]:
-        if self.inference_cfg.task_view == "edge_retrieval":
+        if self._uses_edge_retrieval_task():
             return self.edge_evaluator.build_predict_labels(batch, outputs)
-        return self.execution.build_predict_labels(batch, outputs)
+        return self.reachability_evaluator.build_predict_labels(batch, outputs)
 
     def summarize_predict_epoch(
         self,
         *,
         predict_results: list[Any],
         metrics_profile: str,
-    ) -> dict[str, Any]:
-        if self.inference_cfg.task_view == "edge_retrieval":
+    ) -> dict[str, float]:
+        if self._uses_edge_retrieval_task():
             return self.edge_evaluator.summarize_predict_epoch(
                 predict_results=predict_results,
                 metrics_profile=metrics_profile,
@@ -135,17 +139,15 @@ class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
             else compute_support_metrics(
                 SupportWindowEvalBatch(
                     dataset_scope=predict_results[0].dataset_scope,
-                    mass_threshold=float(self.inference_cfg.support_mass_threshold),
+                    mass_threshold=float(self.eval_cfg.support_mass_threshold),
                     results=predict_results,
-                    window_top_ks=tuple(
-                        int(k) for k in self.inference_cfg.window_top_ks
-                    ),
+                    window_top_ks=tuple(int(k) for k in self.eval_cfg.window_top_ks),
                 )
             )
         )
         rank_metrics = aggregate_rank_metrics(
             results=predict_results,
-            answer_top_ks=tuple(int(k) for k in self.inference_cfg.answer_top_ks),
+            answer_top_ks=tuple(int(k) for k in self.eval_cfg.answer_top_ks),
         )
         return {
             **rank_metrics,
@@ -169,7 +171,7 @@ class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
         questions_path: str | Path | None,
         overwrite: bool,
     ) -> dict[str, Path] | None:
-        if self.inference_cfg.task_view == "edge_retrieval":
+        if self._uses_edge_retrieval_task():
             return self.edge_evaluator.write_prediction_artifacts(
                 results=results,
                 labels=labels,
@@ -197,19 +199,19 @@ class AnswerReachabilityMetricRuntime(BaseMetricRuntime):
         return writer.write(results=results, labels=labels)
 
 
-class AnswerReachabilityMetricRuntimeFactory:
+class SearchMetricRuntimeFactory:
     def build_runtime(
         self,
         *,
         horizon_cfg: HorizonConfig,
         training_cfg: GFlowNetTrainingConfig,
-        inference_cfg: AnswerReachabilityInferenceConfig,
+        eval_cfg: SearchEvalConfig,
         policy: SearchPolicyProtocol,
     ) -> MetricRuntimeProtocol:
         analyzer = ExactReachabilityAnalyzer(max_steps=int(horizon_cfg.max_steps))
-        search = ReachabilityGuidedSearch(
+        support_search = ExactSupportSearch(
             horizon_cfg=horizon_cfg,
-            inference_cfg=inference_cfg,
+            eval_cfg=eval_cfg,
             analyzer=analyzer,
         )
         trajectory_supervisor = AnswerReachabilityTrajectorySupervisor(
@@ -220,27 +222,27 @@ class AnswerReachabilityMetricRuntimeFactory:
             max_steps=int(horizon_cfg.max_steps),
             trajectory_supervisor=trajectory_supervisor,
         )
-        execution = AnswerReachabilityExecution(
-            inference_cfg=inference_cfg,
+        reachability_evaluator = ReachabilityBatchEvaluator(
+            eval_cfg=eval_cfg,
             policy=policy,
             analyzer=analyzer,
-            search=search,
+            support_search=support_search,
         )
         edge_evaluator = EdgeRetrievalEvaluator(
-            inference_cfg=inference_cfg,
+            eval_cfg=eval_cfg,
             policy=policy,
             analyzer=analyzer,
         )
-        return AnswerReachabilityMetricRuntime(
-            inference_cfg=inference_cfg,
-            execution=execution,
+        return SearchMetricRuntime(
+            eval_cfg=eval_cfg,
+            reachability_evaluator=reachability_evaluator,
             edge_evaluator=edge_evaluator,
             sampler=sampler,
-            search=search,
+            support_search=support_search,
         )
 
 
 __all__ = [
-    "AnswerReachabilityMetricRuntime",
-    "AnswerReachabilityMetricRuntimeFactory",
+    "SearchMetricRuntime",
+    "SearchMetricRuntimeFactory",
 ]

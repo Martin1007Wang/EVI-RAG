@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
 
 from src.graph_runtime import build_graph_batch
+from src.graph_runtime.batch import TrajectoryBatch
 from src.metrics.answer_reachability import ExactReachabilityAnalysis
-from src.metrics.answer_reachability.search import ReachabilityGuidedSearch
-from src.models.configs import AnswerReachabilityInferenceConfig, HorizonConfig
-from src.models.policy.trajectory_policy import (
+from src.metrics.answer_reachability.support_search import ExactSupportSearch
+from src.models.configs import SearchEvalConfig, HorizonConfig
+from src.models.gflownet import BaseSearchPolicy
+from src.models.gflownet import (
     ForwardActionDistribution,
+    PreparedSearchBatch,
     StartDistribution,
-    TrajectoryPolicy,
 )
-from src.models.policy.types import PreparedSearchBatch
 
 from .conftest import make_batch_from_graph
 
@@ -36,7 +38,9 @@ class _ConstantAnalyzer:
 class _ManualPolicy:
     def __init__(self) -> None:
         self.start_nodes = torch.tensor([0], dtype=torch.long)
+        self.start_log_flows = torch.tensor([0.0], dtype=torch.float32)
         self.start_log_probs = torch.tensor([0.0], dtype=torch.float32)
+        self.graph_log_z = torch.tensor([0.0], dtype=torch.float32)
         self.transitions = {
             (0, 0): [(0, 1, 0.6), (1, 2, 0.4)],
             (1, 1): [(2, 3, 1.0)],
@@ -49,7 +53,9 @@ class _ManualPolicy:
         return StartDistribution(
             candidate_nodes_abs=self.start_nodes,
             candidate_graph_ids=torch.zeros((1,), dtype=torch.long),
+            log_flows=self.start_log_flows,
             log_probs=self.start_log_probs,
+            graph_log_z=self.graph_log_z,
         )
 
     def compute_forward_distribution(
@@ -83,11 +89,19 @@ class _ManualPolicy:
 
     @staticmethod
     def compute_move_log_probs(distribution: ForwardActionDistribution):
-        return TrajectoryPolicy.compute_move_log_probs(distribution)
+        return BaseSearchPolicy.compute_move_log_probs(distribution)
+
+    def prepare_batch(self, batch: Any) -> PreparedSearchBatch:
+        del batch
+        raise NotImplementedError
+
+    def compute_log_state_scores(self, prepared_batch: Any, state: Any) -> torch.Tensor:
+        del prepared_batch, state
+        raise NotImplementedError
 
 
 def _make_search_fixture() -> tuple[
-    object, PreparedSearchBatch, _ManualPolicy, _ConstantAnalyzer
+    TrajectoryBatch, PreparedSearchBatch, _ManualPolicy, _ConstantAnalyzer
 ]:
     batch = make_batch_from_graph(
         num_nodes=4,
@@ -113,9 +127,9 @@ def _make_search_fixture() -> tuple[
 
 def test_search_exact_top_order() -> None:
     batch, prepared_batch, policy, analyzer = _make_search_fixture()
-    search = ReachabilityGuidedSearch(
+    search = ExactSupportSearch(
         horizon_cfg=HorizonConfig(max_steps=2),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=1.0,
             support_mass_threshold=1.0,
             max_expansions=32,
@@ -134,9 +148,9 @@ def test_search_exact_top_order() -> None:
 
 def test_window_is_minimal_probability_prefix() -> None:
     batch, prepared_batch, policy, analyzer = _make_search_fixture()
-    search = ReachabilityGuidedSearch(
+    search = ExactSupportSearch(
         horizon_cfg=HorizonConfig(max_steps=2),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=0.55,
             support_mass_threshold=1.0,
             max_expansions=32,
@@ -156,9 +170,9 @@ def test_window_is_minimal_probability_prefix() -> None:
 
 def test_search_raises_on_truncation_guard() -> None:
     batch, prepared_batch, policy, analyzer = _make_search_fixture()
-    search = ReachabilityGuidedSearch(
+    search = ExactSupportSearch(
         horizon_cfg=HorizonConfig(max_steps=2),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=0.9,
             support_mass_threshold=1.0,
             max_expansions=32,
@@ -176,9 +190,9 @@ def test_search_raises_on_truncation_guard() -> None:
 
 def test_search_returns_partial_window_when_non_strict() -> None:
     batch, prepared_batch, policy, analyzer = _make_search_fixture()
-    search = ReachabilityGuidedSearch(
+    search = ExactSupportSearch(
         horizon_cfg=HorizonConfig(max_steps=2),
-        inference_cfg=AnswerReachabilityInferenceConfig(
+        eval_cfg=SearchEvalConfig(
             answer_mass_threshold=0.9,
             support_mass_threshold=1.0,
             max_expansions=32,

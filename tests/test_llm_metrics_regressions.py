@@ -31,7 +31,7 @@ def test_sub_hal_score_is_computed_from_sub_scope_samples(tmp_path) -> None:
     output_path = tmp_path / "output.jsonl"
     input_record = {
         "sample_id": "s1",
-        "question_text": "Where was X born?",
+        "question": "Where was X born?",
         "answer_texts": ["Paris"],
         "a_entity_in_graph": True,
         "trajectories": [
@@ -69,7 +69,7 @@ def test_metrics_use_structured_answer_field_not_raw_response(tmp_path) -> None:
     output_path = tmp_path / "output.jsonl"
     input_record = {
         "sample_id": "s1",
-        "question_text": "Where was X born?",
+        "question": "Where was X born?",
         "answer_texts": ["Paris"],
         "a_entity_in_graph": True,
         "trajectories": [],
@@ -107,7 +107,7 @@ def test_metrics_can_read_gold_labels_from_sidecar(tmp_path) -> None:
     }
     labels_record = {
         "sample_id": "s1",
-        "question_text": "Where was X born?",
+        "question": "Where was X born?",
         "answer_texts": ["Paris"],
         "a_entity_in_graph": True,
     }
@@ -195,7 +195,7 @@ def test_metrics_artifacts_keep_json_and_jsonl_together(tmp_path) -> None:
     metrics_log_dir = tmp_path / "logs"
     input_record = {
         "sample_id": "s1",
-        "question_text": "Where was X born?",
+        "question": "Where was X born?",
         "answer_texts": ["Paris"],
         "a_entity_in_graph": True,
         "trajectories": [],

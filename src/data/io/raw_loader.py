@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import importlib
 import re
+import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 import pyarrow.dataset as ds
 
 from omegaconf import DictConfig
 
-from src.data.schema.constants import (
-    _TIME_RELATION_MODE_DROP,
-    _TIME_RELATION_MODE_KEEP,
-    _TIME_RELATION_MODE_QUESTION,
-    _TIME_RELATION_MODES,
+from src.data.schema.types import (
+    CvtEntityConfig,
+    Sample,
+    TextEntityConfig,
 )
-from src.data.schema.types import CvtEntityConfig, Sample, TextEntityConfig, TimeRelationConfig
 
 
 _QID_IN_PARENS_RE = re.compile(r"(Q\d+)")
@@ -26,6 +27,70 @@ _HF_DATASET_BY_FAMILY = {
     "webqsp": "rmanluo/RoG-webqsp",
 }
 _HF_DATASET_ALLOWED = tuple(_HF_DATASET_BY_FAMILY.values())
+_SRC_DIR = Path(__file__).resolve().parents[2]
+_LOCAL_DATASETS_INIT = _SRC_DIR / "datasets" / "__init__.py"
+_HF_DATASETS_MODULE: ModuleType | None = None
+
+
+def _module_file_path(module: ModuleType) -> Path | None:
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return None
+    try:
+        return Path(module_file).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _is_local_datasets_shadow(module: ModuleType) -> bool:
+    module_path = _module_file_path(module)
+    if module_path is None:
+        return False
+    return (
+        module_path == _LOCAL_DATASETS_INIT
+        or _LOCAL_DATASETS_INIT.parent in module_path.parents
+    )
+
+
+def _import_hf_datasets_module() -> ModuleType:
+    global _HF_DATASETS_MODULE
+
+    cached_module = _HF_DATASETS_MODULE
+    if cached_module is not None and not _is_local_datasets_shadow(cached_module):
+        return cached_module
+
+    imported_module = sys.modules.get("datasets")
+    if imported_module is not None and _is_local_datasets_shadow(imported_module):
+        sys.modules.pop("datasets", None)
+        imported_module = None
+
+    if imported_module is not None:
+        _HF_DATASETS_MODULE = imported_module
+        return imported_module
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path = [
+            entry
+            for entry in original_sys_path
+            if Path(entry or ".").resolve() != _SRC_DIR
+        ]
+        hf_datasets = importlib.import_module("datasets")
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "datasets is required for HF-based preprocessing."
+        ) from exc
+    finally:
+        sys.path = original_sys_path
+
+    if _is_local_datasets_shadow(hf_datasets):
+        raise RuntimeError(
+            "Resolved local `src.datasets` while importing HuggingFace `datasets`; "
+            "remove the repo `src` directory from `sys.path` before preprocessing."
+        )
+
+    _HF_DATASETS_MODULE = hf_datasets
+    return hf_datasets
 
 
 def build_text_entity_config(cfg: DictConfig) -> TextEntityConfig:
@@ -37,7 +102,9 @@ def build_text_entity_config(cfg: DictConfig) -> TextEntityConfig:
     if mode == "regex" and regex is None:
         raise ValueError("entity_text_mode=regex requires text_regex to be set.")
     if mode == "prefix_allowlist" and not prefixes:
-        raise ValueError("entity_text_mode=prefix_allowlist requires non-empty text_prefixes.")
+        raise ValueError(
+            "entity_text_mode=prefix_allowlist requires non-empty text_prefixes."
+        )
     return TextEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
 
 
@@ -50,23 +117,10 @@ def build_cvt_entity_config(cfg: DictConfig) -> CvtEntityConfig:
     if mode == "regex" and regex is None:
         raise ValueError("cvt_entity_mode=regex requires cvt_regex to be set.")
     if mode == "prefix_allowlist" and not prefixes:
-        raise ValueError("cvt_entity_mode=prefix_allowlist requires non-empty cvt_prefixes.")
+        raise ValueError(
+            "cvt_entity_mode=prefix_allowlist requires non-empty cvt_prefixes."
+        )
     return CvtEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
-
-
-def build_time_relation_config(cfg: DictConfig) -> TimeRelationConfig:
-    mode = str(cfg.get("time_relation_mode", _TIME_RELATION_MODE_KEEP)).strip().lower()
-    if mode not in _TIME_RELATION_MODES:
-        raise ValueError(f"Unsupported time_relation_mode: {mode!r}. Expected one of {_TIME_RELATION_MODES}.")
-    relation_regex_str = cfg.get("time_relation_regex")
-    question_regex_str = cfg.get("time_question_regex")
-    relation_regex = re.compile(str(relation_regex_str)) if relation_regex_str else None
-    question_regex = re.compile(str(question_regex_str), re.IGNORECASE) if question_regex_str else None
-    if mode in (_TIME_RELATION_MODE_DROP, _TIME_RELATION_MODE_QUESTION) and relation_regex is None:
-        raise ValueError("time_relation_regex must be set when time_relation_mode is not keep.")
-    if mode == _TIME_RELATION_MODE_QUESTION and question_regex is None:
-        raise ValueError("time_question_regex must be set when time_relation_mode=question_gated.")
-    return TimeRelationConfig(mode=mode, relation_regex=relation_regex, question_regex=question_regex)
 
 
 def normalize_entity(entity: str, mode: str) -> str:
@@ -77,7 +131,9 @@ def normalize_entity(entity: str, mode: str) -> str:
     return entity
 
 
-def normalize_entity_with_lookup(entity: str, mode: str, label_to_qid: Dict[str, str]) -> str:
+def normalize_entity_with_lookup(
+    entity: str, mode: str, label_to_qid: Dict[str, str]
+) -> str:
     normalized = normalize_entity(entity, mode)
     if mode == "qid_in_parentheses" and normalized == entity:
         qid = label_to_qid.get(entity)
@@ -101,11 +157,15 @@ def to_list(field: object) -> List[str]:
 def load_split(raw_root: Path, split: str) -> ds.Dataset:
     paths = sorted(raw_root.glob(f"{split}-*.parquet"))
     if not paths:
-        raise FileNotFoundError(f"No parquet shards found for split '{split}' under {raw_root}")
+        raise FileNotFoundError(
+            f"No parquet shards found for split '{split}' under {raw_root}"
+        )
     return ds.dataset([str(p) for p in paths])
 
 
-def _resolve_hf_dataset_id(dataset: str, dataset_family: Optional[str], hf_dataset: Optional[str]) -> str:
+def _resolve_hf_dataset_id(
+    dataset: str, dataset_family: Optional[str], hf_dataset: Optional[str]
+) -> str:
     dataset_key = (dataset_family or dataset or "").strip().lower()
     dataset_id = hf_dataset or _HF_DATASET_BY_FAMILY.get(dataset_key)
     if dataset_id is None:
@@ -128,10 +188,9 @@ def _load_hf_split(
     cache_dir: Optional[Path] = None,
     offline: bool = False,
 ):
-    try:
-        from datasets import DownloadConfig, load_dataset  # type: ignore[import-not-found]
-    except ModuleNotFoundError as exc:  # pragma: no cover
-        raise ModuleNotFoundError("datasets is required for HF-based preprocessing.") from exc
+    hf_datasets = _import_hf_datasets_module()
+    DownloadConfig = hf_datasets.DownloadConfig
+    load_dataset = hf_datasets.load_dataset
 
     download_config = DownloadConfig(local_files_only=offline)
     cache_dir_str = str(cache_dir) if cache_dir is not None else None
@@ -174,7 +233,9 @@ def _row_to_sample(
                 for node_raw in (h_raw, t_raw):
                     label_match = _LABEL_QID_RE.match(node_raw)
                     if label_match:
-                        label_to_qid[label_match.group(1).strip()] = label_match.group(2)
+                        label_to_qid[label_match.group(1).strip()] = label_match.group(
+                            2
+                        )
             h = normalize_entity_with_lookup(h_raw, entity_normalization, label_to_qid)
             r = str(tr[1])
             t = normalize_entity_with_lookup(t_raw, entity_normalization, label_to_qid)
@@ -238,7 +299,9 @@ def iter_samples(
         source = str(dataset_source).strip().lower()
         if source == _DATA_SOURCE_HF:
             dataset_id = _resolve_hf_dataset_id(dataset, dataset_family, hf_dataset)
-            dataset_obj = _load_hf_split(dataset_id, split, cache_dir=hf_cache_dir, offline=hf_offline)
+            dataset_obj = _load_hf_split(
+                dataset_id, split, cache_dir=hf_cache_dir, offline=hf_offline
+            )
             row_iter = _iter_hf_rows(dataset_obj)
         elif source == _DATA_SOURCE_PARQUET:
             if raw_root is None:
@@ -246,7 +309,9 @@ def iter_samples(
             dataset_obj = load_split(raw_root, split)
             row_iter = _iter_parquet_rows(dataset_obj)
         else:
-            raise ValueError(f"Unsupported dataset_source={dataset_source!r}; expected '{_DATA_SOURCE_HF}' or 'parquet'.")
+            raise ValueError(
+                f"Unsupported dataset_source={dataset_source!r}; expected '{_DATA_SOURCE_HF}' or 'parquet'."
+            )
 
         for row in row_iter:
             yield _row_to_sample(

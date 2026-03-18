@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - train_rankflow
+  - _self_
+
+optimized_metric: "val/sub/answer/recall@10"
+
+model:
+  training_cfg:
+    exact_aux:
+      enabled: true
+      success_weight: 0.1
+      coverage_weight: 0.2
+      warmup_passes: 1.0
+      interval_steps: 16
+      max_graphs_per_batch: 2
+      eps: 1.0e-8

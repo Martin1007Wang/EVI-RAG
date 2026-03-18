@@ -1,4 +1,4 @@
-# Shared dataset defaults for g_retrieval.
+# Shared dataset defaults for graph_retrieval.
 
 name: ???
 dataset_family: ???
@@ -6,7 +6,6 @@ dataset_scope: ???
 # Total step budget (real edges only; super edges are internal).
 max_steps: ???
 hf_dataset: ???
-val_check_interval: ???
 run_test_after_fit: false
 kb: freebase
 
@@ -23,11 +22,12 @@ paths:
 
 lmdb_readahead: true
 sequential_sample_ids: true
-filter_missing_start:
+# Runtime-only masks applied when loading already materialized samples.
+runtime_filter_missing_start:
   train: true
   validation: true
   test: true
-filter_missing_answer:
+runtime_filter_missing_answer:
   train: true
   validation: true
   test: true
@@ -39,9 +39,6 @@ text_regex: "^(?!m\\.|g\\.).*"
 cvt_entity_mode: prefix_allowlist
 cvt_prefixes: ["m.", "g."]
 cvt_regex: null
-time_relation_mode: keep
-time_relation_regex: null
-time_question_regex: null
 
 column_map:
   question_id_field: id
@@ -51,4 +48,5 @@ column_map:
   a_entity_field: a_entity
   graph_field: graph
 
-# Training length is controlled by Trainer settings (limit_train_batches / max_steps).
+# Training length and validation cadence are resolved from `fit_schedule` after
+# the filtered train split size is known.

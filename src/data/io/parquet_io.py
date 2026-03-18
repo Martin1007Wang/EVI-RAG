@@ -35,7 +35,9 @@ def _validate_graph_record_schema() -> None:
         )
 
 
-def _validate_row_fields(rows: List[Dict[str, object]], *, allowed_fields: List[str], context: str) -> None:
+def _validate_row_fields(
+    rows: List[Dict[str, object]], *, allowed_fields: List[str], context: str
+) -> None:
     if not rows:
         return
     allowed = set(allowed_fields)
@@ -51,7 +53,9 @@ def _validate_question_rows(
     include_question_emb: bool,
     include_question_ctx: bool,
 ) -> None:
-    _validate_row_fields(rows, allowed_fields=list(_QUESTION_PARQUET_FIELDS), context="questions")
+    _validate_row_fields(
+        rows, allowed_fields=list(_QUESTION_PARQUET_FIELDS), context="questions"
+    )
     if not rows:
         return
     required = set(_QUESTION_PARQUET_REQUIRED_FIELDS)
@@ -64,15 +68,23 @@ def _validate_question_rows(
     has_ctx_mask = [QuestionFields.QUESTION_CTX_MASK in row for row in rows]
     if include_question_emb:
         if not all(has_emb):
-            raise ValueError("question_emb missing in questions while include_question_emb is enabled.")
+            raise ValueError(
+                "question_emb missing in questions while include_question_emb is enabled."
+            )
     else:
         if any(has_emb):
-            raise ValueError("question_emb present in questions while include_question_emb is disabled.")
+            raise ValueError(
+                "question_emb present in questions while include_question_emb is disabled."
+            )
     if include_question_ctx:
         if not all(has_ctx):
-            raise ValueError("question_ctx missing in questions while include_question_ctx is enabled.")
+            raise ValueError(
+                "question_ctx missing in questions while include_question_ctx is enabled."
+            )
         if not all(has_ctx_mask):
-            raise ValueError("question_ctx_mask missing in questions while include_question_ctx is enabled.")
+            raise ValueError(
+                "question_ctx_mask missing in questions while include_question_ctx is enabled."
+            )
     else:
         if any(has_ctx) or any(has_ctx_mask):
             raise ValueError(
@@ -82,12 +94,16 @@ def _validate_question_rows(
         has_ctx_i = QuestionFields.QUESTION_CTX in row
         has_mask_i = QuestionFields.QUESTION_CTX_MASK in row
         if has_ctx_i != has_mask_i:
-            raise ValueError(f"questions row {idx} must include question_ctx and question_ctx_mask together.")
+            raise ValueError(
+                f"questions row {idx} must include question_ctx and question_ctx_mask together."
+            )
         if has_ctx_i:
             ctx = row[QuestionFields.QUESTION_CTX]
             mask = row[QuestionFields.QUESTION_CTX_MASK]
             if not isinstance(ctx, list) or not isinstance(mask, list):
-                raise ValueError(f"questions row {idx} question_ctx/question_ctx_mask must be list types.")
+                raise ValueError(
+                    f"questions row {idx} question_ctx/question_ctx_mask must be list types."
+                )
             if len(ctx) != len(mask):
                 raise ValueError(
                     f"questions row {idx} question_ctx/question_ctx_mask length mismatch: "
@@ -95,7 +111,9 @@ def _validate_question_rows(
                 )
 
 
-def _validate_vocab_rows(rows: List[Dict[str, object]], *, allowed_fields: List[str], context: str) -> None:
+def _validate_vocab_rows(
+    rows: List[Dict[str, object]], *, allowed_fields: List[str], context: str
+) -> None:
     _validate_row_fields(rows, allowed_fields=allowed_fields, context=context)
 
 
@@ -118,21 +136,36 @@ class ParquetDatasetWriter:
             _validate_graph_record_schema()
             table = pa.table(
                 {
-                    GraphFields.GRAPH_ID: pa.array([g.graph_id for g in self.graphs], type=pa.string()),
-                    GraphFields.NODE_IDS: pa.array([g.node_entity_ids for g in self.graphs], type=pa.list_(pa.int64())),
-                    GraphFields.NODE_EMBED_IDS: pa.array(
-                        [g.node_embedding_ids for g in self.graphs], type=pa.list_(pa.int64())
+                    GraphFields.GRAPH_ID: pa.array(
+                        [g.graph_id for g in self.graphs], type=pa.string()
                     ),
-                    GraphFields.NODE_LABELS: pa.array([g.node_labels for g in self.graphs], type=pa.list_(pa.string())),
-                    GraphFields.EDGE_SRC: pa.array([g.edge_src for g in self.graphs], type=pa.list_(pa.int64())),
-                    GraphFields.EDGE_DST: pa.array([g.edge_dst for g in self.graphs], type=pa.list_(pa.int64())),
+                    GraphFields.NODE_IDS: pa.array(
+                        [g.node_entity_ids for g in self.graphs],
+                        type=pa.list_(pa.int64()),
+                    ),
+                    GraphFields.NODE_EMBED_IDS: pa.array(
+                        [g.node_embedding_ids for g in self.graphs],
+                        type=pa.list_(pa.int64()),
+                    ),
+                    GraphFields.NODE_LABELS: pa.array(
+                        [g.node_labels for g in self.graphs], type=pa.list_(pa.string())
+                    ),
+                    GraphFields.EDGE_SRC: pa.array(
+                        [g.edge_src for g in self.graphs], type=pa.list_(pa.int64())
+                    ),
+                    GraphFields.EDGE_DST: pa.array(
+                        [g.edge_dst for g in self.graphs], type=pa.list_(pa.int64())
+                    ),
                     GraphFields.EDGE_REL_IDS: pa.array(
-                        [g.edge_relation_ids for g in self.graphs], type=pa.list_(pa.int64())
+                        [g.edge_relation_ids for g in self.graphs],
+                        type=pa.list_(pa.int64()),
                     ),
                 }
             )
             if self.graph_writer is None:
-                self.graph_writer = pq.ParquetWriter(self.out_dir / "graphs.parquet", table.schema, compression="zstd")
+                self.graph_writer = pq.ParquetWriter(
+                    self.out_dir / "graphs.parquet", table.schema, compression="zstd"
+                )
             self.graph_writer.write_table(table)
             self.graphs = []
 
@@ -143,42 +176,64 @@ class ParquetDatasetWriter:
                 include_question_ctx=self.include_question_ctx,
             )
             table_q_data = {
-                QuestionFields.QUESTION_UID: pa.array(
-                    [row[QuestionFields.QUESTION_UID] for row in self.questions], type=pa.string()
-                ),
                 QuestionFields.DATASET: pa.array(
-                    [row[QuestionFields.DATASET] for row in self.questions], type=pa.string()
+                    [row[QuestionFields.DATASET] for row in self.questions],
+                    type=pa.string(),
                 ),
-                QuestionFields.SPLIT: pa.array([row[QuestionFields.SPLIT] for row in self.questions], type=pa.string()),
-                QuestionFields.KB: pa.array([row[QuestionFields.KB] for row in self.questions], type=pa.string()),
+                QuestionFields.SPLIT: pa.array(
+                    [row[QuestionFields.SPLIT] for row in self.questions],
+                    type=pa.string(),
+                ),
+                QuestionFields.KB: pa.array(
+                    [row[QuestionFields.KB] for row in self.questions], type=pa.string()
+                ),
                 QuestionFields.QUESTION: pa.array(
-                    [row[QuestionFields.QUESTION] for row in self.questions], type=pa.string()
+                    [row[QuestionFields.QUESTION] for row in self.questions],
+                    type=pa.string(),
                 ),
                 QuestionFields.SEED_ENTITY_IDS: pa.array(
-                    [row[QuestionFields.SEED_ENTITY_IDS] for row in self.questions], type=pa.list_(pa.int64())
+                    [row[QuestionFields.SEED_ENTITY_IDS] for row in self.questions],
+                    type=pa.list_(pa.int64()),
                 ),
                 QuestionFields.ANSWER_ENTITY_IDS: pa.array(
-                    [row[QuestionFields.ANSWER_ENTITY_IDS] for row in self.questions], type=pa.list_(pa.int64())
+                    [row[QuestionFields.ANSWER_ENTITY_IDS] for row in self.questions],
+                    type=pa.list_(pa.int64()),
                 ),
                 QuestionFields.ANSWER_TEXTS: pa.array(
-                    [row[QuestionFields.ANSWER_TEXTS] for row in self.questions], type=pa.list_(pa.string())
+                    [row[QuestionFields.ANSWER_TEXTS] for row in self.questions],
+                    type=pa.list_(pa.string()),
                 ),
                 QuestionFields.GRAPH_ID: pa.array(
-                    [row[QuestionFields.GRAPH_ID] for row in self.questions], type=pa.string()
+                    [row[QuestionFields.GRAPH_ID] for row in self.questions],
+                    type=pa.string(),
                 ),
             }
             if self.include_question_emb:
-                question_embs = [row[QuestionFields.QUESTION_EMB] for row in self.questions]
-                table_q_data[QuestionFields.QUESTION_EMB] = pa.array(question_embs, type=pa.list_(pa.float32()))
+                question_embs = [
+                    row[QuestionFields.QUESTION_EMB] for row in self.questions
+                ]
+                table_q_data[QuestionFields.QUESTION_EMB] = pa.array(
+                    question_embs, type=pa.list_(pa.float32())
+                )
             if self.include_question_ctx:
-                question_ctx = [row[QuestionFields.QUESTION_CTX] for row in self.questions]
-                question_ctx_mask = [row[QuestionFields.QUESTION_CTX_MASK] for row in self.questions]
-                table_q_data[QuestionFields.QUESTION_CTX] = pa.array(question_ctx, type=pa.list_(pa.list_(pa.float32())))
-                table_q_data[QuestionFields.QUESTION_CTX_MASK] = pa.array(question_ctx_mask, type=pa.list_(pa.bool_()))
+                question_ctx = [
+                    row[QuestionFields.QUESTION_CTX] for row in self.questions
+                ]
+                question_ctx_mask = [
+                    row[QuestionFields.QUESTION_CTX_MASK] for row in self.questions
+                ]
+                table_q_data[QuestionFields.QUESTION_CTX] = pa.array(
+                    question_ctx, type=pa.list_(pa.list_(pa.float32()))
+                )
+                table_q_data[QuestionFields.QUESTION_CTX_MASK] = pa.array(
+                    question_ctx_mask, type=pa.list_(pa.bool_())
+                )
             table_q = pa.table(table_q_data)
             if self.question_writer is None:
                 self.question_writer = pq.ParquetWriter(
-                    self.out_dir / "questions.parquet", table_q.schema, compression="zstd"
+                    self.out_dir / "questions.parquet",
+                    table_q.schema,
+                    compression="zstd",
                 )
             self.question_writer.write_table(table_q)
             self.questions = []
@@ -195,13 +250,27 @@ def write_graphs(graphs: List[GraphRecord], output_path: Path) -> None:
     _validate_graph_record_schema()
     table = pa.table(
         {
-            GraphFields.GRAPH_ID: pa.array([g.graph_id for g in graphs], type=pa.string()),
-            GraphFields.NODE_IDS: pa.array([g.node_entity_ids for g in graphs], type=pa.list_(pa.int64())),
-            GraphFields.NODE_EMBED_IDS: pa.array([g.node_embedding_ids for g in graphs], type=pa.list_(pa.int64())),
-            GraphFields.NODE_LABELS: pa.array([g.node_labels for g in graphs], type=pa.list_(pa.string())),
-            GraphFields.EDGE_SRC: pa.array([g.edge_src for g in graphs], type=pa.list_(pa.int64())),
-            GraphFields.EDGE_DST: pa.array([g.edge_dst for g in graphs], type=pa.list_(pa.int64())),
-            GraphFields.EDGE_REL_IDS: pa.array([g.edge_relation_ids for g in graphs], type=pa.list_(pa.int64())),
+            GraphFields.GRAPH_ID: pa.array(
+                [g.graph_id for g in graphs], type=pa.string()
+            ),
+            GraphFields.NODE_IDS: pa.array(
+                [g.node_entity_ids for g in graphs], type=pa.list_(pa.int64())
+            ),
+            GraphFields.NODE_EMBED_IDS: pa.array(
+                [g.node_embedding_ids for g in graphs], type=pa.list_(pa.int64())
+            ),
+            GraphFields.NODE_LABELS: pa.array(
+                [g.node_labels for g in graphs], type=pa.list_(pa.string())
+            ),
+            GraphFields.EDGE_SRC: pa.array(
+                [g.edge_src for g in graphs], type=pa.list_(pa.int64())
+            ),
+            GraphFields.EDGE_DST: pa.array(
+                [g.edge_dst for g in graphs], type=pa.list_(pa.int64())
+            ),
+            GraphFields.EDGE_REL_IDS: pa.array(
+                [g.edge_relation_ids for g in graphs], type=pa.list_(pa.int64())
+            ),
         }
     )
     pq.write_table(table, output_path, compression="zstd")
@@ -219,93 +288,147 @@ def write_questions(rows: List[Dict[str, object]], output_path: Path) -> None:
         include_question_ctx=include_question_ctx,
     )
     table_data = {
-        QuestionFields.QUESTION_UID: pa.array([row[QuestionFields.QUESTION_UID] for row in rows], type=pa.string()),
-        QuestionFields.DATASET: pa.array([row[QuestionFields.DATASET] for row in rows], type=pa.string()),
-        QuestionFields.SPLIT: pa.array([row[QuestionFields.SPLIT] for row in rows], type=pa.string()),
-        QuestionFields.KB: pa.array([row[QuestionFields.KB] for row in rows], type=pa.string()),
-        QuestionFields.QUESTION: pa.array([row[QuestionFields.QUESTION] for row in rows], type=pa.string()),
+        QuestionFields.DATASET: pa.array(
+            [row[QuestionFields.DATASET] for row in rows], type=pa.string()
+        ),
+        QuestionFields.SPLIT: pa.array(
+            [row[QuestionFields.SPLIT] for row in rows], type=pa.string()
+        ),
+        QuestionFields.KB: pa.array(
+            [row[QuestionFields.KB] for row in rows], type=pa.string()
+        ),
+        QuestionFields.QUESTION: pa.array(
+            [row[QuestionFields.QUESTION] for row in rows], type=pa.string()
+        ),
         QuestionFields.SEED_ENTITY_IDS: pa.array(
-            [row[QuestionFields.SEED_ENTITY_IDS] for row in rows], type=pa.list_(pa.int64())
+            [row[QuestionFields.SEED_ENTITY_IDS] for row in rows],
+            type=pa.list_(pa.int64()),
         ),
         QuestionFields.ANSWER_ENTITY_IDS: pa.array(
-            [row[QuestionFields.ANSWER_ENTITY_IDS] for row in rows], type=pa.list_(pa.int64())
+            [row[QuestionFields.ANSWER_ENTITY_IDS] for row in rows],
+            type=pa.list_(pa.int64()),
         ),
         QuestionFields.ANSWER_TEXTS: pa.array(
-            [row[QuestionFields.ANSWER_TEXTS] for row in rows], type=pa.list_(pa.string())
+            [row[QuestionFields.ANSWER_TEXTS] for row in rows],
+            type=pa.list_(pa.string()),
         ),
-        QuestionFields.GRAPH_ID: pa.array([row[QuestionFields.GRAPH_ID] for row in rows], type=pa.string()),
+        QuestionFields.GRAPH_ID: pa.array(
+            [row[QuestionFields.GRAPH_ID] for row in rows], type=pa.string()
+        ),
     }
     if include_question_emb:
         table_data[QuestionFields.QUESTION_EMB] = pa.array(
-            [row[QuestionFields.QUESTION_EMB] for row in rows], type=pa.list_(pa.float32())
+            [row[QuestionFields.QUESTION_EMB] for row in rows],
+            type=pa.list_(pa.float32()),
         )
     if include_question_ctx:
         table_data[QuestionFields.QUESTION_CTX] = pa.array(
-            [row[QuestionFields.QUESTION_CTX] for row in rows], type=pa.list_(pa.list_(pa.float32()))
+            [row[QuestionFields.QUESTION_CTX] for row in rows],
+            type=pa.list_(pa.list_(pa.float32())),
         )
         table_data[QuestionFields.QUESTION_CTX_MASK] = pa.array(
-            [row[QuestionFields.QUESTION_CTX_MASK] for row in rows], type=pa.list_(pa.bool_())
+            [row[QuestionFields.QUESTION_CTX_MASK] for row in rows],
+            type=pa.list_(pa.bool_()),
         )
     table = pa.table(table_data)
     pq.write_table(table, output_path, compression="zstd")
 
 
-def write_entity_vocab(vocab_records: List[Dict[str, object]], output_path: Path) -> None:
-    _validate_vocab_rows(vocab_records, allowed_fields=list(_ENTITY_VOCAB_FIELDS), context="entity_vocab")
+def write_entity_vocab(
+    vocab_records: List[Dict[str, object]], output_path: Path
+) -> None:
+    _validate_vocab_rows(
+        vocab_records, allowed_fields=list(_ENTITY_VOCAB_FIELDS), context="entity_vocab"
+    )
     table = pa.table(
         {
-            EntityVocabFields.ENTITY_ID: pa.array([rec[EntityVocabFields.ENTITY_ID] for rec in vocab_records], type=pa.int64()),
-            EntityVocabFields.KB: pa.array([rec[EntityVocabFields.KB] for rec in vocab_records], type=pa.string()),
-            EntityVocabFields.KG_ID: pa.array([rec[EntityVocabFields.KG_ID] for rec in vocab_records], type=pa.string()),
+            EntityVocabFields.ENTITY_ID: pa.array(
+                [rec[EntityVocabFields.ENTITY_ID] for rec in vocab_records],
+                type=pa.int64(),
+            ),
+            EntityVocabFields.KB: pa.array(
+                [rec[EntityVocabFields.KB] for rec in vocab_records], type=pa.string()
+            ),
+            EntityVocabFields.KG_ID: pa.array(
+                [rec[EntityVocabFields.KG_ID] for rec in vocab_records],
+                type=pa.string(),
+            ),
             EntityVocabFields.LABEL: pa.array(
-                [rec.get(EntityVocabFields.LABEL, "") for rec in vocab_records], type=pa.string()
+                [rec.get(EntityVocabFields.LABEL, "") for rec in vocab_records],
+                type=pa.string(),
             ),
             EntityVocabFields.IS_TEXT: pa.array(
-                [rec[EntityVocabFields.IS_TEXT] for rec in vocab_records], type=pa.bool_()
+                [rec[EntityVocabFields.IS_TEXT] for rec in vocab_records],
+                type=pa.bool_(),
             ),
             EntityVocabFields.IS_CVT: pa.array(
-                [rec[EntityVocabFields.IS_CVT] for rec in vocab_records], type=pa.bool_()
+                [rec[EntityVocabFields.IS_CVT] for rec in vocab_records],
+                type=pa.bool_(),
             ),
             EntityVocabFields.EMBEDDING_ID: pa.array(
-                [rec[EntityVocabFields.EMBEDDING_ID] for rec in vocab_records], type=pa.int64()
+                [rec[EntityVocabFields.EMBEDDING_ID] for rec in vocab_records],
+                type=pa.int64(),
             ),
         }
     )
     pq.write_table(table, output_path, compression="zstd")
 
 
-def write_embedding_vocab(vocab_records: List[Dict[str, object]], output_path: Path) -> None:
-    _validate_vocab_rows(vocab_records, allowed_fields=list(_EMBEDDING_VOCAB_FIELDS), context="embedding_vocab")
+def write_embedding_vocab(
+    vocab_records: List[Dict[str, object]], output_path: Path
+) -> None:
+    _validate_vocab_rows(
+        vocab_records,
+        allowed_fields=list(_EMBEDDING_VOCAB_FIELDS),
+        context="embedding_vocab",
+    )
     table = pa.table(
         {
             EmbeddingVocabFields.EMBEDDING_ID: pa.array(
-                [rec[EmbeddingVocabFields.EMBEDDING_ID] for rec in vocab_records], type=pa.int64()
+                [rec[EmbeddingVocabFields.EMBEDDING_ID] for rec in vocab_records],
+                type=pa.int64(),
             ),
-            EmbeddingVocabFields.KB: pa.array([rec[EmbeddingVocabFields.KB] for rec in vocab_records], type=pa.string()),
+            EmbeddingVocabFields.KB: pa.array(
+                [rec[EmbeddingVocabFields.KB] for rec in vocab_records],
+                type=pa.string(),
+            ),
             EmbeddingVocabFields.KG_ID: pa.array(
-                [rec[EmbeddingVocabFields.KG_ID] for rec in vocab_records], type=pa.string()
+                [rec[EmbeddingVocabFields.KG_ID] for rec in vocab_records],
+                type=pa.string(),
             ),
             EmbeddingVocabFields.LABEL: pa.array(
-                [rec.get(EmbeddingVocabFields.LABEL, "") for rec in vocab_records], type=pa.string()
+                [rec.get(EmbeddingVocabFields.LABEL, "") for rec in vocab_records],
+                type=pa.string(),
             ),
         }
     )
     pq.write_table(table, output_path, compression="zstd")
 
 
-def write_relation_vocab(vocab_records: List[Dict[str, object]], output_path: Path) -> None:
-    _validate_vocab_rows(vocab_records, allowed_fields=list(_RELATION_VOCAB_FIELDS), context="relation_vocab")
+def write_relation_vocab(
+    vocab_records: List[Dict[str, object]], output_path: Path
+) -> None:
+    _validate_vocab_rows(
+        vocab_records,
+        allowed_fields=list(_RELATION_VOCAB_FIELDS),
+        context="relation_vocab",
+    )
     table = pa.table(
         {
             RelationVocabFields.RELATION_ID: pa.array(
-                [rec[RelationVocabFields.RELATION_ID] for rec in vocab_records], type=pa.int64()
+                [rec[RelationVocabFields.RELATION_ID] for rec in vocab_records],
+                type=pa.int64(),
             ),
-            RelationVocabFields.KB: pa.array([rec[RelationVocabFields.KB] for rec in vocab_records], type=pa.string()),
+            RelationVocabFields.KB: pa.array(
+                [rec[RelationVocabFields.KB] for rec in vocab_records], type=pa.string()
+            ),
             RelationVocabFields.KG_ID: pa.array(
-                [rec[RelationVocabFields.KG_ID] for rec in vocab_records], type=pa.string()
+                [rec[RelationVocabFields.KG_ID] for rec in vocab_records],
+                type=pa.string(),
             ),
             RelationVocabFields.LABEL: pa.array(
-                [rec[RelationVocabFields.LABEL] for rec in vocab_records], type=pa.string()
+                [rec[RelationVocabFields.LABEL] for rec in vocab_records],
+                type=pa.string(),
             ),
         }
     )

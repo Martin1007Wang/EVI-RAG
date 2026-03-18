@@ -23,8 +23,6 @@ class EmbeddingConfig:
     fp16: bool
     progress_bar: bool
     embeddings_out_dir: Path
-    canonicalize_relations: bool
-    cosine_eps: float
     question_ctx_max_tokens: int
 
 
@@ -78,23 +76,6 @@ class CvtEntityConfig:
         if self.mode == "regex":
             return bool(self.regex.match(entity)) if self.regex is not None else False
         raise ValueError(f"Unsupported entity_cvt_mode: {self.mode}")
-
-
-@dataclass(frozen=True)
-class TimeRelationConfig:
-    mode: str
-    relation_regex: Optional[re.Pattern]
-    question_regex: Optional[re.Pattern]
-
-    def is_time_relation(self, relation: str) -> bool:
-        if self.relation_regex is None:
-            return False
-        return bool(self.relation_regex.search(relation))
-
-    def is_time_question(self, question: str) -> bool:
-        if self.question_regex is None:
-            return False
-        return bool(self.question_regex.search(question))
 
 
 @dataclass
