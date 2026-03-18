@@ -451,50 +451,6 @@ class GFlowNetModule(LightningModule):
         metrics["exact_aux_loss"] = loss.detach()
         return AuxiliaryLossResult(loss=loss, metrics=metrics)
 
-    def _compute_contrastive_auxiliary_loss(
-        self,
-        *,
-        sample_batch,
-    ) -> AuxiliaryLossResult | None:
-        contrastive_cfg = self.cfg.training_cfg.contrastive
-        if not bool(contrastive_cfg.enabled) or float(contrastive_cfg.weight) <= 0.0:
-            return None
-        move_counts = sample_batch.move_mask.to(dtype=torch.float32).sum(dim=-1)
-        denom = 1.0 + move_counts + float(contrastive_cfg.terminal_weight)
-        trajectory_scores = (
-            sample_batch.start_state_log_f.to(dtype=torch.float32)
-            + sample_batch.next_state_log_f_steps.to(dtype=torch.float32)
-            .mul(sample_batch.move_mask.to(dtype=torch.float32))
-            .sum(dim=-1)
-            + float(contrastive_cfg.terminal_weight)
-            * sample_batch.terminal_state_log_f.to(dtype=torch.float32)
-        ) / denom.clamp_min(1.0)
-        per_graph_losses: list[torch.Tensor] = []
-        for graph_idx in range(int(trajectory_scores.size(0))):
-            success_mask = sample_batch.success_mask[graph_idx]
-            failure_mask = ~success_mask
-            if int(success_mask.sum().item()) < int(contrastive_cfg.min_successes):
-                continue
-            if int(failure_mask.sum().item()) < int(contrastive_cfg.min_failures):
-                continue
-            logits = trajectory_scores[graph_idx] / float(contrastive_cfg.temperature)
-            log_denom = torch.logsumexp(logits, dim=0)
-            per_graph_losses.append(-(logits[success_mask] - log_denom).mean())
-        if not per_graph_losses:
-            return None
-        raw_loss = torch.stack(per_graph_losses).mean()
-        loss = float(contrastive_cfg.weight) * raw_loss
-        return AuxiliaryLossResult(
-            loss=loss,
-            metrics={
-                "contrastive_loss": raw_loss.detach(),
-                "contrastive_graphs": torch.tensor(
-                    float(len(per_graph_losses)), device=raw_loss.device
-                ),
-                "contrastive_mean_score": trajectory_scores.detach().mean(),
-            },
-        )
-
     def _success_replay_is_ready(self) -> bool:
         replay_cfg = self.cfg.training_cfg.success_replay
         if not bool(replay_cfg.enabled) or self.success_replay_buffer is None:
@@ -660,9 +616,6 @@ class GFlowNetModule(LightningModule):
         replay_graphs = 0
         total_loss = loss_output.loss
         exact_aux_result = self._compute_exact_auxiliary_loss(batch=trajectory_batch)
-        contrastive_aux_result = self._compute_contrastive_auxiliary_loss(
-            sample_batch=sample_batch
-        )
         on_policy_trajectories = int(trajectory_batch.num_graphs) * int(
             self.cfg.training_cfg.rollout_batch_size
         )
@@ -675,8 +628,6 @@ class GFlowNetModule(LightningModule):
             ) / float(total_trajectories)
         if exact_aux_result is not None:
             total_loss = total_loss + exact_aux_result.loss
-        if contrastive_aux_result is not None:
-            total_loss = total_loss + contrastive_aux_result.loss
         if self.success_replay_buffer is not None:
             self.success_replay_buffer.add_successes(
                 batch=trajectory_batch,
@@ -694,8 +645,6 @@ class GFlowNetModule(LightningModule):
         }
         if exact_aux_result is not None:
             metrics.update(exact_aux_result.metrics)
-        if contrastive_aux_result is not None:
-            metrics.update(contrastive_aux_result.metrics)
         if self.success_replay_buffer is not None:
             metrics["success_replay_buffer_size"] = float(
                 len(self.success_replay_buffer)

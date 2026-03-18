@@ -48,14 +48,6 @@ training_cfg:
     interval_steps: 8
     max_graphs_per_batch: 2
     eps: 1.0e-8
-  contrastive:
-    _target_: src.models.configs.gflownet.ContrastiveAuxConfig
-    enabled: false
-    weight: 0.0
-    temperature: 0.2
-    min_successes: 1
-    min_failures: 1
-    terminal_weight: 2.0
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
     lambda_weight: 1.0

@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from src.models.configs import (
-    ContrastiveAuxConfig,
     ExactAnswerObjectiveConfig,
     SearchEvalConfig,
     BackboneConfig,
@@ -388,37 +387,6 @@ def test_gflownet_training_step_logs_exact_auxiliary_metrics() -> None:
     assert "exact_aux_loss" in captured_metrics
     assert "exact_aux_success_loss" in captured_metrics
     assert "exact_aux_coverage_loss" in captured_metrics
-
-
-def test_gflownet_training_step_logs_contrastive_metrics() -> None:
-    module = _make_module_with_training_cfg(
-        "topology",
-        beta=0.5,
-        training_cfg=GFlowNetTrainingConfig(
-            rollout_batch_size=4,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
-            sampling_temperature=1.0,
-            contrastive=ContrastiveAuxConfig(
-                enabled=True,
-                weight=0.1,
-                temperature=0.2,
-            ),
-        ),
-    )
-    captured_metrics: dict[str, object] = {}
-
-    def _capture_metric_bundle(*, metrics: dict[str, object], **kwargs: object) -> None:
-        del kwargs
-        captured_metrics.update(metrics)
-
-    module._log_metric_bundle = _capture_metric_bundle  # type: ignore[method-assign]
-
-    loss = module.training_step(make_toy_batch(), batch_idx=0)
-
-    assert loss.ndim == 0
-    if "contrastive_loss" in captured_metrics:
-        assert captured_metrics["contrastive_loss"] is not None
 
 
 def test_gflownet_training_step_logs_effective_pass_when_schedule_is_set() -> None:

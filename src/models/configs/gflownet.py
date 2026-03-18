@@ -203,28 +203,6 @@ class ExactAnswerObjectiveConfig:
 
 
 @dataclass(frozen=True)
-class ContrastiveAuxConfig:
-    enabled: bool = False
-    weight: float = 0.0
-    temperature: float = 0.2
-    min_successes: int = 1
-    min_failures: int = 1
-    terminal_weight: float = 2.0
-
-    def __post_init__(self) -> None:
-        if self.weight < 0.0:
-            raise ValueError("training.contrastive.weight must be >= 0.")
-        if self.temperature <= 0.0:
-            raise ValueError("training.contrastive.temperature must be > 0.")
-        if self.min_successes < 1:
-            raise ValueError("training.contrastive.min_successes must be >= 1.")
-        if self.min_failures < 1:
-            raise ValueError("training.contrastive.min_failures must be >= 1.")
-        if self.terminal_weight < 0.0:
-            raise ValueError("training.contrastive.terminal_weight must be >= 0.")
-
-
-@dataclass(frozen=True)
 class GFlowNetTrainingConfig:
     rollout_batch_size: int = 8
     reward_epsilon: float = 1.0e-3
@@ -239,7 +217,6 @@ class GFlowNetTrainingConfig:
     exact_aux: ExactAnswerObjectiveConfig = field(
         default_factory=ExactAnswerObjectiveConfig
     )
-    contrastive: ContrastiveAuxConfig = field(default_factory=ContrastiveAuxConfig)
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
     )
@@ -258,7 +235,6 @@ class GFlowNetTrainingConfig:
 
 
 __all__ = [
-    "ContrastiveAuxConfig",
     "ExactAnswerObjectiveConfig",
     "GFlowNetTrainingConfig",
     "HeuristicConfig",
