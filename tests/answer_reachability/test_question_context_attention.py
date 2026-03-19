@@ -87,3 +87,23 @@ def test_masked_question_context_tokens_do_not_change_transition_logits() -> Non
     forward_b = policy.compute_forward_distribution(prepared_b, state)
 
     assert torch.allclose(forward_a.edge_logits, forward_b.edge_logits, atol=1.0e-6)
+
+
+def test_transition_logits_handle_bfloat16_autocast() -> None:
+    torch.manual_seed(2)
+    policy = make_policy(max_steps=2)
+    batch = make_toy_batch()
+    prepared = policy.prepare_batch(batch)
+    state = SearchState(
+        topology=prepared.topology,
+        observation=prepared.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.zeros((1, 1), dtype=torch.long),
+    )
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        distribution = policy.compute_forward_distribution(prepared, state)
+
+    assert distribution.edge_logits.dtype == torch.float32
+    assert torch.isfinite(distribution.edge_logits).all()

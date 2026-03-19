@@ -353,7 +353,7 @@ class BaseSearchPolicy(nn.Module):
                 int(graph_idx)
             ].unsqueeze(0)
             count = int(graph_mask.sum().item())
-            logits[graph_mask] = head(
+            graph_logits = head(
                 current_state_features[graph_mask].to(dtype=torch.float32),
                 candidate_state_features[graph_mask].to(dtype=torch.float32),
                 relation_features[graph_mask].to(dtype=torch.float32),
@@ -361,6 +361,7 @@ class BaseSearchPolicy(nn.Module):
                 question_context_tokens.expand(count, -1, -1).to(dtype=torch.float32),
                 question_context_mask.expand(count, -1),
             )
+            logits[graph_mask] = graph_logits.to(dtype=logits.dtype)
         return _mask_nonfinite_scores(logits.to(dtype=torch.float32))
 
     def _build_child_path_token_ids(
