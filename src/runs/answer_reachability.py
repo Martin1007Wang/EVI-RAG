@@ -280,6 +280,9 @@ class AnswerReachabilityTrainRunner:
     test: bool = False
     test_ckpt_path: str | None = None
     allow_test_without_checkpoint: bool = False
+    final_eval_experiment: str | None = None
+    final_eval_split: str = "test"
+    final_eval_output_subdir: str = "final_eval"
     ckpt_path: str | None = None
     init_ckpt_path: str | None = None
 

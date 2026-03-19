@@ -117,6 +117,18 @@ def load_dataset_config_by_name(
     return OmegaConf.create(dataset_cfg)
 
 
+def compose_config(
+    *,
+    config_name: str,
+    overrides: Sequence[str] | None = None,
+) -> DictConfig:
+    with _hydra_compose_context():
+        return hydra.compose(
+            config_name=config_name,
+            overrides=[str(item) for item in (overrides or [])],
+        )
+
+
 def resolve_dataset_variants(cfg: DictConfig) -> list[DatasetVariantSpec]:
     run_cfg = cfg.get("run") or {}
     raw_variants = run_cfg.get("dataset_variants")
@@ -239,6 +251,7 @@ def save_metrics_snapshot(
 
 
 __all__ = [
+    "compose_config",
     "collect_model_metrics",
     "DatasetVariantSpec",
     "load_dataset_config_by_name",

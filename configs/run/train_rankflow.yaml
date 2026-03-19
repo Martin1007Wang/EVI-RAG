@@ -10,8 +10,11 @@ contract:
   required_groups: [dataset]
   recommended_experiment: train_rankflow
 train: true
-test: ${dataset.run_test_after_fit}
+test: true
 test_ckpt_path: null
 allow_test_without_checkpoint: false
+final_eval_experiment: rankflow
+final_eval_split: test
+final_eval_output_subdir: final_eval
 ckpt_path: null
 init_ckpt_path: null

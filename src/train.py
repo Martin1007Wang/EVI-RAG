@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Protocol, Tuple, cast
 
 import lightning as L
@@ -6,7 +7,7 @@ import rootutils
 import torch
 
 from lightning import LightningModule
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
@@ -27,6 +28,14 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
+from src.runs.answer_reachability import AnswerReachabilityEvalReporter
+from src.runs.common import (
+    DatasetVariantSpec,
+    compose_config,
+    normalize_dataset_scope,
+    resolve_dataset_variants,
+    temporary_cfg_overrides,
+)
 from src.utils.entrypoint_utils import (
     instantiate_lightning_task_objects,
     instantiate_task_runner,
@@ -128,6 +137,267 @@ def _configure_pass_fit_schedule(
     return resolved
 
 
+def _clone_cfg_node(node: Any) -> Any:
+    if node is None:
+        return None
+    if OmegaConf.is_config(node):
+        return OmegaConf.create(OmegaConf.to_container(node, resolve=False))
+    return OmegaConf.create(node)
+
+
+def _resolve_model_contract_value(
+    cfg: DictConfig,
+    *,
+    field_name: str,
+) -> str | None:
+    model_cfg = cfg.get("model") or {}
+    contract_cfg = model_cfg.get("contract") or {}
+    raw_value = contract_cfg.get(field_name) if hasattr(contract_cfg, "get") else None
+    if raw_value in (None, "", "null", "None"):
+        return None
+    return str(raw_value)
+
+
+def _align_validation_metrics_profile(cfg: DictConfig) -> None:
+    validation_profile = _resolve_model_contract_value(
+        cfg,
+        field_name="validation_metrics_profile",
+    )
+    if validation_profile is None:
+        return
+    current_profile = str(cfg.model.eval_cfg.get("metrics_profile") or "")
+    if current_profile == validation_profile:
+        return
+    with open_dict(cfg):
+        cfg.model.eval_cfg.metrics_profile = validation_profile
+    log.info(
+        "Aligned training-time validation metrics_profile=%s from model contract.",
+        validation_profile,
+    )
+
+
+def _resolve_post_fit_ckpt_path(
+    *,
+    run_cfg: DictConfig | dict[str, Any],
+    trainer: Any,
+) -> Optional[str]:
+    test_ckpt_path: Optional[str] = run_cfg.get("test_ckpt_path")
+    if test_ckpt_path not in (None, ""):
+        return test_ckpt_path
+
+    checkpoint_callback = trainer.checkpoint_callback
+    if checkpoint_callback is None:
+        raise RuntimeError(
+            "Testing requested but no checkpoint callback is configured. "
+            "Provide `test_ckpt_path` or enable a checkpoint callback."
+        )
+
+    ckpt_path = checkpoint_callback.best_model_path
+    if ckpt_path != "":
+        return ckpt_path
+
+    if bool(run_cfg.get("allow_test_without_checkpoint", False)):
+        log.warning("Best ckpt not found! Using current weights for testing...")
+        return None
+
+    raise RuntimeError(
+        "Best checkpoint path is empty. Set `allow_test_without_checkpoint=True` "
+        "or provide `test_ckpt_path` to proceed explicitly."
+    )
+
+
+def _resolve_train_output_dir(cfg: DictConfig) -> Path:
+    try:
+        return Path(str(cfg.paths.output_dir))
+    except Exception:
+        paths_cfg = cfg.get("paths") or {}
+        root_dir = paths_cfg.get("root_dir") if hasattr(paths_cfg, "get") else None
+        if root_dir not in (None, ""):
+            return Path(str(root_dir))
+        return Path.cwd()
+
+
+def _build_final_eval_cfg(
+    cfg: DictConfig,
+    *,
+    ckpt_path: str,
+) -> DictConfig:
+    run_cfg = cfg.get("run") or {}
+    dataset_cfg = cfg.get("dataset") or {}
+    dataset_name = str(dataset_cfg.get("name") or "").strip()
+    if not dataset_name:
+        raise ValueError("Final eval requires `dataset.name` to be populated.")
+
+    final_eval_experiment = str(
+        run_cfg.get("final_eval_experiment") or "rankflow"
+    ).strip()
+    final_eval_split = str(run_cfg.get("final_eval_split") or "test").strip() or "test"
+    output_subdir = str(run_cfg.get("final_eval_output_subdir") or "final_eval").strip()
+    output_dir = str(_resolve_train_output_dir(cfg) / output_subdir)
+
+    eval_template = compose_config(
+        config_name="eval.yaml",
+        overrides=[
+            f"experiment={final_eval_experiment}",
+            f"dataset={dataset_name}",
+            f"ckpt.gflownet={ckpt_path}",
+            f"paths.output_dir={output_dir}",
+            "extras.enforce_tags=false",
+            "extras.print_config=false",
+        ],
+    )
+
+    eval_cfg = _clone_cfg_node(eval_template)
+    final_eval_profile = _resolve_model_contract_value(
+        cfg,
+        field_name="final_eval_metrics_profile",
+    )
+    merged_eval_cfg = OmegaConf.merge(
+        _clone_cfg_node(cfg.model.eval_cfg),
+        _clone_cfg_node(eval_template.model.eval_cfg),
+    )
+    if final_eval_profile is not None:
+        with open_dict(merged_eval_cfg):
+            merged_eval_cfg.metrics_profile = final_eval_profile
+
+    model_cfg = _clone_cfg_node(cfg.model)
+    with open_dict(model_cfg):
+        model_cfg.eval_cfg = merged_eval_cfg
+
+    with open_dict(eval_cfg):
+        eval_cfg.seed = cfg.get("seed")
+        eval_cfg.ckpt_path = ckpt_path
+        eval_cfg.paths = OmegaConf.merge(
+            _clone_cfg_node(cfg.paths),
+            OmegaConf.create({"output_dir": output_dir}),
+        )
+        eval_cfg.dataset = _clone_cfg_node(cfg.dataset)
+        eval_cfg.data = _clone_cfg_node(cfg.data)
+        eval_cfg.model = model_cfg
+        eval_cfg.callbacks = OmegaConf.create({})
+        eval_cfg.logger = OmegaConf.create({})
+        eval_cfg.trainer = _clone_cfg_node(eval_template.trainer)
+        eval_cfg.run = _clone_cfg_node(eval_template.run)
+        eval_cfg.run.split = final_eval_split
+        eval_cfg.run.ckpt_path = ckpt_path
+
+    return eval_cfg
+
+
+def _namespace_final_eval_metrics(
+    *,
+    metrics: Dict[str, Any],
+    dataset_variant: str,
+    split: str,
+) -> Dict[str, Any]:
+    prefix = f"final_eval/{dataset_variant}/{split}"
+    return {f"{prefix}/{name}": value for name, value in metrics.items()}
+
+
+def _default_final_eval_variant(cfg: DictConfig) -> DatasetVariantSpec:
+    dataset_cfg = _clone_cfg_node(cfg.dataset)
+    label = str(dataset_cfg.get("name") or normalize_dataset_scope(dataset_cfg))
+    return DatasetVariantSpec(
+        label=label,
+        dataset_name=label,
+        dataset_cfg=dataset_cfg,
+        run_overrides={},
+    )
+
+
+def _run_final_eval_suite(cfg: DictConfig) -> Dict[str, Any]:
+    from src.eval import evaluate_model as evaluate_model_fn
+
+    reporter = AnswerReachabilityEvalReporter()
+    variants = resolve_dataset_variants(cfg)
+    if not variants:
+        variants = [_default_final_eval_variant(cfg)]
+
+    final_metrics: Dict[str, Any] = {}
+    split = str(cfg.run.get("split") or "test")
+    metrics_profile = str(cfg.model.eval_cfg.get("metrics_profile") or "")
+    for variant in variants:
+        log.info(
+            "Final evaluation: dataset_variant=%s split=%s metrics_profile=%s",
+            variant.label,
+            split,
+            metrics_profile,
+        )
+        with temporary_cfg_overrides(
+            cfg,
+            dataset_cfg=variant.dataset_cfg,
+            run_overrides={
+                **variant.run_overrides,
+                "dataset_variant": variant.label,
+            },
+        ):
+            metric_dict, object_dict = evaluate_model_fn(cfg)
+            persisted_metrics = reporter.persist_outputs(
+                cfg=cfg,
+                callback_metrics=metric_dict,
+                model=object_dict["model"],
+                log=log,
+            )
+            final_metrics.update(
+                _namespace_final_eval_metrics(
+                    metrics=persisted_metrics,
+                    dataset_variant=variant.label,
+                    split=split,
+                )
+            )
+    return final_metrics
+
+
+def _run_inprocess_test(
+    *,
+    trainer: Any,
+    model: LightningModule,
+    datamodule: Any,
+    ckpt_path: Optional[str],
+) -> Dict[str, Any]:
+    trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+    log.info("Best ckpt path: %s", ckpt_path)
+    return dict(trainer.callback_metrics)
+
+
+def _run_post_fit_evaluation(
+    *,
+    cfg: DictConfig,
+    trainer: Any,
+    model: LightningModule,
+    datamodule: Any,
+) -> Dict[str, Any]:
+    run_cfg = cfg.get("run") or {}
+    if not bool(run_cfg.get("test", False)):
+        return {}
+
+    log.info("Starting post-fit evaluation!")
+    ckpt_path = _resolve_post_fit_ckpt_path(run_cfg=run_cfg, trainer=trainer)
+    final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
+    if final_eval_experiment:
+        if ckpt_path is None:
+            log.warning(
+                "Final eval experiment=%s requested without a resolved checkpoint path; "
+                "falling back to in-process trainer.test().",
+                final_eval_experiment,
+            )
+            return _run_inprocess_test(
+                trainer=trainer,
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+            )
+        final_eval_cfg = _build_final_eval_cfg(cfg, ckpt_path=ckpt_path)
+        return _run_final_eval_suite(final_eval_cfg)
+
+    return _run_inprocess_test(
+        trainer=trainer,
+        model=model,
+        datamodule=datamodule,
+        ckpt_path=ckpt_path,
+    )
+
+
 @task_wrapper
 def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
@@ -143,10 +413,28 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
 
+    _align_validation_metrics_profile(cfg)
+
     resolved_run_name = apply_run_name(cfg)
     log.info(f"Resolved run name: {resolved_run_name}")
 
     run_cfg = cfg.get("run") or {}
+    log.info(
+        "Training-time validation metrics_profile=%s",
+        cfg.model.eval_cfg.get("metrics_profile"),
+    )
+    if bool(run_cfg.get("test", False)):
+        final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
+        if final_eval_experiment:
+            log.info(
+                "Post-fit final evaluation is enabled: experiment=%s split=%s output_subdir=%s",
+                final_eval_experiment,
+                run_cfg.get("final_eval_split") or "test",
+                run_cfg.get("final_eval_output_subdir") or "final_eval",
+            )
+        else:
+            log.info("Post-fit evaluation is enabled via in-process trainer.test().")
+
     resolved_fit_schedule: ResolvedPassFitSchedule | None = None
 
     def _on_datamodule_instantiated(datamodule: Any) -> None:
@@ -180,36 +468,13 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
 
-    train_metrics = trainer.callback_metrics
-
-    if bool(run_cfg.get("test", False)):
-        log.info("Starting testing!")
-        test_ckpt_path: Optional[str] = run_cfg.get("test_ckpt_path")
-        if test_ckpt_path not in (None, ""):
-            ckpt_path = test_ckpt_path
-        else:
-            checkpoint_callback = trainer.checkpoint_callback
-            if checkpoint_callback is None:
-                raise RuntimeError(
-                    "Testing requested but no checkpoint callback is configured. "
-                    "Provide `test_ckpt_path` or enable a checkpoint callback."
-                )
-            ckpt_path = checkpoint_callback.best_model_path
-            if ckpt_path == "":
-                if bool(run_cfg.get("allow_test_without_checkpoint", False)):
-                    log.warning(
-                        "Best ckpt not found! Using current weights for testing..."
-                    )
-                    ckpt_path = None
-                else:
-                    raise RuntimeError(
-                        "Best checkpoint path is empty. Set `allow_test_without_checkpoint=True` "
-                        "or provide `test_ckpt_path` to proceed explicitly."
-                    )
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-        log.info(f"Best ckpt path: {ckpt_path}")
-
-    test_metrics = trainer.callback_metrics
+    train_metrics = dict(trainer.callback_metrics)
+    test_metrics = _run_post_fit_evaluation(
+        cfg=cfg,
+        trainer=trainer,
+        model=model,
+        datamodule=datamodule,
+    )
 
     # merge train and test metrics
     metric_dict = {**train_metrics, **test_metrics}

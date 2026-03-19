@@ -6,7 +6,12 @@ import pytest
 from omegaconf import OmegaConf
 
 from src.eval import _configure_eval_split, _enforce_single_gpu_eval
-from src.train import _maybe_load_model_weights
+from src.train import (
+    _align_validation_metrics_profile,
+    _build_final_eval_cfg,
+    _maybe_load_model_weights,
+    _run_post_fit_evaluation,
+)
 from src.utils.entrypoint_contracts import (
     validate_eval_entry_contract,
     validate_train_entry_contract,
@@ -72,6 +77,177 @@ def test_maybe_load_model_weights_uses_state_dict_payload(monkeypatch) -> None:
     )
 
     assert seen == {"state_dict": {"layer.weight": 1}, "strict": False}
+
+
+def test_align_validation_metrics_profile_uses_model_contract() -> None:
+    cfg = OmegaConf.create(
+        {
+            "model": {
+                "contract": {"validation_metrics_profile": "rank_only"},
+                "eval_cfg": {"metrics_profile": "full"},
+            }
+        }
+    )
+
+    _align_validation_metrics_profile(cfg)
+
+    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
+
+
+def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
+    monkeypatch, tmp_path
+) -> None:
+    train_cfg = OmegaConf.create(
+        {
+            "seed": 7,
+            "paths": {
+                "output_dir": str(tmp_path / "train-run"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp-sub",
+                "dataset_family": "webqsp",
+                "dataset_scope": "sub",
+            },
+            "data": {"batch_size": 32, "num_workers": 4},
+            "model": {
+                "contract": {"final_eval_metrics_profile": "full"},
+                "policy_cfg": {"backbone": {"hidden_dim": 512}},
+                "eval_cfg": {
+                    "metrics_profile": "rank_only",
+                    "max_expansions": 100000,
+                    "max_frontier_size": 32768,
+                },
+            },
+            "run": {
+                "final_eval_experiment": "rankflow",
+                "final_eval_split": "test",
+                "final_eval_output_subdir": "final_eval",
+            },
+        }
+    )
+    eval_template = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "template"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp",
+                "dataset_family": "webqsp",
+                "dataset_scope": "full",
+            },
+            "data": {"batch_size": 64},
+            "model": {
+                "eval_cfg": {
+                    "metrics_profile": "full",
+                    "max_expansions": 500000,
+                    "max_frontier_size": 65536,
+                }
+            },
+            "trainer": {"accelerator": "gpu", "devices": 1},
+            "run": {
+                "name": "rankflow",
+                "split": "test",
+                "execution_mode": "predict",
+                "dataset_variants": [
+                    "${dataset.dataset_family}",
+                    "${dataset.dataset_family}-sub",
+                ],
+                "ckpt_path": "${ckpt.gflownet}",
+            },
+        }
+    )
+
+    monkeypatch.setattr("src.train.compose_config", lambda **_: eval_template)
+
+    final_eval_cfg = _build_final_eval_cfg(train_cfg, ckpt_path="/tmp/best.ckpt")
+
+    assert final_eval_cfg.run.name == "rankflow"
+    assert final_eval_cfg.run.split == "test"
+    assert final_eval_cfg.ckpt_path == "/tmp/best.ckpt"
+    assert final_eval_cfg.paths.output_dir.endswith("final_eval")
+    assert final_eval_cfg.dataset.name == "webqsp-sub"
+    assert final_eval_cfg.model.policy_cfg.backbone.hidden_dim == 512
+    assert final_eval_cfg.model.eval_cfg.metrics_profile == "full"
+    assert final_eval_cfg.model.eval_cfg.max_expansions == 500000
+    assert final_eval_cfg.model.eval_cfg.max_frontier_size == 65536
+    assert final_eval_cfg.trainer.devices == 1
+    assert list(final_eval_cfg.callbacks.keys()) == []
+    assert list(final_eval_cfg.logger.keys()) == []
+
+
+def test_run_post_fit_evaluation_uses_final_eval_suite(monkeypatch) -> None:
+    cfg = OmegaConf.create(
+        {
+            "run": {"test": True, "final_eval_experiment": "rankflow"},
+        }
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "src.train._resolve_post_fit_ckpt_path",
+        lambda **_: "/tmp/best.ckpt",
+    )
+
+    def _build_eval_cfg(current_cfg, *, ckpt_path):  # type: ignore[no-untyped-def]
+        seen["build"] = (current_cfg, ckpt_path)
+        return OmegaConf.create({"run": {"split": "test"}})
+
+    monkeypatch.setattr("src.train._build_final_eval_cfg", _build_eval_cfg)
+    monkeypatch.setattr(
+        "src.train._run_final_eval_suite",
+        lambda eval_cfg: {
+            "final_eval/webqsp-sub/test/answer/recall@10": 0.5,
+            "seen_cfg": eval_cfg,
+        },
+    )
+
+    metrics = _run_post_fit_evaluation(
+        cfg=cfg,
+        trainer=SimpleNamespace(
+            checkpoint_callback=SimpleNamespace(best_model_path="/tmp/best.ckpt")
+        ),
+        model=SimpleNamespace(),
+        datamodule=SimpleNamespace(),
+    )
+
+    assert seen["build"] == (cfg, "/tmp/best.ckpt")
+    assert metrics["final_eval/webqsp-sub/test/answer/recall@10"] == 0.5
+
+
+def test_run_post_fit_evaluation_falls_back_to_inprocess_test_when_ckpt_missing() -> (
+    None
+):
+    trainer = SimpleNamespace(
+        checkpoint_callback=SimpleNamespace(best_model_path=""),
+        callback_metrics={"test/answer/recall@10": 0.3},
+    )
+    seen = {"called": False}
+
+    def _test(**_: object) -> None:
+        seen["called"] = True
+
+    trainer.test = _test
+    cfg = OmegaConf.create(
+        {
+            "run": {
+                "test": True,
+                "final_eval_experiment": "rankflow",
+                "allow_test_without_checkpoint": True,
+            }
+        }
+    )
+
+    metrics = _run_post_fit_evaluation(
+        cfg=cfg,
+        trainer=trainer,
+        model=SimpleNamespace(),
+        datamodule=SimpleNamespace(),
+    )
+
+    assert seen["called"] is True
+    assert metrics == {"test/answer/recall@10": 0.3}
 
 
 def test_validate_train_entry_contract_rejects_eval_experiment() -> None:

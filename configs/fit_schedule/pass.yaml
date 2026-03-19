@@ -7,10 +7,13 @@
 mode: pass_based
 
 # Total train-set passes to allow before the Trainer hard-stop fires.
-max_passes: 120.0
+# This keeps the canonical RankFlow runs alive long enough to reach late-pass
+# improvements instead of capping out near the old ~60-check regime.
+max_passes: 240.0
 
 # Run validation after approximately this many train-set passes.
 val_every_passes: 2.0
 
 # Early stopping patience expressed in train-set passes instead of raw val checks.
-early_stopping_patience_passes: 24.0
+# With the default 2-pass validation cadence, this is 24 validation checks.
+early_stopping_patience_passes: 48.0

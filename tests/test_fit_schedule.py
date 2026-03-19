@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from hydra import compose, initialize_config_dir
 import pytest
 
 from omegaconf import OmegaConf
@@ -66,3 +69,22 @@ def test_resolve_pass_fit_schedule_rejects_non_positive_values() -> None:
             train_size=128,
             per_device_batch_size=32,
         )
+
+
+def test_train_rankflow_experiment_uses_canonical_long_pass_schedule() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "experiment=train_rankflow",
+                "dataset=webqsp-sub",
+                "extras.enforce_tags=false",
+                "extras.print_config=false",
+            ],
+        )
+
+    assert cfg.fit_schedule.max_passes == pytest.approx(240.0)
+    assert cfg.fit_schedule.val_every_passes == pytest.approx(2.0)
+    assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(48.0)
