@@ -26,10 +26,19 @@ def make_batch_from_graph(
     answer_entity_ids: torch.Tensor,
     node_global_ids: torch.Tensor | None = None,
     sample_id: str = "toy-sample",
+    question_emb: torch.Tensor | None = None,
+    question_ctx: torch.Tensor | None = None,
+    question_ctx_mask: torch.Tensor | None = None,
 ) -> TrajectoryBatch:
     if node_global_ids is None:
         node_global_ids = torch.arange(100, 100 + num_nodes, dtype=torch.long)
     emb_dim = 8
+    if question_emb is None:
+        question_emb = torch.randn(1, emb_dim)
+    if question_ctx is None:
+        question_ctx = torch.randn(1, 2, emb_dim)
+    if question_ctx_mask is None:
+        question_ctx_mask = torch.tensor([[True, True]], dtype=torch.bool)
     return TrajectoryBatch(
         num_graphs=1,
         node_ptr=torch.tensor([0, num_nodes], dtype=torch.long),
@@ -39,9 +48,9 @@ def make_batch_from_graph(
         node_batch=torch.zeros((num_nodes,), dtype=torch.long),
         node_embeddings=torch.randn(num_nodes, emb_dim),
         edge_embeddings=torch.randn(edge_index.size(1), emb_dim),
-        question_emb=torch.randn(1, emb_dim),
-        question_ctx=torch.randn(1, 2, emb_dim),
-        question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
+        question_emb=question_emb,
+        question_ctx=question_ctx,
+        question_ctx_mask=question_ctx_mask,
         q_local_indices=q_local_indices,
         q_ptr=torch.tensor([0, int(q_local_indices.numel())], dtype=torch.long),
         a_local_indices=a_local_indices,

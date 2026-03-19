@@ -26,6 +26,7 @@ class BackboneInput:
     edge_index: torch.Tensor
     edge_relations: torch.Tensor
     num_nodes: int
+    question_context: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class BackboneOutput:
     node_tokens: torch.Tensor
     relation_tokens: torch.Tensor
     question_tokens: torch.Tensor
+    question_context_tokens: torch.Tensor
 
 
 class EmbeddingAdapter(nn.Module):
@@ -119,11 +121,17 @@ class EmbeddingBackbone(nn.Module):
         node_features: torch.Tensor,
         relation_features: torch.Tensor,
         question_embedding: torch.Tensor,
+        question_context: torch.Tensor | None = None,
     ) -> BackboneOutput:
+        if question_context is None:
+            question_context = question_embedding.unsqueeze(1)
         return BackboneOutput(
             node_tokens=self.project_node_embeddings(node_features),
             relation_tokens=self.project_relation_embeddings(relation_features),
             question_tokens=self.project_question_embeddings(question_embedding),
+            question_context_tokens=self.project_question_context_embeddings(
+                question_context
+            ),
         )
 
     def encode(self, inputs: BackboneInput) -> BackboneOutput:
@@ -131,6 +139,7 @@ class EmbeddingBackbone(nn.Module):
             node_features=inputs.node_features,
             relation_features=inputs.relation_features,
             question_embedding=inputs.question_embedding,
+            question_context=inputs.question_context,
         )
         node_tokens = self.encode_graph(
             node_tokens=projected.node_tokens,
@@ -143,6 +152,7 @@ class EmbeddingBackbone(nn.Module):
             node_tokens=node_tokens,
             relation_tokens=projected.relation_tokens,
             question_tokens=projected.question_tokens,
+            question_context_tokens=projected.question_context_tokens,
         )
 
     def forward(self, inputs: BackboneInput) -> BackboneOutput:
@@ -162,6 +172,11 @@ class EmbeddingBackbone(nn.Module):
 
     def project_question_embeddings(self, question_emb: torch.Tensor) -> torch.Tensor:
         return self.q_proj(question_emb)
+
+    def project_question_context_embeddings(
+        self, question_context: torch.Tensor
+    ) -> torch.Tensor:
+        return self.q_proj(question_context)
 
     def encode_graph(
         self,

@@ -14,6 +14,13 @@ from src.models.configs import HeuristicConfig, PolicyConfig
 from src.utils.segment_ops import segment_logsumexp_1d
 
 from .heuristics import SearchHeuristic
+from .path import (
+    append_relation_and_node_tokens,
+    build_path_token_embeddings,
+    derive_parent_path_token_ids,
+    encode_path_history,
+    initialize_path_token_ids,
+)
 from .types import (
     ForwardActionDistribution,
     PreparedGFlowNetBatch,
@@ -126,6 +133,19 @@ class BaseSearchPolicy(nn.Module):
         self.backward_policy_head = backward_policy_head
         self.step_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
         self.remaining_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
+        self.path_position_embedding = nn.Embedding(
+            (2 * self.max_steps) + 1, graph_hidden_dim
+        )
+        self.path_self_attention = nn.MultiheadAttention(
+            embed_dim=graph_hidden_dim,
+            num_heads=1,
+            dropout=float(config.state_score_head.dropout),
+            batch_first=True,
+        )
+        self.path_self_attention_norm = nn.LayerNorm(graph_hidden_dim)
+        self.path_summary_proj = nn.Linear(
+            graph_hidden_dim, graph_hidden_dim, bias=False
+        )
         self.state_feature_norm = nn.LayerNorm(graph_hidden_dim)
         self.backbone = backbone
 
@@ -136,6 +156,7 @@ class BaseSearchPolicy(nn.Module):
                 node_features=observation.node_features,
                 relation_features=observation.relation_features,
                 question_embedding=observation.question_embedding,
+                question_context=observation.question_context,
                 edge_index=topology.edge_index,
                 edge_relations=topology.edge_type,
                 num_nodes=topology.num_nodes,
@@ -147,6 +168,8 @@ class BaseSearchPolicy(nn.Module):
             node_tokens=encoded.node_tokens,
             relation_tokens=encoded.relation_tokens,
             question_tokens=encoded.question_tokens,
+            question_context_tokens=encoded.question_context_tokens,
+            question_context_mask=observation.question_valid_mask,
         )
 
     def encode(self, batch) -> PreparedSearchBatch:
@@ -199,6 +222,7 @@ class BaseSearchPolicy(nn.Module):
         flat_nodes: torch.Tensor,
         flat_num_steps: torch.Tensor,
         flat_done_mask: torch.Tensor,
+        flat_path_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_nodes = int(prepared_batch.topology.num_nodes)
         safe_nodes = flat_nodes.clamp(min=0, max=max(num_nodes - 1, 0))
@@ -211,13 +235,49 @@ class BaseSearchPolicy(nn.Module):
         remaining_features = self.remaining_embedding(remaining_ids).to(
             dtype=node_features.dtype
         )
+        path_summary = self._build_path_summary(
+            prepared_batch=prepared_batch,
+            flat_nodes=flat_nodes,
+            flat_num_steps=flat_num_steps,
+            flat_path_token_ids=flat_path_token_ids,
+        )
         state_features = self.state_feature_norm(
-            node_features + step_features + remaining_features
+            node_features
+            + step_features
+            + remaining_features
+            + self.path_summary_proj(path_summary).to(dtype=node_features.dtype)
         )
         return torch.where(
             flat_done_mask.unsqueeze(-1),
             torch.zeros_like(state_features),
             state_features,
+        )
+
+    def _build_path_summary(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        flat_nodes: torch.Tensor,
+        flat_num_steps: torch.Tensor,
+        flat_path_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if flat_path_token_ids is None:
+            flat_path_token_ids = flat_nodes.new_zeros(
+                (int(flat_nodes.numel()), (2 * self.max_steps) + 1)
+            )
+            flat_path_token_ids[:, 0] = flat_nodes
+        path_tokens = build_path_token_embeddings(
+            path_token_ids=flat_path_token_ids,
+            path_lengths=(2 * flat_num_steps + 1).to(dtype=torch.long),
+            node_tokens=prepared_batch.node_tokens,
+            relation_tokens=prepared_batch.relation_tokens,
+            position_embedding=self.path_position_embedding,
+        )
+        return encode_path_history(
+            path_tokens=path_tokens,
+            path_lengths=(2 * flat_num_steps + 1).to(dtype=torch.long),
+            path_self_attention=self.path_self_attention,
+            path_self_attention_norm=self.path_self_attention_norm,
         )
 
     def build_state_features(
@@ -231,6 +291,7 @@ class BaseSearchPolicy(nn.Module):
             flat_nodes=state.flatten_current_nodes(),
             flat_num_steps=state.flatten_num_steps(),
             flat_done_mask=state.flatten_done_mask(),
+            flat_path_token_ids=state.flatten_path_token_ids(max_steps=self.max_steps),
         )
         return flat_features.view(batch_size, num_rollouts, -1)
 
@@ -277,14 +338,66 @@ class BaseSearchPolicy(nn.Module):
     ) -> torch.Tensor:
         relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
         relation_features = prepared_batch.relation_tokens.index_select(0, relation_ids)
-        question_features = prepared_batch.question_tokens.index_select(0, graph_ids)
-        logits = head(
-            current_state_features.to(dtype=torch.float32),
-            candidate_state_features.to(dtype=torch.float32),
-            relation_features.to(dtype=torch.float32),
-            question_features.to(dtype=torch.float32),
+        logits = torch.empty(
+            (int(graph_ids.numel()),), device=graph_ids.device, dtype=torch.float32
         )
+        for graph_idx in torch.unique(graph_ids, sorted=True).tolist():
+            graph_mask = graph_ids == int(graph_idx)
+            question_features = prepared_batch.question_tokens[
+                int(graph_idx)
+            ].unsqueeze(0)
+            question_context_tokens = prepared_batch.question_context_tokens[
+                int(graph_idx)
+            ].unsqueeze(0)
+            question_context_mask = prepared_batch.question_context_mask[
+                int(graph_idx)
+            ].unsqueeze(0)
+            count = int(graph_mask.sum().item())
+            logits[graph_mask] = head(
+                current_state_features[graph_mask].to(dtype=torch.float32),
+                candidate_state_features[graph_mask].to(dtype=torch.float32),
+                relation_features[graph_mask].to(dtype=torch.float32),
+                question_features.expand(count, -1).to(dtype=torch.float32),
+                question_context_tokens.expand(count, -1, -1).to(dtype=torch.float32),
+                question_context_mask.expand(count, -1),
+            )
         return _mask_nonfinite_scores(logits.to(dtype=torch.float32))
+
+    def _build_child_path_token_ids(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+        edge_agent_batch: torch.Tensor,
+        edge_ids: torch.Tensor,
+        target_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        parent_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
+        parent_path_token_ids = parent_path_token_ids.index_select(0, edge_agent_batch)
+        parent_num_steps = state.flatten_num_steps().index_select(0, edge_agent_batch)
+        relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
+        return append_relation_and_node_tokens(
+            path_token_ids=parent_path_token_ids,
+            num_steps=parent_num_steps,
+            relation_ids=relation_ids,
+            target_nodes=target_nodes,
+        )
+
+    def _build_parent_path_token_ids(
+        self,
+        *,
+        state: SearchState,
+        edge_agent_batch: torch.Tensor,
+        source_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        child_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
+        child_path_token_ids = child_path_token_ids.index_select(0, edge_agent_batch)
+        child_num_steps = state.flatten_num_steps().index_select(0, edge_agent_batch)
+        return derive_parent_path_token_ids(
+            child_path_token_ids=child_path_token_ids,
+            child_num_steps=child_num_steps,
+            parent_nodes=source_nodes,
+        )
 
     def _gather_forward_candidates(
         self,
@@ -379,17 +492,27 @@ class BaseSearchPolicy(nn.Module):
             (0,), device=state.current_nodes.device, dtype=torch.float32
         )
         if int(edge_ids.numel()) > 0:
+            flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
             current_state_features = self._build_flat_state_features(
                 prepared_batch,
                 flat_nodes=state.flatten_current_nodes(),
                 flat_num_steps=state.flatten_num_steps(),
                 flat_done_mask=state.flatten_done_mask(),
+                flat_path_token_ids=flat_path_token_ids,
             ).index_select(0, edge_agent_batch)
+            child_path_token_ids = self._build_child_path_token_ids(
+                prepared_batch=prepared_batch,
+                state=state,
+                edge_agent_batch=edge_agent_batch,
+                edge_ids=edge_ids,
+                target_nodes=target_nodes,
+            )
             child_state_features = self._build_flat_state_features(
                 prepared_batch,
                 flat_nodes=target_nodes,
                 flat_num_steps=child_num_steps,
                 flat_done_mask=torch.zeros_like(child_num_steps, dtype=torch.bool),
+                flat_path_token_ids=child_path_token_ids,
             )
             graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
             edge_logits = self._compute_transition_logits(
@@ -420,17 +543,25 @@ class BaseSearchPolicy(nn.Module):
             (0,), device=state.current_nodes.device, dtype=torch.float32
         )
         if int(edge_ids.numel()) > 0:
+            flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
             current_state_features = self._build_flat_state_features(
                 prepared_batch,
                 flat_nodes=state.flatten_current_nodes(),
                 flat_num_steps=state.flatten_num_steps(),
                 flat_done_mask=state.flatten_done_mask(),
+                flat_path_token_ids=flat_path_token_ids,
             ).index_select(0, edge_agent_batch)
+            parent_path_token_ids = self._build_parent_path_token_ids(
+                state=state,
+                edge_agent_batch=edge_agent_batch,
+                source_nodes=source_nodes,
+            )
             parent_state_features = self._build_flat_state_features(
                 prepared_batch,
                 flat_nodes=source_nodes,
                 flat_num_steps=parent_num_steps,
                 flat_done_mask=torch.zeros_like(parent_num_steps, dtype=torch.bool),
+                flat_path_token_ids=parent_path_token_ids,
             )
             graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
             edge_logits = self._compute_transition_logits(
@@ -508,6 +639,8 @@ class GFlowNetPolicy(nn.Module):
             node_tokens=prepared_batch.node_tokens,
             relation_tokens=prepared_batch.relation_tokens,
             question_tokens=prepared_batch.question_tokens,
+            question_context_tokens=prepared_batch.question_context_tokens,
+            question_context_mask=prepared_batch.question_context_mask,
             heuristic_cache=heuristic_cache,
         )
 
@@ -520,13 +653,20 @@ class GFlowNetPolicy(nn.Module):
         start_distribution = self.compute_start_distribution(prepared_batch)
         return start_distribution.graph_log_z.to(dtype=torch.float32)
 
-    @staticmethod
     def _build_state_from_nodes(
+        self,
         *,
         prepared_batch: PreparedGFlowNetBatch,
         nodes: torch.Tensor,
         num_steps: torch.Tensor,
+        path_token_ids: torch.Tensor | None = None,
     ) -> SearchState:
+        resolved_path_token_ids = path_token_ids
+        if resolved_path_token_ids is None:
+            resolved_path_token_ids = initialize_path_token_ids(
+                start_nodes=nodes.view(-1, 1),
+                max_steps=self.base_policy.max_steps,
+            )
         return SearchState(
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
@@ -537,6 +677,7 @@ class GFlowNetPolicy(nn.Module):
                 dtype=torch.bool,
             ),
             num_steps=num_steps.view(-1, 1),
+            path_token_ids=resolved_path_token_ids,
         )
 
     def _compute_state_bias(
@@ -579,10 +720,20 @@ class GFlowNetPolicy(nn.Module):
         child_num_steps = (
             state.flatten_num_steps().index_select(0, distribution.edge_agent_batch) + 1
         )
+        child_path_token_ids = self.base_policy._build_child_path_token_ids(
+            prepared_batch=prepared_batch,
+            state=state,
+            edge_agent_batch=distribution.edge_agent_batch,
+            edge_ids=distribution.edge_ids,
+            target_nodes=distribution.target_nodes,
+        )
         child_state = self._build_state_from_nodes(
             prepared_batch=prepared_batch,
             nodes=distribution.target_nodes,
             num_steps=child_num_steps,
+            path_token_ids=child_path_token_ids.view(
+                int(distribution.target_nodes.numel()), 1, -1
+            ),
         )
         child_bias = self._compute_state_bias(
             prepared_batch=prepared_batch,
@@ -621,6 +772,10 @@ class GFlowNetPolicy(nn.Module):
             prepared_batch=prepared_batch,
             nodes=candidate_nodes_abs,
             num_steps=torch.zeros_like(candidate_nodes_abs, dtype=torch.long),
+            path_token_ids=initialize_path_token_ids(
+                start_nodes=candidate_nodes_abs.view(-1, 1),
+                max_steps=self.base_policy.max_steps,
+            ),
         )
         log_flows = self.base_policy.compute_start_log_flows(
             prepared_batch=prepared_batch,

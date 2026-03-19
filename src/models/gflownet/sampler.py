@@ -8,6 +8,7 @@ import torch
 
 from src.graph_runtime import TrajectoryBatch
 from src.models.configs import AnswerRewardConfig
+from .path import append_relation_and_node_tokens, initialize_path_token_ids
 from .transitions import apply_forward_constraints
 from .types import (
     ForwardActionDistribution,
@@ -335,6 +336,10 @@ def _rebuild_target_sample_batch(
 
     current_nodes = start_nodes.clone()
     num_steps = torch.zeros_like(start_nodes)
+    current_path_token_ids = initialize_path_token_ids(
+        start_nodes=start_nodes,
+        max_steps=max_steps,
+    )
     total_agents = int(batch.num_graphs * int(start_nodes.size(1)))
 
     for step_idx in range(max_steps):
@@ -348,6 +353,7 @@ def _rebuild_target_sample_batch(
             current_nodes=current_nodes,
             done_mask=~active_mask,
             num_steps=num_steps,
+            path_token_ids=current_path_token_ids,
         )
         distribution = apply_forward_constraints(
             policy.compute_forward_distribution(prepared_batch, search_state),
@@ -381,12 +387,24 @@ def _rebuild_target_sample_batch(
         next_nodes[flat_active] = chosen_target_nodes[flat_active]
         next_num_steps = flat_num_steps.clone()
         next_num_steps[flat_active] = next_num_steps[flat_active] + 1
+        safe_edge_ids = chosen_edge_ids.clamp(min=0)
+        chosen_relation_ids = prepared_batch.topology.edge_type.index_select(
+            0, safe_edge_ids
+        )
+        next_path_token_ids = append_relation_and_node_tokens(
+            path_token_ids=current_path_token_ids,
+            num_steps=num_steps,
+            relation_ids=chosen_relation_ids.view_as(current_nodes),
+            target_nodes=next_nodes.view_as(current_nodes),
+            active_mask=active_mask,
+        )
         next_state = SearchState(
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
             current_nodes=next_nodes.view_as(current_nodes),
             done_mask=torch.zeros_like(active_mask),
             num_steps=next_num_steps.view_as(num_steps),
+            path_token_ids=next_path_token_ids,
         )
         next_log_f = policy.compute_log_state_scores(prepared_batch, next_state)
         backward_distribution = policy.compute_backward_distribution(
@@ -411,6 +429,7 @@ def _rebuild_target_sample_batch(
         move_mask[:, :, step_idx] = active_mask
         current_nodes = next_nodes.view_as(current_nodes)
         num_steps = next_num_steps.view_as(num_steps)
+        current_path_token_ids = next_path_token_ids
 
     terminal_state = SearchState(
         topology=prepared_batch.topology,
@@ -418,6 +437,7 @@ def _rebuild_target_sample_batch(
         current_nodes=current_nodes,
         done_mask=torch.zeros_like(num_steps, dtype=torch.bool),
         num_steps=path_lengths,
+        path_token_ids=current_path_token_ids,
     )
     terminal_state_log_f = policy.compute_log_state_scores(
         prepared_batch, terminal_state
@@ -519,6 +539,7 @@ class ForwardTrajectoryGFNSampler:
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
             start_nodes=start_nodes,
+            max_steps=self.max_steps,
         )
         num_graphs, num_rollouts = start_nodes.shape
         terminal_target_mask = self.trajectory_supervisor.build_terminal_target_mask(
@@ -540,6 +561,7 @@ class ForwardTrajectoryGFNSampler:
         current_nodes = state.current_nodes.clone()
         done_mask = state.done_mask.clone()
         num_steps = state.num_steps.clone()
+        current_path_token_ids = state.resolve_path_token_ids(max_steps=self.max_steps)
 
         for step_idx in range(self.max_steps):
             active_mask = ~done_mask
@@ -564,6 +586,7 @@ class ForwardTrajectoryGFNSampler:
                 current_nodes=current_nodes,
                 done_mask=done_mask,
                 num_steps=num_steps,
+                path_token_ids=current_path_token_ids,
             )
             distribution = apply_forward_constraints(
                 policy.compute_behavior_forward_distribution(
@@ -599,6 +622,17 @@ class ForwardTrajectoryGFNSampler:
 
             current_nodes = flat_next_nodes.view_as(current_nodes)
             num_steps = next_num_steps.view_as(num_steps)
+            safe_edge_ids = chosen_edge_ids.clamp(min=0)
+            chosen_relation_ids = prepared_batch.topology.edge_type.index_select(
+                0, safe_edge_ids
+            ).view_as(current_nodes)
+            current_path_token_ids = append_relation_and_node_tokens(
+                path_token_ids=current_path_token_ids,
+                num_steps=(next_num_steps.view_as(num_steps) - 1).clamp_min(0),
+                relation_ids=chosen_relation_ids,
+                target_nodes=current_nodes,
+                active_mask=movable_mask,
+            )
             reached_horizon = num_steps >= int(self.max_steps)
             reached_target = terminal_target_mask.index_select(
                 0, current_nodes.view(-1)

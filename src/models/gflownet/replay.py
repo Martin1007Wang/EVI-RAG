@@ -8,6 +8,7 @@ import torch
 
 from src.graph_runtime import TrajectoryBatch
 
+from .path import append_relation_and_node_tokens, initialize_path_token_ids
 from .sampler import (
     TrajectoryGFNSampleBatch,
     TrajectoryRolloutSupervisorProtocol,
@@ -290,6 +291,10 @@ def build_replay_sample_batch(
 
     current_nodes = start_nodes.clone()
     num_steps = torch.zeros_like(start_nodes)
+    current_path_token_ids = initialize_path_token_ids(
+        start_nodes=start_nodes,
+        max_steps=max_steps,
+    )
     total_agents = int(batch.num_graphs * num_rollouts)
 
     for step_idx in range(max_steps):
@@ -306,6 +311,7 @@ def build_replay_sample_batch(
             current_nodes=current_nodes,
             done_mask=~active_mask,
             num_steps=num_steps,
+            path_token_ids=current_path_token_ids,
         )
         step = compute_constrained_policy_step(
             policy=policy,
@@ -338,12 +344,24 @@ def build_replay_sample_batch(
         next_nodes[flat_active] = chosen_target_nodes[flat_active]
         next_num_steps = flat_num_steps.clone()
         next_num_steps[flat_active] = next_num_steps[flat_active] + 1
+        safe_edge_ids = chosen_edge_ids.clamp(min=0)
+        chosen_relation_ids = prepared_batch.topology.edge_type.index_select(
+            0, safe_edge_ids
+        )
+        next_path_token_ids = append_relation_and_node_tokens(
+            path_token_ids=current_path_token_ids,
+            num_steps=num_steps,
+            relation_ids=chosen_relation_ids.view_as(current_nodes),
+            target_nodes=next_nodes.view_as(current_nodes),
+            active_mask=active_mask,
+        )
         next_state = SearchState(
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
             current_nodes=next_nodes.view_as(current_nodes),
             done_mask=torch.zeros_like(active_mask),
             num_steps=next_num_steps.view_as(num_steps),
+            path_token_ids=next_path_token_ids,
         )
         next_log_f = policy.compute_log_state_scores(prepared_batch, next_state)
         backward_distribution = policy.compute_backward_distribution(
@@ -367,6 +385,7 @@ def build_replay_sample_batch(
         trace_edge_ids[:, :, step_idx] = chosen_edge_ids.view_as(current_nodes)
         current_nodes = next_nodes.view_as(current_nodes)
         num_steps = next_num_steps.view_as(num_steps)
+        current_path_token_ids = next_path_token_ids
 
     terminal_state = SearchState(
         topology=prepared_batch.topology,
@@ -374,6 +393,7 @@ def build_replay_sample_batch(
         current_nodes=current_nodes,
         done_mask=torch.zeros_like(num_steps, dtype=torch.bool),
         num_steps=path_lengths,
+        path_token_ids=current_path_token_ids,
     )
     terminal_state_log_f = policy.compute_log_state_scores(
         prepared_batch, terminal_state

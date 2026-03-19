@@ -17,7 +17,6 @@ from src.models.configs import (
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
-    RankAuxiliaryLossConfig,
     SamplingTemperatureScheduleConfig,
     SchedulerConfig,
     StateScoreHeadConfig,
@@ -527,40 +526,7 @@ def test_guidance_loss_uses_learned_behavior_head_targets() -> None:
     assert 0.0 <= guidance_result.target_mean.item() <= 1.0
 
 
-def test_rank_auxiliary_loss_uses_exact_answer_posterior() -> None:
-    torch.manual_seed(3)
-    module = _make_module_with_training_cfg(
-        "learned",
-        training_cfg=GFlowNetTrainingConfig(
-            answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
-            rank_aux=RankAuxiliaryLossConfig(
-                loss_weight=0.3,
-                temperature=1.0,
-                max_graphs_per_batch=1,
-                max_negative_answers=8,
-            ),
-        ),
-    )
-    batch = make_batch_from_graph(
-        num_nodes=3,
-        edge_index=torch.tensor([[0, 0], [1, 2]], dtype=torch.long),
-        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
-        q_local_indices=torch.tensor([0], dtype=torch.long),
-        a_local_indices=torch.tensor([2], dtype=torch.long),
-        answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
-        sample_id="rank-aux",
-    )
-
-    rank_result = module._compute_rank_auxiliary_loss(batch=batch)
-
-    assert rank_result is not None
-    assert torch.isfinite(rank_result.loss)
-    assert rank_result.graph_count == 1
-    assert rank_result.pair_count >= 1
-
-
-def test_training_step_logs_guidance_and_rank_aux_metrics_when_enabled() -> None:
+def test_training_step_logs_guidance_metrics_when_enabled() -> None:
     torch.manual_seed(5)
     module = _make_module_with_training_cfg(
         "learned",
@@ -568,12 +534,6 @@ def test_training_step_logs_guidance_and_rank_aux_metrics_when_enabled() -> None
             rollout_batch_size=2,
             answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
             guidance=GuidanceLossConfig(loss_weight=0.1, detach_features=True),
-            rank_aux=RankAuxiliaryLossConfig(
-                loss_weight=0.2,
-                temperature=1.0,
-                max_graphs_per_batch=1,
-                max_negative_answers=8,
-            ),
         ),
     )
     batch = make_batch_from_graph(
@@ -598,8 +558,8 @@ def test_training_step_logs_guidance_and_rank_aux_metrics_when_enabled() -> None
 
     assert loss.ndim == 0
     assert "guidance_loss" in captured_metrics
-    assert "rank_aux_loss" in captured_metrics
     assert "actor_loss" in captured_metrics
+    assert "rank_aux_loss" not in captured_metrics
 
 
 def test_success_replay_rollout_resolution_rejects_invalid_ratio() -> None:
@@ -732,7 +692,9 @@ def test_sampler_emits_uniform_backward_log_probs_for_multi_parent_state() -> No
         lambda current_state_features,
         candidate_state_features,
         relation_features,
-        question_features: torch.zeros(
+        question_features,
+        question_context_features,
+        question_context_mask: torch.zeros(
             (int(current_state_features.size(0)),),
             device=current_state_features.device,
             dtype=torch.float32,
@@ -766,7 +728,9 @@ def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:
         lambda current_state_features,
         candidate_state_features,
         relation_features,
-        question_features: torch.zeros(
+        question_features,
+        question_context_features,
+        question_context_mask: torch.zeros(
             (int(current_state_features.size(0)),),
             device=current_state_features.device,
             dtype=torch.float32,

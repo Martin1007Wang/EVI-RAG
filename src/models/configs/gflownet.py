@@ -135,24 +135,6 @@ class GuidanceLossConfig:
 
 
 @dataclass(frozen=True)
-class RankAuxiliaryLossConfig:
-    loss_weight: float = 0.0
-    temperature: float = 1.0
-    max_graphs_per_batch: int = 4
-    max_negative_answers: int = 16
-
-    def __post_init__(self) -> None:
-        if self.loss_weight < 0.0:
-            raise ValueError("training.rank_aux.loss_weight must be >= 0.")
-        if self.temperature <= 0.0:
-            raise ValueError("training.rank_aux.temperature must be > 0.")
-        if self.max_graphs_per_batch < 1:
-            raise ValueError("training.rank_aux.max_graphs_per_batch must be >= 1.")
-        if self.max_negative_answers < 1:
-            raise ValueError("training.rank_aux.max_negative_answers must be >= 1.")
-
-
-@dataclass(frozen=True)
 class SubTrajectoryBalanceConfig:
     lambda_weight: float = 1.0
     normalize: bool = True
@@ -235,7 +217,6 @@ class GFlowNetTrainingConfig:
     failure_reward_mode: str = "graph_normalized"
     answer_reward: AnswerRewardConfig = field(default_factory=AnswerRewardConfig)
     guidance: GuidanceLossConfig = field(default_factory=GuidanceLossConfig)
-    rank_aux: RankAuxiliaryLossConfig = field(default_factory=RankAuxiliaryLossConfig)
     sampling_temperature: float = 1.0
     sampling_temperature_schedule: SamplingTemperatureScheduleConfig = field(
         default_factory=SamplingTemperatureScheduleConfig
@@ -266,7 +247,6 @@ __all__ = [
     "GuidanceLossConfig",
     "HeuristicConfig",
     "HorizonConfig",
-    "RankAuxiliaryLossConfig",
     "SamplingTemperatureScheduleConfig",
     "SearchEvalConfig",
     "SuccessfulTrajectoryReplayConfig",

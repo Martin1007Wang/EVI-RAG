@@ -38,12 +38,6 @@ training_cfg:
     _target_: src.models.configs.gflownet.GuidanceLossConfig
     loss_weight: 0.0
     detach_features: true
-  rank_aux:
-    _target_: src.models.configs.gflownet.RankAuxiliaryLossConfig
-    loss_weight: 0.0
-    temperature: 1.0
-    max_graphs_per_batch: 4
-    max_negative_answers: 16
   sampling_temperature: 1.0
   sampling_temperature_schedule:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig

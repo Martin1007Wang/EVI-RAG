@@ -53,11 +53,6 @@ model:
     guidance:
       loss_weight: 0.1
       detach_features: true
-    rank_aux:
-      loss_weight: 0.05
-      temperature: 1.0
-      max_graphs_per_batch: 4
-      max_negative_answers: 16
     success_replay:
       enabled: true
       ratio: 0.25
