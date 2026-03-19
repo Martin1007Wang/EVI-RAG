@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any, cast
 
 import pytest
@@ -419,6 +418,26 @@ def test_start_distribution_defines_virtual_source_log_z() -> None:
     )
 
 
+def test_sampler_preserves_selected_start_flow_gradients() -> None:
+    module = _make_module("topology")
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    assert module.sampler is not None
+    sample_batch = module.sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
+    )
+
+    assert sample_batch.start_state_log_f.requires_grad
+    assert sample_batch.start_state_log_f.grad_fn is not None
+    assert sample_batch.start_log_probs.requires_grad
+    assert sample_batch.start_log_probs.grad_fn is not None
+
+
 def test_target_policy_ignores_behavior_heuristic_beta() -> None:
     torch.manual_seed(5)
     target_only = _make_module_with_training_cfg("topology", beta=0.0)
@@ -674,7 +693,7 @@ def test_gflownet_sampling_temperature_schedule_anneals() -> None:
     assert module._resolve_sampling_temperature(global_step=1) == pytest.approx(1.5)
 
 
-def test_sampler_emits_uniform_backward_log_probs_for_multi_parent_state() -> None:
+def test_sampler_emits_deterministic_backward_log_probs_for_path_state() -> None:
     module = _make_module("topology")
     batch = make_batch_from_graph(
         num_nodes=3,
@@ -688,18 +707,6 @@ def test_sampler_emits_uniform_backward_log_probs_for_multi_parent_state() -> No
     )
     prepared_batch = module.policy.prepare_batch(batch)
     assert module.sampler is not None
-    module.policy.base_policy.backward_policy_head.forward = (  # type: ignore[method-assign]
-        lambda current_state_features,
-        candidate_state_features,
-        relation_features,
-        question_features,
-        question_context_features,
-        question_context_mask: torch.zeros(
-            (int(current_state_features.size(0)),),
-            device=current_state_features.device,
-            dtype=torch.float32,
-        )
-    )
 
     sample_batch = module.sampler.sample(
         batch=batch,
@@ -709,7 +716,7 @@ def test_sampler_emits_uniform_backward_log_probs_for_multi_parent_state() -> No
         temperature=1.0,
     )
 
-    assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(-math.log(2.0))
+    assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(0.0)
 
 
 def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:

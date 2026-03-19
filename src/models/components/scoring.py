@@ -110,6 +110,21 @@ class TransitionPolicyHead(nn.Module):
             raise ValueError(
                 "question_context_mask contains rows without valid tokens in TransitionPolicyHead."
             )
+        batch_size = int(current_state_features.size(0))
+        if int(question_features.size(0)) not in {1, batch_size}:
+            raise ValueError(
+                "question_features batch must be 1 or match current_state_features in TransitionPolicyHead. "
+                f"got question_features.shape={tuple(question_features.shape)} "
+                f"current_state_features.shape={tuple(current_state_features.shape)}."
+            )
+        if int(question_context_features.size(0)) not in {1, batch_size}:
+            raise ValueError(
+                "question_context_features batch must be 1 or match current_state_features in TransitionPolicyHead. "
+                f"got question_context_features.shape={tuple(question_context_features.shape)} "
+                f"current_state_features.shape={tuple(current_state_features.shape)}."
+            )
+        if int(question_features.size(0)) == 1 and batch_size != 1:
+            question_features = question_features.expand(batch_size, -1)
         context_query = self.context_query(
             torch.cat(
                 (
@@ -121,30 +136,51 @@ class TransitionPolicyHead(nn.Module):
                 dim=-1,
             )
         )
-        context_key = self.context_key(
-            question_context_features.to(dtype=torch.float32)
-        )
-        context_value = self.context_value(
-            question_context_features.to(dtype=torch.float32)
-        )
-        attention_scores = torch.einsum(
-            "bd,bld->bl", context_query.to(dtype=torch.float32), context_key
-        )
-        attention_scores = attention_scores / math.sqrt(float(context_key.size(-1)))
-        attention_scores = attention_scores.masked_fill(
-            ~question_context_mask, float("-inf")
-        )
-        attention_weights = torch.softmax(attention_scores, dim=-1)
-        attention_weights = torch.where(
-            torch.isfinite(attention_weights),
-            attention_weights,
-            torch.zeros_like(attention_weights),
-        )
-        question_context_summary = torch.einsum(
-            "bl,bld->bd", attention_weights, context_value
-        )
+        context_query_fp32 = context_query.to(dtype=torch.float32)
+        if int(question_context_features.size(0)) == 1 and batch_size != 1:
+            shared_context = question_context_features.squeeze(0)
+            shared_mask = question_context_mask.squeeze(0)
+            context_key = self.context_key(shared_context).to(dtype=torch.float32)
+            context_value = self.context_value(shared_context).to(dtype=torch.float32)
+            attention_scores = torch.matmul(
+                context_query_fp32, context_key.transpose(0, 1)
+            )
+            attention_scores = attention_scores / math.sqrt(float(context_key.size(-1)))
+            attention_scores = attention_scores.masked_fill(
+                ~shared_mask.unsqueeze(0), float("-inf")
+            )
+            attention_weights = torch.softmax(attention_scores, dim=-1)
+            attention_weights = torch.where(
+                torch.isfinite(attention_weights),
+                attention_weights,
+                torch.zeros_like(attention_weights),
+            )
+            question_context_summary = torch.matmul(attention_weights, context_value)
+        else:
+            context_key = self.context_key(question_context_features).to(
+                dtype=torch.float32
+            )
+            context_value = self.context_value(question_context_features).to(
+                dtype=torch.float32
+            )
+            attention_scores = torch.einsum(
+                "bd,bld->bl", context_query_fp32, context_key
+            )
+            attention_scores = attention_scores / math.sqrt(float(context_key.size(-1)))
+            attention_scores = attention_scores.masked_fill(
+                ~question_context_mask, float("-inf")
+            )
+            attention_weights = torch.softmax(attention_scores, dim=-1)
+            attention_weights = torch.where(
+                torch.isfinite(attention_weights),
+                attention_weights,
+                torch.zeros_like(attention_weights),
+            )
+            question_context_summary = torch.einsum(
+                "bl,bld->bd", attention_weights, context_value
+            )
         question_context_summary = self.context_norm(
-            question_context_summary + context_query.to(dtype=torch.float32)
+            question_context_summary + context_query_fp32
         )
         relation_context_interaction = (
             question_context_summary

@@ -6,6 +6,9 @@ import torch
 from torch import nn
 
 
+_PATH_ATTENTION_CHUNK_SIZE = 64
+
+
 def max_path_tokens(*, max_steps: int) -> int:
     return (2 * int(max_steps)) + 1
 
@@ -135,40 +138,50 @@ def encode_path_history(
     path_self_attention_norm: nn.LayerNorm,
 ) -> torch.Tensor:
     total_agents, token_len, hidden_dim = path_tokens.shape
-    key_padding_mask = torch.arange(
-        token_len, device=path_tokens.device, dtype=torch.long
-    ).unsqueeze(0) >= path_lengths.reshape(-1, 1)
+    path_lengths = path_lengths.reshape(-1)
     causal_mask = torch.triu(
         torch.ones((token_len, token_len), device=path_tokens.device, dtype=torch.bool),
         diagonal=1,
     )
-    path_tokens_fp32 = path_tokens.to(dtype=torch.float32)
-    sdp_ctx = nullcontext()
+    last_hidden_chunks: list[torch.Tensor] = []
+    chunk_size = total_agents
     if path_tokens.device.type == "cuda":
-        sdp_ctx = torch.backends.cuda.sdp_kernel(
-            enable_flash=False,
-            enable_mem_efficient=False,
-            enable_math=True,
+        chunk_size = min(total_agents, _PATH_ATTENTION_CHUNK_SIZE)
+    for start in range(0, total_agents, max(chunk_size, 1)):
+        end = min(start + max(chunk_size, 1), total_agents)
+        chunk_tokens = path_tokens[start:end]
+        chunk_lengths = path_lengths[start:end]
+        key_padding_mask = torch.arange(
+            token_len, device=path_tokens.device, dtype=torch.long
+        ).unsqueeze(0) >= chunk_lengths.unsqueeze(1)
+        chunk_tokens_fp32 = chunk_tokens.to(dtype=torch.float32)
+        sdp_ctx = nullcontext()
+        if path_tokens.device.type == "cuda":
+            sdp_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            )
+        with sdp_ctx:
+            attn_out, _ = path_self_attention(
+                chunk_tokens_fp32,
+                chunk_tokens_fp32,
+                chunk_tokens_fp32,
+                attn_mask=causal_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+        encoded = path_self_attention_norm(chunk_tokens_fp32 + attn_out)
+        last_idx = (chunk_lengths - 1).clamp_min(0)
+        row_idx = torch.arange(end - start, device=path_tokens.device, dtype=torch.long)
+        last_hidden = encoded[row_idx, last_idx]
+        last_hidden = torch.where(
+            torch.isfinite(last_hidden),
+            last_hidden,
+            torch.zeros_like(last_hidden),
         )
-    with sdp_ctx:
-        attn_out, _ = path_self_attention(
-            path_tokens_fp32,
-            path_tokens_fp32,
-            path_tokens_fp32,
-            attn_mask=causal_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-    encoded = path_self_attention_norm(path_tokens_fp32 + attn_out)
-    last_idx = (path_lengths.reshape(-1) - 1).clamp_min(0)
-    row_idx = torch.arange(total_agents, device=path_tokens.device, dtype=torch.long)
-    last_hidden = encoded[row_idx, last_idx]
-    last_hidden = torch.where(
-        torch.isfinite(last_hidden),
-        last_hidden,
-        torch.zeros_like(last_hidden),
-    )
-    return last_hidden.to(dtype=path_tokens.dtype).view(total_agents, hidden_dim)
+        last_hidden_chunks.append(last_hidden.to(dtype=path_tokens.dtype))
+    return torch.cat(last_hidden_chunks, dim=0).view(total_agents, hidden_dim)
 
 
 def reconstruct_trace_path_token_ids(

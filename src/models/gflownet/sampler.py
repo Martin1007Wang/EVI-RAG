@@ -257,44 +257,33 @@ def _resolve_selected_start_values(
     start_nodes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     start_distribution = policy.compute_start_distribution(prepared_batch)
-    log_prob_lookup: list[dict[int, float]] = []
-    log_flow_lookup: list[dict[int, float]] = []
-    num_graphs = int(prepared_batch.topology.num_graphs)
-    for graph_idx in range(num_graphs):
-        mask = start_distribution.candidate_graph_ids == graph_idx
-        log_prob_lookup.append(
-            {
-                int(node.item()): float(log_prob.item())
-                for node, log_prob in zip(
-                    start_distribution.candidate_nodes_abs[mask],
-                    start_distribution.log_probs[mask],
-                )
-            }
-        )
-        log_flow_lookup.append(
-            {
-                int(node.item()): float(log_flow.item())
-                for node, log_flow in zip(
-                    start_distribution.candidate_nodes_abs[mask],
-                    start_distribution.log_flows[mask],
-                )
-            }
-        )
-
     start_log_probs = torch.zeros_like(start_nodes, dtype=torch.float32)
     start_log_flows = torch.zeros_like(start_nodes, dtype=torch.float32)
     for graph_idx in range(int(start_nodes.size(0))):
-        graph_log_probs = log_prob_lookup[graph_idx]
-        graph_log_flows = log_flow_lookup[graph_idx]
-        for rollout_idx in range(int(start_nodes.size(1))):
-            node_id = int(start_nodes[graph_idx, rollout_idx].item())
-            if node_id not in graph_log_probs or node_id not in graph_log_flows:
-                raise ValueError(
-                    "Sampled start node is not a valid target-policy start candidate. "
-                    f"graph_idx={graph_idx} node_id={node_id}."
-                )
-            start_log_probs[graph_idx, rollout_idx] = graph_log_probs[node_id]
-            start_log_flows[graph_idx, rollout_idx] = graph_log_flows[node_id]
+        graph_mask = start_distribution.candidate_graph_ids == graph_idx
+        graph_nodes = start_distribution.candidate_nodes_abs[graph_mask]
+        graph_log_probs = start_distribution.log_probs[graph_mask].to(
+            dtype=torch.float32
+        )
+        graph_log_flows = start_distribution.log_flows[graph_mask].to(
+            dtype=torch.float32
+        )
+        if int(graph_nodes.numel()) == 0:
+            raise ValueError(
+                "Sampled start node is not a valid target-policy start candidate. "
+                f"graph_idx={graph_idx} has no candidates."
+            )
+        matches = start_nodes[graph_idx].unsqueeze(1) == graph_nodes.unsqueeze(0)
+        match_counts = matches.sum(dim=1)
+        if not bool((match_counts == 1).all().item()):
+            invalid_nodes = start_nodes[graph_idx][match_counts != 1].tolist()
+            raise ValueError(
+                "Sampled start node is not a valid target-policy start candidate. "
+                f"graph_idx={graph_idx} node_ids={invalid_nodes}."
+            )
+        selected_indices = matches.to(dtype=torch.long).argmax(dim=1)
+        start_log_probs[graph_idx] = graph_log_probs.index_select(0, selected_indices)
+        start_log_flows[graph_idx] = graph_log_flows.index_select(0, selected_indices)
     return (
         start_log_probs,
         start_log_flows,

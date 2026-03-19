@@ -38,9 +38,17 @@ def test_transition_logits_change_with_question_context_tokens() -> None:
     backward_state = SearchState(
         topology=prepared_a.topology,
         observation=prepared_a.observation,
-        current_nodes=torch.tensor([[1, 2]], dtype=torch.long),
-        done_mask=torch.zeros((1, 2), dtype=torch.bool),
-        num_steps=torch.ones((1, 2), dtype=torch.long),
+        current_nodes=torch.tensor([[1]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.ones((1, 1), dtype=torch.long),
+        path_token_ids=SearchState.from_edge_path(
+            topology=prepared_a.topology,
+            observation=prepared_a.observation,
+            start_node=0,
+            edge_ids=(0,),
+            max_steps=2,
+            device=prepared_a.topology.edge_index.device,
+        ).path_token_ids,
     )
 
     forward_a = policy.compute_forward_distribution(prepared_a, forward_state)
@@ -51,7 +59,7 @@ def test_transition_logits_change_with_question_context_tokens() -> None:
     assert torch.equal(forward_a.edge_ids, forward_b.edge_ids)
     assert torch.equal(backward_a.edge_ids, backward_b.edge_ids)
     assert not torch.allclose(forward_a.edge_logits, forward_b.edge_logits)
-    assert not torch.allclose(backward_a.edge_logits, backward_b.edge_logits)
+    assert torch.allclose(backward_a.edge_logits, backward_b.edge_logits, atol=1.0e-6)
 
 
 def test_masked_question_context_tokens_do_not_change_transition_logits() -> None:

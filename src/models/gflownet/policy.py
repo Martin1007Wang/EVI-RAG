@@ -358,8 +358,8 @@ class BaseSearchPolicy(nn.Module):
                 candidate_state_features[graph_mask].to(dtype=torch.float32),
                 relation_features[graph_mask].to(dtype=torch.float32),
                 question_features.expand(count, -1).to(dtype=torch.float32),
-                question_context_tokens.expand(count, -1, -1).to(dtype=torch.float32),
-                question_context_mask.expand(count, -1),
+                question_context_tokens,
+                question_context_mask,
             )
             logits[graph_mask] = graph_logits.to(dtype=logits.dtype)
         return _mask_nonfinite_scores(logits.to(dtype=torch.float32))
@@ -398,6 +398,114 @@ class BaseSearchPolicy(nn.Module):
             child_path_token_ids=child_path_token_ids,
             child_num_steps=child_num_steps,
             parent_nodes=source_nodes,
+        )
+
+    def _expected_backward_transitions(
+        self,
+        *,
+        state: SearchState,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        flat_num_steps = state.flatten_num_steps()
+        flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
+        parent_step_ids = (flat_num_steps - 1).clamp_min(0)
+        parent_node_positions = (2 * parent_step_ids).to(dtype=torch.long)
+        parent_relation_positions = (parent_node_positions + 1).to(dtype=torch.long)
+        row_idx = torch.arange(
+            int(flat_num_steps.numel()),
+            device=flat_num_steps.device,
+            dtype=torch.long,
+        )
+        expected_parent_nodes = flat_path_token_ids[row_idx, parent_node_positions]
+        expected_relation_ids = flat_path_token_ids[row_idx, parent_relation_positions]
+        return expected_parent_nodes, expected_relation_ids
+
+    def _compute_deterministic_backward_logits(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+        edge_ids: torch.Tensor,
+        source_nodes: torch.Tensor,
+        edge_agent_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        edge_logits = torch.full(
+            (int(edge_ids.numel()),),
+            fill_value=float("-inf"),
+            device=edge_ids.device,
+            dtype=torch.float32,
+        )
+        if int(edge_ids.numel()) == 0:
+            return edge_logits
+
+        expected_parent_nodes, expected_relation_ids = (
+            self._expected_backward_transitions(state=state)
+        )
+        relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
+        valid_edges = (
+            source_nodes == expected_parent_nodes.index_select(0, edge_agent_batch)
+        ) & (relation_ids == expected_relation_ids.index_select(0, edge_agent_batch))
+        edge_logits = torch.where(
+            valid_edges, torch.zeros_like(edge_logits), edge_logits
+        )
+
+        valid_counts = torch.zeros(
+            (int(state.current_nodes.numel()),),
+            device=edge_ids.device,
+            dtype=torch.long,
+        )
+        if int(valid_edges.numel()) > 0:
+            valid_counts.scatter_add_(
+                0, edge_agent_batch, valid_edges.to(dtype=torch.long)
+            )
+        active_mask = (~state.flatten_done_mask()) & (state.flatten_num_steps() > 0)
+        if not bool((valid_counts[active_mask] > 0).all().item()):
+            invalid_agents = torch.nonzero(
+                active_mask & (valid_counts <= 0), as_tuple=False
+            ).view(-1)
+            raise RuntimeError(
+                "Backward distribution could not recover a parent edge from the encoded path. "
+                f"invalid_agents={invalid_agents.tolist()}"
+            )
+        return edge_logits
+
+    def _compute_legacy_backward_logits(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+        edge_ids: torch.Tensor,
+        source_nodes: torch.Tensor,
+        edge_agent_batch: torch.Tensor,
+        parent_num_steps: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
+        current_state_features = self._build_flat_state_features(
+            prepared_batch,
+            flat_nodes=state.flatten_current_nodes(),
+            flat_num_steps=state.flatten_num_steps(),
+            flat_done_mask=state.flatten_done_mask(),
+            flat_path_token_ids=flat_path_token_ids,
+        ).index_select(0, edge_agent_batch)
+        parent_path_token_ids = self._build_parent_path_token_ids(
+            state=state,
+            edge_agent_batch=edge_agent_batch,
+            source_nodes=source_nodes,
+        )
+        parent_state_features = self._build_flat_state_features(
+            prepared_batch,
+            flat_nodes=source_nodes,
+            flat_num_steps=parent_num_steps,
+            flat_done_mask=torch.zeros_like(parent_num_steps, dtype=torch.bool),
+            flat_path_token_ids=parent_path_token_ids,
+        )
+        graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
+        return self._compute_transition_logits(
+            prepared_batch=prepared_batch,
+            current_state_features=current_state_features,
+            candidate_state_features=parent_state_features,
+            edge_ids=edge_ids,
+            graph_ids=graph_ids,
+            head=self.backward_policy_head,
         )
 
     def _gather_forward_candidates(
@@ -544,35 +652,28 @@ class BaseSearchPolicy(nn.Module):
             (0,), device=state.current_nodes.device, dtype=torch.float32
         )
         if int(edge_ids.numel()) > 0:
-            flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
-            current_state_features = self._build_flat_state_features(
-                prepared_batch,
-                flat_nodes=state.flatten_current_nodes(),
-                flat_num_steps=state.flatten_num_steps(),
-                flat_done_mask=state.flatten_done_mask(),
-                flat_path_token_ids=flat_path_token_ids,
-            ).index_select(0, edge_agent_batch)
-            parent_path_token_ids = self._build_parent_path_token_ids(
-                state=state,
-                edge_agent_batch=edge_agent_batch,
-                source_nodes=source_nodes,
+            uses_legacy_backward = state.path_token_ids is None and bool(
+                ((~state.flatten_done_mask()) & (state.flatten_num_steps() > 0))
+                .any()
+                .item()
             )
-            parent_state_features = self._build_flat_state_features(
-                prepared_batch,
-                flat_nodes=source_nodes,
-                flat_num_steps=parent_num_steps,
-                flat_done_mask=torch.zeros_like(parent_num_steps, dtype=torch.bool),
-                flat_path_token_ids=parent_path_token_ids,
-            )
-            graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
-            edge_logits = self._compute_transition_logits(
-                prepared_batch=prepared_batch,
-                current_state_features=current_state_features,
-                candidate_state_features=parent_state_features,
-                edge_ids=edge_ids,
-                graph_ids=graph_ids,
-                head=self.backward_policy_head,
-            )
+            if uses_legacy_backward:
+                edge_logits = self._compute_legacy_backward_logits(
+                    prepared_batch=prepared_batch,
+                    state=state,
+                    edge_ids=edge_ids,
+                    source_nodes=source_nodes,
+                    edge_agent_batch=edge_agent_batch,
+                    parent_num_steps=parent_num_steps,
+                )
+            else:
+                edge_logits = self._compute_deterministic_backward_logits(
+                    prepared_batch=prepared_batch,
+                    state=state,
+                    edge_ids=edge_ids,
+                    source_nodes=source_nodes,
+                    edge_agent_batch=edge_agent_batch,
+                )
         return ForwardActionDistribution(
             edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
             edge_agent_batch=edge_agent_batch,
