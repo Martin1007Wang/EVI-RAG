@@ -164,6 +164,39 @@ class SearchHeuristic(nn.Module):
         )
         return torch.nn.functional.logsigmoid(logits)
 
+    def compute_state_logits(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+        build_state_features: StateFeatureBuilder,
+        detach_features: bool = False,
+    ) -> torch.Tensor:
+        if not self.uses_learned_head:
+            return torch.zeros(
+                state.current_nodes.shape,
+                device=state.current_nodes.device,
+                dtype=torch.float32,
+            )
+        state_features = build_state_features(prepared_batch, state).view(
+            int(state.current_nodes.numel()), -1
+        )
+        question_features = prepared_batch.question_tokens.index_select(
+            0, state.flatten_graph_index()
+        )
+        if detach_features:
+            state_features = state_features.detach()
+            question_features = question_features.detach()
+        if self.learned_head is None:
+            raise RuntimeError(
+                "learned heuristic logits require a LearnedHeuristicHead."
+            )
+        logits = self.learned_head(
+            state_features=state_features,
+            question_features=question_features,
+        ).view_as(state.current_nodes)
+        return torch.where(state.done_mask, torch.zeros_like(logits), logits)
+
     def compute_state_bias(
         self,
         *,
@@ -180,15 +213,12 @@ class SearchHeuristic(nn.Module):
             )
         flat_nodes = state.flatten_current_nodes()
         if self.uses_learned_head:
-            state_features = build_state_features(prepared_batch, state).view(
-                int(flat_nodes.numel()), -1
-            )
-            question_features = prepared_batch.question_tokens.index_select(
-                0, state.flatten_graph_index()
-            )
-            flat_bias = self._state_log_heuristic(
-                state_features=state_features,
-                question_features=question_features,
+            flat_bias = torch.nn.functional.logsigmoid(
+                self.compute_state_logits(
+                    prepared_batch=prepared_batch,
+                    state=state,
+                    build_state_features=build_state_features,
+                ).view(-1)
             )
         else:
             flat_bias = self._node_log_heuristic(

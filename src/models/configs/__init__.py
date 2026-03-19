@@ -5,9 +5,12 @@
 
 from .backbone import BackboneConfig
 from .gflownet import (
+    AnswerRewardConfig,
     GFlowNetTrainingConfig,
+    GuidanceLossConfig,
     HeuristicConfig,
     HorizonConfig,
+    RankAuxiliaryLossConfig,
     SamplingTemperatureScheduleConfig,
     SearchEvalConfig,
     SuccessfulTrajectoryReplayConfig,
@@ -26,8 +29,11 @@ __all__ = [
     "BackboneConfig",
     "StateScoreHeadConfig",
     "TransitionPolicyHeadConfig",
+    "AnswerRewardConfig",
     "HeuristicConfig",
     "GFlowNetTrainingConfig",
+    "GuidanceLossConfig",
+    "RankAuxiliaryLossConfig",
     "SamplingTemperatureScheduleConfig",
     "SuccessfulTrajectoryReplayConfig",
     "SubTrajectoryBalanceConfig",

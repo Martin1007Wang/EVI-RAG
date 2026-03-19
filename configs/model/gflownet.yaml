@@ -27,6 +27,23 @@ training_cfg:
   rollout_batch_size: 8
   reward_epsilon: 1.0e-3
   failure_reward_mode: graph_normalized
+  answer_reward:
+    _target_: src.models.configs.gflownet.AnswerRewardConfig
+    mode: legacy
+    positive_utility: 1.0
+    negative_utility: -1.0
+    beta: 1.0
+    normalize_by_entity_count: true
+  guidance:
+    _target_: src.models.configs.gflownet.GuidanceLossConfig
+    loss_weight: 0.0
+    detach_features: true
+  rank_aux:
+    _target_: src.models.configs.gflownet.RankAuxiliaryLossConfig
+    loss_weight: 0.0
+    temperature: 1.0
+    max_graphs_per_batch: 4
+    max_negative_answers: 16
   sampling_temperature: 1.0
   sampling_temperature_schedule:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig

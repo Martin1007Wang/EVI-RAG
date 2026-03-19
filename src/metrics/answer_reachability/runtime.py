@@ -217,6 +217,7 @@ class SearchMetricRuntimeFactory:
         trajectory_supervisor = AnswerReachabilityTrajectorySupervisor(
             epsilon=float(training_cfg.reward_epsilon),
             failure_reward_mode=str(training_cfg.failure_reward_mode),
+            answer_reward=training_cfg.answer_reward,
         )
         sampler = ForwardTrajectoryGFNSampler(
             max_steps=int(horizon_cfg.max_steps),

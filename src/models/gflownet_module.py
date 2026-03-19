@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import (
@@ -23,14 +24,17 @@ from src.models.components import (
 from src.models.components.heuristic_heads import LearnedHeuristicHead
 from src.models.configs import (
     GFlowNetTrainingConfig,
+    GuidanceLossConfig,
     HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
+    RankAuxiliaryLossConfig,
     SearchEvalConfig,
     SchedulerConfig,
 )
 from src.graph_runtime import TrajectoryBatch
+from src.metrics.answer_reachability.exact_analysis import ExactReachabilityAnalyzer
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeFactoryProtocol
 from src.utils.fit_schedule import ResolvedPassFitSchedule
 from src.utils.logging_utils import get_logger, log_event, log_metric
@@ -46,9 +50,11 @@ from .gflownet import (
     GFlowNetPolicy,
     SamplingTemperatureScheduler,
     SearchHeuristic,
+    SearchState,
     SubTrajectoryBalanceLossOutput,
     SuccessfulTrajectoryReplayBuffer,
     SubTrajectoryBalanceLoss,
+    TrajectoryGFNSampleBatch,
     TrainingScheduleContext,
     build_replay_sample_batch,
     normalize_scheduler_interval,
@@ -80,6 +86,23 @@ class ReplayLossResult:
 class TrainingLossAggregation:
     total_loss: torch.Tensor
     replay_result: ReplayLossResult | None
+
+
+@dataclass(frozen=True)
+class GuidanceLossResult:
+    loss: torch.Tensor
+    target_mean: torch.Tensor
+    prediction_mean: torch.Tensor
+    active_states: int
+
+
+@dataclass(frozen=True)
+class RankAuxiliaryLossResult:
+    loss: torch.Tensor
+    graph_count: int
+    pair_count: int
+    gold_score_mean: torch.Tensor
+    negative_score_mean: torch.Tensor
 
 
 class GFlowNetPolicyFactory:
@@ -293,8 +316,16 @@ class GFlowNetModule(LightningModule):
             metrics_profile=str(self.cfg.eval_cfg.metrics_profile),
             on_invalid_start=self._log_invalid_start,
         )
+        self._validate_auxiliary_config(
+            heuristic_cfg=heuristic_cfg,
+            guidance_cfg=training_cfg.guidance,
+            rank_aux_cfg=training_cfg.rank_aux,
+        )
         self.sampler = self.runtime_controller.sampler
         self.loss_fn = SubTrajectoryBalanceLoss(config=training_cfg.subtb)
+        self.training_exact_analyzer = ExactReachabilityAnalyzer(
+            max_steps=int(horizon_cfg.max_steps)
+        )
         self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
             base_temperature=training_cfg.sampling_temperature,
             config=training_cfg.sampling_temperature_schedule,
@@ -315,6 +346,25 @@ class GFlowNetModule(LightningModule):
             self.success_replay_buffer = SuccessfulTrajectoryReplayBuffer(
                 max_buffer_size=replay_cfg.max_buffer_size,
                 max_trajectories_per_sample=replay_cfg.max_trajectories_per_sample,
+            )
+
+    @staticmethod
+    def _validate_auxiliary_config(
+        *,
+        heuristic_cfg: HeuristicConfig,
+        guidance_cfg: GuidanceLossConfig,
+        rank_aux_cfg: RankAuxiliaryLossConfig,
+    ) -> None:
+        if float(guidance_cfg.loss_weight) > 0.0 and heuristic_cfg.kind != "learned":
+            raise ValueError(
+                "training.guidance.loss_weight > 0 requires heuristic.kind='learned'."
+            )
+        if (
+            float(rank_aux_cfg.loss_weight) > 0.0
+            and rank_aux_cfg.max_graphs_per_batch < 1
+        ):
+            raise ValueError(
+                "training.rank_aux.max_graphs_per_batch must be >= 1 when rank_aux is enabled."
             )
 
     @property
@@ -486,16 +536,140 @@ class GFlowNetModule(LightningModule):
             total_loss=total_loss, replay_result=replay_result
         )
 
+    def _compute_guidance_loss(
+        self,
+        *,
+        prepared_batch: Any,
+        sample_batch: TrajectoryGFNSampleBatch,
+    ) -> GuidanceLossResult | None:
+        guidance_cfg = self.cfg.training_cfg.guidance
+        if (
+            float(guidance_cfg.loss_weight) <= 0.0
+            or self.cfg.heuristic_cfg.kind != "learned"
+        ):
+            return None
+        trace_mask = sample_batch.trace_mask
+        if not bool(trace_mask.any().item()):
+            return None
+        flat_shape = (
+            int(sample_batch.trace_nodes.size(0) * sample_batch.trace_nodes.size(1)),
+            int(sample_batch.trace_nodes.size(2)),
+        )
+        state = SearchState(
+            topology=prepared_batch.topology,
+            observation=prepared_batch.observation,
+            current_nodes=sample_batch.trace_nodes.view(flat_shape),
+            done_mask=(~trace_mask).view(flat_shape),
+            num_steps=sample_batch.trace_num_steps.view(flat_shape),
+        )
+        logits = self.policy.compute_guidance_logits(
+            prepared_batch,
+            state,
+            detach_features=bool(guidance_cfg.detach_features),
+        ).view_as(sample_batch.trace_nodes)
+        targets = (
+            sample_batch.success_mask.to(dtype=torch.float32)
+            .unsqueeze(-1)
+            .expand_as(logits)
+        )
+        per_state_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction="none",
+        )
+        active_loss = per_state_loss[trace_mask]
+        if int(active_loss.numel()) == 0:
+            return None
+        active_logits = logits[trace_mask]
+        return GuidanceLossResult(
+            loss=active_loss.mean() * float(guidance_cfg.loss_weight),
+            target_mean=targets[trace_mask].mean().detach(),
+            prediction_mean=torch.sigmoid(active_logits).mean().detach(),
+            active_states=int(active_loss.numel()),
+        )
+
+    def _compute_rank_auxiliary_loss(
+        self,
+        *,
+        batch: TrajectoryBatch,
+    ) -> RankAuxiliaryLossResult | None:
+        rank_aux_cfg = self.cfg.training_cfg.rank_aux
+        if (
+            float(rank_aux_cfg.loss_weight) <= 0.0
+            or self.evaluation_task == "edge_retrieval"
+        ):
+            return None
+        per_graph_losses: list[torch.Tensor] = []
+        gold_score_means: list[torch.Tensor] = []
+        negative_score_means: list[torch.Tensor] = []
+        pair_count = 0
+        max_graphs = min(batch.num_graphs, int(rank_aux_cfg.max_graphs_per_batch))
+        for graph_idx in range(max_graphs):
+            graph_batch = batch.select_graph(graph_idx)
+            if int(graph_batch.answer_entity_ids.numel()) == 0:
+                continue
+            prepared_graph = self.policy.prepare_batch(graph_batch)
+            analysis = self.training_exact_analyzer.analyze(
+                batch=graph_batch,
+                policy=self.policy,
+                prepared_batch=prepared_graph,
+            )
+            answer_entity_ids = analysis.retrieval_answer_entity_ids
+            log_answer_probs = analysis.log_retrieval_answer_probs
+            if (
+                answer_entity_ids is None
+                or log_answer_probs is None
+                or int(answer_entity_ids.numel()) == 0
+            ):
+                continue
+            gold_entity_ids = torch.unique(graph_batch.answer_entity_ids).to(
+                device=answer_entity_ids.device,
+                dtype=torch.long,
+            )
+            if int(gold_entity_ids.numel()) == 0:
+                continue
+            gold_mask = (
+                answer_entity_ids.unsqueeze(1) == gold_entity_ids.unsqueeze(0)
+            ).any(dim=1)
+            if not bool(gold_mask.any().item()) or not bool((~gold_mask).any().item()):
+                continue
+            positive_scores = log_answer_probs[gold_mask]
+            negative_scores = log_answer_probs[~gold_mask]
+            max_negatives = int(rank_aux_cfg.max_negative_answers)
+            if int(negative_scores.numel()) > max_negatives:
+                negative_scores = torch.topk(negative_scores, k=max_negatives).values
+            pairwise_margin = (
+                positive_scores.unsqueeze(-1) - negative_scores.unsqueeze(0)
+            ) / float(rank_aux_cfg.temperature)
+            pair_loss = F.softplus(-pairwise_margin)
+            per_graph_losses.append(pair_loss.mean())
+            gold_score_means.append(positive_scores.mean().detach())
+            negative_score_means.append(negative_scores.mean().detach())
+            pair_count += int(pair_loss.numel())
+        if not per_graph_losses:
+            return None
+        return RankAuxiliaryLossResult(
+            loss=torch.stack(per_graph_losses).mean() * float(rank_aux_cfg.loss_weight),
+            graph_count=len(per_graph_losses),
+            pair_count=pair_count,
+            gold_score_mean=torch.stack(gold_score_means).mean(),
+            negative_score_mean=torch.stack(negative_score_means).mean(),
+        )
+
     def _build_training_metrics(
         self,
         *,
         loss_output: SubTrajectoryBalanceLossOutput,
         loss_aggregation: TrainingLossAggregation,
+        total_loss: torch.Tensor,
         sampling_temperature: float,
         on_policy_trajectories: int,
+        guidance_result: GuidanceLossResult | None,
+        rank_aux_result: RankAuxiliaryLossResult | None,
     ) -> dict[str, Any]:
         metrics: dict[str, Any] = {
-            "loss": loss_aggregation.total_loss.detach(),
+            "loss": total_loss.detach(),
+            "actor_loss": loss_aggregation.total_loss.detach(),
             "subtb_loss": loss_output.subtb_loss,
             "subtb_residual": loss_output.residual_abs,
             "subtb_root": loss_output.root_abs,
@@ -524,6 +698,19 @@ class GFlowNetModule(LightningModule):
         if replay_result is not None:
             metrics["on_policy_loss"] = loss_output.loss.detach()
             metrics["success_replay_loss"] = replay_result.loss_output.loss.detach()
+        if guidance_result is not None:
+            metrics["guidance_loss"] = guidance_result.loss.detach()
+            metrics["guidance_target_mean"] = guidance_result.target_mean
+            metrics["guidance_prediction_mean"] = guidance_result.prediction_mean
+            metrics["guidance_active_states"] = float(guidance_result.active_states)
+        if rank_aux_result is not None:
+            metrics["rank_aux_loss"] = rank_aux_result.loss.detach()
+            metrics["rank_aux_graphs"] = float(rank_aux_result.graph_count)
+            metrics["rank_aux_pairs"] = float(rank_aux_result.pair_count)
+            metrics["rank_aux_gold_score_mean"] = rank_aux_result.gold_score_mean
+            metrics["rank_aux_negative_score_mean"] = (
+                rank_aux_result.negative_score_mean
+            )
         effective_pass = self._resolve_effective_pass(after_current_step=True)
         if effective_pass is not None:
             metrics["effective_pass"] = effective_pass
@@ -673,8 +860,18 @@ class GFlowNetModule(LightningModule):
             replay_result=replay_result,
             on_policy_trajectories=on_policy_trajectories,
         )
+        guidance_result = self._compute_guidance_loss(
+            prepared_batch=prepared_batch,
+            sample_batch=sample_batch,
+        )
+        rank_aux_result = self._compute_rank_auxiliary_loss(batch=trajectory_batch)
+        total_loss = loss_aggregation.total_loss
+        if guidance_result is not None:
+            total_loss = total_loss + guidance_result.loss
+        if rank_aux_result is not None:
+            total_loss = total_loss + rank_aux_result.loss
         self._raise_on_nonfinite_training_loss(
-            total_loss=loss_aggregation.total_loss,
+            total_loss=total_loss,
             batch=trajectory_batch,
         )
         if self.success_replay_buffer is not None:
@@ -685,8 +882,11 @@ class GFlowNetModule(LightningModule):
         metrics = self._build_training_metrics(
             loss_output=loss_output,
             loss_aggregation=loss_aggregation,
+            total_loss=total_loss,
             sampling_temperature=sampling_temperature,
             on_policy_trajectories=on_policy_trajectories,
+            guidance_result=guidance_result,
+            rank_aux_result=rank_aux_result,
         )
         self._log_metric_bundle(
             metrics=metrics,
@@ -696,7 +896,7 @@ class GFlowNetModule(LightningModule):
             on_epoch=False,
             prog_bar_key="train/loss",
         )
-        return loss_aggregation.total_loss
+        return total_loss
 
     def _evaluate_batch_output(
         self, *, batch: TrajectoryBatch

@@ -8,13 +8,16 @@ import torch
 
 import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
+    AnswerRewardConfig,
     SearchEvalConfig,
     BackboneConfig,
     GFlowNetTrainingConfig,
+    GuidanceLossConfig,
     HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
+    RankAuxiliaryLossConfig,
     SamplingTemperatureScheduleConfig,
     SchedulerConfig,
     StateScoreHeadConfig,
@@ -490,6 +493,113 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     assert "subtb_residual" in captured_metrics
     assert "subtb_root" in captured_metrics
     assert not any(str(key).startswith("exact_aux") for key in captured_metrics)
+
+
+def test_guidance_loss_uses_learned_behavior_head_targets() -> None:
+    module = _make_module_with_training_cfg(
+        "learned",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=2,
+            answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
+            guidance=GuidanceLossConfig(loss_weight=0.2, detach_features=True),
+        ),
+    )
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+    assert module.sampler is not None
+    sample_batch = module.sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=2,
+        temperature=1.0,
+    )
+
+    guidance_result = module._compute_guidance_loss(
+        prepared_batch=prepared_batch,
+        sample_batch=sample_batch,
+    )
+
+    assert guidance_result is not None
+    assert torch.isfinite(guidance_result.loss)
+    assert guidance_result.active_states > 0
+    assert 0.0 <= guidance_result.prediction_mean.item() <= 1.0
+    assert 0.0 <= guidance_result.target_mean.item() <= 1.0
+
+
+def test_rank_auxiliary_loss_uses_exact_answer_posterior() -> None:
+    torch.manual_seed(3)
+    module = _make_module_with_training_cfg(
+        "learned",
+        training_cfg=GFlowNetTrainingConfig(
+            answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
+            rank_aux=RankAuxiliaryLossConfig(
+                loss_weight=0.3,
+                temperature=1.0,
+                max_graphs_per_batch=1,
+                max_negative_answers=8,
+            ),
+        ),
+    )
+    batch = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 0], [1, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        sample_id="rank-aux",
+    )
+
+    rank_result = module._compute_rank_auxiliary_loss(batch=batch)
+
+    assert rank_result is not None
+    assert torch.isfinite(rank_result.loss)
+    assert rank_result.graph_count == 1
+    assert rank_result.pair_count >= 1
+
+
+def test_training_step_logs_guidance_and_rank_aux_metrics_when_enabled() -> None:
+    torch.manual_seed(5)
+    module = _make_module_with_training_cfg(
+        "learned",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=2,
+            answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
+            guidance=GuidanceLossConfig(loss_weight=0.1, detach_features=True),
+            rank_aux=RankAuxiliaryLossConfig(
+                loss_weight=0.2,
+                temperature=1.0,
+                max_graphs_per_batch=1,
+                max_negative_answers=8,
+            ),
+        ),
+    )
+    batch = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 0], [1, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        sample_id="train-rank-aux",
+    )
+    captured_metrics: dict[str, object] = {}
+
+    def _capture_metric_bundle(*, metrics: dict[str, object], **kwargs: object) -> None:
+        del kwargs
+        captured_metrics.update(metrics)
+
+    module._log_metric_bundle = _capture_metric_bundle  # type: ignore[method-assign]
+
+    loss = module.training_step(batch, batch_idx=0)
+
+    assert loss.ndim == 0
+    assert "guidance_loss" in captured_metrics
+    assert "rank_aux_loss" in captured_metrics
+    assert "actor_loss" in captured_metrics
 
 
 def test_success_replay_rollout_resolution_rejects_invalid_ratio() -> None:

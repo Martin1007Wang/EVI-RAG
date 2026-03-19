@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Protocol
 
 import torch
 
 from src.graph_runtime import TrajectoryBatch
+from src.models.configs import AnswerRewardConfig
 from .transitions import apply_forward_constraints
 from .types import (
     ForwardActionDistribution,
@@ -41,24 +43,28 @@ def _build_answer_mask(batch: TrajectoryBatch) -> torch.Tensor:
 
 
 class AnswerReachabilityTrajectorySupervisor:
-    def __init__(self, *, epsilon: float, failure_reward_mode: str) -> None:
+    def __init__(
+        self,
+        *,
+        epsilon: float,
+        failure_reward_mode: str,
+        answer_reward: AnswerRewardConfig | None = None,
+    ) -> None:
         self.epsilon = float(epsilon)
         self.failure_reward_mode = str(failure_reward_mode)
         if self.failure_reward_mode not in {"constant", "graph_normalized"}:
             raise ValueError(
                 "failure_reward_mode must be one of {'constant', 'graph_normalized'}."
             )
+        self.answer_reward = answer_reward or AnswerRewardConfig()
 
-    def build_terminal_target_mask(self, *, batch: TrajectoryBatch) -> torch.Tensor:
-        return _build_answer_mask(batch)
-
-    def compute_terminal_rewards(
+    def _compute_legacy_rewards(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
         success_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         rewards = torch.full(
             terminal_nodes.shape,
             fill_value=self.epsilon,
@@ -75,7 +81,92 @@ class AnswerReachabilityTrajectorySupervisor:
                 device=terminal_nodes.device
             ).unsqueeze(1)
             rewards = self.epsilon / graph_non_answer_counts.expand_as(terminal_nodes)
-        rewards = torch.where(success_mask, torch.ones_like(rewards), rewards)
+        return torch.where(success_mask, torch.ones_like(rewards), rewards)
+
+    @staticmethod
+    def _build_graph_gold_entities(batch: TrajectoryBatch) -> list[set[int]]:
+        gold_entities: list[set[int]] = []
+        for graph_idx in range(int(batch.num_graphs)):
+            start = int(batch.answer_ptr[graph_idx].item())
+            end = int(batch.answer_ptr[graph_idx + 1].item())
+            gold_entities.append(
+                {int(value) for value in batch.answer_entity_ids[start:end].tolist()}
+            )
+        return gold_entities
+
+    @staticmethod
+    def _build_graph_entity_counts(batch: TrajectoryBatch) -> list[dict[int, int]]:
+        entity_counts: list[dict[int, int]] = []
+        for graph_idx in range(int(batch.num_graphs)):
+            node_start = int(batch.node_ptr[graph_idx].item())
+            node_end = int(batch.node_ptr[graph_idx + 1].item())
+            counts: dict[int, int] = {}
+            for entity_id in batch.node_global_ids[node_start:node_end].tolist():
+                entity_int = int(entity_id)
+                counts[entity_int] = counts.get(entity_int, 0) + 1
+            entity_counts.append(counts)
+        return entity_counts
+
+    def _compute_answer_ranking_rewards(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        terminal_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        rewards = torch.zeros(
+            terminal_nodes.shape,
+            device=terminal_nodes.device,
+            dtype=torch.float32,
+        )
+        flat_terminal_nodes = terminal_nodes.reshape(-1)
+        flat_rewards = rewards.reshape(-1)
+        terminal_entity_ids = batch.node_global_ids.index_select(0, flat_terminal_nodes)
+        graph_ids = torch.arange(
+            int(batch.num_graphs), device=terminal_nodes.device, dtype=torch.long
+        ).unsqueeze(1)
+        flat_graph_ids = graph_ids.expand_as(terminal_nodes).reshape(-1)
+        gold_entities = self._build_graph_gold_entities(batch)
+        entity_counts = self._build_graph_entity_counts(batch)
+        reward_cfg = self.answer_reward
+        for position, (graph_idx, entity_id) in enumerate(
+            zip(flat_graph_ids.tolist(), terminal_entity_ids.tolist())
+        ):
+            utility = (
+                float(reward_cfg.positive_utility)
+                if int(entity_id) in gold_entities[int(graph_idx)]
+                else float(reward_cfg.negative_utility)
+            )
+            reward_value = float(self.epsilon) + math.exp(
+                float(reward_cfg.beta) * utility
+            )
+            if bool(reward_cfg.normalize_by_entity_count):
+                reward_value /= float(
+                    entity_counts[int(graph_idx)].get(int(entity_id), 1)
+                )
+            flat_rewards[position] = float(reward_value)
+        return rewards
+
+    def build_terminal_target_mask(self, *, batch: TrajectoryBatch) -> torch.Tensor:
+        return _build_answer_mask(batch)
+
+    def compute_terminal_rewards(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        terminal_nodes: torch.Tensor,
+        success_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.answer_reward.mode == "legacy":
+            rewards = self._compute_legacy_rewards(
+                batch=batch,
+                terminal_nodes=terminal_nodes,
+                success_mask=success_mask,
+            )
+        else:
+            rewards = self._compute_answer_ranking_rewards(
+                batch=batch,
+                terminal_nodes=terminal_nodes,
+            )
         return rewards, rewards.clamp_min(1.0e-12).log()
 
 

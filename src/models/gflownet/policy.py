@@ -552,6 +552,20 @@ class GFlowNetPolicy(nn.Module):
             build_state_features=self.base_policy.build_state_features,
         ).to(dtype=torch.float32)
 
+    def compute_guidance_logits(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        state: SearchState,
+        *,
+        detach_features: bool = False,
+    ) -> torch.Tensor:
+        return self.search_heuristic.compute_state_logits(
+            prepared_batch=prepared_batch,
+            state=state,
+            build_state_features=self.base_policy.build_state_features,
+            detach_features=detach_features,
+        ).to(dtype=torch.float32)
+
     def _compute_behavior_forward_logits(
         self,
         *,
