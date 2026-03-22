@@ -25,7 +25,7 @@
 - 运行时过滤：`configs/dataset/base.yaml`
 - 前向步约束：`src/models/gflownet/transitions.py`
 - rank metric 定义：`src/metrics/answer_reachability/posterior.py`
-- exact reachability analysis：`src/metrics/answer_reachability/exact_analysis.py`
+- reachability analysis runtime：`src/metrics/answer_reachability/analysis.py`、`src/metrics/answer_reachability/flow_frontier.py`、`src/metrics/answer_reachability/monte_carlo.py`
 
 ## 3. 当前最终验证性能
 

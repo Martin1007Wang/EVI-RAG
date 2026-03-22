@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
@@ -41,13 +42,20 @@ def apply_forward_constraints(
         )
         edge_agent_batch = distribution.edge_agent_batch
         edge_at_horizon = at_horizon.index_select(0, edge_agent_batch)
-        edge_logits = edge_logits.masked_fill(edge_at_horizon, neg_inf)
+        submit_mask = (
+            distribution.is_submit.to(dtype=torch.bool)
+            if distribution.is_submit is not None
+            else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
+        )
+        edge_logits = edge_logits.masked_fill(edge_at_horizon & (~submit_mask), neg_inf)
     return ForwardActionDistribution(
         edge_logits=edge_logits,
         edge_agent_batch=distribution.edge_agent_batch,
         edge_ids=distribution.edge_ids,
         target_nodes=distribution.target_nodes,
         out_degrees=distribution.out_degrees,
+        is_submit=distribution.is_submit,
+        current_log_f=distribution.current_log_f,
     )
 
 
@@ -57,8 +65,54 @@ def compute_constrained_policy_step(
     prepared_batch: PreparedSearchBatch,
     state: SearchState,
     max_steps: int,
+    disable_candidate_shortlist: bool = False,
+    required_edge_ids: torch.Tensor | None = None,
 ) -> ConstrainedPolicyStep:
-    distribution = policy.compute_forward_distribution(prepared_batch, state)
+    distribution: ForwardActionDistribution
+    if disable_candidate_shortlist:
+        no_shortlist_fn = getattr(
+            policy, "compute_forward_distribution_without_shortlist", None
+        )
+        if callable(no_shortlist_fn):
+            distribution = cast(
+                ForwardActionDistribution,
+                no_shortlist_fn(prepared_batch, state),
+            )
+        else:
+            try:
+                distribution = cast(
+                    ForwardActionDistribution,
+                    policy.compute_forward_distribution(
+                        prepared_batch,
+                        state,
+                        required_edge_ids=required_edge_ids,
+                    ),
+                )
+            except TypeError as error:
+                if "unexpected keyword argument" not in str(error):
+                    raise
+                distribution = cast(
+                    ForwardActionDistribution,
+                    policy.compute_forward_distribution(prepared_batch, state),
+                )
+    else:
+        try:
+            distribution = cast(
+                ForwardActionDistribution,
+                policy.compute_forward_distribution(
+                    prepared_batch,
+                    state,
+                    required_edge_ids=required_edge_ids,
+                ),
+            )
+        except TypeError as error:
+            if "unexpected keyword argument" not in str(error):
+                raise
+            distribution = cast(
+                ForwardActionDistribution,
+                policy.compute_forward_distribution(prepared_batch, state),
+            )
+    distribution = cast(ForwardActionDistribution, distribution)
     distribution = apply_forward_constraints(
         distribution,
         state=state,

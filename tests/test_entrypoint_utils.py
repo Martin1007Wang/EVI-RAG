@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from lightning.pytorch.callbacks import ModelCheckpoint
 import pytest
 from omegaconf import OmegaConf
 
@@ -215,3 +216,99 @@ def test_instantiate_lightning_task_objects_allows_datamodule_hook_to_mutate_cfg
         "_target_": "tests.Model",
         "horizon_cfg": {"max_steps": 7},
     }
+
+
+def test_normalize_trainer_cfg_rewrites_null_max_steps_for_instantiation() -> None:
+    trainer_cfg = OmegaConf.create(
+        {
+            "_target_": "tests.Trainer",
+            "accelerator": "gpu",
+            "devices": 1,
+            "max_steps": None,
+        }
+    )
+
+    normalized = entrypoint_utils._normalize_trainer_cfg(trainer_cfg)
+
+    assert normalized.max_steps == -1
+    assert trainer_cfg.max_steps is None
+
+
+def test_instantiate_lightning_task_objects_normalizes_trainer_max_steps(
+    monkeypatch,
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "data": {"_target_": "tests.DataModule"},
+            "model": {"_target_": "tests.Model"},
+            "trainer": {"_target_": "tests.Trainer", "max_steps": None},
+            "callbacks": None,
+            "logger": None,
+        }
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_instantiate(config, **kwargs):  # type: ignore[no-untyped-def]
+        target = str(config.get("_target_"))
+        if target == "tests.DataModule":
+            return SimpleNamespace(name="data")
+        if target == "tests.Model":
+            return SimpleNamespace(name="model")
+        if target == "tests.Trainer":
+            seen["trainer_config"] = OmegaConf.to_container(config, resolve=True)
+            return SimpleNamespace(name="trainer", kwargs=kwargs)
+        raise AssertionError(f"Unexpected instantiate target: {target}")
+
+    monkeypatch.setattr(entrypoint_utils.hydra.utils, "instantiate", _fake_instantiate)
+    monkeypatch.setattr(entrypoint_utils, "instantiate_callbacks", lambda _: [])
+    monkeypatch.setattr(entrypoint_utils, "instantiate_loggers", lambda _: [])
+
+    entrypoint_utils.instantiate_lightning_task_objects(
+        cfg,
+        log=SimpleNamespace(info=lambda *args, **kwargs: None),
+    )
+
+    assert seen["trainer_config"] == {"_target_": "tests.Trainer", "max_steps": -1}
+    assert cfg.trainer.max_steps is None
+
+
+def test_instantiate_lightning_task_objects_drops_model_checkpoint_when_disabled(
+    monkeypatch,
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "data": {"_target_": "tests.DataModule"},
+            "model": {"_target_": "tests.Model"},
+            "trainer": {
+                "_target_": "tests.Trainer",
+                "enable_checkpointing": False,
+            },
+            "callbacks": None,
+            "logger": None,
+        }
+    )
+    seen: dict[str, object] = {}
+    checkpoint_callback = ModelCheckpoint(dirpath="/tmp")
+    callbacks = [SimpleNamespace(name="plain"), checkpoint_callback]
+
+    def _fake_instantiate(config, **kwargs):  # type: ignore[no-untyped-def]
+        target = str(config.get("_target_"))
+        if target == "tests.DataModule":
+            return SimpleNamespace(name="data")
+        if target == "tests.Model":
+            return SimpleNamespace(name="model")
+        if target == "tests.Trainer":
+            seen["trainer_callbacks"] = kwargs["callbacks"]
+            return SimpleNamespace(name="trainer", kwargs=kwargs)
+        raise AssertionError(f"Unexpected instantiate target: {target}")
+
+    monkeypatch.setattr(entrypoint_utils.hydra.utils, "instantiate", _fake_instantiate)
+    monkeypatch.setattr(entrypoint_utils, "instantiate_callbacks", lambda _: callbacks)
+    monkeypatch.setattr(entrypoint_utils, "instantiate_loggers", lambda _: [])
+
+    entrypoint_utils.instantiate_lightning_task_objects(
+        cfg,
+        log=SimpleNamespace(info=lambda *args, **kwargs: None),
+    )
+
+    assert seen["trainer_callbacks"] == [callbacks[0]]

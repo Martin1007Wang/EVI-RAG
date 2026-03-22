@@ -1,12 +1,12 @@
 # @package _global_
 #
-# Backward-compatible alias for `experiment=train_rankflow`.
+# Fast-iteration RankFlow training bundle for quick idea validation.
 # Usage:
-#   python src/train.py experiment=train_rankflow dataset=webqsp-sub
+#   python src/train.py experiment=train_rankflow_fastiter dataset=webqsp-sub
 #
 # Contract:
-# - overrides `/run`, `/trainer`, `/model`, `/callbacks`, `/logger`
-# - still requires the caller to choose `/dataset`
+# - keeps the RankFlow train path but makes validation/test intentionally cheap
+# - disables post-fit heavy eval and replay-driven training extras by default
 
 defaults:
   - override /callbacks: default
@@ -19,13 +19,22 @@ defaults:
 optimized_metric: "val/sub/answer/recall@10"
 
 data:
-  batch_size: 32
   eval_batch_size: 64
+
+run:
+  # Tuning runs should stop after fit; final eval remains available from the
+  # full `train_rankflow` experiment or a dedicated eval command.
+  test: false
+
+fit_schedule:
+  max_passes: 48.0
+  val_every_passes: 8.0
+  early_stopping_patience_passes: 16.0
 
 trainer:
   min_epochs: 0
   max_epochs: -1
-  max_time: "00:08:00:00"
+  max_time: "00:02:00:00"
   check_val_every_n_epoch: null
   log_every_n_steps: 50
   precision: bf16-mixed
@@ -42,35 +51,23 @@ callbacks:
   early_stopping:
     monitor: "val/sub/answer/recall@10"
     mode: max
-    # Runtime rewrites this from `fit_schedule.early_stopping_patience_passes`.
-    patience: 12
+    patience: 2
     min_delta: 0.002
 
 model:
   training_cfg:
-    answer_reward:
-      mode: entity_sink
-      beta: 1.25
-      cycle_penalty: 0.85
-      failure_length_penalty_alpha: 0.05
-    guidance:
-      loss_weight: 0.0
-      detach_features: true
     success_replay:
-      enabled: true
-      ratio: 0.25
-      warmup_passes: 1.0
-      min_buffer_size: 256
-      max_buffer_size: 50000
-      max_trajectories_per_sample: 8
+      enabled: false
+    adaptive_sampling:
+      enabled: false
   heuristic_cfg:
     kind: none
     beta: 0.0
   eval_cfg:
-    # Training-time validation only needs answer-ranking metrics; full window search is reserved for final eval.
+    # Fast-iteration validation only needs a coarse trend estimate.
     strict_search: true
     metrics_profile: rank_only
-    monte_carlo_rollouts: 256
+    monte_carlo_rollouts: 128
     max_expansions: 100000
     max_frontier_size: 32768
   scheduler_cfg:

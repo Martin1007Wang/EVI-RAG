@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+from hydra import compose, initialize_config_dir
 import pytest
 from omegaconf import OmegaConf
 
@@ -33,6 +35,25 @@ def test_enforce_single_gpu_eval_accepts_single_gpu_auto_strategy() -> None:
     )
 
     _enforce_single_gpu_eval(trainer_cfg)
+
+
+def test_rankflow_eval_config_resolves_model_scheduler_without_trainer_max_steps() -> (
+    None
+):
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="eval.yaml",
+            overrides=["experiment=rankflow", "ckpt.gflownet=/tmp/mock.ckpt"],
+        )
+
+    assert "max_steps" in cfg.trainer
+    assert cfg.trainer.max_steps is None
+    assert (
+        OmegaConf.to_container(cfg.model, resolve=True)["scheduler_cfg"]["t_max"]
+        is None
+    )
 
 
 def test_configure_eval_split_updates_datamodule_when_supported() -> None:
@@ -92,6 +113,51 @@ def test_align_validation_metrics_profile_uses_model_contract() -> None:
     _align_validation_metrics_profile(cfg)
 
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
+
+
+def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "experiment=train_rankflow_fastiter",
+                "dataset=webqsp-sub",
+                "logger=none",
+                "extras.enforce_tags=false",
+                "extras.print_config=false",
+            ],
+        )
+
+    assert cfg.run.test is False
+    assert cfg.data.eval_batch_size == 64
+    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
+    assert cfg.model.eval_cfg.monte_carlo_rollouts == 128
+    assert cfg.model.training_cfg.success_replay.enabled is False
+    assert cfg.model.training_cfg.adaptive_sampling.enabled is False
+    assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
+
+
+def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "experiment=train_rankflow",
+                "dataset=webqsp-sub",
+                "logger=none",
+                "extras.enforce_tags=false",
+                "extras.print_config=false",
+            ],
+        )
+
+    assert cfg.data.eval_batch_size == 32
+    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
+    assert cfg.model.eval_cfg.monte_carlo_rollouts == 256
+    assert cfg.run.test is True
 
 
 def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(

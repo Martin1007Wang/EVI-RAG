@@ -15,85 +15,145 @@
 ## 1. 任务、状态与记号
 
 给定一个样本图 `G = (V, E)`、问题起点集合 `Q`、答案节点集合 `A`，以及最大步数
-`H`，当前实现把搜索过程建模为一个有限 horizon 的 node-time GFlowNet。
+`H`，当前实现把搜索过程定义在一个有限 horizon 的离散 prefix-tree 上。
 
-状态不是静态节点，而是：
+环境状态不是静态 `(node, time)`，而是精确离散前缀：
 
 ```text
-x_t = (v_t, t),  v_t in V,  t in {0, 1, ..., H}
+x_t = (v_0, r_1, v_1, ..., r_t, v_t)
 ```
 
-其中 `t` 表示已经执行的 move 数。
+其中：
 
-为了和代码保持一致，下面使用这些记号：
+- `v_0 in Q`
+- `t in {0, 1, ..., H}` 表示已经执行的 graph move 数
+- 当前节点是 `v_t`
 
-- `F_t(v)`: 状态 `(v, t)` 的非归一化 flow。
-- `f_t(v) = log F_t(v)`: 对应的 log-flow。
-- `P_F^start(v)`: 从问题起点集合中选择起始节点的目标分布。
-- `P_F(e | v, t)`: 在状态 `(v, t)` 选择边 `e = (v -> u)` 的目标前向分布。
-- `P_B(v, t - 1 | u, t)`: 在状态 `(u, t)` 上的目标后向分布。
+为了高效前向打分，策略不会在每一步重新对整段 prefix 做 self-attention，而是额外维护一
+个连续控制状态：
+
+```text
+c_t in R^d
+```
+
+`c_t` 压缩了问题条件下的 prefix 历史；而 `x_t` 仍以离散 `path_token_ids` 的形式保留在
+环境状态里，用于 backward、replay、trace 和离线路径重建。
+
+下面统一使用这些记号：
+
+- `F(x_t)`: prefix state `x_t` 的非归一化 flow。
+- `f(x_t) = log F(x_t)`: 对应的 log-flow。
+- `P_F^start(q)`: 从起点集合中选择起始节点 `q` 的目标分布。
+- `P_F(e | x_t)`: 在 prefix `x_t` 上选择 graph move `e = (v_t -r-> u)` 的目标前向分布。
+- `P_B(parent(x_t) | x_t)`: 非根 prefix 的目标后向分布。
 - `R(tau)`: 轨迹 `tau` 的终止奖励。
 
-当前实现采用共享 encoder + 解耦三头：
+当前实现采用共享 encoder + 两个学习头 + 一个精确 backward kernel：
 
-- state-flow head：输出 `f_t(v)`
+- state-flow head：输出 `f(x_t)`
 - forward-policy head：输出 `P_F`
-- backward-policy head：输出 `P_B`
+- backward kernel：从离散 prefix 直接恢复唯一合法 parent
 
-也就是说，当前主线不再使用 `P_F prop F * P_B` 的诱导式前向策略。
+也就是说，当前主线不再使用历史 path self-attention，也不再学习一个独立 backward
+head。
 
 ## 2. 状态流参数化
 
-编码器先产生：
+`prepare_batch()` 先一次性编码整张图与问题，得到：
 
 - 节点表示 `z_v`
-- 问题表示 `z_q`
+- 关系表示 `z_r`
+- 全局问题向量 `q_root`
+- 问题 token 序列 `H_Q`
 
-然后对任意状态 `(v, t)` 构造状态特征：
+### 2.1 recurrent prefix controller
+
+控制状态以全局问题向量为根：
 
 ```text
-phi(v, t)
-= LayerNorm(z_v + step_embed(t) + remaining_embed(H - t))
+c_root = q_root
+```
+
+对起点 `q in Q`，当前实现先用一个 learned start relation token 触发第一次 controller
+更新：
+
+```text
+a_root = Attn(W_q c_root, H_Q)
+c_0(q) = LN(GRU([a_root; z_q; z_start], c_root))
+```
+
+对任意后续 graph move `x_t --r_{t+1}--> x_{t+1}`，controller 按相同模式递推：
+
+```text
+a_t = Attn(W_q c_t, H_Q)
+c_{t+1} = LN(GRU([a_t; z_{v_{t+1}}; z_{r_{t+1}}], c_t))
+```
+
+这里：
+
+- `Attn` 是当前 `control_state` 对问题 token 的单头注意
+- `GRU` 是轻量 prefix updater
+- `LN` 表示 LayerNorm
+
+如果 rollout 时已经显式携带 `control_state`，策略直接复用；如果只给离散
+`path_token_ids`，策略会按上面的递推重新回放 prefix，重建对应的 `c_t`。
+
+### 2.2 state feature 与 log-flow
+
+先构造与当前节点和步数有关的静态基底：
+
+```text
+b(x_t) = z_{v_t} + step_embed(t) + remaining_embed(H - t)
+```
+
+再把这个基底与控制状态拼接，经过小 MLP 得到真正的 state feature：
+
+```text
+phi(x_t) = LN(MLP(LN([b(x_t); c_t])))
 ```
 
 统一的状态流头输出：
 
 ```text
-f_t(v) = log F_t(v)
+f(x_t) = log F(x_t)
 ```
 
-也就是说，当前主线学习的是一个 node-time flow 函数：
+因此当前主线学习的是：
 
 ```text
-(v, t) -> f_t(v)
+x_t -> c_t -> phi(x_t) -> f(x_t)
 ```
 
-起点状态 `(q, 0)` 与中间状态 `(v, t)` 共享同一套参数化，只是时间索引不同。
+也就是说，flow 的数学状态仍是 exact prefix state，而神经表征是它的 recurrent
+compression。
 
 ## 3. 起点分布与隐式虚拟源
 
-当前实现把多起点问题写成一个隐式虚拟源 `s_root` 指向所有真实起点状态
-`(q, 0), q in Q`。
-
-对于每个起点候选 `q in Q`，先计算：
+当前实现把多起点问题写成一个隐式虚拟源 `s_root` 指向所有真实起点 prefix：
 
 ```text
-f_0(q) = log F_0(q)
+x_0(q) = (q), q in Q
 ```
 
-然后 graph 的根流量由所有起点流量归一化得到：
+对于每个起点候选 `q in Q`，先通过上面的 start controller 得到 `c_0(q)`，再计算：
 
 ```text
-Z = sum_{q in Q} F_0(q)
-log Z = logsumexp_{q in Q} f_0(q)
+f(x_0(q)) = log F(x_0(q))
+```
+
+graph 的根流量由所有起点流量归一化得到：
+
+```text
+Z = sum_{q in Q} F(x_0(q))
+log Z = logsumexp_{q in Q} f(x_0(q))
 ```
 
 因此目标起点分布不是额外学习的，而是直接由起点流量归一化得到：
 
 ```text
 P_F^start(q)
-= F_0(q) / Z
-= exp(f_0(q) - log Z)
+= F(x_0(q)) / Z
+= exp(f(x_0(q)) - log Z)
 ```
 
 这正是 `build_start_distribution_from_log_flows()` 的数学含义。
@@ -101,69 +161,84 @@ P_F^start(q)
 由此立即得到一个重要恒等式：
 
 ```text
-f_0(q) - log P_F^start(q) = log Z
+f(x_0(q)) - log P_F^start(q) = log Z
 ```
 
 这个恒等式解释了为什么当前 `SubTB` 根边界和起点边界能天然对齐。
 
-## 4. 解耦三头参数化
+## 4. 前向 actor 与 backward kernel
 
 ### 4.1 state-flow head
 
 state-flow head 只负责输出：
 
 ```text
-f_t(v) = log F_t(v)
+f(x_t) = log F(x_t)
 ```
 
-它不再直接参与 `P_F` 或 `P_B` 的参数化。
+它不再直接诱导 `P_F`，而是作为独立的 flow anchor 进入 `SubTB`。
 
 ### 4.2 forward-policy head
 
-给定当前状态 `(v, t)` 和每条候选边 `e = (v -> u)`，forward head 直接输出未归一化
-logit：
+给定当前 prefix `x_t` 的 state feature `phi(x_t)`，以及候选边
+`e = (v_t -r-> u)`，forward head 直接输出未归一化 logit：
 
 ```text
-ell_F(e : v -> u, t)
+ell_F(e | x_t) = g_theta(phi(x_t), z_u, z_r)
 ```
 
-然后在所有合法 outgoing edges 上归一化：
+这里 actor 读取的是：
+
+- 当前 prefix 的 state feature
+- 静态候选节点表示 `z_u`
+- 关系表示 `z_r`
+
+它不再对整段 path 做 self-attention，也不要求先显式构造 child prefix 的完整 state
+feature。
+
+另外还有一个显式 submit 动作：
 
 ```text
-P_F(e | v, t)
-= exp(ell_F(e)) / sum_{e'=(v->u')} exp(ell_F(e'))
+ell_submit(x_t) = g_theta(phi(x_t), z_{v_t}, z_submit)
 ```
 
-当前实现里，`ell_F` 来自共享状态特征、候选 child state 特征、relation 特征和问题
-特征的联合打分，而不是由 `f_{t+1}(u)` 诱导出来。
-
-### 4.3 backward-policy head
-
-给定当前状态 `(u, t)` 以及其每条合法入边 `e = (v -> u)`，backward head 直接输出：
+最终目标前向分布在所有合法 outgoing edges 与 submit 动作上归一化：
 
 ```text
-ell_B(e : v -> u, t)
+P_F(a | x_t) = exp(ell(a | x_t)) / sum_{a' in A(x_t)} exp(ell(a' | x_t))
 ```
 
-再在所有合法 incoming edges 上归一化：
+### 4.3 backward kernel
+
+对非根 prefix，当前实现不学习独立 backward head，而是直接从 `path_token_ids` 恢复：
 
 ```text
-P_B(v, t - 1 | u, t)
-= exp(ell_B(e)) / sum_{e'=(v'->u)} exp(ell_B(e'))
+parent(x_t)
 ```
 
-因此当前训练目标里的 `log P_B` 也来自独立参数化，而不是固定均匀父分布。
+也就是该 prefix 在离散 prefix-tree 上唯一合法的父状态。因此在 graph move 部分：
+
+```text
+P_B(parent(x_t) | x_t) = 1
+P_B(x' | x_t) = 0,  for x' != parent(x_t)
+```
+
+实现上，代码会根据已编码 prefix 取出“上一个节点 + 最后一步 relation”，然后在 incoming
+edges 中找到与之匹配的那条父边。
+
+因此当前训练目标里的非终止 `log P_B` 不再来自 learned backward，也不来自 uniform
+indegree，而是来自 exact parent recovery。
 
 ## 5. heuristic、behavior policy 与采样温度
 
 当前实现里 heuristic 不进入目标分布 `P_F` / `P_B`，而只进入 behavior policy，也就是
 训练期的探索分布。
 
-如果记启发式 bias 为 `h_t(v)`，权重为 `beta`，则 behavior 分布使用：
+如果记启发式 bias 为 `h(x_t)`，权重为 `beta`，则 behavior 分布使用：
 
 ```text
-Q_F^start(q) prop exp(f_0(q) + beta h_0(q))
-Q_F(e : v -> u | v, t) prop exp(ell_F(e : v -> u, t) + beta h_{t+1}(u))
+Q_F^start(q) prop exp(f(x_0(q)) + beta h(x_0(q)))
+Q_F(e | x_t) prop exp(ell_F(e | x_t) + beta h(child(x_t, e)))
 ```
 
 其中 `h` 的来源可以是：
@@ -177,14 +252,14 @@ Q_F(e : v -> u | v, t) prop exp(ell_F(e : v -> u, t) + beta h_{t+1}(u))
 训练时真正采样边还会再经过温度 `tau`：
 
 ```text
-Q_sample(e | v, t) = softmax(logits_behavior / tau)
+Q_sample(a | x_t) = softmax(logits_behavior / tau)
 ```
 
 因此当前训练链条是：
 
 - 用 behavior distribution 提高探索质量；
-- 用 target distribution 重新计算 `log P_F` 与 `log P_B`；
-- 用 target 的 flow consistency 做 `SubTB`。
+- 用 target distribution 重新计算 `log P_F`，并记录 backward 量做诊断/兼容；
+- 用前向子轨迹的一致性残差做 `SubTB`。
 
 ## 6. 终止规则与奖励
 
@@ -204,15 +279,84 @@ R(tau) = epsilon / N_nonanswer,  if failure_reward_mode = graph_normalized
 
 其中 `N_nonanswer` 是该 graph 的非答案节点数，至少截到 `1`。
 
+当 `training.answer_reward.mode = binary_ranking` 时，当前实现改为：
+
+```text
+R(tau) = epsilon + exp(beta * u(y(tau)))
+```
+
+其中：
+
+- `y(tau)` 是 terminal entity；
+- `u(y)` 对 gold answer 取 `positive_utility`，对非 gold answer 取 `negative_utility`。
+
+如果 `training.answer_reward.terminal_reward_scale = entity_alias_count`，代码还会再做一步
+启发式缩放：
+
+```text
+R(tau) = [epsilon + exp(beta * u(y(tau)))] / alias_count_graph(y(tau))
+```
+
+这里的 `alias_count_graph(y)` 只是“同一实体在当前 graph 中出现了多少个节点副本”的计数。
+它只能部分缓解 duplicate entity node 带来的放大效应，并不能校正 tree policy 下的
+path multiplicity bias。也就是说，如果同一实体的不同 alias 节点背后可达路径数差异很大，
+这个缩放仍然不是严格的 entity-level unbiased normalization，而只是 alias-level
+heuristic。
+
+当 `training.answer_reward.mode = entity_sink` 时，reward 本身保留 entity-level 形式：
+
+```text
+R_sink(y) = epsilon + exp(beta * u(y))
+```
+
+如果 `training.answer_reward.length_penalty_alpha = alpha > 0`，终止 reward 会再乘一个
+随 graph move 步数衰减的长度因子：
+
+```text
+R_sink(y, t) = R_sink(y) * exp(-alpha * t)
+```
+
+其中 `t` 是命中答案前的 graph move 次数，也就是 `terminal_num_steps`；最终的
+`submit -> sink(y)` 动作本身不额外计步。
+
+不再把 alias-count 缩放直接塞进 reward，而是把最后一步 `submit -> sink(y)` 当成显式终止
+转移，并给它一个单独的 backward kernel。当前默认近似是：
+
+```text
+P_B(parent | sink(y)) = 1 / alias_count_graph(y)
+```
+
+对应的 terminal backward log-prob 为：
+
+```text
+log P_B(parent | sink(y)) = -log alias_count_graph(y)
+```
+
+这样把“实体奖励”和“终止 backward 近似”在实现上拆开了，更接近 entity-sink 语义；但要强调，
+`uniform_entity_alias` 仍然只是在 alias 节点层面近似 terminal parent 分布，并没有解决
+path-dependent tree policy 下真正的 path multiplicity 归一化问题。
+
 所以终止 log-reward 为：
 
 ```text
-log R(tau)
+log R(tau) = log R_base(tau) - alpha * t(tau)
 ```
 
 这就是 `TrajectoryGFNSampleBatch.terminal_log_rewards` 的来源。
 
-## 7. SubTB 的推导
+## 7. 当前 `SubTB` 实际约束了什么
+
+这里必须以 `src/models/gflownet/losses.py` 为准。
+
+当前 `SubTrajectoryBalanceLoss.compute()` 读取的主要量是：
+
+- `start_state_log_f`
+- `next_state_log_f_steps`
+- `log_pf_steps`
+- `terminal_log_rewards`
+
+虽然 sample batch 里也携带 `log_pb_steps` 和 `graph_log_z`，但当前 loss 实现没有把它们写进
+训练残差；它们目前主要保留给日志、诊断和兼容接口。
 
 ### 7.1 一条轨迹上的前缀量
 
@@ -224,92 +368,85 @@ tau = (x_0, x_1, ..., x_T)
 
 其中：
 
-- `x_0` 是 sampled start state；
-- `x_{k+1}` 对应第 `k` 次 move 之后的状态；
+- `x_0` 是 sampled start prefix；
+- `x_{k+1}` 对应第 `k` 次 graph move 之后的状态；
 - `x_T` 是 rollout 的最后一个实际状态。
 
-定义前向和后向前缀和：
+定义前向前缀和：
 
 ```text
 G_k^F = sum_{i < k} log P_F(x_{i+1} | x_i)
-G_k^B = sum_{i < k} log P_B(x_i | x_{i+1})
 ```
 
-在代码里：
-
-- `forward_prefix` 对应 `G_k^F`
-- `backward_prefix` 对应 `G_k^B`
-
-### 7.2 轨迹锚点
+### 7.2 状态锚点和终止锚点
 
 对非终止状态，定义：
 
 ```text
-A_k = log F(x_k) - G_k^F + G_k^B
+A_k = log F(x_k) - G_k^F
 ```
 
-对终止位置，不再使用 `log F(x_T)`，而是用 reward 锚点替换：
+对终止位置，不再使用 `log F(x_T)`，而是直接用 reward 锚点替换：
 
 ```text
-A_term = log R(tau) - G_term^F + G_term^B
+A_term = log R(tau) - G_T^F
 ```
 
-这就是代码中的 `anchored_values`。
+### 7.3 当前实现的 pairwise residual
 
-### 7.3 为什么所有子轨迹都应该对齐
-
-如果 flow 完全满足 trajectory balance，那么对任意一段子轨迹
-`x_i -> x_{i+1} -> ... -> x_j`，都应满足：
-
-```text
-log F(x_i) + sum_{k=i}^{j-1} log P_F(x_{k+1} | x_k)
-= log F(x_j) + sum_{k=i}^{j-1} log P_B(x_k | x_{k+1})
-```
-
-移项可得：
-
-```text
-A_i = A_j
-```
-
-如果 `x_j` 是终止状态，则把右侧的 `log F(x_j)` 替换成 `log R(tau)`，同样得到：
-
-```text
-A_i = A_term
-```
-
-因此理想情况下，整条轨迹上所有锚点应该彼此相等。
-
-### 7.4 当前实现的 SubTB
-
-代码没有只约束单一 start-to-terminal，而是对所有合法子轨迹做二次残差：
+对任意 `0 <= i < j < T`，代码实际构造：
 
 ```text
 Delta_{i,j} = A_i - A_j
 ```
 
-并对每一对 `i < j` 施加权重：
+展开就是：
 
 ```text
-w_{i,j} = lambda_weight^(j - i - 1)
+Delta_{i,j}
+= log F(x_i)
+ + sum_{k=i}^{j-1} log P_F(x_{k+1} | x_k)
+ - log F(x_j)
 ```
 
-于是单条 rollout 的 `SubTB` 为：
+对任意中间状态到 terminal 的残差则是：
+
+```text
+Delta_{i,term} = A_i - A_term
+```
+
+也就是：
+
+```text
+Delta_{i,term}
+= log F(x_i)
+ + sum_{k=i}^{T-1} log P_F(x_{k+1} | x_k)
+ - log R(tau)
+```
+
+### 7.4 加权 `SubTB`
+
+如果 `lambda_weight = lambda`，当前实现对更长的子段做指数衰减：
+
+```text
+w_{i,j} = lambda^(j - i - 1)
+```
+
+单条 rollout 的 loss 可以写成：
 
 ```text
 L_subtb(tau)
-= WeightedMean_{i < j} [w_{i,j} (A_i - A_j)^2]
+= WeightedMean({Delta_{i,j}^2, Delta_{i,term}^2})
 ```
 
-如果 `normalize=True`，就除以权重总和；否则直接求加权和。
+最后 batch loss 为所有 sampled rollout 的平均。
 
-最后 batch loss 为：
+因此当前实现更准确的一句话是：
 
 ```text
-L_on = mean_{tau in sampled rollouts} L_subtb(tau)
+用 prefix state log-flow、forward log-prob 和 terminal log-reward
+做前向子轨迹一致性约束。
 ```
-
-这就是 `SubTrajectoryBalanceLoss.compute()` 返回的 `loss_output.loss`。
 
 ## 8. Success replay 的数学逻辑
 
@@ -347,116 +484,113 @@ K_rep = K r / (1 - r)
 - `N_on`: on-policy 轨迹数
 - `N_rep`: replay 轨迹数
 
-当前实现不是简单相加，而是按轨迹条数加权平均：
-
-```text
-L_subtb_total
-= (N_on L_on + N_rep L_rep) / (N_on + N_rep)
-```
-
-这样 replay 不会因为开启与否改变 `SubTB` 的整体量纲。
-
-## 9. 总训练目标
-
-删掉训练期 exact DP auxiliary 之后，当前主线重新回到 GFlowNet 的核心命题：
-
-```text
-基于局部流一致性的信用分配
-```
-
-因此训练目标只剩下两部分：
-
-1. on-policy sampled rollouts 的 `SubTB`
-2. 可选的 successful trajectory replay 加权 `SubTB`
-
-最终训练目标为：
+当前实现按轨迹条数加权平均：
 
 ```text
 L_total = (N_on L_on + N_rep L_rep) / (N_on + N_rep)
 ```
 
-如果 replay 关闭或当前 batch 没有可用 replay plan，则 `N_rep = 0`，公式退化为：
+这样 replay 不会因为开启与否改变目标的整体量纲。
+
+## 9. 总训练目标
+
+当前训练目标只剩两部分：
+
+1. on-policy sampled rollouts 的 `SubTB`
+2. 可选的 success replay `SubTB`
+
+如果 replay 关闭或当前 batch 没有可用 replay plan，则 `N_rep = 0`，退化为：
 
 ```text
 L_total = L_on
 ```
 
-也就是说，当前训练不再通过额外的精确全局路径质量目标来干预优化；所有 credit
-assignment 都回到 sampled trajectory 上的局部 flow consistency 约束。
+也就是说，当前训练并不再依赖一个额外的全局 exact path objective；credit assignment
+全部发生在 sampled trajectory 的前向一致性残差上。
 
-## 10. 评估阶段仍保留 exact analysis
+## 10. 评估阶段的 flow-frontier analysis
 
-虽然训练已经移除了 exact DP auxiliary，但评估栈仍然保留 exact analysis，用来做：
+当前默认 answer-reachability 评估不再用 Monte Carlo rollout 估计 posterior，而是直接沿
+learned flow 做 deterministic frontier expansion。
 
-- exact answer posterior
-- gold mass 估计
-- support search 的前缀上界
-
-这部分逻辑不再参与训练目标，只服务于验证、测试和 artifact 生成。
-
-精确分析里仍然定义：
+对每张图，先由起点流得到：
 
 ```text
-S_t(v) = 从状态 (v, t) 出发，在剩余步数内最终命中答案节点的总概率
+Z_theta(x) = sum_{q in Q(x)} F(x_0(q))
+log Z_theta(x) = logsumexp_{q in Q(x)} f(x_0(q))
 ```
 
-其 log-space 递推为：
+然后从所有起点 prefix 建立初始 frontier，并对每个保留下来的 state `x_t` 同时维护：
+
+- 真实 prefix probability
+- state log-flow `f(x_t)`
+
+其中 prefix probability 由 tree policy 直接给出：
 
 ```text
-log S_t(v)
-= LSE_{e=(v->u)} [log P_F(e | v, t) + log S_{t+1}(u)]
+P_theta(x_t | x)
+= P_F^start(v_0 | x) * prod_{i=1}^t P_F(a_i | x_{i-1})
 ```
 
-并由此得到：
+对任意候选 child state，当前实现使用 normalized state flow
 
 ```text
-log M_gold = LSE_v [log m_start(v) + log S_0(v)]
+U(x_t) = F(x_t) / Z_theta(x) = exp(f(x_t) - log Z_theta(x))
 ```
 
-这部分现在应被理解为 evaluation-time analysis，而不是 training-time credit
-assignment。
-
-## 11. 评估阶段的 best-first support search
-
-精确 analysis 还提供了一个 prefix 的上界函数。
-
-若某个搜索前缀 `pi`：
-
-- 当前累计 log 概率为 `log P(pi)`；
-- 当前位于节点 `v`；
-- 已走 `m` 步；
-
-那么它未来所有成功补全的总概率质量上界为：
+作为 descendant terminal mass 的可剪枝上界；如果：
 
 ```text
-U(pi) = log P(pi) + log S_m(v)
+U(x_t) < epsilon_flow
 ```
 
-原因很直接：
+则该 state 会被 flow-admissible pruning 丢弃，并把对应质量累计到
+`remaining_mass_upper`。
+
+保留下来的 terminal trajectory 直接贡献 terminal / answer posterior：
 
 ```text
-P(any successful completion extending pi)
-= P(pi) * S_m(v)
+P_ret(u | x) = sum_{tau: term(tau)=u, retained} P_theta(tau | x)
+P_ret(a | x) = sum_{u: entity(u)=a} P_ret(u | x)
 ```
 
-取 log 就得到上式。
+如果 frontier 被完全穷尽且没有额外 prune/budget overflow，则这些量就是当前 learned
+policy 下的精确值；否则它们表示 retained support 上的精确质量，并由
+`remaining_mass_upper` 给出遗漏尾部的保守上界。
 
-因此 `ExactSupportSearch` 使用：
+## 11. support search 的语义
 
-- prefix 当前概率 `log P(pi)`
-- 精确 suffix success `log S_m(v)`
+当前 `FlowFrontierSupportSearch`：
 
-来排序 frontier，这就是 `upper_bound_log_mass` 的数学来源。
+- 直接复用 deterministic frontier search 得到的 discovered trajectories；
+- 用 exact path probability 而不是 sampled frequency 组装 answer posterior；
+- 再用 answer mass threshold 和 support mass threshold 选择要发出的 support window。
+
+窗口结果里的 `remaining_mass_upper` 由两部分组成：
+
+```text
+remaining_mass_upper
+= search_omitted_mass_upper
++ uncovered_discovered_mass
+```
+
+其中前者来自被 prune 或因 budget 未展开的 frontier 质量，后者来自已发现但未 emit 到
+最终 support window 的质量。因此在 exhaustive 无剪枝时，窗口级
+`remaining_mass_upper = 1 - covered_mass`。
+
+显式切回 `support_search_method=monte_carlo` 时，旧的 Monte Carlo analysis/search
+仍然可用；当前 edge retrieval 任务也固定使用这条 legacy 路径。
 
 ## 12. 一句话总结
 
 当前主线可以概括为：
 
 ```text
-用 behavior-biased 的前向策略采样轨迹，
-用解耦的 log F / log P_F / log P_B 做 SubTB，
-让 credit assignment 回到局部流一致性本身，
-并仅在评估时使用精确 DP 解释 posterior 与 support-search 上界。
+用 exact discrete prefix 定义状态，
+用 recurrent control state 压缩前缀历史，
+用 state-flow head 估计 log F，
+用 control-state actor 估计前向动作，
+并用前向子轨迹一致性 loss 训练。
 ```
 
 如果需要看更偏工程视角的流程图，请结合阅读：

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from .batch import TrajectoryBatch
 from .observation import GraphObservation, GroupedLocalNodeIndex
 from .protocol import GraphBatchProtocol
 from .topology import CsrAdjacency, GraphTopology
@@ -233,8 +234,25 @@ def _build_relation_table(
 
 def build_graph_batch(
     batch: GraphBatchProtocol,
+    *,
+    validate: bool = True,
 ) -> tuple[GraphTopology, GraphObservation]:
-    tensors = _validate_graph_batch_protocol(batch)
+    if isinstance(batch, TrajectoryBatch) and not validate:
+        tensors = {
+            "node_ptr": batch.node_ptr,
+            "edge_index": batch.edge_index,
+            "edge_rel_global": batch.edge_rel_global,
+            "node_embeddings": batch.node_embeddings,
+            "edge_embeddings": batch.edge_embeddings,
+            "question_emb": batch.question_emb,
+            "question_ctx": batch.question_ctx,
+            "question_ctx_mask": batch.question_ctx_mask,
+            "q_local_indices": batch.q_local_indices,
+            "q_ptr": batch.q_ptr,
+            "node_global_ids": batch.node_global_ids,
+        }
+    else:
+        tensors = _validate_graph_batch_protocol(batch)
     relation_embeddings, edge_relations = _build_relation_table(
         edge_rel_global=tensors["edge_rel_global"],
         edge_embeddings=tensors["edge_embeddings"],
@@ -279,13 +297,14 @@ def build_graph_batch(
         sample_ids=sample_ids,
     )
 
-    topology.validate()
-    observation.validate(topology=topology)
-    topology.resolve_local_node_indices(
-        observation.q_local_indices,
-        field_name="q_local_indices",
-        validate_grouping=False,
-    )
+    if validate:
+        topology.validate()
+        observation.validate(topology=topology)
+        topology.resolve_local_node_indices(
+            observation.q_local_indices,
+            field_name="q_local_indices",
+            validate_grouping=False,
+        )
     return topology, observation
 
 

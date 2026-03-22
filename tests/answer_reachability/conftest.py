@@ -120,18 +120,10 @@ def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
     forward_policy_head = TransitionPolicyHead(
         state_dim=graph_hidden_dim,
         relation_dim=graph_hidden_dim,
-        question_dim=graph_hidden_dim,
         hidden_dim=int(cfg.forward_policy_head.hidden_dim),
         num_layers=int(cfg.forward_policy_head.num_layers),
         dropout=float(cfg.forward_policy_head.dropout),
-    )
-    backward_policy_head = TransitionPolicyHead(
-        state_dim=graph_hidden_dim,
-        relation_dim=graph_hidden_dim,
-        question_dim=graph_hidden_dim,
-        hidden_dim=int(cfg.backward_policy_head.hidden_dim),
-        num_layers=int(cfg.backward_policy_head.num_layers),
-        dropout=float(cfg.backward_policy_head.dropout),
+        microbatch_size=int(cfg.forward_policy_head.microbatch_size),
     )
     return BaseSearchPolicy(
         cfg,
@@ -139,5 +131,4 @@ def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
         backbone=backbone,
         state_score_head=state_score_head,
         forward_policy_head=forward_policy_head,
-        backward_policy_head=backward_policy_head,
     )

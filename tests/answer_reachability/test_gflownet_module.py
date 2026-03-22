@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
 import torch
 
+import src.models.gflownet.policy as gflownet_policy_impl
 import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
+    AdaptiveSamplingConfig,
     AnswerRewardConfig,
+    CandidateShortlistConfig,
     SearchEvalConfig,
     BackboneConfig,
     GFlowNetTrainingConfig,
@@ -22,8 +26,10 @@ from src.models.configs import (
     SuccessfulTrajectoryReplayConfig,
 )
 from src.models.gflownet import (
+    ForwardTrajectoryGFNSampler,
     SearchState,
     SubTrajectoryBalanceLossOutput,
+    TrajectoryGFNSampleBatch,
     TrainingScheduleContext,
     compute_embedding_log_heuristic,
     compute_topology_log_heuristic,
@@ -116,6 +122,63 @@ def _make_module_with_training_cfg(
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=SearchMetricRuntimeFactory(),
+    )
+
+
+def _make_manual_sample_batch(
+    *,
+    batch: TrajectoryBatch,
+    rollout_batch_size: int,
+    success_mask: torch.Tensor,
+    start_entropy: float,
+    start_entropy_normalized: float,
+) -> TrajectoryGFNSampleBatch:
+    max_actions = 3
+    start_nodes = torch.zeros(
+        (batch.num_graphs, rollout_batch_size),
+        dtype=torch.long,
+        device=batch.node_ptr.device,
+    )
+    trace_nodes = torch.zeros(
+        (batch.num_graphs, rollout_batch_size, max_actions),
+        dtype=torch.long,
+        device=batch.node_ptr.device,
+    )
+    trace_edge_ids = torch.full_like(trace_nodes, fill_value=-1)
+    trace_num_steps = torch.zeros_like(trace_nodes)
+    trace_mask = torch.zeros_like(trace_nodes, dtype=torch.bool)
+    return TrajectoryGFNSampleBatch(
+        graph_log_z=torch.zeros((batch.num_graphs,), dtype=torch.float32),
+        start_nodes=start_nodes,
+        start_log_probs=torch.zeros_like(start_nodes, dtype=torch.float32),
+        start_state_log_f=torch.zeros_like(start_nodes, dtype=torch.float32),
+        log_pf_steps=torch.zeros_like(trace_nodes, dtype=torch.float32),
+        log_pb_steps=torch.zeros_like(trace_nodes, dtype=torch.float32),
+        state_log_f_steps=torch.zeros_like(trace_nodes, dtype=torch.float32),
+        next_state_log_f_steps=torch.zeros_like(trace_nodes, dtype=torch.float32),
+        move_mask=torch.zeros_like(trace_nodes, dtype=torch.bool),
+        trace_nodes=trace_nodes,
+        trace_edge_ids=trace_edge_ids,
+        trace_num_steps=trace_num_steps,
+        trace_mask=trace_mask,
+        terminal_nodes=start_nodes.clone(),
+        terminal_num_steps=torch.zeros_like(start_nodes),
+        terminal_state_log_f=torch.zeros_like(start_nodes, dtype=torch.float32),
+        terminal_rewards=torch.zeros_like(start_nodes, dtype=torch.float32),
+        terminal_log_rewards=torch.zeros_like(start_nodes, dtype=torch.float32),
+        success_mask=success_mask,
+        behavior_start_entropy=torch.full(
+            (batch.num_graphs,),
+            fill_value=float(start_entropy),
+            dtype=torch.float32,
+            device=batch.node_ptr.device,
+        ),
+        behavior_start_entropy_normalized=torch.full(
+            (batch.num_graphs,),
+            fill_value=float(start_entropy_normalized),
+            dtype=torch.float32,
+            device=batch.node_ptr.device,
+        ),
     )
 
 
@@ -423,6 +486,19 @@ def test_sampler_preserves_selected_start_flow_gradients() -> None:
     batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
 
+    def _prefer_graph_moves(*args: object, **kwargs: object) -> torch.Tensor:
+        distribution = kwargs.get("distribution")
+        if distribution is None and len(args) >= 3:
+            distribution = args[2]
+        distribution = cast(Any, distribution)
+        assert distribution is not None
+        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
+        if distribution.is_submit is not None:
+            logits[distribution.is_submit.to(dtype=torch.bool)] = -1.0e9
+        return logits
+
+    module.policy.compute_behavior_edge_logits = _prefer_graph_moves  # type: ignore[method-assign]
+
     assert module.sampler is not None
     sample_batch = module.sampler.sample(
         batch=batch,
@@ -436,6 +512,204 @@ def test_sampler_preserves_selected_start_flow_gradients() -> None:
     assert sample_batch.start_state_log_f.grad_fn is not None
     assert sample_batch.start_log_probs.requires_grad
     assert sample_batch.start_log_probs.grad_fn is not None
+
+
+def test_sampler_forces_submit_on_terminal_targets_before_behavior_expansion() -> None:
+    module = _make_module("learned")
+    batch = make_batch_from_graph(
+        num_nodes=2,
+        edge_index=torch.tensor([[0], [1]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([0], dtype=torch.long),
+        answer_entity_ids=torch.tensor([100], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        sample_id="submit-before-expand",
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    assert module.sampler is not None
+    sampler = cast(ForwardTrajectoryGFNSampler, module.sampler)
+    call_count = 0
+    original_behavior = module.policy.compute_behavior_forward_distribution
+    terminal_target_mask = sampler.trajectory_supervisor.build_terminal_target_mask(
+        batch=batch
+    )
+
+    def _wrapped_behavior_distribution(prepared_batch_arg, state):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        active_nodes = state.current_nodes[~state.done_mask].reshape(-1)
+        if int(active_nodes.numel()) > 0:
+            assert not bool(
+                terminal_target_mask.index_select(0, active_nodes).any().item()
+            )
+        return original_behavior(prepared_batch_arg, state)
+
+    module.policy.compute_behavior_forward_distribution = (  # type: ignore[method-assign]
+        _wrapped_behavior_distribution
+    )
+
+    sample_batch = sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
+    )
+
+    assert sample_batch.trace_submit_mask is not None
+    assert sample_batch.terminal_action_counts is not None
+    assert call_count == 0
+    assert bool(sample_batch.trace_submit_mask[0, 0, 0].item()) is True
+    assert int(sample_batch.trace_edge_ids[0, 0, 0].item()) == -1
+    assert int(sample_batch.terminal_action_counts[0, 0].item()) == 1
+    assert int(sample_batch.terminal_num_steps[0, 0].item()) == 0
+    assert int(sample_batch.terminal_nodes[0, 0].item()) == 0
+    assert bool(sample_batch.success_mask[0, 0].item()) is True
+
+
+def test_sampler_entity_sink_uses_deterministic_terminal_backward_log_prob() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=1,
+            reward_epsilon=1.0e-3,
+            failure_reward_mode="graph_normalized",
+            answer_reward=AnswerRewardConfig(
+                mode="entity_sink",
+                beta=1.0,
+                terminal_reward_scale="none",
+                terminal_backward_mode="uniform_entity_alias",
+            ),
+            sampling_temperature=1.0,
+        ),
+    )
+    batch = make_batch_from_graph(
+        num_nodes=2,
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        edge_rel_global=torch.empty((0,), dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([0, 1], dtype=torch.long),
+        answer_entity_ids=torch.tensor([100], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 100], dtype=torch.long),
+        sample_id="entity-sink-submit",
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    assert module.sampler is not None
+    sample_batch = module.sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
+    )
+
+    assert sample_batch.trace_submit_mask is not None
+    assert sample_batch.terminal_entity_ids is not None
+    assert sample_batch.terminal_backward_log_probs is not None
+    assert bool(sample_batch.trace_submit_mask[0, 0, 0].item()) is True
+    assert sample_batch.terminal_entity_ids[0, 0].item() == 100
+    assert sample_batch.terminal_backward_log_probs[0, 0].item() == pytest.approx(0.0)
+    assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(0.0)
+
+
+def test_sampler_keeps_success_terminal_reward_free_of_length_penalty() -> None:
+    alpha = 0.3
+    module = _make_module_with_training_cfg(
+        "none",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=1,
+            reward_epsilon=1.0e-3,
+            failure_reward_mode="graph_normalized",
+            answer_reward=AnswerRewardConfig(
+                mode="entity_sink",
+                beta=1.0,
+                length_penalty_alpha=alpha,
+                terminal_reward_scale="none",
+                terminal_backward_mode="uniform_entity_alias",
+            ),
+            sampling_temperature=1.0,
+        ),
+    )
+    batch = make_batch_from_graph(
+        num_nodes=2,
+        edge_index=torch.tensor([[0], [1]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([1], dtype=torch.long),
+        answer_entity_ids=torch.tensor([101], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        sample_id="length-penalty",
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    def _prefer_graph_moves(*args: object, **kwargs: object) -> torch.Tensor:
+        distribution = kwargs.get("distribution")
+        if distribution is None and len(args) >= 3:
+            distribution = args[2]
+        distribution = cast(Any, distribution)
+        assert distribution is not None
+        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
+        if distribution.is_submit is not None:
+            logits[distribution.is_submit.to(dtype=torch.bool)] = -1.0e9
+        return logits
+
+    module.policy.compute_behavior_edge_logits = _prefer_graph_moves  # type: ignore[method-assign]
+
+    assert module.sampler is not None
+    sample_batch = module.sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
+    )
+
+    base_reward = 1.0e-3 + torch.exp(torch.tensor(1.0)).item()
+    assert sample_batch.terminal_num_steps[0, 0].item() == 1
+    assert sample_batch.terminal_rewards[0, 0].item() == pytest.approx(base_reward)
+    assert sample_batch.terminal_log_rewards[0, 0].item() == pytest.approx(
+        torch.log(torch.tensor(base_reward)).item()
+    )
+
+
+def test_sampler_disables_autograd_for_behavior_policy_queries() -> None:
+    module = _make_module("learned")
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    assert module.sampler is not None
+    sampler = cast(ForwardTrajectoryGFNSampler, module.sampler)
+    start_grad_enabled: list[bool] = []
+    behavior_grad_enabled: list[bool] = []
+    original_start = module.policy.compute_behavior_start_distribution
+    original_behavior_logits = module.policy.compute_behavior_edge_logits
+
+    def _wrapped_start(prepared_batch_arg):  # noqa: ANN001
+        start_grad_enabled.append(torch.is_grad_enabled())
+        return original_start(prepared_batch_arg)
+
+    def _wrapped_behavior_logits(prepared_batch_arg, state, distribution):  # noqa: ANN001
+        behavior_grad_enabled.append(torch.is_grad_enabled())
+        return original_behavior_logits(prepared_batch_arg, state, distribution)
+
+    module.policy.compute_behavior_start_distribution = _wrapped_start  # type: ignore[method-assign]
+    module.policy.compute_behavior_edge_logits = _wrapped_behavior_logits  # type: ignore[method-assign]
+
+    sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
+    )
+
+    assert start_grad_enabled and all(flag is False for flag in start_grad_enabled)
+    assert behavior_grad_enabled and all(
+        flag is False for flag in behavior_grad_enabled
+    )
 
 
 def test_target_policy_ignores_behavior_heuristic_beta() -> None:
@@ -485,6 +759,76 @@ def test_target_policy_ignores_behavior_heuristic_beta() -> None:
     )
 
 
+def test_none_heuristic_disables_behavior_guidance() -> None:
+    module = _make_module_with_training_cfg("none", beta=5.0)
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    start_target = module.policy.compute_start_distribution(prepared_batch)
+    start_behavior = module.policy.compute_behavior_start_distribution(prepared_batch)
+
+    state = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+    )
+    target_distribution = module.policy.compute_forward_distribution(
+        prepared_batch,
+        state,
+    )
+    behavior_distribution = module.policy.compute_behavior_forward_distribution(
+        prepared_batch,
+        state,
+    )
+
+    assert torch.allclose(start_target.log_probs, start_behavior.log_probs, atol=1.0e-6)
+    assert torch.allclose(
+        target_distribution.edge_logits,
+        behavior_distribution.edge_logits,
+        atol=1.0e-6,
+    )
+
+
+def test_learned_behavior_proposal_uses_cached_local_bias() -> None:
+    module = _make_module("learned")
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+    assert prepared_batch.heuristic_cache.step_node_log_heuristic is not None
+
+    state = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+    )
+    target_distribution = module.policy.base_policy.compute_forward_distribution(
+        prepared_batch,
+        state,
+    )
+
+    def _boom(*args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("behavior proposal should use cached local bias")
+
+    module.policy.search_heuristic.compute_state_logits = _boom  # type: ignore[method-assign]
+
+    behavior_logits = module.policy.compute_behavior_edge_logits(
+        prepared_batch,
+        state,
+        target_distribution,
+    )
+    start_distribution = module.policy.compute_behavior_start_distribution(
+        prepared_batch
+    )
+
+    assert behavior_logits.shape == target_distribution.edge_logits.shape
+    assert torch.isfinite(behavior_logits).all()
+    assert torch.isfinite(start_distribution.log_probs).all()
+
+
 def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     module = _make_module_with_training_cfg(
         "topology",
@@ -509,7 +853,10 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     assert loss.ndim == 0
     assert "subtb_loss" in captured_metrics
     assert "subtb_residual" in captured_metrics
+    assert "subtb_residual_variance_per_batch" in captured_metrics
     assert "subtb_root" in captured_metrics
+    assert "unique_success_paths_per_100_rollouts" in captured_metrics
+    assert "start_node_entropy" in captured_metrics
     assert not any(str(key).startswith("exact_aux") for key in captured_metrics)
 
 
@@ -620,12 +967,76 @@ def test_success_replay_rollout_resolution_matches_target_fraction() -> None:
     assert module._resolve_success_replay_rollouts_per_graph() == 1
 
 
+def test_success_replay_rollout_resolution_caps_dynamic_budget() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=64,
+            success_replay=SuccessfulTrajectoryReplayConfig(
+                enabled=True,
+                ratio=0.25,
+                warmup_passes=0.0,
+                min_buffer_size=1,
+                max_buffer_size=32,
+                max_trajectories_per_sample=8,
+                max_rollouts_per_graph=8,
+            ),
+        ),
+    )
+
+    assert module._resolve_success_replay_rollouts_per_graph() == 8
+
+
+def test_training_rollout_metrics_track_new_success_paths_once_per_sample() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=1,
+            adaptive_sampling=AdaptiveSamplingConfig(
+                enabled=True,
+                min_rollout_batch_size=1,
+                max_rollout_batch_size=4,
+                warmup_steps=0,
+            ),
+        ),
+    )
+    batch = make_toy_batch()
+    sample_batch = replace(
+        _make_manual_sample_batch(
+            batch=batch,
+            rollout_batch_size=1,
+            success_mask=torch.ones((1, 1), dtype=torch.bool),
+            start_entropy=0.0,
+            start_entropy_normalized=0.0,
+        ),
+        start_nodes=torch.tensor([[0]], dtype=torch.long),
+        terminal_nodes=torch.tensor([[2]], dtype=torch.long),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        trace_edge_ids=torch.tensor([[[1, -1, -1]]], dtype=torch.long),
+    )
+
+    first_metrics = module._compute_training_rollout_metrics(
+        batch=batch,
+        sample_batch=sample_batch,
+    )
+    second_metrics = module._compute_training_rollout_metrics(
+        batch=batch,
+        sample_batch=sample_batch,
+    )
+
+    assert first_metrics.new_success_paths == 1
+    assert first_metrics.unique_success_paths_per_100_rollouts == pytest.approx(100.0)
+    assert second_metrics.new_success_paths == 0
+    assert second_metrics.unique_success_paths_per_100_rollouts == pytest.approx(0.0)
+
+
 def test_gflownet_training_step_raises_on_nonfinite_loss() -> None:
     module = _make_module("topology")
     module.loss_fn.compute = lambda *args, **kwargs: SubTrajectoryBalanceLossOutput(  # type: ignore[method-assign]
         loss=torch.tensor(float("nan")),
         subtb_loss=torch.tensor(float("nan")),
         residual_abs=torch.tensor(0.0),
+        residual_variance=torch.tensor(0.0),
         root_abs=torch.tensor(0.0),
         success_rate=torch.tensor(0.0),
         log_z_mean=torch.tensor(0.0),
@@ -693,6 +1104,76 @@ def test_gflownet_sampling_temperature_schedule_anneals() -> None:
     assert module._resolve_sampling_temperature(global_step=1) == pytest.approx(1.5)
 
 
+def test_adaptive_sampling_controller_increases_budget_after_sparse_rollouts() -> None:
+    module = _make_module_with_training_cfg(
+        "topology",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=2,
+            sampling_temperature=1.0,
+            adaptive_sampling=AdaptiveSamplingConfig(
+                enabled=True,
+                min_rollout_batch_size=2,
+                max_rollout_batch_size=6,
+                warmup_steps=0,
+                rollout_growth_factor=2.0,
+                rollout_shrink_factor=0.5,
+                temperature_multiplier_up=1.5,
+                low_success_rate_threshold=0.2,
+                high_success_rate_threshold=0.8,
+                low_unique_success_paths_per_100_rollouts=1.0,
+                high_unique_success_paths_per_100_rollouts=20.0,
+                low_start_entropy_normalized=0.3,
+                high_start_entropy_normalized=0.9,
+                low_subtb_residual_variance=0.1,
+                high_subtb_residual_variance=0.3,
+            ),
+        ),
+    )
+    batch = make_toy_batch()
+    captured_rollout_calls: list[tuple[int, float]] = []
+
+    def _fake_sample(
+        *,
+        batch: TrajectoryBatch,
+        policy: object,
+        prepared_batch: object,
+        rollout_batch_size: int,
+        temperature: float,
+    ) -> TrajectoryGFNSampleBatch:
+        del policy, prepared_batch
+        captured_rollout_calls.append((rollout_batch_size, temperature))
+        return _make_manual_sample_batch(
+            batch=batch,
+            rollout_batch_size=rollout_batch_size,
+            success_mask=torch.zeros(
+                (batch.num_graphs, rollout_batch_size),
+                dtype=torch.bool,
+                device=batch.node_ptr.device,
+            ),
+            start_entropy=0.1,
+            start_entropy_normalized=0.1,
+        )
+
+    module.sampler.sample = _fake_sample  # type: ignore[method-assign]
+    module.loss_fn.compute = lambda *args, **kwargs: SubTrajectoryBalanceLossOutput(  # type: ignore[method-assign]
+        loss=torch.tensor(1.0),
+        subtb_loss=torch.tensor(1.0),
+        residual_abs=torch.tensor(0.5),
+        residual_variance=torch.tensor(0.8),
+        root_abs=torch.tensor(0.5),
+        success_rate=torch.tensor(0.0),
+        log_z_mean=torch.tensor(0.0),
+        log_z_variance=torch.tensor(0.0),
+    )
+
+    module.training_step(batch, batch_idx=0)
+    module.training_step(batch, batch_idx=1)
+
+    assert captured_rollout_calls[0][0] == 2
+    assert captured_rollout_calls[1][0] == 4
+    assert captured_rollout_calls[1][1] == pytest.approx(1.5)
+
+
 def test_sampler_emits_deterministic_backward_log_probs_for_path_state() -> None:
     module = _make_module("topology")
     batch = make_batch_from_graph(
@@ -734,10 +1215,7 @@ def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:
     module.policy.base_policy.forward_policy_head.forward = (  # type: ignore[method-assign]
         lambda current_state_features,
         candidate_state_features,
-        relation_features,
-        question_features,
-        question_context_features,
-        question_context_mask: torch.zeros(
+        relation_features: torch.zeros(
             (int(current_state_features.size(0)),),
             device=current_state_features.device,
             dtype=torch.float32,
@@ -753,16 +1231,29 @@ def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:
     )
 
     distribution = module.policy.compute_forward_distribution(prepared_batch, state)
+    submit_mask = distribution.is_submit
+    assert submit_mask is not None
+    graph_mask = ~submit_mask
+    child_states = [
+        SearchState.from_edge_path(
+            topology=prepared_batch.topology,
+            observation=prepared_batch.observation,
+            start_node=0,
+            edge_ids=(int(edge_id),),
+            max_steps=int(module.cfg.horizon_cfg.max_steps),
+            device=batch.node_ptr.device,
+        )
+        for edge_id in distribution.edge_ids[graph_mask].tolist()
+    ]
     child_state = SearchState(
         topology=prepared_batch.topology,
         observation=prepared_batch.observation,
-        current_nodes=distribution.target_nodes.view(-1, 1),
+        current_nodes=torch.cat([path.current_nodes for path in child_states], dim=0),
         done_mask=torch.zeros(
-            (int(distribution.target_nodes.numel()), 1), dtype=torch.bool
+            (int(distribution.target_nodes[graph_mask].numel()), 1), dtype=torch.bool
         ),
-        num_steps=torch.ones(
-            (int(distribution.target_nodes.numel()), 1), dtype=torch.long
-        ),
+        num_steps=torch.cat([path.num_steps for path in child_states], dim=0),
+        path_token_ids=torch.cat([path.path_token_ids for path in child_states], dim=0),
     )
     expected_child_log_flows = module.policy.compute_log_state_scores(
         prepared_batch,
@@ -770,11 +1261,160 @@ def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:
     ).view(-1)
 
     assert torch.allclose(
-        distribution.edge_logits.to(dtype=torch.float32), torch.zeros(2)
+        distribution.edge_logits[graph_mask].to(dtype=torch.float32), torch.zeros(2)
     )
     assert not torch.allclose(
-        distribution.edge_logits.to(dtype=torch.float32), expected_child_log_flows
+        distribution.edge_logits[graph_mask].to(dtype=torch.float32),
+        expected_child_log_flows,
     )
+
+
+def test_forward_distribution_matches_under_aggressive_chunking() -> None:
+    module = _make_module("topology")
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+    state = SearchState.initialize(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_nodes=torch.tensor([[0, 0, 0]], dtype=torch.long),
+        max_steps=2,
+    )
+
+    baseline = module.policy.compute_forward_distribution(prepared_batch, state)
+    original_forward_chunk = gflownet_policy_impl._FORWARD_EDGE_CHUNK_SIZE
+    original_transition_chunk = gflownet_policy_impl._TRANSITION_LOGIT_CHUNK_SIZE
+    gflownet_policy_impl._FORWARD_EDGE_CHUNK_SIZE = 1
+    gflownet_policy_impl._TRANSITION_LOGIT_CHUNK_SIZE = 1
+    try:
+        chunked = module.policy.compute_forward_distribution(prepared_batch, state)
+    finally:
+        gflownet_policy_impl._FORWARD_EDGE_CHUNK_SIZE = original_forward_chunk
+        gflownet_policy_impl._TRANSITION_LOGIT_CHUNK_SIZE = original_transition_chunk
+
+    assert torch.equal(chunked.edge_agent_batch, baseline.edge_agent_batch)
+    assert torch.equal(chunked.edge_ids, baseline.edge_ids)
+    assert torch.equal(chunked.target_nodes, baseline.target_nodes)
+    assert torch.equal(chunked.out_degrees, baseline.out_degrees)
+    assert torch.equal(chunked.is_submit, baseline.is_submit)
+    assert torch.allclose(
+        chunked.edge_logits.to(dtype=torch.float32),
+        baseline.edge_logits.to(dtype=torch.float32),
+        atol=1.0e-6,
+    )
+
+
+def test_forward_distribution_shortlists_high_degree_candidates() -> None:
+    policy_cfg = PolicyConfig(
+        backbone=BackboneConfig(
+            embedding_dim=8,
+            hidden_dim=8,
+            gnn_layers=1,
+            gnn_dropout=0.0,
+            use_adapter=True,
+            adapter_dim=4,
+            adapter_dropout=0.0,
+        ),
+        state_score_head=StateScoreHeadConfig(hidden_dim=8, num_layers=2, dropout=0.0),
+        candidate_shortlist=CandidateShortlistConfig(
+            enabled=True,
+            topk=1,
+            degree_threshold=1,
+            heuristic_weight=0.0,
+        ),
+    )
+    module = GFlowNetModule(
+        horizon_cfg=HorizonConfig(max_steps=2),
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=3,
+            reward_epsilon=1.0e-3,
+            failure_reward_mode="graph_normalized",
+            sampling_temperature=1.0,
+        ),
+        heuristic_cfg=HeuristicConfig(kind="topology", beta=0.0),
+        policy_cfg=policy_cfg,
+        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
+        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
+        metric_runtime_factory=SearchMetricRuntimeFactory(),
+    )
+    batch = make_batch_from_graph(
+        num_nodes=4,
+        edge_index=torch.tensor([[0, 0, 0], [1, 2, 3]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1, 2], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+    prepared_batch = replace(
+        prepared_batch,
+        question_tokens=torch.tensor(
+            [[1.0] + [0.0] * 7],
+            dtype=prepared_batch.question_tokens.dtype,
+            device=prepared_batch.question_tokens.device,
+        ),
+    )
+    state = SearchState.initialize(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_nodes=torch.tensor([[0]], dtype=torch.long),
+        max_steps=2,
+    )
+
+    module.policy.base_policy._build_flat_state_features = (  # type: ignore[method-assign]
+        lambda prepared_batch,
+        flat_nodes,
+        flat_num_steps,
+        flat_done_mask,
+        flat_control_states: torch.zeros(
+            (int(flat_nodes.numel()), 8),
+            device=flat_nodes.device,
+            dtype=prepared_batch.node_tokens.dtype,
+        )
+    )
+
+    def _mock_local_features(
+        prepared_batch,
+        *,
+        flat_nodes,
+        flat_num_steps,
+        flat_done_mask,
+    ):
+        del prepared_batch, flat_num_steps, flat_done_mask
+        features = torch.zeros(
+            (int(flat_nodes.numel()), 8),
+            device=flat_nodes.device,
+            dtype=torch.float32,
+        )
+        features[:, 0] = torch.tensor(
+            [
+                {1: 1.0, 2: 4.0, 3: 2.0}.get(int(node.item()), 0.0)
+                for node in flat_nodes
+            ],
+            device=flat_nodes.device,
+            dtype=torch.float32,
+        )
+        return features
+
+    module.policy.base_policy.build_local_state_features = _mock_local_features  # type: ignore[method-assign]
+    module.policy.base_policy.forward_policy_head.forward = (  # type: ignore[method-assign]
+        lambda current_state_features,
+        candidate_state_features,
+        relation_features: torch.zeros(
+            (int(current_state_features.size(0)),),
+            device=current_state_features.device,
+            dtype=torch.float32,
+        )
+    )
+
+    distribution = module.policy.compute_forward_distribution(prepared_batch, state)
+    assert distribution.is_submit is not None
+    graph_mask = ~distribution.is_submit.to(dtype=torch.bool)
+
+    assert torch.equal(distribution.edge_ids[graph_mask], torch.tensor([1]))
+    assert torch.equal(distribution.target_nodes[graph_mask], torch.tensor([2]))
+    assert torch.equal(distribution.out_degrees.view(-1), torch.tensor([2]))
 
 
 @pytest.mark.parametrize("h_kind", ["topology", "embedding", "learned"])

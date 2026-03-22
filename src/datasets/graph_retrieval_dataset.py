@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -53,6 +54,13 @@ class GraphRetrievalData(GraphData):
         return super().__inc__(key, value, *args, **kwargs)
 
 
+@dataclass(frozen=True)
+class GraphSampleStats:
+    num_nodes: int
+    num_edges: int
+    question_tokens: int
+
+
 class GraphRetrievalDataset(Dataset):
     def __init__(
         self,
@@ -82,6 +90,7 @@ class GraphRetrievalDataset(Dataset):
         )
         self._heuristic_log_v: Optional[torch.Tensor] = None
         self._lmdb_readahead = bool(lmdb_readahead)
+        self._sample_stats_cache: dict[str, GraphSampleStats] = {}
 
         self._init_sample_ids()
         self._apply_filters(
@@ -184,6 +193,27 @@ class GraphRetrievalDataset(Dataset):
             for store in self._sample_stores:
                 store.close()
             self._sample_stores = None
+
+    def get_sample_stats(self, idx: int) -> GraphSampleStats:
+        sample_id = self.sample_ids[int(idx)]
+        cached = self._sample_stats_cache.get(sample_id)
+        if cached is not None:
+            return cached
+        raw = self._load_raw_sample(sample_id)
+        question_ctx_mask = raw.get("question_ctx_mask")
+        if question_ctx_mask is None:
+            raise ValueError(
+                f"question_ctx_mask is required to estimate sample stats (sample_id={sample_id})."
+            )
+        stats = GraphSampleStats(
+            num_nodes=_coerce_num_nodes(raw.get("num_nodes"), sample_id),
+            num_edges=int(torch.as_tensor(raw["edge_attr"], dtype=torch.long).numel()),
+            question_tokens=int(
+                torch.as_tensor(question_ctx_mask, dtype=torch.bool).sum().item()
+            ),
+        )
+        self._sample_stats_cache[sample_id] = stats
+        return stats
 
     def __del__(self) -> None:  # pragma: no cover - defensive cleanup
         self.close()

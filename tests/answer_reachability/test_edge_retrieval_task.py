@@ -33,6 +33,7 @@ def _make_edge_retrieval_module() -> GFlowNetModule:
         eval_cfg=SearchEvalConfig(
             task="edge_retrieval",
             metrics_profile="rank_only",
+            support_search_method="monte_carlo",
             edge_top_ks=(1, 2, 3),
             edge_emit_top_k=3,
         ),

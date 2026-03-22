@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import torch
 
+from src.models.components.scoring import TransitionPolicyHead
 from src.models.gflownet import SearchState
 
 from .conftest import make_policy, make_toy_batch
@@ -115,3 +116,86 @@ def test_transition_logits_handle_bfloat16_autocast() -> None:
 
     assert distribution.edge_logits.dtype == torch.float32
     assert torch.isfinite(distribution.edge_logits).all()
+
+
+def test_transition_policy_head_microbatch_matches_full_batch() -> None:
+    torch.manual_seed(3)
+    full_head = TransitionPolicyHead(
+        state_dim=8,
+        relation_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        microbatch_size=128,
+    )
+    chunked_head = TransitionPolicyHead(
+        state_dim=8,
+        relation_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        microbatch_size=3,
+    )
+    chunked_head.load_state_dict(full_head.state_dict())
+
+    current_state_features = torch.randn((9, 8), dtype=torch.float32)
+    candidate_state_features = torch.randn((9, 8), dtype=torch.float32)
+    relation_features = torch.randn((9, 8), dtype=torch.float32)
+    full_logits = full_head(
+        current_state_features,
+        candidate_state_features,
+        relation_features,
+    )
+    chunked_logits = chunked_head(
+        current_state_features,
+        candidate_state_features,
+        relation_features,
+    )
+
+    assert torch.allclose(full_logits, chunked_logits, atol=1.0e-6)
+
+
+def test_start_control_state_depends_on_question_global_vector() -> None:
+    torch.manual_seed(4)
+    policy = make_policy(max_steps=2)
+    batch = make_toy_batch()
+    prepared = policy.prepare_batch(batch)
+    prepared_shifted = replace(
+        prepared,
+        question_tokens=prepared.question_tokens + 3.0,
+    )
+
+    start_nodes = torch.tensor([[0]], dtype=torch.long)
+    control_a = policy.build_start_control_states(prepared, start_nodes)
+    control_b = policy.build_start_control_states(prepared_shifted, start_nodes)
+
+    assert not torch.allclose(control_a, control_b)
+
+
+def test_transition_policy_head_detaches_encoder_features() -> None:
+    torch.manual_seed(4)
+    head = TransitionPolicyHead(
+        state_dim=8,
+        relation_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        microbatch_size=32,
+    )
+    current_state_features = torch.randn(
+        (5, 8), dtype=torch.float32, requires_grad=True
+    )
+    candidate_state_features = torch.randn(
+        (5, 8), dtype=torch.float32, requires_grad=True
+    )
+    relation_features = torch.randn((5, 8), dtype=torch.float32, requires_grad=True)
+    logits = head(
+        current_state_features,
+        candidate_state_features,
+        relation_features,
+    )
+    logits.sum().backward()
+
+    assert current_state_features.grad is None
+    assert candidate_state_features.grad is None
+    assert relation_features.grad is None

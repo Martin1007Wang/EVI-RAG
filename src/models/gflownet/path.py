@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
-from torch import nn
-
-
-_PATH_ATTENTION_CHUNK_SIZE = 64
 
 
 def max_path_tokens(*, max_steps: int) -> int:
@@ -34,7 +28,25 @@ def append_relation_and_node_tokens(
     active_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     updated = path_token_ids.clone()
-    flat_updated = updated.view(-1, int(updated.size(-1)))
+    append_relation_and_node_tokens_inplace(
+        path_token_ids=updated,
+        num_steps=num_steps,
+        relation_ids=relation_ids,
+        target_nodes=target_nodes,
+        active_mask=active_mask,
+    )
+    return updated
+
+
+def append_relation_and_node_tokens_inplace(
+    *,
+    path_token_ids: torch.Tensor,
+    num_steps: torch.Tensor,
+    relation_ids: torch.Tensor,
+    target_nodes: torch.Tensor,
+    active_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    flat_updated = path_token_ids.view(-1, int(path_token_ids.size(-1)))
     flat_num_steps = num_steps.reshape(-1)
     flat_relation_ids = relation_ids.reshape(-1)
     flat_target_nodes = target_nodes.reshape(-1)
@@ -45,7 +57,7 @@ def append_relation_and_node_tokens(
     else:
         active_indices = torch.nonzero(active_mask.reshape(-1), as_tuple=False).view(-1)
     if int(active_indices.numel()) == 0:
-        return updated
+        return path_token_ids
     relation_positions = (2 * flat_num_steps.index_select(0, active_indices) + 1).to(
         dtype=torch.long
     )
@@ -56,7 +68,7 @@ def append_relation_and_node_tokens(
     flat_updated[active_indices, node_positions] = flat_target_nodes.index_select(
         0, active_indices
     )
-    return updated.view_as(path_token_ids)
+    return path_token_ids
 
 
 def derive_parent_path_token_ids(
@@ -83,105 +95,20 @@ def derive_parent_path_token_ids(
     return flat_updated.view_as(child_path_token_ids)
 
 
-def build_path_token_embeddings(
-    *,
-    path_token_ids: torch.Tensor,
-    path_lengths: torch.Tensor,
-    node_tokens: torch.Tensor,
-    relation_tokens: torch.Tensor,
-    position_embedding: nn.Embedding,
+def count_path_node_revisits(
+    *, path_token_ids: torch.Tensor, num_steps: torch.Tensor
 ) -> torch.Tensor:
-    if path_token_ids.dim() != 2:
-        raise ValueError(
-            f"path_token_ids must be 2D [N, T], got shape={tuple(path_token_ids.shape)}."
-        )
-    total_agents, token_len = path_token_ids.shape
-    hidden_dim = int(node_tokens.size(-1))
-    safe_node_ids = path_token_ids.clamp(
-        min=0, max=max(int(node_tokens.size(0)) - 1, 0)
-    )
-    node_part = node_tokens.index_select(0, safe_node_ids.reshape(-1)).view(
-        total_agents, token_len, hidden_dim
-    )
-    if int(relation_tokens.size(0)) == 0:
-        relation_part = torch.zeros_like(node_part)
-    else:
-        safe_rel_ids = path_token_ids.clamp(
-            min=0, max=max(int(relation_tokens.size(0)) - 1, 0)
-        )
-        relation_part = relation_tokens.index_select(0, safe_rel_ids.reshape(-1)).view(
-            total_agents, token_len, hidden_dim
-        )
-    token_types = (
-        torch.arange(token_len, device=path_token_ids.device, dtype=torch.long) % 2 == 1
-    )
-    path_tokens = torch.where(
-        token_types.view(1, token_len, 1), relation_part, node_part
-    )
-    pos = position_embedding(
-        torch.arange(token_len, device=path_token_ids.device, dtype=torch.long)
-    ).to(dtype=path_tokens.dtype)
-    path_tokens = path_tokens + pos.unsqueeze(0)
-    key_padding_mask = torch.arange(
-        token_len, device=path_token_ids.device, dtype=torch.long
-    ).unsqueeze(0) >= path_lengths.reshape(-1, 1)
-    return torch.where(
-        key_padding_mask.unsqueeze(-1), torch.zeros_like(path_tokens), path_tokens
-    )
-
-
-def encode_path_history(
-    *,
-    path_tokens: torch.Tensor,
-    path_lengths: torch.Tensor,
-    path_self_attention: nn.MultiheadAttention,
-    path_self_attention_norm: nn.LayerNorm,
-) -> torch.Tensor:
-    total_agents, token_len, hidden_dim = path_tokens.shape
-    path_lengths = path_lengths.reshape(-1)
-    causal_mask = torch.triu(
-        torch.ones((token_len, token_len), device=path_tokens.device, dtype=torch.bool),
-        diagonal=1,
-    )
-    last_hidden_chunks: list[torch.Tensor] = []
-    chunk_size = total_agents
-    if path_tokens.device.type == "cuda":
-        chunk_size = min(total_agents, _PATH_ATTENTION_CHUNK_SIZE)
-    for start in range(0, total_agents, max(chunk_size, 1)):
-        end = min(start + max(chunk_size, 1), total_agents)
-        chunk_tokens = path_tokens[start:end]
-        chunk_lengths = path_lengths[start:end]
-        key_padding_mask = torch.arange(
-            token_len, device=path_tokens.device, dtype=torch.long
-        ).unsqueeze(0) >= chunk_lengths.unsqueeze(1)
-        chunk_tokens_fp32 = chunk_tokens.to(dtype=torch.float32)
-        sdp_ctx = nullcontext()
-        if path_tokens.device.type == "cuda":
-            sdp_ctx = torch.backends.cuda.sdp_kernel(
-                enable_flash=False,
-                enable_mem_efficient=False,
-                enable_math=True,
-            )
-        with sdp_ctx:
-            attn_out, _ = path_self_attention(
-                chunk_tokens_fp32,
-                chunk_tokens_fp32,
-                chunk_tokens_fp32,
-                attn_mask=causal_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=False,
-            )
-        encoded = path_self_attention_norm(chunk_tokens_fp32 + attn_out)
-        last_idx = (chunk_lengths - 1).clamp_min(0)
-        row_idx = torch.arange(end - start, device=path_tokens.device, dtype=torch.long)
-        last_hidden = encoded[row_idx, last_idx]
-        last_hidden = torch.where(
-            torch.isfinite(last_hidden),
-            last_hidden,
-            torch.zeros_like(last_hidden),
-        )
-        last_hidden_chunks.append(last_hidden.to(dtype=path_tokens.dtype))
-    return torch.cat(last_hidden_chunks, dim=0).view(total_agents, hidden_dim)
+    flat_paths = path_token_ids.view(-1, int(path_token_ids.size(-1)))
+    flat_num_steps = num_steps.reshape(-1).to(dtype=torch.long)
+    revisit_counts = torch.zeros_like(flat_num_steps, dtype=torch.long)
+    for row_idx in range(int(flat_paths.size(0))):
+        step_count = int(flat_num_steps[row_idx].item())
+        node_ids = flat_paths[row_idx, : (2 * step_count) + 1 : 2]
+        if int(node_ids.numel()) <= 1:
+            continue
+        _, visit_counts = torch.unique(node_ids, sorted=False, return_counts=True)
+        revisit_counts[row_idx] = (visit_counts - 1).clamp_min(0).sum()
+    return revisit_counts.view_as(num_steps)
 
 
 def reconstruct_trace_path_token_ids(
@@ -214,7 +141,7 @@ def reconstruct_trace_path_token_ids(
         target_nodes = (
             edge_index[1].index_select(0, safe_edge_ids).view_as(chosen_edge_ids)
         )
-        current_path_token_ids = append_relation_and_node_tokens(
+        current_path_token_ids = append_relation_and_node_tokens_inplace(
             path_token_ids=current_path_token_ids,
             num_steps=trace_num_steps[:, :, step_idx],
             relation_ids=relation_ids,
@@ -226,9 +153,9 @@ def reconstruct_trace_path_token_ids(
 
 __all__ = [
     "append_relation_and_node_tokens",
-    "build_path_token_embeddings",
+    "append_relation_and_node_tokens_inplace",
+    "count_path_node_revisits",
     "derive_parent_path_token_ids",
-    "encode_path_history",
     "initialize_path_token_ids",
     "max_path_tokens",
     "reconstruct_trace_path_token_ids",

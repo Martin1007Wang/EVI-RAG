@@ -78,7 +78,7 @@ def test_predict_step_emits_placeholder_for_missing_start_candidates() -> None:
     result = outputs[0]
     assert result.sample_id == "missing-start-candidates"
     assert result.stop_reason == "invalid_start_candidates"
-    assert result.inference_mode == "exact"
+    assert result.inference_mode == "flow_frontier"
     assert result.window_size == 0
     assert result.covered_mass == 0.0
     assert result.residual_mass == 1.0

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol
 
 import torch
 
@@ -11,11 +11,21 @@ from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labe
 from src.graph_runtime import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
 from src.models.gflownet import StartDistributionError
-from src.models.gflownet import SearchPolicyProtocol
+from src.models.gflownet import PreparedSearchBatch, SearchPolicyProtocol
 from src.metrics.protocol import MetricEvaluationOutput
 from src.utils.metrics_io import to_serializable
 
-from .exact_analysis import ExactEdgeSupportAnalysis, ExactReachabilityAnalyzer
+from .analysis import EdgeSupportAnalysis
+
+
+class EdgeSupportAnalyzerProtocol(Protocol):
+    def analyze_edge_support(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        policy: SearchPolicyProtocol,
+        prepared_batch: PreparedSearchBatch,
+    ) -> EdgeSupportAnalysis: ...
 
 
 @dataclass(frozen=True)
@@ -62,7 +72,7 @@ class EdgeRetrievalLabels:
 @dataclass(frozen=True)
 class PreparedEdgeRetrievalGraph:
     batch: TrajectoryBatch
-    edge_support: ExactEdgeSupportAnalysis
+    edge_support: EdgeSupportAnalysis
     labels: EdgeRetrievalLabels
     invalid_start: bool = False
 
@@ -128,19 +138,19 @@ class EdgeRetrievalEvaluator:
         *,
         eval_cfg: SearchEvalConfig,
         policy: SearchPolicyProtocol,
-        analyzer: ExactReachabilityAnalyzer,
+        analyzer: EdgeSupportAnalyzerProtocol,
     ) -> None:
         self.eval_cfg = eval_cfg
         self.policy = policy
         self.analyzer = analyzer
 
     @staticmethod
-    def _empty_edge_support(*, batch: TrajectoryBatch) -> ExactEdgeSupportAnalysis:
+    def _empty_edge_support(*, batch: TrajectoryBatch) -> EdgeSupportAnalysis:
         num_edges = int(batch.edge_index.size(1))
         zeros = torch.zeros(
             (num_edges,), device=batch.edge_index.device, dtype=torch.float32
         )
-        return ExactEdgeSupportAnalysis(
+        return EdgeSupportAnalysis(
             edge_success_mass=zeros,
             edge_conditional_success_prob=zeros,
             gold_mass=0.0,
@@ -265,7 +275,7 @@ class EdgeRetrievalEvaluator:
         invalid_start = 0
         for graph_idx in range(batch.num_graphs):
             graph = self._prepare_graph(
-                batch=batch.select_graph(graph_idx),
+                batch=batch.select_graph(graph_idx, validate=False),
                 on_invalid_start=on_invalid_start,
             )
             invalid_start += int(graph.invalid_start)
@@ -311,7 +321,7 @@ class EdgeRetrievalEvaluator:
             )
         labels: list[EdgeRetrievalLabelRecord] = []
         for graph_idx, result in enumerate(outputs):
-            graph_batch = batch.select_graph(graph_idx)
+            graph_batch = batch.select_graph(graph_idx, validate=False)
             graph_labels = compute_edge_retrieval_labels(batch=graph_batch)
             labels.append(
                 EdgeRetrievalLabelRecord(

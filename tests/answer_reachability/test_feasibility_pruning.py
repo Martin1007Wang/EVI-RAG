@@ -3,10 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.metrics.answer_reachability import ExactReachabilityAnalyzer
+from src.metrics.answer_reachability import FlowFrontierReachabilityAnalyzer
 from src.models.gflownet import BaseSearchPolicy
 from src.models.gflownet import apply_forward_constraints
 from src.models.gflownet import SearchState
+from src.models.configs import SearchEvalConfig
 
 from .conftest import make_batch_from_graph, make_policy
 
@@ -28,7 +29,13 @@ def test_answer_start_without_future_support_is_absorbing_success() -> None:
     )
     policy = _make_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
-    analyzer = ExactReachabilityAnalyzer(max_steps=2)
+    analyzer = FlowFrontierReachabilityAnalyzer(
+        max_steps=2,
+        eval_cfg=SearchEvalConfig(
+            support_search_method="flow_frontier",
+            flow_prune_epsilon=0.0,
+        ),
+    )
 
     distribution = policy.compute_start_distribution(prepared_batch)
     analysis = analyzer.analyze(

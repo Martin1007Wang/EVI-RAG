@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.metrics.answer_reachability import ExactReachabilityAnalysis
+from src.metrics.answer_reachability import ReachabilityAnalysis
 from src.metrics.answer_reachability.metrics import compute_support_metrics
 from src.metrics.answer_reachability.posterior import (
     DiscoveredTrajectory,
@@ -27,7 +27,7 @@ def test_support_window_penalizes_overlapping_paths() -> None:
         node_global_ids=torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.long),
         sample_id="support-diversity",
     )
-    analysis = ExactReachabilityAnalysis(
+    analysis = ReachabilityAnalysis(
         terminal_mass=torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
         answer_probs=torch.tensor([1.0], dtype=torch.float32),
@@ -64,7 +64,7 @@ def test_support_window_penalizes_overlapping_paths() -> None:
         batch=batch,
         discovered_paths=discovered_paths,
         analysis=analysis,
-        inference_mode="exact",
+        inference_mode="monte_carlo",
         answer_mass_threshold=1.0,
         support_mass_threshold=0.8,
         support_path_overlap_penalty=1.0,

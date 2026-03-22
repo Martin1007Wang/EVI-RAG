@@ -50,6 +50,17 @@ def _require_bool_2d(value: Any, *, name: str, device: torch.device) -> torch.Te
     return tensor
 
 
+def _move_float_feature(
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None,
+) -> torch.Tensor:
+    if dtype is not None and torch.is_floating_point(tensor):
+        return tensor.to(device=device, dtype=dtype)
+    return tensor.to(device=device)
+
+
 def _require_edge_index(value: Any, *, device: torch.device) -> torch.Tensor:
     tensor = _require_tensor(value, name="edge_index", device=device)
     if tensor.dtype != torch.long or tensor.dim() != 2 or int(tensor.size(0)) != 2:
@@ -162,22 +173,47 @@ class TrajectoryBatch:
         if len(self.questions) != self.num_graphs:
             raise ValueError("questions length mismatch with num_graphs.")
 
-    def to(self, device: torch.device | str) -> "TrajectoryBatch":
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        feature_dtype: torch.dtype | None = None,
+    ) -> "TrajectoryBatch":
         target_device = torch.device(device)
         heuristic_log_v = None
         if self.heuristic_log_v is not None:
-            heuristic_log_v = self.heuristic_log_v.to(device=target_device)
-        moved = TrajectoryBatch(
+            heuristic_log_v = _move_float_feature(
+                self.heuristic_log_v,
+                device=target_device,
+                dtype=feature_dtype,
+            )
+        return TrajectoryBatch(
             num_graphs=self.num_graphs,
             node_ptr=self.node_ptr.to(device=target_device),
             edge_index=self.edge_index.to(device=target_device),
             edge_rel_global=self.edge_rel_global.to(device=target_device),
             edge_batch=self.edge_batch.to(device=target_device),
             node_batch=self.node_batch.to(device=target_device),
-            node_embeddings=self.node_embeddings.to(device=target_device),
-            edge_embeddings=self.edge_embeddings.to(device=target_device),
-            question_emb=self.question_emb.to(device=target_device),
-            question_ctx=self.question_ctx.to(device=target_device),
+            node_embeddings=_move_float_feature(
+                self.node_embeddings,
+                device=target_device,
+                dtype=feature_dtype,
+            ),
+            edge_embeddings=_move_float_feature(
+                self.edge_embeddings,
+                device=target_device,
+                dtype=feature_dtype,
+            ),
+            question_emb=_move_float_feature(
+                self.question_emb,
+                device=target_device,
+                dtype=feature_dtype,
+            ),
+            question_ctx=_move_float_feature(
+                self.question_ctx,
+                device=target_device,
+                dtype=feature_dtype,
+            ),
             question_ctx_mask=self.question_ctx_mask.to(device=target_device),
             q_local_indices=self.q_local_indices.to(device=target_device),
             q_ptr=self.q_ptr.to(device=target_device),
@@ -191,8 +227,6 @@ class TrajectoryBatch:
             dataset_scope=self.dataset_scope,
             heuristic_log_v=heuristic_log_v,
         )
-        moved.validate()
-        return moved
 
     @classmethod
     def from_pyg_batch(
@@ -311,7 +345,9 @@ class TrajectoryBatch:
         return trajectory_batch
 
     @classmethod
-    def concatenate(cls, batches: list["TrajectoryBatch"]) -> "TrajectoryBatch":
+    def concatenate(
+        cls, batches: list["TrajectoryBatch"], *, validate: bool = True
+    ) -> "TrajectoryBatch":
         if not batches:
             raise ValueError("TrajectoryBatch.concatenate requires at least one batch.")
         if len(batches) == 1:
@@ -423,10 +459,13 @@ class TrajectoryBatch:
             dataset_scope=dataset_scope,
             heuristic_log_v=heuristic_log_v,
         )
-        concatenated.validate()
+        if validate:
+            concatenated.validate()
         return concatenated
 
-    def select_graph(self, graph_idx: int) -> "TrajectoryBatch":
+    def select_graph(
+        self, graph_idx: int, *, validate: bool = True
+    ) -> "TrajectoryBatch":
         if graph_idx < 0 or graph_idx >= self.num_graphs:
             raise IndexError(f"graph_idx out of range: {graph_idx}.")
         node_start = int(self.node_ptr[graph_idx].item())
@@ -481,7 +520,8 @@ class TrajectoryBatch:
             dataset_scope=self.dataset_scope,
             heuristic_log_v=heuristic_log_v,
         )
-        sub_batch.validate()
+        if validate:
+            sub_batch.validate()
         return sub_batch
 
 

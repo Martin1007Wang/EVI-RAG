@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,10 @@ class SearchEvalConfig:
     answer_top_ks: tuple[int, ...] = (1, 5, 10)
     edge_top_ks: tuple[int, ...] = (1, 5, 10, 25, 50)
     edge_emit_top_k: int = 25
+    support_search_method: str = "flow_frontier"
+    flow_prune_epsilon: float = 1.0e-3
+    monte_carlo_rollouts: int = 4096
+    monte_carlo_confidence: float = 0.95
     max_expansions: int = 20000
     max_frontier_size: int = 4096
     strict_search: bool = True
@@ -67,6 +72,23 @@ class SearchEvalConfig:
             raise ValueError("eval_cfg.edge_top_ks values must be >= 1.")
         if self.edge_emit_top_k < 1:
             raise ValueError("eval_cfg.edge_emit_top_k must be >= 1.")
+        if self.support_search_method not in {"monte_carlo", "flow_frontier"}:
+            raise ValueError(
+                "eval_cfg.support_search_method must be one of {'monte_carlo', 'flow_frontier'}."
+            )
+        if (
+            self.task == "edge_retrieval"
+            and self.support_search_method != "monte_carlo"
+        ):
+            raise ValueError(
+                "edge_retrieval only supports eval_cfg.support_search_method='monte_carlo'."
+            )
+        if not 0.0 <= self.flow_prune_epsilon <= 1.0:
+            raise ValueError("eval_cfg.flow_prune_epsilon must be in [0, 1].")
+        if self.monte_carlo_rollouts < 1:
+            raise ValueError("eval_cfg.monte_carlo_rollouts must be >= 1.")
+        if not 0.0 < self.monte_carlo_confidence < 1.0:
+            raise ValueError("eval_cfg.monte_carlo_confidence must be in (0, 1).")
         if self.max_expansions < 1:
             raise ValueError("eval_cfg.max_expansions must be >= 1.")
         if self.max_frontier_size < 1:
@@ -77,7 +99,7 @@ class SearchEvalConfig:
 class HeuristicConfig:
     """Configuration for the supported search-heuristic variants."""
 
-    kind: str = "topology"
+    kind: str = "none"
     beta: float = 1.0
     topology_restart_prob: float = 0.25
     topology_num_iters: int = 8
@@ -87,9 +109,9 @@ class HeuristicConfig:
     learned_dropout: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.kind not in {"topology", "embedding", "learned"}:
+        if self.kind not in {"none", "topology", "embedding", "learned"}:
             raise ValueError(
-                "heuristic.kind must be one of {'topology', 'embedding', 'learned'}."
+                "heuristic.kind must be one of {'none', 'topology', 'embedding', 'learned'}."
             )
         if self.beta < 0.0:
             raise ValueError("heuristic.beta must be >= 0.")
@@ -113,15 +135,51 @@ class AnswerRewardConfig:
     positive_utility: float = 1.0
     negative_utility: float = -1.0
     beta: float = 1.0
-    normalize_by_entity_count: bool = True
+    cycle_penalty: float = 1.0
+    failure_length_penalty_alpha: float = 0.0
+    length_penalty_alpha: float | None = None
+    terminal_reward_scale: str | None = None
+    terminal_backward_mode: str | None = None
+    normalize_by_entity_count: bool | None = None
 
     def __post_init__(self) -> None:
-        if self.mode not in {"legacy", "binary_ranking"}:
+        if self.mode not in {"legacy", "binary_ranking", "entity_sink"}:
             raise ValueError(
-                "training.answer_reward.mode must be one of {'legacy', 'binary_ranking'}."
+                "training.answer_reward.mode must be one of "
+                "{'legacy', 'binary_ranking', 'entity_sink'}."
             )
         if self.beta <= 0.0:
             raise ValueError("training.answer_reward.beta must be > 0.")
+        if not 0.0 < self.cycle_penalty <= 1.0:
+            raise ValueError("training.answer_reward.cycle_penalty must be in (0, 1].")
+        resolved_failure_alpha = float(self.failure_length_penalty_alpha)
+        if self.length_penalty_alpha is not None:
+            if resolved_failure_alpha > 0.0 and not math.isclose(
+                resolved_failure_alpha,
+                float(self.length_penalty_alpha),
+            ):
+                raise ValueError(
+                    "training.answer_reward.length_penalty_alpha conflicts with "
+                    "training.answer_reward.failure_length_penalty_alpha."
+                )
+            resolved_failure_alpha = float(self.length_penalty_alpha)
+        if resolved_failure_alpha < 0.0:
+            raise ValueError(
+                "training.answer_reward.failure_length_penalty_alpha must be >= 0."
+            )
+        object.__setattr__(self, "failure_length_penalty_alpha", resolved_failure_alpha)
+        if self.length_penalty_alpha is None:
+            object.__setattr__(
+                self,
+                "length_penalty_alpha",
+                resolved_failure_alpha,
+            )
+        # Deprecated knobs are accepted for compatibility but ignored: the tree
+        # policy uses P_B == 1 and reward scaling stays in R(tau) directly.
+        if self.terminal_reward_scale is None:
+            object.__setattr__(self, "terminal_reward_scale", "none")
+        if self.terminal_backward_mode is None:
+            object.__setattr__(self, "terminal_backward_mode", "none")
 
 
 @dataclass(frozen=True)
@@ -190,6 +248,7 @@ class SuccessfulTrajectoryReplayConfig:
     min_buffer_size: int = 256
     max_buffer_size: int = 50000
     max_trajectories_per_sample: int = 8
+    max_rollouts_per_graph: int | None = None
 
     def __post_init__(self) -> None:
         if self.ratio < 0.0 or self.ratio >= 1.0:
@@ -208,6 +267,132 @@ class SuccessfulTrajectoryReplayConfig:
             raise ValueError(
                 "training.success_replay.max_trajectories_per_sample must be >= 1."
             )
+        if self.max_rollouts_per_graph is not None and self.max_rollouts_per_graph < 1:
+            raise ValueError(
+                "training.success_replay.max_rollouts_per_graph must be >= 1 when set."
+            )
+
+
+@dataclass(frozen=True)
+class AdaptiveSamplingConfig:
+    enabled: bool = False
+    min_rollout_batch_size: int | None = None
+    max_rollout_batch_size: int | None = None
+    warmup_steps: int = 0
+    ema_alpha: float = 0.2
+    low_success_rate_threshold: float = 0.05
+    high_success_rate_threshold: float = 0.35
+    low_unique_success_paths_per_100_rollouts: float = 0.5
+    high_unique_success_paths_per_100_rollouts: float = 5.0
+    low_start_entropy_normalized: float = 0.35
+    high_start_entropy_normalized: float = 0.85
+    low_subtb_residual_variance: float = 0.05
+    high_subtb_residual_variance: float = 0.5
+    rollout_growth_factor: float = 1.5
+    rollout_shrink_factor: float = 0.75
+    temperature_multiplier_up: float = 1.15
+    temperature_multiplier_down: float = 0.92
+    min_temperature_multiplier: float = 0.5
+    max_temperature_multiplier: float = 2.5
+
+    def __post_init__(self) -> None:
+        if self.min_rollout_batch_size is not None and self.min_rollout_batch_size < 1:
+            raise ValueError(
+                "training.adaptive_sampling.min_rollout_batch_size must be >= 1."
+            )
+        if self.max_rollout_batch_size is not None and self.max_rollout_batch_size < 1:
+            raise ValueError(
+                "training.adaptive_sampling.max_rollout_batch_size must be >= 1."
+            )
+        if (
+            self.min_rollout_batch_size is not None
+            and self.max_rollout_batch_size is not None
+            and self.min_rollout_batch_size > self.max_rollout_batch_size
+        ):
+            raise ValueError(
+                "training.adaptive_sampling.min_rollout_batch_size must be <= max_rollout_batch_size."
+            )
+        if self.warmup_steps < 0:
+            raise ValueError("training.adaptive_sampling.warmup_steps must be >= 0.")
+        if not 0.0 < self.ema_alpha <= 1.0:
+            raise ValueError("training.adaptive_sampling.ema_alpha must be in (0, 1].")
+        if not 0.0 <= self.low_success_rate_threshold <= 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.low_success_rate_threshold must be in [0, 1]."
+            )
+        if not 0.0 <= self.high_success_rate_threshold <= 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.high_success_rate_threshold must be in [0, 1]."
+            )
+        if self.low_success_rate_threshold > self.high_success_rate_threshold:
+            raise ValueError(
+                "training.adaptive_sampling.low_success_rate_threshold must be <= high_success_rate_threshold."
+            )
+        if self.low_unique_success_paths_per_100_rollouts < 0.0:
+            raise ValueError(
+                "training.adaptive_sampling.low_unique_success_paths_per_100_rollouts must be >= 0."
+            )
+        if (
+            self.high_unique_success_paths_per_100_rollouts
+            < self.low_unique_success_paths_per_100_rollouts
+        ):
+            raise ValueError(
+                "training.adaptive_sampling.high_unique_success_paths_per_100_rollouts must be >= low_unique_success_paths_per_100_rollouts."
+            )
+        if not 0.0 <= self.low_start_entropy_normalized <= 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.low_start_entropy_normalized must be in [0, 1]."
+            )
+        if not 0.0 <= self.high_start_entropy_normalized <= 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.high_start_entropy_normalized must be in [0, 1]."
+            )
+        if self.low_start_entropy_normalized > self.high_start_entropy_normalized:
+            raise ValueError(
+                "training.adaptive_sampling.low_start_entropy_normalized must be <= high_start_entropy_normalized."
+            )
+        if self.low_subtb_residual_variance < 0.0:
+            raise ValueError(
+                "training.adaptive_sampling.low_subtb_residual_variance must be >= 0."
+            )
+        if self.high_subtb_residual_variance < self.low_subtb_residual_variance:
+            raise ValueError(
+                "training.adaptive_sampling.high_subtb_residual_variance must be >= low_subtb_residual_variance."
+            )
+        if self.rollout_growth_factor < 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.rollout_growth_factor must be >= 1.0."
+            )
+        if not 0.0 < self.rollout_shrink_factor <= 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.rollout_shrink_factor must be in (0, 1]."
+            )
+        if self.temperature_multiplier_up < 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.temperature_multiplier_up must be >= 1.0."
+            )
+        if not 0.0 < self.temperature_multiplier_down <= 1.0:
+            raise ValueError(
+                "training.adaptive_sampling.temperature_multiplier_down must be in (0, 1]."
+            )
+        if self.min_temperature_multiplier <= 0.0:
+            raise ValueError(
+                "training.adaptive_sampling.min_temperature_multiplier must be > 0."
+            )
+        if self.max_temperature_multiplier <= 0.0:
+            raise ValueError(
+                "training.adaptive_sampling.max_temperature_multiplier must be > 0."
+            )
+        if self.min_temperature_multiplier > self.max_temperature_multiplier:
+            raise ValueError(
+                "training.adaptive_sampling.min_temperature_multiplier must be <= max_temperature_multiplier."
+            )
+        if not (
+            self.min_temperature_multiplier <= 1.0 <= self.max_temperature_multiplier
+        ):
+            raise ValueError(
+                "training.adaptive_sampling temperature multiplier bounds must contain 1.0."
+            )
 
 
 @dataclass(frozen=True)
@@ -223,6 +408,9 @@ class GFlowNetTrainingConfig:
     )
     success_replay: SuccessfulTrajectoryReplayConfig = field(
         default_factory=SuccessfulTrajectoryReplayConfig
+    )
+    adaptive_sampling: AdaptiveSamplingConfig = field(
+        default_factory=AdaptiveSamplingConfig
     )
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
@@ -242,6 +430,7 @@ class GFlowNetTrainingConfig:
 
 
 __all__ = [
+    "AdaptiveSamplingConfig",
     "AnswerRewardConfig",
     "GFlowNetTrainingConfig",
     "GuidanceLossConfig",

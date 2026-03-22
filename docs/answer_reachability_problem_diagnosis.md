@@ -73,7 +73,8 @@ R_x(tau) = epsilon_x,  otherwise
 
 ### 3.2 评估目标
 
-验证和测试时，`ExactReachabilityAnalyzer` 通过 exact DP 计算：
+验证和测试时，answer-reachability 默认通过 `FlowFrontierReachabilityAnalyzer`
+deterministically 构造：
 
 ```text
 M_gold(x) = P_theta(eventually hit any gold answer | x)
@@ -87,8 +88,15 @@ M_gold(x) = P_theta(eventually hit any gold answer | x)
 
 对应实现：
 
-- `src/metrics/answer_reachability/exact_analysis.py`
+- `src/metrics/answer_reachability/analysis.py`
+- `src/metrics/answer_reachability/flow_frontier.py`
+- `src/metrics/answer_reachability/monte_carlo.py`
 - `src/metrics/answer_reachability/posterior.py`
+
+其中：
+
+- answer-reachability 默认后端是 flow-frontier；
+- edge retrieval 和显式 legacy fallback 仍会使用 Monte Carlo。
 
 ### 3.3 根本错位
 
@@ -141,89 +149,78 @@ P_theta(a | x)
 这正是当前 `gold_mass` 可以提升，但 `recall@10` 仍显著落后于 oracle ceiling 的一个
 核心原因。
 
-## 5. 问题二：当前信用分配粒度不足以区分路径质量
+## 5. 问题二：信用分配仍然受 prefix 表征瓶颈限制
 
-### 5.1 当前状态抽象是 `(node, time)`，不是 path-aware state
+### 5.1 旧的 `(node, time)` 抽象已经移除，但表示瓶颈没有完全消失
 
-当前数学推导中，状态定义为：
+当前主线已经不再把搜索状态写成纯 `(node, time)`。
+
+现在的 `SearchState` 同时保留：
+
+- 精确离散前缀 `path_token_ids`
+- 当前节点与步数
+- recurrent `control_state`
+
+这带来了两个实质改进：
+
+- 不同 prefix 不会在环境语义上被错误合并成同一个状态；
+- non-root backward 可以直接从离散 prefix 恢复唯一 parent，而不需要再靠粗糙近似。
+
+但这并不等于“路径质量区分问题已经彻底解决”。
+
+前向 `log F` 和 `P_F` 看到的不是原始整段 prefix，而是一个压缩后的连续 summary：
 
 ```text
-s_t = (v_t, t)
+c_t = recurrent summary of prefix history conditioned on the question
 ```
 
-这意味着：
+因此当前真正的限制变成：
 
-- 只要两条轨迹在同一步到达同一个节点，
-- 它们之后共享同一个 `F(s)`，
-- 也共享同一个 forward policy `P_F(s' | s)`。
+- 如果 `control_state` 容量不足，
+- 或者对问题 token 的注意无法稳定挑出关键约束，
+- 那么两条语义差异很大的 prefix 仍可能被压缩到过于接近的表示。
 
-因此如果两条不同前缀路径都在第 `t` 步到达节点 `v`：
+也就是说，主问题已经从“状态根本不保留路径信息”变成了：
 
 ```text
-tau_1 -> (v, t)
-tau_2 -> (v, t)
+路径信息只通过一个轻量 recurrent controller 进入前向打分，表达力仍然可能不够。
 ```
 
-当前模型无法继续区分：
+### 5.2 backward 已经变精确，但 terminal credit 仍有近似
 
-- 哪条前缀更合理，
-- 哪条前缀更短、信息更干净，
-- 哪条前缀更符合语义约束，
-- 哪条前缀更值得保留更多概率质量。
-
-这不是“训练得还不够好”，而是“当前状态表达本身没有保留这些信息”。
-
-### 5.2 backward 分解也比较粗
-
-当前采样时使用的 backward log-prob 是按 target 节点入度构造的 uniform backward：
+当前 graph move 的 backward 不再是按入度均摊的 uniform backward，而是 exact
+prefix-tree backward：
 
 ```text
-log P_B(parent | child) = -log indegree(child)
+P_B(parent(x_t) | x_t) = 1
 ```
 
-这会进一步让 credit assignment 更偏向拓扑均摊，而不是语义区分。
+这修复了过去 credit assignment 里一个非常粗的近似。
 
-换句话说，当前 SubTB 不是在一个强表达的 path-aware 流模型上工作，而是在一个较粗
-的 node-time 流模型上工作。
+但 terminal `submit -> sink(entity)` 这一步仍然需要 entity-level 的近似 backward
+kernel，例如 alias-count 归一化。它解决的是“同一实体多个节点副本”的一部分问题，但仍
+然没有完全校正 tree policy 下的 path multiplicity。
 
-### 5.3 起点流和中间状态流的参数化已经统一
+所以当前 backward 面临的核心残留问题已经不是“父边太粗”，而是：
 
-这个位置曾经存在一个重要问题：
+- terminal entity aggregation 仍有近似；
+- answer-level credit 仍然会受到 alias/path multiplicity 的影响。
 
-- 起点状态 `(q, 0)` 由专门起点头估计
-- 后续状态 `(v, t), t >= 1` 由状态流头估计
+### 5.3 已经修复的表示级问题，不再是当前主矛盾
 
-这会在 `t=0 -> t=1` 之间引入人为的参数鸿沟，让 SubTB 额外承担“两套头对齐”的负担。
+这轮主线重构已经顺手修掉了几个以前确实存在的问题：
 
-当前主线已经改成统一状态流头：
+- 起点状态和中间状态现在共享同一个 `NodeFlowHead`
+- 起点分布由起点 flow 直接归一化，不再依赖独立 `log Z` 头
+- heuristic 默认不再污染 target policy；若开启，也只进入 behavior sampling
 
-```text
-a_theta(q, x) := f_theta(q, 0, x)
-```
+因此“起点头/状态头割裂”以及“heuristic 与 target flow 方程不一致”都不再是当前主线的
+主要矛盾。
 
-也就是说：
-
-- 起点状态和后续状态现在共享同一个 `NodeFlowHead`
-- 起点特殊性由 `step_embed(0)` 和 `remaining_embed(T)` 表达
-- `Y_start` 与后续中间状态锚点之间现在对应同一流函数的时间延拓
-
-因此“起点头/状态头割裂”不再是当前主线的主要问题。
-
-同样地，过去还存在一个配套问题：heuristic 被注入 forward policy，但没有进入状态锚点，
-会让 SubTB 去拟合被 heuristic 污染后的残差。当前主线也已经把 heuristic 并入有效状态值
-定义，并在 forward logit 中显式加入固定 backward 项，因此这条数学不一致也不再是当前主
-线的主问题。
-
-换句话说，当前需要继续学习的是真正的流量关系：
+换句话说，当前还需要继续解决的是：
 
 ```text
-同一个状态流函数如何随 node 和 time 变化
-```
-
-而不是：
-
-```text
-两个不同网络如何先彼此对齐
+如何让轻量 control-state 表征承载足够细的 prefix 语义与答案排序信用分配。
 ```
 
 ## 6. 问题三：非零失败奖励和大失败空间会稀释 gold mass
@@ -419,7 +416,7 @@ P_theta(s_0=q | x) = exp(V_start(q; x) - log Z_theta(x))
 1. 一个严格数学文档，明确当前 `R`、`Z`、SubTB、oracle upper bound 之间的关系。
 2. 一个新目标设计文档，明确哪些改动属于：
    - reward shaping / answer ranking
-   - path-aware credit assignment
+   - prefix-aware / control-state credit assignment
    - state representation 升级
 
 在这两类文档完成之前，不建议把主要精力继续放在常规调参上。

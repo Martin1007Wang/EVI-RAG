@@ -92,6 +92,8 @@ def compute_support_metrics(eval_batch: SupportWindowEvalBatch) -> dict[str, flo
         "inference/probe_count": [],
         "cert/remaining_mass_upper": [],
         "cert/coverage_rate": [],
+        "cert/covered_mass_ci_width": [],
+        "answer/gold_mass_ci_width": [],
     }
     window_top_ks = tuple(
         sorted({int(k) for k in eval_batch.window_top_ks if int(k) >= 1})
@@ -144,6 +146,24 @@ def compute_support_metrics(eval_batch: SupportWindowEvalBatch) -> dict[str, flo
         )
         metric_values["cert/coverage_rate"].append(
             1.0 if result.coverage_certified else 0.0
+        )
+        metric_values["cert/covered_mass_ci_width"].append(
+            float(
+                max(
+                    float(result.covered_mass_ci_high or 0.0)
+                    - float(result.covered_mass_ci_low or 0.0),
+                    0.0,
+                )
+            )
+        )
+        metric_values["answer/gold_mass_ci_width"].append(
+            float(
+                max(
+                    float(result.gold_total_mass_ci_high or result.gold_total_mass)
+                    - float(result.gold_total_mass_ci_low or result.gold_total_mass),
+                    0.0,
+                )
+            )
         )
         for top_k in window_top_ks:
             topk_hit, topk_recall, topk_precision, topk_f1 = _prefix_window_stats(

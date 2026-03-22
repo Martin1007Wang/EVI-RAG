@@ -28,6 +28,7 @@ model:
     _target_: src.models.configs.gflownet.SearchEvalConfig
     task: edge_retrieval
     metrics_profile: rank_only
+    support_search_method: monte_carlo
     edge_top_ks: [1, 5, 10, 25, 50]
     edge_emit_top_k: 25
 

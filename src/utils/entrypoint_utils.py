@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import hydra
+from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import DictConfig, OmegaConf
 
 from .hydra_utils import instantiate_callbacks, instantiate_loggers
@@ -40,6 +41,28 @@ def _strip_instantiate_metadata(cfg_node: DictConfig) -> DictConfig:
         return cfg_node
     container.pop("contract", None)
     return OmegaConf.create(container)
+
+
+def _normalize_trainer_cfg(cfg_node: DictConfig) -> DictConfig:
+    trainer_cfg = _strip_instantiate_metadata(cfg_node)
+    container = OmegaConf.to_container(trainer_cfg, resolve=True)
+    if not isinstance(container, dict):
+        return trainer_cfg
+    # Lightning rejects `max_steps=None`, but eval configs still use `null`
+    # upstream so model-side `${trainer.max_steps}` can resolve to `None`.
+    if container.get("max_steps") is None:
+        container["max_steps"] = -1
+    return OmegaConf.create(container)
+
+
+def _filter_trainer_callbacks(
+    *, callbacks: list[Any], trainer_cfg: DictConfig
+) -> list[Any]:
+    if bool(trainer_cfg.get("enable_checkpointing", True)):
+        return callbacks
+    return [
+        callback for callback in callbacks if not isinstance(callback, ModelCheckpoint)
+    ]
 
 
 def require_run_target_config(
@@ -99,8 +122,10 @@ def instantiate_lightning_task_objects(
     log.info("Instantiating loggers...")
     logger = instantiate_loggers(cfg.get("logger"))
 
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
+    trainer_cfg = _normalize_trainer_cfg(cfg.trainer)
+    callbacks = _filter_trainer_callbacks(callbacks=callbacks, trainer_cfg=trainer_cfg)
+    log.info(f"Instantiating trainer <{trainer_cfg._target_}>")
+    trainer = hydra.utils.instantiate(trainer_cfg, callbacks=callbacks, logger=logger)
 
     objects = LightningTaskObjects(
         cfg=cfg,
@@ -118,6 +143,8 @@ def instantiate_lightning_task_objects(
 
 __all__ = [
     "LightningTaskObjects",
+    "_filter_trainer_callbacks",
+    "_normalize_trainer_cfg",
     "instantiate_lightning_task_objects",
     "instantiate_task_runner",
     "require_run_target_config",

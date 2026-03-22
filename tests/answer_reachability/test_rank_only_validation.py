@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.metrics.answer_reachability.exact_analysis import ExactReachabilityAnalysis
+from src.graph_runtime import TrajectoryBatch
+from src.metrics.answer_reachability.analysis import ReachabilityAnalysis
 from src.metrics.answer_reachability.posterior import (
     build_rank_only_result,
     compute_rank_metrics,
@@ -90,10 +91,11 @@ def test_rank_only_validation_skips_support_search() -> None:
     assert support_metrics == {}
     assert model_metrics == {}
     assert len(window_results) == 1
-    assert window_results[0].stop_reason == "rank_only_exact"
+    assert window_results[0].stop_reason == "flow_frontier_exhausted"
     assert window_results[0].answer_posterior
     assert window_results[0].trajectories == []
     assert window_results[0].support_mass_reference == "skipped"
+    assert window_results[0].answer_mass_reference == "flow_frontier"
     assert "answer/gold_mass" in rank_metrics
     assert "answer/hit@1" in rank_metrics
 
@@ -123,11 +125,61 @@ def test_rank_only_predict_skips_support_search_and_support_metrics() -> None:
     module.on_predict_epoch_end()
 
     assert len(outputs) == 1
-    assert outputs[0].stop_reason == "rank_only_exact"
+    assert outputs[0].stop_reason == "flow_frontier_exhausted"
     assert outputs[0].trajectories == []
     assert outputs[0].support_mass_reference == "skipped"
+    assert outputs[0].answer_mass_reference == "flow_frontier"
     assert "answer/hit@1" in module.predict_metrics
     assert "window/adaptive/hit" not in module.predict_metrics
+
+
+def test_rank_only_validation_batches_disconnected_graphs(monkeypatch) -> None:
+    torch.manual_seed(17)
+    batch_one = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        sample_id="rank-only-batch-a",
+    )
+    batch_two = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([202], dtype=torch.long),
+        node_global_ids=torch.tensor([200, 201, 202], dtype=torch.long),
+        sample_id="rank-only-batch-b",
+    )
+    batch = TrajectoryBatch.concatenate([batch_one, batch_two])
+    module = _make_module()
+    prepare_call_count = 0
+    original_prepare_batch = module.policy.prepare_batch
+
+    def _count_prepare(current_batch):  # type: ignore[no-untyped-def]
+        nonlocal prepare_call_count
+        prepare_call_count += 1
+        return original_prepare_batch(current_batch)
+
+    monkeypatch.setattr(module.policy, "prepare_batch", _count_prepare)
+
+    support_metrics, window_results, model_metrics, rank_metrics = (
+        module._evaluate_batch(batch=batch)
+    )
+
+    assert support_metrics == {}
+    assert model_metrics == {}
+    assert len(window_results) == 2
+    assert [result.sample_id for result in window_results] == [
+        "rank-only-batch-a",
+        "rank-only-batch-b",
+    ]
+    assert prepare_call_count == 1
+    assert "answer/gold_mass" in rank_metrics
 
 
 def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
@@ -141,7 +193,7 @@ def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
         node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="rank-only-retrieval",
     )
-    analysis = ExactReachabilityAnalysis(
+    analysis = ReachabilityAnalysis(
         terminal_mass=torch.tensor([0.0, 0.0, 0.4], dtype=torch.float32),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
         answer_probs=torch.tensor([0.4], dtype=torch.float32),
@@ -153,14 +205,14 @@ def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
     result = build_rank_only_result(
         batch=batch,
         analysis=analysis,
-        inference_mode="exact",
+        inference_mode="monte_carlo",
         answer_mass_threshold=0.9,
         support_mass_threshold=0.9,
         probe_count=0,
         remaining_mass_upper=0.0,
-        stop_reason="rank_only_exact",
-        coverage_certified=True,
-        answer_mass_reference="exact",
+        stop_reason="rank_only_monte_carlo",
+        coverage_certified=False,
+        answer_mass_reference="monte_carlo",
         answer_mass_reference_total=1.0,
     )
     metrics = compute_rank_metrics(

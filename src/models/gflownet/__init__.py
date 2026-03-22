@@ -25,6 +25,7 @@ from .replay import (
 from .sampler import (
     AnswerReachabilityTrajectorySupervisor,
     ForwardTrajectoryGFNSampler,
+    TerminalTransitionBatch,
     TrajectoryGFNSampleBatch,
     TrajectoryRolloutSupervisorProtocol,
     TrajectorySamplerProtocol,
@@ -78,6 +79,7 @@ __all__ = [
     "SubTrajectoryBalanceLossOutput",
     "SuccessfulTrajectoryRecord",
     "SuccessfulTrajectoryReplayBuffer",
+    "TerminalTransitionBatch",
     "TrainingScheduleContext",
     "TrajectoryGFNSampleBatch",
     "TrajectoryRolloutSupervisorProtocol",

@@ -18,6 +18,7 @@ def build_retrieval_dataloader(
     batch_size: int,
     shuffle: bool,
     sampler: Sampler[int] | None = None,
+    batch_sampler: Sampler[list[int]] | None = None,
     drop_last: bool,
     num_workers: int,
     random_seed: Optional[int] = None,
@@ -58,18 +59,26 @@ def build_retrieval_dataloader(
     if sampler is not None:
         shuffle = False
         kwargs["sampler"] = sampler
+    if batch_sampler is not None:
+        shuffle = False
+        kwargs.pop("sampler", None)
+        kwargs["batch_sampler"] = batch_sampler
 
-    loader = DataLoader(
+    loader_kwargs = dict(
         dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=drop_last,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
         **kwargs,
     )
+    if batch_sampler is None:
+        loader_kwargs.update(
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
+    loader = DataLoader(**loader_kwargs)
     log_event(
         logger,
         "retrieval_dataloader_init",

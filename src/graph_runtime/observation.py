@@ -180,4 +180,21 @@ class GraphObservation:
             )
 
 
-__all__ = ["GraphObservation", "GroupedLocalNodeIndex"]
+@dataclass(frozen=True)
+class SearchObservation:
+    """Lightweight observation metadata needed after encoding finishes."""
+
+    q_local_indices: GroupedLocalNodeIndex
+    sample_ids: tuple[str, ...]
+
+    @classmethod
+    def from_graph_observation(
+        cls, observation: GraphObservation
+    ) -> "SearchObservation":
+        return cls(
+            q_local_indices=observation.q_local_indices,
+            sample_ids=tuple(str(sample_id) for sample_id in observation.sample_ids),
+        )
+
+
+__all__ = ["GraphObservation", "GroupedLocalNodeIndex", "SearchObservation"]

@@ -26,7 +26,7 @@ def _make_sample_batch(**overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**sample_batch)
 
 
-def test_subtb_loss_zero_for_consistent_single_move_rollout() -> None:
+def test_subtb_loss_zero_for_consistent_move_then_submit_rollout() -> None:
     loss_fn = SubTrajectoryBalanceLoss(
         config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
     )
@@ -34,11 +34,12 @@ def test_subtb_loss_zero_for_consistent_single_move_rollout() -> None:
         graph_log_z=torch.tensor([0.0], dtype=torch.float32),
         start_log_probs=torch.tensor([[0.0]], dtype=torch.float32),
         start_state_log_f=torch.tensor([[-0.4]], dtype=torch.float32),
-        log_pf_steps=torch.tensor([[[-0.3, 0.0]]], dtype=torch.float32),
-        log_pb_steps=torch.tensor([[[-0.5, 0.0]]], dtype=torch.float32),
-        next_state_log_f_steps=torch.tensor([[[-0.2, 0.0]]], dtype=torch.float32),
+        log_pf_steps=torch.tensor([[[-0.3, -0.2]]], dtype=torch.float32),
+        log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.tensor([[[-0.7, 0.0]]], dtype=torch.float32),
         terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
-        terminal_log_rewards=torch.tensor([[-0.2]], dtype=torch.float32),
+        terminal_action_counts=torch.tensor([[2]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[-0.9]], dtype=torch.float32),
         success_mask=torch.ones((1, 1), dtype=torch.bool),
     )
 

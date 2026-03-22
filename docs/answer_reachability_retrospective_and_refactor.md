@@ -5,7 +5,7 @@
 ## 1. 这轮重构解决了什么
 
 - 用 `src/models/gflownet_module.py` 取代历史 `trajectory_gfn/module.py`。
-- 把训练逻辑集中到 `src/models/training/`。
+- 把训练逻辑集中到 `src/models/gflownet/`。
 - 把评估逻辑集中到 `src/metrics/answer_reachability/`。
 - 把图批处理抽到 `src/graph_runtime/`，避免 model/metric 重复维护 batch 语义。
 - 把任务级调度抽到 `src/runs/`，让 train/eval contract、dataset variant、输出落盘不再散落在入口脚本里。
@@ -13,22 +13,22 @@
 ## 2. 当前目录分工
 
 - `src/models/`: 可训练主线与策略组件。
-- `src/models/training/`: 只放训练期采样、reward supervisor、loss。
-- `src/metrics/answer_reachability/`: 只放验证/测试/预测期 exact/search/metrics。
+- `src/models/gflownet/`: 只放训练期采样、reward supervisor、policy、replay、loss。
+- `src/metrics/answer_reachability/`: 只放验证/测试/预测期 flow-frontier、legacy Monte Carlo、posterior、metrics、artifact writer。
 - `src/runs/`: 只放任务运行器和输出编排。
 - `src/archive/`: 只放历史兼容代码，不参与主线。
 
 ## 3. 旧路径到新路径的迁移表
 
 - `src/models/trajectory_gfn/module.py` -> `src/models/gflownet_module.py`
-- `src/models/trajectory_gfn/sampler.py` -> `src/models/training/sampler.py`
-- `src/models/trajectory_gfn/losses.py` -> `src/models/training/losses.py`
-- `src/models/trajectory_gfn/reward.py` -> `src/models/training/answer_reachability.py`
+- `src/models/trajectory_gfn/sampler.py` -> `src/models/gflownet/sampler.py`
+- `src/models/trajectory_gfn/losses.py` -> `src/models/gflownet/losses.py`
+- `src/models/trajectory_gfn/reward.py` -> `src/models/gflownet/sampler.py`
 - `src/models/trajectory_gfn/batch.py` -> `src/graph_runtime/__init__.py`
 - `src/tasks/answer_reachability/execution.py` -> `src/metrics/answer_reachability/batch_evaluator.py`
 - `src/tasks/answer_reachability/posterior.py` -> `src/metrics/answer_reachability/posterior.py`
 - `src/tasks/answer_reachability/metrics.py` -> `src/metrics/answer_reachability/metrics.py`
-- `src/tasks/answer_reachability/search.py` -> `src/metrics/answer_reachability/support_search.py`
+- `src/tasks/answer_reachability/search.py` -> `src/metrics/answer_reachability/flow_frontier.py`
 
 ## 4. 当前仍保留的约束
 

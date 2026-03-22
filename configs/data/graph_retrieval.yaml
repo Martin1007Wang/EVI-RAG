@@ -14,6 +14,8 @@ dataset_cfg: ${dataset}
 
 # === Dataloader 逻辑参数 ===
 batch_size: 16
+# Eval defaults to the train batch size unless experiments explicitly raise it.
+eval_batch_size: null
 num_workers: 16
 drop_last: false
 train_shuffle: true
@@ -26,6 +28,12 @@ persistent_workers: true
 precompute_edge_batch: true
 # Node/question embedding tensors are prepared on CPU and moved with the batch.
 embeddings_device: cpu
+train_feature_dtype: null
+eval_feature_dtype: null
+train_max_graphs_per_batch: null
+train_max_nodes_per_batch: null
+train_max_edges_per_batch: null
+train_max_question_tokens_per_batch: null
 # Eval runners may replay train/validation/test by mutating `run.split`.
 eval_split: ${oc.select:run.split,test}
 # 多答案由模型/奖励处理；DataLoader 不展开。

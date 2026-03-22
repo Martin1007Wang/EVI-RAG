@@ -1,0 +1,6 @@
+# @package _global_
+#
+# Backward-compatible alias for `experiment=train_rankflow_fastiter`.
+
+defaults:
+  - train_rankflow_fastiter

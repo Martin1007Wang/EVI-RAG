@@ -11,6 +11,8 @@ from src.metrics.answer_reachability.schema import (
     SupportWindowLabelRecord,
     SupportWindowResult,
     TrajectoryRecord,
+    UNSPECIFIED_INFERENCE_MODE,
+    UNSPECIFIED_MASS_REFERENCE,
 )
 
 
@@ -53,7 +55,7 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
                 conditional_cumulative_mass=1.0,
             )
         ],
-        inference_mode="exact",
+        inference_mode="monte_carlo",
         answer_mass_threshold=0.9,
         support_mass_threshold=0.9,
         probe_count=4,
@@ -61,8 +63,8 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
         remaining_mass_upper=0.4,
         stop_reason="support_mass_reached",
         coverage_certified=False,
-        answer_mass_reference="exact",
-        support_mass_reference="exact",
+        answer_mass_reference="monte_carlo",
+        support_mass_reference="monte_carlo",
         selected_answer_ids=[2],
         answer_posterior=[
             AnswerPosteriorRecord(
@@ -132,21 +134,29 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
     assert prompt_record["question"] == "Where was X born?"
     assert prompt_record["dataset_scope"] == "full"
     assert prompt_record["mass_threshold"] == 0.9
-    assert prompt_record["inference_mode"] == "exact"
+    assert prompt_record["inference_mode"] == "monte_carlo"
     assert prompt_record["answer_mass_threshold"] == 0.9
     assert prompt_record["support_mass_threshold"] == 0.9
     assert prompt_record["probe_count"] == 4
     assert prompt_record["emit_path_count"] == 1
     assert prompt_record["remaining_mass_upper"] == 0.4
+    assert prompt_record["covered_mass_ci_low"] is None
+    assert prompt_record["covered_mass_ci_high"] is None
+    assert prompt_record["gold_total_mass"] == 0.6
+    assert prompt_record["gold_total_mass_ci_low"] is None
+    assert prompt_record["gold_total_mass_ci_high"] is None
+    assert prompt_record["ci_confidence_level"] is None
     assert prompt_record["coverage_certified"] is False
-    assert prompt_record["answer_mass_reference"] == "exact"
-    assert prompt_record["support_mass_reference"] == "exact"
+    assert prompt_record["answer_mass_reference"] == "monte_carlo"
+    assert prompt_record["support_mass_reference"] == "monte_carlo"
     assert prompt_record["selected_answer_ids"] == [2]
     assert prompt_record["residual_mass"] == 0.4
     assert prompt_record["answer_posterior"] == [
         {
             "answer_entity_id": 2,
             "prob": 0.6,
+            "prob_ci_low": 0.0,
+            "prob_ci_high": 0.0,
             "cumulative_mass": 0.6,
             "is_gold": True,
             "is_selected": True,
@@ -160,6 +170,8 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
             "answer_entity_id": 2,
             "answer_rank": 1,
             "prob": 0.6,
+            "prob_ci_low": 0.0,
+            "prob_ci_high": 0.0,
             "cumulative_mass": 0.6,
             "is_gold": True,
             "is_selected": True,
@@ -261,3 +273,30 @@ def test_artifact_writer_rejects_existing_outputs_when_overwrite_false(
 
     with pytest.raises(FileExistsError, match="Artifact already exists"):
         writer.write(results=[result], labels=[label])
+
+
+def test_artifact_writer_uses_backend_neutral_metadata_defaults(tmp_path) -> None:
+    result = SupportWindowResult(
+        sample_id="s1",
+        dataset_scope="full",
+        mass_threshold=0.9,
+        window_size=0,
+        covered_mass=0.0,
+        residual_mass=1.0,
+        gold_total_mass=0.0,
+        covered_gold_mass=0.0,
+        missed_gold_mass=0.0,
+        unique_answer_count=0,
+        unique_path_count=0,
+        gold_answer_entity_ids=[],
+        start_entity_ids=[],
+        trajectories=[],
+        answer_posterior=[],
+    )
+    writer = SupportWindowArtifactWriter(output_dir=tmp_path, split="test")
+
+    prompt_record = writer._build_prompt_record(result, label=None)
+
+    assert prompt_record["inference_mode"] == UNSPECIFIED_INFERENCE_MODE
+    assert prompt_record["answer_mass_reference"] == UNSPECIFIED_MASS_REFERENCE
+    assert prompt_record["support_mass_reference"] == UNSPECIFIED_MASS_REFERENCE

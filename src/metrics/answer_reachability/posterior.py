@@ -5,7 +5,7 @@ import math
 
 from src.graph_runtime import TrajectoryBatch
 
-from .exact_analysis import ExactReachabilityAnalysis
+from .analysis import ReachabilityAnalysis
 from .schema import (
     AnswerPosteriorRecord,
     AnswerSupportRecord,
@@ -44,12 +44,24 @@ def graph_start_entity_ids(*, batch: TrajectoryBatch) -> list[int]:
 
 def build_answer_posterior(
     *,
-    analysis: ExactReachabilityAnalysis,
+    analysis: ReachabilityAnalysis,
     gold_answers: set[int],
     answer_mass_threshold: float,
     total_mass_reference: float | None = None,
 ) -> tuple[list[AnswerPosteriorRecord], list[int]]:
     answer_ids = [int(value) for value in analysis.answer_entity_ids.tolist()]
+    answer_ci_low = (
+        [float(value) for value in analysis.answer_prob_ci_low.tolist()]
+        if analysis.answer_prob_ci_low is not None
+        and int(analysis.answer_prob_ci_low.numel()) == len(answer_ids)
+        else [0.0 for _ in answer_ids]
+    )
+    answer_ci_high = (
+        [float(value) for value in analysis.answer_prob_ci_high.tolist()]
+        if analysis.answer_prob_ci_high is not None
+        and int(analysis.answer_prob_ci_high.numel()) == len(answer_ids)
+        else [0.0 for _ in answer_ids]
+    )
     if analysis.log_answer_probs is not None and int(
         analysis.log_answer_probs.numel()
     ) == len(answer_ids):
@@ -98,6 +110,8 @@ def build_answer_posterior(
                 cumulative_mass=min(cumulative, 1.0),
                 is_gold=answer_id in gold_answers,
                 is_selected=is_selected,
+                prob_ci_low=max(float(answer_ci_low[idx]), 0.0),
+                prob_ci_high=max(float(answer_ci_high[idx]), 0.0),
             )
         )
     return records, selected_answer_ids
@@ -198,7 +212,7 @@ def build_window_result(
     *,
     batch: TrajectoryBatch,
     discovered_paths: list[DiscoveredTrajectory],
-    analysis: ExactReachabilityAnalysis,
+    analysis: ReachabilityAnalysis,
     inference_mode: str,
     answer_mass_threshold: float,
     support_mass_threshold: float,
@@ -212,6 +226,11 @@ def build_window_result(
     answer_mass_reference_total: float | None = None,
     support_answer_upper_bounds: dict[int, float] | None = None,
     include_answer_support: bool = True,
+    ci_confidence_level: float | None = None,
+    covered_mass_ci_low: float | None = None,
+    covered_mass_ci_high: float | None = None,
+    gold_total_mass_ci_low: float | None = None,
+    gold_total_mass_ci_high: float | None = None,
 ) -> SupportWindowResult:
     gold_answers = graph_gold_answers(batch=batch)
     answer_records, selected_answer_ids = build_answer_posterior(
@@ -240,6 +259,20 @@ def build_window_result(
     )
     covered_mass = sum(path.prob for path in emitted_paths)
     covered_gold_mass = sum(path.prob for path in emitted_paths if path.is_gold)
+    resolved_gold_ci_low = (
+        float(analysis.gold_total_mass_ci_low)
+        if analysis.gold_total_mass_ci_low is not None
+        else float(gold_total_mass_ci_low)
+        if gold_total_mass_ci_low is not None
+        else float(analysis.gold_total_mass)
+    )
+    resolved_gold_ci_high = (
+        float(analysis.gold_total_mass_ci_high)
+        if analysis.gold_total_mass_ci_high is not None
+        else float(gold_total_mass_ci_high)
+        if gold_total_mass_ci_high is not None
+        else float(analysis.gold_total_mass)
+    )
     return SupportWindowResult(
         sample_id=batch.sample_ids[0],
         dataset_scope=batch.dataset_scope,
@@ -256,6 +289,23 @@ def build_window_result(
         start_entity_ids=graph_start_entity_ids(batch=batch),
         trajectories=emitted_paths,
         inference_mode=str(inference_mode),
+        ci_confidence_level=(
+            float(ci_confidence_level)
+            if ci_confidence_level is not None
+            else analysis.ci_confidence_level
+        ),
+        covered_mass_ci_low=(
+            float(covered_mass_ci_low)
+            if covered_mass_ci_low is not None
+            else float(covered_mass)
+        ),
+        covered_mass_ci_high=(
+            float(covered_mass_ci_high)
+            if covered_mass_ci_high is not None
+            else float(covered_mass)
+        ),
+        gold_total_mass_ci_low=resolved_gold_ci_low,
+        gold_total_mass_ci_high=resolved_gold_ci_high,
         answer_mass_threshold=float(answer_mass_threshold),
         support_mass_threshold=float(support_mass_threshold),
         probe_count=int(probe_count),
@@ -274,7 +324,7 @@ def build_window_result(
 def build_rank_only_result(
     *,
     batch: TrajectoryBatch,
-    analysis: ExactReachabilityAnalysis,
+    analysis: ReachabilityAnalysis,
     inference_mode: str,
     answer_mass_threshold: float,
     support_mass_threshold: float,
@@ -284,6 +334,9 @@ def build_rank_only_result(
     coverage_certified: bool = False,
     answer_mass_reference: str = "discovered",
     answer_mass_reference_total: float | None = None,
+    ci_confidence_level: float | None = None,
+    gold_total_mass_ci_low: float | None = None,
+    gold_total_mass_ci_high: float | None = None,
 ) -> SupportWindowResult:
     gold_answers = graph_gold_answers(batch=batch)
     retrieval_answer_entity_ids = (
@@ -297,7 +350,7 @@ def build_rank_only_result(
         else analysis.answer_probs
     )
     answer_records, selected_answer_ids = build_answer_posterior(
-        analysis=ExactReachabilityAnalysis(
+        analysis=ReachabilityAnalysis(
             terminal_mass=analysis.terminal_mass,
             answer_entity_ids=retrieval_answer_entity_ids,
             answer_probs=retrieval_answer_probs,
@@ -331,6 +384,27 @@ def build_rank_only_result(
         start_entity_ids=graph_start_entity_ids(batch=batch),
         trajectories=[],
         inference_mode=str(inference_mode),
+        ci_confidence_level=(
+            float(ci_confidence_level)
+            if ci_confidence_level is not None
+            else analysis.ci_confidence_level
+        ),
+        covered_mass_ci_low=0.0,
+        covered_mass_ci_high=0.0,
+        gold_total_mass_ci_low=(
+            float(analysis.gold_total_mass_ci_low)
+            if analysis.gold_total_mass_ci_low is not None
+            else float(gold_total_mass_ci_low)
+            if gold_total_mass_ci_low is not None
+            else float(analysis.gold_total_mass)
+        ),
+        gold_total_mass_ci_high=(
+            float(analysis.gold_total_mass_ci_high)
+            if analysis.gold_total_mass_ci_high is not None
+            else float(gold_total_mass_ci_high)
+            if gold_total_mass_ci_high is not None
+            else float(analysis.gold_total_mass)
+        ),
         answer_mass_threshold=float(answer_mass_threshold),
         support_mass_threshold=float(support_mass_threshold),
         probe_count=int(probe_count),
@@ -538,6 +612,8 @@ def _build_support_outputs(
                 support_mass=float(support_mass),
                 support_conditioned_mass=float(conditioned_mass),
                 support_path_count=int(support_path_count),
+                prob_ci_low=float(record.prob_ci_low),
+                prob_ci_high=float(record.prob_ci_high),
             )
         )
     return ranked_support_paths, updated_answers
@@ -570,6 +646,8 @@ def _build_answer_support_records(
                 support_conditioned_mass=float(record.support_conditioned_mass),
                 support_path_count=int(record.support_path_count),
                 trajectories=list(grouped_paths.get(answer_id, [])),
+                prob_ci_low=float(record.prob_ci_low),
+                prob_ci_high=float(record.prob_ci_high),
             )
         )
     return support_records

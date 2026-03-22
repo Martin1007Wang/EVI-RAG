@@ -5,9 +5,9 @@ from typing import Protocol
 
 import torch
 
-from src.graph_runtime import GraphObservation, GraphTopology
+from src.graph_runtime import GraphTopology, SearchObservation
 
-from .path import append_relation_and_node_tokens, initialize_path_token_ids
+from .path import append_relation_and_node_tokens_inplace, initialize_path_token_ids
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,8 @@ class ForwardActionDistribution:
     edge_ids: torch.Tensor
     target_nodes: torch.Tensor
     out_degrees: torch.Tensor
+    is_submit: torch.Tensor | None = None
+    current_log_f: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -33,7 +35,7 @@ class PreparedSearchBatch:
     """Encoded batch payload shared across search, training, and evaluation."""
 
     topology: GraphTopology
-    observation: GraphObservation
+    observation: SearchObservation
     node_tokens: torch.Tensor
     relation_tokens: torch.Tensor
     question_tokens: torch.Tensor
@@ -43,7 +45,10 @@ class PreparedSearchBatch:
 
 @dataclass(frozen=True)
 class HeuristicCache:
+    """Cheap proposal cache used by behavior-policy sampling."""
+
     node_log_heuristic: torch.Tensor | None = None
+    step_node_log_heuristic: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -53,19 +58,58 @@ class PreparedGFlowNetBatch(PreparedSearchBatch):
 
 @dataclass(frozen=True)
 class SearchState:
+    """Canonical recurrent-prefix search state.
+
+    The environment state still keeps the exact discrete trajectory prefix for
+    tree-structured backward transitions, but forward scoring is driven by a
+    recurrent control state that compresses question-conditioned prefix history.
+    """
+
     topology: GraphTopology
-    observation: GraphObservation
+    observation: SearchObservation
     current_nodes: torch.Tensor
     done_mask: torch.Tensor
     num_steps: torch.Tensor
     path_token_ids: torch.Tensor | None = None
+    control_state: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        expected_shape = tuple(self.current_nodes.shape)
+        if tuple(self.done_mask.shape) != expected_shape:
+            raise ValueError(
+                "done_mask must match current_nodes shape in SearchState. "
+                f"current_nodes={expected_shape} done_mask={tuple(self.done_mask.shape)}."
+            )
+        if tuple(self.num_steps.shape) != expected_shape:
+            raise ValueError(
+                "num_steps must match current_nodes shape in SearchState. "
+                f"current_nodes={expected_shape} num_steps={tuple(self.num_steps.shape)}."
+            )
+        if bool((self.num_steps < 0).any().item()):
+            raise ValueError("num_steps must be >= 0 in SearchState.")
+        if (
+            self.path_token_ids is not None
+            and tuple(self.path_token_ids.shape[:2]) != expected_shape
+        ):
+            raise ValueError(
+                "path_token_ids batch shape must match current_nodes shape in SearchState. "
+                f"current_nodes={expected_shape} path_token_ids={tuple(self.path_token_ids.shape)}."
+            )
+        if (
+            self.control_state is not None
+            and tuple(self.control_state.shape[:2]) != expected_shape
+        ):
+            raise ValueError(
+                "control_state batch shape must match current_nodes shape in SearchState. "
+                f"current_nodes={expected_shape} control_state={tuple(self.control_state.shape)}."
+            )
 
     @classmethod
     def initialize(
         cls,
         *,
         topology: GraphTopology,
-        observation: GraphObservation,
+        observation: SearchObservation,
         start_nodes: torch.Tensor,
         max_steps: int | None = None,
     ) -> SearchState:
@@ -87,6 +131,7 @@ class SearchState:
             done_mask=torch.zeros_like(start_nodes, dtype=torch.bool),
             num_steps=torch.zeros_like(start_nodes, dtype=torch.long),
             path_token_ids=path_token_ids,
+            control_state=None,
         )
 
     @classmethod
@@ -94,7 +139,7 @@ class SearchState:
         cls,
         *,
         topology: GraphTopology,
-        observation: GraphObservation,
+        observation: SearchObservation,
         start_node: int,
         edge_ids: tuple[int, ...],
         max_steps: int,
@@ -117,7 +162,7 @@ class SearchState:
             if edge_src != current_node:
                 raise ValueError("edge path is not source-contiguous.")
             relation_id = int(topology.edge_type[edge_id_int].item())
-            path_token_ids = append_relation_and_node_tokens(
+            path_token_ids = append_relation_and_node_tokens_inplace(
                 path_token_ids=path_token_ids,
                 num_steps=step_tensor,
                 relation_ids=torch.tensor(
@@ -138,6 +183,7 @@ class SearchState:
             done_mask=torch.zeros((1, 1), device=device, dtype=torch.bool),
             num_steps=torch.tensor([[num_steps]], device=device, dtype=torch.long),
             path_token_ids=path_token_ids,
+            control_state=None,
         )
 
     def flatten_current_nodes(self) -> torch.Tensor:
@@ -157,6 +203,12 @@ class SearchState:
 
     def resolve_path_token_ids(self, *, max_steps: int) -> torch.Tensor:
         if self.path_token_ids is None:
+            if bool((self.num_steps != 0).any().item()):
+                raise ValueError(
+                    "Non-root SearchState instances must carry exact path_token_ids. "
+                    "The search space is defined over discrete trajectory prefixes, so "
+                    "path history cannot be reconstructed from (current_node, num_steps) alone."
+                )
             return initialize_path_token_ids(
                 start_nodes=self.current_nodes,
                 max_steps=int(max_steps),
@@ -174,12 +226,34 @@ class SearchState:
             -1, (2 * int(max_steps)) + 1
         )
 
+    def flatten_control_state(self) -> torch.Tensor:
+        if self.control_state is None:
+            raise ValueError(
+                "SearchState is missing control_state; provide it explicitly or let the policy reconstruct it."
+            )
+        return self.control_state.view(-1, int(self.control_state.size(-1)))
+
     def flatten_graph_index(self) -> torch.Tensor:
         return self.topology.graph_index_from_nodes(self.flatten_current_nodes())
 
 
 class SearchPolicyProtocol(Protocol):
     def prepare_batch(self, batch) -> PreparedSearchBatch: ...
+
+    def build_start_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        start_nodes: torch.Tensor,
+    ) -> torch.Tensor: ...
+
+    def compute_next_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        *,
+        control_states: torch.Tensor,
+        next_nodes: torch.Tensor,
+        relation_ids: torch.Tensor,
+    ) -> torch.Tensor: ...
 
     def compute_start_distribution(
         self,
@@ -190,6 +264,8 @@ class SearchPolicyProtocol(Protocol):
         self,
         prepared_batch: PreparedSearchBatch,
         state: SearchState,
+        *,
+        required_edge_ids: torch.Tensor | None = None,
     ) -> ForwardActionDistribution: ...
 
     def compute_log_state_scores(
@@ -221,6 +297,13 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
     ) -> ForwardActionDistribution: ...
+
+    def compute_behavior_edge_logits(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        state: SearchState,
+        distribution: ForwardActionDistribution,
+    ) -> torch.Tensor: ...
 
     def compute_backward_distribution(
         self,

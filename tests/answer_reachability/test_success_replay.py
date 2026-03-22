@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+from typing import cast
 
 from src.graph_runtime import TrajectoryBatch
 from src.metrics.answer_reachability.runtime import SearchMetricRuntimeFactory
 from src.models.configs import (
     BackboneConfig,
+    CandidateShortlistConfig,
     GFlowNetTrainingConfig,
     HeuristicConfig,
     HorizonConfig,
@@ -18,6 +20,8 @@ from src.models.configs import (
 )
 from src.models.configs.training import SchedulerConfig
 from src.models.gflownet import TrajectoryGFNSampleBatch
+from src.models.gflownet import SearchState
+from src.models.gflownet import ForwardTrajectoryGFNSampler
 from src.models.gflownet.replay import (
     SuccessfulTrajectoryRecord,
     SuccessfulTrajectoryReplayBuffer,
@@ -28,7 +32,9 @@ from src.models.gflownet_module import GFlowNetModule
 from .conftest import make_batch_from_graph, make_toy_batch
 
 
-def _make_policy_config() -> PolicyConfig:
+def _make_policy_config(
+    *, candidate_shortlist: CandidateShortlistConfig | None = None
+) -> PolicyConfig:
     return PolicyConfig(
         backbone=BackboneConfig(
             embedding_dim=8,
@@ -40,6 +46,7 @@ def _make_policy_config() -> PolicyConfig:
             adapter_dropout=0.0,
         ),
         state_score_head=StateScoreHeadConfig(hidden_dim=8, num_layers=2, dropout=0.0),
+        candidate_shortlist=candidate_shortlist or CandidateShortlistConfig(),
     )
 
 
@@ -145,7 +152,9 @@ def test_build_replay_sample_batch_replays_successful_path() -> None:
         batch=batch,
         policy=module.policy,
         prepared_batch=prepared_batch,
-        trajectory_supervisor=module.sampler.trajectory_supervisor,
+        trajectory_supervisor=cast(
+            ForwardTrajectoryGFNSampler, module.sampler
+        ).trajectory_supervisor,
         replay_records=(
             (
                 SuccessfulTrajectoryRecord(
@@ -165,3 +174,127 @@ def test_build_replay_sample_batch_replays_successful_path() -> None:
     assert int(replay_sample_batch.trace_edge_ids[0, 0, 0].item()) == 1
     assert torch.isfinite(loss.loss)
     assert loss.success_rate == pytest.approx(1.0)
+
+
+def test_build_replay_sample_batch_force_keeps_recorded_edges_in_shortlist() -> None:
+    batch = make_toy_batch()
+    module = GFlowNetModule(
+        horizon_cfg=HorizonConfig(max_steps=2),
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=3,
+            reward_epsilon=1.0e-3,
+            failure_reward_mode="graph_normalized",
+            sampling_temperature=1.0,
+            success_replay=SuccessfulTrajectoryReplayConfig(
+                enabled=True,
+                ratio=0.25,
+                warmup_passes=0.0,
+                min_buffer_size=1,
+                max_buffer_size=16,
+                max_trajectories_per_sample=4,
+            ),
+        ),
+        heuristic_cfg=HeuristicConfig(kind="none", beta=0.0),
+        policy_cfg=_make_policy_config(
+            candidate_shortlist=CandidateShortlistConfig(
+                enabled=True,
+                topk=1,
+                degree_threshold=1,
+                heuristic_weight=0.0,
+            )
+        ),
+        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
+        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
+        metric_runtime_factory=SearchMetricRuntimeFactory(),
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+    assert module.sampler is not None
+
+    def _force_shortlist_away_from_answer(
+        *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        del args, kwargs
+        return torch.tensor([10.0, -10.0], dtype=torch.float32)
+
+    module.policy.base_policy._compute_shortlist_scores = (  # type: ignore[method-assign]
+        _force_shortlist_away_from_answer
+    )
+
+    state = SearchState.initialize(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_nodes=torch.tensor([[0]], dtype=torch.long),
+        max_steps=module.policy.base_policy.max_steps,
+    )
+    shortlisted_distribution = module.policy.compute_forward_distribution(
+        prepared_batch,
+        state,
+    )
+    assert 1 not in shortlisted_distribution.edge_ids.tolist()
+
+    forced_distribution = module.policy.compute_forward_distribution(
+        prepared_batch,
+        state,
+        required_edge_ids=torch.tensor([1], dtype=torch.long),
+    )
+    assert forced_distribution.is_submit is not None
+    forced_graph_edges = forced_distribution.edge_ids[
+        ~forced_distribution.is_submit.to(dtype=torch.bool)
+    ]
+    assert torch.equal(torch.sort(forced_graph_edges).values, torch.tensor([0, 1]))
+    assert torch.equal(forced_distribution.out_degrees.view(-1), torch.tensor([3]))
+
+    replay_sample_batch = build_replay_sample_batch(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        trajectory_supervisor=cast(
+            ForwardTrajectoryGFNSampler, module.sampler
+        ).trajectory_supervisor,
+        replay_records=((SuccessfulTrajectoryRecord("toy-sample", 0, (1,)),),),
+        max_steps=2,
+    )
+
+    assert int(replay_sample_batch.trace_edge_ids[0, 0, 0].item()) == 1
+    assert bool(replay_sample_batch.success_mask.item()) is True
+
+
+def test_forward_distribution_rejects_missing_required_replay_edge() -> None:
+    batch = make_toy_batch()
+    module = GFlowNetModule(
+        horizon_cfg=HorizonConfig(max_steps=2),
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=3,
+            reward_epsilon=1.0e-3,
+            failure_reward_mode="graph_normalized",
+            sampling_temperature=1.0,
+        ),
+        heuristic_cfg=HeuristicConfig(kind="none", beta=0.0),
+        policy_cfg=_make_policy_config(
+            candidate_shortlist=CandidateShortlistConfig(
+                enabled=True,
+                topk=1,
+                degree_threshold=1,
+                heuristic_weight=0.0,
+            )
+        ),
+        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
+        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
+        metric_runtime_factory=SearchMetricRuntimeFactory(),
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+    state = SearchState.initialize(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_nodes=torch.tensor([[1]], dtype=torch.long),
+        max_steps=module.policy.base_policy.max_steps,
+    )
+
+    with pytest.raises(ValueError, match="required replay edge"):
+        module.policy.compute_forward_distribution(
+            prepared_batch,
+            state,
+            required_edge_ids=torch.tensor([0], dtype=torch.long),
+        )

@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+UNSPECIFIED_INFERENCE_MODE = "unspecified"
+UNSPECIFIED_MASS_REFERENCE = "unspecified"
+
+
 @dataclass(frozen=True)
 class EdgeRecord:
     edge_id: int
@@ -38,6 +42,8 @@ class AnswerPosteriorRecord:
     support_mass: float = 0.0
     support_conditioned_mass: float = 0.0
     support_path_count: int = 0
+    prob_ci_low: float = 0.0
+    prob_ci_high: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -52,10 +58,19 @@ class AnswerSupportRecord:
     support_conditioned_mass: float
     support_path_count: int
     trajectories: list[TrajectoryRecord]
+    prob_ci_low: float = 0.0
+    prob_ci_high: float = 0.0
 
 
 @dataclass(frozen=True)
 class SupportWindowResult:
+    """Artifact-facing evaluation output.
+
+    Backend-specific metadata should be filled explicitly by the evaluator.
+    The schema defaults stay backend-neutral so ad hoc constructions in tests or
+    tools do not silently claim Monte Carlo provenance.
+    """
+
     sample_id: str
     dataset_scope: str
     mass_threshold: float
@@ -70,7 +85,12 @@ class SupportWindowResult:
     gold_answer_entity_ids: list[int]
     start_entity_ids: list[int]
     trajectories: list[TrajectoryRecord]
-    inference_mode: str = "exact"
+    inference_mode: str = UNSPECIFIED_INFERENCE_MODE
+    ci_confidence_level: float | None = None
+    covered_mass_ci_low: float | None = None
+    covered_mass_ci_high: float | None = None
+    gold_total_mass_ci_low: float | None = None
+    gold_total_mass_ci_high: float | None = None
     answer_mass_threshold: float = 1.0
     support_mass_threshold: float = 1.0
     probe_count: int = 0
@@ -78,8 +98,8 @@ class SupportWindowResult:
     remaining_mass_upper: float = 0.0
     stop_reason: str = ""
     coverage_certified: bool = False
-    answer_mass_reference: str = "exact"
-    support_mass_reference: str = "exact"
+    answer_mass_reference: str = UNSPECIFIED_MASS_REFERENCE
+    support_mass_reference: str = UNSPECIFIED_MASS_REFERENCE
     selected_answer_ids: list[int] = field(default_factory=list)
     answer_posterior: list[AnswerPosteriorRecord] = field(default_factory=list)
     answer_support: list[AnswerSupportRecord] = field(default_factory=list)

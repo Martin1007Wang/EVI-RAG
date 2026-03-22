@@ -6,8 +6,35 @@ import torch
 from torch import nn
 
 
+def _build_mlp(
+    *,
+    input_dim: int,
+    output_dim: int,
+    hidden_dim: int,
+    num_layers: int,
+    dropout: float,
+) -> nn.Sequential:
+    if num_layers < 1:
+        raise ValueError("num_layers must be >= 1.")
+    layers: list[nn.Module] = []
+    in_dim = int(input_dim)
+    for _ in range(max(num_layers - 1, 0)):
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        layers.append(nn.GELU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        in_dim = int(hidden_dim)
+    layers.append(nn.Linear(in_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
 class NodeFlowHead(nn.Module):
-    """Question-conditioned node flow scorer used by the mainline GFlowNet."""
+    """Critic head over state features.
+
+    The critic reads the already question-conditioned state feature and maps it to
+    a single log-flow scalar. ``question_features`` is kept in the signature only
+    for interface compatibility with older call sites.
+    """
 
     def __init__(
         self,
@@ -18,186 +45,130 @@ class NodeFlowHead(nn.Module):
         num_layers: int,
         dropout: float,
     ) -> None:
+        del question_dim, hidden_dim, num_layers, dropout
         super().__init__()
-        if num_layers < 1:
-            raise ValueError("priority_head.num_layers must be >= 1.")
-        self.q_proj = nn.Linear(node_dim, question_dim, bias=False)
-        layers: list[nn.Module] = []
-        in_dim = int(node_dim + question_dim)
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.GELU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, 1))
-        self.residual = nn.Sequential(*layers)
+        self.critic = nn.Linear(int(node_dim), 1)
 
     def forward(
         self, node_features: torch.Tensor, question_features: torch.Tensor
     ) -> torch.Tensor:
-        bilinear = (question_features * self.q_proj(node_features)).sum(dim=-1)
-        bilinear = bilinear / math.sqrt(question_features.size(-1))
-        residual = self.residual(
-            torch.cat((node_features, question_features), dim=-1)
-        ).squeeze(-1)
-        return bilinear + residual
+        del question_features
+        return self.critic(node_features).squeeze(-1)
 
 
 class TransitionPolicyHead(nn.Module):
-    """Question-conditioned transition scorer over candidate graph edges."""
+    """Detached actor head over recurrent state queries and edge keys."""
 
     def __init__(
         self,
         *,
         state_dim: int,
         relation_dim: int,
-        question_dim: int,
         hidden_dim: int,
         num_layers: int,
         dropout: float,
+        microbatch_size: int,
     ) -> None:
         super().__init__()
         if num_layers < 1:
             raise ValueError("transition_head.num_layers must be >= 1.")
-        self.context_query = nn.Linear(
-            int((2 * state_dim) + relation_dim + question_dim), question_dim
+        if microbatch_size < 1:
+            raise ValueError("transition_head.microbatch_size must be >= 1.")
+        self.microbatch_size = int(microbatch_size)
+        self.actor_dim = int(state_dim)
+        self.query_norm = nn.LayerNorm(self.actor_dim)
+        self.edge_norm = nn.LayerNorm(int(state_dim + relation_dim))
+        self.query_mlp = _build_mlp(
+            input_dim=self.actor_dim,
+            output_dim=self.actor_dim,
+            hidden_dim=int(hidden_dim),
+            num_layers=int(num_layers),
+            dropout=float(dropout),
         )
-        self.context_key = nn.Linear(question_dim, question_dim, bias=False)
-        self.context_value = nn.Linear(question_dim, question_dim, bias=False)
-        self.context_norm = nn.LayerNorm(question_dim)
-        self.relation_context_proj = nn.Linear(relation_dim, question_dim, bias=False)
-        input_dim = int((2 * state_dim) + relation_dim + (3 * question_dim))
-        self.input_norm = nn.LayerNorm(input_dim)
-        layers: list[nn.Module] = []
-        in_dim = input_dim
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.GELU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, 1))
-        self.mlp = nn.Sequential(*layers)
+        self.edge_mlp = _build_mlp(
+            input_dim=int(state_dim + relation_dim),
+            output_dim=self.actor_dim,
+            hidden_dim=int(hidden_dim),
+            num_layers=int(num_layers),
+            dropout=float(dropout),
+        )
+
+    @staticmethod
+    def _validate_inputs(
+        *,
+        current_state_features: torch.Tensor,
+        candidate_state_features: torch.Tensor,
+        relation_features: torch.Tensor,
+    ) -> None:
+        if candidate_state_features.shape != current_state_features.shape:
+            raise ValueError(
+                "candidate_state_features must match current_state_features shape in TransitionPolicyHead."
+            )
+        if tuple(relation_features.shape[:-1]) != tuple(
+            current_state_features.shape[:-1]
+        ):
+            raise ValueError(
+                "relation_features batch shape must match current_state_features in TransitionPolicyHead."
+            )
+
+    def _forward_chunk(
+        self,
+        *,
+        current_state_features: torch.Tensor,
+        candidate_state_features: torch.Tensor,
+        relation_features: torch.Tensor,
+    ) -> torch.Tensor:
+        actor_query = self.query_mlp(
+            self.query_norm(current_state_features.detach().to(dtype=torch.float32))
+        )
+        detached_relation_features = relation_features.detach().to(dtype=torch.float32)
+        detached_candidate_features = candidate_state_features.detach().to(
+            dtype=torch.float32
+        )
+        edge_key = self.edge_mlp(
+            self.edge_norm(
+                torch.cat(
+                    (
+                        detached_relation_features,
+                        detached_candidate_features,
+                    ),
+                    dim=-1,
+                )
+            )
+        )
+        logits = (actor_query * edge_key).sum(dim=-1)
+        return logits / math.sqrt(float(max(self.actor_dim, 1)))
 
     def forward(
         self,
         current_state_features: torch.Tensor,
         candidate_state_features: torch.Tensor,
         relation_features: torch.Tensor,
-        question_features: torch.Tensor,
-        question_context_features: torch.Tensor,
-        question_context_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if question_context_features.dim() != 3:
-            raise ValueError(
-                "question_context_features must be 3D [N, L, d] in TransitionPolicyHead."
-            )
-        if (
-            question_context_mask.dtype != torch.bool
-            or question_context_mask.dim() != 2
-        ):
-            raise ValueError(
-                "question_context_mask must be 2D bool in TransitionPolicyHead."
-            )
-        if tuple(question_context_mask.shape) != tuple(
-            question_context_features.shape[:2]
-        ):
-            raise ValueError(
-                "question_context_mask shape must match question_context_features in TransitionPolicyHead."
-            )
-        if bool((~question_context_mask).all(dim=1).any().item()):
-            raise ValueError(
-                "question_context_mask contains rows without valid tokens in TransitionPolicyHead."
-            )
+        self._validate_inputs(
+            current_state_features=current_state_features,
+            candidate_state_features=candidate_state_features,
+            relation_features=relation_features,
+        )
         batch_size = int(current_state_features.size(0))
-        if int(question_features.size(0)) not in {1, batch_size}:
-            raise ValueError(
-                "question_features batch must be 1 or match current_state_features in TransitionPolicyHead. "
-                f"got question_features.shape={tuple(question_features.shape)} "
-                f"current_state_features.shape={tuple(current_state_features.shape)}."
+        if batch_size <= self.microbatch_size:
+            return self._forward_chunk(
+                current_state_features=current_state_features,
+                candidate_state_features=candidate_state_features,
+                relation_features=relation_features,
             )
-        if int(question_context_features.size(0)) not in {1, batch_size}:
-            raise ValueError(
-                "question_context_features batch must be 1 or match current_state_features in TransitionPolicyHead. "
-                f"got question_context_features.shape={tuple(question_context_features.shape)} "
-                f"current_state_features.shape={tuple(current_state_features.shape)}."
+        logits_chunks: list[torch.Tensor] = []
+        for start in range(0, batch_size, self.microbatch_size):
+            end = min(start + self.microbatch_size, batch_size)
+            chunk_slice = slice(start, end)
+            logits_chunks.append(
+                self._forward_chunk(
+                    current_state_features=current_state_features[chunk_slice],
+                    candidate_state_features=candidate_state_features[chunk_slice],
+                    relation_features=relation_features[chunk_slice],
+                )
             )
-        if int(question_features.size(0)) == 1 and batch_size != 1:
-            question_features = question_features.expand(batch_size, -1)
-        context_query = self.context_query(
-            torch.cat(
-                (
-                    current_state_features,
-                    candidate_state_features,
-                    relation_features,
-                    question_features,
-                ),
-                dim=-1,
-            )
-        )
-        context_query_fp32 = context_query.to(dtype=torch.float32)
-        if int(question_context_features.size(0)) == 1 and batch_size != 1:
-            shared_context = question_context_features.squeeze(0)
-            shared_mask = question_context_mask.squeeze(0)
-            context_key = self.context_key(shared_context).to(dtype=torch.float32)
-            context_value = self.context_value(shared_context).to(dtype=torch.float32)
-            attention_scores = torch.matmul(
-                context_query_fp32, context_key.transpose(0, 1)
-            )
-            attention_scores = attention_scores / math.sqrt(float(context_key.size(-1)))
-            attention_scores = attention_scores.masked_fill(
-                ~shared_mask.unsqueeze(0), float("-inf")
-            )
-            attention_weights = torch.softmax(attention_scores, dim=-1)
-            attention_weights = torch.where(
-                torch.isfinite(attention_weights),
-                attention_weights,
-                torch.zeros_like(attention_weights),
-            )
-            question_context_summary = torch.matmul(attention_weights, context_value)
-        else:
-            context_key = self.context_key(question_context_features).to(
-                dtype=torch.float32
-            )
-            context_value = self.context_value(question_context_features).to(
-                dtype=torch.float32
-            )
-            attention_scores = torch.einsum(
-                "bd,bld->bl", context_query_fp32, context_key
-            )
-            attention_scores = attention_scores / math.sqrt(float(context_key.size(-1)))
-            attention_scores = attention_scores.masked_fill(
-                ~question_context_mask, float("-inf")
-            )
-            attention_weights = torch.softmax(attention_scores, dim=-1)
-            attention_weights = torch.where(
-                torch.isfinite(attention_weights),
-                attention_weights,
-                torch.zeros_like(attention_weights),
-            )
-            question_context_summary = torch.einsum(
-                "bl,bld->bd", attention_weights, context_value
-            )
-        question_context_summary = self.context_norm(
-            question_context_summary + context_query_fp32
-        )
-        relation_context_interaction = (
-            question_context_summary
-            * self.relation_context_proj(relation_features.to(dtype=torch.float32))
-        )
-        fused = torch.cat(
-            (
-                current_state_features,
-                candidate_state_features,
-                relation_features,
-                question_features,
-                question_context_summary.to(dtype=current_state_features.dtype),
-                relation_context_interaction.to(dtype=current_state_features.dtype),
-            ),
-            dim=-1,
-        )
-        return self.mlp(self.input_norm(fused)).squeeze(-1)
+        return torch.cat(logits_chunks, dim=0)
 
 
 __all__ = ["NodeFlowHead", "TransitionPolicyHead"]

@@ -185,6 +185,8 @@ def _answer_to_dict(answer: AnswerPosteriorRecord) -> dict[str, Any]:
     return {
         "answer_entity_id": int(answer.answer_entity_id),
         "prob": float(answer.prob),
+        "prob_ci_low": float(answer.prob_ci_low),
+        "prob_ci_high": float(answer.prob_ci_high),
         "cumulative_mass": float(answer.cumulative_mass),
         "is_gold": bool(answer.is_gold),
         "is_selected": bool(answer.is_selected),
@@ -204,6 +206,8 @@ def _answer_support_to_dict(
         "answer_entity_id": int(answer_support.answer_entity_id),
         "answer_rank": int(answer_support.answer_rank),
         "prob": float(answer_support.prob),
+        "prob_ci_low": float(answer_support.prob_ci_low),
+        "prob_ci_high": float(answer_support.prob_ci_high),
         "cumulative_mass": float(answer_support.cumulative_mass),
         "is_gold": bool(answer_support.is_gold),
         "is_selected": bool(answer_support.is_selected),
@@ -314,8 +318,34 @@ class SupportWindowArtifactWriter:
             "support_mass_threshold": float(result.support_mass_threshold),
             "window_size": int(result.window_size),
             "covered_mass": float(result.covered_mass),
+            "covered_mass_ci_low": (
+                None
+                if result.covered_mass_ci_low is None
+                else float(result.covered_mass_ci_low)
+            ),
+            "covered_mass_ci_high": (
+                None
+                if result.covered_mass_ci_high is None
+                else float(result.covered_mass_ci_high)
+            ),
             "residual_mass": float(result.residual_mass),
             "remaining_mass_upper": float(result.remaining_mass_upper),
+            "gold_total_mass": float(result.gold_total_mass),
+            "gold_total_mass_ci_low": (
+                None
+                if result.gold_total_mass_ci_low is None
+                else float(result.gold_total_mass_ci_low)
+            ),
+            "gold_total_mass_ci_high": (
+                None
+                if result.gold_total_mass_ci_high is None
+                else float(result.gold_total_mass_ci_high)
+            ),
+            "ci_confidence_level": (
+                None
+                if result.ci_confidence_level is None
+                else float(result.ci_confidence_level)
+            ),
             "probe_count": int(result.probe_count),
             "emit_path_count": int(result.emit_path_count),
             "stop_reason": result.stop_reason,

@@ -16,6 +16,7 @@ class SubTrajectoryBalanceLossOutput:
     loss: torch.Tensor
     subtb_loss: torch.Tensor
     residual_abs: torch.Tensor
+    residual_variance: torch.Tensor
     root_abs: torch.Tensor
     success_rate: torch.Tensor
     log_z_mean: torch.Tensor
@@ -89,94 +90,125 @@ class SubTrajectoryBalanceLoss:
                 dtype=torch.float32
             )
 
-        forward_prefix, backward_prefix = self._build_prefix_terms(
+        forward_prefix, _ = self._build_prefix_terms(
             log_pf_steps=log_pf_steps,
             log_pb_steps=log_pb_steps,
         )
-        trajectory_values = state_values - forward_prefix + backward_prefix
 
-        terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long)
+        terminal_counts = getattr(sample_batch, "terminal_action_counts", None)
+        if terminal_counts is None:
+            terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long)
+        else:
+            terminal_index = terminal_counts.to(dtype=torch.long)
         if bool((terminal_index < 0).any().item()) or bool(
             (terminal_index >= sequence_horizon).any().item()
         ):
             raise ValueError(
-                "terminal_num_steps produced an out-of-range terminal state index for SubTB. "
+                "terminal action index produced an out-of-range terminal state index for SubTB. "
                 f"sequence_horizon={sequence_horizon}"
             )
         terminal_forward_prefix = forward_prefix.gather(
             -1, terminal_index.unsqueeze(-1)
         ).squeeze(-1)
-        terminal_backward_prefix = backward_prefix.gather(
-            -1, terminal_index.unsqueeze(-1)
-        ).squeeze(-1)
         terminal_values = (
             sample_batch.terminal_log_rewards.to(dtype=torch.float32)
             - terminal_forward_prefix
-            + terminal_backward_prefix
         )
 
-        position_ids = torch.arange(sequence_horizon, device=trajectory_values.device)
+        position_ids = torch.arange(sequence_horizon, device=state_values.device)
         position_ids = position_ids.view(1, 1, -1)
-        valid_positions = position_ids <= terminal_index.unsqueeze(-1)
-        terminal_mask = position_ids == terminal_index.unsqueeze(-1)
-        anchored_values = torch.where(
-            terminal_mask,
-            terminal_values.unsqueeze(-1),
-            trajectory_values,
-        )
-        if not torch.isfinite(anchored_values[valid_positions]).all():
+        state_position_mask = position_ids < terminal_index.unsqueeze(-1)
+        terminal_start_mask = state_position_mask
+        if not torch.isfinite(state_values[state_position_mask]).all():
             raise RuntimeError(
-                "Non-finite loss detected in SubTB. Check log_z/log_pf/log_pb/log_reward."
+                "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
+            )
+        if not torch.isfinite(terminal_values).all():
+            raise RuntimeError(
+                "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
             )
 
         start_positions = position_ids.unsqueeze(-1)
         end_positions = position_ids.unsqueeze(-2)
         pair_mask = (
-            valid_positions.unsqueeze(-1)
-            & valid_positions.unsqueeze(-2)
+            state_position_mask.unsqueeze(-1)
+            & state_position_mask.unsqueeze(-2)
             & (start_positions < end_positions)
         )
         pair_lengths = (
             (end_positions - start_positions).clamp_min(0).to(dtype=torch.float32)
         )
-        pairwise_residual = anchored_values.unsqueeze(-1) - anchored_values.unsqueeze(
-            -2
+        pairwise_forward = forward_prefix.unsqueeze(-2) - forward_prefix.unsqueeze(-1)
+        pairwise_residual = (
+            state_values.unsqueeze(-1) + pairwise_forward - state_values.unsqueeze(-2)
+        )
+        terminal_residual = (
+            state_values
+            + terminal_forward_prefix.unsqueeze(-1)
+            - forward_prefix
+            - sample_batch.terminal_log_rewards.to(dtype=torch.float32).unsqueeze(-1)
         )
 
         lambda_weight = float(self.config.lambda_weight)
         if lambda_weight == 1.0:
-            weights = torch.ones_like(pairwise_residual)
+            state_weights = torch.ones_like(pairwise_residual)
+            terminal_weights = torch.ones_like(terminal_residual)
         else:
-            weights = torch.pow(
+            state_weights = torch.pow(
                 torch.full_like(pairwise_residual, fill_value=lambda_weight),
                 (pair_lengths - 1.0).clamp_min(0.0),
             )
-        weights = torch.where(pair_mask, weights, torch.zeros_like(weights))
-
-        per_rollout_loss = self._weighted_mean(
-            values=pairwise_residual.square(),
-            weights=weights,
-            normalize=bool(self.config.normalize),
+            terminal_lengths = terminal_index.unsqueeze(-1).to(
+                dtype=torch.float32
+            ) - position_ids.to(dtype=torch.float32)
+            terminal_weights = torch.pow(
+                torch.full_like(terminal_residual, fill_value=lambda_weight),
+                (terminal_lengths - 1.0).clamp_min(0.0),
+            )
+        state_weights = torch.where(
+            pair_mask, state_weights, torch.zeros_like(state_weights)
         )
+        terminal_weights = torch.where(
+            terminal_start_mask,
+            terminal_weights,
+            torch.zeros_like(terminal_weights),
+        )
+
+        state_loss = (pairwise_residual.square() * state_weights).sum(dim=(-2, -1))
+        terminal_loss = (terminal_residual.square() * terminal_weights).sum(dim=-1)
+        total_weight = state_weights.sum(dim=(-2, -1)) + terminal_weights.sum(dim=-1)
+        per_rollout_loss = state_loss + terminal_loss
+        if bool(self.config.normalize):
+            per_rollout_loss = per_rollout_loss / total_weight.clamp_min(1.0)
         loss = per_rollout_loss.mean()
         if not torch.isfinite(loss):
             raise RuntimeError(
-                "Non-finite loss detected in SubTB. Check log_z/log_pf/log_pb/log_reward."
+                "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
             )
 
-        terminal_state_values = anchored_values.gather(
-            -1, terminal_index.unsqueeze(-1)
-        ).squeeze(-1)
-        root_residual = anchored_values[:, :, 0] - terminal_state_values
+        root_mask = terminal_start_mask[:, :, 0]
+        root_residual = torch.zeros_like(terminal_values)
+        if bool(root_mask.any().item()):
+            root_residual[root_mask] = terminal_residual[:, :, 0][root_mask]
+
+        valid_residuals: list[torch.Tensor] = []
         if bool(pair_mask.any().item()):
-            residual_abs = pairwise_residual[pair_mask].abs().mean()
+            valid_residuals.append(pairwise_residual[pair_mask])
+        if bool(terminal_start_mask.any().item()):
+            valid_residuals.append(terminal_residual[terminal_start_mask])
+        if valid_residuals:
+            all_residuals = torch.cat(valid_residuals, dim=0)
+            residual_abs = all_residuals.abs().mean()
+            residual_variance = all_residuals.var(unbiased=False)
         else:
             residual_abs = torch.zeros((), device=loss.device)
+            residual_variance = torch.zeros((), device=loss.device)
 
         return SubTrajectoryBalanceLossOutput(
             loss=loss,
             subtb_loss=loss.detach(),
             residual_abs=residual_abs.detach(),
+            residual_variance=residual_variance.detach(),
             root_abs=root_residual.abs().mean().detach(),
             success_rate=sample_batch.success_mask.to(dtype=torch.float32)
             .mean()

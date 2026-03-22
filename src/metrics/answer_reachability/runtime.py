@@ -24,11 +24,15 @@ from .batch_evaluator import (
     ReachabilityBatchEvaluator,
 )
 from .edge_eval import EdgeRetrievalEvaluator
-from .exact_analysis import ExactReachabilityAnalyzer
+from .flow_frontier import (
+    FlowFrontierReachabilityAnalyzer,
+    FlowFrontierSupportSearch,
+)
 from .metrics import compute_support_metrics
+from .monte_carlo import MonteCarloReachabilityAnalyzer, MonteCarloSupportSearch
 from .posterior import aggregate_rank_metrics
 from .schema import SupportWindowEvalBatch
-from .support_search import ExactSupportSearch
+from .support_search import SupportSearchProtocol
 
 
 class SearchMetricRuntime(BaseMetricRuntime):
@@ -41,7 +45,7 @@ class SearchMetricRuntime(BaseMetricRuntime):
         reachability_evaluator: ReachabilityBatchEvaluator,
         edge_evaluator: EdgeRetrievalEvaluator,
         sampler: TrajectorySamplerProtocol,
-        support_search: ExactSupportSearch,
+        support_search: SupportSearchProtocol,
     ) -> None:
         self.eval_cfg = eval_cfg
         self.reachability_evaluator = reachability_evaluator
@@ -50,7 +54,7 @@ class SearchMetricRuntime(BaseMetricRuntime):
         self.support_search = support_search
 
     @property
-    def search(self) -> ExactSupportSearch:
+    def search(self) -> SupportSearchProtocol:
         return self.support_search
 
     def _uses_edge_retrieval_task(self) -> bool:
@@ -208,11 +212,27 @@ class SearchMetricRuntimeFactory:
         eval_cfg: SearchEvalConfig,
         policy: SearchPolicyProtocol,
     ) -> MetricRuntimeProtocol:
-        analyzer = ExactReachabilityAnalyzer(max_steps=int(horizon_cfg.max_steps))
-        support_search = ExactSupportSearch(
-            horizon_cfg=horizon_cfg,
+        if eval_cfg.support_search_method == "flow_frontier":
+            analyzer = FlowFrontierReachabilityAnalyzer(
+                max_steps=int(horizon_cfg.max_steps),
+                eval_cfg=eval_cfg,
+            )
+            support_search = FlowFrontierSupportSearch(
+                horizon_cfg=horizon_cfg,
+                eval_cfg=eval_cfg,
+            )
+        else:
+            analyzer = MonteCarloReachabilityAnalyzer(
+                max_steps=int(horizon_cfg.max_steps),
+                eval_cfg=eval_cfg,
+            )
+            support_search = MonteCarloSupportSearch(
+                horizon_cfg=horizon_cfg,
+                eval_cfg=eval_cfg,
+            )
+        edge_analyzer = MonteCarloReachabilityAnalyzer(
+            max_steps=int(horizon_cfg.max_steps),
             eval_cfg=eval_cfg,
-            analyzer=analyzer,
         )
         trajectory_supervisor = AnswerReachabilityTrajectorySupervisor(
             epsilon=float(training_cfg.reward_epsilon),
@@ -232,7 +252,7 @@ class SearchMetricRuntimeFactory:
         edge_evaluator = EdgeRetrievalEvaluator(
             eval_cfg=eval_cfg,
             policy=policy,
-            analyzer=analyzer,
+            analyzer=edge_analyzer,
         )
         return SearchMetricRuntime(
             eval_cfg=eval_cfg,

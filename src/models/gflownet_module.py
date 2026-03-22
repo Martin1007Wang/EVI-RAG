@@ -57,7 +57,16 @@ from .gflownet import (
     build_replay_sample_batch,
     normalize_scheduler_interval,
 )
+from .gflownet.adaptive_sampling import (
+    AdaptiveSamplingController,
+    AdaptiveSamplingMetrics,
+)
 from .gflownet.path import reconstruct_trace_path_token_ids
+from .gflownet.success_paths import (
+    collect_success_rollout_key_rows,
+    compute_success_path_hash_pairs,
+    deduplicate_success_rollout_key_rows,
+)
 
 
 logger = get_logger(__name__)
@@ -95,6 +104,14 @@ class GuidanceLossResult:
     active_states: int
 
 
+@dataclass(frozen=True)
+class TrainingRolloutMetrics:
+    unique_success_paths_per_100_rollouts: float
+    new_success_paths: int
+    start_node_entropy: torch.Tensor
+    start_node_entropy_normalized: torch.Tensor
+
+
 class GFlowNetPolicyFactory:
     @staticmethod
     def build_base_policy(
@@ -114,18 +131,10 @@ class GFlowNetPolicyFactory:
         forward_policy_head = TransitionPolicyHead(
             state_dim=graph_hidden_dim,
             relation_dim=graph_hidden_dim,
-            question_dim=graph_hidden_dim,
             hidden_dim=int(policy_cfg.forward_policy_head.hidden_dim),
             num_layers=int(policy_cfg.forward_policy_head.num_layers),
             dropout=float(policy_cfg.forward_policy_head.dropout),
-        )
-        backward_policy_head = TransitionPolicyHead(
-            state_dim=graph_hidden_dim,
-            relation_dim=graph_hidden_dim,
-            question_dim=graph_hidden_dim,
-            hidden_dim=int(policy_cfg.backward_policy_head.hidden_dim),
-            num_layers=int(policy_cfg.backward_policy_head.num_layers),
-            dropout=float(policy_cfg.backward_policy_head.dropout),
+            microbatch_size=int(policy_cfg.forward_policy_head.microbatch_size),
         )
         return BaseSearchPolicy(
             config=policy_cfg,
@@ -133,7 +142,6 @@ class GFlowNetPolicyFactory:
             backbone=backbone,
             state_score_head=state_score_head,
             forward_policy_head=forward_policy_head,
-            backward_policy_head=backward_policy_head,
         )
 
     @staticmethod
@@ -316,10 +324,20 @@ class GFlowNetModule(LightningModule):
             base_temperature=training_cfg.sampling_temperature,
             config=training_cfg.sampling_temperature_schedule,
         )
+        self.adaptive_sampling_controller = AdaptiveSamplingController(
+            config=training_cfg.adaptive_sampling,
+            base_rollout_batch_size=training_cfg.rollout_batch_size,
+        )
         self.search = self.runtime_controller.search
         self._fit_schedule: ResolvedPassFitSchedule | None = None
         self._schedule_context_override: TrainingScheduleContext | None = None
         self._invalid_start_count = 0
+        self._pending_adaptive_observation_steps = 0
+        self._pending_adaptive_success_rate: torch.Tensor | None = None
+        self._pending_adaptive_unique_success = 0.0
+        self._pending_adaptive_residual_variance: torch.Tensor | None = None
+        self._pending_adaptive_start_entropy_normalized: torch.Tensor | None = None
+        self._seen_success_path_hashes_by_sample: dict[str, set[tuple[int, int]]] = {}
         self.success_replay_buffer: SuccessfulTrajectoryReplayBuffer | None = None
         replay_cfg = self.cfg.training_cfg.success_replay
         if replay_cfg.enabled:
@@ -415,7 +433,9 @@ class GFlowNetModule(LightningModule):
             return required_passes <= 0.0
         return effective_pass >= required_passes
 
-    def _resolve_success_replay_rollouts_per_graph(self) -> int:
+    def _resolve_success_replay_rollouts_per_graph(
+        self, *, on_policy_rollouts_per_graph: int | None = None
+    ) -> int:
         replay_cfg = self.cfg.training_cfg.success_replay
         if not replay_cfg.enabled:
             return 0
@@ -424,11 +444,105 @@ class GFlowNetModule(LightningModule):
             raise ValueError(
                 f"training.success_replay.ratio must be in [0, 1). Got {ratio}."
             )
-        total_rollouts = self.cfg.training_cfg.rollout_batch_size
+        total_rollouts = (
+            self.cfg.training_cfg.rollout_batch_size
+            if on_policy_rollouts_per_graph is None
+            else int(on_policy_rollouts_per_graph)
+        )
         if total_rollouts < 1:
             return 0
         replay_rollouts = int(round((total_rollouts * ratio) / (1.0 - ratio)))
-        return max(replay_rollouts, 0)
+        replay_rollouts = max(replay_rollouts, 0)
+        max_rollouts_per_graph = replay_cfg.max_rollouts_per_graph
+        if max_rollouts_per_graph is None:
+            max_rollouts_per_graph = replay_cfg.max_trajectories_per_sample
+        return min(replay_rollouts, int(max_rollouts_per_graph))
+
+    @staticmethod
+    def _graph_sample_id(batch: TrajectoryBatch, graph_idx: int) -> str:
+        sample_ids = getattr(batch, "sample_ids", None)
+        if sample_ids is not None and len(sample_ids) > graph_idx:
+            return str(sample_ids[graph_idx])
+        return str(graph_idx)
+
+    def _should_track_global_success_paths(self) -> bool:
+        return bool(self.cfg.training_cfg.adaptive_sampling.enabled)
+
+    def _count_new_success_paths(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        unique_success_path_rows: torch.Tensor,
+    ) -> int:
+        if int(unique_success_path_rows.numel()) == 0:
+            return 0
+        graph_idx_and_hashes = torch.cat(
+            (
+                unique_success_path_rows[:, :1],
+                compute_success_path_hash_pairs(unique_success_path_rows[:, 1:]),
+            ),
+            dim=1,
+        )
+        hash_rows_cpu = graph_idx_and_hashes.detach().to(device="cpu", dtype=torch.long)
+        new_success_paths = 0
+        for graph_idx, hash_a, hash_b in hash_rows_cpu.tolist():
+            sample_id = self._graph_sample_id(batch, graph_idx)
+            seen_for_sample = self._seen_success_path_hashes_by_sample.setdefault(
+                sample_id, set()
+            )
+            path_hash = (int(hash_a), int(hash_b))
+            if path_hash not in seen_for_sample:
+                seen_for_sample.add(path_hash)
+                new_success_paths += 1
+        return new_success_paths
+
+    def _compute_training_rollout_metrics(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        sample_batch: TrajectoryGFNSampleBatch,
+    ) -> TrainingRolloutMetrics:
+        total_rollouts = int(sample_batch.success_mask.numel())
+        new_success_paths = 0
+        success_path_rows = collect_success_rollout_key_rows(
+            batch=batch,
+            sample_batch=sample_batch,
+        )
+        unique_success_path_rows = deduplicate_success_rollout_key_rows(
+            success_path_rows
+        )
+        if unique_success_path_rows is not None:
+            if self._should_track_global_success_paths():
+                new_success_paths = self._count_new_success_paths(
+                    batch=batch,
+                    unique_success_path_rows=unique_success_path_rows,
+                )
+            else:
+                new_success_paths = int(unique_success_path_rows.size(0))
+        start_entropy = sample_batch.behavior_start_entropy
+        start_entropy_normalized = sample_batch.behavior_start_entropy_normalized
+        mean_start_entropy = (
+            start_entropy.detach().to(dtype=torch.float32).mean()
+            if start_entropy is not None and int(start_entropy.numel()) > 0
+            else torch.zeros((), device=batch.node_ptr.device, dtype=torch.float32)
+        )
+        mean_start_entropy_normalized = (
+            start_entropy_normalized.detach().to(dtype=torch.float32).mean()
+            if start_entropy_normalized is not None
+            and int(start_entropy_normalized.numel()) > 0
+            else torch.zeros((), device=batch.node_ptr.device, dtype=torch.float32)
+        )
+        unique_success_rate = (
+            (100.0 * float(new_success_paths)) / float(total_rollouts)
+            if total_rollouts > 0
+            else 0.0
+        )
+        return TrainingRolloutMetrics(
+            unique_success_paths_per_100_rollouts=unique_success_rate,
+            new_success_paths=new_success_paths,
+            start_node_entropy=mean_start_entropy,
+            start_node_entropy_normalized=mean_start_entropy_normalized,
+        )
 
     def _success_replay_enabled(self) -> bool:
         replay_cfg = self.cfg.training_cfg.success_replay
@@ -478,7 +592,11 @@ class GFlowNetModule(LightningModule):
                 "Successful trajectory replay requires sampler.trajectory_supervisor."
             )
         replay_batch = TrajectoryBatch.concatenate(
-            [batch.select_graph(graph_idx) for graph_idx in plan.graph_indices]
+            [
+                batch.select_graph(graph_idx, validate=False)
+                for graph_idx in plan.graph_indices
+            ],
+            validate=False,
         )
         replay_prepared_batch = self.policy.prepare_batch(replay_batch)
         replay_sample_batch = build_replay_sample_batch(
@@ -578,14 +696,100 @@ class GFlowNetModule(LightningModule):
             active_states=int(active_loss.numel()),
         )
 
+    def _adaptive_sampling_observe_interval(self) -> int:
+        trainer = getattr(self, "_trainer", None)
+        if trainer is None:
+            return 1
+        return max(1, int(getattr(trainer, "log_every_n_steps", 1) or 1))
+
+    def _flush_pending_adaptive_sampling_metrics(self) -> None:
+        pending_steps = int(self._pending_adaptive_observation_steps)
+        if pending_steps < 1 or self._pending_adaptive_success_rate is None:
+            return
+        residual_variance = self._pending_adaptive_residual_variance
+        start_entropy_normalized = self._pending_adaptive_start_entropy_normalized
+        if residual_variance is None or start_entropy_normalized is None:
+            raise RuntimeError(
+                "adaptive sampling accumulator is missing tensor statistics before flush."
+            )
+        denom = float(pending_steps)
+        self.adaptive_sampling_controller.observe(
+            AdaptiveSamplingMetrics(
+                success_rate=float(
+                    (self._pending_adaptive_success_rate / denom).detach().item()
+                ),
+                unique_success_paths_per_100_rollouts=(
+                    self._pending_adaptive_unique_success / denom
+                ),
+                subtb_residual_variance_per_batch=float(
+                    (residual_variance / denom).detach().item()
+                ),
+                start_node_entropy_normalized=float(
+                    (start_entropy_normalized / denom).detach().item()
+                ),
+            )
+        )
+        self._pending_adaptive_observation_steps = 0
+        self._pending_adaptive_success_rate = None
+        self._pending_adaptive_unique_success = 0.0
+        self._pending_adaptive_residual_variance = None
+        self._pending_adaptive_start_entropy_normalized = None
+
+    def _buffer_adaptive_sampling_metrics(
+        self,
+        *,
+        loss_output: SubTrajectoryBalanceLossOutput,
+        rollout_metrics: TrainingRolloutMetrics,
+    ) -> None:
+        if not self.cfg.training_cfg.adaptive_sampling.enabled:
+            return
+        success_rate = loss_output.success_rate.detach().to(dtype=torch.float32)
+        residual_variance = loss_output.residual_variance.detach().to(
+            dtype=torch.float32
+        )
+        start_entropy_normalized = (
+            rollout_metrics.start_node_entropy_normalized.detach().to(
+                dtype=torch.float32
+            )
+        )
+        if self._pending_adaptive_success_rate is None:
+            self._pending_adaptive_success_rate = success_rate
+            self._pending_adaptive_residual_variance = residual_variance
+            self._pending_adaptive_start_entropy_normalized = start_entropy_normalized
+        else:
+            self._pending_adaptive_success_rate = (
+                self._pending_adaptive_success_rate + success_rate
+            )
+            self._pending_adaptive_residual_variance = (
+                self._pending_adaptive_residual_variance + residual_variance
+            )
+            self._pending_adaptive_start_entropy_normalized = (
+                self._pending_adaptive_start_entropy_normalized
+                + start_entropy_normalized
+            )
+        self._pending_adaptive_unique_success += float(
+            rollout_metrics.unique_success_paths_per_100_rollouts
+        )
+        self._pending_adaptive_observation_steps += 1
+        if (
+            self._pending_adaptive_observation_steps
+            >= self._adaptive_sampling_observe_interval()
+        ):
+            self._flush_pending_adaptive_sampling_metrics()
+
     def _build_training_metrics(
         self,
         *,
         loss_output: SubTrajectoryBalanceLossOutput,
         loss_aggregation: TrainingLossAggregation,
         total_loss: torch.Tensor,
+        rollout_batch_size: int,
+        replay_rollouts_per_graph: int,
         sampling_temperature: float,
+        temperature_multiplier: float,
         on_policy_trajectories: int,
+        controller_metrics: dict[str, float],
+        rollout_metrics: TrainingRolloutMetrics,
         guidance_result: GuidanceLossResult | None,
     ) -> dict[str, Any]:
         metrics: dict[str, Any] = {
@@ -593,16 +797,27 @@ class GFlowNetModule(LightningModule):
             "actor_loss": loss_aggregation.total_loss.detach(),
             "subtb_loss": loss_output.subtb_loss,
             "subtb_residual": loss_output.residual_abs,
+            "subtb_residual_variance_per_batch": loss_output.residual_variance,
             "subtb_root": loss_output.root_abs,
             "rollout_success": loss_output.success_rate,
+            "unique_success_paths_per_100_rollouts": rollout_metrics.unique_success_paths_per_100_rollouts,
+            "new_success_paths": float(rollout_metrics.new_success_paths),
+            "start_node_entropy": rollout_metrics.start_node_entropy,
+            "start_node_entropy_normalized": rollout_metrics.start_node_entropy_normalized,
             "log_z_mean": loss_output.log_z_mean,
             "log_z_variance": loss_output.log_z_variance,
+            "rollout_batch_size": float(rollout_batch_size),
             "sampling_temperature": sampling_temperature,
+            "sampling_temperature_multiplier": temperature_multiplier,
         }
+        metrics.update(controller_metrics)
         replay_result = loss_aggregation.replay_result
         if self.success_replay_buffer is not None:
             metrics["success_replay_buffer_size"] = float(
                 len(self.success_replay_buffer)
+            )
+            metrics["success_replay_rollouts_per_graph"] = float(
+                replay_rollouts_per_graph
             )
             metrics["success_replay_ratio"] = (
                 float(replay_result.num_trajectories)
@@ -751,22 +966,31 @@ class GFlowNetModule(LightningModule):
                 "Current metric runtime does not define a training sampler; this model cannot train with the configured metric_runtime_factory."
             )
         prepared_batch = self.policy.prepare_batch(trajectory_batch)
-        sampling_temperature = self._resolve_sampling_temperature()
-        replay_rollouts_per_graph = self._resolve_success_replay_rollouts_per_graph()
+        sampling_plan = self.adaptive_sampling_controller.decision(
+            base_temperature=self._resolve_sampling_temperature()
+        )
+        controller_metrics = self.adaptive_sampling_controller.snapshot_metrics()
+        replay_rollouts_per_graph = self._resolve_success_replay_rollouts_per_graph(
+            on_policy_rollouts_per_graph=sampling_plan.rollout_batch_size
+        )
         sample_batch = self.sampler.sample(
             batch=trajectory_batch,
             policy=self.policy,
             prepared_batch=prepared_batch,
-            rollout_batch_size=self.cfg.training_cfg.rollout_batch_size,
-            temperature=sampling_temperature,
+            rollout_batch_size=sampling_plan.rollout_batch_size,
+            temperature=sampling_plan.sampling_temperature,
         )
         loss_output = self.loss_fn.compute(sample_batch)
+        rollout_metrics = self._compute_training_rollout_metrics(
+            batch=trajectory_batch,
+            sample_batch=sample_batch,
+        )
         replay_result = self._compute_success_replay_loss(
             batch=trajectory_batch,
             replay_rollouts_per_graph=replay_rollouts_per_graph,
         )
         on_policy_trajectories = (
-            trajectory_batch.num_graphs * self.cfg.training_cfg.rollout_batch_size
+            trajectory_batch.num_graphs * sampling_plan.rollout_batch_size
         )
         loss_aggregation = self._aggregate_total_loss(
             loss_output=loss_output,
@@ -793,8 +1017,13 @@ class GFlowNetModule(LightningModule):
             loss_output=loss_output,
             loss_aggregation=loss_aggregation,
             total_loss=total_loss,
-            sampling_temperature=sampling_temperature,
+            rollout_batch_size=sampling_plan.rollout_batch_size,
+            replay_rollouts_per_graph=replay_rollouts_per_graph,
+            sampling_temperature=sampling_plan.sampling_temperature,
+            temperature_multiplier=sampling_plan.temperature_multiplier,
             on_policy_trajectories=on_policy_trajectories,
+            controller_metrics=controller_metrics,
+            rollout_metrics=rollout_metrics,
             guidance_result=guidance_result,
         )
         self._log_metric_bundle(
@@ -805,7 +1034,14 @@ class GFlowNetModule(LightningModule):
             on_epoch=False,
             prog_bar_key="train/loss",
         )
+        self._buffer_adaptive_sampling_metrics(
+            loss_output=loss_output,
+            rollout_metrics=rollout_metrics,
+        )
         return total_loss
+
+    def on_train_epoch_end(self) -> None:
+        self._flush_pending_adaptive_sampling_metrics()
 
     def _evaluate_batch_output(
         self, *, batch: TrajectoryBatch

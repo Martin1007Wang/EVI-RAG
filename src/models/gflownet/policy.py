@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
-from src.graph_runtime import build_graph_batch
+from src.graph_runtime import SearchObservation, build_graph_batch
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
@@ -11,18 +13,12 @@ from src.models.components import (
 )
 from src.models.components.embedding import BackboneInput
 from src.models.configs import HeuristicConfig, PolicyConfig
-from src.utils.segment_ops import segment_logsumexp_1d
+from src.utils.segment_ops import sample_segmented_one_1d, segment_logsumexp_1d
 
 from .heuristics import SearchHeuristic
-from .path import (
-    append_relation_and_node_tokens,
-    build_path_token_embeddings,
-    derive_parent_path_token_ids,
-    encode_path_history,
-    initialize_path_token_ids,
-)
 from .types import (
     ForwardActionDistribution,
+    HeuristicCache,
     PreparedGFlowNetBatch,
     PreparedSearchBatch,
     SearchState,
@@ -33,6 +29,10 @@ from .types import (
 def _mask_nonfinite_scores(values: torch.Tensor) -> torch.Tensor:
     neg_inf = torch.full_like(values, float("-inf"))
     return torch.where(torch.isfinite(values), values, neg_inf)
+
+
+_FORWARD_EDGE_CHUNK_SIZE = 1024
+_TRANSITION_LOGIT_CHUNK_SIZE = 1024
 
 
 class StartDistributionError(ValueError):
@@ -118,7 +118,6 @@ class BaseSearchPolicy(nn.Module):
         backbone: EmbeddingBackbone,
         state_score_head: NodeFlowHead,
         forward_policy_head: TransitionPolicyHead,
-        backward_policy_head: TransitionPolicyHead,
     ) -> None:
         super().__init__()
         self.config = config
@@ -130,27 +129,43 @@ class BaseSearchPolicy(nn.Module):
         self.state_flow_head = state_score_head
         self.state_score_head = self.state_flow_head
         self.forward_policy_head = forward_policy_head
-        self.backward_policy_head = backward_policy_head
         self.step_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
         self.remaining_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
-        self.path_position_embedding = nn.Embedding(
-            (2 * self.max_steps) + 1, graph_hidden_dim
+        self.control_query = nn.Linear(graph_hidden_dim, graph_hidden_dim, bias=False)
+        self.control_input_norm = nn.LayerNorm(graph_hidden_dim * 3)
+        self.control_update = nn.GRUCell(
+            input_size=graph_hidden_dim * 3,
+            hidden_size=graph_hidden_dim,
         )
-        self.path_self_attention = nn.MultiheadAttention(
-            embed_dim=graph_hidden_dim,
-            num_heads=1,
-            dropout=float(config.state_score_head.dropout),
-            batch_first=True,
-        )
-        self.path_self_attention_norm = nn.LayerNorm(graph_hidden_dim)
-        self.path_summary_proj = nn.Linear(
-            graph_hidden_dim, graph_hidden_dim, bias=False
-        )
+        self.control_norm = nn.LayerNorm(graph_hidden_dim)
+        self.control_dropout = nn.Dropout(float(config.prefix_controller.dropout))
+        self.state_feature_input_norm = nn.LayerNorm(graph_hidden_dim * 2)
+        state_hidden_dim = int(config.state_score_head.hidden_dim)
+        state_layers: list[nn.Module] = [
+            nn.Linear(graph_hidden_dim * 2, state_hidden_dim),
+            nn.GELU(),
+        ]
+        if float(config.state_score_head.dropout) > 0.0:
+            state_layers.append(nn.Dropout(float(config.state_score_head.dropout)))
+        for _ in range(max(int(config.state_score_head.num_layers) - 2, 0)):
+            state_layers.extend(
+                [
+                    nn.Linear(state_hidden_dim, state_hidden_dim),
+                    nn.GELU(),
+                ]
+            )
+            if float(config.state_score_head.dropout) > 0.0:
+                state_layers.append(nn.Dropout(float(config.state_score_head.dropout)))
+        state_layers.append(nn.Linear(state_hidden_dim, graph_hidden_dim))
+        self.state_feature_mlp = nn.Sequential(*state_layers)
         self.state_feature_norm = nn.LayerNorm(graph_hidden_dim)
+        self.start_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
+        self.submit_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
         self.backbone = backbone
+        self.candidate_shortlist_cfg = config.candidate_shortlist
 
     def prepare_batch(self, batch) -> PreparedSearchBatch:
-        topology, observation = build_graph_batch(batch)
+        topology, observation = build_graph_batch(batch, validate=False)
         encoded = self.backbone.encode(
             BackboneInput(
                 node_features=observation.node_features,
@@ -164,7 +179,7 @@ class BaseSearchPolicy(nn.Module):
         )
         return PreparedSearchBatch(
             topology=topology,
-            observation=observation,
+            observation=SearchObservation.from_graph_observation(observation),
             node_tokens=encoded.node_tokens,
             relation_tokens=encoded.relation_tokens,
             question_tokens=encoded.question_tokens,
@@ -201,11 +216,16 @@ class BaseSearchPolicy(nn.Module):
     ) -> torch.Tensor:
         flat_num_steps = torch.zeros_like(candidate_nodes_abs, dtype=torch.long)
         flat_done_mask = torch.zeros_like(candidate_nodes_abs, dtype=torch.bool)
+        flat_control_states = self.build_start_control_states(
+            prepared_batch,
+            candidate_nodes_abs.view(-1, 1),
+        ).view(int(candidate_nodes_abs.numel()), -1)
         flat_state_features = self._build_flat_state_features(
             prepared_batch,
             flat_nodes=candidate_nodes_abs,
             flat_num_steps=flat_num_steps,
             flat_done_mask=flat_done_mask,
+            flat_control_states=flat_control_states,
         )
         return self._compute_log_state_scores_from_flat_features(
             prepared_batch=prepared_batch,
@@ -222,7 +242,38 @@ class BaseSearchPolicy(nn.Module):
         flat_nodes: torch.Tensor,
         flat_num_steps: torch.Tensor,
         flat_done_mask: torch.Tensor,
-        flat_path_token_ids: torch.Tensor | None = None,
+        flat_control_states: torch.Tensor,
+    ) -> torch.Tensor:
+        base_state_features = self._build_base_state_features(
+            prepared_batch,
+            flat_nodes=flat_nodes,
+            flat_num_steps=flat_num_steps,
+        )
+        state_features = self.state_feature_norm(
+            self.state_feature_mlp(
+                self.state_feature_input_norm(
+                    torch.cat(
+                        (
+                            base_state_features,
+                            flat_control_states.to(dtype=base_state_features.dtype),
+                        ),
+                        dim=-1,
+                    )
+                )
+            ).to(dtype=base_state_features.dtype)
+        )
+        return torch.where(
+            flat_done_mask.unsqueeze(-1),
+            torch.zeros_like(state_features),
+            state_features,
+        )
+
+    def _build_base_state_features(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        *,
+        flat_nodes: torch.Tensor,
+        flat_num_steps: torch.Tensor,
     ) -> torch.Tensor:
         num_nodes = int(prepared_batch.topology.num_nodes)
         safe_nodes = flat_nodes.clamp(min=0, max=max(num_nodes - 1, 0))
@@ -235,49 +286,227 @@ class BaseSearchPolicy(nn.Module):
         remaining_features = self.remaining_embedding(remaining_ids).to(
             dtype=node_features.dtype
         )
-        path_summary = self._build_path_summary(
-            prepared_batch=prepared_batch,
+        return node_features + step_features + remaining_features
+
+    def build_local_state_features(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        *,
+        flat_nodes: torch.Tensor,
+        flat_num_steps: torch.Tensor,
+        flat_done_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        graph_ids = prepared_batch.topology.graph_index_from_nodes(flat_nodes)
+        local_control_states = prepared_batch.question_tokens.index_select(0, graph_ids)
+        return self._build_flat_state_features(
+            prepared_batch,
             flat_nodes=flat_nodes,
             flat_num_steps=flat_num_steps,
-            flat_path_token_ids=flat_path_token_ids,
-        )
-        state_features = self.state_feature_norm(
-            node_features
-            + step_features
-            + remaining_features
-            + self.path_summary_proj(path_summary).to(dtype=node_features.dtype)
-        )
-        return torch.where(
-            flat_done_mask.unsqueeze(-1),
-            torch.zeros_like(state_features),
-            state_features,
+            flat_done_mask=flat_done_mask,
+            flat_control_states=local_control_states,
         )
 
-    def _build_path_summary(
+    def _attend_question_context(
         self,
         *,
         prepared_batch: PreparedSearchBatch,
-        flat_nodes: torch.Tensor,
-        flat_num_steps: torch.Tensor,
-        flat_path_token_ids: torch.Tensor | None,
+        control_states: torch.Tensor,
+        graph_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if flat_path_token_ids is None:
-            flat_path_token_ids = flat_nodes.new_zeros(
-                (int(flat_nodes.numel()), (2 * self.max_steps) + 1)
+        total_states = int(control_states.size(0))
+        if total_states == 0:
+            return control_states.new_empty((0, int(control_states.size(-1))))
+        context_query = self.control_query(control_states).to(dtype=torch.float32)
+        context_summary = torch.zeros_like(context_query)
+        unique_graph_ids = torch.unique(graph_ids, sorted=True)
+        for graph_id_tensor in unique_graph_ids:
+            graph_id = int(graph_id_tensor.item())
+            graph_mask = graph_ids == graph_id
+            question_context = prepared_batch.question_context_tokens[graph_id]
+            question_mask = prepared_batch.question_context_mask[graph_id]
+            if not bool(question_mask.any().item()):
+                raise ValueError(
+                    "question_context_mask contains rows without valid tokens when updating control states."
+                )
+            context_matrix = question_context.to(dtype=torch.float32)
+            attention_scores = torch.matmul(
+                context_query[graph_mask],
+                context_matrix.transpose(0, 1),
             )
-            flat_path_token_ids[:, 0] = flat_nodes
-        path_tokens = build_path_token_embeddings(
-            path_token_ids=flat_path_token_ids,
-            path_lengths=(2 * flat_num_steps + 1).to(dtype=torch.long),
-            node_tokens=prepared_batch.node_tokens,
-            relation_tokens=prepared_batch.relation_tokens,
-            position_embedding=self.path_position_embedding,
+            attention_scores = attention_scores / math.sqrt(
+                float(context_matrix.size(-1))
+            )
+            attention_scores = attention_scores.masked_fill(
+                ~question_mask.unsqueeze(0),
+                float("-inf"),
+            )
+            attention_weights = torch.softmax(attention_scores, dim=-1)
+            attention_weights = torch.where(
+                torch.isfinite(attention_weights),
+                attention_weights,
+                torch.zeros_like(attention_weights),
+            )
+            context_summary[graph_mask] = torch.matmul(
+                attention_weights.to(dtype=context_matrix.dtype),
+                context_matrix,
+            ).to(dtype=torch.float32)
+        return context_summary.to(dtype=control_states.dtype)
+
+    def _update_control_states_from_features(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        previous_control_states: torch.Tensor,
+        node_features: torch.Tensor,
+        relation_features: torch.Tensor,
+        graph_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        attended_question = self._attend_question_context(
+            prepared_batch=prepared_batch,
+            control_states=previous_control_states,
+            graph_ids=graph_ids,
         )
-        return encode_path_history(
-            path_tokens=path_tokens,
-            path_lengths=(2 * flat_num_steps + 1).to(dtype=torch.long),
-            path_self_attention=self.path_self_attention,
-            path_self_attention_norm=self.path_self_attention_norm,
+        update_inputs = self.control_input_norm(
+            torch.cat(
+                (
+                    attended_question.to(dtype=previous_control_states.dtype),
+                    node_features.to(dtype=previous_control_states.dtype),
+                    relation_features.to(dtype=previous_control_states.dtype),
+                ),
+                dim=-1,
+            )
+        )
+        next_control = self.control_update(
+            self.control_dropout(update_inputs).to(dtype=torch.float32),
+            previous_control_states.to(dtype=torch.float32),
+        )
+        return self.control_norm(next_control).to(dtype=previous_control_states.dtype)
+
+    def build_start_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        start_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_start_nodes = start_nodes.reshape(-1)
+        if int(flat_start_nodes.numel()) == 0:
+            hidden_dim = int(prepared_batch.question_tokens.size(-1))
+            return prepared_batch.question_tokens.new_empty(
+                (*start_nodes.shape, hidden_dim)
+            )
+        graph_ids = prepared_batch.topology.graph_index_from_nodes(flat_start_nodes)
+        root_control_states = prepared_batch.question_tokens.index_select(0, graph_ids)
+        start_node_features = prepared_batch.node_tokens.index_select(
+            0, flat_start_nodes
+        )
+        start_relation_features = (
+            self.start_relation_feature.to(dtype=start_node_features.dtype)
+            .unsqueeze(0)
+            .expand(int(flat_start_nodes.numel()), -1)
+        )
+        start_control_states = self._update_control_states_from_features(
+            prepared_batch=prepared_batch,
+            previous_control_states=root_control_states,
+            node_features=start_node_features,
+            relation_features=start_relation_features,
+            graph_ids=graph_ids,
+        )
+        return start_control_states.view(*start_nodes.shape, -1)
+
+    def compute_next_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        *,
+        control_states: torch.Tensor,
+        next_nodes: torch.Tensor,
+        relation_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if tuple(control_states.shape[:-1]) != tuple(next_nodes.shape):
+            raise ValueError(
+                "control_states must align with next_nodes when updating the recurrent controller. "
+                f"control_states={tuple(control_states.shape)} next_nodes={tuple(next_nodes.shape)}."
+            )
+        if tuple(relation_ids.shape) != tuple(next_nodes.shape):
+            raise ValueError(
+                "relation_ids must align with next_nodes when updating the recurrent controller. "
+                f"relation_ids={tuple(relation_ids.shape)} next_nodes={tuple(next_nodes.shape)}."
+            )
+        flat_next_nodes = next_nodes.reshape(-1)
+        if int(flat_next_nodes.numel()) == 0:
+            return control_states
+        graph_ids = prepared_batch.topology.graph_index_from_nodes(flat_next_nodes)
+        next_node_features = prepared_batch.node_tokens.index_select(0, flat_next_nodes)
+        relation_features = prepared_batch.relation_tokens.index_select(
+            0, relation_ids.reshape(-1)
+        )
+        next_control_states = self._update_control_states_from_features(
+            prepared_batch=prepared_batch,
+            previous_control_states=control_states.view(
+                -1, int(control_states.size(-1))
+            ),
+            node_features=next_node_features,
+            relation_features=relation_features,
+            graph_ids=graph_ids,
+        )
+        return next_control_states.view_as(control_states)
+
+    def _reconstruct_flat_control_states(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        flat_path_token_ids: torch.Tensor,
+        flat_num_steps: torch.Tensor,
+        graph_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        del graph_ids
+        if int(flat_path_token_ids.size(0)) == 0:
+            hidden_dim = int(prepared_batch.question_tokens.size(-1))
+            return prepared_batch.question_tokens.new_empty((0, hidden_dim))
+        control_states = self.build_start_control_states(
+            prepared_batch,
+            flat_path_token_ids[:, 0].view(-1, 1),
+        ).view(int(flat_path_token_ids.size(0)), -1)
+        max_num_steps = (
+            int(flat_num_steps.max().item()) if int(flat_num_steps.numel()) > 0 else 0
+        )
+        for step_idx in range(1, max_num_steps + 1):
+            active_mask = flat_num_steps >= step_idx
+            if not bool(active_mask.any().item()):
+                break
+            relation_ids = flat_path_token_ids[active_mask, (2 * step_idx) - 1]
+            next_nodes = flat_path_token_ids[active_mask, 2 * step_idx]
+            control_states[active_mask] = self.compute_next_control_states(
+                prepared_batch,
+                control_states=control_states[active_mask],
+                next_nodes=next_nodes,
+                relation_ids=relation_ids,
+            )
+        return control_states
+
+    def _resolve_flat_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+    ) -> torch.Tensor:
+        if state.control_state is not None:
+            return state.flatten_control_state().to(
+                dtype=prepared_batch.node_tokens.dtype
+            )
+        flat_num_steps = state.flatten_num_steps()
+        if state.path_token_ids is None:
+            if bool((flat_num_steps != 0).any().item()):
+                raise ValueError(
+                    "Non-root state features require exact path_token_ids or control_state. "
+                    "The recurrent controller cannot reconstruct prefix history from (current_node, num_steps) alone."
+                )
+            return self.build_start_control_states(
+                prepared_batch,
+                state.current_nodes,
+            ).view(-1, int(prepared_batch.question_tokens.size(-1)))
+        return self._reconstruct_flat_control_states(
+            prepared_batch=prepared_batch,
+            flat_path_token_ids=state.flatten_path_token_ids(max_steps=self.max_steps),
+            flat_num_steps=flat_num_steps,
+            graph_ids=state.flatten_graph_index(),
         )
 
     def build_state_features(
@@ -286,12 +515,13 @@ class BaseSearchPolicy(nn.Module):
         state: SearchState,
     ) -> torch.Tensor:
         batch_size, num_rollouts = state.current_nodes.shape
+        flat_control_states = self._resolve_flat_control_states(prepared_batch, state)
         flat_features = self._build_flat_state_features(
             prepared_batch,
             flat_nodes=state.flatten_current_nodes(),
             flat_num_steps=state.flatten_num_steps(),
             flat_done_mask=state.flatten_done_mask(),
-            flat_path_token_ids=state.flatten_path_token_ids(max_steps=self.max_steps),
+            flat_control_states=flat_control_states,
         )
         return flat_features.view(batch_size, num_rollouts, -1)
 
@@ -336,69 +566,392 @@ class BaseSearchPolicy(nn.Module):
         graph_ids: torch.Tensor,
         head: TransitionPolicyHead,
     ) -> torch.Tensor:
+        del graph_ids
+        total_candidates = int(edge_ids.numel())
+        if total_candidates == 0:
+            return torch.empty((0,), device=edge_ids.device, dtype=torch.float32)
         relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
         relation_features = prepared_batch.relation_tokens.index_select(0, relation_ids)
-        logits = torch.empty(
-            (int(graph_ids.numel()),), device=graph_ids.device, dtype=torch.float32
-        )
-        for graph_idx in torch.unique(graph_ids, sorted=True).tolist():
-            graph_mask = graph_ids == int(graph_idx)
-            question_features = prepared_batch.question_tokens[
-                int(graph_idx)
-            ].unsqueeze(0)
-            question_context_tokens = prepared_batch.question_context_tokens[
-                int(graph_idx)
-            ].unsqueeze(0)
-            question_context_mask = prepared_batch.question_context_mask[
-                int(graph_idx)
-            ].unsqueeze(0)
-            count = int(graph_mask.sum().item())
-            graph_logits = head(
-                current_state_features[graph_mask].to(dtype=torch.float32),
-                candidate_state_features[graph_mask].to(dtype=torch.float32),
-                relation_features[graph_mask].to(dtype=torch.float32),
-                question_features.expand(count, -1).to(dtype=torch.float32),
-                question_context_tokens,
-                question_context_mask,
+        chunk_size = total_candidates
+        if edge_ids.device.type == "cuda":
+            chunk_size = min(total_candidates, _TRANSITION_LOGIT_CHUNK_SIZE)
+        logits_chunks: list[torch.Tensor] = []
+        for start in range(0, total_candidates, max(chunk_size, 1)):
+            end = min(start + max(chunk_size, 1), total_candidates)
+            logits_chunks.append(
+                head(
+                    current_state_features=current_state_features[start:end],
+                    candidate_state_features=candidate_state_features[start:end],
+                    relation_features=relation_features[start:end],
+                )
             )
-            logits[graph_mask] = graph_logits.to(dtype=logits.dtype)
-        return _mask_nonfinite_scores(logits.to(dtype=torch.float32))
+        return _mask_nonfinite_scores(torch.cat(logits_chunks, dim=0))
 
-    def _build_child_path_token_ids(
+    def _compute_submit_logits(
         self,
         *,
         prepared_batch: PreparedSearchBatch,
-        state: SearchState,
-        edge_agent_batch: torch.Tensor,
-        edge_ids: torch.Tensor,
-        target_nodes: torch.Tensor,
+        current_state_features: torch.Tensor,
+        current_node_features: torch.Tensor,
+        graph_ids: torch.Tensor,
     ) -> torch.Tensor:
-        parent_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
-        parent_path_token_ids = parent_path_token_ids.index_select(0, edge_agent_batch)
-        parent_num_steps = state.flatten_num_steps().index_select(0, edge_agent_batch)
-        relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
-        return append_relation_and_node_tokens(
-            path_token_ids=parent_path_token_ids,
-            num_steps=parent_num_steps,
-            relation_ids=relation_ids,
-            target_nodes=target_nodes,
+        total_candidates = int(graph_ids.numel())
+        if total_candidates == 0:
+            return torch.empty((0,), device=graph_ids.device, dtype=torch.float32)
+        submit_relation = self.submit_relation_feature.to(
+            dtype=current_state_features.dtype
+        )
+        chunk_size = total_candidates
+        if graph_ids.device.type == "cuda":
+            chunk_size = min(total_candidates, _TRANSITION_LOGIT_CHUNK_SIZE)
+        logits_chunks: list[torch.Tensor] = []
+        for start in range(0, total_candidates, max(chunk_size, 1)):
+            end = min(start + max(chunk_size, 1), total_candidates)
+            chunk_size_current = end - start
+            logits_chunks.append(
+                self.forward_policy_head(
+                    current_state_features=current_state_features[start:end],
+                    candidate_state_features=current_node_features[start:end],
+                    relation_features=submit_relation.unsqueeze(0).expand(
+                        chunk_size_current, -1
+                    ),
+                )
+            )
+        return _mask_nonfinite_scores(torch.cat(logits_chunks, dim=0))
+
+    @staticmethod
+    def _distribution_submit_mask(
+        distribution: ForwardActionDistribution,
+    ) -> torch.Tensor:
+        if distribution.is_submit is None:
+            return torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
+        return distribution.is_submit.to(dtype=torch.bool)
+
+    @staticmethod
+    def _lookup_shortlist_heuristic_scores(
+        *,
+        heuristic_cache: HeuristicCache | None,
+        node_ids: torch.Tensor,
+        num_steps: torch.Tensor,
+    ) -> torch.Tensor:
+        if heuristic_cache is None:
+            return torch.zeros_like(node_ids, dtype=torch.float32)
+        if heuristic_cache.step_node_log_heuristic is not None:
+            safe_steps = num_steps.to(dtype=torch.long).clamp(
+                min=0,
+                max=max(int(heuristic_cache.step_node_log_heuristic.size(0)) - 1, 0),
+            )
+            return heuristic_cache.step_node_log_heuristic[safe_steps, node_ids]
+        if heuristic_cache.node_log_heuristic is not None:
+            return heuristic_cache.node_log_heuristic.index_select(0, node_ids)
+        return torch.zeros_like(node_ids, dtype=torch.float32)
+
+    @staticmethod
+    def _select_segment_topk_positions(
+        *,
+        values: torch.Tensor,
+        segment_ids: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        if int(values.numel()) == 0:
+            return torch.empty((0,), device=values.device, dtype=torch.long)
+        order = torch.argsort(segment_ids, stable=True)
+        sorted_segment_ids = segment_ids.index_select(0, order)
+        sorted_values = values.index_select(0, order)
+        unique_segment_ids, group_counts = torch.unique_consecutive(
+            sorted_segment_ids,
+            return_counts=True,
+        )
+        del unique_segment_ids
+        selected_positions: list[torch.Tensor] = []
+        offset = 0
+        for group_count in group_counts.tolist():
+            group_size = int(group_count)
+            group_order = torch.argsort(
+                sorted_values[offset : offset + group_size],
+                descending=True,
+                stable=True,
+            )
+            keep = min(int(k), group_size)
+            selected_positions.append(
+                order[offset : offset + group_size].index_select(0, group_order[:keep])
+            )
+            offset += group_size
+        return torch.cat(selected_positions, dim=0)
+
+    @staticmethod
+    def _normalize_required_edge_ids(
+        *,
+        required_edge_ids: torch.Tensor | None,
+        num_agents: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if required_edge_ids is None:
+            return None
+        normalized = required_edge_ids.to(device=device, dtype=torch.long)
+        if normalized.dim() != 1 or int(normalized.numel()) != num_agents:
+            raise ValueError(
+                "required_edge_ids must be a flat torch.long tensor aligned with the active agents. "
+                f"required_edge_ids={tuple(normalized.shape)} num_agents={num_agents}."
+            )
+        return normalized
+
+    @staticmethod
+    def _resolve_required_shortlist_pairs(
+        *,
+        required_edge_ids: torch.Tensor | None,
+        active_agents: torch.Tensor,
+        active_to_unique: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if required_edge_ids is None or int(active_agents.numel()) == 0:
+            return None
+        active_required_edge_ids = required_edge_ids.index_select(0, active_agents)
+        valid_required_mask = active_required_edge_ids >= 0
+        if not bool(valid_required_mask.any().item()):
+            return None
+        return torch.unique(
+            torch.stack(
+                (
+                    active_to_unique[valid_required_mask],
+                    active_required_edge_ids[valid_required_mask],
+                ),
+                dim=1,
+            ),
+            dim=0,
         )
 
-    def _build_parent_path_token_ids(
+    @staticmethod
+    def _build_required_shortlist_keep_mask(
+        *,
+        edge_ids: torch.Tensor,
+        edge_agent_batch: torch.Tensor,
+        required_edge_pairs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        keep_mask = torch.zeros_like(edge_ids, dtype=torch.bool)
+        if required_edge_pairs is None or int(required_edge_pairs.numel()) == 0:
+            return keep_mask
+        if int(edge_ids.numel()) == 0:
+            invalid_pairs = required_edge_pairs.to(dtype=torch.long)
+            raise ValueError(
+                "required replay edge is not a valid forward candidate under the current state. "
+                f"agent_idx={invalid_pairs[:, 0].tolist()} edge_id={invalid_pairs[:, 1].tolist()}."
+            )
+        required_pairs = required_edge_pairs.to(
+            device=edge_ids.device, dtype=torch.long
+        )
+        lookup_base = (
+            torch.maximum(
+                edge_ids.to(dtype=torch.long).max(),
+                required_pairs[:, 1].to(dtype=torch.long).max(),
+            )
+            + 2
+        )
+        candidate_keys = (edge_agent_batch.to(dtype=torch.long) * lookup_base) + (
+            edge_ids.to(dtype=torch.long) + 1
+        )
+        required_keys = torch.unique(
+            (required_pairs[:, 0] * lookup_base) + (required_pairs[:, 1] + 1),
+            sorted=True,
+        )
+        match_idx = torch.searchsorted(required_keys, candidate_keys)
+        in_range = match_idx < int(required_keys.numel())
+        keep_mask[in_range] = (
+            required_keys.index_select(0, match_idx[in_range])
+            == candidate_keys[in_range]
+        )
+        matched_required = torch.zeros_like(required_keys, dtype=torch.bool)
+        if bool(keep_mask.any().item()):
+            matched_keys = torch.unique(candidate_keys[keep_mask], sorted=True)
+            matched_idx = torch.searchsorted(required_keys, matched_keys)
+            matched_required[matched_idx] = (
+                required_keys.index_select(0, matched_idx) == matched_keys
+            )
+        if not bool(matched_required.all().item()):
+            invalid_pairs = required_pairs[~matched_required]
+            raise ValueError(
+                "required replay edge is not a valid forward candidate under the current state. "
+                f"agent_idx={invalid_pairs[:, 0].tolist()} edge_id={invalid_pairs[:, 1].tolist()}."
+            )
+        return keep_mask
+
+    def _compute_shortlist_scores(
         self,
         *,
-        state: SearchState,
+        prepared_batch: PreparedSearchBatch,
+        flat_state_features: torch.Tensor,
         edge_agent_batch: torch.Tensor,
-        source_nodes: torch.Tensor,
+        target_nodes: torch.Tensor,
+        child_num_steps: torch.Tensor,
+        graph_ids: torch.Tensor,
     ) -> torch.Tensor:
-        child_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
-        child_path_token_ids = child_path_token_ids.index_select(0, edge_agent_batch)
-        child_num_steps = state.flatten_num_steps().index_select(0, edge_agent_batch)
-        return derive_parent_path_token_ids(
-            child_path_token_ids=child_path_token_ids,
-            child_num_steps=child_num_steps,
-            parent_nodes=source_nodes,
+        total_edges = int(target_nodes.numel())
+        if total_edges == 0:
+            return torch.empty((0,), device=target_nodes.device, dtype=torch.float32)
+        chunk_size = total_edges
+        if target_nodes.device.type == "cuda":
+            chunk_size = min(total_edges, _FORWARD_EDGE_CHUNK_SIZE)
+        heuristic_cache = getattr(prepared_batch, "heuristic_cache", None)
+        shortlist_scores: list[torch.Tensor] = []
+        scale = 1.0 / math.sqrt(max(int(flat_state_features.size(-1)), 1))
+        for start in range(0, total_edges, max(chunk_size, 1)):
+            end = min(start + max(chunk_size, 1), total_edges)
+            chunk_target_nodes = target_nodes[start:end]
+            chunk_child_num_steps = child_num_steps[start:end]
+            chunk_agent_batch = edge_agent_batch[start:end]
+            chunk_graph_ids = graph_ids[start:end]
+            chunk_candidate_features = prepared_batch.node_tokens.index_select(
+                0, chunk_target_nodes
+            )
+            chunk_question_features = prepared_batch.question_tokens.index_select(
+                0, chunk_graph_ids
+            )
+            chunk_current_state_features = flat_state_features.index_select(
+                0, chunk_agent_batch
+            )
+            chunk_scores = scale * (
+                (chunk_candidate_features * chunk_question_features).sum(dim=-1)
+                + (chunk_candidate_features * chunk_current_state_features).sum(dim=-1)
+            )
+            if float(self.candidate_shortlist_cfg.heuristic_weight) > 0.0:
+                chunk_scores = chunk_scores.to(dtype=torch.float32) + float(
+                    self.candidate_shortlist_cfg.heuristic_weight
+                ) * self._lookup_shortlist_heuristic_scores(
+                    heuristic_cache=heuristic_cache,
+                    node_ids=chunk_target_nodes,
+                    num_steps=chunk_child_num_steps,
+                )
+            shortlist_scores.append(chunk_scores.to(dtype=torch.float32))
+        return torch.cat(shortlist_scores, dim=0)
+
+    def _maybe_shortlist_forward_candidates(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        flat_state_features: torch.Tensor,
+        edge_ids: torch.Tensor,
+        target_nodes: torch.Tensor,
+        edge_agent_batch: torch.Tensor,
+        child_num_steps: torch.Tensor,
+        out_degrees: torch.Tensor,
+        graph_ids: torch.Tensor,
+        required_edge_pairs: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfg = self.candidate_shortlist_cfg
+        total_edges = int(edge_ids.numel())
+        if not cfg.enabled or total_edges == 0:
+            return (
+                edge_ids,
+                target_nodes,
+                edge_agent_batch,
+                child_num_steps,
+                out_degrees,
+            )
+        num_agents = int(flat_state_features.size(0))
+        candidate_counts = torch.zeros(
+            (num_agents,), device=edge_agent_batch.device, dtype=torch.long
         )
+        candidate_counts.scatter_add_(
+            0,
+            edge_agent_batch,
+            torch.ones_like(edge_agent_batch, dtype=torch.long),
+        )
+        shortlist_agent_mask = candidate_counts > int(cfg.degree_threshold)
+        if not bool(shortlist_agent_mask.any().item()):
+            return (
+                edge_ids,
+                target_nodes,
+                edge_agent_batch,
+                child_num_steps,
+                out_degrees,
+            )
+        shortlist_edge_mask = shortlist_agent_mask.index_select(0, edge_agent_batch)
+        shortlist_subset_positions = torch.nonzero(
+            shortlist_edge_mask,
+            as_tuple=False,
+        ).view(-1)
+        shortlist_scores = self._compute_shortlist_scores(
+            prepared_batch=prepared_batch,
+            flat_state_features=flat_state_features,
+            edge_agent_batch=edge_agent_batch,
+            target_nodes=target_nodes,
+            child_num_steps=child_num_steps,
+            graph_ids=graph_ids,
+        )
+        shortlisted_local_positions = self._select_segment_topk_positions(
+            values=shortlist_scores.index_select(0, shortlist_subset_positions),
+            segment_ids=edge_agent_batch.index_select(0, shortlist_subset_positions),
+            k=int(cfg.topk),
+        )
+        keep_mask = (~shortlist_edge_mask) | self._build_required_shortlist_keep_mask(
+            edge_ids=edge_ids,
+            edge_agent_batch=edge_agent_batch,
+            required_edge_pairs=required_edge_pairs,
+        )
+        if int(shortlisted_local_positions.numel()) > 0:
+            keep_mask[
+                shortlist_subset_positions.index_select(0, shortlisted_local_positions)
+            ] = True
+        filtered_edge_ids = edge_ids[keep_mask]
+        filtered_target_nodes = target_nodes[keep_mask]
+        filtered_edge_agent_batch = edge_agent_batch[keep_mask]
+        filtered_child_num_steps = child_num_steps[keep_mask]
+        filtered_out_degrees = torch.zeros_like(out_degrees).view(-1)
+        if int(filtered_edge_agent_batch.numel()) > 0:
+            filtered_out_degrees.scatter_add_(
+                0,
+                filtered_edge_agent_batch,
+                torch.ones_like(
+                    filtered_edge_agent_batch, dtype=filtered_out_degrees.dtype
+                ),
+            )
+        return (
+            filtered_edge_ids,
+            filtered_target_nodes,
+            filtered_edge_agent_batch,
+            filtered_child_num_steps,
+            filtered_out_degrees.view_as(out_degrees),
+        )
+
+    def _compute_forward_edge_logits(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        flat_state_features: torch.Tensor,
+        edge_ids: torch.Tensor,
+        target_nodes: torch.Tensor,
+        edge_agent_batch: torch.Tensor,
+        child_num_steps: torch.Tensor,
+        graph_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        _ = child_num_steps
+        if int(edge_ids.numel()) == 0:
+            return torch.empty((0,), device=edge_ids.device, dtype=torch.float32)
+        total_edges = int(edge_ids.numel())
+        chunk_size = total_edges
+        if edge_ids.device.type == "cuda":
+            chunk_size = min(total_edges, _FORWARD_EDGE_CHUNK_SIZE)
+        edge_logits_chunks: list[torch.Tensor] = []
+        for start in range(0, total_edges, max(chunk_size, 1)):
+            end = min(start + max(chunk_size, 1), total_edges)
+            chunk_edge_agent_batch = edge_agent_batch[start:end]
+            chunk_edge_ids = edge_ids[start:end]
+            chunk_target_nodes = target_nodes[start:end]
+            chunk_child_node_features = prepared_batch.node_tokens.index_select(
+                0, chunk_target_nodes
+            )
+            edge_logits_chunks.append(
+                self._compute_transition_logits(
+                    prepared_batch=prepared_batch,
+                    current_state_features=flat_state_features.index_select(
+                        0, chunk_edge_agent_batch
+                    ),
+                    candidate_state_features=chunk_child_node_features,
+                    edge_ids=chunk_edge_ids,
+                    graph_ids=graph_ids[start:end],
+                    head=self.forward_policy_head,
+                )
+            )
+        return torch.cat(edge_logits_chunks, dim=0)
 
     def _expected_backward_transitions(
         self,
@@ -419,7 +972,7 @@ class BaseSearchPolicy(nn.Module):
         expected_relation_ids = flat_path_token_ids[row_idx, parent_relation_positions]
         return expected_parent_nodes, expected_relation_ids
 
-    def _compute_deterministic_backward_logits(
+    def _compute_tree_backward_logits(
         self,
         *,
         prepared_batch: PreparedSearchBatch,
@@ -428,6 +981,8 @@ class BaseSearchPolicy(nn.Module):
         source_nodes: torch.Tensor,
         edge_agent_batch: torch.Tensor,
     ) -> torch.Tensor:
+        """Recover the unique parent edge on the prefix-tree state space."""
+
         edge_logits = torch.full(
             (int(edge_ids.numel()),),
             fill_value=float("-inf"),
@@ -468,46 +1023,6 @@ class BaseSearchPolicy(nn.Module):
             )
         return edge_logits
 
-    def _compute_legacy_backward_logits(
-        self,
-        *,
-        prepared_batch: PreparedSearchBatch,
-        state: SearchState,
-        edge_ids: torch.Tensor,
-        source_nodes: torch.Tensor,
-        edge_agent_batch: torch.Tensor,
-        parent_num_steps: torch.Tensor,
-    ) -> torch.Tensor:
-        flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
-        current_state_features = self._build_flat_state_features(
-            prepared_batch,
-            flat_nodes=state.flatten_current_nodes(),
-            flat_num_steps=state.flatten_num_steps(),
-            flat_done_mask=state.flatten_done_mask(),
-            flat_path_token_ids=flat_path_token_ids,
-        ).index_select(0, edge_agent_batch)
-        parent_path_token_ids = self._build_parent_path_token_ids(
-            state=state,
-            edge_agent_batch=edge_agent_batch,
-            source_nodes=source_nodes,
-        )
-        parent_state_features = self._build_flat_state_features(
-            prepared_batch,
-            flat_nodes=source_nodes,
-            flat_num_steps=parent_num_steps,
-            flat_done_mask=torch.zeros_like(parent_num_steps, dtype=torch.bool),
-            flat_path_token_ids=parent_path_token_ids,
-        )
-        graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
-        return self._compute_transition_logits(
-            prepared_batch=prepared_batch,
-            current_state_features=current_state_features,
-            candidate_state_features=parent_state_features,
-            edge_ids=edge_ids,
-            graph_ids=graph_ids,
-            head=self.backward_policy_head,
-        )
-
     def _gather_forward_candidates(
         self,
         state: SearchState,
@@ -521,10 +1036,11 @@ class BaseSearchPolicy(nn.Module):
             num_rollouts,
         ) = self._prepare_agent_state(state)
         del total_agents
+        forward_active_mask = active_mask & (flat_num_steps < self.max_steps)
         edge_ids, target_nodes, edge_agent_batch, out_degrees = (
             state.topology.gather_outgoing_edges(
                 current_nodes=flat_current_nodes,
-                active_mask=active_mask,
+                active_mask=forward_active_mask,
             )
         )
         if int(edge_ids.numel()) > 0:
@@ -555,6 +1071,150 @@ class BaseSearchPolicy(nn.Module):
             flat_num_steps,
             batch_size,
             num_rollouts,
+        )
+
+    @staticmethod
+    def _deduplicate_active_forward_states(
+        *,
+        state: SearchState,
+        flat_path_token_ids: torch.Tensor | None,
+        flat_control_states: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        active_agents = torch.nonzero(~state.flatten_done_mask(), as_tuple=False).view(
+            -1
+        )
+        if int(active_agents.numel()) == 0:
+            empty_long = state.current_nodes.new_empty((0,), dtype=torch.long)
+            empty_control = flat_control_states.new_empty(
+                (0, int(flat_control_states.size(-1))),
+            )
+            return active_agents, empty_long, empty_long, empty_long, empty_control
+        active_nodes = state.flatten_current_nodes().index_select(0, active_agents)
+        active_num_steps = state.flatten_num_steps().index_select(0, active_agents)
+        active_control_states = flat_control_states.index_select(0, active_agents)
+        if int(active_agents.numel()) == 1:
+            return (
+                active_agents,
+                torch.zeros_like(active_agents),
+                active_nodes,
+                active_num_steps,
+                active_control_states,
+            )
+        if flat_path_token_ids is None:
+            if bool((active_num_steps != 0).any().item()):
+                unique_index = torch.arange(
+                    int(active_agents.numel()),
+                    device=active_agents.device,
+                    dtype=torch.long,
+                )
+                return (
+                    active_agents,
+                    unique_index,
+                    active_nodes,
+                    active_num_steps,
+                    active_control_states,
+                )
+            unique_state_rows, active_to_unique = torch.unique(
+                torch.stack((active_nodes, active_num_steps), dim=1),
+                dim=0,
+                return_inverse=True,
+            )
+            sorted_inverse = torch.argsort(active_to_unique, stable=True)
+            _, inverse_counts = torch.unique_consecutive(
+                active_to_unique.index_select(0, sorted_inverse),
+                return_counts=True,
+            )
+            inverse_offsets = inverse_counts.cumsum(0) - inverse_counts
+            representative_positions = sorted_inverse.index_select(0, inverse_offsets)
+            return (
+                active_agents,
+                active_to_unique,
+                unique_state_rows[:, 0].to(dtype=torch.long),
+                unique_state_rows[:, 1].to(dtype=torch.long),
+                active_control_states.index_select(0, representative_positions),
+            )
+        active_path_token_ids = flat_path_token_ids.index_select(0, active_agents)
+        # Prefix history is part of the state definition, so deduplication must
+        # key on the full encoded trajectory prefix instead of node/time alone.
+        unique_state_rows, active_to_unique = torch.unique(
+            torch.cat(
+                (
+                    active_nodes.unsqueeze(1),
+                    active_num_steps.unsqueeze(1),
+                    active_path_token_ids,
+                ),
+                dim=1,
+            ),
+            dim=0,
+            return_inverse=True,
+        )
+        sorted_inverse = torch.argsort(active_to_unique, stable=True)
+        _, inverse_counts = torch.unique_consecutive(
+            active_to_unique.index_select(0, sorted_inverse),
+            return_counts=True,
+        )
+        inverse_offsets = inverse_counts.cumsum(0) - inverse_counts
+        representative_positions = sorted_inverse.index_select(0, inverse_offsets)
+        return (
+            active_agents,
+            active_to_unique,
+            unique_state_rows[:, 0].to(dtype=torch.long),
+            unique_state_rows[:, 1].to(dtype=torch.long),
+            active_control_states.index_select(0, representative_positions),
+        )
+
+    @staticmethod
+    def _expand_unique_edge_candidates(
+        *,
+        active_agents: torch.Tensor,
+        active_to_unique: torch.Tensor,
+        unique_edge_ids: torch.Tensor,
+        unique_target_nodes: torch.Tensor,
+        unique_edge_agent_batch: torch.Tensor,
+        unique_edge_logits: torch.Tensor,
+        unique_out_degrees: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if int(active_agents.numel()) == 0 or int(unique_edge_ids.numel()) == 0:
+            empty_logits = unique_edge_logits.new_empty((0,))
+            empty_long = unique_edge_ids.new_empty((0,))
+            return empty_logits, empty_long, empty_long, empty_long
+        del unique_edge_agent_batch
+        unique_edge_ptr = torch.zeros(
+            (int(unique_out_degrees.numel()) + 1),
+            device=unique_out_degrees.device,
+            dtype=torch.long,
+        )
+        unique_edge_ptr[1:] = unique_out_degrees.to(dtype=torch.long).cumsum(0)
+        active_edge_counts = unique_out_degrees.index_select(0, active_to_unique).to(
+            dtype=torch.long
+        )
+        expanded_edge_agent_batch = active_agents.repeat_interleave(active_edge_counts)
+        if int(expanded_edge_agent_batch.numel()) == 0:
+            empty_logits = unique_edge_logits.new_empty((0,))
+            empty_long = unique_edge_ids.new_empty((0,))
+            return empty_logits, empty_long, empty_long, empty_long
+        base_index = unique_edge_ptr[:-1].index_select(0, active_to_unique)
+        base_index = base_index.repeat_interleave(active_edge_counts)
+        segment_starts = active_edge_counts.cumsum(0) - active_edge_counts
+        expanded_positions = base_index + (
+            torch.arange(
+                int(expanded_edge_agent_batch.numel()),
+                device=unique_edge_ids.device,
+                dtype=torch.long,
+            )
+            - segment_starts.repeat_interleave(active_edge_counts)
+        )
+        return (
+            unique_edge_logits.index_select(0, expanded_positions),
+            expanded_edge_agent_batch,
+            unique_edge_ids.index_select(0, expanded_positions),
+            unique_target_nodes.index_select(0, expanded_positions),
         )
 
     def _gather_backward_candidates(
@@ -589,55 +1249,260 @@ class BaseSearchPolicy(nn.Module):
             parent_num_steps,
         )
 
+    def _compute_forward_distribution_impl(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+        *,
+        allow_candidate_shortlist: bool,
+        required_edge_ids: torch.Tensor | None = None,
+    ) -> ForwardActionDistribution:
+        total_agents = int(state.current_nodes.numel())
+        flat_current_nodes = state.flatten_current_nodes()
+        flat_done_mask = state.flatten_done_mask()
+        flat_num_steps = state.flatten_num_steps()
+        flat_path_token_ids = None
+        if state.path_token_ids is not None:
+            flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
+        flat_control_states = self._resolve_flat_control_states(prepared_batch, state)
+        (
+            active_agents,
+            active_to_unique,
+            unique_current_nodes,
+            unique_num_steps,
+            unique_control_states,
+        ) = self._deduplicate_active_forward_states(
+            state=state,
+            flat_path_token_ids=flat_path_token_ids,
+            flat_control_states=flat_control_states,
+        )
+        hidden_dim = int(prepared_batch.node_tokens.size(-1))
+        unique_state_features = prepared_batch.node_tokens.new_empty((0, hidden_dim))
+        unique_graph_ids = prepared_batch.node_tokens.new_empty((0,), dtype=torch.long)
+        if int(unique_current_nodes.numel()) > 0:
+            unique_state_features = self._build_flat_state_features(
+                prepared_batch,
+                flat_nodes=unique_current_nodes,
+                flat_num_steps=unique_num_steps,
+                flat_done_mask=torch.zeros_like(unique_num_steps, dtype=torch.bool),
+                flat_control_states=unique_control_states,
+            )
+            unique_graph_ids = state.topology.graph_index_from_nodes(
+                unique_current_nodes
+            )
+        flat_state_features = torch.zeros(
+            (total_agents, hidden_dim),
+            device=state.current_nodes.device,
+            dtype=prepared_batch.node_tokens.dtype,
+        )
+        if int(active_agents.numel()) > 0:
+            flat_state_features.index_copy_(
+                0,
+                active_agents,
+                unique_state_features.index_select(0, active_to_unique),
+            )
+        normalized_required_edge_ids = self._normalize_required_edge_ids(
+            required_edge_ids=required_edge_ids,
+            num_agents=total_agents,
+            device=state.current_nodes.device,
+        )
+        if normalized_required_edge_ids is not None:
+            normalized_required_edge_ids = torch.where(
+                flat_done_mask,
+                torch.full_like(normalized_required_edge_ids, fill_value=-1),
+                normalized_required_edge_ids,
+            )
+        required_edge_pairs = self._resolve_required_shortlist_pairs(
+            required_edge_ids=normalized_required_edge_ids,
+            active_agents=active_agents,
+            active_to_unique=active_to_unique,
+        )
+        unique_forward_active_mask = unique_num_steps < self.max_steps
+        (
+            unique_edge_ids,
+            unique_target_nodes,
+            unique_edge_agent_batch,
+            unique_out_degrees,
+        ) = state.topology.gather_outgoing_edges(
+            current_nodes=unique_current_nodes,
+            active_mask=unique_forward_active_mask,
+        )
+        if int(unique_edge_ids.numel()) > 0:
+            unique_child_num_steps = (
+                unique_num_steps.index_select(0, unique_edge_agent_batch) + 1
+            )
+        else:
+            unique_child_num_steps = unique_num_steps.new_empty((0,))
+        if required_edge_pairs is not None:
+            self._build_required_shortlist_keep_mask(
+                edge_ids=unique_edge_ids,
+                edge_agent_batch=unique_edge_agent_batch,
+                required_edge_pairs=required_edge_pairs,
+            )
+        if int(unique_edge_ids.numel()) > 0 and allow_candidate_shortlist:
+            unique_candidate_graph_ids = unique_graph_ids.index_select(
+                0, unique_edge_agent_batch
+            )
+            (
+                unique_edge_ids,
+                unique_target_nodes,
+                unique_edge_agent_batch,
+                unique_child_num_steps,
+                unique_out_degrees,
+            ) = self._maybe_shortlist_forward_candidates(
+                prepared_batch=prepared_batch,
+                flat_state_features=unique_state_features,
+                edge_ids=unique_edge_ids,
+                target_nodes=unique_target_nodes,
+                edge_agent_batch=unique_edge_agent_batch,
+                child_num_steps=unique_child_num_steps,
+                out_degrees=unique_out_degrees,
+                graph_ids=unique_candidate_graph_ids,
+                required_edge_pairs=required_edge_pairs,
+            )
+        current_log_f_flat = torch.zeros(
+            (total_agents,), device=state.current_nodes.device, dtype=torch.float32
+        )
+        if int(active_agents.numel()) > 0:
+            unique_current_log_f = self._compute_log_state_scores_from_flat_features(
+                prepared_batch=prepared_batch,
+                flat_state_features=unique_state_features,
+                graph_ids=unique_graph_ids,
+            )
+            current_log_f_flat.index_copy_(
+                0,
+                active_agents,
+                unique_current_log_f.index_select(0, active_to_unique),
+            )
+        current_log_f = current_log_f_flat.view_as(state.current_nodes)
+        edge_logits = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.float32
+        )
+        edge_agent_batch = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.long
+        )
+        edge_ids = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.long
+        )
+        target_nodes = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.long
+        )
+        submit_logits = torch.empty_like(edge_logits)
+        submit_agent_batch = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.long
+        )
+        submit_target_nodes = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.long
+        )
+        submit_edge_ids = torch.empty(
+            (0,), device=state.current_nodes.device, dtype=torch.long
+        )
+        flat_graph_out_degrees = torch.zeros(
+            (total_agents,), device=state.current_nodes.device, dtype=torch.long
+        )
+        if int(active_agents.numel()) > 0:
+            flat_graph_out_degrees.index_copy_(
+                0,
+                active_agents,
+                unique_out_degrees.index_select(0, active_to_unique),
+            )
+        if int(unique_edge_ids.numel()) > 0:
+            unique_edge_logits = self._compute_forward_edge_logits(
+                prepared_batch=prepared_batch,
+                flat_state_features=unique_state_features,
+                edge_ids=unique_edge_ids,
+                target_nodes=unique_target_nodes,
+                edge_agent_batch=unique_edge_agent_batch,
+                child_num_steps=unique_child_num_steps,
+                graph_ids=unique_graph_ids.index_select(0, unique_edge_agent_batch),
+            )
+            (
+                edge_logits,
+                edge_agent_batch,
+                edge_ids,
+                target_nodes,
+            ) = self._expand_unique_edge_candidates(
+                active_agents=active_agents,
+                active_to_unique=active_to_unique,
+                unique_edge_ids=unique_edge_ids,
+                unique_target_nodes=unique_target_nodes,
+                unique_edge_agent_batch=unique_edge_agent_batch,
+                unique_edge_logits=unique_edge_logits,
+                unique_out_degrees=unique_out_degrees,
+            )
+        if int(active_agents.numel()) > 0:
+            submit_agent_batch = active_agents
+            submit_target_nodes = flat_current_nodes.index_select(0, active_agents)
+            submit_edge_ids = torch.full_like(submit_target_nodes, fill_value=-1)
+            unique_submit_logits = self._compute_submit_logits(
+                prepared_batch=prepared_batch,
+                current_state_features=unique_state_features,
+                current_node_features=prepared_batch.node_tokens.index_select(
+                    0, unique_current_nodes
+                ),
+                graph_ids=unique_graph_ids,
+            )
+            submit_logits = unique_submit_logits.index_select(0, active_to_unique)
+        combined_edge_logits = torch.cat((edge_logits, submit_logits), dim=0)
+        combined_edge_agent_batch = torch.cat(
+            (edge_agent_batch, submit_agent_batch), dim=0
+        )
+        combined_edge_ids = torch.cat((edge_ids, submit_edge_ids), dim=0)
+        combined_target_nodes = torch.cat((target_nodes, submit_target_nodes), dim=0)
+        is_submit = torch.cat(
+            (
+                torch.zeros_like(edge_ids, dtype=torch.bool),
+                torch.ones_like(submit_edge_ids, dtype=torch.bool),
+            ),
+            dim=0,
+        )
+        if int(combined_edge_agent_batch.numel()) > 0:
+            order = torch.argsort(combined_edge_agent_batch, stable=True)
+            combined_edge_logits = combined_edge_logits.index_select(0, order)
+            combined_edge_agent_batch = combined_edge_agent_batch.index_select(0, order)
+            combined_edge_ids = combined_edge_ids.index_select(0, order)
+            combined_target_nodes = combined_target_nodes.index_select(0, order)
+            is_submit = is_submit.index_select(0, order)
+        out_degrees = flat_graph_out_degrees.view_as(state.current_nodes)
+        combined_out_degrees = out_degrees + (~flat_done_mask).view_as(out_degrees).to(
+            dtype=out_degrees.dtype
+        )
+        return ForwardActionDistribution(
+            edge_logits=combined_edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
+            edge_agent_batch=combined_edge_agent_batch,
+            edge_ids=combined_edge_ids,
+            target_nodes=combined_target_nodes,
+            out_degrees=combined_out_degrees,
+            is_submit=is_submit,
+            current_log_f=current_log_f,
+        )
+
     def compute_forward_distribution(
         self,
         prepared_batch: PreparedSearchBatch,
         state: SearchState,
+        *,
+        required_edge_ids: torch.Tensor | None = None,
     ) -> ForwardActionDistribution:
-        edge_ids, target_nodes, edge_agent_batch, out_degrees, child_num_steps = (
-            self._gather_forward_candidates(state)
+        return self._compute_forward_distribution_impl(
+            prepared_batch,
+            state,
+            allow_candidate_shortlist=True,
+            required_edge_ids=required_edge_ids,
         )
-        edge_logits = torch.empty(
-            (0,), device=state.current_nodes.device, dtype=torch.float32
-        )
-        if int(edge_ids.numel()) > 0:
-            flat_path_token_ids = state.flatten_path_token_ids(max_steps=self.max_steps)
-            current_state_features = self._build_flat_state_features(
-                prepared_batch,
-                flat_nodes=state.flatten_current_nodes(),
-                flat_num_steps=state.flatten_num_steps(),
-                flat_done_mask=state.flatten_done_mask(),
-                flat_path_token_ids=flat_path_token_ids,
-            ).index_select(0, edge_agent_batch)
-            child_path_token_ids = self._build_child_path_token_ids(
-                prepared_batch=prepared_batch,
-                state=state,
-                edge_agent_batch=edge_agent_batch,
-                edge_ids=edge_ids,
-                target_nodes=target_nodes,
-            )
-            child_state_features = self._build_flat_state_features(
-                prepared_batch,
-                flat_nodes=target_nodes,
-                flat_num_steps=child_num_steps,
-                flat_done_mask=torch.zeros_like(child_num_steps, dtype=torch.bool),
-                flat_path_token_ids=child_path_token_ids,
-            )
-            graph_ids = state.flatten_graph_index().index_select(0, edge_agent_batch)
-            edge_logits = self._compute_transition_logits(
-                prepared_batch=prepared_batch,
-                current_state_features=current_state_features,
-                candidate_state_features=child_state_features,
-                edge_ids=edge_ids,
-                graph_ids=graph_ids,
-                head=self.forward_policy_head,
-            )
-        return ForwardActionDistribution(
-            edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
-            edge_agent_batch=edge_agent_batch,
-            edge_ids=edge_ids,
-            target_nodes=target_nodes,
-            out_degrees=out_degrees,
+
+    def compute_forward_distribution_without_shortlist(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        state: SearchState,
+        *,
+        required_edge_ids: torch.Tensor | None = None,
+    ) -> ForwardActionDistribution:
+        return self._compute_forward_distribution_impl(
+            prepared_batch,
+            state,
+            allow_candidate_shortlist=False,
+            required_edge_ids=required_edge_ids,
         )
 
     def compute_backward_distribution(
@@ -645,41 +1510,36 @@ class BaseSearchPolicy(nn.Module):
         prepared_batch: PreparedSearchBatch,
         state: SearchState,
     ) -> ForwardActionDistribution:
-        edge_ids, source_nodes, edge_agent_batch, in_degrees, parent_num_steps = (
+        active_non_root = (~state.flatten_done_mask()) & (state.flatten_num_steps() > 0)
+        if bool(active_non_root.any().item()):
+            state.flatten_path_token_ids(max_steps=self.max_steps)
+        edge_ids, source_nodes, edge_agent_batch, in_degrees, _ = (
             self._gather_backward_candidates(state)
         )
+        if bool(active_non_root.any().item()) and int(edge_ids.numel()) == 0:
+            invalid_agents = torch.nonzero(active_non_root, as_tuple=False).view(-1)
+            raise RuntimeError(
+                "Backward distribution could not recover a parent edge from the encoded path. "
+                f"invalid_agents={invalid_agents.tolist()}"
+            )
         edge_logits = torch.empty(
             (0,), device=state.current_nodes.device, dtype=torch.float32
         )
         if int(edge_ids.numel()) > 0:
-            uses_legacy_backward = state.path_token_ids is None and bool(
-                ((~state.flatten_done_mask()) & (state.flatten_num_steps() > 0))
-                .any()
-                .item()
+            edge_logits = self._compute_tree_backward_logits(
+                prepared_batch=prepared_batch,
+                state=state,
+                edge_ids=edge_ids,
+                source_nodes=source_nodes,
+                edge_agent_batch=edge_agent_batch,
             )
-            if uses_legacy_backward:
-                edge_logits = self._compute_legacy_backward_logits(
-                    prepared_batch=prepared_batch,
-                    state=state,
-                    edge_ids=edge_ids,
-                    source_nodes=source_nodes,
-                    edge_agent_batch=edge_agent_batch,
-                    parent_num_steps=parent_num_steps,
-                )
-            else:
-                edge_logits = self._compute_deterministic_backward_logits(
-                    prepared_batch=prepared_batch,
-                    state=state,
-                    edge_ids=edge_ids,
-                    source_nodes=source_nodes,
-                    edge_agent_batch=edge_agent_batch,
-                )
         return ForwardActionDistribution(
             edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
             edge_agent_batch=edge_agent_batch,
             edge_ids=edge_ids,
             target_nodes=source_nodes,
             out_degrees=in_degrees,
+            is_submit=torch.zeros_like(edge_ids, dtype=torch.bool),
         )
 
     @staticmethod
@@ -734,7 +1594,12 @@ class GFlowNetPolicy(nn.Module):
 
     def prepare_batch(self, batch) -> PreparedGFlowNetBatch:
         prepared_batch = self.base_policy.prepare_batch(batch)
-        heuristic_cache = self.search_heuristic.build_cache(prepared_batch)
+        with torch.no_grad():
+            heuristic_cache = self.search_heuristic.build_cache(
+                prepared_batch,
+                build_local_state_features=self.base_policy.build_local_state_features,
+                max_steps=self.base_policy.max_steps,
+            )
         return PreparedGFlowNetBatch(
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
@@ -755,45 +1620,20 @@ class GFlowNetPolicy(nn.Module):
         start_distribution = self.compute_start_distribution(prepared_batch)
         return start_distribution.graph_log_z.to(dtype=torch.float32)
 
-    def _build_state_from_nodes(
-        self,
-        *,
-        prepared_batch: PreparedGFlowNetBatch,
-        nodes: torch.Tensor,
-        num_steps: torch.Tensor,
-        path_token_ids: torch.Tensor | None = None,
-    ) -> SearchState:
-        resolved_path_token_ids = path_token_ids
-        if resolved_path_token_ids is None:
-            resolved_path_token_ids = initialize_path_token_ids(
-                start_nodes=nodes.view(-1, 1),
-                max_steps=self.base_policy.max_steps,
-            )
-        return SearchState(
-            topology=prepared_batch.topology,
-            observation=prepared_batch.observation,
-            current_nodes=nodes.view(-1, 1),
-            done_mask=torch.zeros(
-                (int(nodes.numel()), 1),
-                device=nodes.device,
-                dtype=torch.bool,
-            ),
-            num_steps=num_steps.view(-1, 1),
-            path_token_ids=resolved_path_token_ids,
-        )
-
     def _compute_state_bias(
         self,
         *,
         prepared_batch: PreparedGFlowNetBatch,
-        state: SearchState,
+        node_ids: torch.Tensor,
+        num_steps: torch.Tensor,
+        done_mask: torch.Tensor,
     ) -> torch.Tensor:
-        return self.search_heuristic.compute_state_bias(
-            prepared_batch=prepared_batch,
+        return self.search_heuristic.compute_cached_bias(
             heuristic_cache=prepared_batch.heuristic_cache,
-            state=state,
-            build_state_features=self.base_policy.build_state_features,
-        ).to(dtype=torch.float32)
+            node_ids=node_ids,
+            num_steps=num_steps,
+            done_mask=done_mask,
+        )
 
     def compute_guidance_logits(
         self,
@@ -819,30 +1659,61 @@ class GFlowNetPolicy(nn.Module):
         edge_logits = distribution.edge_logits.to(dtype=torch.float32)
         if int(edge_logits.numel()) == 0 or float(self.heuristic_cfg.beta) == 0.0:
             return edge_logits
+        submit_mask = self.base_policy._distribution_submit_mask(distribution)
+        if bool(submit_mask.all().item()):
+            return edge_logits
+        graph_mask = ~submit_mask
+        child_target_nodes = distribution.target_nodes[graph_mask]
         child_num_steps = (
-            state.flatten_num_steps().index_select(0, distribution.edge_agent_batch) + 1
-        )
-        child_path_token_ids = self.base_policy._build_child_path_token_ids(
-            prepared_batch=prepared_batch,
-            state=state,
-            edge_agent_batch=distribution.edge_agent_batch,
-            edge_ids=distribution.edge_ids,
-            target_nodes=distribution.target_nodes,
-        )
-        child_state = self._build_state_from_nodes(
-            prepared_batch=prepared_batch,
-            nodes=distribution.target_nodes,
-            num_steps=child_num_steps,
-            path_token_ids=child_path_token_ids.view(
-                int(distribution.target_nodes.numel()), 1, -1
-            ),
+            state.flatten_num_steps().index_select(
+                0, distribution.edge_agent_batch[graph_mask]
+            )
+            + 1
         )
         child_bias = self._compute_state_bias(
             prepared_batch=prepared_batch,
-            state=child_state,
-        ).view(-1)
-        return _mask_nonfinite_scores(
-            edge_logits + float(self.heuristic_cfg.beta) * child_bias
+            node_ids=child_target_nodes,
+            num_steps=child_num_steps,
+            done_mask=torch.zeros_like(child_num_steps, dtype=torch.bool),
+        )
+        adjusted_logits = edge_logits.clone()
+        adjusted_logits[graph_mask] = _mask_nonfinite_scores(
+            adjusted_logits[graph_mask] + float(self.heuristic_cfg.beta) * child_bias
+        )
+        return adjusted_logits
+
+    def compute_behavior_edge_logits(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        state: SearchState,
+        distribution: ForwardActionDistribution,
+    ) -> torch.Tensor:
+        return self._compute_behavior_forward_logits(
+            prepared_batch=prepared_batch,
+            state=state,
+            distribution=distribution,
+        )
+
+    def build_start_control_states(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        start_nodes: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.base_policy.build_start_control_states(prepared_batch, start_nodes)
+
+    def compute_next_control_states(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        *,
+        control_states: torch.Tensor,
+        next_nodes: torch.Tensor,
+        relation_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.base_policy.compute_next_control_states(
+            prepared_batch,
+            control_states=control_states,
+            next_nodes=next_nodes,
+            relation_ids=relation_ids,
         )
 
     def compute_start_distribution(
@@ -870,23 +1741,16 @@ class GFlowNetPolicy(nn.Module):
         candidate_nodes_abs, candidate_graph_ids = resolve_start_candidates(
             prepared_batch
         )
-        start_state = self._build_state_from_nodes(
-            prepared_batch=prepared_batch,
-            nodes=candidate_nodes_abs,
-            num_steps=torch.zeros_like(candidate_nodes_abs, dtype=torch.long),
-            path_token_ids=initialize_path_token_ids(
-                start_nodes=candidate_nodes_abs.view(-1, 1),
-                max_steps=self.base_policy.max_steps,
-            ),
-        )
         log_flows = self.base_policy.compute_start_log_flows(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
         )
         start_bias = self._compute_state_bias(
             prepared_batch=prepared_batch,
-            state=start_state,
-        ).view(-1)
+            node_ids=candidate_nodes_abs,
+            num_steps=torch.zeros_like(candidate_nodes_abs, dtype=torch.long),
+            done_mask=torch.zeros_like(candidate_nodes_abs, dtype=torch.bool),
+        )
         return build_start_distribution_from_log_flows(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
@@ -901,10 +1765,14 @@ class GFlowNetPolicy(nn.Module):
         num_rollouts: int,
         deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_graphs = int(distribution.candidate_graph_ids.max().item()) + 1
+        num_graphs = int(distribution.graph_log_z.numel())
         selected_nodes: list[torch.Tensor] = []
         selected_log_probs: list[torch.Tensor] = []
         selected_log_flows: list[torch.Tensor] = []
+        if num_graphs < 1:
+            empty = distribution.candidate_nodes_abs.new_empty((0, num_rollouts))
+            empty_scores = distribution.log_probs.new_empty((0, num_rollouts))
+            return empty, empty_scores, empty_scores
         for graph_idx in range(num_graphs):
             mask = distribution.candidate_graph_ids == graph_idx
             graph_nodes = distribution.candidate_nodes_abs[mask]
@@ -929,23 +1797,38 @@ class GFlowNetPolicy(nn.Module):
                     graph_nodes = graph_nodes[:num_rollouts]
                     graph_log_probs = graph_log_probs[:num_rollouts]
                     graph_log_flows = graph_log_flows[:num_rollouts]
-            else:
-                probs = torch.softmax(graph_log_probs, dim=0)
-                sample_idx = torch.multinomial(
-                    probs,
-                    num_samples=num_rollouts,
-                    replacement=True,
-                )
-                graph_nodes = graph_nodes.index_select(0, sample_idx)
-                graph_log_probs = graph_log_probs.index_select(0, sample_idx)
-                graph_log_flows = graph_log_flows.index_select(0, sample_idx)
             selected_nodes.append(graph_nodes)
             selected_log_probs.append(graph_log_probs)
             selected_log_flows.append(graph_log_flows)
+        if deterministic:
+            return (
+                torch.stack(selected_nodes, dim=0),
+                torch.stack(selected_log_probs, dim=0),
+                torch.stack(selected_log_flows, dim=0),
+            )
+        sampled_nodes: list[torch.Tensor] = []
+        sampled_log_probs: list[torch.Tensor] = []
+        sampled_log_flows: list[torch.Tensor] = []
+        for _ in range(num_rollouts):
+            sampled_positions, sampled_probs, has_values = sample_segmented_one_1d(
+                logits=distribution.log_probs,
+                segment_ids=distribution.candidate_graph_ids,
+                num_segments=num_graphs,
+                temperature=1.0,
+            )
+            if not bool(has_values.all().item()):
+                raise ValueError("Each graph must expose at least one start candidate.")
+            sampled_nodes.append(
+                distribution.candidate_nodes_abs.index_select(0, sampled_positions)
+            )
+            sampled_log_probs.append(sampled_probs)
+            sampled_log_flows.append(
+                distribution.log_flows.index_select(0, sampled_positions)
+            )
         return (
-            torch.stack(selected_nodes, dim=0),
-            torch.stack(selected_log_probs, dim=0),
-            torch.stack(selected_log_flows, dim=0),
+            torch.stack(sampled_nodes, dim=1),
+            torch.stack(sampled_log_probs, dim=1),
+            torch.stack(sampled_log_flows, dim=1),
         )
 
     def compute_log_state_scores(
@@ -962,10 +1845,26 @@ class GFlowNetPolicy(nn.Module):
         self,
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
+        *,
+        required_edge_ids: torch.Tensor | None = None,
     ) -> ForwardActionDistribution:
         return self.base_policy.compute_forward_distribution(
             prepared_batch,
             state,
+            required_edge_ids=required_edge_ids,
+        )
+
+    def compute_forward_distribution_without_shortlist(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+        state: SearchState,
+        *,
+        required_edge_ids: torch.Tensor | None = None,
+    ) -> ForwardActionDistribution:
+        return self.base_policy.compute_forward_distribution_without_shortlist(
+            prepared_batch,
+            state,
+            required_edge_ids=required_edge_ids,
         )
 
     def compute_backward_distribution(
@@ -997,6 +1896,8 @@ class GFlowNetPolicy(nn.Module):
             edge_ids=distribution.edge_ids,
             target_nodes=distribution.target_nodes,
             out_degrees=distribution.out_degrees,
+            is_submit=distribution.is_submit,
+            current_log_f=distribution.current_log_f,
         )
 
     @staticmethod

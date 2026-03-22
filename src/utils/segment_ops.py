@@ -187,9 +187,134 @@ def segment_logsumexp_1d(
     return out.to(dtype=dtype), has_values
 
 
+def segment_argmax_1d(
+    *,
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+    ignore_non_finite: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = _normalize_segment_ids(
+        values=values,
+        segment_ids=segment_ids,
+        num_segments=num_segments,
+        op_name="segment_argmax_1d",
+    )
+    if num_segments == 0:
+        empty = torch.empty((0,), device=values.device, dtype=torch.long)
+        return empty, torch.empty((0,), device=values.device, dtype=torch.bool)
+
+    chosen_positions = torch.full(
+        (num_segments,),
+        fill_value=-1,
+        device=values.device,
+        dtype=torch.long,
+    )
+    has_values = torch.zeros((num_segments,), device=values.device, dtype=torch.bool)
+    if int(values.numel()) == 0:
+        return chosen_positions, has_values
+
+    finite_mask = torch.isfinite(values)
+    if not ignore_non_finite and not bool(finite_mask.all().item()):
+        raise ValueError(
+            "segment_argmax_1d received non-finite values while ignore_non_finite=False."
+        )
+    considered_mask = (
+        finite_mask
+        if ignore_non_finite
+        else torch.ones_like(finite_mask, dtype=torch.bool)
+    )
+    if not bool(considered_mask.any().item()):
+        return chosen_positions, has_values
+
+    considered_ids = ids[considered_mask]
+    considered_values = values[considered_mask].to(dtype=torch.float32)
+    considered_positions = torch.arange(
+        int(values.numel()), device=values.device, dtype=torch.long
+    )[considered_mask]
+    has_values.scatter_(0, considered_ids, True)
+
+    max_per_segment = torch.full(
+        (num_segments,),
+        fill_value=float("-inf"),
+        device=values.device,
+        dtype=torch.float32,
+    )
+    max_per_segment.scatter_reduce_(
+        0, considered_ids, considered_values, reduce="amax", include_self=True
+    )
+    winner_mask = considered_values == max_per_segment.index_select(0, considered_ids)
+    winner_ids = considered_ids[winner_mask]
+    winner_positions = considered_positions[winner_mask]
+    sentinel = int(values.numel())
+    first_positions = torch.full(
+        (num_segments,),
+        fill_value=sentinel,
+        device=values.device,
+        dtype=torch.long,
+    )
+    if int(winner_positions.numel()) > 0:
+        first_positions.scatter_reduce_(
+            0, winner_ids, winner_positions, reduce="amin", include_self=True
+        )
+    valid_positions = has_values & (first_positions < sentinel)
+    chosen_positions = torch.where(
+        valid_positions,
+        first_positions,
+        torch.full_like(first_positions, fill_value=-1),
+    )
+    return chosen_positions, valid_positions
+
+
+def sample_segmented_one_1d(
+    *,
+    logits: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}.")
+    if num_segments == 0:
+        empty_long = torch.empty((0,), device=logits.device, dtype=torch.long)
+        empty_float = torch.empty((0,), device=logits.device, dtype=torch.float32)
+        empty_bool = torch.empty((0,), device=logits.device, dtype=torch.bool)
+        return empty_long, empty_float, empty_bool
+
+    scaled_logits = logits.to(dtype=torch.float32) / float(temperature)
+    noise = torch.rand_like(scaled_logits)
+    noise = noise.clamp(
+        min=torch.finfo(noise.dtype).tiny,
+        max=1.0 - torch.finfo(noise.dtype).eps,
+    )
+    gumbel_noise = -torch.log(-torch.log(noise))
+    sampled_scores = scaled_logits + gumbel_noise
+    chosen_positions, has_values = segment_argmax_1d(
+        values=sampled_scores,
+        segment_ids=segment_ids,
+        num_segments=num_segments,
+        ignore_non_finite=True,
+    )
+    log_probs = torch.zeros((num_segments,), device=logits.device, dtype=torch.float32)
+    if bool(has_values.any().item()):
+        log_norm, _ = segment_logsumexp_1d(
+            values=scaled_logits,
+            segment_ids=segment_ids,
+            num_segments=num_segments,
+            dtype=torch.float32,
+            ignore_non_finite=True,
+            empty_value=float("-inf"),
+        )
+        selected_logits = scaled_logits.index_select(0, chosen_positions[has_values])
+        log_probs[has_values] = selected_logits - log_norm[has_values]
+    return chosen_positions, log_probs, has_values
+
+
 __all__ = [
     "compute_has_finite_edges",
     "mask_stop_logits_for_min_steps",
+    "sample_segmented_one_1d",
+    "segment_argmax_1d",
     "segment_logsumexp_1d",
     "segment_mean_1d",
 ]
