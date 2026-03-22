@@ -15,6 +15,7 @@ from src.models.gflownet import (
 )
 from src.models.gflownet.path import (
     append_relation_and_node_tokens_inplace,
+    append_stop_token_inplace,
     initialize_path_token_ids,
 )
 from src.utils.segment_ops import sample_segmented_one_1d
@@ -273,13 +274,14 @@ def rollout_search_policy(
     max_steps: int,
     num_rollouts: int,
 ) -> MonteCarloRolloutSummary:
-    start_distribution = policy.compute_start_distribution(prepared_batch)
+    start_distribution = policy.compute_root_action_distribution(prepared_batch)
     sampled_start_nodes = _sample_start_nodes_from_distribution(
         distribution=start_distribution,
         num_rollouts=int(num_rollouts),
     )
     current_nodes = sampled_start_nodes.clone()
     done_mask = torch.zeros_like(current_nodes, dtype=torch.bool)
+    absorbing_mask = torch.zeros_like(current_nodes, dtype=torch.bool)
     num_steps = torch.zeros_like(current_nodes, dtype=torch.long)
     path_token_ids = initialize_path_token_ids(
         start_nodes=sampled_start_nodes,
@@ -312,6 +314,7 @@ def rollout_search_policy(
             num_steps=num_steps,
             path_token_ids=path_token_ids,
             control_state=control_states,
+            absorbing_mask=absorbing_mask,
         )
         step = compute_constrained_policy_step(
             policy=policy,
@@ -333,7 +336,7 @@ def rollout_search_policy(
         next_nodes = flat_current_nodes.clone()
         next_num_steps = num_steps.view(-1).clone()
         chosen_edge_ids = torch.full_like(flat_current_nodes, fill_value=-1)
-        chosen_is_submit = torch.zeros_like(flat_current_nodes, dtype=torch.bool)
+        chosen_is_stop_action = torch.zeros_like(flat_current_nodes, dtype=torch.bool)
         if bool(selected_mask.any().item()):
             selected_positions = chosen_positions[selected_mask]
             chosen_edge_ids[selected_mask] = step.distribution.edge_ids.index_select(
@@ -342,16 +345,16 @@ def rollout_search_policy(
             next_nodes[selected_mask] = step.distribution.target_nodes.index_select(
                 0, selected_positions
             )
-            submit_mask = (
-                step.distribution.is_submit.to(dtype=torch.bool)
-                if step.distribution.is_submit is not None
+            stop_action_mask = (
+                step.distribution.is_stop_action.to(dtype=torch.bool)
+                if step.distribution.is_stop_action is not None
                 else torch.zeros_like(step.distribution.edge_ids, dtype=torch.bool)
             )
-            chosen_is_submit[selected_mask] = submit_mask.index_select(
+            chosen_is_stop_action[selected_mask] = stop_action_mask.index_select(
                 0, selected_positions
             )
-        graph_move_mask = selected_mask & (~chosen_is_submit)
-        submit_mask = selected_mask & chosen_is_submit
+        graph_move_mask = selected_mask & (~chosen_is_stop_action)
+        stop_action_mask = selected_mask & chosen_is_stop_action
         if bool(graph_move_mask.any().item()):
             trace_edge_ids[:, :, step_idx].view(-1)[graph_move_mask.view(-1)] = (
                 chosen_edge_ids[graph_move_mask]
@@ -371,6 +374,11 @@ def rollout_search_policy(
             relation_ids=relation_ids,
             target_nodes=next_nodes.view_as(current_nodes),
             active_mask=graph_move_mask.view_as(current_nodes),
+        )
+        path_token_ids = append_stop_token_inplace(
+            path_token_ids=path_token_ids,
+            num_steps=num_steps,
+            active_mask=stop_action_mask.view_as(current_nodes),
         )
         next_control_states = control_states
         compute_next_control_states = getattr(
@@ -396,7 +404,8 @@ def rollout_search_policy(
         current_nodes = next_nodes.view_as(current_nodes)
         num_steps = next_num_steps.view_as(num_steps)
         control_states = next_control_states
-        done_mask = done_mask | dead_end | submit_mask.view_as(done_mask)
+        absorbing_mask = absorbing_mask | stop_action_mask.view_as(absorbing_mask)
+        done_mask = done_mask | dead_end | stop_action_mask.view_as(done_mask)
 
     return MonteCarloRolloutSummary(
         start_nodes=sampled_start_nodes,

@@ -203,12 +203,12 @@ def test_build_replay_sample_batch_skips_move_backward_reconstruction() -> None:
         max_steps=2,
     )
 
-    assert replay_sample_batch.trace_submit_mask is not None
+    assert replay_sample_batch.trace_stop_mask is not None
     assert torch.isfinite(replay_sample_batch.log_pf_steps).all()
     assert torch.equal(
-        replay_sample_batch.log_pb_steps[~replay_sample_batch.trace_submit_mask],
+        replay_sample_batch.log_pb_steps[~replay_sample_batch.trace_stop_mask],
         torch.zeros_like(
-            replay_sample_batch.log_pb_steps[~replay_sample_batch.trace_submit_mask]
+            replay_sample_batch.log_pb_steps[~replay_sample_batch.trace_stop_mask]
         ),
     )
 
@@ -275,9 +275,9 @@ def test_build_replay_sample_batch_force_keeps_recorded_edges_in_shortlist() -> 
         state,
         required_edge_ids=torch.tensor([1], dtype=torch.long),
     )
-    assert forced_distribution.is_submit is not None
+    assert forced_distribution.is_stop_action is not None
     forced_graph_edges = forced_distribution.edge_ids[
-        ~forced_distribution.is_submit.to(dtype=torch.bool)
+        ~forced_distribution.is_stop_action.to(dtype=torch.bool)
     ]
     assert torch.equal(torch.sort(forced_graph_edges).values, torch.tensor([0, 1]))
     assert torch.equal(forced_distribution.out_degrees.view(-1), torch.tensor([3]))

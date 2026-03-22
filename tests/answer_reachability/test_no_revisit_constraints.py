@@ -71,7 +71,7 @@ def test_forward_constraints_mask_all_moves_at_horizon() -> None:
         max_steps=2,
     )
     move_log_probs, _, has_values = policy.compute_move_log_probs(distribution)
-    submit_mask = distribution.is_submit
+    submit_mask = distribution.is_stop_action
 
     assert submit_mask is not None
     assert bool(has_values.item()) is True

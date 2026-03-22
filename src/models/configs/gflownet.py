@@ -135,6 +135,7 @@ class AnswerRewardConfig:
     positive_utility: float = 1.0
     negative_utility: float = -1.0
     beta: float = 1.0
+    structure_cost_weight: float = 1.0
     cycle_penalty: float = 1.0
     failure_length_penalty_alpha: float = 0.0
     length_penalty_alpha: float | None = None
@@ -150,6 +151,10 @@ class AnswerRewardConfig:
             )
         if self.beta <= 0.0:
             raise ValueError("training.answer_reward.beta must be > 0.")
+        if self.structure_cost_weight < 0.0:
+            raise ValueError(
+                "training.answer_reward.structure_cost_weight must be >= 0."
+            )
         if not 0.0 < self.cycle_penalty <= 1.0:
             raise ValueError("training.answer_reward.cycle_penalty must be in (0, 1].")
         resolved_failure_alpha = float(self.failure_length_penalty_alpha)
@@ -284,16 +289,10 @@ class AdaptiveSamplingConfig:
     high_success_rate_threshold: float = 0.35
     low_unique_success_paths_per_100_rollouts: float = 0.5
     high_unique_success_paths_per_100_rollouts: float = 5.0
-    low_start_entropy_normalized: float = 0.35
-    high_start_entropy_normalized: float = 0.85
     low_subtb_residual_variance: float = 0.05
     high_subtb_residual_variance: float = 0.5
     rollout_growth_factor: float = 1.5
     rollout_shrink_factor: float = 0.75
-    temperature_multiplier_up: float = 1.15
-    temperature_multiplier_down: float = 0.92
-    min_temperature_multiplier: float = 0.5
-    max_temperature_multiplier: float = 2.5
 
     def __post_init__(self) -> None:
         if self.min_rollout_batch_size is not None and self.min_rollout_batch_size < 1:
@@ -339,18 +338,6 @@ class AdaptiveSamplingConfig:
             raise ValueError(
                 "training.adaptive_sampling.high_unique_success_paths_per_100_rollouts must be >= low_unique_success_paths_per_100_rollouts."
             )
-        if not 0.0 <= self.low_start_entropy_normalized <= 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.low_start_entropy_normalized must be in [0, 1]."
-            )
-        if not 0.0 <= self.high_start_entropy_normalized <= 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.high_start_entropy_normalized must be in [0, 1]."
-            )
-        if self.low_start_entropy_normalized > self.high_start_entropy_normalized:
-            raise ValueError(
-                "training.adaptive_sampling.low_start_entropy_normalized must be <= high_start_entropy_normalized."
-            )
         if self.low_subtb_residual_variance < 0.0:
             raise ValueError(
                 "training.adaptive_sampling.low_subtb_residual_variance must be >= 0."
@@ -367,32 +354,6 @@ class AdaptiveSamplingConfig:
             raise ValueError(
                 "training.adaptive_sampling.rollout_shrink_factor must be in (0, 1]."
             )
-        if self.temperature_multiplier_up < 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.temperature_multiplier_up must be >= 1.0."
-            )
-        if not 0.0 < self.temperature_multiplier_down <= 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.temperature_multiplier_down must be in (0, 1]."
-            )
-        if self.min_temperature_multiplier <= 0.0:
-            raise ValueError(
-                "training.adaptive_sampling.min_temperature_multiplier must be > 0."
-            )
-        if self.max_temperature_multiplier <= 0.0:
-            raise ValueError(
-                "training.adaptive_sampling.max_temperature_multiplier must be > 0."
-            )
-        if self.min_temperature_multiplier > self.max_temperature_multiplier:
-            raise ValueError(
-                "training.adaptive_sampling.min_temperature_multiplier must be <= max_temperature_multiplier."
-            )
-        if not (
-            self.min_temperature_multiplier <= 1.0 <= self.max_temperature_multiplier
-        ):
-            raise ValueError(
-                "training.adaptive_sampling temperature multiplier bounds must contain 1.0."
-            )
 
 
 @dataclass(frozen=True)
@@ -403,6 +364,7 @@ class GFlowNetTrainingConfig:
     answer_reward: AnswerRewardConfig = field(default_factory=AnswerRewardConfig)
     guidance: GuidanceLossConfig = field(default_factory=GuidanceLossConfig)
     sampling_temperature: float = 1.0
+    force_stop_on_answer_hit: bool = False
     sampling_temperature_schedule: SamplingTemperatureScheduleConfig = field(
         default_factory=SamplingTemperatureScheduleConfig
     )

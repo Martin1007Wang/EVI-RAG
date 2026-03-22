@@ -9,9 +9,9 @@ from src.graph_runtime import TrajectoryBatch
 from src.models.configs import HorizonConfig, SearchEvalConfig
 from src.models.gflownet import (
     PreparedSearchBatch,
+    RootActionDistribution,
     SearchPolicyProtocol,
     SearchState,
-    StartDistribution,
     compute_constrained_policy_step,
 )
 from src.models.gflownet.path import (
@@ -71,7 +71,7 @@ def _compute_edge_offsets(batch: TrajectoryBatch) -> torch.Tensor:
 def _select_graph_search_context(
     *,
     batch: TrajectoryBatch,
-    start_distribution: StartDistribution,
+    start_distribution: RootActionDistribution,
     graph_idx: int,
 ) -> _GraphSearchContext:
     graph_batch = batch.select_graph(graph_idx, validate=False)
@@ -462,7 +462,7 @@ def run_flow_frontier_search(
     prepared_batch: PreparedSearchBatch,
     max_steps: int,
     eval_cfg: SearchEvalConfig,
-    start_distribution: StartDistribution,
+    start_distribution: RootActionDistribution,
     graph_idx: int = 0,
 ) -> FlowFrontierSearchSummary:
     context = _select_graph_search_context(
@@ -540,9 +540,9 @@ def run_flow_frontier_search(
                 0, edge_agent_batch, torch.ones_like(edge_agent_batch)
             )
         action_offsets = action_counts.cumsum(0) - action_counts
-        submit_mask = (
-            distribution.is_submit.to(dtype=torch.bool)
-            if distribution.is_submit is not None
+        stop_action_mask = (
+            distribution.is_stop_action.to(dtype=torch.bool)
+            if distribution.is_stop_action is not None
             else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
         )
 
@@ -567,7 +567,7 @@ def run_flow_frontier_search(
                     step.move_log_probs[action_index].to(dtype=torch.float64).item()
                 )
                 trajectory_log_prob = prefix_log_prob + action_log_prob
-                if bool(submit_mask[action_index].item()):
+                if bool(stop_action_mask[action_index].item()):
                     _add_terminal_path(
                         context=context,
                         current_node_abs=current_node_abs,
@@ -655,7 +655,7 @@ class FlowFrontierReachabilityAnalyzer:
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
     ) -> ReachabilityAnalysis:
-        start_distribution = policy.compute_start_distribution(prepared_batch)
+        start_distribution = policy.compute_root_action_distribution(prepared_batch)
         summary = run_flow_frontier_search(
             batch=batch,
             policy=policy,
@@ -674,7 +674,7 @@ class FlowFrontierReachabilityAnalyzer:
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
     ) -> list[ReachabilityAnalysis]:
-        start_distribution = policy.compute_start_distribution(prepared_batch)
+        start_distribution = policy.compute_root_action_distribution(prepared_batch)
         return [
             run_flow_frontier_search(
                 batch=batch,
@@ -763,7 +763,7 @@ class FlowFrontierSupportSearch:
         include_answer_support: bool = True,
     ) -> SupportWindowResult:
         del analysis
-        start_distribution = policy.compute_start_distribution(prepared_batch)
+        start_distribution = policy.compute_root_action_distribution(prepared_batch)
         summary = run_flow_frontier_search(
             batch=batch,
             policy=policy,
@@ -789,7 +789,7 @@ class FlowFrontierSupportSearch:
         include_answer_support: bool = True,
     ) -> list[SupportWindowResult]:
         del analysis
-        start_distribution = policy.compute_start_distribution(prepared_batch)
+        start_distribution = policy.compute_root_action_distribution(prepared_batch)
         results: list[SupportWindowResult] = []
         for graph_idx in range(batch.num_graphs):
             graph_batch = batch.select_graph(graph_idx, validate=False)

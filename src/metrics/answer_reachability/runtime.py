@@ -242,6 +242,7 @@ class SearchMetricRuntimeFactory:
         sampler = ForwardTrajectoryGFNSampler(
             max_steps=int(horizon_cfg.max_steps),
             trajectory_supervisor=trajectory_supervisor,
+            force_stop_on_answer_hit=bool(training_cfg.force_stop_on_answer_hit),
         )
         reachability_evaluator = ReachabilityBatchEvaluator(
             eval_cfg=eval_cfg,

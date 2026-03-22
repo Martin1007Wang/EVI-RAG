@@ -21,8 +21,9 @@ from .types import (
     HeuristicCache,
     PreparedGFlowNetBatch,
     PreparedSearchBatch,
+    RootState,
     SearchState,
-    StartDistribution,
+    RootActionDistribution,
 )
 
 
@@ -35,11 +36,11 @@ _FORWARD_EDGE_CHUNK_SIZE = 1024
 _TRANSITION_LOGIT_CHUNK_SIZE = 1024
 
 
-class StartDistributionError(ValueError):
-    """Base class for recoverable start-distribution failures."""
+class RootActionDistributionError(ValueError):
+    """Base class for recoverable root-action-distribution failures."""
 
 
-class EmptyStartCandidatesError(StartDistributionError):
+class EmptyStartCandidatesError(RootActionDistributionError):
     def __init__(self, *, empty_samples: list[str]) -> None:
         self.empty_samples = tuple(str(sample_id) for sample_id in empty_samples)
         super().__init__(
@@ -48,7 +49,7 @@ class EmptyStartCandidatesError(StartDistributionError):
         )
 
 
-class InvalidStartCandidatesError(StartDistributionError):
+class InvalidStartCandidatesError(RootActionDistributionError):
     def __init__(self, *, invalid_samples: list[str]) -> None:
         self.invalid_samples = tuple(str(sample_id) for sample_id in invalid_samples)
         super().__init__(
@@ -77,17 +78,19 @@ def resolve_start_candidates(
     return candidate_nodes_abs, candidate_graph_ids
 
 
-def build_start_distribution_from_log_flows(
+def build_root_action_distribution(
     *,
     prepared_batch: PreparedSearchBatch,
     candidate_nodes_abs: torch.Tensor,
     candidate_graph_ids: torch.Tensor,
-    log_flows: torch.Tensor,
-) -> StartDistribution:
+    action_logits: torch.Tensor,
+    start_state_log_flows: torch.Tensor,
+    graph_log_z: torch.Tensor,
+) -> RootActionDistribution:
     num_graphs = int(prepared_batch.topology.num_graphs)
-    log_flows = _mask_nonfinite_scores(log_flows.to(dtype=torch.float32))
+    action_logits = _mask_nonfinite_scores(action_logits.to(dtype=torch.float32))
     lse, has_values = segment_logsumexp_1d(
-        values=log_flows,
+        values=action_logits,
         segment_ids=candidate_graph_ids,
         num_segments=num_graphs,
         dtype=torch.float32,
@@ -100,12 +103,17 @@ def build_start_distribution_from_log_flows(
             prepared_batch.observation.sample_ids[idx] for idx in invalid_graphs
         ]
         raise InvalidStartCandidatesError(invalid_samples=invalid_samples)
-    return StartDistribution(
+    return RootActionDistribution(
         candidate_nodes_abs=candidate_nodes_abs,
         candidate_graph_ids=candidate_graph_ids,
-        log_flows=log_flows,
-        log_probs=log_flows - lse.index_select(0, candidate_graph_ids),
-        graph_log_z=lse,
+        log_flows=_mask_nonfinite_scores(start_state_log_flows.to(dtype=torch.float32)),
+        log_probs=action_logits - lse.index_select(0, candidate_graph_ids),
+        graph_log_z=_mask_nonfinite_scores(graph_log_z.to(dtype=torch.float32)),
+        action_logits=action_logits,
+        root_state=RootState(
+            topology=prepared_batch.topology,
+            observation=prepared_batch.observation,
+        ),
     )
 
 
@@ -126,9 +134,13 @@ class BaseSearchPolicy(nn.Module):
             raise ValueError("max_steps must be >= 1.")
 
         graph_hidden_dim = int(config.backbone.hidden_dim)
+        base_state_dim = graph_hidden_dim * 3
+        state_feature_input_dim = base_state_dim + graph_hidden_dim
         self.state_flow_head = state_score_head
         self.state_score_head = self.state_flow_head
         self.forward_policy_head = forward_policy_head
+        self.root_flow_head = nn.Linear(graph_hidden_dim, 1)
+        self.root_action_head = nn.Linear(graph_hidden_dim, 1)
         self.step_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
         self.remaining_embedding = nn.Embedding(self.max_steps + 1, graph_hidden_dim)
         self.control_query = nn.Linear(graph_hidden_dim, graph_hidden_dim, bias=False)
@@ -139,10 +151,10 @@ class BaseSearchPolicy(nn.Module):
         )
         self.control_norm = nn.LayerNorm(graph_hidden_dim)
         self.control_dropout = nn.Dropout(float(config.prefix_controller.dropout))
-        self.state_feature_input_norm = nn.LayerNorm(graph_hidden_dim * 2)
+        self.state_feature_input_norm = nn.LayerNorm(state_feature_input_dim)
         state_hidden_dim = int(config.state_score_head.hidden_dim)
         state_layers: list[nn.Module] = [
-            nn.Linear(graph_hidden_dim * 2, state_hidden_dim),
+            nn.Linear(state_feature_input_dim, state_hidden_dim),
             nn.GELU(),
         ]
         if float(config.state_score_head.dropout) > 0.0:
@@ -160,7 +172,7 @@ class BaseSearchPolicy(nn.Module):
         self.state_feature_mlp = nn.Sequential(*state_layers)
         self.state_feature_norm = nn.LayerNorm(graph_hidden_dim)
         self.start_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
-        self.submit_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
+        self.stop_action_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
         self.backbone = backbone
         self.candidate_shortlist_cfg = config.candidate_shortlist
 
@@ -190,30 +202,42 @@ class BaseSearchPolicy(nn.Module):
     def encode(self, batch) -> PreparedSearchBatch:
         return self.prepare_batch(batch)
 
-    def compute_start_distribution(
+    def compute_root_action_distribution(
         self,
         prepared_batch: PreparedSearchBatch,
-    ) -> StartDistribution:
+    ) -> RootActionDistribution:
         candidate_nodes_abs, candidate_graph_ids = resolve_start_candidates(
             prepared_batch
         )
-        log_flows = self.compute_start_log_flows(
+        start_state_log_flows = self.compute_start_log_flows(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
         )
-        return build_start_distribution_from_log_flows(
+        action_logits = self.compute_root_action_logits(
+            prepared_batch=prepared_batch,
+            candidate_nodes_abs=candidate_nodes_abs,
+        )
+        return build_root_action_distribution(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
             candidate_graph_ids=candidate_graph_ids,
-            log_flows=log_flows,
+            action_logits=action_logits,
+            start_state_log_flows=start_state_log_flows,
+            graph_log_z=self.compute_graph_log_z(prepared_batch),
         )
 
-    def compute_start_log_flows(
+    def compute_start_distribution(
+        self,
+        prepared_batch: PreparedSearchBatch,
+    ) -> RootActionDistribution:
+        return self.compute_root_action_distribution(prepared_batch)
+
+    def _build_start_state_features(
         self,
         *,
         prepared_batch: PreparedSearchBatch,
         candidate_nodes_abs: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat_num_steps = torch.zeros_like(candidate_nodes_abs, dtype=torch.long)
         flat_done_mask = torch.zeros_like(candidate_nodes_abs, dtype=torch.bool)
         flat_control_states = self.build_start_control_states(
@@ -227,13 +251,48 @@ class BaseSearchPolicy(nn.Module):
             flat_done_mask=flat_done_mask,
             flat_control_states=flat_control_states,
         )
+        graph_ids = prepared_batch.topology.graph_index_from_nodes(candidate_nodes_abs)
+        return flat_state_features, graph_ids
+
+    def compute_start_log_flows(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        candidate_nodes_abs: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_state_features, graph_ids = self._build_start_state_features(
+            prepared_batch=prepared_batch,
+            candidate_nodes_abs=candidate_nodes_abs,
+        )
         return self._compute_log_state_scores_from_flat_features(
             prepared_batch=prepared_batch,
             flat_state_features=flat_state_features,
-            graph_ids=prepared_batch.topology.graph_index_from_nodes(
-                candidate_nodes_abs
-            ),
+            graph_ids=graph_ids,
         )
+
+    def compute_root_action_logits(
+        self,
+        *,
+        prepared_batch: PreparedSearchBatch,
+        candidate_nodes_abs: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_state_features, _ = self._build_start_state_features(
+            prepared_batch=prepared_batch,
+            candidate_nodes_abs=candidate_nodes_abs,
+        )
+        action_logits = self.root_action_head(
+            flat_state_features.to(dtype=torch.float32)
+        ).squeeze(-1)
+        return _mask_nonfinite_scores(action_logits)
+
+    def compute_graph_log_z(
+        self,
+        prepared_batch: PreparedSearchBatch,
+    ) -> torch.Tensor:
+        root_log_z = self.root_flow_head(
+            prepared_batch.question_tokens.to(dtype=torch.float32)
+        ).squeeze(-1)
+        return _mask_nonfinite_scores(root_log_z)
 
     def _build_flat_state_features(
         self,
@@ -249,12 +308,24 @@ class BaseSearchPolicy(nn.Module):
             flat_nodes=flat_nodes,
             flat_num_steps=flat_num_steps,
         )
+        step_ids = flat_num_steps.clamp(min=0, max=self.max_steps)
+        step_features = self.step_embedding(step_ids).to(
+            dtype=base_state_features.dtype
+        )
+        remaining_ids = (self.max_steps - flat_num_steps).clamp(
+            min=0, max=self.max_steps
+        )
+        remaining_features = self.remaining_embedding(remaining_ids).to(
+            dtype=base_state_features.dtype
+        )
         state_features = self.state_feature_norm(
             self.state_feature_mlp(
                 self.state_feature_input_norm(
                     torch.cat(
                         (
                             base_state_features,
+                            step_features,
+                            remaining_features,
                             flat_control_states.to(dtype=base_state_features.dtype),
                         ),
                         dim=-1,
@@ -277,16 +348,8 @@ class BaseSearchPolicy(nn.Module):
     ) -> torch.Tensor:
         num_nodes = int(prepared_batch.topology.num_nodes)
         safe_nodes = flat_nodes.clamp(min=0, max=max(num_nodes - 1, 0))
-        node_features = prepared_batch.node_tokens.index_select(0, safe_nodes)
-        step_ids = flat_num_steps.clamp(min=0, max=self.max_steps)
-        step_features = self.step_embedding(step_ids).to(dtype=node_features.dtype)
-        remaining_ids = (self.max_steps - flat_num_steps).clamp(
-            min=0, max=self.max_steps
-        )
-        remaining_features = self.remaining_embedding(remaining_ids).to(
-            dtype=node_features.dtype
-        )
-        return node_features + step_features + remaining_features
+        del flat_num_steps
+        return prepared_batch.node_tokens.index_select(0, safe_nodes)
 
     def build_local_state_features(
         self,
@@ -370,8 +433,8 @@ class BaseSearchPolicy(nn.Module):
             torch.cat(
                 (
                     attended_question.to(dtype=previous_control_states.dtype),
-                    node_features.to(dtype=previous_control_states.dtype),
                     relation_features.to(dtype=previous_control_states.dtype),
+                    node_features.to(dtype=previous_control_states.dtype),
                 ),
                 dim=-1,
             )
@@ -587,7 +650,7 @@ class BaseSearchPolicy(nn.Module):
             )
         return _mask_nonfinite_scores(torch.cat(logits_chunks, dim=0))
 
-    def _compute_submit_logits(
+    def _compute_stop_action_logits(
         self,
         *,
         prepared_batch: PreparedSearchBatch,
@@ -598,7 +661,7 @@ class BaseSearchPolicy(nn.Module):
         total_candidates = int(graph_ids.numel())
         if total_candidates == 0:
             return torch.empty((0,), device=graph_ids.device, dtype=torch.float32)
-        submit_relation = self.submit_relation_feature.to(
+        stop_action_relation = self.stop_action_relation_feature.to(
             dtype=current_state_features.dtype
         )
         chunk_size = total_candidates
@@ -612,7 +675,7 @@ class BaseSearchPolicy(nn.Module):
                 self.forward_policy_head(
                     current_state_features=current_state_features[start:end],
                     candidate_state_features=current_node_features[start:end],
-                    relation_features=submit_relation.unsqueeze(0).expand(
+                    relation_features=stop_action_relation.unsqueeze(0).expand(
                         chunk_size_current, -1
                     ),
                 )
@@ -620,12 +683,12 @@ class BaseSearchPolicy(nn.Module):
         return _mask_nonfinite_scores(torch.cat(logits_chunks, dim=0))
 
     @staticmethod
-    def _distribution_submit_mask(
+    def _distribution_stop_mask(
         distribution: ForwardActionDistribution,
     ) -> torch.Tensor:
-        if distribution.is_submit is None:
+        if distribution.is_stop_action is None:
             return torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
-        return distribution.is_submit.to(dtype=torch.bool)
+        return distribution.is_stop_action.to(dtype=torch.bool)
 
     @staticmethod
     def _lookup_shortlist_heuristic_scores(
@@ -1400,14 +1463,14 @@ class BaseSearchPolicy(nn.Module):
         target_nodes = torch.empty(
             (0,), device=state.current_nodes.device, dtype=torch.long
         )
-        submit_logits = torch.empty_like(edge_logits)
-        submit_agent_batch = torch.empty(
+        stop_action_logits = torch.empty_like(edge_logits)
+        stop_action_agent_batch = torch.empty(
             (0,), device=state.current_nodes.device, dtype=torch.long
         )
-        submit_target_nodes = torch.empty(
+        stop_action_target_nodes = torch.empty(
             (0,), device=state.current_nodes.device, dtype=torch.long
         )
-        submit_edge_ids = torch.empty(
+        stop_action_edge_ids = torch.empty(
             (0,), device=state.current_nodes.device, dtype=torch.long
         )
         flat_graph_out_degrees = torch.zeros(
@@ -1444,10 +1507,12 @@ class BaseSearchPolicy(nn.Module):
                 unique_out_degrees=unique_out_degrees,
             )
         if int(active_agents.numel()) > 0:
-            submit_agent_batch = active_agents
-            submit_target_nodes = flat_current_nodes.index_select(0, active_agents)
-            submit_edge_ids = torch.full_like(submit_target_nodes, fill_value=-1)
-            unique_submit_logits = self._compute_submit_logits(
+            stop_action_agent_batch = active_agents
+            stop_action_target_nodes = flat_current_nodes.index_select(0, active_agents)
+            stop_action_edge_ids = torch.full_like(
+                stop_action_target_nodes, fill_value=-1
+            )
+            unique_stop_action_logits = self._compute_stop_action_logits(
                 prepared_batch=prepared_batch,
                 current_state_features=unique_state_features,
                 current_node_features=prepared_batch.node_tokens.index_select(
@@ -1455,17 +1520,21 @@ class BaseSearchPolicy(nn.Module):
                 ),
                 graph_ids=unique_graph_ids,
             )
-            submit_logits = unique_submit_logits.index_select(0, active_to_unique)
-        combined_edge_logits = torch.cat((edge_logits, submit_logits), dim=0)
+            stop_action_logits = unique_stop_action_logits.index_select(
+                0, active_to_unique
+            )
+        combined_edge_logits = torch.cat((edge_logits, stop_action_logits), dim=0)
         combined_edge_agent_batch = torch.cat(
-            (edge_agent_batch, submit_agent_batch), dim=0
+            (edge_agent_batch, stop_action_agent_batch), dim=0
         )
-        combined_edge_ids = torch.cat((edge_ids, submit_edge_ids), dim=0)
-        combined_target_nodes = torch.cat((target_nodes, submit_target_nodes), dim=0)
-        is_submit = torch.cat(
+        combined_edge_ids = torch.cat((edge_ids, stop_action_edge_ids), dim=0)
+        combined_target_nodes = torch.cat(
+            (target_nodes, stop_action_target_nodes), dim=0
+        )
+        is_stop_action = torch.cat(
             (
                 torch.zeros_like(edge_ids, dtype=torch.bool),
-                torch.ones_like(submit_edge_ids, dtype=torch.bool),
+                torch.ones_like(stop_action_edge_ids, dtype=torch.bool),
             ),
             dim=0,
         )
@@ -1475,7 +1544,7 @@ class BaseSearchPolicy(nn.Module):
             combined_edge_agent_batch = combined_edge_agent_batch.index_select(0, order)
             combined_edge_ids = combined_edge_ids.index_select(0, order)
             combined_target_nodes = combined_target_nodes.index_select(0, order)
-            is_submit = is_submit.index_select(0, order)
+            is_stop_action = is_stop_action.index_select(0, order)
         out_degrees = flat_graph_out_degrees.view_as(state.current_nodes)
         combined_out_degrees = out_degrees + (~flat_done_mask).view_as(out_degrees).to(
             dtype=out_degrees.dtype
@@ -1486,7 +1555,7 @@ class BaseSearchPolicy(nn.Module):
             edge_ids=combined_edge_ids,
             target_nodes=combined_target_nodes,
             out_degrees=combined_out_degrees,
-            is_submit=is_submit,
+            is_stop_action=is_stop_action,
             current_log_f=current_log_f,
             active_agent_count=active_agent_count,
             unique_active_state_count=unique_active_state_count,
@@ -1528,7 +1597,13 @@ class BaseSearchPolicy(nn.Module):
         prepared_batch: PreparedSearchBatch,
         state: SearchState,
     ) -> ForwardActionDistribution:
-        active_non_root = (~state.flatten_done_mask()) & (state.flatten_num_steps() > 0)
+        flat_done_mask = state.flatten_done_mask()
+        flat_absorbing_mask = state.flatten_absorbing_mask()
+        flat_num_steps = state.flatten_num_steps()
+        flat_current_nodes = state.flatten_current_nodes()
+        active_non_root = (~flat_done_mask) & (flat_num_steps > 0)
+        active_start = (~flat_done_mask) & (flat_num_steps == 0)
+        absorbing_mask = flat_absorbing_mask
         if bool(active_non_root.any().item()):
             state.flatten_path_token_ids(max_steps=self.max_steps)
         edge_ids, source_nodes, edge_agent_batch, in_degrees, _ = (
@@ -1543,6 +1618,8 @@ class BaseSearchPolicy(nn.Module):
         edge_logits = torch.empty(
             (0,), device=state.current_nodes.device, dtype=torch.float32
         )
+        is_stop_action = torch.zeros_like(edge_ids, dtype=torch.bool)
+        is_root_action = torch.zeros_like(edge_ids, dtype=torch.bool)
         if int(edge_ids.numel()) > 0:
             edge_logits = self._compute_tree_backward_logits(
                 prepared_batch=prepared_batch,
@@ -1551,13 +1628,56 @@ class BaseSearchPolicy(nn.Module):
                 source_nodes=source_nodes,
                 edge_agent_batch=edge_agent_batch,
             )
+        if bool(active_start.any().item()):
+            root_agents = torch.nonzero(active_start, as_tuple=False).view(-1)
+            root_edge_ids = torch.full_like(root_agents, fill_value=-2)
+            root_source_nodes = flat_current_nodes.index_select(0, root_agents)
+            root_logits = torch.zeros_like(root_agents, dtype=torch.float32)
+            edge_ids = torch.cat((edge_ids, root_edge_ids), dim=0)
+            source_nodes = torch.cat((source_nodes, root_source_nodes), dim=0)
+            edge_agent_batch = torch.cat((edge_agent_batch, root_agents), dim=0)
+            edge_logits = torch.cat((edge_logits, root_logits), dim=0)
+            is_stop_action = torch.cat(
+                (is_stop_action, torch.zeros_like(root_agents, dtype=torch.bool)), dim=0
+            )
+            is_root_action = torch.cat(
+                (is_root_action, torch.ones_like(root_agents, dtype=torch.bool)), dim=0
+            )
+        if bool(absorbing_mask.any().item()):
+            stop_agents = torch.nonzero(absorbing_mask, as_tuple=False).view(-1)
+            stop_edge_ids = torch.full_like(stop_agents, fill_value=-1)
+            stop_source_nodes = flat_current_nodes.index_select(0, stop_agents)
+            stop_logits = torch.zeros_like(stop_agents, dtype=torch.float32)
+            edge_ids = torch.cat((edge_ids, stop_edge_ids), dim=0)
+            source_nodes = torch.cat((source_nodes, stop_source_nodes), dim=0)
+            edge_agent_batch = torch.cat((edge_agent_batch, stop_agents), dim=0)
+            edge_logits = torch.cat((edge_logits, stop_logits), dim=0)
+            is_stop_action = torch.cat(
+                (is_stop_action, torch.ones_like(stop_agents, dtype=torch.bool)), dim=0
+            )
+            is_root_action = torch.cat(
+                (is_root_action, torch.zeros_like(stop_agents, dtype=torch.bool)), dim=0
+            )
+        if int(edge_agent_batch.numel()) > 0:
+            order = torch.argsort(edge_agent_batch, stable=True)
+            edge_ids = edge_ids.index_select(0, order)
+            source_nodes = source_nodes.index_select(0, order)
+            edge_agent_batch = edge_agent_batch.index_select(0, order)
+            edge_logits = edge_logits.index_select(0, order)
+            is_stop_action = is_stop_action.index_select(0, order)
+            is_root_action = is_root_action.index_select(0, order)
+        if bool(active_start.any().item()):
+            in_degrees.view(-1)[active_start] = 1
+        if bool(absorbing_mask.any().item()):
+            in_degrees.view(-1)[absorbing_mask] = 1
         return ForwardActionDistribution(
             edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
             edge_agent_batch=edge_agent_batch,
             edge_ids=edge_ids,
             target_nodes=source_nodes,
             out_degrees=in_degrees,
-            is_submit=torch.zeros_like(edge_ids, dtype=torch.bool),
+            is_stop_action=is_stop_action,
+            is_root_action=is_root_action,
         )
 
     @staticmethod
@@ -1635,8 +1755,9 @@ class GFlowNetPolicy(nn.Module):
     def compute_graph_log_z(
         self, prepared_batch: PreparedGFlowNetBatch
     ) -> torch.Tensor:
-        start_distribution = self.compute_start_distribution(prepared_batch)
-        return start_distribution.graph_log_z.to(dtype=torch.float32)
+        return self.base_policy.compute_graph_log_z(prepared_batch).to(
+            dtype=torch.float32
+        )
 
     def _compute_state_bias(
         self,
@@ -1677,10 +1798,10 @@ class GFlowNetPolicy(nn.Module):
         edge_logits = distribution.edge_logits.to(dtype=torch.float32)
         if int(edge_logits.numel()) == 0 or float(self.heuristic_cfg.beta) == 0.0:
             return edge_logits
-        submit_mask = self.base_policy._distribution_submit_mask(distribution)
-        if bool(submit_mask.all().item()):
+        stop_action_mask = self.base_policy._distribution_stop_mask(distribution)
+        if bool(stop_action_mask.all().item()):
             return edge_logits
-        graph_mask = ~submit_mask
+        graph_mask = ~stop_action_mask
         child_target_nodes = distribution.target_nodes[graph_mask]
         child_num_steps = (
             state.flatten_num_steps().index_select(
@@ -1734,32 +1855,48 @@ class GFlowNetPolicy(nn.Module):
             relation_ids=relation_ids,
         )
 
-    def compute_start_distribution(
+    def compute_root_action_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
-    ) -> StartDistribution:
+    ) -> RootActionDistribution:
         candidate_nodes_abs, candidate_graph_ids = resolve_start_candidates(
             prepared_batch
         )
-        log_flows = self.base_policy.compute_start_log_flows(
+        start_state_log_flows = self.base_policy.compute_start_log_flows(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
         )
-        return build_start_distribution_from_log_flows(
+        action_logits = self.base_policy.compute_root_action_logits(
+            prepared_batch=prepared_batch,
+            candidate_nodes_abs=candidate_nodes_abs,
+        )
+        return build_root_action_distribution(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
             candidate_graph_ids=candidate_graph_ids,
-            log_flows=log_flows,
+            action_logits=action_logits,
+            start_state_log_flows=start_state_log_flows,
+            graph_log_z=self.base_policy.compute_graph_log_z(prepared_batch),
         )
 
-    def compute_behavior_start_distribution(
+    def compute_start_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
-    ) -> StartDistribution:
+    ) -> RootActionDistribution:
+        return self.compute_root_action_distribution(prepared_batch)
+
+    def compute_behavior_root_action_distribution(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+    ) -> RootActionDistribution:
         candidate_nodes_abs, candidate_graph_ids = resolve_start_candidates(
             prepared_batch
         )
-        log_flows = self.base_policy.compute_start_log_flows(
+        start_state_log_flows = self.base_policy.compute_start_log_flows(
+            prepared_batch=prepared_batch,
+            candidate_nodes_abs=candidate_nodes_abs,
+        )
+        action_logits = self.base_policy.compute_root_action_logits(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
         )
@@ -1769,16 +1906,37 @@ class GFlowNetPolicy(nn.Module):
             num_steps=torch.zeros_like(candidate_nodes_abs, dtype=torch.long),
             done_mask=torch.zeros_like(candidate_nodes_abs, dtype=torch.bool),
         )
-        return build_start_distribution_from_log_flows(
+        return build_root_action_distribution(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
             candidate_graph_ids=candidate_graph_ids,
-            log_flows=log_flows + float(self.heuristic_cfg.beta) * start_bias,
+            action_logits=action_logits + float(self.heuristic_cfg.beta) * start_bias,
+            start_state_log_flows=start_state_log_flows,
+            graph_log_z=self.base_policy.compute_graph_log_z(prepared_batch),
+        )
+
+    def compute_behavior_start_distribution(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+    ) -> RootActionDistribution:
+        return self.compute_behavior_root_action_distribution(prepared_batch)
+
+    @staticmethod
+    def sample_root_start_nodes(
+        distribution: RootActionDistribution,
+        *,
+        num_rollouts: int,
+        deterministic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return GFlowNetPolicy.sample_start_nodes(
+            distribution,
+            num_rollouts=num_rollouts,
+            deterministic=deterministic,
         )
 
     @staticmethod
     def sample_start_nodes(
-        distribution: StartDistribution,
+        distribution: RootActionDistribution,
         *,
         num_rollouts: int,
         deterministic: bool = False,
@@ -1914,7 +2072,8 @@ class GFlowNetPolicy(nn.Module):
             edge_ids=distribution.edge_ids,
             target_nodes=distribution.target_nodes,
             out_degrees=distribution.out_degrees,
-            is_submit=distribution.is_submit,
+            is_stop_action=distribution.is_stop_action,
+            is_root_action=distribution.is_root_action,
             current_log_f=distribution.current_log_f,
             active_agent_count=distribution.active_agent_count,
             unique_active_state_count=distribution.unique_active_state_count,
@@ -1937,8 +2096,17 @@ __all__ = [
     "GFlowNetPolicy",
     "InvalidStartCandidatesError",
     "PreparedGFlowNetBatch",
-    "StartDistribution",
+    "RootActionDistribution",
+    "RootActionDistributionError",
     "StartDistributionError",
-    "build_start_distribution_from_log_flows",
+    "StartDistribution",
+    "build_root_action_distribution",
     "resolve_start_candidates",
 ]
+
+# Backward-compatible aliases for older imports.
+StartDistributionError = RootActionDistributionError
+StartDistribution = RootActionDistribution
+# Backward-compatible alias for older imports.
+build_root_action_distribution_from_log_flows = build_root_action_distribution
+build_start_distribution_from_log_flows = build_root_action_distribution

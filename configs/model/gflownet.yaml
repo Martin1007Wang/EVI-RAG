@@ -33,6 +33,7 @@ training_cfg:
     positive_utility: 1.0
     negative_utility: -1.0
     beta: 1.0
+    structure_cost_weight: 1.0
     cycle_penalty: 1.0
     failure_length_penalty_alpha: 0.0
   guidance:
@@ -40,6 +41,7 @@ training_cfg:
     loss_weight: 0.0
     detach_features: true
   sampling_temperature: 1.0
+  force_stop_on_answer_hit: false
   sampling_temperature_schedule:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
     type: constant
@@ -63,16 +65,10 @@ training_cfg:
     high_success_rate_threshold: 0.35
     low_unique_success_paths_per_100_rollouts: 0.5
     high_unique_success_paths_per_100_rollouts: 5.0
-    low_start_entropy_normalized: 0.35
-    high_start_entropy_normalized: 0.85
     low_subtb_residual_variance: 0.05
     high_subtb_residual_variance: 0.5
     rollout_growth_factor: 1.5
     rollout_shrink_factor: 0.75
-    temperature_multiplier_up: 1.15
-    temperature_multiplier_down: 0.92
-    min_temperature_multiplier: 0.5
-    max_temperature_multiplier: 2.5
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
     lambda_weight: 1.0

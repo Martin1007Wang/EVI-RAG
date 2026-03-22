@@ -64,7 +64,7 @@ def test_compute_constrained_forward_step_masks_horizon_agents() -> None:
         max_steps=2,
     )
 
-    submit_mask = step.distribution.is_submit
+    submit_mask = step.distribution.is_stop_action
     assert submit_mask is not None
     assert bool(step.has_values.item()) is True
     assert bool(submit_mask.any().item()) is True

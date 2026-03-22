@@ -346,7 +346,6 @@ class GFlowNetModule(LightningModule):
         self._pending_adaptive_success_rate: torch.Tensor | None = None
         self._pending_adaptive_unique_success = 0.0
         self._pending_adaptive_residual_variance: torch.Tensor | None = None
-        self._pending_adaptive_start_entropy_normalized: torch.Tensor | None = None
         self._seen_success_path_hashes_by_sample: dict[str, set[tuple[int, int]]] = {}
         self.success_replay_buffer: SuccessfulTrajectoryReplayBuffer | None = None
         replay_cfg = self.cfg.training_cfg.success_replay
@@ -705,6 +704,7 @@ class GFlowNetModule(LightningModule):
             start_nodes=sample_batch.start_nodes,
             trace_edge_ids=sample_batch.trace_edge_ids,
             trace_num_steps=sample_batch.trace_num_steps,
+            trace_stop_mask=sample_batch.trace_stop_mask,
             edge_index=prepared_batch.topology.edge_index,
             edge_type=prepared_batch.topology.edge_type,
             max_steps=int(self.cfg.horizon_cfg.max_steps),
@@ -719,6 +719,7 @@ class GFlowNetModule(LightningModule):
                 *flat_shape,
                 int(trace_path_token_ids.size(-1)),
             ),
+            absorbing_mask=torch.zeros_like(trace_mask).view(flat_shape),
         )
         logits = self.policy.compute_guidance_logits(
             prepared_batch,
@@ -757,8 +758,7 @@ class GFlowNetModule(LightningModule):
         if pending_steps < 1 or self._pending_adaptive_success_rate is None:
             return
         residual_variance = self._pending_adaptive_residual_variance
-        start_entropy_normalized = self._pending_adaptive_start_entropy_normalized
-        if residual_variance is None or start_entropy_normalized is None:
+        if residual_variance is None:
             raise RuntimeError(
                 "adaptive sampling accumulator is missing tensor statistics before flush."
             )
@@ -774,16 +774,12 @@ class GFlowNetModule(LightningModule):
                 subtb_residual_variance_per_batch=float(
                     (residual_variance / denom).detach().item()
                 ),
-                start_node_entropy_normalized=float(
-                    (start_entropy_normalized / denom).detach().item()
-                ),
             )
         )
         self._pending_adaptive_observation_steps = 0
         self._pending_adaptive_success_rate = None
         self._pending_adaptive_unique_success = 0.0
         self._pending_adaptive_residual_variance = None
-        self._pending_adaptive_start_entropy_normalized = None
 
     def _buffer_adaptive_sampling_metrics(
         self,
@@ -797,25 +793,15 @@ class GFlowNetModule(LightningModule):
         residual_variance = loss_output.residual_variance.detach().to(
             dtype=torch.float32
         )
-        start_entropy_normalized = (
-            rollout_metrics.start_node_entropy_normalized.detach().to(
-                dtype=torch.float32
-            )
-        )
         if self._pending_adaptive_success_rate is None:
             self._pending_adaptive_success_rate = success_rate
             self._pending_adaptive_residual_variance = residual_variance
-            self._pending_adaptive_start_entropy_normalized = start_entropy_normalized
         else:
             self._pending_adaptive_success_rate = (
                 self._pending_adaptive_success_rate + success_rate
             )
             self._pending_adaptive_residual_variance = (
                 self._pending_adaptive_residual_variance + residual_variance
-            )
-            self._pending_adaptive_start_entropy_normalized = (
-                self._pending_adaptive_start_entropy_normalized
-                + start_entropy_normalized
             )
         self._pending_adaptive_unique_success += float(
             rollout_metrics.unique_success_paths_per_100_rollouts
@@ -836,7 +822,6 @@ class GFlowNetModule(LightningModule):
         rollout_batch_size: int,
         replay_rollouts_per_graph: int,
         sampling_temperature: float,
-        temperature_multiplier: float,
         on_policy_trajectories: int,
         controller_metrics: dict[str, float],
         rollout_metrics: TrainingRolloutMetrics,
@@ -868,7 +853,6 @@ class GFlowNetModule(LightningModule):
             "log_z_variance": loss_output.log_z_variance,
             "rollout_batch_size": float(rollout_batch_size),
             "sampling_temperature": sampling_temperature,
-            "sampling_temperature_multiplier": temperature_multiplier,
         }
         metrics.update(controller_metrics)
         replay_result = loss_aggregation.replay_result
@@ -1080,7 +1064,6 @@ class GFlowNetModule(LightningModule):
             rollout_batch_size=sampling_plan.rollout_batch_size,
             replay_rollouts_per_graph=replay_rollouts_per_graph,
             sampling_temperature=sampling_plan.sampling_temperature,
-            temperature_multiplier=sampling_plan.temperature_multiplier,
             on_policy_trajectories=on_policy_trajectories,
             controller_metrics=controller_metrics,
             rollout_metrics=rollout_metrics,

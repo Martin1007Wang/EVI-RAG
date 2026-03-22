@@ -7,32 +7,77 @@ import torch
 
 from src.graph_runtime import GraphTopology, SearchObservation
 
-from .path import append_relation_and_node_tokens_inplace, initialize_path_token_ids
+from .path import (
+    STOP_TOKEN_ID,
+    append_relation_and_node_tokens_inplace,
+    append_stop_token_inplace,
+    initialize_path_token_ids,
+    max_path_tokens,
+)
 
 
 @dataclass(frozen=True)
-class StartDistribution:
+class RootState:
+    """Explicit abstract root boundary state for the prefix-tree search space."""
+
+    topology: GraphTopology
+    observation: SearchObservation
+    sequence_token_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class RootActionDistribution:
+    """Outgoing action distribution from the abstract root boundary state.
+
+    The root itself is not materialized as a regular ``SearchState`` because its
+    outgoing actions are query-dependent start-node selections rather than graph
+    edges. This distribution is the explicit runtime object that represents
+    those root actions together with the decoupled root-flow and child-state-flow
+    quantities used by SubTB.
+    """
+
     candidate_nodes_abs: torch.Tensor
     candidate_graph_ids: torch.Tensor
     log_flows: torch.Tensor
     log_probs: torch.Tensor
     graph_log_z: torch.Tensor
+    action_logits: torch.Tensor | None = None
+    root_state: RootState | None = None
+
+    @property
+    def start_state_log_flows(self) -> torch.Tensor:
+        return self.log_flows
+
+    @property
+    def root_log_flow(self) -> torch.Tensor:
+        return self.graph_log_z
+
+
+# Backward-compatible alias for older call sites and tests.
+StartDistribution = RootActionDistribution
 
 
 @dataclass(frozen=True)
 class ForwardActionDistribution:
+    """Per-state action logits over graph edges plus the explicit STOP action."""
+
     edge_logits: torch.Tensor
     edge_agent_batch: torch.Tensor
     edge_ids: torch.Tensor
     target_nodes: torch.Tensor
     out_degrees: torch.Tensor
-    is_submit: torch.Tensor | None = None
+    is_stop_action: torch.Tensor | None = None
+    is_root_action: torch.Tensor | None = None
     current_log_f: torch.Tensor | None = None
     active_agent_count: int = 0
     unique_active_state_count: int = 0
     raw_graph_candidate_count: int = 0
     scored_graph_candidate_count: int = 0
     shortlist_active_state_count: int = 0
+
+    @property
+    def is_submit(self) -> torch.Tensor | None:
+        return self.is_stop_action
 
 
 @dataclass(frozen=True)
@@ -68,6 +113,8 @@ class SearchState:
     The environment state still keeps the exact discrete trajectory prefix for
     tree-structured backward transitions, but forward scoring is driven by a
     recurrent control state that compresses question-conditioned prefix history.
+    Root selection is modeled separately by ``RootActionDistribution`` rather
+    than materializing the abstract root as a regular ``SearchState``.
     """
 
     topology: GraphTopology
@@ -77,6 +124,7 @@ class SearchState:
     num_steps: torch.Tensor
     path_token_ids: torch.Tensor | None = None
     control_state: torch.Tensor | None = None
+    absorbing_mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         expected_shape = tuple(self.current_nodes.shape)
@@ -108,6 +156,14 @@ class SearchState:
                 "control_state batch shape must match current_nodes shape in SearchState. "
                 f"current_nodes={expected_shape} control_state={tuple(self.control_state.shape)}."
             )
+        if (
+            self.absorbing_mask is not None
+            and tuple(self.absorbing_mask.shape) != expected_shape
+        ):
+            raise ValueError(
+                "absorbing_mask must match current_nodes shape in SearchState. "
+                f"current_nodes={expected_shape} absorbing_mask={tuple(self.absorbing_mask.shape)}."
+            )
 
     @classmethod
     def initialize(
@@ -135,6 +191,27 @@ class SearchState:
             current_nodes=start_nodes.clone(),
             done_mask=torch.zeros_like(start_nodes, dtype=torch.bool),
             num_steps=torch.zeros_like(start_nodes, dtype=torch.long),
+            path_token_ids=path_token_ids,
+            control_state=None,
+        )
+
+    @classmethod
+    def from_sequence_prefix(
+        cls,
+        *,
+        topology: GraphTopology,
+        observation: SearchObservation,
+        start_nodes: torch.Tensor,
+        path_token_ids: torch.Tensor,
+        num_steps: torch.Tensor,
+        done_mask: torch.Tensor,
+    ) -> SearchState:
+        return cls(
+            topology=topology,
+            observation=observation,
+            current_nodes=start_nodes,
+            done_mask=done_mask,
+            num_steps=num_steps,
             path_token_ids=path_token_ids,
             control_state=None,
         )
@@ -194,21 +271,44 @@ class SearchState:
     def flatten_current_nodes(self) -> torch.Tensor:
         return self.current_nodes.view(-1)
 
+    @property
+    def prefix_token_ids(self) -> torch.Tensor | None:
+        return self.path_token_ids
+
+    @property
+    def is_absorbing_mask(self) -> torch.Tensor:
+        if self.absorbing_mask is not None:
+            return self.absorbing_mask
+        return self.done_mask
+
+    @property
+    def hop_counts(self) -> torch.Tensor:
+        return self.num_steps
+
     def flatten_done_mask(self) -> torch.Tensor:
         return self.done_mask.view(-1)
+
+    def flatten_absorbing_mask(self) -> torch.Tensor:
+        return self.is_absorbing_mask.view(-1)
 
     def flatten_num_steps(self) -> torch.Tensor:
         return self.num_steps.view(-1)
 
     def path_lengths(self) -> torch.Tensor:
-        return (2 * self.num_steps + 1).to(dtype=torch.long)
+        return (
+            2 * self.num_steps
+            + 1
+            + self.is_absorbing_mask.to(dtype=self.num_steps.dtype)
+        ).to(dtype=torch.long)
 
     def flatten_path_lengths(self) -> torch.Tensor:
         return self.path_lengths().view(-1)
 
     def resolve_path_token_ids(self, *, max_steps: int) -> torch.Tensor:
         if self.path_token_ids is None:
-            if bool((self.num_steps != 0).any().item()):
+            if bool((self.num_steps != 0).any().item()) or bool(
+                self.done_mask.any().item()
+            ):
                 raise ValueError(
                     "Non-root SearchState instances must carry exact path_token_ids. "
                     "The search space is defined over discrete trajectory prefixes, so "
@@ -218,17 +318,30 @@ class SearchState:
                 start_nodes=self.current_nodes,
                 max_steps=int(max_steps),
             )
-        expected_shape = (*self.current_nodes.shape, (2 * int(max_steps)) + 1)
+        expected_shape = (
+            *self.current_nodes.shape,
+            max_path_tokens(max_steps=int(max_steps)),
+        )
         if tuple(self.path_token_ids.shape) != tuple(expected_shape):
             raise ValueError(
                 "path_token_ids shape mismatch with current_nodes/max_steps in SearchState. "
                 f"expected={expected_shape} got={tuple(self.path_token_ids.shape)}."
             )
+        absorbing_mask = self.is_absorbing_mask.to(dtype=torch.bool)
+        if bool(absorbing_mask.any().item()):
+            stop_positions = (2 * self.num_steps[absorbing_mask] + 1).to(
+                dtype=torch.long
+            )
+            observed_stop_tokens = self.path_token_ids[absorbing_mask, stop_positions]
+            if not bool((observed_stop_tokens == STOP_TOKEN_ID).all().item()):
+                raise ValueError(
+                    "Absorbing SearchState rows must terminate with STOP_TOKEN_ID."
+                )
         return self.path_token_ids
 
     def flatten_path_token_ids(self, *, max_steps: int) -> torch.Tensor:
         return self.resolve_path_token_ids(max_steps=max_steps).view(
-            -1, (2 * int(max_steps)) + 1
+            -1, max_path_tokens(max_steps=int(max_steps))
         )
 
     def flatten_control_state(self) -> torch.Tensor:
@@ -260,10 +373,15 @@ class SearchPolicyProtocol(Protocol):
         relation_ids: torch.Tensor,
     ) -> torch.Tensor: ...
 
+    def compute_root_action_distribution(
+        self,
+        prepared_batch: PreparedSearchBatch,
+    ) -> RootActionDistribution: ...
+
     def compute_start_distribution(
         self,
         prepared_batch: PreparedSearchBatch,
-    ) -> StartDistribution: ...
+    ) -> RootActionDistribution: ...
 
     def compute_forward_distribution(
         self,
@@ -292,10 +410,15 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
         self, prepared_batch: PreparedGFlowNetBatch
     ) -> torch.Tensor: ...
 
+    def compute_behavior_root_action_distribution(
+        self,
+        prepared_batch: PreparedGFlowNetBatch,
+    ) -> RootActionDistribution: ...
+
     def compute_behavior_start_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
-    ) -> StartDistribution: ...
+    ) -> RootActionDistribution: ...
 
     def compute_behavior_forward_distribution(
         self,
@@ -318,7 +441,7 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
 
     @staticmethod
     def sample_start_nodes(
-        distribution: StartDistribution,
+        distribution: RootActionDistribution,
         *,
         num_rollouts: int,
         deterministic: bool = False,
@@ -331,6 +454,8 @@ __all__ = [
     "HeuristicCache",
     "PreparedGFlowNetBatch",
     "PreparedSearchBatch",
+    "RootState",
+    "RootActionDistribution",
     "SearchPolicyProtocol",
     "SearchState",
     "StartDistribution",

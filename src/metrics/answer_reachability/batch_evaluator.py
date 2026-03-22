@@ -124,7 +124,7 @@ class ReachabilityBatchEvaluator:
                     prepared_batch=prepared_batch,
                 )
             else:
-                self.policy.compute_start_distribution(prepared_batch)
+                self.policy.compute_root_action_distribution(prepared_batch)
         except StartDistributionError:
             if on_invalid_start is not None:
                 on_invalid_start(batch)

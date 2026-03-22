@@ -9,7 +9,6 @@ from src.models.configs import AdaptiveSamplingConfig
 @dataclass(frozen=True)
 class AdaptiveSamplingDecision:
     rollout_batch_size: int
-    temperature_multiplier: float
     sampling_temperature: float
 
 
@@ -18,7 +17,6 @@ class AdaptiveSamplingMetrics:
     success_rate: float
     unique_success_paths_per_100_rollouts: float
     subtb_residual_variance_per_batch: float
-    start_node_entropy_normalized: float
 
 
 class AdaptiveSamplingController:
@@ -52,29 +50,19 @@ class AdaptiveSamplingController:
             max(self.base_rollout_batch_size, self.min_rollout_batch_size),
             self.max_rollout_batch_size,
         )
-        self._temperature_multiplier = 1.0
         self._observed_steps = 0
         self._ema_success_rate: float | None = None
         self._ema_unique_success_paths_per_100_rollouts: float | None = None
         self._ema_subtb_residual_variance_per_batch: float | None = None
-        self._ema_start_node_entropy_normalized: float | None = None
 
     @property
     def current_rollout_batch_size(self) -> int:
         return int(self._current_rollout_batch_size)
 
-    @property
-    def temperature_multiplier(self) -> float:
-        return float(self._temperature_multiplier)
-
     def decision(self, *, base_temperature: float) -> AdaptiveSamplingDecision:
-        resolved_temperature = float(base_temperature) * float(
-            self._temperature_multiplier
-        )
         return AdaptiveSamplingDecision(
             rollout_batch_size=int(self._current_rollout_batch_size),
-            temperature_multiplier=float(self._temperature_multiplier),
-            sampling_temperature=max(resolved_temperature, 1.0e-6),
+            sampling_temperature=max(float(base_temperature), 1.0e-6),
         )
 
     def observe(self, metrics: AdaptiveSamplingMetrics) -> None:
@@ -93,19 +81,13 @@ class AdaptiveSamplingController:
             current=self._ema_subtb_residual_variance_per_batch,
             value=metrics.subtb_residual_variance_per_batch,
         )
-        self._ema_start_node_entropy_normalized = self._update_ema(
-            current=self._ema_start_node_entropy_normalized,
-            value=metrics.start_node_entropy_normalized,
-        )
         if self._observed_steps <= int(self.config.warmup_steps):
             return
         self._maybe_adjust_rollout_batch_size()
-        self._maybe_adjust_temperature_multiplier()
 
     def snapshot_metrics(self) -> dict[str, float]:
         metrics = {
             "rollout_batch_size": float(self._current_rollout_batch_size),
-            "sampling_temperature_multiplier": float(self._temperature_multiplier),
         }
         if self._ema_success_rate is not None:
             metrics["adaptive_success_rate_ema"] = float(self._ema_success_rate)
@@ -116,10 +98,6 @@ class AdaptiveSamplingController:
         if self._ema_subtb_residual_variance_per_batch is not None:
             metrics["adaptive_subtb_residual_variance_ema"] = float(
                 self._ema_subtb_residual_variance_per_batch
-            )
-        if self._ema_start_node_entropy_normalized is not None:
-            metrics["adaptive_start_node_entropy_normalized_ema"] = float(
-                self._ema_start_node_entropy_normalized
             )
         return metrics
 
@@ -162,34 +140,6 @@ class AdaptiveSamplingController:
                 )
             )
             self._current_rollout_batch_size = max(shrunk, self.min_rollout_batch_size)
-
-    def _maybe_adjust_temperature_multiplier(self) -> None:
-        entropy = self._require_metric(
-            self._ema_start_node_entropy_normalized,
-            "start_node_entropy_normalized",
-        )
-        success_rate = self._require_metric(self._ema_success_rate, "success_rate")
-        unique_success = self._require_metric(
-            self._ema_unique_success_paths_per_100_rollouts,
-            "unique_success_paths_per_100_rollouts",
-        )
-        if entropy < float(self.config.low_start_entropy_normalized):
-            self._temperature_multiplier = min(
-                self._temperature_multiplier
-                * float(self.config.temperature_multiplier_up),
-                float(self.config.max_temperature_multiplier),
-            )
-            return
-        if entropy > float(self.config.high_start_entropy_normalized) and (
-            success_rate < float(self.config.high_success_rate_threshold)
-            or unique_success
-            > float(self.config.high_unique_success_paths_per_100_rollouts)
-        ):
-            self._temperature_multiplier = max(
-                self._temperature_multiplier
-                * float(self.config.temperature_multiplier_down),
-                float(self.config.min_temperature_multiplier),
-            )
 
     def _update_ema(self, *, current: float | None, value: float) -> float:
         if current is None or not math.isfinite(current):

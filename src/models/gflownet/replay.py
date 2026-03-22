@@ -10,6 +10,7 @@ from src.graph_runtime import TrajectoryBatch
 
 from .path import (
     append_relation_and_node_tokens_inplace,
+    append_stop_token_inplace,
     count_path_node_revisits,
     initialize_path_token_ids,
 )
@@ -22,8 +23,8 @@ from .sampler import (
     TerminalTransitionBatch,
     TrajectoryGFNSampleBatch,
     TrajectoryRolloutSupervisorProtocol,
-    _apply_terminal_submit_backward_log_probs,
-    _mask_terminal_submit_backward_log_probs,
+    _apply_terminal_stop_action_backward_log_probs,
+    _mask_terminal_stop_action_backward_log_probs,
     _resolve_chosen_relation_ids,
     _select_edge_log_probs,
 )
@@ -193,7 +194,7 @@ def _resolve_start_distribution_values(
     policy: GFlowNetPolicyProtocol,
     start_nodes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    start_distribution = policy.compute_start_distribution(prepared_batch)
+    start_distribution = policy.compute_root_action_distribution(prepared_batch)
     start_log_probs = torch.zeros_like(start_nodes, dtype=torch.float32)
     start_log_flows = torch.zeros_like(start_nodes, dtype=torch.float32)
     num_graphs, num_rollouts = start_nodes.shape
@@ -294,7 +295,7 @@ def build_replay_sample_batch(
         device=device,
         dtype=torch.long,
     )
-    planned_submit_mask = torch.zeros(
+    planned_stop_mask = torch.zeros(
         (batch.num_graphs, num_rollouts, max_actions),
         device=device,
         dtype=torch.bool,
@@ -305,7 +306,7 @@ def build_replay_sample_batch(
         dtype=torch.long,
     )
     path_lengths = torch.zeros_like(start_nodes)
-    terminal_action_counts = torch.zeros_like(start_nodes)
+    termination_action_steps = torch.zeros_like(start_nodes)
     for graph_idx, records in enumerate(replay_records):
         for rollout_idx, record in enumerate(records):
             local_edge_ids = tuple(int(edge_id) for edge_id in record.local_edge_ids)
@@ -318,7 +319,7 @@ def build_replay_sample_batch(
                 int(record.start_local_node) + node_offsets[graph_idx, 0]
             )
             path_lengths[graph_idx, rollout_idx] = int(len(local_edge_ids))
-            terminal_action_counts[graph_idx, rollout_idx] = (
+            termination_action_steps[graph_idx, rollout_idx] = (
                 int(len(local_edge_ids)) + 1
             )
             if local_edge_ids:
@@ -326,7 +327,7 @@ def build_replay_sample_batch(
                     torch.tensor(local_edge_ids, device=device, dtype=torch.long)
                     + edge_offsets[graph_idx, 0]
                 )
-            planned_submit_mask[graph_idx, rollout_idx, len(local_edge_ids)] = True
+            planned_stop_mask[graph_idx, rollout_idx, len(local_edge_ids)] = True
 
     start_log_probs, start_log_flows, graph_log_z = _resolve_start_distribution_values(
         prepared_batch=prepared_batch,
@@ -341,7 +342,7 @@ def build_replay_sample_batch(
         device=device,
         dtype=torch.float32,
     )
-    # Replay still records terminal submit backward scores, but move-step
+    # Replay still records terminal stop-action backward scores, but move-step
     # backward reconstruction is skipped because the current SubTB loss only
     # consumes forward prefixes on the training hot path.
     log_pb_steps = torch.zeros_like(log_pf_steps)
@@ -351,9 +352,10 @@ def build_replay_sample_batch(
     trace_edge_ids = torch.full_like(planned_edge_ids, fill_value=-1)
     trace_num_steps = torch.zeros_like(planned_edge_ids)
     trace_mask = torch.zeros_like(move_mask)
-    trace_submit_mask = planned_submit_mask
+    trace_stop_mask = planned_stop_mask
 
     current_nodes = start_nodes.clone()
+    absorbing_mask = torch.zeros_like(start_nodes, dtype=torch.bool)
     num_steps = torch.zeros_like(start_nodes)
     current_path_token_ids = initialize_path_token_ids(
         start_nodes=start_nodes,
@@ -371,7 +373,7 @@ def build_replay_sample_batch(
     total_shortlist_active_state_count = 0
 
     for step_idx in range(max_actions):
-        active_mask = terminal_action_counts > step_idx
+        active_mask = termination_action_steps > step_idx
         trace_nodes[:, :, step_idx] = current_nodes
         trace_num_steps[:, :, step_idx] = num_steps
         trace_mask[:, :, step_idx] = active_mask
@@ -386,9 +388,10 @@ def build_replay_sample_batch(
             num_steps=num_steps,
             path_token_ids=current_path_token_ids,
             control_state=current_control_states,
+            absorbing_mask=absorbing_mask,
         )
         chosen_edge_ids = planned_edge_ids[:, :, step_idx].reshape(-1)
-        chosen_is_submit = planned_submit_mask[:, :, step_idx].reshape(-1)
+        chosen_is_stop_action = planned_stop_mask[:, :, step_idx].reshape(-1)
         # Replay keeps the recorded edge in the shortlist support so SubTB can
         # reconstruct a finite log-prob for the teacher-forced transition.
         step = compute_constrained_policy_step(
@@ -422,7 +425,7 @@ def build_replay_sample_batch(
         selected_nodes, selected_log_probs = _select_edge_log_probs(
             distribution=step.distribution,
             selected_edge_ids=chosen_edge_ids,
-            selected_is_submit=chosen_is_submit,
+            selected_is_stop_action=chosen_is_stop_action,
             active_mask=flat_active,
             policy=policy,
             error_prefix=(f"Replay trajectory step={step_idx}"),
@@ -430,7 +433,7 @@ def build_replay_sample_batch(
         chosen_target_nodes[flat_active] = selected_nodes[flat_active]
         chosen_log_probs[flat_active] = selected_log_probs[flat_active]
 
-        flat_graph_move = flat_active & (~chosen_is_submit)
+        flat_graph_move = flat_active & (~chosen_is_stop_action)
         next_nodes = flat_current_nodes.clone()
         next_nodes[flat_graph_move] = chosen_target_nodes[flat_graph_move]
         next_num_steps = flat_num_steps.clone()
@@ -446,6 +449,11 @@ def build_replay_sample_batch(
             relation_ids=chosen_relation_ids,
             target_nodes=next_nodes.view_as(current_nodes),
             active_mask=flat_graph_move.view_as(active_mask),
+        )
+        next_path_token_ids = append_stop_token_inplace(
+            path_token_ids=next_path_token_ids,
+            num_steps=num_steps,
+            active_mask=chosen_is_stop_action.view_as(active_mask),
         )
         next_control_states = current_control_states.clone()
         if bool(flat_graph_move.any().item()):
@@ -485,6 +493,7 @@ def build_replay_sample_batch(
         num_steps = next_num_steps.view_as(num_steps)
         current_path_token_ids = next_path_token_ids
         current_control_states = next_control_states
+        absorbing_mask = absorbing_mask | chosen_is_stop_action.view_as(active_mask)
 
     success_mask = terminal_target_mask.index_select(0, current_nodes.view(-1)).view_as(
         current_nodes
@@ -506,14 +515,14 @@ def build_replay_sample_batch(
             terminal_cycle_counts=terminal_cycle_counts,
         )
     )
-    masked_terminal_backward_log_probs = _mask_terminal_submit_backward_log_probs(
-        terminal_action_counts=terminal_action_counts,
+    masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
+        termination_action_steps=termination_action_steps,
         terminal_num_steps=path_lengths,
         terminal_backward_log_probs=terminal_transition.terminal_backward_log_probs,
     )
-    log_pb_steps = _apply_terminal_submit_backward_log_probs(
+    log_pb_steps = _apply_terminal_stop_action_backward_log_probs(
         log_pb_steps=log_pb_steps,
-        terminal_action_counts=terminal_action_counts,
+        termination_action_steps=termination_action_steps,
         terminal_num_steps=path_lengths,
         terminal_backward_log_probs=masked_terminal_backward_log_probs,
     )
@@ -531,11 +540,11 @@ def build_replay_sample_batch(
         trace_edge_ids=trace_edge_ids,
         trace_num_steps=trace_num_steps,
         trace_mask=trace_mask,
-        trace_submit_mask=trace_submit_mask,
+        trace_stop_mask=trace_stop_mask,
         terminal_nodes=current_nodes,
         terminal_entity_ids=terminal_transition.terminal_entity_ids,
         terminal_num_steps=path_lengths,
-        terminal_action_counts=terminal_action_counts,
+        termination_action_steps=termination_action_steps,
         terminal_state_log_f=None,
         terminal_rewards=terminal_transition.terminal_rewards,
         terminal_log_rewards=terminal_transition.terminal_log_rewards,

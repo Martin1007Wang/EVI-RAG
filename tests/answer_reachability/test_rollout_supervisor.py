@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -95,8 +94,13 @@ def test_answer_ranking_reward_keeps_aliases_at_same_terminal_mass() -> None:
         success_mask=torch.tensor([[True, True, False]], dtype=torch.bool),
     )
 
-    expected_gold = 1.0e-3 + torch.exp(torch.tensor(1.0)).item()
-    expected_non_gold = 1.0e-3 + torch.exp(torch.tensor(-1.0)).item()
+    expected_gold = (
+        1.0e-3
+        + 1.0
+        + torch.exp(torch.tensor(1.0)).item()
+        - torch.exp(torch.tensor(-1.0)).item()
+    )
+    expected_non_gold = 1.0e-3 + 1.0
     assert rewards.shape == (1, 3)
     assert rewards[0, 0].item() == pytest.approx(expected_gold)
     assert rewards[0, 1].item() == pytest.approx(expected_gold)
@@ -133,13 +137,18 @@ def test_rollout_supervisor_uses_asymmetric_length_penalty_only_for_failures() -
         terminal_num_steps=torch.tensor([[3, 3]], dtype=torch.long),
     )
 
-    base_reward = 1.0e-3 + torch.exp(torch.tensor(1.0)).item()
-    failure_reward = 1.0e-3 + torch.exp(torch.tensor(-1.0)).item()
+    base_reward = (
+        1.0e-3
+        + 1.0
+        + torch.exp(torch.tensor(1.0)).item()
+        - torch.exp(torch.tensor(-1.0)).item()
+    )
+    failure_reward = 1.0e-3 + 1.0
     assert terminal_transition.terminal_rewards[0, 0].item() == pytest.approx(
         base_reward
     )
     assert terminal_transition.terminal_rewards[0, 1].item() == pytest.approx(
-        failure_reward * math.exp(-3.0 * alpha)
+        failure_reward - (3.0 * alpha)
     )
     assert terminal_transition.terminal_backward_log_probs.tolist() == [[0.0, 0.0]]
 
@@ -173,8 +182,13 @@ def test_rollout_supervisor_penalizes_cycles_for_success_and_failure() -> None:
         terminal_cycle_counts=torch.tensor([[2, 1]], dtype=torch.long),
     )
 
-    expected_gold = (1.0e-3 + torch.exp(torch.tensor(1.0)).item()) * (cycle_penalty**2)
-    expected_fail = (1.0e-3 + torch.exp(torch.tensor(-1.0)).item()) * cycle_penalty
+    expected_gold = (
+        1.0e-3
+        + 1.0
+        + torch.exp(torch.tensor(1.0)).item()
+        - torch.exp(torch.tensor(-1.0)).item()
+    ) - (2.0 * (1.0 - cycle_penalty))
+    expected_fail = (1.0e-3 + 1.0) - (1.0 - cycle_penalty)
     assert terminal_transition.terminal_rewards[0, 0].item() == pytest.approx(
         expected_gold
     )

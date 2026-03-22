@@ -42,19 +42,22 @@ def apply_forward_constraints(
         )
         edge_agent_batch = distribution.edge_agent_batch
         edge_at_horizon = at_horizon.index_select(0, edge_agent_batch)
-        submit_mask = (
-            distribution.is_submit.to(dtype=torch.bool)
-            if distribution.is_submit is not None
+        stop_action_mask = (
+            distribution.is_stop_action.to(dtype=torch.bool)
+            if distribution.is_stop_action is not None
             else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
         )
-        edge_logits = edge_logits.masked_fill(edge_at_horizon & (~submit_mask), neg_inf)
+        edge_logits = edge_logits.masked_fill(
+            edge_at_horizon & (~stop_action_mask), neg_inf
+        )
     return ForwardActionDistribution(
         edge_logits=edge_logits,
         edge_agent_batch=distribution.edge_agent_batch,
         edge_ids=distribution.edge_ids,
         target_nodes=distribution.target_nodes,
         out_degrees=distribution.out_degrees,
-        is_submit=distribution.is_submit,
+        is_stop_action=distribution.is_stop_action,
+        is_root_action=distribution.is_root_action,
         current_log_f=distribution.current_log_f,
         active_agent_count=distribution.active_agent_count,
         unique_active_state_count=distribution.unique_active_state_count,

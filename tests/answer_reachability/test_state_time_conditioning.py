@@ -4,6 +4,11 @@ import pytest
 import torch
 
 from src.models.gflownet import SearchState
+from src.models.gflownet.path import (
+    STOP_TOKEN_ID,
+    append_stop_token_inplace,
+    initialize_path_token_ids,
+)
 
 from .conftest import make_batch_from_graph, make_policy, make_toy_batch
 
@@ -125,3 +130,108 @@ def test_non_root_state_without_path_history_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="exact path_token_ids"):
         policy.compute_log_state_scores(prepared_batch, invalid_state)
+
+
+def test_absorbing_state_requires_explicit_stop_token_in_sequence() -> None:
+    batch = make_toy_batch()
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    invalid_absorbing = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.tensor([[True]], dtype=torch.bool),
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+        path_token_ids=initialize_path_token_ids(
+            start_nodes=torch.tensor([[0]], dtype=torch.long),
+            max_steps=2,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="STOP_TOKEN_ID"):
+        invalid_absorbing.resolve_path_token_ids(max_steps=2)
+
+
+def test_inactive_rows_do_not_require_stop_token_when_not_absorbing() -> None:
+    batch = make_toy_batch()
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    inactive_padding = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.tensor([[True]], dtype=torch.bool),
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+        path_token_ids=initialize_path_token_ids(
+            start_nodes=torch.tensor([[0]], dtype=torch.long),
+            max_steps=2,
+        ),
+        absorbing_mask=torch.tensor([[False]], dtype=torch.bool),
+    )
+
+    resolved = inactive_padding.resolve_path_token_ids(max_steps=2)
+
+    assert torch.equal(resolved, inactive_padding.path_token_ids)
+
+
+def test_inactive_non_absorbing_rows_do_not_emit_stop_predecessors() -> None:
+    batch = make_toy_batch()
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    inactive_padding = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.tensor([[True]], dtype=torch.bool),
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+        path_token_ids=initialize_path_token_ids(
+            start_nodes=torch.tensor([[0]], dtype=torch.long),
+            max_steps=2,
+        ),
+        absorbing_mask=torch.tensor([[False]], dtype=torch.bool),
+    )
+
+    backward = policy.compute_backward_distribution(prepared_batch, inactive_padding)
+
+    assert int(backward.edge_ids.numel()) == 0
+
+
+def test_sequence_backward_includes_root_and_stop_predecessors() -> None:
+    batch = make_toy_batch()
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+
+    start_state = SearchState.initialize(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_nodes=torch.tensor([[0]], dtype=torch.long),
+        max_steps=2,
+    )
+    start_backward = policy.compute_backward_distribution(prepared_batch, start_state)
+    assert start_backward.is_root_action is not None
+    assert bool(start_backward.is_root_action[0].item()) is True
+    assert int(start_backward.edge_ids[0].item()) == -2
+
+    absorbing_path = initialize_path_token_ids(
+        start_nodes=torch.tensor([[0]], dtype=torch.long),
+        max_steps=2,
+    )
+    absorbing_path = append_stop_token_inplace(
+        path_token_ids=absorbing_path,
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+    )
+    assert int(absorbing_path[0, 0, 1].item()) == STOP_TOKEN_ID
+    absorbing_state = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.tensor([[True]], dtype=torch.bool),
+        num_steps=torch.tensor([[0]], dtype=torch.long),
+        path_token_ids=absorbing_path,
+    )
+    stop_backward = policy.compute_backward_distribution(
+        prepared_batch, absorbing_state
+    )
+    assert stop_backward.is_stop_action is not None
+    assert bool(stop_backward.is_stop_action[0].item()) is True
+    assert int(stop_backward.edge_ids[0].item()) == -1

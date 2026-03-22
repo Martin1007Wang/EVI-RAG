@@ -76,22 +76,27 @@ class SubTrajectoryBalanceLoss:
         batch_size, num_rollouts, max_steps = log_pf_steps.shape
         sequence_horizon = max_steps + 1
         graph_log_z_values = sample_batch.graph_log_z.to(dtype=torch.float32)
+        start_log_probs = sample_batch.start_log_probs.to(dtype=torch.float32)
+        start_state_log_f = sample_batch.start_state_log_f.to(dtype=torch.float32)
 
         state_values = log_pf_steps.new_zeros(
             (batch_size, num_rollouts, sequence_horizon)
         )
-        state_values[:, :, 0] = sample_batch.start_state_log_f.to(dtype=torch.float32)
+        state_values[:, :, 0] = start_state_log_f
         if max_steps > 0:
             state_values[:, :, 1:] = sample_batch.next_state_log_f_steps.to(
                 dtype=torch.float32
             )
 
-        # The current SubTB objective is defined over forward prefix sums and
-        # state/terminal flow anchors. We keep `log_pb_steps` in the sample batch
-        # for interface compatibility, but the loss itself does not depend on it.
+        # The current SubTB objective uses an explicit root boundary residual,
+        # forward prefix sums between active states, and terminal reward anchors.
+        # We keep `log_pb_steps` in the sample batch for interface compatibility,
+        # but the loss itself does not depend on it.
         forward_prefix = self._build_forward_prefix(log_pf_steps=log_pf_steps)
 
-        terminal_counts = getattr(sample_batch, "terminal_action_counts", None)
+        terminal_counts = getattr(sample_batch, "termination_action_steps", None)
+        if terminal_counts is None:
+            terminal_counts = getattr(sample_batch, "terminal_action_counts", None)
         if terminal_counts is None:
             terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long)
         else:
@@ -122,6 +127,13 @@ class SubTrajectoryBalanceLoss:
         if not torch.isfinite(terminal_values).all():
             raise RuntimeError(
                 "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
+            )
+        root_residual = (
+            graph_log_z_values.unsqueeze(1) + start_log_probs - start_state_log_f
+        )
+        if not torch.isfinite(root_residual).all():
+            raise RuntimeError(
+                "Non-finite loss detected in SubTB. Check root log_z/log_pf/log_f."
             )
 
         start_positions = position_ids.unsqueeze(-1)
@@ -172,8 +184,13 @@ class SubTrajectoryBalanceLoss:
 
         state_loss = (pairwise_residual.square() * state_weights).sum(dim=(-2, -1))
         terminal_loss = (terminal_residual.square() * terminal_weights).sum(dim=-1)
-        total_weight = state_weights.sum(dim=(-2, -1)) + terminal_weights.sum(dim=-1)
-        per_rollout_loss = state_loss + terminal_loss
+        root_loss = root_residual.square()
+        total_weight = (
+            state_weights.sum(dim=(-2, -1))
+            + terminal_weights.sum(dim=-1)
+            + torch.ones_like(root_loss)
+        )
+        per_rollout_loss = state_loss + terminal_loss + root_loss
         if bool(self.config.normalize):
             per_rollout_loss = per_rollout_loss / total_weight.clamp_min(1.0)
         loss = per_rollout_loss.mean()
@@ -182,12 +199,9 @@ class SubTrajectoryBalanceLoss:
                 "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
             )
 
-        root_mask = terminal_start_mask[:, :, 0]
-        root_residual = torch.zeros_like(terminal_values)
-        if bool(root_mask.any().item()):
-            root_residual[root_mask] = terminal_residual[:, :, 0][root_mask]
-
         valid_residuals: list[torch.Tensor] = []
+        if int(root_residual.numel()) > 0:
+            valid_residuals.append(root_residual.reshape(-1))
         if bool(pair_mask.any().item()):
             valid_residuals.append(pairwise_residual[pair_mask])
         if bool(terminal_start_mask.any().item()):

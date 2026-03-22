@@ -58,7 +58,11 @@ class _ManualMonteCarloPolicy:
             log_flows=self.start_log_flows,
             log_probs=self.start_log_probs,
             graph_log_z=self.graph_log_z,
+            action_logits=self.start_log_probs,
         )
+
+    def compute_root_action_distribution(self, prepared_batch) -> StartDistribution:  # noqa: ANN001
+        return self.compute_start_distribution(prepared_batch)
 
     def compute_forward_distribution(
         self, prepared_batch, state
@@ -90,7 +94,7 @@ class _ManualMonteCarloPolicy:
                 edge_ids=torch.empty((0,), dtype=torch.long),
                 target_nodes=torch.empty((0,), dtype=torch.long),
                 out_degrees=torch.zeros_like(state.current_nodes, dtype=torch.long),
-                is_submit=torch.empty((0,), dtype=torch.bool),
+                is_stop_action=torch.empty((0,), dtype=torch.bool),
             )
         return ForwardActionDistribution(
             edge_logits=torch.tensor(edge_logits, dtype=torch.float32),
@@ -100,7 +104,7 @@ class _ManualMonteCarloPolicy:
             out_degrees=torch.tensor(out_degrees, dtype=torch.long).view_as(
                 state.current_nodes
             ),
-            is_submit=torch.tensor(is_submit, dtype=torch.bool),
+            is_stop_action=torch.tensor(is_submit, dtype=torch.bool),
         )
 
     @staticmethod

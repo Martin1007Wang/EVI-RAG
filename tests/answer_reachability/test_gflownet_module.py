@@ -167,13 +167,13 @@ def _make_manual_sample_batch(
         terminal_rewards=torch.zeros_like(start_nodes, dtype=torch.float32),
         terminal_log_rewards=torch.zeros_like(start_nodes, dtype=torch.float32),
         success_mask=success_mask,
-        behavior_start_entropy=torch.full(
+        start_entropy=torch.full(
             (batch.num_graphs,),
             fill_value=float(start_entropy),
             dtype=torch.float32,
             device=batch.node_ptr.device,
         ),
-        behavior_start_entropy_normalized=torch.full(
+        start_entropy_normalized=torch.full(
             (batch.num_graphs,),
             fill_value=float(start_entropy_normalized),
             dtype=torch.float32,
@@ -438,6 +438,7 @@ def test_gflownet_training_step_logs_log_z_statistics() -> None:
     assert "log_z_mean" in captured_metrics
     assert "log_z_variance" in captured_metrics
     assert captured_metrics["sampling_temperature"] == pytest.approx(1.0)
+    assert "sampling_temperature_multiplier" not in captured_metrics
 
 
 def test_start_distribution_defines_virtual_source_log_z() -> None:
@@ -464,21 +465,33 @@ def test_start_distribution_defines_virtual_source_log_z() -> None:
     )
 
     assert torch.allclose(
-        start_dist.graph_log_z,
-        torch.tensor([torch.logsumexp(start_dist.log_flows, dim=0).item()]),
-        atol=1.0e-6,
-    )
-    assert torch.allclose(
         module.policy.compute_graph_log_z(prepared_batch),
         start_dist.graph_log_z,
         atol=1.0e-6,
     )
-    assert sampled_nodes.shape == (1, 4)
+    graph_mask = start_dist.candidate_graph_ids == 0
     assert torch.allclose(
-        sampled_log_flows - sampled_log_probs,
-        start_dist.graph_log_z.unsqueeze(1).expand_as(sampled_log_probs),
+        torch.logsumexp(start_dist.log_probs[graph_mask], dim=0),
+        torch.tensor(0.0),
         atol=1.0e-6,
     )
+    assert sampled_nodes.shape == (1, 4)
+    candidate_nodes = start_dist.candidate_nodes_abs[graph_mask]
+    candidate_log_probs = start_dist.log_probs[graph_mask]
+    candidate_log_flows = start_dist.log_flows[graph_mask]
+    for rollout_idx in range(int(sampled_nodes.size(1))):
+        sampled_node = sampled_nodes[0, rollout_idx]
+        candidate_idx = torch.nonzero(
+            candidate_nodes == sampled_node, as_tuple=False
+        ).view(-1)
+        assert int(candidate_idx.numel()) == 1
+        selected_idx = int(candidate_idx.item())
+        assert sampled_log_probs[0, rollout_idx].item() == pytest.approx(
+            float(candidate_log_probs[selected_idx].item())
+        )
+        assert sampled_log_flows[0, rollout_idx].item() == pytest.approx(
+            float(candidate_log_flows[selected_idx].item())
+        )
 
 
 def test_sampler_preserves_selected_start_flow_gradients() -> None:
@@ -486,18 +499,16 @@ def test_sampler_preserves_selected_start_flow_gradients() -> None:
     batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
 
-    def _prefer_graph_moves(*args: object, **kwargs: object) -> torch.Tensor:
-        distribution = kwargs.get("distribution")
-        if distribution is None and len(args) >= 3:
-            distribution = args[2]
-        distribution = cast(Any, distribution)
-        assert distribution is not None
-        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
-        if distribution.is_submit is not None:
-            logits[distribution.is_submit.to(dtype=torch.bool)] = -1.0e9
-        return logits
+    original_forward = module.policy.compute_forward_distribution
 
-    module.policy.compute_behavior_edge_logits = _prefer_graph_moves  # type: ignore[method-assign]
+    def _prefer_graph_moves(prepared_batch_arg, state, **kwargs):  # noqa: ANN001
+        distribution = original_forward(prepared_batch_arg, state, **kwargs)
+        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
+        if distribution.is_stop_action is not None:
+            logits[distribution.is_stop_action.to(dtype=torch.bool)] = -1.0e9
+        return replace(distribution, edge_logits=logits)
+
+    module.policy.compute_forward_distribution = _prefer_graph_moves  # type: ignore[method-assign]
 
     assert module.sampler is not None
     sample_batch = module.sampler.sample(
@@ -514,8 +525,17 @@ def test_sampler_preserves_selected_start_flow_gradients() -> None:
     assert sample_batch.start_log_probs.grad_fn is not None
 
 
-def test_sampler_forces_submit_on_terminal_targets_before_behavior_expansion() -> None:
-    module = _make_module("learned")
+def test_sampler_can_force_stop_on_terminal_targets_before_behavior_expansion() -> None:
+    module = _make_module_with_training_cfg(
+        "learned",
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=3,
+            reward_epsilon=1.0e-3,
+            failure_reward_mode="graph_normalized",
+            sampling_temperature=1.0,
+            force_stop_on_answer_hit=True,
+        ),
+    )
     batch = make_batch_from_graph(
         num_nodes=2,
         edge_index=torch.tensor([[0], [1]], dtype=torch.long),
@@ -524,7 +544,7 @@ def test_sampler_forces_submit_on_terminal_targets_before_behavior_expansion() -
         a_local_indices=torch.tensor([0], dtype=torch.long),
         answer_entity_ids=torch.tensor([100], dtype=torch.long),
         node_global_ids=torch.tensor([100, 101], dtype=torch.long),
-        sample_id="submit-before-expand",
+        sample_id="stop-before-expand",
     )
     prepared_batch = module.policy.prepare_batch(batch)
 
@@ -558,15 +578,59 @@ def test_sampler_forces_submit_on_terminal_targets_before_behavior_expansion() -
         temperature=1.0,
     )
 
-    assert sample_batch.trace_submit_mask is not None
-    assert sample_batch.terminal_action_counts is not None
+    assert sample_batch.trace_stop_mask is not None
+    assert sample_batch.termination_action_steps is not None
     assert call_count == 0
-    assert bool(sample_batch.trace_submit_mask[0, 0, 0].item()) is True
+    assert bool(sample_batch.trace_stop_mask[0, 0, 0].item()) is True
     assert int(sample_batch.trace_edge_ids[0, 0, 0].item()) == -1
-    assert int(sample_batch.terminal_action_counts[0, 0].item()) == 1
+    assert int(sample_batch.termination_action_steps[0, 0].item()) == 1
     assert int(sample_batch.terminal_num_steps[0, 0].item()) == 0
     assert int(sample_batch.terminal_nodes[0, 0].item()) == 0
     assert bool(sample_batch.success_mask[0, 0].item()) is True
+
+
+def test_sampler_does_not_force_stop_on_terminal_targets_by_default() -> None:
+    module = _make_module("learned")
+    batch = make_batch_from_graph(
+        num_nodes=2,
+        edge_index=torch.tensor([[0], [1]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([0], dtype=torch.long),
+        answer_entity_ids=torch.tensor([100], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        sample_id="no-forced-stop-default",
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    original_forward = module.policy.compute_forward_distribution
+
+    def _prefer_graph_moves(prepared_batch_arg, state, **kwargs):  # noqa: ANN001
+        distribution = original_forward(prepared_batch_arg, state, **kwargs)
+        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
+        if distribution.is_stop_action is not None:
+            logits[distribution.is_stop_action.to(dtype=torch.bool)] = -1.0e9
+        return replace(distribution, edge_logits=logits)
+
+    module.policy.compute_forward_distribution = _prefer_graph_moves  # type: ignore[method-assign]
+
+    assert module.sampler is not None
+    sample_batch = module.sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
+    )
+
+    assert sample_batch.trace_stop_mask is not None
+    assert sample_batch.termination_action_steps is not None
+    assert bool(sample_batch.trace_stop_mask[0, 0, 0].item()) is False
+    assert int(sample_batch.trace_edge_ids[0, 0, 0].item()) == 0
+    assert int(sample_batch.termination_action_steps[0, 0].item()) == 2
+    assert int(sample_batch.terminal_num_steps[0, 0].item()) == 1
+    assert int(sample_batch.terminal_nodes[0, 0].item()) == 1
+    assert bool(sample_batch.success_mask[0, 0].item()) is False
 
 
 def test_sampler_entity_sink_uses_deterministic_terminal_backward_log_prob() -> None:
@@ -606,10 +670,10 @@ def test_sampler_entity_sink_uses_deterministic_terminal_backward_log_prob() -> 
         temperature=1.0,
     )
 
-    assert sample_batch.trace_submit_mask is not None
+    assert sample_batch.trace_stop_mask is not None
     assert sample_batch.terminal_entity_ids is not None
     assert sample_batch.terminal_backward_log_probs is not None
-    assert bool(sample_batch.trace_submit_mask[0, 0, 0].item()) is True
+    assert bool(sample_batch.trace_stop_mask[0, 0, 0].item()) is True
     assert sample_batch.terminal_entity_ids[0, 0].item() == 100
     assert sample_batch.terminal_backward_log_probs[0, 0].item() == pytest.approx(0.0)
     assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(0.0)
@@ -645,18 +709,16 @@ def test_sampler_keeps_success_terminal_reward_free_of_length_penalty() -> None:
     )
     prepared_batch = module.policy.prepare_batch(batch)
 
-    def _prefer_graph_moves(*args: object, **kwargs: object) -> torch.Tensor:
-        distribution = kwargs.get("distribution")
-        if distribution is None and len(args) >= 3:
-            distribution = args[2]
-        distribution = cast(Any, distribution)
-        assert distribution is not None
-        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
-        if distribution.is_submit is not None:
-            logits[distribution.is_submit.to(dtype=torch.bool)] = -1.0e9
-        return logits
+    original_forward = module.policy.compute_forward_distribution
 
-    module.policy.compute_behavior_edge_logits = _prefer_graph_moves  # type: ignore[method-assign]
+    def _prefer_graph_moves(prepared_batch_arg, state, **kwargs):  # noqa: ANN001
+        distribution = original_forward(prepared_batch_arg, state, **kwargs)
+        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
+        if distribution.is_stop_action is not None:
+            logits[distribution.is_stop_action.to(dtype=torch.bool)] = -1.0e9
+        return replace(distribution, edge_logits=logits)
+
+    module.policy.compute_forward_distribution = _prefer_graph_moves  # type: ignore[method-assign]
 
     assert module.sampler is not None
     sample_batch = module.sampler.sample(
@@ -667,7 +729,12 @@ def test_sampler_keeps_success_terminal_reward_free_of_length_penalty() -> None:
         temperature=1.0,
     )
 
-    base_reward = 1.0e-3 + torch.exp(torch.tensor(1.0)).item()
+    base_reward = (
+        1.0e-3
+        + 1.0
+        + torch.exp(torch.tensor(1.0)).item()
+        - torch.exp(torch.tensor(-1.0)).item()
+    )
     assert sample_batch.terminal_num_steps[0, 0].item() == 1
     assert sample_batch.terminal_rewards[0, 0].item() == pytest.approx(base_reward)
     assert sample_batch.terminal_log_rewards[0, 0].item() == pytest.approx(
@@ -675,7 +742,7 @@ def test_sampler_keeps_success_terminal_reward_free_of_length_penalty() -> None:
     )
 
 
-def test_sampler_disables_autograd_for_behavior_policy_queries() -> None:
+def test_sampler_samples_root_actions_without_behavior_helpers() -> None:
     module = _make_module("learned")
     batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
@@ -683,19 +750,26 @@ def test_sampler_disables_autograd_for_behavior_policy_queries() -> None:
     assert module.sampler is not None
     sampler = cast(ForwardTrajectoryGFNSampler, module.sampler)
     start_grad_enabled: list[bool] = []
-    behavior_grad_enabled: list[bool] = []
-    original_start = module.policy.compute_behavior_start_distribution
+    behavior_start_calls: list[bool] = []
+    behavior_edge_calls: list[bool] = []
+    original_start = module.policy.compute_root_action_distribution
     original_behavior_logits = module.policy.compute_behavior_edge_logits
 
     def _wrapped_start(prepared_batch_arg):  # noqa: ANN001
         start_grad_enabled.append(torch.is_grad_enabled())
         return original_start(prepared_batch_arg)
 
+    def _wrapped_behavior_start(prepared_batch_arg):  # noqa: ANN001
+        del prepared_batch_arg
+        behavior_start_calls.append(True)
+        return original_start(prepared_batch)
+
     def _wrapped_behavior_logits(prepared_batch_arg, state, distribution):  # noqa: ANN001
-        behavior_grad_enabled.append(torch.is_grad_enabled())
+        behavior_edge_calls.append(True)
         return original_behavior_logits(prepared_batch_arg, state, distribution)
 
-    module.policy.compute_behavior_start_distribution = _wrapped_start  # type: ignore[method-assign]
+    module.policy.compute_root_action_distribution = _wrapped_start  # type: ignore[method-assign]
+    module.policy.compute_behavior_start_distribution = _wrapped_behavior_start  # type: ignore[method-assign]
     module.policy.compute_behavior_edge_logits = _wrapped_behavior_logits  # type: ignore[method-assign]
 
     sampler.sample(
@@ -706,10 +780,11 @@ def test_sampler_disables_autograd_for_behavior_policy_queries() -> None:
         temperature=1.0,
     )
 
-    assert start_grad_enabled and all(flag is False for flag in start_grad_enabled)
-    assert behavior_grad_enabled and all(
-        flag is False for flag in behavior_grad_enabled
-    )
+    assert start_grad_enabled
+    assert start_grad_enabled[0] is False
+    assert any(flag is True for flag in start_grad_enabled[1:])
+    assert behavior_start_calls == []
+    assert behavior_edge_calls == []
 
 
 def test_target_policy_ignores_behavior_heuristic_beta() -> None:
@@ -923,11 +998,11 @@ def test_sampler_skips_move_backward_reconstruction() -> None:
         temperature=1.0,
     )
 
-    assert sample_batch.trace_submit_mask is not None
+    assert sample_batch.trace_stop_mask is not None
     assert torch.isfinite(sample_batch.log_pf_steps).all()
     assert torch.equal(
-        sample_batch.log_pb_steps[~sample_batch.trace_submit_mask],
-        torch.zeros_like(sample_batch.log_pb_steps[~sample_batch.trace_submit_mask]),
+        sample_batch.log_pb_steps[~sample_batch.trace_stop_mask],
+        torch.zeros_like(sample_batch.log_pb_steps[~sample_batch.trace_stop_mask]),
     )
 
 
@@ -1188,13 +1263,10 @@ def test_adaptive_sampling_controller_increases_budget_after_sparse_rollouts() -
                 warmup_steps=0,
                 rollout_growth_factor=2.0,
                 rollout_shrink_factor=0.5,
-                temperature_multiplier_up=1.5,
                 low_success_rate_threshold=0.2,
                 high_success_rate_threshold=0.8,
                 low_unique_success_paths_per_100_rollouts=1.0,
                 high_unique_success_paths_per_100_rollouts=20.0,
-                low_start_entropy_normalized=0.3,
-                high_start_entropy_normalized=0.9,
                 low_subtb_residual_variance=0.1,
                 high_subtb_residual_variance=0.3,
             ),
@@ -1242,7 +1314,7 @@ def test_adaptive_sampling_controller_increases_budget_after_sparse_rollouts() -
 
     assert captured_rollout_calls[0][0] == 2
     assert captured_rollout_calls[1][0] == 4
-    assert captured_rollout_calls[1][1] == pytest.approx(1.5)
+    assert captured_rollout_calls[1][1] == pytest.approx(1.0)
 
 
 def test_sampler_emits_deterministic_backward_log_probs_for_path_state() -> None:
@@ -1302,7 +1374,7 @@ def test_forward_distribution_is_decoupled_from_state_flow_head() -> None:
     )
 
     distribution = module.policy.compute_forward_distribution(prepared_batch, state)
-    submit_mask = distribution.is_submit
+    submit_mask = distribution.is_stop_action
     assert submit_mask is not None
     graph_mask = ~submit_mask
     child_states = [
@@ -1366,7 +1438,7 @@ def test_forward_distribution_matches_under_aggressive_chunking() -> None:
     assert torch.equal(chunked.edge_ids, baseline.edge_ids)
     assert torch.equal(chunked.target_nodes, baseline.target_nodes)
     assert torch.equal(chunked.out_degrees, baseline.out_degrees)
-    assert torch.equal(chunked.is_submit, baseline.is_submit)
+    assert torch.equal(chunked.is_stop_action, baseline.is_stop_action)
     assert torch.allclose(
         chunked.edge_logits.to(dtype=torch.float32),
         baseline.edge_logits.to(dtype=torch.float32),
@@ -1469,6 +1541,21 @@ def test_forward_distribution_shortlists_high_degree_candidates() -> None:
         return features
 
     module.policy.base_policy.build_local_state_features = _mock_local_features  # type: ignore[method-assign]
+    module.policy.base_policy._compute_shortlist_scores = (  # type: ignore[method-assign]
+        lambda prepared_batch,
+        flat_state_features,
+        edge_agent_batch,
+        target_nodes,
+        child_num_steps,
+        graph_ids: torch.tensor(
+            [
+                {1: 1.0, 2: 4.0, 3: 2.0}.get(int(node.item()), 0.0)
+                for node in target_nodes
+            ],
+            device=target_nodes.device,
+            dtype=torch.float32,
+        )
+    )
     module.policy.base_policy.forward_policy_head.forward = (  # type: ignore[method-assign]
         lambda current_state_features,
         candidate_state_features,
@@ -1480,8 +1567,8 @@ def test_forward_distribution_shortlists_high_degree_candidates() -> None:
     )
 
     distribution = module.policy.compute_forward_distribution(prepared_batch, state)
-    assert distribution.is_submit is not None
-    graph_mask = ~distribution.is_submit.to(dtype=torch.bool)
+    assert distribution.is_stop_action is not None
+    graph_mask = ~distribution.is_stop_action.to(dtype=torch.bool)
 
     assert torch.equal(distribution.edge_ids[graph_mask], torch.tensor([1]))
     assert torch.equal(distribution.target_nodes[graph_mask], torch.tensor([2]))
