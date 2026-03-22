@@ -24,8 +24,6 @@ def _make_edge_retrieval_module() -> GFlowNetModule:
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
         ),
         heuristic_cfg=HeuristicConfig(kind="topology", beta=0.5),

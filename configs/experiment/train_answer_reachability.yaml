@@ -54,11 +54,6 @@ model:
       degree_threshold: 32
       heuristic_weight: 1.0
   training_cfg:
-    answer_reward:
-      mode: entity_sink
-      beta: 1.25
-      cycle_penalty: 0.85
-      failure_length_penalty_alpha: 0.05
     guidance:
       loss_weight: 0.0
       detach_features: true

@@ -10,7 +10,6 @@ import src.models.gflownet.policy as gflownet_policy_impl
 import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
     AdaptiveSamplingConfig,
-    AnswerRewardConfig,
     CandidateShortlistConfig,
     SearchEvalConfig,
     BackboneConfig,
@@ -67,8 +66,6 @@ def _make_module(h_kind: str) -> GFlowNetModule:
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
         ),
         heuristic_cfg=HeuristicConfig(
@@ -102,8 +99,6 @@ def _make_module_with_training_cfg(
             if training_cfg is not None
             else GFlowNetTrainingConfig(
                 rollout_batch_size=3,
-                reward_epsilon=1.0e-3,
-                failure_reward_mode="graph_normalized",
                 sampling_temperature=1.0,
             )
         ),
@@ -288,6 +283,24 @@ def test_predict_epoch_end_summarizes_prediction_metrics() -> None:
     assert module.get_predict_metrics() == {"answer/hit@1": 0.25}
 
 
+def test_predict_epoch_end_prefers_online_accumulator_over_jsonl_reread() -> None:
+    module = _make_module("topology")
+    batch = make_toy_batch()
+    module.on_predict_epoch_start()
+    outputs = module.predict_step(batch, batch_idx=0)
+    module.on_predict_batch_end(outputs, batch, batch_idx=0)
+
+    def _unexpected_jsonl_summary(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        raise AssertionError("expected online predict metric accumulation")
+
+    module.metric_runtime.summarize_predict_epoch_from_jsonl = _unexpected_jsonl_summary  # type: ignore[attr-defined, method-assign]
+
+    module.on_predict_epoch_end()
+
+    assert module.get_predict_metrics()["answer/gold_mass"] >= 0.0
+
+
 def test_on_predict_batch_end_ignores_none_outputs() -> None:
     module = _make_module("topology")
     module.on_predict_epoch_start()
@@ -348,6 +361,42 @@ def test_write_prediction_artifacts_accepts_write_config(tmp_path) -> None:
     assert captured["results"] == ["result"]
     assert captured["labels"] == ["label"]
     assert paths == {"prompt_path": tmp_path / "test.jsonl"}
+
+
+def test_write_prediction_artifacts_prefers_jsonl_cache_when_predict_batches_recorded(
+    tmp_path,
+) -> None:
+    module = _make_module("topology")
+    batch = make_toy_batch()
+    module.on_predict_epoch_start()
+    outputs = module.predict_step(batch, batch_idx=0)
+    module.on_predict_batch_end(outputs, batch, batch_idx=0)
+    captured: dict[str, object] = {}
+
+    def _write_prediction_artifacts_from_jsonl(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"prompt_path": tmp_path / "streamed.jsonl"}
+
+    def _unexpected_write_prediction_artifacts(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        raise AssertionError("expected jsonl-backed artifact writing path")
+
+    module.metric_runtime.write_prediction_artifacts_from_jsonl = (  # type: ignore[attr-defined, method-assign]
+        _write_prediction_artifacts_from_jsonl
+    )
+    module.metric_runtime.write_prediction_artifacts = (
+        _unexpected_write_prediction_artifacts  # type: ignore[method-assign]
+    )
+
+    paths = module.write_prediction_artifacts(
+        output_dir=tmp_path,
+        split="test",
+        artifact_name="rankflow",
+    )
+
+    assert paths == {"prompt_path": tmp_path / "streamed.jsonl"}
+    assert str(captured["results_path"]).endswith("results.jsonl")
+    assert str(captured["labels_path"]).endswith("labels.jsonl")
 
 
 def test_log_metric_bundle_syncs_only_epoch_metrics() -> None:
@@ -530,8 +579,6 @@ def test_sampler_can_force_stop_on_terminal_targets_before_behavior_expansion() 
         "learned",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
             force_stop_on_answer_hit=True,
         ),
@@ -633,19 +680,11 @@ def test_sampler_does_not_force_stop_on_terminal_targets_by_default() -> None:
     assert bool(sample_batch.success_mask[0, 0].item()) is False
 
 
-def test_sampler_entity_sink_uses_deterministic_terminal_backward_log_prob() -> None:
+def test_sampler_uses_deterministic_terminal_backward_log_prob() -> None:
     module = _make_module_with_training_cfg(
         "topology",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=1,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
-            answer_reward=AnswerRewardConfig(
-                mode="entity_sink",
-                beta=1.0,
-                terminal_reward_scale="none",
-                terminal_backward_mode="uniform_entity_alias",
-            ),
             sampling_temperature=1.0,
         ),
     )
@@ -657,7 +696,7 @@ def test_sampler_entity_sink_uses_deterministic_terminal_backward_log_prob() -> 
         a_local_indices=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([100], dtype=torch.long),
         node_global_ids=torch.tensor([100, 100], dtype=torch.long),
-        sample_id="entity-sink-submit",
+        sample_id="stop-action-submit",
     )
     prepared_batch = module.policy.prepare_batch(batch)
 
@@ -679,21 +718,11 @@ def test_sampler_entity_sink_uses_deterministic_terminal_backward_log_prob() -> 
     assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(0.0)
 
 
-def test_sampler_keeps_success_terminal_reward_free_of_length_penalty() -> None:
-    alpha = 0.3
+def test_sampler_assigns_fixed_gold_energy_reward() -> None:
     module = _make_module_with_training_cfg(
         "none",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=1,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
-            answer_reward=AnswerRewardConfig(
-                mode="entity_sink",
-                beta=1.0,
-                length_penalty_alpha=alpha,
-                terminal_reward_scale="none",
-                terminal_backward_mode="uniform_entity_alias",
-            ),
             sampling_temperature=1.0,
         ),
     )
@@ -729,17 +758,9 @@ def test_sampler_keeps_success_terminal_reward_free_of_length_penalty() -> None:
         temperature=1.0,
     )
 
-    base_reward = (
-        1.0e-3
-        + 1.0
-        + torch.exp(torch.tensor(1.0)).item()
-        - torch.exp(torch.tensor(-1.0)).item()
-    )
     assert sample_batch.terminal_num_steps[0, 0].item() == 1
-    assert sample_batch.terminal_rewards[0, 0].item() == pytest.approx(base_reward)
-    assert sample_batch.terminal_log_rewards[0, 0].item() == pytest.approx(
-        torch.log(torch.tensor(base_reward)).item()
-    )
+    assert sample_batch.terminal_rewards[0, 0].item() == pytest.approx(1.0)
+    assert sample_batch.terminal_log_rewards[0, 0].item() == pytest.approx(0.0)
 
 
 def test_sampler_samples_root_actions_without_behavior_helpers() -> None:
@@ -910,8 +931,6 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
         beta=0.5,
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
         ),
     )
@@ -1011,7 +1030,6 @@ def test_guidance_loss_uses_learned_behavior_head_targets() -> None:
         "learned",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=2,
-            answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
             guidance=GuidanceLossConfig(loss_weight=0.2, detach_features=True),
         ),
     )
@@ -1044,7 +1062,6 @@ def test_training_step_logs_guidance_metrics_when_enabled() -> None:
         "learned",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=2,
-            answer_reward=AnswerRewardConfig(mode="binary_ranking", beta=1.0),
             guidance=GuidanceLossConfig(loss_weight=0.1, detach_features=True),
         ),
     )
@@ -1469,8 +1486,6 @@ def test_forward_distribution_shortlists_high_degree_candidates() -> None:
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
         ),
         heuristic_cfg=HeuristicConfig(kind="topology", beta=0.0),

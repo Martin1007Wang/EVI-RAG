@@ -6,7 +6,6 @@
 from .backbone import BackboneConfig
 from .gflownet import (
     AdaptiveSamplingConfig,
-    AnswerRewardConfig,
     GFlowNetTrainingConfig,
     GuidanceLossConfig,
     HeuristicConfig,
@@ -34,7 +33,6 @@ __all__ = [
     "TransitionPolicyHeadConfig",
     "CandidateShortlistConfig",
     "AdaptiveSamplingConfig",
-    "AnswerRewardConfig",
     "HeuristicConfig",
     "GFlowNetTrainingConfig",
     "GuidanceLossConfig",

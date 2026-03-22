@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Protocol
 
 import torch
 
 from src.graph_runtime import TrajectoryBatch
-from src.models.configs import AnswerRewardConfig
 from src.utils.segment_ops import sample_segmented_one_1d
 
 from .path import (
     append_relation_and_node_tokens_inplace,
     append_stop_token_inplace,
-    count_path_node_revisits,
     initialize_path_token_ids,
 )
 from .transitions import apply_forward_constraints
@@ -33,9 +30,6 @@ class TrajectoryRolloutSupervisorProtocol(Protocol):
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-        success_mask: torch.Tensor,
-        terminal_num_steps: torch.Tensor | None = None,
-        terminal_cycle_counts: torch.Tensor | None = None,
     ) -> "TerminalTransitionBatch": ...
 
     def compute_terminal_rewards(
@@ -43,19 +37,19 @@ class TrajectoryRolloutSupervisorProtocol(Protocol):
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-        success_mask: torch.Tensor,
-        terminal_num_steps: torch.Tensor | None = None,
-        terminal_cycle_counts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 @dataclass(frozen=True)
-class _AnswerRewardMetadata:
+class _AnswerSupervisionMetadata:
     entity_offset: torch.Tensor
     key_base: torch.Tensor
     gold_keys: torch.Tensor
-    alias_keys: torch.Tensor
-    alias_counts: torch.Tensor
+
+
+# Fixed terminal energy reward keeps supervision entirely in log-reward space.
+_GOLD_TERMINAL_LOG_REWARD = 0.0
+_NON_GOLD_TERMINAL_LOG_REWARD = -3.0
 
 
 @dataclass(frozen=True)
@@ -80,45 +74,15 @@ def _build_answer_mask(batch: TrajectoryBatch) -> torch.Tensor:
 
 
 class AnswerReachabilityTrajectorySupervisor:
-    def __init__(
-        self,
-        *,
-        epsilon: float,
-        failure_reward_mode: str,
-        answer_reward: AnswerRewardConfig | None = None,
-    ) -> None:
-        self.epsilon = float(epsilon)
-        self.failure_reward_mode = str(failure_reward_mode)
-        if self.failure_reward_mode not in {"constant", "graph_normalized"}:
-            raise ValueError(
-                "failure_reward_mode must be one of {'constant', 'graph_normalized'}."
-            )
-        self.answer_reward = answer_reward or AnswerRewardConfig()
+    """Fixed terminal-energy supervisor for answer reachability.
 
-    def _compute_legacy_rewards(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        terminal_nodes: torch.Tensor,
-        success_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        rewards = torch.full(
-            terminal_nodes.shape,
-            fill_value=self.epsilon,
-            device=terminal_nodes.device,
-            dtype=torch.float32,
-        )
-        if self.failure_reward_mode == "graph_normalized":
-            answer_counts = (batch.a_ptr[1:] - batch.a_ptr[:-1]).to(dtype=torch.float32)
-            non_answer_counts = (
-                (batch.node_ptr[1:] - batch.node_ptr[:-1]).to(dtype=torch.float32)
-                - answer_counts
-            ).clamp_min(1.0)
-            graph_non_answer_counts = non_answer_counts.to(
-                device=terminal_nodes.device
-            ).unsqueeze(1)
-            rewards = self.epsilon / graph_non_answer_counts.expand_as(terminal_nodes)
-        return torch.where(success_mask, torch.ones_like(rewards), rewards)
+    The terminal anchor depends only on whether the reached entity is gold. Path
+    length, cycle counts, and terminal backward heuristics are intentionally not
+    part of the reward semantics anymore.
+    """
+
+    def __init__(self) -> None:
+        pass
 
     @staticmethod
     def _graph_ids_from_ptr(ptr: torch.Tensor) -> torch.Tensor:
@@ -133,7 +97,9 @@ class AnswerReachabilityTrajectorySupervisor:
         )
 
     @staticmethod
-    def _build_answer_reward_metadata(batch: TrajectoryBatch) -> _AnswerRewardMetadata:
+    def _build_answer_supervision_metadata(
+        batch: TrajectoryBatch,
+    ) -> _AnswerSupervisionMetadata:
         node_global_ids = batch.node_global_ids.to(
             device=batch.node_ptr.device,
             dtype=torch.long,
@@ -167,39 +133,11 @@ class AnswerReachabilityTrajectorySupervisor:
             gold_keys = torch.empty(
                 (0,), device=batch.node_ptr.device, dtype=torch.long
             )
-
-        node_graph_ids = AnswerReachabilityTrajectorySupervisor._graph_ids_from_ptr(
-            batch.node_ptr.to(device=batch.node_ptr.device, dtype=torch.long)
-        )
-        if int(node_global_ids.numel()) > 0:
-            alias_raw_keys = node_graph_ids * key_base + (
-                node_global_ids + entity_offset
-            )
-            alias_sorted_keys = torch.sort(alias_raw_keys).values
-            alias_keys, alias_counts = torch.unique_consecutive(
-                alias_sorted_keys,
-                return_counts=True,
-            )
-        else:
-            alias_keys = torch.empty(
-                (0,), device=batch.node_ptr.device, dtype=torch.long
-            )
-            alias_counts = torch.empty(
-                (0,), device=batch.node_ptr.device, dtype=torch.long
-            )
-        return _AnswerRewardMetadata(
+        return _AnswerSupervisionMetadata(
             entity_offset=entity_offset,
             key_base=key_base,
             gold_keys=gold_keys,
-            alias_keys=alias_keys,
-            alias_counts=alias_counts,
         )
-
-    @staticmethod
-    def _compute_binary_ranking_base_reward(
-        *, reward_cfg: AnswerRewardConfig, epsilon: float, utility: float
-    ) -> float:
-        return float(epsilon) + math.exp(float(reward_cfg.beta) * float(utility))
 
     @staticmethod
     def _flatten_terminal_graph_ids(terminal_values: torch.Tensor) -> torch.Tensor:
@@ -214,11 +152,11 @@ class AnswerReachabilityTrajectorySupervisor:
         return graph_ids.view(view_shape).expand_as(terminal_values).reshape(-1)
 
     @staticmethod
-    def _lookup_terminal_metadata(
+    def _lookup_terminal_is_gold(
         *,
-        metadata: _AnswerRewardMetadata,
+        metadata: _AnswerSupervisionMetadata,
         terminal_entity_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         flat_graph_ids = (
             AnswerReachabilityTrajectorySupervisor._flatten_terminal_graph_ids(
                 terminal_entity_ids
@@ -237,106 +175,34 @@ class AnswerReachabilityTrajectorySupervisor:
                 metadata.gold_keys.index_select(0, gold_match_idx[gold_in_range])
                 == terminal_keys[gold_in_range]
             )
+        return is_gold.view_as(terminal_entity_ids)
 
-        alias_counts = torch.ones_like(terminal_keys, dtype=torch.float32)
-        if int(metadata.alias_keys.numel()) > 0:
-            alias_match_idx = torch.searchsorted(metadata.alias_keys, terminal_keys)
-            alias_in_range = alias_match_idx < int(metadata.alias_keys.numel())
-            exact_alias = torch.zeros_like(alias_in_range)
-            exact_alias[alias_in_range] = (
-                metadata.alias_keys.index_select(0, alias_match_idx[alias_in_range])
-                == terminal_keys[alias_in_range]
-            )
-            alias_counts[exact_alias] = metadata.alias_counts.index_select(
-                0, alias_match_idx[exact_alias]
-            ).to(dtype=torch.float32)
-        return is_gold.view_as(terminal_entity_ids), alias_counts.view_as(
-            terminal_entity_ids
-        )
-
-    def _compute_answer_ranking_answer_rewards(
+    def _compute_terminal_energy_log_rewards(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_entity_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        metadata = self._build_answer_reward_metadata(batch)
-        reward_cfg = self.answer_reward
-        is_gold, alias_counts = self._lookup_terminal_metadata(
+        metadata = self._build_answer_supervision_metadata(batch)
+        is_gold = self._lookup_terminal_is_gold(
             metadata=metadata,
             terminal_entity_ids=terminal_entity_ids,
         )
-        utility = torch.where(
+        log_rewards = torch.where(
             is_gold,
             torch.full_like(
                 terminal_entity_ids,
-                float(reward_cfg.positive_utility),
+                fill_value=_GOLD_TERMINAL_LOG_REWARD,
                 dtype=torch.float32,
             ),
             torch.full_like(
                 terminal_entity_ids,
-                float(reward_cfg.negative_utility),
+                fill_value=_NON_GOLD_TERMINAL_LOG_REWARD,
                 dtype=torch.float32,
             ),
         )
-        baseline_utility = min(
-            float(reward_cfg.positive_utility),
-            float(reward_cfg.negative_utility),
-        )
-        baseline_reward = math.exp(float(reward_cfg.beta) * baseline_utility)
-        rewards = (
-            float(self.epsilon)
-            + 1.0
-            + torch.exp(float(reward_cfg.beta) * utility)
-            - baseline_reward
-        )
-        del batch, alias_counts
-        return rewards.to(dtype=torch.float32), is_gold.to(dtype=torch.bool)
-
-    def _compute_terminal_answer_rewards(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        terminal_nodes: torch.Tensor,
-        terminal_entity_ids: torch.Tensor,
-        success_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.answer_reward.mode == "legacy":
-            return (
-                self._compute_legacy_rewards(
-                    batch=batch,
-                    terminal_nodes=terminal_nodes,
-                    success_mask=success_mask,
-                ),
-                success_mask.to(dtype=torch.bool),
-            )
-        return self._compute_answer_ranking_answer_rewards(
-            batch=batch,
-            terminal_entity_ids=terminal_entity_ids,
-        )
-
-    def _compute_terminal_structure_costs(
-        self,
-        *,
-        success_mask: torch.Tensor,
-        terminal_num_steps: torch.Tensor,
-        terminal_cycle_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        structure_costs = torch.zeros_like(terminal_num_steps, dtype=torch.float32)
-        cycle_cost = max(0.0, 1.0 - float(self.answer_reward.cycle_penalty or 1.0))
-        if cycle_cost > 0.0:
-            structure_costs = (
-                structure_costs
-                + terminal_cycle_counts.to(dtype=torch.float32) * cycle_cost
-            )
-        alpha = float(self.answer_reward.failure_length_penalty_alpha or 0.0)
-        if alpha > 0.0:
-            structure_costs = structure_costs + (
-                (~success_mask).to(dtype=torch.float32)
-                * terminal_num_steps.to(dtype=torch.float32)
-                * alpha
-            )
-        return structure_costs * float(self.answer_reward.structure_cost_weight)
+        del batch
+        return log_rewards, is_gold.to(dtype=torch.bool)
 
     @staticmethod
     def _resolve_terminal_entity_ids(
@@ -349,107 +215,24 @@ class AnswerReachabilityTrajectorySupervisor:
         terminal_entity_ids = node_global_ids.index_select(0, flat_terminal_nodes)
         return terminal_entity_ids.view_as(terminal_nodes)
 
-    def _compute_entity_sink_backward_log_probs(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        terminal_entity_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        del batch
-        return torch.zeros_like(terminal_entity_ids, dtype=torch.float32)
-
-    @staticmethod
-    def _resolve_terminal_num_steps(
-        *, terminal_nodes: torch.Tensor, terminal_num_steps: torch.Tensor | None
-    ) -> torch.Tensor:
-        if terminal_num_steps is None:
-            return torch.zeros_like(terminal_nodes, dtype=torch.long)
-        if tuple(terminal_num_steps.shape) != tuple(terminal_nodes.shape):
-            raise ValueError(
-                "terminal_num_steps must match terminal_nodes shape. "
-                f"terminal_num_steps={tuple(terminal_num_steps.shape)} "
-                f"terminal_nodes={tuple(terminal_nodes.shape)}."
-            )
-        return terminal_num_steps.to(device=terminal_nodes.device, dtype=torch.long)
-
-    @staticmethod
-    def _resolve_terminal_cycle_counts(
-        *, terminal_nodes: torch.Tensor, terminal_cycle_counts: torch.Tensor | None
-    ) -> torch.Tensor:
-        if terminal_cycle_counts is None:
-            return torch.zeros_like(terminal_nodes, dtype=torch.long)
-        if tuple(terminal_cycle_counts.shape) != tuple(terminal_nodes.shape):
-            raise ValueError(
-                "terminal_cycle_counts must match terminal_nodes shape. "
-                f"terminal_cycle_counts={tuple(terminal_cycle_counts.shape)} "
-                f"terminal_nodes={tuple(terminal_nodes.shape)}."
-            )
-        return terminal_cycle_counts.to(device=terminal_nodes.device, dtype=torch.long)
-
-    def _compose_terminal_rewards(
-        self,
-        *,
-        terminal_answer_rewards: torch.Tensor,
-        success_mask: torch.Tensor,
-        terminal_num_steps: torch.Tensor,
-        terminal_cycle_counts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        terminal_structure_costs = self._compute_terminal_structure_costs(
-            success_mask=success_mask,
-            terminal_num_steps=terminal_num_steps,
-            terminal_cycle_counts=terminal_cycle_counts,
-        )
-        terminal_rewards = terminal_answer_rewards - terminal_structure_costs
-        if bool((terminal_rewards <= 0.0).any().item()):
-            min_reward = float(terminal_rewards.min().item())
-            min_answer_reward = float(terminal_answer_rewards.min().item())
-            max_structure_cost = float(terminal_structure_costs.max().item())
-            raise ValueError(
-                "Terminal reward must stay strictly positive for SubTB. "
-                f"min_reward={min_reward:.6f} min_answer_reward={min_answer_reward:.6f} "
-                f"max_structure_cost={max_structure_cost:.6f}. Reduce structure penalties or "
-                "increase the answer reward floor."
-            )
-        return terminal_rewards, terminal_rewards.log()
-
     def resolve_terminal_transitions(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-        success_mask: torch.Tensor,
-        terminal_num_steps: torch.Tensor | None = None,
-        terminal_cycle_counts: torch.Tensor | None = None,
     ) -> TerminalTransitionBatch:
         terminal_entity_ids = self._resolve_terminal_entity_ids(
             batch=batch,
             terminal_nodes=terminal_nodes,
         )
-        resolved_terminal_num_steps = self._resolve_terminal_num_steps(
-            terminal_nodes=terminal_nodes,
-            terminal_num_steps=terminal_num_steps,
-        )
-        resolved_terminal_cycle_counts = self._resolve_terminal_cycle_counts(
-            terminal_nodes=terminal_nodes,
-            terminal_cycle_counts=terminal_cycle_counts,
-        )
-        terminal_answer_rewards, reward_success_mask = (
-            self._compute_terminal_answer_rewards(
-                batch=batch,
-                terminal_nodes=terminal_nodes,
-                terminal_entity_ids=terminal_entity_ids,
-                success_mask=success_mask,
-            )
+        terminal_log_rewards, _ = self._compute_terminal_energy_log_rewards(
+            batch=batch,
+            terminal_entity_ids=terminal_entity_ids,
         )
         terminal_backward_log_probs = torch.zeros_like(
-            terminal_answer_rewards, dtype=torch.float32
+            terminal_log_rewards, dtype=torch.float32
         )
-        terminal_rewards, terminal_log_rewards = self._compose_terminal_rewards(
-            terminal_answer_rewards=terminal_answer_rewards,
-            success_mask=reward_success_mask,
-            terminal_num_steps=resolved_terminal_num_steps,
-            terminal_cycle_counts=resolved_terminal_cycle_counts,
-        )
+        terminal_rewards = terminal_log_rewards.exp()
         return TerminalTransitionBatch(
             terminal_entity_ids=terminal_entity_ids,
             terminal_rewards=terminal_rewards,
@@ -465,16 +248,10 @@ class AnswerReachabilityTrajectorySupervisor:
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-        success_mask: torch.Tensor,
-        terminal_num_steps: torch.Tensor | None = None,
-        terminal_cycle_counts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         terminal_transition = self.resolve_terminal_transitions(
             batch=batch,
             terminal_nodes=terminal_nodes,
-            success_mask=success_mask,
-            terminal_num_steps=terminal_num_steps,
-            terminal_cycle_counts=terminal_cycle_counts,
         )
         return (
             terminal_transition.terminal_rewards,
@@ -1018,16 +795,9 @@ def _rebuild_target_sample_batch(
     success_mask = terminal_target_mask.index_select(0, current_nodes.view(-1)).view_as(
         current_nodes
     )
-    terminal_cycle_counts = count_path_node_revisits(
-        path_token_ids=current_path_token_ids,
-        num_steps=path_lengths,
-    )
     terminal_transition = trajectory_supervisor.resolve_terminal_transitions(
         batch=batch,
         terminal_nodes=current_nodes,
-        success_mask=success_mask,
-        terminal_num_steps=path_lengths,
-        terminal_cycle_counts=terminal_cycle_counts,
     )
     masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
         termination_action_steps=termination_action_steps,
@@ -1430,16 +1200,9 @@ class ForwardTrajectoryGFNSampler:
         success_mask = terminal_target_mask.index_select(
             0, current_nodes.view(-1)
         ).view_as(current_nodes)
-        terminal_cycle_counts = count_path_node_revisits(
-            path_token_ids=current_path_token_ids,
-            num_steps=num_steps,
-        )
         terminal_transition = self.trajectory_supervisor.resolve_terminal_transitions(
             batch=batch,
             terminal_nodes=current_nodes,
-            success_mask=success_mask,
-            terminal_num_steps=num_steps,
-            terminal_cycle_counts=terminal_cycle_counts,
         )
         masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
             termination_action_steps=termination_action_steps,

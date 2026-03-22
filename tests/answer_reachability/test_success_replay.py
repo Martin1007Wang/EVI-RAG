@@ -55,8 +55,6 @@ def _make_module() -> GFlowNetModule:
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
             success_replay=SuccessfulTrajectoryReplayConfig(
                 enabled=True,
@@ -219,8 +217,6 @@ def test_build_replay_sample_batch_force_keeps_recorded_edges_in_shortlist() -> 
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
             success_replay=SuccessfulTrajectoryReplayConfig(
                 enabled=True,
@@ -303,8 +299,6 @@ def test_forward_distribution_rejects_missing_required_replay_edge() -> None:
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
-            reward_epsilon=1.0e-3,
-            failure_reward_mode="graph_normalized",
             sampling_temperature=1.0,
         ),
         heuristic_cfg=HeuristicConfig(kind="none", beta=0.0),

@@ -11,7 +11,6 @@ from src.graph_runtime import TrajectoryBatch
 from .path import (
     append_relation_and_node_tokens_inplace,
     append_stop_token_inplace,
-    count_path_node_revisits,
     initialize_path_token_ids,
 )
 from .success_paths import (
@@ -502,17 +501,10 @@ def build_replay_sample_batch(
         raise ValueError(
             "Replay buffer produced a trajectory that no longer lands on an answer node."
         )
-    terminal_cycle_counts = count_path_node_revisits(
-        path_token_ids=current_path_token_ids,
-        num_steps=path_lengths,
-    )
     terminal_transition: TerminalTransitionBatch = (
         trajectory_supervisor.resolve_terminal_transitions(
             batch=batch,
             terminal_nodes=current_nodes,
-            success_mask=success_mask,
-            terminal_num_steps=path_lengths,
-            terminal_cycle_counts=terminal_cycle_counts,
         )
     )
     masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(

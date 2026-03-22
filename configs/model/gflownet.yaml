@@ -25,17 +25,6 @@ horizon_cfg:
 training_cfg:
   _target_: src.models.configs.gflownet.GFlowNetTrainingConfig
   rollout_batch_size: 8
-  reward_epsilon: 1.0e-3
-  failure_reward_mode: graph_normalized
-  answer_reward:
-    _target_: src.models.configs.gflownet.AnswerRewardConfig
-    mode: legacy
-    positive_utility: 1.0
-    negative_utility: -1.0
-    beta: 1.0
-    structure_cost_weight: 1.0
-    cycle_penalty: 1.0
-    failure_length_penalty_alpha: 0.0
   guidance:
     _target_: src.models.configs.gflownet.GuidanceLossConfig
     loss_weight: 0.0

@@ -121,22 +121,6 @@ def derive_parent_path_token_ids(
     return flat_updated.view_as(child_path_token_ids)
 
 
-def count_path_node_revisits(
-    *, path_token_ids: torch.Tensor, num_steps: torch.Tensor
-) -> torch.Tensor:
-    flat_paths = path_token_ids.view(-1, int(path_token_ids.size(-1)))
-    flat_num_steps = num_steps.reshape(-1).to(dtype=torch.long)
-    revisit_counts = torch.zeros_like(flat_num_steps, dtype=torch.long)
-    for row_idx in range(int(flat_paths.size(0))):
-        step_count = int(flat_num_steps[row_idx].item())
-        node_ids = flat_paths[row_idx, : (2 * step_count) + 1 : 2]
-        if int(node_ids.numel()) <= 1:
-            continue
-        _, visit_counts = torch.unique(node_ids, sorted=False, return_counts=True)
-        revisit_counts[row_idx] = (visit_counts - 1).clamp_min(0).sum()
-    return revisit_counts.view_as(num_steps)
-
-
 def reconstruct_trace_path_token_ids(
     *,
     start_nodes: torch.Tensor,
@@ -192,7 +176,6 @@ __all__ = [
     "append_relation_and_node_tokens",
     "append_relation_and_node_tokens_inplace",
     "append_stop_token_inplace",
-    "count_path_node_revisits",
     "derive_parent_path_token_ids",
     "initialize_path_token_ids",
     "max_path_tokens",

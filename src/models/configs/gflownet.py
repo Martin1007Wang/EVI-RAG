@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 
 
 @dataclass(frozen=True)
@@ -127,64 +126,6 @@ class HeuristicConfig:
             raise ValueError("heuristic.learned_hidden_dim must be >= 1.")
         if self.learned_dropout < 0.0 or self.learned_dropout >= 1.0:
             raise ValueError("heuristic.learned_dropout must be in [0, 1).")
-
-
-@dataclass(frozen=True)
-class AnswerRewardConfig:
-    mode: str = "legacy"
-    positive_utility: float = 1.0
-    negative_utility: float = -1.0
-    beta: float = 1.0
-    structure_cost_weight: float = 1.0
-    cycle_penalty: float = 1.0
-    failure_length_penalty_alpha: float = 0.0
-    length_penalty_alpha: float | None = None
-    terminal_reward_scale: str | None = None
-    terminal_backward_mode: str | None = None
-    normalize_by_entity_count: bool | None = None
-
-    def __post_init__(self) -> None:
-        if self.mode not in {"legacy", "binary_ranking", "entity_sink"}:
-            raise ValueError(
-                "training.answer_reward.mode must be one of "
-                "{'legacy', 'binary_ranking', 'entity_sink'}."
-            )
-        if self.beta <= 0.0:
-            raise ValueError("training.answer_reward.beta must be > 0.")
-        if self.structure_cost_weight < 0.0:
-            raise ValueError(
-                "training.answer_reward.structure_cost_weight must be >= 0."
-            )
-        if not 0.0 < self.cycle_penalty <= 1.0:
-            raise ValueError("training.answer_reward.cycle_penalty must be in (0, 1].")
-        resolved_failure_alpha = float(self.failure_length_penalty_alpha)
-        if self.length_penalty_alpha is not None:
-            if resolved_failure_alpha > 0.0 and not math.isclose(
-                resolved_failure_alpha,
-                float(self.length_penalty_alpha),
-            ):
-                raise ValueError(
-                    "training.answer_reward.length_penalty_alpha conflicts with "
-                    "training.answer_reward.failure_length_penalty_alpha."
-                )
-            resolved_failure_alpha = float(self.length_penalty_alpha)
-        if resolved_failure_alpha < 0.0:
-            raise ValueError(
-                "training.answer_reward.failure_length_penalty_alpha must be >= 0."
-            )
-        object.__setattr__(self, "failure_length_penalty_alpha", resolved_failure_alpha)
-        if self.length_penalty_alpha is None:
-            object.__setattr__(
-                self,
-                "length_penalty_alpha",
-                resolved_failure_alpha,
-            )
-        # Deprecated knobs are accepted for compatibility but ignored: the tree
-        # policy uses P_B == 1 and reward scaling stays in R(tau) directly.
-        if self.terminal_reward_scale is None:
-            object.__setattr__(self, "terminal_reward_scale", "none")
-        if self.terminal_backward_mode is None:
-            object.__setattr__(self, "terminal_backward_mode", "none")
 
 
 @dataclass(frozen=True)
@@ -359,9 +300,6 @@ class AdaptiveSamplingConfig:
 @dataclass(frozen=True)
 class GFlowNetTrainingConfig:
     rollout_batch_size: int = 8
-    reward_epsilon: float = 1.0e-3
-    failure_reward_mode: str = "graph_normalized"
-    answer_reward: AnswerRewardConfig = field(default_factory=AnswerRewardConfig)
     guidance: GuidanceLossConfig = field(default_factory=GuidanceLossConfig)
     sampling_temperature: float = 1.0
     force_stop_on_answer_hit: bool = False
@@ -381,19 +319,12 @@ class GFlowNetTrainingConfig:
     def __post_init__(self) -> None:
         if self.rollout_batch_size < 1:
             raise ValueError("training.rollout_batch_size must be >= 1.")
-        if self.reward_epsilon <= 0.0:
-            raise ValueError("training.reward_epsilon must be > 0.")
-        if self.failure_reward_mode not in {"constant", "graph_normalized"}:
-            raise ValueError(
-                "training.failure_reward_mode must be one of {'constant', 'graph_normalized'}."
-            )
         if self.sampling_temperature <= 0.0:
             raise ValueError("training.sampling_temperature must be > 0.")
 
 
 __all__ = [
     "AdaptiveSamplingConfig",
-    "AnswerRewardConfig",
     "GFlowNetTrainingConfig",
     "GuidanceLossConfig",
     "HeuristicConfig",

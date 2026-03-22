@@ -116,20 +116,24 @@ path.
 
 ## Terminal reward realization
 
-The terminal anchor now follows the paper-facing direct reward form more
-closely:
+The runtime now uses a single fixed terminal-energy scheme.
 
-`R = R_ans - lambda * C_struct`
+- gold terminal entities get `log R = 0.0`, so `R = 1.0`
+- non-gold terminal entities get `log R = -3.0`, so `R = exp(-3.0)`
+- the terminal reward depends only on the reached entity identity, not on path
+  length, revisit counts, or mode-specific reward shaping knobs
 
-where `R_ans` is the answer-quality reward and `C_struct` is the additive
-structural cost induced by cycles and failure-path length.
+This keeps the supervision contract simple: SubTB always anchors against a
+stable terminal log-reward table instead of switching between multiple reward
+parameterizations.
 
-For non-legacy answer-ranking modes, the implementation shifts `R_ans` to keep a
-strictly positive floor before subtracting structural costs, and then validates
-that the final reward remains strictly positive before taking `log R` for SubTB.
-If the configured costs would drive a terminal reward to zero or below, the
-runtime now raises an explicit error instead of silently producing invalid
-log-rewards.
+`success_mask`, termination steps, and revisit counters are still tracked for
+rollout bookkeeping and reporting, but they are not part of the terminal reward
+definition.
+
+The terminal STOP backward factor is also fixed: the absorbing STOP edge uses
+`log P_B = 0`, matching the unique-prefix-parent interpretation used elsewhere
+in the runtime.
 
 ## Forced STOP behavior
 

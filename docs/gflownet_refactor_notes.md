@@ -53,9 +53,10 @@ useful for bookkeeping and metrics:
   values `log F([e_0])`.
 - SubTB now trains the root consistency residual
   `log F(s_root) + log P_F([e_0] | s_root) - log F([e_0])` directly.
-- Terminal rewards now use direct subtraction in reward space,
-  `R = R_ans - lambda * C_struct`, with an explicit positivity check before
-  converting to `log R`.
+- Terminal rewards now use a single fixed terminal-energy table:
+  gold entities map to `log R = 0.0`, non-gold entities map to `log R = -3.0`.
+- STOP termination keeps `log P_B = 0`, so there is no separate terminal
+  backward heuristic layered on top of the prefix-tree backward semantics.
 
 ## Recommended terminology
 
