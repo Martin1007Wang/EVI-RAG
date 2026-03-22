@@ -6,10 +6,12 @@ from typing import Any, Callable, Dict, Optional, Protocol, Tuple, cast
 import hydra
 import lightning as L
 import rootutils
-from omegaconf import DictConfig
+import torch
+from omegaconf import DictConfig, OmegaConf
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+from src.models.configs import SearchEvalConfig
 from src.runs.common import resolve_execution_mode
 from src.utils.entrypoint_utils import (
     instantiate_lightning_task_objects,
@@ -95,6 +97,130 @@ def _configure_eval_split(datamodule: Any, run_cfg: DictConfig) -> str:
     return split
 
 
+def _coerce_eval_cfg(eval_cfg: Any) -> SearchEvalConfig:
+    if isinstance(eval_cfg, SearchEvalConfig):
+        return eval_cfg
+    if isinstance(eval_cfg, DictConfig):
+        container = OmegaConf.to_container(eval_cfg, resolve=True)
+    elif isinstance(eval_cfg, dict):
+        container = dict(eval_cfg)
+    else:
+        raise TypeError(f"Unsupported eval_cfg type: {type(eval_cfg)!r}.")
+    if not isinstance(container, dict):
+        raise TypeError("Expected eval_cfg to resolve to a mapping.")
+    return SearchEvalConfig(**container)
+
+
+def _load_checkpoint_into_model_if_needed(model: Any, *, ckpt_path: str | None) -> None:
+    if ckpt_path in (None, ""):
+        return
+    resolved_ckpt = str(ckpt_path)
+    if getattr(model, "_rankflow_loaded_eval_ckpt_path", None) == resolved_ckpt:
+        return
+    checkpoint = torch.load(resolved_ckpt, map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            "ckpt_path must point to a checkpoint containing a `state_dict`."
+        )
+    loader = getattr(model, "load_state_dict", None)
+    if not callable(loader):
+        raise TypeError("Existing evaluation model does not support `load_state_dict`.")
+    incompatible = loader(state_dict, strict=False)
+    missing = sorted(getattr(incompatible, "missing_keys", []))
+    unexpected = sorted(getattr(incompatible, "unexpected_keys", []))
+    log.info(
+        "Loaded evaluation checkpoint into existing model: %s (missing=%d, unexpected=%d)",
+        resolved_ckpt,
+        len(missing),
+        len(unexpected),
+    )
+    if missing:
+        log.warning("Missing keys when loading ckpt_path for eval: %s", missing)
+    if unexpected:
+        log.warning("Unexpected keys when loading ckpt_path for eval: %s", unexpected)
+    setattr(model, "_rankflow_loaded_eval_ckpt_path", resolved_ckpt)
+
+
+def _trainer_supports_inprocess_eval(trainer: Any) -> bool:
+    num_devices = getattr(trainer, "num_devices", None)
+    if num_devices is not None and int(num_devices) != 1:
+        return False
+    strategy = getattr(trainer, "strategy", None)
+    strategy_name = str(getattr(strategy, "strategy_name", "") or "").lower()
+    if any(tag in strategy_name for tag in ("ddp", "fsdp", "deepspeed")):
+        return False
+    root_device = getattr(strategy, "root_device", None)
+    if isinstance(root_device, torch.device):
+        device = cast(torch.device, root_device)
+        return device.type == "cuda"
+    return True
+
+
+def _select_evaluation_metrics(trainer: Any, *, execution_mode: str) -> dict[str, Any]:
+    callback_metrics = dict(getattr(trainer, "callback_metrics", {}) or {})
+    if execution_mode == "predict":
+        return {}
+    return {
+        key: value
+        for key, value in callback_metrics.items()
+        if str(key).startswith("test/")
+    }
+
+
+def evaluate_model_inprocess(
+    cfg: DictConfig,
+    *,
+    trainer: Any,
+    datamodule: Any,
+    model: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not _trainer_supports_inprocess_eval(trainer):
+        raise ValueError(
+            "In-process final eval requires a single-device non-distributed trainer."
+        )
+    run_cfg = cfg.get("run")
+    if run_cfg is None:
+        raise ValueError("Missing required config group: `run`.")
+    replace_dataset_cfg = getattr(datamodule, "replace_dataset_cfg", None)
+    if not callable(replace_dataset_cfg):
+        raise TypeError(
+            "Existing datamodule does not support `replace_dataset_cfg()` for in-process eval."
+        )
+    split = str(run_cfg.get("split") or "test").strip() or "test"
+    replace_dataset_cfg(cfg.dataset, eval_split=split)
+    _load_checkpoint_into_model_if_needed(model, ckpt_path=cfg.get("ckpt_path"))
+    reconfigure_evaluation = getattr(model, "reconfigure_evaluation", None)
+    if not callable(reconfigure_evaluation):
+        raise TypeError(
+            "Existing model does not support `reconfigure_evaluation()` for in-process eval."
+        )
+    reconfigure_evaluation(eval_cfg=_coerce_eval_cfg(cfg.model.eval_cfg))
+    execution_mode = resolve_execution_mode(run_cfg)
+    if execution_mode == "test":
+        log.info("Running in-process trainer.test() on split=%s...", split)
+        trainer.test(
+            model=model,
+            datamodule=datamodule,
+            ckpt_path=None,
+            verbose=False,
+        )
+    else:
+        log.info("Running in-process trainer.predict() on split=%s...", split)
+        trainer.predict(
+            model=model,
+            datamodule=datamodule,
+            ckpt_path=None,
+            return_predictions=False,
+        )
+    return _select_evaluation_metrics(trainer, execution_mode=execution_mode), {
+        "cfg": cfg,
+        "datamodule": datamodule,
+        "model": model,
+        "trainer": trainer,
+    }
+
+
 @task_wrapper
 def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("seed") is not None:
@@ -136,7 +262,9 @@ def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             return_predictions=False,
         )
 
-    return dict(trainer.callback_metrics), object_dict
+    return _select_evaluation_metrics(
+        trainer, execution_mode=execution_mode
+    ), object_dict
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="eval.yaml")

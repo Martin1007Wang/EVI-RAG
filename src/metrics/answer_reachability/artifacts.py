@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import ast
 from datetime import datetime
+from itertools import zip_longest
 import json
 from pathlib import Path
 from typing import Any, Sequence
 
+from .prediction_io import (
+    iter_jsonl_records,
+    load_support_window_label,
+    load_support_window_result,
+)
 from .schema import (
     AnswerPosteriorRecord,
     AnswerSupportRecord,
@@ -267,6 +273,79 @@ class SupportWindowArtifactWriter:
         results: Sequence[SupportWindowResult],
         labels: Sequence[SupportWindowLabelRecord],
     ) -> dict[str, Path]:
+        prompt_path, labels_path, manifest_path = self._prepare_output_paths()
+        label_map = {record.sample_id: record for record in labels}
+        with (
+            prompt_path.open("w", encoding="utf-8") as prompt_handle,
+            labels_path.open("w", encoding="utf-8") as label_handle,
+        ):
+            for result in results:
+                label = label_map.get(result.sample_id)
+                self._write_jsonl_record(
+                    prompt_handle,
+                    self._build_prompt_record(result, label),
+                )
+                self._write_jsonl_record(
+                    label_handle,
+                    self._build_label_record(result, label),
+                )
+        self._write_manifest(
+            manifest_path=manifest_path,
+            prompt_path=prompt_path,
+            labels_path=labels_path,
+        )
+        return {
+            "prompt_path": prompt_path,
+            "labels_path": labels_path,
+            "manifest_path": manifest_path,
+        }
+
+    def write_from_jsonl(
+        self,
+        *,
+        results_path: str | Path,
+        labels_path: str | Path,
+    ) -> dict[str, Path]:
+        prompt_path, output_labels_path, manifest_path = self._prepare_output_paths()
+        with (
+            prompt_path.open("w", encoding="utf-8") as prompt_handle,
+            output_labels_path.open("w", encoding="utf-8") as label_handle,
+        ):
+            for result_record, label_record in zip_longest(
+                iter_jsonl_records(results_path),
+                iter_jsonl_records(labels_path),
+            ):
+                if result_record is None or label_record is None:
+                    raise ValueError(
+                        "Prediction result/label jsonl files must contain the same number of records."
+                    )
+                result = load_support_window_result(result_record)
+                label = load_support_window_label(label_record)
+                if result.sample_id != label.sample_id:
+                    raise ValueError(
+                        "Prediction result/label jsonl files are not aligned by sample_id. "
+                        f"result={result.sample_id!r} label={label.sample_id!r}."
+                    )
+                self._write_jsonl_record(
+                    prompt_handle,
+                    self._build_prompt_record(result, label),
+                )
+                self._write_jsonl_record(
+                    label_handle,
+                    self._build_label_record(result, label),
+                )
+        self._write_manifest(
+            manifest_path=manifest_path,
+            prompt_path=prompt_path,
+            labels_path=output_labels_path,
+        )
+        return {
+            "prompt_path": prompt_path,
+            "labels_path": output_labels_path,
+            "manifest_path": manifest_path,
+        }
+
+    def _prepare_output_paths(self) -> tuple[Path, Path, Path]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = self.output_dir / f"{self.split}.jsonl"
         labels_path = self.output_dir / f"{self.split}.labels.jsonl"
@@ -275,17 +354,15 @@ class SupportWindowArtifactWriter:
             for path in (prompt_path, labels_path, manifest_path):
                 if path.exists():
                     raise FileExistsError(f"Artifact already exists: {path}")
-        label_map = {record.sample_id: record for record in labels}
-        prompt_records = [
-            self._build_prompt_record(result, label_map.get(result.sample_id))
-            for result in results
-        ]
-        label_records = [
-            self._build_label_record(result, label_map.get(result.sample_id))
-            for result in results
-        ]
-        self._write_jsonl(prompt_path, prompt_records)
-        self._write_jsonl(labels_path, label_records)
+        return prompt_path, labels_path, manifest_path
+
+    def _write_manifest(
+        self,
+        *,
+        manifest_path: Path,
+        prompt_path: Path,
+        labels_path: Path,
+    ) -> None:
         manifest = {
             "artifact": self.artifact_name,
             "schema_version": self.schema_version,
@@ -295,11 +372,6 @@ class SupportWindowArtifactWriter:
             "producer": "rankflow_artifact_writer",
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        return {
-            "prompt_path": prompt_path,
-            "labels_path": labels_path,
-            "manifest_path": manifest_path,
-        }
 
     def _build_prompt_record(
         self,
@@ -418,10 +490,8 @@ class SupportWindowArtifactWriter:
             return []
         return [str(value) for value in meta.get("answer_texts") or []]
 
-    def _write_jsonl(self, path: Path, records: Sequence[dict[str, Any]]) -> None:
-        with path.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    def _write_jsonl_record(self, handle: Any, record: dict[str, Any]) -> None:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 __all__ = ["SupportWindowArtifactWriter"]

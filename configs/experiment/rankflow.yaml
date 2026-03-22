@@ -14,7 +14,7 @@ defaults:
   - override /dataset: webqsp
   - override /data: graph_retrieval
   - override /model: gflownet
-  - override /callbacks: default
+  - override /callbacks: eval
   - override /logger: none
   - override /trainer: predict
   - _self_

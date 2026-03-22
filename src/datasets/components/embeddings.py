@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -135,16 +135,21 @@ class GlobalEmbeddingStore:
         return buffer
 
     def get_entity_embeddings(
-        self, entity_ids: torch.Tensor, *, device: Optional[torch.device] = None
+        self,
+        entity_ids: torch.Tensor,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         target_device = (
             torch.device(device) if device is not None else entity_ids.device
         )
+        target_dtype = self.entity_embeddings.dtype if dtype is None else dtype
         table_device = self.entity_embeddings.device
         if entity_ids.numel() == 0:
             return torch.empty(
                 (0, int(self.entity_embeddings.size(1))),
-                dtype=self.entity_embeddings.dtype,
+                dtype=target_dtype,
                 device=target_device,
             )
         if table_device.type == "cuda":
@@ -153,8 +158,10 @@ class GlobalEmbeddingStore:
             )
             out = self.entity_embeddings.index_select(0, ids)
             if target_device == table_device:
+                if out.dtype != target_dtype:
+                    return out.to(dtype=target_dtype)
                 return out
-            return out.to(target_device, non_blocking=True)
+            return out.to(device=target_device, dtype=target_dtype, non_blocking=True)
         cpu_ids = (
             entity_ids
             if entity_ids.device.type == "cpu"
@@ -163,7 +170,10 @@ class GlobalEmbeddingStore:
         if cpu_ids.dtype != torch.long:
             cpu_ids = cpu_ids.to(dtype=torch.long)
         if target_device.type == "cpu":
-            return self.entity_embeddings.index_select(0, cpu_ids)
+            out = self.entity_embeddings.index_select(0, cpu_ids)
+            if out.dtype != target_dtype:
+                return out.to(dtype=target_dtype)
+            return out
         if target_device.type == "cuda":
             num = int(cpu_ids.numel())
             dim = int(self.entity_embeddings.size(1))
@@ -173,22 +183,31 @@ class GlobalEmbeddingStore:
                 dim=dim,
                 dtype=self.entity_embeddings.dtype,
             )
+            assert self._pinned_entity_buffer is not None
             out_cpu = self._pinned_entity_buffer[:num]
             torch.index_select(self.entity_embeddings, 0, cpu_ids, out=out_cpu)
-            return out_cpu.to(target_device, non_blocking=True)
-        return self.entity_embeddings.index_select(0, cpu_ids).to(target_device)
+            return out_cpu.to(
+                device=target_device, dtype=target_dtype, non_blocking=True
+            )
+        out = self.entity_embeddings.index_select(0, cpu_ids)
+        return out.to(device=target_device, dtype=target_dtype)
 
     def get_relation_embeddings(
-        self, relation_ids: torch.Tensor, *, device: Optional[torch.device] = None
+        self,
+        relation_ids: torch.Tensor,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         target_device = (
             torch.device(device) if device is not None else relation_ids.device
         )
+        target_dtype = self.relation_embeddings.dtype if dtype is None else dtype
         table_device = self.relation_embeddings.device
         if relation_ids.numel() == 0:
             return torch.empty(
                 (0, int(self.relation_embeddings.size(1))),
-                dtype=self.relation_embeddings.dtype,
+                dtype=target_dtype,
                 device=target_device,
             )
         if table_device.type == "cuda":
@@ -197,8 +216,10 @@ class GlobalEmbeddingStore:
             )
             out = self.relation_embeddings.index_select(0, ids)
             if target_device == table_device:
+                if out.dtype != target_dtype:
+                    return out.to(dtype=target_dtype)
                 return out
-            return out.to(target_device, non_blocking=True)
+            return out.to(device=target_device, dtype=target_dtype, non_blocking=True)
         cpu_ids = (
             relation_ids
             if relation_ids.device.type == "cpu"
@@ -207,7 +228,10 @@ class GlobalEmbeddingStore:
         if cpu_ids.dtype != torch.long:
             cpu_ids = cpu_ids.to(dtype=torch.long)
         if target_device.type == "cpu":
-            return self.relation_embeddings.index_select(0, cpu_ids)
+            out = self.relation_embeddings.index_select(0, cpu_ids)
+            if out.dtype != target_dtype:
+                return out.to(dtype=target_dtype)
+            return out
         if target_device.type == "cuda":
             num = int(cpu_ids.numel())
             dim = int(self.relation_embeddings.size(1))
@@ -217,10 +241,14 @@ class GlobalEmbeddingStore:
                 dim=dim,
                 dtype=self.relation_embeddings.dtype,
             )
+            assert self._pinned_relation_buffer is not None
             out_cpu = self._pinned_relation_buffer[:num]
             torch.index_select(self.relation_embeddings, 0, cpu_ids, out=out_cpu)
-            return out_cpu.to(target_device, non_blocking=True)
-        return self.relation_embeddings.index_select(0, cpu_ids).to(target_device)
+            return out_cpu.to(
+                device=target_device, dtype=target_dtype, non_blocking=True
+            )
+        out = self.relation_embeddings.index_select(0, cpu_ids)
+        return out.to(device=target_device, dtype=target_dtype)
 
     @property
     def entity_dim(self) -> int:
@@ -232,10 +260,11 @@ class GlobalEmbeddingStore:
 
 
 def attach_embeddings_to_batch(
-    batch: object,
+    batch: Any,
     *,
     global_embeddings: GlobalEmbeddingStore,
     embeddings_device: Optional[Union[str, torch.device]] = None,
+    feature_dtype: Optional[torch.dtype] = None,
 ) -> None:
     node_embedding_ids = torch.as_tensor(
         batch.node_embedding_ids, dtype=torch.long, device="cpu"
@@ -261,8 +290,17 @@ def attach_embeddings_to_batch(
                 f"valid [0, {rel_rows - 1}]"
             )
     batch.node_embeddings = global_embeddings.get_entity_embeddings(
-        node_embedding_ids, device=embeddings_device
+        node_embedding_ids,
+        device=embeddings_device,
+        dtype=feature_dtype,
     )
-    batch.edge_embeddings = global_embeddings.get_relation_embeddings(
-        relation_ids, device=embeddings_device
+    relation_ids_unique, edge_rel_local = torch.unique(
+        relation_ids, sorted=True, return_inverse=True
     )
+    batch.relation_embeddings = global_embeddings.get_relation_embeddings(
+        relation_ids_unique,
+        device=embeddings_device,
+        dtype=feature_dtype,
+    )
+    batch.edge_rel_local = edge_rel_local
+    batch.edge_embeddings = None

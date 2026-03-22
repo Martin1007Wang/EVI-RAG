@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from typing import Iterable
 
 from src.data.preprocess.context import PreprocessContext
@@ -103,8 +102,7 @@ def _ensure_preprocess_dirs(ctx: PreprocessContext) -> None:
 
 
 def run_preprocess_pipeline(cfg) -> None:
-    run_id = str(cfg.get("run_id") or uuid.uuid4().hex)
-    ctx = PreprocessContext(cfg=cfg, logger=LOGGER, run_id=run_id)
+    ctx = PreprocessContext(cfg=cfg, logger=LOGGER)
     stage = _resolve_preprocess_stage(cfg)
     _validate_preprocess_cfg(ctx)
     _ensure_preprocess_dirs(ctx)

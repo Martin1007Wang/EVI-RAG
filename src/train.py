@@ -305,8 +305,30 @@ def _default_final_eval_variant(cfg: DictConfig) -> DatasetVariantSpec:
     )
 
 
-def _run_final_eval_suite(cfg: DictConfig) -> Dict[str, Any]:
+def _release_post_fit_runtime_state(
+    *,
+    model: LightningModule | None,
+    datamodule: Any | None,
+) -> None:
+    if model is not None:
+        reset_prediction_state = getattr(model, "reset_prediction_state", None)
+        if callable(reset_prediction_state):
+            reset_prediction_state()
+    if datamodule is not None:
+        teardown = getattr(datamodule, "teardown", None)
+        if callable(teardown):
+            teardown()
+
+
+def _run_final_eval_suite(
+    cfg: DictConfig,
+    *,
+    trainer: Any | None = None,
+    model: LightningModule | None = None,
+    datamodule: Any | None = None,
+) -> Dict[str, Any]:
     from src.eval import evaluate_model as evaluate_model_fn
+    from src.eval import evaluate_model_inprocess as evaluate_model_inprocess_fn
 
     reporter = AnswerReachabilityEvalReporter()
     variants = resolve_dataset_variants(cfg)
@@ -316,6 +338,10 @@ def _run_final_eval_suite(cfg: DictConfig) -> Dict[str, Any]:
     final_metrics: Dict[str, Any] = {}
     split = str(cfg.run.get("split") or "test")
     metrics_profile = str(cfg.model.eval_cfg.get("metrics_profile") or "")
+    can_reuse_eval_stack = (
+        trainer is not None and model is not None and datamodule is not None
+    )
+    released_original_state = False
     for variant in variants:
         log.info(
             "Final evaluation: dataset_variant=%s split=%s metrics_profile=%s",
@@ -331,7 +357,35 @@ def _run_final_eval_suite(cfg: DictConfig) -> Dict[str, Any]:
                 "dataset_variant": variant.label,
             },
         ):
-            metric_dict, object_dict = evaluate_model_fn(cfg)
+            if can_reuse_eval_stack:
+                try:
+                    metric_dict, object_dict = evaluate_model_inprocess_fn(
+                        cfg,
+                        trainer=trainer,
+                        datamodule=datamodule,
+                        model=model,
+                    )
+                except (TypeError, ValueError) as exc:
+                    log.warning(
+                        "In-process final eval reuse unavailable (%s); falling back to a fresh eval stack.",
+                        exc,
+                    )
+                    can_reuse_eval_stack = False
+                    if not released_original_state:
+                        _release_post_fit_runtime_state(
+                            model=model,
+                            datamodule=datamodule,
+                        )
+                        released_original_state = True
+                    metric_dict, object_dict = evaluate_model_fn(cfg)
+            else:
+                if not released_original_state:
+                    _release_post_fit_runtime_state(
+                        model=model,
+                        datamodule=datamodule,
+                    )
+                    released_original_state = True
+                metric_dict, object_dict = evaluate_model_fn(cfg)
             persisted_metrics = reporter.persist_outputs(
                 cfg=cfg,
                 callback_metrics=metric_dict,
@@ -372,30 +426,38 @@ def _run_post_fit_evaluation(
         return {}
 
     log.info("Starting post-fit evaluation!")
-    ckpt_path = _resolve_post_fit_ckpt_path(run_cfg=run_cfg, trainer=trainer)
-    final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
-    if final_eval_experiment:
-        if ckpt_path is None:
-            log.warning(
-                "Final eval experiment=%s requested without a resolved checkpoint path; "
-                "falling back to in-process trainer.test().",
-                final_eval_experiment,
-            )
-            return _run_inprocess_test(
+    try:
+        ckpt_path = _resolve_post_fit_ckpt_path(run_cfg=run_cfg, trainer=trainer)
+        final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
+        if final_eval_experiment:
+            if ckpt_path is None:
+                log.warning(
+                    "Final eval experiment=%s requested without a resolved checkpoint path; "
+                    "falling back to in-process trainer.test().",
+                    final_eval_experiment,
+                )
+                return _run_inprocess_test(
+                    trainer=trainer,
+                    model=model,
+                    datamodule=datamodule,
+                    ckpt_path=ckpt_path,
+                )
+            final_eval_cfg = _build_final_eval_cfg(cfg, ckpt_path=ckpt_path)
+            return _run_final_eval_suite(
+                final_eval_cfg,
                 trainer=trainer,
                 model=model,
                 datamodule=datamodule,
-                ckpt_path=ckpt_path,
             )
-        final_eval_cfg = _build_final_eval_cfg(cfg, ckpt_path=ckpt_path)
-        return _run_final_eval_suite(final_eval_cfg)
 
-    return _run_inprocess_test(
-        trainer=trainer,
-        model=model,
-        datamodule=datamodule,
-        ckpt_path=ckpt_path,
-    )
+        return _run_inprocess_test(
+            trainer=trainer,
+            model=model,
+            datamodule=datamodule,
+            ckpt_path=ckpt_path,
+        )
+    finally:
+        _release_post_fit_runtime_state(model=model, datamodule=datamodule)
 
 
 @task_wrapper

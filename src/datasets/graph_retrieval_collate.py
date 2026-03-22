@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, Sampler
 from torch_geometric.loader.dataloader import Collater
 
 from .graph_retrieval_dataset import GraphRetrievalDataset
+from src.graph_runtime.batch import compute_edge_batch_and_ptr
 from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
@@ -149,6 +150,21 @@ def _iter_answer_candidates(
     ]
 
 
+def _filter_zero_hop_answers(
+    q_vals: torch.Tensor,
+    a_vals: torch.Tensor,
+    answer_vals: torch.Tensor,
+    *,
+    filter_zero_hop: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not filter_zero_hop or q_vals.numel() == 0 or a_vals.numel() == 0:
+        return a_vals, answer_vals
+    keep_mask = ~(q_vals.view(-1, 1) == a_vals.view(1, -1)).any(dim=0)
+    if bool(keep_mask.all().item()):
+        return a_vals, answer_vals
+    return a_vals[keep_mask], answer_vals[keep_mask]
+
+
 def _should_skip_zero_hop(
     q_vals: torch.Tensor,
     a_val: torch.Tensor,
@@ -181,6 +197,15 @@ def _expand_answer_samples(
             answer_vals=answer_ids.view(-1),
             node_global_ids=node_global_ids,
         )
+        if not expand_multi_answer:
+            a_vals, answer_vals = _filter_zero_hop_answers(
+                q_vals,
+                a_vals,
+                answer_vals,
+                filter_zero_hop=filter_zero_hop,
+            )
+            if a_vals.numel() == 0:
+                continue
         a_candidates = _iter_answer_candidates(
             a_vals,
             answer_vals,
@@ -283,7 +308,7 @@ def _attach_edge_batch(batch: Any) -> None:
         raise ValueError(
             "ptr must encode at least one graph when precomputing edge_batch."
         )
-    edge_batch, edge_ptr = _compute_edge_batch(
+    edge_batch, edge_ptr = compute_edge_batch_and_ptr(
         edge_index,
         node_ptr=node_ptr,
         num_graphs=num_graphs,
@@ -292,54 +317,6 @@ def _attach_edge_batch(batch: Any) -> None:
     )
     batch.edge_batch = edge_batch
     batch.edge_ptr = edge_ptr
-
-
-def _compute_edge_batch(
-    edge_index: torch.Tensor,
-    *,
-    node_ptr: torch.Tensor,
-    num_graphs: int,
-    device: torch.device,
-    validate: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if edge_index.dim() != 2 or edge_index.size(0) != 2:
-        raise ValueError(
-            f"edge_index must have shape [2, E], got {tuple(edge_index.shape)}"
-        )
-    if node_ptr.numel() != num_graphs + 1:
-        raise ValueError(
-            f"node_ptr length mismatch: got {node_ptr.numel()} expected {num_graphs + 1}"
-        )
-    # NOTE: right=True assigns boundary nodes to their owning graph: ptr[g] <= i < ptr[g+1].
-    edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
-    if validate:
-        tail_batch = torch.bucketize(edge_index[1], node_ptr[1:], right=True)
-        if edge_batch.numel() > 0:
-            min_idx = int(edge_batch.min().item())
-            max_idx = int(edge_batch.max().item())
-            if min_idx < 0 or max_idx >= num_graphs:
-                raise ValueError(
-                    "edge_batch contains out-of-range indices; "
-                    f"min={min_idx} max={max_idx} num_graphs={num_graphs}."
-                )
-        if not torch.equal(edge_batch, tail_batch):
-            raise ValueError(
-                "edge_index crosses graph boundaries; head/tail graph assignments differ."
-            )
-        if edge_batch.numel() > 1 and not bool(
-            (edge_batch[:-1] <= edge_batch[1:]).all().item()
-        ):
-            raise ValueError(
-                "edge_batch is not non-decreasing along the flattened edge list, "
-                "which breaks per-graph slicing; ensure edges are concatenated per-graph (PyG Batch)."
-            )
-    edge_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
-    edge_counts.scatter_add_(
-        0, edge_batch, torch.ones_like(edge_batch, dtype=torch.long)
-    )
-    edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
-    edge_ptr[1:] = edge_counts.cumsum(0)
-    return edge_batch, edge_ptr
 
 
 def _validate_ptrs(batch: Any) -> None:

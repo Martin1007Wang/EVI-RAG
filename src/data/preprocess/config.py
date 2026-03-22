@@ -162,28 +162,6 @@ def build_preprocess_filters(
     return train_filter, eval_filter, overrides
 
 
-_ENTITY_VOCAB_FILENAME = "entity_vocab.parquet"
-
-
-def resolve_entity_vocab_path(cfg: Any) -> Optional[Path]:
-    """Resolve entity_vocab.parquet from dataset cfg or fall back to out_dir."""
-    if OmegaConf is not None and isinstance(cfg, DictConfig):
-        cfg = OmegaConf.to_container(cfg, resolve=True)
-    if not isinstance(cfg, dict):
-        return None
-    paths_cfg = cfg.get("paths")
-    if OmegaConf is not None and isinstance(paths_cfg, DictConfig):
-        paths_cfg = OmegaConf.to_container(paths_cfg, resolve=True)
-    if isinstance(paths_cfg, dict):
-        entity_vocab = paths_cfg.get("entity_vocab")
-        if entity_vocab:
-            return Path(entity_vocab)
-    out_dir = cfg.get("out_dir")
-    if out_dir:
-        return Path(out_dir) / _ENTITY_VOCAB_FILENAME
-    return None
-
-
 __all__ = [
     "_resolve_parquet_chunk_size",
     "_resolve_parquet_num_workers",
@@ -192,5 +170,4 @@ __all__ = [
     "resolve_embedding_batch_size",
     "resolve_embedding_device",
     "resolve_embedding_fp16",
-    "resolve_entity_vocab_path",
 ]

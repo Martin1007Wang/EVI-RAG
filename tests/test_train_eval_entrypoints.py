@@ -12,6 +12,7 @@ from src.train import (
     _align_validation_metrics_profile,
     _build_final_eval_cfg,
     _maybe_load_model_weights,
+    _run_final_eval_suite,
     _run_post_fit_evaluation,
 )
 from src.utils.entrypoint_contracts import (
@@ -154,10 +155,40 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
             ],
         )
 
+    assert cfg.data.batch_size == 192
     assert cfg.data.eval_batch_size == 32
+    assert cfg.data.train_max_graphs_per_batch == 192
+    assert cfg.data.train_max_nodes_per_batch == 480000
+    assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
+    assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
+    assert cfg.trainer.log_every_n_steps == 10
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
     assert cfg.model.eval_cfg.monte_carlo_rollouts == 256
     assert cfg.run.test is True
+
+
+def test_train_answer_reachability_alias_matches_rankflow_defaults() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "experiment=train_answer_reachability",
+                "dataset=webqsp-sub",
+                "logger=none",
+                "extras.enforce_tags=false",
+                "extras.print_config=false",
+            ],
+        )
+
+    assert cfg.data.batch_size == 192
+    assert cfg.data.eval_batch_size == 32
+    assert cfg.data.train_max_edges_per_batch == 1440000
+    assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
+    assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
+    assert cfg.trainer.log_every_n_steps == 10
+    assert cfg.model.training_cfg.success_replay.enabled is True
 
 
 def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
@@ -263,9 +294,10 @@ def test_run_post_fit_evaluation_uses_final_eval_suite(monkeypatch) -> None:
     monkeypatch.setattr("src.train._build_final_eval_cfg", _build_eval_cfg)
     monkeypatch.setattr(
         "src.train._run_final_eval_suite",
-        lambda eval_cfg: {
+        lambda eval_cfg, **kwargs: {
             "final_eval/webqsp-sub/test/answer/recall@10": 0.5,
             "seen_cfg": eval_cfg,
+            "seen_kwargs": kwargs,
         },
     )
 
@@ -280,6 +312,101 @@ def test_run_post_fit_evaluation_uses_final_eval_suite(monkeypatch) -> None:
 
     assert seen["build"] == (cfg, "/tmp/best.ckpt")
     assert metrics["final_eval/webqsp-sub/test/answer/recall@10"] == 0.5
+
+
+def test_run_final_eval_suite_prefers_inprocess_reuse_when_available(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "paths": {"output_dir": str(tmp_path)},
+            "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
+            "model": {"eval_cfg": {"metrics_profile": "full"}},
+            "run": {"split": "test"},
+        }
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("src.train.resolve_dataset_variants", lambda _cfg: [])
+
+    def _evaluate_model_inprocess(current_cfg, *, trainer, datamodule, model):  # type: ignore[no-untyped-def]
+        seen["inprocess"] = (current_cfg, trainer, datamodule, model)
+        return {}, {
+            "model": SimpleNamespace(get_predict_metrics=lambda: {"answer/hit@1": 0.5})
+        }
+
+    monkeypatch.setattr("src.eval.evaluate_model_inprocess", _evaluate_model_inprocess)
+    monkeypatch.setattr(
+        "src.eval.evaluate_model",
+        lambda current_cfg: (_ for _ in ()).throw(AssertionError(current_cfg)),
+    )
+
+    class _Reporter:
+        def persist_outputs(self, *, cfg, callback_metrics, model, log):  # type: ignore[no-untyped-def]
+            del cfg, callback_metrics, log
+            return model.get_predict_metrics()
+
+    monkeypatch.setattr("src.train.AnswerReachabilityEvalReporter", lambda: _Reporter())
+
+    trainer = SimpleNamespace()
+    datamodule = SimpleNamespace()
+    model = SimpleNamespace()
+    metrics = _run_final_eval_suite(
+        cfg,
+        trainer=trainer,
+        model=model,
+        datamodule=datamodule,
+    )
+
+    assert seen["inprocess"] == (cfg, trainer, datamodule, model)
+    assert metrics["final_eval/webqsp-sub/test/answer/hit@1"] == 0.5
+
+
+def test_run_final_eval_suite_releases_runtime_state_before_fresh_fallback(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "paths": {"output_dir": str(tmp_path)},
+            "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
+            "model": {"eval_cfg": {"metrics_profile": "full"}},
+            "run": {"split": "test"},
+        }
+    )
+    seen = {"reset": False, "teardown": False}
+
+    monkeypatch.setattr("src.train.resolve_dataset_variants", lambda _cfg: [])
+    monkeypatch.setattr(
+        "src.eval.evaluate_model_inprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unsupported")),
+    )
+
+    def _evaluate_model(_current_cfg):  # type: ignore[no-untyped-def]
+        assert seen == {"reset": True, "teardown": True}
+        return {"test/answer/hit@1": 0.25}, {"model": SimpleNamespace()}
+
+    monkeypatch.setattr("src.eval.evaluate_model", _evaluate_model)
+
+    class _Reporter:
+        def persist_outputs(self, *, cfg, callback_metrics, model, log):  # type: ignore[no-untyped-def]
+            del cfg, model, log
+            return callback_metrics
+
+    monkeypatch.setattr("src.train.AnswerReachabilityEvalReporter", lambda: _Reporter())
+
+    model = SimpleNamespace(
+        reset_prediction_state=lambda: seen.__setitem__("reset", True)
+    )
+    datamodule = SimpleNamespace(teardown=lambda: seen.__setitem__("teardown", True))
+
+    metrics = _run_final_eval_suite(
+        cfg,
+        trainer=SimpleNamespace(),
+        model=model,
+        datamodule=datamodule,
+    )
+
+    assert metrics["final_eval/webqsp-sub/test/test/answer/hit@1"] == 0.25
 
 
 def test_run_post_fit_evaluation_falls_back_to_inprocess_test_when_ckpt_missing() -> (
@@ -313,6 +440,34 @@ def test_run_post_fit_evaluation_falls_back_to_inprocess_test_when_ckpt_missing(
     )
 
     assert seen["called"] is True
+    assert metrics == {"test/answer/recall@10": 0.3}
+
+
+def test_run_post_fit_evaluation_releases_runtime_state_after_inprocess_test(
+    monkeypatch,
+) -> None:
+    seen = {"tested": False, "reset": False, "teardown": False}
+    trainer = SimpleNamespace(callback_metrics={"test/answer/recall@10": 0.3})
+
+    def _test(**_: object) -> None:
+        seen["tested"] = True
+
+    trainer.test = _test
+    monkeypatch.setattr(
+        "src.train._resolve_post_fit_ckpt_path",
+        lambda **_: "/tmp/best.ckpt",
+    )
+
+    metrics = _run_post_fit_evaluation(
+        cfg=OmegaConf.create({"run": {"test": True}}),
+        trainer=trainer,
+        model=SimpleNamespace(
+            reset_prediction_state=lambda: seen.__setitem__("reset", True)
+        ),
+        datamodule=SimpleNamespace(teardown=lambda: seen.__setitem__("teardown", True)),
+    )
+
+    assert seen == {"tested": True, "reset": True, "teardown": True}
     assert metrics == {"test/answer/recall@10": 0.3}
 
 

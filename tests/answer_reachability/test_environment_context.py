@@ -80,6 +80,38 @@ def test_topology_derives_graph_ids_without_exposing_batch_vectors() -> None:
     )
 
 
+def test_build_graph_batch_uses_relation_table_without_per_edge_embeddings() -> None:
+    emb_dim = 8
+    torch.manual_seed(17)
+    batch = SimpleNamespace(
+        num_graphs=1,
+        node_ptr=torch.tensor([0, 3], dtype=torch.long),
+        edge_index=torch.tensor([[0, 0, 1], [1, 2, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([5, 7, 5], dtype=torch.long),
+        node_embeddings=torch.randn(3, emb_dim),
+        edge_embeddings=None,
+        relation_embeddings=torch.randn(3, emb_dim),
+        edge_rel_local=torch.tensor([2, 1, 2], dtype=torch.long),
+        question_emb=torch.randn(1, emb_dim),
+        question_ctx=torch.randn(1, 2, emb_dim),
+        question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        q_ptr=torch.tensor([0, 1], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        sample_ids=["graph-0"],
+    )
+
+    topology, observation = build_graph_batch(batch)
+
+    assert torch.equal(topology.edge_type, torch.tensor([1, 0, 1], dtype=torch.long))
+    assert torch.equal(
+        observation.relation_features,
+        batch.relation_embeddings.index_select(
+            0, torch.tensor([1, 2], dtype=torch.long)
+        ),
+    )
+
+
 def test_build_graph_batch_rejects_out_of_range_q_local_indices() -> None:
     batch = make_toy_batch()
     batch.q_local_indices[0] = 3

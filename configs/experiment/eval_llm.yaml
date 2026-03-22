@@ -10,7 +10,7 @@
 # - does require `/llm`, typically supplied entirely by this experiment bundle
 
 defaults:
-  - override /callbacks: default
+  - override /callbacks: eval
   - override /logger: none
   - override /run: eval_llm
   - override /trainer: predict

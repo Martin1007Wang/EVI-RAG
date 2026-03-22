@@ -12,7 +12,7 @@ defaults:
   - dataset: null
   - data: graph_retrieval
   - model: gflownet
-  - callbacks: default
+  - callbacks: eval
   - logger: null
   - trainer: predict
   - paths: default

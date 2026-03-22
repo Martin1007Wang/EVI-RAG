@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from src.graph_runtime import SearchObservation, build_graph_batch
+from src.graph_runtime import SearchObservation, TrajectoryBatch, build_graph_batch
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
@@ -177,6 +177,8 @@ class BaseSearchPolicy(nn.Module):
         self.candidate_shortlist_cfg = config.candidate_shortlist
 
     def prepare_batch(self, batch) -> PreparedSearchBatch:
+        if isinstance(batch, TrajectoryBatch):
+            batch.require_raw_features()
         topology, observation = build_graph_batch(batch, validate=False)
         encoded = self.backbone.encode(
             BackboneInput(

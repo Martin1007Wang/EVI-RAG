@@ -69,3 +69,38 @@ def test_import_hf_datasets_module_replaces_local_shadow(monkeypatch) -> None:
     assert hf_datasets is not shadow_module
     assert sys.modules["datasets"] is hf_datasets
     assert not raw_loader._is_local_datasets_shadow(hf_datasets)
+
+
+def test_row_to_sample_resolves_plain_labels_after_qid_lookup() -> None:
+    column_map = {
+        "graph_field": "graph",
+        "q_entity_field": "q_entity",
+        "a_entity_field": "a_entity",
+        "answer_text_field": "answer_text",
+        "question_id_field": "question_id",
+        "question_field": "question",
+    }
+    row = {
+        "graph": [
+            ["Alpha Entity", "rel", "Beta Entity"],
+            ["Alpha Entity (Q1)", "rel", "Beta Entity (Q2)"],
+        ],
+        "q_entity": ["Alpha Entity"],
+        "a_entity": ["Beta Entity"],
+        "answer_text": ["beta"],
+        "question_id": "q1",
+        "question": "Which beta?",
+    }
+
+    sample = raw_loader._row_to_sample(
+        row,
+        dataset="unit",
+        split="train",
+        kb="freebase",
+        column_map=column_map,
+        entity_normalization="qid_in_parentheses",
+    )
+
+    assert sample.graph == [("Q1", "rel", "Q2"), ("Q1", "rel", "Q2")]
+    assert sample.q_entity == ["Q1"]
+    assert sample.a_entity == ["Q2"]

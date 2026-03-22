@@ -23,14 +23,19 @@ from src.data.io.lmdb_utils import (
     assign_lmdb_shard,
     resolve_core_lmdb_paths,
 )
+from src.data.io.runtime_sample_metadata import (
+    RuntimeSampleMetadata,
+    load_runtime_sample_metadata,
+    runtime_sample_metadata_path,
+)
 from src.data.schema.constants import (
     _FILTER_MISSING_ANSWER_FILENAME,
     _FILTER_MISSING_START_FILENAME,
 )
+from src.data.utils.validation import _assert_allowed_split_name
 from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
-_ALLOWED_SPLITS = ("train", "validation", "test")
 _SEQUENTIAL_SAMPLE_IDS_DEFAULT = False
 _SPLIT_HASH_MASK = 0x7FFFFFFF
 _REMOVED_DATASET_KEYS = (
@@ -59,6 +64,91 @@ class GraphSampleStats:
     num_nodes: int
     num_edges: int
     question_tokens: int
+
+
+@dataclass(frozen=True)
+class _RuntimeSampleMetadataIndex:
+    metadata: RuntimeSampleMetadata
+    positions: dict[str, int]
+
+    @classmethod
+    def from_metadata(
+        cls, metadata: RuntimeSampleMetadata
+    ) -> "_RuntimeSampleMetadataIndex":
+        return cls(
+            metadata=metadata,
+            positions={
+                sample_id: idx for idx, sample_id in enumerate(metadata.sample_ids)
+            },
+        )
+
+    def question(self, sample_id: str) -> Optional[str]:
+        idx = self.positions.get(sample_id)
+        if idx is None:
+            return None
+        return self.metadata.questions[idx]
+
+    def stats(self, sample_id: str) -> Optional[GraphSampleStats]:
+        idx = self.positions.get(sample_id)
+        if idx is None:
+            return None
+        return GraphSampleStats(
+            num_nodes=int(self.metadata.num_nodes[idx].item()),
+            num_edges=int(self.metadata.num_edges[idx].item()),
+            question_tokens=int(self.metadata.question_tokens[idx].item()),
+        )
+
+
+def _coerce_question_embedding(value: Any, sample_id: str) -> torch.Tensor:
+    question_emb = torch.as_tensor(value, dtype=torch.float32)
+    if question_emb.dim() == 1:
+        question_emb = question_emb.unsqueeze(0)
+    if question_emb.dim() != 2:
+        raise ValueError(
+            f"question_emb must have shape [B, d] for sample_id={sample_id}; "
+            f"got shape={tuple(question_emb.shape)}."
+        )
+    return question_emb
+
+
+def _resolve_question_context(
+    *,
+    question_emb: torch.Tensor,
+    question_ctx: Any,
+    question_ctx_mask: Any,
+    sample_id: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if question_ctx is None and question_ctx_mask is None:
+        synthesized_ctx = question_emb.unsqueeze(1)
+        synthesized_mask = torch.ones(
+            synthesized_ctx.shape[:2],
+            dtype=torch.bool,
+            device=synthesized_ctx.device,
+        )
+        return synthesized_ctx, synthesized_mask
+    if question_ctx is None or question_ctx_mask is None:
+        raise ValueError(
+            "question_ctx and question_ctx_mask must be provided together in LMDB samples "
+            f"(sample_id={sample_id})."
+        )
+    resolved_ctx = torch.as_tensor(question_ctx, dtype=torch.float32)
+    resolved_mask = torch.as_tensor(question_ctx_mask, dtype=torch.bool)
+    if resolved_ctx.dim() != 3:
+        raise ValueError(
+            f"question_ctx must have shape [B, L, d] for sample_id={sample_id}; "
+            f"got shape={tuple(resolved_ctx.shape)}."
+        )
+    if resolved_mask.dim() != 2:
+        raise ValueError(
+            f"question_ctx_mask must have shape [B, L] for sample_id={sample_id}; "
+            f"got shape={tuple(resolved_mask.shape)}."
+        )
+    if tuple(resolved_mask.shape) != tuple(resolved_ctx.shape[:2]):
+        raise ValueError(
+            "question_ctx_mask shape mismatch with question_ctx for sample_id="
+            f"{sample_id}: mask={tuple(resolved_mask.shape)} ctx={tuple(resolved_ctx.shape[:2])}."
+        )
+    return resolved_ctx, resolved_mask
 
 
 class GraphRetrievalDataset(Dataset):
@@ -91,6 +181,10 @@ class GraphRetrievalDataset(Dataset):
         self._heuristic_log_v: Optional[torch.Tensor] = None
         self._lmdb_readahead = bool(lmdb_readahead)
         self._sample_stats_cache: dict[str, GraphSampleStats] = {}
+        self._runtime_sample_metadata_path = runtime_sample_metadata_path(
+            self._embeddings_dir, self.split
+        )
+        self._runtime_sample_metadata: Optional[_RuntimeSampleMetadataIndex] = None
 
         self._init_sample_ids()
         self._apply_filters(
@@ -137,14 +231,13 @@ class GraphRetrievalDataset(Dataset):
         num_nodes = _coerce_num_nodes(raw.get("num_nodes"), sample_id)
         node_global_ids = raw["node_global_ids"]
         node_embedding_ids = raw["node_embedding_ids"]
-        question_emb = raw["question_emb"]
-        question_ctx = raw.get("question_ctx")
-        question_ctx_mask = raw.get("question_ctx_mask")
-        if question_ctx is None or question_ctx_mask is None:
-            raise ValueError(
-                "question_ctx/question_ctx_mask are required fields in LMDB samples "
-                f"(sample_id={sample_id})."
-            )
+        question_emb = _coerce_question_embedding(raw["question_emb"], sample_id)
+        question_ctx, question_ctx_mask = _resolve_question_context(
+            question_emb=question_emb,
+            question_ctx=raw.get("question_ctx"),
+            question_ctx_mask=raw.get("question_ctx_mask"),
+            sample_id=sample_id,
+        )
 
         answer_ids = raw["answer_entity_ids"]
 
@@ -182,7 +275,9 @@ class GraphRetrievalDataset(Dataset):
                         f"max_id={max_id} size={heuristic_log_v.numel()}"
                     )
             data_kwargs["heuristic_log_v"] = heuristic_log_v.index_select(0, node_ids)
-        question_text = raw.get("question")
+        question_text = self._question_text_for_sample(sample_id)
+        if question_text is None:
+            question_text = raw.get("question")
         if question_text is not None:
             data_kwargs["question"] = question_text
         data = GraphRetrievalData(**data_kwargs)
@@ -199,12 +294,17 @@ class GraphRetrievalDataset(Dataset):
         cached = self._sample_stats_cache.get(sample_id)
         if cached is not None:
             return cached
+        metadata_stats = self._sample_stats_from_metadata(sample_id)
+        if metadata_stats is not None:
+            return metadata_stats
         raw = self._load_raw_sample(sample_id)
-        question_ctx_mask = raw.get("question_ctx_mask")
-        if question_ctx_mask is None:
-            raise ValueError(
-                f"question_ctx_mask is required to estimate sample stats (sample_id={sample_id})."
-            )
+        question_emb = _coerce_question_embedding(raw["question_emb"], sample_id)
+        _, question_ctx_mask = _resolve_question_context(
+            question_emb=question_emb,
+            question_ctx=raw.get("question_ctx"),
+            question_ctx_mask=raw.get("question_ctx_mask"),
+            sample_id=sample_id,
+        )
         stats = GraphSampleStats(
             num_nodes=_coerce_num_nodes(raw.get("num_nodes"), sample_id),
             num_edges=int(torch.as_tensor(raw["edge_attr"], dtype=torch.long).numel()),
@@ -325,7 +425,36 @@ class GraphRetrievalDataset(Dataset):
         state["_sample_stores"] = None
         state["_entity_embedding_map"] = None
         state["_heuristic_log_v"] = None
+        state["_runtime_sample_metadata"] = None
         return state
+
+    def _question_text_for_sample(self, sample_id: str) -> Optional[str]:
+        metadata = self._runtime_sample_metadata_index()
+        if metadata is None:
+            return None
+        return metadata.question(sample_id)
+
+    def _sample_stats_from_metadata(self, sample_id: str) -> Optional[GraphSampleStats]:
+        metadata = self._runtime_sample_metadata_index()
+        if metadata is None:
+            return None
+        return metadata.stats(sample_id)
+
+    def _runtime_sample_metadata_index(self) -> Optional[_RuntimeSampleMetadataIndex]:
+        if self._runtime_sample_metadata is not None:
+            return self._runtime_sample_metadata
+        if not self._runtime_sample_metadata_path.exists():
+            return None
+        metadata = load_runtime_sample_metadata(self._runtime_sample_metadata_path)
+        if metadata.split and metadata.split != self.split:
+            raise ValueError(
+                "Runtime sample metadata split mismatch: "
+                f"expected {self.split!r}, got {metadata.split!r}."
+            )
+        self._runtime_sample_metadata = _RuntimeSampleMetadataIndex.from_metadata(
+            metadata
+        )
+        return self._runtime_sample_metadata
 
     # ------------------------------------------------------------------ #
     # Filtering Utilities
@@ -492,15 +621,6 @@ def _resolve_missing_filter_paths(
             "Rebuild LMDB to emit runtime_filter_missing_* artifacts or disable those runtime filters."
         )
     return filter_paths
-
-
-def _assert_allowed_split_name(split_name: str) -> str:
-    split = str(split_name)
-    if split not in _ALLOWED_SPLITS:
-        raise ValueError(
-            f"Unsupported split name: {split}. Expected one of {_ALLOWED_SPLITS}."
-        )
-    return split
 
 
 def _load_sample_ids_from_lmdb(

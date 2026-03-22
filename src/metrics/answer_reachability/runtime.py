@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,7 +24,7 @@ from .batch_evaluator import (
     INVALID_START_REASON,
     ReachabilityBatchEvaluator,
 )
-from .edge_eval import EdgeRetrievalEvaluator
+from .edge_eval import EdgeRetrievalEvaluator, compute_edge_metrics
 from .flow_frontier import (
     FlowFrontierReachabilityAnalyzer,
     FlowFrontierSupportSearch,
@@ -31,8 +32,21 @@ from .flow_frontier import (
 from .metrics import compute_support_metrics
 from .monte_carlo import MonteCarloReachabilityAnalyzer, MonteCarloSupportSearch
 from .posterior import aggregate_rank_metrics
+from .prediction_io import (
+    iter_jsonl_records,
+    jsonl_has_records,
+    load_edge_retrieval_result,
+    load_support_window_result,
+)
 from .schema import SupportWindowEvalBatch
 from .support_search import SupportSearchProtocol
+
+
+@dataclass
+class _OnlinePredictMetricsAccumulator:
+    metric_sums: dict[str, float] = field(default_factory=dict)
+    count: int = 0
+    invalid_start_count: int = 0
 
 
 class SearchMetricRuntime(BaseMetricRuntime):
@@ -201,6 +215,193 @@ class SearchMetricRuntime(BaseMetricRuntime):
             overwrite=overwrite,
         )
         return writer.write(results=results, labels=labels)
+
+    @staticmethod
+    def initialize_predict_metrics_accumulator(
+        *,
+        metrics_profile: str,
+    ) -> _OnlinePredictMetricsAccumulator:
+        del metrics_profile
+        return _OnlinePredictMetricsAccumulator()
+
+    def update_predict_metrics_accumulator(
+        self,
+        *,
+        accumulator: _OnlinePredictMetricsAccumulator,
+        predict_results: list[Any],
+        metrics_profile: str,
+    ) -> None:
+        if self._uses_edge_retrieval_task():
+            for result in predict_results:
+                metrics = compute_edge_metrics(
+                    results=[result],
+                    edge_top_ks=tuple(int(k) for k in self.eval_cfg.edge_top_ks),
+                )
+                for name, value in metrics.items():
+                    accumulator.metric_sums[name] = accumulator.metric_sums.get(
+                        name, 0.0
+                    ) + float(value)
+                accumulator.count += 1
+            return
+
+        for result in predict_results:
+            if result.stop_reason == INVALID_START_REASON:
+                accumulator.invalid_start_count += 1
+            rank_metrics = aggregate_rank_metrics(
+                results=[result],
+                answer_top_ks=tuple(int(k) for k in self.eval_cfg.answer_top_ks),
+            )
+            for name, value in rank_metrics.items():
+                accumulator.metric_sums[name] = accumulator.metric_sums.get(
+                    name, 0.0
+                ) + float(value)
+            if metrics_profile != "rank_only":
+                support_metrics = compute_support_metrics(
+                    SupportWindowEvalBatch(
+                        dataset_scope=result.dataset_scope,
+                        mass_threshold=float(self.eval_cfg.support_mass_threshold),
+                        results=[result],
+                        window_top_ks=tuple(
+                            int(k) for k in self.eval_cfg.window_top_ks
+                        ),
+                    )
+                )
+                for name, value in support_metrics.items():
+                    if name == "meta/num_samples":
+                        continue
+                    accumulator.metric_sums[name] = accumulator.metric_sums.get(
+                        name, 0.0
+                    ) + float(value)
+            accumulator.count += 1
+
+    def finalize_predict_metrics_accumulator(
+        self,
+        *,
+        accumulator: _OnlinePredictMetricsAccumulator,
+        metrics_profile: str,
+    ) -> dict[str, float]:
+        if accumulator.count < 1:
+            return {}
+        metrics = {
+            name: value / float(accumulator.count)
+            for name, value in accumulator.metric_sums.items()
+        }
+        if not self._uses_edge_retrieval_task():
+            if metrics_profile != "rank_only":
+                metrics["meta/num_samples"] = float(accumulator.count)
+            metrics["invalid_start_count"] = float(accumulator.invalid_start_count)
+            metrics["invalid_start_rate"] = float(
+                accumulator.invalid_start_count
+            ) / float(accumulator.count)
+        return metrics
+
+    def summarize_predict_epoch_from_jsonl(
+        self,
+        *,
+        predict_results_path: str | Path,
+        metrics_profile: str,
+    ) -> dict[str, float]:
+        if not jsonl_has_records(predict_results_path):
+            return {}
+        if self._uses_edge_retrieval_task():
+            metric_sums: dict[str, float] = {}
+            count = 0
+            for record in iter_jsonl_records(predict_results_path):
+                result = load_edge_retrieval_result(record)
+                metrics = compute_edge_metrics(
+                    results=[result],
+                    edge_top_ks=tuple(int(k) for k in self.eval_cfg.edge_top_ks),
+                )
+                for name, value in metrics.items():
+                    metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
+                count += 1
+            if count < 1:
+                return {}
+            return {name: value / float(count) for name, value in metric_sums.items()}
+
+        rank_metric_sums: dict[str, float] = {}
+        support_metric_sums: dict[str, float] = {}
+        count = 0
+        invalid_start_count = 0
+        for record in iter_jsonl_records(predict_results_path):
+            result = load_support_window_result(record)
+            if result.stop_reason == INVALID_START_REASON:
+                invalid_start_count += 1
+            rank_metrics = aggregate_rank_metrics(
+                results=[result],
+                answer_top_ks=tuple(int(k) for k in self.eval_cfg.answer_top_ks),
+            )
+            for name, value in rank_metrics.items():
+                rank_metric_sums[name] = rank_metric_sums.get(name, 0.0) + float(value)
+            if metrics_profile != "rank_only":
+                support_metrics = compute_support_metrics(
+                    SupportWindowEvalBatch(
+                        dataset_scope=result.dataset_scope,
+                        mass_threshold=float(self.eval_cfg.support_mass_threshold),
+                        results=[result],
+                        window_top_ks=tuple(
+                            int(k) for k in self.eval_cfg.window_top_ks
+                        ),
+                    )
+                )
+                for name, value in support_metrics.items():
+                    if name == "meta/num_samples":
+                        continue
+                    support_metric_sums[name] = support_metric_sums.get(
+                        name, 0.0
+                    ) + float(value)
+            count += 1
+        if count < 1:
+            return {}
+        metrics = {
+            name: value / float(count)
+            for name, value in {**rank_metric_sums, **support_metric_sums}.items()
+        }
+        if metrics_profile != "rank_only":
+            metrics["meta/num_samples"] = float(count)
+        metrics["invalid_start_count"] = float(invalid_start_count)
+        metrics["invalid_start_rate"] = float(invalid_start_count) / float(count)
+        return metrics
+
+    def write_prediction_artifacts_from_jsonl(
+        self,
+        *,
+        results_path: str | Path,
+        labels_path: str | Path,
+        output_dir: str | Path,
+        split: str,
+        artifact_name: str,
+        schema_version: int,
+        entity_vocab_path: str | Path | None,
+        relation_vocab_path: str | Path | None,
+        questions_path: str | Path | None,
+        overwrite: bool,
+    ) -> dict[str, Path] | None:
+        if not jsonl_has_records(results_path):
+            return None
+        if self._uses_edge_retrieval_task():
+            return self.edge_evaluator.write_prediction_artifacts_from_jsonl(
+                results_path=results_path,
+                labels_path=labels_path,
+                output_dir=output_dir,
+                split=split,
+                artifact_name=artifact_name,
+                overwrite=overwrite,
+            )
+        writer = SupportWindowArtifactWriter(
+            output_dir=output_dir,
+            split=split,
+            artifact_name=artifact_name,
+            schema_version=schema_version,
+            entity_vocab_path=entity_vocab_path,
+            relation_vocab_path=relation_vocab_path,
+            questions_path=questions_path,
+            overwrite=overwrite,
+        )
+        return writer.write_from_jsonl(
+            results_path=results_path,
+            labels_path=labels_path,
+        )
 
 
 class SearchMetricRuntimeFactory:

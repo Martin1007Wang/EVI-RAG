@@ -207,6 +207,21 @@ def _dedup_directed_edges(
     return out
 
 
+def _prepare_graph_edges(
+    graph: Sequence[Tuple[str, str, str]],
+    *,
+    remove_self_loops: bool,
+    dedup_edges: bool,
+) -> List[Tuple[str, str, str]]:
+    kept_edges = _partition_graph_edges(
+        graph,
+        remove_self_loops=remove_self_loops,
+    )
+    if dedup_edges:
+        return _dedup_directed_edges(kept_edges)
+    return kept_edges
+
+
 def _compute_target_reachable_nodes(
     edges: Sequence[Tuple[str, str, str]],
     targets: Sequence[str],
@@ -395,11 +410,11 @@ def preprocess(ctx: PreprocessContext) -> None:
         sample = _apply_q_entity_blacklist(sample, q_entity_blacklist)
         graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
         total_by_split[sample.split] = total_by_split.get(sample.split, 0) + 1
-        kept_edges = _partition_graph_edges(
+        kept_edges = _prepare_graph_edges(
             sample.graph,
             remove_self_loops=remove_self_loops,
+            dedup_edges=dedup_edges,
         )
-        kept_edges = _dedup_directed_edges(kept_edges)
         split_key = sample.split
         raw_edges = len(sample.graph)
         self_loop_edges = 0
@@ -1029,15 +1044,13 @@ def build_graph(
     edge_src: List[int] = []
     edge_dst: List[int] = []
     edge_relation_ids: List[int] = []
-    edge_key_to_indices: Dict[Tuple[str, str, str], int] = {}
-
     # sample.graph must be derived only from q_entity (e.g., PPR on the full graph) with no answer-conditioned steps,
     # per prior work by rmanluo.
-    kept_edges = _partition_graph_edges(
+    kept_edges = _prepare_graph_edges(
         sample.graph,
         remove_self_loops=remove_self_loops,
+        dedup_edges=dedup_edges,
     )
-    kept_edges = _dedup_directed_edges(kept_edges)
     if target_reachable_pruning:
         reachable_nodes = _compute_target_reachable_nodes(kept_edges, sample.a_entity)
         if not reachable_nodes:
@@ -1053,9 +1066,6 @@ def build_graph(
         if not kept_edges:
             return None
     for h, r, t in kept_edges:
-        edge_key = (h, r, t)
-        if dedup_edges and edge_key in edge_key_to_indices:
-            continue
         src_idx = local_index(h)
         dst_idx = local_index(t)
         if isinstance(relation_vocab, RelationLookup):
@@ -1065,8 +1075,6 @@ def build_graph(
         edge_src.append(src_idx)
         edge_dst.append(dst_idx)
         edge_relation_ids.append(rel_idx)
-        if dedup_edges:
-            edge_key_to_indices[edge_key] = len(edge_src) - 1
 
     graph = GraphRecord(
         graph_id=graph_id,

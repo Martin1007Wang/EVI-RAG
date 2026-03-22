@@ -5,18 +5,12 @@ from functools import cached_property
 from pathlib import Path
 from typing import Optional, Tuple
 
-from src.data.schema.constants import _MIN_CHUNK_SIZE
-from src.data.schema.types import (
-    EmbeddingConfig,
-    EntityVocab,
-    RelationVocab,
-    SplitFilter,
-)
+from src.data.schema.types import EmbeddingConfig, SplitFilter
 from src.data.preprocess.config import (
-    build_embedding_cfg,
-    build_preprocess_filters,
     _resolve_parquet_chunk_size,
     _resolve_parquet_num_workers,
+    build_embedding_cfg,
+    build_preprocess_filters,
     resolve_embedding_batch_size,
 )
 
@@ -25,16 +19,6 @@ from src.data.preprocess.config import (
 class PreprocessContext:
     cfg: object
     logger: object
-    run_id: str
-    base_dir: Optional[Path] = None
-
-    _entity_vocab: Optional[EntityVocab] = None
-    _relation_vocab: Optional[RelationVocab] = None
-
-    def __post_init__(self) -> None:
-        if self.base_dir is None:
-            base = self.cfg.get("out_dir") or "."
-            self.base_dir = self._to_abs_path(base)
 
     def _to_abs_path(self, value: str | Path) -> Path:
         try:
@@ -103,23 +87,3 @@ class PreprocessContext:
     @cached_property
     def parquet_num_workers(self) -> int:
         return _resolve_parquet_num_workers(self.cfg)
-
-    @property
-    def entity_vocab(self) -> EntityVocab:
-        if self._entity_vocab is None:
-            raise RuntimeError("EntityVocab is not initialized yet.")
-        return self._entity_vocab
-
-    @property
-    def relation_vocab(self) -> RelationVocab:
-        if self._relation_vocab is None:
-            raise RuntimeError("RelationVocab is not initialized yet.")
-        return self._relation_vocab
-
-    def get_path(self, stage: str, filename: str) -> Path:
-        return self.base_dir / stage / filename
-
-    def ensure_stage_dir(self, stage: str) -> Path:
-        path = self.base_dir / stage
-        path.mkdir(parents=True, exist_ok=True)
-        return path

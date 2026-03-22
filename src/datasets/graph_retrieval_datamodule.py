@@ -40,6 +40,14 @@ _FEATURE_DTYPE_ALIASES = {
     "float16": torch.float16,
     "16": torch.float16,
 }
+_FLOAT_BATCH_FEATURE_ATTRS = (
+    "node_embeddings",
+    "edge_embeddings",
+    "relation_embeddings",
+    "question_emb",
+    "question_ctx",
+    "heuristic_log_v",
+)
 
 
 def _canonicalize_dataset_cfg(dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -213,20 +221,27 @@ class BudgetBatchSampler(Sampler[list[int]]):
         ):
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be >= 1 when set.")
+        self._cached_length: int | None = None
+        self._cached_length_key: tuple[int, ...] | None = None
 
     def __len__(self) -> int:
-        base_len = len(self.sampler)
-        if base_len == 0:
-            return 0
-        if self.max_graphs_per_batch is not None:
-            return max(
-                1,
-                (base_len + int(self.max_graphs_per_batch) - 1)
-                // int(self.max_graphs_per_batch),
-            )
-        return base_len
+        cache_key = self._length_cache_key()
+        if (
+            cache_key is not None
+            and self._cached_length_key == cache_key
+            and self._cached_length is not None
+        ):
+            return self._cached_length
+        length = sum(1 for _ in self._iter_batches())
+        if cache_key is not None:
+            self._cached_length_key = cache_key
+            self._cached_length = length
+        return length
 
     def __iter__(self) -> Iterator[list[int]]:
+        yield from self._iter_batches()
+
+    def _iter_batches(self) -> Iterator[list[int]]:
         batch: list[int] = []
         nodes = 0
         edges = 0
@@ -234,6 +249,17 @@ class BudgetBatchSampler(Sampler[list[int]]):
         for raw_idx in self.sampler:
             idx = int(raw_idx)
             stats = self.dataset.get_sample_stats(idx)
+            if self._would_exceed(
+                batch_size=1,
+                nodes=int(stats.num_nodes),
+                edges=int(stats.num_edges),
+                question_tokens=int(stats.question_tokens),
+            ):
+                raise ValueError(
+                    "Single sample exceeds batch budget: "
+                    f"idx={idx} nodes={int(stats.num_nodes)} edges={int(stats.num_edges)} "
+                    f"question_tokens={int(stats.question_tokens)}. Increase the active batch limits."
+                )
             would_exceed = bool(batch) and self._would_exceed(
                 batch_size=len(batch) + 1,
                 nodes=nodes + int(stats.num_nodes),
@@ -252,6 +278,22 @@ class BudgetBatchSampler(Sampler[list[int]]):
             question_tokens += int(stats.question_tokens)
         if batch and not self.drop_last:
             yield batch
+
+    def _length_cache_key(self) -> tuple[int, ...] | None:
+        epoch = getattr(self.sampler, "epoch", None)
+        if epoch is None:
+            return None
+        return (
+            int(epoch),
+            len(self.sampler),
+            int(self.drop_last),
+            -1 if self.max_graphs_per_batch is None else int(self.max_graphs_per_batch),
+            -1 if self.max_nodes_per_batch is None else int(self.max_nodes_per_batch),
+            -1 if self.max_edges_per_batch is None else int(self.max_edges_per_batch),
+            -1
+            if self.max_question_tokens_per_batch is None
+            else int(self.max_question_tokens_per_batch),
+        )
 
     def _would_exceed(
         self,
@@ -441,7 +483,23 @@ class GraphRetrievalDataModule(LightningDataModule):
         return self._shared_resources
 
     def set_eval_split(self, split: str) -> None:
-        self.eval_split = _normalize_split_key(split)
+        normalized = _normalize_split_key(split)
+        if normalized == self.eval_split:
+            return
+        self.eval_split = normalized
+        self.eval_dataset = None
+
+    def replace_dataset_cfg(
+        self,
+        dataset_cfg: Any,
+        *,
+        eval_split: str | None = None,
+    ) -> None:
+        self.teardown()
+        self.dataset_cfg = _resolve_dataset_cfg(dataset_cfg)
+        self.dataset_scope = _resolve_dataset_scope(self.dataset_cfg)
+        if eval_split is not None:
+            self.eval_split = _normalize_split_key(eval_split)
 
     def prepare_data(self) -> None:
         """
@@ -533,14 +591,23 @@ class GraphRetrievalDataModule(LightningDataModule):
         resources = self._shared_resources
         if resources is None:
             return batch
-        if not hasattr(batch, "node_embeddings") or not hasattr(
-            batch, "edge_embeddings"
+        feature_dtype = self._current_feature_dtype()
+        if (
+            not _has_attached_tensor(batch, "node_embeddings")
+            or not _has_attached_tensor(batch, "relation_embeddings")
+            or not _has_attached_tensor(batch, "edge_rel_local")
         ):
             attach_embeddings_to_batch(
                 batch,
                 global_embeddings=resources.global_embeddings,
-                embeddings_device=self.embeddings_device,
+                embeddings_device=_resolve_embedding_attachment_device(
+                    self.embeddings_device,
+                    trainer=getattr(self, "trainer", None),
+                ),
+                feature_dtype=feature_dtype,
             )
+        if feature_dtype is not None:
+            _cast_batch_float_features_inplace(batch, feature_dtype=feature_dtype)
         return batch
 
     def on_after_batch_transfer(self, batch: Any, dataloader_idx: int) -> Any:
@@ -798,8 +865,64 @@ def _resolve_dataset_scope(dataset_cfg: Dict[str, Any]) -> str:
 
 
 def _infer_batch_device(batch: Any) -> torch.device:
-    for attr in ("edge_index", "node_embeddings", "edge_attr", "question_emb"):
+    for attr in (
+        "edge_index",
+        "node_embeddings",
+        "relation_embeddings",
+        "edge_attr",
+        "question_emb",
+    ):
         value = getattr(batch, attr, None)
         if torch.is_tensor(value):
             return cast(torch.Tensor, value).device
     return torch.device("cpu")
+
+
+def _has_attached_tensor(batch: Any, name: str) -> bool:
+    return torch.is_tensor(getattr(batch, name, None))
+
+
+def _cast_batch_float_features_inplace(
+    batch: Any, *, feature_dtype: torch.dtype
+) -> None:
+    for attr in _FLOAT_BATCH_FEATURE_ATTRS:
+        value = getattr(batch, attr, None)
+        if torch.is_tensor(value) and torch.is_floating_point(value):
+            tensor = cast(torch.Tensor, value)
+            if tensor.dtype != feature_dtype:
+                setattr(batch, attr, tensor.to(dtype=feature_dtype))
+
+
+def _resolve_trainer_root_device(trainer: Any) -> torch.device | None:
+    if trainer is None:
+        return None
+    strategy = getattr(trainer, "strategy", None)
+    root_device = getattr(strategy, "root_device", None)
+    if isinstance(root_device, torch.device):
+        return root_device
+    if root_device is not None:
+        return torch.device(root_device)
+    module = getattr(trainer, "lightning_module", None)
+    module_device = getattr(module, "device", None)
+    if isinstance(module_device, torch.device):
+        return module_device
+    if module_device is not None:
+        return torch.device(module_device)
+    return None
+
+
+def _resolve_embedding_attachment_device(
+    embeddings_device: str | None,
+    *,
+    trainer: Any,
+) -> torch.device | None:
+    root_device = _resolve_trainer_root_device(trainer)
+    if embeddings_device == _EMBEDDINGS_DEVICE_CPU:
+        return torch.device("cpu")
+    if embeddings_device == _EMBEDDINGS_DEVICE_CUDA:
+        if root_device is not None and root_device.type == "cuda":
+            return root_device
+        return torch.device("cuda")
+    if root_device is not None and root_device.type == "cuda":
+        return root_device
+    return None

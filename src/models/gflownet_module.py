@@ -313,6 +313,7 @@ class GFlowNetModule(LightningModule):
             heuristic_cfg=heuristic_cfg,
             max_steps=horizon_cfg.max_steps,
         )
+        self.metric_runtime_factory = metric_runtime_factory
         self.metric_runtime = metric_runtime_factory.build_runtime(
             horizon_cfg=horizon_cfg,
             training_cfg=training_cfg,
@@ -394,6 +395,31 @@ class GFlowNetModule(LightningModule):
 
     def reset_prediction_state(self) -> None:
         self.runtime_controller.reset_prediction_state()
+
+    def reconfigure_evaluation(self, *, eval_cfg: SearchEvalConfig) -> None:
+        self.cfg = GFlowNetConfig(
+            horizon_cfg=self.cfg.horizon_cfg,
+            training_cfg=self.cfg.training_cfg,
+            heuristic_cfg=self.cfg.heuristic_cfg,
+            policy_cfg=self.cfg.policy_cfg,
+            eval_cfg=eval_cfg,
+            optimizer_cfg=self.cfg.optimizer_cfg,
+            scheduler_cfg=self.cfg.scheduler_cfg,
+        )
+        self.metric_runtime = self.metric_runtime_factory.build_runtime(
+            horizon_cfg=self.cfg.horizon_cfg,
+            training_cfg=self.cfg.training_cfg,
+            eval_cfg=eval_cfg,
+            policy=self.policy,
+        )
+        self.runtime_controller = MetricRuntimeController(
+            metric_runtime=self.metric_runtime,
+            metrics_profile=str(eval_cfg.metrics_profile),
+            on_invalid_start=self._log_invalid_start,
+        )
+        self.sampler = self.runtime_controller.sampler
+        self.search = self.runtime_controller.search
+        self.reset_prediction_state()
 
     def replace_prediction_state(
         self,
@@ -648,6 +674,7 @@ class GFlowNetModule(LightningModule):
             validate=False,
         )
         replay_prepared_batch = self.policy.prepare_batch(replay_batch)
+        replay_batch = replay_batch.without_raw_features()
         replay_sample_batch = build_replay_sample_batch(
             batch=replay_batch,
             policy=self.policy,
@@ -1017,6 +1044,11 @@ class GFlowNetModule(LightningModule):
         replay_rollouts_per_graph = self._resolve_success_replay_rollouts_per_graph(
             on_policy_rollouts_per_graph=sampling_plan.rollout_batch_size
         )
+        replay_result = self._compute_success_replay_loss(
+            batch=trajectory_batch,
+            replay_rollouts_per_graph=replay_rollouts_per_graph,
+        )
+        trajectory_batch = trajectory_batch.without_raw_features()
         sample_batch = self.sampler.sample(
             batch=trajectory_batch,
             policy=self.policy,
@@ -1028,10 +1060,6 @@ class GFlowNetModule(LightningModule):
         rollout_metrics = self._compute_training_rollout_metrics(
             batch=trajectory_batch,
             sample_batch=sample_batch,
-        )
-        replay_result = self._compute_success_replay_loss(
-            batch=trajectory_batch,
-            replay_rollouts_per_graph=replay_rollouts_per_graph,
         )
         on_policy_trajectories = (
             trajectory_batch.num_graphs * sampling_plan.rollout_batch_size

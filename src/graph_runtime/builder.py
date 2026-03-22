@@ -61,7 +61,7 @@ def _require_edge_index(*, value: object) -> torch.Tensor:
 
 def _validate_graph_batch_protocol(
     batch: GraphBatchProtocol,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | None]:
     num_graphs = int(batch.num_graphs)
     if num_graphs < 1:
         raise ValueError("graph batch num_graphs must be >= 1.")
@@ -76,10 +76,6 @@ def _validate_graph_batch_protocol(
         "node_embeddings": _require_2d_float(
             value=batch.node_embeddings,
             name="node_embeddings",
-        ),
-        "edge_embeddings": _require_2d_float(
-            value=batch.edge_embeddings,
-            name="edge_embeddings",
         ),
         "question_emb": _require_2d_float(
             value=batch.question_emb,
@@ -106,7 +102,28 @@ def _validate_graph_batch_protocol(
             name="node_global_ids",
         ),
     }
-    devices = {tensor.device for tensor in tensors.values()}
+    edge_embeddings = getattr(batch, "edge_embeddings", None)
+    if edge_embeddings is not None:
+        edge_embeddings = _require_2d_float(
+            value=edge_embeddings,
+            name="edge_embeddings",
+        )
+    relation_embeddings = getattr(batch, "relation_embeddings", None)
+    if relation_embeddings is not None:
+        relation_embeddings = _require_2d_float(
+            value=relation_embeddings,
+            name="relation_embeddings",
+        )
+    edge_rel_local = getattr(batch, "edge_rel_local", None)
+    if edge_rel_local is not None:
+        edge_rel_local = _require_1d_long(
+            value=edge_rel_local,
+            name="edge_rel_local",
+        )
+    tensors["edge_embeddings"] = edge_embeddings
+    tensors["relation_embeddings"] = relation_embeddings
+    tensors["edge_rel_local"] = edge_rel_local
+    devices = {tensor.device for tensor in tensors.values() if tensor is not None}
     if len(devices) != 1:
         raise ValueError(
             f"graph batch tensors must share one device, got {sorted(str(device) for device in devices)}."
@@ -130,14 +147,38 @@ def _validate_graph_batch_protocol(
         )
 
     edge_index = tensors["edge_index"]
+    assert edge_index is not None
     num_edges = int(edge_index.size(1))
     if int(tensors["edge_rel_global"].numel()) != num_edges:
         raise ValueError(
             "edge_rel_global length mismatch with edge_index column count in graph batch."
         )
-    if int(tensors["edge_embeddings"].size(0)) != num_edges:
+    has_relation_table = relation_embeddings is not None or edge_rel_local is not None
+    if has_relation_table:
+        if relation_embeddings is None or edge_rel_local is None:
+            raise ValueError(
+                "graph batch must provide relation_embeddings and edge_rel_local together."
+            )
+        if int(edge_rel_local.numel()) != num_edges:
+            raise ValueError(
+                "edge_rel_local length mismatch with edge_index column count in graph batch."
+            )
+        if int(edge_rel_local.numel()) > 0 and bool(
+            (edge_rel_local >= int(relation_embeddings.size(0))).any().item()
+            or (edge_rel_local < 0).any().item()
+        ):
+            raise ValueError(
+                "edge_rel_local contains out-of-range relation table indices in graph batch."
+            )
+    elif edge_embeddings is not None:
+        if int(edge_embeddings.size(0)) != num_edges:
+            raise ValueError(
+                "edge_embeddings row count mismatch with edge_index column count in graph batch."
+            )
+    else:
         raise ValueError(
-            "edge_embeddings row count mismatch with edge_index column count in graph batch."
+            "graph batch must provide either edge_embeddings or "
+            "(relation_embeddings, edge_rel_local)."
         )
     if num_edges > 0:
         if bool((edge_index < 0).any().item()) or bool(
@@ -157,9 +198,11 @@ def _validate_graph_batch_protocol(
     if int(tensors["question_emb"].size(0)) != num_graphs:
         raise ValueError("question_emb batch mismatch with num_graphs in graph batch.")
     question_ctx = tensors["question_ctx"]
+    assert question_ctx is not None
     if int(question_ctx.size(0)) != num_graphs:
         raise ValueError("question_ctx batch mismatch with num_graphs in graph batch.")
     question_ctx_mask = tensors["question_ctx_mask"]
+    assert question_ctx_mask is not None
     if tuple(question_ctx_mask.shape) != tuple(question_ctx.shape[:2]):
         raise ValueError(
             "question_ctx_mask shape mismatch with question_ctx in graph batch."
@@ -232,18 +275,66 @@ def _build_relation_table(
     return relation_embeddings, edge_relations
 
 
+def _compact_relation_table(
+    *,
+    relation_embeddings: torch.Tensor,
+    edge_rel_local: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if int(edge_rel_local.numel()) == 0:
+        return relation_embeddings.new_empty(
+            (0, int(relation_embeddings.size(-1)))
+        ), edge_rel_local.new_empty((0,))
+    used_local_ids, compact_edge_rel_local = torch.unique(
+        edge_rel_local, sorted=True, return_inverse=True
+    )
+    return (
+        relation_embeddings.index_select(0, used_local_ids),
+        compact_edge_rel_local,
+    )
+
+
+def _resolve_relation_table(
+    *,
+    edge_rel_global: torch.Tensor,
+    edge_embeddings: torch.Tensor | None,
+    relation_embeddings: torch.Tensor | None,
+    edge_rel_local: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if relation_embeddings is not None or edge_rel_local is not None:
+        if relation_embeddings is None or edge_rel_local is None:
+            raise ValueError(
+                "relation_embeddings and edge_rel_local must be provided together."
+            )
+        return _compact_relation_table(
+            relation_embeddings=relation_embeddings,
+            edge_rel_local=edge_rel_local,
+        )
+    if edge_embeddings is None:
+        raise ValueError(
+            "build_graph_batch requires either edge_embeddings or "
+            "(relation_embeddings, edge_rel_local)."
+        )
+    return _build_relation_table(
+        edge_rel_global=edge_rel_global,
+        edge_embeddings=edge_embeddings,
+    )
+
+
 def build_graph_batch(
     batch: GraphBatchProtocol,
     *,
     validate: bool = True,
 ) -> tuple[GraphTopology, GraphObservation]:
     if isinstance(batch, TrajectoryBatch) and not validate:
+        batch.require_raw_features()
         tensors = {
             "node_ptr": batch.node_ptr,
             "edge_index": batch.edge_index,
             "edge_rel_global": batch.edge_rel_global,
             "node_embeddings": batch.node_embeddings,
             "edge_embeddings": batch.edge_embeddings,
+            "relation_embeddings": batch.relation_embeddings,
+            "edge_rel_local": batch.edge_rel_local,
             "question_emb": batch.question_emb,
             "question_ctx": batch.question_ctx,
             "question_ctx_mask": batch.question_ctx_mask,
@@ -253,14 +344,34 @@ def build_graph_batch(
         }
     else:
         tensors = _validate_graph_batch_protocol(batch)
-    relation_embeddings, edge_relations = _build_relation_table(
+    relation_embeddings, edge_relations = _resolve_relation_table(
         edge_rel_global=tensors["edge_rel_global"],
         edge_embeddings=tensors["edge_embeddings"],
+        relation_embeddings=tensors["relation_embeddings"],
+        edge_rel_local=tensors["edge_rel_local"],
     )
-    num_nodes = int(tensors["node_ptr"][-1].item())
+    node_ptr = tensors["node_ptr"]
+    edge_index = tensors["edge_index"]
+    node_embeddings = tensors["node_embeddings"]
+    question_emb = tensors["question_emb"]
+    question_ctx = tensors["question_ctx"]
+    question_ctx_mask = tensors["question_ctx_mask"]
+    q_local_indices_tensor = tensors["q_local_indices"]
+    q_ptr = tensors["q_ptr"]
+    node_global_ids = tensors["node_global_ids"]
+    assert node_ptr is not None
+    assert edge_index is not None
+    assert node_embeddings is not None
+    assert question_emb is not None
+    assert question_ctx is not None
+    assert question_ctx_mask is not None
+    assert q_local_indices_tensor is not None
+    assert q_ptr is not None
+    assert node_global_ids is not None
+    num_nodes = int(node_ptr[-1].item())
     q_local_indices = GroupedLocalNodeIndex.from_group_ptr(
-        local_indices=tensors["q_local_indices"],
-        group_ptr=tensors["q_ptr"],
+        local_indices=q_local_indices_tensor,
+        group_ptr=q_ptr,
         num_groups=batch.num_graphs,
         field_name="q_local_indices",
     )
@@ -274,25 +385,25 @@ def build_graph_batch(
     topology = GraphTopology(
         num_graphs=batch.num_graphs,
         num_nodes=num_nodes,
-        edge_index=tensors["edge_index"],
+        edge_index=edge_index,
         edge_type=edge_relations,
-        _graph_node_offsets=tensors["node_ptr"],
+        _graph_node_offsets=node_ptr,
         adjacency=_build_csr_with_edge_ids(
-            edge_index=tensors["edge_index"],
+            edge_index=edge_index,
             num_nodes_total=num_nodes,
         ),
         reverse_adjacency=_build_csr_with_edge_ids(
-            edge_index=tensors["edge_index"].flip(0),
+            edge_index=edge_index.flip(0),
             num_nodes_total=num_nodes,
         ),
     )
     observation = GraphObservation(
-        node_features=tensors["node_embeddings"],
+        node_features=node_embeddings,
         relation_features=relation_embeddings,
-        node_ids=tensors["node_global_ids"],
-        question_embedding=tensors["question_emb"],
-        question_context=tensors["question_ctx"],
-        question_valid_mask=tensors["question_ctx_mask"],
+        node_ids=node_global_ids,
+        question_embedding=question_emb,
+        question_context=question_ctx,
+        question_valid_mask=question_ctx_mask,
         q_local_indices=q_local_indices,
         sample_ids=sample_ids,
     )

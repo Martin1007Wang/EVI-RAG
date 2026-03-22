@@ -92,6 +92,9 @@ class SharedDataResources:
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_global_embeddings"] = None
+        state["_entity_embedding_map"] = None
+        state["_cvt_mask"] = None
+        state["_heuristic_log_v"] = None
         return state
 
     def __setstate__(self, state):

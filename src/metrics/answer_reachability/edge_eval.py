@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+import shutil
 from typing import Callable, Iterable, Protocol
 
 import torch
@@ -374,12 +375,41 @@ class EdgeRetrievalEvaluator:
             for path in (results_path, labels_path):
                 if path.exists():
                     raise FileExistsError(f"Artifact already exists: {path}")
-        self._write_jsonl(results_path, [asdict(result) for result in results])
-        self._write_jsonl(labels_path, [asdict(label) for label in labels])
+        self._write_jsonl(results_path, (asdict(result) for result in results))
+        self._write_jsonl(labels_path, (asdict(label) for label in labels))
         return {"results_path": results_path, "labels_path": labels_path}
 
+    def write_prediction_artifacts_from_jsonl(
+        self,
+        *,
+        results_path: str | Path,
+        labels_path: str | Path,
+        output_dir: str | Path,
+        split: str,
+        artifact_name: str,
+        overwrite: bool,
+    ) -> dict[str, Path] | None:
+        source_results_path = Path(results_path)
+        source_labels_path = Path(labels_path)
+        if not source_results_path.exists() or source_results_path.stat().st_size == 0:
+            return None
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        target_results_path = output_path / f"{artifact_name}.{split}.results.jsonl"
+        target_labels_path = output_path / f"{artifact_name}.{split}.labels.jsonl"
+        if not overwrite:
+            for path in (target_results_path, target_labels_path):
+                if path.exists():
+                    raise FileExistsError(f"Artifact already exists: {path}")
+        shutil.copyfile(source_results_path, target_results_path)
+        shutil.copyfile(source_labels_path, target_labels_path)
+        return {
+            "results_path": target_results_path,
+            "labels_path": target_labels_path,
+        }
+
     @staticmethod
-    def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
+    def _write_jsonl(path: Path, records: Iterable[dict[str, object]]) -> None:
         with path.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(

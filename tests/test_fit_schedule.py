@@ -86,5 +86,5 @@ def test_train_rankflow_experiment_uses_canonical_long_pass_schedule() -> None:
         )
 
     assert cfg.fit_schedule.max_passes == pytest.approx(240.0)
-    assert cfg.fit_schedule.val_every_passes == pytest.approx(2.0)
-    assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(48.0)
+    assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
+    assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)

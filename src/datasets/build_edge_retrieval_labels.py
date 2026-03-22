@@ -44,26 +44,29 @@ def _build_split(
 
     no_path = 0
     zero_hop = 0
-    for idx in tqdm(range(len(dataset)), desc=f"labels/{split}"):
-        data = dataset.get(idx)
-        sample_id = str(getattr(data, "sample_id", ""))
-        if not sample_id:
-            continue
-        labels = compute_shortest_path_labels(
-            edge_index=torch.as_tensor(data.edge_index, dtype=torch.long),
-            q_local_indices=torch.as_tensor(data.q_local_indices, dtype=torch.long),
-            a_local_indices=torch.as_tensor(data.a_local_indices, dtype=torch.long),
-            num_nodes=int(data.num_nodes),
-        )
-        if labels.max_path_length is None:
-            no_path += 1
-        elif int(labels.max_path_length) == 0:
-            zero_hop += 1
-        entries[sample_id] = {
-            "num_edges": int(labels.num_edges),
-            "positive_edge_ids": labels.positive_edge_ids,
-            "max_path_length": labels.max_path_length,
-        }
+    try:
+        for idx in tqdm(range(len(dataset)), desc=f"labels/{split}"):
+            data = dataset.get(idx)
+            sample_id = str(getattr(data, "sample_id", ""))
+            if not sample_id:
+                continue
+            labels = compute_shortest_path_labels(
+                edge_index=torch.as_tensor(data.edge_index, dtype=torch.long),
+                q_local_indices=torch.as_tensor(data.q_local_indices, dtype=torch.long),
+                a_local_indices=torch.as_tensor(data.a_local_indices, dtype=torch.long),
+                num_nodes=int(data.num_nodes),
+            )
+            if labels.max_path_length is None:
+                no_path += 1
+            elif int(labels.max_path_length) == 0:
+                zero_hop += 1
+            entries[sample_id] = {
+                "num_edges": int(labels.num_edges),
+                "positive_edge_ids": labels.positive_edge_ids,
+                "max_path_length": labels.max_path_length,
+            }
+    finally:
+        dataset.close()
 
     payload = {
         "meta": {

@@ -7,6 +7,7 @@ from collections import deque
 import json
 
 import lmdb
+import pyarrow as pa
 import torch
 
 try:
@@ -30,6 +31,10 @@ from src.data.io.lmdb_utils import (
     ensure_dir,
 )
 from src.data.io.parquet_io import _load_parquet
+from src.data.io.runtime_sample_metadata import (
+    runtime_sample_metadata_path,
+    save_runtime_sample_metadata,
+)
 from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labels
 from src.data.schema.constants import (
     _FILTER_MISSING_ANSWER_FILENAME,
@@ -57,6 +62,21 @@ def _write_sample_filter(path: Path, *, dataset: str, sample_ids: List[str]) -> 
         "sample_ids": sorted(sample_ids),
     }
     path.write_text(json.dumps(payload, indent=2))
+
+
+def _new_runtime_sample_metadata_buffers(
+    splits: List[str],
+) -> Dict[str, Dict[str, List[object]]]:
+    return {
+        str(split): {
+            "sample_ids": [],
+            "questions": [],
+            "num_nodes": [],
+            "num_edges": [],
+            "question_tokens": [],
+        }
+        for split in splits
+    }
 
 
 def _bfs_multi(
@@ -113,6 +133,38 @@ def _count_reachable_any_direction(
     return reachable
 
 
+def _expected_entity_embedding_rows(entity_vocab: Dict[str, List[object]]) -> int:
+    embedding_ids = [int(emb_id) for emb_id in entity_vocab.get("embedding_id", [])]
+    if not embedding_ids:
+        return 1
+    return max(embedding_ids) + 1
+
+
+def _build_entity_embedding_inputs(
+    entity_vocab: Dict[str, List[object]],
+    embedding_vocab: Dict[str, List[object]],
+) -> tuple[list[str], list[int], int]:
+    emb_rows = sorted(
+        zip(embedding_vocab["embedding_id"], embedding_vocab["label"]),
+        key=lambda item: int(item[0]),
+    )
+    text_labels = [str(label) for _, label in emb_rows]
+    text_ids = [int(emb_id) for emb_id, _ in emb_rows]
+    max_embedding_id = _expected_entity_embedding_rows(entity_vocab) - 1
+    return text_labels, text_ids, max_embedding_id
+
+
+def _take_graph_batch_columns(
+    graphs_table, row_indices: List[int]
+) -> tuple[dict[int, int], Dict[str, List[object]]]:
+    unique_row_indices = list(dict.fromkeys(int(row_idx) for row_idx in row_indices))
+    graph_batch = graphs_table.take(pa.array(unique_row_indices, type=pa.int64()))
+    row_lookup = {
+        row_idx: local_idx for local_idx, row_idx in enumerate(unique_row_indices)
+    }
+    return row_lookup, graph_batch.to_pydict()
+
+
 def build_dataset(ctx: PreprocessContext) -> None:
     cfg = ctx.cfg
     logger = ctx.logger
@@ -148,6 +200,10 @@ def build_dataset(ctx: PreprocessContext) -> None:
         zip(relation_vocab["relation_id"], relation_vocab["label"]), key=lambda x: x[0]
     )
     relation_labels: List[str] = [str(label) for _, label in relation_rows]
+    text_labels, text_ids, max_embedding_id = _build_entity_embedding_inputs(
+        entity_vocab,
+        embedding_vocab,
+    )
     use_precomputed_embeddings = bool(cfg.get("use_precomputed_embeddings", False))
     use_precomputed_questions = bool(cfg.get("use_precomputed_questions", False))
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
@@ -186,6 +242,30 @@ def build_dataset(ctx: PreprocessContext) -> None:
             )
         return encoder
 
+    def _encode_entity_embeddings() -> None:
+        log_event(logger, "lmdb_encode_entity_embeddings", count=len(text_labels))
+        encode_to_memmap(
+            encoder=_get_encoder(),
+            texts=text_labels,
+            emb_ids=text_ids,
+            batch_size=embedding_batch_size,
+            max_embedding_id=max_embedding_id,
+            out_path=entity_emb_path,
+            desc="Entities",
+            show_progress=cfg.progress_bar,
+        )
+
+    def _encode_relation_embeddings() -> torch.Tensor:
+        log_event(logger, "lmdb_encode_relation_embeddings", count=len(relation_labels))
+        relation_emb = _get_encoder().encode(
+            relation_labels,
+            embedding_batch_size,
+            show_progress=cfg.progress_bar,
+            desc="Relations",
+        )
+        torch.save(relation_emb, relation_emb_path)
+        return relation_emb
+
     if not use_precomputed_embeddings and reuse_embeddings_if_exists:
         if entity_emb_path.exists() and relation_emb_path.exists():
             log_event(logger, "lmdb_reuse_embeddings", path=str(emb_dir))
@@ -197,6 +277,18 @@ def build_dataset(ctx: PreprocessContext) -> None:
         ]
         if missing_paths:
             raise FileNotFoundError(f"Precomputed embeddings missing: {missing_paths}")
+        entity_emb = torch.load(entity_emb_path, map_location="cpu")
+        expected_entity_rows = max_embedding_id + 1
+        actual_entity_rows = int(entity_emb.size(0))
+        if actual_entity_rows != expected_entity_rows:
+            log_event(
+                logger,
+                "entity_embeddings_mismatch",
+                expected=expected_entity_rows,
+                actual=actual_entity_rows,
+                path=str(entity_emb_path),
+            )
+            _encode_entity_embeddings()
         relation_emb = torch.load(relation_emb_path, map_location="cpu")
         expected_relations = len(relation_labels)
         actual_relations = int(relation_emb.size(0))
@@ -208,47 +300,10 @@ def build_dataset(ctx: PreprocessContext) -> None:
                 actual=actual_relations,
                 path=str(relation_emb_path),
             )
-            encoder = _get_encoder()
-            log_event(
-                logger, "lmdb_encode_relation_embeddings", count=len(relation_labels)
-            )
-            relation_emb = encoder.encode(
-                relation_labels,
-                embedding_batch_size,
-                show_progress=cfg.progress_bar,
-                desc="Relations",
-            )
-            torch.save(relation_emb, relation_emb_path)
+            relation_emb = _encode_relation_embeddings()
     else:
-        encoder = _get_encoder()
-        emb_rows = sorted(
-            zip(embedding_vocab["embedding_id"], embedding_vocab["label"]),
-            key=lambda x: x[0],
-        )
-        text_labels: List[str] = [str(label) for _, label in emb_rows]
-        text_ids: List[int] = [int(eid) for eid, _ in emb_rows]
-        log_event(logger, "lmdb_encode_entity_embeddings", count=len(text_labels))
-        max_embedding_id = (
-            max(entity_vocab["embedding_id"]) if entity_vocab["embedding_id"] else 0
-        )
-        encode_to_memmap(
-            encoder=encoder,
-            texts=text_labels,
-            emb_ids=text_ids,
-            batch_size=embedding_batch_size,
-            max_embedding_id=max_embedding_id,
-            out_path=entity_emb_path,
-            desc="Entities",
-            show_progress=cfg.progress_bar,
-        )
-        log_event(logger, "lmdb_encode_relation_embeddings", count=len(relation_labels))
-        relation_emb = encoder.encode(
-            relation_labels,
-            embedding_batch_size,
-            show_progress=cfg.progress_bar,
-            desc="Relations",
-        )
-        torch.save(relation_emb, relation_emb_path)
+        _encode_entity_embeddings()
+        relation_emb = _encode_relation_embeddings()
 
     graphs_table = _load_parquet(ctx.out_dir / "graphs.parquet")
     questions_table = _load_parquet(ctx.out_dir / "questions.parquet")
@@ -291,13 +346,6 @@ def build_dataset(ctx: PreprocessContext) -> None:
     graph_id_to_row: Dict[str, int] = {
         gid: idx for idx, gid in enumerate(graph_id_list)
     }
-    graph_cols: Dict[str, List] = {
-        "node_entity_ids": graphs_table.column("node_entity_ids").to_pylist(),
-        "node_embedding_ids": graphs_table.column("node_embedding_ids").to_pylist(),
-        "edge_src": graphs_table.column("edge_src").to_pylist(),
-        "edge_dst": graphs_table.column("edge_dst").to_pylist(),
-        "edge_relation_ids": graphs_table.column("edge_relation_ids").to_pylist(),
-    }
 
     questions_rows = questions_table.num_rows
     log_event(logger, "lmdb_prepare_samples", samples=questions_rows)
@@ -311,6 +359,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
     lmdb_stats = {
         str(split): {"samples": 0, "nodes": 0, "edges": 0} for split in all_splits
     }
+    runtime_sample_metadata = _new_runtime_sample_metadata_buffers(all_splits)
     label_entries = None
     label_stats = None
     labels_dir: Optional[Path] = None
@@ -473,10 +522,11 @@ def build_dataset(ctx: PreprocessContext) -> None:
             graph_ids_batch = q_batch_dict["graph_id"]
             graph_row_indices: List[int] = []
             for gid in graph_ids_batch:
-                idx = graph_id_to_row.get(gid)
-                if idx is None:
+                row_idx = graph_id_to_row.get(gid)
+                if row_idx is None:
                     missing_graph_ids.append(gid)
-                graph_row_indices.append(idx)
+                    continue
+                graph_row_indices.append(int(row_idx))
 
             if missing_graph_ids:
                 sample_ids = ", ".join(list(dict.fromkeys(missing_graph_ids))[:5])
@@ -484,18 +534,26 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     f"Missing graph_id(s) in graphs.parquet, examples: {sample_ids}"
                 )
 
+            graph_row_lookup, graph_batch_cols = _take_graph_batch_columns(
+                graphs_table,
+                graph_row_indices,
+            )
+
             for i in range(q_batch.num_rows):
                 graph_id = graph_ids_batch[i]
-                split = q_batch_dict["split"][i]
+                split = str(q_batch_dict["split"][i])
                 if split not in envs:
                     continue
 
                 g_idx = graph_row_indices[i]
-                node_entity_ids = graph_cols["node_entity_ids"][g_idx]
-                node_embedding_ids = graph_cols["node_embedding_ids"][g_idx]
-                edge_src = graph_cols["edge_src"][g_idx]
-                edge_dst = graph_cols["edge_dst"][g_idx]
-                edge_rel = graph_cols["edge_relation_ids"][g_idx]
+                graph_local_idx = graph_row_lookup[g_idx]
+                node_entity_ids = graph_batch_cols["node_entity_ids"][graph_local_idx]
+                node_embedding_ids = graph_batch_cols["node_embedding_ids"][
+                    graph_local_idx
+                ]
+                edge_src = graph_batch_cols["edge_src"][graph_local_idx]
+                edge_dst = graph_batch_cols["edge_dst"][graph_local_idx]
+                edge_rel = graph_batch_cols["edge_relation_ids"][graph_local_idx]
 
                 num_nodes = len(node_entity_ids)
                 num_edges = len(edge_src)
@@ -531,7 +589,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     and label_entries is not None
                     and label_stats is not None
                 ):
-                    split_key = str(split)
+                    split_key = split
                     entries = label_entries[split_key]
                     stats = label_stats[split_key]
                     labels = compute_shortest_path_labels(
@@ -569,10 +627,21 @@ def build_dataset(ctx: PreprocessContext) -> None:
                         else:
                             stats["reachable_partial_samples"] += 1
 
-                split_key = str(split)
+                split_key = split
                 lmdb_stats[split_key]["samples"] += 1
                 lmdb_stats[split_key]["nodes"] += num_nodes
                 lmdb_stats[split_key]["edges"] += num_edges
+                runtime_sample_metadata[split_key]["sample_ids"].append(str(graph_id))
+                runtime_sample_metadata[split_key]["questions"].append(
+                    str(q_batch_dict["question"][i])
+                )
+                runtime_sample_metadata[split_key]["num_nodes"].append(int(num_nodes))
+                runtime_sample_metadata[split_key]["num_edges"].append(int(num_edges))
+                runtime_sample_metadata[split_key]["question_tokens"].append(
+                    int(q_batch_ctx_mask[i].sum().item())
+                    if q_batch_ctx_mask is not None
+                    else 1
+                )
                 core_sample = {
                     "edge_index": edge_index,
                     "edge_attr": edge_attr,
@@ -704,6 +773,23 @@ def build_dataset(ctx: PreprocessContext) -> None:
                 keep_start=len(keep_start_ids),
                 keep_answer=len(keep_answer_ids),
                 path=str(processed_dir),
+            )
+            for split_key, split_metadata in runtime_sample_metadata.items():
+                metadata_path = runtime_sample_metadata_path(emb_dir, split_key)
+                save_runtime_sample_metadata(
+                    metadata_path,
+                    split=split_key,
+                    sample_ids=split_metadata["sample_ids"],
+                    questions=split_metadata["questions"],
+                    num_nodes=split_metadata["num_nodes"],
+                    num_edges=split_metadata["num_edges"],
+                    question_tokens=split_metadata["question_tokens"],
+                )
+            log_event(
+                logger,
+                "runtime_sample_metadata_written",
+                path=str(emb_dir),
+                splits=list(runtime_sample_metadata.keys()),
             )
             if (
                 emit_edge_retrieval_labels

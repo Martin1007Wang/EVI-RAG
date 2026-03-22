@@ -61,6 +61,79 @@ def _move_float_feature(
     return tensor.to(device=device)
 
 
+def _compact_relation_table(
+    *,
+    edge_rel_global: torch.Tensor,
+    relation_embeddings: torch.Tensor,
+    edge_rel_local: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rel_dim = int(relation_embeddings.size(-1))
+    if int(edge_rel_local.numel()) == 0:
+        return (
+            edge_rel_global.new_empty((0,)),
+            relation_embeddings.new_empty((0, rel_dim)),
+            edge_rel_local.new_empty((0,)),
+        )
+    used_local_ids, compact_edge_rel_local = torch.unique(
+        edge_rel_local, sorted=True, return_inverse=True
+    )
+    first_occ = torch.full(
+        (int(used_local_ids.numel()),),
+        fill_value=int(edge_rel_local.numel()),
+        device=edge_rel_local.device,
+        dtype=torch.long,
+    )
+    edge_ids = torch.arange(
+        int(edge_rel_local.numel()), device=edge_rel_local.device, dtype=torch.long
+    )
+    first_occ.scatter_reduce_(
+        0,
+        compact_edge_rel_local,
+        edge_ids,
+        reduce="amin",
+        include_self=True,
+    )
+    return (
+        edge_rel_global.index_select(0, first_occ),
+        relation_embeddings.index_select(0, used_local_ids),
+        compact_edge_rel_local,
+    )
+
+
+def _build_relation_table_from_rows(
+    *,
+    relation_global_ids: torch.Tensor,
+    relation_embeddings: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rel_dim = int(relation_embeddings.size(-1))
+    if int(relation_global_ids.numel()) == 0:
+        return relation_global_ids.new_empty((0,)), relation_embeddings.new_empty(
+            (0, rel_dim)
+        )
+    unique_relation_ids, relation_inverse = torch.unique(
+        relation_global_ids, sorted=True, return_inverse=True
+    )
+    first_occ = torch.full(
+        (int(unique_relation_ids.numel()),),
+        fill_value=int(relation_global_ids.numel()),
+        device=relation_global_ids.device,
+        dtype=torch.long,
+    )
+    relation_row_ids = torch.arange(
+        int(relation_global_ids.numel()),
+        device=relation_global_ids.device,
+        dtype=torch.long,
+    )
+    first_occ.scatter_reduce_(
+        0,
+        relation_inverse,
+        relation_row_ids,
+        reduce="amin",
+        include_self=True,
+    )
+    return unique_relation_ids, relation_embeddings.index_select(0, first_occ)
+
+
 def _require_edge_index(value: Any, *, device: torch.device) -> torch.Tensor:
     tensor = _require_tensor(value, name="edge_index", device=device)
     if tensor.dtype != torch.long or tensor.dim() != 2 or int(tensor.size(0)) != 2:
@@ -68,6 +141,49 @@ def _require_edge_index(value: Any, *, device: torch.device) -> torch.Tensor:
             f"edge_index must be [2, E] torch.long, got {tensor.dtype} {tuple(tensor.shape)}."
         )
     return tensor
+
+
+def compute_edge_batch_and_ptr(
+    edge_index: torch.Tensor,
+    *,
+    node_ptr: torch.Tensor,
+    num_graphs: int,
+    device: torch.device,
+    validate: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if node_ptr.numel() != num_graphs + 1:
+        raise ValueError(
+            f"node_ptr length mismatch: got {node_ptr.numel()} expected {num_graphs + 1}."
+        )
+    edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
+    if validate:
+        tail_batch = torch.bucketize(edge_index[1], node_ptr[1:], right=True)
+        if edge_batch.numel() > 0:
+            min_idx = int(edge_batch.min().item())
+            max_idx = int(edge_batch.max().item())
+            if min_idx < 0 or max_idx >= num_graphs:
+                raise ValueError(
+                    "edge_batch contains out-of-range indices; "
+                    f"min={min_idx} max={max_idx} num_graphs={num_graphs}."
+                )
+        if not torch.equal(edge_batch, tail_batch):
+            raise ValueError(
+                "edge_index crosses graph boundaries; head/tail graph assignments differ."
+            )
+        if edge_batch.numel() > 1 and not bool(
+            (edge_batch[:-1] <= edge_batch[1:]).all().item()
+        ):
+            raise ValueError(
+                "edge_batch is not non-decreasing along the flattened edge list, "
+                "which breaks per-graph slicing; ensure edges are concatenated per-graph."
+            )
+    edge_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
+    edge_counts.scatter_add_(
+        0, edge_batch, torch.ones_like(edge_batch, dtype=torch.long)
+    )
+    edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
+    edge_ptr[1:] = edge_counts.cumsum(0)
+    return edge_batch, edge_ptr
 
 
 def _coerce_str_list(value: Any, *, expected_size: int, name: str) -> list[str]:
@@ -99,11 +215,11 @@ class TrajectoryBatch:
     edge_rel_global: torch.Tensor
     edge_batch: torch.Tensor
     node_batch: torch.Tensor
-    node_embeddings: torch.Tensor
-    edge_embeddings: torch.Tensor
-    question_emb: torch.Tensor
-    question_ctx: torch.Tensor
-    question_ctx_mask: torch.Tensor
+    node_embeddings: torch.Tensor | None
+    edge_embeddings: torch.Tensor | None
+    question_emb: torch.Tensor | None
+    question_ctx: torch.Tensor | None
+    question_ctx_mask: torch.Tensor | None
     q_local_indices: torch.Tensor
     q_ptr: torch.Tensor
     a_local_indices: torch.Tensor
@@ -115,6 +231,8 @@ class TrajectoryBatch:
     questions: list[str]
     dataset_scope: str
     heuristic_log_v: torch.Tensor | None = None
+    relation_embeddings: torch.Tensor | None = None
+    edge_rel_local: torch.Tensor | None = None
 
     @property
     def num_nodes_total(self) -> int:
@@ -124,6 +242,54 @@ class TrajectoryBatch:
     def dummy_mask(self) -> torch.Tensor:
         counts = self.answer_ptr[1:] - self.answer_ptr[:-1]
         return counts <= 0
+
+    @property
+    def has_raw_features(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.node_embeddings,
+                self.question_emb,
+                self.question_ctx,
+                self.question_ctx_mask,
+            )
+        )
+
+    def require_raw_features(self) -> None:
+        if self.has_raw_features:
+            return
+        raise ValueError(
+            "TrajectoryBatch is missing raw float features required for encoding. "
+            "Use the pre-encoded PreparedBatch path or keep node/question features attached."
+        )
+
+    def without_raw_features(self) -> "TrajectoryBatch":
+        return TrajectoryBatch(
+            num_graphs=self.num_graphs,
+            node_ptr=self.node_ptr,
+            edge_index=self.edge_index,
+            edge_rel_global=self.edge_rel_global,
+            edge_batch=self.edge_batch,
+            node_batch=self.node_batch,
+            node_embeddings=None,
+            edge_embeddings=None,
+            question_emb=None,
+            question_ctx=None,
+            question_ctx_mask=None,
+            q_local_indices=self.q_local_indices,
+            q_ptr=self.q_ptr,
+            a_local_indices=self.a_local_indices,
+            a_ptr=self.a_ptr,
+            answer_entity_ids=self.answer_entity_ids,
+            answer_ptr=self.answer_ptr,
+            node_global_ids=self.node_global_ids,
+            sample_ids=list(self.sample_ids),
+            questions=list(self.questions),
+            dataset_scope=self.dataset_scope,
+            heuristic_log_v=None,
+            relation_embeddings=None,
+            edge_rel_local=None,
+        )
 
     def validate(self) -> None:
         if self.num_graphs < 1:
@@ -136,8 +302,6 @@ class TrajectoryBatch:
             raise ValueError("a_ptr must have length num_graphs + 1.")
         if int(self.answer_ptr.numel()) != self.num_graphs + 1:
             raise ValueError("answer_ptr must have length num_graphs + 1.")
-        if int(self.node_embeddings.size(0)) != self.num_nodes_total:
-            raise ValueError("node_embeddings row count mismatch with node_ptr.")
         if int(self.node_batch.numel()) != self.num_nodes_total:
             raise ValueError("node_batch length mismatch with node_ptr.")
         if int(self.node_global_ids.numel()) != self.num_nodes_total:
@@ -146,16 +310,6 @@ class TrajectoryBatch:
             raise ValueError("edge_index/edge_rel_global mismatch.")
         if int(self.edge_index.size(1)) != int(self.edge_batch.numel()):
             raise ValueError("edge_index/edge_batch mismatch.")
-        if int(self.edge_index.size(1)) != int(self.edge_embeddings.size(0)):
-            raise ValueError("edge_index/edge_embeddings mismatch.")
-        if int(self.question_emb.size(0)) != self.num_graphs:
-            raise ValueError("question_emb batch mismatch.")
-        if int(self.question_ctx.size(0)) != self.num_graphs:
-            raise ValueError("question_ctx batch mismatch.")
-        if tuple(self.question_ctx_mask.shape) != tuple(self.question_ctx.shape[:2]):
-            raise ValueError("question_ctx_mask shape mismatch with question_ctx.")
-        if bool((~self.question_ctx_mask).all(dim=1).any().item()):
-            raise ValueError("question_ctx_mask contains rows without valid tokens.")
         if int(self.q_local_indices.numel()) != int(
             (self.q_ptr[1:] - self.q_ptr[:-1]).sum().item()
         ):
@@ -173,6 +327,80 @@ class TrajectoryBatch:
         if len(self.questions) != self.num_graphs:
             raise ValueError("questions length mismatch with num_graphs.")
 
+        raw_feature_presence = (
+            self.node_embeddings,
+            self.question_emb,
+            self.question_ctx,
+            self.question_ctx_mask,
+        )
+        has_any_raw_feature = any(value is not None for value in raw_feature_presence)
+        if has_any_raw_feature and not self.has_raw_features:
+            raise ValueError(
+                "node_embeddings/question_emb/question_ctx/question_ctx_mask must either "
+                "all be populated or all be omitted."
+            )
+        if self.has_raw_features:
+            node_embeddings = self.node_embeddings
+            question_emb = self.question_emb
+            question_ctx = self.question_ctx
+            question_ctx_mask = self.question_ctx_mask
+            assert node_embeddings is not None
+            assert question_emb is not None
+            assert question_ctx is not None
+            assert question_ctx_mask is not None
+            if int(node_embeddings.size(0)) != self.num_nodes_total:
+                raise ValueError("node_embeddings row count mismatch with node_ptr.")
+            if int(question_emb.size(0)) != self.num_graphs:
+                raise ValueError("question_emb batch mismatch.")
+            if int(question_ctx.size(0)) != self.num_graphs:
+                raise ValueError("question_ctx batch mismatch.")
+            if tuple(question_ctx_mask.shape) != tuple(question_ctx.shape[:2]):
+                raise ValueError("question_ctx_mask shape mismatch with question_ctx.")
+            if bool((~question_ctx_mask).all(dim=1).any().item()):
+                raise ValueError(
+                    "question_ctx_mask contains rows without valid tokens."
+                )
+
+        has_relation_table = (
+            self.relation_embeddings is not None or self.edge_rel_local is not None
+        )
+        if has_relation_table:
+            if self.relation_embeddings is None or self.edge_rel_local is None:
+                raise ValueError(
+                    "relation_embeddings and edge_rel_local must be provided together."
+                )
+            if (
+                not torch.is_floating_point(self.relation_embeddings)
+                or self.relation_embeddings.dim() != 2
+            ):
+                raise ValueError(
+                    "relation_embeddings must be 2D floating point when provided."
+                )
+            if (
+                self.edge_rel_local.dtype != torch.long
+                or self.edge_rel_local.dim() != 1
+            ):
+                raise ValueError("edge_rel_local must be 1D torch.long when provided.")
+            if int(self.edge_rel_local.numel()) != int(self.edge_index.size(1)):
+                raise ValueError("edge_index/edge_rel_local mismatch.")
+            if int(self.edge_rel_local.numel()) > 0:
+                if bool((self.edge_rel_local < 0).any().item()) or bool(
+                    (self.edge_rel_local >= int(self.relation_embeddings.size(0)))
+                    .any()
+                    .item()
+                ):
+                    raise ValueError(
+                        "edge_rel_local contains out-of-range indices for relation_embeddings."
+                    )
+        elif self.edge_embeddings is not None:
+            if int(self.edge_index.size(1)) != int(self.edge_embeddings.size(0)):
+                raise ValueError("edge_index/edge_embeddings mismatch.")
+        elif self.has_raw_features and int(self.edge_index.size(1)) > 0:
+            raise ValueError(
+                "Raw TrajectoryBatch with edges must provide either edge_embeddings or "
+                "(relation_embeddings, edge_rel_local)."
+            )
+
     def to(
         self,
         device: torch.device | str,
@@ -187,6 +415,47 @@ class TrajectoryBatch:
                 device=target_device,
                 dtype=feature_dtype,
             )
+        node_embeddings = None
+        if self.node_embeddings is not None:
+            node_embeddings = _move_float_feature(
+                self.node_embeddings,
+                device=target_device,
+                dtype=feature_dtype,
+            )
+        edge_embeddings = None
+        if self.edge_embeddings is not None:
+            edge_embeddings = _move_float_feature(
+                self.edge_embeddings,
+                device=target_device,
+                dtype=feature_dtype,
+            )
+        question_emb = None
+        if self.question_emb is not None:
+            question_emb = _move_float_feature(
+                self.question_emb,
+                device=target_device,
+                dtype=feature_dtype,
+            )
+        question_ctx = None
+        if self.question_ctx is not None:
+            question_ctx = _move_float_feature(
+                self.question_ctx,
+                device=target_device,
+                dtype=feature_dtype,
+            )
+        question_ctx_mask = None
+        if self.question_ctx_mask is not None:
+            question_ctx_mask = self.question_ctx_mask.to(device=target_device)
+        relation_embeddings = None
+        if self.relation_embeddings is not None:
+            relation_embeddings = _move_float_feature(
+                self.relation_embeddings,
+                device=target_device,
+                dtype=feature_dtype,
+            )
+        edge_rel_local = None
+        if self.edge_rel_local is not None:
+            edge_rel_local = self.edge_rel_local.to(device=target_device)
         return TrajectoryBatch(
             num_graphs=self.num_graphs,
             node_ptr=self.node_ptr.to(device=target_device),
@@ -194,27 +463,11 @@ class TrajectoryBatch:
             edge_rel_global=self.edge_rel_global.to(device=target_device),
             edge_batch=self.edge_batch.to(device=target_device),
             node_batch=self.node_batch.to(device=target_device),
-            node_embeddings=_move_float_feature(
-                self.node_embeddings,
-                device=target_device,
-                dtype=feature_dtype,
-            ),
-            edge_embeddings=_move_float_feature(
-                self.edge_embeddings,
-                device=target_device,
-                dtype=feature_dtype,
-            ),
-            question_emb=_move_float_feature(
-                self.question_emb,
-                device=target_device,
-                dtype=feature_dtype,
-            ),
-            question_ctx=_move_float_feature(
-                self.question_ctx,
-                device=target_device,
-                dtype=feature_dtype,
-            ),
-            question_ctx_mask=self.question_ctx_mask.to(device=target_device),
+            node_embeddings=node_embeddings,
+            edge_embeddings=edge_embeddings,
+            question_emb=question_emb,
+            question_ctx=question_ctx,
+            question_ctx_mask=question_ctx_mask,
             q_local_indices=self.q_local_indices.to(device=target_device),
             q_ptr=self.q_ptr.to(device=target_device),
             a_local_indices=self.a_local_indices.to(device=target_device),
@@ -226,6 +479,8 @@ class TrajectoryBatch:
             questions=list(self.questions),
             dataset_scope=self.dataset_scope,
             heuristic_log_v=heuristic_log_v,
+            relation_embeddings=relation_embeddings,
+            edge_rel_local=edge_rel_local,
         )
 
     @classmethod
@@ -248,9 +503,19 @@ class TrajectoryBatch:
         edge_rel_global = _require_1d_long(
             getattr(batch, "edge_attr", None), name="edge_attr", device=device
         )
-        edge_batch = _require_1d_long(
-            getattr(batch, "edge_batch", None), name="edge_batch", device=device
-        )
+        edge_batch_value = getattr(batch, "edge_batch", None)
+        if edge_batch_value is None:
+            edge_batch, _ = compute_edge_batch_and_ptr(
+                edge_index,
+                node_ptr=node_ptr,
+                num_graphs=num_graphs,
+                device=device,
+                validate=True,
+            )
+        else:
+            edge_batch = _require_1d_long(
+                edge_batch_value, name="edge_batch", device=device
+            )
         node_batch = _require_1d_long(
             getattr(batch, "batch", None), name="batch", device=device
         )
@@ -259,11 +524,30 @@ class TrajectoryBatch:
             name="node_embeddings",
             device=device,
         )
-        edge_embeddings = _require_2d_float(
-            getattr(batch, "edge_embeddings", None),
-            name="edge_embeddings",
-            device=device,
-        )
+        edge_embeddings_value = getattr(batch, "edge_embeddings", None)
+        edge_embeddings = None
+        if edge_embeddings_value is not None:
+            edge_embeddings = _require_2d_float(
+                edge_embeddings_value,
+                name="edge_embeddings",
+                device=device,
+            )
+        relation_embeddings_value = getattr(batch, "relation_embeddings", None)
+        relation_embeddings = None
+        if relation_embeddings_value is not None:
+            relation_embeddings = _require_2d_float(
+                relation_embeddings_value,
+                name="relation_embeddings",
+                device=device,
+            )
+        edge_rel_local_value = getattr(batch, "edge_rel_local", None)
+        edge_rel_local = None
+        if edge_rel_local_value is not None:
+            edge_rel_local = _require_1d_long(
+                edge_rel_local_value,
+                name="edge_rel_local",
+                device=device,
+            )
         question_emb = _require_2d_float(
             getattr(batch, "question_emb", None), name="question_emb", device=device
         )
@@ -340,6 +624,8 @@ class TrajectoryBatch:
             ),
             dataset_scope=str(dataset_scope),
             heuristic_log_v=heuristic_log_v,
+            relation_embeddings=relation_embeddings,
+            edge_rel_local=edge_rel_local,
         )
         trajectory_batch.validate()
         return trajectory_batch
@@ -356,6 +642,13 @@ class TrajectoryBatch:
         device = batches[0].node_ptr.device
         dataset_scope = str(batches[0].dataset_scope)
         has_heuristic = batches[0].heuristic_log_v is not None
+        has_node_embeddings = batches[0].node_embeddings is not None
+        has_question_features = batches[0].question_emb is not None
+        has_edge_embeddings = batches[0].edge_embeddings is not None
+        has_relation_tables = (
+            batches[0].relation_embeddings is not None
+            and batches[0].edge_rel_local is not None
+        )
 
         num_graphs = 0
         node_offset = 0
@@ -370,6 +663,8 @@ class TrajectoryBatch:
         node_batch_parts: list[torch.Tensor] = []
         node_embedding_parts: list[torch.Tensor] = []
         edge_embedding_parts: list[torch.Tensor] = []
+        relation_global_parts: list[torch.Tensor] = []
+        relation_embedding_parts: list[torch.Tensor] = []
         question_emb_parts: list[torch.Tensor] = []
         question_ctx_parts: list[torch.Tensor] = []
         question_ctx_mask_parts: list[torch.Tensor] = []
@@ -395,6 +690,26 @@ class TrajectoryBatch:
                 raise ValueError(
                     "All TrajectoryBatch instances must either all include heuristic_log_v or all omit it."
                 )
+            if (batch.node_embeddings is not None) != has_node_embeddings:
+                raise ValueError(
+                    "All TrajectoryBatch instances must either all include node_embeddings or all omit them."
+                )
+            if (batch.question_emb is not None) != has_question_features:
+                raise ValueError(
+                    "All TrajectoryBatch instances must either all include question features or all omit them."
+                )
+            batch_has_relation_table = (
+                batch.relation_embeddings is not None
+                and batch.edge_rel_local is not None
+            )
+            if (batch.edge_embeddings is not None) != has_edge_embeddings:
+                raise ValueError(
+                    "All TrajectoryBatch instances must either all include edge_embeddings or all omit them."
+                )
+            if batch_has_relation_table != has_relation_tables:
+                raise ValueError(
+                    "All TrajectoryBatch instances must share the same relation-table representation."
+                )
 
             node_counts = (batch.node_ptr[1:] - batch.node_ptr[:-1]).tolist()
             q_counts = (batch.q_ptr[1:] - batch.q_ptr[:-1]).tolist()
@@ -414,11 +729,28 @@ class TrajectoryBatch:
             edge_rel_parts.append(batch.edge_rel_global)
             edge_batch_parts.append(batch.edge_batch + int(num_graphs))
             node_batch_parts.append(batch.node_batch + int(num_graphs))
-            node_embedding_parts.append(batch.node_embeddings)
-            edge_embedding_parts.append(batch.edge_embeddings)
-            question_emb_parts.append(batch.question_emb)
-            question_ctx_parts.append(batch.question_ctx)
-            question_ctx_mask_parts.append(batch.question_ctx_mask)
+            if has_node_embeddings and batch.node_embeddings is not None:
+                node_embedding_parts.append(batch.node_embeddings)
+            if has_question_features and batch.question_emb is not None:
+                question_emb_parts.append(batch.question_emb)
+                question_ctx_parts.append(batch.question_ctx)
+                question_ctx_mask_parts.append(batch.question_ctx_mask)
+            if has_edge_embeddings and batch.edge_embeddings is not None:
+                edge_embedding_parts.append(batch.edge_embeddings)
+            elif (
+                has_relation_tables
+                and batch.relation_embeddings is not None
+                and batch.edge_rel_local is not None
+            ):
+                compact_relation_ids, compact_relation_embeddings, _ = (
+                    _compact_relation_table(
+                        edge_rel_global=batch.edge_rel_global,
+                        relation_embeddings=batch.relation_embeddings,
+                        edge_rel_local=batch.edge_rel_local,
+                    )
+                )
+                relation_global_parts.append(compact_relation_ids)
+                relation_embedding_parts.append(compact_relation_embeddings)
             q_local_parts.append(batch.q_local_indices)
             a_local_parts.append(batch.a_local_indices)
             answer_entity_parts.append(batch.answer_entity_ids)
@@ -435,18 +767,49 @@ class TrajectoryBatch:
         if has_heuristic:
             heuristic_log_v = torch.cat(heuristic_parts, dim=0)
 
+        edge_rel_global = torch.cat(edge_rel_parts, dim=0)
+        node_embeddings = None
+        if has_node_embeddings:
+            node_embeddings = torch.cat(node_embedding_parts, dim=0)
+        edge_embeddings = None
+        relation_embeddings = None
+        edge_rel_local = None
+        if has_edge_embeddings:
+            edge_embeddings = torch.cat(edge_embedding_parts, dim=0)
+        elif has_relation_tables:
+            flat_relation_global_ids = torch.cat(relation_global_parts, dim=0)
+            flat_relation_embeddings = torch.cat(relation_embedding_parts, dim=0)
+            relation_ids, relation_embeddings = _build_relation_table_from_rows(
+                relation_global_ids=flat_relation_global_ids,
+                relation_embeddings=flat_relation_embeddings,
+            )
+            relation_ids_from_edges, edge_rel_local = torch.unique(
+                edge_rel_global, sorted=True, return_inverse=True
+            )
+            if not torch.equal(relation_ids, relation_ids_from_edges):
+                raise ValueError(
+                    "Relation table rows are inconsistent with concatenated edge_rel_global values."
+                )
+        question_emb = None
+        question_ctx = None
+        question_ctx_mask = None
+        if has_question_features:
+            question_emb = torch.cat(question_emb_parts, dim=0)
+            question_ctx = torch.cat(question_ctx_parts, dim=0)
+            question_ctx_mask = torch.cat(question_ctx_mask_parts, dim=0)
+
         concatenated = cls(
             num_graphs=num_graphs,
             node_ptr=torch.tensor(node_ptr_values, device=device, dtype=torch.long),
             edge_index=torch.cat(edge_index_parts, dim=1),
-            edge_rel_global=torch.cat(edge_rel_parts, dim=0),
+            edge_rel_global=edge_rel_global,
             edge_batch=torch.cat(edge_batch_parts, dim=0),
             node_batch=torch.cat(node_batch_parts, dim=0),
-            node_embeddings=torch.cat(node_embedding_parts, dim=0),
-            edge_embeddings=torch.cat(edge_embedding_parts, dim=0),
-            question_emb=torch.cat(question_emb_parts, dim=0),
-            question_ctx=torch.cat(question_ctx_parts, dim=0),
-            question_ctx_mask=torch.cat(question_ctx_mask_parts, dim=0),
+            node_embeddings=node_embeddings,
+            edge_embeddings=edge_embeddings,
+            question_emb=question_emb,
+            question_ctx=question_ctx,
+            question_ctx_mask=question_ctx_mask,
             q_local_indices=torch.cat(q_local_parts, dim=0),
             q_ptr=torch.tensor(q_ptr_values, device=device, dtype=torch.long),
             a_local_indices=torch.cat(a_local_parts, dim=0),
@@ -458,6 +821,8 @@ class TrajectoryBatch:
             questions=questions,
             dataset_scope=dataset_scope,
             heuristic_log_v=heuristic_log_v,
+            relation_embeddings=relation_embeddings,
+            edge_rel_local=edge_rel_local,
         )
         if validate:
             concatenated.validate()
@@ -473,7 +838,18 @@ class TrajectoryBatch:
         edge_mask = self.edge_batch == graph_idx
         edge_index = self.edge_index[:, edge_mask] - node_start
         edge_rel_global = self.edge_rel_global[edge_mask]
-        edge_embeddings = self.edge_embeddings[edge_mask]
+        edge_embeddings = None
+        if self.edge_embeddings is not None:
+            edge_embeddings = self.edge_embeddings[edge_mask]
+        relation_embeddings = None
+        edge_rel_local = None
+        if self.relation_embeddings is not None and self.edge_rel_local is not None:
+            relation_edge_rel_local = self.edge_rel_local[edge_mask]
+            _, relation_embeddings, edge_rel_local = _compact_relation_table(
+                edge_rel_global=edge_rel_global,
+                relation_embeddings=self.relation_embeddings,
+                edge_rel_local=relation_edge_rel_local,
+            )
         num_nodes = node_end - node_start
         q_start = int(self.q_ptr[graph_idx].item())
         q_end = int(self.q_ptr[graph_idx + 1].item())
@@ -484,6 +860,20 @@ class TrajectoryBatch:
         heuristic_log_v = None
         if self.heuristic_log_v is not None:
             heuristic_log_v = self.heuristic_log_v[node_start:node_end]
+        node_embeddings = None
+        if self.node_embeddings is not None:
+            node_embeddings = self.node_embeddings[node_start:node_end]
+        question_emb = None
+        question_ctx = None
+        question_ctx_mask = None
+        if (
+            self.question_emb is not None
+            and self.question_ctx is not None
+            and self.question_ctx_mask is not None
+        ):
+            question_emb = self.question_emb[graph_idx : graph_idx + 1]
+            question_ctx = self.question_ctx[graph_idx : graph_idx + 1]
+            question_ctx_mask = self.question_ctx_mask[graph_idx : graph_idx + 1]
         sub_batch = TrajectoryBatch(
             num_graphs=1,
             node_ptr=torch.tensor(
@@ -495,11 +885,11 @@ class TrajectoryBatch:
             node_batch=torch.zeros(
                 (num_nodes,), device=self.node_batch.device, dtype=torch.long
             ),
-            node_embeddings=self.node_embeddings[node_start:node_end],
+            node_embeddings=node_embeddings,
             edge_embeddings=edge_embeddings,
-            question_emb=self.question_emb[graph_idx : graph_idx + 1],
-            question_ctx=self.question_ctx[graph_idx : graph_idx + 1],
-            question_ctx_mask=self.question_ctx_mask[graph_idx : graph_idx + 1],
+            question_emb=question_emb,
+            question_ctx=question_ctx,
+            question_ctx_mask=question_ctx_mask,
             q_local_indices=self.q_local_indices[q_start:q_end],
             q_ptr=torch.tensor(
                 [0, q_end - q_start], device=self.q_ptr.device, dtype=torch.long
@@ -519,6 +909,8 @@ class TrajectoryBatch:
             questions=[self.questions[graph_idx]],
             dataset_scope=self.dataset_scope,
             heuristic_log_v=heuristic_log_v,
+            relation_embeddings=relation_embeddings,
+            edge_rel_local=edge_rel_local,
         )
         if validate:
             sub_batch.validate()

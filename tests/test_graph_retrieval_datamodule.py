@@ -10,15 +10,23 @@ from src.datasets.graph_retrieval_datamodule import (
     BudgetBatchSampler,
     GraphRetrievalDataModule,
     StepDrivenTrainSampler,
+    _resolve_embedding_attachment_device,
 )
 from src.graph_runtime import TrajectoryBatch
 
 
 class _DummyDataset:
-    def __init__(self, split: str, size: int = 5) -> None:
+    def __init__(
+        self,
+        split: str,
+        size: int = 5,
+        *,
+        stats_by_idx: dict[int, SimpleNamespace] | None = None,
+    ) -> None:
         self.split = str(split)
         self.size = int(size)
         self.closed = False
+        self._stats_by_idx = stats_by_idx or {}
 
     def __len__(self) -> int:
         return self.size
@@ -27,8 +35,10 @@ class _DummyDataset:
         self.closed = True
 
     def get_sample_stats(self, idx: int):
-        del idx
-        return SimpleNamespace(num_nodes=4, num_edges=6, question_tokens=8)
+        return self._stats_by_idx.get(
+            int(idx),
+            SimpleNamespace(num_nodes=4, num_edges=6, question_tokens=8),
+        )
 
 
 def _make_runtime_batch() -> TrajectoryBatch:
@@ -40,7 +50,7 @@ def _make_runtime_batch() -> TrajectoryBatch:
         edge_batch=torch.tensor([0], dtype=torch.long),
         node_batch=torch.tensor([0, 0], dtype=torch.long),
         node_embeddings=torch.randn((2, 4), dtype=torch.float32),
-        edge_embeddings=torch.randn((1, 4), dtype=torch.float32),
+        edge_embeddings=None,
         question_emb=torch.randn((1, 4), dtype=torch.float32),
         question_ctx=torch.randn((1, 2, 4), dtype=torch.float32),
         question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
@@ -54,6 +64,34 @@ def _make_runtime_batch() -> TrajectoryBatch:
         sample_ids=["sample"],
         questions=["q"],
         dataset_scope="sub",
+        relation_embeddings=torch.randn((1, 4), dtype=torch.float32),
+        edge_rel_local=torch.tensor([0], dtype=torch.long),
+    )
+
+
+def _make_pyg_batch_without_edge_batch() -> SimpleNamespace:
+    return SimpleNamespace(
+        num_graphs=1,
+        ptr=torch.tensor([0, 2], dtype=torch.long),
+        node_ptr=torch.tensor([0, 2], dtype=torch.long),
+        batch=torch.tensor([0, 0], dtype=torch.long),
+        edge_index=torch.tensor([[0], [1]], dtype=torch.long),
+        edge_attr=torch.tensor([0], dtype=torch.long),
+        node_embeddings=torch.randn((2, 4), dtype=torch.float32),
+        relation_embeddings=torch.randn((1, 4), dtype=torch.float32),
+        edge_rel_local=torch.tensor([0], dtype=torch.long),
+        question_emb=torch.randn((1, 4), dtype=torch.float32),
+        question_ctx=torch.randn((1, 2, 4), dtype=torch.float32),
+        question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        q_ptr=torch.tensor([0, 1], dtype=torch.long),
+        a_local_indices=torch.tensor([1], dtype=torch.long),
+        a_ptr=torch.tensor([0, 1], dtype=torch.long),
+        answer_entity_ids=torch.tensor([101], dtype=torch.long),
+        answer_ptr=torch.tensor([0, 1], dtype=torch.long),
+        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        sample_id=["sample"],
+        question=["q"],
     )
 
 
@@ -237,6 +275,196 @@ def test_graph_retrieval_datamodule_train_loader_uses_budget_batch_sampler(
     assert captured["kwargs"]["sampler"] is not None
 
 
+def test_budget_batch_sampler_rejects_oversized_singleton() -> None:
+    dataset = _DummyDataset(
+        "train",
+        size=1,
+        stats_by_idx={0: SimpleNamespace(num_nodes=32, num_edges=4, question_tokens=2)},
+    )
+    sampler = BudgetBatchSampler(
+        sampler=[0],
+        dataset=dataset,
+        max_graphs_per_batch=4,
+        max_nodes_per_batch=16,
+        max_edges_per_batch=None,
+        max_question_tokens_per_batch=None,
+        drop_last=False,
+    )
+
+    with pytest.raises(ValueError, match="Single sample exceeds batch budget"):
+        list(sampler)
+
+
+def test_budget_batch_sampler_len_respects_active_edge_budget() -> None:
+    dataset = _DummyDataset(
+        "train",
+        size=3,
+        stats_by_idx={
+            0: SimpleNamespace(num_nodes=4, num_edges=6, question_tokens=2),
+            1: SimpleNamespace(num_nodes=4, num_edges=6, question_tokens=2),
+            2: SimpleNamespace(num_nodes=4, num_edges=1, question_tokens=2),
+        },
+    )
+    sampler = BudgetBatchSampler(
+        sampler=[0, 1, 2],
+        dataset=dataset,
+        max_graphs_per_batch=10,
+        max_nodes_per_batch=None,
+        max_edges_per_batch=10,
+        max_question_tokens_per_batch=None,
+        drop_last=False,
+    )
+
+    assert len(sampler) == 2
+    assert list(sampler) == [[0], [1, 2]]
+
+
+def test_graph_retrieval_datamodule_set_eval_split_invalidates_cached_dataset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_splits: list[str] = []
+
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
+    )
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        lambda **kwargs: created_splits.append(str(kwargs["split_name"]))
+        or _DummyDataset(str(kwargs["split_name"])),
+    )
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
+        lambda dataset, **kwargs: {
+            "split": dataset.split,
+            "shuffle": kwargs["shuffle"],
+            "batch_size": kwargs["batch_size"],
+        },
+    )
+
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        eval_batch_size=7,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+        eval_split="validation",
+    )
+
+    datamodule.setup(stage="predict")
+    datamodule.set_eval_split("test")
+    loader = datamodule.predict_dataloader()
+
+    assert created_splits == ["validation", "test"]
+    assert loader == {"split": "test", "shuffle": False, "batch_size": 7}
+
+
+def test_on_after_batch_transfer_computes_missing_edge_batch(tmp_path: Path) -> None:
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+        precompute_edge_batch=False,
+    )
+
+    runtime_batch = datamodule.on_after_batch_transfer(
+        _make_pyg_batch_without_edge_batch(),
+        dataloader_idx=0,
+    )
+
+    assert isinstance(runtime_batch, TrajectoryBatch)
+    assert torch.equal(runtime_batch.edge_batch, torch.tensor([0], dtype=torch.long))
+    assert runtime_batch.edge_embeddings is None
+    assert runtime_batch.relation_embeddings is not None
+    assert torch.equal(
+        runtime_batch.edge_rel_local, torch.tensor([0], dtype=torch.long)
+    )
+
+
+def test_on_before_batch_transfer_attaches_relation_table_and_casts_features(
+    tmp_path: Path,
+) -> None:
+    class _DummyGlobalEmbeddings:
+        def __init__(self) -> None:
+            self.entity_embeddings = torch.arange(12, dtype=torch.float32).view(3, 4)
+            self.relation_embeddings = torch.arange(8, dtype=torch.float32).view(2, 4)
+
+        def get_entity_embeddings(self, ids, *, device=None, dtype=None):
+            out = self.entity_embeddings.index_select(0, ids.to(dtype=torch.long))
+            if dtype is not None:
+                out = out.to(dtype=dtype)
+            if device is not None:
+                out = out.to(device=device)
+            return out
+
+        def get_relation_embeddings(self, ids, *, device=None, dtype=None):
+            out = self.relation_embeddings.index_select(0, ids.to(dtype=torch.long))
+            if dtype is not None:
+                out = out.to(dtype=dtype)
+            if device is not None:
+                out = out.to(device=device)
+            return out
+
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+        eval_feature_dtype="bf16",
+    )
+    datamodule._shared_resources = SimpleNamespace(
+        global_embeddings=_DummyGlobalEmbeddings()
+    )
+    batch = SimpleNamespace(
+        node_embedding_ids=torch.tensor([0, 2], dtype=torch.long),
+        edge_attr=torch.tensor([1, 1, 0], dtype=torch.long),
+        question_emb=torch.randn((1, 4), dtype=torch.float32),
+        question_ctx=torch.randn((1, 2, 4), dtype=torch.float32),
+        heuristic_log_v=torch.randn((2,), dtype=torch.float32),
+    )
+
+    attached = datamodule.on_before_batch_transfer(batch, dataloader_idx=0)
+
+    assert attached is batch
+    assert attached.node_embeddings.dtype == torch.bfloat16
+    assert attached.relation_embeddings.dtype == torch.bfloat16
+    assert torch.equal(
+        attached.edge_rel_local, torch.tensor([1, 1, 0], dtype=torch.long)
+    )
+    assert attached.edge_embeddings is None
+    assert attached.question_emb.dtype == torch.bfloat16
+    assert attached.question_ctx.dtype == torch.bfloat16
+    assert attached.heuristic_log_v.dtype == torch.bfloat16
+
+
+def test_resolve_embedding_attachment_device_prefers_trainer_cuda_root() -> None:
+    trainer = SimpleNamespace(
+        strategy=SimpleNamespace(root_device=torch.device("cuda", 1)),
+        lightning_module=None,
+    )
+
+    assert _resolve_embedding_attachment_device(None, trainer=trainer) == torch.device(
+        "cuda", 1
+    )
+    assert _resolve_embedding_attachment_device("cpu", trainer=trainer) == torch.device(
+        "cpu"
+    )
+
+
 def test_transfer_batch_to_device_casts_runtime_features_when_configured(
     tmp_path: Path,
 ) -> None:
@@ -259,7 +487,9 @@ def test_transfer_batch_to_device_casts_runtime_features_when_configured(
     )
 
     assert transferred.node_embeddings.dtype == torch.bfloat16
-    assert transferred.edge_embeddings.dtype == torch.bfloat16
+    assert transferred.edge_embeddings is None
+    assert transferred.relation_embeddings is not None
+    assert transferred.relation_embeddings.dtype == torch.bfloat16
     assert transferred.question_emb.dtype == torch.bfloat16
     assert transferred.question_ctx.dtype == torch.bfloat16
     assert transferred.question_ctx_mask.dtype == torch.bool

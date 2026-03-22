@@ -7,8 +7,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
-import pyarrow.dataset as ds
-
 from omegaconf import DictConfig
 
 from src.data.schema.types import (
@@ -21,7 +19,6 @@ from src.data.schema.types import (
 _QID_IN_PARENS_RE = re.compile(r"(Q\d+)")
 _LABEL_QID_RE = re.compile(r"(.+)\s+\((Q\d+)\)$")
 _DATA_SOURCE_HF = "hf"
-_DATA_SOURCE_PARQUET = "parquet"
 _HF_DATASET_BY_FAMILY = {
     "cwq": "rmanluo/RoG-cwq",
     "webqsp": "rmanluo/RoG-webqsp",
@@ -147,20 +144,12 @@ def to_list(field: object) -> List[str]:
         return []
     if isinstance(field, (list, tuple)):
         return [str(x) for x in field]
-    import numpy as np
-
-    if isinstance(field, np.ndarray):
-        return [str(x) for x in field.tolist()]
+    tolist = getattr(field, "tolist", None)
+    if callable(tolist):
+        values = tolist()
+        if isinstance(values, list):
+            return [str(x) for x in values]
     return [str(field)]
-
-
-def load_split(raw_root: Path, split: str) -> ds.Dataset:
-    paths = sorted(raw_root.glob(f"{split}-*.parquet"))
-    if not paths:
-        raise FileNotFoundError(
-            f"No parquet shards found for split '{split}' under {raw_root}"
-        )
-    return ds.dataset([str(p) for p in paths])
 
 
 def _resolve_hf_dataset_id(
@@ -202,15 +191,40 @@ def _load_hf_split(
     )
 
 
-def _iter_parquet_rows(dataset_obj: ds.Dataset) -> Iterator[Mapping[str, object]]:
-    for batch in dataset_obj.to_batches():
-        for row in batch.to_pylist():
-            yield row
-
-
 def _iter_hf_rows(dataset_obj) -> Iterator[Mapping[str, object]]:
     for row in dataset_obj:
         yield row
+
+
+def _register_label_qid(label_to_qid: Dict[str, str], raw_value: object) -> None:
+    label_match = _LABEL_QID_RE.match(str(raw_value))
+    if label_match is None:
+        return
+    label_to_qid[label_match.group(1).strip()] = label_match.group(2)
+
+
+def _build_label_to_qid_lookup(
+    graph_raw: Sequence[object],
+    *,
+    q_entities_raw: Sequence[str],
+    a_entities_raw: Sequence[str],
+    entity_normalization: str,
+) -> Dict[str, str]:
+    if entity_normalization != "qid_in_parentheses":
+        return {}
+    label_to_qid: Dict[str, str] = {}
+    for tr in graph_raw:
+        if not isinstance(tr, (list, tuple)):
+            continue
+        if len(tr) < 3:
+            continue
+        _register_label_qid(label_to_qid, tr[0])
+        _register_label_qid(label_to_qid, tr[2])
+    for entity in q_entities_raw:
+        _register_label_qid(label_to_qid, entity)
+    for entity in a_entities_raw:
+        _register_label_qid(label_to_qid, entity)
+    return label_to_qid
 
 
 def _row_to_sample(
@@ -222,20 +236,26 @@ def _row_to_sample(
     column_map: Dict[str, str],
     entity_normalization: str,
 ) -> Sample:
-    graph_raw = row.get(column_map["graph_field"]) or []
-    label_to_qid: Dict[str, str] = {}
+    graph_raw_value = row.get(column_map["graph_field"])
+    if isinstance(graph_raw_value, (list, tuple)):
+        graph_raw: list[object] = list(graph_raw_value)
+    else:
+        graph_raw = []
+    q_entities_raw = to_list(row.get(column_map["q_entity_field"]))
+    a_entities_raw = to_list(row.get(column_map["a_entity_field"]))
+    label_to_qid = _build_label_to_qid_lookup(
+        graph_raw,
+        q_entities_raw=q_entities_raw,
+        a_entities_raw=a_entities_raw,
+        entity_normalization=entity_normalization,
+    )
     graph: List[tuple[str, str, str]] = []
     for tr in graph_raw:
+        if not isinstance(tr, (list, tuple)):
+            continue
         if len(tr) >= 3:
             h_raw = str(tr[0])
             t_raw = str(tr[2])
-            if entity_normalization == "qid_in_parentheses":
-                for node_raw in (h_raw, t_raw):
-                    label_match = _LABEL_QID_RE.match(node_raw)
-                    if label_match:
-                        label_to_qid[label_match.group(1).strip()] = label_match.group(
-                            2
-                        )
             h = normalize_entity_with_lookup(h_raw, entity_normalization, label_to_qid)
             r = str(tr[1])
             t = normalize_entity_with_lookup(t_raw, entity_normalization, label_to_qid)
@@ -243,11 +263,11 @@ def _row_to_sample(
 
     q_entities = [
         normalize_entity_with_lookup(ent, entity_normalization, label_to_qid)
-        for ent in to_list(row.get(column_map["q_entity_field"]))
+        for ent in q_entities_raw
     ]
     a_entities = [
         normalize_entity_with_lookup(ent, entity_normalization, label_to_qid)
-        for ent in to_list(row.get(column_map["a_entity_field"]))
+        for ent in a_entities_raw
     ]
     answer_texts = to_list(row.get(column_map["answer_text_field"]))
     graph_iso_type = None
@@ -270,7 +290,7 @@ def _row_to_sample(
         split=split,
         question_id=str(row[column_map["question_id_field"]]),
         kb=kb,
-        question=row.get(column_map["question_field"]) or "",
+        question=str(row.get(column_map["question_field"]) or ""),
         graph=graph,
         q_entity=q_entities,
         a_entity=a_entities,
@@ -289,29 +309,24 @@ def iter_samples(
     column_map: Dict[str, str],
     entity_normalization: str,
     *,
-    dataset_source: str = _DATA_SOURCE_PARQUET,
+    dataset_source: str = _DATA_SOURCE_HF,
     dataset_family: Optional[str] = None,
     hf_dataset: Optional[str] = None,
     hf_cache_dir: Optional[Path] = None,
     hf_offline: bool = False,
 ) -> Iterable[Sample]:
+    del raw_root
     for split in splits:
         source = str(dataset_source).strip().lower()
-        if source == _DATA_SOURCE_HF:
-            dataset_id = _resolve_hf_dataset_id(dataset, dataset_family, hf_dataset)
-            dataset_obj = _load_hf_split(
-                dataset_id, split, cache_dir=hf_cache_dir, offline=hf_offline
-            )
-            row_iter = _iter_hf_rows(dataset_obj)
-        elif source == _DATA_SOURCE_PARQUET:
-            if raw_root is None:
-                raise ValueError("raw_root must be set when dataset_source='parquet'.")
-            dataset_obj = load_split(raw_root, split)
-            row_iter = _iter_parquet_rows(dataset_obj)
-        else:
+        if source != _DATA_SOURCE_HF:
             raise ValueError(
-                f"Unsupported dataset_source={dataset_source!r}; expected '{_DATA_SOURCE_HF}' or 'parquet'."
+                f"Unsupported dataset_source={dataset_source!r}; expected '{_DATA_SOURCE_HF}'."
             )
+        dataset_id = _resolve_hf_dataset_id(dataset, dataset_family, hf_dataset)
+        dataset_obj = _load_hf_split(
+            dataset_id, split, cache_dir=hf_cache_dir, offline=hf_offline
+        )
+        row_iter = _iter_hf_rows(dataset_obj)
 
         for row in row_iter:
             yield _row_to_sample(
