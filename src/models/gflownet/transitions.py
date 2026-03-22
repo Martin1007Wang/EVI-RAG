@@ -56,6 +56,11 @@ def apply_forward_constraints(
         out_degrees=distribution.out_degrees,
         is_submit=distribution.is_submit,
         current_log_f=distribution.current_log_f,
+        active_agent_count=distribution.active_agent_count,
+        unique_active_state_count=distribution.unique_active_state_count,
+        raw_graph_candidate_count=distribution.raw_graph_candidate_count,
+        scored_graph_candidate_count=distribution.scored_graph_candidate_count,
+        shortlist_active_state_count=distribution.shortlist_active_state_count,
     )
 
 

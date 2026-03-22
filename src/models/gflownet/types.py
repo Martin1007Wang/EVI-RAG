@@ -28,6 +28,11 @@ class ForwardActionDistribution:
     out_degrees: torch.Tensor
     is_submit: torch.Tensor | None = None
     current_log_f: torch.Tensor | None = None
+    active_agent_count: int = 0
+    unique_active_state_count: int = 0
+    raw_graph_candidate_count: int = 0
+    scored_graph_candidate_count: int = 0
+    shortlist_active_state_count: int = 0
 
 
 @dataclass(frozen=True)

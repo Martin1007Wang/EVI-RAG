@@ -176,6 +176,43 @@ def test_build_replay_sample_batch_replays_successful_path() -> None:
     assert loss.success_rate == pytest.approx(1.0)
 
 
+def test_build_replay_sample_batch_skips_move_backward_reconstruction() -> None:
+    batch = make_toy_batch()
+    module = _make_module()
+    assert module.sampler is not None
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    def _unexpected_backward_distribution(
+        *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError(
+            "replay builder should not reconstruct move backward logits"
+        )
+
+    module.policy.compute_backward_distribution = _unexpected_backward_distribution  # type: ignore[method-assign]
+
+    replay_sample_batch = build_replay_sample_batch(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        trajectory_supervisor=cast(
+            ForwardTrajectoryGFNSampler, module.sampler
+        ).trajectory_supervisor,
+        replay_records=((SuccessfulTrajectoryRecord("toy-sample", 0, (1,)),),),
+        max_steps=2,
+    )
+
+    assert replay_sample_batch.trace_submit_mask is not None
+    assert torch.isfinite(replay_sample_batch.log_pf_steps).all()
+    assert torch.equal(
+        replay_sample_batch.log_pb_steps[~replay_sample_batch.trace_submit_mask],
+        torch.zeros_like(
+            replay_sample_batch.log_pb_steps[~replay_sample_batch.trace_submit_mask]
+        ),
+    )
+
+
 def test_build_replay_sample_batch_force_keeps_recorded_edges_in_shortlist() -> None:
     batch = make_toy_batch()
     module = GFlowNetModule(

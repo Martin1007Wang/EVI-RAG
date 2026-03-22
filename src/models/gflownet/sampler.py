@@ -819,6 +819,9 @@ def _rebuild_target_sample_batch(
         device=batch.node_ptr.device,
         dtype=torch.float32,
     )
+    # Move-step backward logits are no longer reconstructed on the training hot
+    # path because the current SubTB objective only consumes forward prefixes.
+    # Terminal submit backward scores are still written after rollout assembly.
     log_pb_steps = torch.zeros_like(log_pf_steps)
     next_state_log_f_steps = torch.zeros_like(log_pf_steps)
     move_mask = torch.zeros_like(log_pf_steps, dtype=torch.bool)
@@ -834,6 +837,11 @@ def _rebuild_target_sample_batch(
         start_nodes,
     )
     total_agents = int(batch.num_graphs * int(start_nodes.size(1)))
+    total_active_agent_count = 0
+    total_unique_active_state_count = 0
+    total_raw_graph_candidate_count = 0
+    total_scored_graph_candidate_count = 0
+    total_shortlist_active_state_count = 0
 
     for step_idx in range(max_actions):
         active_mask = terminal_action_counts > step_idx
@@ -854,11 +862,15 @@ def _rebuild_target_sample_batch(
             state=search_state,
             max_steps=max_steps,
         )
-        current_log_f = distribution.current_log_f
-        if current_log_f is None:
-            current_log_f = policy.compute_log_state_scores(
-                prepared_batch, search_state
-            )
+        total_active_agent_count += int(distribution.active_agent_count)
+        total_unique_active_state_count += int(distribution.unique_active_state_count)
+        total_raw_graph_candidate_count += int(distribution.raw_graph_candidate_count)
+        total_scored_graph_candidate_count += int(
+            distribution.scored_graph_candidate_count
+        )
+        total_shortlist_active_state_count += int(
+            distribution.shortlist_active_state_count
+        )
         chosen_edge_ids = planned_edge_ids[:, :, step_idx].reshape(-1)
         chosen_is_submit = planned_submit_mask[:, :, step_idx].reshape(-1)
         flat_active = active_mask.reshape(-1)
@@ -870,8 +882,6 @@ def _rebuild_target_sample_batch(
             device=batch.node_ptr.device,
             dtype=torch.float32,
         )
-        chosen_log_pb = torch.zeros_like(chosen_log_probs)
-
         selected_nodes, selected_log_probs = _select_edge_log_probs(
             distribution=distribution,
             selected_edge_ids=chosen_edge_ids,
@@ -884,7 +894,6 @@ def _rebuild_target_sample_batch(
         chosen_log_probs[flat_active] = selected_log_probs[flat_active]
 
         flat_graph_move = flat_active & (~chosen_is_submit)
-        flat_submit = flat_active & chosen_is_submit
         next_nodes = flat_current_nodes.clone()
         next_nodes[flat_graph_move] = chosen_target_nodes[flat_graph_move]
         next_num_steps = flat_num_steps.clone()
@@ -918,7 +927,7 @@ def _rebuild_target_sample_batch(
                     relation_ids=flat_relation_ids[flat_graph_move],
                 )
             )
-        next_log_f = torch.zeros_like(current_log_f)
+        next_log_f = torch.zeros_like(current_nodes, dtype=torch.float32)
         if bool(flat_graph_move.any().item()):
             next_state = SearchState(
                 topology=prepared_batch.topology,
@@ -930,25 +939,8 @@ def _rebuild_target_sample_batch(
                 control_state=next_control_states,
             )
             next_log_f = policy.compute_log_state_scores(prepared_batch, next_state)
-            backward_distribution = policy.compute_backward_distribution(
-                prepared_batch,
-                next_state,
-            )
-            _, selected_log_pb = _select_edge_log_probs(
-                distribution=backward_distribution,
-                selected_edge_ids=chosen_edge_ids,
-                selected_is_submit=torch.zeros_like(chosen_is_submit),
-                active_mask=flat_graph_move,
-                policy=policy,
-                error_prefix=(
-                    f"Sampled trajectory backward reconstruction step={step_idx}"
-                ),
-            )
-            chosen_log_pb[flat_graph_move] = selected_log_pb[flat_graph_move]
-        chosen_log_pb[flat_submit] = 0.0
 
         log_pf_steps[:, :, step_idx] = chosen_log_probs.view_as(current_nodes)
-        log_pb_steps[:, :, step_idx] = chosen_log_pb.view_as(current_nodes)
         next_state_log_f_steps[:, :, step_idx] = next_log_f
         move_mask[:, :, step_idx] = active_mask
         current_nodes = next_nodes.view_as(current_nodes)
@@ -1005,6 +997,11 @@ def _rebuild_target_sample_batch(
         terminal_log_rewards=terminal_transition.terminal_log_rewards,
         terminal_backward_log_probs=masked_terminal_backward_log_probs,
         success_mask=success_mask,
+        total_active_agent_count=total_active_agent_count,
+        total_unique_active_state_count=total_unique_active_state_count,
+        total_raw_graph_candidate_count=total_raw_graph_candidate_count,
+        total_scored_graph_candidate_count=total_scored_graph_candidate_count,
+        total_shortlist_active_state_count=total_shortlist_active_state_count,
     )
 
 
@@ -1035,6 +1032,11 @@ class TrajectoryGFNSampleBatch:
     terminal_backward_log_probs: torch.Tensor | None = None
     behavior_start_entropy: torch.Tensor | None = None
     behavior_start_entropy_normalized: torch.Tensor | None = None
+    total_active_agent_count: int = 0
+    total_unique_active_state_count: int = 0
+    total_raw_graph_candidate_count: int = 0
+    total_scored_graph_candidate_count: int = 0
+    total_shortlist_active_state_count: int = 0
 
 
 class TrajectorySamplerProtocol(Protocol):
@@ -1110,6 +1112,9 @@ class ForwardTrajectoryGFNSampler:
             device=batch.node_ptr.device,
             dtype=torch.float32,
         )
+        # Move-step backward logits are no longer reconstructed on the training
+        # hot path because the current SubTB objective only consumes forward
+        # prefixes. Terminal submit backward scores are still written below.
         log_pb_steps = torch.zeros_like(log_pf_steps)
         next_state_log_f_steps = torch.zeros_like(log_pf_steps)
         move_mask = torch.zeros_like(log_pf_steps, dtype=torch.bool)
@@ -1127,6 +1132,11 @@ class ForwardTrajectoryGFNSampler:
         )
         terminal_action_counts = torch.zeros_like(start_nodes)
         total_agents = int(num_graphs * num_rollouts)
+        total_active_agent_count = 0
+        total_unique_active_state_count = 0
+        total_raw_graph_candidate_count = 0
+        total_scored_graph_candidate_count = 0
+        total_shortlist_active_state_count = 0
 
         for step_idx in range(max_actions):
             active_mask = ~done_mask
@@ -1155,11 +1165,19 @@ class ForwardTrajectoryGFNSampler:
                 state=search_state,
                 max_steps=self.max_steps,
             )
-            current_log_f = distribution.current_log_f
-            if current_log_f is None:
-                current_log_f = policy.compute_log_state_scores(
-                    prepared_batch, search_state
-                )
+            total_active_agent_count += int(distribution.active_agent_count)
+            total_unique_active_state_count += int(
+                distribution.unique_active_state_count
+            )
+            total_raw_graph_candidate_count += int(
+                distribution.raw_graph_candidate_count
+            )
+            total_scored_graph_candidate_count += int(
+                distribution.scored_graph_candidate_count
+            )
+            total_shortlist_active_state_count += int(
+                distribution.shortlist_active_state_count
+            )
             move_log_probs, _, has_values = policy.compute_move_log_probs(distribution)
             has_values = has_values.view_as(current_nodes)
             policy_active_mask = active_mask & (~forced_submit_mask)
@@ -1293,8 +1311,7 @@ class ForwardTrajectoryGFNSampler:
                         relation_ids=flat_relation_ids[flat_graph_move],
                     )
                 )
-            chosen_log_pb = torch.zeros_like(chosen_log_probs)
-            next_log_f = torch.zeros_like(current_log_f)
+            next_log_f = torch.zeros_like(current_nodes, dtype=torch.float32)
             if bool(flat_graph_move.any().item()):
                 next_state = SearchState(
                     topology=prepared_batch.topology,
@@ -1306,29 +1323,8 @@ class ForwardTrajectoryGFNSampler:
                     control_state=next_control_states,
                 )
                 next_log_f = policy.compute_log_state_scores(prepared_batch, next_state)
-                backward_distribution = policy.compute_backward_distribution(
-                    prepared_batch,
-                    next_state,
-                )
-                backward_positions = _resolve_selected_action_positions(
-                    distribution=backward_distribution,
-                    selected_edge_ids=chosen_edge_ids,
-                    selected_is_submit=torch.zeros_like(chosen_is_submit),
-                    active_mask=flat_graph_move,
-                    error_prefix=(
-                        f"Sampled trajectory backward reconstruction step={step_idx}"
-                    ),
-                )
-                backward_log_probs, _, _ = policy.compute_move_log_probs(
-                    backward_distribution
-                )
-                chosen_log_pb[flat_graph_move] = backward_log_probs.index_select(
-                    0, backward_positions[flat_graph_move]
-                )
-            chosen_log_pb[flat_submit] = 0.0
 
             log_pf_steps[:, :, step_idx] = chosen_log_probs.view_as(current_nodes)
-            log_pb_steps[:, :, step_idx] = chosen_log_pb.view_as(current_nodes)
             next_state_log_f_steps[:, :, step_idx] = next_log_f
             move_mask[:, :, step_idx] = active_mask
 
@@ -1389,6 +1385,11 @@ class ForwardTrajectoryGFNSampler:
             success_mask=success_mask,
             behavior_start_entropy=start_entropy,
             behavior_start_entropy_normalized=start_entropy_normalized,
+            total_active_agent_count=total_active_agent_count,
+            total_unique_active_state_count=total_unique_active_state_count,
+            total_raw_graph_candidate_count=total_raw_graph_candidate_count,
+            total_scored_graph_candidate_count=total_scored_graph_candidate_count,
+            total_shortlist_active_state_count=total_shortlist_active_state_count,
         )
 
 

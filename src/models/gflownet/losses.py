@@ -49,31 +49,27 @@ class SubTrajectoryBalanceLoss:
         return weighted.sum(dim=(-2, -1))
 
     @staticmethod
-    def _build_prefix_terms(
+    def _build_forward_prefix(
         *,
         log_pf_steps: torch.Tensor,
-        log_pb_steps: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         batch_size, num_rollouts, max_steps = log_pf_steps.shape
         state_horizon = max_steps + 1
         forward_prefix = log_pf_steps.new_zeros(
             (batch_size, num_rollouts, state_horizon)
         )
-        backward_prefix = torch.zeros_like(forward_prefix)
         if max_steps > 0:
             forward_prefix[:, :, 1:] = torch.cumsum(log_pf_steps, dim=-1)
-            backward_prefix[:, :, 1:] = torch.cumsum(log_pb_steps, dim=-1)
-        return forward_prefix, backward_prefix
+        return forward_prefix
 
     def compute(
         self, sample_batch: TrajectoryGFNSampleBatch
     ) -> SubTrajectoryBalanceLossOutput:
         log_pf_steps = sample_batch.log_pf_steps.to(dtype=torch.float32)
-        log_pb_steps = sample_batch.log_pb_steps.to(dtype=torch.float32)
-        if tuple(log_pb_steps.shape) != tuple(log_pf_steps.shape):
+        if tuple(sample_batch.log_pb_steps.shape) != tuple(log_pf_steps.shape):
             raise ValueError(
                 "log_pb_steps must match log_pf_steps shape for SubTB. "
-                f"log_pb_steps={tuple(log_pb_steps.shape)} "
+                f"log_pb_steps={tuple(sample_batch.log_pb_steps.shape)} "
                 f"log_pf_steps={tuple(log_pf_steps.shape)}."
             )
 
@@ -90,10 +86,10 @@ class SubTrajectoryBalanceLoss:
                 dtype=torch.float32
             )
 
-        forward_prefix, _ = self._build_prefix_terms(
-            log_pf_steps=log_pf_steps,
-            log_pb_steps=log_pb_steps,
-        )
+        # The current SubTB objective is defined over forward prefix sums and
+        # state/terminal flow anchors. We keep `log_pb_steps` in the sample batch
+        # for interface compatibility, but the loss itself does not depend on it.
+        forward_prefix = self._build_forward_prefix(log_pf_steps=log_pf_steps)
 
         terminal_counts = getattr(sample_batch, "terminal_action_counts", None)
         if terminal_counts is None:

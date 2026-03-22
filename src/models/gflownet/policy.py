@@ -1276,6 +1276,8 @@ class BaseSearchPolicy(nn.Module):
             flat_path_token_ids=flat_path_token_ids,
             flat_control_states=flat_control_states,
         )
+        active_agent_count = int(active_agents.numel())
+        unique_active_state_count = int(unique_current_nodes.numel())
         hidden_dim = int(prepared_batch.node_tokens.size(-1))
         unique_state_features = prepared_batch.node_tokens.new_empty((0, hidden_dim))
         unique_graph_ids = prepared_batch.node_tokens.new_empty((0,), dtype=torch.long)
@@ -1327,6 +1329,8 @@ class BaseSearchPolicy(nn.Module):
             current_nodes=unique_current_nodes,
             active_mask=unique_forward_active_mask,
         )
+        raw_graph_candidate_count = int(unique_edge_ids.numel())
+        shortlist_active_state_count = 0
         if int(unique_edge_ids.numel()) > 0:
             unique_child_num_steps = (
                 unique_num_steps.index_select(0, unique_edge_agent_batch) + 1
@@ -1340,6 +1344,14 @@ class BaseSearchPolicy(nn.Module):
                 required_edge_pairs=required_edge_pairs,
             )
         if int(unique_edge_ids.numel()) > 0 and allow_candidate_shortlist:
+            shortlist_active_state_count = int(
+                (
+                    unique_out_degrees
+                    > int(self.candidate_shortlist_cfg.degree_threshold)
+                )
+                .sum()
+                .item()
+            )
             unique_candidate_graph_ids = unique_graph_ids.index_select(
                 0, unique_edge_agent_batch
             )
@@ -1360,6 +1372,7 @@ class BaseSearchPolicy(nn.Module):
                 graph_ids=unique_candidate_graph_ids,
                 required_edge_pairs=required_edge_pairs,
             )
+        scored_graph_candidate_count = int(unique_edge_ids.numel())
         current_log_f_flat = torch.zeros(
             (total_agents,), device=state.current_nodes.device, dtype=torch.float32
         )
@@ -1475,6 +1488,11 @@ class BaseSearchPolicy(nn.Module):
             out_degrees=combined_out_degrees,
             is_submit=is_submit,
             current_log_f=current_log_f,
+            active_agent_count=active_agent_count,
+            unique_active_state_count=unique_active_state_count,
+            raw_graph_candidate_count=raw_graph_candidate_count,
+            scored_graph_candidate_count=scored_graph_candidate_count,
+            shortlist_active_state_count=shortlist_active_state_count,
         )
 
     def compute_forward_distribution(
@@ -1898,6 +1916,11 @@ class GFlowNetPolicy(nn.Module):
             out_degrees=distribution.out_degrees,
             is_submit=distribution.is_submit,
             current_log_f=distribution.current_log_f,
+            active_agent_count=distribution.active_agent_count,
+            unique_active_state_count=distribution.unique_active_state_count,
+            raw_graph_candidate_count=distribution.raw_graph_candidate_count,
+            scored_graph_candidate_count=distribution.scored_graph_candidate_count,
+            shortlist_active_state_count=distribution.shortlist_active_state_count,
         )
 
     @staticmethod

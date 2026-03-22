@@ -857,7 +857,78 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     assert "subtb_root" in captured_metrics
     assert "unique_success_paths_per_100_rollouts" in captured_metrics
     assert "start_node_entropy" in captured_metrics
+    assert "active_forward_states" in captured_metrics
+    assert "unique_forward_states" in captured_metrics
+    assert "raw_graph_candidates" in captured_metrics
+    assert "scored_graph_candidates" in captured_metrics
+    assert "candidate_shortlist_keep_ratio" in captured_metrics
     assert not any(str(key).startswith("exact_aux") for key in captured_metrics)
+
+
+def test_training_rollout_metrics_report_forward_search_observability() -> None:
+    module = _make_module("topology")
+    batch = make_toy_batch()
+    sample_batch = replace(
+        _make_manual_sample_batch(
+            batch=batch,
+            rollout_batch_size=2,
+            success_mask=torch.tensor([[True, False]], dtype=torch.bool),
+            start_entropy=0.3,
+            start_entropy_normalized=0.6,
+        ),
+        total_active_agent_count=10,
+        total_unique_active_state_count=4,
+        total_raw_graph_candidate_count=18,
+        total_scored_graph_candidate_count=7,
+        total_shortlist_active_state_count=3,
+    )
+
+    metrics = module._compute_training_rollout_metrics(
+        batch=batch, sample_batch=sample_batch
+    )
+
+    assert metrics.active_forward_states == pytest.approx(10.0)
+    assert metrics.unique_forward_states == pytest.approx(4.0)
+    assert metrics.forward_state_dedup_keep_ratio == pytest.approx(0.4)
+    assert metrics.raw_graph_candidates == pytest.approx(18.0)
+    assert metrics.scored_graph_candidates == pytest.approx(7.0)
+    assert metrics.raw_graph_candidates_per_unique_state == pytest.approx(4.5)
+    assert metrics.scored_graph_candidates_per_unique_state == pytest.approx(1.75)
+    assert metrics.shortlist_active_states == pytest.approx(3.0)
+    assert metrics.candidate_shortlist_activation_rate == pytest.approx(0.75)
+    assert metrics.candidate_shortlist_keep_ratio == pytest.approx(7.0 / 18.0)
+
+
+def test_sampler_skips_move_backward_reconstruction() -> None:
+    module = _make_module("topology")
+    batch = make_toy_batch()
+    prepared_batch = module.policy.prepare_batch(batch)
+    assert module.sampler is not None
+
+    def _unexpected_backward_distribution(
+        *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError(
+            "training sampler should not reconstruct move backward logits"
+        )
+
+    module.policy.compute_backward_distribution = _unexpected_backward_distribution  # type: ignore[method-assign]
+
+    sample_batch = module.sampler.sample(
+        batch=batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=2,
+        temperature=1.0,
+    )
+
+    assert sample_batch.trace_submit_mask is not None
+    assert torch.isfinite(sample_batch.log_pf_steps).all()
+    assert torch.equal(
+        sample_batch.log_pb_steps[~sample_batch.trace_submit_mask],
+        torch.zeros_like(sample_batch.log_pb_steps[~sample_batch.trace_submit_mask]),
+    )
 
 
 def test_guidance_loss_uses_learned_behavior_head_targets() -> None:

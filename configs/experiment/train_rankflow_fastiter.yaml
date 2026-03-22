@@ -55,6 +55,12 @@ callbacks:
     min_delta: 0.002
 
 model:
+  policy_cfg:
+    candidate_shortlist:
+      enabled: true
+      topk: 16
+      degree_threshold: 32
+      heuristic_weight: 1.0
   training_cfg:
     success_replay:
       enabled: false

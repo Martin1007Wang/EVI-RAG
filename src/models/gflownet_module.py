@@ -110,6 +110,16 @@ class TrainingRolloutMetrics:
     new_success_paths: int
     start_node_entropy: torch.Tensor
     start_node_entropy_normalized: torch.Tensor
+    active_forward_states: float
+    unique_forward_states: float
+    forward_state_dedup_keep_ratio: float
+    raw_graph_candidates: float
+    scored_graph_candidates: float
+    raw_graph_candidates_per_unique_state: float
+    scored_graph_candidates_per_unique_state: float
+    shortlist_active_states: float
+    candidate_shortlist_activation_rate: float
+    candidate_shortlist_keep_ratio: float
 
 
 class GFlowNetPolicyFactory:
@@ -537,11 +547,51 @@ class GFlowNetModule(LightningModule):
             if total_rollouts > 0
             else 0.0
         )
+        active_forward_states = float(sample_batch.total_active_agent_count)
+        unique_forward_states = float(sample_batch.total_unique_active_state_count)
+        raw_graph_candidates = float(sample_batch.total_raw_graph_candidate_count)
+        scored_graph_candidates = float(sample_batch.total_scored_graph_candidate_count)
+        shortlist_active_states = float(sample_batch.total_shortlist_active_state_count)
+        forward_state_dedup_keep_ratio = (
+            unique_forward_states / active_forward_states
+            if active_forward_states > 0.0
+            else 0.0
+        )
+        raw_graph_candidates_per_unique_state = (
+            raw_graph_candidates / unique_forward_states
+            if unique_forward_states > 0.0
+            else 0.0
+        )
+        scored_graph_candidates_per_unique_state = (
+            scored_graph_candidates / unique_forward_states
+            if unique_forward_states > 0.0
+            else 0.0
+        )
+        candidate_shortlist_activation_rate = (
+            shortlist_active_states / unique_forward_states
+            if unique_forward_states > 0.0
+            else 0.0
+        )
+        candidate_shortlist_keep_ratio = (
+            scored_graph_candidates / raw_graph_candidates
+            if raw_graph_candidates > 0.0
+            else 0.0
+        )
         return TrainingRolloutMetrics(
             unique_success_paths_per_100_rollouts=unique_success_rate,
             new_success_paths=new_success_paths,
             start_node_entropy=mean_start_entropy,
             start_node_entropy_normalized=mean_start_entropy_normalized,
+            active_forward_states=active_forward_states,
+            unique_forward_states=unique_forward_states,
+            forward_state_dedup_keep_ratio=forward_state_dedup_keep_ratio,
+            raw_graph_candidates=raw_graph_candidates,
+            scored_graph_candidates=scored_graph_candidates,
+            raw_graph_candidates_per_unique_state=raw_graph_candidates_per_unique_state,
+            scored_graph_candidates_per_unique_state=scored_graph_candidates_per_unique_state,
+            shortlist_active_states=shortlist_active_states,
+            candidate_shortlist_activation_rate=candidate_shortlist_activation_rate,
+            candidate_shortlist_keep_ratio=candidate_shortlist_keep_ratio,
         )
 
     def _success_replay_enabled(self) -> bool:
@@ -804,6 +854,16 @@ class GFlowNetModule(LightningModule):
             "new_success_paths": float(rollout_metrics.new_success_paths),
             "start_node_entropy": rollout_metrics.start_node_entropy,
             "start_node_entropy_normalized": rollout_metrics.start_node_entropy_normalized,
+            "active_forward_states": rollout_metrics.active_forward_states,
+            "unique_forward_states": rollout_metrics.unique_forward_states,
+            "forward_state_dedup_keep_ratio": rollout_metrics.forward_state_dedup_keep_ratio,
+            "raw_graph_candidates": rollout_metrics.raw_graph_candidates,
+            "scored_graph_candidates": rollout_metrics.scored_graph_candidates,
+            "raw_graph_candidates_per_unique_state": rollout_metrics.raw_graph_candidates_per_unique_state,
+            "scored_graph_candidates_per_unique_state": rollout_metrics.scored_graph_candidates_per_unique_state,
+            "shortlist_active_states": rollout_metrics.shortlist_active_states,
+            "candidate_shortlist_activation_rate": rollout_metrics.candidate_shortlist_activation_rate,
+            "candidate_shortlist_keep_ratio": rollout_metrics.candidate_shortlist_keep_ratio,
             "log_z_mean": loss_output.log_z_mean,
             "log_z_variance": loss_output.log_z_variance,
             "rollout_batch_size": float(rollout_batch_size),
