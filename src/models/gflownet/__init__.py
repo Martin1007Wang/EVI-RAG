@@ -18,12 +18,6 @@ from .policy import (
     build_start_distribution_from_log_flows,
     resolve_start_candidates,
 )
-from .replay import (
-    BatchReplayPlan,
-    SuccessfulTrajectoryRecord,
-    SuccessfulTrajectoryReplayBuffer,
-    build_replay_sample_batch,
-)
 from .sampler import (
     AnswerReachabilityTrajectorySupervisor,
     ForwardTrajectoryGFNSampler,
@@ -34,6 +28,7 @@ from .sampler import (
 )
 from .schedules import (
     SamplingTemperatureScheduler,
+    ShortestPathRewardScheduler,
     TrainingScheduleContext,
     normalize_scheduler_interval,
 )
@@ -60,7 +55,6 @@ from .types import (
 __all__ = [
     "AnswerReachabilityTrajectorySupervisor",
     "BaseSearchPolicy",
-    "BatchReplayPlan",
     "ConstrainedForwardStep",
     "ConstrainedPolicyStep",
     "EmptyStartCandidatesError",
@@ -79,20 +73,18 @@ __all__ = [
     "SearchHeuristic",
     "SearchPolicyProtocol",
     "SearchState",
+    "ShortestPathRewardScheduler",
     "StartDistribution",
     "StartDistributionError",
     "StateFeatureBuilder",
     "SubTrajectoryBalanceLoss",
     "SubTrajectoryBalanceLossOutput",
-    "SuccessfulTrajectoryRecord",
-    "SuccessfulTrajectoryReplayBuffer",
     "TerminalTransitionBatch",
     "TrainingScheduleContext",
     "TrajectoryGFNSampleBatch",
     "TrajectoryRolloutSupervisorProtocol",
     "TrajectorySamplerProtocol",
     "apply_forward_constraints",
-    "build_replay_sample_batch",
     "build_root_action_distribution_from_log_flows",
     "build_start_distribution_from_log_flows",
     "compute_constrained_forward_step",

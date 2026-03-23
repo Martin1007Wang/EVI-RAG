@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 
-from src.datasets.graph_retrieval_collate import _expand_answer_samples
+from src.datasets.graph_retrieval_collate import (
+    _InstrumentedDataLoader,
+    _expand_answer_samples,
+)
 
 
 @dataclass
@@ -49,3 +53,33 @@ def test_expand_answer_samples_filters_only_zero_hop_answers_when_not_expanding(
         torch.tensor([101], dtype=torch.long),
     )
     assert expanded[0].sample_id == "sample-1"
+
+
+def test_instrumented_dataloader_logs_iterator_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def _capture(_logger, event: str, **fields: object) -> None:  # type: ignore[no-untyped-def]
+        events.append((event, dict(fields)))
+
+    monkeypatch.setattr("src.datasets.graph_retrieval_collate.log_event", _capture)
+
+    loader = _InstrumentedDataLoader(
+        [1, 2, 3],
+        batch_size=2,
+        num_workers=0,
+        loader_name="probe",
+        multiprocessing_context_name=None,
+    )
+
+    iterator = iter(loader)
+    batch = next(iterator)
+
+    assert torch.equal(batch, torch.tensor([1, 2]))
+    assert [event for event, _ in events] == [
+        "retrieval_dataloader_iter_start",
+        "retrieval_dataloader_iter_ready",
+        "retrieval_dataloader_first_batch_ready",
+    ]
+    assert all(fields["loader_name"] == "probe" for _, fields in events)

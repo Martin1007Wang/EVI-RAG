@@ -69,13 +69,10 @@ model:
     guidance:
       loss_weight: 0.0
       detach_features: true
-    success_replay:
-      enabled: true
-      ratio: 0.25
-      warmup_passes: 1.0
-      min_buffer_size: 256
-      max_buffer_size: 50000
-      max_trajectories_per_sample: 8
+    shortest_path_reward:
+      weight: 0.75
+      schedule_type: constant
+      completion_power: 2.0
   heuristic_cfg:
     kind: none
     beta: 0.0

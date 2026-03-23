@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import time
 from typing import Any, Optional, Union
 
 import torch
@@ -98,6 +99,7 @@ class GlobalEmbeddingStore:
     def _load_tensor(self, path: Path) -> torch.Tensor:
         if not path.exists():
             raise FileNotFoundError(f"Embedding file missing: {path}")
+        start_time = time.perf_counter()
         log_event(
             logger,
             "embedding_load_start",
@@ -111,6 +113,14 @@ class GlobalEmbeddingStore:
             tensor = torch.load(path, map_location="cpu")
         if self.device.type == "cuda":
             tensor = tensor.to(device=self.device, non_blocking=False)
+        log_event(
+            logger,
+            "embedding_load_complete",
+            path=str(path),
+            device=str(tensor.device),
+            shape=list(tensor.shape),
+            elapsed_s=round(time.perf_counter() - start_time, 3),
+        )
         return tensor
 
     @staticmethod

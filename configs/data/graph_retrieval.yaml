@@ -16,15 +16,27 @@ dataset_cfg: ${dataset}
 batch_size: 16
 # Eval defaults to the train batch size unless experiments explicitly raise it.
 eval_batch_size: null
-num_workers: 16
+num_workers: 8
+# Force both train and eval workers to use `spawn`; long-running webqsp-sub fits
+# proved that Linux `fork` can corrupt worker state and trigger later segfaults.
+# Keep worker count conservative because `spawn` startup cost dominates cold-start
+# latency once the loader is unsized.
+multiprocessing_context: spawn
+eval_num_workers: 8
+eval_multiprocessing_context: spawn
 drop_last: false
 train_shuffle: true
-# Keep the train loader effectively unbounded so Trainer max_steps, not dataset length,
-# controls fit-loop lifetime.
-train_num_samples: 1000000000
-# 如需缩短训练，优先使用 Trainer 的 `limit_train_batches` / `max_steps`。
-prefetch_factor: 4
+# Train loader is intentionally unsized so Lightning never blocks on
+# `len(train_dataloader())`; fit lifetime comes from `fit_schedule` / `max_steps`.
+train_num_samples: null
+# 如需缩短训练，优先使用 Trainer 的 `limit_train_batches` / `max_steps`；如需有限采样调试，
+# 可显式覆盖 `data.train_num_samples=<positive-int>`。
+# Keep prefetch modest under `spawn`; higher values amplify cold-start and host-memory
+# pressure without helping the first step.
+prefetch_factor: 2
+eval_prefetch_factor: 2
 persistent_workers: true
+eval_persistent_workers: true
 precompute_edge_batch: true
 # Node/question embedding tensors are prepared on CPU and moved with the batch.
 embeddings_device: cpu

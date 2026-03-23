@@ -4,11 +4,11 @@ from dataclasses import asdict
 import json
 import pytest
 
-from src.metrics.answer_reachability.artifacts import SupportWindowArtifactWriter
-from src.metrics.answer_reachability.schema import (
+from src.metrics.answer_metrics import (
     AnswerPosteriorRecord,
     AnswerSupportRecord,
     EdgeRecord,
+    SupportWindowArtifactWriter,
     SupportWindowLabelRecord,
     SupportWindowResult,
     TrajectoryRecord,
@@ -25,9 +25,9 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
         window_size=1,
         covered_mass=0.6,
         residual_mass=0.4,
-        gold_total_mass=0.6,
-        covered_gold_mass=0.6,
-        missed_gold_mass=0.0,
+        gold_answer_mass=0.6,
+        covered_gold_answer_mass=0.6,
+        missed_gold_answer_mass=0.0,
         unique_answer_count=1,
         unique_path_count=1,
         gold_answer_entity_ids=[2],
@@ -143,9 +143,9 @@ def test_artifact_writer_splits_prompt_and_label_records(tmp_path) -> None:
     assert prompt_record["remaining_mass_upper"] == 0.4
     assert prompt_record["covered_mass_ci_low"] is None
     assert prompt_record["covered_mass_ci_high"] is None
-    assert prompt_record["gold_total_mass"] == 0.6
-    assert prompt_record["gold_total_mass_ci_low"] is None
-    assert prompt_record["gold_total_mass_ci_high"] is None
+    assert prompt_record["gold_answer_mass"] == 0.6
+    assert prompt_record["gold_answer_mass_ci_low"] is None
+    assert prompt_record["gold_answer_mass_ci_high"] is None
     assert prompt_record["ci_confidence_level"] is None
     assert prompt_record["coverage_certified"] is False
     assert prompt_record["answer_mass_reference"] == "monte_carlo"
@@ -247,9 +247,9 @@ def test_artifact_writer_rejects_existing_outputs_when_overwrite_false(
         window_size=0,
         covered_mass=0.0,
         residual_mass=1.0,
-        gold_total_mass=0.0,
-        covered_gold_mass=0.0,
-        missed_gold_mass=0.0,
+        gold_answer_mass=0.0,
+        covered_gold_answer_mass=0.0,
+        missed_gold_answer_mass=0.0,
         unique_answer_count=0,
         unique_path_count=0,
         gold_answer_entity_ids=[],
@@ -284,9 +284,9 @@ def test_artifact_writer_uses_backend_neutral_metadata_defaults(tmp_path) -> Non
         window_size=0,
         covered_mass=0.0,
         residual_mass=1.0,
-        gold_total_mass=0.0,
-        covered_gold_mass=0.0,
-        missed_gold_mass=0.0,
+        gold_answer_mass=0.0,
+        covered_gold_answer_mass=0.0,
+        missed_gold_answer_mass=0.0,
         unique_answer_count=0,
         unique_path_count=0,
         gold_answer_entity_ids=[],
@@ -311,9 +311,9 @@ def test_artifact_writer_streams_from_jsonl_inputs(tmp_path) -> None:
         window_size=1,
         covered_mass=0.6,
         residual_mass=0.4,
-        gold_total_mass=0.6,
-        covered_gold_mass=0.6,
-        missed_gold_mass=0.0,
+        gold_answer_mass=0.6,
+        covered_gold_answer_mass=0.6,
+        missed_gold_answer_mass=0.0,
         unique_answer_count=1,
         unique_path_count=1,
         gold_answer_entity_ids=[2],

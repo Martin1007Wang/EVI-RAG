@@ -14,9 +14,7 @@ from src.models.configs import (
     StateScoreHeadConfig,
 )
 from src.models.gflownet_module import GFlowNetModule
-from src.metrics.answer_reachability.runtime import (
-    SearchMetricRuntimeFactory,
-)
+from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 
 from .conftest import make_batch_from_graph
 
@@ -51,7 +49,7 @@ def _make_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
-        metric_runtime_factory=SearchMetricRuntimeFactory(),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
     )
 
 
@@ -86,7 +84,6 @@ def test_predict_step_emits_placeholder_for_missing_start_candidates() -> None:
     assert result.answer_posterior == []
     assert module.predict_metrics["invalid_start_count"] == 1
     assert module.predict_metrics["invalid_start_rate"] == 1.0
-    assert module.predict_metrics["meta/num_samples"] == 1.0
     assert module.predict_labels[0].sample_id == "missing-start-candidates"
     assert module.predict_labels[0].start_entity_ids == []
 
@@ -105,10 +102,13 @@ def test_evaluate_batch_emits_placeholder_for_missing_start_candidates() -> None
     )
     module = _make_module()
 
-    _, window_results, model_metrics, rank_metrics = module._evaluate_batch(batch=batch)
+    rank_metrics, window_results, model_metrics, diagnostics = module._evaluate_batch(
+        batch=batch
+    )
 
     assert len(window_results) == 1
     assert window_results[0].stop_reason == "invalid_start_candidates"
     assert window_results[0].answer_posterior == []
     assert model_metrics == {}
-    assert rank_metrics["answer/gold_mass"] == 0.0
+    assert diagnostics["invalid_start_count"] == 1.0
+    assert rank_metrics["answer/gold_answer_mass"] == 0.0

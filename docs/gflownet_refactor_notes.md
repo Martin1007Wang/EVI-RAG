@@ -31,23 +31,22 @@ The runtime also separates two masks that used to be conflated:
 - `SearchState.absorbing_mask` means "this prefix already carries explicit
   STOP"
 
-That separation lets replay, Monte Carlo, and guidance traces keep padded or
-dead-end rows inactive without incorrectly forcing them to masquerade as true
-absorbing states.
+That separation lets Monte Carlo and guidance traces keep padded or dead-end
+rows inactive without incorrectly forcing them to masquerade as true absorbing
+states.
 
 The implementation still keeps separate rollout-side traces because they are
 useful for bookkeeping and metrics:
 
 - parent recovery on the prefix tree
-- replay path reconstruction
-- path revisit counting
+- full no-repeat masking over previously seen entities
 - recurrent control-state reconstruction
 
 ## Root and reward boundaries
 
 - `RootActionDistribution.graph_log_z` is now an explicit root-flow boundary
-  `log F(s_root)`, predicted by its own head instead of `logsumexp` over start
-  states.
+  `log F(s_root)`, predicted from question tokens, pooled graph summaries, and
+  explicit graph-size features instead of `logsumexp` over start states.
 - `RootActionDistribution.log_probs` now come from a dedicated root-action head.
 - `RootActionDistribution.log_flows` continue to store the child start-state
   values `log F([e_0])`.
@@ -55,6 +54,8 @@ useful for bookkeeping and metrics:
   `log F(s_root) + log P_F([e_0] | s_root) - log F([e_0])` directly.
 - Terminal rewards now use a single fixed terminal-energy table:
   gold entities map to `log R = 0.0`, non-gold entities map to `log R = -3.0`.
+- Sampled rollouts additionally apply the configured path-length discount
+  `gamma^|tau|` before SubTB consumes the terminal anchor.
 - STOP termination keeps `log P_B = 0`, so there is no separate terminal
   backward heuristic layered on top of the prefix-tree backward semantics.
 

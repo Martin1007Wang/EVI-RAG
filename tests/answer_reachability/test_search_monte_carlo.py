@@ -8,13 +8,13 @@ import torch
 
 from src.graph_runtime import build_graph_batch
 from src.graph_runtime.batch import TrajectoryBatch
-from src.metrics.answer_reachability.monte_carlo import (
+from src.metrics.answer_metrics import SupportWindowResult
+from src.metrics.search_backends import (
+    MonteCarloBackend,
     MonteCarloRolloutSummary,
-    MonteCarloSupportSearch,
     build_monte_carlo_edge_support_analysis,
 )
-from src.metrics.answer_reachability.runtime import SearchMetricRuntimeFactory
-from src.metrics.answer_reachability.schema import SupportWindowResult
+from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 from src.models.configs import (
     BackboneConfig,
     GFlowNetTrainingConfig,
@@ -64,10 +64,33 @@ class _ManualMonteCarloPolicy:
     def compute_root_action_distribution(self, prepared_batch) -> StartDistribution:  # noqa: ANN001
         return self.compute_start_distribution(prepared_batch)
 
-    def compute_forward_distribution(
-        self, prepared_batch, state
-    ) -> ForwardActionDistribution:  # noqa: ANN001
+    def build_start_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        start_nodes: torch.Tensor,
+    ) -> torch.Tensor:
         del prepared_batch
+        return torch.zeros((*start_nodes.shape, 1), dtype=torch.float32)
+
+    def compute_next_control_states(
+        self,
+        prepared_batch: PreparedSearchBatch,
+        *,
+        control_states: torch.Tensor,
+        next_nodes: torch.Tensor,
+        relation_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        del prepared_batch, next_nodes, relation_ids
+        return torch.zeros_like(control_states)
+
+    def compute_forward_distribution(
+        self,
+        prepared_batch,
+        state,
+        *,
+        required_edge_ids: torch.Tensor | None = None,
+    ) -> ForwardActionDistribution:  # noqa: ANN001
+        del prepared_batch, required_edge_ids
         edge_logits: list[float] = []
         edge_agent_batch: list[int] = []
         edge_ids: list[int] = []
@@ -191,7 +214,7 @@ def _make_rank_only_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
-        metric_runtime_factory=SearchMetricRuntimeFactory(),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
     )
 
 
@@ -230,15 +253,15 @@ def _make_full_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
-        metric_runtime_factory=SearchMetricRuntimeFactory(),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
     )
 
 
 def test_monte_carlo_support_search_reports_confidence_intervals() -> None:
     torch.manual_seed(0)
     batch, prepared_batch, policy = _make_manual_fixture()
-    search = MonteCarloSupportSearch(
-        horizon_cfg=HorizonConfig(max_steps=2),
+    search = MonteCarloBackend(
+        max_steps=2,
         eval_cfg=SearchEvalConfig(
             support_search_method="monte_carlo",
             monte_carlo_rollouts=4096,
@@ -248,10 +271,12 @@ def test_monte_carlo_support_search_reports_confidence_intervals() -> None:
         ),
     )
 
-    result = search.generate_window(
+    result = search.evaluate_graph(
         batch=batch,
         policy=policy,
         prepared_batch=prepared_batch,
+        metrics_profile="full",
+        include_answer_support=True,
     )
 
     assert result.inference_mode == "monte_carlo"
@@ -264,17 +289,17 @@ def test_monte_carlo_support_search_reports_confidence_intervals() -> None:
     assert result.covered_mass == pytest.approx(0.6, abs=0.05)
     assert result.covered_mass_ci_low is not None
     assert result.covered_mass_ci_high is not None
-    assert result.gold_total_mass_ci_low is not None
-    assert result.gold_total_mass_ci_high is not None
+    assert result.gold_answer_mass_ci_low is not None
+    assert result.gold_answer_mass_ci_high is not None
     assert (
         float(result.covered_mass_ci_low)
         <= result.covered_mass
         <= float(result.covered_mass_ci_high)
     )
     assert (
-        float(result.gold_total_mass_ci_low)
+        float(result.gold_answer_mass_ci_low)
         <= 0.6
-        <= float(result.gold_total_mass_ci_high)
+        <= float(result.gold_answer_mass_ci_high)
     )
     assert result.remaining_mass_upper == pytest.approx(
         max(1.0 - float(result.covered_mass_ci_low), 0.0)
@@ -298,7 +323,7 @@ def test_monte_carlo_edge_support_tracks_successful_edge_presence() -> None:
         rollout_summary=rollout_summary,
     )
 
-    assert edge_support.gold_mass == pytest.approx(0.5)
+    assert edge_support.success_rollout_mass == pytest.approx(0.5)
     assert edge_support.edge_success_mass[0].item() == pytest.approx(0.5)
     assert edge_support.edge_success_mass[2].item() == pytest.approx(0.5)
     assert edge_support.edge_success_mass[1].item() == pytest.approx(0.0)
@@ -320,18 +345,18 @@ def test_rank_only_monte_carlo_uses_interval_aware_answer_posterior() -> None:
     )
     module = _make_rank_only_module()
 
-    support_metrics, window_results, model_metrics, rank_metrics = (
-        module._evaluate_batch(batch=batch)
+    rank_metrics, window_results, model_metrics, diagnostics = module._evaluate_batch(
+        batch=batch
     )
 
-    del support_metrics, model_metrics, rank_metrics
+    del rank_metrics, model_metrics, diagnostics
     assert len(window_results) == 1
     result = cast(SupportWindowResult, window_results[0])
     assert result.inference_mode == "monte_carlo"
     assert result.answer_mass_reference == "monte_carlo"
     assert result.stop_reason == "rank_only_monte_carlo"
-    assert result.gold_total_mass_ci_low is not None
-    assert result.gold_total_mass_ci_high is not None
+    assert result.gold_answer_mass_ci_low is not None
+    assert result.gold_answer_mass_ci_high is not None
     assert result.answer_posterior
     assert result.answer_posterior[0].prob_ci_low >= 0.0
     assert (
@@ -378,20 +403,18 @@ def test_full_monte_carlo_validation_batches_disconnected_graphs(
         return original_prepare_batch(current_batch)
 
     monkeypatch.setattr(module.policy, "prepare_batch", _count_prepare)
-    module.search.generate_window = lambda **_: (_ for _ in ()).throw(  # type: ignore[assignment]
-        AssertionError("per-graph Monte Carlo support search should be skipped")
-    )
 
-    support_metrics, window_results, model_metrics, rank_metrics = (
-        module._evaluate_batch(batch=batch)
+    rank_metrics, window_results, model_metrics, diagnostics = module._evaluate_batch(
+        batch=batch
     )
 
     assert prepare_call_count == 1
     assert model_metrics == {}
-    assert support_metrics
+    assert rank_metrics
     assert len(window_results) == 2
     assert [result.sample_id for result in window_results] == [
         "full-batch-a",
         "full-batch-b",
     ]
-    assert "answer/gold_mass" in rank_metrics
+    assert "answer/gold_answer_mass" in rank_metrics
+    assert "support/path_mass" in diagnostics

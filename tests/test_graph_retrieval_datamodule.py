@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import islice
+import multiprocessing as mp
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,11 +165,24 @@ def test_graph_retrieval_datamodule_predict_stage_uses_requested_eval_split(
 def test_step_driven_train_sampler_cycles_without_epoch_boundary() -> None:
     sampler = StepDrivenTrainSampler(
         dataset_size=3,
+        shuffle=False,
+        seed=13,
+    )
+
+    assert list(islice(iter(sampler), 7)) == [0, 1, 2, 0, 1, 2, 0]
+    with pytest.raises(TypeError, match="intentionally unsized"):
+        len(sampler)
+
+
+def test_step_driven_train_sampler_supports_explicit_finite_budget() -> None:
+    sampler = StepDrivenTrainSampler(
+        dataset_size=3,
         num_samples=7,
         shuffle=False,
         seed=13,
     )
 
+    assert len(sampler) == 7
     assert list(sampler) == [0, 1, 2, 0, 1, 2, 0]
 
 
@@ -215,7 +230,6 @@ def test_graph_retrieval_datamodule_train_loader_uses_step_driven_sampler(
         pin_memory=False,
         drop_last=False,
         train_shuffle=True,
-        train_num_samples=17,
         prefetch_factor=None,
         persistent_workers=False,
         eval_split="validation",
@@ -229,7 +243,8 @@ def test_graph_retrieval_datamodule_train_loader_uses_step_driven_sampler(
     sampler = loader["sampler"]
     assert isinstance(sampler, StepDrivenTrainSampler)
     assert sampler.dataset_size == 4
-    assert len(sampler) == 17
+    with pytest.raises(TypeError, match="intentionally unsized"):
+        len(sampler)
 
 
 def test_graph_retrieval_datamodule_train_loader_uses_budget_batch_sampler(
@@ -261,7 +276,6 @@ def test_graph_retrieval_datamodule_train_loader_uses_budget_batch_sampler(
         pin_memory=False,
         drop_last=False,
         train_shuffle=True,
-        train_num_samples=17,
         prefetch_factor=None,
         persistent_workers=False,
         train_max_edges_per_batch=12,
@@ -273,6 +287,43 @@ def test_graph_retrieval_datamodule_train_loader_uses_budget_batch_sampler(
     batch_sampler = loader["batch_sampler"]
     assert isinstance(batch_sampler, BudgetBatchSampler)
     assert captured["kwargs"]["sampler"] is not None
+    with pytest.raises(TypeError, match="unsized sampler"):
+        len(batch_sampler)
+
+
+def test_graph_retrieval_datamodule_train_loader_is_unsized_but_eval_loader_is_sized(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
+    )
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        lambda **kwargs: _DummyDataset(str(kwargs["split_name"]), size=4),
+    )
+
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        eval_batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=True,
+        prefetch_factor=None,
+        persistent_workers=False,
+        train_max_edges_per_batch=12,
+    )
+
+    datamodule.setup(stage="fit")
+    train_loader = datamodule.train_dataloader()
+    val_loader = datamodule.val_dataloader()
+
+    with pytest.raises(TypeError, match="unsized sampler"):
+        len(train_loader)
+    assert len(val_loader) == 2
 
 
 def test_budget_batch_sampler_rejects_oversized_singleton() -> None:
@@ -362,6 +413,101 @@ def test_graph_retrieval_datamodule_set_eval_split_invalidates_cached_dataset(
 
     assert created_splits == ["validation", "test"]
     assert loader == {"split": "test", "shuffle": False, "batch_size": 7}
+
+
+def test_graph_retrieval_datamodule_uses_eval_worker_overrides(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured_calls: list[dict[str, object]] = []
+    supported_methods = [method.lower() for method in mp.get_all_start_methods()]
+    train_context = next(
+        (method for method in supported_methods if method != "spawn"),
+        supported_methods[0],
+    )
+    eval_context = "spawn" if "spawn" in supported_methods else supported_methods[0]
+
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
+    )
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        lambda **kwargs: _DummyDataset(str(kwargs["split_name"]), size=4),
+    )
+
+    def _build_loader(dataset, **kwargs):  # type: ignore[no-untyped-def]
+        captured_calls.append({"dataset": dataset, **kwargs})
+        return {"split": dataset.split, "num_workers": kwargs["num_workers"]}
+
+    monkeypatch.setattr(
+        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
+        _build_loader,
+    )
+
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        eval_batch_size=7,
+        num_workers=8,
+        eval_num_workers=3,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=True,
+        prefetch_factor=4,
+        eval_prefetch_factor=2,
+        persistent_workers=True,
+        eval_persistent_workers=True,
+        multiprocessing_context=train_context,
+        eval_multiprocessing_context=eval_context,
+        eval_split="validation",
+    )
+
+    datamodule.setup(stage="fit")
+    train_loader = datamodule.train_dataloader()
+    val_loader = datamodule.val_dataloader()
+
+    assert train_loader == {"split": "train", "num_workers": 8}
+    assert val_loader == {"split": "validation", "num_workers": 3}
+    assert captured_calls[0]["prefetch_factor"] == 4
+    assert captured_calls[0]["persistent_workers"] is True
+    assert captured_calls[0]["multiprocessing_context"] == train_context
+    assert captured_calls[1]["prefetch_factor"] == 2
+    assert captured_calls[1]["persistent_workers"] is True
+    assert captured_calls[1]["multiprocessing_context"] == eval_context
+
+
+def test_graph_retrieval_datamodule_disables_eval_context_when_workers_zero(
+    tmp_path: Path,
+) -> None:
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        num_workers=4,
+        eval_num_workers=0,
+        prefetch_factor=4,
+        eval_prefetch_factor=2,
+        persistent_workers=True,
+        eval_persistent_workers=True,
+        multiprocessing_context="spawn",
+        eval_multiprocessing_context="spawn",
+    )
+
+    assert datamodule.eval_prefetch_factor is None
+    assert datamodule.eval_persistent_workers is False
+    assert datamodule.eval_multiprocessing_context is None
+
+
+def test_graph_retrieval_datamodule_rejects_unknown_multiprocessing_context(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="multiprocessing_context"):
+        GraphRetrievalDataModule(
+            dataset_cfg=_write_dataset_paths(tmp_path),
+            batch_size=2,
+            num_workers=1,
+            multiprocessing_context="definitely-not-a-start-method",
+        )
 
 
 def test_on_after_batch_transfer_computes_missing_edge_batch(tmp_path: Path) -> None:

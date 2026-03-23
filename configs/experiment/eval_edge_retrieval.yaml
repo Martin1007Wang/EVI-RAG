@@ -20,7 +20,7 @@ defaults:
 
 model:
   metric_runtime_factory:
-    _target_: src.metrics.answer_reachability.runtime.SearchMetricRuntimeFactory
+    _target_: src.metrics.runtime_factory.GraphTaskRuntimeFactory
   heuristic_cfg:
     kind: topology
     beta: 1.0

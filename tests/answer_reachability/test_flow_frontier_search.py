@@ -7,8 +7,8 @@ import torch
 
 from src.graph_runtime import build_graph_batch
 from src.graph_runtime.batch import TrajectoryBatch
-from src.metrics.answer_reachability.flow_frontier import (
-    FlowFrontierSupportSearch,
+from src.metrics.search_backends import (
+    FlowFrontierBackend,
     run_flow_frontier_search,
 )
 from src.models.configs import HorizonConfig, SearchEvalConfig
@@ -177,8 +177,8 @@ def _make_manual_fixture() -> tuple[
 
 def test_flow_frontier_support_search_returns_exact_window() -> None:
     batch, prepared_batch, policy = _make_manual_fixture()
-    search = FlowFrontierSupportSearch(
-        horizon_cfg=HorizonConfig(max_steps=2),
+    search = FlowFrontierBackend(
+        max_steps=2,
         eval_cfg=SearchEvalConfig(
             support_search_method="flow_frontier",
             flow_prune_epsilon=0.0,
@@ -189,10 +189,12 @@ def test_flow_frontier_support_search_returns_exact_window() -> None:
         ),
     )
 
-    result = search.generate_window(
+    result = search.evaluate_graph(
         batch=batch,
         policy=policy,
         prepared_batch=prepared_batch,
+        metrics_profile="full",
+        include_answer_support=True,
     )
 
     assert result.inference_mode == "flow_frontier"
@@ -203,7 +205,7 @@ def test_flow_frontier_support_search_returns_exact_window() -> None:
     assert result.window_size == 1
     assert [edge.edge_id for edge in result.trajectories[0].edges] == [0, 2]
     assert result.covered_mass == pytest.approx(0.6)
-    assert result.gold_total_mass == pytest.approx(0.6)
+    assert result.gold_answer_mass == pytest.approx(0.6)
     assert result.remaining_mass_upper == pytest.approx(0.4)
     assert [record.answer_entity_id for record in result.answer_posterior] == [103, 102]
     assert result.answer_posterior[0].prob == pytest.approx(0.6)
@@ -230,6 +232,6 @@ def test_flow_frontier_prunes_low_flow_branch_with_global_mass_bound() -> None:
 
     assert summary.stop_reason == "flow_frontier_exhausted"
     assert summary.coverage_certified is True
-    assert summary.analysis.gold_total_mass == pytest.approx(0.6)
+    assert summary.analysis.gold_answer_mass == pytest.approx(0.6)
     assert summary.remaining_mass_upper == pytest.approx(0.4)
     assert [path.edge_ids for path in summary.discovered_paths] == [(0, 2)]

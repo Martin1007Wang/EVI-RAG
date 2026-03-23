@@ -62,10 +62,10 @@ model:
       degree_threshold: 32
       heuristic_weight: 1.0
   training_cfg:
-    success_replay:
-      enabled: false
-    adaptive_sampling:
-      enabled: false
+    shortest_path_reward:
+      weight: 0.75
+      schedule_type: constant
+      completion_power: 2.0
   heuristic_cfg:
     kind: none
     beta: 0.0

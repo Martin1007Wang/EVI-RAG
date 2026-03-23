@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+import multiprocessing as mp
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
@@ -26,7 +27,7 @@ from src.graph_runtime import TrajectoryBatch
 
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"
-_DEFAULT_TRAIN_NUM_SAMPLES = 1_000_000_000
+_LEGACY_TRAIN_NUM_SAMPLES_SENTINEL = 1_000_000_000
 _FEATURE_DTYPE_ALIASES = {
     None: None,
     "": None,
@@ -95,6 +96,20 @@ def _normalize_split_key(split: str | None) -> str:
     raise ValueError("eval_split must be one of {'train', 'validation', 'test'}.")
 
 
+def _normalize_multiprocessing_context(context_name: str | None) -> str | None:
+    normalized = None if context_name is None else str(context_name).strip().lower()
+    if normalized in (None, "", "none"):
+        return None
+    valid_methods = {method.lower() for method in mp.get_all_start_methods()}
+    if normalized not in valid_methods:
+        valid_text = ", ".join(sorted(valid_methods))
+        raise ValueError(
+            "multiprocessing_context must be one of "
+            f"{{None, {valid_text}}}, got {context_name!r}."
+        )
+    return normalized
+
+
 def _resolve_dataset_cfg(dataset_cfg: Any) -> Dict[str, Any]:
     if OmegaConf is not None and isinstance(dataset_cfg, DictConfig):
         cfg = OmegaConf.to_container(dataset_cfg, resolve=True)  # type: ignore[arg-type]
@@ -113,29 +128,52 @@ def _resolve_distributed_rank_and_world_size() -> tuple[int, int]:
     return 0, 1
 
 
+def _resolve_optional_length(iterable: object) -> int | None:
+    try:
+        return len(iterable)  # type: ignore[arg-type]
+    except (TypeError, NotImplementedError):
+        return None
+
+
+def _normalize_train_num_samples(num_samples: Any) -> int | None:
+    if num_samples in (None, "", 0):
+        return None
+    resolved = int(num_samples)
+    if resolved < 1:
+        raise ValueError("train_num_samples must be >= 1 when set.")
+    if resolved == _LEGACY_TRAIN_NUM_SAMPLES_SENTINEL:
+        return None
+    return resolved
+
+
 class StepDrivenTrainSampler(Sampler[int]):
-    """Large finite sampler that keeps fit loops step-driven instead of dataset-driven."""
+    """Step-driven sampler with an unsized default for Lightning training loops."""
 
     def __init__(
         self,
         *,
         dataset_size: int,
-        num_samples: int,
+        num_samples: int | None = None,
         shuffle: bool,
         seed: int | None = None,
     ) -> None:
         if dataset_size < 1:
             raise ValueError("train dataset must contain at least one sample.")
-        if num_samples < 1:
-            raise ValueError("train_num_samples must be >= 1.")
         self.dataset_size = int(dataset_size)
-        self.num_samples = int(num_samples)
+        self.num_samples = None if num_samples is None else int(num_samples)
+        if self.num_samples is not None and self.num_samples < 1:
+            raise ValueError("train_num_samples must be >= 1 when set.")
         self.shuffle = bool(shuffle)
         self.seed = 0 if seed is None else int(seed)
         self.epoch = 0
         self.rank, self.world_size = _resolve_distributed_rank_and_world_size()
 
     def __len__(self) -> int:
+        if self.num_samples is None:
+            raise TypeError(
+                "StepDrivenTrainSampler is intentionally unsized. "
+                "Control training lifetime with trainer.max_steps or fit_schedule."
+            )
         return self.num_samples
 
     def __iter__(self) -> Iterator[int]:
@@ -153,8 +191,10 @@ class StepDrivenTrainSampler(Sampler[int]):
         )
         remaining = self.num_samples
         chunk_size = 4096
-        while remaining > 0:
-            current_chunk = min(chunk_size, remaining)
+        while remaining is None or remaining > 0:
+            current_chunk = (
+                chunk_size if remaining is None else min(chunk_size, remaining)
+            )
             indices = torch.randint(
                 low=0,
                 high=self.dataset_size,
@@ -163,10 +203,17 @@ class StepDrivenTrainSampler(Sampler[int]):
             )
             for index in indices.tolist():
                 yield int(index)
-            remaining -= current_chunk
+            if remaining is not None:
+                remaining -= current_chunk
 
     def _iter_cycled_indices(self) -> Iterator[int]:
         stride = max(self.world_size, 1)
+        if self.num_samples is None:
+            index = (self.rank + self.epoch * stride) % self.dataset_size
+            while True:
+                yield int(index)
+                index = (index + stride) % self.dataset_size
+            return
         start = (self.rank + self.epoch * self.num_samples * stride) % self.dataset_size
         for offset in range(self.num_samples):
             yield int((start + offset * stride) % self.dataset_size)
@@ -178,7 +225,7 @@ class BudgetBatchSampler(Sampler[list[int]]):
     def __init__(
         self,
         *,
-        sampler: Sampler[int],
+        sampler: Iterable[int],
         dataset: GraphRetrievalDataset,
         max_graphs_per_batch: int | None,
         max_nodes_per_batch: int | None,
@@ -226,16 +273,15 @@ class BudgetBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         cache_key = self._length_cache_key()
-        if (
-            cache_key is not None
-            and self._cached_length_key == cache_key
-            and self._cached_length is not None
-        ):
+        if cache_key is None:
+            raise TypeError(
+                "BudgetBatchSampler length is undefined when backed by an unsized sampler."
+            )
+        if self._cached_length_key == cache_key and self._cached_length is not None:
             return self._cached_length
         length = sum(1 for _ in self._iter_batches())
-        if cache_key is not None:
-            self._cached_length_key = cache_key
-            self._cached_length = length
+        self._cached_length_key = cache_key
+        self._cached_length = length
         return length
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -280,12 +326,13 @@ class BudgetBatchSampler(Sampler[list[int]]):
             yield batch
 
     def _length_cache_key(self) -> tuple[int, ...] | None:
-        epoch = getattr(self.sampler, "epoch", None)
-        if epoch is None:
+        sampler_length = _resolve_optional_length(self.sampler)
+        if sampler_length is None:
             return None
+        epoch = getattr(self.sampler, "epoch", -1)
         return (
             int(epoch),
-            len(self.sampler),
+            sampler_length,
             int(self.drop_last),
             -1 if self.max_graphs_per_batch is None else int(self.max_graphs_per_batch),
             -1 if self.max_nodes_per_batch is None else int(self.max_nodes_per_batch),
@@ -340,12 +387,17 @@ class GraphRetrievalDataModule(LightningDataModule):
         batch_size: int,
         eval_batch_size: int | None = None,
         num_workers: int,
+        eval_num_workers: int | None = None,
         pin_memory: bool = True,
         drop_last: bool = True,
         train_shuffle: bool = True,
-        train_num_samples: int = _DEFAULT_TRAIN_NUM_SAMPLES,
+        train_num_samples: int | None = None,
         prefetch_factor: int | None = 2,
+        eval_prefetch_factor: int | None = None,
         persistent_workers: bool = False,
+        eval_persistent_workers: bool | None = None,
+        multiprocessing_context: str | None = None,
+        eval_multiprocessing_context: str | None = None,
         precompute_edge_batch: bool = False,
         embeddings_device: str | None = None,
         train_feature_dtype: str | None = None,
@@ -369,12 +421,17 @@ class GraphRetrievalDataModule(LightningDataModule):
             batch_size=batch_size,
             eval_batch_size=eval_batch_size,
             num_workers=num_workers,
+            eval_num_workers=eval_num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,
             train_shuffle=train_shuffle,
             train_num_samples=train_num_samples,
             prefetch_factor=prefetch_factor,
+            eval_prefetch_factor=eval_prefetch_factor,
             persistent_workers=persistent_workers,
+            eval_persistent_workers=eval_persistent_workers,
+            multiprocessing_context=multiprocessing_context,
+            eval_multiprocessing_context=eval_multiprocessing_context,
             precompute_edge_batch=precompute_edge_batch,
             train_max_graphs_per_batch=train_max_graphs_per_batch,
             train_max_nodes_per_batch=train_max_nodes_per_batch,
@@ -397,12 +454,17 @@ class GraphRetrievalDataModule(LightningDataModule):
         batch_size: int,
         eval_batch_size: int | None,
         num_workers: int,
+        eval_num_workers: int | None,
         pin_memory: bool,
         drop_last: bool,
         train_shuffle: bool,
-        train_num_samples: int,
+        train_num_samples: int | None,
         prefetch_factor: int | None,
+        eval_prefetch_factor: int | None,
         persistent_workers: bool,
+        eval_persistent_workers: bool | None,
+        multiprocessing_context: str | None,
+        eval_multiprocessing_context: str | None,
         precompute_edge_batch: bool,
         train_max_graphs_per_batch: int | None,
         train_max_nodes_per_batch: int | None,
@@ -416,14 +478,41 @@ class GraphRetrievalDataModule(LightningDataModule):
         if self.eval_batch_size < 1:
             raise ValueError("eval_batch_size must be >= 1.")
         self.num_workers = num_workers
+        self.eval_num_workers = (
+            self.num_workers if eval_num_workers is None else int(eval_num_workers)
+        )
         self.pin_memory = pin_memory
         self.drop_last = drop_last
         self.train_shuffle = bool(train_shuffle)
-        self.train_num_samples = int(train_num_samples)
-        if self.train_num_samples < 1:
-            raise ValueError("train_num_samples must be >= 1.")
+        self.train_num_samples = _normalize_train_num_samples(train_num_samples)
         self.persistent_workers = persistent_workers
         self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
+        self.eval_prefetch_factor = (
+            self.prefetch_factor
+            if eval_prefetch_factor is None
+            else int(eval_prefetch_factor)
+        )
+        self.eval_persistent_workers = (
+            self.persistent_workers
+            if eval_persistent_workers is None
+            else bool(eval_persistent_workers)
+        )
+        self.multiprocessing_context = _normalize_multiprocessing_context(
+            multiprocessing_context
+        )
+        self.eval_multiprocessing_context = (
+            self.multiprocessing_context
+            if eval_multiprocessing_context is None
+            else _normalize_multiprocessing_context(eval_multiprocessing_context)
+        )
+        if self.num_workers < 0 or self.eval_num_workers < 0:
+            raise ValueError("num_workers and eval_num_workers must be >= 0.")
+        if self.num_workers == 0:
+            self.multiprocessing_context = None
+        if self.eval_num_workers == 0:
+            self.eval_prefetch_factor = None
+            self.eval_persistent_workers = False
+            self.eval_multiprocessing_context = None
         self.precompute_edge_batch = bool(precompute_edge_batch)
         self.train_max_graphs_per_batch = (
             None
@@ -767,9 +856,16 @@ class GraphRetrievalDataModule(LightningDataModule):
             training=training,
             drop_last=drop_last,
         )
+        (
+            num_workers,
+            prefetch_factor,
+            persistent_workers,
+            multiprocessing_context,
+        ) = self._loader_worker_cfg(training=training)
 
         return build_retrieval_dataloader(
             dataset,
+            loader_name=self._loader_name(training=training, dataset=dataset),
             batch_size=(
                 self.batch_size_per_device if training else int(self.eval_batch_size)
             ),
@@ -777,15 +873,41 @@ class GraphRetrievalDataModule(LightningDataModule):
             sampler=sampler,
             batch_sampler=batch_sampler,
             drop_last=drop_last,
-            num_workers=self.num_workers,
+            num_workers=num_workers,
             pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            prefetch_factor=self.prefetch_factor,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            multiprocessing_context=multiprocessing_context,
             precompute_edge_batch=self.precompute_edge_batch,
             random_seed=self.dataset_cfg.get("random_seed"),
             expand_multi_answer=self.expand_multi_answer,
             filter_zero_hop=self.filter_zero_hop,
         )
+
+    def _loader_worker_cfg(
+        self,
+        *,
+        training: bool,
+    ) -> tuple[int, int | None, bool, str | None]:
+        if training:
+            return (
+                self.num_workers,
+                self.prefetch_factor,
+                self.persistent_workers,
+                self.multiprocessing_context,
+            )
+        return (
+            self.eval_num_workers,
+            self.eval_prefetch_factor,
+            self.eval_persistent_workers,
+            self.eval_multiprocessing_context,
+        )
+
+    @staticmethod
+    def _loader_name(*, training: bool, dataset: GraphRetrievalDataset) -> str:
+        if training:
+            return f"train:{dataset.split}"
+        return f"eval:{dataset.split}"
 
     def _build_sampler(
         self,

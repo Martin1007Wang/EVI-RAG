@@ -23,8 +23,9 @@ terms used by the code.
 Root selection is handled in two steps:
 
 1. Build `RootState` from the prepared batch context.
-2. Predict the root boundary flow `log F(s_root)` from the query-conditioned
-   graph context.
+2. Predict the root boundary flow `log F(s_root)` from the concatenation of the
+   per-graph question token, pooled all-node and start-node graph embeddings,
+   plus explicit graph-size scalars.
 3. Build `RootActionDistribution` from the candidate start nodes resolved from
    `q_local_indices` using a dedicated root-action head.
 3. Sample start nodes from that root action distribution.
@@ -118,18 +119,24 @@ path.
 
 The runtime now uses a single fixed terminal-energy scheme.
 
-- gold terminal entities get `log R = 0.0`, so `R = 1.0`
-- non-gold terminal entities get `log R = -3.0`, so `R = exp(-3.0)`
-- the terminal reward depends only on the reached entity identity, not on path
-  length, revisit counts, or mode-specific reward shaping knobs
+- gold terminal entities get `log R_terminal = 0.0`, so `R_terminal = 1.0`
+- non-gold terminal entities get `log R_terminal = -3.0`, so
+  `R_terminal = exp(-3.0)`
+- sampled trajectories then apply a length discount
+  `R(τ) = R_terminal * gamma^|τ|`, where `gamma` is
+  `training.trajectory_length_discount`
+- revisit counts and other rollout bookkeeping are still not part of the reward
+  definition
+- full no-repeat is now enforced as a forward legality rule: graph moves that
+  revisit any previously seen entity on the current prefix are masked, while
+  STOP remains legal
 
 This keeps the supervision contract simple: SubTB always anchors against a
 stable terminal log-reward table instead of switching between multiple reward
 parameterizations.
 
-`success_mask`, termination steps, and revisit counters are still tracked for
-rollout bookkeeping and reporting, but they are not part of the terminal reward
-definition.
+`success_mask`, termination steps, and revisit bookkeeping are still tracked for
+rollout reporting, but they are not part of the terminal reward definition.
 
 The terminal STOP backward factor is also fixed: the absorbing STOP edge uses
 `log P_B = 0`, matching the unique-prefix-parent interpretation used elsewhere

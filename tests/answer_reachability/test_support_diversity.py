@@ -3,13 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.metrics.answer_reachability import ReachabilityAnalysis
-from src.metrics.answer_reachability.metrics import compute_support_metrics
-from src.metrics.answer_reachability.posterior import (
+from src.metrics.answer_metrics import (
     DiscoveredTrajectory,
+    ReachabilityAnalysis,
+    SearchDiagnostics,
     build_window_result,
+    compute_support_metrics,
 )
-from src.metrics.answer_reachability.schema import SupportWindowEvalBatch
 
 from .conftest import make_batch_from_graph
 
@@ -31,7 +31,7 @@ def test_support_window_penalizes_overlapping_paths() -> None:
         terminal_mass=torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
         answer_probs=torch.tensor([1.0], dtype=torch.float32),
-        gold_total_mass=1.0,
+        gold_answer_mass=1.0,
     )
     discovered_paths = [
         DiscoveredTrajectory(
@@ -62,15 +62,20 @@ def test_support_window_penalizes_overlapping_paths() -> None:
 
     result = build_window_result(
         batch=batch,
-        discovered_paths=discovered_paths,
         analysis=analysis,
-        inference_mode="monte_carlo",
+        diagnostics=SearchDiagnostics(
+            inference_mode="monte_carlo",
+            probe_count=3,
+            remaining_mass_upper=0.0,
+            stop_reason="support_mass_reached",
+            coverage_certified=False,
+        ),
+        discovered_paths=discovered_paths,
         answer_mass_threshold=1.0,
         support_mass_threshold=0.8,
         support_path_overlap_penalty=1.0,
-        probe_count=3,
-        remaining_mass_upper=0.0,
-        stop_reason="support_mass_reached",
+        answer_mass_reference="monte_carlo",
+        support_mass_reference="monte_carlo",
     )
 
     emitted_edge_ids = [
@@ -80,9 +85,5 @@ def test_support_window_penalizes_overlapping_paths() -> None:
     assert result.covered_mass == pytest.approx(0.84)
     assert result.answer_posterior[0].support_path_count == 2
 
-    metrics = compute_support_metrics(
-        SupportWindowEvalBatch(
-            dataset_scope="sub", mass_threshold=0.8, results=[result]
-        )
-    )
-    assert metrics["window/adaptive/support_diversity"] == pytest.approx(1.0)
+    metrics = compute_support_metrics([result])
+    assert metrics["support/diversity"] == pytest.approx(1.0)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,22 +49,22 @@ from .gflownet import (
     SamplingTemperatureScheduler,
     SearchHeuristic,
     SearchState,
-    SubTrajectoryBalanceLossOutput,
-    SuccessfulTrajectoryReplayBuffer,
+    ShortestPathRewardScheduler,
     SubTrajectoryBalanceLoss,
+    SubTrajectoryBalanceLossOutput,
     TrajectoryGFNSampleBatch,
     TrainingScheduleContext,
-    build_replay_sample_batch,
     normalize_scheduler_interval,
 )
-from .gflownet.adaptive_sampling import (
-    AdaptiveSamplingController,
-    AdaptiveSamplingMetrics,
-)
 from .gflownet.path import reconstruct_trace_path_token_ids
+from .gflownet.reward_shaping import (
+    ShortestPathRewardOracle,
+    build_shortest_path_reward_oracle,
+    compute_shortest_path_alignment_trace,
+    compute_shortest_path_prefix_alignment,
+)
 from .gflownet.success_paths import (
     collect_success_rollout_key_rows,
-    compute_success_path_hash_pairs,
     deduplicate_success_rollout_key_rows,
 )
 
@@ -81,19 +81,6 @@ class GFlowNetConfig:
     eval_cfg: SearchEvalConfig
     optimizer_cfg: OptimizerConfig
     scheduler_cfg: SchedulerConfig
-
-
-@dataclass(frozen=True)
-class ReplayLossResult:
-    loss_output: SubTrajectoryBalanceLossOutput
-    num_trajectories: int
-    num_graphs: int
-
-
-@dataclass(frozen=True)
-class TrainingLossAggregation:
-    total_loss: torch.Tensor
-    replay_result: ReplayLossResult | None
 
 
 @dataclass(frozen=True)
@@ -120,6 +107,17 @@ class TrainingRolloutMetrics:
     shortlist_active_states: float
     candidate_shortlist_activation_rate: float
     candidate_shortlist_keep_ratio: float
+
+
+@dataclass(frozen=True)
+class ShortestPathRewardMetrics:
+    lambda_weight: float
+    mean_alignment: float
+    mean_bonus: float
+    reachable_start_rate: float
+    full_match_rate: float
+    success_alignment: float
+    failure_alignment: float
 
 
 class GFlowNetPolicyFactory:
@@ -330,37 +328,27 @@ class GFlowNetModule(LightningModule):
             guidance_cfg=training_cfg.guidance,
         )
         self.sampler = self.runtime_controller.sampler
+        if self.sampler is not None and hasattr(
+            self.sampler, "trajectory_length_discount"
+        ):
+            setattr(
+                self.sampler,
+                "trajectory_length_discount",
+                float(training_cfg.trajectory_length_discount),
+            )
         self.loss_fn = SubTrajectoryBalanceLoss(config=training_cfg.subtb)
         self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
             base_temperature=training_cfg.sampling_temperature,
             config=training_cfg.sampling_temperature_schedule,
         )
-        self.adaptive_sampling_controller = AdaptiveSamplingController(
-            config=training_cfg.adaptive_sampling,
-            base_rollout_batch_size=training_cfg.rollout_batch_size,
+        self.shortest_path_reward_scheduler = ShortestPathRewardScheduler(
+            config=training_cfg.shortest_path_reward,
         )
         self.search = self.runtime_controller.search
         self._fit_schedule: ResolvedPassFitSchedule | None = None
         self._schedule_context_override: TrainingScheduleContext | None = None
         self._invalid_start_count = 0
-        self._pending_adaptive_observation_steps = 0
-        self._pending_adaptive_success_rate: torch.Tensor | None = None
-        self._pending_adaptive_unique_success = 0.0
-        self._pending_adaptive_residual_variance: torch.Tensor | None = None
-        self._seen_success_path_hashes_by_sample: dict[str, set[tuple[int, int]]] = {}
-        self.success_replay_buffer: SuccessfulTrajectoryReplayBuffer | None = None
-        replay_cfg = self.cfg.training_cfg.success_replay
-        if replay_cfg.enabled:
-            if self.sampler is None or not hasattr(
-                self.sampler, "trajectory_supervisor"
-            ):
-                raise RuntimeError(
-                    "Successful trajectory replay requires a sampler with a trajectory_supervisor."
-                )
-            self.success_replay_buffer = SuccessfulTrajectoryReplayBuffer(
-                max_buffer_size=replay_cfg.max_buffer_size,
-                max_trajectories_per_sample=replay_cfg.max_trajectories_per_sample,
-            )
+        self._shortest_path_reward_cache: dict[str, ShortestPathRewardOracle] = {}
 
     @staticmethod
     def _validate_auxiliary_config(
@@ -458,79 +446,6 @@ class GFlowNetModule(LightningModule):
             current_step += 1
         return self._fit_schedule.effective_pass(global_step=current_step)
 
-    def _warmup_passes_completed(
-        self, *, required_passes: float, after_current_step: bool = False
-    ) -> bool:
-        effective_pass = self._resolve_effective_pass(
-            after_current_step=after_current_step
-        )
-        if effective_pass is None:
-            return required_passes <= 0.0
-        return effective_pass >= required_passes
-
-    def _resolve_success_replay_rollouts_per_graph(
-        self, *, on_policy_rollouts_per_graph: int | None = None
-    ) -> int:
-        replay_cfg = self.cfg.training_cfg.success_replay
-        if not replay_cfg.enabled:
-            return 0
-        ratio = replay_cfg.ratio
-        if not 0.0 <= ratio < 1.0:
-            raise ValueError(
-                f"training.success_replay.ratio must be in [0, 1). Got {ratio}."
-            )
-        total_rollouts = (
-            self.cfg.training_cfg.rollout_batch_size
-            if on_policy_rollouts_per_graph is None
-            else int(on_policy_rollouts_per_graph)
-        )
-        if total_rollouts < 1:
-            return 0
-        replay_rollouts = int(round((total_rollouts * ratio) / (1.0 - ratio)))
-        replay_rollouts = max(replay_rollouts, 0)
-        max_rollouts_per_graph = replay_cfg.max_rollouts_per_graph
-        if max_rollouts_per_graph is None:
-            max_rollouts_per_graph = replay_cfg.max_trajectories_per_sample
-        return min(replay_rollouts, int(max_rollouts_per_graph))
-
-    @staticmethod
-    def _graph_sample_id(batch: TrajectoryBatch, graph_idx: int) -> str:
-        sample_ids = getattr(batch, "sample_ids", None)
-        if sample_ids is not None and len(sample_ids) > graph_idx:
-            return str(sample_ids[graph_idx])
-        return str(graph_idx)
-
-    def _should_track_global_success_paths(self) -> bool:
-        return bool(self.cfg.training_cfg.adaptive_sampling.enabled)
-
-    def _count_new_success_paths(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        unique_success_path_rows: torch.Tensor,
-    ) -> int:
-        if int(unique_success_path_rows.numel()) == 0:
-            return 0
-        graph_idx_and_hashes = torch.cat(
-            (
-                unique_success_path_rows[:, :1],
-                compute_success_path_hash_pairs(unique_success_path_rows[:, 1:]),
-            ),
-            dim=1,
-        )
-        hash_rows_cpu = graph_idx_and_hashes.detach().to(device="cpu", dtype=torch.long)
-        new_success_paths = 0
-        for graph_idx, hash_a, hash_b in hash_rows_cpu.tolist():
-            sample_id = self._graph_sample_id(batch, graph_idx)
-            seen_for_sample = self._seen_success_path_hashes_by_sample.setdefault(
-                sample_id, set()
-            )
-            path_hash = (int(hash_a), int(hash_b))
-            if path_hash not in seen_for_sample:
-                seen_for_sample.add(path_hash)
-                new_success_paths += 1
-        return new_success_paths
-
     def _compute_training_rollout_metrics(
         self,
         *,
@@ -538,7 +453,6 @@ class GFlowNetModule(LightningModule):
         sample_batch: TrajectoryGFNSampleBatch,
     ) -> TrainingRolloutMetrics:
         total_rollouts = int(sample_batch.success_mask.numel())
-        new_success_paths = 0
         success_path_rows = collect_success_rollout_key_rows(
             batch=batch,
             sample_batch=sample_batch,
@@ -546,14 +460,11 @@ class GFlowNetModule(LightningModule):
         unique_success_path_rows = deduplicate_success_rollout_key_rows(
             success_path_rows
         )
-        if unique_success_path_rows is not None:
-            if self._should_track_global_success_paths():
-                new_success_paths = self._count_new_success_paths(
-                    batch=batch,
-                    unique_success_path_rows=unique_success_path_rows,
-                )
-            else:
-                new_success_paths = int(unique_success_path_rows.size(0))
+        new_success_paths = (
+            0
+            if unique_success_path_rows is None
+            else int(unique_success_path_rows.size(0))
+        )
         start_entropy = sample_batch.behavior_start_entropy
         start_entropy_normalized = sample_batch.behavior_start_entropy_normalized
         mean_start_entropy = (
@@ -617,95 +528,6 @@ class GFlowNetModule(LightningModule):
             shortlist_active_states=shortlist_active_states,
             candidate_shortlist_activation_rate=candidate_shortlist_activation_rate,
             candidate_shortlist_keep_ratio=candidate_shortlist_keep_ratio,
-        )
-
-    def _success_replay_enabled(self) -> bool:
-        replay_cfg = self.cfg.training_cfg.success_replay
-        return replay_cfg.enabled and self.success_replay_buffer is not None
-
-    def _success_replay_buffer_ready(self) -> bool:
-        if self.success_replay_buffer is None:
-            return False
-        return (
-            len(self.success_replay_buffer)
-            >= self.cfg.training_cfg.success_replay.min_buffer_size
-        )
-
-    def _success_replay_warmup_done(self) -> bool:
-        return self._warmup_passes_completed(
-            required_passes=self.cfg.training_cfg.success_replay.warmup_passes
-        )
-
-    def _success_replay_is_ready(self) -> bool:
-        return (
-            self._success_replay_enabled()
-            and self._success_replay_buffer_ready()
-            and self._success_replay_warmup_done()
-        )
-
-    def _compute_success_replay_loss(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        replay_rollouts_per_graph: int,
-    ) -> ReplayLossResult | None:
-        if (
-            replay_rollouts_per_graph < 1
-            or self.success_replay_buffer is None
-            or not self._success_replay_is_ready()
-        ):
-            return None
-        plan = self.success_replay_buffer.plan_for_batch(
-            batch=batch,
-            replay_rollouts_per_graph=replay_rollouts_per_graph,
-        )
-        if plan is None:
-            return None
-        trajectory_supervisor = getattr(self.sampler, "trajectory_supervisor", None)
-        if trajectory_supervisor is None:
-            raise RuntimeError(
-                "Successful trajectory replay requires sampler.trajectory_supervisor."
-            )
-        replay_batch = TrajectoryBatch.concatenate(
-            [
-                batch.select_graph(graph_idx, validate=False)
-                for graph_idx in plan.graph_indices
-            ],
-            validate=False,
-        )
-        replay_prepared_batch = self.policy.prepare_batch(replay_batch)
-        replay_batch = replay_batch.without_raw_features()
-        replay_sample_batch = build_replay_sample_batch(
-            batch=replay_batch,
-            policy=self.policy,
-            prepared_batch=replay_prepared_batch,
-            trajectory_supervisor=trajectory_supervisor,
-            replay_records=plan.records_by_graph,
-            max_steps=self.cfg.horizon_cfg.max_steps,
-        )
-        replay_loss_output = self.loss_fn.compute(replay_sample_batch)
-        return ReplayLossResult(
-            loss_output=replay_loss_output,
-            num_trajectories=int(plan.num_trajectories),
-            num_graphs=len(plan.graph_indices),
-        )
-
-    def _aggregate_total_loss(
-        self,
-        *,
-        loss_output: SubTrajectoryBalanceLossOutput,
-        replay_result: ReplayLossResult | None,
-        on_policy_trajectories: int,
-    ) -> TrainingLossAggregation:
-        total_loss = loss_output.loss
-        if replay_result is not None:
-            total_trajectories = on_policy_trajectories + replay_result.num_trajectories
-            total_loss = (
-                loss_output.loss * float(on_policy_trajectories)
-                + replay_result.loss_output.loss * float(replay_result.num_trajectories)
-            ) / float(total_trajectories)
-        return TrainingLossAggregation(
-            total_loss=total_loss, replay_result=replay_result
         )
 
     def _compute_guidance_loss(
@@ -774,89 +596,78 @@ class GFlowNetModule(LightningModule):
             active_states=int(active_loss.numel()),
         )
 
-    def _adaptive_sampling_observe_interval(self) -> int:
-        trainer = getattr(self, "_trainer", None)
-        if trainer is None:
-            return 1
-        return max(1, int(getattr(trainer, "log_every_n_steps", 1) or 1))
+    @staticmethod
+    def _safe_batch_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
+        x = x.detach().to(dtype=torch.float32).view(-1)
+        y = y.detach().to(dtype=torch.float32).view(-1)
+        if int(x.numel()) < 2 or int(y.numel()) < 2:
+            return 0.0
+        x = x - x.mean()
+        y = y - y.mean()
+        x_norm = torch.linalg.vector_norm(x)
+        y_norm = torch.linalg.vector_norm(y)
+        if float(x_norm.item()) == 0.0 or float(y_norm.item()) == 0.0:
+            return 0.0
+        corr = torch.dot(x, y) / (x_norm * y_norm)
+        return float(corr.clamp(min=-1.0, max=1.0).item())
 
-    def _flush_pending_adaptive_sampling_metrics(self) -> None:
-        pending_steps = int(self._pending_adaptive_observation_steps)
-        if pending_steps < 1 or self._pending_adaptive_success_rate is None:
-            return
-        residual_variance = self._pending_adaptive_residual_variance
-        if residual_variance is None:
-            raise RuntimeError(
-                "adaptive sampling accumulator is missing tensor statistics before flush."
-            )
-        denom = float(pending_steps)
-        self.adaptive_sampling_controller.observe(
-            AdaptiveSamplingMetrics(
-                success_rate=float(
-                    (self._pending_adaptive_success_rate / denom).detach().item()
-                ),
-                unique_success_paths_per_100_rollouts=(
-                    self._pending_adaptive_unique_success / denom
-                ),
-                subtb_residual_variance_per_batch=float(
-                    (residual_variance / denom).detach().item()
-                ),
-            )
-        )
-        self._pending_adaptive_observation_steps = 0
-        self._pending_adaptive_success_rate = None
-        self._pending_adaptive_unique_success = 0.0
-        self._pending_adaptive_residual_variance = None
-
-    def _buffer_adaptive_sampling_metrics(
+    def _compute_root_diagnostics(
         self,
         *,
-        loss_output: SubTrajectoryBalanceLossOutput,
-        rollout_metrics: TrainingRolloutMetrics,
-    ) -> None:
-        if not self.cfg.training_cfg.adaptive_sampling.enabled:
-            return
-        success_rate = loss_output.success_rate.detach().to(dtype=torch.float32)
-        residual_variance = loss_output.residual_variance.detach().to(
-            dtype=torch.float32
+        prepared_batch: Any,
+        sample_batch: TrajectoryGFNSampleBatch,
+    ) -> dict[str, float]:
+        topology = prepared_batch.topology
+        device = sample_batch.graph_log_z.device
+        node_counts = (
+            topology.graph_node_offsets[1:] - topology.graph_node_offsets[:-1]
+        ).to(
+            device=device,
+            dtype=torch.float32,
         )
-        if self._pending_adaptive_success_rate is None:
-            self._pending_adaptive_success_rate = success_rate
-            self._pending_adaptive_residual_variance = residual_variance
-        else:
-            self._pending_adaptive_success_rate = (
-                self._pending_adaptive_success_rate + success_rate
+        edge_counts = torch.zeros_like(node_counts)
+        if int(topology.edge_index.size(1)) > 0:
+            edge_graph_ids = topology.graph_index_from_nodes(
+                topology.edge_index[0].to(device=device)
             )
-            self._pending_adaptive_residual_variance = (
-                self._pending_adaptive_residual_variance + residual_variance
+            edge_counts.scatter_add_(
+                0,
+                edge_graph_ids,
+                torch.ones_like(edge_graph_ids, dtype=torch.float32),
             )
-        self._pending_adaptive_unique_success += float(
-            rollout_metrics.unique_success_paths_per_100_rollouts
+        start_counts = prepared_batch.observation.q_local_indices.counts().to(
+            device=device,
+            dtype=torch.float32,
         )
-        self._pending_adaptive_observation_steps += 1
-        if (
-            self._pending_adaptive_observation_steps
-            >= self._adaptive_sampling_observe_interval()
-        ):
-            self._flush_pending_adaptive_sampling_metrics()
+        log_z = sample_batch.graph_log_z.detach().to(dtype=torch.float32)
+        return {
+            "log_z_num_nodes_corr": self._safe_batch_correlation(
+                log_z, torch.log1p(node_counts)
+            ),
+            "log_z_num_edges_corr": self._safe_batch_correlation(
+                log_z, torch.log1p(edge_counts)
+            ),
+            "log_z_start_candidates_corr": self._safe_batch_correlation(
+                log_z,
+                torch.log1p(start_counts),
+            ),
+        }
 
     def _build_training_metrics(
         self,
         *,
         loss_output: SubTrajectoryBalanceLossOutput,
-        loss_aggregation: TrainingLossAggregation,
         total_loss: torch.Tensor,
         rollout_batch_size: int,
-        replay_rollouts_per_graph: int,
         sampling_temperature: float,
-        on_policy_trajectories: int,
-        controller_metrics: dict[str, float],
         rollout_metrics: TrainingRolloutMetrics,
+        root_diagnostics: dict[str, float],
+        shortest_path_reward_metrics: ShortestPathRewardMetrics,
         guidance_result: GuidanceLossResult | None,
     ) -> dict[str, Any]:
         metrics: dict[str, Any] = {
             "loss": total_loss.detach(),
-            "actor_loss": loss_aggregation.total_loss.detach(),
+            "actor_loss": loss_output.loss.detach(),
             "subtb_loss": loss_output.subtb_loss,
             "subtb_residual": loss_output.residual_abs,
             "subtb_residual_variance_per_batch": loss_output.residual_variance,
@@ -880,31 +691,15 @@ class GFlowNetModule(LightningModule):
             "log_z_variance": loss_output.log_z_variance,
             "rollout_batch_size": float(rollout_batch_size),
             "sampling_temperature": sampling_temperature,
+            "shortest_path_reward_lambda": shortest_path_reward_metrics.lambda_weight,
+            "oracle_prefix_align_mean": shortest_path_reward_metrics.mean_alignment,
+            "shortest_path_reward_bonus_mean": shortest_path_reward_metrics.mean_bonus,
+            "oracle_reachable_start_rate": shortest_path_reward_metrics.reachable_start_rate,
+            "oracle_prefix_full_match_rate": shortest_path_reward_metrics.full_match_rate,
+            "oracle_prefix_align_on_success": shortest_path_reward_metrics.success_alignment,
+            "oracle_prefix_align_on_failure": shortest_path_reward_metrics.failure_alignment,
         }
-        metrics.update(controller_metrics)
-        replay_result = loss_aggregation.replay_result
-        if self.success_replay_buffer is not None:
-            metrics["success_replay_buffer_size"] = float(
-                len(self.success_replay_buffer)
-            )
-            metrics["success_replay_rollouts_per_graph"] = float(
-                replay_rollouts_per_graph
-            )
-            metrics["success_replay_ratio"] = (
-                float(replay_result.num_trajectories)
-                / float(on_policy_trajectories + replay_result.num_trajectories)
-                if replay_result is not None and replay_result.num_trajectories > 0
-                else 0.0
-            )
-            metrics["success_replay_trajectories"] = float(
-                0 if replay_result is None else replay_result.num_trajectories
-            )
-            metrics["success_replay_graphs"] = float(
-                0 if replay_result is None else replay_result.num_graphs
-            )
-        if replay_result is not None:
-            metrics["on_policy_loss"] = loss_output.loss.detach()
-            metrics["success_replay_loss"] = replay_result.loss_output.loss.detach()
+        metrics.update(root_diagnostics)
         if guidance_result is not None:
             metrics["guidance_loss"] = guidance_result.loss.detach()
             metrics["guidance_target_mean"] = guidance_result.target_mean
@@ -934,7 +729,7 @@ class GFlowNetModule(LightningModule):
             sample_ids=sample_ids,
         )
         raise RuntimeError(
-            "Non-finite training loss detected. Check SubTB, replay, and reward inputs."
+            "Non-finite training loss detected. Check SubTB and reward inputs."
         )
 
     def transfer_batch_to_device(
@@ -978,6 +773,195 @@ class GFlowNetModule(LightningModule):
         return self.sampling_temperature_scheduler.value(
             global_step=current_step,
             schedule_context=self._trainer_schedule_context(),
+        )
+
+    def _resolve_shortest_path_reward_lambda(
+        self, *, global_step: int | None = None
+    ) -> float:
+        trainer = getattr(self, "_trainer", None)
+        current_step = 0 if trainer is None else int(trainer.global_step)
+        if global_step is not None:
+            current_step = int(global_step)
+        return self.shortest_path_reward_scheduler.value(
+            global_step=current_step,
+            schedule_context=self._trainer_schedule_context(),
+        )
+
+    @staticmethod
+    def _mean_or_zero(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    def _shortest_path_reward_cache_key(
+        self, *, batch: TrajectoryBatch, graph_idx: int
+    ) -> str:
+        sample_id = (
+            str(batch.sample_ids[graph_idx]) if batch.sample_ids else str(graph_idx)
+        )
+        return f"{batch.dataset_scope}:{sample_id}"
+
+    def _get_shortest_path_reward_oracle(
+        self, *, batch: TrajectoryBatch, graph_idx: int
+    ) -> ShortestPathRewardOracle:
+        cache_key = self._shortest_path_reward_cache_key(
+            batch=batch, graph_idx=graph_idx
+        )
+        cached = self._shortest_path_reward_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        node_start = int(batch.node_ptr[graph_idx].item())
+        node_end = int(batch.node_ptr[graph_idx + 1].item())
+        edge_mask = batch.edge_batch == int(graph_idx)
+        local_edge_index = batch.edge_index[:, edge_mask] - node_start
+        local_edge_relations = batch.edge_rel_global[edge_mask]
+        answer_start = int(batch.a_ptr[graph_idx].item())
+        answer_end = int(batch.a_ptr[graph_idx + 1].item())
+        oracle = build_shortest_path_reward_oracle(
+            sample_id=str(batch.sample_ids[graph_idx])
+            if batch.sample_ids
+            else str(graph_idx),
+            edge_index=local_edge_index,
+            edge_relations=local_edge_relations,
+            answer_local_indices=batch.a_local_indices[answer_start:answer_end],
+            num_nodes=node_end - node_start,
+        )
+        self._shortest_path_reward_cache[cache_key] = oracle
+        return oracle
+
+    def _apply_shortest_path_reward_shaping(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        sample_batch: TrajectoryGFNSampleBatch,
+    ) -> tuple[TrajectoryGFNSampleBatch, ShortestPathRewardMetrics]:
+        if float(self.cfg.training_cfg.shortest_path_reward.weight) == 0.0:
+            return sample_batch, ShortestPathRewardMetrics(
+                lambda_weight=0.0,
+                mean_alignment=0.0,
+                mean_bonus=0.0,
+                reachable_start_rate=0.0,
+                full_match_rate=0.0,
+                success_alignment=0.0,
+                failure_alignment=0.0,
+            )
+        lambda_weight = self._resolve_shortest_path_reward_lambda()
+        completion_power = float(
+            self.cfg.training_cfg.shortest_path_reward.completion_power
+        )
+        trace_edge_ids = sample_batch.trace_edge_ids.detach().to(dtype=torch.long)
+        relation_trace_ids = torch.full_like(trace_edge_ids, fill_value=-1)
+        graph_move_mask = trace_edge_ids >= 0
+        if bool(graph_move_mask.any().item()):
+            relation_trace_ids[graph_move_mask] = batch.edge_rel_global.index_select(
+                0,
+                trace_edge_ids[graph_move_mask],
+            )
+        log_reward_steps = torch.zeros_like(
+            sample_batch.log_pf_steps, dtype=torch.float32
+        )
+        alignments = torch.zeros_like(
+            sample_batch.terminal_log_rewards,
+            dtype=torch.float32,
+            device=sample_batch.terminal_log_rewards.device,
+        )
+        potentials = torch.zeros_like(alignments)
+        node_ptr_cpu = batch.node_ptr.detach().to(device="cpu", dtype=torch.long)
+        start_nodes_cpu = sample_batch.start_nodes.detach().to(
+            device="cpu", dtype=torch.long
+        )
+        relation_trace_cpu = relation_trace_ids.detach().to(
+            device="cpu", dtype=torch.long
+        )
+        success_mask_cpu = sample_batch.success_mask.detach().to(
+            device="cpu", dtype=torch.bool
+        )
+        total_rollouts = int(start_nodes_cpu.numel())
+        reachable_starts = 0
+        full_matches = 0
+        success_alignments: list[float] = []
+        failure_alignments: list[float] = []
+        for graph_idx in range(batch.num_graphs):
+            oracle = self._get_shortest_path_reward_oracle(
+                batch=batch, graph_idx=graph_idx
+            )
+            node_offset = int(node_ptr_cpu[graph_idx].item())
+            for rollout_idx in range(int(start_nodes_cpu.size(1))):
+                start_local = (
+                    int(start_nodes_cpu[graph_idx, rollout_idx].item()) - node_offset
+                )
+                relation_row = relation_trace_cpu[graph_idx, rollout_idx]
+                step_positions = (
+                    torch.nonzero(relation_row >= 0, as_tuple=False).view(-1).tolist()
+                )
+                relation_sequence = relation_row[relation_row >= 0].tolist()
+                alignment_trace = compute_shortest_path_alignment_trace(
+                    oracle=oracle,
+                    start_node=start_local,
+                    relation_ids=relation_sequence,
+                )
+                potential_trace = [
+                    float(step_alignment) ** completion_power
+                    for step_alignment in alignment_trace
+                ]
+                previous_potential = 0.0
+                for step_position, step_potential in zip(
+                    step_positions, potential_trace
+                ):
+                    increment = float(lambda_weight) * (
+                        float(step_potential) - float(previous_potential)
+                    )
+                    log_reward_steps[graph_idx, rollout_idx, int(step_position)] = (
+                        increment
+                    )
+                    previous_potential = float(step_potential)
+                alignment = (
+                    float(alignment_trace[-1])
+                    if alignment_trace
+                    else compute_shortest_path_prefix_alignment(
+                        oracle=oracle,
+                        start_node=start_local,
+                        relation_ids=relation_sequence,
+                    )
+                )
+                alignments[graph_idx, rollout_idx] = float(alignment)
+                potential = (
+                    float(potential_trace[-1])
+                    if potential_trace
+                    else float(alignment) ** completion_power
+                )
+                potentials[graph_idx, rollout_idx] = float(potential)
+                if oracle.distance_to_answer(start_local) >= 0:
+                    reachable_starts += 1
+                if alignment >= 1.0 - 1.0e-6:
+                    full_matches += 1
+                if bool(success_mask_cpu[graph_idx, rollout_idx].item()):
+                    success_alignments.append(float(alignment))
+                else:
+                    failure_alignments.append(float(alignment))
+        shaped_bonus = float(lambda_weight) * potentials
+        shaped_batch = replace(
+            sample_batch,
+            log_reward_steps=log_reward_steps,
+        )
+        return shaped_batch, ShortestPathRewardMetrics(
+            lambda_weight=float(lambda_weight),
+            mean_alignment=float(alignments.mean().item())
+            if total_rollouts > 0
+            else 0.0,
+            mean_bonus=float(shaped_bonus.mean().item()) if total_rollouts > 0 else 0.0,
+            reachable_start_rate=(
+                float(reachable_starts) / float(total_rollouts)
+                if total_rollouts > 0
+                else 0.0
+            ),
+            full_match_rate=(
+                float(full_matches) / float(total_rollouts)
+                if total_rollouts > 0
+                else 0.0
+            ),
+            success_alignment=self._mean_or_zero(success_alignments),
+            failure_alignment=self._mean_or_zero(failure_alignments),
         )
 
     def configure_optimizers(self) -> dict[str, Any]:
@@ -1037,64 +1021,51 @@ class GFlowNetModule(LightningModule):
                 "Current metric runtime does not define a training sampler; this model cannot train with the configured metric_runtime_factory."
             )
         prepared_batch = self.policy.prepare_batch(trajectory_batch)
-        sampling_plan = self.adaptive_sampling_controller.decision(
-            base_temperature=self._resolve_sampling_temperature()
-        )
-        controller_metrics = self.adaptive_sampling_controller.snapshot_metrics()
-        replay_rollouts_per_graph = self._resolve_success_replay_rollouts_per_graph(
-            on_policy_rollouts_per_graph=sampling_plan.rollout_batch_size
-        )
-        replay_result = self._compute_success_replay_loss(
-            batch=trajectory_batch,
-            replay_rollouts_per_graph=replay_rollouts_per_graph,
-        )
+        rollout_batch_size = int(self.cfg.training_cfg.rollout_batch_size)
+        sampling_temperature = self._resolve_sampling_temperature()
         trajectory_batch = trajectory_batch.without_raw_features()
         sample_batch = self.sampler.sample(
             batch=trajectory_batch,
             policy=self.policy,
             prepared_batch=prepared_batch,
-            rollout_batch_size=sampling_plan.rollout_batch_size,
-            temperature=sampling_plan.sampling_temperature,
+            rollout_batch_size=rollout_batch_size,
+            temperature=sampling_temperature,
+        )
+        (
+            sample_batch,
+            shortest_path_reward_metrics,
+        ) = self._apply_shortest_path_reward_shaping(
+            batch=trajectory_batch,
+            sample_batch=sample_batch,
         )
         loss_output = self.loss_fn.compute(sample_batch)
         rollout_metrics = self._compute_training_rollout_metrics(
             batch=trajectory_batch,
             sample_batch=sample_batch,
         )
-        on_policy_trajectories = (
-            trajectory_batch.num_graphs * sampling_plan.rollout_batch_size
-        )
-        loss_aggregation = self._aggregate_total_loss(
-            loss_output=loss_output,
-            replay_result=replay_result,
-            on_policy_trajectories=on_policy_trajectories,
+        root_diagnostics = self._compute_root_diagnostics(
+            prepared_batch=prepared_batch,
+            sample_batch=sample_batch,
         )
         guidance_result = self._compute_guidance_loss(
             prepared_batch=prepared_batch,
             sample_batch=sample_batch,
         )
-        total_loss = loss_aggregation.total_loss
+        total_loss = loss_output.loss
         if guidance_result is not None:
             total_loss = total_loss + guidance_result.loss
         self._raise_on_nonfinite_training_loss(
             total_loss=total_loss,
             batch=trajectory_batch,
         )
-        if self.success_replay_buffer is not None:
-            self.success_replay_buffer.add_successes(
-                batch=trajectory_batch,
-                sample_batch=sample_batch,
-            )
         metrics = self._build_training_metrics(
             loss_output=loss_output,
-            loss_aggregation=loss_aggregation,
             total_loss=total_loss,
-            rollout_batch_size=sampling_plan.rollout_batch_size,
-            replay_rollouts_per_graph=replay_rollouts_per_graph,
-            sampling_temperature=sampling_plan.sampling_temperature,
-            on_policy_trajectories=on_policy_trajectories,
-            controller_metrics=controller_metrics,
+            rollout_batch_size=rollout_batch_size,
+            sampling_temperature=sampling_temperature,
             rollout_metrics=rollout_metrics,
+            root_diagnostics=root_diagnostics,
+            shortest_path_reward_metrics=shortest_path_reward_metrics,
             guidance_result=guidance_result,
         )
         self._log_metric_bundle(
@@ -1105,14 +1076,7 @@ class GFlowNetModule(LightningModule):
             on_epoch=False,
             prog_bar_key="train/loss",
         )
-        self._buffer_adaptive_sampling_metrics(
-            loss_output=loss_output,
-            rollout_metrics=rollout_metrics,
-        )
         return total_loss
-
-    def on_train_epoch_end(self) -> None:
-        self._flush_pending_adaptive_sampling_metrics()
 
     def _evaluate_batch_output(
         self, *, batch: TrajectoryBatch
@@ -1149,8 +1113,8 @@ class GFlowNetModule(LightningModule):
         effective_pass = self._resolve_effective_pass(after_current_step=False)
         for metrics in (
             outputs.model_metrics,
-            outputs.secondary_metrics,
-            outputs.primary_metrics,
+            outputs.metrics,
+            outputs.diagnostics,
         ):
             self._log_metric_bundle(
                 metrics=metrics,

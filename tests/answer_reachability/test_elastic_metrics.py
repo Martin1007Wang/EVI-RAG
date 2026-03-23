@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from src.metrics.answer_reachability.metrics import compute_support_metrics
-from src.metrics.answer_reachability.posterior import aggregate_rank_metrics
-from src.metrics.answer_reachability.schema import (
+from src.metrics.answer_metrics import (
     AnswerPosteriorRecord,
     EdgeRecord,
-    SupportWindowEvalBatch,
     SupportWindowResult,
     TrajectoryRecord,
+    aggregate_rank_metrics,
+    compute_support_metrics,
 )
 
 
@@ -19,9 +18,9 @@ def test_elastic_metrics_compute_expected_fields() -> None:
         window_size=2,
         covered_mass=0.9,
         residual_mass=0.1,
-        gold_total_mass=0.7,
-        covered_gold_mass=0.6,
-        missed_gold_mass=0.1,
+        gold_answer_mass=0.7,
+        covered_gold_answer_mass=0.6,
+        missed_gold_answer_mass=0.1,
         unique_answer_count=2,
         unique_path_count=2,
         gold_answer_entity_ids=[102],
@@ -76,27 +75,15 @@ def test_elastic_metrics_compute_expected_fields() -> None:
             ),
         ],
     )
-    metrics = compute_support_metrics(
-        SupportWindowEvalBatch(
-            dataset_scope="sub",
-            mass_threshold=0.9,
-            results=[result],
-            window_top_ks=(1, 2),
-        )
-    )
-    assert metrics["window/adaptive/hit"] == 1.0
-    assert metrics["window/adaptive/path_mass"] == 0.9
-    assert metrics["window/adaptive/missed_gold_mass"] == 0.1
-    assert metrics["window/adaptive/support_diversity"] == 1.0
-    assert metrics["window/top1/hit"] == 1.0
-    assert metrics["window/top1/precision"] == 1.0
-    assert metrics["window/top2/precision"] == 0.5
-    assert metrics["window/top2/f1"] == 2.0 / 3.0
+    metrics = compute_support_metrics([result])
+    assert metrics["support/hit"] == 1.0
+    assert metrics["support/path_mass"] == 0.9
+    assert metrics["support/missed_gold_answer_mass"] == 0.1
+    assert metrics["support/diversity"] == 1.0
+    assert metrics["search/coverage_rate"] == 0.0
     assert "elastic_hit" not in metrics
 
     rank_metrics = aggregate_rank_metrics(results=[result], answer_top_ks=(1, 2))
     assert rank_metrics["answer/hit@1"] == 1.0
     assert rank_metrics["answer/recall@2"] == 1.0
-    assert rank_metrics["answer/precision@2"] == 0.5
-    assert rank_metrics["answer/f1@2"] == 2.0 / 3.0
     assert "pass@1" not in rank_metrics

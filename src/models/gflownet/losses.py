@@ -49,18 +49,16 @@ class SubTrajectoryBalanceLoss:
         return weighted.sum(dim=(-2, -1))
 
     @staticmethod
-    def _build_forward_prefix(
+    def _build_step_prefix(
         *,
-        log_pf_steps: torch.Tensor,
+        step_values: torch.Tensor,
     ) -> torch.Tensor:
-        batch_size, num_rollouts, max_steps = log_pf_steps.shape
+        batch_size, num_rollouts, max_steps = step_values.shape
         state_horizon = max_steps + 1
-        forward_prefix = log_pf_steps.new_zeros(
-            (batch_size, num_rollouts, state_horizon)
-        )
+        step_prefix = step_values.new_zeros((batch_size, num_rollouts, state_horizon))
         if max_steps > 0:
-            forward_prefix[:, :, 1:] = torch.cumsum(log_pf_steps, dim=-1)
-        return forward_prefix
+            step_prefix[:, :, 1:] = torch.cumsum(step_values, dim=-1)
+        return step_prefix
 
     def compute(
         self, sample_batch: TrajectoryGFNSampleBatch
@@ -88,11 +86,24 @@ class SubTrajectoryBalanceLoss:
                 dtype=torch.float32
             )
 
+        log_reward_steps = getattr(sample_batch, "log_reward_steps", None)
+        if log_reward_steps is None:
+            log_reward_steps = torch.zeros_like(log_pf_steps)
+        else:
+            log_reward_steps = log_reward_steps.to(dtype=torch.float32)
+            if tuple(log_reward_steps.shape) != tuple(log_pf_steps.shape):
+                raise ValueError(
+                    "log_reward_steps must match log_pf_steps shape for SubTB. "
+                    f"log_reward_steps={tuple(log_reward_steps.shape)} "
+                    f"log_pf_steps={tuple(log_pf_steps.shape)}."
+                )
+
         # The current SubTB objective uses an explicit root boundary residual,
         # forward prefix sums between active states, and terminal reward anchors.
         # We keep `log_pb_steps` in the sample batch for interface compatibility,
         # but the loss itself does not depend on it.
-        forward_prefix = self._build_forward_prefix(log_pf_steps=log_pf_steps)
+        forward_prefix = self._build_step_prefix(step_values=log_pf_steps)
+        reward_prefix = self._build_step_prefix(step_values=log_reward_steps)
 
         terminal_counts = getattr(sample_batch, "termination_action_steps", None)
         if terminal_counts is None:
@@ -111,9 +122,13 @@ class SubTrajectoryBalanceLoss:
         terminal_forward_prefix = forward_prefix.gather(
             -1, terminal_index.unsqueeze(-1)
         ).squeeze(-1)
+        terminal_reward_prefix = reward_prefix.gather(
+            -1, terminal_index.unsqueeze(-1)
+        ).squeeze(-1)
         terminal_values = (
             sample_batch.terminal_log_rewards.to(dtype=torch.float32)
             - terminal_forward_prefix
+            + terminal_reward_prefix
         )
 
         position_ids = torch.arange(sequence_horizon, device=state_values.device)
@@ -123,6 +138,10 @@ class SubTrajectoryBalanceLoss:
         if not torch.isfinite(state_values[state_position_mask]).all():
             raise RuntimeError(
                 "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
+            )
+        if not torch.isfinite(log_reward_steps).all():
+            raise RuntimeError(
+                "Non-finite loss detected in SubTB. Check step-level log rewards."
             )
         if not torch.isfinite(terminal_values).all():
             raise RuntimeError(
@@ -147,13 +166,19 @@ class SubTrajectoryBalanceLoss:
             (end_positions - start_positions).clamp_min(0).to(dtype=torch.float32)
         )
         pairwise_forward = forward_prefix.unsqueeze(-2) - forward_prefix.unsqueeze(-1)
+        pairwise_reward = reward_prefix.unsqueeze(-2) - reward_prefix.unsqueeze(-1)
         pairwise_residual = (
-            state_values.unsqueeze(-1) + pairwise_forward - state_values.unsqueeze(-2)
+            state_values.unsqueeze(-1)
+            + pairwise_forward
+            - pairwise_reward
+            - state_values.unsqueeze(-2)
         )
         terminal_residual = (
             state_values
             + terminal_forward_prefix.unsqueeze(-1)
+            - terminal_reward_prefix.unsqueeze(-1)
             - forward_prefix
+            + reward_prefix
             - sample_batch.terminal_log_rewards.to(dtype=torch.float32).unsqueeze(-1)
         )
 

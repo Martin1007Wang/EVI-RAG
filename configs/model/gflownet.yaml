@@ -16,7 +16,7 @@ contract:
   single_gpu_eval_only: true
 
 metric_runtime_factory:
-  _target_: src.metrics.answer_reachability.runtime.SearchMetricRuntimeFactory
+  _target_: src.metrics.runtime_factory.GraphTaskRuntimeFactory
 
 horizon_cfg:
   _target_: src.models.configs.gflownet.HorizonConfig
@@ -31,33 +31,15 @@ training_cfg:
     detach_features: true
   sampling_temperature: 1.0
   force_stop_on_answer_hit: false
+  trajectory_length_discount: 0.97
   sampling_temperature_schedule:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
     type: constant
-  success_replay:
-    _target_: src.models.configs.gflownet.SuccessfulTrajectoryReplayConfig
-    enabled: false
-    ratio: 0.25
-    warmup_passes: 1.0
-    min_buffer_size: 256
-    max_buffer_size: 50000
-    max_trajectories_per_sample: 8
-    max_rollouts_per_graph: 8
-  adaptive_sampling:
-    _target_: src.models.configs.gflownet.AdaptiveSamplingConfig
-    enabled: true
-    min_rollout_batch_size: 8
-    max_rollout_batch_size: 64
-    warmup_steps: 10
-    ema_alpha: 0.2
-    low_success_rate_threshold: 0.05
-    high_success_rate_threshold: 0.35
-    low_unique_success_paths_per_100_rollouts: 0.5
-    high_unique_success_paths_per_100_rollouts: 5.0
-    low_subtb_residual_variance: 0.05
-    high_subtb_residual_variance: 0.5
-    rollout_growth_factor: 1.5
-    rollout_shrink_factor: 0.75
+  shortest_path_reward:
+    _target_: src.models.configs.gflownet.ShortestPathRewardConfig
+    weight: 0.0
+    schedule_type: constant
+    completion_power: 1.0
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
     lambda_weight: 1.0
@@ -65,8 +47,7 @@ training_cfg:
 
 heuristic_cfg:
   _target_: src.models.configs.gflownet.HeuristicConfig
-  # Default training path keeps behavior sampling on-policy; eval experiments can
-  # still override this with topology/embedding heuristics when needed.
+  # Default training stays on-policy; eval-time heuristics can still override this.
   kind: none
   beta: 0.0
   topology_restart_prob: 0.25

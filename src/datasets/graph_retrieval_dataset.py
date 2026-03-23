@@ -296,6 +296,7 @@ class GraphRetrievalDataset(Dataset):
             return cached
         metadata_stats = self._sample_stats_from_metadata(sample_id)
         if metadata_stats is not None:
+            self._sample_stats_cache[sample_id] = metadata_stats
             return metadata_stats
         raw = self._load_raw_sample(sample_id)
         question_emb = _coerce_question_embedding(raw["question_emb"], sample_id)

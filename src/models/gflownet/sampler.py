@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Protocol
 
 import torch
@@ -23,21 +24,24 @@ from .types import (
 
 
 class TrajectoryRolloutSupervisorProtocol(Protocol):
-    def build_terminal_target_mask(self, *, batch: TrajectoryBatch) -> torch.Tensor: ...
+    def build_terminal_target_mask(self, *, batch: TrajectoryBatch) -> torch.Tensor:
+        ...
 
     def resolve_terminal_transitions(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-    ) -> "TerminalTransitionBatch": ...
+    ) -> "TerminalTransitionBatch":
+        ...
 
     def compute_terminal_rewards(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -74,11 +78,11 @@ def _build_answer_mask(batch: TrajectoryBatch) -> torch.Tensor:
 
 
 class AnswerReachabilityTrajectorySupervisor:
-    """Fixed terminal-energy supervisor for answer reachability.
+    """Base terminal-energy supervisor for answer reachability.
 
     The terminal anchor depends only on whether the reached entity is gold. Path
-    length, cycle counts, and terminal backward heuristics are intentionally not
-    part of the reward semantics anymore.
+    discounts are applied later by the sampler because rollout length is not part
+    of this supervisor interface.
     """
 
     def __init__(self) -> None:
@@ -294,6 +298,28 @@ def _mask_terminal_stop_action_backward_log_probs(
         stopped_mask,
         terminal_backward_log_probs,
         torch.zeros_like(terminal_backward_log_probs),
+    )
+
+
+def _apply_terminal_length_discount(
+    *,
+    terminal_transition: TerminalTransitionBatch,
+    path_lengths: torch.Tensor,
+    trajectory_length_discount: float,
+) -> TerminalTransitionBatch:
+    if trajectory_length_discount == 1.0:
+        return terminal_transition
+    log_discount = path_lengths.to(dtype=torch.float32) * math.log(
+        float(trajectory_length_discount)
+    )
+    terminal_log_rewards = (
+        terminal_transition.terminal_log_rewards.to(dtype=torch.float32) + log_discount
+    )
+    return TerminalTransitionBatch(
+        terminal_entity_ids=terminal_transition.terminal_entity_ids,
+        terminal_rewards=terminal_log_rewards.exp(),
+        terminal_log_rewards=terminal_log_rewards,
+        terminal_backward_log_probs=terminal_transition.terminal_backward_log_probs,
     )
 
 
@@ -762,13 +788,13 @@ def _rebuild_target_sample_batch(
                 -1, int(current_control_states.size(-1))
             )
             flat_relation_ids = chosen_relation_ids.view(-1)
-            flat_next_control_states[flat_graph_move] = (
-                policy.compute_next_control_states(
-                    prepared_batch,
-                    control_states=flat_current_control_states[flat_graph_move],
-                    next_nodes=next_nodes[flat_graph_move],
-                    relation_ids=flat_relation_ids[flat_graph_move],
-                )
+            flat_next_control_states[
+                flat_graph_move
+            ] = policy.compute_next_control_states(
+                prepared_batch,
+                control_states=flat_current_control_states[flat_graph_move],
+                next_nodes=next_nodes[flat_graph_move],
+                relation_ids=flat_relation_ids[flat_graph_move],
             )
         next_log_f = torch.zeros_like(current_nodes, dtype=torch.float32)
         if bool(flat_graph_move.any().item()):
@@ -798,6 +824,11 @@ def _rebuild_target_sample_batch(
     terminal_transition = trajectory_supervisor.resolve_terminal_transitions(
         batch=batch,
         terminal_nodes=current_nodes,
+    )
+    terminal_transition = _apply_terminal_length_discount(
+        terminal_transition=terminal_transition,
+        path_lengths=path_lengths,
+        trajectory_length_discount=1.0,
     )
     masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
         termination_action_steps=termination_action_steps,
@@ -869,6 +900,7 @@ class TrajectoryGFNSampleBatch:
     terminal_rewards: torch.Tensor
     terminal_log_rewards: torch.Tensor
     success_mask: torch.Tensor
+    log_reward_steps: torch.Tensor | None = None
     state_log_f_steps: torch.Tensor | None = None
     trace_stop_mask: torch.Tensor | None = None
     terminal_entity_ids: torch.Tensor | None = None
@@ -909,7 +941,8 @@ class TrajectorySamplerProtocol(Protocol):
         prepared_batch: PreparedGFlowNetBatch,
         rollout_batch_size: int,
         temperature: float,
-    ) -> TrajectoryGFNSampleBatch: ...
+    ) -> TrajectoryGFNSampleBatch:
+        ...
 
 
 class ForwardTrajectoryGFNSampler:
@@ -919,10 +952,16 @@ class ForwardTrajectoryGFNSampler:
         max_steps: int,
         trajectory_supervisor: TrajectoryRolloutSupervisorProtocol,
         force_stop_on_answer_hit: bool = False,
+        trajectory_length_discount: float = 1.0,
     ) -> None:
         self.max_steps = int(max_steps)
         self.trajectory_supervisor = trajectory_supervisor
         self.force_stop_on_answer_hit = bool(force_stop_on_answer_hit)
+        if not 0.0 < float(trajectory_length_discount) <= 1.0:
+            raise ValueError(
+                "trajectory_length_discount must be in (0, 1] for ForwardTrajectoryGFNSampler."
+            )
+        self.trajectory_length_discount = float(trajectory_length_discount)
 
     def sample(
         self,
@@ -934,13 +973,14 @@ class ForwardTrajectoryGFNSampler:
         temperature: float,
     ) -> TrajectoryGFNSampleBatch:
         with torch.no_grad():
-            start_dist = policy.compute_root_action_distribution(prepared_batch)
-            start_entropy, start_entropy_normalized = (
-                _compute_start_distribution_entropy(
-                    log_probs=start_dist.log_probs,
-                    candidate_graph_ids=start_dist.candidate_graph_ids,
-                    num_graphs=int(start_dist.graph_log_z.numel()),
-                )
+            start_dist = policy.compute_behavior_start_distribution(prepared_batch)
+            (
+                start_entropy,
+                start_entropy_normalized,
+            ) = _compute_start_distribution_entropy(
+                log_probs=start_dist.log_probs,
+                candidate_graph_ids=start_dist.candidate_graph_ids,
+                num_graphs=int(start_dist.graph_log_z.numel()),
             )
             start_nodes, _, _ = policy.sample_start_nodes(
                 start_dist,
@@ -1029,65 +1069,31 @@ class ForwardTrajectoryGFNSampler:
                 control_state=current_control_states,
                 absorbing_mask=absorbing_mask,
             )
-            distribution = apply_forward_constraints(
+            target_distribution = apply_forward_constraints(
                 policy.compute_forward_distribution(prepared_batch, search_state),
                 state=search_state,
                 max_steps=self.max_steps,
             )
-            total_active_agent_count += int(distribution.active_agent_count)
+            total_active_agent_count += int(target_distribution.active_agent_count)
             total_unique_active_state_count += int(
-                distribution.unique_active_state_count
+                target_distribution.unique_active_state_count
             )
             total_raw_graph_candidate_count += int(
-                distribution.raw_graph_candidate_count
+                target_distribution.raw_graph_candidate_count
             )
             total_scored_graph_candidate_count += int(
-                distribution.scored_graph_candidate_count
+                target_distribution.scored_graph_candidate_count
             )
             total_shortlist_active_state_count += int(
-                distribution.shortlist_active_state_count
+                target_distribution.shortlist_active_state_count
             )
-            move_log_probs, _, has_values = policy.compute_move_log_probs(distribution)
+            _, _, has_values = policy.compute_move_log_probs(target_distribution)
             has_values = has_values.view_as(current_nodes)
             policy_active_mask = active_mask & (~forced_stop_mask)
             dead_end = policy_active_mask & (~has_values)
-            movable_mask = policy_active_mask & has_values
             flat_active = active_mask.view(-1)
             flat_policy_active = policy_active_mask.view(-1)
             flat_forced_stop = forced_stop_mask.view(-1)
-            flat_movable = movable_mask.view(-1)
-
-            chosen_positions = torch.full(
-                (total_agents,),
-                fill_value=-1,
-                device=batch.node_ptr.device,
-                dtype=torch.long,
-            )
-            if bool(flat_forced_stop.any().item()):
-                chosen_positions = _resolve_selected_action_positions(
-                    distribution=distribution,
-                    selected_edge_ids=torch.full_like(
-                        flat_forced_stop.to(dtype=torch.long), fill_value=-1
-                    ),
-                    selected_is_stop_action=torch.ones_like(flat_forced_stop),
-                    active_mask=flat_forced_stop,
-                    error_prefix=f"Forced stop step={step_idx}",
-                )
-            if bool(flat_policy_active.any().item()):
-                with torch.no_grad():
-                    (
-                        sampled_positions,
-                        _,
-                        _,
-                        _,
-                        _,
-                    ) = _sample_edges(
-                        distribution=distribution,
-                        temperature=float(temperature),
-                    )
-                chosen_positions[flat_policy_active] = sampled_positions[
-                    flat_policy_active
-                ]
 
             chosen_edge_ids = torch.full(
                 (total_agents,),
@@ -1102,26 +1108,58 @@ class ForwardTrajectoryGFNSampler:
             chosen_log_probs = torch.zeros(
                 (total_agents,), device=batch.node_ptr.device, dtype=torch.float32
             )
-            selected_mask = chosen_positions >= 0
+            chosen_is_stop_action[flat_forced_stop] = True
+            selected_mask = flat_forced_stop.clone()
+            if bool(flat_policy_active.any().item()):
+                with torch.no_grad():
+                    behavior_distribution = ForwardActionDistribution(
+                        edge_logits=policy.compute_behavior_edge_logits(
+                            prepared_batch,
+                            search_state,
+                            target_distribution,
+                        ),
+                        edge_agent_batch=target_distribution.edge_agent_batch,
+                        edge_ids=target_distribution.edge_ids,
+                        target_nodes=target_distribution.target_nodes,
+                        out_degrees=target_distribution.out_degrees,
+                        is_stop_action=target_distribution.is_stop_action,
+                        is_root_action=target_distribution.is_root_action,
+                        current_log_f=target_distribution.current_log_f,
+                        active_agent_count=target_distribution.active_agent_count,
+                        unique_active_state_count=target_distribution.unique_active_state_count,
+                        raw_graph_candidate_count=target_distribution.raw_graph_candidate_count,
+                        scored_graph_candidate_count=target_distribution.scored_graph_candidate_count,
+                        shortlist_active_state_count=target_distribution.shortlist_active_state_count,
+                    )
+                    (
+                        sampled_positions,
+                        sampled_edge_ids,
+                        _,
+                        _,
+                        sampled_is_stop_action,
+                    ) = _sample_edges(
+                        distribution=behavior_distribution,
+                        temperature=float(temperature),
+                    )
+                sampled_selected_mask = sampled_positions >= 0
+                selected_mask = selected_mask | sampled_selected_mask
+                chosen_edge_ids[sampled_selected_mask] = sampled_edge_ids[
+                    sampled_selected_mask
+                ]
+                chosen_is_stop_action[sampled_selected_mask] = sampled_is_stop_action[
+                    sampled_selected_mask
+                ]
             if bool(selected_mask.any().item()):
-                selected_positions = chosen_positions[selected_mask]
-                chosen_edge_ids[selected_mask] = distribution.edge_ids.index_select(
-                    0, selected_positions
+                selected_nodes, selected_log_probs = _select_edge_log_probs(
+                    distribution=target_distribution,
+                    selected_edge_ids=chosen_edge_ids,
+                    selected_is_stop_action=chosen_is_stop_action,
+                    active_mask=selected_mask,
+                    policy=policy,
+                    error_prefix=f"Sampled trajectory step={step_idx}",
                 )
-                chosen_target_nodes[selected_mask] = (
-                    distribution.target_nodes.index_select(0, selected_positions)
-                )
-                stop_action_mask = (
-                    distribution.is_stop_action.to(dtype=torch.bool)
-                    if distribution.is_stop_action is not None
-                    else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
-                )
-                chosen_is_stop_action[selected_mask] = stop_action_mask.index_select(
-                    0, selected_positions
-                )
-                chosen_log_probs[selected_mask] = move_log_probs.index_select(
-                    0, selected_positions
-                )
+                chosen_target_nodes[selected_mask] = selected_nodes[selected_mask]
+                chosen_log_probs[selected_mask] = selected_log_probs[selected_mask]
 
             flat_current = current_nodes.view(-1)
             flat_next_nodes = flat_current.clone()
@@ -1165,13 +1203,13 @@ class ForwardTrajectoryGFNSampler:
                     -1, int(current_control_states.size(-1))
                 )
                 flat_relation_ids = chosen_relation_ids.view(-1)
-                flat_next_control_states[flat_graph_move] = (
-                    policy.compute_next_control_states(
-                        prepared_batch,
-                        control_states=flat_current_control_states[flat_graph_move],
-                        next_nodes=flat_next_nodes[flat_graph_move],
-                        relation_ids=flat_relation_ids[flat_graph_move],
-                    )
+                flat_next_control_states[
+                    flat_graph_move
+                ] = policy.compute_next_control_states(
+                    prepared_batch,
+                    control_states=flat_current_control_states[flat_graph_move],
+                    next_nodes=flat_next_nodes[flat_graph_move],
+                    relation_ids=flat_relation_ids[flat_graph_move],
                 )
             next_log_f = torch.zeros_like(current_nodes, dtype=torch.float32)
             if bool(flat_graph_move.any().item()):
@@ -1203,6 +1241,11 @@ class ForwardTrajectoryGFNSampler:
         terminal_transition = self.trajectory_supervisor.resolve_terminal_transitions(
             batch=batch,
             terminal_nodes=current_nodes,
+        )
+        terminal_transition = _apply_terminal_length_discount(
+            terminal_transition=terminal_transition,
+            path_lengths=num_steps,
+            trajectory_length_discount=self.trajectory_length_discount,
         )
         masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
             termination_action_steps=termination_action_steps,

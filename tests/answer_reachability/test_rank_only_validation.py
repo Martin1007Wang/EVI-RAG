@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from src.graph_runtime import TrajectoryBatch
-from src.metrics.answer_reachability.analysis import ReachabilityAnalysis
-from src.metrics.answer_reachability.posterior import (
+from src.metrics.answer_metrics import (
+    ReachabilityAnalysis,
+    ReachabilityRanking,
+    SearchDiagnostics,
     build_rank_only_result,
     compute_rank_metrics,
 )
@@ -21,9 +23,7 @@ from src.models.configs import (
     StateScoreHeadConfig,
 )
 from src.models.gflownet_module import GFlowNetModule
-from src.metrics.answer_reachability.runtime import (
-    SearchMetricRuntimeFactory,
-)
+from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 
 from .conftest import make_batch_from_graph
 
@@ -59,7 +59,7 @@ def _make_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
-        metric_runtime_factory=SearchMetricRuntimeFactory(),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
     )
 
 
@@ -77,18 +77,12 @@ def test_rank_only_validation_skips_support_search() -> None:
     )
     module = _make_module()
 
-    def _fail_search(**_: object) -> None:
-        raise AssertionError("support search should be skipped in rank-only validation")
-
-    module.search.generate_window = _fail_search  # type: ignore[assignment]
-
-    support_metrics, window_results, model_metrics, rank_metrics = (
-        module._evaluate_batch(
-            batch=batch,
-        )
+    rank_metrics, window_results, model_metrics, diagnostics = module._evaluate_batch(
+        batch=batch,
     )
 
-    assert support_metrics == {}
+    assert diagnostics["invalid_start_count"] == 0.0
+    assert diagnostics["invalid_start_rate"] == 0.0
     assert model_metrics == {}
     assert len(window_results) == 1
     assert window_results[0].stop_reason == "flow_frontier_exhausted"
@@ -96,7 +90,7 @@ def test_rank_only_validation_skips_support_search() -> None:
     assert window_results[0].trajectories == []
     assert window_results[0].support_mass_reference == "skipped"
     assert window_results[0].answer_mass_reference == "flow_frontier"
-    assert "answer/gold_mass" in rank_metrics
+    assert "answer/gold_answer_mass" in rank_metrics
     assert "answer/hit@1" in rank_metrics
 
 
@@ -114,11 +108,6 @@ def test_rank_only_predict_skips_support_search_and_support_metrics() -> None:
     )
     module = _make_module()
 
-    def _fail_search(**_: object) -> None:
-        raise AssertionError("support search should be skipped in rank-only predict")
-
-    module.search.generate_window = _fail_search  # type: ignore[assignment]
-
     module.on_predict_epoch_start()
     outputs = module.predict_step(batch, batch_idx=0)
     module.on_predict_batch_end(outputs, batch, batch_idx=0)
@@ -130,7 +119,7 @@ def test_rank_only_predict_skips_support_search_and_support_metrics() -> None:
     assert outputs[0].support_mass_reference == "skipped"
     assert outputs[0].answer_mass_reference == "flow_frontier"
     assert "answer/hit@1" in module.predict_metrics
-    assert "window/adaptive/hit" not in module.predict_metrics
+    assert "support/hit" not in module.predict_metrics
 
 
 def test_rank_only_validation_batches_disconnected_graphs(monkeypatch) -> None:
@@ -167,11 +156,11 @@ def test_rank_only_validation_batches_disconnected_graphs(monkeypatch) -> None:
 
     monkeypatch.setattr(module.policy, "prepare_batch", _count_prepare)
 
-    support_metrics, window_results, model_metrics, rank_metrics = (
-        module._evaluate_batch(batch=batch)
+    rank_metrics, window_results, model_metrics, diagnostics = module._evaluate_batch(
+        batch=batch
     )
 
-    assert support_metrics == {}
+    assert diagnostics["invalid_start_count"] == 0.0
     assert model_metrics == {}
     assert len(window_results) == 2
     assert [result.sample_id for result in window_results] == [
@@ -179,7 +168,7 @@ def test_rank_only_validation_batches_disconnected_graphs(monkeypatch) -> None:
         "rank-only-batch-b",
     ]
     assert prepare_call_count == 1
-    assert "answer/gold_mass" in rank_metrics
+    assert "answer/gold_answer_mass" in rank_metrics
 
 
 def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
@@ -197,21 +186,26 @@ def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
         terminal_mass=torch.tensor([0.0, 0.0, 0.4], dtype=torch.float32),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
         answer_probs=torch.tensor([0.4], dtype=torch.float32),
-        gold_total_mass=0.4,
-        retrieval_answer_entity_ids=torch.tensor([101, 102], dtype=torch.long),
-        retrieval_answer_probs=torch.tensor([0.6, 0.4], dtype=torch.float32),
+        gold_answer_mass=0.4,
+    )
+    ranking = ReachabilityRanking(
+        answer_entity_ids=torch.tensor([101, 102], dtype=torch.long),
+        answer_probs=torch.tensor([0.6, 0.4], dtype=torch.float32),
     )
 
     result = build_rank_only_result(
         batch=batch,
         analysis=analysis,
-        inference_mode="monte_carlo",
+        ranking=ranking,
+        diagnostics=SearchDiagnostics(
+            inference_mode="monte_carlo",
+            probe_count=0,
+            remaining_mass_upper=0.0,
+            stop_reason="rank_only_monte_carlo",
+            coverage_certified=False,
+        ),
         answer_mass_threshold=0.9,
         support_mass_threshold=0.9,
-        probe_count=0,
-        remaining_mass_upper=0.0,
-        stop_reason="rank_only_monte_carlo",
-        coverage_certified=False,
         answer_mass_reference="monte_carlo",
         answer_mass_reference_total=1.0,
     )
@@ -220,12 +214,8 @@ def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
     )
 
     assert [record.answer_entity_id for record in result.answer_posterior] == [101, 102]
-    assert metrics["answer/gold_mass"] == pytest.approx(0.4)
+    assert metrics["answer/gold_answer_mass"] == pytest.approx(0.4)
     assert metrics["answer/hit@1"] == 0.0
     assert metrics["answer/recall@1"] == 0.0
-    assert metrics["answer/precision@1"] == 0.0
-    assert metrics["answer/f1@1"] == 0.0
     assert metrics["answer/hit@2"] == 1.0
     assert metrics["answer/recall@2"] == 1.0
-    assert metrics["answer/precision@2"] == 0.5
-    assert metrics["answer/f1@2"] == 2.0 / 3.0

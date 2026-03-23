@@ -20,6 +20,8 @@ from src.utils.entrypoint_contracts import (
     validate_train_entry_contract,
 )
 
+_HYDRA_TEST_OVERRIDES = ["hydra/job_logging=stdout", "hydra/hydra_logging=none"]
+
 
 def test_enforce_single_gpu_eval_rejects_non_gpu_accelerator() -> None:
     trainer_cfg = OmegaConf.create(
@@ -46,7 +48,11 @@ def test_rankflow_eval_config_resolves_model_scheduler_without_trainer_max_steps
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
         cfg = compose(
             config_name="eval.yaml",
-            overrides=["experiment=rankflow", "ckpt.gflownet=/tmp/mock.ckpt"],
+            overrides=[
+                "experiment=rankflow",
+                "ckpt.gflownet=/tmp/mock.ckpt",
+                *_HYDRA_TEST_OVERRIDES,
+            ],
         )
 
     assert "max_steps" in cfg.trainer
@@ -128,15 +134,21 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
                 "logger=none",
                 "extras.enforce_tags=false",
                 "extras.print_config=false",
+                *_HYDRA_TEST_OVERRIDES,
             ],
         )
 
     assert cfg.run.test is False
     assert cfg.data.eval_batch_size == 64
+    assert cfg.data.num_workers == 8
+    assert cfg.data.multiprocessing_context == "spawn"
+    assert cfg.data.prefetch_factor == 2
+    assert cfg.data.eval_num_workers == 8
+    assert cfg.data.eval_prefetch_factor == 2
+    assert cfg.data.eval_persistent_workers is True
+    assert cfg.data.eval_multiprocessing_context == "spawn"
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
     assert cfg.model.eval_cfg.monte_carlo_rollouts == 128
-    assert cfg.model.training_cfg.success_replay.enabled is False
-    assert cfg.model.training_cfg.adaptive_sampling.enabled is False
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
 
 
@@ -152,11 +164,20 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
                 "logger=none",
                 "extras.enforce_tags=false",
                 "extras.print_config=false",
+                *_HYDRA_TEST_OVERRIDES,
             ],
         )
 
     assert cfg.data.batch_size == 192
     assert cfg.data.eval_batch_size == 32
+    assert cfg.data.num_workers == 8
+    assert cfg.data.multiprocessing_context == "spawn"
+    assert cfg.data.prefetch_factor == 2
+    assert cfg.data.eval_num_workers == 8
+    assert cfg.data.eval_prefetch_factor == 2
+    assert cfg.data.eval_persistent_workers is True
+    assert cfg.data.eval_multiprocessing_context == "spawn"
+    assert cfg.data.train_num_samples is None
     assert cfg.data.train_max_graphs_per_batch == 192
     assert cfg.data.train_max_nodes_per_batch == 480000
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
@@ -179,16 +200,24 @@ def test_train_answer_reachability_alias_matches_rankflow_defaults() -> None:
                 "logger=none",
                 "extras.enforce_tags=false",
                 "extras.print_config=false",
+                *_HYDRA_TEST_OVERRIDES,
             ],
         )
 
     assert cfg.data.batch_size == 192
     assert cfg.data.eval_batch_size == 32
+    assert cfg.data.num_workers == 8
+    assert cfg.data.multiprocessing_context == "spawn"
+    assert cfg.data.prefetch_factor == 2
+    assert cfg.data.eval_num_workers == 8
+    assert cfg.data.eval_prefetch_factor == 2
+    assert cfg.data.train_num_samples is None
+    assert cfg.data.eval_persistent_workers is True
+    assert cfg.data.eval_multiprocessing_context == "spawn"
     assert cfg.data.train_max_edges_per_batch == 1440000
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
     assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
     assert cfg.trainer.log_every_n_steps == 10
-    assert cfg.model.training_cfg.success_replay.enabled is True
 
 
 def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(

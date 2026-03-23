@@ -6,29 +6,18 @@ import tempfile
 from typing import Any, Callable, cast
 
 from src.graph_runtime import TrajectoryBatch
-from src.metrics.answer_reachability.edge_eval import (
-    EdgeRetrievalLabelRecord,
-    EdgeRetrievalResult,
-)
-from src.metrics.answer_reachability.prediction_io import (
-    PredictionKind,
+from src.metrics.prediction_io import (
+    PredictionCodecProtocol,
     append_jsonl_records,
-    infer_prediction_kind,
-    jsonl_has_records,
     iter_jsonl_records,
-    load_prediction_label,
-    load_prediction_result,
-)
-from src.metrics.answer_reachability.schema import (
-    SupportWindowLabelRecord,
-    SupportWindowResult,
+    jsonl_has_records,
 )
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeProtocol
 from src.models.gflownet import TrajectorySamplerProtocol
 
 
-PredictionResult = SupportWindowResult | EdgeRetrievalResult
-PredictionLabel = SupportWindowLabelRecord | EdgeRetrievalLabelRecord
+PredictionResult = Any
+PredictionLabel = Any
 
 
 @dataclass
@@ -37,7 +26,7 @@ class PredictionEpochState:
     labels: list[PredictionLabel] = field(default_factory=list)
     metrics: dict[str, float] = field(default_factory=dict)
     metrics_accumulator: Any | None = None
-    prediction_kind: PredictionKind | None = None
+    prediction_codec: PredictionCodecProtocol | None = None
     temp_dir: tempfile.TemporaryDirectory[str] | None = field(default=None, repr=False)
     results_jsonl_path: Path | None = None
     labels_jsonl_path: Path | None = None
@@ -48,30 +37,34 @@ class PredictionEpochState:
         self.labels.clear()
         self.metrics.clear()
         self.metrics_accumulator = None
-        self.prediction_kind = None
+        self.prediction_codec = None
 
     def record_batch(
         self,
         *,
         results: list[PredictionResult],
         labels: list[PredictionLabel],
+        codec: PredictionCodecProtocol,
     ) -> None:
         if not results:
             return
-        inferred_kind = infer_prediction_kind(results=cast(list[Any], results))
-        if inferred_kind is None:
-            raise TypeError("Unsupported prediction result type for prediction cache.")
-        if self.prediction_kind is None:
-            self.prediction_kind = inferred_kind
-        elif self.prediction_kind != inferred_kind:
+        if self.prediction_codec is None:
+            self.prediction_codec = codec
+        elif self.prediction_codec.kind != codec.kind:
             raise ValueError(
                 "Prediction epoch state cannot mix different prediction result types."
             )
         self.results.clear()
         self.labels.clear()
         results_path, labels_path = self._ensure_file_cache()
-        append_jsonl_records(results_path, records=cast(list[Any], results))
-        append_jsonl_records(labels_path, records=cast(list[Any], labels))
+        append_jsonl_records(
+            results_path,
+            records=[codec.serialize_result(result) for result in results],
+        )
+        append_jsonl_records(
+            labels_path,
+            records=[codec.serialize_label(label) for label in labels],
+        )
 
     def finalize(self, metrics: dict[str, float]) -> None:
         self.metrics = dict(metrics)
@@ -82,49 +75,38 @@ class PredictionEpochState:
         results: list[PredictionResult] | None = None,
         labels: list[PredictionLabel] | None = None,
         metrics: dict[str, float] | None = None,
+        codec: PredictionCodecProtocol | None = None,
     ) -> None:
         if results is not None or labels is not None:
             self._clear_file_cache()
             self.results.clear()
             self.labels.clear()
             self.metrics_accumulator = None
-            self.prediction_kind = None
+            self.prediction_codec = codec
         if results is not None:
             self.results = list(results)
-            inferred_kind = infer_prediction_kind(results=cast(list[Any], self.results))
-            if inferred_kind is not None:
-                self.prediction_kind = inferred_kind
         if labels is not None:
             self.labels = list(labels)
-            inferred_kind = infer_prediction_kind(labels=cast(list[Any], self.labels))
-            if inferred_kind is not None:
-                self.prediction_kind = inferred_kind
         if metrics is not None:
             self.metrics = dict(metrics)
 
     def get_results(self) -> list[PredictionResult]:
         if self.results:
             return list(self.results)
-        if self.prediction_kind is None or self.results_jsonl_path is None:
+        if self.prediction_codec is None or self.results_jsonl_path is None:
             return []
         return [
-            cast(
-                PredictionResult,
-                load_prediction_result(record, kind=self.prediction_kind),
-            )
+            self.prediction_codec.deserialize_result(record)
             for record in iter_jsonl_records(self.results_jsonl_path)
         ]
 
     def get_labels(self) -> list[PredictionLabel]:
         if self.labels:
             return list(self.labels)
-        if self.prediction_kind is None or self.labels_jsonl_path is None:
+        if self.prediction_codec is None or self.labels_jsonl_path is None:
             return []
         return [
-            cast(
-                PredictionLabel,
-                load_prediction_label(record, kind=self.prediction_kind),
-            )
+            self.prediction_codec.deserialize_label(record)
             for record in iter_jsonl_records(self.labels_jsonl_path)
         ]
 
@@ -211,10 +193,10 @@ class MetricRuntimeController:
             include_answer_support=include_answer_support,
         )
         return (
-            outputs.primary_metrics,
+            outputs.metrics,
             cast(list[PredictionResult], outputs.results),
             outputs.model_metrics,
-            outputs.secondary_metrics,
+            outputs.diagnostics,
         )
 
     def reset_prediction_state(self) -> None:
@@ -227,7 +209,13 @@ class MetricRuntimeController:
         labels: list[PredictionLabel] | None = None,
         metrics: dict[str, float] | None = None,
     ) -> None:
-        self._prediction_state.replace(results=results, labels=labels, metrics=metrics)
+        codec = self.metric_runtime.prediction_codec if results or labels else None
+        self._prediction_state.replace(
+            results=results,
+            labels=labels,
+            metrics=metrics,
+            codec=codec,
+        )
 
     def get_predict_results(self) -> list[PredictionResult]:
         return self._prediction_state.get_results()
@@ -254,49 +242,35 @@ class MetricRuntimeController:
     ) -> None:
         if not outputs:
             return
-        initialize_accumulator = getattr(
-            self.metric_runtime, "initialize_predict_metrics_accumulator", None
-        )
-        update_accumulator = getattr(
-            self.metric_runtime, "update_predict_metrics_accumulator", None
-        )
-        if callable(update_accumulator):
-            if self._prediction_state.metrics_accumulator is None:
-                self._prediction_state.metrics_accumulator = (
-                    initialize_accumulator(metrics_profile=self.metrics_profile)
-                    if callable(initialize_accumulator)
-                    else {}
+        if self._prediction_state.metrics_accumulator is None:
+            self._prediction_state.metrics_accumulator = (
+                self.metric_runtime.initialize_predict_metrics_accumulator(
+                    metrics_profile=self.metrics_profile
                 )
-            update_accumulator(
-                accumulator=self._prediction_state.metrics_accumulator,
-                predict_results=cast(list[Any], outputs),
-                metrics_profile=self.metrics_profile,
             )
+        self.metric_runtime.update_predict_metrics_accumulator(
+            accumulator=self._prediction_state.metrics_accumulator,
+            predict_results=cast(list[Any], outputs),
+            metrics_profile=self.metrics_profile,
+        )
         self._prediction_state.record_batch(
             results=list(outputs),
             labels=cast(
                 list[PredictionLabel],
                 self.metric_runtime.build_predict_labels(batch, outputs),
             ),
+            codec=self.metric_runtime.prediction_codec,
         )
 
     def finalize_prediction_epoch(self) -> None:
-        finalize_accumulator = getattr(
-            self.metric_runtime, "finalize_predict_metrics_accumulator", None
-        )
-        summarize_from_jsonl = getattr(
-            self.metric_runtime, "summarize_predict_epoch_from_jsonl", None
-        )
-        if (
-            callable(finalize_accumulator)
-            and self._prediction_state.metrics_accumulator is not None
-        ):
-            metrics = finalize_accumulator(
+        if self._prediction_state.metrics_accumulator is not None:
+            metrics = self.metric_runtime.finalize_predict_metrics_accumulator(
                 accumulator=self._prediction_state.metrics_accumulator,
                 metrics_profile=self.metrics_profile,
             )
-        elif callable(summarize_from_jsonl) and self._prediction_state.has_file_cache():
-            metrics = summarize_from_jsonl(
+        elif self._prediction_state.has_file_cache():
+            assert self._prediction_state.results_jsonl_path is not None
+            metrics = self.metric_runtime.summarize_predict_epoch_from_jsonl(
                 predict_results_path=self._prediction_state.results_jsonl_path,
                 metrics_profile=self.metrics_profile,
             )
@@ -315,13 +289,12 @@ class MetricRuntimeController:
         *,
         settings: PredictionArtifactWriteConfig,
     ) -> dict[str, Path] | None:
-        write_from_jsonl = getattr(
-            self.metric_runtime, "write_prediction_artifacts_from_jsonl", None
-        )
-        if callable(write_from_jsonl) and self._prediction_state.has_file_cache():
+        if self._prediction_state.has_file_cache():
+            assert self._prediction_state.results_jsonl_path is not None
+            assert self._prediction_state.labels_jsonl_path is not None
             return cast(
                 dict[str, Path] | None,
-                write_from_jsonl(
+                self.metric_runtime.write_prediction_artifacts_from_jsonl(
                     results_path=self._prediction_state.results_jsonl_path,
                     labels_path=self._prediction_state.labels_jsonl_path,
                     output_dir=settings.output_dir,

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import atexit
+import faulthandler
+import os
+from functools import partial
+from pathlib import Path
+import time
 from typing import Any, Optional
 
 import torch
@@ -11,11 +17,74 @@ from src.graph_runtime.batch import compute_edge_batch_and_ptr
 from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
+_WORKER_DIAG_DIR_ENV = "RETRIEVAL_WORKER_DIAG_DIR"
+
+
+def _elapsed_seconds(start_time: float) -> float:
+    return round(time.perf_counter() - start_time, 3)
+
+
+class _LoggedDataLoaderIterator:
+    def __init__(self, iterator: Any, *, loader_name: str) -> None:
+        self._iterator = iterator
+        self._loader_name = loader_name
+        self._first_batch_pending = True
+
+    def __iter__(self) -> "_LoggedDataLoaderIterator":
+        return self
+
+    def __next__(self) -> Any:
+        if not self._first_batch_pending:
+            return next(self._iterator)
+        start_time = time.perf_counter()
+        batch = next(self._iterator)
+        self._first_batch_pending = False
+        log_event(
+            logger,
+            "retrieval_dataloader_first_batch_ready",
+            loader_name=self._loader_name,
+            elapsed_s=_elapsed_seconds(start_time),
+        )
+        return batch
+
+
+class _InstrumentedDataLoader(DataLoader):
+    def __init__(
+        self,
+        *args: Any,
+        loader_name: str,
+        multiprocessing_context_name: str | None,
+        **kwargs: Any,
+    ) -> None:
+        self._loader_name = str(loader_name)
+        self._multiprocessing_context_name = multiprocessing_context_name
+        super().__init__(*args, **kwargs)
+
+    def __iter__(self) -> _LoggedDataLoaderIterator:
+        log_event(
+            logger,
+            "retrieval_dataloader_iter_start",
+            loader_name=self._loader_name,
+            num_workers=int(self.num_workers),
+            multiprocessing_context=self._multiprocessing_context_name,
+        )
+        start_time = time.perf_counter()
+        iterator = super().__iter__()
+        log_event(
+            logger,
+            "retrieval_dataloader_iter_ready",
+            loader_name=self._loader_name,
+            num_workers=int(self.num_workers),
+            multiprocessing_context=self._multiprocessing_context_name,
+            elapsed_s=_elapsed_seconds(start_time),
+        )
+        return _LoggedDataLoaderIterator(iterator, loader_name=self._loader_name)
 
 
 def build_retrieval_dataloader(
     dataset: GraphRetrievalDataset,
     *,
+    loader_name: str = "loader",
     batch_size: int,
     shuffle: bool,
     sampler: Sampler[int] | None = None,
@@ -25,6 +94,7 @@ def build_retrieval_dataloader(
     random_seed: Optional[int] = None,
     prefetch_factor: Optional[int] = None,
     persistent_workers: bool = False,
+    multiprocessing_context: str | None = None,
     pin_memory: bool = True,
     precompute_edge_batch: bool = True,
     follow_batch: Optional[list[str]] = None,
@@ -38,6 +108,7 @@ def build_retrieval_dataloader(
 
     if num_workers == 0:
         persistent_workers = False
+        multiprocessing_context = None
 
     augmenter = BatchAugmenter(
         precompute_edge_batch=precompute_edge_batch,
@@ -57,6 +128,8 @@ def build_retrieval_dataloader(
         kwargs["generator"] = generator
     if prefetch_factor is not None and num_workers > 0:
         kwargs["prefetch_factor"] = int(prefetch_factor)
+    if multiprocessing_context is not None and num_workers > 0:
+        kwargs["multiprocessing_context"] = str(multiprocessing_context)
     if sampler is not None:
         shuffle = False
         kwargs["sampler"] = sampler
@@ -64,6 +137,9 @@ def build_retrieval_dataloader(
         shuffle = False
         kwargs.pop("sampler", None)
         kwargs["batch_sampler"] = batch_sampler
+    worker_init_fn = _build_worker_diagnostics_init_fn(loader_name=loader_name)
+    if worker_init_fn is not None:
+        kwargs["worker_init_fn"] = worker_init_fn
 
     loader_kwargs = dict(
         dataset=dataset,
@@ -79,15 +155,58 @@ def build_retrieval_dataloader(
             shuffle=shuffle,
             drop_last=drop_last,
         )
-    loader = DataLoader(**loader_kwargs)
+    loader = _InstrumentedDataLoader(
+        **loader_kwargs,
+        loader_name=loader_name,
+        multiprocessing_context_name=multiprocessing_context,
+    )
     log_event(
         logger,
         "retrieval_dataloader_init",
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        multiprocessing_context=multiprocessing_context,
     )
     return loader
+
+
+def _build_worker_diagnostics_init_fn(*, loader_name: str):
+    diag_dir = os.environ.get(_WORKER_DIAG_DIR_ENV)
+    if diag_dir in (None, ""):
+        return None
+    base_dir = Path(diag_dir).expanduser()
+    return partial(
+        _init_worker_diagnostics,
+        loader_name=loader_name,
+        diag_dir=str(base_dir),
+    )
+
+
+def _init_worker_diagnostics(
+    worker_id: int,
+    *,
+    loader_name: str,
+    diag_dir: str,
+) -> None:
+    base_dir = Path(diag_dir).expanduser()
+    base_dir.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid()
+    log_path = base_dir / f"{loader_name}.worker{worker_id}.pid{pid}.log"
+    log_file = open(log_path, "a", encoding="utf-8")
+    faulthandler.enable(file=log_file, all_threads=True)
+    log_file.write(
+        f"worker_start pid={pid} ppid={os.getppid()} "
+        f"loader={loader_name} worker_id={worker_id}\n"
+    )
+    log_file.flush()
+
+    def _on_exit() -> None:
+        log_file.write(f"worker_exit pid={pid} loader={loader_name}\n")
+        log_file.flush()
+        log_file.close()
+
+    atexit.register(_on_exit)
 
 
 def _as_1d_long(value: Any, *, device: Optional[torch.device] = None) -> torch.Tensor:

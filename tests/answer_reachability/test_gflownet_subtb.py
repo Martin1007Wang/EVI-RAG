@@ -181,3 +181,40 @@ def test_subtb_root_metric_tracks_explicit_root_boundary_residual() -> None:
     loss_output = loss_fn.compute(cast(Any, sample_batch))
 
     assert loss_output.root_abs.item() == pytest.approx(0.2)
+
+
+def test_subtb_step_level_log_rewards_match_equivalent_terminal_bonus() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(
+        config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
+    )
+    terminal_bonus_batch = _make_sample_batch(
+        graph_log_z=torch.tensor([0.4], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.0]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[0.4]], dtype=torch.float32),
+        log_pf_steps=torch.tensor([[[-0.3, -0.2]]], dtype=torch.float32),
+        log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.tensor([[[0.1, 0.0]]], dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[-0.1]], dtype=torch.float32),
+        success_mask=torch.ones((1, 1), dtype=torch.bool),
+    )
+    process_reward_batch = _make_sample_batch(
+        graph_log_z=torch.tensor([0.4], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.0]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[0.4]], dtype=torch.float32),
+        log_pf_steps=torch.tensor([[[-0.3, -0.2]]], dtype=torch.float32),
+        log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.tensor([[[-0.15, 0.0]]], dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2]], dtype=torch.long),
+        log_reward_steps=torch.tensor([[[0.25, 0.0]]], dtype=torch.float32),
+        terminal_log_rewards=torch.tensor([[-0.35]], dtype=torch.float32),
+        success_mask=torch.ones((1, 1), dtype=torch.bool),
+    )
+
+    process_loss = loss_fn.compute(cast(Any, process_reward_batch))
+    terminal_bonus_loss = loss_fn.compute(cast(Any, terminal_bonus_batch))
+
+    assert process_loss.loss.item() == pytest.approx(0.0, abs=1.0e-6)
+    assert terminal_bonus_loss.loss.item() == pytest.approx(0.0, abs=1.0e-6)

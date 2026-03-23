@@ -9,6 +9,8 @@ from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEval
 from src.models.gflownet import TrajectorySamplerProtocol
 from src.models.gflownet import SearchPolicyProtocol
 
+from .prediction_io import PredictionCodecProtocol
+
 
 @dataclass(frozen=True)
 class MetricEvaluationOutput:
@@ -17,8 +19,19 @@ class MetricEvaluationOutput:
     secondary_metrics: dict[str, float] = field(default_factory=dict)
     results: list[Any] = field(default_factory=list)
 
+    @property
+    def metrics(self) -> dict[str, float]:
+        return self.primary_metrics
+
+    @property
+    def diagnostics(self) -> dict[str, float]:
+        return self.secondary_metrics
+
 
 class MetricRuntimeProtocol(Protocol):
+    @property
+    def prediction_codec(self) -> PredictionCodecProtocol: ...
+
     sampler: TrajectorySamplerProtocol | None
     search: Any
 
@@ -58,6 +71,49 @@ class MetricRuntimeProtocol(Protocol):
         *,
         results: list[Any],
         labels: list[Any],
+        output_dir: str | Path,
+        split: str,
+        artifact_name: str,
+        schema_version: int,
+        entity_vocab_path: str | Path | None,
+        relation_vocab_path: str | Path | None,
+        questions_path: str | Path | None,
+        overwrite: bool,
+    ) -> dict[str, Path] | None: ...
+
+    def initialize_predict_metrics_accumulator(
+        self,
+        *,
+        metrics_profile: str,
+    ) -> Any: ...
+
+    def update_predict_metrics_accumulator(
+        self,
+        *,
+        accumulator: Any,
+        predict_results: list[Any],
+        metrics_profile: str,
+    ) -> None: ...
+
+    def finalize_predict_metrics_accumulator(
+        self,
+        *,
+        accumulator: Any,
+        metrics_profile: str,
+    ) -> dict[str, float]: ...
+
+    def summarize_predict_epoch_from_jsonl(
+        self,
+        *,
+        predict_results_path: str | Path,
+        metrics_profile: str,
+    ) -> dict[str, float]: ...
+
+    def write_prediction_artifacts_from_jsonl(
+        self,
+        *,
+        results_path: str | Path,
+        labels_path: str | Path,
         output_dir: str | Path,
         split: str,
         artifact_name: str,

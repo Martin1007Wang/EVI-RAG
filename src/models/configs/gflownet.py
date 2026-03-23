@@ -181,120 +181,29 @@ class SamplingTemperatureScheduleConfig:
 
 
 @dataclass(frozen=True)
-class SuccessfulTrajectoryReplayConfig:
-    """Replay settings.
-
-    `ratio` targets the realized replay fraction `replay / (on_policy + replay)`
-    per graph after replay trajectories are added to the on-policy batch.
-    """
-
-    enabled: bool = False
-    ratio: float = 0.25
-    warmup_passes: float = 1.0
-    min_buffer_size: int = 256
-    max_buffer_size: int = 50000
-    max_trajectories_per_sample: int = 8
-    max_rollouts_per_graph: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.ratio < 0.0 or self.ratio >= 1.0:
-            raise ValueError("training.success_replay.ratio must be in [0, 1).")
-        if self.warmup_passes < 0.0:
-            raise ValueError("training.success_replay.warmup_passes must be >= 0.")
-        if self.min_buffer_size < 1:
-            raise ValueError("training.success_replay.min_buffer_size must be >= 1.")
-        if self.max_buffer_size < 1:
-            raise ValueError("training.success_replay.max_buffer_size must be >= 1.")
-        if self.min_buffer_size > self.max_buffer_size:
-            raise ValueError(
-                "training.success_replay.min_buffer_size must be <= max_buffer_size."
-            )
-        if self.max_trajectories_per_sample < 1:
-            raise ValueError(
-                "training.success_replay.max_trajectories_per_sample must be >= 1."
-            )
-        if self.max_rollouts_per_graph is not None and self.max_rollouts_per_graph < 1:
-            raise ValueError(
-                "training.success_replay.max_rollouts_per_graph must be >= 1 when set."
-            )
-
-
-@dataclass(frozen=True)
-class AdaptiveSamplingConfig:
-    enabled: bool = False
-    min_rollout_batch_size: int | None = None
-    max_rollout_batch_size: int | None = None
+class ShortestPathRewardConfig:
+    weight: float = 0.0
+    schedule_type: str = "constant"
+    completion_power: float = 1.0
     warmup_steps: int = 0
-    ema_alpha: float = 0.2
-    low_success_rate_threshold: float = 0.05
-    high_success_rate_threshold: float = 0.35
-    low_unique_success_paths_per_100_rollouts: float = 0.5
-    high_unique_success_paths_per_100_rollouts: float = 5.0
-    low_subtb_residual_variance: float = 0.05
-    high_subtb_residual_variance: float = 0.5
-    rollout_growth_factor: float = 1.5
-    rollout_shrink_factor: float = 0.75
+    total_steps: int | None = None
 
     def __post_init__(self) -> None:
-        if self.min_rollout_batch_size is not None and self.min_rollout_batch_size < 1:
+        if self.weight < 0.0:
+            raise ValueError("training.shortest_path_reward.weight must be >= 0.")
+        if self.schedule_type not in {"constant", "linear", "cosine"}:
             raise ValueError(
-                "training.adaptive_sampling.min_rollout_batch_size must be >= 1."
+                "training.shortest_path_reward.schedule_type must be one of "
+                "{'constant', 'linear', 'cosine'}."
             )
-        if self.max_rollout_batch_size is not None and self.max_rollout_batch_size < 1:
+        if self.completion_power < 1.0:
             raise ValueError(
-                "training.adaptive_sampling.max_rollout_batch_size must be >= 1."
-            )
-        if (
-            self.min_rollout_batch_size is not None
-            and self.max_rollout_batch_size is not None
-            and self.min_rollout_batch_size > self.max_rollout_batch_size
-        ):
-            raise ValueError(
-                "training.adaptive_sampling.min_rollout_batch_size must be <= max_rollout_batch_size."
+                "training.shortest_path_reward.completion_power must be >= 1.0."
             )
         if self.warmup_steps < 0:
-            raise ValueError("training.adaptive_sampling.warmup_steps must be >= 0.")
-        if not 0.0 < self.ema_alpha <= 1.0:
-            raise ValueError("training.adaptive_sampling.ema_alpha must be in (0, 1].")
-        if not 0.0 <= self.low_success_rate_threshold <= 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.low_success_rate_threshold must be in [0, 1]."
-            )
-        if not 0.0 <= self.high_success_rate_threshold <= 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.high_success_rate_threshold must be in [0, 1]."
-            )
-        if self.low_success_rate_threshold > self.high_success_rate_threshold:
-            raise ValueError(
-                "training.adaptive_sampling.low_success_rate_threshold must be <= high_success_rate_threshold."
-            )
-        if self.low_unique_success_paths_per_100_rollouts < 0.0:
-            raise ValueError(
-                "training.adaptive_sampling.low_unique_success_paths_per_100_rollouts must be >= 0."
-            )
-        if (
-            self.high_unique_success_paths_per_100_rollouts
-            < self.low_unique_success_paths_per_100_rollouts
-        ):
-            raise ValueError(
-                "training.adaptive_sampling.high_unique_success_paths_per_100_rollouts must be >= low_unique_success_paths_per_100_rollouts."
-            )
-        if self.low_subtb_residual_variance < 0.0:
-            raise ValueError(
-                "training.adaptive_sampling.low_subtb_residual_variance must be >= 0."
-            )
-        if self.high_subtb_residual_variance < self.low_subtb_residual_variance:
-            raise ValueError(
-                "training.adaptive_sampling.high_subtb_residual_variance must be >= low_subtb_residual_variance."
-            )
-        if self.rollout_growth_factor < 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.rollout_growth_factor must be >= 1.0."
-            )
-        if not 0.0 < self.rollout_shrink_factor <= 1.0:
-            raise ValueError(
-                "training.adaptive_sampling.rollout_shrink_factor must be in (0, 1]."
-            )
+            raise ValueError("training.shortest_path_reward.warmup_steps must be >= 0.")
+        if self.total_steps is not None and self.total_steps < 1:
+            raise ValueError("training.shortest_path_reward.total_steps must be >= 1.")
 
 
 @dataclass(frozen=True)
@@ -303,14 +212,12 @@ class GFlowNetTrainingConfig:
     guidance: GuidanceLossConfig = field(default_factory=GuidanceLossConfig)
     sampling_temperature: float = 1.0
     force_stop_on_answer_hit: bool = False
+    trajectory_length_discount: float = 0.97
     sampling_temperature_schedule: SamplingTemperatureScheduleConfig = field(
         default_factory=SamplingTemperatureScheduleConfig
     )
-    success_replay: SuccessfulTrajectoryReplayConfig = field(
-        default_factory=SuccessfulTrajectoryReplayConfig
-    )
-    adaptive_sampling: AdaptiveSamplingConfig = field(
-        default_factory=AdaptiveSamplingConfig
+    shortest_path_reward: ShortestPathRewardConfig = field(
+        default_factory=ShortestPathRewardConfig
     )
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
@@ -321,16 +228,17 @@ class GFlowNetTrainingConfig:
             raise ValueError("training.rollout_batch_size must be >= 1.")
         if self.sampling_temperature <= 0.0:
             raise ValueError("training.sampling_temperature must be > 0.")
+        if not 0.0 < self.trajectory_length_discount <= 1.0:
+            raise ValueError("training.trajectory_length_discount must be in (0, 1].")
 
 
 __all__ = [
-    "AdaptiveSamplingConfig",
     "GFlowNetTrainingConfig",
     "GuidanceLossConfig",
     "HeuristicConfig",
     "HorizonConfig",
     "SamplingTemperatureScheduleConfig",
     "SearchEvalConfig",
-    "SuccessfulTrajectoryReplayConfig",
+    "ShortestPathRewardConfig",
     "SubTrajectoryBalanceConfig",
 ]

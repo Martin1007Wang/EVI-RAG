@@ -5,6 +5,7 @@ from typing import cast
 
 import torch
 
+from .repetition import build_full_no_repeat_mask
 from .types import (
     ForwardActionDistribution,
     PreparedSearchBatch,
@@ -49,6 +50,16 @@ def apply_forward_constraints(
         )
         edge_logits = edge_logits.masked_fill(
             edge_at_horizon & (~stop_action_mask), neg_inf
+        )
+        repeat_entity_mask = build_full_no_repeat_mask(
+            state=state,
+            candidate_target_nodes=distribution.target_nodes,
+            candidate_edge_agent_batch=edge_agent_batch,
+            max_steps=max_steps,
+        )
+        edge_logits = edge_logits.masked_fill(
+            repeat_entity_mask & (~stop_action_mask),
+            neg_inf,
         )
     return ForwardActionDistribution(
         edge_logits=edge_logits,

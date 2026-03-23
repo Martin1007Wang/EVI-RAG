@@ -184,6 +184,7 @@ class GraphObservation:
 class SearchObservation:
     """Lightweight observation metadata needed after encoding finishes."""
 
+    node_ids: torch.Tensor
     q_local_indices: GroupedLocalNodeIndex
     sample_ids: tuple[str, ...]
 
@@ -192,6 +193,7 @@ class SearchObservation:
         cls, observation: GraphObservation
     ) -> "SearchObservation":
         return cls(
+            node_ids=observation.node_ids,
             q_local_indices=observation.q_local_indices,
             sample_ids=tuple(str(sample_id) for sample_id in observation.sample_ids),
         )

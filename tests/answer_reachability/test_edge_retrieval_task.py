@@ -11,10 +11,8 @@ from src.models.configs import (
     SchedulerConfig,
 )
 from src.models.gflownet_module import GFlowNetModule
-from src.metrics.answer_reachability import compute_edge_retrieval_labels
-from src.metrics.answer_reachability.runtime import (
-    SearchMetricRuntimeFactory,
-)
+from src.metrics.edge_metrics import compute_edge_retrieval_labels
+from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 
 from .conftest import make_policy_config, make_toy_batch
 
@@ -37,7 +35,7 @@ def _make_edge_retrieval_module() -> GFlowNetModule:
         ),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
-        metric_runtime_factory=SearchMetricRuntimeFactory(),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
     )
 
 
@@ -67,3 +65,23 @@ def test_edge_retrieval_predict_metrics_smoke() -> None:
     metrics = module.get_predict_metrics()
     assert "edge/hit@1" in metrics
     assert torch.isfinite(torch.tensor(metrics["edge/hit@1"], dtype=torch.float32))
+
+
+def test_edge_retrieval_artifact_paths_ignore_artifact_name_prefix(tmp_path) -> None:
+    module = _make_edge_retrieval_module()
+    batch = make_toy_batch()
+
+    outputs = module.predict_step(batch, batch_idx=0)
+    module.on_predict_batch_end(outputs, batch, batch_idx=0)
+    module.on_predict_epoch_end()
+
+    paths = module.write_prediction_artifacts(
+        output_dir=tmp_path,
+        split="test",
+        artifact_name="custom-edge-name",
+    )
+
+    assert paths == {
+        "results_path": tmp_path / "test.results.jsonl",
+        "labels_path": tmp_path / "test.labels.jsonl",
+    }
