@@ -563,7 +563,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                         "Fix raw parquet/filters and rebuild; empty edge_index is unsupported."
                     )
                 num_nodes_tensor = torch.tensor(num_nodes, dtype=torch.long)
-                node_global_ids = torch.tensor(node_entity_ids, dtype=torch.long)
+                node_entity_ids = torch.tensor(node_entity_ids, dtype=torch.long)
                 node_emb_ids = torch.tensor(node_embedding_ids, dtype=torch.long)
                 edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
                 edge_attr = torch.tensor(edge_rel, dtype=torch.long)
@@ -646,7 +646,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     "edge_index": edge_index,
                     "edge_attr": edge_attr,
                     "num_nodes": num_nodes_tensor,
-                    "node_global_ids": node_global_ids,
+                    "node_entity_ids": node_entity_ids,
                     "node_embedding_ids": node_emb_ids,
                     "question_emb": q_batch_emb[i].unsqueeze(0),
                     "q_local_indices": torch.as_tensor(q_local, dtype=torch.long),

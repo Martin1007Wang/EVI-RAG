@@ -14,7 +14,7 @@ from src.datasets.graph_retrieval_datamodule import (
     StepDrivenTrainSampler,
     _resolve_embedding_attachment_device,
 )
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 
 
 class _DummyDataset:
@@ -62,7 +62,7 @@ def _make_runtime_batch() -> TrajectoryBatch:
         a_ptr=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([101], dtype=torch.long),
         answer_ptr=torch.tensor([0, 1], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_ids=["sample"],
         questions=["q"],
         dataset_scope="sub",
@@ -91,7 +91,7 @@ def _make_pyg_batch_without_edge_batch() -> SimpleNamespace:
         a_ptr=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([101], dtype=torch.long),
         answer_ptr=torch.tensor([0, 1], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id=["sample"],
         question=["q"],
     )

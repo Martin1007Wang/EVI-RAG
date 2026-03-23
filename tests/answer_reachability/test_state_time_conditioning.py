@@ -21,7 +21,7 @@ def test_same_node_changes_with_time_budget() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([1], dtype=torch.long),
         answer_entity_ids=torch.tensor([101], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id="time-conditioned-cycle",
     )
     policy = make_policy()
@@ -60,7 +60,7 @@ def test_same_node_and_time_depends_on_prefix_history() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([3], dtype=torch.long),
         answer_entity_ids=torch.tensor([103], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
         sample_id="merged-prefix",
     )
     policy = make_policy()

@@ -15,7 +15,7 @@ def test_default_training_callbacks_use_logged_metric_early_stopping() -> None:
         callbacks_cfg.early_stopping._target_
         == "src.callbacks.step_early_stopping.LoggedMetricEarlyStopping"
     )
-    assert callbacks_cfg.local_metrics_writer.train_window_size == 256
+    assert callbacks_cfg.local_metrics_writer.train_window_size == 32
 
 
 def test_eval_config_uses_eval_callback_bundle() -> None:
@@ -27,10 +27,13 @@ def test_eval_config_uses_eval_callback_bundle() -> None:
             overrides=[
                 "experiment=rankflow",
                 "ckpt.gflownet=/tmp/model.ckpt",
+                "logger=none",
+                "hydra/job_logging=stdout",
+                "hydra/hydra_logging=none",
                 "extras.enforce_tags=false",
                 "extras.print_config=false",
             ],
         )
 
     assert sorted(cfg.callbacks.keys()) == ["local_metrics_writer", "rich_progress_bar"]
-    assert cfg.callbacks.local_metrics_writer.train_window_size == 256
+    assert cfg.callbacks.local_metrics_writer.train_window_size == 32

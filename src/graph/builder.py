@@ -59,6 +59,10 @@ def _require_edge_index(*, value: object) -> torch.Tensor:
     return tensor
 
 
+def _resolve_node_entity_ids(*, batch: GraphBatchProtocol) -> torch.Tensor:
+    return _require_1d_long(value=batch.node_entity_ids, name="node_entity_ids")
+
+
 def _validate_graph_batch_protocol(
     batch: GraphBatchProtocol,
 ) -> dict[str, torch.Tensor | None]:
@@ -97,10 +101,7 @@ def _validate_graph_batch_protocol(
             value=batch.q_ptr,
             name="q_ptr",
         ),
-        "node_global_ids": _require_1d_long(
-            value=batch.node_global_ids,
-            name="node_global_ids",
-        ),
+        "node_entity_ids": _resolve_node_entity_ids(batch=batch),
     }
     edge_embeddings = getattr(batch, "edge_embeddings", None)
     if edge_embeddings is not None:
@@ -141,9 +142,9 @@ def _validate_graph_batch_protocol(
         raise ValueError(
             "node_embeddings row count mismatch with node_ptr in graph batch."
         )
-    if int(tensors["node_global_ids"].numel()) != num_nodes:
+    if int(tensors["node_entity_ids"].numel()) != num_nodes:
         raise ValueError(
-            "node_global_ids length mismatch with node_ptr in graph batch."
+            "node_entity_ids length mismatch with node_ptr in graph batch."
         )
 
     edge_index = tensors["edge_index"]
@@ -340,7 +341,7 @@ def build_graph_batch(
             "question_ctx_mask": batch.question_ctx_mask,
             "q_local_indices": batch.q_local_indices,
             "q_ptr": batch.q_ptr,
-            "node_global_ids": batch.node_global_ids,
+            "node_entity_ids": batch.node_entity_ids,
         }
     else:
         tensors = _validate_graph_batch_protocol(batch)
@@ -358,7 +359,7 @@ def build_graph_batch(
     question_ctx_mask = tensors["question_ctx_mask"]
     q_local_indices_tensor = tensors["q_local_indices"]
     q_ptr = tensors["q_ptr"]
-    node_global_ids = tensors["node_global_ids"]
+    node_entity_ids = tensors["node_entity_ids"]
     assert node_ptr is not None
     assert edge_index is not None
     assert node_embeddings is not None
@@ -367,7 +368,7 @@ def build_graph_batch(
     assert question_ctx_mask is not None
     assert q_local_indices_tensor is not None
     assert q_ptr is not None
-    assert node_global_ids is not None
+    assert node_entity_ids is not None
     num_nodes = int(node_ptr[-1].item())
     q_local_indices = GroupedLocalNodeIndex.from_group_ptr(
         local_indices=q_local_indices_tensor,
@@ -400,7 +401,7 @@ def build_graph_batch(
     observation = GraphObservation(
         node_features=node_embeddings,
         relation_features=relation_embeddings,
-        node_ids=node_global_ids,
+        node_entity_ids=node_entity_ids,
         question_embedding=question_emb,
         question_context=question_ctx,
         question_valid_mask=question_ctx_mask,

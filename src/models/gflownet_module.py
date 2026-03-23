@@ -32,7 +32,7 @@ from src.models.configs import (
     SearchEvalConfig,
     SchedulerConfig,
 )
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeFactoryProtocol
 from src.utils.fit_schedule import ResolvedPassFitSchedule
 from src.utils.logging_utils import get_logger, log_event, log_metric
@@ -104,9 +104,6 @@ class TrainingRolloutMetrics:
     scored_graph_candidates: float
     raw_graph_candidates_per_unique_state: float
     scored_graph_candidates_per_unique_state: float
-    shortlist_active_states: float
-    candidate_shortlist_activation_rate: float
-    candidate_shortlist_keep_ratio: float
 
 
 @dataclass(frozen=True)
@@ -360,6 +357,16 @@ class GFlowNetModule(LightningModule):
             raise ValueError(
                 "training.guidance.loss_weight > 0 requires heuristic.kind='learned'."
             )
+        if (
+            heuristic_cfg.kind == "learned"
+            and float(heuristic_cfg.beta) > 0.0
+            and float(guidance_cfg.loss_weight) <= 0.0
+        ):
+            raise ValueError(
+                "heuristic.kind='learned' with heuristic.beta > 0 requires "
+                "training.guidance.loss_weight > 0 because the learned proposal "
+                "cache is built without gradients."
+            )
 
     @property
     def metrics_profile(self) -> str:
@@ -487,7 +494,6 @@ class GFlowNetModule(LightningModule):
         unique_forward_states = float(sample_batch.total_unique_active_state_count)
         raw_graph_candidates = float(sample_batch.total_raw_graph_candidate_count)
         scored_graph_candidates = float(sample_batch.total_scored_graph_candidate_count)
-        shortlist_active_states = float(sample_batch.total_shortlist_active_state_count)
         forward_state_dedup_keep_ratio = (
             unique_forward_states / active_forward_states
             if active_forward_states > 0.0
@@ -503,16 +509,6 @@ class GFlowNetModule(LightningModule):
             if unique_forward_states > 0.0
             else 0.0
         )
-        candidate_shortlist_activation_rate = (
-            shortlist_active_states / unique_forward_states
-            if unique_forward_states > 0.0
-            else 0.0
-        )
-        candidate_shortlist_keep_ratio = (
-            scored_graph_candidates / raw_graph_candidates
-            if raw_graph_candidates > 0.0
-            else 0.0
-        )
         return TrainingRolloutMetrics(
             unique_success_paths_per_100_rollouts=unique_success_rate,
             new_success_paths=new_success_paths,
@@ -525,9 +521,6 @@ class GFlowNetModule(LightningModule):
             scored_graph_candidates=scored_graph_candidates,
             raw_graph_candidates_per_unique_state=raw_graph_candidates_per_unique_state,
             scored_graph_candidates_per_unique_state=scored_graph_candidates_per_unique_state,
-            shortlist_active_states=shortlist_active_states,
-            candidate_shortlist_activation_rate=candidate_shortlist_activation_rate,
-            candidate_shortlist_keep_ratio=candidate_shortlist_keep_ratio,
         )
 
     def _compute_guidance_loss(
@@ -684,9 +677,6 @@ class GFlowNetModule(LightningModule):
             "scored_graph_candidates": rollout_metrics.scored_graph_candidates,
             "raw_graph_candidates_per_unique_state": rollout_metrics.raw_graph_candidates_per_unique_state,
             "scored_graph_candidates_per_unique_state": rollout_metrics.scored_graph_candidates_per_unique_state,
-            "shortlist_active_states": rollout_metrics.shortlist_active_states,
-            "candidate_shortlist_activation_rate": rollout_metrics.candidate_shortlist_activation_rate,
-            "candidate_shortlist_keep_ratio": rollout_metrics.candidate_shortlist_keep_ratio,
             "log_z_mean": loss_output.log_z_mean,
             "log_z_variance": loss_output.log_z_variance,
             "rollout_batch_size": float(rollout_batch_size),

@@ -1,20 +1,17 @@
 from __future__ import annotations
 
-from types import MethodType
-
 import torch
 
-from src.models.configs import CandidateShortlistConfig
 from src.models.gflownet import ForwardActionDistribution
 from src.models.gflownet import SearchState
 from src.models.gflownet import apply_forward_constraints
-from src.models.gflownet.repetition import build_full_no_repeat_mask
-from src.models.gflownet.repetition import build_full_no_repeat_mask_from_flat_state
+from src.models.gflownet.repetition import build_entity_revisit_mask
+from src.models.gflownet.repetition import build_entity_revisit_mask_from_flat_state
 
 from .conftest import make_batch_from_graph, make_policy
 
 
-def test_search_observation_keeps_node_ids_for_no_repeat_constraints() -> None:
+def test_search_observation_keeps_node_entity_ids_for_no_repeat_constraints() -> None:
     batch = make_batch_from_graph(
         num_nodes=3,
         edge_index=torch.tensor([[0, 0, 1], [1, 2, 2]], dtype=torch.long),
@@ -22,13 +19,15 @@ def test_search_observation_keeps_node_ids_for_no_repeat_constraints() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
     policy = make_policy()
 
     prepared_batch = policy.prepare_batch(batch)
 
-    assert torch.equal(prepared_batch.observation.node_ids, batch.node_global_ids)
+    assert torch.equal(
+        prepared_batch.observation.node_entity_ids, batch.node_entity_ids
+    )
 
 
 def test_path_token_ids_interleave_absolute_nodes_and_relations() -> None:
@@ -39,7 +38,7 @@ def test_path_token_ids_interleave_absolute_nodes_and_relations() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
     policy = make_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -66,7 +65,7 @@ def test_flat_no_repeat_helper_matches_state_wrapper() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
     policy = make_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -81,20 +80,20 @@ def test_flat_no_repeat_helper_matches_state_wrapper() -> None:
     candidate_target_nodes = torch.tensor([0, 2], dtype=torch.long)
     candidate_edge_agent_batch = torch.tensor([0, 0], dtype=torch.long)
 
-    wrapped_mask = build_full_no_repeat_mask(
+    wrapped_mask = build_entity_revisit_mask(
         state=state,
-        candidate_target_nodes=candidate_target_nodes,
-        candidate_edge_agent_batch=candidate_edge_agent_batch,
+        candidate_target_abs_nodes=candidate_target_nodes,
+        candidate_agent_indices=candidate_edge_agent_batch,
         max_steps=2,
     )
-    flat_mask = build_full_no_repeat_mask_from_flat_state(
-        flat_current_nodes=state.flatten_current_nodes(),
+    flat_mask = build_entity_revisit_mask_from_flat_state(
+        flat_current_abs_nodes=state.flatten_current_nodes(),
         flat_num_steps=state.flatten_num_steps(),
         flat_path_token_ids=state.flatten_path_token_ids(max_steps=2),
-        node_ids=prepared_batch.observation.node_ids,
+        node_entity_ids_by_abs_node=prepared_batch.observation.node_entity_ids,
         num_nodes=int(prepared_batch.topology.num_nodes),
-        candidate_target_nodes=candidate_target_nodes,
-        candidate_edge_agent_batch=candidate_edge_agent_batch,
+        candidate_target_abs_nodes=candidate_target_nodes,
+        candidate_agent_indices=candidate_edge_agent_batch,
     )
 
     assert torch.equal(wrapped_mask, flat_mask)
@@ -109,7 +108,7 @@ def test_root_state_no_repeat_only_blocks_current_entity() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
     policy = make_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -121,10 +120,10 @@ def test_root_state_no_repeat_only_blocks_current_entity() -> None:
         num_steps=torch.zeros((1, 1), dtype=torch.long),
     )
 
-    repeat_mask = build_full_no_repeat_mask(
+    repeat_mask = build_entity_revisit_mask(
         state=state,
-        candidate_target_nodes=torch.tensor([0, 1, 2], dtype=torch.long),
-        candidate_edge_agent_batch=torch.tensor([0, 0, 0], dtype=torch.long),
+        candidate_target_abs_nodes=torch.tensor([0, 1, 2], dtype=torch.long),
+        candidate_agent_indices=torch.tensor([0, 0, 0], dtype=torch.long),
         max_steps=2,
     )
 
@@ -141,7 +140,7 @@ def test_forward_distribution_filters_full_revisit_before_scoring() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
     policy = make_policy()
     prepared_batch = policy.prepare_batch(batch)
@@ -175,7 +174,7 @@ def test_apply_forward_constraints_masks_revisit_on_manual_distribution() -> Non
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
     policy = make_policy()
     prepared_batch = policy.prepare_batch(batch)
@@ -222,7 +221,7 @@ def test_forward_distribution_masks_repeated_entity_across_duplicate_nodes() -> 
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([3], dtype=torch.long),
         answer_entity_ids=torch.tensor([103], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 100, 103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 100, 103], dtype=torch.long),
     )
     policy = make_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -248,51 +247,6 @@ def test_forward_distribution_masks_repeated_entity_across_duplicate_nodes() -> 
     assert 3 in {int(node) for node in graph_targets.tolist()}
 
 
-def test_forward_distribution_filters_revisits_before_shortlist_topk() -> None:
-    batch = make_batch_from_graph(
-        num_nodes=3,
-        edge_index=torch.tensor([[0, 1, 1], [1, 0, 2]], dtype=torch.long),
-        edge_rel_global=torch.tensor([0, 1, 2], dtype=torch.long),
-        q_local_indices=torch.tensor([0], dtype=torch.long),
-        a_local_indices=torch.tensor([2], dtype=torch.long),
-        answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
-    )
-    policy = make_policy(max_steps=2)
-    policy.candidate_shortlist_cfg = CandidateShortlistConfig(
-        enabled=True,
-        topk=1,
-        degree_threshold=1,
-        heuristic_weight=0.0,
-    )
-    prepared_batch = policy.prepare_batch(batch)
-    state = SearchState.from_edge_path(
-        topology=prepared_batch.topology,
-        observation=prepared_batch.observation,
-        start_node=0,
-        edge_ids=(0,),
-        max_steps=2,
-        device=batch.node_ptr.device,
-    )
-
-    def _mock_shortlist_scores(self, **kwargs):  # type: ignore[no-untyped-def]
-        del self, kwargs
-        return torch.tensor([10.0, 0.0], dtype=torch.float32)
-
-    policy._compute_shortlist_scores = MethodType(_mock_shortlist_scores, policy)
-
-    distribution = policy.compute_forward_distribution(prepared_batch, state)
-
-    stop_mask = (
-        distribution.is_stop_action.to(dtype=torch.bool)
-        if distribution.is_stop_action is not None
-        else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
-    )
-    graph_targets = distribution.target_nodes[~stop_mask]
-
-    assert graph_targets.tolist() == [2]
-
-
 def test_forward_constraints_mask_all_moves_at_horizon() -> None:
     batch = make_batch_from_graph(
         num_nodes=2,
@@ -301,7 +255,7 @@ def test_forward_constraints_mask_all_moves_at_horizon() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([1], dtype=torch.long),
         answer_entity_ids=torch.tensor([101], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
     )
     policy = make_policy()
     prepared_batch = policy.prepare_batch(batch)

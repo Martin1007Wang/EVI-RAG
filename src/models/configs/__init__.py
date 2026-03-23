@@ -15,7 +15,6 @@ from .gflownet import (
     SubTrajectoryBalanceConfig,
 )
 from .policy import (
-    CandidateShortlistConfig,
     PolicyConfig,
     PrefixControllerConfig,
     StateScoreHeadConfig,
@@ -30,7 +29,6 @@ __all__ = [
     "PrefixControllerConfig",
     "StateScoreHeadConfig",
     "TransitionPolicyHeadConfig",
-    "CandidateShortlistConfig",
     "HeuristicConfig",
     "GFlowNetTrainingConfig",
     "GuidanceLossConfig",

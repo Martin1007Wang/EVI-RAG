@@ -24,7 +24,7 @@ def test_answer_start_without_future_support_is_absorbing_success() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([0], dtype=torch.long),
         answer_entity_ids=torch.tensor([100], dtype=torch.long),
-        node_global_ids=torch.tensor([100], dtype=torch.long),
+        node_entity_ids=torch.tensor([100], dtype=torch.long),
         sample_id="answer-start-dead-end",
     )
     policy = _make_policy(max_steps=2)
@@ -58,7 +58,7 @@ def test_cycle_only_start_becomes_stop_only_after_revisit_is_masked() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id="cycle-only-start",
     )
     policy = _make_policy(max_steps=2)
@@ -95,7 +95,7 @@ def test_forward_distribution_keeps_edges_into_future_failures() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
         sample_id="future-dead-end",
     )
     policy = _make_policy(max_steps=3)

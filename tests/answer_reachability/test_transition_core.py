@@ -44,7 +44,7 @@ def test_compute_constrained_forward_step_masks_horizon_agents() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([1], dtype=torch.long),
         answer_entity_ids=torch.tensor([101], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
     )
     policy = make_policy()
     prepared_batch = policy.prepare_batch(batch)

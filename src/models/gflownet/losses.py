@@ -24,6 +24,14 @@ class SubTrajectoryBalanceLossOutput:
 
 
 class SubTrajectoryBalanceLoss:
+    """Forward-prefix SubTB specialized to the prefix-tree state space.
+
+    The current objective keeps the root consistency residual, pairwise forward
+    prefix residuals, and terminal reward anchors. Move-step backward logits are
+    carried in the sample batch for interface compatibility, but they are not
+    consumed by this loss.
+    """
+
     def __init__(
         self,
         *,

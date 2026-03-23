@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Sampler
 from torch_geometric.loader.dataloader import Collater
 
 from .graph_retrieval_dataset import GraphRetrievalDataset
-from src.graph_runtime.batch import compute_edge_batch_and_ptr
+from src.graph.batch import compute_edge_batch_and_ptr
 from src.utils.logging_utils import get_logger, log_event
 
 logger = get_logger(__name__)
@@ -244,15 +244,15 @@ def _resolve_answer_values(
     *,
     a_vals: torch.Tensor,
     answer_vals: torch.Tensor,
-    node_global_ids: Optional[torch.Tensor],
+    node_entity_ids: Optional[torch.Tensor],
 ) -> torch.Tensor:
     if a_vals.numel() == answer_vals.numel():
         return answer_vals
-    if node_global_ids is None:
-        raise AttributeError("Batch missing node_global_ids required to align answers.")
+    if node_entity_ids is None:
+        raise AttributeError("Batch missing node_entity_ids required to align answers.")
     if a_vals.numel() == 0:
         return a_vals.new_empty((0,))
-    return node_global_ids.view(-1).index_select(0, a_vals)
+    return node_entity_ids.view(-1).index_select(0, a_vals)
 
 
 def _iter_answer_candidates(
@@ -308,13 +308,13 @@ def _expand_answer_samples(
         q_local = _require_long_tensor(data, "q_local_indices")
         a_local = _require_long_tensor(data, "a_local_indices")
         answer_ids = _require_long_tensor(data, "answer_entity_ids")
-        node_global_ids = _maybe_long_tensor(data, "node_global_ids")
+        node_entity_ids = _maybe_long_tensor(data, "node_entity_ids")
         q_vals = q_local.view(-1)
         a_vals = a_local.view(-1)
         answer_vals = _resolve_answer_values(
             a_vals=a_vals,
             answer_vals=answer_ids.view(-1),
-            node_global_ids=node_global_ids,
+            node_entity_ids=node_entity_ids,
         )
         if not expand_multi_answer:
             a_vals, answer_vals = _filter_zero_hop_answers(

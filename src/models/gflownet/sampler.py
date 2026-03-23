@@ -6,9 +6,10 @@ from typing import Protocol
 
 import torch
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.utils.segment_ops import sample_segmented_one_1d
 
+from .policy import _temper_segmented_log_probs
 from .path import (
     append_relation_and_node_tokens_inplace,
     append_stop_token_inplace,
@@ -24,24 +25,21 @@ from .types import (
 
 
 class TrajectoryRolloutSupervisorProtocol(Protocol):
-    def build_terminal_target_mask(self, *, batch: TrajectoryBatch) -> torch.Tensor:
-        ...
+    def build_terminal_target_mask(self, *, batch: TrajectoryBatch) -> torch.Tensor: ...
 
     def resolve_terminal_transitions(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-    ) -> "TerminalTransitionBatch":
-        ...
+    ) -> "TerminalTransitionBatch": ...
 
     def compute_terminal_rewards(
         self,
         *,
         batch: TrajectoryBatch,
         terminal_nodes: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        ...
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 @dataclass(frozen=True)
@@ -65,15 +63,32 @@ class TerminalTransitionBatch:
 
 
 def _build_answer_mask(batch: TrajectoryBatch) -> torch.Tensor:
-    answer_mask = torch.zeros(
-        (batch.num_nodes_total,), device=batch.node_ptr.device, dtype=torch.bool
+    num_nodes_total = (
+        int(batch.node_ptr[-1].item()) if int(batch.node_ptr.numel()) > 0 else 0
     )
-    if int(batch.a_local_indices.numel()) == 0:
+    answer_mask = torch.zeros(
+        (num_nodes_total,), device=batch.node_ptr.device, dtype=torch.bool
+    )
+    if int(answer_mask.numel()) == 0 or int(batch.answer_entity_ids.numel()) == 0:
         return answer_mask
-    counts = batch.a_ptr[1:] - batch.a_ptr[:-1]
-    offsets = batch.node_ptr[:-1].repeat_interleave(counts)
-    absolute = batch.a_local_indices + offsets
-    answer_mask.scatter_(0, absolute, True)
+    metadata = (
+        AnswerReachabilityTrajectorySupervisor._build_answer_supervision_metadata(batch)
+    )
+    node_graph_ids = AnswerReachabilityTrajectorySupervisor._graph_ids_from_ptr(
+        batch.node_ptr.to(device=batch.node_ptr.device, dtype=torch.long)
+    )
+    node_entity_ids = batch.node_entity_ids.to(
+        device=batch.node_ptr.device, dtype=torch.long
+    )
+    node_keys = node_graph_ids * metadata.key_base + (
+        node_entity_ids + metadata.entity_offset
+    )
+    gold_match_idx = torch.searchsorted(metadata.gold_keys, node_keys)
+    in_range = gold_match_idx < int(metadata.gold_keys.numel())
+    answer_mask[in_range] = (
+        metadata.gold_keys.index_select(0, gold_match_idx[in_range])
+        == node_keys[in_range]
+    )
     return answer_mask
 
 
@@ -104,7 +119,7 @@ class AnswerReachabilityTrajectorySupervisor:
     def _build_answer_supervision_metadata(
         batch: TrajectoryBatch,
     ) -> _AnswerSupervisionMetadata:
-        node_global_ids = batch.node_global_ids.to(
+        node_entity_ids = batch.node_entity_ids.to(
             device=batch.node_ptr.device,
             dtype=torch.long,
         )
@@ -113,9 +128,9 @@ class AnswerReachabilityTrajectorySupervisor:
             dtype=torch.long,
         )
         zero = torch.zeros((), device=batch.node_ptr.device, dtype=torch.long)
-        if int(node_global_ids.numel()) > 0:
-            min_entity = node_global_ids.min()
-            max_entity = node_global_ids.max()
+        if int(node_entity_ids.numel()) > 0:
+            min_entity = node_entity_ids.min()
+            max_entity = node_entity_ids.max()
         else:
             min_entity = zero
             max_entity = zero
@@ -212,11 +227,9 @@ class AnswerReachabilityTrajectorySupervisor:
     def _resolve_terminal_entity_ids(
         *, batch: TrajectoryBatch, terminal_nodes: torch.Tensor
     ) -> torch.Tensor:
-        node_global_ids = getattr(batch, "node_global_ids", None)
-        if node_global_ids is None:
-            return terminal_nodes.to(dtype=torch.long).clone()
+        node_entity_ids = batch.node_entity_ids.to(dtype=torch.long)
         flat_terminal_nodes = terminal_nodes.reshape(-1)
-        terminal_entity_ids = node_global_ids.index_select(0, flat_terminal_nodes)
+        terminal_entity_ids = node_entity_ids.index_select(0, flat_terminal_nodes)
         return terminal_entity_ids.view_as(terminal_nodes)
 
     def resolve_terminal_transitions(
@@ -591,10 +604,10 @@ def _resolve_selected_start_values(
     )
     if not bool(exact_match.all().item()):
         invalid_graphs = flat_graph_ids[~exact_match].tolist()
-        invalid_nodes = flat_start_nodes[~exact_match].tolist()
+        invalid_start_abs_nodes = flat_start_nodes[~exact_match].tolist()
         raise ValueError(
             "Sampled start node is not a valid target-policy start candidate. "
-            f"graph_idx={invalid_graphs} node_ids={invalid_nodes}."
+            f"graph_idx={invalid_graphs} start_abs_nodes={invalid_start_abs_nodes}."
         )
     selected_positions = order.index_select(0, match_idx)
     start_log_probs = (
@@ -704,7 +717,6 @@ def _rebuild_target_sample_batch(
     total_unique_active_state_count = 0
     total_raw_graph_candidate_count = 0
     total_scored_graph_candidate_count = 0
-    total_shortlist_active_state_count = 0
 
     for step_idx in range(max_actions):
         active_mask = termination_action_steps > step_idx
@@ -731,9 +743,6 @@ def _rebuild_target_sample_batch(
         total_raw_graph_candidate_count += int(distribution.raw_graph_candidate_count)
         total_scored_graph_candidate_count += int(
             distribution.scored_graph_candidate_count
-        )
-        total_shortlist_active_state_count += int(
-            distribution.shortlist_active_state_count
         )
         chosen_edge_ids = planned_edge_ids[:, :, step_idx].reshape(-1)
         chosen_is_stop_action = planned_stop_mask[:, :, step_idx].reshape(-1)
@@ -788,13 +797,13 @@ def _rebuild_target_sample_batch(
                 -1, int(current_control_states.size(-1))
             )
             flat_relation_ids = chosen_relation_ids.view(-1)
-            flat_next_control_states[
-                flat_graph_move
-            ] = policy.compute_next_control_states(
-                prepared_batch,
-                control_states=flat_current_control_states[flat_graph_move],
-                next_nodes=next_nodes[flat_graph_move],
-                relation_ids=flat_relation_ids[flat_graph_move],
+            flat_next_control_states[flat_graph_move] = (
+                policy.compute_next_control_states(
+                    prepared_batch,
+                    control_states=flat_current_control_states[flat_graph_move],
+                    next_nodes=next_nodes[flat_graph_move],
+                    relation_ids=flat_relation_ids[flat_graph_move],
+                )
             )
         next_log_f = torch.zeros_like(current_nodes, dtype=torch.float32)
         if bool(flat_graph_move.any().item()):
@@ -811,7 +820,7 @@ def _rebuild_target_sample_batch(
 
         log_pf_steps[:, :, step_idx] = chosen_log_probs.view_as(current_nodes)
         next_state_log_f_steps[:, :, step_idx] = next_log_f
-        move_mask[:, :, step_idx] = active_mask
+        move_mask[:, :, step_idx] = flat_graph_move.view_as(current_nodes)
         current_nodes = next_nodes.view_as(current_nodes)
         num_steps = next_num_steps.view_as(num_steps)
         current_path_token_ids = next_path_token_ids
@@ -869,7 +878,6 @@ def _rebuild_target_sample_batch(
         total_unique_active_state_count=total_unique_active_state_count,
         total_raw_graph_candidate_count=total_raw_graph_candidate_count,
         total_scored_graph_candidate_count=total_scored_graph_candidate_count,
-        total_shortlist_active_state_count=total_shortlist_active_state_count,
     )
 
 
@@ -913,7 +921,6 @@ class TrajectoryGFNSampleBatch:
     total_unique_active_state_count: int = 0
     total_raw_graph_candidate_count: int = 0
     total_scored_graph_candidate_count: int = 0
-    total_shortlist_active_state_count: int = 0
 
     @property
     def trace_submit_mask(self) -> torch.Tensor | None:
@@ -941,8 +948,7 @@ class TrajectorySamplerProtocol(Protocol):
         prepared_batch: PreparedGFlowNetBatch,
         rollout_batch_size: int,
         temperature: float,
-    ) -> TrajectoryGFNSampleBatch:
-        ...
+    ) -> TrajectoryGFNSampleBatch: ...
 
 
 class ForwardTrajectoryGFNSampler:
@@ -974,11 +980,17 @@ class ForwardTrajectoryGFNSampler:
     ) -> TrajectoryGFNSampleBatch:
         with torch.no_grad():
             start_dist = policy.compute_behavior_start_distribution(prepared_batch)
+            sampling_start_log_probs = _temper_segmented_log_probs(
+                log_probs=start_dist.log_probs,
+                segment_ids=start_dist.candidate_graph_ids,
+                num_segments=int(start_dist.graph_log_z.numel()),
+                temperature=float(temperature),
+            )
             (
                 start_entropy,
                 start_entropy_normalized,
             ) = _compute_start_distribution_entropy(
-                log_probs=start_dist.log_probs,
+                log_probs=sampling_start_log_probs,
                 candidate_graph_ids=start_dist.candidate_graph_ids,
                 num_graphs=int(start_dist.graph_log_z.numel()),
             )
@@ -986,6 +998,7 @@ class ForwardTrajectoryGFNSampler:
                 start_dist,
                 num_rollouts=int(rollout_batch_size),
                 deterministic=False,
+                temperature=float(temperature),
             )
         start_log_probs, start_log_flows, graph_log_z = _resolve_selected_start_values(
             prepared_batch=prepared_batch,
@@ -1040,7 +1053,6 @@ class ForwardTrajectoryGFNSampler:
         total_unique_active_state_count = 0
         total_raw_graph_candidate_count = 0
         total_scored_graph_candidate_count = 0
-        total_shortlist_active_state_count = 0
 
         for step_idx in range(max_actions):
             active_mask = ~done_mask
@@ -1084,9 +1096,6 @@ class ForwardTrajectoryGFNSampler:
             total_scored_graph_candidate_count += int(
                 target_distribution.scored_graph_candidate_count
             )
-            total_shortlist_active_state_count += int(
-                target_distribution.shortlist_active_state_count
-            )
             _, _, has_values = policy.compute_move_log_probs(target_distribution)
             has_values = has_values.view_as(current_nodes)
             policy_active_mask = active_mask & (~forced_stop_mask)
@@ -1129,7 +1138,6 @@ class ForwardTrajectoryGFNSampler:
                         unique_active_state_count=target_distribution.unique_active_state_count,
                         raw_graph_candidate_count=target_distribution.raw_graph_candidate_count,
                         scored_graph_candidate_count=target_distribution.scored_graph_candidate_count,
-                        shortlist_active_state_count=target_distribution.shortlist_active_state_count,
                     )
                     (
                         sampled_positions,
@@ -1203,13 +1211,13 @@ class ForwardTrajectoryGFNSampler:
                     -1, int(current_control_states.size(-1))
                 )
                 flat_relation_ids = chosen_relation_ids.view(-1)
-                flat_next_control_states[
-                    flat_graph_move
-                ] = policy.compute_next_control_states(
-                    prepared_batch,
-                    control_states=flat_current_control_states[flat_graph_move],
-                    next_nodes=flat_next_nodes[flat_graph_move],
-                    relation_ids=flat_relation_ids[flat_graph_move],
+                flat_next_control_states[flat_graph_move] = (
+                    policy.compute_next_control_states(
+                        prepared_batch,
+                        control_states=flat_current_control_states[flat_graph_move],
+                        next_nodes=flat_next_nodes[flat_graph_move],
+                        relation_ids=flat_relation_ids[flat_graph_move],
+                    )
                 )
             next_log_f = torch.zeros_like(current_nodes, dtype=torch.float32)
             if bool(flat_graph_move.any().item()):
@@ -1226,7 +1234,7 @@ class ForwardTrajectoryGFNSampler:
 
             log_pf_steps[:, :, step_idx] = chosen_log_probs.view_as(current_nodes)
             next_state_log_f_steps[:, :, step_idx] = next_log_f
-            move_mask[:, :, step_idx] = active_mask
+            move_mask[:, :, step_idx] = flat_graph_move.view_as(current_nodes)
 
             current_nodes = flat_next_nodes.view_as(current_nodes)
             num_steps = next_num_steps.view_as(num_steps)
@@ -1288,7 +1296,6 @@ class ForwardTrajectoryGFNSampler:
             total_unique_active_state_count=total_unique_active_state_count,
             total_raw_graph_candidate_count=total_raw_graph_candidate_count,
             total_scored_graph_candidate_count=total_scored_graph_candidate_count,
-            total_shortlist_active_state_count=total_shortlist_active_state_count,
         )
 
 

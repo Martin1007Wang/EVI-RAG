@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 
 from .sampler import TrajectoryGFNSampleBatch
 

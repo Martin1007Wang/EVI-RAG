@@ -82,14 +82,6 @@ policy_cfg:
     num_layers: 2
     dropout: 0.0
     microbatch_size: 4096
-  # Backward transitions are not learned: on the discrete prefix-tree state
-  # space, every non-root state has exactly one legal parent.
-  candidate_shortlist:
-    _target_: src.models.configs.policy.CandidateShortlistConfig
-    enabled: false
-    topk: 16
-    degree_threshold: 32
-    heuristic_weight: 1.0
 
 eval_cfg:
   _target_: src.models.configs.gflownet.SearchEvalConfig

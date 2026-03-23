@@ -24,6 +24,23 @@ def test_rollout_supervisor_marks_answer_nodes_as_terminal_targets() -> None:
     assert terminal_target_mask.tolist() == [False, False, True]
 
 
+def test_rollout_supervisor_marks_alias_answer_entities_as_terminal_targets() -> None:
+    supervisor = AnswerReachabilityTrajectorySupervisor()
+    batch = SimpleNamespace(
+        num_graphs=1,
+        node_ptr=torch.tensor([0, 4], dtype=torch.long),
+        a_ptr=torch.tensor([0, 1], dtype=torch.long),
+        answer_ptr=torch.tensor([0, 1], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 102], dtype=torch.long),
+    )
+
+    terminal_target_mask = supervisor.build_terminal_target_mask(batch=cast(Any, batch))
+
+    assert terminal_target_mask.dtype == torch.bool
+    assert terminal_target_mask.tolist() == [False, False, True, True]
+
+
 def test_rollout_supervisor_uses_fixed_energy_rewards() -> None:
     supervisor = AnswerReachabilityTrajectorySupervisor()
     batch = make_toy_batch()
@@ -50,7 +67,7 @@ def test_rollout_supervisor_uses_fixed_energy_rewards_multi_graph() -> None:
         a_ptr=torch.tensor([0, 1, 3], dtype=torch.long),
         answer_ptr=torch.tensor([0, 1, 3], dtype=torch.long),
         answer_entity_ids=torch.tensor([102, 204, 207], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 200, 201, 204, 205, 207]),
+        node_entity_ids=torch.tensor([100, 101, 102, 200, 201, 204, 205, 207]),
     )
 
     rewards, log_rewards = supervisor.compute_terminal_rewards(
@@ -83,7 +100,7 @@ def test_energy_reward_keeps_aliases_at_same_terminal_mass() -> None:
         a_ptr=torch.tensor([0, 1], dtype=torch.long),
         answer_ptr=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 102], dtype=torch.long),
     )
 
     rewards, log_rewards = supervisor.compute_terminal_rewards(
@@ -109,7 +126,7 @@ def test_rollout_supervisor_assigns_zero_terminal_backward_for_energy_reward() -
         a_ptr=torch.tensor([0, 1], dtype=torch.long),
         answer_ptr=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
     )
 
     terminal_transition = supervisor.resolve_terminal_transitions(

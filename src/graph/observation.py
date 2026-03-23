@@ -88,7 +88,7 @@ class GraphObservation:
 
     node_features: torch.Tensor
     relation_features: torch.Tensor
-    node_ids: torch.Tensor
+    node_entity_ids: torch.Tensor
     question_embedding: torch.Tensor
     question_context: torch.Tensor
     question_valid_mask: torch.Tensor
@@ -117,12 +117,14 @@ class GraphObservation:
             raise ValueError(
                 "relation_features must be 2D floating point in graph observation."
             )
-        if self.node_ids.dtype != torch.long or self.node_ids.dim() != 1:
-            raise ValueError("node_ids must be 1D torch.long in graph observation.")
-        if int(self.node_ids.numel()) != int(topology.num_nodes):
+        if self.node_entity_ids.dtype != torch.long or self.node_entity_ids.dim() != 1:
             raise ValueError(
-                "node_ids length mismatch with topology.num_nodes in graph observation: "
-                f"node_ids={int(self.node_ids.numel())}, num_nodes={int(topology.num_nodes)}."
+                "node_entity_ids must be 1D torch.long in graph observation."
+            )
+        if int(self.node_entity_ids.numel()) != int(topology.num_nodes):
+            raise ValueError(
+                "node_entity_ids length mismatch with topology.num_nodes in graph observation: "
+                f"node_entity_ids={int(self.node_entity_ids.numel())}, num_nodes={int(topology.num_nodes)}."
             )
         if self.question_embedding.dim() != 2 or not torch.is_floating_point(
             self.question_embedding
@@ -184,7 +186,7 @@ class GraphObservation:
 class SearchObservation:
     """Lightweight observation metadata needed after encoding finishes."""
 
-    node_ids: torch.Tensor
+    node_entity_ids: torch.Tensor
     q_local_indices: GroupedLocalNodeIndex
     sample_ids: tuple[str, ...]
 
@@ -193,7 +195,7 @@ class SearchObservation:
         cls, observation: GraphObservation
     ) -> "SearchObservation":
         return cls(
-            node_ids=observation.node_ids,
+            node_entity_ids=observation.node_entity_ids,
             q_local_indices=observation.q_local_indices,
             sample_ids=tuple(str(sample_id) for sample_id in observation.sample_ids),
         )

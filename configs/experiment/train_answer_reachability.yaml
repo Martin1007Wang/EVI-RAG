@@ -21,17 +21,18 @@ optimized_metric: "val/sub/answer/recall@10"
 data:
   # Keep the alias aligned with `train_rankflow` so the canonical webqsp-sub run
   # does not need per-session tmux overrides.
-  batch_size: 192
+  batch_size: 256
   eval_batch_size: 32
   train_feature_dtype: bf16
   eval_feature_dtype: fp32
-  train_max_graphs_per_batch: 192
-  train_max_nodes_per_batch: 480000
-  train_max_edges_per_batch: 1440000
-  train_max_question_tokens_per_batch: 12288
+  train_max_graphs_per_batch: 256
+  train_max_nodes_per_batch: 640000
+  train_max_edges_per_batch: 1920000
+  train_max_question_tokens_per_batch: 16384
 
 fit_schedule:
   val_every_passes: 8.0
+  log_every_passes: 1.0
   early_stopping_patience_passes: 96.0
 
 trainer:
@@ -39,7 +40,9 @@ trainer:
   max_epochs: -1
   max_time: "00:08:00:00"
   check_val_every_n_epoch: null
-  log_every_n_steps: 10
+  # WebQSP-sub sees >1 full train pass by step 32 at batch 256, which keeps
+  # train metrics closer to dataset-level trends than per-mini-batch noise.
+  log_every_n_steps: 32
   precision: bf16-mixed
   gradient_clip_val: 0.5
   limit_val_batches: null
@@ -59,12 +62,6 @@ callbacks:
     min_delta: 0.002
 
 model:
-  policy_cfg:
-    candidate_shortlist:
-      enabled: true
-      topk: 16
-      degree_threshold: 32
-      heuristic_weight: 1.0
   training_cfg:
     guidance:
       loss_weight: 0.0

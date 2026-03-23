@@ -54,8 +54,8 @@ def _write_sample(txn: lmdb.Transaction, sample_key: bytes, payload: bytes) -> N
     txn.put(sample_key, payload)
 
 
-def _local_indices(node_ids: Sequence[int], targets: Sequence[int]) -> List[int]:
-    position = {nid: idx for idx, nid in enumerate(node_ids)}
+def _local_indices(node_entity_ids: Sequence[int], targets: Sequence[int]) -> List[int]:
+    position = {nid: idx for idx, nid in enumerate(node_entity_ids)}
     return [position[t] for t in targets if t in position]
 
 
@@ -256,6 +256,133 @@ def _finalize_lmdb_dir(*, tmp_path: Path, final_path: Path, overwrite: bool) -> 
     tmp_path.rename(final_path)
 
 
+def _rename_legacy_node_entity_field(
+    sample: Dict[str, torch.Tensor], *, sample_id: str
+) -> tuple[Dict[str, torch.Tensor], bool]:
+    if "node_entity_ids" in sample:
+        if "node_global_ids" not in sample:
+            return sample, False
+        current = torch.as_tensor(sample["node_entity_ids"], dtype=torch.long).view(-1)
+        legacy = torch.as_tensor(sample["node_global_ids"], dtype=torch.long).view(-1)
+        if not torch.equal(current, legacy):
+            raise ValueError(
+                "LMDB sample contains conflicting node entity id fields for "
+                f"sample_id={sample_id}."
+            )
+        updated = dict(sample)
+        del updated["node_global_ids"]
+        return updated, True
+    if "node_global_ids" not in sample:
+        raise KeyError(
+            f"LMDB sample missing required node_entity_ids field for sample_id={sample_id}."
+        )
+    updated = dict(sample)
+    updated["node_entity_ids"] = updated.pop("node_global_ids")
+    return updated, True
+
+
+def migrate_legacy_node_entity_ids_lmdb(
+    lmdb_path: Path,
+    *,
+    overwrite: bool = True,
+    batch_size: int = 1024,
+) -> dict[str, int]:
+    lmdb_path = Path(lmdb_path)
+    if not lmdb_path.exists():
+        raise FileNotFoundError(f"LMDB not found: {lmdb_path}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+    src_env = lmdb.open(
+        str(lmdb_path),
+        readonly=True,
+        lock=False,
+        readahead=False,
+        meminit=False,
+        max_readers=1,
+        subdir=lmdb_path.is_dir(),
+    )
+    map_size_bytes = int(src_env.info()["map_size"])
+    growth_bytes = _DEFAULT_LMDB_MAP_GROWTH_GB * _BYTES_PER_GB
+    growth_factor = _DEFAULT_LMDB_MAP_GROWTH_FACTOR
+    tmp_path = _prepare_lmdb_dir(lmdb_path, overwrite=overwrite)
+    dst_env = lmdb.open(
+        str(tmp_path),
+        map_size=map_size_bytes,
+        subdir=True,
+        lock=True,
+        readahead=False,
+        meminit=False,
+    )
+    migrated_samples = 0
+    total_samples = 0
+    pending_payloads: List[Tuple[bytes, bytes]] = []
+    try:
+        with src_env.begin(write=False) as src_txn:
+            cursor = src_txn.cursor()
+            for key, value in cursor:
+                sample_id = key.decode("utf-8")
+                sample = _deserialize_sample(value)
+                updated_sample, changed = _rename_legacy_node_entity_field(
+                    sample, sample_id=sample_id
+                )
+                pending_payloads.append((bytes(key), _serialize_sample(updated_sample)))
+                total_samples += 1
+                migrated_samples += int(changed)
+                if len(pending_payloads) >= batch_size:
+                    txn, map_size_bytes = _retry_pending_with_growth(
+                        env=dst_env,
+                        pending_payloads=pending_payloads,
+                        map_size_bytes=map_size_bytes,
+                        growth_bytes=growth_bytes,
+                        growth_factor=growth_factor,
+                        max_size_bytes=None,
+                    )
+                    txn, map_size_bytes = _commit_pending_with_growth(
+                        env=dst_env,
+                        txn=txn,
+                        pending_payloads=pending_payloads,
+                        map_size_bytes=map_size_bytes,
+                        growth_bytes=growth_bytes,
+                        growth_factor=growth_factor,
+                        max_size_bytes=None,
+                    )
+                    txn.abort()
+                    pending_payloads.clear()
+        if pending_payloads:
+            txn, map_size_bytes = _retry_pending_with_growth(
+                env=dst_env,
+                pending_payloads=pending_payloads,
+                map_size_bytes=map_size_bytes,
+                growth_bytes=growth_bytes,
+                growth_factor=growth_factor,
+                max_size_bytes=None,
+            )
+            txn, map_size_bytes = _commit_pending_with_growth(
+                env=dst_env,
+                txn=txn,
+                pending_payloads=pending_payloads,
+                map_size_bytes=map_size_bytes,
+                growth_bytes=growth_bytes,
+                growth_factor=growth_factor,
+                max_size_bytes=None,
+            )
+            txn.abort()
+            pending_payloads.clear()
+    except Exception:
+        dst_env.close()
+        src_env.close()
+        if tmp_path.exists():
+            shutil.rmtree(tmp_path)
+        raise
+
+    dst_env.sync()
+    dst_env.close()
+    src_env.close()
+    _finalize_lmdb_dir(tmp_path=tmp_path, final_path=lmdb_path, overwrite=overwrite)
+    return {"total_samples": total_samples, "migrated_samples": migrated_samples}
+
+
 def _load_filter_ids_from_path(path: Path) -> set[str]:
     if not path.exists():
         raise FileNotFoundError(f"Filter file not found: {path}")
@@ -306,3 +433,14 @@ def apply_filter_intersection(
     sample_ids: Sequence[str], filter_paths: Sequence[Path]
 ) -> List[str]:
     return _apply_filter_intersection(sample_ids, filter_paths)
+
+
+__all__ = [
+    "_deserialize_sample",
+    "_serialize_sample",
+    "_local_indices",
+    "apply_filter_intersection",
+    "assign_lmdb_shard",
+    "migrate_legacy_node_entity_ids_lmdb",
+    "resolve_core_lmdb_paths",
+]

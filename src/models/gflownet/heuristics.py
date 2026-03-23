@@ -5,7 +5,7 @@ from typing import Callable, Protocol
 import torch
 from torch import nn
 
-from src.graph_runtime import GraphTopology, SearchObservation
+from src.graph import GraphTopology, SearchObservation
 from src.models.components.heuristic_heads import LearnedHeuristicHead
 from src.models.configs import HeuristicConfig
 
@@ -173,11 +173,11 @@ class SearchHeuristic(nn.Module):
 
     @staticmethod
     def _node_log_heuristic(
-        *, node_ids: torch.Tensor, cache: HeuristicCache
+        *, node_abs_indices: torch.Tensor, cache: HeuristicCache
     ) -> torch.Tensor:
         if cache.node_log_heuristic is None:
-            return torch.zeros_like(node_ids, dtype=torch.float32)
-        return cache.node_log_heuristic.index_select(0, node_ids)
+            return torch.zeros_like(node_abs_indices, dtype=torch.float32)
+        return cache.node_log_heuristic.index_select(0, node_abs_indices)
 
     def _build_step_node_log_heuristic(
         self,
@@ -192,7 +192,7 @@ class SearchHeuristic(nn.Module):
             )
         num_nodes = int(prepared_batch.topology.num_nodes)
         device = prepared_batch.node_tokens.device
-        node_ids = torch.arange(num_nodes, device=device, dtype=torch.long)
+        node_abs_indices = torch.arange(num_nodes, device=device, dtype=torch.long)
         node_graph_ids = prepared_batch.topology.all_node_graph_index(device=device)
         cache = torch.empty(
             (max_steps + 1, num_nodes),
@@ -208,7 +208,7 @@ class SearchHeuristic(nn.Module):
             chunk_logits: list[torch.Tensor] = []
             for start in range(0, num_nodes, max(chunk_size, 1)):
                 end = min(start + max(chunk_size, 1), num_nodes)
-                chunk_nodes = node_ids[start:end]
+                chunk_nodes = node_abs_indices[start:end]
                 chunk_steps = torch.full_like(chunk_nodes, fill_value=step)
                 chunk_done = torch.zeros_like(chunk_nodes, dtype=torch.bool)
                 local_state_features = build_local_state_features(
@@ -233,21 +233,26 @@ class SearchHeuristic(nn.Module):
         self,
         *,
         heuristic_cache: HeuristicCache,
-        node_ids: torch.Tensor,
+        node_abs_indices: torch.Tensor,
         num_steps: torch.Tensor,
         done_mask: torch.Tensor,
     ) -> torch.Tensor:
         safe_steps = num_steps.to(dtype=torch.long)
         if heuristic_cache.step_node_log_heuristic is not None:
-            safe_node_ids = node_ids.to(dtype=torch.long).clamp(
+            safe_node_abs_indices = node_abs_indices.to(dtype=torch.long).clamp(
                 min=0,
                 max=max(int(heuristic_cache.step_node_log_heuristic.size(1)) - 1, 0),
             )
             max_step = int(heuristic_cache.step_node_log_heuristic.size(0)) - 1
             safe_steps = safe_steps.clamp(min=0, max=max(max_step, 0))
-            bias = heuristic_cache.step_node_log_heuristic[safe_steps, safe_node_ids]
+            bias = heuristic_cache.step_node_log_heuristic[
+                safe_steps, safe_node_abs_indices
+            ]
         else:
-            bias = self._node_log_heuristic(node_ids=node_ids, cache=heuristic_cache)
+            bias = self._node_log_heuristic(
+                node_abs_indices=node_abs_indices,
+                cache=heuristic_cache,
+            )
         return torch.where(
             done_mask.to(dtype=torch.bool),
             torch.zeros_like(bias),

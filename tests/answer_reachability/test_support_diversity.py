@@ -24,7 +24,7 @@ def test_support_window_penalizes_overlapping_paths() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.long),
         sample_id="support-diversity",
     )
     analysis = ReachabilityAnalysis(

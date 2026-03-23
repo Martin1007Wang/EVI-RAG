@@ -12,7 +12,7 @@ from src.models.configs import (
     PolicyConfig,
     StateScoreHeadConfig,
 )
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.gflownet import BaseSearchPolicy
 
 
@@ -24,14 +24,14 @@ def make_batch_from_graph(
     q_local_indices: torch.Tensor,
     a_local_indices: torch.Tensor,
     answer_entity_ids: torch.Tensor,
-    node_global_ids: torch.Tensor | None = None,
+    node_entity_ids: torch.Tensor | None = None,
     sample_id: str = "toy-sample",
     question_emb: torch.Tensor | None = None,
     question_ctx: torch.Tensor | None = None,
     question_ctx_mask: torch.Tensor | None = None,
 ) -> TrajectoryBatch:
-    if node_global_ids is None:
-        node_global_ids = torch.arange(100, 100 + num_nodes, dtype=torch.long)
+    if node_entity_ids is None:
+        node_entity_ids = torch.arange(100, 100 + num_nodes, dtype=torch.long)
     emb_dim = 8
     if question_emb is None:
         question_emb = torch.randn(1, emb_dim)
@@ -57,7 +57,7 @@ def make_batch_from_graph(
         a_ptr=torch.tensor([0, int(a_local_indices.numel())], dtype=torch.long),
         answer_entity_ids=answer_entity_ids,
         answer_ptr=torch.tensor([0, int(answer_entity_ids.numel())], dtype=torch.long),
-        node_global_ids=node_global_ids,
+        node_entity_ids=node_entity_ids,
         sample_ids=[sample_id],
         questions=["toy question"],
         dataset_scope="sub",
@@ -73,7 +73,7 @@ def make_toy_batch() -> TrajectoryBatch:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
     )
 
 
@@ -86,7 +86,7 @@ def make_dead_end_batch() -> TrajectoryBatch:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100], dtype=torch.long),
+        node_entity_ids=torch.tensor([100], dtype=torch.long),
         sample_id="dead-end",
     )
 

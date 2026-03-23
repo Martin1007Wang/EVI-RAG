@@ -1,0 +1,8 @@
+- eval-only src/train.py:163 配合 configs/model/gflownet.yaml:14：训练时会自动把 validation 的 metrics_profile 对齐成 contract 里的 rank_only，哪怕基础 eval config 不是这个值；这是个隐藏的“验证降配”。
+- eval-only configs/experiment/train_rankflow.yaml:79、configs/experiment/train_answer_reachability.yaml:76、configs/experiment/train_rankflow_fastiter.yaml:72：训练实验都把验证设成 rank_only，而不是 full support-window。
+- search-runtime src/metrics/search_backends.py:326 和 src/metrics/search_backends.py:416：flow-frontier search 会用 flow_prune_epsilon 剪掉低 mass 状态；默认开着，配置在 configs/model/gflownet.yaml:95。
+- search-runtime src/metrics/search_backends.py:479 和 src/metrics/search_backends.py:487：flow-frontier search 有 max_frontier_size / max_expansions 两层硬 budget，超了就提前停；默认配置在 configs/model/gflownet.yaml:103 和 configs/model/gflownet.yaml:104。
+- eval-only src/metrics/search_backends.py:668：metrics_profile == "rank_only" 时直接走 build_rank_only_result(...)，跳过 full support-window 构造。
+- eval-only configs/experiment/train_rankflow_fastiter.yaml:8、configs/experiment/train_rankflow_fastiter.yaml:32、configs/experiment/train_rankflow_fastiter.yaml:73：fastiter 明确就是“便宜验证”模式，关闭 post-fit test，缩小验证预算，只看粗趋势。
+- eval-only src/metrics/answer_metrics.py:979：batch eval 一旦遇到 StartDistributionError，会退化成逐图评估并把坏图记成 invalid-start，而不是直接炸掉整个 batch。
+- dead knob src/models/configs/gflownet.py:39：strict_search 这个开关我只在 config/YAML 里找到了，src 代码里没有实际消费它；这更像一个未接线的遗留参数，不是 trick，但很容易误导人。

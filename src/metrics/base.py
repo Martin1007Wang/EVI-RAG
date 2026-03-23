@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.gflownet import TrajectorySamplerProtocol
 
 from .prediction_io import (

@@ -17,7 +17,7 @@ def test_start_distribution_keeps_dead_end_question_entities_in_support() -> Non
         q_local_indices=torch.tensor([0, 1], dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="mixed-start-support",
     )
     policy = make_policy()
@@ -38,7 +38,7 @@ def test_start_distribution_rejects_all_nonfinite_start_logits() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id="nonfinite-start-logits",
     )
     policy = make_policy()

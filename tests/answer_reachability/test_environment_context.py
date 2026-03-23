@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import src.graph.topology as graph_topology_module
 import torch
 
-from src.graph_runtime import GroupedLocalNodeIndex, build_graph_batch
+from src.graph import GroupedLocalNodeIndex, TrajectoryBatch, build_graph_batch
 
 from .conftest import make_toy_batch
 
@@ -25,7 +27,7 @@ def _make_two_graph_protocol_batch() -> SimpleNamespace:
         question_ctx_mask=torch.tensor([[True, True], [True, False]], dtype=torch.bool),
         q_local_indices=torch.tensor([0, 2, 1], dtype=torch.long),
         q_ptr=torch.tensor([0, 2, 3], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 200, 201], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 200, 201], dtype=torch.long),
         sample_ids=["graph-0", "graph-1"],
     )
 
@@ -97,7 +99,7 @@ def test_build_graph_batch_uses_relation_table_without_per_edge_embeddings() -> 
         question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
         q_local_indices=torch.tensor([0], dtype=torch.long),
         q_ptr=torch.tensor([0, 1], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_ids=["graph-0"],
     )
 
@@ -168,3 +170,59 @@ def test_topology_build_node_membership_mask_debug_checks_are_opt_in() -> None:
             field_name="q_local_indices",
             debug_checks=True,
         )
+
+
+def test_topology_build_node_membership_mask_rejects_negative_local_indices() -> None:
+    topology, _ = build_graph_batch(_make_two_graph_protocol_batch())
+    local_node_index = GroupedLocalNodeIndex(
+        local_indices=torch.tensor([0, -1], dtype=torch.long),
+        _group_ptr=torch.tensor([0, 1, 2], dtype=torch.long),
+    )
+
+    with pytest.raises(ValueError, match="out of range"):
+        topology.build_node_membership_mask(
+            local_node_index,
+            field_name="q_local_indices",
+        )
+
+
+def test_topology_gather_outgoing_edges_only_queries_active_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology, _ = build_graph_batch(_make_two_graph_protocol_batch())
+    captured: dict[str, torch.Tensor] = {}
+    original = graph_topology_module._gather_actions_from_csr
+
+    def _record_nodes(*, adjacency, nodes):
+        captured["nodes"] = nodes.clone()
+        return original(adjacency=adjacency, nodes=nodes)
+
+    monkeypatch.setattr(
+        graph_topology_module, "_gather_actions_from_csr", _record_nodes
+    )
+
+    edge_ids, target_nodes, edge_agent_index, out_degrees = (
+        topology.gather_outgoing_edges(
+            current_nodes=torch.tensor([0, 3], dtype=torch.long),
+            active_mask=torch.tensor([False, True], dtype=torch.bool),
+        )
+    )
+
+    assert torch.equal(captured["nodes"], torch.tensor([3], dtype=torch.long))
+    assert torch.equal(edge_ids, torch.tensor([2], dtype=torch.long))
+    assert torch.equal(target_nodes, torch.tensor([4], dtype=torch.long))
+    assert torch.equal(edge_agent_index, torch.tensor([1], dtype=torch.long))
+    assert torch.equal(out_degrees, torch.tensor([0, 1], dtype=torch.long))
+
+
+def test_trajectory_batch_validate_rejects_edge_batch_mismatch() -> None:
+    batch_one = make_toy_batch()
+    batch_two = make_toy_batch()
+    batch = TrajectoryBatch.concatenate([batch_one, batch_two], validate=False)
+    invalid_batch = replace(
+        batch,
+        edge_batch=torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.long),
+    )
+
+    with pytest.raises(ValueError, match="edge_batch mismatch"):
+        invalid_batch.validate()

@@ -5,7 +5,7 @@ from typing import cast
 
 import torch
 
-from .repetition import build_full_no_repeat_mask
+from .repetition import build_entity_revisit_mask
 from .types import (
     ForwardActionDistribution,
     PreparedSearchBatch,
@@ -51,14 +51,14 @@ def apply_forward_constraints(
         edge_logits = edge_logits.masked_fill(
             edge_at_horizon & (~stop_action_mask), neg_inf
         )
-        repeat_entity_mask = build_full_no_repeat_mask(
+        entity_revisit_mask = build_entity_revisit_mask(
             state=state,
-            candidate_target_nodes=distribution.target_nodes,
-            candidate_edge_agent_batch=edge_agent_batch,
+            candidate_target_abs_nodes=distribution.target_nodes,
+            candidate_agent_indices=edge_agent_batch,
             max_steps=max_steps,
         )
         edge_logits = edge_logits.masked_fill(
-            repeat_entity_mask & (~stop_action_mask),
+            entity_revisit_mask & (~stop_action_mask),
             neg_inf,
         )
     return ForwardActionDistribution(
@@ -74,7 +74,6 @@ def apply_forward_constraints(
         unique_active_state_count=distribution.unique_active_state_count,
         raw_graph_candidate_count=distribution.raw_graph_candidate_count,
         scored_graph_candidate_count=distribution.scored_graph_candidate_count,
-        shortlist_active_state_count=distribution.shortlist_active_state_count,
     )
 
 
@@ -84,53 +83,24 @@ def compute_constrained_policy_step(
     prepared_batch: PreparedSearchBatch,
     state: SearchState,
     max_steps: int,
-    disable_candidate_shortlist: bool = False,
     required_edge_ids: torch.Tensor | None = None,
 ) -> ConstrainedPolicyStep:
-    distribution: ForwardActionDistribution
-    if disable_candidate_shortlist:
-        no_shortlist_fn = getattr(
-            policy, "compute_forward_distribution_without_shortlist", None
+    try:
+        distribution = cast(
+            ForwardActionDistribution,
+            policy.compute_forward_distribution(
+                prepared_batch,
+                state,
+                required_edge_ids=required_edge_ids,
+            ),
         )
-        if callable(no_shortlist_fn):
-            distribution = cast(
-                ForwardActionDistribution,
-                no_shortlist_fn(prepared_batch, state),
-            )
-        else:
-            try:
-                distribution = cast(
-                    ForwardActionDistribution,
-                    policy.compute_forward_distribution(
-                        prepared_batch,
-                        state,
-                        required_edge_ids=required_edge_ids,
-                    ),
-                )
-            except TypeError as error:
-                if "unexpected keyword argument" not in str(error):
-                    raise
-                distribution = cast(
-                    ForwardActionDistribution,
-                    policy.compute_forward_distribution(prepared_batch, state),
-                )
-    else:
-        try:
-            distribution = cast(
-                ForwardActionDistribution,
-                policy.compute_forward_distribution(
-                    prepared_batch,
-                    state,
-                    required_edge_ids=required_edge_ids,
-                ),
-            )
-        except TypeError as error:
-            if "unexpected keyword argument" not in str(error):
-                raise
-            distribution = cast(
-                ForwardActionDistribution,
-                policy.compute_forward_distribution(prepared_batch, state),
-            )
+    except TypeError as error:
+        if "unexpected keyword argument" not in str(error):
+            raise
+        distribution = cast(
+            ForwardActionDistribution,
+            policy.compute_forward_distribution(prepared_batch, state),
+        )
     distribution = cast(ForwardActionDistribution, distribution)
     distribution = apply_forward_constraints(
         distribution,

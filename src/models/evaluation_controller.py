@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Callable, cast
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.metrics.prediction_io import (
     PredictionCodecProtocol,
     append_jsonl_records,

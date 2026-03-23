@@ -5,7 +5,7 @@ import torch
 from src.models.components import EmbeddingBackbone
 from src.models.components.embedding import BackboneInput
 from src.models.configs import BackboneConfig
-from src.graph_runtime import build_graph_batch
+from src.graph import build_graph_batch
 
 from .conftest import make_toy_batch
 

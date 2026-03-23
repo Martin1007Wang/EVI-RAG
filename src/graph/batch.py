@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import torch
@@ -186,6 +187,43 @@ def compute_edge_batch_and_ptr(
     return edge_batch, edge_ptr
 
 
+def _build_edge_ptr_from_edge_batch(
+    edge_batch: torch.Tensor,
+    *,
+    num_graphs: int,
+    device: torch.device,
+    validate: bool,
+) -> torch.Tensor:
+    if edge_batch.dtype != torch.long or edge_batch.dim() != 1:
+        raise ValueError(
+            f"edge_batch must be 1D torch.long, got {edge_batch.dtype} {tuple(edge_batch.shape)}."
+        )
+    if int(edge_batch.numel()) == 0:
+        return torch.zeros((num_graphs + 1,), dtype=torch.long, device=device)
+    if validate:
+        min_idx = int(edge_batch.min().item())
+        max_idx = int(edge_batch.max().item())
+        if min_idx < 0 or max_idx >= num_graphs:
+            raise ValueError(
+                "edge_batch contains out-of-range indices; "
+                f"min={min_idx} max={max_idx} num_graphs={num_graphs}."
+            )
+        if edge_batch.numel() > 1 and not bool(
+            (edge_batch[:-1] <= edge_batch[1:]).all().item()
+        ):
+            raise ValueError(
+                "edge_batch is not non-decreasing along the flattened edge list, "
+                "which breaks per-graph slicing; ensure edges are concatenated per-graph."
+            )
+    edge_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
+    edge_counts.scatter_add_(
+        0, edge_batch, torch.ones_like(edge_batch, dtype=torch.long)
+    )
+    edge_ptr = torch.zeros((num_graphs + 1,), dtype=torch.long, device=device)
+    edge_ptr[1:] = edge_counts.cumsum(0)
+    return edge_ptr
+
+
 def _coerce_str_list(value: Any, *, expected_size: int, name: str) -> list[str]:
     if value is None:
         return ["" for _ in range(expected_size)]
@@ -226,7 +264,7 @@ class TrajectoryBatch:
     a_ptr: torch.Tensor
     answer_entity_ids: torch.Tensor
     answer_ptr: torch.Tensor
-    node_global_ids: torch.Tensor
+    node_entity_ids: torch.Tensor
     sample_ids: list[str]
     questions: list[str]
     dataset_scope: str
@@ -237,6 +275,15 @@ class TrajectoryBatch:
     @property
     def num_nodes_total(self) -> int:
         return int(self.node_ptr[-1].item()) if int(self.node_ptr.numel()) > 0 else 0
+
+    @cached_property
+    def edge_ptr(self) -> torch.Tensor:
+        return _build_edge_ptr_from_edge_batch(
+            self.edge_batch,
+            num_graphs=self.num_graphs,
+            device=self.edge_batch.device,
+            validate=True,
+        )
 
     @property
     def dummy_mask(self) -> torch.Tensor:
@@ -282,7 +329,7 @@ class TrajectoryBatch:
             a_ptr=self.a_ptr,
             answer_entity_ids=self.answer_entity_ids,
             answer_ptr=self.answer_ptr,
-            node_global_ids=self.node_global_ids,
+            node_entity_ids=self.node_entity_ids,
             sample_ids=list(self.sample_ids),
             questions=list(self.questions),
             dataset_scope=self.dataset_scope,
@@ -304,12 +351,24 @@ class TrajectoryBatch:
             raise ValueError("answer_ptr must have length num_graphs + 1.")
         if int(self.node_batch.numel()) != self.num_nodes_total:
             raise ValueError("node_batch length mismatch with node_ptr.")
-        if int(self.node_global_ids.numel()) != self.num_nodes_total:
-            raise ValueError("node_global_ids length mismatch with node_ptr.")
+        if int(self.node_entity_ids.numel()) != self.num_nodes_total:
+            raise ValueError("node_entity_ids length mismatch with node_ptr.")
         if int(self.edge_index.size(1)) != int(self.edge_rel_global.numel()):
             raise ValueError("edge_index/edge_rel_global mismatch.")
         if int(self.edge_index.size(1)) != int(self.edge_batch.numel()):
             raise ValueError("edge_index/edge_batch mismatch.")
+        actual_edge_ptr = self.edge_ptr
+        computed_edge_batch, computed_edge_ptr = compute_edge_batch_and_ptr(
+            self.edge_index,
+            node_ptr=self.node_ptr,
+            num_graphs=self.num_graphs,
+            device=self.edge_index.device,
+            validate=True,
+        )
+        if not torch.equal(self.edge_batch, computed_edge_batch):
+            raise ValueError("edge_batch mismatch with edge_index/node_ptr.")
+        if not torch.equal(actual_edge_ptr, computed_edge_ptr):
+            raise ValueError("edge_ptr mismatch with edge_batch.")
         if int(self.q_local_indices.numel()) != int(
             (self.q_ptr[1:] - self.q_ptr[:-1]).sum().item()
         ):
@@ -474,7 +533,7 @@ class TrajectoryBatch:
             a_ptr=self.a_ptr.to(device=target_device),
             answer_entity_ids=self.answer_entity_ids.to(device=target_device),
             answer_ptr=self.answer_ptr.to(device=target_device),
-            node_global_ids=self.node_global_ids.to(device=target_device),
+            node_entity_ids=self.node_entity_ids.to(device=target_device),
             sample_ids=list(self.sample_ids),
             questions=list(self.questions),
             dataset_scope=self.dataset_scope,
@@ -583,9 +642,9 @@ class TrajectoryBatch:
         answer_ptr = _require_1d_long(
             getattr(batch, "answer_ptr", None), name="answer_ptr", device=device
         )
-        node_global_ids = _require_1d_long(
-            getattr(batch, "node_global_ids", None),
-            name="node_global_ids",
+        node_entity_ids = _require_1d_long(
+            getattr(batch, "node_entity_ids", None),
+            name="node_entity_ids",
             device=device,
         )
         heuristic_log_v = getattr(batch, "heuristic_log_v", None)
@@ -611,7 +670,7 @@ class TrajectoryBatch:
             a_ptr=a_ptr,
             answer_entity_ids=answer_entity_ids,
             answer_ptr=answer_ptr,
-            node_global_ids=node_global_ids,
+            node_entity_ids=node_entity_ids,
             sample_ids=_coerce_str_list(
                 getattr(batch, "sample_id", None),
                 expected_size=num_graphs,
@@ -671,7 +730,7 @@ class TrajectoryBatch:
         q_local_parts: list[torch.Tensor] = []
         a_local_parts: list[torch.Tensor] = []
         answer_entity_parts: list[torch.Tensor] = []
-        node_global_parts: list[torch.Tensor] = []
+        node_entity_parts: list[torch.Tensor] = []
         heuristic_parts: list[torch.Tensor] = []
         sample_ids: list[str] = []
         questions: list[str] = []
@@ -754,7 +813,7 @@ class TrajectoryBatch:
             q_local_parts.append(batch.q_local_indices)
             a_local_parts.append(batch.a_local_indices)
             answer_entity_parts.append(batch.answer_entity_ids)
-            node_global_parts.append(batch.node_global_ids)
+            node_entity_parts.append(batch.node_entity_ids)
             if has_heuristic and batch.heuristic_log_v is not None:
                 heuristic_parts.append(batch.heuristic_log_v)
 
@@ -816,7 +875,7 @@ class TrajectoryBatch:
             a_ptr=torch.tensor(a_ptr_values, device=device, dtype=torch.long),
             answer_entity_ids=torch.cat(answer_entity_parts, dim=0),
             answer_ptr=torch.tensor(answer_ptr_values, device=device, dtype=torch.long),
-            node_global_ids=torch.cat(node_global_parts, dim=0),
+            node_entity_ids=torch.cat(node_entity_parts, dim=0),
             sample_ids=sample_ids,
             questions=questions,
             dataset_scope=dataset_scope,
@@ -835,16 +894,17 @@ class TrajectoryBatch:
             raise IndexError(f"graph_idx out of range: {graph_idx}.")
         node_start = int(self.node_ptr[graph_idx].item())
         node_end = int(self.node_ptr[graph_idx + 1].item())
-        edge_mask = self.edge_batch == graph_idx
-        edge_index = self.edge_index[:, edge_mask] - node_start
-        edge_rel_global = self.edge_rel_global[edge_mask]
+        edge_start = int(self.edge_ptr[graph_idx].item())
+        edge_end = int(self.edge_ptr[graph_idx + 1].item())
+        edge_index = self.edge_index[:, edge_start:edge_end] - node_start
+        edge_rel_global = self.edge_rel_global[edge_start:edge_end]
         edge_embeddings = None
         if self.edge_embeddings is not None:
-            edge_embeddings = self.edge_embeddings[edge_mask]
+            edge_embeddings = self.edge_embeddings[edge_start:edge_end]
         relation_embeddings = None
         edge_rel_local = None
         if self.relation_embeddings is not None and self.edge_rel_local is not None:
-            relation_edge_rel_local = self.edge_rel_local[edge_mask]
+            relation_edge_rel_local = self.edge_rel_local[edge_start:edge_end]
             _, relation_embeddings, edge_rel_local = _compact_relation_table(
                 edge_rel_global=edge_rel_global,
                 relation_embeddings=self.relation_embeddings,
@@ -904,7 +964,7 @@ class TrajectoryBatch:
                 device=self.answer_ptr.device,
                 dtype=torch.long,
             ),
-            node_global_ids=self.node_global_ids[node_start:node_end],
+            node_entity_ids=self.node_entity_ids[node_start:node_end],
             sample_ids=[self.sample_ids[graph_idx]],
             questions=[self.questions[graph_idx]],
             dataset_scope=self.dataset_scope,

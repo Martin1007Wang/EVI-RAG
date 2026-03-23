@@ -58,14 +58,16 @@ TrainModelFn = Callable[[DictConfig], Tuple[Dict[str, Any], Dict[str, Any]]]
 
 
 class TrainRunnerProtocol(Protocol):
-    def validate(self, cfg: DictConfig) -> None: ...
+    def validate(self, cfg: DictConfig) -> None:
+        ...
 
     def run(
         self,
         *,
         cfg: DictConfig,
         train_model: TrainModelFn,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]: ...
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        ...
 
 
 def _maybe_load_model_weights(model: LightningModule, cfg: DictConfig) -> None:

@@ -23,7 +23,7 @@ from .graph_retrieval_dataset import (
     create_graph_retrieval_dataset,
 )
 from src.data.io.lmdb_utils import resolve_core_lmdb_paths
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"

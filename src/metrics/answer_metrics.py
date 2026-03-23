@@ -9,7 +9,7 @@ from typing import Any, Callable, Iterable, Protocol, Sequence
 import torch
 from torchmetrics import MeanMetric, SumMetric
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
 from src.models.gflownet import (
     PreparedSearchBatch,
@@ -459,7 +459,7 @@ def graph_gold_answers(*, batch: TrajectoryBatch) -> set[int]:
 
 def graph_start_entity_ids(*, batch: TrajectoryBatch) -> list[int]:
     return [
-        int(batch.node_global_ids[node_idx].item())
+        int(batch.node_entity_ids[node_idx].item())
         for node_idx in batch.q_local_indices.tolist()
     ]
 
@@ -474,9 +474,9 @@ def build_edge_records(
         records.append(
             EdgeRecord(
                 edge_id=int(edge_id),
-                src_entity_id=int(batch.node_global_ids[src].item()),
+                src_entity_id=int(batch.node_entity_ids[src].item()),
                 relation_id=int(batch.edge_rel_global[edge_id].item()),
-                dst_entity_id=int(batch.node_global_ids[dst].item()),
+                dst_entity_id=int(batch.node_entity_ids[dst].item()),
             )
         )
     return records
@@ -584,7 +584,7 @@ def _build_support_outputs(
                     terminal_entity_id=int(path.answer_entity_id),
                     is_gold=bool(path.is_gold),
                     edges=build_edge_records(batch=batch, edge_ids=path.edge_ids),
-                    start_entity_id=int(batch.node_global_ids[path.start_node].item()),
+                    start_entity_id=int(batch.node_entity_ids[path.start_node].item()),
                     answer_rank=int(answer_rank.get(answer_id, 0)),
                     support_rank=int(support_rank),
                     conditional_prob=(

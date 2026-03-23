@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from src.graph_runtime import SearchObservation, TrajectoryBatch, build_graph_batch
+from src.graph import SearchObservation, TrajectoryBatch, build_graph_batch
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
@@ -17,10 +17,9 @@ from src.utils.nn_init import init_linear_xavier
 from src.utils.segment_ops import sample_segmented_one_1d, segment_logsumexp_1d
 
 from .heuristics import SearchHeuristic
-from .repetition import build_full_no_repeat_mask_from_flat_state
+from .repetition import build_entity_revisit_mask_from_flat_state
 from .types import (
     ForwardActionDistribution,
-    HeuristicCache,
     PreparedGFlowNetBatch,
     PreparedSearchBatch,
     RootState,
@@ -120,6 +119,30 @@ def build_root_action_distribution(
     )
 
 
+def _temper_segmented_log_probs(
+    *,
+    log_probs: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+    temperature: float,
+) -> torch.Tensor:
+    if temperature <= 0.0:
+        raise ValueError(f"sampling temperature must be > 0, got {temperature!r}.")
+    tempered = _mask_nonfinite_scores(log_probs.to(dtype=torch.float32))
+    if int(tempered.numel()) == 0 or float(temperature) == 1.0:
+        return tempered
+    tempered = tempered / float(temperature)
+    lse, _ = segment_logsumexp_1d(
+        values=tempered,
+        segment_ids=segment_ids,
+        num_segments=num_segments,
+        dtype=torch.float32,
+        ignore_non_finite=True,
+        empty_value=float("-inf"),
+    )
+    return tempered - lse.index_select(0, segment_ids)
+
+
 class BaseSearchPolicy(nn.Module):
     def __init__(
         self,
@@ -179,9 +202,10 @@ class BaseSearchPolicy(nn.Module):
         self.state_feature_mlp = nn.Sequential(*state_layers)
         self.state_feature_norm = nn.LayerNorm(graph_hidden_dim)
         self.start_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
-        self.stop_action_relation_feature = nn.Parameter(torch.zeros(graph_hidden_dim))
+        self.register_buffer(
+            "stop_action_relation_feature", torch.zeros(graph_hidden_dim)
+        )
         self.backbone = backbone
-        self.candidate_shortlist_cfg = config.candidate_shortlist
         init_linear_xavier(self.root_flow_hidden)
         nn.init.normal_(self.root_flow_head.weight, mean=0.0, std=1.0e-2)
         if self.root_flow_head.bias is not None:
@@ -855,202 +879,6 @@ class BaseSearchPolicy(nn.Module):
         return distribution.is_stop_action.to(dtype=torch.bool)
 
     @staticmethod
-    def _lookup_shortlist_heuristic_scores(
-        *,
-        heuristic_cache: HeuristicCache | None,
-        node_ids: torch.Tensor,
-        num_steps: torch.Tensor,
-    ) -> torch.Tensor:
-        if heuristic_cache is None:
-            return torch.zeros_like(node_ids, dtype=torch.float32)
-        if heuristic_cache.step_node_log_heuristic is not None:
-            safe_steps = num_steps.to(dtype=torch.long).clamp(
-                min=0,
-                max=max(int(heuristic_cache.step_node_log_heuristic.size(0)) - 1, 0),
-            )
-            return heuristic_cache.step_node_log_heuristic[safe_steps, node_ids]
-        if heuristic_cache.node_log_heuristic is not None:
-            return heuristic_cache.node_log_heuristic.index_select(0, node_ids)
-        return torch.zeros_like(node_ids, dtype=torch.float32)
-
-    @staticmethod
-    def _select_segment_topk_positions(
-        *,
-        values: torch.Tensor,
-        segment_ids: torch.Tensor,
-        k: int,
-    ) -> torch.Tensor:
-        if int(values.numel()) == 0:
-            return torch.empty((0,), device=values.device, dtype=torch.long)
-        order = torch.argsort(segment_ids, stable=True)
-        sorted_segment_ids = segment_ids.index_select(0, order)
-        sorted_values = values.index_select(0, order)
-        unique_segment_ids, group_counts = torch.unique_consecutive(
-            sorted_segment_ids,
-            return_counts=True,
-        )
-        del unique_segment_ids
-        selected_positions: list[torch.Tensor] = []
-        offset = 0
-        for group_count in group_counts.tolist():
-            group_size = int(group_count)
-            group_order = torch.argsort(
-                sorted_values[offset : offset + group_size],
-                descending=True,
-                stable=True,
-            )
-            keep = min(int(k), group_size)
-            selected_positions.append(
-                order[offset : offset + group_size].index_select(0, group_order[:keep])
-            )
-            offset += group_size
-        return torch.cat(selected_positions, dim=0)
-
-    @staticmethod
-    def _normalize_required_edge_ids(
-        *,
-        required_edge_ids: torch.Tensor | None,
-        num_agents: int,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if required_edge_ids is None:
-            return None
-        normalized = required_edge_ids.to(device=device, dtype=torch.long)
-        if normalized.dim() != 1 or int(normalized.numel()) != num_agents:
-            raise ValueError(
-                "required_edge_ids must be a flat torch.long tensor aligned with the active agents. "
-                f"required_edge_ids={tuple(normalized.shape)} num_agents={num_agents}."
-            )
-        return normalized
-
-    @staticmethod
-    def _resolve_required_shortlist_pairs(
-        *,
-        required_edge_ids: torch.Tensor | None,
-        active_agents: torch.Tensor,
-        active_to_unique: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if required_edge_ids is None or int(active_agents.numel()) == 0:
-            return None
-        active_required_edge_ids = required_edge_ids.index_select(0, active_agents)
-        valid_required_mask = active_required_edge_ids >= 0
-        if not bool(valid_required_mask.any().item()):
-            return None
-        return torch.unique(
-            torch.stack(
-                (
-                    active_to_unique[valid_required_mask],
-                    active_required_edge_ids[valid_required_mask],
-                ),
-                dim=1,
-            ),
-            dim=0,
-        )
-
-    @staticmethod
-    def _build_required_shortlist_keep_mask(
-        *,
-        edge_ids: torch.Tensor,
-        edge_agent_batch: torch.Tensor,
-        required_edge_pairs: torch.Tensor | None,
-    ) -> torch.Tensor:
-        keep_mask = torch.zeros_like(edge_ids, dtype=torch.bool)
-        if required_edge_pairs is None or int(required_edge_pairs.numel()) == 0:
-            return keep_mask
-        if int(edge_ids.numel()) == 0:
-            invalid_pairs = required_edge_pairs.to(dtype=torch.long)
-            raise ValueError(
-                "required replay edge is not a valid forward candidate under the current state. "
-                f"agent_idx={invalid_pairs[:, 0].tolist()} edge_id={invalid_pairs[:, 1].tolist()}."
-            )
-        required_pairs = required_edge_pairs.to(
-            device=edge_ids.device, dtype=torch.long
-        )
-        lookup_base = (
-            torch.maximum(
-                edge_ids.to(dtype=torch.long).max(),
-                required_pairs[:, 1].to(dtype=torch.long).max(),
-            )
-            + 2
-        )
-        candidate_keys = (edge_agent_batch.to(dtype=torch.long) * lookup_base) + (
-            edge_ids.to(dtype=torch.long) + 1
-        )
-        required_keys = torch.unique(
-            (required_pairs[:, 0] * lookup_base) + (required_pairs[:, 1] + 1),
-            sorted=True,
-        )
-        match_idx = torch.searchsorted(required_keys, candidate_keys)
-        in_range = match_idx < int(required_keys.numel())
-        keep_mask[in_range] = (
-            required_keys.index_select(0, match_idx[in_range])
-            == candidate_keys[in_range]
-        )
-        matched_required = torch.zeros_like(required_keys, dtype=torch.bool)
-        if bool(keep_mask.any().item()):
-            matched_keys = torch.unique(candidate_keys[keep_mask], sorted=True)
-            matched_idx = torch.searchsorted(required_keys, matched_keys)
-            matched_required[matched_idx] = (
-                required_keys.index_select(0, matched_idx) == matched_keys
-            )
-        if not bool(matched_required.all().item()):
-            invalid_pairs = required_pairs[~matched_required]
-            raise ValueError(
-                "required replay edge is not a valid forward candidate under the current state. "
-                f"agent_idx={invalid_pairs[:, 0].tolist()} edge_id={invalid_pairs[:, 1].tolist()}."
-            )
-        return keep_mask
-
-    def _compute_shortlist_scores(
-        self,
-        *,
-        prepared_batch: PreparedSearchBatch,
-        flat_state_features: torch.Tensor,
-        edge_agent_batch: torch.Tensor,
-        target_nodes: torch.Tensor,
-        child_num_steps: torch.Tensor,
-        graph_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        total_edges = int(target_nodes.numel())
-        if total_edges == 0:
-            return torch.empty((0,), device=target_nodes.device, dtype=torch.float32)
-        chunk_size = total_edges
-        if target_nodes.device.type == "cuda":
-            chunk_size = min(total_edges, _FORWARD_EDGE_CHUNK_SIZE)
-        heuristic_cache = getattr(prepared_batch, "heuristic_cache", None)
-        shortlist_scores: list[torch.Tensor] = []
-        scale = 1.0 / math.sqrt(max(int(flat_state_features.size(-1)), 1))
-        for start in range(0, total_edges, max(chunk_size, 1)):
-            end = min(start + max(chunk_size, 1), total_edges)
-            chunk_target_nodes = target_nodes[start:end]
-            chunk_child_num_steps = child_num_steps[start:end]
-            chunk_agent_batch = edge_agent_batch[start:end]
-            chunk_graph_ids = graph_ids[start:end]
-            chunk_candidate_features = prepared_batch.node_tokens.index_select(
-                0, chunk_target_nodes
-            )
-            chunk_question_features = prepared_batch.question_tokens.index_select(
-                0, chunk_graph_ids
-            )
-            chunk_current_state_features = flat_state_features.index_select(
-                0, chunk_agent_batch
-            )
-            chunk_scores = scale * (
-                (chunk_candidate_features * chunk_question_features).sum(dim=-1)
-                + (chunk_candidate_features * chunk_current_state_features).sum(dim=-1)
-            )
-            if float(self.candidate_shortlist_cfg.heuristic_weight) > 0.0:
-                chunk_scores = chunk_scores.to(dtype=torch.float32) + float(
-                    self.candidate_shortlist_cfg.heuristic_weight
-                ) * self._lookup_shortlist_heuristic_scores(
-                    heuristic_cache=heuristic_cache,
-                    node_ids=chunk_target_nodes,
-                    num_steps=chunk_child_num_steps,
-                )
-            shortlist_scores.append(chunk_scores.to(dtype=torch.float32))
-        return torch.cat(shortlist_scores, dim=0)
-
-    @staticmethod
     def _filter_edge_candidate_tensors(
         *,
         edge_ids: torch.Tensor,
@@ -1092,83 +920,6 @@ class BaseSearchPolicy(nn.Module):
             filtered_edge_agent_batch,
             filtered_child_num_steps,
             filtered_out_degrees.view_as(out_degrees),
-        )
-
-    def _maybe_shortlist_forward_candidates(
-        self,
-        *,
-        prepared_batch: PreparedSearchBatch,
-        flat_state_features: torch.Tensor,
-        edge_ids: torch.Tensor,
-        target_nodes: torch.Tensor,
-        edge_agent_batch: torch.Tensor,
-        child_num_steps: torch.Tensor,
-        out_degrees: torch.Tensor,
-        graph_ids: torch.Tensor,
-        required_edge_pairs: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        cfg = self.candidate_shortlist_cfg
-        total_edges = int(edge_ids.numel())
-        if not cfg.enabled or total_edges == 0:
-            return (
-                edge_ids,
-                target_nodes,
-                edge_agent_batch,
-                child_num_steps,
-                out_degrees,
-            )
-        num_agents = int(flat_state_features.size(0))
-        candidate_counts = torch.zeros(
-            (num_agents,), device=edge_agent_batch.device, dtype=torch.long
-        )
-        candidate_counts.scatter_add_(
-            0,
-            edge_agent_batch,
-            torch.ones_like(edge_agent_batch, dtype=torch.long),
-        )
-        shortlist_agent_mask = candidate_counts > int(cfg.degree_threshold)
-        if not bool(shortlist_agent_mask.any().item()):
-            return (
-                edge_ids,
-                target_nodes,
-                edge_agent_batch,
-                child_num_steps,
-                out_degrees,
-            )
-        shortlist_edge_mask = shortlist_agent_mask.index_select(0, edge_agent_batch)
-        shortlist_subset_positions = torch.nonzero(
-            shortlist_edge_mask,
-            as_tuple=False,
-        ).view(-1)
-        shortlist_scores = self._compute_shortlist_scores(
-            prepared_batch=prepared_batch,
-            flat_state_features=flat_state_features,
-            edge_agent_batch=edge_agent_batch,
-            target_nodes=target_nodes,
-            child_num_steps=child_num_steps,
-            graph_ids=graph_ids,
-        )
-        shortlisted_local_positions = self._select_segment_topk_positions(
-            values=shortlist_scores.index_select(0, shortlist_subset_positions),
-            segment_ids=edge_agent_batch.index_select(0, shortlist_subset_positions),
-            k=int(cfg.topk),
-        )
-        keep_mask = (~shortlist_edge_mask) | self._build_required_shortlist_keep_mask(
-            edge_ids=edge_ids,
-            edge_agent_batch=edge_agent_batch,
-            required_edge_pairs=required_edge_pairs,
-        )
-        if int(shortlisted_local_positions.numel()) > 0:
-            keep_mask[
-                shortlist_subset_positions.index_select(0, shortlisted_local_positions)
-            ] = True
-        return self._filter_edge_candidate_tensors(
-            edge_ids=edge_ids,
-            target_nodes=target_nodes,
-            edge_agent_batch=edge_agent_batch,
-            child_num_steps=child_num_steps,
-            out_degrees=out_degrees,
-            keep_mask=keep_mask,
         )
 
     def _compute_forward_edge_logits(
@@ -1537,9 +1288,9 @@ class BaseSearchPolicy(nn.Module):
         prepared_batch: PreparedSearchBatch,
         state: SearchState,
         *,
-        allow_candidate_shortlist: bool,
         required_edge_ids: torch.Tensor | None = None,
     ) -> ForwardActionDistribution:
+        _ = required_edge_ids
         total_agents = int(state.current_nodes.numel())
         flat_current_nodes = state.flatten_current_nodes()
         flat_done_mask = state.flatten_done_mask()
@@ -1587,22 +1338,6 @@ class BaseSearchPolicy(nn.Module):
                 active_agents,
                 unique_state_features.index_select(0, active_to_unique),
             )
-        normalized_required_edge_ids = self._normalize_required_edge_ids(
-            required_edge_ids=required_edge_ids,
-            num_agents=total_agents,
-            device=state.current_nodes.device,
-        )
-        if normalized_required_edge_ids is not None:
-            normalized_required_edge_ids = torch.where(
-                flat_done_mask,
-                torch.full_like(normalized_required_edge_ids, fill_value=-1),
-                normalized_required_edge_ids,
-            )
-        required_edge_pairs = self._resolve_required_shortlist_pairs(
-            required_edge_ids=normalized_required_edge_ids,
-            active_agents=active_agents,
-            active_to_unique=active_to_unique,
-        )
         unique_forward_active_mask = unique_num_steps < self.max_steps
         (
             unique_edge_ids,
@@ -1617,14 +1352,14 @@ class BaseSearchPolicy(nn.Module):
             unique_child_num_steps = (
                 unique_num_steps.index_select(0, unique_edge_agent_batch) + 1
             )
-            no_repeat_keep_mask = ~build_full_no_repeat_mask_from_flat_state(
-                flat_current_nodes=unique_current_nodes,
+            legal_fresh_entity_mask = ~build_entity_revisit_mask_from_flat_state(
+                flat_current_abs_nodes=unique_current_nodes,
                 flat_num_steps=unique_num_steps,
                 flat_path_token_ids=unique_path_token_ids,
-                node_ids=getattr(state.observation, "node_ids", None),
+                node_entity_ids_by_abs_node=state.observation.node_entity_ids,
                 num_nodes=int(state.topology.num_nodes),
-                candidate_target_nodes=unique_target_nodes,
-                candidate_edge_agent_batch=unique_edge_agent_batch,
+                candidate_target_abs_nodes=unique_target_nodes,
+                candidate_agent_indices=unique_edge_agent_batch,
             )
             (
                 unique_edge_ids,
@@ -1638,47 +1373,11 @@ class BaseSearchPolicy(nn.Module):
                 edge_agent_batch=unique_edge_agent_batch,
                 child_num_steps=unique_child_num_steps,
                 out_degrees=unique_out_degrees,
-                keep_mask=no_repeat_keep_mask,
+                keep_mask=legal_fresh_entity_mask,
             )
         else:
             unique_child_num_steps = unique_num_steps.new_empty((0,))
         raw_graph_candidate_count = int(unique_edge_ids.numel())
-        shortlist_active_state_count = 0
-        if required_edge_pairs is not None:
-            self._build_required_shortlist_keep_mask(
-                edge_ids=unique_edge_ids,
-                edge_agent_batch=unique_edge_agent_batch,
-                required_edge_pairs=required_edge_pairs,
-            )
-        if int(unique_edge_ids.numel()) > 0 and allow_candidate_shortlist:
-            shortlist_active_state_count = int(
-                (
-                    unique_out_degrees
-                    > int(self.candidate_shortlist_cfg.degree_threshold)
-                )
-                .sum()
-                .item()
-            )
-            unique_candidate_graph_ids = unique_graph_ids.index_select(
-                0, unique_edge_agent_batch
-            )
-            (
-                unique_edge_ids,
-                unique_target_nodes,
-                unique_edge_agent_batch,
-                unique_child_num_steps,
-                unique_out_degrees,
-            ) = self._maybe_shortlist_forward_candidates(
-                prepared_batch=prepared_batch,
-                flat_state_features=unique_state_features,
-                edge_ids=unique_edge_ids,
-                target_nodes=unique_target_nodes,
-                edge_agent_batch=unique_edge_agent_batch,
-                child_num_steps=unique_child_num_steps,
-                out_degrees=unique_out_degrees,
-                graph_ids=unique_candidate_graph_ids,
-                required_edge_pairs=required_edge_pairs,
-            )
         scored_graph_candidate_count = int(unique_edge_ids.numel())
         current_log_f_flat = torch.zeros(
             (total_agents,), device=state.current_nodes.device, dtype=torch.float32
@@ -1805,7 +1504,6 @@ class BaseSearchPolicy(nn.Module):
             unique_active_state_count=unique_active_state_count,
             raw_graph_candidate_count=raw_graph_candidate_count,
             scored_graph_candidate_count=scored_graph_candidate_count,
-            shortlist_active_state_count=shortlist_active_state_count,
         )
 
     def compute_forward_distribution(
@@ -1818,21 +1516,6 @@ class BaseSearchPolicy(nn.Module):
         return self._compute_forward_distribution_impl(
             prepared_batch,
             state,
-            allow_candidate_shortlist=True,
-            required_edge_ids=required_edge_ids,
-        )
-
-    def compute_forward_distribution_without_shortlist(
-        self,
-        prepared_batch: PreparedSearchBatch,
-        state: SearchState,
-        *,
-        required_edge_ids: torch.Tensor | None = None,
-    ) -> ForwardActionDistribution:
-        return self._compute_forward_distribution_impl(
-            prepared_batch,
-            state,
-            allow_candidate_shortlist=False,
             required_edge_ids=required_edge_ids,
         )
 
@@ -2011,13 +1694,13 @@ class GFlowNetPolicy(nn.Module):
         self,
         *,
         prepared_batch: PreparedGFlowNetBatch,
-        node_ids: torch.Tensor,
+        node_abs_indices: torch.Tensor,
         num_steps: torch.Tensor,
         done_mask: torch.Tensor,
     ) -> torch.Tensor:
         return self.search_heuristic.compute_cached_bias(
             heuristic_cache=prepared_batch.heuristic_cache,
-            node_ids=node_ids,
+            node_abs_indices=node_abs_indices,
             num_steps=num_steps,
             done_mask=done_mask,
         )
@@ -2059,7 +1742,7 @@ class GFlowNetPolicy(nn.Module):
         )
         child_bias = self._compute_state_bias(
             prepared_batch=prepared_batch,
-            node_ids=child_target_nodes,
+            node_abs_indices=child_target_nodes,
             num_steps=child_num_steps,
             done_mask=torch.zeros_like(child_num_steps, dtype=torch.bool),
         )
@@ -2150,7 +1833,7 @@ class GFlowNetPolicy(nn.Module):
         )
         start_bias = self._compute_state_bias(
             prepared_batch=prepared_batch,
-            node_ids=candidate_nodes_abs,
+            node_abs_indices=candidate_nodes_abs,
             num_steps=torch.zeros_like(candidate_nodes_abs, dtype=torch.long),
             done_mask=torch.zeros_like(candidate_nodes_abs, dtype=torch.bool),
         )
@@ -2175,11 +1858,13 @@ class GFlowNetPolicy(nn.Module):
         *,
         num_rollouts: int,
         deterministic: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return GFlowNetPolicy.sample_start_nodes(
             distribution,
             num_rollouts=num_rollouts,
             deterministic=deterministic,
+            temperature=temperature,
         )
 
     @staticmethod
@@ -2188,19 +1873,26 @@ class GFlowNetPolicy(nn.Module):
         *,
         num_rollouts: int,
         deterministic: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_graphs = int(distribution.graph_log_z.numel())
         selected_nodes: list[torch.Tensor] = []
         selected_log_probs: list[torch.Tensor] = []
         selected_log_flows: list[torch.Tensor] = []
+        sampling_log_probs = _temper_segmented_log_probs(
+            log_probs=distribution.log_probs,
+            segment_ids=distribution.candidate_graph_ids,
+            num_segments=num_graphs,
+            temperature=float(temperature),
+        )
         if num_graphs < 1:
             empty = distribution.candidate_nodes_abs.new_empty((0, num_rollouts))
-            empty_scores = distribution.log_probs.new_empty((0, num_rollouts))
+            empty_scores = sampling_log_probs.new_empty((0, num_rollouts))
             return empty, empty_scores, empty_scores
         for graph_idx in range(num_graphs):
             mask = distribution.candidate_graph_ids == graph_idx
             graph_nodes = distribution.candidate_nodes_abs[mask]
-            graph_log_probs = distribution.log_probs[mask]
+            graph_log_probs = sampling_log_probs[mask]
             graph_log_flows = distribution.log_flows[mask]
             if int(graph_nodes.numel()) == 0:
                 raise ValueError("Each graph must expose at least one start candidate.")
@@ -2235,7 +1927,7 @@ class GFlowNetPolicy(nn.Module):
         sampled_log_flows: list[torch.Tensor] = []
         for _ in range(num_rollouts):
             sampled_positions, sampled_probs, has_values = sample_segmented_one_1d(
-                logits=distribution.log_probs,
+                logits=sampling_log_probs,
                 segment_ids=distribution.candidate_graph_ids,
                 num_segments=num_graphs,
                 temperature=1.0,
@@ -2278,19 +1970,6 @@ class GFlowNetPolicy(nn.Module):
             required_edge_ids=required_edge_ids,
         )
 
-    def compute_forward_distribution_without_shortlist(
-        self,
-        prepared_batch: PreparedGFlowNetBatch,
-        state: SearchState,
-        *,
-        required_edge_ids: torch.Tensor | None = None,
-    ) -> ForwardActionDistribution:
-        return self.base_policy.compute_forward_distribution_without_shortlist(
-            prepared_batch,
-            state,
-            required_edge_ids=required_edge_ids,
-        )
-
     def compute_backward_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
@@ -2327,7 +2006,6 @@ class GFlowNetPolicy(nn.Module):
             unique_active_state_count=distribution.unique_active_state_count,
             raw_graph_candidate_count=distribution.raw_graph_candidate_count,
             scored_graph_candidate_count=distribution.scored_graph_candidate_count,
-            shortlist_active_state_count=distribution.shortlist_active_state_count,
         )
 
     @staticmethod

@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-from src.graph_runtime import build_graph_batch
-from src.graph_runtime.batch import TrajectoryBatch
+from src.graph import build_graph_batch
+from src.graph.batch import TrajectoryBatch
 from src.metrics.search_backends import (
     FlowFrontierBackend,
     run_flow_frontier_search,
@@ -159,7 +159,7 @@ def _make_manual_fixture() -> tuple[
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([3], dtype=torch.long),
         answer_entity_ids=torch.tensor([103], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
         sample_id="manual-flow-frontier",
     )
     topology, observation = build_graph_batch(batch)

@@ -62,7 +62,7 @@ def test_predict_step_emits_placeholder_for_missing_start_candidates() -> None:
         q_local_indices=torch.empty((0,), dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id="missing-start-candidates",
     )
     module = _make_module()
@@ -97,7 +97,7 @@ def test_evaluate_batch_emits_placeholder_for_missing_start_candidates() -> None
         q_local_indices=torch.empty((0,), dtype=torch.long),
         a_local_indices=torch.empty((0,), dtype=torch.long),
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id="missing-start-candidates-eval",
     )
     module = _make_module()

@@ -80,6 +80,9 @@ def test_train_rankflow_experiment_uses_canonical_long_pass_schedule() -> None:
             overrides=[
                 "experiment=train_rankflow",
                 "dataset=webqsp-sub",
+                "logger=none",
+                "hydra/job_logging=stdout",
+                "hydra/hydra_logging=none",
                 "extras.enforce_tags=false",
                 "extras.print_config=false",
             ],

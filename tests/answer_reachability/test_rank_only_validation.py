@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.metrics.answer_metrics import (
     ReachabilityAnalysis,
     ReachabilityRanking,
@@ -72,7 +72,7 @@ def test_rank_only_validation_skips_support_search() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="rank-only",
     )
     module = _make_module()
@@ -103,7 +103,7 @@ def test_rank_only_predict_skips_support_search_and_support_metrics() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="rank-only-predict",
     )
     module = _make_module()
@@ -131,7 +131,7 @@ def test_rank_only_validation_batches_disconnected_graphs(monkeypatch) -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="rank-only-batch-a",
     )
     batch_two = make_batch_from_graph(
@@ -141,7 +141,7 @@ def test_rank_only_validation_batches_disconnected_graphs(monkeypatch) -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([202], dtype=torch.long),
-        node_global_ids=torch.tensor([200, 201, 202], dtype=torch.long),
+        node_entity_ids=torch.tensor([200, 201, 202], dtype=torch.long),
         sample_id="rank-only-batch-b",
     )
     batch = TrajectoryBatch.concatenate([batch_one, batch_two])
@@ -179,7 +179,7 @@ def test_rank_only_metrics_follow_retrieval_ranking_semantics() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="rank-only-retrieval",
     )
     analysis = ReachabilityAnalysis(

@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
 from src.models.gflownet import (
     PreparedSearchBatch,
@@ -168,7 +168,7 @@ def _build_exact_analysis(
     terminal_mass = terminal_mass.to(device=batch.node_ptr.device, dtype=torch.float32)
     nonzero_mask = terminal_mass > 0
     if bool(nonzero_mask.any().item()):
-        terminal_entities = batch.node_global_ids.index_select(
+        terminal_entities = batch.node_entity_ids.index_select(
             0, torch.nonzero(nonzero_mask, as_tuple=False).view(-1)
         )
         terminal_probs = terminal_mass[nonzero_mask]
@@ -289,7 +289,7 @@ def _add_terminal_path(
         terminal_mass[terminal_node_local] + probability
     )
     answer_entity_id = int(
-        context.graph_batch.node_global_ids[terminal_node_local].item()
+        context.graph_batch.node_entity_ids[terminal_node_local].item()
     )
     gold_answers = {
         int(value) for value in context.graph_batch.answer_entity_ids.tolist()
@@ -1137,7 +1137,7 @@ def build_monte_carlo_analysis(
         minlength=int(batch.num_nodes_total),
     ).to(device=batch.node_ptr.device, dtype=torch.float32)
     terminal_mass = terminal_counts / float(max(total_rollouts, 1))
-    terminal_entities = batch.node_global_ids.index_select(
+    terminal_entities = batch.node_entity_ids.index_select(
         0, rollout_summary.terminal_nodes
     )
     answer_entity_ids, answer_counts = torch.unique(
@@ -1200,7 +1200,7 @@ def build_discovered_trajectories(
         edge_ids = tuple(
             int(edge_id) for edge_id in row[1:-1].tolist() if int(edge_id) >= 0
         )
-        answer_id = int(batch.node_global_ids[terminal_node].item())
+        answer_id = int(batch.node_entity_ids[terminal_node].item())
         probability = float(int(count.item())) / float(rollout_summary.total_rollouts)
         discovered_paths.append(
             DiscoveredTrajectory(
@@ -1215,7 +1215,7 @@ def build_discovered_trajectories(
             )
         )
         path_counts[
-            (int(batch.node_global_ids[start_node].item()), answer_id, edge_ids)
+            (int(batch.node_entity_ids[start_node].item()), answer_id, edge_ids)
         ] = int(count.item())
     discovered_paths.sort(
         key=lambda item: (

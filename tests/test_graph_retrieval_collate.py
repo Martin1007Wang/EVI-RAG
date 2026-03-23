@@ -16,7 +16,7 @@ class _CloneableSample:
     q_local_indices: torch.Tensor
     a_local_indices: torch.Tensor
     answer_entity_ids: torch.Tensor
-    node_global_ids: torch.Tensor
+    node_entity_ids: torch.Tensor
     sample_id: str
 
     def clone(self) -> "_CloneableSample":
@@ -24,7 +24,7 @@ class _CloneableSample:
             q_local_indices=self.q_local_indices.clone(),
             a_local_indices=self.a_local_indices.clone(),
             answer_entity_ids=self.answer_entity_ids.clone(),
-            node_global_ids=self.node_global_ids.clone(),
+            node_entity_ids=self.node_entity_ids.clone(),
             sample_id=self.sample_id,
         )
 
@@ -36,7 +36,7 @@ def test_expand_answer_samples_filters_only_zero_hop_answers_when_not_expanding(
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([100, 101], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         sample_id="sample-1",
     )
 

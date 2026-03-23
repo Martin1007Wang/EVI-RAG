@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEvalConfig
 from src.models.gflownet import TrajectorySamplerProtocol
 from src.models.gflownet import SearchPolicyProtocol

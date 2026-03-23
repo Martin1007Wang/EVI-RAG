@@ -5,7 +5,7 @@ from typing import Protocol
 
 import torch
 
-from src.graph_runtime import GraphTopology, SearchObservation
+from src.graph import GraphTopology, SearchObservation
 
 from .path import (
     STOP_TOKEN_ID,
@@ -73,7 +73,6 @@ class ForwardActionDistribution:
     unique_active_state_count: int = 0
     raw_graph_candidate_count: int = 0
     scored_graph_candidate_count: int = 0
-    shortlist_active_state_count: int = 0
 
     @property
     def is_submit(self) -> torch.Tensor | None:
@@ -445,6 +444,7 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
         *,
         num_rollouts: int,
         deterministic: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 

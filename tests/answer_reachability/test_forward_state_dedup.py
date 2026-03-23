@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.gflownet import SearchState
 
 from .conftest import make_batch_from_graph, make_policy
@@ -23,7 +23,7 @@ def test_forward_distribution_deduplicates_identical_states_with_graph_aligned_s
                 q_local_indices=torch.tensor([0], dtype=torch.long),
                 a_local_indices=torch.tensor([2], dtype=torch.long),
                 answer_entity_ids=torch.tensor([102], dtype=torch.long),
-                node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+                node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
                 question_emb=torch.tensor([[10.0] + [0.0] * 7], dtype=torch.float32),
                 question_ctx=torch.zeros((1, 2, 8), dtype=torch.float32),
                 sample_id="graph-a",
@@ -35,7 +35,7 @@ def test_forward_distribution_deduplicates_identical_states_with_graph_aligned_s
                 q_local_indices=torch.tensor([0], dtype=torch.long),
                 a_local_indices=torch.tensor([2], dtype=torch.long),
                 answer_entity_ids=torch.tensor([202], dtype=torch.long),
-                node_global_ids=torch.tensor([200, 201, 202], dtype=torch.long),
+                node_entity_ids=torch.tensor([200, 201, 202], dtype=torch.long),
                 question_emb=torch.tensor([[20.0] + [0.0] * 7], dtype=torch.float32),
                 question_ctx=torch.zeros((1, 2, 8), dtype=torch.float32),
                 sample_id="graph-b",
@@ -83,7 +83,7 @@ def test_forward_distribution_dedup_keeps_distinct_path_histories_separate() -> 
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([4], dtype=torch.long),
         answer_entity_ids=torch.tensor([104], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103, 104], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103, 104], dtype=torch.long),
         sample_id="path-sensitive-forward",
     )
     policy = make_policy(max_steps=3)

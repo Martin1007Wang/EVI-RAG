@@ -229,7 +229,7 @@ class GraphRetrievalDataset(Dataset):
         edge_index = raw["edge_index"]
         edge_attr = raw["edge_attr"]
         num_nodes = _coerce_num_nodes(raw.get("num_nodes"), sample_id)
-        node_global_ids = raw["node_global_ids"]
+        node_entity_ids = raw["node_entity_ids"]
         node_embedding_ids = raw["node_embedding_ids"]
         question_emb = _coerce_question_embedding(raw["question_emb"], sample_id)
         question_ctx, question_ctx_mask = _resolve_question_context(
@@ -248,7 +248,7 @@ class GraphRetrievalDataset(Dataset):
             "num_nodes": num_nodes,
             "edge_index": edge_index,
             "edge_attr": edge_attr,  # Global relation IDs
-            "node_global_ids": node_global_ids,
+            "node_entity_ids": node_entity_ids,
             "node_embedding_ids": node_embedding_ids,
             "question_emb": question_emb,
             "q_local_indices": q_local_indices,
@@ -261,20 +261,24 @@ class GraphRetrievalDataset(Dataset):
         data_kwargs["question_ctx_mask"] = question_ctx_mask
         heuristic_log_v = self.heuristic_log_v
         if heuristic_log_v is not None:
-            node_ids = torch.as_tensor(node_global_ids, dtype=torch.long).view(-1)
-            if node_ids.numel() > 0:
-                min_id = int(node_ids.min().detach().tolist())
-                max_id = int(node_ids.max().detach().tolist())
+            node_entity_ids_tensor = torch.as_tensor(
+                node_entity_ids, dtype=torch.long
+            ).view(-1)
+            if node_entity_ids_tensor.numel() > 0:
+                min_id = int(node_entity_ids_tensor.min().detach().tolist())
+                max_id = int(node_entity_ids_tensor.max().detach().tolist())
                 if min_id < 0:
                     raise ValueError(
-                        f"node_global_ids contains negative values (sample_id={sample_id})."
+                        f"node_entity_ids contains negative values (sample_id={sample_id})."
                     )
                 if max_id >= int(heuristic_log_v.numel()):
                     raise ValueError(
                         f"heuristic_log_v out of range for sample_id={sample_id}; "
                         f"max_id={max_id} size={heuristic_log_v.numel()}"
                     )
-            data_kwargs["heuristic_log_v"] = heuristic_log_v.index_select(0, node_ids)
+            data_kwargs["heuristic_log_v"] = heuristic_log_v.index_select(
+                0, node_entity_ids_tensor
+            )
         question_text = self._question_text_for_sample(sample_id)
         if question_text is None:
             question_text = raw.get("question")

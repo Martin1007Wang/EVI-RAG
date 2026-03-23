@@ -168,7 +168,7 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
             ],
         )
 
-    assert cfg.data.batch_size == 192
+    assert cfg.data.batch_size == 256
     assert cfg.data.eval_batch_size == 32
     assert cfg.data.num_workers == 8
     assert cfg.data.multiprocessing_context == "spawn"
@@ -178,11 +178,11 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
     assert cfg.data.eval_persistent_workers is True
     assert cfg.data.eval_multiprocessing_context == "spawn"
     assert cfg.data.train_num_samples is None
-    assert cfg.data.train_max_graphs_per_batch == 192
-    assert cfg.data.train_max_nodes_per_batch == 480000
+    assert cfg.data.train_max_graphs_per_batch == 256
+    assert cfg.data.train_max_nodes_per_batch == 640000
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
     assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
-    assert cfg.trainer.log_every_n_steps == 10
+    assert cfg.trainer.log_every_n_steps == 32
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
     assert cfg.model.eval_cfg.monte_carlo_rollouts == 256
     assert cfg.run.test is True
@@ -204,7 +204,7 @@ def test_train_answer_reachability_alias_matches_rankflow_defaults() -> None:
             ],
         )
 
-    assert cfg.data.batch_size == 192
+    assert cfg.data.batch_size == 256
     assert cfg.data.eval_batch_size == 32
     assert cfg.data.num_workers == 8
     assert cfg.data.multiprocessing_context == "spawn"
@@ -214,10 +214,10 @@ def test_train_answer_reachability_alias_matches_rankflow_defaults() -> None:
     assert cfg.data.train_num_samples is None
     assert cfg.data.eval_persistent_workers is True
     assert cfg.data.eval_multiprocessing_context == "spawn"
-    assert cfg.data.train_max_edges_per_batch == 1440000
+    assert cfg.data.train_max_edges_per_batch == 1920000
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
     assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
-    assert cfg.trainer.log_every_n_steps == 10
+    assert cfg.trainer.log_every_n_steps == 32
 
 
 def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(

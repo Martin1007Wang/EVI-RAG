@@ -137,6 +137,9 @@ parameterizations.
 
 `success_mask`, termination steps, and revisit bookkeeping are still tracked for
 rollout reporting, but they are not part of the terminal reward definition.
+`success_mask` follows the same entity-level gold semantics as the terminal
+reward table, so alias nodes of a gold answer entity count as successful
+terminals too.
 
 The terminal STOP backward factor is also fixed: the absorbing STOP edge uses
 `log P_B = 0`, matching the unique-prefix-parent interpretation used elsewhere
@@ -147,14 +150,16 @@ in the runtime.
 Training-time forced STOP is now explicit and configurable through
 `training.force_stop_on_answer_hit`.
 
-- `false` means STOP is treated as a normal action, even if the current node is
-  already a gold answer
+- `false` means STOP is treated as a normal action, even if the current entity
+  is already a gold answer
 - `true` means the sampler immediately emits STOP when an active rollout lands
-  on a gold answer
+  on a node whose entity is a gold answer
 
 This is a behavior-policy choice, not an environment axiom. Keep that
 distinction in mind when comparing theory notes with rollout behavior.
 
 With the default training config, start-node sampling and rollout action
 sampling are on-policy: the sampler draws from the target root/action
-distributions rather than a separate behavior policy.
+distributions rather than a separate behavior policy. The training-time
+sampling temperature applies to both the root start distribution and the
+rollout action distributions.

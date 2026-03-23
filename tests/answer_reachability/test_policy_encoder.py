@@ -6,7 +6,7 @@ import torch
 
 from src.models.components import EmbeddingBackbone, NodeFlowHead
 from src.models.configs import BackboneConfig
-from src.graph_runtime import build_graph_batch
+from src.graph import build_graph_batch
 from src.archive.policy.encoder import PolicyEncoder, PreparedPolicyContext
 from src.archive.policy.modules import QuestionContextModule
 
@@ -77,7 +77,7 @@ def test_policy_encoder_build_action_cache_uses_topology_super_source_metadata()
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([1], dtype=torch.long),
         answer_entity_ids=torch.tensor([101], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, -1, -2], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, -1, -2], dtype=torch.long),
         sample_id="super-source",
     )
     topology, observation = build_graph_batch(batch)

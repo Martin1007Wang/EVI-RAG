@@ -6,8 +6,8 @@ from typing import cast
 import pytest
 import torch
 
-from src.graph_runtime import build_graph_batch
-from src.graph_runtime.batch import TrajectoryBatch
+from src.graph import build_graph_batch
+from src.graph.batch import TrajectoryBatch
 from src.metrics.answer_metrics import SupportWindowResult
 from src.metrics.search_backends import (
     MonteCarloBackend,
@@ -140,11 +140,13 @@ class _ManualMonteCarloPolicy:
         *,
         num_rollouts: int,
         deterministic: bool = False,
+        temperature: float = 1.0,
     ):
         return BaseSearchPolicy.sample_start_nodes(
             distribution,
             num_rollouts=num_rollouts,
             deterministic=deterministic,
+            temperature=temperature,
         )
 
     def prepare_batch(self, batch: TrajectoryBatch) -> PreparedSearchBatch:
@@ -166,7 +168,7 @@ def _make_manual_fixture() -> tuple[
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([3], dtype=torch.long),
         answer_entity_ids=torch.tensor([103], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
         sample_id="manual-monte-carlo",
     )
     topology, observation = build_graph_batch(batch)
@@ -340,7 +342,7 @@ def test_rank_only_monte_carlo_uses_interval_aware_answer_posterior() -> None:
         q_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_id="rank-only-monte-carlo",
     )
     module = _make_rank_only_module()
@@ -378,7 +380,7 @@ def test_full_monte_carlo_validation_batches_disconnected_graphs(
                 q_local_indices=torch.tensor([0], dtype=torch.long),
                 a_local_indices=torch.tensor([2], dtype=torch.long),
                 answer_entity_ids=torch.tensor([102], dtype=torch.long),
-                node_global_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+                node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
                 sample_id="full-batch-a",
             ),
             make_batch_from_graph(
@@ -388,7 +390,7 @@ def test_full_monte_carlo_validation_batches_disconnected_graphs(
                 q_local_indices=torch.tensor([0], dtype=torch.long),
                 a_local_indices=torch.tensor([2], dtype=torch.long),
                 answer_entity_ids=torch.tensor([202], dtype=torch.long),
-                node_global_ids=torch.tensor([200, 201, 202], dtype=torch.long),
+                node_entity_ids=torch.tensor([200, 201, 202], dtype=torch.long),
                 sample_id="full-batch-b",
             ),
         ]

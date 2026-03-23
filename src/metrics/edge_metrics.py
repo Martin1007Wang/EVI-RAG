@@ -10,7 +10,7 @@ import torch
 from torchmetrics import MeanMetric
 
 from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labels
-from src.graph_runtime import TrajectoryBatch
+from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
 from src.models.gflownet import (
     SearchPolicyProtocol,
@@ -342,13 +342,13 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
             EdgePredictionRecord(
                 edge_id=edge_id,
                 src_entity_id=int(
-                    batch.node_global_ids[
+                    batch.node_entity_ids[
                         int(batch.edge_index[0, edge_id].item())
                     ].item()
                 ),
                 relation_id=int(edge_types[edge_id].item()),
                 dst_entity_id=int(
-                    batch.node_global_ids[
+                    batch.node_entity_ids[
                         int(batch.edge_index[1, edge_id].item())
                     ].item()
                 ),

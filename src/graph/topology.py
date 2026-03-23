@@ -51,6 +51,43 @@ def _gather_actions_from_csr(
     return edge_ids[gather_index], col[gather_index], out_degrees
 
 
+def _gather_active_actions_from_csr(
+    *,
+    adjacency: CsrAdjacency,
+    current_nodes: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if current_nodes.dim() != 1:
+        raise ValueError("current_nodes must be a 1D tensor.")
+    if active_mask.dtype != torch.bool or active_mask.dim() != 1:
+        raise ValueError("active_mask must be a 1D bool tensor.")
+    if tuple(current_nodes.shape) != tuple(active_mask.shape):
+        raise ValueError("current_nodes and active_mask must have the same shape.")
+
+    total_agents = int(current_nodes.numel())
+    filtered_degrees = torch.zeros(
+        (total_agents,),
+        device=current_nodes.device,
+        dtype=torch.long,
+    )
+    empty = torch.empty((0,), device=current_nodes.device, dtype=torch.long)
+    active_agent_index = torch.nonzero(active_mask, as_tuple=False).view(-1)
+    if int(active_agent_index.numel()) == 0:
+        return empty, empty, empty, filtered_degrees
+
+    active_nodes = current_nodes.index_select(0, active_agent_index)
+    edge_ids, neighbor_nodes, active_degrees = _gather_actions_from_csr(
+        adjacency=adjacency,
+        nodes=active_nodes,
+    )
+    filtered_degrees.index_copy_(0, active_agent_index, active_degrees)
+    if int(edge_ids.numel()) == 0:
+        return edge_ids, neighbor_nodes, empty, filtered_degrees
+
+    edge_agent_index = active_agent_index.repeat_interleave(active_degrees)
+    return edge_ids, neighbor_nodes, edge_agent_index, filtered_degrees
+
+
 @dataclass(frozen=True)
 class GraphTopology:
     """Static disconnected graph topology shared across a search episode."""
@@ -278,20 +315,28 @@ class GraphTopology:
         )
         if int(counts.sum().item()) != int(local_node_index.local_indices.numel()):
             raise ValueError(f"{field_name} ptr mismatch with index length.")
-        offsets = (
-            self._graph_node_offsets[:-1]
-            .to(device=target_device)
-            .repeat_interleave(counts)
+        graph_index = torch.arange(
+            int(counts.numel()), device=target_device, dtype=torch.long
+        ).repeat_interleave(counts)
+        local_indices = local_node_index.local_indices.to(
+            device=target_device,
+            dtype=torch.long,
         )
-        absolute_indices = (
-            local_node_index.local_indices.to(device=target_device) + offsets
+        graph_offsets = self._graph_node_offsets[:-1].to(
+            device=target_device,
+            dtype=torch.long,
         )
-        if bool((absolute_indices < 0).any().item()) or bool(
-            (absolute_indices >= self.num_nodes).any().item()
-        ):
+        graph_sizes = (self._graph_node_offsets[1:] - self._graph_node_offsets[:-1]).to(
+            device=target_device,
+            dtype=torch.long,
+        )
+        max_local = graph_sizes.index_select(0, graph_index)
+        invalid = (local_indices < 0) | (local_indices >= max_local)
+        if bool(invalid.any().item()):
             raise ValueError(
                 f"{field_name} out of range for membership mask construction."
             )
+        absolute_indices = local_indices + graph_offsets.index_select(0, graph_index)
         mask.scatter_(0, absolute_indices, True)
         return mask
 
@@ -301,43 +346,11 @@ class GraphTopology:
         current_nodes: torch.Tensor,
         active_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        total_agents = int(current_nodes.numel())
-        active_nodes = torch.where(
-            active_mask,
-            current_nodes,
-            torch.zeros_like(current_nodes),
-        )
-        edge_ids, target_nodes, out_degrees = _gather_actions_from_csr(
+        return _gather_active_actions_from_csr(
             adjacency=self.adjacency,
-            nodes=active_nodes,
+            current_nodes=current_nodes,
+            active_mask=active_mask,
         )
-        edge_agent_index = torch.empty(
-            (0,),
-            device=current_nodes.device,
-            dtype=torch.long,
-        )
-        if int(edge_ids.numel()) == 0:
-            return edge_ids, target_nodes, edge_agent_index, out_degrees
-
-        agent_index = torch.arange(
-            total_agents,
-            device=current_nodes.device,
-            dtype=torch.long,
-        )
-        edge_agent_full = agent_index.repeat_interleave(out_degrees)
-        edge_active_mask = active_mask.index_select(0, edge_agent_full)
-        edge_ids = edge_ids[edge_active_mask]
-        target_nodes = target_nodes[edge_active_mask]
-        edge_agent_index = edge_agent_full[edge_active_mask]
-
-        filtered_out_degrees = torch.zeros_like(out_degrees)
-        if int(edge_agent_index.numel()) > 0:
-            filtered_out_degrees.scatter_add_(
-                0,
-                edge_agent_index,
-                torch.ones_like(edge_agent_index, dtype=torch.long),
-            )
-        return edge_ids, target_nodes, edge_agent_index, filtered_out_degrees
 
     def gather_incoming_edges(
         self,
@@ -345,43 +358,11 @@ class GraphTopology:
         current_nodes: torch.Tensor,
         active_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        total_agents = int(current_nodes.numel())
-        active_nodes = torch.where(
-            active_mask,
-            current_nodes,
-            torch.zeros_like(current_nodes),
-        )
-        edge_ids, source_nodes, in_degrees = _gather_actions_from_csr(
+        return _gather_active_actions_from_csr(
             adjacency=self.reverse_adjacency,
-            nodes=active_nodes,
+            current_nodes=current_nodes,
+            active_mask=active_mask,
         )
-        edge_agent_index = torch.empty(
-            (0,),
-            device=current_nodes.device,
-            dtype=torch.long,
-        )
-        if int(edge_ids.numel()) == 0:
-            return edge_ids, source_nodes, edge_agent_index, in_degrees
-
-        agent_index = torch.arange(
-            total_agents,
-            device=current_nodes.device,
-            dtype=torch.long,
-        )
-        edge_agent_full = agent_index.repeat_interleave(in_degrees)
-        edge_active_mask = active_mask.index_select(0, edge_agent_full)
-        edge_ids = edge_ids[edge_active_mask]
-        source_nodes = source_nodes[edge_active_mask]
-        edge_agent_index = edge_agent_full[edge_active_mask]
-
-        filtered_in_degrees = torch.zeros_like(in_degrees)
-        if int(edge_agent_index.numel()) > 0:
-            filtered_in_degrees.scatter_add_(
-                0,
-                edge_agent_index,
-                torch.ones_like(edge_agent_index, dtype=torch.long),
-            )
-        return edge_ids, source_nodes, edge_agent_index, filtered_in_degrees
 
     def graph_index_from_edges(self, edge_ids: torch.Tensor) -> torch.Tensor:
         safe_edge_ids = edge_ids.clamp(
@@ -395,11 +376,14 @@ class GraphTopology:
     def has_super_source_layout(
         self,
         *,
-        node_ids: torch.Tensor,
+        node_entity_ids: torch.Tensor,
         device: torch.device | None = None,
     ) -> bool:
         try:
-            self.infer_super_source_indices(node_ids=node_ids, device=device)
+            self.infer_super_source_indices(
+                node_entity_ids=node_entity_ids,
+                device=device,
+            )
         except ValueError:
             return False
         return True
@@ -407,10 +391,10 @@ class GraphTopology:
     def infer_super_source_indices(
         self,
         *,
-        node_ids: torch.Tensor,
+        node_entity_ids: torch.Tensor,
         device: torch.device | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        target_device = node_ids.device if device is None else device
+        target_device = node_entity_ids.device if device is None else device
         graph_node_offsets = self._graph_node_offsets.to(
             device=target_device,
             dtype=torch.long,
@@ -423,11 +407,13 @@ class GraphTopology:
             raise ValueError(
                 "graph node offsets do not end at num_nodes for super source inference."
             )
-        node_global_long = node_ids.to(device=target_device, dtype=torch.long)
-        if int(node_global_long.numel()) != int(self.num_nodes):
+        node_entity_ids_long = node_entity_ids.to(
+            device=target_device, dtype=torch.long
+        )
+        if int(node_entity_ids_long.numel()) != int(self.num_nodes):
             raise ValueError(
-                "node_ids length mismatch with num_nodes when inferring super source nodes: "
-                f"node_ids={int(node_global_long.numel())}, num_nodes={int(self.num_nodes)}."
+                "node_entity_ids length mismatch with num_nodes when inferring super source nodes: "
+                f"node_entity_ids={int(node_entity_ids_long.numel())}, num_nodes={int(self.num_nodes)}."
             )
         counts = graph_node_offsets[1:] - graph_node_offsets[:-1]
         if bool((counts < 2).any().item()):
@@ -436,7 +422,7 @@ class GraphTopology:
             )
         question_super_abs = graph_node_offsets[1:] - 2
         answer_super_abs = graph_node_offsets[1:] - 1
-        super_mask = node_global_long < 0
+        super_mask = node_entity_ids_long < 0
         if int(super_mask.sum().item()) != 2 * int(self.num_graphs):
             raise ValueError(
                 "Super-source layout invariant violated: expected exactly two virtual nodes per graph "

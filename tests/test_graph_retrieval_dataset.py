@@ -12,6 +12,7 @@ def _build_dataset_shell(tmp_path: Path) -> GraphRetrievalDataset:
     dataset = GraphRetrievalDataset.__new__(GraphRetrievalDataset)
     dataset.split = "train"
     dataset._shared_resources = None
+    dataset._sample_stores = None
     dataset._heuristic_log_v_path = None
     dataset._heuristic_log_v = None
     dataset._sample_stats_cache = {}
@@ -29,7 +30,7 @@ def test_build_data_synthesizes_question_context_from_question_embedding(
         "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
         "edge_attr": torch.tensor([0], dtype=torch.long),
         "num_nodes": torch.tensor(2, dtype=torch.long),
-        "node_global_ids": torch.tensor([0, 1], dtype=torch.long),
+        "node_entity_ids": torch.tensor([0, 1], dtype=torch.long),
         "node_embedding_ids": torch.tensor([0, 0], dtype=torch.long),
         "question_emb": torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
         "q_local_indices": torch.tensor([0], dtype=torch.long),
@@ -99,7 +100,7 @@ def test_build_data_uses_runtime_sample_metadata_question_text(tmp_path: Path) -
         "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
         "edge_attr": torch.tensor([0], dtype=torch.long),
         "num_nodes": torch.tensor(2, dtype=torch.long),
-        "node_global_ids": torch.tensor([0, 1], dtype=torch.long),
+        "node_entity_ids": torch.tensor([0, 1], dtype=torch.long),
         "node_embedding_ids": torch.tensor([0, 0], dtype=torch.long),
         "question_emb": torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
         "q_local_indices": torch.tensor([0], dtype=torch.long),
