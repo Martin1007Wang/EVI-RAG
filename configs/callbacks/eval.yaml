@@ -5,4 +5,3 @@ local_metrics_writer:
   _target_: src.callbacks.local_metrics_writer.LocalMetricsWriter
   output_dir: ${paths.output_dir}/metrics
   enabled: true
-  train_window_size: 32

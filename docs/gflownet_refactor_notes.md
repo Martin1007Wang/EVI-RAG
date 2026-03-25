@@ -1,74 +1,118 @@
 # GFlowNet Refactor Notes
 
-This repo now uses a clearer boundary-vs-prefix split.
+This file is background and compatibility guidance.
 
-The latest refactor also makes the root boundary explicit in the training
-objective instead of deriving it from start-state flows.
+For the current algorithm itself, read `docs/gflownet_semantics.md` first.
 
-## Naming changes
+## What the refactor stabilized
 
-- `StartDistribution` is still available as a compatibility alias, but the
-  preferred name is `RootActionDistribution`.
-- `RootState` is now the explicit runtime object for the abstract virtual root.
-- `is_submit` is still available as a compatibility alias, but the preferred
-  name is `is_stop_action`.
-- `trace_submit_mask` is still available as a compatibility alias, but the
-  preferred name is `trace_stop_mask`.
-- `terminal_action_counts` is still available as a compatibility alias, but the
-  preferred name is `termination_action_steps`.
+The current codebase has converged on four important contracts:
 
-## Why the prefix tensor now includes STOP for absorbing states
+1. The root boundary is explicit.
+2. `STOP` is an explicit action and absorbing states store it directly.
+3. Step-level rewards live in `log_reward_steps` instead of being hidden inside
+   terminal-only bookkeeping.
+4. Training now uses only the main MS-SubTB objective instead of layering on
+   extra oracle-imitation or success-classification losses.
 
-The code now encodes STOP explicitly so the published math and runtime state
-space agree exactly:
+These decisions make the training logic easier to reason about and easier to map
+from math to tensors.
 
-- active prefixes end with an entity token
-- absorbing prefixes end with the dedicated STOP token
+## Public contract vs compatibility shims
 
-The runtime also separates two masks that used to be conflated:
+The repo still carries a few compatibility aliases so older call sites do not
+break immediately.
 
-- `SearchState.done_mask` now means "inactive in this batched policy call"
-- `SearchState.absorbing_mask` means "this prefix already carries explicit
-  STOP"
+| Preferred name | Compatibility alias or legacy field |
+| --- | --- |
+| `RootActionDistribution` | `StartDistribution` |
+| `is_stop_action` | `is_submit` |
+| `trace_stop_mask` | `trace_submit_mask` |
+| `termination_action_steps` | `terminal_action_counts` |
 
-That separation lets Monte Carlo and guidance traces keep padded or dead-end
-rows inactive without incorrectly forcing them to masquerade as true absorbing
+Treat the left column as the real contract for new code and new docs.
+
+## Root boundary changes
+
+The root boundary used to be easier to blur together with start states. The
+current implementation keeps it explicit.
+
+- `RootActionDistribution.graph_log_z` is the boundary flow `log F(s_root)`.
+- `RootActionDistribution.log_probs` is the start-node action distribution.
+- `RootActionDistribution.log_flows` stores the child start-state values.
+
+This lets training use the root consistency residual directly:
+
+`log F(s_root) + log P_F([e_0] | s_root) - log F([e_0])`
+
+That is simpler to inspect than recovering root behavior indirectly from start
 states.
 
-The implementation still keeps separate rollout-side traces because they are
-useful for bookkeeping and metrics:
+## STOP and prefix representation
 
-- parent recovery on the prefix tree
-- full no-repeat masking over previously seen entities
-- recurrent control-state reconstruction
+The refactor made the exact prefix representation match the conceptual state
+space.
 
-## Root and reward boundaries
+- Active prefixes end with a node token.
+- Absorbing prefixes end with an explicit `STOP` token.
 
-- `RootActionDistribution.graph_log_z` is now an explicit root-flow boundary
-  `log F(s_root)`, predicted from question tokens, pooled graph summaries, and
-  explicit graph-size features instead of `logsumexp` over start states.
-- `RootActionDistribution.log_probs` now come from a dedicated root-action head.
-- `RootActionDistribution.log_flows` continue to store the child start-state
-  values `log F([e_0])`.
-- SubTB now trains the root consistency residual
-  `log F(s_root) + log P_F([e_0] | s_root) - log F([e_0])` directly.
-- Terminal rewards now use a single fixed terminal-energy table:
-  gold entities map to `log R = 0.0`, non-gold entities map to `log R = -3.0`.
-- Sampled rollouts additionally apply the configured path-length discount
-  `gamma^|tau|` before SubTB consumes the terminal anchor.
-- STOP termination keeps `log P_B = 0`, so there is no separate terminal
-  backward heuristic layered on top of the prefix-tree backward semantics.
+This also made it useful to separate:
 
-## Recommended terminology
+- `done_mask`: inactive in the current batched computation
+- `absorbing_mask`: truly STOP-terminated prefix
 
-Use these terms in future code and docs:
+That distinction matters because padded rows, dead ends, and STOP-terminated
+rows are all inactive for different reasons.
+
+## Reward design after the refactor
+
+The public training contract is now easier to explain:
+
+- terminal correctness determines `terminal_log_rewards`
+- step-level costs live in `log_reward_steps`
+- MS-SubTB consumes both explicitly
+
+In the base public config, this means:
+
+- gold terminal entity -> `0.0`
+- non-gold terminal entity -> `training.terminal_failure_log_reward`
+- every graph move -> `training.step_log_penalty`
+
+## Auxiliary losses removed
+
+The old auxiliary losses were removed from the training path:
+
+- no learned success-classification head
+- no oracle action imitation loss
+
+The model is now trained only through MS-SubTB on the configured reward
+measure. This keeps the optimization target single-purpose and avoids mixing
+flow matching with separate supervised objectives.
+
+## Terminology to standardize
+
+Use these terms in future docs and code comments:
 
 - abstract root boundary
 - root state
 - root action distribution
 - graph prefix state
 - STOP action
-- termination step
+- termination action step
+- terminal number of graph moves
+- terminal reward
+- step log reward
 
-Avoid mixing `submit`, `stop`, and `terminal action` in the same explanation
-unless you explicitly say they refer to the same event.
+Avoid mixing `submit`, `stop`, and `terminal action` unless you immediately say
+they refer to the same event.
+
+## Practical note for future edits
+
+If a future change touches reward design, keep these three questions separate:
+
+1. What defines the trajectory measure?
+2. What only changes sampling behavior?
+3. What is merely auxiliary supervision?
+
+Keeping those layers separate is the easiest way to prevent the docs and the
+implementation from drifting apart again.

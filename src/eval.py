@@ -21,6 +21,7 @@ from src.utils.entrypoint_utils import (
 from src.utils.entrypoint_contracts import validate_eval_entry_contract
 from src.utils.hydra_utils import extras
 from src.utils.logging_utils import RankedLogger
+from src.utils.precision_utils import normalize_precision
 from src.utils.task_utils import task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -157,6 +158,25 @@ def _trainer_supports_inprocess_eval(trainer: Any) -> bool:
     return True
 
 
+def _enforce_inprocess_eval_precision(cfg: DictConfig, *, trainer: Any) -> None:
+    trainer_cfg = cfg.get("trainer")
+    if trainer_cfg is None:
+        return
+    requested_precision = normalize_precision(trainer_cfg.get("precision"))
+    active_precision = normalize_precision(getattr(trainer, "precision", None))
+    if (
+        requested_precision is None
+        or active_precision is None
+        or requested_precision == active_precision
+    ):
+        return
+    raise ValueError(
+        "In-process final eval precision mismatch: "
+        f"active trainer.precision={active_precision!r} requested eval precision={requested_precision!r}. "
+        "Use a fresh eval stack so Lightning can instantiate the requested precision plugin."
+    )
+
+
 def _select_evaluation_metrics(trainer: Any, *, execution_mode: str) -> dict[str, Any]:
     callback_metrics = dict(getattr(trainer, "callback_metrics", {}) or {})
     if execution_mode == "predict":
@@ -179,6 +199,7 @@ def evaluate_model_inprocess(
         raise ValueError(
             "In-process final eval requires a single-device non-distributed trainer."
         )
+    _enforce_inprocess_eval_precision(cfg, trainer=trainer)
     run_cfg = cfg.get("run")
     if run_cfg is None:
         raise ValueError("Missing required config group: `run`.")

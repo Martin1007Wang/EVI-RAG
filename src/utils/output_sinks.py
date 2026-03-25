@@ -35,6 +35,7 @@ class StageMetricsSettings:
     stage: str
     step: int
     epoch: int | None = None
+    record_kind: str | None = None
     metadata: dict[str, Any] | None = None
     file_name: str | None = None
 
@@ -110,6 +111,7 @@ def append_stage_metrics(
         metrics=payload,
         step=int(settings.step),
         epoch=settings.epoch,
+        record_kind=settings.record_kind,
         metadata=settings.metadata,
     )
     return path

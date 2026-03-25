@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Protocol
 
 import torch
@@ -51,7 +50,6 @@ class _AnswerSupervisionMetadata:
 
 # Fixed terminal energy reward keeps supervision entirely in log-reward space.
 _GOLD_TERMINAL_LOG_REWARD = 0.0
-_NON_GOLD_TERMINAL_LOG_REWARD = -3.0
 
 
 @dataclass(frozen=True)
@@ -95,13 +93,15 @@ def _build_answer_mask(batch: TrajectoryBatch) -> torch.Tensor:
 class AnswerReachabilityTrajectorySupervisor:
     """Base terminal-energy supervisor for answer reachability.
 
-    The terminal anchor depends only on whether the reached entity is gold. Path
-    discounts are applied later by the sampler because rollout length is not part
-    of this supervisor interface.
+    The terminal anchor depends only on whether the reached entity is gold.
     """
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, *, non_gold_terminal_log_reward: float = -3.0) -> None:
+        if float(non_gold_terminal_log_reward) > 0.0:
+            raise ValueError(
+                "non_gold_terminal_log_reward must be <= 0 for terminal supervision."
+            )
+        self.non_gold_terminal_log_reward = float(non_gold_terminal_log_reward)
 
     @staticmethod
     def _graph_ids_from_ptr(ptr: torch.Tensor) -> torch.Tensor:
@@ -216,7 +216,7 @@ class AnswerReachabilityTrajectorySupervisor:
             ),
             torch.full_like(
                 terminal_entity_ids,
-                fill_value=_NON_GOLD_TERMINAL_LOG_REWARD,
+                fill_value=self.non_gold_terminal_log_reward,
                 dtype=torch.float32,
             ),
         )
@@ -311,28 +311,6 @@ def _mask_terminal_stop_action_backward_log_probs(
         stopped_mask,
         terminal_backward_log_probs,
         torch.zeros_like(terminal_backward_log_probs),
-    )
-
-
-def _apply_terminal_length_discount(
-    *,
-    terminal_transition: TerminalTransitionBatch,
-    path_lengths: torch.Tensor,
-    trajectory_length_discount: float,
-) -> TerminalTransitionBatch:
-    if trajectory_length_discount == 1.0:
-        return terminal_transition
-    log_discount = path_lengths.to(dtype=torch.float32) * math.log(
-        float(trajectory_length_discount)
-    )
-    terminal_log_rewards = (
-        terminal_transition.terminal_log_rewards.to(dtype=torch.float32) + log_discount
-    )
-    return TerminalTransitionBatch(
-        terminal_entity_ids=terminal_transition.terminal_entity_ids,
-        terminal_rewards=terminal_log_rewards.exp(),
-        terminal_log_rewards=terminal_log_rewards,
-        terminal_backward_log_probs=terminal_transition.terminal_backward_log_probs,
     )
 
 
@@ -834,11 +812,6 @@ def _rebuild_target_sample_batch(
         batch=batch,
         terminal_nodes=current_nodes,
     )
-    terminal_transition = _apply_terminal_length_discount(
-        terminal_transition=terminal_transition,
-        path_lengths=path_lengths,
-        trajectory_length_discount=1.0,
-    )
     masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
         termination_action_steps=termination_action_steps,
         terminal_num_steps=path_lengths,
@@ -958,16 +931,16 @@ class ForwardTrajectoryGFNSampler:
         max_steps: int,
         trajectory_supervisor: TrajectoryRolloutSupervisorProtocol,
         force_stop_on_answer_hit: bool = False,
-        trajectory_length_discount: float = 1.0,
+        step_log_penalty: float = 0.0,
     ) -> None:
         self.max_steps = int(max_steps)
         self.trajectory_supervisor = trajectory_supervisor
         self.force_stop_on_answer_hit = bool(force_stop_on_answer_hit)
-        if not 0.0 < float(trajectory_length_discount) <= 1.0:
+        if float(step_log_penalty) > 0.0:
             raise ValueError(
-                "trajectory_length_discount must be in (0, 1] for ForwardTrajectoryGFNSampler."
+                "step_log_penalty must be <= 0 for ForwardTrajectoryGFNSampler."
             )
-        self.trajectory_length_discount = float(trajectory_length_discount)
+        self.step_log_penalty = float(step_log_penalty)
 
     def sample(
         self,
@@ -1250,11 +1223,6 @@ class ForwardTrajectoryGFNSampler:
             batch=batch,
             terminal_nodes=current_nodes,
         )
-        terminal_transition = _apply_terminal_length_discount(
-            terminal_transition=terminal_transition,
-            path_lengths=num_steps,
-            trajectory_length_discount=self.trajectory_length_discount,
-        )
         masked_terminal_backward_log_probs = _mask_terminal_stop_action_backward_log_probs(
             termination_action_steps=termination_action_steps,
             terminal_num_steps=num_steps,
@@ -1266,6 +1234,9 @@ class ForwardTrajectoryGFNSampler:
             terminal_num_steps=num_steps,
             terminal_backward_log_probs=masked_terminal_backward_log_probs,
         )
+        log_reward_steps = move_mask.to(dtype=torch.float32) * float(
+            self.step_log_penalty
+        )
         return TrajectoryGFNSampleBatch(
             graph_log_z=graph_log_z,
             start_nodes=start_nodes,
@@ -1273,6 +1244,7 @@ class ForwardTrajectoryGFNSampler:
             start_state_log_f=start_log_flows.to(dtype=torch.float32),
             log_pf_steps=log_pf_steps,
             log_pb_steps=log_pb_steps,
+            log_reward_steps=log_reward_steps,
             state_log_f_steps=None,
             next_state_log_f_steps=next_state_log_f_steps,
             move_mask=move_mask,

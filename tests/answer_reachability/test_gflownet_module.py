@@ -9,17 +9,15 @@ import torch
 import src.models.gflownet.policy as gflownet_policy_impl
 import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
+    ActionPriorConfig,
     SearchEvalConfig,
     BackboneConfig,
     GFlowNetTrainingConfig,
-    GuidanceLossConfig,
-    HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
     SamplingTemperatureScheduleConfig,
     SchedulerConfig,
-    ShortestPathRewardConfig,
     StateScoreHeadConfig,
 )
 from src.models.gflownet import (
@@ -47,8 +45,6 @@ def _make_policy_config() -> PolicyConfig:
         backbone=BackboneConfig(
             embedding_dim=8,
             hidden_dim=8,
-            gnn_layers=1,
-            gnn_dropout=0.0,
             use_adapter=True,
             adapter_dim=4,
             adapter_dropout=0.0,
@@ -57,22 +53,20 @@ def _make_policy_config() -> PolicyConfig:
     )
 
 
-def _make_module(h_kind: str) -> GFlowNetModule:
+def _make_module(prior_kind: str) -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
             sampling_temperature=1.0,
         ),
-        heuristic_cfg=HeuristicConfig(
-            kind=h_kind,
+        action_prior_cfg=ActionPriorConfig(
+            kind=prior_kind,
             beta=0.5,
             topology_restart_prob=0.3,
             topology_num_iters=6,
             topology_eps=1.0e-8,
             embedding_temperature=0.7,
-            learned_hidden_dim=16,
-            learned_dropout=0.0,
         ),
         policy_cfg=_make_policy_config(),
         eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
@@ -83,7 +77,7 @@ def _make_module(h_kind: str) -> GFlowNetModule:
 
 
 def _make_module_with_training_cfg(
-    h_kind: str,
+    prior_kind: str,
     *,
     beta: float = 0.5,
     training_cfg: GFlowNetTrainingConfig | None = None,
@@ -98,40 +92,19 @@ def _make_module_with_training_cfg(
                 sampling_temperature=1.0,
             )
         ),
-        heuristic_cfg=HeuristicConfig(
-            kind=h_kind,
+        action_prior_cfg=ActionPriorConfig(
+            kind=prior_kind,
             beta=beta,
             topology_restart_prob=0.3,
             topology_num_iters=6,
             topology_eps=1.0e-8,
             embedding_temperature=0.7,
-            learned_hidden_dim=16,
-            learned_dropout=0.0,
         ),
         policy_cfg=_make_policy_config(),
         eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
-    )
-
-
-def _make_learned_module(
-    *,
-    beta: float = 0.5,
-    guidance_loss_weight: float = 0.1,
-) -> GFlowNetModule:
-    return _make_module_with_training_cfg(
-        "learned",
-        beta=beta,
-        training_cfg=GFlowNetTrainingConfig(
-            rollout_batch_size=3,
-            sampling_temperature=1.0,
-            guidance=GuidanceLossConfig(
-                loss_weight=guidance_loss_weight,
-                detach_features=True,
-            ),
-        ),
     )
 
 
@@ -228,11 +201,11 @@ def test_compute_embedding_log_heuristic_tracks_cosine_similarity() -> None:
     assert log_heuristic[0] > log_heuristic[2] > log_heuristic[1]
 
 
-def test_gflownet_module_uses_heuristic_config() -> None:
+def test_gflownet_module_uses_action_prior_config() -> None:
     module = GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        heuristic_cfg=HeuristicConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(beta=0.0),
         policy_cfg=_make_policy_config(),
         eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
@@ -240,24 +213,8 @@ def test_gflownet_module_uses_heuristic_config() -> None:
         metric_runtime_factory=GraphTaskRuntimeFactory(),
     )
 
-    assert module.cfg.heuristic_cfg.beta == 0.0
-    assert module.policy.heuristic_cfg.beta == 0.0
-
-
-def test_gflownet_module_rejects_untrained_learned_behavior_policy() -> None:
-    with pytest.raises(
-        ValueError,
-        match="heuristic.kind='learned' with heuristic.beta > 0 requires",
-    ):
-        _make_module_with_training_cfg(
-            "learned",
-            beta=0.5,
-            training_cfg=GFlowNetTrainingConfig(
-                rollout_batch_size=3,
-                sampling_temperature=1.0,
-                guidance=GuidanceLossConfig(loss_weight=0.0, detach_features=True),
-            ),
-        )
+    assert module.cfg.action_prior_cfg.beta == 0.0
+    assert module.policy.action_prior_cfg.beta == 0.0
 
 
 def test_gflownet_module_exposes_eval_settings() -> None:
@@ -680,12 +637,11 @@ def test_root_flow_features_include_start_pool_and_size_scalars() -> None:
 
 def test_sampler_can_force_stop_on_terminal_targets_before_behavior_expansion() -> None:
     module = _make_module_with_training_cfg(
-        "learned",
+        "topology",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=3,
             sampling_temperature=1.0,
             force_stop_on_answer_hit=True,
-            guidance=GuidanceLossConfig(loss_weight=0.1, detach_features=True),
         ),
     )
     batch = make_batch_from_graph(
@@ -742,7 +698,7 @@ def test_sampler_can_force_stop_on_terminal_targets_before_behavior_expansion() 
 
 
 def test_sampler_does_not_force_stop_on_terminal_targets_by_default() -> None:
-    module = _make_learned_module()
+    module = _make_module("topology")
     batch = make_batch_from_graph(
         num_nodes=2,
         edge_index=torch.tensor([[0], [1]], dtype=torch.long),
@@ -877,13 +833,13 @@ def test_sampler_uses_deterministic_terminal_backward_log_prob() -> None:
     assert sample_batch.log_pb_steps[0, 0, 0].item() == pytest.approx(0.0)
 
 
-def test_sampler_applies_trajectory_length_discount_to_gold_reward() -> None:
+def test_sampler_keeps_terminal_reward_pure_without_length_discount() -> None:
     module = _make_module_with_training_cfg(
         "none",
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=1,
             sampling_temperature=1.0,
-            trajectory_length_discount=0.5,
+            step_log_penalty=float(torch.log(torch.tensor(0.5)).item()),
         ),
     )
     batch = make_batch_from_graph(
@@ -919,14 +875,16 @@ def test_sampler_applies_trajectory_length_discount_to_gold_reward() -> None:
     )
 
     assert sample_batch.terminal_num_steps[0, 0].item() == 1
-    assert sample_batch.terminal_rewards[0, 0].item() == pytest.approx(0.5)
-    assert sample_batch.terminal_log_rewards[0, 0].item() == pytest.approx(
+    assert sample_batch.terminal_rewards[0, 0].item() == pytest.approx(1.0)
+    assert sample_batch.terminal_log_rewards[0, 0].item() == pytest.approx(0.0)
+    assert sample_batch.log_reward_steps is not None
+    assert sample_batch.log_reward_steps[0, 0, 0].item() == pytest.approx(
         float(torch.log(torch.tensor(0.5)).item())
     )
 
 
 def test_sampler_samples_root_actions_with_behavior_helpers() -> None:
-    module = _make_learned_module()
+    module = _make_module("topology")
     batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
 
@@ -1061,7 +1019,7 @@ def test_sampler_reports_tempered_root_entropy() -> None:
     )
 
 
-def test_target_policy_ignores_behavior_heuristic_beta() -> None:
+def test_target_policy_ignores_behavior_action_prior_beta() -> None:
     torch.manual_seed(5)
     target_only = _make_module_with_training_cfg("topology", beta=0.0)
     torch.manual_seed(5)
@@ -1108,8 +1066,8 @@ def test_target_policy_ignores_behavior_heuristic_beta() -> None:
     )
 
 
-def test_none_heuristic_disables_behavior_guidance() -> None:
-    module = _make_module_with_training_cfg("none", beta=5.0)
+def test_zero_action_prior_disables_behavior_bias() -> None:
+    module = _make_module_with_training_cfg("none", beta=0.0)
     batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
 
@@ -1140,11 +1098,40 @@ def test_none_heuristic_disables_behavior_guidance() -> None:
     )
 
 
-def test_learned_behavior_proposal_uses_cached_local_bias() -> None:
-    module = _make_learned_module()
+def test_relation_action_prior_biases_behavior_edge_sampling() -> None:
+    module = GFlowNetModule(
+        horizon_cfg=HorizonConfig(max_steps=2),
+        training_cfg=GFlowNetTrainingConfig(
+            rollout_batch_size=3, sampling_temperature=1.0
+        ),
+        action_prior_cfg=ActionPriorConfig(
+            kind="none",
+            beta=0.0,
+            edge_beta=1.0,
+            relation_embedding_weight=1.0,
+            target_node_weight=0.0,
+            progress_weight=0.0,
+        ),
+        policy_cfg=_make_policy_config(),
+        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
+        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
+    )
     batch = make_toy_batch()
     prepared_batch = module.policy.prepare_batch(batch)
-    assert prepared_batch.heuristic_cache.step_node_log_heuristic is not None
+    hidden_dim = int(prepared_batch.question_tokens.size(-1))
+    forced_question = torch.zeros_like(prepared_batch.question_tokens)
+    forced_question[0, 0] = 1.0
+    forced_relations = torch.zeros_like(prepared_batch.relation_tokens)
+    forced_relations[0, 0] = 1.0
+    forced_relations[1, 1] = 1.0
+    prepared_batch = replace(
+        prepared_batch,
+        question_tokens=forced_question,
+        relation_tokens=forced_relations,
+    )
+    assert hidden_dim >= 2
 
     state = SearchState(
         topology=prepared_batch.topology,
@@ -1153,29 +1140,26 @@ def test_learned_behavior_proposal_uses_cached_local_bias() -> None:
         done_mask=torch.zeros((1, 1), dtype=torch.bool),
         num_steps=torch.tensor([[0]], dtype=torch.long),
     )
-    target_distribution = module.policy.base_policy.compute_forward_distribution(
+    target_distribution = module.policy.compute_forward_distribution(
+        prepared_batch, state
+    )
+    behavior_distribution = module.policy.compute_behavior_forward_distribution(
         prepared_batch,
         state,
     )
+    assert behavior_distribution.is_stop_action is not None
+    move_mask = ~behavior_distribution.is_stop_action
+    move_logits = behavior_distribution.edge_logits[move_mask]
+    move_edge_ids = behavior_distribution.edge_ids[move_mask]
+    relation_ids = prepared_batch.topology.edge_type.index_select(0, move_edge_ids)
+    relation0_logit = move_logits[relation_ids == 0].max().item()
+    relation1_logit = move_logits[relation_ids == 1].max().item()
 
-    def _boom(*args: object, **kwargs: object) -> torch.Tensor:
-        del args, kwargs
-        raise AssertionError("behavior proposal should use cached local bias")
-
-    module.policy.search_heuristic.compute_state_logits = _boom  # type: ignore[method-assign]
-
-    behavior_logits = module.policy.compute_behavior_edge_logits(
-        prepared_batch,
-        state,
-        target_distribution,
+    assert not torch.allclose(
+        target_distribution.edge_logits,
+        behavior_distribution.edge_logits,
     )
-    start_distribution = module.policy.compute_behavior_start_distribution(
-        prepared_batch
-    )
-
-    assert behavior_logits.shape == target_distribution.edge_logits.shape
-    assert torch.isfinite(behavior_logits).all()
-    assert torch.isfinite(start_distribution.log_probs).all()
+    assert relation0_logit > relation1_logit
 
 
 def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
@@ -1199,6 +1183,9 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
 
     assert loss.ndim == 0
     assert "subtb_loss" in captured_metrics
+    assert "subtb_root_loss" in captured_metrics
+    assert "subtb_pairwise_loss" in captured_metrics
+    assert "subtb_terminal_loss" in captured_metrics
     assert "subtb_residual" in captured_metrics
     assert "subtb_residual_variance_per_batch" in captured_metrics
     assert "subtb_root" in captured_metrics
@@ -1208,6 +1195,13 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     assert "unique_forward_states" in captured_metrics
     assert "raw_graph_candidates" in captured_metrics
     assert "scored_graph_candidates" in captured_metrics
+    assert module.cfg.training_cfg.step_log_penalty is not None
+    assert captured_metrics["step_log_penalty"] == pytest.approx(
+        float(module.cfg.training_cfg.step_log_penalty)
+    )
+    assert captured_metrics["terminal_failure_log_reward"] == pytest.approx(
+        float(module.cfg.training_cfg.terminal_failure_log_reward)
+    )
     assert not any(str(key).startswith("exact_aux") for key in captured_metrics)
 
 
@@ -1273,72 +1267,6 @@ def test_sampler_skips_move_backward_reconstruction() -> None:
     )
 
 
-def test_guidance_loss_uses_learned_behavior_head_targets() -> None:
-    module = _make_module_with_training_cfg(
-        "learned",
-        training_cfg=GFlowNetTrainingConfig(
-            rollout_batch_size=2,
-            guidance=GuidanceLossConfig(loss_weight=0.2, detach_features=True),
-        ),
-    )
-    batch = make_toy_batch()
-    prepared_batch = module.policy.prepare_batch(batch)
-    assert module.sampler is not None
-    sample_batch = module.sampler.sample(
-        batch=batch,
-        policy=module.policy,
-        prepared_batch=prepared_batch,
-        rollout_batch_size=2,
-        temperature=1.0,
-    )
-
-    guidance_result = module._compute_guidance_loss(
-        prepared_batch=prepared_batch,
-        sample_batch=sample_batch,
-    )
-
-    assert guidance_result is not None
-    assert torch.isfinite(guidance_result.loss)
-    assert guidance_result.active_states > 0
-    assert 0.0 <= guidance_result.prediction_mean.item() <= 1.0
-    assert 0.0 <= guidance_result.target_mean.item() <= 1.0
-
-
-def test_training_step_logs_guidance_metrics_when_enabled() -> None:
-    torch.manual_seed(5)
-    module = _make_module_with_training_cfg(
-        "learned",
-        training_cfg=GFlowNetTrainingConfig(
-            rollout_batch_size=2,
-            guidance=GuidanceLossConfig(loss_weight=0.1, detach_features=True),
-        ),
-    )
-    batch = make_batch_from_graph(
-        num_nodes=3,
-        edge_index=torch.tensor([[0, 0], [1, 2]], dtype=torch.long),
-        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
-        q_local_indices=torch.tensor([0], dtype=torch.long),
-        a_local_indices=torch.tensor([2], dtype=torch.long),
-        answer_entity_ids=torch.tensor([102], dtype=torch.long),
-        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
-        sample_id="train-rank-aux",
-    )
-    captured_metrics: dict[str, object] = {}
-
-    def _capture_metric_bundle(*, metrics: dict[str, object], **kwargs: object) -> None:
-        del kwargs
-        captured_metrics.update(metrics)
-
-    module._log_metric_bundle = _capture_metric_bundle  # type: ignore[method-assign]
-
-    loss = module.training_step(batch, batch_idx=0)
-
-    assert loss.ndim == 0
-    assert "guidance_loss" in captured_metrics
-    assert "actor_loss" in captured_metrics
-    assert "rank_aux_loss" not in captured_metrics
-
-
 def test_gflownet_training_step_raises_on_nonfinite_loss() -> None:
     module = _make_module("topology")
     module.loss_fn.compute = lambda *args, **kwargs: SubTrajectoryBalanceLossOutput(  # type: ignore[method-assign]
@@ -1400,7 +1328,7 @@ def test_gflownet_sampling_temperature_schedule_anneals() -> None:
                 total_steps=4,
             ),
         ),
-        heuristic_cfg=HeuristicConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(beta=0.0),
         policy_cfg=_make_policy_config(),
         eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
@@ -1413,47 +1341,14 @@ def test_gflownet_sampling_temperature_schedule_anneals() -> None:
     assert module._resolve_sampling_temperature(global_step=1) == pytest.approx(1.5)
 
 
-def test_gflownet_shortest_path_reward_schedule_decays_to_zero() -> None:
-    module = GFlowNetModule(
-        horizon_cfg=HorizonConfig(max_steps=2),
-        training_cfg=GFlowNetTrainingConfig(
-            shortest_path_reward=ShortestPathRewardConfig(
-                weight=1.2,
-                schedule_type="linear",
-                total_steps=4,
-            ),
-        ),
-        heuristic_cfg=HeuristicConfig(beta=0.0),
-        policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
-        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
-        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
-        metric_runtime_factory=GraphTaskRuntimeFactory(),
-    )
-
-    assert module._resolve_shortest_path_reward_lambda(global_step=0) == pytest.approx(
-        1.2
-    )
-    assert module._resolve_shortest_path_reward_lambda(global_step=1) == pytest.approx(
-        0.8
-    )
-    assert module._resolve_shortest_path_reward_lambda(global_step=3) == pytest.approx(
-        0.0
-    )
-
-
-def test_shortest_path_reward_shaping_uses_prefix_alignment() -> None:
+def test_sampler_applies_constant_step_log_penalty_to_each_move() -> None:
     module = _make_module_with_training_cfg(
         "none",
         beta=0.0,
         training_cfg=GFlowNetTrainingConfig(
             rollout_batch_size=2,
             sampling_temperature=1.0,
-            shortest_path_reward=ShortestPathRewardConfig(
-                weight=0.75,
-                schedule_type="constant",
-                completion_power=2.0,
-            ),
+            step_log_penalty=float(torch.log(torch.tensor(0.5)).item()),
         ),
     )
     batch = make_batch_from_graph(
@@ -1464,49 +1359,39 @@ def test_shortest_path_reward_shaping_uses_prefix_alignment() -> None:
         a_local_indices=torch.tensor([2], dtype=torch.long),
         answer_entity_ids=torch.tensor([102], dtype=torch.long),
         node_entity_ids=torch.tensor([100, 101, 102, 103], dtype=torch.long),
-        sample_id="shortest-path-reward",
-    ).without_raw_features()
-    sample_batch = TrajectoryGFNSampleBatch(
-        graph_log_z=torch.zeros((1,), dtype=torch.float32),
-        start_nodes=torch.tensor([[0, 0]], dtype=torch.long),
-        start_log_probs=torch.zeros((1, 2), dtype=torch.float32),
-        start_state_log_f=torch.zeros((1, 2), dtype=torch.float32),
-        log_pf_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
-        log_pb_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
-        next_state_log_f_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
-        move_mask=torch.ones((1, 2, 2), dtype=torch.bool),
-        trace_nodes=torch.zeros((1, 2, 3), dtype=torch.long),
-        trace_edge_ids=torch.tensor([[[0, 1], [0, 2]]], dtype=torch.long),
-        trace_num_steps=torch.zeros((1, 2, 3), dtype=torch.long),
-        trace_mask=torch.ones((1, 2, 3), dtype=torch.bool),
-        terminal_nodes=torch.tensor([[2, 3]], dtype=torch.long),
-        terminal_num_steps=torch.tensor([[2, 2]], dtype=torch.long),
-        terminal_rewards=torch.ones((1, 2), dtype=torch.float32),
-        terminal_log_rewards=torch.zeros((1, 2), dtype=torch.float32),
-        success_mask=torch.tensor([[True, False]], dtype=torch.bool),
+        sample_id="constant-step-penalty",
     )
+    prepared_batch = module.policy.prepare_batch(batch)
 
-    shaped_batch, metrics = module._apply_shortest_path_reward_shaping(
+    original_forward = module.policy.compute_forward_distribution
+
+    def _prefer_graph_moves(prepared_batch_arg, state, **kwargs):  # noqa: ANN001
+        distribution = original_forward(prepared_batch_arg, state, **kwargs)
+        logits = distribution.edge_logits.detach().clone().to(dtype=torch.float32)
+        if distribution.is_stop_action is not None:
+            logits[distribution.is_stop_action.to(dtype=torch.bool)] = -1.0e9
+        return replace(distribution, edge_logits=logits)
+
+    module.policy.compute_forward_distribution = _prefer_graph_moves  # type: ignore[method-assign]
+
+    assert module.sampler is not None
+    sample_batch = module.sampler.sample(
         batch=batch,
-        sample_batch=sample_batch,
+        policy=module.policy,
+        prepared_batch=prepared_batch,
+        rollout_batch_size=1,
+        temperature=1.0,
     )
 
-    assert shaped_batch.terminal_log_rewards[0, 0].item() == pytest.approx(0.0)
-    assert shaped_batch.terminal_log_rewards[0, 1].item() == pytest.approx(0.0)
-    assert shaped_batch.terminal_rewards[0, 0].item() == pytest.approx(1.0)
-    assert shaped_batch.terminal_rewards[0, 1].item() == pytest.approx(1.0)
-    assert shaped_batch.log_reward_steps is not None
-    assert shaped_batch.log_reward_steps[0, 0, 0].item() == pytest.approx(0.1875)
-    assert shaped_batch.log_reward_steps[0, 0, 1].item() == pytest.approx(0.5625)
-    assert shaped_batch.log_reward_steps[0, 1, 0].item() == pytest.approx(0.1875)
-    assert shaped_batch.log_reward_steps[0, 1, 1].item() == pytest.approx(0.0)
-    assert metrics.lambda_weight == pytest.approx(0.75)
-    assert metrics.mean_alignment == pytest.approx(0.75)
-    assert metrics.mean_bonus == pytest.approx(0.46875)
-    assert metrics.reachable_start_rate == pytest.approx(1.0)
-    assert metrics.full_match_rate == pytest.approx(0.5)
-    assert metrics.success_alignment == pytest.approx(1.0)
-    assert metrics.failure_alignment == pytest.approx(0.5)
+    assert sample_batch.log_reward_steps is not None
+    step_penalty = float(torch.log(torch.tensor(0.5)).item())
+    move_penalties = sample_batch.log_reward_steps[sample_batch.move_mask]
+    assert int(move_penalties.numel()) >= 1
+    assert torch.allclose(move_penalties, torch.full_like(move_penalties, step_penalty))
+    assert torch.equal(
+        sample_batch.log_reward_steps[~sample_batch.move_mask],
+        torch.zeros_like(sample_batch.log_reward_steps[~sample_batch.move_mask]),
+    )
 
 
 def test_sampler_emits_deterministic_backward_log_probs_for_path_state() -> None:
@@ -1626,15 +1511,12 @@ def test_forward_distribution_matches_under_aggressive_chunking() -> None:
     )
 
     baseline = module.policy.compute_forward_distribution(prepared_batch, state)
-    original_forward_chunk = gflownet_policy_impl._FORWARD_EDGE_CHUNK_SIZE
-    original_transition_chunk = gflownet_policy_impl._TRANSITION_LOGIT_CHUNK_SIZE
-    gflownet_policy_impl._FORWARD_EDGE_CHUNK_SIZE = 1
-    gflownet_policy_impl._TRANSITION_LOGIT_CHUNK_SIZE = 1
+    original_chunk = gflownet_policy_impl._CANDIDATE_SCORING_CHUNK_SIZE
+    gflownet_policy_impl._CANDIDATE_SCORING_CHUNK_SIZE = 1
     try:
         chunked = module.policy.compute_forward_distribution(prepared_batch, state)
     finally:
-        gflownet_policy_impl._FORWARD_EDGE_CHUNK_SIZE = original_forward_chunk
-        gflownet_policy_impl._TRANSITION_LOGIT_CHUNK_SIZE = original_transition_chunk
+        gflownet_policy_impl._CANDIDATE_SCORING_CHUNK_SIZE = original_chunk
 
     assert torch.equal(chunked.edge_agent_batch, baseline.edge_agent_batch)
     assert torch.equal(chunked.edge_ids, baseline.edge_ids)
@@ -1648,10 +1530,10 @@ def test_forward_distribution_matches_under_aggressive_chunking() -> None:
     )
 
 
-@pytest.mark.parametrize("h_kind", ["topology", "embedding", "learned"])
+@pytest.mark.parametrize("h_kind", ["topology", "embedding"])
 def test_gflownet_training_step_smoke(h_kind: str) -> None:
     torch.manual_seed(7)
-    module = _make_learned_module() if h_kind == "learned" else _make_module(h_kind)
+    module = _make_module(h_kind)
     module.log = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
     loss = module.training_step(make_toy_batch(), batch_idx=0)

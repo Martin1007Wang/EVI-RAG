@@ -51,6 +51,7 @@ def write_metrics_jsonl(
     metrics: Dict[str, Any],
     step: int,
     epoch: Optional[int] = None,
+    record_kind: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     record = {
@@ -60,6 +61,8 @@ def write_metrics_jsonl(
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "metrics": _serialize_mapping(metrics),
     }
+    if record_kind is not None:
+        record["record_kind"] = str(record_kind)
     if metadata:
         record["metadata"] = _serialize_mapping(metadata)
     with path.open("a", encoding="utf-8") as f:

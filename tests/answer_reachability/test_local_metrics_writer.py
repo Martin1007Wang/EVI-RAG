@@ -34,51 +34,94 @@ def test_local_metrics_writer_skips_non_global_zero_predict_writes(
     assert not (tmp_path / "predict.jsonl").exists()
 
 
-def test_local_metrics_writer_logs_current_batch_and_flushes_tail(
+def test_local_metrics_writer_logs_raw_snapshots_at_logger_cadence(
     tmp_path: Path,
 ) -> None:
-    writer = LocalMetricsWriter(output_dir=tmp_path, enabled=True, train_window_size=2)
+    writer = LocalMetricsWriter(output_dir=tmp_path, enabled=True)
     trainer = SimpleNamespace(
         global_step=0,
         current_epoch=3,
-        log_every_n_steps=2,
         is_global_zero=True,
-        callback_metrics={},
-        logged_metrics={},
+        log_every_n_steps=2,
     )
-
-    writer.on_fit_start(trainer, object())
-
-    trainer.global_step = 1
-    trainer.callback_metrics = {"train/loss": 4.0}
-    writer.on_train_batch_end(trainer, object(), None, None, 0)
-
-    trainer.global_step = 2
-    trainer.callback_metrics = {"train/loss": 2.0}
-    writer.on_train_batch_end(trainer, object(), None, None, 1)
-
-    trainer.global_step = 3
-    trainer.callback_metrics = {"train/loss": 1.0}
-    writer.on_train_batch_end(trainer, object(), None, None, 2)
-    writer.on_train_end(trainer, object())
-
     records = [
+        {"train/loss": 4.0, "train/effective_pass": 0.5},
+        {"train/loss": 2.0, "train/effective_pass": 1.0},
+        {"train/loss": 1.0, "train/effective_pass": 1.5},
+    ]
+
+    def _pop_latest_train_metrics() -> dict[str, float] | None:
+        return records.pop(0) if records else None
+
+    model = SimpleNamespace(pop_latest_train_metrics=_pop_latest_train_metrics)
+
+    writer.on_fit_start(trainer, model)
+    for batch_idx, global_step in enumerate((1, 2, 3)):
+        trainer.global_step = global_step
+        writer.on_train_batch_end(trainer, model, None, object(), batch_idx)
+    writer.on_train_end(trainer, model)
+
+    written_records = [
         json.loads(line)
         for line in (tmp_path / "train.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert records == [
+    assert written_records == [
         {
             "stage": "train",
             "epoch": 3,
             "step": 2,
-            "timestamp": records[0]["timestamp"],
-            "metrics": {"train/loss": 3.0},
+            "timestamp": written_records[0]["timestamp"],
+            "record_kind": "train_step",
+            "metrics": {"train/effective_pass": 1.0, "train/loss": 2.0},
+            "metadata": {"batch_idx": 1},
         },
         {
             "stage": "train",
             "epoch": 3,
             "step": 3,
-            "timestamp": records[1]["timestamp"],
-            "metrics": {"train/loss": 1.5},
+            "timestamp": written_records[1]["timestamp"],
+            "record_kind": "train_step",
+            "metrics": {"train/effective_pass": 1.5, "train/loss": 1.0},
+            "metadata": {"batch_idx": 2},
         },
     ]
+    assert not (tmp_path / "train.summary.jsonl").exists()
+
+
+def test_local_metrics_writer_deduplicates_repeated_global_steps(
+    tmp_path: Path,
+) -> None:
+    writer = LocalMetricsWriter(output_dir=tmp_path, enabled=True)
+    trainer = SimpleNamespace(
+        global_step=0,
+        current_epoch=1,
+        is_global_zero=True,
+        log_every_n_steps=1,
+    )
+    records = [
+        {"train/loss": 4.0},
+        {"train/loss": 2.0},
+        {"train/loss": 1.0},
+    ]
+
+    def _pop_latest_train_metrics() -> dict[str, float] | None:
+        return records.pop(0) if records else None
+
+    model = SimpleNamespace(pop_latest_train_metrics=_pop_latest_train_metrics)
+
+    writer.on_fit_start(trainer, model)
+    trainer.global_step = 1
+    writer.on_train_batch_end(trainer, model, None, object(), 0)
+    trainer.global_step = 1
+    writer.on_train_batch_end(trainer, model, None, object(), 1)
+    trainer.global_step = 2
+    writer.on_train_batch_end(trainer, model, None, object(), 2)
+    writer.on_train_end(trainer, model)
+
+    written_records = [
+        json.loads(line)
+        for line in (tmp_path / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["step"] for record in written_records] == [1, 2]
+    assert [record["metrics"]["train/loss"] for record in written_records] == [2.0, 1.0]
+    assert [record["metadata"]["batch_idx"] for record in written_records] == [1, 2]

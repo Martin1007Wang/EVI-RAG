@@ -97,7 +97,7 @@ def test_subtb_loss_reports_log_z_statistics() -> None:
     assert loss_output.log_z_variance.item() == pytest.approx(1.0)
 
 
-def test_subtb_loss_matches_pairwise_subtrajectory_objective() -> None:
+def test_subtb_loss_matches_ms_subtrajectory_objective() -> None:
     loss_fn = SubTrajectoryBalanceLoss(
         config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
     )
@@ -114,7 +114,63 @@ def test_subtb_loss_matches_pairwise_subtrajectory_objective() -> None:
 
     loss_output = loss_fn.compute(cast(Any, sample_batch))
 
-    assert loss_output.loss.item() == pytest.approx(1.5)
+    assert loss_output.root_component_loss.item() == pytest.approx(0.0)
+    assert loss_output.pairwise_component_loss.item() == pytest.approx(1.0)
+    assert loss_output.terminal_component_loss.item() == pytest.approx(2.5)
+    assert loss_output.loss.item() == pytest.approx(3.5)
+
+
+def test_subtb_loss_applies_component_weights_after_ms_component_means() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(
+        config=SubTrajectoryBalanceConfig(
+            lambda_weight=1.0,
+            normalize=True,
+            root_loss_weight=2.0,
+            pairwise_loss_weight=3.0,
+            terminal_loss_weight=4.0,
+        )
+    )
+    sample_batch = _make_sample_batch(
+        graph_log_z=torch.tensor([1.0], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.0]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[1.0]], dtype=torch.float32),
+        log_pf_steps=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
+        log_pb_steps=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
+        next_state_log_f_steps=torch.tensor([[[2.0, 7.0]]], dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[2]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[3.0]], dtype=torch.float32),
+    )
+
+    loss_output = loss_fn.compute(cast(Any, sample_batch))
+
+    assert loss_output.root_component_loss.item() == pytest.approx(0.0)
+    assert loss_output.pairwise_component_loss.item() == pytest.approx(3.0)
+    assert loss_output.terminal_component_loss.item() == pytest.approx(10.0)
+    assert loss_output.loss.item() == pytest.approx(13.0)
+
+
+def test_subtb_loss_keeps_terminal_components_per_rollout_before_batch_mean() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(
+        config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
+    )
+    sample_batch = _make_sample_batch(
+        graph_log_z=torch.tensor([0.0], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        log_pf_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
+        log_pb_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[1, 1]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[0.0, 2.0]], dtype=torch.float32),
+        success_mask=torch.ones((1, 2), dtype=torch.bool),
+    )
+
+    loss_output = loss_fn.compute(cast(Any, sample_batch))
+
+    assert loss_output.root_component_loss.item() == pytest.approx(0.0)
+    assert loss_output.pairwise_component_loss.item() == pytest.approx(0.0)
+    assert loss_output.terminal_component_loss.item() == pytest.approx(2.0)
+    assert loss_output.loss.item() == pytest.approx(2.0)
 
 
 def test_subtb_loss_backward_is_autograd_safe() -> None:

@@ -21,11 +21,14 @@ def _build_trajectory_sampler(
     horizon_cfg: HorizonConfig,
     training_cfg: GFlowNetTrainingConfig,
 ) -> ForwardTrajectoryGFNSampler:
-    trajectory_supervisor = AnswerReachabilityTrajectorySupervisor()
+    trajectory_supervisor = AnswerReachabilityTrajectorySupervisor(
+        non_gold_terminal_log_reward=float(training_cfg.terminal_failure_log_reward)
+    )
     return ForwardTrajectoryGFNSampler(
         max_steps=int(horizon_cfg.max_steps),
         trajectory_supervisor=trajectory_supervisor,
         force_stop_on_answer_hit=bool(training_cfg.force_stop_on_answer_hit),
+        step_log_penalty=float(training_cfg.step_log_penalty),
     )
 
 

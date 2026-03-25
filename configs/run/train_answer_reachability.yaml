@@ -1,20 +1,4 @@
 # Backward-compatible alias for the canonical `train_rankflow` run.
-# Contract: use with `python src/train.py ...`; requires a `-sub` dataset and is
-# usually selected via `experiment=train_rankflow dataset=webqsp-sub`.
-_target_: src.runs.answer_reachability.AnswerReachabilityTrainRunner
-name: train_rankflow
-task_name: "train/rankflow"
-tags: ["rankflow", "gflownet", "guided"]
-contract:
-  entrypoint: train
-  required_groups: [dataset]
-  recommended_experiment: train_rankflow
-train: true
-test: true
-test_ckpt_path: null
-allow_test_without_checkpoint: false
-final_eval_experiment: rankflow
-final_eval_split: test
-final_eval_output_subdir: final_eval
-ckpt_path: null
-init_ckpt_path: null
+
+defaults:
+  - train_rankflow

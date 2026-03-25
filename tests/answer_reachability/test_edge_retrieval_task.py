@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch
 
 from src.models.configs import (
+    ActionPriorConfig,
     SearchEvalConfig,
     GFlowNetTrainingConfig,
-    HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     SchedulerConfig,
@@ -24,7 +24,7 @@ def _make_edge_retrieval_module() -> GFlowNetModule:
             rollout_batch_size=3,
             sampling_temperature=1.0,
         ),
-        heuristic_cfg=HeuristicConfig(kind="topology", beta=0.5),
+        action_prior_cfg=ActionPriorConfig(kind="topology", beta=0.5),
         policy_cfg=make_policy_config(),
         eval_cfg=SearchEvalConfig(
             task="edge_retrieval",

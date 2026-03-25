@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from src.datasets.graph_retrieval_datamodule import (
-    BudgetBatchSampler,
     GraphRetrievalDataModule,
     StepDrivenTrainSampler,
     _resolve_embedding_attachment_device,
@@ -247,7 +246,7 @@ def test_graph_retrieval_datamodule_train_loader_uses_step_driven_sampler(
         len(sampler)
 
 
-def test_graph_retrieval_datamodule_train_loader_uses_budget_batch_sampler(
+def test_graph_retrieval_datamodule_train_loader_uses_fixed_batch_size(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -278,17 +277,14 @@ def test_graph_retrieval_datamodule_train_loader_uses_budget_batch_sampler(
         train_shuffle=True,
         prefetch_factor=None,
         persistent_workers=False,
-        train_max_edges_per_batch=12,
     )
 
     datamodule.setup(stage="fit")
     loader = datamodule.train_dataloader()
 
-    batch_sampler = loader["batch_sampler"]
-    assert isinstance(batch_sampler, BudgetBatchSampler)
+    assert loader["batch_sampler"] is None
     assert captured["kwargs"]["sampler"] is not None
-    with pytest.raises(TypeError, match="unsized sampler"):
-        len(batch_sampler)
+    assert captured["kwargs"]["batch_size"] == 2
 
 
 def test_graph_retrieval_datamodule_train_loader_is_unsized_but_eval_loader_is_sized(
@@ -314,60 +310,15 @@ def test_graph_retrieval_datamodule_train_loader_is_unsized_but_eval_loader_is_s
         train_shuffle=True,
         prefetch_factor=None,
         persistent_workers=False,
-        train_max_edges_per_batch=12,
     )
 
     datamodule.setup(stage="fit")
     train_loader = datamodule.train_dataloader()
     val_loader = datamodule.val_dataloader()
 
-    with pytest.raises(TypeError, match="unsized sampler"):
+    with pytest.raises(TypeError, match="intentionally unsized"):
         len(train_loader)
     assert len(val_loader) == 2
-
-
-def test_budget_batch_sampler_rejects_oversized_singleton() -> None:
-    dataset = _DummyDataset(
-        "train",
-        size=1,
-        stats_by_idx={0: SimpleNamespace(num_nodes=32, num_edges=4, question_tokens=2)},
-    )
-    sampler = BudgetBatchSampler(
-        sampler=[0],
-        dataset=dataset,
-        max_graphs_per_batch=4,
-        max_nodes_per_batch=16,
-        max_edges_per_batch=None,
-        max_question_tokens_per_batch=None,
-        drop_last=False,
-    )
-
-    with pytest.raises(ValueError, match="Single sample exceeds batch budget"):
-        list(sampler)
-
-
-def test_budget_batch_sampler_len_respects_active_edge_budget() -> None:
-    dataset = _DummyDataset(
-        "train",
-        size=3,
-        stats_by_idx={
-            0: SimpleNamespace(num_nodes=4, num_edges=6, question_tokens=2),
-            1: SimpleNamespace(num_nodes=4, num_edges=6, question_tokens=2),
-            2: SimpleNamespace(num_nodes=4, num_edges=1, question_tokens=2),
-        },
-    )
-    sampler = BudgetBatchSampler(
-        sampler=[0, 1, 2],
-        dataset=dataset,
-        max_graphs_per_batch=10,
-        max_nodes_per_batch=None,
-        max_edges_per_batch=10,
-        max_question_tokens_per_batch=None,
-        drop_last=False,
-    )
-
-    assert len(sampler) == 2
-    assert list(sampler) == [[0], [1, 2]]
 
 
 def test_graph_retrieval_datamodule_set_eval_split_invalidates_cached_dataset(
@@ -595,6 +546,102 @@ def test_on_before_batch_transfer_attaches_relation_table_and_casts_features(
     assert attached.question_emb.dtype == torch.bfloat16
     assert attached.question_ctx.dtype == torch.bfloat16
     assert attached.heuristic_log_v.dtype == torch.bfloat16
+
+
+def test_on_before_batch_transfer_auto_feature_dtype_follows_trainer_precision(
+    tmp_path: Path,
+) -> None:
+    class _DummyGlobalEmbeddings:
+        def __init__(self) -> None:
+            self.entity_embeddings = torch.arange(12, dtype=torch.float32).view(3, 4)
+            self.relation_embeddings = torch.arange(8, dtype=torch.float32).view(2, 4)
+
+        def get_entity_embeddings(self, ids, *, device=None, dtype=None):
+            out = self.entity_embeddings.index_select(0, ids.to(dtype=torch.long))
+            if dtype is not None:
+                out = out.to(dtype=dtype)
+            if device is not None:
+                out = out.to(device=device)
+            return out
+
+        def get_relation_embeddings(self, ids, *, device=None, dtype=None):
+            out = self.relation_embeddings.index_select(0, ids.to(dtype=torch.long))
+            if dtype is not None:
+                out = out.to(dtype=dtype)
+            if device is not None:
+                out = out.to(device=device)
+            return out
+
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+        eval_feature_dtype="auto",
+    )
+    datamodule.trainer = SimpleNamespace(
+        precision="bf16-mixed",
+        state=SimpleNamespace(fn="predict"),
+    )
+    datamodule._shared_resources = SimpleNamespace(
+        global_embeddings=_DummyGlobalEmbeddings()
+    )
+    batch = SimpleNamespace(
+        node_embedding_ids=torch.tensor([0, 2], dtype=torch.long),
+        edge_attr=torch.tensor([1, 1, 0], dtype=torch.long),
+        question_emb=torch.randn((1, 4), dtype=torch.float32),
+        question_ctx=torch.randn((1, 2, 4), dtype=torch.float32),
+    )
+
+    attached = datamodule.on_before_batch_transfer(batch, dataloader_idx=0)
+
+    assert attached.node_embeddings.dtype == torch.bfloat16
+    assert attached.relation_embeddings.dtype == torch.bfloat16
+    assert attached.question_emb.dtype == torch.bfloat16
+    assert attached.question_ctx.dtype == torch.bfloat16
+
+
+def test_current_feature_dtype_null_preserves_source_dtype(tmp_path: Path) -> None:
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+    )
+    datamodule.trainer = SimpleNamespace(
+        precision="bf16-mixed",
+        state=SimpleNamespace(fn="predict"),
+    )
+
+    assert datamodule._current_feature_dtype() is None
+
+
+def test_current_feature_dtype_auto_uses_train_stage_precision(tmp_path: Path) -> None:
+    datamodule = GraphRetrievalDataModule(
+        dataset_cfg=_write_dataset_paths(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        train_shuffle=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+        train_feature_dtype="auto",
+    )
+    datamodule.trainer = SimpleNamespace(
+        precision="16-mixed",
+        state=SimpleNamespace(fn="fit"),
+    )
+
+    assert datamodule._current_feature_dtype() == torch.float16
 
 
 def test_resolve_embedding_attachment_device_prefers_trainer_cuda_root() -> None:

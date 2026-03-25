@@ -12,11 +12,15 @@ from src.models.components import (
     TransitionPolicyHead,
 )
 from src.models.components.embedding import BackboneInput
-from src.models.configs import HeuristicConfig, PolicyConfig
+from src.models.configs import ActionPriorConfig, PolicyConfig
 from src.utils.nn_init import init_linear_xavier
+from src.utils.precision_utils import (
+    align_float_input_dtype,
+    masked_softmax_in_float32,
+)
 from src.utils.segment_ops import sample_segmented_one_1d, segment_logsumexp_1d
 
-from .heuristics import SearchHeuristic
+from .heuristics import SearchActionPrior
 from .repetition import build_entity_revisit_mask_from_flat_state
 from .types import (
     ForwardActionDistribution,
@@ -33,8 +37,13 @@ def _mask_nonfinite_scores(values: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isfinite(values), values, neg_inf)
 
 
-_FORWARD_EDGE_CHUNK_SIZE = 1024
-_TRANSITION_LOGIT_CHUNK_SIZE = 1024
+_CANDIDATE_SCORING_CHUNK_SIZE = 1024
+
+
+def _candidate_chunk_size(*, device: torch.device, total_candidates: int) -> int:
+    if device.type != "cuda":
+        return max(total_candidates, 1)
+    return max(min(total_candidates, _CANDIDATE_SCORING_CHUNK_SIZE), 1)
 
 
 class RootActionDistributionError(ValueError):
@@ -91,6 +100,9 @@ def build_root_action_distribution(
 ) -> RootActionDistribution:
     num_graphs = int(prepared_batch.topology.num_graphs)
     action_logits = _mask_nonfinite_scores(action_logits.to(dtype=torch.float32))
+    start_state_log_flows = _mask_nonfinite_scores(
+        start_state_log_flows.to(dtype=torch.float32)
+    )
     lse, has_values = segment_logsumexp_1d(
         values=action_logits,
         segment_ids=candidate_graph_ids,
@@ -105,10 +117,26 @@ def build_root_action_distribution(
             prepared_batch.observation.sample_ids[idx] for idx in invalid_graphs
         ]
         raise InvalidStartCandidatesError(invalid_samples=invalid_samples)
+    _, has_finite_flows = segment_logsumexp_1d(
+        values=start_state_log_flows,
+        segment_ids=candidate_graph_ids,
+        num_segments=num_graphs,
+        dtype=torch.float32,
+        ignore_non_finite=True,
+        empty_value=float("-inf"),
+    )
+    if not bool(has_finite_flows.all().item()):
+        invalid_graphs = (
+            torch.nonzero(~has_finite_flows, as_tuple=False).view(-1).tolist()
+        )
+        invalid_samples = [
+            prepared_batch.observation.sample_ids[idx] for idx in invalid_graphs
+        ]
+        raise InvalidStartCandidatesError(invalid_samples=invalid_samples)
     return RootActionDistribution(
         candidate_nodes_abs=candidate_nodes_abs,
         candidate_graph_ids=candidate_graph_ids,
-        log_flows=_mask_nonfinite_scores(start_state_log_flows.to(dtype=torch.float32)),
+        log_flows=start_state_log_flows,
         log_probs=action_logits - lse.index_select(0, candidate_graph_ids),
         graph_log_z=_mask_nonfinite_scores(graph_log_z.to(dtype=torch.float32)),
         action_logits=action_logits,
@@ -476,9 +504,13 @@ class BaseSearchPolicy(nn.Module):
             candidate_nodes_abs=candidate_nodes_abs,
             candidate_graph_ids=candidate_graph_ids,
         )
-        hidden = self.root_flow_activation(
-            self.root_flow_hidden(self.root_flow_input_norm(root_inputs))
+        root_inputs = align_float_input_dtype(
+            root_inputs, module=self.root_flow_input_norm
         )
+        root_inputs = self.root_flow_input_norm(root_inputs)
+        root_inputs = align_float_input_dtype(root_inputs, module=self.root_flow_hidden)
+        hidden = self.root_flow_activation(self.root_flow_hidden(root_inputs))
+        hidden = align_float_input_dtype(hidden, module=self.root_flow_head)
         root_log_z = self.root_flow_head(hidden).squeeze(-1)
         return _mask_nonfinite_scores(root_log_z)
 
@@ -496,31 +528,35 @@ class BaseSearchPolicy(nn.Module):
             flat_nodes=flat_nodes,
             flat_num_steps=flat_num_steps,
         )
+        state_dtype = base_state_features.dtype
         step_ids = flat_num_steps.clamp(min=0, max=self.max_steps)
-        step_features = self.step_embedding(step_ids).to(
-            dtype=base_state_features.dtype
-        )
+        step_features = self.step_embedding(step_ids).to(dtype=state_dtype)
         remaining_ids = (self.max_steps - flat_num_steps).clamp(
             min=0, max=self.max_steps
         )
         remaining_features = self.remaining_embedding(remaining_ids).to(
-            dtype=base_state_features.dtype
+            dtype=state_dtype
         )
-        state_features = self.state_feature_norm(
-            self.state_feature_mlp(
-                self.state_feature_input_norm(
-                    torch.cat(
-                        (
-                            base_state_features,
-                            step_features,
-                            remaining_features,
-                            flat_control_states.to(dtype=base_state_features.dtype),
-                        ),
-                        dim=-1,
-                    )
-                )
-            ).to(dtype=base_state_features.dtype)
+        state_inputs = torch.cat(
+            (
+                base_state_features,
+                step_features,
+                remaining_features,
+                flat_control_states.to(dtype=state_dtype),
+            ),
+            dim=-1,
         )
+        state_inputs = align_float_input_dtype(
+            state_inputs, module=self.state_feature_input_norm
+        )
+        state_inputs = self.state_feature_input_norm(state_inputs)
+        first_state_layer = self.state_feature_mlp[0]
+        state_inputs = align_float_input_dtype(state_inputs, module=first_state_layer)
+        state_features = self.state_feature_mlp(state_inputs)
+        state_features = align_float_input_dtype(
+            state_features, module=self.state_feature_norm
+        )
+        state_features = self.state_feature_norm(state_features).to(dtype=state_dtype)
         return torch.where(
             flat_done_mask.unsqueeze(-1),
             torch.zeros_like(state_features),
@@ -567,7 +603,10 @@ class BaseSearchPolicy(nn.Module):
         total_states = int(control_states.size(0))
         if total_states == 0:
             return control_states.new_empty((0, int(control_states.size(-1))))
-        context_query = self.control_query(control_states).to(dtype=torch.float32)
+        control_states = align_float_input_dtype(
+            control_states, module=self.control_query
+        )
+        context_query = self.control_query(control_states)
         context_summary = torch.zeros_like(context_query)
         unique_graph_ids = torch.unique(graph_ids, sorted=True)
         for graph_id_tensor in unique_graph_ids:
@@ -579,29 +618,25 @@ class BaseSearchPolicy(nn.Module):
                 raise ValueError(
                     "question_context_mask contains rows without valid tokens when updating control states."
                 )
-            context_matrix = question_context.to(dtype=torch.float32)
+            context_matrix = question_context
             attention_scores = torch.matmul(
-                context_query[graph_mask],
-                context_matrix.transpose(0, 1),
+                context_query[graph_mask].to(dtype=torch.float32),
+                context_matrix.to(dtype=torch.float32).transpose(0, 1),
             )
             attention_scores = attention_scores / math.sqrt(
                 float(context_matrix.size(-1))
             )
-            attention_scores = attention_scores.masked_fill(
-                ~question_mask.unsqueeze(0),
-                float("-inf"),
-            )
-            attention_weights = torch.softmax(attention_scores, dim=-1)
-            attention_weights = torch.where(
-                torch.isfinite(attention_weights),
-                attention_weights,
-                torch.zeros_like(attention_weights),
+            attention_weights = masked_softmax_in_float32(
+                attention_scores,
+                mask=question_mask.unsqueeze(0).expand_as(attention_scores),
+                dim=-1,
+                output_dtype=context_summary.dtype,
             )
             context_summary[graph_mask] = torch.matmul(
-                attention_weights.to(dtype=context_matrix.dtype),
-                context_matrix,
-            ).to(dtype=torch.float32)
-        return context_summary.to(dtype=control_states.dtype)
+                attention_weights,
+                context_matrix.to(dtype=attention_weights.dtype),
+            )
+        return context_summary
 
     def _update_control_states_from_features(
         self,
@@ -617,21 +652,31 @@ class BaseSearchPolicy(nn.Module):
             control_states=previous_control_states,
             graph_ids=graph_ids,
         )
-        update_inputs = self.control_input_norm(
-            torch.cat(
-                (
-                    attended_question.to(dtype=previous_control_states.dtype),
-                    relation_features.to(dtype=previous_control_states.dtype),
-                    node_features.to(dtype=previous_control_states.dtype),
-                ),
-                dim=-1,
-            )
+        control_dtype = attended_question.dtype
+        update_inputs = torch.cat(
+            (
+                attended_question,
+                relation_features.to(dtype=control_dtype),
+                node_features.to(dtype=control_dtype),
+            ),
+            dim=-1,
+        )
+        update_inputs = align_float_input_dtype(
+            update_inputs, module=self.control_input_norm
+        )
+        update_inputs = self.control_input_norm(update_inputs)
+        update_inputs = align_float_input_dtype(
+            update_inputs, module=self.control_update
+        )
+        previous_control_states = align_float_input_dtype(
+            previous_control_states, module=self.control_update
         )
         next_control = self.control_update(
-            self.control_dropout(update_inputs).to(dtype=torch.float32),
-            previous_control_states.to(dtype=torch.float32),
+            self.control_dropout(update_inputs),
+            previous_control_states,
         )
-        return self.control_norm(next_control).to(dtype=previous_control_states.dtype)
+        next_control = align_float_input_dtype(next_control, module=self.control_norm)
+        return self.control_norm(next_control).to(dtype=control_dtype)
 
     def build_start_control_states(
         self,
@@ -807,36 +852,25 @@ class BaseSearchPolicy(nn.Module):
         scores = scores.to(dtype=torch.float32)
         return _mask_nonfinite_scores(scores)
 
-    def _compute_transition_logits(
+    def _score_transition_chunk(
         self,
         *,
-        prepared_batch: PreparedSearchBatch,
         current_state_features: torch.Tensor,
         candidate_state_features: torch.Tensor,
-        edge_ids: torch.Tensor,
-        graph_ids: torch.Tensor,
-        head: TransitionPolicyHead,
+        relation_features: torch.Tensor,
     ) -> torch.Tensor:
-        del graph_ids
-        total_candidates = int(edge_ids.numel())
+        total_candidates = int(current_state_features.size(0))
         if total_candidates == 0:
-            return torch.empty((0,), device=edge_ids.device, dtype=torch.float32)
-        relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_ids)
-        relation_features = prepared_batch.relation_tokens.index_select(0, relation_ids)
-        chunk_size = total_candidates
-        if edge_ids.device.type == "cuda":
-            chunk_size = min(total_candidates, _TRANSITION_LOGIT_CHUNK_SIZE)
-        logits_chunks: list[torch.Tensor] = []
-        for start in range(0, total_candidates, max(chunk_size, 1)):
-            end = min(start + max(chunk_size, 1), total_candidates)
-            logits_chunks.append(
-                head(
-                    current_state_features=current_state_features[start:end],
-                    candidate_state_features=candidate_state_features[start:end],
-                    relation_features=relation_features[start:end],
-                )
+            return torch.empty(
+                (0,), device=current_state_features.device, dtype=torch.float32
             )
-        return _mask_nonfinite_scores(torch.cat(logits_chunks, dim=0))
+        return _mask_nonfinite_scores(
+            self.forward_policy_head(
+                current_state_features=current_state_features,
+                candidate_state_features=candidate_state_features,
+                relation_features=relation_features,
+            )
+        )
 
     def _compute_stop_action_logits(
         self,
@@ -852,15 +886,15 @@ class BaseSearchPolicy(nn.Module):
         stop_action_relation = self.stop_action_relation_feature.to(
             dtype=current_state_features.dtype
         )
-        chunk_size = total_candidates
-        if graph_ids.device.type == "cuda":
-            chunk_size = min(total_candidates, _TRANSITION_LOGIT_CHUNK_SIZE)
+        chunk_size = _candidate_chunk_size(
+            device=graph_ids.device, total_candidates=total_candidates
+        )
         logits_chunks: list[torch.Tensor] = []
-        for start in range(0, total_candidates, max(chunk_size, 1)):
-            end = min(start + max(chunk_size, 1), total_candidates)
+        for start in range(0, total_candidates, chunk_size):
+            end = min(start + chunk_size, total_candidates)
             chunk_size_current = end - start
             logits_chunks.append(
-                self.forward_policy_head(
+                self._score_transition_chunk(
                     current_state_features=current_state_features[start:end],
                     candidate_state_features=current_node_features[start:end],
                     relation_features=stop_action_relation.unsqueeze(0).expand(
@@ -931,34 +965,36 @@ class BaseSearchPolicy(nn.Module):
         target_nodes: torch.Tensor,
         edge_agent_batch: torch.Tensor,
         child_num_steps: torch.Tensor,
-        graph_ids: torch.Tensor,
     ) -> torch.Tensor:
         _ = child_num_steps
         if int(edge_ids.numel()) == 0:
             return torch.empty((0,), device=edge_ids.device, dtype=torch.float32)
         total_edges = int(edge_ids.numel())
-        chunk_size = total_edges
-        if edge_ids.device.type == "cuda":
-            chunk_size = min(total_edges, _FORWARD_EDGE_CHUNK_SIZE)
+        chunk_size = _candidate_chunk_size(
+            device=edge_ids.device, total_candidates=total_edges
+        )
         edge_logits_chunks: list[torch.Tensor] = []
-        for start in range(0, total_edges, max(chunk_size, 1)):
-            end = min(start + max(chunk_size, 1), total_edges)
+        for start in range(0, total_edges, chunk_size):
+            end = min(start + chunk_size, total_edges)
             chunk_edge_agent_batch = edge_agent_batch[start:end]
             chunk_edge_ids = edge_ids[start:end]
             chunk_target_nodes = target_nodes[start:end]
+            chunk_relation_ids = prepared_batch.topology.edge_type.index_select(
+                0, chunk_edge_ids
+            )
+            chunk_relation_features = prepared_batch.relation_tokens.index_select(
+                0, chunk_relation_ids
+            )
             chunk_child_node_features = prepared_batch.node_tokens.index_select(
                 0, chunk_target_nodes
             )
             edge_logits_chunks.append(
-                self._compute_transition_logits(
-                    prepared_batch=prepared_batch,
+                self._score_transition_chunk(
                     current_state_features=flat_state_features.index_select(
                         0, chunk_edge_agent_batch
                     ),
                     candidate_state_features=chunk_child_node_features,
-                    edge_ids=chunk_edge_ids,
-                    graph_ids=graph_ids[start:end],
-                    head=self.forward_policy_head,
+                    relation_features=chunk_relation_features,
                 )
             )
         return torch.cat(edge_logits_chunks, dim=0)
@@ -1433,7 +1469,6 @@ class BaseSearchPolicy(nn.Module):
                 target_nodes=unique_target_nodes,
                 edge_agent_batch=unique_edge_agent_batch,
                 child_num_steps=unique_child_num_steps,
-                graph_ids=unique_graph_ids.index_select(0, unique_edge_agent_batch),
             )
             (
                 edge_logits,
@@ -1493,7 +1528,7 @@ class BaseSearchPolicy(nn.Module):
             dtype=out_degrees.dtype
         )
         return ForwardActionDistribution(
-            edge_logits=combined_edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
+            edge_logits=combined_edge_logits.to(dtype=torch.float32),
             edge_agent_batch=combined_edge_agent_batch,
             edge_ids=combined_edge_ids,
             target_nodes=combined_target_nodes,
@@ -1602,7 +1637,7 @@ class BaseSearchPolicy(nn.Module):
         if bool(absorbing_mask.any().item()):
             in_degrees.view(-1)[absorbing_mask] = 1
         return ForwardActionDistribution(
-            edge_logits=edge_logits.to(dtype=prepared_batch.node_tokens.dtype),
+            edge_logits=edge_logits.to(dtype=torch.float32),
             edge_agent_batch=edge_agent_batch,
             edge_ids=edge_ids,
             target_nodes=source_nodes,
@@ -1649,26 +1684,26 @@ class GFlowNetPolicy(nn.Module):
         self,
         *,
         base_policy: BaseSearchPolicy,
-        heuristic_cfg: HeuristicConfig,
-        search_heuristic: SearchHeuristic,
+        action_prior_cfg: ActionPriorConfig,
+        search_action_prior: SearchActionPrior,
     ) -> None:
         super().__init__()
         self.base_policy = base_policy
-        self._heuristic_cfg = heuristic_cfg
-        self.search_heuristic = search_heuristic
+        self._action_prior_cfg = action_prior_cfg
+        self.search_action_prior = search_action_prior
 
     @property
-    def heuristic_cfg(self) -> HeuristicConfig:
-        return self._heuristic_cfg
+    def action_prior_cfg(self) -> ActionPriorConfig:
+        return self._action_prior_cfg
+
+    @property
+    def heuristic_cfg(self) -> ActionPriorConfig:
+        return self.action_prior_cfg
 
     def prepare_batch(self, batch) -> PreparedGFlowNetBatch:
         prepared_batch = self.base_policy.prepare_batch(batch)
         with torch.no_grad():
-            heuristic_cache = self.search_heuristic.build_cache(
-                prepared_batch,
-                build_local_state_features=self.base_policy.build_local_state_features,
-                max_steps=self.base_policy.max_steps,
-            )
+            action_prior_cache = self.search_action_prior.build_cache(prepared_batch)
         return PreparedGFlowNetBatch(
             topology=prepared_batch.topology,
             observation=prepared_batch.observation,
@@ -1677,7 +1712,7 @@ class GFlowNetPolicy(nn.Module):
             question_tokens=prepared_batch.question_tokens,
             question_context_tokens=prepared_batch.question_context_tokens,
             question_context_mask=prepared_batch.question_context_mask,
-            heuristic_cache=heuristic_cache,
+            action_prior_cache=action_prior_cache,
         )
 
     def encode(self, batch) -> PreparedGFlowNetBatch:
@@ -1690,35 +1725,6 @@ class GFlowNetPolicy(nn.Module):
             dtype=torch.float32
         )
 
-    def _compute_state_bias(
-        self,
-        *,
-        prepared_batch: PreparedGFlowNetBatch,
-        node_abs_indices: torch.Tensor,
-        num_steps: torch.Tensor,
-        done_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.search_heuristic.compute_cached_bias(
-            heuristic_cache=prepared_batch.heuristic_cache,
-            node_abs_indices=node_abs_indices,
-            num_steps=num_steps,
-            done_mask=done_mask,
-        )
-
-    def compute_guidance_logits(
-        self,
-        prepared_batch: PreparedGFlowNetBatch,
-        state: SearchState,
-        *,
-        detach_features: bool = False,
-    ) -> torch.Tensor:
-        return self.search_heuristic.compute_state_logits(
-            prepared_batch=prepared_batch,
-            state=state,
-            build_state_features=self.base_policy.build_state_features,
-            detach_features=detach_features,
-        ).to(dtype=torch.float32)
-
     def _compute_behavior_forward_logits(
         self,
         *,
@@ -1727,30 +1733,14 @@ class GFlowNetPolicy(nn.Module):
         distribution: ForwardActionDistribution,
     ) -> torch.Tensor:
         edge_logits = distribution.edge_logits.to(dtype=torch.float32)
-        if int(edge_logits.numel()) == 0 or float(self.heuristic_cfg.beta) == 0.0:
+        if int(edge_logits.numel()) == 0 or not self.action_prior_cfg.enabled:
             return edge_logits
-        stop_action_mask = self.base_policy._distribution_stop_mask(distribution)
-        if bool(stop_action_mask.all().item()):
-            return edge_logits
-        graph_mask = ~stop_action_mask
-        child_target_nodes = distribution.target_nodes[graph_mask]
-        child_num_steps = (
-            state.flatten_num_steps().index_select(
-                0, distribution.edge_agent_batch[graph_mask]
-            )
-            + 1
-        )
-        child_bias = self._compute_state_bias(
+        action_prior = self.search_action_prior.score_forward_actions(
             prepared_batch=prepared_batch,
-            node_abs_indices=child_target_nodes,
-            num_steps=child_num_steps,
-            done_mask=torch.zeros_like(child_num_steps, dtype=torch.bool),
+            state=state,
+            distribution=distribution,
         )
-        adjusted_logits = edge_logits.clone()
-        adjusted_logits[graph_mask] = _mask_nonfinite_scores(
-            adjusted_logits[graph_mask] + float(self.heuristic_cfg.beta) * child_bias
-        )
-        return adjusted_logits
+        return _mask_nonfinite_scores(edge_logits + action_prior)
 
     def compute_behavior_edge_logits(
         self,
@@ -1831,17 +1821,16 @@ class GFlowNetPolicy(nn.Module):
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
         )
-        start_bias = self._compute_state_bias(
+        start_bias = self.search_action_prior.score_root_actions(
             prepared_batch=prepared_batch,
-            node_abs_indices=candidate_nodes_abs,
-            num_steps=torch.zeros_like(candidate_nodes_abs, dtype=torch.long),
-            done_mask=torch.zeros_like(candidate_nodes_abs, dtype=torch.bool),
+            candidate_nodes_abs=candidate_nodes_abs,
+            candidate_graph_ids=candidate_graph_ids,
         )
         return build_root_action_distribution(
             prepared_batch=prepared_batch,
             candidate_nodes_abs=candidate_nodes_abs,
             candidate_graph_ids=candidate_graph_ids,
-            action_logits=action_logits + float(self.heuristic_cfg.beta) * start_bias,
+            action_logits=action_logits + start_bias,
             start_state_log_flows=start_state_log_flows,
             graph_log_z=self.base_policy.compute_graph_log_z(prepared_batch),
         )

@@ -1,29 +1,6 @@
 # @package _global_
 #
 # Backward-compatible alias for `experiment=rankflow`.
-# Usage:
-#   python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt
-#
-# Contract:
-# - overrides `/run`, `/dataset`, `/data`, `/model`, `/trainer`
-# - the `/dataset` override chooses the dataset family root; `/run.dataset_variants`
-#   then expands it into `full + sub`
 
 defaults:
-  - override /run: rankflow
-  - override /dataset: webqsp
-  - override /data: graph_retrieval
-  - override /model: gflownet
-  - override /callbacks: eval
-  - override /logger: none
-  - override /trainer: predict
-  - _self_
-
-model:
-  heuristic_cfg:
-    kind: topology
-    beta: 1.0
-  eval_cfg:
-    # Final eval uses the full support-window search budget.
-    max_expansions: 500000
-    max_frontier_size: 65536
+  - rankflow

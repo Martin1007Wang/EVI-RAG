@@ -9,22 +9,11 @@
 # - disables post-fit heavy eval and replay-driven training extras by default
 
 defaults:
-  - override /callbacks: default
-  - override /logger: wandb
-  - override /run: train_rankflow
-  - override /trainer: gpu
-  - override /model: gflownet
+  - train_rankflow
   - _self_
 
-optimized_metric: "val/sub/answer/recall@10"
-
 data:
-  batch_size: 256
   eval_batch_size: 64
-  train_max_graphs_per_batch: 256
-  train_max_nodes_per_batch: 640000
-  train_max_edges_per_batch: 1920000
-  train_max_question_tokens_per_batch: 16384
 
 run:
   # Tuning runs should stop after fit; final eval remains available from the
@@ -33,54 +22,12 @@ run:
 
 fit_schedule:
   max_passes: 48.0
-  val_every_passes: 8.0
-  log_every_passes: 1.0
   early_stopping_patience_passes: 16.0
 
 trainer:
-  min_epochs: 0
-  max_epochs: -1
   max_time: "00:02:00:00"
-  check_val_every_n_epoch: null
-  log_every_n_steps: 32
-  precision: bf16-mixed
-  gradient_clip_val: 0.5
-  limit_val_batches: null
-
-callbacks:
-  model_checkpoint:
-    monitor: "val/sub/answer/recall@10"
-    mode: max
-    filename: "step_{step:07d}"
-    auto_insert_metric_name: False
-    save_weights_only: True
-  early_stopping:
-    monitor: "val/sub/answer/recall@10"
-    mode: max
-    patience: 2
-    min_delta: 0.002
 
 model:
-  training_cfg:
-    shortest_path_reward:
-      weight: 0.75
-      schedule_type: constant
-      completion_power: 2.0
-  heuristic_cfg:
-    kind: none
-    beta: 0.0
   eval_cfg:
-    # Fast-iteration validation only needs a coarse trend estimate.
-    strict_search: true
-    metrics_profile: rank_only
+    # Fast-iteration validation only needs a coarser Monte Carlo trend estimate.
     monte_carlo_rollouts: 128
-    max_expansions: 100000
-    max_frontier_size: 32768
-  scheduler_cfg:
-    type: cosine
-    interval: step
-    t_max: ${trainer.max_steps}
-    eta_min: 1.0e-6
-  optimizer_cfg:
-    lr: 5.0e-5
-    weight_decay: 1.0e-4

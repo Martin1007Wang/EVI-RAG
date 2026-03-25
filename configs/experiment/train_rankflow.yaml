@@ -19,75 +19,47 @@ defaults:
 optimized_metric: "val/sub/answer/recall@10"
 
 data:
-  # Keep the default large enough to use A6000 throughput while leaving headroom
-  # for graph-size variance in the budgeted train batches.
   batch_size: 256
   eval_batch_size: 32
-  train_feature_dtype: bf16
-  eval_feature_dtype: fp32
-  train_max_graphs_per_batch: 256
-  train_max_nodes_per_batch: 640000
-  train_max_edges_per_batch: 1920000
-  train_max_question_tokens_per_batch: 16384
 
 fit_schedule:
   # With large batches, validation every 2 passes becomes too chatty. Keep the
   # pass-based semantics but space checks out so the train loop does more useful
   # optimizer work between validations.
   val_every_passes: 8.0
-  log_every_passes: 1.0
   early_stopping_patience_passes: 96.0
 
 trainer:
-  min_epochs: 0
-  max_epochs: -1
   max_time: "00:08:00:00"
-  check_val_every_n_epoch: null
   # WebQSP-sub sees >1 full train pass by step 32 at batch 256, which keeps
   # train metrics closer to dataset-level trends than per-mini-batch noise.
   log_every_n_steps: 32
-  precision: bf16-mixed
   gradient_clip_val: 0.5
-  limit_val_batches: null
 
 callbacks:
   model_checkpoint:
-    monitor: "val/sub/answer/recall@10"
-    mode: max
-    filename: "step_{step:07d}"
-    auto_insert_metric_name: False
+    monitor: ${optimized_metric}
     save_weights_only: True
   early_stopping:
-    monitor: "val/sub/answer/recall@10"
-    mode: max
-    # Runtime rewrites this from `fit_schedule.early_stopping_patience_passes`.
-    patience: 12
+    monitor: ${optimized_metric}
     min_delta: 0.002
 
 model:
-  training_cfg:
-    guidance:
-      loss_weight: 0.0
-      detach_features: true
-    shortest_path_reward:
-      weight: 0.75
-      schedule_type: constant
-      completion_power: 2.0
-  heuristic_cfg:
-    kind: none
-    beta: 0.0
+  action_prior_cfg:
+    kind: hybrid
+    beta: 0.75
+    node_topology_weight: 1.0
+    node_embedding_weight: 0.5
+    relation_embedding_weight: 1.0
+    target_node_weight: 0.5
+    progress_weight: 1.0
+    stop_beta: 0.0
   eval_cfg:
-    # Training-time validation only needs answer-ranking metrics; full window search is reserved for final eval.
+    # Training-time validation only needs cheap Monte Carlo answer-ranking estimates;
+    # full flow-frontier search is reserved for final eval.
     strict_search: true
     metrics_profile: rank_only
+    support_search_method: monte_carlo
     monte_carlo_rollouts: 256
-    max_expansions: 100000
-    max_frontier_size: 32768
-  scheduler_cfg:
-    type: cosine
-    interval: step
-    t_max: ${trainer.max_steps}
-    eta_min: 1.0e-6
   optimizer_cfg:
     lr: 5.0e-5
-    weight_decay: 1.0e-4

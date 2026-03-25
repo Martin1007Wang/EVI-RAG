@@ -3,10 +3,10 @@ from __future__ import annotations
 import torch
 
 from src.models.configs import (
+    ActionPriorConfig,
     BackboneConfig,
     SearchEvalConfig,
     GFlowNetTrainingConfig,
-    HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
@@ -23,13 +23,11 @@ def _make_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        heuristic_cfg=HeuristicConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(beta=0.0),
         policy_cfg=PolicyConfig(
             backbone=BackboneConfig(
                 embedding_dim=8,
                 hidden_dim=8,
-                gnn_layers=1,
-                gnn_dropout=0.0,
                 use_adapter=True,
                 adapter_dim=4,
                 adapter_dropout=0.0,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from math import log
 from typing import Any
 
 import pytest
@@ -8,7 +9,10 @@ import torch
 from torch.nn import Parameter
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
-from src.models.configs import SamplingTemperatureScheduleConfig
+from src.models.configs import (
+    GFlowNetTrainingConfig,
+    SamplingTemperatureScheduleConfig,
+)
 from src.models.gflownet import (
     SamplingTemperatureScheduler,
     TrainingScheduleContext,
@@ -41,6 +45,13 @@ def _build_linear_named_parameters() -> tuple[
     torch.nn.Module, Iterator[tuple[str, Parameter]]
 ]:
     model = torch.nn.Linear(8, 4)
+    return model, model.named_parameters()
+
+
+def _build_linear_with_norm_named_parameters() -> tuple[
+    torch.nn.Module, Iterator[tuple[str, Parameter]]
+]:
+    model = torch.nn.Sequential(torch.nn.Linear(8, 4), torch.nn.LayerNorm(4))
     return model, model.named_parameters()
 
 
@@ -143,6 +154,50 @@ def test_onecycle_scheduler_rejects_epoch_interval() -> None:
         )
 
 
+def test_optimizer_excludes_bias_and_norm_from_weight_decay() -> None:
+    model, named_parameters = _build_linear_with_norm_named_parameters()
+    config = _build_optimizer_config(
+        model_parameters=named_parameters,
+        optimizer_cfg={"type": "adamw", "lr": 1e-4, "weight_decay": 0.1},
+        scheduler_cfg={"type": "cosine", "t_max": 8},
+        estimated_stepping_batches=8,
+    )
+
+    optimizer = config["optimizer"]
+    named_by_id = {id(parameter): name for name, parameter in model.named_parameters()}
+    decay_names: set[str] = set()
+    no_decay_names: set[str] = set()
+    for group in optimizer.param_groups:
+        param_names = {named_by_id[id(parameter)] for parameter in group["params"]}
+        if float(group["weight_decay"]) == 0.0:
+            no_decay_names |= param_names
+        else:
+            decay_names |= param_names
+
+    assert decay_names == {"0.weight"}
+    assert no_decay_names == {"0.bias", "1.weight", "1.bias"}
+
+
+def test_optimizer_can_apply_weight_decay_to_all_params_when_requested() -> None:
+    model, named_parameters = _build_linear_with_norm_named_parameters()
+    config = _build_optimizer_config(
+        model_parameters=named_parameters,
+        optimizer_cfg={
+            "type": "adamw",
+            "lr": 1e-4,
+            "weight_decay": 0.1,
+            "no_decay_on_bias_and_norm": False,
+        },
+        scheduler_cfg={"type": "cosine", "t_max": 8},
+        estimated_stepping_batches=8,
+    )
+
+    optimizer = config["optimizer"]
+
+    assert len(optimizer.param_groups) == 1
+    assert float(optimizer.param_groups[0]["weight_decay"]) == pytest.approx(0.1)
+
+
 def test_linear_sampling_temperature_scheduler_uses_training_horizon() -> None:
     scheduler = SamplingTemperatureScheduler(
         base_temperature=2.0,
@@ -170,3 +225,9 @@ def test_annealed_sampling_temperature_scheduler_requires_known_horizon() -> Non
 
     with pytest.raises(RuntimeError, match="known step horizon"):
         scheduler.value(global_step=0, schedule_context=schedule_context)
+
+
+def test_gflownet_training_config_exposes_direct_step_log_penalty() -> None:
+    training_cfg = GFlowNetTrainingConfig(step_log_penalty=log(0.5))
+
+    assert training_cfg.step_log_penalty == pytest.approx(log(0.5))

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from .heuristics import (
+    SearchActionPrior,
     SearchHeuristic,
-    StateFeatureBuilder,
     compute_embedding_log_heuristic,
+    compute_question_node_prior,
+    compute_question_relation_prior,
     compute_topology_log_heuristic,
+    compute_topology_node_prior,
 )
 from .losses import SubTrajectoryBalanceLoss, SubTrajectoryBalanceLossOutput
 from .policy import (
@@ -28,7 +31,6 @@ from .sampler import (
 )
 from .schedules import (
     SamplingTemperatureScheduler,
-    ShortestPathRewardScheduler,
     TrainingScheduleContext,
     normalize_scheduler_interval,
 )
@@ -40,6 +42,7 @@ from .transitions import (
     compute_constrained_policy_step,
 )
 from .types import (
+    ActionPriorCache,
     ForwardActionDistribution,
     GFlowNetPolicyProtocol,
     HeuristicCache,
@@ -54,6 +57,7 @@ from .types import (
 
 __all__ = [
     "AnswerReachabilityTrajectorySupervisor",
+    "ActionPriorCache",
     "BaseSearchPolicy",
     "ConstrainedForwardStep",
     "ConstrainedPolicyStep",
@@ -70,13 +74,12 @@ __all__ = [
     "RootActionDistribution",
     "RootActionDistributionError",
     "SamplingTemperatureScheduler",
+    "SearchActionPrior",
     "SearchHeuristic",
     "SearchPolicyProtocol",
     "SearchState",
-    "ShortestPathRewardScheduler",
     "StartDistribution",
     "StartDistributionError",
-    "StateFeatureBuilder",
     "SubTrajectoryBalanceLoss",
     "SubTrajectoryBalanceLossOutput",
     "TerminalTransitionBatch",
@@ -90,7 +93,10 @@ __all__ = [
     "compute_constrained_forward_step",
     "compute_constrained_policy_step",
     "compute_embedding_log_heuristic",
+    "compute_question_node_prior",
+    "compute_question_relation_prior",
     "compute_topology_log_heuristic",
+    "compute_topology_node_prior",
     "normalize_scheduler_interval",
     "resolve_start_candidates",
 ]

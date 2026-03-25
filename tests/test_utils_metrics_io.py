@@ -53,3 +53,20 @@ def test_write_metrics_jsonl_serializes_metrics_and_metadata(tmp_path: Path) -> 
         "source": "artifact.json",
         "flags": [True, 2.0],
     }
+
+
+def test_write_metrics_jsonl_supports_record_kind(tmp_path: Path) -> None:
+    path = tmp_path / "metrics.jsonl"
+
+    write_metrics_jsonl(
+        path=path,
+        stage="train",
+        metrics={"train/loss": 1.25},
+        step=8,
+        record_kind="train_batch",
+    )
+
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[0]["record_kind"] == "train_batch"

@@ -9,28 +9,14 @@
 # - only changes the inference view/profile and artifact naming
 
 defaults:
-  - override /run: rankflow
-  - override /dataset: webqsp
-  - override /data: graph_retrieval
-  - override /model: gflownet
-  - override /callbacks: eval
-  - override /logger: none
-  - override /trainer: predict
+  - rankflow
   - _self_
 
 model:
-  metric_runtime_factory:
-    _target_: src.metrics.runtime_factory.GraphTaskRuntimeFactory
-  heuristic_cfg:
-    kind: topology
-    beta: 1.0
   eval_cfg:
-    _target_: src.models.configs.gflownet.SearchEvalConfig
     task: edge_retrieval
     metrics_profile: rank_only
     support_search_method: monte_carlo
-    edge_top_ks: [1, 5, 10, 25, 50]
-    edge_emit_top_k: 25
 
 run:
   artifact_subdir: eval_edge_retrieval

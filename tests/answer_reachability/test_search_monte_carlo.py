@@ -16,9 +16,9 @@ from src.metrics.search_backends import (
 )
 from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 from src.models.configs import (
+    ActionPriorConfig,
     BackboneConfig,
     GFlowNetTrainingConfig,
-    HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
@@ -188,13 +188,11 @@ def _make_rank_only_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        heuristic_cfg=HeuristicConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(beta=0.0),
         policy_cfg=PolicyConfig(
             backbone=BackboneConfig(
                 embedding_dim=8,
                 hidden_dim=8,
-                gnn_layers=1,
-                gnn_dropout=0.0,
                 use_adapter=True,
                 adapter_dim=4,
                 adapter_dropout=0.0,
@@ -224,13 +222,11 @@ def _make_full_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        heuristic_cfg=HeuristicConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(beta=0.0),
         policy_cfg=PolicyConfig(
             backbone=BackboneConfig(
                 embedding_dim=8,
                 hidden_dim=8,
-                gnn_layers=1,
-                gnn_dropout=0.0,
                 use_adapter=True,
                 adapter_dim=4,
                 adapter_dropout=0.0,

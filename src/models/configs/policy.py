@@ -10,6 +10,19 @@ class StateScoreHeadConfig:
     hidden_dim: int = 256
     num_layers: int = 2
     dropout: float = 0.0
+    conditioning: str = "concat"
+
+    def __post_init__(self) -> None:
+        if self.hidden_dim < 1:
+            raise ValueError("state_score_head.hidden_dim must be >= 1.")
+        if self.num_layers < 1:
+            raise ValueError("state_score_head.num_layers must be >= 1.")
+        if self.dropout < 0.0 or self.dropout >= 1.0:
+            raise ValueError("state_score_head.dropout must be in [0, 1).")
+        if self.conditioning not in {"concat", "none"}:
+            raise ValueError(
+                "state_score_head.conditioning must be one of {'concat', 'none'}."
+            )
 
 
 @dataclass(frozen=True)
@@ -19,7 +32,7 @@ class TransitionPolicyHeadConfig:
     hidden_dim: int = 256
     num_layers: int = 2
     dropout: float = 0.0
-    microbatch_size: int = 4096
+    detach_input_features: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim < 1:
@@ -28,8 +41,6 @@ class TransitionPolicyHeadConfig:
             raise ValueError("transition_head.num_layers must be >= 1.")
         if self.dropout < 0.0 or self.dropout >= 1.0:
             raise ValueError("transition_head.dropout must be in [0, 1).")
-        if self.microbatch_size < 1:
-            raise ValueError("transition_head.microbatch_size must be >= 1.")
 
 
 @dataclass(frozen=True)

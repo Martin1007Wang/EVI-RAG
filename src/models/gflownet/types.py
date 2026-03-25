@@ -93,16 +93,23 @@ class PreparedSearchBatch:
 
 
 @dataclass(frozen=True)
-class HeuristicCache:
-    """Cheap proposal cache used by behavior-policy sampling."""
+class ActionPriorCache:
+    """Cached per-node priors shared across behavior-policy action scoring."""
 
-    node_log_heuristic: torch.Tensor | None = None
-    step_node_log_heuristic: torch.Tensor | None = None
+    node_prior: torch.Tensor | None = None
+
+
+# Backward-compatible alias for older imports.
+HeuristicCache = ActionPriorCache
 
 
 @dataclass(frozen=True)
 class PreparedGFlowNetBatch(PreparedSearchBatch):
-    heuristic_cache: HeuristicCache
+    action_prior_cache: ActionPriorCache
+
+    @property
+    def heuristic_cache(self) -> ActionPriorCache:
+        return self.action_prior_cache
 
 
 @dataclass(frozen=True)
@@ -451,6 +458,7 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
 __all__ = [
     "ForwardActionDistribution",
     "GFlowNetPolicyProtocol",
+    "ActionPriorCache",
     "HeuristicCache",
     "PreparedGFlowNetBatch",
     "PreparedSearchBatch",

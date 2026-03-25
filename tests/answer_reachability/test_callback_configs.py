@@ -15,7 +15,7 @@ def test_default_training_callbacks_use_logged_metric_early_stopping() -> None:
         callbacks_cfg.early_stopping._target_
         == "src.callbacks.step_early_stopping.LoggedMetricEarlyStopping"
     )
-    assert callbacks_cfg.local_metrics_writer.train_window_size == 32
+    assert "train_window_size" not in callbacks_cfg.local_metrics_writer
 
 
 def test_eval_config_uses_eval_callback_bundle() -> None:
@@ -36,4 +36,4 @@ def test_eval_config_uses_eval_callback_bundle() -> None:
         )
 
     assert sorted(cfg.callbacks.keys()) == ["local_metrics_writer", "rich_progress_bar"]
-    assert cfg.callbacks.local_metrics_writer.train_window_size == 32
+    assert "train_window_size" not in cfg.callbacks.local_metrics_writer

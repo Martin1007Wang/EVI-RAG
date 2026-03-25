@@ -25,37 +25,38 @@ horizon_cfg:
 training_cfg:
   _target_: src.models.configs.gflownet.GFlowNetTrainingConfig
   rollout_batch_size: 8
-  guidance:
-    _target_: src.models.configs.gflownet.GuidanceLossConfig
-    loss_weight: 0.0
-    detach_features: true
   sampling_temperature: 1.0
   force_stop_on_answer_hit: false
-  trajectory_length_discount: 0.97
+  terminal_failure_log_reward: -3.0
+  step_log_penalty: -0.030459207484708574
   sampling_temperature_schedule:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
     type: constant
-  shortest_path_reward:
-    _target_: src.models.configs.gflownet.ShortestPathRewardConfig
-    weight: 0.0
-    schedule_type: constant
-    completion_power: 1.0
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
     lambda_weight: 1.0
     normalize: true
+    root_loss_weight: 1.0
+    pairwise_loss_weight: 1.0
+    terminal_loss_weight: 1.0
 
-heuristic_cfg:
-  _target_: src.models.configs.gflownet.HeuristicConfig
-  # Default training stays on-policy; eval-time heuristics can still override this.
+action_prior_cfg:
+  _target_: src.models.configs.gflownet.ActionPriorConfig
+  # Behavior-policy priors improve training exploration without changing the
+  # target policy or adding auxiliary losses. Base model defaults stay off.
   kind: none
   beta: 0.0
+  stop_beta: 0.0
+  node_topology_weight: 1.0
+  node_embedding_weight: 1.0
+  relation_embedding_weight: 1.0
+  target_node_weight: 0.5
+  progress_weight: 1.0
+  stop_node_weight: 1.0
   topology_restart_prob: 0.25
   topology_num_iters: 8
   topology_eps: 1.0e-8
   embedding_temperature: 1.0
-  learned_hidden_dim: 256
-  learned_dropout: 0.0
 
 policy_cfg:
   _target_: src.models.configs.policy.PolicyConfig
@@ -63,8 +64,6 @@ policy_cfg:
     _target_: src.models.configs.backbone.BackboneConfig
     embedding_dim: 1024
     hidden_dim: 512
-    gnn_layers: 2
-    gnn_dropout: 0.1
     use_adapter: true
     adapter_dim: 128
     adapter_dropout: 0.1
@@ -76,19 +75,20 @@ policy_cfg:
     hidden_dim: 256
     num_layers: 2
     dropout: 0.0
+    conditioning: concat
   forward_policy_head:
     _target_: src.models.configs.policy.TransitionPolicyHeadConfig
     hidden_dim: 256
     num_layers: 2
     dropout: 0.0
-    microbatch_size: 4096
+    detach_input_features: false
 
 eval_cfg:
   _target_: src.models.configs.gflownet.SearchEvalConfig
   # Base model defaults use deterministic flow-frontier search for full
-  # answer-reachability evaluation. Training experiments still override to
-  # rank_only validation for a cheaper fit loop, while Monte Carlo knobs remain
-  # available for legacy and edge-retrieval paths.
+  # answer-reachability evaluation. Training experiments override this to
+  # rank_only Monte Carlo validation for a cheaper fit loop, while Monte Carlo
+  # knobs remain available for edge-retrieval and explicit eval overrides.
   strict_search: true
   metrics_profile: full
   support_search_method: flow_frontier
@@ -109,6 +109,7 @@ optimizer_cfg:
   lr: 1.0e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
+  no_decay_on_bias_and_norm: true
 
 scheduler_cfg:
   _target_: src.models.configs.training.SchedulerConfig

@@ -1,32 +1,24 @@
 from __future__ import annotations
 
-from typing import Callable, Protocol
-
 import torch
 from torch import nn
 
-from src.graph import GraphTopology, SearchObservation
-from src.models.components.heuristic_heads import LearnedHeuristicHead
-from src.models.configs import HeuristicConfig
+from src.models.configs import ActionPriorConfig
 
-from .types import (
-    ForwardActionDistribution,
-    HeuristicCache,
-    PreparedSearchBatch,
-    SearchState,
-)
+from .types import ActionPriorCache, ForwardActionDistribution, PreparedGFlowNetBatch
+from .types import PreparedSearchBatch, SearchState
 
 
-def compute_topology_log_heuristic(
+def compute_topology_node_prior(
     *,
-    topology: GraphTopology,
-    observation: SearchObservation,
+    topology,
+    observation,
     restart_prob: float,
     num_iters: int,
     eps: float,
 ) -> torch.Tensor:
     device = topology.edge_index.device
-    log_heuristic = torch.full(
+    log_prior = torch.full(
         (topology.num_nodes,), fill_value=float("-inf"), device=device
     )
     q_abs, q_graph_ids = topology.resolve_local_node_indices(
@@ -53,7 +45,7 @@ def compute_topology_log_heuristic(
         edge_mask = edge_graph_ids == graph_idx
         local_edge_index = topology.edge_index[:, edge_mask] - node_start
         if int(local_edge_index.numel()) == 0:
-            log_heuristic[node_start:node_end] = (seeds + float(eps)).log()
+            log_prior[node_start:node_end] = (seeds + float(eps)).log()
             continue
         src = local_edge_index[0]
         dst = local_edge_index[1]
@@ -65,13 +57,13 @@ def compute_topology_log_heuristic(
             mass = (
                 float(restart_prob) * seeds + (1.0 - float(restart_prob)) * propagated
             )
-        log_heuristic[node_start:node_end] = (mass + float(eps)).log()
-    return log_heuristic
+        log_prior[node_start:node_end] = (mass + float(eps)).log()
+    return log_prior.to(dtype=torch.float32)
 
 
-def compute_embedding_log_heuristic(
+def compute_question_node_prior(
     *,
-    topology: GraphTopology,
+    topology,
     node_tokens: torch.Tensor,
     question_tokens: torch.Tensor,
     temperature: float,
@@ -82,269 +74,299 @@ def compute_embedding_log_heuristic(
     return cosine.to(dtype=torch.float32) / float(temperature)
 
 
-StateFeatureBuilder = Callable[[PreparedSearchBatch, SearchState], torch.Tensor]
+def compute_question_relation_prior(
+    *,
+    relation_features: torch.Tensor,
+    question_features: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    if tuple(relation_features.shape[:-1]) != tuple(question_features.shape[:-1]):
+        raise ValueError(
+            "question_features must match relation_features batch shape when scoring relation priors."
+        )
+    cosine = torch.nn.functional.cosine_similarity(
+        relation_features,
+        question_features,
+        dim=-1,
+    )
+    return cosine.to(dtype=torch.float32) / float(temperature)
 
 
-class LocalStateFeatureBuilder(Protocol):
-    def __call__(
-        self,
-        prepared_batch: PreparedSearchBatch,
-        *,
-        flat_nodes: torch.Tensor,
-        flat_num_steps: torch.Tensor,
-        flat_done_mask: torch.Tensor,
-    ) -> torch.Tensor: ...
+def _group_center(
+    *,
+    values: torch.Tensor,
+    group_ids: torch.Tensor,
+    num_groups: int,
+) -> torch.Tensor:
+    centered = values.to(dtype=torch.float32).clone()
+    if int(centered.numel()) == 0:
+        return centered
+    for group_idx in range(int(num_groups)):
+        group_mask = group_ids == group_idx
+        if not bool(group_mask.any().item()):
+            continue
+        group_values = centered[group_mask]
+        centered[group_mask] = group_values - group_values.mean()
+    return centered
 
 
-_LEARNED_PROPOSAL_CACHE_CHUNK_SIZE = 4096
+def _group_standardize(
+    *,
+    values: torch.Tensor,
+    group_ids: torch.Tensor,
+    num_groups: int,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    standardized = values.to(dtype=torch.float32).clone()
+    if int(standardized.numel()) == 0:
+        return standardized
+    for group_idx in range(int(num_groups)):
+        group_mask = group_ids == group_idx
+        if not bool(group_mask.any().item()):
+            continue
+        group_values = standardized[group_mask]
+        centered = group_values - group_values.mean()
+        scale = centered.square().mean().sqrt().clamp_min(float(eps))
+        standardized[group_mask] = centered / scale
+    return standardized
 
 
-class SearchHeuristic(nn.Module):
-    def __init__(
-        self,
-        *,
-        config: HeuristicConfig,
-        learned_head: LearnedHeuristicHead | None = None,
-    ) -> None:
+class SearchActionPrior(nn.Module):
+    def __init__(self, *, config: ActionPriorConfig) -> None:
         super().__init__()
         self._config = config
-        self.learned_head = learned_head
-        if self.uses_learned_head and self.learned_head is None:
-            raise ValueError("learned heuristic requires a LearnedHeuristicHead.")
-        if not self.uses_learned_head and self.learned_head is not None:
-            raise ValueError(
-                "learned_head should only be provided when heuristic.kind is 'learned'."
-            )
 
     @property
-    def config(self) -> HeuristicConfig:
+    def config(self) -> ActionPriorConfig:
         return self._config
 
     @property
     def enabled(self) -> bool:
-        return self.config.kind != "none" and float(self.config.beta) > 0.0
+        return self.config.enabled
 
-    @property
-    def uses_learned_head(self) -> bool:
-        return self.config.kind == "learned"
+    def _build_node_prior(
+        self,
+        prepared_batch: PreparedSearchBatch,
+    ) -> torch.Tensor | None:
+        if self.config.kind == "none":
+            return None
+        topology = prepared_batch.topology
+        num_graphs = int(topology.num_graphs)
+        node_graph_ids = topology.all_node_graph_index(
+            device=prepared_batch.node_tokens.device
+        )
+        components: list[torch.Tensor] = []
+        weights: list[float] = []
+        if (
+            self.config.kind in {"topology", "hybrid"}
+            and self.config.node_topology_weight > 0.0
+        ):
+            topology_prior = compute_topology_node_prior(
+                topology=topology,
+                observation=prepared_batch.observation,
+                restart_prob=float(self.config.topology_restart_prob),
+                num_iters=int(self.config.topology_num_iters),
+                eps=float(self.config.topology_eps),
+            )
+            components.append(
+                _group_standardize(
+                    values=topology_prior,
+                    group_ids=node_graph_ids,
+                    num_groups=num_graphs,
+                )
+            )
+            weights.append(float(self.config.node_topology_weight))
+        if (
+            self.config.kind in {"embedding", "hybrid"}
+            and self.config.node_embedding_weight > 0.0
+        ):
+            embedding_prior = compute_question_node_prior(
+                topology=topology,
+                node_tokens=prepared_batch.node_tokens,
+                question_tokens=prepared_batch.question_tokens,
+                temperature=float(self.config.embedding_temperature),
+            )
+            components.append(
+                _group_standardize(
+                    values=embedding_prior,
+                    group_ids=node_graph_ids,
+                    num_groups=num_graphs,
+                )
+            )
+            weights.append(float(self.config.node_embedding_weight))
+        if not components:
+            return None
+        node_prior = torch.zeros_like(components[0], dtype=torch.float32)
+        for component, weight in zip(components, weights):
+            node_prior = node_prior + float(weight) * component
+        return node_prior
 
     def build_cache(
         self,
         prepared_batch: PreparedSearchBatch,
-        *,
-        build_local_state_features: LocalStateFeatureBuilder | None = None,
-        max_steps: int | None = None,
-    ) -> HeuristicCache:
-        # Behavior sampling only needs a cheap proposal prior, so we cache
-        # per-node or per-(step, node) scores once per prepared batch.
+    ) -> ActionPriorCache:
         if not self.enabled:
-            return HeuristicCache(node_log_heuristic=None, step_node_log_heuristic=None)
-        if self.config.kind == "topology":
-            return HeuristicCache(
-                node_log_heuristic=compute_topology_log_heuristic(
-                    topology=prepared_batch.topology,
-                    observation=prepared_batch.observation,
-                    restart_prob=float(self.config.topology_restart_prob),
-                    num_iters=int(self.config.topology_num_iters),
-                    eps=float(self.config.topology_eps),
-                )
-            )
-        if self.config.kind == "embedding":
-            return HeuristicCache(
-                node_log_heuristic=compute_embedding_log_heuristic(
-                    topology=prepared_batch.topology,
-                    node_tokens=prepared_batch.node_tokens,
-                    question_tokens=prepared_batch.question_tokens,
-                    temperature=float(self.config.embedding_temperature),
-                )
-            )
-        if build_local_state_features is None or max_steps is None:
-            raise ValueError(
-                "learned heuristic cache requires build_local_state_features and max_steps."
-            )
-        return HeuristicCache(
-            node_log_heuristic=None,
-            step_node_log_heuristic=self._build_step_node_log_heuristic(
-                prepared_batch=prepared_batch,
-                build_local_state_features=build_local_state_features,
-                max_steps=int(max_steps),
-            ),
-        )
+            return ActionPriorCache(node_prior=None)
+        return ActionPriorCache(node_prior=self._build_node_prior(prepared_batch))
 
     @staticmethod
-    def _node_log_heuristic(
-        *, node_abs_indices: torch.Tensor, cache: HeuristicCache
-    ) -> torch.Tensor:
-        if cache.node_log_heuristic is None:
-            return torch.zeros_like(node_abs_indices, dtype=torch.float32)
-        return cache.node_log_heuristic.index_select(0, node_abs_indices)
-
-    def _build_step_node_log_heuristic(
-        self,
+    def _lookup_node_prior(
         *,
-        prepared_batch: PreparedSearchBatch,
-        build_local_state_features: LocalStateFeatureBuilder,
-        max_steps: int,
+        action_prior_cache: ActionPriorCache,
+        node_abs_indices: torch.Tensor,
     ) -> torch.Tensor:
-        if self.learned_head is None:
-            raise RuntimeError(
-                "learned heuristic cache requires a LearnedHeuristicHead."
-            )
-        num_nodes = int(prepared_batch.topology.num_nodes)
-        device = prepared_batch.node_tokens.device
-        node_abs_indices = torch.arange(num_nodes, device=device, dtype=torch.long)
-        node_graph_ids = prepared_batch.topology.all_node_graph_index(device=device)
-        cache = torch.empty(
-            (max_steps + 1, num_nodes),
-            device=device,
-            dtype=torch.float32,
-        )
-        if num_nodes == 0:
-            return cache
-        chunk_size = num_nodes
-        if device.type == "cuda":
-            chunk_size = min(num_nodes, _LEARNED_PROPOSAL_CACHE_CHUNK_SIZE)
-        for step in range(max_steps + 1):
-            chunk_logits: list[torch.Tensor] = []
-            for start in range(0, num_nodes, max(chunk_size, 1)):
-                end = min(start + max(chunk_size, 1), num_nodes)
-                chunk_nodes = node_abs_indices[start:end]
-                chunk_steps = torch.full_like(chunk_nodes, fill_value=step)
-                chunk_done = torch.zeros_like(chunk_nodes, dtype=torch.bool)
-                local_state_features = build_local_state_features(
-                    prepared_batch,
-                    flat_nodes=chunk_nodes,
-                    flat_num_steps=chunk_steps,
-                    flat_done_mask=chunk_done,
-                )
-                question_features = prepared_batch.question_tokens.index_select(
-                    0, node_graph_ids[start:end]
-                )
-                chunk_logits.append(
-                    self._state_log_heuristic(
-                        state_features=local_state_features,
-                        question_features=question_features,
-                    )
-                )
-            cache[step] = torch.cat(chunk_logits, dim=0)
-        return cache
+        if action_prior_cache.node_prior is None:
+            return torch.zeros_like(node_abs_indices, dtype=torch.float32)
+        return action_prior_cache.node_prior.index_select(0, node_abs_indices)
 
     def compute_cached_bias(
         self,
         *,
-        heuristic_cache: HeuristicCache,
+        heuristic_cache: ActionPriorCache,
         node_abs_indices: torch.Tensor,
         num_steps: torch.Tensor,
         done_mask: torch.Tensor,
     ) -> torch.Tensor:
-        safe_steps = num_steps.to(dtype=torch.long)
-        if heuristic_cache.step_node_log_heuristic is not None:
-            safe_node_abs_indices = node_abs_indices.to(dtype=torch.long).clamp(
-                min=0,
-                max=max(int(heuristic_cache.step_node_log_heuristic.size(1)) - 1, 0),
-            )
-            max_step = int(heuristic_cache.step_node_log_heuristic.size(0)) - 1
-            safe_steps = safe_steps.clamp(min=0, max=max(max_step, 0))
-            bias = heuristic_cache.step_node_log_heuristic[
-                safe_steps, safe_node_abs_indices
-            ]
-        else:
-            bias = self._node_log_heuristic(
-                node_abs_indices=node_abs_indices,
-                cache=heuristic_cache,
-            )
+        del num_steps
+        node_prior = self._lookup_node_prior(
+            action_prior_cache=heuristic_cache,
+            node_abs_indices=node_abs_indices,
+        )
         return torch.where(
             done_mask.to(dtype=torch.bool),
-            torch.zeros_like(bias),
-            bias.to(dtype=torch.float32),
+            torch.zeros_like(node_prior),
+            node_prior,
         )
 
-    def _state_log_heuristic(
+    def score_root_actions(
         self,
         *,
-        state_features: torch.Tensor,
-        question_features: torch.Tensor,
+        prepared_batch: PreparedGFlowNetBatch,
+        candidate_nodes_abs: torch.Tensor,
+        candidate_graph_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if self.learned_head is None:
-            return torch.zeros(
-                (int(state_features.size(0)),),
-                device=state_features.device,
-                dtype=torch.float32,
-            )
-        logits = self.learned_head(
-            state_features=state_features,
+        if float(self.config.root_beta or 0.0) == 0.0:
+            return torch.zeros_like(candidate_nodes_abs, dtype=torch.float32)
+        node_prior = self._lookup_node_prior(
+            action_prior_cache=prepared_batch.action_prior_cache,
+            node_abs_indices=candidate_nodes_abs,
+        )
+        node_prior = _group_center(
+            values=node_prior,
+            group_ids=candidate_graph_ids,
+            num_groups=int(prepared_batch.topology.num_graphs),
+        )
+        return float(self.config.root_beta or 0.0) * node_prior
+
+    def _score_relation_prior(
+        self,
+        *,
+        prepared_batch: PreparedGFlowNetBatch,
+        relation_ids: torch.Tensor,
+        graph_ids: torch.Tensor,
+        action_group_ids: torch.Tensor,
+        num_groups: int,
+    ) -> torch.Tensor:
+        if float(self.config.relation_embedding_weight) == 0.0:
+            return torch.zeros_like(relation_ids, dtype=torch.float32)
+        relation_features = prepared_batch.relation_tokens.index_select(0, relation_ids)
+        question_features = prepared_batch.question_tokens.index_select(0, graph_ids)
+        relation_prior = compute_question_relation_prior(
+            relation_features=relation_features,
             question_features=question_features,
+            temperature=float(self.config.embedding_temperature),
         )
-        return torch.nn.functional.logsigmoid(logits)
+        return _group_standardize(
+            values=relation_prior,
+            group_ids=action_group_ids,
+            num_groups=num_groups,
+        )
 
-    def compute_state_logits(
+    def score_forward_actions(
         self,
         *,
-        prepared_batch: PreparedSearchBatch,
+        prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
-        build_state_features: StateFeatureBuilder,
-        detach_features: bool = False,
+        distribution: ForwardActionDistribution,
     ) -> torch.Tensor:
-        if not self.uses_learned_head:
-            return torch.zeros(
-                state.current_nodes.shape,
-                device=state.current_nodes.device,
-                dtype=torch.float32,
-            )
-        state_features = build_state_features(prepared_batch, state).view(
-            int(state.current_nodes.numel()), -1
+        edge_logits = distribution.edge_logits.to(dtype=torch.float32)
+        if int(edge_logits.numel()) == 0:
+            return edge_logits
+        total_agents = int(state.current_nodes.numel())
+        stop_action_mask = (
+            distribution.is_stop_action.to(dtype=torch.bool)
+            if distribution.is_stop_action is not None
+            else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
         )
-        question_features = prepared_batch.question_tokens.index_select(
-            0, state.flatten_graph_index()
-        )
-        if detach_features:
-            state_features = state_features.detach()
-            question_features = question_features.detach()
-        if self.learned_head is None:
-            raise RuntimeError(
-                "learned heuristic logits require a LearnedHeuristicHead."
+        action_prior = torch.zeros_like(edge_logits, dtype=torch.float32)
+        graph_action_mask = ~stop_action_mask
+        if (
+            bool(graph_action_mask.any().item())
+            and float(self.config.edge_beta or 0.0) > 0.0
+        ):
+            graph_edge_ids = distribution.edge_ids[graph_action_mask]
+            graph_target_nodes = distribution.target_nodes[graph_action_mask]
+            graph_action_groups = distribution.edge_agent_batch[graph_action_mask]
+            current_nodes = state.flatten_current_nodes().index_select(
+                0, graph_action_groups
             )
-        logits = self.learned_head(
-            state_features=state_features,
-            question_features=question_features,
-        ).view_as(state.current_nodes)
-        return torch.where(state.done_mask, torch.zeros_like(logits), logits)
+            graph_ids = prepared_batch.topology.graph_index_from_nodes(current_nodes)
+            relation_ids = prepared_batch.topology.edge_type.index_select(
+                0, graph_edge_ids
+            )
+            target_prior = self._lookup_node_prior(
+                action_prior_cache=prepared_batch.action_prior_cache,
+                node_abs_indices=graph_target_nodes,
+            )
+            current_prior = self._lookup_node_prior(
+                action_prior_cache=prepared_batch.action_prior_cache,
+                node_abs_indices=current_nodes,
+            )
+            relation_prior = self._score_relation_prior(
+                prepared_batch=prepared_batch,
+                relation_ids=relation_ids,
+                graph_ids=graph_ids,
+                action_group_ids=graph_action_groups,
+                num_groups=total_agents,
+            )
+            edge_prior = (
+                float(self.config.relation_embedding_weight) * relation_prior
+                + float(self.config.target_node_weight) * target_prior
+                + float(self.config.progress_weight) * (target_prior - current_prior)
+            )
+            action_prior[graph_action_mask] = (
+                float(self.config.edge_beta or 0.0) * edge_prior
+            )
+        if bool(stop_action_mask.any().item()) and float(self.config.stop_beta) > 0.0:
+            stop_nodes = distribution.target_nodes[stop_action_mask]
+            stop_prior = self._lookup_node_prior(
+                action_prior_cache=prepared_batch.action_prior_cache,
+                node_abs_indices=stop_nodes,
+            )
+            action_prior[stop_action_mask] = (
+                float(self.config.stop_beta)
+                * float(self.config.stop_node_weight)
+                * stop_prior
+            )
+        return _group_center(
+            values=action_prior,
+            group_ids=distribution.edge_agent_batch,
+            num_groups=total_agents,
+        )
 
-    def compute_state_bias(
-        self,
-        *,
-        prepared_batch: PreparedSearchBatch,
-        heuristic_cache: HeuristicCache,
-        state: SearchState,
-        build_state_features: StateFeatureBuilder,
-    ) -> torch.Tensor:
-        if not self.enabled:
-            return torch.zeros(
-                state.current_nodes.shape,
-                device=state.current_nodes.device,
-                dtype=torch.float32,
-            )
-        flat_nodes = state.flatten_current_nodes()
-        if self.uses_learned_head:
-            flat_bias = torch.nn.functional.logsigmoid(
-                self.compute_state_logits(
-                    prepared_batch=prepared_batch,
-                    state=state,
-                    build_state_features=build_state_features,
-                ).view(-1)
-            )
-        else:
-            flat_bias = self._node_log_heuristic(
-                node_ids=flat_nodes,
-                cache=heuristic_cache,
-            )
-        bias = flat_bias.view_as(state.current_nodes)
-        return torch.where(state.done_mask, torch.zeros_like(bias), bias)
+
+# Backward-compatible aliases for older names.
+SearchHeuristic = SearchActionPrior
+compute_topology_log_heuristic = compute_topology_node_prior
+compute_embedding_log_heuristic = compute_question_node_prior
 
 
 __all__ = [
+    "SearchActionPrior",
     "SearchHeuristic",
-    "StateFeatureBuilder",
     "compute_embedding_log_heuristic",
+    "compute_question_node_prior",
+    "compute_question_relation_prior",
     "compute_topology_log_heuristic",
+    "compute_topology_node_prior",
 ]

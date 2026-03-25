@@ -4,10 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from src.models.configs import (
-    SamplingTemperatureScheduleConfig,
-    ShortestPathRewardConfig,
-)
+from src.models.configs import SamplingTemperatureScheduleConfig
 
 
 def normalize_scheduler_interval(scheduler_cfg: dict[str, Any]) -> str:
@@ -126,61 +123,8 @@ class SamplingTemperatureScheduler:
         return float(clipped_step) / float(int(total_steps) - 1)
 
 
-class ShortestPathRewardScheduler:
-    def __init__(self, *, config: ShortestPathRewardConfig) -> None:
-        self.config = config
-
-    def value(
-        self,
-        *,
-        global_step: int,
-        schedule_context: TrainingScheduleContext,
-    ) -> float:
-        max_weight = float(self.config.weight)
-        if max_weight == 0.0:
-            return 0.0
-        if self.config.schedule_type == "constant":
-            return max_weight
-
-        total_steps = schedule_context.resolve_horizon(
-            explicit_horizon=self.config.total_steps,
-            interval="step",
-        )
-        if total_steps is None:
-            raise RuntimeError(
-                "shortest-path reward schedule requires a known step horizon. "
-                "Set trainer.max_steps, ensure estimated_stepping_batches is available, "
-                "or configure training.shortest_path_reward.total_steps explicitly."
-            )
-        warmup_steps = int(self.config.warmup_steps)
-        if total_steps <= warmup_steps:
-            raise RuntimeError(
-                "shortest-path reward schedule requires total_steps > warmup_steps. "
-                f"Got total_steps={total_steps}, warmup_steps={warmup_steps}."
-            )
-
-        current_step = max(int(global_step), 0)
-        if warmup_steps > 0 and current_step < warmup_steps:
-            return max_weight * (float(current_step) / float(warmup_steps))
-
-        decay_span = total_steps - warmup_steps
-        progress = SamplingTemperatureScheduler._progress(
-            global_step=current_step - warmup_steps,
-            total_steps=decay_span,
-        )
-        if self.config.schedule_type == "linear":
-            return max_weight * (1.0 - progress)
-        if self.config.schedule_type == "cosine":
-            return max_weight * 0.5 * (1.0 + math.cos(math.pi * progress))
-        raise ValueError(
-            "Unsupported shortest-path reward schedule type: "
-            f"{self.config.schedule_type!r}."
-        )
-
-
 __all__ = [
     "SamplingTemperatureScheduler",
-    "ShortestPathRewardScheduler",
     "TrainingScheduleContext",
     "normalize_scheduler_interval",
 ]

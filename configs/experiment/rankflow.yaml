@@ -20,9 +20,6 @@ defaults:
   - _self_
 
 model:
-  heuristic_cfg:
-    kind: topology
-    beta: 1.0
   eval_cfg:
     # Final eval uses the full support-window search budget.
     max_expansions: 500000

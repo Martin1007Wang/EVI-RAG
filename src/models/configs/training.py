@@ -10,6 +10,20 @@ class OptimizerConfig:
     lr: float = 1e-4
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.999)
+    no_decay_on_bias_and_norm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.lr <= 0.0:
+            raise ValueError("optimizer.lr must be > 0.")
+        if self.weight_decay < 0.0:
+            raise ValueError("optimizer.weight_decay must be >= 0.")
+        if len(self.betas) != 2:
+            raise ValueError("optimizer.betas must contain exactly two values.")
+        beta1, beta2 = self.betas
+        if not 0.0 <= float(beta1) < 1.0:
+            raise ValueError("optimizer.betas[0] must be in [0, 1).")
+        if not 0.0 <= float(beta2) < 1.0:
+            raise ValueError("optimizer.betas[1] must be in [0, 1).")
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 
 @dataclass(frozen=True)
@@ -95,57 +96,101 @@ class SearchEvalConfig:
 
 
 @dataclass(frozen=True)
-class HeuristicConfig:
-    """Configuration for the supported search-heuristic variants."""
+class ActionPriorConfig:
+    """Behavior-policy action priors used only for training-time sampling.
+
+    The prior is defined over actions, not just nodes. `kind` selects how the
+    shared node prior is built, while root / edge / stop betas decide where that
+    prior is injected into the behavior policy.
+    """
 
     kind: str = "none"
-    beta: float = 1.0
+    beta: float = 0.0
+    root_beta: float | None = None
+    edge_beta: float | None = None
+    stop_beta: float = 0.0
+    node_topology_weight: float = 1.0
+    node_embedding_weight: float = 1.0
+    relation_embedding_weight: float = 1.0
+    target_node_weight: float = 0.5
+    progress_weight: float = 1.0
+    stop_node_weight: float = 1.0
     topology_restart_prob: float = 0.25
     topology_num_iters: int = 8
     topology_eps: float = 1.0e-8
     embedding_temperature: float = 1.0
-    learned_hidden_dim: int = 128
-    learned_dropout: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.kind not in {"none", "topology", "embedding", "learned"}:
+        if self.kind not in {"none", "topology", "embedding", "hybrid"}:
             raise ValueError(
-                "heuristic.kind must be one of {'none', 'topology', 'embedding', 'learned'}."
+                "action_prior.kind must be one of {'none', 'topology', 'embedding', 'hybrid'}."
             )
         if self.beta < 0.0:
-            raise ValueError("heuristic.beta must be >= 0.")
+            raise ValueError("action_prior.beta must be >= 0.")
+        resolved_root_beta = self.beta if self.root_beta is None else self.root_beta
+        resolved_edge_beta = self.beta if self.edge_beta is None else self.edge_beta
+        if resolved_root_beta < 0.0:
+            raise ValueError("action_prior.root_beta must be >= 0.")
+        if resolved_edge_beta < 0.0:
+            raise ValueError("action_prior.edge_beta must be >= 0.")
+        if self.stop_beta < 0.0:
+            raise ValueError("action_prior.stop_beta must be >= 0.")
+        if self.node_topology_weight < 0.0:
+            raise ValueError("action_prior.node_topology_weight must be >= 0.")
+        if self.node_embedding_weight < 0.0:
+            raise ValueError("action_prior.node_embedding_weight must be >= 0.")
+        if self.relation_embedding_weight < 0.0:
+            raise ValueError("action_prior.relation_embedding_weight must be >= 0.")
+        if self.target_node_weight < 0.0:
+            raise ValueError("action_prior.target_node_weight must be >= 0.")
+        if self.progress_weight < 0.0:
+            raise ValueError("action_prior.progress_weight must be >= 0.")
+        if self.stop_node_weight < 0.0:
+            raise ValueError("action_prior.stop_node_weight must be >= 0.")
         if not 0.0 < self.topology_restart_prob <= 1.0:
-            raise ValueError("heuristic.topology_restart_prob must be in (0, 1].")
+            raise ValueError("action_prior.topology_restart_prob must be in (0, 1].")
         if self.topology_num_iters < 1:
-            raise ValueError("heuristic.topology_num_iters must be >= 1.")
+            raise ValueError("action_prior.topology_num_iters must be >= 1.")
         if self.topology_eps <= 0.0:
-            raise ValueError("heuristic.topology_eps must be > 0.")
+            raise ValueError("action_prior.topology_eps must be > 0.")
         if self.embedding_temperature <= 0.0:
-            raise ValueError("heuristic.embedding_temperature must be > 0.")
-        if self.learned_hidden_dim < 1:
-            raise ValueError("heuristic.learned_hidden_dim must be >= 1.")
-        if self.learned_dropout < 0.0 or self.learned_dropout >= 1.0:
-            raise ValueError("heuristic.learned_dropout must be in [0, 1).")
+            raise ValueError("action_prior.embedding_temperature must be > 0.")
+        object.__setattr__(self, "root_beta", float(resolved_root_beta))
+        object.__setattr__(self, "edge_beta", float(resolved_edge_beta))
+
+    @property
+    def enabled(self) -> bool:
+        return any(
+            beta > 0.0
+            for beta in (
+                float(self.root_beta or 0.0),
+                float(self.edge_beta or 0.0),
+                float(self.stop_beta),
+            )
+        )
 
 
-@dataclass(frozen=True)
-class GuidanceLossConfig:
-    loss_weight: float = 0.0
-    detach_features: bool = True
-
-    def __post_init__(self) -> None:
-        if self.loss_weight < 0.0:
-            raise ValueError("training.guidance.loss_weight must be >= 0.")
+# Backward-compatible alias while the rest of the repo migrates to action-prior naming.
+HeuristicConfig = ActionPriorConfig
 
 
 @dataclass(frozen=True)
 class SubTrajectoryBalanceConfig:
     lambda_weight: float = 1.0
     normalize: bool = True
+    root_loss_weight: float = 1.0
+    pairwise_loss_weight: float = 1.0
+    terminal_loss_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.lambda_weight <= 1.0:
             raise ValueError("training.subtb.lambda_weight must be in [0, 1].")
+        if self.root_loss_weight < 0.0:
+            raise ValueError("training.subtb.root_loss_weight must be >= 0.")
+        if self.pairwise_loss_weight < 0.0:
+            raise ValueError("training.subtb.pairwise_loss_weight must be >= 0.")
+        if self.terminal_loss_weight < 0.0:
+            raise ValueError("training.subtb.terminal_loss_weight must be >= 0.")
 
 
 @dataclass(frozen=True)
@@ -181,43 +226,14 @@ class SamplingTemperatureScheduleConfig:
 
 
 @dataclass(frozen=True)
-class ShortestPathRewardConfig:
-    weight: float = 0.0
-    schedule_type: str = "constant"
-    completion_power: float = 1.0
-    warmup_steps: int = 0
-    total_steps: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.weight < 0.0:
-            raise ValueError("training.shortest_path_reward.weight must be >= 0.")
-        if self.schedule_type not in {"constant", "linear", "cosine"}:
-            raise ValueError(
-                "training.shortest_path_reward.schedule_type must be one of "
-                "{'constant', 'linear', 'cosine'}."
-            )
-        if self.completion_power < 1.0:
-            raise ValueError(
-                "training.shortest_path_reward.completion_power must be >= 1.0."
-            )
-        if self.warmup_steps < 0:
-            raise ValueError("training.shortest_path_reward.warmup_steps must be >= 0.")
-        if self.total_steps is not None and self.total_steps < 1:
-            raise ValueError("training.shortest_path_reward.total_steps must be >= 1.")
-
-
-@dataclass(frozen=True)
 class GFlowNetTrainingConfig:
     rollout_batch_size: int = 8
-    guidance: GuidanceLossConfig = field(default_factory=GuidanceLossConfig)
     sampling_temperature: float = 1.0
     force_stop_on_answer_hit: bool = False
-    trajectory_length_discount: float = 0.97
+    terminal_failure_log_reward: float = -3.0
+    step_log_penalty: float = math.log(0.97)
     sampling_temperature_schedule: SamplingTemperatureScheduleConfig = field(
         default_factory=SamplingTemperatureScheduleConfig
-    )
-    shortest_path_reward: ShortestPathRewardConfig = field(
-        default_factory=ShortestPathRewardConfig
     )
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
@@ -228,17 +244,18 @@ class GFlowNetTrainingConfig:
             raise ValueError("training.rollout_batch_size must be >= 1.")
         if self.sampling_temperature <= 0.0:
             raise ValueError("training.sampling_temperature must be > 0.")
-        if not 0.0 < self.trajectory_length_discount <= 1.0:
-            raise ValueError("training.trajectory_length_discount must be in (0, 1].")
+        if self.terminal_failure_log_reward > 0.0:
+            raise ValueError("training.terminal_failure_log_reward must be <= 0.")
+        if self.step_log_penalty > 0.0:
+            raise ValueError("training.step_log_penalty must be <= 0.")
 
 
 __all__ = [
+    "ActionPriorConfig",
     "GFlowNetTrainingConfig",
-    "GuidanceLossConfig",
     "HeuristicConfig",
     "HorizonConfig",
     "SamplingTemperatureScheduleConfig",
     "SearchEvalConfig",
-    "ShortestPathRewardConfig",
     "SubTrajectoryBalanceConfig",
 ]

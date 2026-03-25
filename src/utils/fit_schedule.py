@@ -44,10 +44,14 @@ class PassFitScheduleConfig:
                 f"Got {container.get('mode')!r}."
             )
         return cls(
-            max_passes=float(container.get("max_passes")),
-            val_every_passes=float(container.get("val_every_passes")),
-            early_stopping_patience_passes=float(
-                container.get("early_stopping_patience_passes")
+            max_passes=_resolve_required_float(container, field_name="max_passes"),
+            val_every_passes=_resolve_required_float(
+                container,
+                field_name="val_every_passes",
+            ),
+            early_stopping_patience_passes=_resolve_required_float(
+                container,
+                field_name="early_stopping_patience_passes",
             ),
         )
 
@@ -99,6 +103,13 @@ def _resolve_positive_int(value: Any, *, field_name: str) -> int:
     if resolved < 1:
         raise ValueError(f"{field_name} must be >= 1.")
     return resolved
+
+
+def _resolve_required_float(container: dict[str, Any], *, field_name: str) -> float:
+    value = container.get(field_name)
+    if value is None:
+        raise ValueError(f"fit_schedule.{field_name} must be provided.")
+    return float(value)
 
 
 def _resolve_configured_device_count(trainer_cfg: DictConfig | dict[str, Any]) -> int:

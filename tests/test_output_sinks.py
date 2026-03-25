@@ -31,11 +31,33 @@ def test_append_stage_metrics_uses_default_stage_file(tmp_path: Path) -> None:
         settings=StageMetricsSettings(output_dir=tmp_path, stage="predict", step=7),
     )
 
+    assert path is not None
     assert path == tmp_path / "predict.jsonl"
     record = json.loads(path.read_text(encoding="utf-8").strip())
     assert record["stage"] == "predict"
     assert record["step"] == 7
     assert record["metrics"] == {"answer/hit@1": 0.5}
+
+
+def test_append_stage_metrics_can_write_custom_train_record_kind(
+    tmp_path: Path,
+) -> None:
+    path = append_stage_metrics(
+        metrics={"train/loss": 1.5},
+        settings=StageMetricsSettings(
+            output_dir=tmp_path,
+            stage="train",
+            step=12,
+            record_kind="train_batch",
+            metadata={"train_batch_index": 3},
+        ),
+    )
+
+    assert path is not None
+    assert path == tmp_path / "train.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["record_kind"] == "train_batch"
+    assert record["metadata"] == {"train_batch_index": 3}
 
 
 def test_write_prediction_artifacts_reuses_existing_model_paths(tmp_path: Path) -> None:

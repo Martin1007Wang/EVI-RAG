@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 import multiprocessing as mp
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
@@ -24,14 +24,17 @@ from .graph_retrieval_dataset import (
 )
 from src.data.io.lmdb_utils import resolve_core_lmdb_paths
 from src.graph import TrajectoryBatch
+from src.utils.precision_utils import infer_float_dtype_from_precision
 
 _EMBEDDINGS_DEVICE_CPU = "cpu"
 _EMBEDDINGS_DEVICE_CUDA = "cuda"
 _LEGACY_TRAIN_NUM_SAMPLES_SENTINEL = 1_000_000_000
+_AUTO_FEATURE_DTYPE = object()
 _FEATURE_DTYPE_ALIASES = {
     None: None,
     "": None,
     "none": None,
+    "auto": _AUTO_FEATURE_DTYPE,
     "fp32": torch.float32,
     "float32": torch.float32,
     "32": torch.float32,
@@ -79,11 +82,11 @@ def _normalize_embeddings_device(embeddings_device: str | None) -> str | None:
     return normalized
 
 
-def _resolve_feature_dtype(dtype_name: str | None) -> torch.dtype | None:
+def _resolve_feature_dtype(dtype_name: str | None) -> object:
     normalized = None if dtype_name is None else str(dtype_name).strip().lower()
     if normalized not in _FEATURE_DTYPE_ALIASES:
         raise ValueError(
-            "feature dtype must be one of {None, fp32, bf16, fp16}, "
+            "feature dtype must be one of {None, auto, fp32, bf16, fp16}, "
             f"got {dtype_name!r}."
         )
     return _FEATURE_DTYPE_ALIASES[normalized]
@@ -126,13 +129,6 @@ def _resolve_distributed_rank_and_world_size() -> tuple[int, int]:
             torch.distributed.get_world_size()
         )
     return 0, 1
-
-
-def _resolve_optional_length(iterable: object) -> int | None:
-    try:
-        return len(iterable)  # type: ignore[arg-type]
-    except (TypeError, NotImplementedError):
-        return None
 
 
 def _normalize_train_num_samples(num_samples: Any) -> int | None:
@@ -219,157 +215,6 @@ class StepDrivenTrainSampler(Sampler[int]):
             yield int((start + offset * stride) % self.dataset_size)
 
 
-class BudgetBatchSampler(Sampler[list[int]]):
-    """Dynamic batcher that caps graphs and graph-size budgets per batch."""
-
-    def __init__(
-        self,
-        *,
-        sampler: Iterable[int],
-        dataset: GraphRetrievalDataset,
-        max_graphs_per_batch: int | None,
-        max_nodes_per_batch: int | None,
-        max_edges_per_batch: int | None,
-        max_question_tokens_per_batch: int | None,
-        drop_last: bool,
-    ) -> None:
-        self.sampler = sampler
-        self.dataset = dataset
-        self.max_graphs_per_batch = (
-            None if max_graphs_per_batch is None else int(max_graphs_per_batch)
-        )
-        self.max_nodes_per_batch = (
-            None if max_nodes_per_batch is None else int(max_nodes_per_batch)
-        )
-        self.max_edges_per_batch = (
-            None if max_edges_per_batch is None else int(max_edges_per_batch)
-        )
-        self.max_question_tokens_per_batch = (
-            None
-            if max_question_tokens_per_batch is None
-            else int(max_question_tokens_per_batch)
-        )
-        self.drop_last = bool(drop_last)
-        if all(
-            limit is None
-            for limit in (
-                self.max_graphs_per_batch,
-                self.max_nodes_per_batch,
-                self.max_edges_per_batch,
-                self.max_question_tokens_per_batch,
-            )
-        ):
-            raise ValueError("BudgetBatchSampler requires at least one active limit.")
-        for name, value in (
-            ("max_graphs_per_batch", self.max_graphs_per_batch),
-            ("max_nodes_per_batch", self.max_nodes_per_batch),
-            ("max_edges_per_batch", self.max_edges_per_batch),
-            ("max_question_tokens_per_batch", self.max_question_tokens_per_batch),
-        ):
-            if value is not None and value < 1:
-                raise ValueError(f"{name} must be >= 1 when set.")
-        self._cached_length: int | None = None
-        self._cached_length_key: tuple[int, ...] | None = None
-
-    def __len__(self) -> int:
-        cache_key = self._length_cache_key()
-        if cache_key is None:
-            raise TypeError(
-                "BudgetBatchSampler length is undefined when backed by an unsized sampler."
-            )
-        if self._cached_length_key == cache_key and self._cached_length is not None:
-            return self._cached_length
-        length = sum(1 for _ in self._iter_batches())
-        self._cached_length_key = cache_key
-        self._cached_length = length
-        return length
-
-    def __iter__(self) -> Iterator[list[int]]:
-        yield from self._iter_batches()
-
-    def _iter_batches(self) -> Iterator[list[int]]:
-        batch: list[int] = []
-        nodes = 0
-        edges = 0
-        question_tokens = 0
-        for raw_idx in self.sampler:
-            idx = int(raw_idx)
-            stats = self.dataset.get_sample_stats(idx)
-            if self._would_exceed(
-                batch_size=1,
-                nodes=int(stats.num_nodes),
-                edges=int(stats.num_edges),
-                question_tokens=int(stats.question_tokens),
-            ):
-                raise ValueError(
-                    "Single sample exceeds batch budget: "
-                    f"idx={idx} nodes={int(stats.num_nodes)} edges={int(stats.num_edges)} "
-                    f"question_tokens={int(stats.question_tokens)}. Increase the active batch limits."
-                )
-            would_exceed = bool(batch) and self._would_exceed(
-                batch_size=len(batch) + 1,
-                nodes=nodes + int(stats.num_nodes),
-                edges=edges + int(stats.num_edges),
-                question_tokens=question_tokens + int(stats.question_tokens),
-            )
-            if would_exceed:
-                yield batch
-                batch = []
-                nodes = 0
-                edges = 0
-                question_tokens = 0
-            batch.append(idx)
-            nodes += int(stats.num_nodes)
-            edges += int(stats.num_edges)
-            question_tokens += int(stats.question_tokens)
-        if batch and not self.drop_last:
-            yield batch
-
-    def _length_cache_key(self) -> tuple[int, ...] | None:
-        sampler_length = _resolve_optional_length(self.sampler)
-        if sampler_length is None:
-            return None
-        epoch = getattr(self.sampler, "epoch", -1)
-        return (
-            int(epoch),
-            sampler_length,
-            int(self.drop_last),
-            -1 if self.max_graphs_per_batch is None else int(self.max_graphs_per_batch),
-            -1 if self.max_nodes_per_batch is None else int(self.max_nodes_per_batch),
-            -1 if self.max_edges_per_batch is None else int(self.max_edges_per_batch),
-            -1
-            if self.max_question_tokens_per_batch is None
-            else int(self.max_question_tokens_per_batch),
-        )
-
-    def _would_exceed(
-        self,
-        *,
-        batch_size: int,
-        nodes: int,
-        edges: int,
-        question_tokens: int,
-    ) -> bool:
-        return bool(
-            (
-                self.max_graphs_per_batch is not None
-                and batch_size > self.max_graphs_per_batch
-            )
-            or (
-                self.max_nodes_per_batch is not None
-                and nodes > self.max_nodes_per_batch
-            )
-            or (
-                self.max_edges_per_batch is not None
-                and edges > self.max_edges_per_batch
-            )
-            or (
-                self.max_question_tokens_per_batch is not None
-                and question_tokens > self.max_question_tokens_per_batch
-            )
-        )
-
-
 class GraphRetrievalDataModule(LightningDataModule):
     """
     Refactored GraphRetrievalDataModule following System Engineering principles.
@@ -406,10 +251,6 @@ class GraphRetrievalDataModule(LightningDataModule):
         splits: Optional[Dict[str, str]] = None,
         expand_multi_answer: bool = True,
         filter_zero_hop: bool = True,
-        train_max_graphs_per_batch: int | None = None,
-        train_max_nodes_per_batch: int | None = None,
-        train_max_edges_per_batch: int | None = None,
-        train_max_question_tokens_per_batch: int | None = None,
     ) -> None:
         super().__init__()
         embeddings_device = _normalize_embeddings_device(embeddings_device)
@@ -433,10 +274,6 @@ class GraphRetrievalDataModule(LightningDataModule):
             multiprocessing_context=multiprocessing_context,
             eval_multiprocessing_context=eval_multiprocessing_context,
             precompute_edge_batch=precompute_edge_batch,
-            train_max_graphs_per_batch=train_max_graphs_per_batch,
-            train_max_nodes_per_batch=train_max_nodes_per_batch,
-            train_max_edges_per_batch=train_max_edges_per_batch,
-            train_max_question_tokens_per_batch=train_max_question_tokens_per_batch,
         )
         self._init_runtime_state(
             embeddings_device=embeddings_device,
@@ -466,10 +303,6 @@ class GraphRetrievalDataModule(LightningDataModule):
         multiprocessing_context: str | None,
         eval_multiprocessing_context: str | None,
         precompute_edge_batch: bool,
-        train_max_graphs_per_batch: int | None,
-        train_max_nodes_per_batch: int | None,
-        train_max_edges_per_batch: int | None,
-        train_max_question_tokens_per_batch: int | None,
     ) -> None:
         self.batch_size = batch_size
         self.eval_batch_size = (
@@ -514,26 +347,6 @@ class GraphRetrievalDataModule(LightningDataModule):
             self.eval_persistent_workers = False
             self.eval_multiprocessing_context = None
         self.precompute_edge_batch = bool(precompute_edge_batch)
-        self.train_max_graphs_per_batch = (
-            None
-            if train_max_graphs_per_batch is None
-            else int(train_max_graphs_per_batch)
-        )
-        self.train_max_nodes_per_batch = (
-            None
-            if train_max_nodes_per_batch is None
-            else int(train_max_nodes_per_batch)
-        )
-        self.train_max_edges_per_batch = (
-            None
-            if train_max_edges_per_batch is None
-            else int(train_max_edges_per_batch)
-        )
-        self.train_max_question_tokens_per_batch = (
-            None
-            if train_max_question_tokens_per_batch is None
-            else int(train_max_question_tokens_per_batch)
-        )
 
     def _init_runtime_state(
         self,
@@ -850,12 +663,6 @@ class GraphRetrievalDataModule(LightningDataModule):
             shuffle=shuffle,
             drop_last=drop_last,
         )
-        batch_sampler = self._build_batch_sampler(
-            dataset,
-            sampler=sampler,
-            training=training,
-            drop_last=drop_last,
-        )
         (
             num_workers,
             prefetch_factor,
@@ -871,7 +678,7 @@ class GraphRetrievalDataModule(LightningDataModule):
             ),
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
-            batch_sampler=batch_sampler,
+            batch_sampler=None,
             drop_last=drop_last,
             num_workers=num_workers,
             pin_memory=self.pin_memory,
@@ -928,54 +735,25 @@ class GraphRetrievalDataModule(LightningDataModule):
             return DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
         return None
 
-    def _build_batch_sampler(
-        self,
-        dataset: GraphRetrievalDataset,
-        *,
-        sampler: Sampler[int] | None,
-        training: bool,
-        drop_last: bool,
-    ) -> Sampler[list[int]] | None:
-        if not training:
-            return None
-        if all(
-            limit is None
-            for limit in (
-                self.train_max_graphs_per_batch,
-                self.train_max_nodes_per_batch,
-                self.train_max_edges_per_batch,
-                self.train_max_question_tokens_per_batch,
-            )
-        ):
-            return None
-        base_sampler = sampler
-        if base_sampler is None:
-            raise RuntimeError(
-                "training batch budget requires a base sampler to provide sample indices."
-            )
-        return BudgetBatchSampler(
-            sampler=base_sampler,
-            dataset=dataset,
-            max_graphs_per_batch=(
-                self.train_max_graphs_per_batch
-                if self.train_max_graphs_per_batch is not None
-                else self.batch_size_per_device
-            ),
-            max_nodes_per_batch=self.train_max_nodes_per_batch,
-            max_edges_per_batch=self.train_max_edges_per_batch,
-            max_question_tokens_per_batch=self.train_max_question_tokens_per_batch,
-            drop_last=drop_last,
-        )
-
     def _current_feature_dtype(self) -> torch.dtype | None:
         trainer = getattr(self, "trainer", None)
         if trainer is None:
-            return self.eval_feature_dtype
+            return self._resolve_runtime_feature_dtype(self.eval_feature_dtype)
         trainer_state = getattr(trainer, "state", None)
         trainer_fn = str(getattr(trainer_state, "fn", "") or "").lower()
         if "fit" in trainer_fn or "train" in trainer_fn:
-            return self.train_feature_dtype
-        return self.eval_feature_dtype
+            return self._resolve_runtime_feature_dtype(self.train_feature_dtype)
+        return self._resolve_runtime_feature_dtype(self.eval_feature_dtype)
+
+    def _resolve_runtime_feature_dtype(self, dtype_spec: object) -> torch.dtype | None:
+        if dtype_spec is _AUTO_FEATURE_DTYPE:
+            trainer = getattr(self, "trainer", None)
+            if trainer is None:
+                return None
+            return infer_float_dtype_from_precision(getattr(trainer, "precision", None))
+        if isinstance(dtype_spec, torch.dtype) or dtype_spec is None:
+            return dtype_spec
+        raise TypeError(f"Unsupported feature dtype spec: {dtype_spec!r}.")
 
 
 def _resolve_dataset_scope(dataset_cfg: Dict[str, Any]) -> str:

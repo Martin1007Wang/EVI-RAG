@@ -96,8 +96,6 @@ def make_policy_config() -> PolicyConfig:
         backbone=BackboneConfig(
             embedding_dim=8,
             hidden_dim=8,
-            gnn_layers=1,
-            gnn_dropout=0.0,
             use_adapter=True,
             adapter_dim=4,
             adapter_dropout=0.0,
@@ -116,6 +114,7 @@ def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
         hidden_dim=int(cfg.state_score_head.hidden_dim),
         num_layers=int(cfg.state_score_head.num_layers),
         dropout=float(cfg.state_score_head.dropout),
+        conditioning=str(cfg.state_score_head.conditioning),
     )
     forward_policy_head = TransitionPolicyHead(
         state_dim=graph_hidden_dim,
@@ -123,7 +122,7 @@ def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
         hidden_dim=int(cfg.forward_policy_head.hidden_dim),
         num_layers=int(cfg.forward_policy_head.num_layers),
         dropout=float(cfg.forward_policy_head.dropout),
-        microbatch_size=int(cfg.forward_policy_head.microbatch_size),
+        detach_input_features=bool(cfg.forward_policy_head.detach_input_features),
     )
     return BaseSearchPolicy(
         cfg,

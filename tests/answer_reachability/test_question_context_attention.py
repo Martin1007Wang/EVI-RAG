@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import torch
 
-from src.models.components.scoring import TransitionPolicyHead
+from src.models.components.scoring import NodeFlowHead, TransitionPolicyHead
 from src.models.gflownet import SearchState
 
 from .conftest import make_policy, make_toy_batch
@@ -102,7 +102,8 @@ def test_transition_logits_handle_bfloat16_autocast() -> None:
     torch.manual_seed(2)
     policy = make_policy(max_steps=2)
     batch = make_toy_batch()
-    prepared = policy.prepare_batch(batch)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        prepared = policy.prepare_batch(batch)
     state = SearchState(
         topology=prepared.topology,
         observation=prepared.observation,
@@ -118,45 +119,178 @@ def test_transition_logits_handle_bfloat16_autocast() -> None:
     assert torch.isfinite(distribution.edge_logits).all()
 
 
-def test_transition_policy_head_microbatch_matches_full_batch() -> None:
+def test_transition_logits_handle_bfloat16_inputs_without_autocast() -> None:
+    torch.manual_seed(2)
+    policy = make_policy(max_steps=2)
+    batch = make_toy_batch().to("cpu", feature_dtype=torch.bfloat16)
+    prepared = policy.prepare_batch(batch)
+    state = SearchState(
+        topology=prepared.topology,
+        observation=prepared.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.zeros((1, 1), dtype=torch.long),
+    )
+
+    distribution = policy.compute_forward_distribution(prepared, state)
+
+    assert distribution.edge_logits.dtype == torch.float32
+    assert torch.isfinite(distribution.edge_logits).all()
+
+
+def test_transition_policy_head_matches_manual_external_chunking() -> None:
     torch.manual_seed(3)
-    full_head = TransitionPolicyHead(
+    head = TransitionPolicyHead(
         state_dim=8,
         relation_dim=8,
         hidden_dim=16,
         num_layers=2,
         dropout=0.0,
-        microbatch_size=128,
     )
-    chunked_head = TransitionPolicyHead(
-        state_dim=8,
-        relation_dim=8,
-        hidden_dim=16,
-        num_layers=2,
-        dropout=0.0,
-        microbatch_size=3,
-    )
-    chunked_head.load_state_dict(full_head.state_dict())
 
     current_state_features = torch.randn((9, 8), dtype=torch.float32)
     candidate_state_features = torch.randn((9, 8), dtype=torch.float32)
     relation_features = torch.randn((9, 8), dtype=torch.float32)
-    full_logits = full_head(
+    full_logits = head(
         current_state_features,
         candidate_state_features,
         relation_features,
     )
-    chunked_logits = chunked_head(
-        current_state_features,
-        candidate_state_features,
-        relation_features,
+    chunked_logits = torch.cat(
+        [
+            head(
+                current_state_features[start:end],
+                candidate_state_features[start:end],
+                relation_features[start:end],
+            )
+            for start, end in ((0, 3), (3, 6), (6, 9))
+        ],
+        dim=0,
     )
 
     assert torch.allclose(full_logits, chunked_logits, atol=1.0e-6)
 
 
-def test_start_control_state_depends_on_question_global_vector() -> None:
+def test_node_flow_head_uses_question_features_directly() -> None:
     torch.manual_seed(4)
+    head = NodeFlowHead(
+        node_dim=8,
+        question_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        conditioning="concat",
+    )
+    node_features = torch.randn((5, 8), dtype=torch.float32, requires_grad=True)
+    question_features = torch.randn((5, 8), dtype=torch.float32, requires_grad=True)
+
+    scores = head(node_features, question_features)
+    scores.sum().backward()
+
+    assert node_features.grad is not None
+    assert question_features.grad is not None
+    assert float(node_features.grad.abs().sum().item()) > 0.0
+    assert float(question_features.grad.abs().sum().item()) > 0.0
+
+
+def test_node_flow_head_can_disable_direct_question_conditioning() -> None:
+    torch.manual_seed(5)
+    head = NodeFlowHead(
+        node_dim=8,
+        question_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        conditioning="none",
+    )
+    node_features = torch.randn((5, 8), dtype=torch.float32, requires_grad=True)
+    question_features = torch.randn((5, 8), dtype=torch.float32, requires_grad=True)
+
+    scores = head(node_features, question_features)
+    scores.sum().backward()
+
+    assert node_features.grad is not None
+    assert float(node_features.grad.abs().sum().item()) > 0.0
+    assert question_features.grad is None
+
+
+def test_node_flow_head_autocast_preserves_bfloat16_outputs() -> None:
+    torch.manual_seed(5)
+    head = NodeFlowHead(
+        node_dim=8,
+        question_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        conditioning="concat",
+    )
+    node_features = torch.randn((5, 8), dtype=torch.float32)
+    question_features = torch.randn((5, 8), dtype=torch.float32)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        scores = head(node_features, question_features)
+
+    assert scores.dtype == torch.bfloat16
+    assert torch.isfinite(scores).all()
+
+
+def test_transition_policy_head_preserves_end_to_end_gradients() -> None:
+    torch.manual_seed(6)
+    head = TransitionPolicyHead(
+        state_dim=8,
+        relation_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+    )
+    current_state_features = torch.randn(
+        (5, 8), dtype=torch.float32, requires_grad=True
+    )
+    candidate_state_features = torch.randn(
+        (5, 8), dtype=torch.float32, requires_grad=True
+    )
+    relation_features = torch.randn((5, 8), dtype=torch.float32, requires_grad=True)
+    logits = head(
+        current_state_features,
+        candidate_state_features,
+        relation_features,
+    )
+    logits.sum().backward()
+
+    assert current_state_features.grad is not None
+    assert candidate_state_features.grad is not None
+    assert relation_features.grad is not None
+    assert float(current_state_features.grad.abs().sum().item()) > 0.0
+    assert float(candidate_state_features.grad.abs().sum().item()) > 0.0
+    assert float(relation_features.grad.abs().sum().item()) > 0.0
+
+
+def test_transition_policy_head_autocast_preserves_bfloat16_outputs() -> None:
+    torch.manual_seed(6)
+    head = TransitionPolicyHead(
+        state_dim=8,
+        relation_dim=8,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+    )
+    current_state_features = torch.randn((5, 8), dtype=torch.float32)
+    candidate_state_features = torch.randn((5, 8), dtype=torch.float32)
+    relation_features = torch.randn((5, 8), dtype=torch.float32)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        logits = head(
+            current_state_features,
+            candidate_state_features,
+            relation_features,
+        )
+
+    assert logits.dtype == torch.bfloat16
+    assert torch.isfinite(logits).all()
+
+
+def test_start_control_state_depends_on_question_global_vector() -> None:
+    torch.manual_seed(7)
     policy = make_policy(max_steps=2)
     batch = make_toy_batch()
     prepared = policy.prepare_batch(batch)
@@ -172,15 +306,15 @@ def test_start_control_state_depends_on_question_global_vector() -> None:
     assert not torch.allclose(control_a, control_b)
 
 
-def test_transition_policy_head_detaches_encoder_features() -> None:
-    torch.manual_seed(4)
+def test_transition_policy_head_can_explicitly_detach_encoder_features() -> None:
+    torch.manual_seed(8)
     head = TransitionPolicyHead(
         state_dim=8,
         relation_dim=8,
         hidden_dim=16,
         num_layers=2,
         dropout=0.0,
-        microbatch_size=32,
+        detach_input_features=True,
     )
     current_state_features = torch.randn(
         (5, 8), dtype=torch.float32, requires_grad=True
@@ -199,3 +333,37 @@ def test_transition_policy_head_detaches_encoder_features() -> None:
     assert current_state_features.grad is None
     assert candidate_state_features.grad is None
     assert relation_features.grad is None
+
+
+def test_forward_distribution_backpropagates_into_shared_encoder() -> None:
+    torch.manual_seed(9)
+    policy = make_policy(max_steps=2)
+    batch = make_toy_batch()
+    batch.node_embeddings.requires_grad_()
+    assert batch.edge_embeddings is not None
+    batch.edge_embeddings.requires_grad_()
+    assert batch.question_emb is not None
+    batch.question_emb.requires_grad_()
+    assert batch.question_ctx is not None
+    batch.question_ctx.requires_grad_()
+
+    prepared = policy.prepare_batch(batch)
+    state = SearchState(
+        topology=prepared.topology,
+        observation=prepared.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.zeros((1, 1), dtype=torch.long),
+    )
+
+    distribution = policy.compute_forward_distribution(prepared, state)
+    distribution.edge_logits.sum().backward()
+
+    assert batch.node_embeddings.grad is not None
+    assert batch.edge_embeddings.grad is not None
+    assert batch.question_emb.grad is not None
+    assert batch.question_ctx.grad is not None
+    assert float(batch.node_embeddings.grad.abs().sum().item()) > 0.0
+    assert float(batch.edge_embeddings.grad.abs().sum().item()) > 0.0
+    assert float(batch.question_emb.grad.abs().sum().item()) > 0.0
+    assert float(batch.question_ctx.grad.abs().sum().item()) > 0.0

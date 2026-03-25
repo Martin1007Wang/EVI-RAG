@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,6 +9,10 @@ from src.models.configs import SubTrajectoryBalanceConfig
 
 if TYPE_CHECKING:
     from .sampler import TrajectoryGFNSampleBatch
+
+
+def _zero_metric_tensor() -> torch.Tensor:
+    return torch.tensor(0.0, dtype=torch.float32)
 
 
 @dataclass(frozen=True)
@@ -21,15 +25,19 @@ class SubTrajectoryBalanceLossOutput:
     success_rate: torch.Tensor
     log_z_mean: torch.Tensor
     log_z_variance: torch.Tensor
+    root_component_loss: torch.Tensor = field(default_factory=_zero_metric_tensor)
+    pairwise_component_loss: torch.Tensor = field(default_factory=_zero_metric_tensor)
+    terminal_component_loss: torch.Tensor = field(default_factory=_zero_metric_tensor)
 
 
 class SubTrajectoryBalanceLoss:
     """Forward-prefix SubTB specialized to the prefix-tree state space.
 
-    The current objective keeps the root consistency residual, pairwise forward
-    prefix residuals, and terminal reward anchors. Move-step backward logits are
-    carried in the sample batch for interface compatibility, but they are not
-    consumed by this loss.
+    The current objective fits the multiplicatively shaped trajectory measure
+    defined by the fixed terminal energy table plus any step-level log rewards
+    carried in ``log_reward_steps``. Root, pairwise, and terminal residuals are
+    always aggregated as separate components so long-horizon pairwise terms do
+    not dominate the root boundary or suffix-return anchors.
     """
 
     def __init__(
@@ -49,12 +57,13 @@ class SubTrajectoryBalanceLoss:
         values: torch.Tensor,
         weights: torch.Tensor,
         normalize: bool,
+        reduce_dims: tuple[int, ...],
     ) -> torch.Tensor:
         weighted = values * weights
         if normalize:
-            denom = weights.sum(dim=(-2, -1)).clamp_min(1.0)
-            return weighted.sum(dim=(-2, -1)) / denom
-        return weighted.sum(dim=(-2, -1))
+            denom = weights.sum(dim=reduce_dims).clamp_min(1.0)
+            return weighted.sum(dim=reduce_dims) / denom
+        return weighted.sum(dim=reduce_dims)
 
     @staticmethod
     def _build_step_prefix(
@@ -67,6 +76,61 @@ class SubTrajectoryBalanceLoss:
         if max_steps > 0:
             step_prefix[:, :, 1:] = torch.cumsum(step_values, dim=-1)
         return step_prefix
+
+    @staticmethod
+    def _component_means(
+        *,
+        root_loss: torch.Tensor,
+        pairwise_loss: torch.Tensor,
+        terminal_loss: torch.Tensor,
+        state_weights: torch.Tensor,
+        terminal_weights: torch.Tensor,
+        normalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pairwise_component = SubTrajectoryBalanceLoss._weighted_mean(
+            values=pairwise_loss,
+            weights=state_weights,
+            normalize=normalize,
+            reduce_dims=(-2, -1),
+        )
+        terminal_component = SubTrajectoryBalanceLoss._weighted_mean(
+            values=terminal_loss,
+            weights=terminal_weights,
+            normalize=normalize,
+            reduce_dims=(-1,),
+        )
+        return root_loss, pairwise_component, terminal_component
+
+    def _combine_components(
+        self,
+        *,
+        root_loss: torch.Tensor,
+        pairwise_loss: torch.Tensor,
+        terminal_loss: torch.Tensor,
+        state_weights: torch.Tensor,
+        terminal_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        root_weight = float(self.config.root_loss_weight)
+        pairwise_weight = float(self.config.pairwise_loss_weight)
+        terminal_weight = float(self.config.terminal_loss_weight)
+
+        root_component, pairwise_component, terminal_component = self._component_means(
+            root_loss=root_loss,
+            pairwise_loss=pairwise_loss,
+            terminal_loss=terminal_loss,
+            state_weights=state_weights,
+            terminal_weights=terminal_weights,
+            normalize=bool(self.config.normalize),
+        )
+        weighted_root = root_component * root_weight
+        weighted_pairwise = pairwise_component * pairwise_weight
+        weighted_terminal = terminal_component * terminal_weight
+        return (
+            weighted_root + weighted_pairwise + weighted_terminal,
+            weighted_root,
+            weighted_pairwise,
+            weighted_terminal,
+        )
 
     def compute(
         self, sample_batch: TrajectoryGFNSampleBatch
@@ -106,10 +170,10 @@ class SubTrajectoryBalanceLoss:
                     f"log_pf_steps={tuple(log_pf_steps.shape)}."
                 )
 
-        # The current SubTB objective uses an explicit root boundary residual,
-        # forward prefix sums between active states, and terminal reward anchors.
+        # MS-SubTB fits a shaped trajectory measure whose log-mass is the sum of
+        # the terminal log-reward anchor and any per-step log-reward increments.
         # We keep `log_pb_steps` in the sample batch for interface compatibility,
-        # but the loss itself does not depend on it.
+        # but the loss itself only uses forward prefixes and shaped reward sums.
         forward_prefix = self._build_step_prefix(step_values=log_pf_steps)
         reward_prefix = self._build_step_prefix(step_values=log_reward_steps)
 
@@ -215,17 +279,21 @@ class SubTrajectoryBalanceLoss:
             torch.zeros_like(terminal_weights),
         )
 
-        state_loss = (pairwise_residual.square() * state_weights).sum(dim=(-2, -1))
-        terminal_loss = (terminal_residual.square() * terminal_weights).sum(dim=-1)
+        pairwise_loss = pairwise_residual.square()
+        terminal_loss = terminal_residual.square()
         root_loss = root_residual.square()
-        total_weight = (
-            state_weights.sum(dim=(-2, -1))
-            + terminal_weights.sum(dim=-1)
-            + torch.ones_like(root_loss)
+        (
+            per_rollout_loss,
+            root_component_loss,
+            pairwise_component_loss,
+            terminal_component_loss,
+        ) = self._combine_components(
+            root_loss=root_loss,
+            pairwise_loss=pairwise_loss,
+            terminal_loss=terminal_loss,
+            state_weights=state_weights,
+            terminal_weights=terminal_weights,
         )
-        per_rollout_loss = state_loss + terminal_loss + root_loss
-        if bool(self.config.normalize):
-            per_rollout_loss = per_rollout_loss / total_weight.clamp_min(1.0)
         loss = per_rollout_loss.mean()
         if not torch.isfinite(loss):
             raise RuntimeError(
@@ -258,6 +326,9 @@ class SubTrajectoryBalanceLoss:
             .detach(),
             log_z_mean=graph_log_z_values.mean().detach(),
             log_z_variance=graph_log_z_values.var(unbiased=False).detach(),
+            root_component_loss=root_component_loss.mean().detach(),
+            pairwise_component_loss=pairwise_component_loss.mean().detach(),
+            terminal_component_loss=terminal_component_loss.mean().detach(),
         )
 
 

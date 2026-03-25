@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from lightning import LightningModule
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import (
@@ -21,11 +20,9 @@ from src.models.components import (
     NodeFlowHead,
     TransitionPolicyHead,
 )
-from src.models.components.heuristic_heads import LearnedHeuristicHead
 from src.models.configs import (
+    ActionPriorConfig,
     GFlowNetTrainingConfig,
-    GuidanceLossConfig,
-    HeuristicConfig,
     HorizonConfig,
     OptimizerConfig,
     PolicyConfig,
@@ -46,22 +43,13 @@ from .evaluation_controller import (
 from .gflownet import (
     BaseSearchPolicy,
     GFlowNetPolicy,
+    SearchActionPrior,
     SamplingTemperatureScheduler,
-    SearchHeuristic,
-    SearchState,
-    ShortestPathRewardScheduler,
     SubTrajectoryBalanceLoss,
     SubTrajectoryBalanceLossOutput,
     TrajectoryGFNSampleBatch,
     TrainingScheduleContext,
     normalize_scheduler_interval,
-)
-from .gflownet.path import reconstruct_trace_path_token_ids
-from .gflownet.reward_shaping import (
-    ShortestPathRewardOracle,
-    build_shortest_path_reward_oracle,
-    compute_shortest_path_alignment_trace,
-    compute_shortest_path_prefix_alignment,
 )
 from .gflownet.success_paths import (
     collect_success_rollout_key_rows,
@@ -76,19 +64,15 @@ logger = get_logger(__name__)
 class GFlowNetConfig:
     horizon_cfg: HorizonConfig
     training_cfg: GFlowNetTrainingConfig
-    heuristic_cfg: HeuristicConfig
+    action_prior_cfg: ActionPriorConfig
     policy_cfg: PolicyConfig
     eval_cfg: SearchEvalConfig
     optimizer_cfg: OptimizerConfig
     scheduler_cfg: SchedulerConfig
 
-
-@dataclass(frozen=True)
-class GuidanceLossResult:
-    loss: torch.Tensor
-    target_mean: torch.Tensor
-    prediction_mean: torch.Tensor
-    active_states: int
+    @property
+    def heuristic_cfg(self) -> ActionPriorConfig:
+        return self.action_prior_cfg
 
 
 @dataclass(frozen=True)
@@ -106,17 +90,6 @@ class TrainingRolloutMetrics:
     scored_graph_candidates_per_unique_state: float
 
 
-@dataclass(frozen=True)
-class ShortestPathRewardMetrics:
-    lambda_weight: float
-    mean_alignment: float
-    mean_bonus: float
-    reachable_start_rate: float
-    full_match_rate: float
-    success_alignment: float
-    failure_alignment: float
-
-
 class GFlowNetPolicyFactory:
     @staticmethod
     def build_base_policy(
@@ -132,6 +105,7 @@ class GFlowNetPolicyFactory:
             hidden_dim=int(policy_cfg.state_score_head.hidden_dim),
             num_layers=int(policy_cfg.state_score_head.num_layers),
             dropout=float(policy_cfg.state_score_head.dropout),
+            conditioning=str(policy_cfg.state_score_head.conditioning),
         )
         forward_policy_head = TransitionPolicyHead(
             state_dim=graph_hidden_dim,
@@ -139,7 +113,9 @@ class GFlowNetPolicyFactory:
             hidden_dim=int(policy_cfg.forward_policy_head.hidden_dim),
             num_layers=int(policy_cfg.forward_policy_head.num_layers),
             dropout=float(policy_cfg.forward_policy_head.dropout),
-            microbatch_size=int(policy_cfg.forward_policy_head.microbatch_size),
+            detach_input_features=bool(
+                policy_cfg.forward_policy_head.detach_input_features
+            ),
         )
         return BaseSearchPolicy(
             config=policy_cfg,
@@ -150,43 +126,30 @@ class GFlowNetPolicyFactory:
         )
 
     @staticmethod
-    def build_search_heuristic(
+    def build_action_prior(
         *,
-        heuristic_cfg: HeuristicConfig,
-        graph_hidden_dim: int,
-    ) -> SearchHeuristic:
-        learned_head = None
-        if heuristic_cfg.kind == "learned":
-            learned_head = LearnedHeuristicHead(
-                hidden_dim=int(heuristic_cfg.learned_hidden_dim),
-                dropout=float(heuristic_cfg.learned_dropout),
-                feature_dim=graph_hidden_dim,
-            )
-        return SearchHeuristic(
-            config=heuristic_cfg,
-            learned_head=learned_head,
-        )
+        action_prior_cfg: ActionPriorConfig,
+    ) -> SearchActionPrior:
+        return SearchActionPrior(config=action_prior_cfg)
 
     @staticmethod
     def build_policy(
         *,
         policy_cfg: PolicyConfig,
-        heuristic_cfg: HeuristicConfig,
+        action_prior_cfg: ActionPriorConfig,
         max_steps: int,
     ) -> GFlowNetPolicy:
-        graph_hidden_dim = int(policy_cfg.backbone.hidden_dim)
         base_policy = GFlowNetPolicyFactory.build_base_policy(
             policy_cfg=policy_cfg,
             max_steps=max_steps,
         )
-        search_heuristic = GFlowNetPolicyFactory.build_search_heuristic(
-            heuristic_cfg=heuristic_cfg,
-            graph_hidden_dim=graph_hidden_dim,
+        search_action_prior = GFlowNetPolicyFactory.build_action_prior(
+            action_prior_cfg=action_prior_cfg,
         )
         return GFlowNetPolicy(
             base_policy=base_policy,
-            heuristic_cfg=heuristic_cfg,
-            search_heuristic=search_heuristic,
+            action_prior_cfg=action_prior_cfg,
+            search_action_prior=search_action_prior,
         )
 
 
@@ -200,6 +163,71 @@ class GFlowNetModule(LightningModule):
         raise TypeError(f"Expected dataclass or dict config, got {type(cfg)!r}.")
 
     @classmethod
+    def _use_zero_weight_decay(
+        cls, *, name: str, parameter: torch.nn.Parameter
+    ) -> bool:
+        del cls
+        if name.endswith(".bias"):
+            return True
+        return parameter.ndim <= 1
+
+    @classmethod
+    def _build_optimizer_param_groups(
+        cls,
+        *,
+        model_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+        optimizer_cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        trainable_named_params = [
+            (name, parameter)
+            for name, parameter in model_parameters
+            if parameter.requires_grad
+        ]
+        if not trainable_named_params:
+            raise RuntimeError("No trainable parameters found in model.")
+
+        base_lr = float(optimizer_cfg.get("lr", 1.0e-4))
+        base_weight_decay = float(optimizer_cfg.get("weight_decay", 0.01))
+        if not bool(optimizer_cfg.get("no_decay_on_bias_and_norm", True)):
+            return [
+                {
+                    "params": [parameter for _, parameter in trainable_named_params],
+                    "lr": base_lr,
+                    "weight_decay": base_weight_decay,
+                    "group_name": "default",
+                }
+            ]
+
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+        for name, parameter in trainable_named_params:
+            if cls._use_zero_weight_decay(name=name, parameter=parameter):
+                no_decay_params.append(parameter)
+            else:
+                decay_params.append(parameter)
+
+        param_groups: list[dict[str, Any]] = []
+        if decay_params:
+            param_groups.append(
+                {
+                    "params": decay_params,
+                    "lr": base_lr,
+                    "weight_decay": base_weight_decay,
+                    "group_name": "decay",
+                }
+            )
+        if no_decay_params:
+            param_groups.append(
+                {
+                    "params": no_decay_params,
+                    "lr": base_lr,
+                    "weight_decay": 0.0,
+                    "group_name": "no_decay",
+                }
+            )
+        return param_groups
+
+    @classmethod
     def _build_optimizer_and_scheduler(
         cls,
         *,
@@ -208,17 +236,16 @@ class GFlowNetModule(LightningModule):
         scheduler_cfg: dict[str, Any],
         schedule_context: TrainingScheduleContext,
     ) -> dict[str, Any]:
-        trainable_params = [
-            parameter for _, parameter in model_parameters if parameter.requires_grad
-        ]
-        if not trainable_params:
-            raise RuntimeError("No trainable parameters found in model.")
+        optimizer_param_groups = cls._build_optimizer_param_groups(
+            model_parameters=model_parameters,
+            optimizer_cfg=optimizer_cfg,
+        )
 
         opt_type = str(optimizer_cfg.get("type", "adamw")).lower()
         if opt_type != "adamw":
             raise ValueError(f"Unsupported optimizer type: {opt_type}")
         optimizer = AdamW(
-            trainable_params,
+            optimizer_param_groups,
             lr=float(optimizer_cfg.get("lr", 1.0e-4)),
             weight_decay=float(optimizer_cfg.get("weight_decay", 0.01)),
             betas=tuple(optimizer_cfg.get("betas", (0.9, 0.999))),
@@ -290,13 +317,18 @@ class GFlowNetModule(LightningModule):
         optimizer_cfg: OptimizerConfig,
         scheduler_cfg: SchedulerConfig,
         metric_runtime_factory: MetricRuntimeFactoryProtocol,
-        heuristic_cfg: HeuristicConfig = HeuristicConfig(),
+        action_prior_cfg: ActionPriorConfig | None = None,
+        heuristic_cfg: ActionPriorConfig | None = None,
     ) -> None:
         super().__init__()
+        if action_prior_cfg is not None and heuristic_cfg is not None:
+            raise ValueError("Pass either action_prior_cfg or heuristic_cfg, not both.")
+        if action_prior_cfg is None:
+            action_prior_cfg = heuristic_cfg or ActionPriorConfig()
         self.cfg = GFlowNetConfig(
             horizon_cfg=horizon_cfg,
             training_cfg=training_cfg,
-            heuristic_cfg=heuristic_cfg,
+            action_prior_cfg=action_prior_cfg,
             policy_cfg=policy_cfg,
             eval_cfg=eval_cfg,
             optimizer_cfg=optimizer_cfg,
@@ -305,7 +337,7 @@ class GFlowNetModule(LightningModule):
         self.save_hyperparameters({"config": asdict(self.cfg)}, logger=False)
         self.policy = GFlowNetPolicyFactory.build_policy(
             policy_cfg=policy_cfg,
-            heuristic_cfg=heuristic_cfg,
+            action_prior_cfg=action_prior_cfg,
             max_steps=horizon_cfg.max_steps,
         )
         self.metric_runtime_factory = metric_runtime_factory
@@ -320,53 +352,17 @@ class GFlowNetModule(LightningModule):
             metrics_profile=str(self.cfg.eval_cfg.metrics_profile),
             on_invalid_start=self._log_invalid_start,
         )
-        self._validate_auxiliary_config(
-            heuristic_cfg=heuristic_cfg,
-            guidance_cfg=training_cfg.guidance,
-        )
         self.sampler = self.runtime_controller.sampler
-        if self.sampler is not None and hasattr(
-            self.sampler, "trajectory_length_discount"
-        ):
-            setattr(
-                self.sampler,
-                "trajectory_length_discount",
-                float(training_cfg.trajectory_length_discount),
-            )
         self.loss_fn = SubTrajectoryBalanceLoss(config=training_cfg.subtb)
         self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
             base_temperature=training_cfg.sampling_temperature,
             config=training_cfg.sampling_temperature_schedule,
         )
-        self.shortest_path_reward_scheduler = ShortestPathRewardScheduler(
-            config=training_cfg.shortest_path_reward,
-        )
         self.search = self.runtime_controller.search
         self._fit_schedule: ResolvedPassFitSchedule | None = None
         self._schedule_context_override: TrainingScheduleContext | None = None
         self._invalid_start_count = 0
-        self._shortest_path_reward_cache: dict[str, ShortestPathRewardOracle] = {}
-
-    @staticmethod
-    def _validate_auxiliary_config(
-        *,
-        heuristic_cfg: HeuristicConfig,
-        guidance_cfg: GuidanceLossConfig,
-    ) -> None:
-        if float(guidance_cfg.loss_weight) > 0.0 and heuristic_cfg.kind != "learned":
-            raise ValueError(
-                "training.guidance.loss_weight > 0 requires heuristic.kind='learned'."
-            )
-        if (
-            heuristic_cfg.kind == "learned"
-            and float(heuristic_cfg.beta) > 0.0
-            and float(guidance_cfg.loss_weight) <= 0.0
-        ):
-            raise ValueError(
-                "heuristic.kind='learned' with heuristic.beta > 0 requires "
-                "training.guidance.loss_weight > 0 because the learned proposal "
-                "cache is built without gradients."
-            )
+        self._latest_train_metrics: dict[str, float] | None = None
 
     @property
     def metrics_profile(self) -> str:
@@ -395,7 +391,7 @@ class GFlowNetModule(LightningModule):
         self.cfg = GFlowNetConfig(
             horizon_cfg=self.cfg.horizon_cfg,
             training_cfg=self.cfg.training_cfg,
-            heuristic_cfg=self.cfg.heuristic_cfg,
+            action_prior_cfg=self.cfg.action_prior_cfg,
             policy_cfg=self.cfg.policy_cfg,
             eval_cfg=eval_cfg,
             optimizer_cfg=self.cfg.optimizer_cfg,
@@ -439,6 +435,11 @@ class GFlowNetModule(LightningModule):
 
     def set_fit_schedule(self, schedule: ResolvedPassFitSchedule) -> None:
         self._fit_schedule = schedule
+
+    def pop_latest_train_metrics(self) -> dict[str, float] | None:
+        metrics = self._latest_train_metrics
+        self._latest_train_metrics = None
+        return metrics
 
     def set_training_schedule_context(
         self, schedule_context: TrainingScheduleContext | None
@@ -523,72 +524,6 @@ class GFlowNetModule(LightningModule):
             scored_graph_candidates_per_unique_state=scored_graph_candidates_per_unique_state,
         )
 
-    def _compute_guidance_loss(
-        self,
-        *,
-        prepared_batch: Any,
-        sample_batch: TrajectoryGFNSampleBatch,
-    ) -> GuidanceLossResult | None:
-        guidance_cfg = self.cfg.training_cfg.guidance
-        if (
-            float(guidance_cfg.loss_weight) <= 0.0
-            or self.cfg.heuristic_cfg.kind != "learned"
-        ):
-            return None
-        trace_mask = sample_batch.trace_mask
-        if not bool(trace_mask.any().item()):
-            return None
-        flat_shape = (
-            int(sample_batch.trace_nodes.size(0) * sample_batch.trace_nodes.size(1)),
-            int(sample_batch.trace_nodes.size(2)),
-        )
-        trace_path_token_ids = reconstruct_trace_path_token_ids(
-            start_nodes=sample_batch.start_nodes,
-            trace_edge_ids=sample_batch.trace_edge_ids,
-            trace_num_steps=sample_batch.trace_num_steps,
-            trace_stop_mask=sample_batch.trace_stop_mask,
-            edge_index=prepared_batch.topology.edge_index,
-            edge_type=prepared_batch.topology.edge_type,
-            max_steps=int(self.cfg.horizon_cfg.max_steps),
-        )
-        state = SearchState(
-            topology=prepared_batch.topology,
-            observation=prepared_batch.observation,
-            current_nodes=sample_batch.trace_nodes.view(flat_shape),
-            done_mask=(~trace_mask).view(flat_shape),
-            num_steps=sample_batch.trace_num_steps.view(flat_shape),
-            path_token_ids=trace_path_token_ids.view(
-                *flat_shape,
-                int(trace_path_token_ids.size(-1)),
-            ),
-            absorbing_mask=torch.zeros_like(trace_mask).view(flat_shape),
-        )
-        logits = self.policy.compute_guidance_logits(
-            prepared_batch,
-            state,
-            detach_features=bool(guidance_cfg.detach_features),
-        ).view_as(sample_batch.trace_nodes)
-        targets = (
-            sample_batch.success_mask.to(dtype=torch.float32)
-            .unsqueeze(-1)
-            .expand_as(logits)
-        )
-        per_state_loss = F.binary_cross_entropy_with_logits(
-            logits,
-            targets,
-            reduction="none",
-        )
-        active_loss = per_state_loss[trace_mask]
-        if int(active_loss.numel()) == 0:
-            return None
-        active_logits = logits[trace_mask]
-        return GuidanceLossResult(
-            loss=active_loss.mean() * float(guidance_cfg.loss_weight),
-            target_mean=targets[trace_mask].mean().detach(),
-            prediction_mean=torch.sigmoid(active_logits).mean().detach(),
-            active_states=int(active_loss.numel()),
-        )
-
     @staticmethod
     def _safe_batch_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
         x = x.detach().to(dtype=torch.float32).view(-1)
@@ -655,50 +590,62 @@ class GFlowNetModule(LightningModule):
         sampling_temperature: float,
         rollout_metrics: TrainingRolloutMetrics,
         root_diagnostics: dict[str, float],
-        shortest_path_reward_metrics: ShortestPathRewardMetrics,
-        guidance_result: GuidanceLossResult | None,
     ) -> dict[str, Any]:
         metrics: dict[str, Any] = {
             "loss": total_loss.detach(),
             "actor_loss": loss_output.loss.detach(),
             "subtb_loss": loss_output.subtb_loss,
+            "subtb_root_loss": loss_output.root_component_loss,
+            "subtb_pairwise_loss": loss_output.pairwise_component_loss,
+            "subtb_terminal_loss": loss_output.terminal_component_loss,
             "subtb_residual": loss_output.residual_abs,
             "subtb_residual_variance_per_batch": loss_output.residual_variance,
             "subtb_root": loss_output.root_abs,
             "rollout_success": loss_output.success_rate,
-            "unique_success_paths_per_100_rollouts": rollout_metrics.unique_success_paths_per_100_rollouts,
+            "unique_success_paths_per_100_rollouts": (
+                rollout_metrics.unique_success_paths_per_100_rollouts
+            ),
             "new_success_paths": float(rollout_metrics.new_success_paths),
             "start_node_entropy": rollout_metrics.start_node_entropy,
             "start_node_entropy_normalized": rollout_metrics.start_node_entropy_normalized,
             "active_forward_states": rollout_metrics.active_forward_states,
             "unique_forward_states": rollout_metrics.unique_forward_states,
-            "forward_state_dedup_keep_ratio": rollout_metrics.forward_state_dedup_keep_ratio,
+            "forward_state_dedup_keep_ratio": (
+                rollout_metrics.forward_state_dedup_keep_ratio
+            ),
             "raw_graph_candidates": rollout_metrics.raw_graph_candidates,
             "scored_graph_candidates": rollout_metrics.scored_graph_candidates,
-            "raw_graph_candidates_per_unique_state": rollout_metrics.raw_graph_candidates_per_unique_state,
-            "scored_graph_candidates_per_unique_state": rollout_metrics.scored_graph_candidates_per_unique_state,
+            "raw_graph_candidates_per_unique_state": (
+                rollout_metrics.raw_graph_candidates_per_unique_state
+            ),
+            "scored_graph_candidates_per_unique_state": (
+                rollout_metrics.scored_graph_candidates_per_unique_state
+            ),
             "log_z_mean": loss_output.log_z_mean,
             "log_z_variance": loss_output.log_z_variance,
             "rollout_batch_size": float(rollout_batch_size),
             "sampling_temperature": sampling_temperature,
-            "shortest_path_reward_lambda": shortest_path_reward_metrics.lambda_weight,
-            "oracle_prefix_align_mean": shortest_path_reward_metrics.mean_alignment,
-            "shortest_path_reward_bonus_mean": shortest_path_reward_metrics.mean_bonus,
-            "oracle_reachable_start_rate": shortest_path_reward_metrics.reachable_start_rate,
-            "oracle_prefix_full_match_rate": shortest_path_reward_metrics.full_match_rate,
-            "oracle_prefix_align_on_success": shortest_path_reward_metrics.success_alignment,
-            "oracle_prefix_align_on_failure": shortest_path_reward_metrics.failure_alignment,
+            "step_log_penalty": float(self.cfg.training_cfg.step_log_penalty or 0.0),
+            "terminal_failure_log_reward": float(
+                self.cfg.training_cfg.terminal_failure_log_reward
+            ),
         }
         metrics.update(root_diagnostics)
-        if guidance_result is not None:
-            metrics["guidance_loss"] = guidance_result.loss.detach()
-            metrics["guidance_target_mean"] = guidance_result.target_mean
-            metrics["guidance_prediction_mean"] = guidance_result.prediction_mean
-            metrics["guidance_active_states"] = float(guidance_result.active_states)
         effective_pass = self._resolve_effective_pass(after_current_step=True)
         if effective_pass is not None:
             metrics["effective_pass"] = effective_pass
         return metrics
+
+    @staticmethod
+    def _build_train_metrics_payload(metrics: dict[str, Any]) -> dict[str, float]:
+        payload: dict[str, float] = {}
+        for name, value in metrics.items():
+            if torch.is_tensor(value):
+                scalar = float(value.detach().to(dtype=torch.float32).item())
+            else:
+                scalar = float(value)
+            payload[f"train/{name}"] = scalar
+        return payload
 
     def _raise_on_nonfinite_training_loss(
         self,
@@ -763,195 +710,6 @@ class GFlowNetModule(LightningModule):
         return self.sampling_temperature_scheduler.value(
             global_step=current_step,
             schedule_context=self._trainer_schedule_context(),
-        )
-
-    def _resolve_shortest_path_reward_lambda(
-        self, *, global_step: int | None = None
-    ) -> float:
-        trainer = getattr(self, "_trainer", None)
-        current_step = 0 if trainer is None else int(trainer.global_step)
-        if global_step is not None:
-            current_step = int(global_step)
-        return self.shortest_path_reward_scheduler.value(
-            global_step=current_step,
-            schedule_context=self._trainer_schedule_context(),
-        )
-
-    @staticmethod
-    def _mean_or_zero(values: list[float]) -> float:
-        if not values:
-            return 0.0
-        return float(sum(values) / len(values))
-
-    def _shortest_path_reward_cache_key(
-        self, *, batch: TrajectoryBatch, graph_idx: int
-    ) -> str:
-        sample_id = (
-            str(batch.sample_ids[graph_idx]) if batch.sample_ids else str(graph_idx)
-        )
-        return f"{batch.dataset_scope}:{sample_id}"
-
-    def _get_shortest_path_reward_oracle(
-        self, *, batch: TrajectoryBatch, graph_idx: int
-    ) -> ShortestPathRewardOracle:
-        cache_key = self._shortest_path_reward_cache_key(
-            batch=batch, graph_idx=graph_idx
-        )
-        cached = self._shortest_path_reward_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        node_start = int(batch.node_ptr[graph_idx].item())
-        node_end = int(batch.node_ptr[graph_idx + 1].item())
-        edge_mask = batch.edge_batch == int(graph_idx)
-        local_edge_index = batch.edge_index[:, edge_mask] - node_start
-        local_edge_relations = batch.edge_rel_global[edge_mask]
-        answer_start = int(batch.a_ptr[graph_idx].item())
-        answer_end = int(batch.a_ptr[graph_idx + 1].item())
-        oracle = build_shortest_path_reward_oracle(
-            sample_id=str(batch.sample_ids[graph_idx])
-            if batch.sample_ids
-            else str(graph_idx),
-            edge_index=local_edge_index,
-            edge_relations=local_edge_relations,
-            answer_local_indices=batch.a_local_indices[answer_start:answer_end],
-            num_nodes=node_end - node_start,
-        )
-        self._shortest_path_reward_cache[cache_key] = oracle
-        return oracle
-
-    def _apply_shortest_path_reward_shaping(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        sample_batch: TrajectoryGFNSampleBatch,
-    ) -> tuple[TrajectoryGFNSampleBatch, ShortestPathRewardMetrics]:
-        if float(self.cfg.training_cfg.shortest_path_reward.weight) == 0.0:
-            return sample_batch, ShortestPathRewardMetrics(
-                lambda_weight=0.0,
-                mean_alignment=0.0,
-                mean_bonus=0.0,
-                reachable_start_rate=0.0,
-                full_match_rate=0.0,
-                success_alignment=0.0,
-                failure_alignment=0.0,
-            )
-        lambda_weight = self._resolve_shortest_path_reward_lambda()
-        completion_power = float(
-            self.cfg.training_cfg.shortest_path_reward.completion_power
-        )
-        trace_edge_ids = sample_batch.trace_edge_ids.detach().to(dtype=torch.long)
-        relation_trace_ids = torch.full_like(trace_edge_ids, fill_value=-1)
-        graph_move_mask = trace_edge_ids >= 0
-        if bool(graph_move_mask.any().item()):
-            relation_trace_ids[graph_move_mask] = batch.edge_rel_global.index_select(
-                0,
-                trace_edge_ids[graph_move_mask],
-            )
-        log_reward_steps = torch.zeros_like(
-            sample_batch.log_pf_steps, dtype=torch.float32
-        )
-        alignments = torch.zeros_like(
-            sample_batch.terminal_log_rewards,
-            dtype=torch.float32,
-            device=sample_batch.terminal_log_rewards.device,
-        )
-        potentials = torch.zeros_like(alignments)
-        node_ptr_cpu = batch.node_ptr.detach().to(device="cpu", dtype=torch.long)
-        start_nodes_cpu = sample_batch.start_nodes.detach().to(
-            device="cpu", dtype=torch.long
-        )
-        relation_trace_cpu = relation_trace_ids.detach().to(
-            device="cpu", dtype=torch.long
-        )
-        success_mask_cpu = sample_batch.success_mask.detach().to(
-            device="cpu", dtype=torch.bool
-        )
-        total_rollouts = int(start_nodes_cpu.numel())
-        reachable_starts = 0
-        full_matches = 0
-        success_alignments: list[float] = []
-        failure_alignments: list[float] = []
-        for graph_idx in range(batch.num_graphs):
-            oracle = self._get_shortest_path_reward_oracle(
-                batch=batch, graph_idx=graph_idx
-            )
-            node_offset = int(node_ptr_cpu[graph_idx].item())
-            for rollout_idx in range(int(start_nodes_cpu.size(1))):
-                start_local = (
-                    int(start_nodes_cpu[graph_idx, rollout_idx].item()) - node_offset
-                )
-                relation_row = relation_trace_cpu[graph_idx, rollout_idx]
-                step_positions = (
-                    torch.nonzero(relation_row >= 0, as_tuple=False).view(-1).tolist()
-                )
-                relation_sequence = relation_row[relation_row >= 0].tolist()
-                alignment_trace = compute_shortest_path_alignment_trace(
-                    oracle=oracle,
-                    start_node=start_local,
-                    relation_ids=relation_sequence,
-                )
-                potential_trace = [
-                    float(step_alignment) ** completion_power
-                    for step_alignment in alignment_trace
-                ]
-                previous_potential = 0.0
-                for step_position, step_potential in zip(
-                    step_positions, potential_trace
-                ):
-                    increment = float(lambda_weight) * (
-                        float(step_potential) - float(previous_potential)
-                    )
-                    log_reward_steps[graph_idx, rollout_idx, int(step_position)] = (
-                        increment
-                    )
-                    previous_potential = float(step_potential)
-                alignment = (
-                    float(alignment_trace[-1])
-                    if alignment_trace
-                    else compute_shortest_path_prefix_alignment(
-                        oracle=oracle,
-                        start_node=start_local,
-                        relation_ids=relation_sequence,
-                    )
-                )
-                alignments[graph_idx, rollout_idx] = float(alignment)
-                potential = (
-                    float(potential_trace[-1])
-                    if potential_trace
-                    else float(alignment) ** completion_power
-                )
-                potentials[graph_idx, rollout_idx] = float(potential)
-                if oracle.distance_to_answer(start_local) >= 0:
-                    reachable_starts += 1
-                if alignment >= 1.0 - 1.0e-6:
-                    full_matches += 1
-                if bool(success_mask_cpu[graph_idx, rollout_idx].item()):
-                    success_alignments.append(float(alignment))
-                else:
-                    failure_alignments.append(float(alignment))
-        shaped_bonus = float(lambda_weight) * potentials
-        shaped_batch = replace(
-            sample_batch,
-            log_reward_steps=log_reward_steps,
-        )
-        return shaped_batch, ShortestPathRewardMetrics(
-            lambda_weight=float(lambda_weight),
-            mean_alignment=float(alignments.mean().item())
-            if total_rollouts > 0
-            else 0.0,
-            mean_bonus=float(shaped_bonus.mean().item()) if total_rollouts > 0 else 0.0,
-            reachable_start_rate=(
-                float(reachable_starts) / float(total_rollouts)
-                if total_rollouts > 0
-                else 0.0
-            ),
-            full_match_rate=(
-                float(full_matches) / float(total_rollouts)
-                if total_rollouts > 0
-                else 0.0
-            ),
-            success_alignment=self._mean_or_zero(success_alignments),
-            failure_alignment=self._mean_or_zero(failure_alignments),
         )
 
     def configure_optimizers(self) -> dict[str, Any]:
@@ -1021,13 +779,6 @@ class GFlowNetModule(LightningModule):
             rollout_batch_size=rollout_batch_size,
             temperature=sampling_temperature,
         )
-        (
-            sample_batch,
-            shortest_path_reward_metrics,
-        ) = self._apply_shortest_path_reward_shaping(
-            batch=trajectory_batch,
-            sample_batch=sample_batch,
-        )
         loss_output = self.loss_fn.compute(sample_batch)
         rollout_metrics = self._compute_training_rollout_metrics(
             batch=trajectory_batch,
@@ -1037,13 +788,7 @@ class GFlowNetModule(LightningModule):
             prepared_batch=prepared_batch,
             sample_batch=sample_batch,
         )
-        guidance_result = self._compute_guidance_loss(
-            prepared_batch=prepared_batch,
-            sample_batch=sample_batch,
-        )
         total_loss = loss_output.loss
-        if guidance_result is not None:
-            total_loss = total_loss + guidance_result.loss
         self._raise_on_nonfinite_training_loss(
             total_loss=total_loss,
             batch=trajectory_batch,
@@ -1055,9 +800,8 @@ class GFlowNetModule(LightningModule):
             sampling_temperature=sampling_temperature,
             rollout_metrics=rollout_metrics,
             root_diagnostics=root_diagnostics,
-            shortest_path_reward_metrics=shortest_path_reward_metrics,
-            guidance_result=guidance_result,
         )
+        self._latest_train_metrics = self._build_train_metrics_payload(metrics)
         self._log_metric_bundle(
             metrics=metrics,
             prefix="train",

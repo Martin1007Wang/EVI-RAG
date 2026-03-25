@@ -12,8 +12,7 @@ from torch import nn
 
 from src.models.configs import BackboneConfig
 from src.utils.nn_init import init_linear_xavier
-
-from .gnn import RelationalGNNLayer
+from src.utils.precision_utils import align_float_input_dtype
 
 
 @dataclass(frozen=True)
@@ -63,6 +62,7 @@ class EmbeddingAdapter(nn.Module):
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
         if embeddings.numel() == 0:
             return embeddings
+        embeddings = align_float_input_dtype(embeddings, module=self.norm)
         # 预归一化残差流
         delta = self.drop(self.up(self.act(self.down(self.norm(embeddings)))))
         return embeddings + delta
@@ -74,14 +74,13 @@ class EmbeddingBackbone(nn.Module):
     职责：
     1. 注入 Adapter 微调信号 (同流形微调)
     2. 投影到隐空间 (跨空间映射，严格保证投影矩阵可导)
-    3. 执行关系驱动的 GNN 编码
+    3. 输出供策略层消费的节点/关系/问题表征
     """
 
     def __init__(self, config: BackboneConfig) -> None:
         super().__init__()
         self.emb_dim = config.embedding_dim
         self.hidden_dim = config.hidden_dim
-        self.num_gnn_layers = config.gnn_layers
         self.use_adapter = config.use_adapter
         if self.use_adapter:
             self.node_adapter = EmbeddingAdapter(
@@ -106,15 +105,6 @@ class EmbeddingBackbone(nn.Module):
         init_linear_xavier(self.rel_proj)
         init_linear_xavier(self.q_proj)
 
-        self.gnn_layers = nn.ModuleList(
-            [
-                RelationalGNNLayer(
-                    hidden_dim=self.hidden_dim, dropout=config.gnn_dropout
-                )
-                for _ in range(self.num_gnn_layers)
-            ]
-        )
-
     def project_features(
         self,
         *,
@@ -135,24 +125,12 @@ class EmbeddingBackbone(nn.Module):
         )
 
     def encode(self, inputs: BackboneInput) -> BackboneOutput:
-        projected = self.project_features(
+        _ = inputs.edge_index, inputs.edge_relations, inputs.num_nodes
+        return self.project_features(
             node_features=inputs.node_features,
             relation_features=inputs.relation_features,
             question_embedding=inputs.question_embedding,
             question_context=inputs.question_context,
-        )
-        node_tokens = self.encode_graph(
-            node_tokens=projected.node_tokens,
-            relation_tokens=projected.relation_tokens,
-            edge_index=inputs.edge_index,
-            edge_relations=inputs.edge_relations,
-            num_nodes=int(inputs.num_nodes),
-        )
-        return BackboneOutput(
-            node_tokens=node_tokens,
-            relation_tokens=projected.relation_tokens,
-            question_tokens=projected.question_tokens,
-            question_context_tokens=projected.question_context_tokens,
         )
 
     def forward(self, inputs: BackboneInput) -> BackboneOutput:
@@ -161,6 +139,9 @@ class EmbeddingBackbone(nn.Module):
     def project_node_embeddings(self, node_embeddings: torch.Tensor) -> torch.Tensor:
         if self.node_adapter is not None:
             node_embeddings = self.node_adapter(node_embeddings)
+        node_embeddings = align_float_input_dtype(
+            node_embeddings, module=self.node_norm
+        )
         return self.node_proj(self.node_norm(node_embeddings))
 
     def project_relation_embeddings(
@@ -168,47 +149,20 @@ class EmbeddingBackbone(nn.Module):
     ) -> torch.Tensor:
         if self.rel_adapter is not None:
             relation_embeddings = self.rel_adapter(relation_embeddings)
+        relation_embeddings = align_float_input_dtype(
+            relation_embeddings, module=self.rel_norm
+        )
         return self.rel_proj(self.rel_norm(relation_embeddings))
 
     def project_question_embeddings(self, question_emb: torch.Tensor) -> torch.Tensor:
+        question_emb = align_float_input_dtype(question_emb, module=self.q_proj)
         return self.q_proj(question_emb)
 
     def project_question_context_embeddings(
         self, question_context: torch.Tensor
     ) -> torch.Tensor:
+        question_context = align_float_input_dtype(question_context, module=self.q_proj)
         return self.q_proj(question_context)
-
-    def encode_graph(
-        self,
-        *,
-        node_tokens: torch.Tensor,
-        relation_tokens: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_relations: torch.Tensor,  # <-- 物理链路修补：必须传入关系 ID
-        num_nodes: int,
-        question_tokens: torch.Tensor | None = None,
-        node_batch: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        [数学实体] 图消息传递流
-
-        `question_tokens` 与 `node_batch` 仅为兼容旧调用方保留，当前实现不会使用。
-        """
-        del question_tokens, node_batch
-        # [系统级修正] 使用数值变量进行逻辑判断
-        if self.num_gnn_layers == 0:
-            return node_tokens
-
-        out = node_tokens
-        for layer in self.gnn_layers:
-            out = layer(
-                node_tokens=out,
-                relation_tokens=relation_tokens,
-                edge_index=edge_index,
-                edge_relations=edge_relations,  # 传递给底层 GNN 进行异构计算
-                num_nodes=num_nodes,
-            )
-        return out
 
 
 __all__ = [
