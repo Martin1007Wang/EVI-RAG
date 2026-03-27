@@ -4,7 +4,10 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from src.models.configs import SamplingTemperatureScheduleConfig
+from src.models.configs import (
+    ActionPriorScheduleConfig,
+    SamplingTemperatureScheduleConfig,
+)
 
 
 def normalize_scheduler_interval(scheduler_cfg: dict[str, Any]) -> str:
@@ -99,20 +102,11 @@ class SamplingTemperatureScheduler:
                 "sampling temperature schedule requires final_temperature for annealed "
                 "schedules."
             )
-        final_temperature = float(final_temperature_value)
-        if self.config.type == "linear":
-            return (
-                initial_temperature
-                + (final_temperature - initial_temperature) * progress
-            )
-        if self.config.type == "cosine":
-            cosine_weight = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return (
-                final_temperature
-                + (initial_temperature - final_temperature) * cosine_weight
-            )
-        raise ValueError(
-            f"Unsupported sampling temperature schedule type: {self.config.type!r}."
+        return _interpolate_scalar_schedule(
+            schedule_type=self.config.type,
+            initial_value=initial_temperature,
+            final_value=float(final_temperature_value),
+            progress=progress,
         )
 
     @staticmethod
@@ -123,7 +117,75 @@ class SamplingTemperatureScheduler:
         return float(clipped_step) / float(int(total_steps) - 1)
 
 
+def _interpolate_scalar_schedule(
+    *,
+    schedule_type: str,
+    initial_value: float,
+    final_value: float,
+    progress: float,
+) -> float:
+    if schedule_type == "linear":
+        return initial_value + (final_value - initial_value) * progress
+    if schedule_type == "cosine":
+        cosine_weight = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return final_value + (initial_value - final_value) * cosine_weight
+    raise ValueError(f"Unsupported scalar schedule type: {schedule_type!r}.")
+
+
+class ActionPriorScheduler:
+    def __init__(
+        self,
+        *,
+        base_scale: float,
+        config: ActionPriorScheduleConfig,
+    ) -> None:
+        self.base_scale = float(base_scale)
+        self.config = config
+
+    def value(
+        self,
+        *,
+        global_step: int,
+        schedule_context: TrainingScheduleContext,
+    ) -> float:
+        initial_scale = (
+            self.base_scale
+            if self.config.initial_scale is None
+            else float(self.config.initial_scale)
+        )
+        if self.config.type == "constant":
+            return initial_scale
+
+        total_steps = schedule_context.resolve_horizon(
+            explicit_horizon=self.config.total_steps,
+            interval="step",
+        )
+        if total_steps is None:
+            raise RuntimeError(
+                "action-prior schedule requires a known step horizon. Set trainer.max_steps, "
+                "ensure estimated_stepping_batches is available, or configure "
+                "training.action_prior_schedule.total_steps explicitly."
+            )
+
+        final_scale_value = self.config.final_scale
+        if final_scale_value is None:
+            raise RuntimeError(
+                "action-prior schedule requires final_scale for annealed schedules."
+            )
+        progress = SamplingTemperatureScheduler._progress(
+            global_step=global_step,
+            total_steps=total_steps,
+        )
+        return _interpolate_scalar_schedule(
+            schedule_type=self.config.type,
+            initial_value=initial_scale,
+            final_value=float(final_scale_value),
+            progress=progress,
+        )
+
+
 __all__ = [
+    "ActionPriorScheduler",
     "SamplingTemperatureScheduler",
     "TrainingScheduleContext",
     "normalize_scheduler_interval",

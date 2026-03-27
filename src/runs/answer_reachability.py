@@ -24,15 +24,9 @@ from src.utils.output_sinks import (
 RANKFLOW_MODEL_TARGET = "src.models.gflownet_module.GFlowNetModule"
 ANSWER_REACHABILITY_MODEL_TARGET = RANKFLOW_MODEL_TARGET
 RANKFLOW_EVAL_RUN = "rankflow"
-ANSWER_REACHABILITY_EVAL_RUN = "answer_reachability"
 RANKFLOW_TRAIN_RUN = "train_rankflow"
-ANSWER_REACHABILITY_TRAIN_RUN = "train_answer_reachability"
-RANKFLOW_EVAL_RUN_ALIASES = {RANKFLOW_EVAL_RUN, ANSWER_REACHABILITY_EVAL_RUN}
-RANKFLOW_TRAIN_RUN_ALIASES = {RANKFLOW_TRAIN_RUN, ANSWER_REACHABILITY_TRAIN_RUN}
 SUPPORTED_TRAINING_MODEL_TARGETS = {RANKFLOW_MODEL_TARGET}
-RUN_REQUIRES_CKPT_KIND = {
-    run_name: "gflownet" for run_name in RANKFLOW_EVAL_RUN_ALIASES
-}
+RUN_REQUIRES_CKPT_KIND = {RANKFLOW_EVAL_RUN: "gflownet"}
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -199,7 +193,7 @@ def validate_eval_config(cfg: DictConfig) -> None:
             f"Run `{run_name}` requires `{required_kind}` checkpoint, but `ckpt_path` is empty.\n"
             f"Fix: pass `ckpt.{required_kind}=/path/to/{required_kind}.ckpt`."
         )
-    if run_name not in RANKFLOW_EVAL_RUN_ALIASES:
+    if run_name != RANKFLOW_EVAL_RUN:
         return
 
     variants = resolve_dataset_variants(cfg)
@@ -346,9 +340,7 @@ def persist_eval_outputs(
 
 
 __all__ = [
-    "ANSWER_REACHABILITY_EVAL_RUN",
     "ANSWER_REACHABILITY_MODEL_TARGET",
-    "ANSWER_REACHABILITY_TRAIN_RUN",
     "RANKFLOW_EVAL_RUN",
     "RANKFLOW_MODEL_TARGET",
     "RANKFLOW_TRAIN_RUN",

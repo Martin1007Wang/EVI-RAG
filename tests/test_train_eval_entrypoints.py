@@ -14,7 +14,6 @@ from src.eval import (
     _enforce_single_gpu_eval,
 )
 from src.train import (
-    _align_validation_metrics_profile,
     _build_final_eval_cfg,
     _maybe_load_model_weights,
     _run_final_eval_suite,
@@ -79,67 +78,6 @@ def test_rankflow_eval_config_resolves_model_scheduler_without_trainer_max_steps
     )
 
 
-def test_answer_reachability_eval_alias_matches_rankflow_config() -> None:
-    config_dir = Path(__file__).resolve().parents[1] / "configs"
-
-    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
-        rankflow_cfg = compose(
-            config_name="eval.yaml",
-            overrides=[
-                "run=rankflow",
-                "dataset=webqsp",
-                "ckpt.gflownet=/tmp/mock.ckpt",
-                *_HYDRA_TEST_OVERRIDES,
-            ],
-        )
-        answer_reachability_cfg = compose(
-            config_name="eval.yaml",
-            overrides=[
-                "run=answer_reachability",
-                "dataset=webqsp",
-                "ckpt.gflownet=/tmp/mock.ckpt",
-                *_HYDRA_TEST_OVERRIDES,
-            ],
-        )
-
-    assert OmegaConf.to_container(
-        answer_reachability_cfg.run, resolve=True
-    ) == OmegaConf.to_container(rankflow_cfg.run, resolve=True)
-
-
-def test_train_answer_reachability_run_alias_matches_train_rankflow_run() -> None:
-    config_dir = Path(__file__).resolve().parents[1] / "configs"
-
-    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
-        rankflow_cfg = compose(
-            config_name="train.yaml",
-            overrides=[
-                "run=train_rankflow",
-                "dataset=webqsp-sub",
-                "logger=none",
-                "extras.enforce_tags=false",
-                "extras.print_config=false",
-                *_HYDRA_TEST_OVERRIDES,
-            ],
-        )
-        answer_reachability_cfg = compose(
-            config_name="train.yaml",
-            overrides=[
-                "run=train_answer_reachability",
-                "dataset=webqsp-sub",
-                "logger=none",
-                "extras.enforce_tags=false",
-                "extras.print_config=false",
-                *_HYDRA_TEST_OVERRIDES,
-            ],
-        )
-
-    assert OmegaConf.to_container(
-        answer_reachability_cfg.run, resolve=True
-    ) == OmegaConf.to_container(rankflow_cfg.run, resolve=True)
-    assert "guided" not in list(rankflow_cfg.run.tags)
-
-
 def test_eval_llm_run_inherits_eval_defaults() -> None:
     config_dir = Path(__file__).resolve().parents[1] / "configs"
 
@@ -172,12 +110,16 @@ def test_eval_edge_retrieval_inherits_rankflow_eval_stack() -> None:
             ],
         )
 
+    action_prior_cfg = instantiate(cfg.model.action_prior_cfg)
+
     assert cfg.run.name == "rankflow"
     assert cfg.run.artifact_subdir == "eval_edge_retrieval"
     assert cfg.run.artifact_name == "eval_edge_retrieval"
     assert list(cfg.run.tags) == ["eval", "edge_retrieval"]
-    assert cfg.model.action_prior_cfg.kind == "none"
-    assert cfg.model.action_prior_cfg.beta == pytest.approx(0.0)
+    assert "root_beta" not in cfg.model.action_prior_cfg
+    assert "edge_beta" not in cfg.model.action_prior_cfg
+    assert action_prior_cfg.root_beta == pytest.approx(0.0)
+    assert action_prior_cfg.edge_beta == pytest.approx(0.0)
     assert cfg.model.eval_cfg.task == "edge_retrieval"
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
     assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
@@ -227,21 +169,6 @@ def test_maybe_load_model_weights_uses_state_dict_payload(monkeypatch) -> None:
     assert seen == {"state_dict": {"layer.weight": 1}, "strict": False}
 
 
-def test_align_validation_metrics_profile_uses_model_contract() -> None:
-    cfg = OmegaConf.create(
-        {
-            "model": {
-                "contract": {"validation_metrics_profile": "rank_only"},
-                "eval_cfg": {"metrics_profile": "full"},
-            }
-        }
-    )
-
-    _align_validation_metrics_profile(cfg)
-
-    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
-
-
 def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     config_dir = Path(__file__).resolve().parents[1] / "configs"
 
@@ -258,6 +185,9 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
             ],
         )
 
+    action_prior_cfg = instantiate(cfg.model.action_prior_cfg)
+    training_cfg = instantiate(cfg.model.training_cfg)
+
     assert cfg.run.test is False
     assert cfg.data.eval_batch_size == 64
     assert cfg.data.num_workers == 8
@@ -269,9 +199,19 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert cfg.data.eval_multiprocessing_context == "spawn"
     assert cfg.data.train_feature_dtype == "auto"
     assert cfg.data.eval_feature_dtype == "auto"
+    assert cfg.model.training_cfg.rollouts_per_graph == 32
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
     assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
     assert cfg.model.eval_cfg.monte_carlo_rollouts == 128
+    assert action_prior_cfg.root_beta == pytest.approx(1.0)
+    assert action_prior_cfg.edge_beta == pytest.approx(0.75)
+    assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
+    assert action_prior_cfg.answer_distance_weight == pytest.approx(0.5)
+    assert "step_log_penalty" not in cfg.model.training_cfg
+    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.5)
+    assert cfg.model.policy_cfg.transition_head.enabled is True
+    assert training_cfg.step_log_penalty == pytest.approx(0.0)
+    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.0)
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
@@ -294,7 +234,10 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
             ],
         )
 
-    assert cfg.data.batch_size == 256
+    action_prior_cfg = instantiate(cfg.model.action_prior_cfg)
+    training_cfg = instantiate(cfg.model.training_cfg)
+
+    assert cfg.data.batch_size == 64
     assert cfg.data.eval_batch_size == 32
     assert cfg.data.num_workers == 8
     assert cfg.data.multiprocessing_context == "spawn"
@@ -311,58 +254,32 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
     assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
     assert cfg.trainer.log_every_n_steps == 32
+    assert cfg.model.training_cfg.rollouts_per_graph == 32
     assert cfg.model.eval_cfg.metrics_profile == "rank_only"
     assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
     assert cfg.model.eval_cfg.monte_carlo_rollouts == 256
+    assert action_prior_cfg.root_beta == pytest.approx(1.0)
+    assert action_prior_cfg.edge_beta == pytest.approx(0.75)
+    assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
+    assert action_prior_cfg.answer_distance_weight == pytest.approx(0.5)
+    assert "step_log_penalty" not in cfg.model.training_cfg
+    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.5)
+    assert cfg.model.policy_cfg.transition_head.enabled is True
+    assert training_cfg.step_log_penalty == pytest.approx(0.0)
+    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.5)
+    assert training_cfg.success_replay.min_buffer_size == 64
+    assert training_cfg.success_replay.capacity == 512
+    assert training_cfg.success_replay.replay_trajectories_per_step == 64
+    assert training_cfg.success_replay.add_shortest_path_guidance is True
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.run.test is True
     assert "guided" not in list(cfg.run.tags)
 
 
-def test_train_answer_reachability_alias_matches_rankflow_defaults() -> None:
-    config_dir = Path(__file__).resolve().parents[1] / "configs"
-
-    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
-        cfg = compose(
-            config_name="train.yaml",
-            overrides=[
-                "experiment=train_answer_reachability",
-                "dataset=webqsp-sub",
-                "logger=none",
-                "extras.enforce_tags=false",
-                "extras.print_config=false",
-                *_HYDRA_TEST_OVERRIDES,
-            ],
-        )
-
-    assert cfg.data.batch_size == 256
-    assert cfg.data.eval_batch_size == 32
-    assert cfg.data.num_workers == 8
-    assert cfg.data.multiprocessing_context == "spawn"
-    assert cfg.data.prefetch_factor == 2
-    assert cfg.data.eval_num_workers == 8
-    assert cfg.data.eval_prefetch_factor == 2
-    assert cfg.data.train_num_samples is None
-    assert cfg.data.eval_persistent_workers is True
-    assert cfg.data.eval_multiprocessing_context == "spawn"
-    assert cfg.data.train_feature_dtype == "auto"
-    assert cfg.data.eval_feature_dtype == "auto"
-    assert "train_max_edges_per_batch" not in cfg.data
-    assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
-    assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
-    assert cfg.trainer.log_every_n_steps == 32
-    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
-    assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
-    assert cfg.model.eval_cfg.monte_carlo_rollouts == 256
-    assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
-    assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
-    assert "guided" not in list(cfg.run.tags)
-
-
 @pytest.mark.parametrize(
     "experiment_name",
-    ["train_rankflow", "train_answer_reachability"],
+    ["train_rankflow"],
 )
 def test_train_experiments_keep_model_training_config_instantiable(
     experiment_name: str,
@@ -408,7 +325,6 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
             },
             "data": {"batch_size": 32, "num_workers": 4},
             "model": {
-                "contract": {"final_eval_metrics_profile": "full"},
                 "policy_cfg": {"backbone": {"hidden_dim": 512}},
                 "eval_cfg": {
                     "metrics_profile": "rank_only",

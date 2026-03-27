@@ -1,4 +1,0 @@
-# Backward-compatible alias for the canonical `train_rankflow` run.
-
-defaults:
-  - train_rankflow

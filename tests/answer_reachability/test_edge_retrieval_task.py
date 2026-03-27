@@ -21,10 +21,14 @@ def _make_edge_retrieval_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(
-            rollout_batch_size=3,
+            rollouts_per_graph=3,
             sampling_temperature=1.0,
         ),
-        action_prior_cfg=ActionPriorConfig(kind="topology", beta=0.5),
+        action_prior_cfg=ActionPriorConfig(
+            root_beta=0.5,
+            edge_beta=0.5,
+            node_embedding_weight=0.0,
+        ),
         policy_cfg=make_policy_config(),
         eval_cfg=SearchEvalConfig(
             task="edge_retrieval",

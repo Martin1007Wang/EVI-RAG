@@ -5,7 +5,6 @@ import torch
 from src.models.components import (
     EmbeddingBackbone,
     NodeFlowHead,
-    TransitionPolicyHead,
 )
 from src.models.configs import (
     BackboneConfig,
@@ -116,18 +115,15 @@ def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
         dropout=float(cfg.state_score_head.dropout),
         conditioning=str(cfg.state_score_head.conditioning),
     )
-    forward_policy_head = TransitionPolicyHead(
-        state_dim=graph_hidden_dim,
-        relation_dim=graph_hidden_dim,
-        hidden_dim=int(cfg.forward_policy_head.hidden_dim),
-        num_layers=int(cfg.forward_policy_head.num_layers),
-        dropout=float(cfg.forward_policy_head.dropout),
-        detach_input_features=bool(cfg.forward_policy_head.detach_input_features),
-    )
     return BaseSearchPolicy(
         cfg,
         max_steps=max_steps,
         backbone=backbone,
         state_score_head=state_score_head,
-        forward_policy_head=forward_policy_head,
+        transition_policy_head=None,
+        step_log_penalty=0.0,
+        non_gold_terminal_log_reward=-3.0,
+        answer_stop_log_reward_bonus=0.0,
+        answer_quotient_allocate_stop_mass=False,
+        answer_quotient_gold_reward_mode="shared",
     )

@@ -145,37 +145,6 @@ def _clone_cfg_node(node: Any) -> Any:
     return OmegaConf.create(node)
 
 
-def _resolve_model_contract_value(
-    cfg: DictConfig,
-    *,
-    field_name: str,
-) -> str | None:
-    model_cfg = cfg.get("model") or {}
-    contract_cfg = model_cfg.get("contract") or {}
-    raw_value = contract_cfg.get(field_name) if hasattr(contract_cfg, "get") else None
-    if raw_value in (None, "", "null", "None"):
-        return None
-    return str(raw_value)
-
-
-def _align_validation_metrics_profile(cfg: DictConfig) -> None:
-    validation_profile = _resolve_model_contract_value(
-        cfg,
-        field_name="validation_metrics_profile",
-    )
-    if validation_profile is None:
-        return
-    current_profile = str(cfg.model.eval_cfg.get("metrics_profile") or "")
-    if current_profile == validation_profile:
-        return
-    with open_dict(cfg):
-        cfg.model.eval_cfg.metrics_profile = validation_profile
-    log.info(
-        "Aligned training-time validation metrics_profile=%s from model contract.",
-        validation_profile,
-    )
-
-
 def _resolve_post_fit_ckpt_path(
     *,
     run_cfg: DictConfig | dict[str, Any],
@@ -248,17 +217,10 @@ def _build_final_eval_cfg(
     )
 
     eval_cfg = _clone_cfg_node(eval_template)
-    final_eval_profile = _resolve_model_contract_value(
-        cfg,
-        field_name="final_eval_metrics_profile",
-    )
     merged_eval_cfg = OmegaConf.merge(
         _clone_cfg_node(cfg.model.eval_cfg),
         _clone_cfg_node(eval_template.model.eval_cfg),
     )
-    if final_eval_profile is not None:
-        with open_dict(merged_eval_cfg):
-            merged_eval_cfg.metrics_profile = final_eval_profile
 
     model_cfg = _clone_cfg_node(cfg.model)
     with open_dict(model_cfg):
@@ -474,8 +436,6 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
-
-    _align_validation_metrics_profile(cfg)
 
     resolved_run_name = apply_run_name(cfg)
     log.info(f"Resolved run name: {resolved_run_name}")

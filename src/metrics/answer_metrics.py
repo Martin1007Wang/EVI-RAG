@@ -13,8 +13,8 @@ from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
 from src.models.gflownet import (
     PreparedSearchBatch,
+    RootActionDistributionError,
     SearchPolicyProtocol,
-    StartDistributionError,
     TrajectorySamplerProtocol,
 )
 
@@ -961,7 +961,7 @@ class AnswerReachabilityEvaluator:
                         include_answer_support=include_answer_support,
                     )
                 )
-            except StartDistributionError:
+            except RootActionDistributionError:
                 if on_invalid_start is not None:
                     on_invalid_start(graph_batch)
                 results.append(self.build_invalid_start_result(graph_batch))
@@ -984,7 +984,7 @@ class AnswerReachabilityEvaluator:
                 metrics_profile=metrics_profile,
                 include_answer_support=include_answer_support,
             )
-        except StartDistributionError:
+        except RootActionDistributionError:
             return self._evaluate_individual_graphs(
                 batch=batch,
                 metrics_profile=metrics_profile,

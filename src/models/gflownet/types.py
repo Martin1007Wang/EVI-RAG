@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import torch
@@ -41,6 +41,7 @@ class RootActionDistribution:
     log_flows: torch.Tensor
     log_probs: torch.Tensor
     graph_log_z: torch.Tensor
+    start_log_rewards: torch.Tensor | None = None
     action_logits: torch.Tensor | None = None
     root_state: RootState | None = None
 
@@ -53,13 +54,9 @@ class RootActionDistribution:
         return self.graph_log_z
 
 
-# Backward-compatible alias for older call sites and tests.
-StartDistribution = RootActionDistribution
-
-
 @dataclass(frozen=True)
 class ForwardActionDistribution:
-    """Per-state action logits over graph edges plus the explicit STOP action."""
+    """Per-state branch log-masses over graph moves plus the explicit STOP action."""
 
     edge_logits: torch.Tensor
     edge_agent_batch: torch.Tensor
@@ -74,10 +71,6 @@ class ForwardActionDistribution:
     raw_graph_candidate_count: int = 0
     scored_graph_candidate_count: int = 0
 
-    @property
-    def is_submit(self) -> torch.Tensor | None:
-        return self.is_stop_action
-
 
 @dataclass(frozen=True)
 class PreparedSearchBatch:
@@ -90,26 +83,25 @@ class PreparedSearchBatch:
     question_tokens: torch.Tensor
     question_context_tokens: torch.Tensor
     question_context_mask: torch.Tensor
+    answer_mask: torch.Tensor
+    answer_sink_ids: torch.Tensor
+    answer_sink_log_rewards: torch.Tensor
+    answer_distance: torch.Tensor | None = None
+    shortest_path_edge_mask: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class ActionPriorCache:
-    """Cached per-node priors shared across behavior-policy action scoring."""
+    """Cached per-node priors shared across proposal-policy action scoring."""
 
     node_prior: torch.Tensor | None = None
-
-
-# Backward-compatible alias for older imports.
-HeuristicCache = ActionPriorCache
+    answer_distance: torch.Tensor | None = None
+    shortest_path_edge_mask: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class PreparedGFlowNetBatch(PreparedSearchBatch):
-    action_prior_cache: ActionPriorCache
-
-    @property
-    def heuristic_cache(self) -> ActionPriorCache:
-        return self.action_prior_cache
+    action_prior_cache: ActionPriorCache = field(default_factory=ActionPriorCache)
 
 
 @dataclass(frozen=True)
@@ -416,27 +408,35 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
         self, prepared_batch: PreparedGFlowNetBatch
     ) -> torch.Tensor: ...
 
-    def compute_behavior_root_action_distribution(
+    def compute_proposal_root_action_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
+        *,
+        action_prior_scale: float = 1.0,
     ) -> RootActionDistribution: ...
 
-    def compute_behavior_start_distribution(
+    def compute_proposal_start_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
+        *,
+        action_prior_scale: float = 1.0,
     ) -> RootActionDistribution: ...
 
-    def compute_behavior_forward_distribution(
+    def compute_proposal_forward_distribution(
         self,
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
+        *,
+        action_prior_scale: float = 1.0,
     ) -> ForwardActionDistribution: ...
 
-    def compute_behavior_edge_logits(
+    def compute_proposal_edge_logits(
         self,
         prepared_batch: PreparedGFlowNetBatch,
         state: SearchState,
         distribution: ForwardActionDistribution,
+        *,
+        action_prior_scale: float = 1.0,
     ) -> torch.Tensor: ...
 
     def compute_backward_distribution(
@@ -459,12 +459,10 @@ __all__ = [
     "ForwardActionDistribution",
     "GFlowNetPolicyProtocol",
     "ActionPriorCache",
-    "HeuristicCache",
     "PreparedGFlowNetBatch",
     "PreparedSearchBatch",
     "RootState",
     "RootActionDistribution",
     "SearchPolicyProtocol",
     "SearchState",
-    "StartDistribution",
 ]

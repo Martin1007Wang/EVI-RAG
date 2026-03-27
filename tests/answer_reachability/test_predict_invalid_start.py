@@ -23,7 +23,7 @@ def _make_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        action_prior_cfg=ActionPriorConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(),
         policy_cfg=PolicyConfig(
             backbone=BackboneConfig(
                 embedding_dim=8,

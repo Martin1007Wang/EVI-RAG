@@ -101,11 +101,13 @@ class NodeFlowHead(nn.Module):
 
 
 class TransitionPolicyHead(nn.Module):
-    """Actor head over recurrent state queries and edge keys.
+    """Proposal-policy edge bias head over recurrent state queries and edge keys.
 
-    By default the head stays end-to-end differentiable so policy gradients can
-    shape the shared encoder. The legacy detached behavior remains available as
-    an explicit ablation via ``detach_input_features=True``.
+    The strict target policy stays successor-flow only; this head is reserved for
+    off-policy proposal shaping. By default the head stays end-to-end
+    differentiable so proposal gradients can shape the shared encoder. The
+    legacy detached behavior remains available as an explicit ablation via
+    ``detach_input_features=True``.
     """
 
     def __init__(

@@ -4,17 +4,6 @@ defaults:
 _target_: src.models.gflownet_module.GFlowNetModule
 _recursive_: true
 
-# Model contract metadata. This block is stripped before hydra instantiation.
-contract:
-  task_family: answer_ranking
-  train_dataset_scope: sub_only
-  eval_entrypoint: eval
-  train_entrypoint: train
-  eval_execution_mode: [predict, test]
-  validation_metrics_profile: rank_only
-  final_eval_metrics_profile: full
-  single_gpu_eval_only: true
-
 metric_runtime_factory:
   _target_: src.metrics.runtime_factory.GraphTaskRuntimeFactory
 
@@ -24,96 +13,39 @@ horizon_cfg:
 
 training_cfg:
   _target_: src.models.configs.gflownet.GFlowNetTrainingConfig
-  rollout_batch_size: 8
-  sampling_temperature: 1.0
-  force_stop_on_answer_hit: false
-  terminal_failure_log_reward: -3.0
-  step_log_penalty: -0.030459207484708574
   sampling_temperature_schedule:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
-    type: constant
+  action_prior_schedule:
+    _target_: src.models.configs.gflownet.ActionPriorScheduleConfig
+  success_replay:
+    _target_: src.models.configs.gflownet.SuccessReplayConfig
+  answer_quotient:
+    _target_: src.models.configs.gflownet.AnswerQuotientConfig
+  potential_reward:
+    _target_: src.models.configs.gflownet.PotentialRewardConfig
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
-    lambda_weight: 1.0
-    normalize: true
-    root_loss_weight: 1.0
-    pairwise_loss_weight: 1.0
-    terminal_loss_weight: 1.0
 
 action_prior_cfg:
   _target_: src.models.configs.gflownet.ActionPriorConfig
-  # Behavior-policy priors improve training exploration without changing the
-  # target policy or adding auxiliary losses. Base model defaults stay off.
-  kind: none
-  beta: 0.0
-  stop_beta: 0.0
-  node_topology_weight: 1.0
-  node_embedding_weight: 1.0
-  relation_embedding_weight: 1.0
-  target_node_weight: 0.5
-  progress_weight: 1.0
-  stop_node_weight: 1.0
-  topology_restart_prob: 0.25
-  topology_num_iters: 8
-  topology_eps: 1.0e-8
-  embedding_temperature: 1.0
 
 policy_cfg:
   _target_: src.models.configs.policy.PolicyConfig
   backbone:
     _target_: src.models.configs.backbone.BackboneConfig
-    embedding_dim: 1024
-    hidden_dim: 512
-    use_adapter: true
-    adapter_dim: 128
-    adapter_dropout: 0.1
   prefix_controller:
     _target_: src.models.configs.policy.PrefixControllerConfig
-    dropout: 0.0
   state_score_head:
     _target_: src.models.configs.policy.StateScoreHeadConfig
-    hidden_dim: 256
-    num_layers: 2
-    dropout: 0.0
-    conditioning: concat
-  forward_policy_head:
-    _target_: src.models.configs.policy.TransitionPolicyHeadConfig
-    hidden_dim: 256
-    num_layers: 2
-    dropout: 0.0
-    detach_input_features: false
+  transition_head:
+    _target_: src.models.configs.policy.TransitionHeadConfig
 
 eval_cfg:
   _target_: src.models.configs.gflownet.SearchEvalConfig
-  # Base model defaults use deterministic flow-frontier search for full
-  # answer-reachability evaluation. Training experiments override this to
-  # rank_only Monte Carlo validation for a cheaper fit loop, while Monte Carlo
-  # knobs remain available for edge-retrieval and explicit eval overrides.
-  strict_search: true
-  metrics_profile: full
-  support_search_method: flow_frontier
-  flow_prune_epsilon: 1.0e-3
-  monte_carlo_rollouts: 4096
-  monte_carlo_confidence: 0.95
-  answer_mass_threshold: 0.90
-  support_mass_threshold: 0.90
-  support_path_overlap_penalty: 0.25
-  window_top_ks: [1, 10, 25, 50, 100]
-  answer_top_ks: [1, 5, 10]
-  max_expansions: 20000
-  max_frontier_size: 4096
 
 optimizer_cfg:
   _target_: src.models.configs.training.OptimizerConfig
-  type: adamw
-  lr: 1.0e-4
-  weight_decay: 1.0e-4
-  betas: [0.9, 0.999]
-  no_decay_on_bias_and_norm: true
 
 scheduler_cfg:
   _target_: src.models.configs.training.SchedulerConfig
-  type: cosine
-  interval: step
   t_max: ${oc.select:trainer.max_steps,null}
-  eta_min: 1.0e-6

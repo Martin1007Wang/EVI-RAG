@@ -10,10 +10,17 @@ from torch.nn import Parameter
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
 from src.models.configs import (
+    ActionPriorConfig,
+    ActionPriorScheduleConfig,
+    AnswerQuotientConfig,
     GFlowNetTrainingConfig,
+    OptimizerConfig,
+    PotentialRewardConfig,
     SamplingTemperatureScheduleConfig,
+    SchedulerConfig,
 )
 from src.models.gflownet import (
+    ActionPriorScheduler,
     SamplingTemperatureScheduler,
     TrainingScheduleContext,
 )
@@ -227,7 +234,116 @@ def test_annealed_sampling_temperature_scheduler_requires_known_horizon() -> Non
         scheduler.value(global_step=0, schedule_context=schedule_context)
 
 
+def test_linear_action_prior_scheduler_uses_training_horizon() -> None:
+    scheduler = ActionPriorScheduler(
+        base_scale=1.0,
+        config=ActionPriorScheduleConfig(type="linear", final_scale=0.25),
+    )
+    schedule_context = TrainingScheduleContext(
+        estimated_stepping_batches=1_000_000,
+        trainer_max_steps=4,
+    )
+
+    assert scheduler.value(
+        global_step=0, schedule_context=schedule_context
+    ) == pytest.approx(1.0)
+    assert scheduler.value(
+        global_step=3, schedule_context=schedule_context
+    ) == pytest.approx(0.25)
+
+
+def test_annealed_action_prior_scheduler_requires_known_horizon() -> None:
+    scheduler = ActionPriorScheduler(
+        base_scale=1.0,
+        config=ActionPriorScheduleConfig(type="cosine", final_scale=0.25),
+    )
+    schedule_context = TrainingScheduleContext(estimated_stepping_batches=None)
+
+    with pytest.raises(RuntimeError, match="known step horizon"):
+        scheduler.value(global_step=0, schedule_context=schedule_context)
+
+
+def test_intent_alignment_prior_requires_nonzero_action_features() -> None:
+    with pytest.raises(ValueError, match="intent_alignment_weight requires"):
+        ActionPriorConfig(
+            root_beta=0.5,
+            edge_beta=0.5,
+            intent_alignment_weight=1.0,
+            intent_relation_weight=0.0,
+            intent_target_weight=0.0,
+        )
+
+
 def test_gflownet_training_config_exposes_direct_step_log_penalty() -> None:
     training_cfg = GFlowNetTrainingConfig(step_log_penalty=log(0.5))
 
     assert training_cfg.step_log_penalty == pytest.approx(log(0.5))
+
+
+def test_gflownet_training_config_default_step_log_penalty_is_neutral() -> None:
+    assert GFlowNetTrainingConfig().step_log_penalty == pytest.approx(0.0)
+
+
+def test_optimizer_config_default_weight_decay_matches_model_config() -> None:
+    assert OptimizerConfig().weight_decay == pytest.approx(1.0e-4)
+
+
+def test_scheduler_config_default_eta_min_matches_model_config() -> None:
+    assert SchedulerConfig().eta_min == pytest.approx(1.0e-6)
+
+
+def test_gflownet_training_config_validates_answer_stop_bonus() -> None:
+    training_cfg = GFlowNetTrainingConfig(answer_stop_log_reward_bonus=0.75)
+
+    assert training_cfg.answer_stop_log_reward_bonus == pytest.approx(0.75)
+    with pytest.raises(ValueError, match="answer_stop_log_reward_bonus"):
+        GFlowNetTrainingConfig(answer_stop_log_reward_bonus=-0.1)
+
+
+def test_answer_quotient_config_validates_terminal_replacement_weight() -> None:
+    cfg = AnswerQuotientConfig(enabled=True, weight=0.25, replace_terminal_loss=False)
+
+    assert cfg.active is True
+    assert cfg.stop_allocation_active is False
+    with pytest.raises(ValueError, match="replace_terminal_loss requires weight > 0"):
+        AnswerQuotientConfig(enabled=True, weight=0.0, replace_terminal_loss=True)
+
+
+def test_answer_quotient_config_exposes_stop_allocation_flag() -> None:
+    cfg = AnswerQuotientConfig(enabled=True, allocate_stop_mass=True)
+
+    assert cfg.active is False
+    assert cfg.stop_allocation_active is True
+
+
+def test_answer_quotient_config_exposes_direct_entity_ranking_flag() -> None:
+    cfg = AnswerQuotientConfig(enabled=True, direct_entity_ranking_weight=0.25)
+
+    assert cfg.active is False
+    assert cfg.direct_entity_ranking_active is True
+
+
+def test_answer_quotient_config_validates_direct_entity_ranking_weight() -> None:
+    with pytest.raises(ValueError, match="direct_entity_ranking_weight must be >= 0"):
+        AnswerQuotientConfig(enabled=True, direct_entity_ranking_weight=-0.1)
+    with pytest.raises(
+        ValueError,
+        match="direct_entity_ranking_weight requires enabled=True",
+    ):
+        AnswerQuotientConfig(direct_entity_ranking_weight=0.1)
+
+
+def test_potential_reward_config_exposes_answer_distance_flag() -> None:
+    cfg = PotentialRewardConfig(answer_distance_weight=0.5)
+
+    assert cfg.active is True
+
+
+def test_potential_reward_config_validates_weight_and_unreachable_distance() -> None:
+    with pytest.raises(ValueError, match="answer_distance_weight must be >= 0"):
+        PotentialRewardConfig(answer_distance_weight=-0.1)
+    with pytest.raises(ValueError, match="unreachable_distance must be >= 0"):
+        PotentialRewardConfig(
+            answer_distance_weight=0.5,
+            unreachable_distance=-1,
+        )

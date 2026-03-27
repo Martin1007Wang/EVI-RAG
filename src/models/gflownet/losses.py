@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from src.models.configs import SubTrajectoryBalanceConfig
+from src.models.configs import AnswerQuotientConfig, SubTrajectoryBalanceConfig
 
 if TYPE_CHECKING:
     from .sampler import TrajectoryGFNSampleBatch
@@ -13,6 +13,75 @@ if TYPE_CHECKING:
 
 def _zero_metric_tensor() -> torch.Tensor:
     return torch.tensor(0.0, dtype=torch.float32)
+
+
+def _select_unique_terminal_path_indices(
+    sample_batch: "TrajectoryGFNSampleBatch",
+) -> torch.Tensor:
+    termination_steps = getattr(sample_batch, "termination_action_steps", None)
+    if termination_steps is None:
+        termination_steps = sample_batch.terminal_num_steps
+    trace_stop_mask = sample_batch.trace_stop_mask
+    if trace_stop_mask is None:
+        trace_stop_mask = torch.zeros_like(
+            sample_batch.trace_edge_ids, dtype=torch.bool
+        )
+    batch_size, num_rollouts = sample_batch.start_nodes.shape
+    max_actions = int(sample_batch.trace_edge_ids.size(-1))
+    flat_graph_ids = (
+        torch.arange(
+            batch_size, device=sample_batch.start_nodes.device, dtype=torch.long
+        )
+        .unsqueeze(1)
+        .expand(batch_size, num_rollouts)
+        .reshape(-1)
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    flat_start_nodes = (
+        sample_batch.start_nodes.reshape(-1)
+        .detach()
+        .cpu()
+        .to(dtype=torch.long)
+        .tolist()
+    )
+    flat_termination_steps = (
+        termination_steps.reshape(-1).detach().cpu().to(dtype=torch.long).tolist()
+    )
+    flat_edge_rows = (
+        sample_batch.trace_edge_ids.reshape(-1, max_actions)
+        .detach()
+        .cpu()
+        .to(dtype=torch.long)
+        .tolist()
+    )
+    flat_stop_rows = (
+        trace_stop_mask.reshape(-1, max_actions)
+        .detach()
+        .cpu()
+        .to(dtype=torch.long)
+        .tolist()
+    )
+    unique_positions: list[int] = []
+    seen_keys: set[tuple[int, ...]] = set()
+    for idx in range(len(flat_graph_ids)):
+        key = (
+            int(flat_graph_ids[idx]),
+            int(flat_start_nodes[idx]),
+            int(flat_termination_steps[idx]),
+            *[int(value) for value in flat_edge_rows[idx]],
+            *[int(value) for value in flat_stop_rows[idx]],
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_positions.append(idx)
+    return torch.tensor(
+        unique_positions,
+        device=sample_batch.start_nodes.device,
+        dtype=torch.long,
+    )
 
 
 @dataclass(frozen=True)
@@ -28,6 +97,15 @@ class SubTrajectoryBalanceLossOutput:
     root_component_loss: torch.Tensor = field(default_factory=_zero_metric_tensor)
     pairwise_component_loss: torch.Tensor = field(default_factory=_zero_metric_tensor)
     terminal_component_loss: torch.Tensor = field(default_factory=_zero_metric_tensor)
+    answer_quotient_component_loss: torch.Tensor = field(
+        default_factory=_zero_metric_tensor
+    )
+    answer_quotient_residual_abs: torch.Tensor = field(
+        default_factory=_zero_metric_tensor
+    )
+    answer_quotient_observed_sink_count: torch.Tensor = field(
+        default_factory=_zero_metric_tensor
+    )
 
 
 class SubTrajectoryBalanceLoss:
@@ -37,19 +115,31 @@ class SubTrajectoryBalanceLoss:
     defined by the fixed terminal energy table plus any step-level log rewards
     carried in ``log_reward_steps``. Root, pairwise, and terminal residuals are
     always aggregated as separate components so long-horizon pairwise terms do
-    not dominate the root boundary or suffix-return anchors.
+    not dominate the root boundary or suffix-return anchors. When configured,
+    an additional answer-sink component groups terminal path mass by answer
+    equivalence class before applying the terminal boundary constraint.
+
+    Importantly, the loss is evaluated under whichever coverage distribution
+    produced ``sample_batch``. Online rollouts may come from a proposal policy
+    and replayed rollouts may come from teacher-forced buffer trajectories, but
+    the residuals themselves always use target-policy ``log P_F`` and ``log F``.
+    This implementation therefore fits SubTB constraints under the sampled
+    coverage measure instead of importance-reweighting back to a target-policy
+    expectation.
     """
 
     def __init__(
         self,
         *,
         config: SubTrajectoryBalanceConfig | None = None,
+        answer_quotient_config: AnswerQuotientConfig | None = None,
         root_weight: float | None = None,
         move_weight: float | None = None,
         terminal_weight: float | None = None,
     ) -> None:
         del root_weight, move_weight, terminal_weight
         self.config = config or SubTrajectoryBalanceConfig()
+        self.answer_quotient_config = answer_quotient_config or AnswerQuotientConfig()
 
     @staticmethod
     def _weighted_mean(
@@ -109,10 +199,12 @@ class SubTrajectoryBalanceLoss:
         terminal_loss: torch.Tensor,
         state_weights: torch.Tensor,
         terminal_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        answer_quotient_loss: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         root_weight = float(self.config.root_loss_weight)
         pairwise_weight = float(self.config.pairwise_loss_weight)
         terminal_weight = float(self.config.terminal_loss_weight)
+        answer_weight = float(self.answer_quotient_config.weight)
 
         root_component, pairwise_component, terminal_component = self._component_means(
             root_loss=root_loss,
@@ -125,11 +217,84 @@ class SubTrajectoryBalanceLoss:
         weighted_root = root_component * root_weight
         weighted_pairwise = pairwise_component * pairwise_weight
         weighted_terminal = terminal_component * terminal_weight
+        weighted_answer = root_component.new_zeros(root_component.shape)
+        if answer_quotient_loss is not None:
+            weighted_answer = answer_quotient_loss * answer_weight
+        total = weighted_root + weighted_pairwise + weighted_answer
+        if not bool(self.answer_quotient_config.replace_terminal_loss):
+            total = total + weighted_terminal
         return (
-            weighted_root + weighted_pairwise + weighted_terminal,
+            total,
             weighted_root,
             weighted_pairwise,
             weighted_terminal,
+            weighted_answer,
+        )
+
+    def _compute_answer_quotient_loss(
+        self,
+        *,
+        sample_batch: "TrajectoryGFNSampleBatch",
+        terminal_log_mass: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        terminal_sink_ids = getattr(sample_batch, "terminal_sink_ids", None)
+        terminal_sink_log_rewards = getattr(
+            sample_batch, "terminal_sink_log_rewards", None
+        )
+        if terminal_sink_ids is None or terminal_sink_log_rewards is None:
+            zero = terminal_log_mass.new_zeros(())
+            return zero, zero, zero
+        batch_size, num_rollouts = terminal_log_mass.shape
+        unique_path_indices = _select_unique_terminal_path_indices(sample_batch)
+        flat_graph_ids = (
+            torch.arange(batch_size, device=terminal_log_mass.device, dtype=torch.long)
+            .unsqueeze(1)
+            .expand(batch_size, num_rollouts)
+            .reshape(-1)
+        )
+        flat_terminal_log_mass = terminal_log_mass.reshape(-1).index_select(
+            0, unique_path_indices
+        )
+        flat_graph_ids = flat_graph_ids.index_select(0, unique_path_indices)
+        flat_sink_ids = (
+            terminal_sink_ids.to(dtype=torch.long)
+            .reshape(-1)
+            .index_select(0, unique_path_indices)
+        )
+        flat_sink_log_rewards = (
+            terminal_sink_log_rewards.to(dtype=torch.float32)
+            .reshape(-1)
+            .index_select(0, unique_path_indices)
+        )
+        group_to_positions: dict[tuple[int, int], list[int]] = {}
+        key_graph_ids = flat_graph_ids.detach().cpu().tolist()
+        key_sink_ids = flat_sink_ids.detach().cpu().tolist()
+        for position, (graph_id, sink_id) in enumerate(
+            zip(key_graph_ids, key_sink_ids)
+        ):
+            group_to_positions.setdefault((int(graph_id), int(sink_id)), []).append(
+                position
+            )
+        if not group_to_positions:
+            zero = terminal_log_mass.new_zeros(())
+            return zero, zero, zero
+        sink_residuals: list[torch.Tensor] = []
+        for positions in group_to_positions.values():
+            position_index = torch.tensor(
+                positions,
+                device=terminal_log_mass.device,
+                dtype=torch.long,
+            )
+            grouped_log_mass = torch.logsumexp(
+                flat_terminal_log_mass.index_select(0, position_index), dim=0
+            )
+            sink_target = flat_sink_log_rewards[positions[0]]
+            sink_residuals.append(grouped_log_mass - sink_target)
+        residual_tensor = torch.stack(sink_residuals, dim=0)
+        return (
+            residual_tensor.square().mean(),
+            residual_tensor.abs().mean(),
+            residual_tensor.new_tensor(float(residual_tensor.numel())),
         )
 
     def compute(
@@ -148,6 +313,17 @@ class SubTrajectoryBalanceLoss:
         graph_log_z_values = sample_batch.graph_log_z.to(dtype=torch.float32)
         start_log_probs = sample_batch.start_log_probs.to(dtype=torch.float32)
         start_state_log_f = sample_batch.start_state_log_f.to(dtype=torch.float32)
+        start_log_rewards = getattr(sample_batch, "start_log_rewards", None)
+        if start_log_rewards is None:
+            start_log_rewards = torch.zeros_like(start_log_probs)
+        else:
+            start_log_rewards = start_log_rewards.to(dtype=torch.float32)
+            if tuple(start_log_rewards.shape) != tuple(start_log_probs.shape):
+                raise ValueError(
+                    "start_log_rewards must match start_log_probs shape for SubTB. "
+                    f"start_log_rewards={tuple(start_log_rewards.shape)} "
+                    f"start_log_probs={tuple(start_log_probs.shape)}."
+                )
 
         state_values = log_pf_steps.new_zeros(
             (batch_size, num_rollouts, sequence_horizon)
@@ -173,13 +349,13 @@ class SubTrajectoryBalanceLoss:
         # MS-SubTB fits a shaped trajectory measure whose log-mass is the sum of
         # the terminal log-reward anchor and any per-step log-reward increments.
         # We keep `log_pb_steps` in the sample batch for interface compatibility,
-        # but the loss itself only uses forward prefixes and shaped reward sums.
+        # but the loss itself only uses target forward prefixes and shaped reward
+        # sums under the sampled coverage measure; there is no importance-ratio
+        # correction against the online proposal policy in this implementation.
         forward_prefix = self._build_step_prefix(step_values=log_pf_steps)
         reward_prefix = self._build_step_prefix(step_values=log_reward_steps)
 
         terminal_counts = getattr(sample_batch, "termination_action_steps", None)
-        if terminal_counts is None:
-            terminal_counts = getattr(sample_batch, "terminal_action_counts", None)
         if terminal_counts is None:
             terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long)
         else:
@@ -202,6 +378,13 @@ class SubTrajectoryBalanceLoss:
             - terminal_forward_prefix
             + terminal_reward_prefix
         )
+        terminal_log_mass = (
+            graph_log_z_values.unsqueeze(1)
+            + start_log_probs
+            - start_log_rewards
+            + terminal_forward_prefix
+            - terminal_reward_prefix
+        )
 
         position_ids = torch.arange(sequence_horizon, device=state_values.device)
         position_ids = position_ids.view(1, 1, -1)
@@ -220,7 +403,10 @@ class SubTrajectoryBalanceLoss:
                 "Non-finite loss detected in SubTB. Check log_pf/log_f/log_reward."
             )
         root_residual = (
-            graph_log_z_values.unsqueeze(1) + start_log_probs - start_state_log_f
+            graph_log_z_values.unsqueeze(1)
+            + start_log_probs
+            - start_log_rewards
+            - start_state_log_f
         )
         if not torch.isfinite(root_residual).all():
             raise RuntimeError(
@@ -282,17 +468,31 @@ class SubTrajectoryBalanceLoss:
         pairwise_loss = pairwise_residual.square()
         terminal_loss = terminal_residual.square()
         root_loss = root_residual.square()
+        answer_quotient_loss = root_loss.new_zeros(())
+        answer_quotient_residual_abs = root_loss.new_zeros(())
+        answer_quotient_observed_sink_count = root_loss.new_zeros(())
+        if self.answer_quotient_config.active:
+            (
+                answer_quotient_loss,
+                answer_quotient_residual_abs,
+                answer_quotient_observed_sink_count,
+            ) = self._compute_answer_quotient_loss(
+                sample_batch=sample_batch,
+                terminal_log_mass=terminal_log_mass,
+            )
         (
             per_rollout_loss,
             root_component_loss,
             pairwise_component_loss,
             terminal_component_loss,
+            answer_quotient_component_loss,
         ) = self._combine_components(
             root_loss=root_loss,
             pairwise_loss=pairwise_loss,
             terminal_loss=terminal_loss,
             state_weights=state_weights,
             terminal_weights=terminal_weights,
+            answer_quotient_loss=answer_quotient_loss,
         )
         loss = per_rollout_loss.mean()
         if not torch.isfinite(loss):
@@ -329,6 +529,9 @@ class SubTrajectoryBalanceLoss:
             root_component_loss=root_component_loss.mean().detach(),
             pairwise_component_loss=pairwise_component_loss.mean().detach(),
             terminal_component_loss=terminal_component_loss.mean().detach(),
+            answer_quotient_component_loss=answer_quotient_component_loss.mean().detach(),
+            answer_quotient_residual_abs=answer_quotient_residual_abs.detach(),
+            answer_quotient_observed_sink_count=answer_quotient_observed_sink_count.detach(),
         )
 
 

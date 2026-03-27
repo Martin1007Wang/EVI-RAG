@@ -24,6 +24,16 @@ class ShortestPathLabels:
     max_path_length: Optional[int]
 
 
+@dataclass(frozen=True)
+class ForwardShortestPathTrajectory:
+    """Deterministic forward shortest path used for guidance replay."""
+
+    start_node: int
+    path_nodes: tuple[int, ...]
+    path_edge_ids: tuple[int, ...]
+    hop_length: int
+
+
 def _unique_valid_indices(raw: torch.Tensor, *, num_nodes: int) -> list[int]:
     if raw.numel() == 0:
         return []
@@ -38,6 +48,26 @@ def _bfs_dist(adjacency: list[list[int]], start: int) -> list[int]:
         return dist
     dist[start] = 0
     q: deque[int] = deque([int(start)])
+    while q:
+        u = q.popleft()
+        du = dist[u] + 1
+        for v in adjacency[u]:
+            if dist[v] != _DIST_UNREACHABLE:
+                continue
+            dist[v] = du
+            q.append(v)
+    return dist
+
+
+def _multi_source_bfs_dist(adjacency: list[list[int]], starts: list[int]) -> list[int]:
+    num_nodes = len(adjacency)
+    dist = [_DIST_UNREACHABLE] * num_nodes
+    q: deque[int] = deque()
+    for start in starts:
+        if not (0 <= start < num_nodes) or dist[start] != _DIST_UNREACHABLE:
+            continue
+        dist[start] = 0
+        q.append(int(start))
     while q:
         u = q.popleft()
         du = dist[u] + 1
@@ -84,6 +114,29 @@ def _build_digraph_overwrite(
     adjacency = [sorted(nbrs) for nbrs in out_sets]
     rev_adjacency = [sorted(nbrs) for nbrs in in_sets]
     return pair_to_edge, adjacency, rev_adjacency
+
+
+def _build_forward_adjacency_with_edges(
+    edge_index: torch.Tensor,
+    *,
+    num_nodes: int,
+) -> tuple[list[list[tuple[int, int]]], list[list[int]]]:
+    outgoing: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+    incoming_sets: list[set[int]] = [set() for _ in range(num_nodes)]
+    if int(edge_index.numel()) == 0:
+        return outgoing, [sorted(values) for values in incoming_sets]
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+    for edge_id, (u_raw, v_raw) in enumerate(zip(src, dst)):
+        u = int(u_raw)
+        v = int(v_raw)
+        if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
+            continue
+        outgoing[u].append((int(edge_id), v))
+        incoming_sets[v].add(u)
+    for neighbors in outgoing:
+        neighbors.sort(key=lambda item: (item[0], item[1]))
+    return outgoing, [sorted(values) for values in incoming_sets]
 
 
 def _precompute_dist_maps(
@@ -272,6 +325,144 @@ def compute_shortest_path_labels(
     )
 
 
+def compute_forward_answer_distances(
+    *,
+    edge_index: torch.Tensor,
+    a_local_indices: torch.Tensor,
+    num_nodes: int,
+) -> torch.Tensor:
+    """Return forward distance-to-answer for every node, or -1 if unreachable."""
+
+    edge_index, _ = _validate_edge_index(edge_index)
+    num_nodes = int(num_nodes)
+    if num_nodes <= 0:
+        return torch.empty((0,), dtype=torch.long)
+    answer_nodes = _unique_valid_indices(
+        torch.as_tensor(a_local_indices), num_nodes=num_nodes
+    )
+    if not answer_nodes:
+        return torch.full((num_nodes,), fill_value=_DIST_UNREACHABLE, dtype=torch.long)
+    _, _, rev_adjacency = _build_digraph_overwrite(edge_index, num_nodes=num_nodes)
+    distances = _multi_source_bfs_dist(rev_adjacency, answer_nodes)
+    return torch.as_tensor(distances, dtype=torch.long)
+
+
+def compute_forward_shortest_path_edge_mask(
+    *,
+    edge_index: torch.Tensor,
+    q_local_indices: torch.Tensor,
+    a_local_indices: torch.Tensor,
+    num_nodes: int,
+) -> torch.Tensor:
+    """Mark executable forward edges that lie on a shortest q->answer path."""
+
+    edge_index, num_edges = _validate_edge_index(edge_index)
+    num_nodes = int(num_nodes)
+    if num_nodes <= 0 or num_edges == 0:
+        return torch.zeros((num_edges,), dtype=torch.bool)
+    q_nodes = _unique_valid_indices(
+        torch.as_tensor(q_local_indices), num_nodes=num_nodes
+    )
+    if not q_nodes:
+        return torch.zeros((num_edges,), dtype=torch.bool)
+    answer_dist = compute_forward_answer_distances(
+        edge_index=edge_index,
+        a_local_indices=a_local_indices,
+        num_nodes=num_nodes,
+    ).tolist()
+    reachable_starts = [
+        int(start) for start in q_nodes if answer_dist[int(start)] != _DIST_UNREACHABLE
+    ]
+    if not reachable_starts:
+        return torch.zeros((num_edges,), dtype=torch.bool)
+    best_hop = min(int(answer_dist[start]) for start in reachable_starts)
+    best_starts = [
+        start for start in reachable_starts if int(answer_dist[start]) == best_hop
+    ]
+    _, adjacency, _ = _build_digraph_overwrite(edge_index, num_nodes=num_nodes)
+    dist_from_best_starts = _multi_source_bfs_dist(adjacency, best_starts)
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+    keep = torch.zeros((num_edges,), dtype=torch.bool)
+    for edge_id, (u_raw, v_raw) in enumerate(zip(src, dst)):
+        u = int(u_raw)
+        v = int(v_raw)
+        if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
+            continue
+        du = dist_from_best_starts[u]
+        dv = answer_dist[v]
+        if du == _DIST_UNREACHABLE or dv == _DIST_UNREACHABLE:
+            continue
+        if int(du) + 1 + int(dv) == int(best_hop):
+            keep[edge_id] = True
+    return keep
+
+
+def resolve_forward_shortest_path_trajectory(
+    *,
+    edge_index: torch.Tensor,
+    q_local_indices: torch.Tensor,
+    a_local_indices: torch.Tensor,
+    num_nodes: int,
+) -> ForwardShortestPathTrajectory | None:
+    """Return a deterministic executable shortest path for forward replay guidance."""
+
+    edge_index, _ = _validate_edge_index(edge_index)
+    num_nodes = int(num_nodes)
+    if num_nodes <= 0:
+        return None
+    q_nodes = _unique_valid_indices(
+        torch.as_tensor(q_local_indices), num_nodes=num_nodes
+    )
+    if not q_nodes:
+        return None
+    answer_dist_tensor = compute_forward_answer_distances(
+        edge_index=edge_index,
+        a_local_indices=a_local_indices,
+        num_nodes=num_nodes,
+    )
+    answer_dist = answer_dist_tensor.tolist()
+    best_start: int | None = None
+    best_hop: int | None = None
+    for start in q_nodes:
+        hop = int(answer_dist[start])
+        if hop == _DIST_UNREACHABLE:
+            continue
+        if (
+            best_hop is None
+            or hop < best_hop
+            or (hop == best_hop and (best_start is None or start < best_start))
+        ):
+            best_start = int(start)
+            best_hop = int(hop)
+    if best_start is None or best_hop is None:
+        return None
+    outgoing, _ = _build_forward_adjacency_with_edges(edge_index, num_nodes=num_nodes)
+    current = int(best_start)
+    remaining = int(best_hop)
+    path_nodes = [int(best_start)]
+    path_edge_ids: list[int] = []
+    while remaining > 0:
+        candidates = [
+            (edge_id, dst)
+            for edge_id, dst in outgoing[current]
+            if 0 <= dst < num_nodes and int(answer_dist[dst]) == int(remaining) - 1
+        ]
+        if not candidates:
+            return None
+        edge_id, dst = min(candidates, key=lambda item: (item[0], item[1]))
+        path_edge_ids.append(int(edge_id))
+        path_nodes.append(int(dst))
+        current = int(dst)
+        remaining -= 1
+    return ForwardShortestPathTrajectory(
+        start_node=int(best_start),
+        path_nodes=tuple(path_nodes),
+        path_edge_ids=tuple(path_edge_ids),
+        hop_length=int(best_hop),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Label store (disk cache)
 # ---------------------------------------------------------------------------
@@ -330,7 +521,11 @@ class EdgeLabelStore:
 
 
 __all__ = [
+    "ForwardShortestPathTrajectory",
     "ShortestPathLabels",
+    "compute_forward_answer_distances",
+    "compute_forward_shortest_path_edge_mask",
+    "resolve_forward_shortest_path_trajectory",
     "compute_shortest_path_labels",
     "EdgeLabelEntry",
     "EdgeLabelStore",

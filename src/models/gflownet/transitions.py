@@ -5,7 +5,7 @@ from typing import cast
 
 import torch
 
-from .repetition import build_entity_revisit_mask
+from .legality import apply_forward_legality
 from .types import (
     ForwardActionDistribution,
     PreparedSearchBatch,
@@ -31,49 +31,10 @@ def apply_forward_constraints(
     state: SearchState,
     max_steps: int,
 ) -> ForwardActionDistribution:
-    active_flat = ~state.flatten_done_mask()
-    num_steps_flat = state.flatten_num_steps()
-    at_horizon = active_flat & (num_steps_flat >= max_steps)
-    edge_logits = distribution.edge_logits
-    if int(edge_logits.numel()) > 0:
-        neg_inf = torch.tensor(
-            float("-inf"),
-            device=edge_logits.device,
-            dtype=edge_logits.dtype,
-        )
-        edge_agent_batch = distribution.edge_agent_batch
-        edge_at_horizon = at_horizon.index_select(0, edge_agent_batch)
-        stop_action_mask = (
-            distribution.is_stop_action.to(dtype=torch.bool)
-            if distribution.is_stop_action is not None
-            else torch.zeros_like(distribution.edge_ids, dtype=torch.bool)
-        )
-        edge_logits = edge_logits.masked_fill(
-            edge_at_horizon & (~stop_action_mask), neg_inf
-        )
-        entity_revisit_mask = build_entity_revisit_mask(
-            state=state,
-            candidate_target_abs_nodes=distribution.target_nodes,
-            candidate_agent_indices=edge_agent_batch,
-            max_steps=max_steps,
-        )
-        edge_logits = edge_logits.masked_fill(
-            entity_revisit_mask & (~stop_action_mask),
-            neg_inf,
-        )
-    return ForwardActionDistribution(
-        edge_logits=edge_logits,
-        edge_agent_batch=distribution.edge_agent_batch,
-        edge_ids=distribution.edge_ids,
-        target_nodes=distribution.target_nodes,
-        out_degrees=distribution.out_degrees,
-        is_stop_action=distribution.is_stop_action,
-        is_root_action=distribution.is_root_action,
-        current_log_f=distribution.current_log_f,
-        active_agent_count=distribution.active_agent_count,
-        unique_active_state_count=distribution.unique_active_state_count,
-        raw_graph_candidate_count=distribution.raw_graph_candidate_count,
-        scored_graph_candidate_count=distribution.scored_graph_candidate_count,
+    return apply_forward_legality(
+        distribution,
+        state=state,
+        max_steps=max_steps,
     )
 
 

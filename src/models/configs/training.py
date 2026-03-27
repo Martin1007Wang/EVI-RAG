@@ -8,7 +8,7 @@ class OptimizerConfig:
 
     type: str = "adamw"
     lr: float = 1e-4
-    weight_decay: float = 0.01
+    weight_decay: float = 1e-4
     betas: tuple[float, float] = (0.9, 0.999)
     no_decay_on_bias_and_norm: bool = True
 
@@ -34,7 +34,7 @@ class SchedulerConfig:
     interval: str = "step"  # step, epoch
     t_max: int | None = None
     t_mult: int = 1
-    eta_min: float = 0.0
+    eta_min: float = 1e-6
     pct_start: float = 0.3
     anneal: str = "cos"
     lr: float | None = None

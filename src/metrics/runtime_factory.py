@@ -22,13 +22,15 @@ def _build_trajectory_sampler(
     training_cfg: GFlowNetTrainingConfig,
 ) -> ForwardTrajectoryGFNSampler:
     trajectory_supervisor = AnswerReachabilityTrajectorySupervisor(
-        non_gold_terminal_log_reward=float(training_cfg.terminal_failure_log_reward)
+        non_gold_terminal_log_reward=float(training_cfg.terminal_failure_log_reward),
+        gold_reward_mode=str(training_cfg.answer_quotient.gold_reward_mode),
     )
     return ForwardTrajectoryGFNSampler(
         max_steps=int(horizon_cfg.max_steps),
         trajectory_supervisor=trajectory_supervisor,
         force_stop_on_answer_hit=bool(training_cfg.force_stop_on_answer_hit),
         step_log_penalty=float(training_cfg.step_log_penalty),
+        answer_stop_log_reward_bonus=float(training_cfg.answer_stop_log_reward_bonus),
     )
 
 
@@ -61,7 +63,7 @@ class GraphTaskRuntimeFactory:
             horizon_cfg=horizon_cfg,
             training_cfg=training_cfg,
         )
-        if eval_cfg.task == "edge_retrieval":
+        if eval_cfg.runtime_task == "edge_retrieval":
             return EdgeRetrievalRuntime(
                 eval_cfg=eval_cfg,
                 policy=policy,

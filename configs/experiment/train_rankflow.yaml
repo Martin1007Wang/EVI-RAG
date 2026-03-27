@@ -19,7 +19,9 @@ defaults:
 optimized_metric: "val/sub/answer/recall@10"
 
 data:
-  batch_size: 256
+  # Raise rollouts per graph aggressively, then shrink the number of graphs per
+  # optimizer step so per-step memory stays in a workable range.
+  batch_size: 64
   eval_batch_size: 32
 
 fit_schedule:
@@ -31,8 +33,8 @@ fit_schedule:
 
 trainer:
   max_time: "00:08:00:00"
-  # WebQSP-sub sees >1 full train pass by step 32 at batch 256, which keeps
-  # train metrics closer to dataset-level trends than per-mini-batch noise.
+  # Even after shrinking the graph batch for higher rollout density, logging
+  # every 32 steps still lands often enough to show sub-pass training movement.
   log_every_n_steps: 32
   gradient_clip_val: 0.5
 
@@ -46,18 +48,29 @@ callbacks:
 
 model:
   action_prior_cfg:
-    kind: hybrid
-    beta: 0.75
-    node_topology_weight: 1.0
-    node_embedding_weight: 0.5
-    relation_embedding_weight: 1.0
-    target_node_weight: 0.5
-    progress_weight: 1.0
-    stop_beta: 0.0
+    root_beta: 1.0
+    edge_beta: 0.75
+    node_embedding_weight: 0.25
+    relation_embedding_weight: 0.75
+    target_node_weight: 0.0
+    progress_weight: 0.0
+    shortest_path_edge_weight: 1.0
+    answer_distance_weight: 0.5
+  policy_cfg:
+    transition_head:
+      enabled: true
+  training_cfg:
+    rollouts_per_graph: 32
+    potential_reward:
+      answer_distance_weight: 0.5
+    action_prior_schedule:
+      initial_scale: 0.5
+    success_replay:
+      mix_alpha: 0.5
+      capacity: 512
+      replay_trajectories_per_step: 64
+      add_shortest_path_guidance: true
   eval_cfg:
-    # Training-time validation only needs cheap Monte Carlo answer-ranking estimates;
-    # full flow-frontier search is reserved for final eval.
-    strict_search: true
     metrics_profile: rank_only
     support_search_method: monte_carlo
     monte_carlo_rollouts: 256

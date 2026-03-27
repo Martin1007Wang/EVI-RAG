@@ -45,16 +45,15 @@ def test_forward_distribution_deduplicates_identical_states_with_graph_aligned_s
     prepared_batch = policy.prepare_batch(batch)
     scored_batch_sizes: list[int] = []
 
-    def _mock_forward(
-        current_state_features: torch.Tensor,
-        candidate_state_features: torch.Tensor,
-        relation_features: torch.Tensor,
+    def _mock_state_scores(
+        node_features: torch.Tensor,
+        question_features: torch.Tensor,
     ) -> torch.Tensor:
-        del candidate_state_features, relation_features
-        scored_batch_sizes.append(int(current_state_features.size(0)))
-        return current_state_features[:, 0].to(dtype=torch.float32)
+        del question_features
+        scored_batch_sizes.append(int(node_features.size(0)))
+        return node_features[:, 0].to(dtype=torch.float32)
 
-    policy.forward_policy_head.forward = _mock_forward  # type: ignore[method-assign]
+    policy.state_score_head.forward = _mock_state_scores  # type: ignore[method-assign]
 
     state = SearchState(
         topology=prepared_batch.topology,
@@ -90,20 +89,19 @@ def test_forward_distribution_dedup_keeps_distinct_path_histories_separate() -> 
     prepared_batch = policy.prepare_batch(batch)
     scored_batch_sizes: list[int] = []
 
-    def _mock_forward(
-        current_state_features: torch.Tensor,
-        candidate_state_features: torch.Tensor,
-        relation_features: torch.Tensor,
+    def _mock_state_scores(
+        node_features: torch.Tensor,
+        question_features: torch.Tensor,
     ) -> torch.Tensor:
-        del candidate_state_features, relation_features
-        scored_batch_sizes.append(int(current_state_features.size(0)))
+        del question_features
+        scored_batch_sizes.append(int(node_features.size(0)))
         return torch.zeros(
-            (int(current_state_features.size(0)),),
-            device=current_state_features.device,
+            (int(node_features.size(0)),),
+            device=node_features.device,
             dtype=torch.float32,
         )
 
-    policy.forward_policy_head.forward = _mock_forward  # type: ignore[method-assign]
+    policy.state_score_head.forward = _mock_state_scores  # type: ignore[method-assign]
 
     state_path_a = SearchState.from_edge_path(
         topology=prepared_batch.topology,

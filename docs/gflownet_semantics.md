@@ -1,353 +1,253 @@
-# GFlowNet Algorithm Overview
+# RankFlow / GFlowNet Semantics
 
-This document is the reader-first description of the current answer-reachability
-GFlowNet in this repo.
+This document describes the current algorithmic contract.
 
-At a high level, the model defines a probability flow over graph-search
-prefixes. A trajectory starts from an abstract root boundary, chooses a start
-node, repeatedly takes either a graph-edge move or an explicit `STOP` action,
-and then receives terminal and step-level rewards. Training minimizes an
-MS-SubTB objective built from root, pairwise, and terminal consistency
-residuals.
+It intentionally avoids copying descriptive numeric values from experiment
+bundles. If you need the canonical runnable settings, read these files
+directly:
 
-If you only want the main idea, remember these three points:
+- `configs/model/gflownet.yaml`
+- `configs/experiment/train_rankflow.yaml`
+- `configs/experiment/rankflow.yaml`
 
-1. The state space is a prefix tree, not just a set of current nodes.
-2. The base reward is terminal correctness plus a fixed per-move log cost.
-3. The training objective is just SubTB on that reward measure; there are no
-   extra oracle-imitation or success-classification losses in the current path.
+## 1. Mainline in one sentence
 
-## 1. One rollout from start to finish
+The current RankFlow stack trains a strict successor-flow GFlowNet with
+MS-SubTB, samples trajectories from a proposal policy that may differ from the
+target policy, and interprets online rollouts plus replay as a coverage-mixture
+for residual fitting rather than as an importance-corrected off-policy target.
 
-One training rollout looks like this:
+## 2. State space
 
-1. Build an abstract root boundary state from the question and graph context.
-2. Predict the root boundary flow `log F(s_root)`.
-3. Predict a start-node action distribution `P_F([e_0] | s_root)`.
-4. Sample a start node.
-5. From the resulting prefix state, repeatedly choose either:
-   - a graph-edge expansion action, or
-   - the explicit `STOP` action.
-6. Once the rollout stops or can no longer expand, assign terminal reward and
-   accumulate any step-level rewards.
-7. Fit the resulting trajectory measure with MS-SubTB.
+The search space is a prefix tree over graph-walk trajectories.
 
-Here is the smallest useful mental picture:
+- The abstract root boundary is not materialized as an ordinary `SearchState`.
+- Root actions choose a start node and are represented by
+  `RootActionDistribution`.
+- Non-root states are explicit prefix states stored in `SearchState`.
+- `STOP` is an explicit action and absorbing prefixes store it directly.
 
-```text
-root -> [e0] -> [e0, r1, e1] -> [e0, r1, e1, r2, e2] -> [e0, r1, e1, r2, e2, STOP]
-```
+This split matters because root actions are query-conditioned start selections,
+while non-root actions are graph transitions plus `STOP`.
 
-- `root` is an abstract boundary, not a graph node.
-- `[e0]` is the start state chosen from the root action distribution.
-- Each graph move appends `relation, node` to the prefix.
-- `STOP` is a real action and is explicitly appended for absorbing states.
-
-In this example:
-
-- `terminal_num_steps = 2` because the rollout took two graph moves.
-- `termination_action_steps = 3` because the third action was `STOP`.
-
-Those two counters are intentionally different.
-
-## 2. Search space and runtime objects
-
-The runtime uses a small set of objects repeatedly. Their roles are:
-
-| Object | Meaning |
-| --- | --- |
-| `RootState` | Explicit abstract root boundary state |
-| `RootActionDistribution` | Outgoing start-node actions from the root |
-| `SearchState` | Exact graph-prefix state for non-root search |
-| `ForwardActionDistribution` | Legal graph moves plus one `STOP` action per active state |
-| `TrajectoryGFNSampleBatch` | Rollout tensors consumed by training |
+## 3. Target policy and target measure
 
 ### Root boundary
 
-The root boundary is modeled separately from ordinary prefix states.
+For each candidate start node, the target branch mass is
 
-- `graph_log_z` stores `log F(s_root)`.
-- `log_probs` stores the root action probabilities
-  `log P_F([e_0] | s_root)`.
-- `log_flows` stores the child start-state values `log F([e_0])`.
+`rho_start([e_0]) + log F([e_0])`
 
-This matters because the model learns root consistency explicitly instead of
-deriving root flow from start states.
+and the root flow is the segment-wise `logsumexp` over those branch masses:
 
-### Prefix state
+`log F(s_root) = logsumexp_{[e_0]} (rho_start([e_0]) + log F([e_0]))`
 
-For non-root search, the semantic state is the exact trajectory prefix. The
-important `SearchState` fields are:
+The target root action distribution is the normalized decomposition of that root
+mass.
 
-- `path_token_ids`: exact prefix encoded as
-  `node, relation, node, relation, ...`
-- `current_nodes`: current terminal node of each prefix
-- `num_steps`: number of graph moves already taken
-- `done_mask`: rows that are inactive in the current batched call
-- `absorbing_mask`: rows whose prefix already contains explicit `STOP`
-- `control_state`: cached recurrent controller state used for fast rescoring
+### Non-root move actions
 
-The key distinction is:
+For a graph move `a_t: s_t -> s_{t+1}`, the target branch log-mass is
 
-- `done_mask` means "do not expand this row right now"
-- `absorbing_mask` means "this row is a true STOP-terminated state"
+`rho_move(s_t, a_t) + log F(s_{t+1})`
 
-So a row can be inactive because it is padded or at a dead end without being a
-true absorbing state.
+where `rho_move` contains the configured step-level reward terms.
 
-### STOP semantics
+### STOP action
 
-`STOP` is not a bookkeeping trick. It is a real public action.
+For `STOP`, the target branch mass is anchored by the terminal reward semantics.
+Depending on the answer-quotient settings, this can use the direct terminal
+reward or an answer-sink reward together with an in-sink allocation factor.
 
-- `ForwardActionDistribution.is_stop_action` marks which logits correspond to
-  `STOP`.
-- `TrajectoryGFNSampleBatch.trace_stop_mask` records where `STOP` was sampled.
-- `TrajectoryGFNSampleBatch.termination_action_steps` stores the 1-based action
-  index where termination happened.
+### Reward decomposition
 
-Absorbing prefixes literally end with a `STOP` token. Active prefixes do not.
+The target trajectory measure is always described by two pieces:
 
-### Forward legality
+- `terminal_log_rewards`: terminal anchor
+- `log_reward_steps`: per-step reward increments
 
-The sampler applies forward constraints before sampling actions.
+The public knobs that change the target measure live under
+`model.training_cfg`.
 
-- Graph moves that revisit previously seen entities on the same prefix are
-  masked.
-- `STOP` remains legal even when graph moves are masked.
-- If no legal non-forced action remains, the rollout becomes inactive.
+## 4. Target-side shaping
 
-Rollout behavior can also optionally force immediate `STOP` on answer hit via
-`training.force_stop_on_answer_hit`.
+The current target-side shaping mechanism is answer-distance potential shaping.
 
-This keeps the search space tree-structured without allowing arbitrary revisit
-loops.
+- The start action gets a root reward equal to the chosen start state's
+  potential.
+- Each move step gets the potential difference
+  `Phi(s_{t+1}) - Phi(s_t)`.
 
-## 3. Target policy and behavior policy
+When answer-distance shaping is active, successful answer-reaching trajectories
+keep the same total reward, while failed trajectories are penalized according to
+remaining answer distance.
 
-The code distinguishes the policy used for training equations from the policy
-used for rollout sampling.
+This is a target-measure change. It is part of the algebra seen by SubTB.
 
-### Target policy
+## 5. Proposal policy
 
-The target policy defines the quantities that enter MS-SubTB:
+The sampler may use a proposal policy `Q` that differs from the target policy
+`P_F`.
 
-- root action probabilities
-- forward action probabilities
-- state flow values
+### Root proposals
 
-Whenever training stores `log P_F`, it is using the target policy.
+Root proposals start from the target root branch masses and may add proposal
+priors from `model.action_prior_cfg`.
 
-### Behavior policy
+### Edge proposals
 
-The sampler goes through behavior-policy hooks when it chooses starts and graph
-actions.
+For non-root graph actions, the live proposal logits are built from three terms:
 
-- Start-node sampling uses `compute_behavior_start_distribution(...)`.
-- Move sampling uses `compute_behavior_edge_logits(...)`.
-
-Behavior and target match when heuristic bias is off. This is the default public
-setup in the base YAML:
-
-- `heuristic.kind: none`
-- `heuristic.beta: 0.0`
-
-When heuristic bias is enabled, behavior sampling is intentionally tilted for
-exploration, but the stored training log-probabilities still come from the
-target policy.
-
-### Sampling temperature
-
-The same training-time sampling temperature is applied to:
-
-- the root start distribution, and
-- the rollout action distributions.
-
-The temperature itself can be constant or annealed through
-`training.sampling_temperature_schedule`.
-
-## 4. Policy parameterization
-
-The model uses one parameterization for the root boundary and another for
-ordinary prefix states.
-
-### Root boundary scoring
-
-At the root, the model predicts:
-
-- `log F(s_root)` from question features, pooled graph summaries, pooled
-  start-node summaries, and graph-size scalars
-- start-node action logits with a dedicated root-action head
-
-So the root boundary flow and the start-node action distribution are explicit
-and decoupled.
-
-### Non-root state scoring
-
-For a non-root active prefix at hop `t`, the implementation uses a state
-representation of the form:
-
-`MLP([node(e_t) || step(t) || remain(T_max - t) || h_t])`
-
-where the recurrent controller state `h_t` is updated from the previous prefix
-history, relation token, next node, and question context.
-
-The important point is not the exact block choice, but the contract:
-
-- the state is still the exact prefix
-- the scoring network also carries a recurrent summary to make rescoring fast
-
-## 5. Reward and target measure
-
-The training target is a trajectory measure. In log space, it is the terminal
-log reward plus any step-level log rewards.
-
-The core relation is:
-
-`log R_target(tau) = ell_term(tau) + sum_t rho_t`
+`logits_Q = logits_F + b_transition + alpha_t * b_prior`
 
 where:
 
-- `ell_term(tau)` is the terminal log reward
-- `rho_t` is the step-level log reward stored in `log_reward_steps`
+- `logits_F` are the strict successor-flow target branch masses
+- `b_transition` is the learned proposal-only transition head bias from
+  `model.policy_cfg.transition_head`
+- `b_prior` is the heuristic proposal bias from `model.action_prior_cfg`
+- `alpha_t` is the training-time proposal-prior scale from
+  `model.training_cfg.action_prior_schedule`
 
-### Terminal reward
+The important boundary is:
 
-Terminal reward is defined at the entity level.
+- `b_transition` changes proposal sampling only
+- `b_prior` changes proposal sampling only
+- neither term enters the target-policy residual algebra
 
-- Gold answer entities get `log R_terminal = 0.0`.
-- Non-gold terminal entities get
-  `log R_terminal = training.terminal_failure_log_reward`.
+Evaluation and prediction stay on target-policy search.
 
-By default that failure value is `-3.0`, but the field is configurable.
+## 6. Proposal-side guidance terms
 
-Alias answer entities count as gold too, because terminal supervision is matched
-against entity ids rather than only one local answer node index.
+`model.action_prior_cfg` controls proposal-only guidance components.
 
-### Base step reward
+The config is now component-based rather than family-labeled. In practice there
+are three groups of proposal terms:
 
-Each graph move contributes a fixed log cost.
+- root / edge / stop strength knobs (`root_beta`, `edge_beta`, `stop_beta`)
+- static feature weights (topology, node embedding, relation embedding,
+  target-node, progress)
+- optional dynamic guidance terms (intent alignment, shortest-path bonus,
+  answer-distance progress)
 
-- Public config: `training.step_log_penalty`
+Two answer-distance mechanisms now exist and must not be conflated:
 
-In the default public config, each graph move contributes the same constant
-negative log reward, so longer trajectories are less preferred unless they are
-needed to reach a correct answer.
+- `model.action_prior_cfg.answer_distance_weight` is proposal-only guidance
+- `model.training_cfg.potential_reward.answer_distance_weight` changes the target
+  measure
 
-### Backward scores
+If you change the first one, you change which constraints are visited. If you
+change the second one, you change the target residuals themselves.
 
-The current SubTB hot path does not reconstruct move-step backward scores.
+## 7. Coverage-measure interpretation
 
-- `log_pb_steps` is still present in the sample batch for interface stability.
-- The terminal `STOP` backward factor is fixed to `log P_B = 0`.
+The implementation does not importance-reweight proposal-sampled trajectories
+back to a target-policy expectation.
 
-So the objective is driven by forward prefixes and reward prefixes, not by a
-full backward-policy reconstruction at every move step.
+Instead, it minimizes SubTB residuals under the sampled coverage measure:
 
-## 6. MS-SubTB objective
+`L_nu(theta) = E_{tau ~ nu} [sum_{c in C(tau)} w(c) * Delta_c(tau; theta)^2]`
 
-The main objective is a multi-scale SubTrajectory Balance loss specialized to
-this prefix-tree state space.
+So proposal engineering changes coverage, not the definition of each residual.
 
-Let:
+## 8. Replay
 
-- `f_t = log F(s_t)`
-- `p_t = log P_F(a_t | s_t)`
-- `rho_t = log_reward_steps[t]`
-- `ell_term(tau) = terminal_log_rewards(tau)`
+Replay is treated as another coverage source.
 
-The implementation fits three residual families.
+- Online rollouts come from the current proposal sampler.
+- Replay stores trajectory definitions, not frozen `log P_F` or `log F` tensors.
+- Replayed trajectories are rebuilt under the current parameters before SubTB is
+  evaluated.
+
+The resulting optimization view is a coverage mixture:
+
+`nu_mix = (1 - alpha_replay) * nu_online + alpha_replay * nu_replay`
+
+This is not a second objective and not an importance-correction layer.
+
+## 9. MS-SubTB objective
+
+The main objective is a multi-scale SubTrajectory Balance loss over three
+families of residuals.
 
 ### Root residual
 
-`r_root = log F(s_root) + log P_F([e_0] | s_root) - log F([e_0])`
-
-This is the explicit root-boundary consistency equation.
+`r_root = log F(s_root) + log P_F([e_0] | s_root) - rho_start([e_0]) - log F([e_0])`
 
 ### Pairwise residual
 
-For prefix states `s_i -> s_j` on the same rollout:
-
 `r_pair(i, j) = f_i + sum_{t=i}^{j-1} p_t - sum_{t=i}^{j-1} rho_t - f_j`
-
-This forces consistency between intermediate prefixes under the shaped
-trajectory measure.
 
 ### Terminal residual
 
-For a prefix state `s_i` and the rollout terminal anchor:
-
 `r_term(i) = f_i + sum_{t=i}^{T-1} p_t - (ell_term(tau) + sum_{t=i}^{T-1} rho_t)`
 
-This anchors every valid prefix against the final reward-bearing suffix.
+The component weights and length weighting are controlled only by
+`model.training_cfg.subtb.*`.
 
-### Final SubTB loss
+## 10. Config surface by role
 
-The code squares each residual family, aggregates them separately, and then
-combines them with component weights:
+### Target measure
 
-- `training.subtb.root_loss_weight`
-- `training.subtb.pairwise_loss_weight`
-- `training.subtb.terminal_loss_weight`
+These knobs change the target distribution fitted by SubTB:
 
-Subtrajectory-length weighting is controlled by `training.subtb.lambda_weight`.
-This keeps long-horizon pairwise terms from dominating the root and terminal
-anchors.
+- `model.training_cfg.terminal_failure_log_reward`
+- `model.training_cfg.step_log_penalty`
+- `model.training_cfg.answer_stop_log_reward_bonus`
+- `model.training_cfg.potential_reward.*`
+- `model.training_cfg.answer_quotient.*`
 
-## 7. No auxiliary imitation or guidance loss
+### Proposal sampler
 
-The current training path does not add extra behavior-cloning, oracle-action,
-or success-classification losses on top of MS-SubTB.
+These knobs change sampling coverage without changing the target residual
+definitions:
 
-That is intentional. The optimization target is the shaped trajectory measure
-defined by terminal reward plus step-level rewards, without a second objective
-trying to pull the policy toward oracle actions or a separate classifier trying
-to predict eventual success.
+- `model.policy_cfg.transition_head.*`
+- `model.action_prior_cfg.*`
+- `model.training_cfg.action_prior_schedule.*`
+- `model.training_cfg.sampling_temperature`
+- `model.training_cfg.sampling_temperature_schedule.*`
 
-## 8. Important config knobs
+### Coverage supply
 
-If you are trying to understand or tune the algorithm, these are the main knobs
-that matter:
+These knobs change how much online and replay coverage is gathered:
 
-| Config | Role |
-| --- | --- |
-| `training.terminal_failure_log_reward` | Terminal penalty for non-gold entities |
-| `training.step_log_penalty` | Fixed log cost per graph move |
-| `training.force_stop_on_answer_hit` | Forces immediate `STOP` on answer hit during rollout |
-| `training.sampling_temperature` | Sampling temperature for starts and moves |
-| `training.sampling_temperature_schedule.*` | Optional temperature annealing |
-| `training.subtb.lambda_weight` | Subtrajectory-length weighting |
-| `training.subtb.root_loss_weight` | Root residual contribution |
-| `training.subtb.pairwise_loss_weight` | Pairwise residual contribution |
-| `training.subtb.terminal_loss_weight` | Terminal residual contribution |
+- `model.training_cfg.rollouts_per_graph`
+- `model.training_cfg.success_replay.*`
 
-The base YAML in `configs/model/gflownet.yaml` uses the simple reward path:
+### Evaluation
 
-- fixed `step_log_penalty`
-- fixed `terminal_failure_log_reward`
+These knobs change validation and final-eval search/reporting behavior:
 
-## 9. Symbol-to-code map
+- `model.eval_cfg.metrics_profile`
+- `model.eval_cfg.support_search_method`
+- `model.eval_cfg.monte_carlo_*`
+- `model.eval_cfg.flow_prune_epsilon`
+- `model.eval_cfg.max_expansions`
+- `model.eval_cfg.max_frontier_size`
 
-If you want to line the math up with the code quickly, use this map.
+## 11. Canonical source of truth
 
-| Math object | Tensor or helper | Main location |
-| --- | --- | --- |
-| `log F(s_root)` | `TrajectoryGFNSampleBatch.graph_log_z` | `src/models/gflownet/sampler.py`, `src/models/gflownet/losses.py` |
-| `log P_F([e_0] | s_root)` | `TrajectoryGFNSampleBatch.start_log_probs` | `src/models/gflownet/sampler.py` |
-| `log F([e_0])` | `TrajectoryGFNSampleBatch.start_state_log_f` | `src/models/gflownet/sampler.py` |
-| `p_t` | `TrajectoryGFNSampleBatch.log_pf_steps` | `src/models/gflownet/sampler.py` |
-| `rho_t` | `TrajectoryGFNSampleBatch.log_reward_steps` | `src/models/gflownet/sampler.py`, `src/models/gflownet_module.py` |
-| `ell_term(tau)` | `TrajectoryGFNSampleBatch.terminal_log_rewards` | `src/models/gflownet/sampler.py` |
-| SubTB residual assembly | `SubTrajectoryBalanceLoss.compute(...)` | `src/models/gflownet/losses.py` |
+To keep docs stable, this document explains mechanisms only.
 
-## 10. Recommended reading order in code
+- `configs/model/gflownet.yaml` defines the minimal public schema surface.
+- `configs/experiment/train_rankflow.yaml` defines the canonical training bundle.
+- `configs/experiment/rankflow.yaml` defines the canonical final-eval bundle.
 
-If you are onboarding to the implementation, read files in this order:
+If any numeric value in an older note disagrees with those files, treat the
+config files as the source of truth.
 
-1. `src/models/configs/gflownet.py`
-2. `src/models/gflownet/types.py`
-3. `src/models/gflownet/sampler.py`
-4. `src/models/gflownet/losses.py`
-5. `src/models/gflownet_module.py`
+## 12. Reading order in code
 
-That order mirrors the algorithm: config -> state/action types -> rollout
-generation -> SubTB math -> training glue.
+If you want to audit the implementation from config to loss, read files in this
+order:
+
+1. `src/models/configs/gflownet_training.py`
+2. `src/models/configs/policy.py`
+3. `src/models/configs/gflownet_eval.py`
+4. `src/models/gflownet/types.py`
+5. `src/models/gflownet/heuristics.py`
+6. `src/models/gflownet/policy.py`
+7. `src/models/gflownet/sampler.py`
+8. `src/models/gflownet/losses.py`
+9. `src/models/gflownet_module.py`

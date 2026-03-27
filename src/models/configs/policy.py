@@ -26,9 +26,21 @@ class StateScoreHeadConfig:
 
 
 @dataclass(frozen=True)
-class TransitionPolicyHeadConfig:
-    """Question-conditioned transition-policy head."""
+class PrefixControllerConfig:
+    """Recurrent prefix tracker that compresses path history into a control state."""
 
+    dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.dropout < 0.0 or self.dropout >= 1.0:
+            raise ValueError("prefix_controller.dropout must be in [0, 1).")
+
+
+@dataclass(frozen=True)
+class TransitionHeadConfig:
+    """Proposal-only edge bias head layered on top of strict successor-flow logits."""
+
+    enabled: bool = False
     hidden_dim: int = 256
     num_layers: int = 2
     dropout: float = 0.0
@@ -44,17 +56,6 @@ class TransitionPolicyHeadConfig:
 
 
 @dataclass(frozen=True)
-class PrefixControllerConfig:
-    """Recurrent prefix tracker that compresses path history into a control state."""
-
-    dropout: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.dropout < 0.0 or self.dropout >= 1.0:
-            raise ValueError("prefix_controller.dropout must be in [0, 1).")
-
-
-@dataclass(frozen=True)
 class PolicyConfig:
     """Full answer-reachability policy configuration."""
 
@@ -63,6 +64,4 @@ class PolicyConfig:
         default_factory=PrefixControllerConfig
     )
     state_score_head: StateScoreHeadConfig = field(default_factory=StateScoreHeadConfig)
-    forward_policy_head: TransitionPolicyHeadConfig = field(
-        default_factory=TransitionPolicyHeadConfig
-    )
+    transition_head: TransitionHeadConfig = field(default_factory=TransitionHeadConfig)

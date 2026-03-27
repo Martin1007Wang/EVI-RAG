@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 import torch
 
-from src.graph import build_graph_batch
+from src.graph import SearchObservation, build_graph_batch
 from src.graph.batch import TrajectoryBatch
 from src.metrics.answer_metrics import SupportWindowResult
 from src.metrics.search_backends import (
@@ -30,7 +30,7 @@ from src.models.gflownet import (
     BaseSearchPolicy,
     ForwardActionDistribution,
     PreparedSearchBatch,
-    StartDistribution,
+    RootActionDistribution,
 )
 from src.models.gflownet_module import GFlowNetModule
 
@@ -50,9 +50,9 @@ class _ManualMonteCarloPolicy:
             (3, 2): [(-1, 3, 1.0, True)],
         }
 
-    def compute_start_distribution(self, prepared_batch) -> StartDistribution:  # noqa: ANN001
+    def compute_start_distribution(self, prepared_batch) -> RootActionDistribution:  # noqa: ANN001
         del prepared_batch
-        return StartDistribution(
+        return RootActionDistribution(
             candidate_nodes_abs=self.start_nodes,
             candidate_graph_ids=torch.zeros((1,), dtype=torch.long),
             log_flows=self.start_log_flows,
@@ -61,7 +61,9 @@ class _ManualMonteCarloPolicy:
             action_logits=self.start_log_probs,
         )
 
-    def compute_root_action_distribution(self, prepared_batch) -> StartDistribution:  # noqa: ANN001
+    def compute_root_action_distribution(
+        self, prepared_batch
+    ) -> RootActionDistribution:  # noqa: ANN001
         return self.compute_start_distribution(prepared_batch)
 
     def build_start_control_states(
@@ -95,7 +97,7 @@ class _ManualMonteCarloPolicy:
         edge_agent_batch: list[int] = []
         edge_ids: list[int] = []
         target_nodes: list[int] = []
-        is_submit: list[bool] = []
+        is_stop_action: list[bool] = []
         out_degrees: list[int] = []
         flat_nodes = state.current_nodes.view(-1)
         flat_steps = state.num_steps.view(-1)
@@ -109,7 +111,7 @@ class _ManualMonteCarloPolicy:
                 edge_agent_batch.append(agent_idx)
                 edge_ids.append(edge_id)
                 target_nodes.append(dst)
-                is_submit.append(submit)
+                is_stop_action.append(submit)
         if not edge_ids:
             return ForwardActionDistribution(
                 edge_logits=torch.empty((0,), dtype=torch.float32),
@@ -127,7 +129,7 @@ class _ManualMonteCarloPolicy:
             out_degrees=torch.tensor(out_degrees, dtype=torch.long).view_as(
                 state.current_nodes
             ),
-            is_stop_action=torch.tensor(is_submit, dtype=torch.bool),
+            is_stop_action=torch.tensor(is_stop_action, dtype=torch.bool),
         )
 
     @staticmethod
@@ -136,7 +138,7 @@ class _ManualMonteCarloPolicy:
 
     @staticmethod
     def sample_start_nodes(
-        distribution: StartDistribution,
+        distribution: RootActionDistribution,
         *,
         num_rollouts: int,
         deterministic: bool = False,
@@ -174,12 +176,17 @@ def _make_manual_fixture() -> tuple[
     topology, observation = build_graph_batch(batch)
     prepared_batch = PreparedSearchBatch(
         topology=topology,
-        observation=observation,
+        observation=SearchObservation.from_graph_observation(observation),
         node_tokens=torch.empty((0, 0), dtype=torch.float32),
         relation_tokens=torch.empty((0, 0), dtype=torch.float32),
         question_tokens=torch.empty((0, 0), dtype=torch.float32),
         question_context_tokens=torch.empty((0, 0, 0), dtype=torch.float32),
         question_context_mask=torch.empty((0, 0), dtype=torch.bool),
+        answer_mask=torch.zeros((int(topology.num_nodes),), dtype=torch.bool),
+        answer_sink_ids=torch.zeros((int(topology.num_nodes),), dtype=torch.long),
+        answer_sink_log_rewards=torch.zeros(
+            (int(topology.num_nodes),), dtype=torch.float32
+        ),
     )
     return batch, prepared_batch, _ManualMonteCarloPolicy()
 
@@ -188,7 +195,7 @@ def _make_rank_only_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        action_prior_cfg=ActionPriorConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(),
         policy_cfg=PolicyConfig(
             backbone=BackboneConfig(
                 embedding_dim=8,
@@ -222,7 +229,7 @@ def _make_full_module() -> GFlowNetModule:
     return GFlowNetModule(
         horizon_cfg=HorizonConfig(max_steps=2),
         training_cfg=GFlowNetTrainingConfig(),
-        action_prior_cfg=ActionPriorConfig(beta=0.0),
+        action_prior_cfg=ActionPriorConfig(),
         policy_cfg=PolicyConfig(
             backbone=BackboneConfig(
                 embedding_dim=8,
@@ -245,7 +252,6 @@ def _make_full_module() -> GFlowNetModule:
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
-            window_top_ks=(1, 5),
             max_expansions=32,
             max_frontier_size=32,
         ),

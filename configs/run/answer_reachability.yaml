@@ -1,4 +1,0 @@
-# Backward-compatible alias for the canonical `rankflow` eval run.
-
-defaults:
-  - rankflow

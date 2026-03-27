@@ -28,6 +28,9 @@ trainer:
   max_time: "00:02:00:00"
 
 model:
+  training_cfg:
+    success_replay:
+      mix_alpha: 0.0
   eval_cfg:
     # Fast-iteration validation only needs a coarser Monte Carlo trend estimate.
     monte_carlo_rollouts: 128

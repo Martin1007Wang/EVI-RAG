@@ -1,6 +1,0 @@
-# @package _global_
-#
-# Backward-compatible alias for `experiment=rankflow`.
-
-defaults:
-  - rankflow

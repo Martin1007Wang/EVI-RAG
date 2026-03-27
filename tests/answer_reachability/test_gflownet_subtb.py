@@ -239,6 +239,27 @@ def test_subtb_root_metric_tracks_explicit_root_boundary_residual() -> None:
     assert loss_output.root_abs.item() == pytest.approx(0.2)
 
 
+def test_subtb_root_metric_subtracts_start_log_rewards() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(
+        config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
+    )
+    sample_batch = _make_sample_batch(
+        graph_log_z=torch.tensor([0.2], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.1]], dtype=torch.float32),
+        start_log_rewards=torch.tensor([[0.3]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[0.0]], dtype=torch.float32),
+        log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[0]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[0.0]], dtype=torch.float32),
+    )
+
+    loss_output = loss_fn.compute(cast(Any, sample_batch))
+
+    assert loss_output.root_abs.item() == pytest.approx(0.0)
+    assert loss_output.root_component_loss.item() == pytest.approx(0.0)
+
+
 def test_subtb_step_level_log_rewards_match_equivalent_terminal_bonus() -> None:
     loss_fn = SubTrajectoryBalanceLoss(
         config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)

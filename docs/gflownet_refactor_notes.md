@@ -1,118 +1,93 @@
 # GFlowNet Refactor Notes
 
-This file is background and compatibility guidance.
+This file records the cleanup decisions behind the current RankFlow config and
+documentation surface.
 
-For the current algorithm itself, read `docs/gflownet_semantics.md` first.
+For the algorithm itself, read `docs/gflownet_semantics.md` first.
 
-## What the refactor stabilized
+## What changed
 
-The current codebase has converged on four important contracts:
+The current cleanup pass removed several sources of drift and redundancy.
 
-1. The root boundary is explicit.
-2. `STOP` is an explicit action and absorbing states store it directly.
-3. Step-level rewards live in `log_reward_steps` instead of being hidden inside
-   terminal-only bookkeeping.
-4. Training now uses only the main MS-SubTB objective instead of layering on
-   extra oracle-imitation or success-classification losses.
+### Removed compatibility and alias surface
 
-These decisions make the training logic easier to reason about and easier to map
-from math to tensors.
+- legacy start/root naming shims were removed earlier from the code surface
+- legacy `answer_reachability` train/eval experiment aliases were removed
+- legacy `answer_reachability` run aliases were removed
+- eval answer-task aliases were removed from the public config schema
 
-## Public contract vs compatibility shims
+### Removed redundant config knobs
 
-The repo still carries a few compatibility aliases so older call sites do not
-break immediately.
+- `ActionPriorConfig.beta` was removed; proposal strengths are now explicit via
+  `root_beta`, `edge_beta`, and `stop_beta`
+- `ActionPriorConfig.kind` was removed; node-prior construction is now driven
+  directly by component weights
+- `GFlowNetTrainingConfig.rollout_batch_size` was removed; only
+  `rollouts_per_graph` remains
+- `PotentialRewardConfig.kind` was removed; answer-distance shaping is active
+  exactly when `answer_distance_weight > 0`
+- model-level validation/final-eval profile contract metadata was removed;
+  training and eval bundles are now the only sources of truth for those choices
 
-| Preferred name | Compatibility alias or legacy field |
+## Config design rules
+
+The config surface now follows four rules.
+
+1. One mechanism gets one public knob.
+2. Base dataclass defaults and shipped Hydra defaults should agree.
+3. Base model YAML should only spell out structure or true overrides.
+4. Canonical numeric choices belong in experiment bundles, not in prose docs.
+
+## Documentation rules
+
+To avoid future drift, the docs now separate mechanism from numbers.
+
+- `docs/gflownet_semantics.md` explains the algorithm and config roles.
+- `configs/model/gflownet.yaml` defines the minimal public schema surface.
+- `configs/experiment/train_rankflow.yaml` carries the canonical training values.
+- `configs/experiment/rankflow.yaml` carries the canonical final-eval values.
+
+If you need to reproduce the live setup, read the config files directly instead
+of relying on a copied list of numbers in Markdown.
+
+## Proposal vs target boundary
+
+The most important conceptual boundary is unchanged but now documented more
+explicitly:
+
+- target-side quantities define the SubTB residual algebra
+- proposal-side quantities only change coverage
+
+Concretely, that means:
+
+- `model.policy_cfg.transition_head.*` is proposal-only
+- `model.action_prior_cfg.*` is proposal-only
+- `model.training_cfg.potential_reward.*` changes the target measure
+- `model.training_cfg.success_replay.*` changes coverage mixture, not target
+  equations
+
+## Migration guide
+
+If you are updating local configs or scripts, use these replacements.
+
+| Removed surface | Use instead |
 | --- | --- |
-| `RootActionDistribution` | `StartDistribution` |
-| `is_stop_action` | `is_submit` |
-| `trace_stop_mask` | `trace_submit_mask` |
-| `termination_action_steps` | `terminal_action_counts` |
+| `action_prior_cfg.beta` | set `root_beta` and `edge_beta` explicitly |
+| `action_prior_cfg.kind` | set component weights directly |
+| `training.rollout_batch_size` | `training.rollouts_per_graph` |
+| `potential_reward.kind: answer_distance` | set `potential_reward.answer_distance_weight > 0` |
+| `experiment=train_answer_reachability` | `experiment=train_rankflow` |
+| `experiment=answer_reachability` | `experiment=rankflow` |
+| `run=train_answer_reachability` | `run=train_rankflow` |
+| `run=answer_reachability` | `run=rankflow` |
 
-Treat the left column as the real contract for new code and new docs.
+## What to inspect first
 
-## Root boundary changes
+If something looks inconsistent again, audit in this order:
 
-The root boundary used to be easier to blur together with start states. The
-current implementation keeps it explicit.
-
-- `RootActionDistribution.graph_log_z` is the boundary flow `log F(s_root)`.
-- `RootActionDistribution.log_probs` is the start-node action distribution.
-- `RootActionDistribution.log_flows` stores the child start-state values.
-
-This lets training use the root consistency residual directly:
-
-`log F(s_root) + log P_F([e_0] | s_root) - log F([e_0])`
-
-That is simpler to inspect than recovering root behavior indirectly from start
-states.
-
-## STOP and prefix representation
-
-The refactor made the exact prefix representation match the conceptual state
-space.
-
-- Active prefixes end with a node token.
-- Absorbing prefixes end with an explicit `STOP` token.
-
-This also made it useful to separate:
-
-- `done_mask`: inactive in the current batched computation
-- `absorbing_mask`: truly STOP-terminated prefix
-
-That distinction matters because padded rows, dead ends, and STOP-terminated
-rows are all inactive for different reasons.
-
-## Reward design after the refactor
-
-The public training contract is now easier to explain:
-
-- terminal correctness determines `terminal_log_rewards`
-- step-level costs live in `log_reward_steps`
-- MS-SubTB consumes both explicitly
-
-In the base public config, this means:
-
-- gold terminal entity -> `0.0`
-- non-gold terminal entity -> `training.terminal_failure_log_reward`
-- every graph move -> `training.step_log_penalty`
-
-## Auxiliary losses removed
-
-The old auxiliary losses were removed from the training path:
-
-- no learned success-classification head
-- no oracle action imitation loss
-
-The model is now trained only through MS-SubTB on the configured reward
-measure. This keeps the optimization target single-purpose and avoids mixing
-flow matching with separate supervised objectives.
-
-## Terminology to standardize
-
-Use these terms in future docs and code comments:
-
-- abstract root boundary
-- root state
-- root action distribution
-- graph prefix state
-- STOP action
-- termination action step
-- terminal number of graph moves
-- terminal reward
-- step log reward
-
-Avoid mixing `submit`, `stop`, and `terminal action` unless you immediately say
-they refer to the same event.
-
-## Practical note for future edits
-
-If a future change touches reward design, keep these three questions separate:
-
-1. What defines the trajectory measure?
-2. What only changes sampling behavior?
-3. What is merely auxiliary supervision?
-
-Keeping those layers separate is the easiest way to prevent the docs and the
-implementation from drifting apart again.
+1. `src/models/configs/gflownet_training.py`
+2. `configs/model/gflownet.yaml`
+3. `configs/experiment/train_rankflow.yaml`
+4. `src/models/gflownet/policy.py`
+5. `src/models/gflownet/heuristics.py`
+6. `docs/gflownet_semantics.md`

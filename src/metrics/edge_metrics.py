@@ -13,8 +13,8 @@ from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labe
 from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
 from src.models.gflownet import (
+    RootActionDistributionError,
     SearchPolicyProtocol,
-    StartDistributionError,
     TrajectorySamplerProtocol,
 )
 from src.utils.metrics_io import to_serializable
@@ -247,7 +247,7 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
                 policy=self.policy,
                 prepared_batch=prepared_batch,
             )
-        except StartDistributionError:
+        except RootActionDistributionError:
             if on_invalid_start is not None:
                 on_invalid_start(batch)
             return self._empty_graph(batch)
@@ -275,7 +275,7 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
                 policy=self.policy,
                 prepared_batch=prepared_batch,
             )
-        except StartDistributionError:
+        except RootActionDistributionError:
             return [
                 self._prepare_graph(
                     batch=batch.select_graph(graph_idx, validate=False),

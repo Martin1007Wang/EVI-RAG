@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from src.graph import build_graph_batch
+from src.graph import SearchObservation, build_graph_batch
 from src.graph.batch import TrajectoryBatch
 from src.metrics.search_backends import (
     FlowFrontierBackend,
@@ -16,7 +16,7 @@ from src.models.gflownet import (
     BaseSearchPolicy,
     ForwardActionDistribution,
     PreparedSearchBatch,
-    StartDistribution,
+    RootActionDistribution,
 )
 
 from .conftest import make_batch_from_graph
@@ -66,9 +66,9 @@ class _ManualFlowFrontierPolicy:
 
     def compute_start_distribution(
         self, prepared_batch: PreparedSearchBatch
-    ) -> StartDistribution:
+    ) -> RootActionDistribution:
         del prepared_batch
-        return StartDistribution(
+        return RootActionDistribution(
             candidate_nodes_abs=self.start_nodes,
             candidate_graph_ids=torch.zeros((1,), dtype=torch.long),
             log_flows=self.start_log_flows,
@@ -79,7 +79,7 @@ class _ManualFlowFrontierPolicy:
 
     def compute_root_action_distribution(
         self, prepared_batch: PreparedSearchBatch
-    ) -> StartDistribution:
+    ) -> RootActionDistribution:
         return self.compute_start_distribution(prepared_batch)
 
     def compute_forward_distribution(
@@ -94,7 +94,7 @@ class _ManualFlowFrontierPolicy:
         edge_agent_batch: list[int] = []
         edge_ids: list[int] = []
         target_nodes: list[int] = []
-        is_submit: list[bool] = []
+        is_stop_action: list[bool] = []
         out_degrees: list[int] = []
         flat_nodes = state.current_nodes.view(-1)
         flat_steps = state.num_steps.view(-1)
@@ -108,7 +108,7 @@ class _ManualFlowFrontierPolicy:
                 edge_agent_batch.append(agent_idx)
                 edge_ids.append(edge_id)
                 target_nodes.append(dst)
-                is_submit.append(submit)
+                is_stop_action.append(submit)
         if not edge_ids:
             return ForwardActionDistribution(
                 edge_logits=torch.empty((0,), dtype=torch.float32),
@@ -126,7 +126,7 @@ class _ManualFlowFrontierPolicy:
             out_degrees=torch.tensor(out_degrees, dtype=torch.long).view_as(
                 state.current_nodes
             ),
-            is_stop_action=torch.tensor(is_submit, dtype=torch.bool),
+            is_stop_action=torch.tensor(is_stop_action, dtype=torch.bool),
         )
 
     def compute_log_state_scores(
@@ -165,12 +165,17 @@ def _make_manual_fixture() -> tuple[
     topology, observation = build_graph_batch(batch)
     prepared_batch = PreparedSearchBatch(
         topology=topology,
-        observation=observation,
+        observation=SearchObservation.from_graph_observation(observation),
         node_tokens=torch.empty((0, 0), dtype=torch.float32),
         relation_tokens=torch.empty((0, 0), dtype=torch.float32),
         question_tokens=torch.empty((0, 0), dtype=torch.float32),
         question_context_tokens=torch.empty((0, 0, 0), dtype=torch.float32),
         question_context_mask=torch.empty((0, 0), dtype=torch.bool),
+        answer_mask=torch.zeros((int(topology.num_nodes),), dtype=torch.bool),
+        answer_sink_ids=torch.zeros((int(topology.num_nodes),), dtype=torch.long),
+        answer_sink_log_rewards=torch.zeros(
+            (int(topology.num_nodes),), dtype=torch.float32
+        ),
     )
     return batch, prepared_batch, _ManualFlowFrontierPolicy()
 
