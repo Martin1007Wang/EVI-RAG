@@ -219,12 +219,15 @@ These knobs change how much online and replay coverage is gathered:
 
 These knobs change validation and final-eval search/reporting behavior:
 
-- `model.eval_cfg.metrics_profile`
-- `model.eval_cfg.support_search_method`
-- `model.eval_cfg.monte_carlo_*`
-- `model.eval_cfg.flow_prune_epsilon`
-- `model.eval_cfg.max_expansions`
-- `model.eval_cfg.max_frontier_size`
+- canonical answer-ranking validation and final eval both use
+  `answer_posterior_backend: flow_frontier`
+- `monte_carlo` remains for edge retrieval and optional diagnostics, not for the
+  canonical answer-ranking checkpoint selector
+
+- `model.eval_cfg.report_profile`
+- `model.eval_cfg.answer_posterior_backend`
+- `model.eval_cfg.monte_carlo.*`
+- `model.eval_cfg.flow_frontier.*`
 
 ## 11. Canonical source of truth
 

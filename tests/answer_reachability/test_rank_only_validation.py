@@ -14,6 +14,7 @@ from src.metrics.answer_metrics import (
 from src.models.configs import (
     ActionPriorConfig,
     BackboneConfig,
+    FlowFrontierEvalConfig,
     SearchEvalConfig,
     GFlowNetTrainingConfig,
     HorizonConfig,
@@ -48,12 +49,14 @@ def _make_module() -> GFlowNetModule:
             ),
         ),
         eval_cfg=SearchEvalConfig(
-            metrics_profile="rank_only",
+            report_profile="rank_only",
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
-            max_expansions=32,
-            max_frontier_size=32,
+            flow_frontier=FlowFrontierEvalConfig(
+                max_expansions=32,
+                max_frontier_size=32,
+            ),
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),

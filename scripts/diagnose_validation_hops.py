@@ -789,27 +789,33 @@ def _build_eval_cfgs(base_eval_cfg: SearchEvalConfig) -> dict[str, SearchEvalCon
     return {
         "monte_carlo_256_rank_only": replace(
             base_eval_cfg,
-            metrics_profile="rank_only",
-            support_search_method="monte_carlo",
-            monte_carlo_rollouts=256,
+            report_profile="rank_only",
+            answer_posterior_backend="monte_carlo",
+            monte_carlo=replace(base_eval_cfg.monte_carlo, rollouts=256),
         ),
         "monte_carlo_4096_rank_only": replace(
             base_eval_cfg,
-            metrics_profile="rank_only",
-            support_search_method="monte_carlo",
-            monte_carlo_rollouts=4096,
+            report_profile="rank_only",
+            answer_posterior_backend="monte_carlo",
+            monte_carlo=replace(base_eval_cfg.monte_carlo, rollouts=4096),
         ),
         "flow_frontier_prune1e-3_full": replace(
             base_eval_cfg,
-            metrics_profile="full",
-            support_search_method="flow_frontier",
-            flow_prune_epsilon=1.0e-3,
+            report_profile="full",
+            answer_posterior_backend="flow_frontier",
+            flow_frontier=replace(
+                base_eval_cfg.flow_frontier,
+                prune_epsilon=1.0e-3,
+            ),
         ),
         "flow_frontier_prune0_full": replace(
             base_eval_cfg,
-            metrics_profile="full",
-            support_search_method="flow_frontier",
-            flow_prune_epsilon=0.0,
+            report_profile="full",
+            answer_posterior_backend="flow_frontier",
+            flow_frontier=replace(
+                base_eval_cfg.flow_frontier,
+                prune_epsilon=0.0,
+            ),
         ),
     }
 
@@ -881,12 +887,17 @@ def main() -> None:
         "sample_limit": args.sample_limit,
         "eval_cfgs": {
             name: {
-                "metrics_profile": eval_cfg.metrics_profile,
-                "support_search_method": eval_cfg.support_search_method,
-                "flow_prune_epsilon": float(eval_cfg.flow_prune_epsilon),
-                "monte_carlo_rollouts": int(eval_cfg.monte_carlo_rollouts),
-                "max_expansions": int(eval_cfg.max_expansions),
-                "max_frontier_size": int(eval_cfg.max_frontier_size),
+                "report_profile": eval_cfg.report_profile,
+                "answer_posterior_backend": eval_cfg.answer_posterior_backend,
+                "flow_frontier": {
+                    "prune_epsilon": float(eval_cfg.flow_frontier.prune_epsilon),
+                    "max_expansions": int(eval_cfg.flow_frontier.max_expansions),
+                    "max_frontier_size": int(eval_cfg.flow_frontier.max_frontier_size),
+                },
+                "monte_carlo": {
+                    "rollouts": int(eval_cfg.monte_carlo.rollouts),
+                    "confidence": float(eval_cfg.monte_carlo.confidence),
+                },
             }
             for name, eval_cfg in eval_cfgs.items()
         },

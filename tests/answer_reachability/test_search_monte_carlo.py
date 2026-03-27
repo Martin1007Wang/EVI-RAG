@@ -18,8 +18,10 @@ from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 from src.models.configs import (
     ActionPriorConfig,
     BackboneConfig,
+    FlowFrontierEvalConfig,
     GFlowNetTrainingConfig,
     HorizonConfig,
+    MonteCarloEvalConfig,
     OptimizerConfig,
     PolicyConfig,
     SchedulerConfig,
@@ -211,10 +213,12 @@ def _make_rank_only_module() -> GFlowNetModule:
             ),
         ),
         eval_cfg=SearchEvalConfig(
-            metrics_profile="rank_only",
-            support_search_method="monte_carlo",
-            monte_carlo_rollouts=2048,
-            monte_carlo_confidence=0.95,
+            report_profile="rank_only",
+            answer_posterior_backend="monte_carlo",
+            monte_carlo=MonteCarloEvalConfig(
+                rollouts=2048,
+                confidence=0.95,
+            ),
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
@@ -245,15 +249,19 @@ def _make_full_module() -> GFlowNetModule:
             ),
         ),
         eval_cfg=SearchEvalConfig(
-            metrics_profile="full",
-            support_search_method="monte_carlo",
-            monte_carlo_rollouts=64,
-            monte_carlo_confidence=0.95,
+            report_profile="full",
+            answer_posterior_backend="monte_carlo",
+            monte_carlo=MonteCarloEvalConfig(
+                rollouts=64,
+                confidence=0.95,
+            ),
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
-            max_expansions=32,
-            max_frontier_size=32,
+            flow_frontier=FlowFrontierEvalConfig(
+                max_expansions=32,
+                max_frontier_size=32,
+            ),
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),
@@ -267,9 +275,11 @@ def test_monte_carlo_support_search_reports_confidence_intervals() -> None:
     search = MonteCarloBackend(
         max_steps=2,
         eval_cfg=SearchEvalConfig(
-            support_search_method="monte_carlo",
-            monte_carlo_rollouts=4096,
-            monte_carlo_confidence=0.95,
+            answer_posterior_backend="monte_carlo",
+            monte_carlo=MonteCarloEvalConfig(
+                rollouts=4096,
+                confidence=0.95,
+            ),
             answer_mass_threshold=0.55,
             support_mass_threshold=1.0,
         ),
@@ -279,7 +289,7 @@ def test_monte_carlo_support_search_reports_confidence_intervals() -> None:
         batch=batch,
         policy=policy,
         prepared_batch=prepared_batch,
-        metrics_profile="full",
+        report_profile="full",
         include_answer_support=True,
     )
 

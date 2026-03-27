@@ -71,8 +71,12 @@ model:
       replay_trajectories_per_step: 64
       add_shortest_path_guidance: true
   eval_cfg:
-    metrics_profile: rank_only
-    support_search_method: monte_carlo
-    monte_carlo_rollouts: 256
+    # Keep training-time checkpoint selection on the same flow-frontier answer
+    # posterior that final eval uses; only the report surface stays rank-only.
+    report_profile: rank_only
+    answer_posterior_backend: flow_frontier
+    flow_frontier:
+      max_expansions: 500000
+      max_frontier_size: 65536
   optimizer_cfg:
     lr: 5.0e-5

@@ -112,7 +112,7 @@ def _make_module(prior_kind: str) -> GFlowNetModule:
             edge_beta=0.5,
         ),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -141,7 +141,7 @@ def _make_module_with_training_cfg(
             edge_beta=beta,
         ),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -302,7 +302,7 @@ def test_gflownet_module_uses_action_prior_config() -> None:
         training_cfg=GFlowNetTrainingConfig(),
         action_prior_cfg=ActionPriorConfig(),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -317,7 +317,7 @@ def test_gflownet_module_uses_action_prior_config() -> None:
 def test_gflownet_module_exposes_eval_settings() -> None:
     module = _make_module("topology")
 
-    assert module.metrics_profile == "rank_only"
+    assert module.report_profile == "rank_only"
     assert module.evaluation_task == "answer_search"
 
 
@@ -1317,7 +1317,7 @@ def test_relation_action_prior_biases_proposal_edge_sampling() -> None:
             progress_weight=0.0,
         ),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -1384,7 +1384,7 @@ def test_control_state_intent_prior_biases_proposal_edge_sampling() -> None:
             intent_target_weight=1.0,
         ),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -1448,7 +1448,7 @@ def test_shortest_path_action_prior_biases_proposal_toward_bridge_edge() -> None
             answer_distance_weight=0.0,
         ),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -1751,7 +1751,7 @@ def test_gflownet_sampling_temperature_schedule_anneals() -> None:
         ),
         action_prior_cfg=ActionPriorConfig(),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -1778,7 +1778,7 @@ def test_gflownet_action_prior_schedule_anneals() -> None:
             edge_beta=0.6,
         ),
         policy_cfg=_make_policy_config(),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),
@@ -2294,7 +2294,7 @@ def test_transition_head_only_changes_proposal_logits() -> None:
             edge_beta=0.0,
         ),
         policy_cfg=_make_policy_config(transition_enabled=True),
-        eval_cfg=SearchEvalConfig(metrics_profile="rank_only"),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
         optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
         scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
         metric_runtime_factory=GraphTaskRuntimeFactory(),

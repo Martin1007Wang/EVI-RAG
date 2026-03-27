@@ -5,6 +5,7 @@ import torch
 from src.models.configs import (
     ActionPriorConfig,
     BackboneConfig,
+    FlowFrontierEvalConfig,
     SearchEvalConfig,
     GFlowNetTrainingConfig,
     HorizonConfig,
@@ -42,8 +43,10 @@ def _make_module() -> GFlowNetModule:
             answer_mass_threshold=0.9,
             support_mass_threshold=0.9,
             answer_top_ks=(1, 5),
-            max_expansions=32,
-            max_frontier_size=32,
+            flow_frontier=FlowFrontierEvalConfig(
+                max_expansions=32,
+                max_frontier_size=32,
+            ),
         ),
         optimizer_cfg=OptimizerConfig(),
         scheduler_cfg=SchedulerConfig(),

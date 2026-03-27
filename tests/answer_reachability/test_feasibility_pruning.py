@@ -7,7 +7,7 @@ from src.metrics.search_backends import FlowFrontierBackend
 from src.models.gflownet import BaseSearchPolicy
 from src.models.gflownet import apply_forward_constraints
 from src.models.gflownet import SearchState
-from src.models.configs import SearchEvalConfig
+from src.models.configs import FlowFrontierEvalConfig, SearchEvalConfig
 
 from .conftest import make_batch_from_graph, make_policy
 
@@ -32,8 +32,8 @@ def test_answer_start_without_future_support_is_absorbing_success() -> None:
     backend = FlowFrontierBackend(
         max_steps=2,
         eval_cfg=SearchEvalConfig(
-            support_search_method="flow_frontier",
-            flow_prune_epsilon=0.0,
+            answer_posterior_backend="flow_frontier",
+            flow_frontier=FlowFrontierEvalConfig(prune_epsilon=0.0),
         ),
     )
 
@@ -42,7 +42,7 @@ def test_answer_start_without_future_support_is_absorbing_success() -> None:
         batch=batch,
         policy=policy,
         prepared_batch=prepared_batch,
-        metrics_profile="rank_only",
+        report_profile="rank_only",
         include_answer_support=False,
     )
 

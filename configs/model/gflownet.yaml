@@ -42,6 +42,10 @@ policy_cfg:
 
 eval_cfg:
   _target_: src.models.configs.gflownet.SearchEvalConfig
+  flow_frontier:
+    _target_: src.models.configs.gflownet.FlowFrontierEvalConfig
+  monte_carlo:
+    _target_: src.models.configs.gflownet.MonteCarloEvalConfig
 
 optimizer_cfg:
   _target_: src.models.configs.training.OptimizerConfig

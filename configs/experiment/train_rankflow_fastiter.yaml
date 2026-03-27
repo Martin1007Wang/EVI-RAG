@@ -32,5 +32,8 @@ model:
     success_replay:
       mix_alpha: 0.0
   eval_cfg:
-    # Fast-iteration validation only needs a coarser Monte Carlo trend estimate.
-    monte_carlo_rollouts: 128
+    # Fast iteration keeps the same frontier-based answer posterior semantics as
+    # the canonical train/eval path, but trims the search budget aggressively.
+    flow_frontier:
+      max_expansions: 20000
+      max_frontier_size: 4096

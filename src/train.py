@@ -28,6 +28,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
+from src.models.configs import SearchEvalConfig
 from src.runs.answer_reachability import AnswerReachabilityEvalReporter
 from src.runs.common import (
     DatasetVariantSpec,
@@ -145,6 +146,109 @@ def _clone_cfg_node(node: Any) -> Any:
     return OmegaConf.create(node)
 
 
+def _coerce_search_eval_cfg(eval_cfg: Any) -> SearchEvalConfig:
+    if isinstance(eval_cfg, SearchEvalConfig):
+        return eval_cfg
+    if isinstance(eval_cfg, DictConfig):
+        container = OmegaConf.to_container(eval_cfg, resolve=True)
+    elif isinstance(eval_cfg, dict):
+        container = dict(eval_cfg)
+    else:
+        raise TypeError(f"Unsupported eval_cfg type: {type(eval_cfg)!r}.")
+    if not isinstance(container, dict):
+        raise TypeError("Expected eval_cfg to resolve to a mapping.")
+    return SearchEvalConfig(**container)
+
+
+def _format_answer_posterior_config(eval_cfg: SearchEvalConfig) -> str:
+    backend = str(eval_cfg.answer_posterior_backend)
+    if backend == "flow_frontier":
+        flow_cfg = eval_cfg.flow_frontier
+        return (
+            "flow_frontier("
+            f"prune_epsilon={float(flow_cfg.prune_epsilon):.6g}, "
+            f"max_expansions={int(flow_cfg.max_expansions)}, "
+            f"max_frontier_size={int(flow_cfg.max_frontier_size)}"
+            ")"
+        )
+    return f"monte_carlo(rollouts={int(eval_cfg.monte_carlo.rollouts)})"
+
+
+def _answer_posterior_signature(eval_cfg: SearchEvalConfig) -> tuple[Any, ...]:
+    backend = str(eval_cfg.answer_posterior_backend)
+    if backend == "flow_frontier":
+        flow_cfg = eval_cfg.flow_frontier
+        return (
+            backend,
+            float(flow_cfg.prune_epsilon),
+            int(flow_cfg.max_expansions),
+            int(flow_cfg.max_frontier_size),
+        )
+    return (backend, int(eval_cfg.monte_carlo.rollouts))
+
+
+def _compose_final_eval_template(
+    cfg: DictConfig,
+    *,
+    ckpt_path: str,
+    output_dir: str,
+) -> DictConfig:
+    run_cfg = cfg.get("run") or {}
+    dataset_cfg = cfg.get("dataset") or {}
+    dataset_name = str(dataset_cfg.get("name") or "").strip()
+    if not dataset_name:
+        raise ValueError("Final eval requires `dataset.name` to be populated.")
+
+    final_eval_experiment = str(
+        run_cfg.get("final_eval_experiment") or "rankflow"
+    ).strip()
+    return compose_config(
+        config_name="eval.yaml",
+        overrides=[
+            f"experiment={final_eval_experiment}",
+            f"dataset={dataset_name}",
+            f"ckpt.gflownet={ckpt_path}",
+            f"paths.output_dir={output_dir}",
+            "extras.enforce_tags=false",
+            "extras.print_config=false",
+        ],
+    )
+
+
+def _validate_answer_posterior_alignment(
+    cfg: DictConfig,
+    *,
+    eval_template: DictConfig,
+) -> None:
+    train_eval_cfg = _coerce_search_eval_cfg(cfg.model.eval_cfg)
+    final_eval_cfg = _coerce_search_eval_cfg(eval_template.model.eval_cfg)
+    if not train_eval_cfg.is_answer_task or not final_eval_cfg.is_answer_task:
+        return
+
+    train_signature = _answer_posterior_signature(train_eval_cfg)
+    final_signature = _answer_posterior_signature(final_eval_cfg)
+    if train_signature == final_signature:
+        return
+
+    final_eval_experiment = (
+        str((cfg.get("run") or {}).get("final_eval_experiment") or "rankflow").strip()
+        or "rankflow"
+    )
+    raise ValueError(
+        "Training-time answer-ranking checkpoint selection and post-fit final eval "
+        "must use the same answer-posterior estimator. "
+        f"Got train eval_cfg={_format_answer_posterior_config(train_eval_cfg)} but "
+        f"final eval experiment={final_eval_experiment!r} uses "
+        f"{_format_answer_posterior_config(final_eval_cfg)}. "
+        "This would pick checkpoints under one answer posterior and score final "
+        "eval under another. Keep the answer-posterior config aligned between "
+        "train validation and final eval (the canonical RankFlow pair is "
+        "`flow_frontier(prune_epsilon=0.001, max_expansions=500000, "
+        "max_frontier_size=65536)` in both places), or disable post-fit final "
+        "eval and run the alternate configuration explicitly via `python src/eval.py ...`."
+    )
+
+
 def _resolve_post_fit_ckpt_path(
     *,
     run_cfg: DictConfig | dict[str, Any],
@@ -192,29 +296,16 @@ def _build_final_eval_cfg(
     ckpt_path: str,
 ) -> DictConfig:
     run_cfg = cfg.get("run") or {}
-    dataset_cfg = cfg.get("dataset") or {}
-    dataset_name = str(dataset_cfg.get("name") or "").strip()
-    if not dataset_name:
-        raise ValueError("Final eval requires `dataset.name` to be populated.")
-
-    final_eval_experiment = str(
-        run_cfg.get("final_eval_experiment") or "rankflow"
-    ).strip()
     final_eval_split = str(run_cfg.get("final_eval_split") or "test").strip() or "test"
     output_subdir = str(run_cfg.get("final_eval_output_subdir") or "final_eval").strip()
     output_dir = str(_resolve_train_output_dir(cfg) / output_subdir)
 
-    eval_template = compose_config(
-        config_name="eval.yaml",
-        overrides=[
-            f"experiment={final_eval_experiment}",
-            f"dataset={dataset_name}",
-            f"ckpt.gflownet={ckpt_path}",
-            f"paths.output_dir={output_dir}",
-            "extras.enforce_tags=false",
-            "extras.print_config=false",
-        ],
+    eval_template = _compose_final_eval_template(
+        cfg,
+        ckpt_path=ckpt_path,
+        output_dir=output_dir,
     )
+    _validate_answer_posterior_alignment(cfg, eval_template=eval_template)
 
     eval_cfg = _clone_cfg_node(eval_template)
     merged_eval_cfg = OmegaConf.merge(
@@ -299,17 +390,21 @@ def _run_final_eval_suite(
 
     final_metrics: Dict[str, Any] = {}
     split = str(cfg.run.get("split") or "test")
-    metrics_profile = str(cfg.model.eval_cfg.get("metrics_profile") or "")
+    report_profile = str(cfg.model.eval_cfg.get("report_profile") or "")
+    answer_posterior_backend = str(
+        cfg.model.eval_cfg.get("answer_posterior_backend") or ""
+    )
     can_reuse_eval_stack = (
         trainer is not None and model is not None and datamodule is not None
     )
     released_original_state = False
     for variant in variants:
         log.info(
-            "Final evaluation: dataset_variant=%s split=%s metrics_profile=%s",
+            "Final evaluation: dataset_variant=%s split=%s report_profile=%s answer_posterior_backend=%s",
             variant.label,
             split,
-            metrics_profile,
+            report_profile,
+            answer_posterior_backend,
         )
         with temporary_cfg_overrides(
             cfg,
@@ -442,12 +537,26 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     run_cfg = cfg.get("run") or {}
     log.info(
-        "Training-time validation metrics_profile=%s",
-        cfg.model.eval_cfg.get("metrics_profile"),
+        "Training-time validation report_profile=%s answer_posterior_backend=%s",
+        cfg.model.eval_cfg.get("report_profile"),
+        cfg.model.eval_cfg.get("answer_posterior_backend"),
     )
     if bool(run_cfg.get("test", False)):
         final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
         if final_eval_experiment:
+            output_subdir = str(
+                run_cfg.get("final_eval_output_subdir") or "final_eval"
+            ).strip()
+            eval_template = _compose_final_eval_template(
+                cfg,
+                ckpt_path=str(
+                    run_cfg.get("test_ckpt_path")
+                    or cfg.get("ckpt_path")
+                    or "__rankflow_backend_guard__.ckpt"
+                ),
+                output_dir=str(_resolve_train_output_dir(cfg) / output_subdir),
+            )
+            _validate_answer_posterior_alignment(cfg, eval_template=eval_template)
             log.info(
                 "Post-fit final evaluation is enabled: experiment=%s split=%s output_subdir=%s",
                 final_eval_experiment,

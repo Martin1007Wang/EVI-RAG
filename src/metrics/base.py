@@ -29,7 +29,7 @@ class BaseMetricRuntime(ABC):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> MetricEvaluationOutput:
@@ -40,7 +40,7 @@ class BaseMetricRuntime(ABC):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> list[Any]:
@@ -58,9 +58,9 @@ class BaseMetricRuntime(ABC):
         self,
         *,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
-        del predict_results, metrics_profile
+        del predict_results, report_profile
         return {}
 
     def write_prediction_artifacts(
@@ -94,9 +94,9 @@ class BaseMetricRuntime(ABC):
     def initialize_predict_metrics_accumulator(
         self,
         *,
-        metrics_profile: str,
+        report_profile: str,
     ) -> Any:
-        del metrics_profile
+        del report_profile
         return None
 
     def update_predict_metrics_accumulator(
@@ -104,24 +104,24 @@ class BaseMetricRuntime(ABC):
         *,
         accumulator: Any,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> None:
-        del accumulator, predict_results, metrics_profile
+        del accumulator, predict_results, report_profile
 
     def finalize_predict_metrics_accumulator(
         self,
         *,
         accumulator: Any,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
-        del accumulator, metrics_profile
+        del accumulator, report_profile
         return {}
 
     def summarize_predict_epoch_from_jsonl(
         self,
         *,
         predict_results_path: str | Path,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
         if not jsonl_has_records(predict_results_path):
             return {}
@@ -131,7 +131,7 @@ class BaseMetricRuntime(ABC):
         ]
         return self.summarize_predict_epoch(
             predict_results=results,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
         )
 
     def write_prediction_artifacts_from_jsonl(

@@ -121,8 +121,8 @@ def test_eval_edge_retrieval_inherits_rankflow_eval_stack() -> None:
     assert action_prior_cfg.root_beta == pytest.approx(0.0)
     assert action_prior_cfg.edge_beta == pytest.approx(0.0)
     assert cfg.model.eval_cfg.task == "edge_retrieval"
-    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
-    assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
+    assert cfg.model.eval_cfg.report_profile == "rank_only"
+    assert cfg.model.eval_cfg.answer_posterior_backend == "monte_carlo"
 
 
 def test_configure_eval_split_updates_datamodule_when_supported() -> None:
@@ -200,9 +200,10 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert cfg.data.train_feature_dtype == "auto"
     assert cfg.data.eval_feature_dtype == "auto"
     assert cfg.model.training_cfg.rollouts_per_graph == 32
-    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
-    assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
-    assert cfg.model.eval_cfg.monte_carlo_rollouts == 128
+    assert cfg.model.eval_cfg.report_profile == "rank_only"
+    assert cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
+    assert cfg.model.eval_cfg.flow_frontier.max_expansions == 20000
+    assert cfg.model.eval_cfg.flow_frontier.max_frontier_size == 4096
     assert action_prior_cfg.root_beta == pytest.approx(1.0)
     assert action_prior_cfg.edge_beta == pytest.approx(0.75)
     assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
@@ -218,7 +219,7 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert "guided" not in list(cfg.run.tags)
 
 
-def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
+def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> None:
     config_dir = Path(__file__).resolve().parents[1] / "configs"
 
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
@@ -255,9 +256,10 @@ def test_train_rankflow_experiment_uses_cheaper_validation_budget() -> None:
     assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
     assert cfg.trainer.log_every_n_steps == 32
     assert cfg.model.training_cfg.rollouts_per_graph == 32
-    assert cfg.model.eval_cfg.metrics_profile == "rank_only"
-    assert cfg.model.eval_cfg.support_search_method == "monte_carlo"
-    assert cfg.model.eval_cfg.monte_carlo_rollouts == 256
+    assert cfg.model.eval_cfg.report_profile == "rank_only"
+    assert cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
+    assert cfg.model.eval_cfg.flow_frontier.max_expansions == 500000
+    assert cfg.model.eval_cfg.flow_frontier.max_frontier_size == 65536
     assert action_prior_cfg.root_beta == pytest.approx(1.0)
     assert action_prior_cfg.edge_beta == pytest.approx(0.75)
     assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
@@ -327,10 +329,12 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
             "model": {
                 "policy_cfg": {"backbone": {"hidden_dim": 512}},
                 "eval_cfg": {
-                    "metrics_profile": "rank_only",
-                    "support_search_method": "monte_carlo",
-                    "max_expansions": 100000,
-                    "max_frontier_size": 32768,
+                    "report_profile": "rank_only",
+                    "answer_posterior_backend": "flow_frontier",
+                    "flow_frontier": {
+                        "max_expansions": 500000,
+                        "max_frontier_size": 65536,
+                    },
                 },
             },
             "run": {
@@ -354,10 +358,12 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
             "data": {"batch_size": 64},
             "model": {
                 "eval_cfg": {
-                    "metrics_profile": "full",
-                    "support_search_method": "flow_frontier",
-                    "max_expansions": 500000,
-                    "max_frontier_size": 65536,
+                    "report_profile": "full",
+                    "answer_posterior_backend": "flow_frontier",
+                    "flow_frontier": {
+                        "max_expansions": 500000,
+                        "max_frontier_size": 65536,
+                    },
                 }
             },
             "trainer": {"accelerator": "gpu", "devices": 1},
@@ -384,13 +390,157 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
     assert final_eval_cfg.paths.output_dir.endswith("final_eval")
     assert final_eval_cfg.dataset.name == "webqsp-sub"
     assert final_eval_cfg.model.policy_cfg.backbone.hidden_dim == 512
-    assert final_eval_cfg.model.eval_cfg.metrics_profile == "full"
-    assert final_eval_cfg.model.eval_cfg.support_search_method == "flow_frontier"
-    assert final_eval_cfg.model.eval_cfg.max_expansions == 500000
-    assert final_eval_cfg.model.eval_cfg.max_frontier_size == 65536
+    assert final_eval_cfg.model.eval_cfg.report_profile == "full"
+    assert final_eval_cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
+    assert final_eval_cfg.model.eval_cfg.flow_frontier.max_expansions == 500000
+    assert final_eval_cfg.model.eval_cfg.flow_frontier.max_frontier_size == 65536
     assert final_eval_cfg.trainer.devices == 1
     assert list(final_eval_cfg.callbacks.keys()) == []
     assert list(final_eval_cfg.logger.keys()) == []
+
+
+def test_build_final_eval_cfg_rejects_answer_posterior_backend_mismatch(
+    monkeypatch, tmp_path
+) -> None:
+    train_cfg = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "train-run"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp-sub",
+                "dataset_family": "webqsp",
+                "dataset_scope": "sub",
+            },
+            "data": {"batch_size": 32, "num_workers": 4},
+            "model": {
+                "eval_cfg": {
+                    "report_profile": "rank_only",
+                    "answer_posterior_backend": "monte_carlo",
+                },
+            },
+            "run": {
+                "final_eval_experiment": "rankflow",
+                "final_eval_split": "test",
+                "final_eval_output_subdir": "final_eval",
+            },
+        }
+    )
+    eval_template = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "template"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp",
+                "dataset_family": "webqsp",
+                "dataset_scope": "full",
+            },
+            "data": {"batch_size": 64},
+            "model": {
+                "eval_cfg": {
+                    "report_profile": "full",
+                    "answer_posterior_backend": "flow_frontier",
+                    "flow_frontier": {
+                        "max_expansions": 500000,
+                        "max_frontier_size": 65536,
+                    },
+                }
+            },
+            "trainer": {"accelerator": "gpu", "devices": 1},
+            "run": {
+                "name": "rankflow",
+                "split": "test",
+                "execution_mode": "predict",
+                "dataset_variants": [
+                    "${dataset.dataset_family}",
+                    "${dataset.dataset_family}-sub",
+                ],
+                "ckpt_path": "${ckpt.gflownet}",
+            },
+        }
+    )
+
+    monkeypatch.setattr("src.train.compose_config", lambda **_: eval_template)
+
+    with pytest.raises(ValueError, match="same answer-posterior estimator"):
+        _build_final_eval_cfg(train_cfg, ckpt_path="/tmp/best.ckpt")
+
+
+def test_build_final_eval_cfg_rejects_flow_frontier_budget_mismatch(
+    monkeypatch, tmp_path
+) -> None:
+    train_cfg = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "train-run"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp-sub",
+                "dataset_family": "webqsp",
+                "dataset_scope": "sub",
+            },
+            "data": {"batch_size": 32, "num_workers": 4},
+            "model": {
+                "eval_cfg": {
+                    "report_profile": "rank_only",
+                    "answer_posterior_backend": "flow_frontier",
+                    "flow_frontier": {
+                        "max_expansions": 100000,
+                        "max_frontier_size": 32768,
+                    },
+                },
+            },
+            "run": {
+                "final_eval_experiment": "rankflow",
+                "final_eval_split": "test",
+                "final_eval_output_subdir": "final_eval",
+            },
+        }
+    )
+    eval_template = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "template"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp",
+                "dataset_family": "webqsp",
+                "dataset_scope": "full",
+            },
+            "data": {"batch_size": 64},
+            "model": {
+                "eval_cfg": {
+                    "report_profile": "full",
+                    "answer_posterior_backend": "flow_frontier",
+                    "flow_frontier": {
+                        "max_expansions": 500000,
+                        "max_frontier_size": 65536,
+                    },
+                }
+            },
+            "trainer": {"accelerator": "gpu", "devices": 1},
+            "run": {
+                "name": "rankflow",
+                "split": "test",
+                "execution_mode": "predict",
+                "dataset_variants": [
+                    "${dataset.dataset_family}",
+                    "${dataset.dataset_family}-sub",
+                ],
+                "ckpt_path": "${ckpt.gflownet}",
+            },
+        }
+    )
+
+    monkeypatch.setattr("src.train.compose_config", lambda **_: eval_template)
+
+    with pytest.raises(ValueError, match="same answer-posterior estimator"):
+        _build_final_eval_cfg(train_cfg, ckpt_path="/tmp/best.ckpt")
 
 
 def test_run_post_fit_evaluation_uses_final_eval_suite(monkeypatch) -> None:
@@ -440,7 +590,7 @@ def test_run_final_eval_suite_prefers_inprocess_reuse_when_available(
         {
             "paths": {"output_dir": str(tmp_path)},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
-            "model": {"eval_cfg": {"metrics_profile": "full"}},
+            "model": {"eval_cfg": {"report_profile": "full"}},
             "run": {"split": "test"},
         }
     )
@@ -488,7 +638,7 @@ def test_run_final_eval_suite_releases_runtime_state_before_fresh_fallback(
         {
             "paths": {"output_dir": str(tmp_path)},
             "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
-            "model": {"eval_cfg": {"metrics_profile": "full"}},
+            "model": {"eval_cfg": {"report_profile": "full"}},
             "run": {"split": "test"},
         }
     )

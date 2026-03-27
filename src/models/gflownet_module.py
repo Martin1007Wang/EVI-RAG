@@ -141,7 +141,7 @@ class GFlowNetModule(LightningModule):
         )
         self.runtime_controller = MetricRuntimeController(
             metric_runtime=self.metric_runtime,
-            metrics_profile=str(self.cfg.eval_cfg.metrics_profile),
+            report_profile=str(self.cfg.eval_cfg.report_profile),
             on_invalid_start=self._log_invalid_start,
         )
         self.sampler = self.runtime_controller.sampler
@@ -167,8 +167,8 @@ class GFlowNetModule(LightningModule):
         self._latest_train_metrics: dict[str, float] | None = None
 
     @property
-    def metrics_profile(self) -> str:
-        return str(self.runtime_controller.metrics_profile)
+    def report_profile(self) -> str:
+        return str(self.runtime_controller.report_profile)
 
     @property
     def evaluation_task(self) -> str:
@@ -207,7 +207,7 @@ class GFlowNetModule(LightningModule):
         )
         self.runtime_controller = MetricRuntimeController(
             metric_runtime=self.metric_runtime,
-            metrics_profile=str(eval_cfg.metrics_profile),
+            report_profile=str(eval_cfg.report_profile),
             on_invalid_start=self._log_invalid_start,
         )
         self.sampler = self.runtime_controller.sampler
@@ -708,7 +708,7 @@ class GFlowNetModule(LightningModule):
     ) -> MetricEvaluationOutput:
         return self.runtime_controller.evaluate_batch_output(
             batch=batch,
-            include_answer_support=False,
+            include_answer_support=self.cfg.eval_cfg.include_answer_support,
         )
 
     def _evaluate_batch(
@@ -723,7 +723,7 @@ class GFlowNetModule(LightningModule):
     ]:
         return self.runtime_controller.evaluate_batch(
             batch=batch,
-            include_answer_support=False,
+            include_answer_support=self.cfg.eval_cfg.include_answer_support,
         )
 
     def _log_eval_outputs(

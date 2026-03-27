@@ -28,6 +28,10 @@ The current cleanup pass removed several sources of drift and redundancy.
   exactly when `answer_distance_weight > 0`
 - model-level validation/final-eval profile contract metadata was removed;
   training and eval bundles are now the only sources of truth for those choices
+- answer-ranking validation no longer swaps to a separate Monte Carlo posterior;
+  the canonical train/eval path now stays on flow-frontier answer aggregation
+- eval backend/report/budget knobs were renamed and regrouped so config names
+  match the actual semantics they control
 
 ## Config design rules
 
@@ -76,6 +80,13 @@ If you are updating local configs or scripts, use these replacements.
 | `action_prior_cfg.kind` | set component weights directly |
 | `training.rollout_batch_size` | `training.rollouts_per_graph` |
 | `potential_reward.kind: answer_distance` | set `potential_reward.answer_distance_weight > 0` |
+| `eval_cfg.metrics_profile` | `eval_cfg.report_profile` |
+| `eval_cfg.support_search_method` | `eval_cfg.answer_posterior_backend` |
+| `eval_cfg.monte_carlo_rollouts` | `eval_cfg.monte_carlo.rollouts` |
+| `eval_cfg.monte_carlo_confidence` | `eval_cfg.monte_carlo.confidence` |
+| `eval_cfg.flow_prune_epsilon` | `eval_cfg.flow_frontier.prune_epsilon` |
+| `eval_cfg.max_expansions` | `eval_cfg.flow_frontier.max_expansions` |
+| `eval_cfg.max_frontier_size` | `eval_cfg.flow_frontier.max_frontier_size` |
 | `experiment=train_answer_reachability` | `experiment=train_rankflow` |
 | `experiment=answer_reachability` | `experiment=rankflow` |
 | `run=train_answer_reachability` | `run=train_rankflow` |

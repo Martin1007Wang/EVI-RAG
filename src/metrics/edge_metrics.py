@@ -377,11 +377,11 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> MetricEvaluationOutput:
-        del metrics_profile, include_answer_support
+        del report_profile, include_answer_support
         graphs = self._prepare_batch_graphs(
             batch=batch,
             on_invalid_start=on_invalid_start,
@@ -406,11 +406,11 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> list[EdgeRetrievalResult]:
-        del metrics_profile, include_answer_support
+        del report_profile, include_answer_support
         graphs = self._prepare_batch_graphs(
             batch=batch,
             on_invalid_start=on_invalid_start,
@@ -450,16 +450,16 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
         self,
         *,
         predict_results: list[EdgeRetrievalResult],
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
-        del metrics_profile
+        del report_profile
         return compute_edge_metrics(
             results=predict_results,
             edge_top_ks=tuple(int(k) for k in self.eval_cfg.edge_top_ks),
         )
 
-    def initialize_predict_metrics_accumulator(self, *, metrics_profile: str) -> Any:
-        del metrics_profile
+    def initialize_predict_metrics_accumulator(self, *, report_profile: str) -> Any:
+        del report_profile
         return EdgeMetricsAccumulator()
 
     def update_predict_metrics_accumulator(
@@ -467,9 +467,9 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
         *,
         accumulator: EdgeMetricsAccumulator,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> None:
-        del metrics_profile
+        del report_profile
         if not predict_results:
             return
         metrics = compute_edge_metrics(
@@ -491,9 +491,9 @@ class EdgeRetrievalRuntime(BaseMetricRuntime):
         self,
         *,
         accumulator: EdgeMetricsAccumulator,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
-        del metrics_profile
+        del report_profile
         return {
             name: float(metric.compute().item())
             for name, metric in accumulator.metrics.items()

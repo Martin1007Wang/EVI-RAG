@@ -413,7 +413,7 @@ def summarize_reachability_metrics(
     *,
     results: list[SupportWindowResult],
     answer_top_ks: tuple[int, ...],
-    metrics_profile: str,
+    report_profile: str,
     invalid_start_reason: str = "invalid_start_candidates",
 ) -> tuple[dict[str, float], dict[str, float]]:
     rank_metrics = aggregate_rank_metrics(
@@ -421,7 +421,7 @@ def summarize_reachability_metrics(
         answer_top_ks=answer_top_ks,
     )
     diagnostics: dict[str, float] = {}
-    if metrics_profile != "rank_only":
+    if report_profile != "rank_only":
         diagnostics.update(compute_support_metrics(results))
     invalid_start_count = sum(
         1 for result in results if result.stop_reason == invalid_start_reason
@@ -866,7 +866,7 @@ class ReachabilityBackendProtocol(Protocol):
         batch: TrajectoryBatch,
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
     ) -> SupportWindowResult: ...
 
@@ -876,7 +876,7 @@ class ReachabilityBackendProtocol(Protocol):
         batch: TrajectoryBatch,
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
     ) -> list[SupportWindowResult]: ...
 
@@ -943,7 +943,7 @@ class AnswerReachabilityEvaluator:
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None,
     ) -> list[SupportWindowResult]:
@@ -957,7 +957,7 @@ class AnswerReachabilityEvaluator:
                         batch=graph_batch,
                         policy=self.policy,
                         prepared_batch=prepared_graph,
-                        metrics_profile=metrics_profile,
+                        report_profile=report_profile,
                         include_answer_support=include_answer_support,
                     )
                 )
@@ -971,7 +971,7 @@ class AnswerReachabilityEvaluator:
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None,
     ) -> list[SupportWindowResult]:
@@ -981,13 +981,13 @@ class AnswerReachabilityEvaluator:
                 batch=batch,
                 policy=self.policy,
                 prepared_batch=prepared_batch,
-                metrics_profile=metrics_profile,
+                report_profile=report_profile,
                 include_answer_support=include_answer_support,
             )
         except RootActionDistributionError:
             return self._evaluate_individual_graphs(
                 batch=batch,
-                metrics_profile=metrics_profile,
+                report_profile=report_profile,
                 include_answer_support=include_answer_support,
                 on_invalid_start=on_invalid_start,
             )
@@ -996,21 +996,21 @@ class AnswerReachabilityEvaluator:
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> MetricEvaluationOutput:
         with torch.no_grad():
             window_results = self._build_window_results(
                 batch=batch,
-                metrics_profile=metrics_profile,
+                report_profile=report_profile,
                 include_answer_support=include_answer_support,
                 on_invalid_start=on_invalid_start,
             )
         metrics, diagnostics = summarize_reachability_metrics(
             results=window_results,
             answer_top_ks=tuple(int(k) for k in self.eval_cfg.answer_top_ks),
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
             invalid_start_reason=INVALID_START_REASON,
         )
         return MetricEvaluationOutput(
@@ -1024,14 +1024,14 @@ class AnswerReachabilityEvaluator:
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> list[SupportWindowResult]:
         with torch.no_grad():
             return self._build_window_results(
                 batch=batch,
-                metrics_profile=metrics_profile,
+                report_profile=report_profile,
                 include_answer_support=include_answer_support,
                 on_invalid_start=on_invalid_start,
             )
@@ -1489,14 +1489,14 @@ def update_predict_metrics_accumulator(
     accumulator: SupportWindowMetricsAccumulator,
     eval_cfg: SearchEvalConfig,
     predict_results: list[SupportWindowResult],
-    metrics_profile: str,
+    report_profile: str,
 ) -> None:
     if not predict_results:
         return
     metrics, diagnostics = summarize_reachability_metrics(
         results=predict_results,
         answer_top_ks=tuple(int(k) for k in eval_cfg.answer_top_ks),
-        metrics_profile=metrics_profile,
+        report_profile=report_profile,
         invalid_start_reason=INVALID_START_REASON,
     )
     batch_weight = torch.tensor(float(len(predict_results)), dtype=torch.float32)
@@ -1542,14 +1542,14 @@ def summarize_predict_results(
     *,
     eval_cfg: SearchEvalConfig,
     predict_results: list[SupportWindowResult],
-    metrics_profile: str,
+    report_profile: str,
 ) -> dict[str, float]:
     if not predict_results:
         return {}
     metrics, diagnostics = summarize_reachability_metrics(
         results=predict_results,
         answer_top_ks=tuple(int(k) for k in eval_cfg.answer_top_ks),
-        metrics_profile=metrics_profile,
+        report_profile=report_profile,
         invalid_start_reason=INVALID_START_REASON,
     )
     return {**metrics, **diagnostics}
@@ -1559,7 +1559,7 @@ def summarize_predict_results_from_jsonl(
     *,
     predict_results_path: str | Path,
     eval_cfg: SearchEvalConfig,
-    metrics_profile: str,
+    report_profile: str,
 ) -> dict[str, float]:
     if not jsonl_has_records(predict_results_path):
         return {}
@@ -1572,7 +1572,7 @@ def summarize_predict_results_from_jsonl(
                 accumulator=accumulator,
                 eval_cfg=eval_cfg,
                 predict_results=batch_results,
-                metrics_profile=metrics_profile,
+                report_profile=report_profile,
             )
             batch_results.clear()
     if batch_results:
@@ -1580,7 +1580,7 @@ def summarize_predict_results_from_jsonl(
             accumulator=accumulator,
             eval_cfg=eval_cfg,
             predict_results=batch_results,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
         )
     return finalize_predict_metrics_accumulator(accumulator=accumulator)
 
@@ -1611,13 +1611,13 @@ class AnswerReachabilityRuntime(BaseMetricRuntime):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> MetricEvaluationOutput:
         return self.evaluator.evaluate_batch(
             batch=batch,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
             include_answer_support=include_answer_support,
             on_invalid_start=on_invalid_start,
         )
@@ -1626,13 +1626,13 @@ class AnswerReachabilityRuntime(BaseMetricRuntime):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> list[Any]:
         return self.evaluator.predict_batch(
             batch=batch,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
             include_answer_support=include_answer_support,
             on_invalid_start=on_invalid_start,
         )
@@ -1646,12 +1646,12 @@ class AnswerReachabilityRuntime(BaseMetricRuntime):
         self,
         *,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
         return summarize_predict_results(
             eval_cfg=self.eval_cfg,
             predict_results=predict_results,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
         )
 
     def write_prediction_artifacts(
@@ -1685,9 +1685,9 @@ class AnswerReachabilityRuntime(BaseMetricRuntime):
     def initialize_predict_metrics_accumulator(
         self,
         *,
-        metrics_profile: str,
+        report_profile: str,
     ) -> SupportWindowMetricsAccumulator:
-        del metrics_profile
+        del report_profile
         return initialize_predict_metrics_accumulator()
 
     def update_predict_metrics_accumulator(
@@ -1695,32 +1695,32 @@ class AnswerReachabilityRuntime(BaseMetricRuntime):
         *,
         accumulator: SupportWindowMetricsAccumulator,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> None:
         update_predict_metrics_accumulator(
             accumulator=accumulator,
             eval_cfg=self.eval_cfg,
             predict_results=predict_results,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
         )
 
     def finalize_predict_metrics_accumulator(
         self,
         *,
         accumulator: SupportWindowMetricsAccumulator,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
-        del metrics_profile
+        del report_profile
         return finalize_predict_metrics_accumulator(accumulator=accumulator)
 
     def summarize_predict_epoch_from_jsonl(
         self,
         *,
         predict_results_path: str | Path,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]:
         return summarize_predict_results_from_jsonl(
             predict_results_path=predict_results_path,
             eval_cfg=self.eval_cfg,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
         )

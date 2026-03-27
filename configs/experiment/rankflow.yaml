@@ -21,6 +21,10 @@ defaults:
 
 model:
   eval_cfg:
-    # Final eval uses the full support-window search budget.
-    max_expansions: 500000
-    max_frontier_size: 65536
+    report_profile: full
+    answer_posterior_backend: flow_frontier
+    # Final eval uses the same canonical frontier posterior as checkpoint
+    # selection, but emits the full support-window report surface.
+    flow_frontier:
+      max_expansions: 500000
+      max_frontier_size: 65536

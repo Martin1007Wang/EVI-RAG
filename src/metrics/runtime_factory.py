@@ -39,7 +39,7 @@ def _build_answer_backend(
     horizon_cfg: HorizonConfig,
     eval_cfg: SearchEvalConfig,
 ) -> FlowFrontierBackend | MonteCarloBackend:
-    if eval_cfg.support_search_method == "flow_frontier":
+    if eval_cfg.answer_posterior_backend == "flow_frontier":
         return FlowFrontierBackend(
             max_steps=int(horizon_cfg.max_steps),
             eval_cfg=eval_cfg,

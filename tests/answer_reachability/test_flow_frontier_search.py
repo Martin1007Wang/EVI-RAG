@@ -11,7 +11,7 @@ from src.metrics.search_backends import (
     FlowFrontierBackend,
     run_flow_frontier_search,
 )
-from src.models.configs import HorizonConfig, SearchEvalConfig
+from src.models.configs import FlowFrontierEvalConfig, HorizonConfig, SearchEvalConfig
 from src.models.gflownet import (
     BaseSearchPolicy,
     ForwardActionDistribution,
@@ -185,12 +185,14 @@ def test_flow_frontier_support_search_returns_exact_window() -> None:
     search = FlowFrontierBackend(
         max_steps=2,
         eval_cfg=SearchEvalConfig(
-            support_search_method="flow_frontier",
-            flow_prune_epsilon=0.0,
+            answer_posterior_backend="flow_frontier",
             answer_mass_threshold=0.55,
             support_mass_threshold=1.0,
-            max_expansions=32,
-            max_frontier_size=32,
+            flow_frontier=FlowFrontierEvalConfig(
+                prune_epsilon=0.0,
+                max_expansions=32,
+                max_frontier_size=32,
+            ),
         ),
     )
 
@@ -198,7 +200,7 @@ def test_flow_frontier_support_search_returns_exact_window() -> None:
         batch=batch,
         policy=policy,
         prepared_batch=prepared_batch,
-        metrics_profile="full",
+        report_profile="full",
         include_answer_support=True,
     )
 
@@ -227,10 +229,12 @@ def test_flow_frontier_prunes_low_flow_branch_with_global_mass_bound() -> None:
         prepared_batch=prepared_batch,
         max_steps=2,
         eval_cfg=SearchEvalConfig(
-            support_search_method="flow_frontier",
-            flow_prune_epsilon=0.5,
-            max_expansions=32,
-            max_frontier_size=32,
+            answer_posterior_backend="flow_frontier",
+            flow_frontier=FlowFrontierEvalConfig(
+                prune_epsilon=0.5,
+                max_expansions=32,
+                max_frontier_size=32,
+            ),
         ),
         start_distribution=start_distribution,
     )

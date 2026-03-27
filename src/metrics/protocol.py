@@ -39,7 +39,7 @@ class MetricRuntimeProtocol(Protocol):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> MetricEvaluationOutput: ...
@@ -48,7 +48,7 @@ class MetricRuntimeProtocol(Protocol):
         self,
         *,
         batch: TrajectoryBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> list[Any]: ...
@@ -63,7 +63,7 @@ class MetricRuntimeProtocol(Protocol):
         self,
         *,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]: ...
 
     def write_prediction_artifacts(
@@ -84,7 +84,7 @@ class MetricRuntimeProtocol(Protocol):
     def initialize_predict_metrics_accumulator(
         self,
         *,
-        metrics_profile: str,
+        report_profile: str,
     ) -> Any: ...
 
     def update_predict_metrics_accumulator(
@@ -92,21 +92,21 @@ class MetricRuntimeProtocol(Protocol):
         *,
         accumulator: Any,
         predict_results: list[Any],
-        metrics_profile: str,
+        report_profile: str,
     ) -> None: ...
 
     def finalize_predict_metrics_accumulator(
         self,
         *,
         accumulator: Any,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]: ...
 
     def summarize_predict_epoch_from_jsonl(
         self,
         *,
         predict_results_path: str | Path,
-        metrics_profile: str,
+        report_profile: str,
     ) -> dict[str, float]: ...
 
     def write_prediction_artifacts_from_jsonl(

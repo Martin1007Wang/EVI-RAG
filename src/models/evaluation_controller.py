@@ -148,11 +148,11 @@ class MetricRuntimeController:
         self,
         *,
         metric_runtime: MetricRuntimeProtocol,
-        metrics_profile: str,
+        report_profile: str,
         on_invalid_start: Callable[[TrajectoryBatch], None] | None = None,
     ) -> None:
         self.metric_runtime = metric_runtime
-        self.metrics_profile = str(metrics_profile)
+        self.report_profile = str(report_profile)
         self.on_invalid_start = on_invalid_start
         self._prediction_state = PredictionEpochState()
 
@@ -172,7 +172,7 @@ class MetricRuntimeController:
     ) -> MetricEvaluationOutput:
         return self.metric_runtime.evaluate_batch(
             batch=batch,
-            metrics_profile=self.metrics_profile,
+            report_profile=self.report_profile,
             include_answer_support=include_answer_support,
             on_invalid_start=self.on_invalid_start,
         )
@@ -228,8 +228,8 @@ class MetricRuntimeController:
             list[PredictionResult],
             self.metric_runtime.predict_batch(
                 batch=batch,
-                metrics_profile=self.metrics_profile,
-                include_answer_support=self.metrics_profile != "rank_only",
+                report_profile=self.report_profile,
+                include_answer_support=self.report_profile != "rank_only",
                 on_invalid_start=self.on_invalid_start,
             ),
         )
@@ -245,13 +245,13 @@ class MetricRuntimeController:
         if self._prediction_state.metrics_accumulator is None:
             self._prediction_state.metrics_accumulator = (
                 self.metric_runtime.initialize_predict_metrics_accumulator(
-                    metrics_profile=self.metrics_profile
+                    report_profile=self.report_profile
                 )
             )
         self.metric_runtime.update_predict_metrics_accumulator(
             accumulator=self._prediction_state.metrics_accumulator,
             predict_results=cast(list[Any], outputs),
-            metrics_profile=self.metrics_profile,
+            report_profile=self.report_profile,
         )
         self._prediction_state.record_batch(
             results=list(outputs),
@@ -266,18 +266,18 @@ class MetricRuntimeController:
         if self._prediction_state.metrics_accumulator is not None:
             metrics = self.metric_runtime.finalize_predict_metrics_accumulator(
                 accumulator=self._prediction_state.metrics_accumulator,
-                metrics_profile=self.metrics_profile,
+                report_profile=self.report_profile,
             )
         elif self._prediction_state.has_file_cache():
             assert self._prediction_state.results_jsonl_path is not None
             metrics = self.metric_runtime.summarize_predict_epoch_from_jsonl(
                 predict_results_path=self._prediction_state.results_jsonl_path,
-                metrics_profile=self.metrics_profile,
+                report_profile=self.report_profile,
             )
         else:
             metrics = self.metric_runtime.summarize_predict_epoch(
                 predict_results=self._prediction_state.get_results(),
-                metrics_profile=self.metrics_profile,
+                report_profile=self.report_profile,
             )
         self._prediction_state.finalize(cast(dict[str, float], metrics))
 

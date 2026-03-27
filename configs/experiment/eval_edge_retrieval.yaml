@@ -15,8 +15,8 @@ defaults:
 model:
   eval_cfg:
     task: edge_retrieval
-    metrics_profile: rank_only
-    support_search_method: monte_carlo
+    report_profile: rank_only
+    answer_posterior_backend: monte_carlo
 
 run:
   artifact_subdir: eval_edge_retrieval

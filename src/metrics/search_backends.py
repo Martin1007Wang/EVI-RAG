@@ -323,7 +323,7 @@ def _build_start_frontier(
     normalized_mass = torch.exp(
         context.start_log_flows.to(dtype=torch.float64) - float(context.graph_log_z)
     )
-    prune_threshold = float(eval_cfg.flow_prune_epsilon)
+    prune_threshold = float(eval_cfg.flow_frontier.prune_epsilon)
     keep_mask = normalized_mass > 0.0
     if prune_threshold > 0.0:
         keep_mask = keep_mask & (normalized_mass >= prune_threshold)
@@ -413,8 +413,8 @@ def _build_child_frontier(
         child_log_state_flows.to(dtype=torch.float64) - float(context.graph_log_z)
     )
     keep_mask = normalized_mass > 0.0
-    if float(eval_cfg.flow_prune_epsilon) > 0.0:
-        keep_mask = keep_mask & (normalized_mass >= float(eval_cfg.flow_prune_epsilon))
+    if float(eval_cfg.flow_frontier.prune_epsilon) > 0.0:
+        keep_mask = keep_mask & (normalized_mass >= float(eval_cfg.flow_frontier.prune_epsilon))
     pruned_mass = float(normalized_mass[~keep_mask].sum().item())
     if not bool(keep_mask.any().item()):
         return None, pruned_mass
@@ -476,7 +476,7 @@ def run_flow_frontier_search(
 
     while frontier is not None and frontier.size() > 0:
         frontier_size = frontier.size()
-        if frontier_size > int(eval_cfg.max_frontier_size):
+        if frontier_size > int(eval_cfg.flow_frontier.max_frontier_size):
             remaining_mass_upper += _sum_normalized_flow_mass(
                 log_state_flows=frontier.log_state_flows,
                 graph_log_z=context.graph_log_z,
@@ -484,7 +484,7 @@ def run_flow_frontier_search(
             coverage_certified = False
             stop_reason = "flow_frontier_frontier_budget_exhausted"
             break
-        if expanded_state_count + frontier_size > int(eval_cfg.max_expansions):
+        if expanded_state_count + frontier_size > int(eval_cfg.flow_frontier.max_expansions):
             remaining_mass_upper += _sum_normalized_flow_mass(
                 log_state_flows=frontier.log_state_flows,
                 graph_log_z=context.graph_log_z,
@@ -642,7 +642,7 @@ class FlowFrontierBackend(ReachabilityBackendProtocol):
         *,
         batch: TrajectoryBatch,
         summary: FlowFrontierSearchSummary,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
     ) -> SupportWindowResult:
         discovered_total_mass = float(summary.analysis.answer_probs.sum().item())
@@ -661,11 +661,11 @@ class FlowFrontierBackend(ReachabilityBackendProtocol):
             remaining_mass_upper=float(summary.remaining_mass_upper),
             stop_reason=str(summary.stop_reason),
             coverage_certified=bool(summary.coverage_certified),
-            covered_mass_ci_low=0.0 if metrics_profile == "rank_only" else None,
-            covered_mass_ci_high=0.0 if metrics_profile == "rank_only" else None,
+            covered_mass_ci_low=0.0 if report_profile == "rank_only" else None,
+            covered_mass_ci_high=0.0 if report_profile == "rank_only" else None,
             ci_confidence_level=1.0,
         )
-        if metrics_profile == "rank_only":
+        if report_profile == "rank_only":
             return build_rank_only_result(
                 batch=batch,
                 analysis=summary.analysis,
@@ -713,7 +713,7 @@ class FlowFrontierBackend(ReachabilityBackendProtocol):
         batch: TrajectoryBatch,
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool = True,
     ) -> SupportWindowResult:
         start_distribution = policy.compute_root_action_distribution(prepared_batch)
@@ -729,7 +729,7 @@ class FlowFrontierBackend(ReachabilityBackendProtocol):
         return self._build_graph_result(
             batch=batch,
             summary=summary,
-            metrics_profile=metrics_profile,
+            report_profile=report_profile,
             include_answer_support=include_answer_support,
         )
 
@@ -739,7 +739,7 @@ class FlowFrontierBackend(ReachabilityBackendProtocol):
         batch: TrajectoryBatch,
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool = True,
     ) -> list[SupportWindowResult]:
         start_distribution = policy.compute_root_action_distribution(prepared_batch)
@@ -759,7 +759,7 @@ class FlowFrontierBackend(ReachabilityBackendProtocol):
                 self._build_graph_result(
                     batch=graph_batch,
                     summary=summary,
-                    metrics_profile=metrics_profile,
+                    report_profile=report_profile,
                     include_answer_support=include_answer_support,
                 )
             )
@@ -1378,7 +1378,7 @@ def _build_support_window_result_from_summary(
         remaining_mass_upper=1.0,
         stop_reason="monte_carlo_budget_exhausted",
         coverage_certified=False,
-        ci_confidence_level=float(eval_cfg.monte_carlo_confidence),
+        ci_confidence_level=float(eval_cfg.monte_carlo.confidence),
     )
     result = build_window_result(
         batch=batch,
@@ -1410,7 +1410,7 @@ def _build_support_window_result_from_summary(
     covered_ci_low, covered_ci_high = _wilson_interval_scalar(
         count=selected_count,
         total=rollout_summary.total_rollouts,
-        confidence=float(eval_cfg.monte_carlo_confidence),
+        confidence=float(eval_cfg.monte_carlo.confidence),
     )
     return replace(
         result,
@@ -1418,7 +1418,7 @@ def _build_support_window_result_from_summary(
         covered_mass_ci_high=covered_ci_high,
         gold_answer_mass_ci_low=analysis.gold_answer_mass_ci_low,
         gold_answer_mass_ci_high=analysis.gold_answer_mass_ci_high,
-        ci_confidence_level=float(eval_cfg.monte_carlo_confidence),
+        ci_confidence_level=float(eval_cfg.monte_carlo.confidence),
         remaining_mass_upper=max(1.0 - covered_ci_low, 0.0),
     )
 
@@ -1437,7 +1437,7 @@ def build_batched_monte_carlo_window_results(
     analyses = build_batched_monte_carlo_analyses(
         batch=batch,
         rollout_summary=rollout_summary,
-        confidence=float(eval_cfg.monte_carlo_confidence),
+        confidence=float(eval_cfg.monte_carlo.confidence),
     )
     return [
         _build_support_window_result_from_summary(
@@ -1472,7 +1472,7 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
             policy=policy,
             prepared_batch=prepared_batch,
             max_steps=self.max_steps,
-            num_rollouts=int(self.eval_cfg.monte_carlo_rollouts),
+            num_rollouts=int(self.eval_cfg.monte_carlo.rollouts),
         )
         return build_monte_carlo_edge_support_analysis(
             batch=batch,
@@ -1491,7 +1491,7 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
             policy=policy,
             prepared_batch=prepared_batch,
             max_steps=self.max_steps,
-            num_rollouts=int(self.eval_cfg.monte_carlo_rollouts),
+            num_rollouts=int(self.eval_cfg.monte_carlo.rollouts),
         )
         return build_batched_monte_carlo_edge_support_analyses(
             batch=batch,
@@ -1504,7 +1504,7 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
         batch: TrajectoryBatch,
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
     ) -> SupportWindowResult:
         rollout_summary = rollout_search_policy(
@@ -1512,14 +1512,14 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
             policy=policy,
             prepared_batch=prepared_batch,
             max_steps=self.max_steps,
-            num_rollouts=int(self.eval_cfg.monte_carlo_rollouts),
+            num_rollouts=int(self.eval_cfg.monte_carlo.rollouts),
         )
         analysis = build_monte_carlo_analysis(
             batch=batch,
             rollout_summary=rollout_summary,
-            confidence=float(self.eval_cfg.monte_carlo_confidence),
+            confidence=float(self.eval_cfg.monte_carlo.confidence),
         )
-        if metrics_profile == "rank_only":
+        if report_profile == "rank_only":
             return build_rank_only_result(
                 batch=batch,
                 analysis=analysis,
@@ -1530,7 +1530,7 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
                     remaining_mass_upper=1.0,
                     stop_reason="rank_only_monte_carlo",
                     coverage_certified=False,
-                    ci_confidence_level=float(self.eval_cfg.monte_carlo_confidence),
+                    ci_confidence_level=float(self.eval_cfg.monte_carlo.confidence),
                 ),
                 answer_mass_threshold=float(self.eval_cfg.answer_mass_threshold),
                 support_mass_threshold=float(self.eval_cfg.support_mass_threshold),
@@ -1551,7 +1551,7 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
         batch: TrajectoryBatch,
         policy: SearchPolicyProtocol,
         prepared_batch: PreparedSearchBatch,
-        metrics_profile: str,
+        report_profile: str,
         include_answer_support: bool,
     ) -> list[SupportWindowResult]:
         rollout_summary = rollout_search_policy(
@@ -1559,13 +1559,13 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
             policy=policy,
             prepared_batch=prepared_batch,
             max_steps=self.max_steps,
-            num_rollouts=int(self.eval_cfg.monte_carlo_rollouts),
+            num_rollouts=int(self.eval_cfg.monte_carlo.rollouts),
         )
-        if metrics_profile == "rank_only":
+        if report_profile == "rank_only":
             analyses = build_batched_monte_carlo_analyses(
                 batch=batch,
                 rollout_summary=rollout_summary,
-                confidence=float(self.eval_cfg.monte_carlo_confidence),
+                confidence=float(self.eval_cfg.monte_carlo.confidence),
             )
             return [
                 build_rank_only_result(
@@ -1578,7 +1578,7 @@ class MonteCarloBackend(ReachabilityBackendProtocol):
                         remaining_mass_upper=1.0,
                         stop_reason="rank_only_monte_carlo",
                         coverage_certified=False,
-                        ci_confidence_level=float(self.eval_cfg.monte_carlo_confidence),
+                        ci_confidence_level=float(self.eval_cfg.monte_carlo.confidence),
                     ),
                     answer_mass_threshold=float(self.eval_cfg.answer_mass_threshold),
                     support_mass_threshold=float(self.eval_cfg.support_mass_threshold),
