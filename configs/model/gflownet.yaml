@@ -39,14 +39,9 @@ action_prior_cfg:
 
 policy_cfg:
   _target_: src.models.configs.policy.PolicyConfig
+  state_mode: subgraph
   backbone:
     _target_: src.models.configs.backbone.BackboneConfig
-  prefix_controller:
-    _target_: src.models.configs.policy.PrefixControllerConfig
-  visited_set_encoder:
-    _target_: src.models.configs.policy.VisitedSetEncoderConfig
-  prefix_memory:
-    _target_: src.models.configs.policy.PrefixMemoryConfig
   state_score_head:
     _target_: src.models.configs.policy.StateScoreHeadConfig
   transition_head:

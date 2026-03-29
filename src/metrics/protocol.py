@@ -6,8 +6,6 @@ from typing import Any, Callable, Protocol
 
 from src.graph import TrajectoryBatch
 from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEvalConfig
-from src.models.gflownet.prefix_sampler import TrajectorySamplerProtocol
-from src.models.gflownet.prefix_state import SearchPolicyProtocol
 
 from .prediction_io import PredictionCodecProtocol
 
@@ -32,7 +30,7 @@ class MetricRuntimeProtocol(Protocol):
     @property
     def prediction_codec(self) -> PredictionCodecProtocol: ...
 
-    sampler: TrajectorySamplerProtocol | None
+    sampler: Any
     search: Any
 
     def evaluate_batch(
@@ -132,7 +130,7 @@ class MetricRuntimeFactoryProtocol(Protocol):
         horizon_cfg: HorizonConfig,
         training_cfg: GFlowNetTrainingConfig,
         eval_cfg: SearchEvalConfig,
-        policy: SearchPolicyProtocol,
+        policy: Any,
     ) -> MetricRuntimeProtocol: ...
 
 

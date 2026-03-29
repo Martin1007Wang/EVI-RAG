@@ -13,7 +13,6 @@ from src.metrics.prediction_io import (
     jsonl_has_records,
 )
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeProtocol
-from src.models.gflownet.prefix_sampler import TrajectorySamplerProtocol
 
 
 PredictionResult = Any
@@ -157,7 +156,7 @@ class MetricRuntimeController:
         self._prediction_state = PredictionEpochState()
 
     @property
-    def sampler(self) -> TrajectorySamplerProtocol | None:
+    def sampler(self) -> Any:
         return self.metric_runtime.sampler
 
     @property

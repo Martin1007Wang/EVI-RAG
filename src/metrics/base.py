@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.graph import TrajectoryBatch
-from src.models.gflownet.prefix_sampler import TrajectorySamplerProtocol
 
 from .prediction_io import (
     PredictionCodecProtocol,
@@ -17,7 +16,7 @@ from .protocol import MetricEvaluationOutput
 
 class BaseMetricRuntime(ABC):
     _prediction_codec: PredictionCodecProtocol
-    sampler: TrajectorySamplerProtocol | None = None
+    sampler: Any = None
     search: Any = None
 
     @property

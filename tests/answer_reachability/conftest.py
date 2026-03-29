@@ -2,17 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.models.components import (
-    EmbeddingBackbone,
-    NodeFlowHead,
-)
-from src.models.configs import (
-    BackboneConfig,
-    PolicyConfig,
-    StateScoreHeadConfig,
-)
 from src.graph import TrajectoryBatch
-from src.models.gflownet.prefix_policy import BaseSearchPolicy
 
 
 def make_batch_from_graph(
@@ -87,43 +77,4 @@ def make_dead_end_batch() -> TrajectoryBatch:
         answer_entity_ids=torch.empty((0,), dtype=torch.long),
         node_entity_ids=torch.tensor([100], dtype=torch.long),
         sample_id="dead-end",
-    )
-
-
-def make_policy_config() -> PolicyConfig:
-    return PolicyConfig(
-        backbone=BackboneConfig(
-            embedding_dim=8,
-            hidden_dim=8,
-            use_adapter=True,
-            adapter_dim=4,
-            adapter_dropout=0.0,
-        ),
-        state_score_head=StateScoreHeadConfig(hidden_dim=8, num_layers=2, dropout=0.0),
-    )
-
-
-def make_policy(*, max_steps: int = 2) -> BaseSearchPolicy:
-    cfg = make_policy_config()
-    graph_hidden_dim = int(cfg.backbone.hidden_dim)
-    backbone = EmbeddingBackbone(cfg.backbone)
-    state_score_head = NodeFlowHead(
-        node_dim=graph_hidden_dim,
-        question_dim=graph_hidden_dim,
-        hidden_dim=int(cfg.state_score_head.hidden_dim),
-        num_layers=int(cfg.state_score_head.num_layers),
-        dropout=float(cfg.state_score_head.dropout),
-        conditioning=str(cfg.state_score_head.conditioning),
-    )
-    return BaseSearchPolicy(
-        cfg,
-        max_steps=max_steps,
-        backbone=backbone,
-        state_score_head=state_score_head,
-        transition_policy_head=None,
-        step_log_penalty=0.0,
-        non_gold_terminal_log_reward=-3.0,
-        answer_stop_log_reward_bonus=0.0,
-        answer_quotient_allocate_stop_mass=False,
-        answer_quotient_gold_reward_mode="shared",
     )

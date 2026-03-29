@@ -23,32 +23,24 @@ from .gflownet import (
     TransitionBiasScheduleConfig,
 )
 from .policy import (
-    PATH_PREFIX_STATE_MODE,
-    PrefixMemoryConfig,
     PolicyConfig,
-    PrefixControllerConfig,
     StateScoreHeadConfig,
     SUBGRAPH_STATE_MODE,
     SubgraphActionHeadConfig,
     SubgraphStateEncoderConfig,
     TransitionHeadConfig,
-    VisitedSetEncoderConfig,
 )
 from .training import OptimizerConfig, SchedulerConfig
 
 
 __all__ = [
     "PolicyConfig",
-    "PATH_PREFIX_STATE_MODE",
     "SUBGRAPH_STATE_MODE",
     "BackboneConfig",
-    "PrefixMemoryConfig",
-    "PrefixControllerConfig",
     "StateScoreHeadConfig",
     "SubgraphActionHeadConfig",
     "SubgraphStateEncoderConfig",
     "TransitionHeadConfig",
-    "VisitedSetEncoderConfig",
     "ActionPriorConfig",
     "ActionPriorScheduleConfig",
     "AnswerQuotientConfig",

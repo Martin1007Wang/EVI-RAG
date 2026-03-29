@@ -19,7 +19,7 @@ can explore aggressively early and return toward the target policy late.
 - legacy `answer_reachability` run aliases were removed
 - eval answer-task aliases were removed from the public config schema
 - deprecated Python compatibility wrappers were removed; canonical imports now
-  live under `prefix_*`, `subgraph.*`, and
+  live under `src.models.gflownet.subgraph.*` and
   `src.metrics.subgraph_answer_search_runtime`
 
 ### Removed redundant config knobs

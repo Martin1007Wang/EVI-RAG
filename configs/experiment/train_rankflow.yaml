@@ -58,13 +58,6 @@ model:
     answer_distance_weight: 0.5
   policy_cfg:
     state_mode: subgraph
-    prefix_memory:
-      enabled: false
-      capacity: 16384
-      min_entries: 256
-      top_k: 8
-      temperature: 0.35
-      min_prefix_steps: 0
     transition_head:
       enabled: false
   training_cfg:

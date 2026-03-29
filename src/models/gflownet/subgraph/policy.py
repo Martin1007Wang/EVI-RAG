@@ -187,18 +187,6 @@ class SubgraphPolicy(nn.Module):
         )
         init_linear_xavier(self.stop_head)
 
-    @property
-    def prefix_memory_size(self) -> int:
-        return 0
-
-    @property
-    def prefix_memory_ready(self) -> bool:
-        return False
-
-    def record_sampled_prefix_experience(self, *args: Any, **kwargs: Any) -> int:
-        del args, kwargs
-        return 0
-
     def prepare_batch(self, batch: Any) -> SubgraphPreparedBatch:
         batch.require_raw_features()
         return self.env.prepare_batch(batch=batch, backbone=self.backbone)

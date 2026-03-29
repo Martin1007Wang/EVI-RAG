@@ -1,10 +1,8 @@
 # RankFlow / GFlowNet Semantics
 
-This document describes the current algorithmic contract.
+This document describes the current subgraph-growth RankFlow contract.
 
-It intentionally avoids copying descriptive numeric values from experiment
-bundles. If you need the canonical runnable settings, read these files
-directly:
+If you need the runnable defaults, read these files directly:
 
 - `configs/model/gflownet.yaml`
 - `configs/experiment/train_rankflow.yaml`
@@ -12,293 +10,122 @@ directly:
 
 ## 1. Mainline in one sentence
 
-The current RankFlow stack trains a strict successor-flow GFlowNet with
-MS-SubTB, samples trajectories from a proposal policy that may differ from the
-target policy, and treats proposal guidance plus replay as coverage controls
-rather than as an importance-corrected off-policy target. Canonical training
-anneals those coverage controls toward zero late in training so the sampler
-returns near the target policy.
+RankFlow now trains a subgraph-growth GFlowNet: each state is a partial subgraph,
+each action either adds one frontier edge or emits an explicit `STOP`, and the
+loss is a subgraph-space SubTB objective.
 
 ## 2. State space
 
-The modeled search space is the prefix tree of legal graph-walk prefixes.
+The canonical state is `SubgraphState(edge_ids)`.
 
-- The abstract root boundary is not materialized as an ordinary `SearchState`.
-- Root actions choose a start node and are represented by
-  `RootActionDistribution`.
-- Non-root states are explicit prefix states stored in `SearchState`.
-- Same node and same step with different history are different states.
-- `STOP` is an explicit action and absorbing prefixes store it directly.
+- The stored state identity is the tuple of selected edge ids.
+- The selected node set is derived from anchors plus endpoints of selected edges.
+- The initial state contains no selected edges.
+- Question anchors are treated as already-present nodes in that empty state.
 
-This split matters because root actions are query-conditioned start selections,
-while non-root actions are graph transitions plus `STOP`.
+The environment materializes derived semantics through `SubgraphAnalysis`:
 
-### Legal-prefix contract
+- `selected_node_ids`
+- `reachability_bits`
+- `component_labels`
+- `anchor_component_count`
+- `num_selected_edges`
 
-The legal forward support is defined by hard environment constraints:
+These derived fields drive legality, rewards, and search ranking, but the state
+identity itself is still the explicit selected-edge set.
 
-- graph moves must stay within `max_steps`
-- graph moves must respect entity-level no-repeat
-- repeated-entity moves are outside the forward action support
+## 3. Forward actions
 
-So the implementation is not "all graph walks, then runtime masking as reward
-shaping." Instead, the legal state space itself is the constrained prefix tree.
-Exact prefix history must remain part of the state definition because the
-entity-level no-repeat rule is not Markov on `(current_node, num_steps)` alone.
+Each active state exposes two action families:
 
-## 3. Target policy and target measure
+- `add_edge(edge_id)` for legal frontier edges
+- `stop()` for explicit termination
 
-### Root boundary
+An edge is legal only when it extends the currently selected subgraph under the
+subgraph environment rules. Evaluation and training both use this same explicit
+action space; there is no longer a separate legacy prefix/path state machine.
 
-For each candidate start node, the target branch mass is
+## 4. Rewards
 
-`rho_start([e_0]) + log F([e_0])`
+The environment defines two reward pieces.
 
-and the root flow is the segment-wise `logsumexp` over those branch masses:
+- expand reward: shaped per added edge via `compute_expand_log_reward`
+- stop reward: computed by `compute_stop_log_reward`
 
-`log F(s_root) = logsumexp_{[e_0]} (rho_start([e_0]) + log F([e_0]))`
+The stop reward is driven by the current subgraph semantics, especially:
 
-The target root action distribution is the normalized decomposition of that root
-mass.
+- how many answer entities are covered
+- whether the anchor components have merged
+- the configured subgraph reward weights in `training.subgraph_reward`
 
-### Non-root move actions
+## 5. Policy and proposal bias
 
-For a graph move `a_t: s_t -> s_{t+1}`, the target branch log-mass is
+`SubgraphPolicy` produces target logits for the legal action set and also a
+proposal-only bias used during rollout sampling.
 
-`rho_move(s_t, a_t) + log F(s_{t+1})`
+The target distribution comes from `compute_target_log_probs(...)`.
 
-where `rho_move` contains the configured step-level reward terms.
+The rollout sampler may add proposal bias from `training.subgraph_proposal`:
 
-Hard legality is not encoded as a finite reward penalty. In particular,
-entity-level no-repeat is not converted into a large negative reward inside
-`rho_move`; illegal repeated-entity moves are removed from support before
-normalization.
+- answer-distance progress
+- question similarity
+- component-merge bonus
+- stop-hit bias
 
-### STOP action
+These terms change coverage during sampling but do not replace the target-policy
+SubTB algebra.
 
-For `STOP`, the target branch mass is anchored by the terminal reward semantics.
-Depending on the answer-quotient settings, this can use the direct terminal
-reward or an answer-sink reward together with an in-sink allocation factor.
+## 6. Training objective
 
-### Reward decomposition
+Training uses `SubgraphSubTrajectoryBalanceLoss` over explicit action sequences.
 
-The target trajectory measure is always described by two pieces:
+For each rollout, the sampler records:
 
-- `terminal_log_rewards`: terminal anchor
-- `log_reward_steps`: per-step reward increments
+- state log flows
+- chosen action log-probabilities
+- per-action log rewards
+- explicit stop step
+- terminal answer counts and component counts
 
-The public knobs that change the target measure live under
-`model.training_cfg`.
+The loss then evaluates SubTB residuals over sub-trajectories in this subgraph
+action sequence.
 
-## 4. Target-side shaping
+## 7. Evaluation
 
-The current target-side shaping mechanism is answer-distance potential shaping.
+Evaluation is subgraph-only.
 
-- The start action gets a root reward equal to the chosen start state's
-  potential.
-- Each move step gets the potential difference
-  `Phi(s_{t+1}) - Phi(s_t)`.
+- runtime factory builds `SubgraphAnswerSearchRuntime`
+- runtime uses `beam_search_subgraphs(...)`
+- terminal subgraphs are converted to answer entities through
+  `resolve_subgraph_answer_entities(...)`
 
-When answer-distance shaping is active, successful answer-reaching trajectories
-keep the same total reward, while failed trajectories are penalized according to
-remaining answer distance.
+The canonical evaluation task is `answer_search`.
 
-This is a target-measure change. It is part of the algebra seen by SubTB.
+## 8. Unsupported legacy features
 
-No-repeat is intentionally not part of this shaping family. Converting
-entity-level no-repeat into a finite reward penalty would enlarge the fitted
-support and therefore change the target distribution rather than merely change
-implementation details.
+The old prefix-tree stack has been removed. Current code intentionally rejects:
 
-## 5. Proposal policy
+- `policy.state_mode != subgraph`
+- success replay
+- answer quotient
+- direct entity ranking
+- legacy potential-reward shaping
+- non-`answer_search` GFlowNet evaluation runtimes
 
-The sampler may use a proposal policy `Q` that differs from the target policy
-`P_F`.
+## 9. Reading order in code
 
-### Root proposals
-
-Root proposals start from the target root branch masses, detach that target
-base, and may add proposal priors from `model.action_prior_cfg`.
-
-### Edge proposals
-
-For non-root graph actions, the live proposal logits are built from three terms:
-
-`logits_Q = stopgrad(logits_F) + gamma_t * b_transition + alpha_t * b_prior`
-
-where:
-
-- `logits_F` are the strict successor-flow target branch masses
-- `b_transition` is the learned proposal-only transition head bias from
-  `model.policy_cfg.transition_head`
-- `b_prior` is the heuristic proposal bias from `model.action_prior_cfg`
-- `gamma_t` is the training-time transition-bias scale from
-  `model.training_cfg.transition_bias_schedule`
-- `alpha_t` is the training-time proposal-prior scale from
-  `model.training_cfg.action_prior_schedule`
-
-The important boundary is:
-
-- `stopgrad(logits_F)` makes the proposal branch's target base explicitly
-  coverage-only
-- `b_transition` changes proposal sampling only
-- `b_prior` changes proposal sampling only
-- neither term enters the target-policy residual algebra
-
-Evaluation and prediction stay on target-policy search.
-
-## 6. Proposal-side guidance terms
-
-`model.action_prior_cfg` controls proposal-only guidance components.
-
-The config is now component-based rather than family-labeled. In practice there
-are three groups of proposal terms:
-
-- root / edge / stop strength knobs (`root_beta`, `edge_beta`, `stop_beta`)
-- static feature weights (topology, node embedding, relation embedding,
-  target-node, progress)
-- optional dynamic guidance terms (intent alignment, shortest-path bonus,
-  answer-distance progress)
-
-Two answer-distance mechanisms now exist and must not be conflated:
-
-- `model.action_prior_cfg.answer_distance_weight` is proposal-only guidance
-- `model.training_cfg.potential_reward.answer_distance_weight` changes the target
-  measure
-
-If you change the first one, you change which constraints are visited. If you
-change the second one, you change the target residuals themselves.
-
-## 7. Coverage-measure interpretation
-
-The implementation does not importance-reweight proposal-sampled trajectories
-back to a target-policy expectation.
-
-Instead, it minimizes SubTB residuals under the sampled coverage measure:
-
-`L_nu(theta) = E_{tau ~ nu} [sum_{c in C(tau)} w(c) * Delta_c(tau; theta)^2]`
-
-So proposal engineering changes coverage, not the definition of each residual.
-
-In the current refactor, the intended operating mode is not to leave those
-coverage distortions constant forever. Instead, the canonical schedules anneal
-proposal priors and transition bias toward zero so late-stage online rollouts
-approach the target policy even though early training still uses biased
-coverage for exploration.
-
-## 8. Replay
-
-Replay is treated as another coverage source.
-
-- Online rollouts come from the current proposal sampler.
-- Replay stores trajectory definitions, not frozen `log P_F` or `log F` tensors.
-- Replayed trajectories are rebuilt under the current parameters before SubTB is
-  evaluated.
-
-The resulting optimization view is a coverage mixture:
-
-`nu_mix = (1 - alpha_replay(t)) * nu_online + alpha_replay(t) * nu_replay`
-
-This is not a second objective and not an importance-correction layer.
-
-The refactor adds an explicit replay-mixture schedule under
-`model.training_cfg.replay_mix_schedule`, so replay can help with early
-coverage without remaining a permanent late-stage bias source.
-
-## 9. MS-SubTB objective
-
-The main objective is a multi-scale SubTrajectory Balance loss over three
-families of residuals.
-
-### Root residual
-
-`r_root = log F(s_root) + log P_F([e_0] | s_root) - rho_start([e_0]) - log F([e_0])`
-
-### Pairwise residual
-
-`r_pair(i, j) = f_i + sum_{t=i}^{j-1} p_t - sum_{t=i}^{j-1} rho_t - f_j`
-
-### Terminal residual
-
-`r_term(i) = f_i + sum_{t=i}^{T-1} p_t - (ell_term(tau) + sum_{t=i}^{T-1} rho_t)`
-
-The component weights and length weighting are controlled only by
-`model.training_cfg.subtb.*`.
-
-## 10. Config surface by role
-
-### Target measure
-
-These knobs change the target distribution fitted by SubTB:
-
-- `model.training_cfg.terminal_failure_log_reward`
-- `model.training_cfg.step_log_penalty`
-- `model.training_cfg.answer_stop_log_reward_bonus`
-- `model.training_cfg.potential_reward.*`
-- `model.training_cfg.answer_quotient.*`
-
-### Proposal sampler
-
-These knobs change sampling coverage without changing the target residual
-definitions:
-
-- `model.policy_cfg.transition_head.*`
-- `model.action_prior_cfg.*`
-- `model.training_cfg.action_prior_schedule.*`
-- `model.training_cfg.transition_bias_schedule.*`
-- `model.training_cfg.sampling_temperature`
-- `model.training_cfg.sampling_temperature_schedule.*`
-
-### Coverage supply
-
-These knobs change how much online and replay coverage is gathered:
-
-- `model.training_cfg.rollouts_per_graph`
-- `model.training_cfg.success_replay.*`
-- `model.training_cfg.replay_mix_schedule.*`
-
-### Evaluation
-
-These knobs change validation and final-eval search/reporting behavior:
-
-- canonical answer-ranking validation and final eval both use
-  `answer_posterior_backend: flow_frontier`
-- `monte_carlo` remains for edge retrieval and optional diagnostics, not for the
-  canonical answer-ranking checkpoint selector
-
-- `model.eval_cfg.report_profile`
-- `model.eval_cfg.answer_posterior_backend`
-- `model.eval_cfg.monte_carlo.*`
-- `model.eval_cfg.flow_frontier.*`
-
-## 11. Canonical source of truth
-
-To keep docs stable, this document explains mechanisms only.
-
-- `configs/model/gflownet.yaml` defines the minimal public schema surface.
-- `configs/experiment/train_rankflow.yaml` defines the canonical training bundle.
-- `configs/experiment/rankflow.yaml` defines the canonical final-eval bundle.
-
-If any numeric value in an older note disagrees with those files, treat the
-config files as the source of truth.
-
-## 12. Reading order in code
-
-If you want to audit the implementation from config to loss, read files in this
+If you want to audit the implementation from config to runtime, read in this
 order:
 
-1. `src/models/configs/gflownet_training.py`
+1. `configs/experiment/train_rankflow.yaml`
 2. `src/models/configs/policy.py`
-3. `src/models/configs/gflownet_eval.py`
-4. `src/models/gflownet/prefix_state.py`
-5. `src/models/gflownet/heuristics.py`
-6. `src/models/gflownet/prefix_policy.py`
-7. `src/models/gflownet/prefix_sampler.py`
-8. `src/models/gflownet/prefix_losses.py`
-9. `src/models/gflownet/subgraph/state.py`
-10. `src/models/gflownet/subgraph/mdp.py`
-11. `src/models/gflownet/subgraph/policy.py`
-12. `src/models/gflownet/subgraph/sampler.py`
-13. `src/models/gflownet/subgraph/search.py`
-14. `src/models/gflownet/subgraph/losses.py`
-15. `src/models/gflownet_module.py`
+3. `src/models/configs/gflownet_training.py`
+4. `src/models/gflownet/subgraph/state.py`
+5. `src/models/gflownet/subgraph/prepared_batch.py`
+6. `src/models/gflownet/subgraph/mdp.py`
+7. `src/models/gflownet/subgraph/policy.py`
+8. `src/models/gflownet/subgraph/sampler.py`
+9. `src/models/gflownet/subgraph/search.py`
+10. `src/models/gflownet/subgraph/losses.py`
+11. `src/metrics/subgraph_answer_search_runtime.py`
+12. `src/models/gflownet_module.py`

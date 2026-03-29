@@ -4,7 +4,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import torch
 from lightning import LightningModule
@@ -29,19 +29,8 @@ from .evaluation_controller import (
     PredictionLabel,
     PredictionResult,
 )
-from .gflownet.answer_supervision import compute_gold_entity_ranking_loss
-from .gflownet.prefix_losses import (
-    SubTrajectoryBalanceLoss,
-    SubTrajectoryBalanceLossOutput,
-)
-from .gflownet.prefix_sampler import (
-    ForwardTrajectoryGFNSampler,
-    TrajectoryGFNSampleBatch,
-)
-from .gflownet.replay import SuccessReplayBuffer
 from .gflownet.schedules import (
     ActionPriorScheduler,
-    ReplayMixScheduler,
     SamplingTemperatureScheduler,
     TrainingScheduleContext,
     TransitionBiasScheduler,
@@ -55,20 +44,13 @@ from .gflownet.subgraph.sampler import (
     SubgraphTrajectorySampleBatch,
 )
 from .gflownet.module_factory import GFlowNetPolicyFactory
-from .gflownet.module_metrics import (
-    build_train_metrics_payload,
-    build_training_metrics,
-    compute_root_diagnostics,
-    compute_training_rollout_metrics,
-    safe_batch_correlation,
-)
 from .gflownet.module_optim import (
     build_optimizer_and_scheduler,
     build_optimizer_param_groups,
     cfg_to_dict,
     use_zero_weight_decay,
 )
-from .gflownet.module_types import GFlowNetConfig, TrainingRolloutMetrics
+from .gflownet.module_types import GFlowNetConfig
 
 
 logger = get_logger(__name__)
@@ -141,12 +123,11 @@ class GFlowNetModule(LightningModule):
             scheduler_cfg=scheduler_cfg,
         )
         self.save_hyperparameters({"config": asdict(self.cfg)}, logger=False)
-        self.is_subgraph_mode = str(policy_cfg.state_mode) == SUBGRAPH_STATE_MODE
-        if self.is_subgraph_mode:
-            self._validate_subgraph_mode_config(
-                training_cfg=training_cfg,
-                eval_cfg=eval_cfg,
-            )
+        self._validate_subgraph_only_config(
+            policy_cfg=policy_cfg,
+            training_cfg=training_cfg,
+            eval_cfg=eval_cfg,
+        )
         self.policy = GFlowNetPolicyFactory.build_policy(
             policy_cfg=policy_cfg,
             training_cfg=training_cfg,
@@ -166,13 +147,7 @@ class GFlowNetModule(LightningModule):
             on_invalid_start=self._log_invalid_start,
         )
         self.sampler = self.runtime_controller.sampler
-        if self.is_subgraph_mode:
-            self.loss_fn = SubgraphSubTrajectoryBalanceLoss(config=training_cfg.subtb)
-        else:
-            self.loss_fn = SubTrajectoryBalanceLoss(
-                config=training_cfg.subtb,
-                answer_quotient_config=training_cfg.answer_quotient,
-            )
+        self.loss_fn = SubgraphSubTrajectoryBalanceLoss(config=training_cfg.subtb)
         self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
             base_temperature=training_cfg.sampling_temperature,
             config=training_cfg.sampling_temperature_schedule,
@@ -185,15 +160,6 @@ class GFlowNetModule(LightningModule):
             base_scale=1.0,
             config=training_cfg.transition_bias_schedule,
         )
-        self.replay_mix_scheduler = ReplayMixScheduler(
-            base_alpha=float(training_cfg.success_replay.mix_alpha),
-            config=training_cfg.replay_mix_schedule,
-        )
-        self.success_replay_buffer = None
-        if not self.is_subgraph_mode:
-            self.success_replay_buffer = SuccessReplayBuffer(
-                config=training_cfg.success_replay
-            )
         self.search = self.runtime_controller.search
         self._fit_schedule: ResolvedPassFitSchedule | None = None
         self._schedule_context_override: TrainingScheduleContext | None = None
@@ -201,30 +167,35 @@ class GFlowNetModule(LightningModule):
         self._latest_train_metrics: dict[str, float] | None = None
 
     @staticmethod
-    def _validate_subgraph_mode_config(
+    def _validate_subgraph_only_config(
         *,
+        policy_cfg: PolicyConfig,
         training_cfg: GFlowNetTrainingConfig,
         eval_cfg: SearchEvalConfig,
     ) -> None:
+        if str(policy_cfg.state_mode) != SUBGRAPH_STATE_MODE:
+            raise ValueError(
+                "GFlowNetModule supports only policy.state_mode='subgraph'."
+            )
         if training_cfg.success_replay.enabled:
             raise ValueError(
-                "subgraph mode does not support success replay yet; set training.success_replay.mix_alpha=0.0."
+                "Subgraph mode does not support success replay yet; set training.success_replay.mix_alpha=0.0."
             )
         if training_cfg.answer_quotient.active:
             raise ValueError(
-                "subgraph mode does not support answer_quotient yet; disable training.answer_quotient."
+                "Subgraph mode does not support answer_quotient yet; disable training.answer_quotient."
             )
         if training_cfg.answer_quotient.direct_entity_ranking_active:
             raise ValueError(
-                "subgraph mode does not support direct entity ranking yet."
+                "Subgraph mode does not support direct entity ranking yet."
             )
         if training_cfg.potential_reward.active:
             raise ValueError(
-                "subgraph mode does not support legacy potential_reward shaping; use training.subgraph_reward instead."
+                "Subgraph mode does not support legacy potential_reward shaping; use training.subgraph_reward instead."
             )
         if eval_cfg.runtime_task != "answer_search":
             raise ValueError(
-                "subgraph mode currently supports only answer_search evaluation."
+                "Subgraph mode currently supports only answer_search evaluation."
             )
 
     @property
@@ -251,6 +222,11 @@ class GFlowNetModule(LightningModule):
         self.runtime_controller.reset_prediction_state()
 
     def reconfigure_evaluation(self, *, eval_cfg: SearchEvalConfig) -> None:
+        self._validate_subgraph_only_config(
+            policy_cfg=self.cfg.policy_cfg,
+            training_cfg=self.cfg.training_cfg,
+            eval_cfg=eval_cfg,
+        )
         self.cfg = GFlowNetConfig(
             horizon_cfg=self.cfg.horizon_cfg,
             training_cfg=self.cfg.training_cfg,
@@ -317,86 +293,16 @@ class GFlowNetModule(LightningModule):
             current_step += 1
         return self._fit_schedule.effective_pass(global_step=current_step)
 
-    def _compute_training_rollout_metrics(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        sample_batch: TrajectoryGFNSampleBatch,
-    ) -> TrainingRolloutMetrics:
-        return compute_training_rollout_metrics(
-            batch=batch,
-            sample_batch=sample_batch,
-        )
-
-    @staticmethod
-    def _safe_batch_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-        return safe_batch_correlation(x, y)
-
-    def _compute_root_diagnostics(
-        self,
-        *,
-        prepared_batch: Any,
-        sample_batch: TrajectoryGFNSampleBatch,
-    ) -> dict[str, float]:
-        return compute_root_diagnostics(
-            prepared_batch=prepared_batch,
-            sample_batch=sample_batch,
-        )
-
-    def _build_training_metrics(
-        self,
-        *,
-        online_loss_output: SubTrajectoryBalanceLossOutput,
-        total_loss: torch.Tensor,
-        online_direct_entity_ranking_loss: torch.Tensor,
-        online_direct_gold_entity_mass: torch.Tensor,
-        online_direct_entity_count: torch.Tensor,
-        rollouts_per_graph: int,
-        sampling_temperature: float,
-        action_prior_scale: float,
-        transition_bias_scale: float,
-        rollout_metrics: TrainingRolloutMetrics,
-        root_diagnostics: dict[str, float],
-        success_replay_effective_mix_alpha: float,
-        success_replay_buffer_size: int,
-        success_replay_ready: bool,
-        success_replay_added: int,
-        success_replay_sampled: int,
-        prefix_memory_size: int,
-        prefix_memory_ready: bool,
-        replay_subtb_loss: torch.Tensor,
-        replay_direct_entity_ranking_loss: torch.Tensor,
-    ) -> dict[str, Any]:
-        return build_training_metrics(
-            cfg=self.cfg,
-            online_loss_output=online_loss_output,
-            total_loss=total_loss,
-            online_direct_entity_ranking_loss=online_direct_entity_ranking_loss,
-            online_direct_gold_entity_mass=online_direct_gold_entity_mass,
-            online_direct_entity_count=online_direct_entity_count,
-            rollouts_per_graph=rollouts_per_graph,
-            sampling_temperature=sampling_temperature,
-            action_prior_scale=action_prior_scale,
-            transition_bias_scale=transition_bias_scale,
-            rollout_metrics=rollout_metrics,
-            root_diagnostics=root_diagnostics,
-            success_replay_effective_mix_alpha=success_replay_effective_mix_alpha,
-            success_replay_buffer_size=success_replay_buffer_size,
-            success_replay_ready=success_replay_ready,
-            success_replay_added=success_replay_added,
-            success_replay_sampled=success_replay_sampled,
-            prefix_memory_size=prefix_memory_size,
-            prefix_memory_ready=prefix_memory_ready,
-            replay_subtb_loss=replay_subtb_loss,
-            replay_direct_entity_ranking_loss=replay_direct_entity_ranking_loss,
-            resolve_effective_pass=lambda after_current_step: self._resolve_effective_pass(
-                after_current_step=after_current_step
-            ),
-        )
-
     @staticmethod
     def _build_train_metrics_payload(metrics: dict[str, Any]) -> dict[str, float]:
-        return build_train_metrics_payload(metrics)
+        payload: dict[str, float] = {}
+        for name, value in metrics.items():
+            if torch.is_tensor(value):
+                scalar = float(value.detach().to(dtype=torch.float32).item())
+            else:
+                scalar = float(value)
+            payload[f"train/{name}"] = scalar
+        return payload
 
     def _raise_on_nonfinite_training_loss(
         self,
@@ -476,13 +382,6 @@ class GFlowNetModule(LightningModule):
             schedule_context=self._trainer_schedule_context(),
         )
 
-    def _resolve_replay_mix_alpha(self, *, global_step: int | None = None) -> float:
-        current_step = self._resolve_schedule_step(global_step=global_step)
-        return self.replay_mix_scheduler.value(
-            global_step=current_step,
-            schedule_context=self._trainer_schedule_context(),
-        )
-
     def _resolve_schedule_step(self, *, global_step: int | None = None) -> int:
         trainer = getattr(self, "_trainer", None)
         current_step = 0 if trainer is None else int(trainer.global_step)
@@ -490,138 +389,10 @@ class GFlowNetModule(LightningModule):
             current_step = int(global_step)
         return current_step
 
-    def _require_forward_sampler(self) -> ForwardTrajectoryGFNSampler:
-        if not isinstance(self.sampler, ForwardTrajectoryGFNSampler):
-            raise TypeError(
-                "Success replay currently requires ForwardTrajectoryGFNSampler."
-            )
-        return self.sampler
-
     def _require_subgraph_sampler(self) -> SubgraphSampler:
         if not isinstance(self.sampler, SubgraphSampler):
-            raise TypeError("subgraph training requires SubgraphSampler.")
+            raise TypeError("Subgraph training requires SubgraphSampler.")
         return self.sampler
-
-    def _require_success_replay_buffer(self) -> SuccessReplayBuffer:
-        if self.success_replay_buffer is None:
-            raise RuntimeError("Success replay buffer is unavailable in this mode.")
-        return self.success_replay_buffer
-
-    def _resolve_replay_trajectories_per_step(
-        self,
-        *,
-        num_graphs: int,
-        rollouts_per_graph: int,
-    ) -> int:
-        replay_cfg = self.cfg.training_cfg.success_replay
-        if replay_cfg.replay_trajectories_per_step is not None:
-            return int(replay_cfg.replay_trajectories_per_step)
-        return int(num_graphs) * int(rollouts_per_graph)
-
-    def _compute_direct_gold_entity_ranking_loss(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        prepared_batch: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        zero = torch.zeros((), device=batch.node_ptr.device, dtype=torch.float32)
-        answer_cfg = self.cfg.training_cfg.answer_quotient
-        if not answer_cfg.direct_entity_ranking_active:
-            return zero, zero, zero
-
-        num_nodes = int(prepared_batch.topology.num_nodes)
-        if num_nodes == 0 or int(batch.answer_entity_ids.numel()) == 0:
-            return zero, zero, zero
-
-        base_policy = getattr(self.policy, "base_policy", None)
-        if base_policy is None:
-            base_policy = self.policy
-        if not hasattr(base_policy, "build_local_state_features") or not hasattr(
-            base_policy, "_compute_log_state_scores_from_flat_features"
-        ):
-            raise TypeError(
-                "Direct gold-entity ranking supervision requires a base policy with local state scoring helpers."
-            )
-        flat_nodes = torch.arange(
-            num_nodes, device=batch.node_ptr.device, dtype=torch.long
-        )
-        flat_num_steps = torch.zeros_like(flat_nodes, dtype=torch.long)
-        flat_done_mask = torch.zeros_like(flat_nodes, dtype=torch.bool)
-        flat_state_features = base_policy.build_local_state_features(
-            prepared_batch,
-            flat_nodes=flat_nodes,
-            flat_num_steps=flat_num_steps,
-            flat_done_mask=flat_done_mask,
-        )
-        graph_ids = prepared_batch.topology.graph_index_from_nodes(flat_nodes)
-        entity_scores = base_policy._compute_log_state_scores_from_flat_features(
-            prepared_batch=prepared_batch,
-            flat_state_features=flat_state_features,
-            graph_ids=graph_ids,
-        )
-        return compute_gold_entity_ranking_loss(
-            graph_ids=graph_ids,
-            entity_ids=batch.node_entity_ids.to(device=batch.node_ptr.device),
-            entity_scores=entity_scores,
-            answer_entity_ids=batch.answer_entity_ids.to(device=batch.node_ptr.device),
-            answer_ptr=batch.answer_ptr.to(device=batch.node_ptr.device),
-        )
-
-    def _compute_replay_loss(
-        self,
-        *,
-        num_graphs: int,
-        rollouts_per_graph: int,
-        device: torch.device,
-    ) -> tuple[SubTrajectoryBalanceLossOutput | None, int, torch.Tensor]:
-        replay_cfg = self.cfg.training_cfg.success_replay
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        if self.is_subgraph_mode or self.success_replay_buffer is None:
-            return None, 0, zero
-        if not replay_cfg.enabled or not self.success_replay_buffer.ready:
-            return None, 0, zero
-        replay_trajectories_per_step = self._resolve_replay_trajectories_per_step(
-            num_graphs=num_graphs,
-            rollouts_per_graph=rollouts_per_graph,
-        )
-        replay_batch = self.success_replay_buffer.sample_replay_batch(
-            device=device,
-            replay_trajectories_per_step=replay_trajectories_per_step,
-        )
-        if replay_batch is None:
-            return None, 0, zero
-
-        replay_prepared_batch = self.policy.prepare_batch(replay_batch.batch)
-        replay_sampler = self._require_forward_sampler()
-        replay_sample_batch = replay_sampler.rebuild_sample_batch(
-            batch=replay_batch.batch,
-            policy=cast(Any, self.policy),
-            prepared_batch=cast(Any, replay_prepared_batch),
-            start_nodes=replay_batch.start_nodes,
-            planned_edge_ids=replay_batch.planned_edge_ids,
-            planned_stop_mask=replay_batch.planned_stop_mask,
-            path_lengths=replay_batch.path_lengths,
-            termination_action_steps=replay_batch.termination_action_steps,
-            trace_nodes=replay_batch.trace_nodes,
-            trace_edge_ids=replay_batch.trace_edge_ids,
-            trace_num_steps=replay_batch.trace_num_steps,
-            trace_mask=replay_batch.trace_mask,
-            trace_stop_mask=replay_batch.trace_stop_mask,
-        )
-        replay_loss_output = cast(SubTrajectoryBalanceLoss, self.loss_fn).compute(
-            replay_sample_batch
-        )
-        replay_direct_entity_ranking_loss, _, _ = (
-            self._compute_direct_gold_entity_ranking_loss(
-                batch=replay_batch.batch,
-                prepared_batch=replay_prepared_batch,
-            )
-        )
-        return (
-            replay_loss_output,
-            int(replay_batch.start_nodes.numel()),
-            replay_direct_entity_ranking_loss,
-        )
 
     def _build_subgraph_training_metrics(
         self,
@@ -686,21 +457,16 @@ class GFlowNetModule(LightningModule):
         action_prior_scale = self._resolve_action_prior_scale()
         transition_bias_scale = self._resolve_transition_bias_scale()
         trajectory_batch = batch.without_raw_features()
-        sample_batch = cast(
-            SubgraphTrajectorySampleBatch,
-            sampler.sample(
-                batch=trajectory_batch,
-                policy=self.policy,
-                prepared_batch=prepared_batch,
-                rollouts_per_graph=rollouts_per_graph,
-                temperature=sampling_temperature,
-                action_prior_scale=action_prior_scale,
-                transition_bias_scale=transition_bias_scale,
-            ),
+        sample_batch = sampler.sample(
+            batch=trajectory_batch,
+            policy=self.policy,
+            prepared_batch=prepared_batch,
+            rollouts_per_graph=rollouts_per_graph,
+            temperature=sampling_temperature,
+            action_prior_scale=action_prior_scale,
+            transition_bias_scale=transition_bias_scale,
         )
-        loss_output = cast(SubgraphSubTrajectoryBalanceLoss, self.loss_fn).compute(
-            sample_batch
-        )
+        loss_output = self.loss_fn.compute(sample_batch)
         total_loss = loss_output.loss
         self._raise_on_nonfinite_training_loss(
             total_loss=total_loss,
@@ -715,6 +481,9 @@ class GFlowNetModule(LightningModule):
             action_prior_scale=action_prior_scale,
             transition_bias_scale=transition_bias_scale,
         )
+        effective_pass = self._resolve_effective_pass(after_current_step=True)
+        if effective_pass is not None:
+            metrics["effective_pass"] = float(effective_pass)
         self._latest_train_metrics = self._build_train_metrics_payload(metrics)
         self._log_metric_bundle(
             metrics=metrics,
@@ -725,20 +494,6 @@ class GFlowNetModule(LightningModule):
             prog_bar_key="train/loss",
         )
         return total_loss
-
-    @staticmethod
-    def _mix_coverage_losses(
-        *,
-        online_loss: torch.Tensor,
-        replay_loss: torch.Tensor | None,
-        replay_mix_alpha: float,
-    ) -> torch.Tensor:
-        """Mix online proposal coverage with replay coverage under one objective."""
-
-        if replay_loss is None:
-            return online_loss
-        alpha = float(replay_mix_alpha)
-        return (1.0 - alpha) * online_loss + alpha * replay_loss
 
     def configure_optimizers(self) -> dict[str, Any]:
         schedule_context = self._trainer_schedule_context()
@@ -791,134 +546,7 @@ class GFlowNetModule(LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         del batch_idx
-        replay_source_batch = self._require_trajectory_batch(batch)
-        if self.is_subgraph_mode:
-            return self._training_step_subgraph(replay_source_batch)
-        if self.sampler is None:
-            raise RuntimeError(
-                "Current metric runtime does not define a training sampler; this model cannot train with the configured metric_runtime_factory."
-            )
-        sampler = self._require_forward_sampler()
-        policy = cast(Any, self.policy)
-        loss_fn = cast(SubTrajectoryBalanceLoss, self.loss_fn)
-        success_replay_buffer = self._require_success_replay_buffer()
-        prepared_batch = self.policy.prepare_batch(replay_source_batch)
-        rollouts_per_graph = int(self.cfg.training_cfg.rollouts_per_graph)
-        sampling_temperature = self._resolve_sampling_temperature()
-        action_prior_scale = self._resolve_action_prior_scale()
-        transition_bias_scale = self._resolve_transition_bias_scale()
-        trajectory_batch = replay_source_batch.without_raw_features()
-        sample_batch = sampler.sample(
-            batch=trajectory_batch,
-            policy=policy,
-            prepared_batch=cast(Any, prepared_batch),
-            rollouts_per_graph=rollouts_per_graph,
-            temperature=sampling_temperature,
-            action_prior_scale=action_prior_scale,
-            transition_bias_scale=transition_bias_scale,
-        )
-        online_loss_output = loss_fn.compute(sample_batch)
-        (
-            online_direct_entity_ranking_loss,
-            online_direct_gold_entity_mass,
-            online_direct_entity_count,
-        ) = self._compute_direct_gold_entity_ranking_loss(
-            batch=replay_source_batch,
-            prepared_batch=prepared_batch,
-        )
-        self.policy.record_sampled_prefix_experience(
-            cast(Any, prepared_batch),
-            sample_batch,
-        )
-        direct_entity_weight = float(
-            self.cfg.training_cfg.answer_quotient.direct_entity_ranking_weight
-        )
-        replay_cfg = self.cfg.training_cfg.success_replay
-        replay_added = success_replay_buffer.add_successes(
-            batch=replay_source_batch,
-            sample_batch=sample_batch,
-        )
-        replay_ready = bool(replay_cfg.enabled and success_replay_buffer.ready)
-        replay_loss_output = None
-        replay_sampled = 0
-        effective_replay_mix_alpha = (
-            self._resolve_replay_mix_alpha() if replay_ready else 0.0
-        )
-        replay_direct_entity_ranking_loss = torch.zeros(
-            (), device=online_loss_output.loss.device, dtype=torch.float32
-        )
-        online_total_loss = online_loss_output.loss + (
-            direct_entity_weight * online_direct_entity_ranking_loss
-        )
-        total_loss = online_total_loss
-        if replay_ready and effective_replay_mix_alpha > 0.0:
-            (
-                replay_loss_output,
-                replay_sampled,
-                replay_direct_entity_ranking_loss,
-            ) = self._compute_replay_loss(
-                num_graphs=trajectory_batch.num_graphs,
-                rollouts_per_graph=rollouts_per_graph,
-                device=replay_source_batch.node_ptr.device,
-            )
-            if replay_loss_output is not None:
-                replay_total_loss = replay_loss_output.loss + (
-                    direct_entity_weight * replay_direct_entity_ranking_loss
-                )
-                total_loss = self._mix_coverage_losses(
-                    online_loss=online_total_loss,
-                    replay_loss=replay_total_loss,
-                    replay_mix_alpha=effective_replay_mix_alpha,
-                )
-        rollout_metrics = self._compute_training_rollout_metrics(
-            batch=trajectory_batch,
-            sample_batch=sample_batch,
-        )
-        root_diagnostics = self._compute_root_diagnostics(
-            prepared_batch=prepared_batch,
-            sample_batch=sample_batch,
-        )
-        self._raise_on_nonfinite_training_loss(
-            total_loss=total_loss,
-            batch=trajectory_batch,
-        )
-        replay_subtb_loss = torch.zeros(
-            (), device=total_loss.device, dtype=torch.float32
-        )
-        if replay_loss_output is not None:
-            replay_subtb_loss = replay_loss_output.subtb_loss
-        metrics = self._build_training_metrics(
-            online_loss_output=online_loss_output,
-            total_loss=total_loss,
-            online_direct_entity_ranking_loss=online_direct_entity_ranking_loss,
-            online_direct_gold_entity_mass=online_direct_gold_entity_mass,
-            online_direct_entity_count=online_direct_entity_count,
-            rollouts_per_graph=rollouts_per_graph,
-            sampling_temperature=sampling_temperature,
-            action_prior_scale=action_prior_scale,
-            transition_bias_scale=transition_bias_scale,
-            rollout_metrics=rollout_metrics,
-            root_diagnostics=root_diagnostics,
-            success_replay_effective_mix_alpha=effective_replay_mix_alpha,
-            success_replay_buffer_size=len(success_replay_buffer),
-            success_replay_ready=replay_ready,
-            success_replay_added=replay_added,
-            success_replay_sampled=replay_sampled,
-            prefix_memory_size=self.policy.prefix_memory_size,
-            prefix_memory_ready=self.policy.prefix_memory_ready,
-            replay_subtb_loss=replay_subtb_loss,
-            replay_direct_entity_ranking_loss=replay_direct_entity_ranking_loss,
-        )
-        self._latest_train_metrics = self._build_train_metrics_payload(metrics)
-        self._log_metric_bundle(
-            metrics=metrics,
-            prefix="train",
-            batch_size=trajectory_batch.num_graphs,
-            on_step=True,
-            on_epoch=False,
-            prog_bar_key="train/loss",
-        )
-        return total_loss
+        return self._training_step_subgraph(self._require_trajectory_batch(batch))
 
     def _evaluate_batch_output(
         self, *, batch: TrajectoryBatch
