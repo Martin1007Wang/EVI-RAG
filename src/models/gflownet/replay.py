@@ -12,7 +12,7 @@ from src.data.preprocess.labels.edge_retrieval import (
 from src.graph import TrajectoryBatch
 from src.models.configs import SuccessReplayConfig
 
-from .sampler import TrajectoryGFNSampleBatch
+from .prefix_sampler import TrajectoryGFNSampleBatch
 
 
 @dataclass(frozen=True)
@@ -125,10 +125,6 @@ class SuccessReplayBuffer:
         if sample_batch.trace_stop_mask is None:
             raise ValueError(
                 "Replay buffer requires trace_stop_mask for success storage."
-            )
-        if sample_batch.termination_action_steps is None:
-            raise ValueError(
-                "Replay buffer requires termination_action_steps for success storage."
             )
         trace_stop_mask_steps = sample_batch.trace_stop_mask
         termination_action_steps_tensor = sample_batch.termination_action_steps

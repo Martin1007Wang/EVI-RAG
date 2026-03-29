@@ -28,8 +28,8 @@ from src.models.configs import (
     SearchEvalConfig,
     StateScoreHeadConfig,
 )
-from src.models.gflownet import (
-    BaseSearchPolicy,
+from src.models.gflownet.prefix_policy import BaseSearchPolicy
+from src.models.gflownet.prefix_state import (
     ForwardActionDistribution,
     PreparedSearchBatch,
     RootActionDistribution,

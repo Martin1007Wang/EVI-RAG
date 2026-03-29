@@ -7,8 +7,8 @@ from torch.nn import functional as F
 from src.models.configs import ActionPriorConfig
 from src.utils.segment_ops import segment_mean_1d
 
-from .types import ActionPriorCache, ForwardActionDistribution, PreparedGFlowNetBatch
-from .types import PreparedSearchBatch, SearchState
+from .prefix_state import ActionPriorCache, ForwardActionDistribution, PreparedGFlowNetBatch
+from .prefix_state import PreparedSearchBatch, SearchState
 
 
 def compute_topology_node_prior(

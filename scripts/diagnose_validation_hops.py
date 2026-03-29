@@ -22,7 +22,7 @@ from src.models.gflownet.path import (
     initialize_path_token_ids,
 )
 from src.models.gflownet.transitions import apply_forward_constraints
-from src.models.gflownet.types import SearchState
+from src.models.gflownet.prefix_state import SearchState
 
 
 def _strip_instantiate_metadata(cfg_node: DictConfig) -> DictConfig:

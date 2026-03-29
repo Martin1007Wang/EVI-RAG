@@ -209,10 +209,32 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
     assert action_prior_cfg.answer_distance_weight == pytest.approx(0.5)
     assert "step_log_penalty" not in cfg.model.training_cfg
-    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.5)
-    assert cfg.model.policy_cfg.transition_head.enabled is True
+    assert training_cfg.action_prior_schedule.type == "cosine"
+    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.8)
+    assert training_cfg.action_prior_schedule.final_scale == pytest.approx(0.0)
+    assert training_cfg.action_prior_schedule.hold_steps == 1000
+    assert cfg.model.policy_cfg.state_mode == "subgraph"
+    assert cfg.model.policy_cfg.transition_head.enabled is False
+    assert training_cfg.transition_bias_schedule.type == "cosine"
+    assert training_cfg.transition_bias_schedule.final_scale == pytest.approx(0.0)
+    assert training_cfg.transition_bias_schedule.hold_steps == 1000
     assert training_cfg.step_log_penalty == pytest.approx(0.0)
+    assert training_cfg.potential_reward.answer_distance_weight == pytest.approx(0.0)
+    assert (
+        training_cfg.subgraph_proposal.oracle_answer_distance_weight
+        == pytest.approx(0.5)
+    )
+    assert (
+        training_cfg.subgraph_proposal.prior_question_similarity_weight
+        == pytest.approx(0.75)
+    )
+    assert training_cfg.subgraph_proposal.prior_component_merge_weight == pytest.approx(
+        1.0
+    )
     assert training_cfg.success_replay.mix_alpha == pytest.approx(0.0)
+    assert training_cfg.replay_mix_schedule.type == "cosine"
+    assert training_cfg.replay_mix_schedule.final_alpha == pytest.approx(0.0)
+    assert training_cfg.replay_mix_schedule.hold_steps == 2000
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
@@ -265,14 +287,36 @@ def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> No
     assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
     assert action_prior_cfg.answer_distance_weight == pytest.approx(0.5)
     assert "step_log_penalty" not in cfg.model.training_cfg
-    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.5)
-    assert cfg.model.policy_cfg.transition_head.enabled is True
+    assert training_cfg.action_prior_schedule.type == "cosine"
+    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.8)
+    assert training_cfg.action_prior_schedule.final_scale == pytest.approx(0.0)
+    assert training_cfg.action_prior_schedule.hold_steps == 1000
+    assert cfg.model.policy_cfg.state_mode == "subgraph"
+    assert cfg.model.policy_cfg.transition_head.enabled is False
+    assert training_cfg.transition_bias_schedule.type == "cosine"
+    assert training_cfg.transition_bias_schedule.final_scale == pytest.approx(0.0)
+    assert training_cfg.transition_bias_schedule.hold_steps == 1000
     assert training_cfg.step_log_penalty == pytest.approx(0.0)
-    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.5)
+    assert training_cfg.potential_reward.answer_distance_weight == pytest.approx(0.0)
+    assert (
+        training_cfg.subgraph_proposal.oracle_answer_distance_weight
+        == pytest.approx(0.5)
+    )
+    assert (
+        training_cfg.subgraph_proposal.prior_question_similarity_weight
+        == pytest.approx(0.75)
+    )
+    assert training_cfg.subgraph_proposal.prior_component_merge_weight == pytest.approx(
+        1.0
+    )
+    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.0)
+    assert training_cfg.replay_mix_schedule.type == "cosine"
+    assert training_cfg.replay_mix_schedule.final_alpha == pytest.approx(0.0)
+    assert training_cfg.replay_mix_schedule.hold_steps == 2000
     assert training_cfg.success_replay.min_buffer_size == 64
     assert training_cfg.success_replay.capacity == 512
     assert training_cfg.success_replay.replay_trajectories_per_step == 64
-    assert training_cfg.success_replay.add_shortest_path_guidance is True
+    assert training_cfg.success_replay.add_shortest_path_guidance is False
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.run.test is True

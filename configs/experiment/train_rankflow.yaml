@@ -57,19 +57,45 @@ model:
     shortest_path_edge_weight: 1.0
     answer_distance_weight: 0.5
   policy_cfg:
+    state_mode: subgraph
+    prefix_memory:
+      enabled: false
+      capacity: 16384
+      min_entries: 256
+      top_k: 8
+      temperature: 0.35
+      min_prefix_steps: 0
     transition_head:
-      enabled: true
+      enabled: false
   training_cfg:
     rollouts_per_graph: 32
     potential_reward:
-      answer_distance_weight: 0.5
+      answer_distance_weight: 0.0
+    subgraph_proposal:
+      oracle_answer_distance_weight: 0.5
+      prior_question_similarity_weight: 0.75
+      prior_component_merge_weight: 1.0
+      stop_hit_bias: 0.25
     action_prior_schedule:
-      initial_scale: 0.5
+      # Start with stronger subgraph proposal bias, then anneal it away so the
+      # late-stage rollout policy realigns with the target policy.
+      type: cosine
+      initial_scale: 0.8
+      final_scale: 0.0
+      hold_steps: 1000
+    transition_bias_schedule:
+      type: cosine
+      final_scale: 0.0
+      hold_steps: 1000
     success_replay:
-      mix_alpha: 0.5
+      mix_alpha: 0.0
       capacity: 512
       replay_trajectories_per_step: 64
-      add_shortest_path_guidance: true
+      add_shortest_path_guidance: false
+    replay_mix_schedule:
+      type: cosine
+      final_alpha: 0.0
+      hold_steps: 2000
   eval_cfg:
     # Keep training-time checkpoint selection on the same flow-frontier answer
     # posterior that final eval uses; only the report surface stays rank-only.

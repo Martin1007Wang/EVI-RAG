@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from src.models.components import EmbeddingBackbone, NodeFlowHead, TransitionPolicyHead
 from src.models.configs import ActionPriorConfig, GFlowNetTrainingConfig, PolicyConfig
+from src.models.configs.policy import SUBGRAPH_STATE_MODE
 
 from .heuristics import SearchActionPrior
-from .policy import BaseSearchPolicy, GFlowNetPolicy
+from .prefix_policy import BaseSearchPolicy, GFlowNetPolicy
+from .subgraph import SubgraphPolicy
 
 
 class GFlowNetPolicyFactory:
@@ -73,7 +75,13 @@ class GFlowNetPolicyFactory:
         training_cfg: GFlowNetTrainingConfig,
         action_prior_cfg: ActionPriorConfig,
         max_steps: int,
-    ) -> GFlowNetPolicy:
+    ) -> GFlowNetPolicy | SubgraphPolicy:
+        if str(policy_cfg.state_mode) == SUBGRAPH_STATE_MODE:
+            return SubgraphPolicy(
+                policy_cfg=policy_cfg,
+                training_cfg=training_cfg,
+                max_steps=max_steps,
+            )
         base_policy = GFlowNetPolicyFactory.build_base_policy(
             policy_cfg=policy_cfg,
             training_cfg=training_cfg,

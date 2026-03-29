@@ -8,6 +8,7 @@ class OptimizerConfig:
 
     type: str = "adamw"
     lr: float = 1e-4
+    log_z_head_lr_multiplier: float = 5.0
     weight_decay: float = 1e-4
     betas: tuple[float, float] = (0.9, 0.999)
     no_decay_on_bias_and_norm: bool = True
@@ -15,6 +16,8 @@ class OptimizerConfig:
     def __post_init__(self) -> None:
         if self.lr <= 0.0:
             raise ValueError("optimizer.lr must be > 0.")
+        if self.log_z_head_lr_multiplier <= 0.0:
+            raise ValueError("optimizer.log_z_head_lr_multiplier must be > 0.")
         if self.weight_decay < 0.0:
             raise ValueError("optimizer.weight_decay must be >= 0.")
         if len(self.betas) != 2:

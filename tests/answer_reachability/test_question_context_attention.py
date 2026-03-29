@@ -5,7 +5,7 @@ from dataclasses import replace
 import torch
 
 from src.models.components.scoring import NodeFlowHead, TransitionPolicyHead
-from src.models.gflownet import SearchState
+from src.models.gflownet.prefix_state import SearchState
 
 from .conftest import make_policy, make_toy_batch
 

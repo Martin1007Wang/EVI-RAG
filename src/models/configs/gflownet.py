@@ -19,9 +19,13 @@ from .gflownet_training import (
     AnswerQuotientConfig,
     GFlowNetTrainingConfig,
     PotentialRewardConfig,
+    ReplayMixScheduleConfig,
     SamplingTemperatureScheduleConfig,
+    SubgraphProposalConfig,
+    SubgraphRewardConfig,
     SubTrajectoryBalanceConfig,
     SuccessReplayConfig,
+    TransitionBiasScheduleConfig,
 )
 
 __all__ = [
@@ -38,10 +42,14 @@ __all__ = [
     "MONTE_CARLO_BACKEND",
     "MonteCarloEvalConfig",
     "PotentialRewardConfig",
+    "ReplayMixScheduleConfig",
     "RANK_ONLY_REPORT",
     "RUNTIME_ANSWER_TASK",
     "SamplingTemperatureScheduleConfig",
     "SearchEvalConfig",
+    "SubgraphProposalConfig",
+    "SubgraphRewardConfig",
     "SubTrajectoryBalanceConfig",
     "SuccessReplayConfig",
+    "TransitionBiasScheduleConfig",
 ]

@@ -13,6 +13,7 @@ from .answer_metrics import (
 from .edge_metrics import EdgeRetrievalRuntime, EdgeRetrievalResult
 from .runtime_factory import GraphTaskRuntimeFactory
 from .search_backends import FlowFrontierBackend, MonteCarloBackend
+from .subgraph_answer_search_runtime import SubgraphAnswerSearchRuntime
 
 __all__ = [
     "AnswerReachabilityRuntime",
@@ -24,6 +25,7 @@ __all__ = [
     "MetricEvaluationOutput",
     "MonteCarloBackend",
     "PredictionCodecProtocol",
+    "SubgraphAnswerSearchRuntime",
     "MetricRuntimeFactoryProtocol",
     "MetricRuntimeProtocol",
     "SupportWindowArtifactWriter",

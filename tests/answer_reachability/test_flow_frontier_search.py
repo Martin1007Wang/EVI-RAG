@@ -12,8 +12,8 @@ from src.metrics.search_backends import (
     run_flow_frontier_search,
 )
 from src.models.configs import FlowFrontierEvalConfig, HorizonConfig, SearchEvalConfig
-from src.models.gflownet import (
-    BaseSearchPolicy,
+from src.models.gflownet.prefix_policy import BaseSearchPolicy
+from src.models.gflownet.prefix_state import (
     ForwardActionDistribution,
     PreparedSearchBatch,
     RootActionDistribution,

@@ -6,9 +6,9 @@ import torch
 
 from src.graph import TrajectoryBatch
 
-from .losses import SubTrajectoryBalanceLossOutput
+from .prefix_losses import SubTrajectoryBalanceLossOutput
 from .module_types import TrainingRolloutMetrics
-from .sampler import TrajectoryGFNSampleBatch
+from .prefix_sampler import TrajectoryGFNSampleBatch
 from .success_paths import (
     collect_success_rollout_key_rows,
     deduplicate_success_rollout_key_rows,
@@ -153,6 +153,7 @@ def build_training_metrics(
     rollouts_per_graph: int,
     sampling_temperature: float,
     action_prior_scale: float,
+    transition_bias_scale: float,
     rollout_metrics: TrainingRolloutMetrics,
     root_diagnostics: dict[str, float],
     success_replay_effective_mix_alpha: float,
@@ -160,6 +161,8 @@ def build_training_metrics(
     success_replay_ready: bool,
     success_replay_added: int,
     success_replay_sampled: int,
+    prefix_memory_size: int,
+    prefix_memory_ready: bool,
     replay_subtb_loss: torch.Tensor,
     replay_direct_entity_ranking_loss: torch.Tensor,
     resolve_effective_pass: Callable[[bool], float | None],
@@ -227,6 +230,7 @@ def build_training_metrics(
         "rollouts_per_graph": float(rollouts_per_graph),
         "sampling_temperature": sampling_temperature,
         "proposal_action_prior_scale": float(action_prior_scale),
+        "proposal_transition_bias_scale": float(transition_bias_scale),
         "proposal_root_beta": proposal_root_beta,
         "proposal_edge_beta": proposal_edge_beta,
         "proposal_stop_beta": proposal_stop_beta,
@@ -249,6 +253,8 @@ def build_training_metrics(
         "success_replay_shortest_path_guidance": float(
             cfg.training_cfg.success_replay.add_shortest_path_guidance
         ),
+        "prefix_memory_size": float(prefix_memory_size),
+        "prefix_memory_ready": float(prefix_memory_ready),
         "step_log_penalty": float(cfg.training_cfg.step_log_penalty or 0.0),
         "answer_stop_log_reward_bonus": float(
             cfg.training_cfg.answer_stop_log_reward_bonus or 0.0

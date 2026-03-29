@@ -12,7 +12,7 @@ from src.models.configs import (
     StateScoreHeadConfig,
 )
 from src.graph import TrajectoryBatch
-from src.models.gflownet import BaseSearchPolicy
+from src.models.gflownet.prefix_policy import BaseSearchPolicy
 
 
 def make_batch_from_graph(

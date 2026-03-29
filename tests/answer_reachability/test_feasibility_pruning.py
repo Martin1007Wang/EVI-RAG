@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from src.metrics.search_backends import FlowFrontierBackend
-from src.models.gflownet import BaseSearchPolicy
-from src.models.gflownet import apply_forward_constraints
-from src.models.gflownet import SearchState
+from src.models.gflownet.prefix_policy import BaseSearchPolicy
+from src.models.gflownet.transitions import apply_forward_constraints
+from src.models.gflownet.prefix_state import SearchState
 from src.models.configs import FlowFrontierEvalConfig, SearchEvalConfig
 
 from .conftest import make_batch_from_graph, make_policy

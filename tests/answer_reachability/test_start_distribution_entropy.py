@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.gflownet.sampler import _compute_start_distribution_entropy
+from src.models.gflownet.prefix_sampler import _compute_start_distribution_entropy
 
 
 def test_single_candidate_graph_reports_full_normalized_entropy() -> None:

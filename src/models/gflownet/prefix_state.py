@@ -106,13 +106,17 @@ class PreparedGFlowNetBatch(PreparedSearchBatch):
 
 @dataclass(frozen=True)
 class SearchState:
-    """Canonical recurrent-prefix search state.
+    """Canonical search state on the legal-prefix state space.
 
-    The environment state still keeps the exact discrete trajectory prefix for
-    tree-structured backward transitions, but forward scoring is driven by a
-    recurrent control state that compresses question-conditioned prefix history.
-    Root selection is modeled separately by ``RootActionDistribution`` rather
-    than materializing the abstract root as a regular ``SearchState``.
+    Non-root states are defined by exact discrete trajectory prefixes rather
+    than by ``(current_node, num_steps)`` alone. This is what keeps hard
+    legality rules such as entity-level no-repeat Markovian: same node and same
+    step with different prefix history are different states. Forward scoring may
+    cache a recurrent ``control_state`` summary, but ``path_token_ids`` remain
+    the authoritative discrete state identity for legality and tree-structured
+    backward semantics. Root selection is modeled separately by
+    ``RootActionDistribution`` rather than materializing the abstract root as a
+    regular ``SearchState``.
     """
 
     topology: GraphTopology
@@ -292,6 +296,13 @@ class SearchState:
     def flatten_num_steps(self) -> torch.Tensor:
         return self.num_steps.view(-1)
 
+    def requires_exact_prefix_history(self) -> bool:
+        if bool((self.num_steps != 0).any().item()):
+            return True
+        if self.absorbing_mask is not None:
+            return bool(self.absorbing_mask.any().item())
+        return bool(self.done_mask.any().item())
+
     def path_lengths(self) -> torch.Tensor:
         return (
             2 * self.num_steps
@@ -304,12 +315,10 @@ class SearchState:
 
     def resolve_path_token_ids(self, *, max_steps: int) -> torch.Tensor:
         if self.path_token_ids is None:
-            if bool((self.num_steps != 0).any().item()) or bool(
-                self.done_mask.any().item()
-            ):
+            if self.requires_exact_prefix_history():
                 raise ValueError(
                     "Non-root SearchState instances must carry exact path_token_ids. "
-                    "The search space is defined over discrete trajectory prefixes, so "
+                    "The legal search space is defined over discrete trajectory prefixes, so "
                     "path history cannot be reconstructed from (current_node, num_steps) alone."
                 )
             return initialize_path_token_ids(
@@ -428,6 +437,7 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
         state: SearchState,
         *,
         action_prior_scale: float = 1.0,
+        transition_bias_scale: float = 1.0,
     ) -> ForwardActionDistribution: ...
 
     def compute_proposal_edge_logits(
@@ -437,6 +447,7 @@ class GFlowNetPolicyProtocol(SearchPolicyProtocol, Protocol):
         distribution: ForwardActionDistribution,
         *,
         action_prior_scale: float = 1.0,
+        transition_bias_scale: float = 1.0,
     ) -> torch.Tensor: ...
 
     def compute_backward_distribution(

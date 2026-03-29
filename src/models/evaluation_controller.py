@@ -13,7 +13,7 @@ from src.metrics.prediction_io import (
     jsonl_has_records,
 )
 from src.metrics.protocol import MetricEvaluationOutput, MetricRuntimeProtocol
-from src.models.gflownet import TrajectorySamplerProtocol
+from src.models.gflownet.prefix_sampler import TrajectorySamplerProtocol
 
 
 PredictionResult = Any

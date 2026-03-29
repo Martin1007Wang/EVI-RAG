@@ -4,7 +4,7 @@ import torch
 
 from src.graph import TrajectoryBatch
 
-from .sampler import TrajectoryGFNSampleBatch
+from .prefix_sampler import TrajectoryGFNSampleBatch
 
 _SUCCESS_PATH_HASH_SEED_A = 1469598103934665603
 _SUCCESS_PATH_HASH_SEED_B = 7809847782465536322

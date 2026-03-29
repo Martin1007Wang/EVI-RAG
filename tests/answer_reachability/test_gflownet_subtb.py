@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from src.models.configs import SubTrajectoryBalanceConfig
-from src.models.gflownet import SubTrajectoryBalanceLoss
+from src.models.gflownet.prefix_losses import SubTrajectoryBalanceLoss
 
 
 def _make_sample_batch(**overrides: Any) -> SimpleNamespace:
@@ -23,6 +23,8 @@ def _make_sample_batch(**overrides: Any) -> SimpleNamespace:
         "success_mask": torch.ones((1, 1), dtype=torch.bool),
     }
     sample_batch.update(overrides)
+    if "termination_action_steps" not in sample_batch:
+        raise ValueError("Tests must specify explicit termination_action_steps.")
     return SimpleNamespace(**sample_batch)
 
 
@@ -60,6 +62,7 @@ def test_subtb_loss_handles_zero_move_rollout_with_finite_anchor() -> None:
         log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         terminal_num_steps=torch.tensor([[0]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[1]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[-0.4]], dtype=torch.float32),
         success_mask=torch.ones((1, 1), dtype=torch.bool),
     )
@@ -68,6 +71,46 @@ def test_subtb_loss_handles_zero_move_rollout_with_finite_anchor() -> None:
 
     assert torch.isfinite(loss_output.loss)
     assert torch.allclose(loss_output.loss, torch.tensor(0.0), atol=1.0e-6)
+
+
+def test_subtb_loss_requires_explicit_stop_index() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(
+        config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
+    )
+    sample_batch = SimpleNamespace(
+        graph_log_z=torch.tensor([0.0], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.0]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[0.0]], dtype=torch.float32),
+        log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[0]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[0.0]], dtype=torch.float32),
+        success_mask=torch.ones((1, 1), dtype=torch.bool),
+    )
+
+    with pytest.raises(ValueError, match="termination_action_steps"):
+        loss_fn.compute(cast(Any, sample_batch))
+
+
+def test_subtb_loss_rejects_non_stop_terminal_index_semantics() -> None:
+    loss_fn = SubTrajectoryBalanceLoss(
+        config=SubTrajectoryBalanceConfig(lambda_weight=1.0, normalize=True)
+    )
+    sample_batch = _make_sample_batch(
+        graph_log_z=torch.tensor([-0.4], dtype=torch.float32),
+        start_log_probs=torch.tensor([[0.0]], dtype=torch.float32),
+        start_state_log_f=torch.tensor([[-0.4]], dtype=torch.float32),
+        log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[1]], dtype=torch.long),
+        terminal_log_rewards=torch.tensor([[-0.4]], dtype=torch.float32),
+        success_mask=torch.ones((1, 1), dtype=torch.bool),
+    )
+
+    with pytest.raises(ValueError, match="terminal_num_steps \+ 1"):
+        loss_fn.compute(cast(Any, sample_batch))
 
 
 def test_subtb_loss_reports_log_z_statistics() -> None:
@@ -86,6 +129,7 @@ def test_subtb_loss_reports_log_z_statistics() -> None:
             [[[0.25, 0.0]], [[2.25, 0.0]]], dtype=torch.float32
         ),
         terminal_num_steps=torch.tensor([[1], [1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2], [2]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[0.25], [2.25]], dtype=torch.float32),
         success_mask=torch.ones((2, 1), dtype=torch.bool),
     )
@@ -107,8 +151,9 @@ def test_subtb_loss_matches_ms_subtrajectory_objective() -> None:
         start_state_log_f=torch.tensor([[1.0]], dtype=torch.float32),
         log_pf_steps=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
         log_pb_steps=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
-        next_state_log_f_steps=torch.tensor([[[2.0, 7.0]]], dtype=torch.float32),
-        terminal_num_steps=torch.tensor([[2]], dtype=torch.long),
+        next_state_log_f_steps=torch.tensor([[[2.0, 0.0]]], dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[3.0]], dtype=torch.float32),
     )
 
@@ -136,8 +181,9 @@ def test_subtb_loss_applies_component_weights_after_ms_component_means() -> None
         start_state_log_f=torch.tensor([[1.0]], dtype=torch.float32),
         log_pf_steps=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
         log_pb_steps=torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
-        next_state_log_f_steps=torch.tensor([[[2.0, 7.0]]], dtype=torch.float32),
-        terminal_num_steps=torch.tensor([[2]], dtype=torch.long),
+        next_state_log_f_steps=torch.tensor([[[2.0, 0.0]]], dtype=torch.float32),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[3.0]], dtype=torch.float32),
     )
 
@@ -161,6 +207,7 @@ def test_subtb_loss_keeps_terminal_components_per_rollout_before_batch_mean() ->
         log_pb_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
         next_state_log_f_steps=torch.zeros((1, 2, 2), dtype=torch.float32),
         terminal_num_steps=torch.tensor([[1, 1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2, 2]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[0.0, 2.0]], dtype=torch.float32),
         success_mask=torch.ones((1, 2), dtype=torch.bool),
     )
@@ -182,7 +229,7 @@ def test_subtb_loss_backward_is_autograd_safe() -> None:
     start_state_log_f = torch.tensor([[1.0]], dtype=torch.float32, requires_grad=True)
     log_pf_steps = torch.tensor([[[0.0, 0.0]]], dtype=torch.float32, requires_grad=True)
     next_state_log_f_steps = torch.tensor(
-        [[[2.0, 7.0]]], dtype=torch.float32, requires_grad=True
+        [[[2.0, 0.0]]], dtype=torch.float32, requires_grad=True
     )
     terminal_log_rewards = torch.tensor(
         [[3.0]], dtype=torch.float32, requires_grad=True
@@ -194,7 +241,8 @@ def test_subtb_loss_backward_is_autograd_safe() -> None:
         log_pf_steps=log_pf_steps,
         log_pb_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         next_state_log_f_steps=next_state_log_f_steps,
-        terminal_num_steps=torch.tensor([[2]], dtype=torch.long),
+        terminal_num_steps=torch.tensor([[1]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[2]], dtype=torch.long),
         terminal_log_rewards=terminal_log_rewards,
     )
 
@@ -231,6 +279,7 @@ def test_subtb_root_metric_tracks_explicit_root_boundary_residual() -> None:
         log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         terminal_num_steps=torch.tensor([[0]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[1]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[0.5]], dtype=torch.float32),
     )
 
@@ -251,6 +300,7 @@ def test_subtb_root_metric_subtracts_start_log_rewards() -> None:
         log_pf_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         next_state_log_f_steps=torch.zeros((1, 1, 2), dtype=torch.float32),
         terminal_num_steps=torch.tensor([[0]], dtype=torch.long),
+        termination_action_steps=torch.tensor([[1]], dtype=torch.long),
         terminal_log_rewards=torch.tensor([[0.0]], dtype=torch.float32),
     )
 

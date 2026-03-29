@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.graph import build_graph_batch
-from src.models.gflownet import PreparedSearchBatch
+from src.models.gflownet.prefix_state import PreparedSearchBatch
 
 from .conftest import make_batch_from_graph, make_policy, make_toy_batch
 

@@ -6,7 +6,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from src.models.gflownet import AnswerReachabilityTrajectorySupervisor
+from src.models.gflownet.prefix_sampler import AnswerReachabilityTrajectorySupervisor
 
 from .conftest import make_toy_batch
 

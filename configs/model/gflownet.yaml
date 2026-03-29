@@ -17,12 +17,20 @@ training_cfg:
     _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
   action_prior_schedule:
     _target_: src.models.configs.gflownet.ActionPriorScheduleConfig
+  transition_bias_schedule:
+    _target_: src.models.configs.gflownet.TransitionBiasScheduleConfig
   success_replay:
     _target_: src.models.configs.gflownet.SuccessReplayConfig
+  replay_mix_schedule:
+    _target_: src.models.configs.gflownet.ReplayMixScheduleConfig
   answer_quotient:
     _target_: src.models.configs.gflownet.AnswerQuotientConfig
   potential_reward:
     _target_: src.models.configs.gflownet.PotentialRewardConfig
+  subgraph_reward:
+    _target_: src.models.configs.gflownet.SubgraphRewardConfig
+  subgraph_proposal:
+    _target_: src.models.configs.gflownet.SubgraphProposalConfig
   subtb:
     _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
 
@@ -35,10 +43,18 @@ policy_cfg:
     _target_: src.models.configs.backbone.BackboneConfig
   prefix_controller:
     _target_: src.models.configs.policy.PrefixControllerConfig
+  visited_set_encoder:
+    _target_: src.models.configs.policy.VisitedSetEncoderConfig
+  prefix_memory:
+    _target_: src.models.configs.policy.PrefixMemoryConfig
   state_score_head:
     _target_: src.models.configs.policy.StateScoreHeadConfig
   transition_head:
     _target_: src.models.configs.policy.TransitionHeadConfig
+  subgraph_state_encoder:
+    _target_: src.models.configs.policy.SubgraphStateEncoderConfig
+  subgraph_action_head:
+    _target_: src.models.configs.policy.SubgraphActionHeadConfig
 
 eval_cfg:
   _target_: src.models.configs.gflownet.SearchEvalConfig

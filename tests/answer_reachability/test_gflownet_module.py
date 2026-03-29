@@ -6,7 +6,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-import src.models.gflownet.policy as gflownet_policy_impl
+import src.models.gflownet.prefix_policy as gflownet_policy_impl
 import src.models.gflownet_module as gflownet_module_impl
 from src.models.configs import (
     ActionPriorConfig,
@@ -18,24 +18,30 @@ from src.models.configs import (
     OptimizerConfig,
     PolicyConfig,
     PotentialRewardConfig,
+    ReplayMixScheduleConfig,
     SamplingTemperatureScheduleConfig,
     SchedulerConfig,
     SearchEvalConfig,
     StateScoreHeadConfig,
     SuccessReplayConfig,
+    TransitionBiasScheduleConfig,
     TransitionHeadConfig,
 )
-from src.models.gflownet import (
-    AnswerReachabilityTrajectorySupervisor,
-    ForwardTrajectoryGFNSampler,
-    SearchState,
-    SubTrajectoryBalanceLoss,
-    SubTrajectoryBalanceLossOutput,
-    TrajectoryGFNSampleBatch,
-    TrainingScheduleContext,
+from src.models.gflownet.heuristics import (
     compute_embedding_log_heuristic,
     compute_topology_log_heuristic,
 )
+from src.models.gflownet.prefix_losses import (
+    SubTrajectoryBalanceLoss,
+    SubTrajectoryBalanceLossOutput,
+)
+from src.models.gflownet.prefix_sampler import (
+    AnswerReachabilityTrajectorySupervisor,
+    ForwardTrajectoryGFNSampler,
+    TrajectoryGFNSampleBatch,
+)
+from src.models.gflownet.prefix_state import SearchState
+from src.models.gflownet.schedules import TrainingScheduleContext
 from src.models.gflownet.answer_supervision import compute_gold_entity_ranking_loss
 from src.graph import TrajectoryBatch, build_graph_batch
 from src.models.gflownet_module import (
@@ -186,6 +192,7 @@ def _make_manual_sample_batch(
         trace_mask=trace_mask,
         terminal_nodes=start_nodes.clone(),
         terminal_num_steps=torch.zeros_like(start_nodes),
+        termination_action_steps=torch.ones_like(start_nodes),
         terminal_state_log_f=torch.zeros_like(start_nodes, dtype=torch.float32),
         terminal_rewards=torch.zeros_like(start_nodes, dtype=torch.float32),
         terminal_log_rewards=torch.zeros_like(start_nodes, dtype=torch.float32),
@@ -732,6 +739,58 @@ def test_start_distribution_defines_virtual_source_log_z() -> None:
         )
 
 
+def test_conditioned_graph_log_z_is_decoupled_from_start_logsumexp() -> None:
+    module = _make_module("topology")
+    batch = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1], [2, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1], dtype=torch.long),
+        q_local_indices=torch.tensor([0, 1], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+        sample_id="independent-log-z",
+    )
+    prepared_batch = module.policy.prepare_batch(batch)
+
+    with torch.no_grad():
+        module.policy.base_policy.root_flow_hidden.weight.zero_()
+        if module.policy.base_policy.root_flow_hidden.bias is not None:
+            module.policy.base_policy.root_flow_hidden.bias.zero_()
+        module.policy.base_policy.root_flow_head.weight.zero_()
+        if module.policy.base_policy.root_flow_head.bias is None:
+            raise AssertionError("root_flow_head bias must be present for this test.")
+        module.policy.base_policy.root_flow_head.bias.fill_(7.0)
+
+    def _fixed_start_log_flows(
+        *,
+        prepared_batch: Any,
+        candidate_nodes_abs: torch.Tensor,
+    ) -> torch.Tensor:
+        del prepared_batch
+        if int(candidate_nodes_abs.numel()) != 2:
+            raise AssertionError("Test expects exactly two start candidates.")
+        return torch.tensor([1.0, -2.0], device=candidate_nodes_abs.device)
+
+    module.policy.base_policy.compute_start_log_flows = _fixed_start_log_flows  # type: ignore[method-assign]
+    start_dist = module.policy.compute_start_distribution(prepared_batch)
+
+    graph_mask = start_dist.candidate_graph_ids == 0
+    assert start_dist.start_log_rewards is not None
+    implied_log_normalizer = torch.logsumexp(
+        start_dist.log_flows[graph_mask] + start_dist.start_log_rewards[graph_mask],
+        dim=0,
+    )
+
+    assert start_dist.graph_log_z[0].item() == pytest.approx(7.0)
+    assert implied_log_normalizer.item() == pytest.approx(
+        torch.logsumexp(torch.tensor([1.0, -2.0]), dim=0).item()
+    )
+    assert start_dist.graph_log_z[0].item() != pytest.approx(
+        implied_log_normalizer.item(), abs=1.0e-3
+    )
+
+
 def test_sampler_preserves_selected_start_flow_gradients() -> None:
     module = _make_module("topology")
     batch = make_toy_batch()
@@ -883,7 +942,6 @@ def test_sampler_can_force_stop_on_terminal_targets_before_proposal_expansion() 
     )
 
     assert sample_batch.trace_stop_mask is not None
-    assert sample_batch.termination_action_steps is not None
     assert call_count == 0
     assert bool(sample_batch.trace_stop_mask[0, 0, 0].item()) is True
     assert int(sample_batch.trace_edge_ids[0, 0, 0].item()) == -1
@@ -928,7 +986,6 @@ def test_sampler_does_not_force_stop_on_terminal_targets_by_default() -> None:
     )
 
     assert sample_batch.trace_stop_mask is not None
-    assert sample_batch.termination_action_steps is not None
     assert bool(sample_batch.trace_stop_mask[0, 0, 0].item()) is False
     assert int(sample_batch.trace_edge_ids[0, 0, 0].item()) == 0
     assert int(sample_batch.termination_action_steps[0, 0].item()) == 2
@@ -981,7 +1038,6 @@ def test_sampler_forces_stop_on_alias_answer_entities() -> None:
     )
 
     assert sample_batch.trace_stop_mask is not None
-    assert sample_batch.termination_action_steps is not None
     assert bool(sample_batch.trace_stop_mask[0, 0, 0].item()) is True
     assert int(sample_batch.trace_edge_ids[0, 0, 0].item()) == -1
     assert int(sample_batch.termination_action_steps[0, 0].item()) == 1
@@ -1521,6 +1577,7 @@ def test_gflownet_training_step_logs_core_local_flow_metrics() -> None:
     assert "raw_graph_candidates" in captured_metrics
     assert "scored_graph_candidates" in captured_metrics
     assert "proposal_action_prior_scale" in captured_metrics
+    assert "proposal_transition_bias_scale" in captured_metrics
     assert "proposal_root_beta" in captured_metrics
     assert "proposal_edge_beta" in captured_metrics
     assert "proposal_stop_beta" in captured_metrics
@@ -1787,6 +1844,55 @@ def test_gflownet_action_prior_schedule_anneals() -> None:
     assert module._resolve_action_prior_scale(global_step=0) == pytest.approx(1.0)
     assert module._resolve_action_prior_scale(global_step=3) == pytest.approx(0.25)
     assert module._resolve_action_prior_scale(global_step=1) == pytest.approx(0.75)
+
+
+def test_gflownet_transition_bias_schedule_anneals() -> None:
+    module = GFlowNetModule(
+        horizon_cfg=HorizonConfig(max_steps=2),
+        training_cfg=GFlowNetTrainingConfig(
+            transition_bias_schedule=TransitionBiasScheduleConfig(
+                type="linear",
+                final_scale=0.0,
+                total_steps=4,
+            )
+        ),
+        action_prior_cfg=ActionPriorConfig(),
+        policy_cfg=_make_policy_config(transition_enabled=True),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
+        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
+        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
+    )
+
+    assert module._resolve_transition_bias_scale(global_step=0) == pytest.approx(1.0)
+    assert module._resolve_transition_bias_scale(global_step=3) == pytest.approx(0.0)
+    assert module._resolve_transition_bias_scale(global_step=1) == pytest.approx(
+        2.0 / 3.0
+    )
+
+
+def test_gflownet_replay_mix_schedule_anneals() -> None:
+    module = GFlowNetModule(
+        horizon_cfg=HorizonConfig(max_steps=2),
+        training_cfg=GFlowNetTrainingConfig(
+            success_replay=SuccessReplayConfig(mix_alpha=0.5),
+            replay_mix_schedule=ReplayMixScheduleConfig(
+                type="linear",
+                final_alpha=0.0,
+                total_steps=4,
+            ),
+        ),
+        action_prior_cfg=ActionPriorConfig(),
+        policy_cfg=_make_policy_config(),
+        eval_cfg=SearchEvalConfig(report_profile="rank_only"),
+        optimizer_cfg=OptimizerConfig(type="adamw", lr=1.0e-4, weight_decay=0.0),
+        scheduler_cfg=SchedulerConfig(type="cosine", interval="step", t_max=8),
+        metric_runtime_factory=GraphTaskRuntimeFactory(),
+    )
+
+    assert module._resolve_replay_mix_alpha(global_step=0) == pytest.approx(0.5)
+    assert module._resolve_replay_mix_alpha(global_step=3) == pytest.approx(0.0)
+    assert module._resolve_replay_mix_alpha(global_step=1) == pytest.approx(1.0 / 3.0)
 
 
 def test_sampler_applies_constant_step_log_penalty_to_each_move() -> None:
@@ -2336,16 +2442,29 @@ def test_transition_head_only_changes_proposal_logits() -> None:
         state,
         action_prior_scale=0.0,
     )
+    annealed_proposal_distribution = (
+        module.policy.compute_proposal_forward_distribution(
+            prepared_batch,
+            state,
+            action_prior_scale=0.0,
+            transition_bias_scale=0.0,
+        )
+    )
     assert target_distribution.is_stop_action is not None
     assert proposal_distribution.is_stop_action is not None
+    assert annealed_proposal_distribution.is_stop_action is not None
     target_move_logits = target_distribution.edge_logits[
         ~target_distribution.is_stop_action
     ]
     proposal_move_logits = proposal_distribution.edge_logits[
         ~proposal_distribution.is_stop_action
     ]
+    annealed_move_logits = annealed_proposal_distribution.edge_logits[
+        ~annealed_proposal_distribution.is_stop_action
+    ]
     assert target_move_logits.tolist() == pytest.approx([3.0, 3.0])
     assert proposal_move_logits.tolist() == pytest.approx([3.0, 4.0])
+    assert annealed_move_logits.tolist() == pytest.approx([3.0, 3.0])
 
 
 def test_base_policy_no_longer_registers_stop_relation_buffer() -> None:

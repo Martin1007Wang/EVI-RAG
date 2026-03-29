@@ -7,13 +7,17 @@ from src.metrics.answer_metrics import (
 from src.metrics.edge_metrics import EdgeRetrievalRuntime
 from src.metrics.protocol import MetricRuntimeProtocol
 from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEvalConfig
-from src.models.gflownet import (
+from src.models.configs.policy import SUBGRAPH_STATE_MODE
+from src.models.gflownet.prefix_sampler import (
     AnswerReachabilityTrajectorySupervisor,
     ForwardTrajectoryGFNSampler,
-    SearchPolicyProtocol,
 )
+from src.models.gflownet.prefix_state import SearchPolicyProtocol
+from src.models.gflownet.subgraph.policy import SubgraphPolicy
+from src.models.gflownet.subgraph.sampler import SubgraphSampler
 
 from .search_backends import FlowFrontierBackend, MonteCarloBackend
+from .subgraph_answer_search_runtime import SubgraphAnswerSearchRuntime
 
 
 def _build_trajectory_sampler(
@@ -59,6 +63,18 @@ class GraphTaskRuntimeFactory:
         eval_cfg: SearchEvalConfig,
         policy: SearchPolicyProtocol,
     ) -> MetricRuntimeProtocol:
+        if getattr(policy, "state_mode", None) == SUBGRAPH_STATE_MODE:
+            if not isinstance(policy, SubgraphPolicy):
+                raise TypeError("subgraph runtime requires SubgraphPolicy.")
+            if eval_cfg.runtime_task != "answer_search":
+                raise ValueError(
+                    "subgraph mode currently supports only answer_search evaluation."
+                )
+            return SubgraphAnswerSearchRuntime(
+                eval_cfg=eval_cfg,
+                policy=policy,
+                sampler=SubgraphSampler(max_steps=int(horizon_cfg.max_steps)),
+            )
         sampler = _build_trajectory_sampler(
             horizon_cfg=horizon_cfg,
             training_cfg=training_cfg,

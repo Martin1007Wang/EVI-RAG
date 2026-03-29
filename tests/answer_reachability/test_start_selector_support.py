@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.gflownet import InvalidStartCandidatesError
+from src.models.gflownet.prefix_policy import InvalidStartCandidatesError
 
 from .conftest import make_batch_from_graph, make_policy
 

@@ -7,13 +7,13 @@ import torch
 
 from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
-from src.models.gflownet import (
+from src.models.gflownet.prefix_state import (
     PreparedSearchBatch,
     RootActionDistribution,
     SearchPolicyProtocol,
     SearchState,
-    compute_constrained_policy_step,
 )
+from src.models.gflownet.transitions import compute_constrained_policy_step
 from src.models.gflownet.path import (
     append_relation_and_node_tokens_inplace,
     append_stop_token_inplace,
@@ -414,7 +414,9 @@ def _build_child_frontier(
     )
     keep_mask = normalized_mass > 0.0
     if float(eval_cfg.flow_frontier.prune_epsilon) > 0.0:
-        keep_mask = keep_mask & (normalized_mass >= float(eval_cfg.flow_frontier.prune_epsilon))
+        keep_mask = keep_mask & (
+            normalized_mass >= float(eval_cfg.flow_frontier.prune_epsilon)
+        )
     pruned_mass = float(normalized_mass[~keep_mask].sum().item())
     if not bool(keep_mask.any().item()):
         return None, pruned_mass
@@ -484,7 +486,9 @@ def run_flow_frontier_search(
             coverage_certified = False
             stop_reason = "flow_frontier_frontier_budget_exhausted"
             break
-        if expanded_state_count + frontier_size > int(eval_cfg.flow_frontier.max_expansions):
+        if expanded_state_count + frontier_size > int(
+            eval_cfg.flow_frontier.max_expansions
+        ):
             remaining_mass_upper += _sum_normalized_flow_mass(
                 log_state_flows=frontier.log_state_flows,
                 graph_log_z=context.graph_log_z,

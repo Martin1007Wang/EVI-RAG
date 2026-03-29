@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .types import SearchState
+from .prefix_state import SearchState
 
 
 ABSOLUTE_NODE_TOKEN_STRIDE = 2
@@ -176,6 +176,12 @@ def build_entity_revisit_mask_from_flat_state(
     candidate_target_abs_nodes: torch.Tensor,
     candidate_agent_indices: torch.Tensor,
 ) -> torch.Tensor:
+    """Return the hard legality mask for repeated-entity forward moves.
+
+    The check is performed on exact prefix history. Finite reward shaping is not
+    used here: repeated-entity moves are excluded from the legal action support.
+    """
+
     if tuple(candidate_target_abs_nodes.shape) != tuple(candidate_agent_indices.shape):
         raise ValueError(
             "candidate_target_abs_nodes and candidate_agent_indices must share the same shape for no-repeat constraints. "
@@ -234,6 +240,8 @@ def build_entity_revisit_mask(
     candidate_agent_indices: torch.Tensor,
     max_steps: int,
 ) -> torch.Tensor:
+    """SearchState wrapper for the legal repeated-entity move mask."""
+
     flat_path_token_ids = None
     if state.path_token_ids is not None:
         flat_path_token_ids = state.flatten_path_token_ids(max_steps=max_steps)

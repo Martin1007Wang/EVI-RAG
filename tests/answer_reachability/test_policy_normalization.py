@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from src.models.gflownet import apply_forward_constraints
-from src.models.gflownet import SearchState
+from src.models.gflownet.transitions import apply_forward_constraints
+from src.models.gflownet.prefix_state import SearchState
 
 from .conftest import make_policy, make_toy_batch
 

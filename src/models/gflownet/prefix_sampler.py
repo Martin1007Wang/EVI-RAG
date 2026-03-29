@@ -17,14 +17,14 @@ from .answer_supervision import (
     graph_ids_from_ptr,
     lookup_is_gold,
 )
-from .policy import _temper_segmented_log_probs
+from .prefix_policy import _temper_segmented_log_probs
 from .path import (
     append_relation_and_node_tokens_inplace,
     append_stop_token_inplace,
     initialize_path_token_ids,
 )
 from .transitions import apply_forward_constraints
-from .types import (
+from .prefix_state import (
     ForwardActionDistribution,
     GFlowNetPolicyProtocol,
     PreparedGFlowNetBatch,
@@ -1073,8 +1073,10 @@ class TrajectoryGFNSampleBatch:
 
     ``trace_edge_ids`` keeps only graph expansion moves, while the exact state
     sequence itself is stored in ``path_token_ids`` with the terminal STOP token
-    appended for absorbing states. ``trace_stop_mask`` and
-    ``termination_action_steps`` remain as convenient derived rollout traces.
+    appended for absorbing states. ``termination_action_steps`` is the required
+    explicit STOP-action index for each rollout and must equal
+    ``terminal_num_steps + 1`` because ``terminal_num_steps`` counts only graph
+    moves.
     Terminal metadata includes both the entity-level reward anchor and the
     answer-sink ids/log-rewards used by the quotient-style terminal loss.
     """
@@ -1093,6 +1095,7 @@ class TrajectoryGFNSampleBatch:
     trace_mask: torch.Tensor
     terminal_nodes: torch.Tensor
     terminal_num_steps: torch.Tensor
+    termination_action_steps: torch.Tensor
     terminal_rewards: torch.Tensor
     terminal_log_rewards: torch.Tensor
     success_mask: torch.Tensor
@@ -1105,7 +1108,6 @@ class TrajectoryGFNSampleBatch:
     terminal_sink_ids: torch.Tensor | None = None
     terminal_sink_log_rewards: torch.Tensor | None = None
     gold_answer_counts: torch.Tensor | None = None
-    termination_action_steps: torch.Tensor | None = None
     terminal_state_log_f: torch.Tensor | None = None
     terminal_backward_log_probs: torch.Tensor | None = None
     start_entropy: torch.Tensor | None = None
@@ -1115,6 +1117,30 @@ class TrajectoryGFNSampleBatch:
     total_unique_active_state_count: int = 0
     total_raw_graph_candidate_count: int = 0
     total_scored_graph_candidate_count: int = 0
+
+    def __post_init__(self) -> None:
+        if tuple(self.termination_action_steps.shape) != tuple(
+            self.terminal_num_steps.shape
+        ):
+            raise ValueError(
+                "termination_action_steps must match terminal_num_steps shape. "
+                f"termination_action_steps={tuple(self.termination_action_steps.shape)} "
+                f"terminal_num_steps={tuple(self.terminal_num_steps.shape)}."
+            )
+        termination_action_steps = self.termination_action_steps.to(dtype=torch.long)
+        terminal_num_steps = self.terminal_num_steps.to(dtype=torch.long)
+        if bool((termination_action_steps <= 0).any().item()):
+            raise ValueError(
+                "termination_action_steps must be positive explicit STOP indices."
+            )
+        expected_termination_steps = terminal_num_steps + 1
+        if not bool(
+            (termination_action_steps == expected_termination_steps).all().item()
+        ):
+            raise ValueError(
+                "termination_action_steps must equal terminal_num_steps + 1 so the "
+                "terminal STOP action is represented explicitly in SubTB."
+            )
 
     @property
     def proposal_start_entropy(self) -> torch.Tensor | None:
@@ -1135,6 +1161,7 @@ class TrajectorySamplerProtocol(Protocol):
         rollouts_per_graph: int,
         temperature: float,
         action_prior_scale: float = 1.0,
+        transition_bias_scale: float = 1.0,
     ) -> TrajectoryGFNSampleBatch: ...
 
     def rebuild_sample_batch(
@@ -1189,6 +1216,7 @@ class ForwardTrajectoryGFNSampler:
         rollouts_per_graph: int,
         temperature: float,
         action_prior_scale: float = 1.0,
+        transition_bias_scale: float = 1.0,
     ) -> TrajectoryGFNSampleBatch:
         with torch.no_grad():
             proposal_start_dist = policy.compute_proposal_start_distribution(
@@ -1364,6 +1392,7 @@ class ForwardTrajectoryGFNSampler:
                             search_state,
                             target_distribution,
                             action_prior_scale=action_prior_scale,
+                            transition_bias_scale=transition_bias_scale,
                         ),
                         edge_agent_batch=target_distribution.edge_agent_batch,
                         edge_ids=target_distribution.edge_ids,

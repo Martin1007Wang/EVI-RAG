@@ -6,8 +6,8 @@ from typing import Any, Callable, Protocol
 
 from src.graph import TrajectoryBatch
 from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEvalConfig
-from src.models.gflownet import TrajectorySamplerProtocol
-from src.models.gflownet import SearchPolicyProtocol
+from src.models.gflownet.prefix_sampler import TrajectorySamplerProtocol
+from src.models.gflownet.prefix_state import SearchPolicyProtocol
 
 from .prediction_io import PredictionCodecProtocol
 

@@ -29,6 +29,10 @@ def use_zero_weight_decay(*, name: str, parameter: torch.nn.Parameter) -> bool:
     return parameter.ndim <= 1
 
 
+def is_log_z_head_parameter(*, name: str) -> bool:
+    return "root_flow_" in name
+
+
 def build_optimizer_param_groups(
     *,
     model_parameters: Iterable[tuple[str, torch.nn.Parameter]],
@@ -43,42 +47,35 @@ def build_optimizer_param_groups(
         raise RuntimeError("No trainable parameters found in model.")
 
     base_lr = float(optimizer_cfg.get("lr", 1.0e-4))
+    log_z_head_lr_multiplier = float(optimizer_cfg.get("log_z_head_lr_multiplier", 1.0))
     base_weight_decay = float(optimizer_cfg.get("weight_decay", 0.01))
-    if not bool(optimizer_cfg.get("no_decay_on_bias_and_norm", True)):
-        return [
-            {
-                "params": [parameter for _, parameter in trainable_named_params],
-                "lr": base_lr,
-                "weight_decay": base_weight_decay,
-                "group_name": "default",
-            }
-        ]
-
-    decay_params: list[torch.nn.Parameter] = []
-    no_decay_params: list[torch.nn.Parameter] = []
+    use_no_decay_split = bool(optimizer_cfg.get("no_decay_on_bias_and_norm", True))
+    grouped_params: dict[tuple[bool, bool], list[torch.nn.Parameter]] = {}
     for name, parameter in trainable_named_params:
-        if use_zero_weight_decay(name=name, parameter=parameter):
-            no_decay_params.append(parameter)
-        else:
-            decay_params.append(parameter)
+        has_zero_weight_decay = use_no_decay_split and use_zero_weight_decay(
+            name=name, parameter=parameter
+        )
+        group_key = (is_log_z_head_parameter(name=name), has_zero_weight_decay)
+        grouped_params.setdefault(group_key, []).append(parameter)
 
     param_groups: list[dict[str, Any]] = []
-    if decay_params:
+    for (is_log_z_head, has_zero_weight_decay), params in grouped_params.items():
+        group_lr = base_lr * (log_z_head_lr_multiplier if is_log_z_head else 1.0)
+        group_weight_decay = 0.0 if has_zero_weight_decay else base_weight_decay
+        if is_log_z_head and has_zero_weight_decay:
+            group_name = "log_z_head_no_decay"
+        elif is_log_z_head:
+            group_name = "log_z_head_decay"
+        elif has_zero_weight_decay:
+            group_name = "no_decay"
+        else:
+            group_name = "decay"
         param_groups.append(
             {
-                "params": decay_params,
-                "lr": base_lr,
-                "weight_decay": base_weight_decay,
-                "group_name": "decay",
-            }
-        )
-    if no_decay_params:
-        param_groups.append(
-            {
-                "params": no_decay_params,
-                "lr": base_lr,
-                "weight_decay": 0.0,
-                "group_name": "no_decay",
+                "params": params,
+                "lr": group_lr,
+                "weight_decay": group_weight_decay,
+                "group_name": group_name,
             }
         )
     return param_groups
@@ -165,5 +162,6 @@ __all__ = [
     "build_optimizer_and_scheduler",
     "build_optimizer_param_groups",
     "cfg_to_dict",
+    "is_log_z_head_parameter",
     "use_zero_weight_decay",
 ]

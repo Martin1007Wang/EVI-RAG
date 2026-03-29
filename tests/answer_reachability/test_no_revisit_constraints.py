@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from src.models.gflownet import ForwardActionDistribution
-from src.models.gflownet import SearchState
-from src.models.gflownet import apply_forward_constraints
+from src.models.gflownet.prefix_state import ForwardActionDistribution
+from src.models.gflownet.prefix_state import SearchState
+from src.models.gflownet.legality import build_legal_forward_move_keep_mask
+from src.models.gflownet.prefix import build_flat_visited_entity_sketch
+from src.models.gflownet.transitions import apply_forward_constraints
+from src.models.gflownet.legality import build_unique_forward_candidate_keep_mask
 from src.models.gflownet.repetition import build_entity_revisit_mask
 from src.models.gflownet.repetition import build_entity_revisit_mask_from_flat_state
 
@@ -130,6 +133,138 @@ def test_root_state_no_repeat_only_blocks_current_entity() -> None:
     assert torch.equal(
         repeat_mask, torch.tensor([True, False, False], dtype=torch.bool)
     )
+
+
+def test_legal_forward_move_keep_mask_defines_hard_prefix_space_support() -> None:
+    batch = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1, 1], [1, 0, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1, 2], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+    )
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    state = SearchState.from_edge_path(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_node=0,
+        edge_ids=(0,),
+        max_steps=2,
+        device=batch.node_ptr.device,
+    )
+
+    keep_mask = build_legal_forward_move_keep_mask(
+        flat_current_abs_nodes=state.flatten_current_nodes(),
+        flat_num_steps=state.flatten_num_steps(),
+        flat_path_token_ids=state.flatten_path_token_ids(max_steps=2),
+        node_entity_ids_by_abs_node=prepared_batch.observation.node_entity_ids,
+        num_nodes=int(prepared_batch.topology.num_nodes),
+        candidate_target_abs_nodes=torch.tensor([0, 2, 2], dtype=torch.long),
+        candidate_agent_indices=torch.tensor([0, 0, 0], dtype=torch.long),
+        child_num_steps=torch.tensor([2, 2, 3], dtype=torch.long),
+        max_steps=2,
+    )
+
+    assert torch.equal(
+        keep_mask,
+        torch.tensor([False, True, False], dtype=torch.bool),
+    )
+
+
+def test_legacy_candidate_keep_mask_alias_matches_legal_prefix_helper() -> None:
+    batch = make_batch_from_graph(
+        num_nodes=3,
+        edge_index=torch.tensor([[0, 1, 1], [1, 0, 2]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1, 2], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([2], dtype=torch.long),
+        answer_entity_ids=torch.tensor([102], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
+    )
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    state = SearchState.from_edge_path(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_node=0,
+        edge_ids=(0,),
+        max_steps=2,
+        device=batch.node_ptr.device,
+    )
+    kwargs = dict(
+        flat_current_abs_nodes=state.flatten_current_nodes(),
+        flat_num_steps=state.flatten_num_steps(),
+        flat_path_token_ids=state.flatten_path_token_ids(max_steps=2),
+        node_entity_ids_by_abs_node=prepared_batch.observation.node_entity_ids,
+        num_nodes=int(prepared_batch.topology.num_nodes),
+        candidate_target_abs_nodes=torch.tensor([0, 2], dtype=torch.long),
+        candidate_agent_indices=torch.tensor([0, 0], dtype=torch.long),
+        child_num_steps=torch.tensor([2, 2], dtype=torch.long),
+        max_steps=2,
+    )
+
+    assert torch.equal(
+        build_legal_forward_move_keep_mask(**kwargs),
+        build_unique_forward_candidate_keep_mask(**kwargs),
+    )
+
+
+def test_exact_visited_entity_sketch_separates_distinct_prefix_histories() -> None:
+    batch = make_batch_from_graph(
+        num_nodes=5,
+        edge_index=torch.tensor([[0, 0, 1, 2], [1, 2, 3, 3]], dtype=torch.long),
+        edge_rel_global=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        q_local_indices=torch.tensor([0], dtype=torch.long),
+        a_local_indices=torch.tensor([3], dtype=torch.long),
+        answer_entity_ids=torch.tensor([103], dtype=torch.long),
+        node_entity_ids=torch.tensor([100, 101, 102, 103, 104], dtype=torch.long),
+    )
+    policy = make_policy(max_steps=3)
+    prepared_batch = policy.prepare_batch(batch)
+    state_a = SearchState.from_edge_path(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_node=0,
+        edge_ids=(0, 2),
+        max_steps=3,
+        device=batch.node_ptr.device,
+    )
+    state_b = SearchState.from_edge_path(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        start_node=0,
+        edge_ids=(1, 3),
+        max_steps=3,
+        device=batch.node_ptr.device,
+    )
+    flat_nodes = torch.cat(
+        (state_a.flatten_current_nodes(), state_b.flatten_current_nodes()), dim=0
+    )
+    flat_num_steps = torch.cat(
+        (state_a.flatten_num_steps(), state_b.flatten_num_steps()), dim=0
+    )
+    flat_path_token_ids = torch.cat(
+        (
+            state_a.flatten_path_token_ids(max_steps=3),
+            state_b.flatten_path_token_ids(max_steps=3),
+        ),
+        dim=0,
+    )
+
+    visited_sketch = build_flat_visited_entity_sketch(
+        flat_current_abs_nodes=flat_nodes,
+        flat_num_steps=flat_num_steps,
+        flat_path_token_ids=flat_path_token_ids,
+        node_entity_ids_by_abs_node=prepared_batch.observation.node_entity_ids,
+        num_nodes=int(prepared_batch.topology.num_nodes),
+        sketch_dim=32,
+        num_hashes=2,
+    )
+
+    assert not torch.allclose(visited_sketch[0], visited_sketch[1])
 
 
 def test_forward_distribution_filters_full_revisit_before_scoring() -> None:

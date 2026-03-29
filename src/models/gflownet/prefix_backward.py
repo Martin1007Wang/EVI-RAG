@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .types import ForwardActionDistribution, PreparedSearchBatch, SearchState
+from .prefix_state import ForwardActionDistribution, PreparedSearchBatch, SearchState
 
 
 @dataclass(frozen=True)

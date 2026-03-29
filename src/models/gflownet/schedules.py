@@ -6,7 +6,9 @@ from typing import Any
 
 from src.models.configs import (
     ActionPriorScheduleConfig,
+    ReplayMixScheduleConfig,
     SamplingTemperatureScheduleConfig,
+    TransitionBiasScheduleConfig,
 )
 
 
@@ -95,7 +97,11 @@ class SamplingTemperatureScheduler:
                 "or configure training.sampling_temperature_schedule.total_steps explicitly."
             )
 
-        progress = self._progress(global_step=global_step, total_steps=total_steps)
+        progress = self._progress(
+            global_step=global_step,
+            total_steps=total_steps,
+            hold_steps=int(self.config.hold_steps),
+        )
         final_temperature_value = self.config.final_temperature
         if final_temperature_value is None:
             raise RuntimeError(
@@ -110,11 +116,17 @@ class SamplingTemperatureScheduler:
         )
 
     @staticmethod
-    def _progress(*, global_step: int, total_steps: int) -> float:
+    def _progress(*, global_step: int, total_steps: int, hold_steps: int = 0) -> float:
         if total_steps <= 1:
             return 1.0
         clipped_step = min(max(int(global_step), 0), int(total_steps) - 1)
-        return float(clipped_step) / float(int(total_steps) - 1)
+        effective_hold_steps = min(max(int(hold_steps), 0), int(total_steps) - 1)
+        if effective_hold_steps == 0:
+            return float(clipped_step) / float(int(total_steps) - 1)
+        if clipped_step < effective_hold_steps:
+            return 0.0
+        anneal_steps = int(total_steps) - effective_hold_steps
+        return float(clipped_step - effective_hold_steps + 1) / float(anneal_steps)
 
 
 def _interpolate_scalar_schedule(
@@ -175,6 +187,7 @@ class ActionPriorScheduler:
         progress = SamplingTemperatureScheduler._progress(
             global_step=global_step,
             total_steps=total_steps,
+            hold_steps=int(self.config.hold_steps),
         )
         return _interpolate_scalar_schedule(
             schedule_type=self.config.type,
@@ -184,9 +197,117 @@ class ActionPriorScheduler:
         )
 
 
+class TransitionBiasScheduler:
+    def __init__(
+        self,
+        *,
+        base_scale: float,
+        config: TransitionBiasScheduleConfig,
+    ) -> None:
+        self.base_scale = float(base_scale)
+        self.config = config
+
+    def value(
+        self,
+        *,
+        global_step: int,
+        schedule_context: TrainingScheduleContext,
+    ) -> float:
+        initial_scale = (
+            self.base_scale
+            if self.config.initial_scale is None
+            else float(self.config.initial_scale)
+        )
+        if self.config.type == "constant":
+            return initial_scale
+
+        total_steps = schedule_context.resolve_horizon(
+            explicit_horizon=self.config.total_steps,
+            interval="step",
+        )
+        if total_steps is None:
+            raise RuntimeError(
+                "transition-bias schedule requires a known step horizon. Set trainer.max_steps, "
+                "ensure estimated_stepping_batches is available, or configure "
+                "training.transition_bias_schedule.total_steps explicitly."
+            )
+
+        final_scale_value = self.config.final_scale
+        if final_scale_value is None:
+            raise RuntimeError(
+                "transition-bias schedule requires final_scale for annealed schedules."
+            )
+        progress = SamplingTemperatureScheduler._progress(
+            global_step=global_step,
+            total_steps=total_steps,
+            hold_steps=int(self.config.hold_steps),
+        )
+        return _interpolate_scalar_schedule(
+            schedule_type=self.config.type,
+            initial_value=initial_scale,
+            final_value=float(final_scale_value),
+            progress=progress,
+        )
+
+
+class ReplayMixScheduler:
+    def __init__(
+        self,
+        *,
+        base_alpha: float,
+        config: ReplayMixScheduleConfig,
+    ) -> None:
+        self.base_alpha = float(base_alpha)
+        self.config = config
+
+    def value(
+        self,
+        *,
+        global_step: int,
+        schedule_context: TrainingScheduleContext,
+    ) -> float:
+        initial_alpha = (
+            self.base_alpha
+            if self.config.initial_alpha is None
+            else float(self.config.initial_alpha)
+        )
+        if self.config.type == "constant":
+            return initial_alpha
+
+        total_steps = schedule_context.resolve_horizon(
+            explicit_horizon=self.config.total_steps,
+            interval="step",
+        )
+        if total_steps is None:
+            raise RuntimeError(
+                "replay-mix schedule requires a known step horizon. Set trainer.max_steps, "
+                "ensure estimated_stepping_batches is available, or configure "
+                "training.replay_mix_schedule.total_steps explicitly."
+            )
+
+        final_alpha_value = self.config.final_alpha
+        if final_alpha_value is None:
+            raise RuntimeError(
+                "replay-mix schedule requires final_alpha for annealed schedules."
+            )
+        progress = SamplingTemperatureScheduler._progress(
+            global_step=global_step,
+            total_steps=total_steps,
+            hold_steps=int(self.config.hold_steps),
+        )
+        return _interpolate_scalar_schedule(
+            schedule_type=self.config.type,
+            initial_value=initial_alpha,
+            final_value=float(final_alpha_value),
+            progress=progress,
+        )
+
+
 __all__ = [
     "ActionPriorScheduler",
+    "ReplayMixScheduler",
     "SamplingTemperatureScheduler",
     "TrainingScheduleContext",
+    "TransitionBiasScheduler",
     "normalize_scheduler_interval",
 ]

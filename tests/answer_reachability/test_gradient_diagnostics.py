@@ -9,7 +9,7 @@ import pytest
 import torch
 from omegaconf import open_dict
 
-from src.models.gflownet import TrainingScheduleContext
+from src.models.gflownet.schedules import TrainingScheduleContext
 from src.utils.entrypoint_utils import _strip_instantiate_metadata
 from src.utils.fit_schedule import (
     apply_resolved_pass_fit_schedule,

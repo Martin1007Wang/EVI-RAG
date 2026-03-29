@@ -17,12 +17,12 @@ from src.models.configs import (
     SearchEvalConfig,
     SuccessReplayConfig,
 )
-from src.models.gflownet import (
+from src.models.gflownet.prefix_sampler import (
     ForwardTrajectoryGFNSampler,
-    PreparedGFlowNetBatch,
-    SuccessReplayBuffer,
     TrajectoryGFNSampleBatch,
 )
+from src.models.gflownet.prefix_state import PreparedGFlowNetBatch
+from src.models.gflownet.replay import SuccessReplayBuffer
 from src.models.gflownet_module import GFlowNetModule
 from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 
@@ -172,7 +172,6 @@ def test_success_replay_buffer_round_trips_teacher_forced_success() -> None:
     assert rebuilt_batch.log_reward_steps is not None
     assert torch.equal(rebuilt_batch.move_mask, sample_batch.move_mask[:, :1])
     assert torch.equal(rebuilt_batch.trace_stop_mask, replay_batch.trace_stop_mask)
-    assert rebuilt_batch.termination_action_steps is not None
     assert rebuilt_batch.termination_action_steps[0, 0].item() == pytest.approx(2)
     step_penalty = float(math.log(0.5))
     assert rebuilt_batch.log_reward_steps[

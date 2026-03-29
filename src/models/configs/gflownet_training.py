@@ -3,6 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def _validate_schedule_type(*, schedule_type: str, field_name: str) -> None:
+    if schedule_type not in {"constant", "linear", "cosine"}:
+        raise ValueError(
+            f"{field_name}.type must be one of {{'constant', 'linear', 'cosine'}}."
+        )
+
+
+def _validate_non_negative_hold_steps(*, hold_steps: int, field_name: str) -> None:
+    if int(hold_steps) < 0:
+        raise ValueError(f"{field_name}.hold_steps must be >= 0.")
+
+
 @dataclass(frozen=True)
 class ActionPriorConfig:
     """Proposal-policy action priors used only for training-time sampling."""
@@ -108,13 +120,13 @@ class SamplingTemperatureScheduleConfig:
     initial_temperature: float | None = None
     final_temperature: float | None = None
     total_steps: int | None = None
+    hold_steps: int = 0
 
     def __post_init__(self) -> None:
-        if self.type not in {"constant", "linear", "cosine"}:
-            raise ValueError(
-                "training.sampling_temperature_schedule.type must be one of "
-                "{'constant', 'linear', 'cosine'}."
-            )
+        _validate_schedule_type(
+            schedule_type=self.type,
+            field_name="training.sampling_temperature_schedule",
+        )
         if self.initial_temperature is not None and self.initial_temperature <= 0.0:
             raise ValueError(
                 "training.sampling_temperature_schedule.initial_temperature must be > 0."
@@ -127,6 +139,10 @@ class SamplingTemperatureScheduleConfig:
             raise ValueError(
                 "training.sampling_temperature_schedule.total_steps must be >= 1."
             )
+        _validate_non_negative_hold_steps(
+            hold_steps=self.hold_steps,
+            field_name="training.sampling_temperature_schedule",
+        )
         if self.type != "constant" and self.final_temperature is None:
             raise ValueError(
                 "training.sampling_temperature_schedule.final_temperature must be set "
@@ -140,13 +156,13 @@ class ActionPriorScheduleConfig:
     initial_scale: float | None = None
     final_scale: float | None = None
     total_steps: int | None = None
+    hold_steps: int = 0
 
     def __post_init__(self) -> None:
-        if self.type not in {"constant", "linear", "cosine"}:
-            raise ValueError(
-                "training.action_prior_schedule.type must be one of "
-                "{'constant', 'linear', 'cosine'}."
-            )
+        _validate_schedule_type(
+            schedule_type=self.type,
+            field_name="training.action_prior_schedule",
+        )
         if self.initial_scale is not None and self.initial_scale < 0.0:
             raise ValueError(
                 "training.action_prior_schedule.initial_scale must be >= 0."
@@ -155,9 +171,49 @@ class ActionPriorScheduleConfig:
             raise ValueError("training.action_prior_schedule.final_scale must be >= 0.")
         if self.total_steps is not None and self.total_steps < 1:
             raise ValueError("training.action_prior_schedule.total_steps must be >= 1.")
+        _validate_non_negative_hold_steps(
+            hold_steps=self.hold_steps,
+            field_name="training.action_prior_schedule",
+        )
         if self.type != "constant" and self.final_scale is None:
             raise ValueError(
                 "training.action_prior_schedule.final_scale must be set for "
+                "annealed schedules."
+            )
+
+
+@dataclass(frozen=True)
+class TransitionBiasScheduleConfig:
+    type: str = "constant"
+    initial_scale: float | None = None
+    final_scale: float | None = None
+    total_steps: int | None = None
+    hold_steps: int = 0
+
+    def __post_init__(self) -> None:
+        _validate_schedule_type(
+            schedule_type=self.type,
+            field_name="training.transition_bias_schedule",
+        )
+        if self.initial_scale is not None and self.initial_scale < 0.0:
+            raise ValueError(
+                "training.transition_bias_schedule.initial_scale must be >= 0."
+            )
+        if self.final_scale is not None and self.final_scale < 0.0:
+            raise ValueError(
+                "training.transition_bias_schedule.final_scale must be >= 0."
+            )
+        if self.total_steps is not None and self.total_steps < 1:
+            raise ValueError(
+                "training.transition_bias_schedule.total_steps must be >= 1."
+            )
+        _validate_non_negative_hold_steps(
+            hold_steps=self.hold_steps,
+            field_name="training.transition_bias_schedule",
+        )
+        if self.type != "constant" and self.final_scale is None:
+            raise ValueError(
+                "training.transition_bias_schedule.final_scale must be set for "
                 "annealed schedules."
             )
 
@@ -193,6 +249,43 @@ class SuccessReplayConfig:
     @property
     def enabled(self) -> bool:
         return float(self.mix_alpha) > 0.0
+
+
+@dataclass(frozen=True)
+class ReplayMixScheduleConfig:
+    type: str = "constant"
+    initial_alpha: float | None = None
+    final_alpha: float | None = None
+    total_steps: int | None = None
+    hold_steps: int = 0
+
+    def __post_init__(self) -> None:
+        _validate_schedule_type(
+            schedule_type=self.type,
+            field_name="training.replay_mix_schedule",
+        )
+        if (
+            self.initial_alpha is not None
+            and not 0.0 <= float(self.initial_alpha) < 1.0
+        ):
+            raise ValueError(
+                "training.replay_mix_schedule.initial_alpha must be in [0, 1)."
+            )
+        if self.final_alpha is not None and not 0.0 <= float(self.final_alpha) < 1.0:
+            raise ValueError(
+                "training.replay_mix_schedule.final_alpha must be in [0, 1)."
+            )
+        if self.total_steps is not None and self.total_steps < 1:
+            raise ValueError("training.replay_mix_schedule.total_steps must be >= 1.")
+        _validate_non_negative_hold_steps(
+            hold_steps=self.hold_steps,
+            field_name="training.replay_mix_schedule",
+        )
+        if self.type != "constant" and self.final_alpha is None:
+            raise ValueError(
+                "training.replay_mix_schedule.final_alpha must be set for "
+                "annealed schedules."
+            )
 
 
 @dataclass(frozen=True)
@@ -264,6 +357,54 @@ class PotentialRewardConfig:
 
 
 @dataclass(frozen=True)
+class SubgraphRewardConfig:
+    c_step: float = 0.1
+    lambda_conn: float = 0.5
+    beta_hit: float = 2.0
+    beta_cnt: float = 0.25
+    beta_early: float = 1.0
+    min_stop_edges: int = 1
+
+    def __post_init__(self) -> None:
+        if float(self.c_step) < 0.0:
+            raise ValueError("training.subgraph_reward.c_step must be >= 0.")
+        if float(self.lambda_conn) < 0.0:
+            raise ValueError("training.subgraph_reward.lambda_conn must be >= 0.")
+        if float(self.beta_hit) < 0.0:
+            raise ValueError("training.subgraph_reward.beta_hit must be >= 0.")
+        if float(self.beta_cnt) < 0.0:
+            raise ValueError("training.subgraph_reward.beta_cnt must be >= 0.")
+        if float(self.beta_early) < 0.0:
+            raise ValueError("training.subgraph_reward.beta_early must be >= 0.")
+        if int(self.min_stop_edges) < 0:
+            raise ValueError("training.subgraph_reward.min_stop_edges must be >= 0.")
+
+
+@dataclass(frozen=True)
+class SubgraphProposalConfig:
+    oracle_answer_distance_weight: float = 0.0
+    prior_question_similarity_weight: float = 0.0
+    prior_component_merge_weight: float = 0.0
+    stop_hit_bias: float = 0.0
+
+    def __post_init__(self) -> None:
+        if float(self.oracle_answer_distance_weight) < 0.0:
+            raise ValueError(
+                "training.subgraph_proposal.oracle_answer_distance_weight must be >= 0."
+            )
+        if float(self.prior_question_similarity_weight) < 0.0:
+            raise ValueError(
+                "training.subgraph_proposal.prior_question_similarity_weight must be >= 0."
+            )
+        if float(self.prior_component_merge_weight) < 0.0:
+            raise ValueError(
+                "training.subgraph_proposal.prior_component_merge_weight must be >= 0."
+            )
+        if float(self.stop_hit_bias) < 0.0:
+            raise ValueError("training.subgraph_proposal.stop_hit_bias must be >= 0.")
+
+
+@dataclass(frozen=True)
 class GFlowNetTrainingConfig:
     rollouts_per_graph: int = 8
     sampling_temperature: float = 1.0
@@ -277,10 +418,20 @@ class GFlowNetTrainingConfig:
     action_prior_schedule: ActionPriorScheduleConfig = field(
         default_factory=ActionPriorScheduleConfig
     )
+    transition_bias_schedule: TransitionBiasScheduleConfig = field(
+        default_factory=TransitionBiasScheduleConfig
+    )
     success_replay: SuccessReplayConfig = field(default_factory=SuccessReplayConfig)
+    replay_mix_schedule: ReplayMixScheduleConfig = field(
+        default_factory=ReplayMixScheduleConfig
+    )
     answer_quotient: AnswerQuotientConfig = field(default_factory=AnswerQuotientConfig)
     potential_reward: PotentialRewardConfig = field(
         default_factory=PotentialRewardConfig
+    )
+    subgraph_reward: SubgraphRewardConfig = field(default_factory=SubgraphRewardConfig)
+    subgraph_proposal: SubgraphProposalConfig = field(
+        default_factory=SubgraphProposalConfig
     )
     subtb: SubTrajectoryBalanceConfig = field(
         default_factory=SubTrajectoryBalanceConfig
@@ -305,7 +456,11 @@ __all__ = [
     "AnswerQuotientConfig",
     "GFlowNetTrainingConfig",
     "PotentialRewardConfig",
+    "ReplayMixScheduleConfig",
     "SamplingTemperatureScheduleConfig",
+    "SubgraphProposalConfig",
+    "SubgraphRewardConfig",
     "SubTrajectoryBalanceConfig",
     "SuccessReplayConfig",
+    "TransitionBiasScheduleConfig",
 ]

@@ -9,12 +9,18 @@ For the algorithm itself, read `docs/gflownet_semantics.md` first.
 
 The current cleanup pass removed several sources of drift and redundancy.
 
+It also tightened the proposal-coverage contract so the canonical training path
+can explore aggressively early and return toward the target policy late.
+
 ### Removed compatibility and alias surface
 
 - legacy start/root naming shims were removed earlier from the code surface
 - legacy `answer_reachability` train/eval experiment aliases were removed
 - legacy `answer_reachability` run aliases were removed
 - eval answer-task aliases were removed from the public config schema
+- deprecated Python compatibility wrappers were removed; canonical imports now
+  live under `prefix_*`, `subgraph.*`, and
+  `src.metrics.subgraph_answer_search_runtime`
 
 ### Removed redundant config knobs
 
@@ -70,9 +76,18 @@ Concretely, that means:
 - `model.training_cfg.success_replay.*` changes coverage mixture, not target
   equations
 
+The current refactor makes that boundary more explicit in two ways:
+
+- proposal helpers use detached target-policy logits as their coverage base
+- proposal prior scale, transition-bias scale, and replay mix each have their
+  own training schedule so late-stage training can anneal back toward near
+  on-policy sampling
+
 ## Migration guide
 
 If you are updating local configs or scripts, use these replacements.
+
+For Python import-path changes, read `docs/gflownet_import_migration.md`.
 
 | Removed surface | Use instead |
 | --- | --- |
@@ -99,6 +114,8 @@ If something looks inconsistent again, audit in this order:
 1. `src/models/configs/gflownet_training.py`
 2. `configs/model/gflownet.yaml`
 3. `configs/experiment/train_rankflow.yaml`
-4. `src/models/gflownet/policy.py`
-5. `src/models/gflownet/heuristics.py`
-6. `docs/gflownet_semantics.md`
+4. `src/models/gflownet/subgraph/state.py`
+5. `src/models/gflownet/subgraph/policy.py`
+6. `src/models/gflownet/subgraph/sampler.py`
+7. `docs/gflownet_import_migration.md`
+8. `docs/gflownet_semantics.md`

@@ -6,7 +6,7 @@ from typing import cast
 import torch
 
 from .legality import apply_forward_legality
-from .types import (
+from .prefix_state import (
     ForwardActionDistribution,
     PreparedSearchBatch,
     SearchPolicyProtocol,
@@ -31,6 +31,8 @@ def apply_forward_constraints(
     state: SearchState,
     max_steps: int,
 ) -> ForwardActionDistribution:
+    """Compatibility wrapper around hard forward-legality masking."""
+
     return apply_forward_legality(
         distribution,
         state=state,

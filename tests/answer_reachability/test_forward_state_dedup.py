@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.graph import TrajectoryBatch
-from src.models.gflownet import SearchState
+from src.models.gflownet.prefix_state import SearchState
 
 from .conftest import make_batch_from_graph, make_policy
 
@@ -61,6 +61,7 @@ def test_forward_distribution_deduplicates_identical_states_with_graph_aligned_s
         current_nodes=torch.tensor([[0, 0], [3, 3]], dtype=torch.long),
         done_mask=torch.tensor([[True, True], [False, False]], dtype=torch.bool),
         num_steps=torch.zeros((2, 2), dtype=torch.long),
+        absorbing_mask=torch.tensor([[False, False], [False, False]], dtype=torch.bool),
     )
 
     distribution = policy.compute_forward_distribution(prepared_batch, state)

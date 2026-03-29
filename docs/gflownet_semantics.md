@@ -14,21 +14,37 @@ directly:
 
 The current RankFlow stack trains a strict successor-flow GFlowNet with
 MS-SubTB, samples trajectories from a proposal policy that may differ from the
-target policy, and interprets online rollouts plus replay as a coverage-mixture
-for residual fitting rather than as an importance-corrected off-policy target.
+target policy, and treats proposal guidance plus replay as coverage controls
+rather than as an importance-corrected off-policy target. Canonical training
+anneals those coverage controls toward zero late in training so the sampler
+returns near the target policy.
 
 ## 2. State space
 
-The search space is a prefix tree over graph-walk trajectories.
+The modeled search space is the prefix tree of legal graph-walk prefixes.
 
 - The abstract root boundary is not materialized as an ordinary `SearchState`.
 - Root actions choose a start node and are represented by
   `RootActionDistribution`.
 - Non-root states are explicit prefix states stored in `SearchState`.
+- Same node and same step with different history are different states.
 - `STOP` is an explicit action and absorbing prefixes store it directly.
 
 This split matters because root actions are query-conditioned start selections,
 while non-root actions are graph transitions plus `STOP`.
+
+### Legal-prefix contract
+
+The legal forward support is defined by hard environment constraints:
+
+- graph moves must stay within `max_steps`
+- graph moves must respect entity-level no-repeat
+- repeated-entity moves are outside the forward action support
+
+So the implementation is not "all graph walks, then runtime masking as reward
+shaping." Instead, the legal state space itself is the constrained prefix tree.
+Exact prefix history must remain part of the state definition because the
+entity-level no-repeat rule is not Markov on `(current_node, num_steps)` alone.
 
 ## 3. Target policy and target measure
 
@@ -52,6 +68,11 @@ For a graph move `a_t: s_t -> s_{t+1}`, the target branch log-mass is
 `rho_move(s_t, a_t) + log F(s_{t+1})`
 
 where `rho_move` contains the configured step-level reward terms.
+
+Hard legality is not encoded as a finite reward penalty. In particular,
+entity-level no-repeat is not converted into a large negative reward inside
+`rho_move`; illegal repeated-entity moves are removed from support before
+normalization.
 
 ### STOP action
 
@@ -84,6 +105,11 @@ remaining answer distance.
 
 This is a target-measure change. It is part of the algebra seen by SubTB.
 
+No-repeat is intentionally not part of this shaping family. Converting
+entity-level no-repeat into a finite reward penalty would enlarge the fitted
+support and therefore change the target distribution rather than merely change
+implementation details.
+
 ## 5. Proposal policy
 
 The sampler may use a proposal policy `Q` that differs from the target policy
@@ -91,14 +117,14 @@ The sampler may use a proposal policy `Q` that differs from the target policy
 
 ### Root proposals
 
-Root proposals start from the target root branch masses and may add proposal
-priors from `model.action_prior_cfg`.
+Root proposals start from the target root branch masses, detach that target
+base, and may add proposal priors from `model.action_prior_cfg`.
 
 ### Edge proposals
 
 For non-root graph actions, the live proposal logits are built from three terms:
 
-`logits_Q = logits_F + b_transition + alpha_t * b_prior`
+`logits_Q = stopgrad(logits_F) + gamma_t * b_transition + alpha_t * b_prior`
 
 where:
 
@@ -106,11 +132,15 @@ where:
 - `b_transition` is the learned proposal-only transition head bias from
   `model.policy_cfg.transition_head`
 - `b_prior` is the heuristic proposal bias from `model.action_prior_cfg`
+- `gamma_t` is the training-time transition-bias scale from
+  `model.training_cfg.transition_bias_schedule`
 - `alpha_t` is the training-time proposal-prior scale from
   `model.training_cfg.action_prior_schedule`
 
 The important boundary is:
 
+- `stopgrad(logits_F)` makes the proposal branch's target base explicitly
+  coverage-only
 - `b_transition` changes proposal sampling only
 - `b_prior` changes proposal sampling only
 - neither term enters the target-policy residual algebra
@@ -150,6 +180,12 @@ Instead, it minimizes SubTB residuals under the sampled coverage measure:
 
 So proposal engineering changes coverage, not the definition of each residual.
 
+In the current refactor, the intended operating mode is not to leave those
+coverage distortions constant forever. Instead, the canonical schedules anneal
+proposal priors and transition bias toward zero so late-stage online rollouts
+approach the target policy even though early training still uses biased
+coverage for exploration.
+
 ## 8. Replay
 
 Replay is treated as another coverage source.
@@ -161,9 +197,13 @@ Replay is treated as another coverage source.
 
 The resulting optimization view is a coverage mixture:
 
-`nu_mix = (1 - alpha_replay) * nu_online + alpha_replay * nu_replay`
+`nu_mix = (1 - alpha_replay(t)) * nu_online + alpha_replay(t) * nu_replay`
 
 This is not a second objective and not an importance-correction layer.
+
+The refactor adds an explicit replay-mixture schedule under
+`model.training_cfg.replay_mix_schedule`, so replay can help with early
+coverage without remaining a permanent late-stage bias source.
 
 ## 9. MS-SubTB objective
 
@@ -205,6 +245,7 @@ definitions:
 - `model.policy_cfg.transition_head.*`
 - `model.action_prior_cfg.*`
 - `model.training_cfg.action_prior_schedule.*`
+- `model.training_cfg.transition_bias_schedule.*`
 - `model.training_cfg.sampling_temperature`
 - `model.training_cfg.sampling_temperature_schedule.*`
 
@@ -214,6 +255,7 @@ These knobs change how much online and replay coverage is gathered:
 
 - `model.training_cfg.rollouts_per_graph`
 - `model.training_cfg.success_replay.*`
+- `model.training_cfg.replay_mix_schedule.*`
 
 ### Evaluation
 
@@ -248,9 +290,15 @@ order:
 1. `src/models/configs/gflownet_training.py`
 2. `src/models/configs/policy.py`
 3. `src/models/configs/gflownet_eval.py`
-4. `src/models/gflownet/types.py`
+4. `src/models/gflownet/prefix_state.py`
 5. `src/models/gflownet/heuristics.py`
-6. `src/models/gflownet/policy.py`
-7. `src/models/gflownet/sampler.py`
-8. `src/models/gflownet/losses.py`
-9. `src/models/gflownet_module.py`
+6. `src/models/gflownet/prefix_policy.py`
+7. `src/models/gflownet/prefix_sampler.py`
+8. `src/models/gflownet/prefix_losses.py`
+9. `src/models/gflownet/subgraph/state.py`
+10. `src/models/gflownet/subgraph/mdp.py`
+11. `src/models/gflownet/subgraph/policy.py`
+12. `src/models/gflownet/subgraph/sampler.py`
+13. `src/models/gflownet/subgraph/search.py`
+14. `src/models/gflownet/subgraph/losses.py`
+15. `src/models/gflownet_module.py`

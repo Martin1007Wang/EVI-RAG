@@ -1,102 +1,38 @@
 from __future__ import annotations
 
-from .heuristics import (
-    SearchActionPrior,
-    compute_embedding_log_heuristic,
-    compute_question_node_prior,
-    compute_question_relation_prior,
-    compute_topology_log_heuristic,
-    compute_topology_node_prior,
-)
-from .losses import SubTrajectoryBalanceLoss, SubTrajectoryBalanceLossOutput
-from .policy import (
-    BaseSearchPolicy,
-    EmptyStartCandidatesError,
-    GFlowNetPolicy,
-    InvalidStartCandidatesError,
-    RootActionDistributionError,
-    resolve_start_candidates,
-)
-from .replay import (
-    ReplayGraphPayload,
-    ReplayTrajectoryBatch,
-    ReplayTrajectoryRecord,
-    SuccessReplayBuffer,
-)
-from .sampler import (
-    AnswerReachabilityTrajectorySupervisor,
-    ForwardTrajectoryGFNSampler,
-    TerminalTransitionBatch,
-    TrajectoryGFNSampleBatch,
-    TrajectoryRolloutSupervisorProtocol,
-    TrajectorySamplerProtocol,
-)
-from .schedules import (
-    ActionPriorScheduler,
-    SamplingTemperatureScheduler,
-    TrainingScheduleContext,
-    normalize_scheduler_interval,
-)
-from .transitions import (
-    ConstrainedForwardStep,
-    ConstrainedPolicyStep,
-    apply_forward_constraints,
-    compute_constrained_forward_step,
-    compute_constrained_policy_step,
-)
-from .types import (
-    ActionPriorCache,
-    ForwardActionDistribution,
-    GFlowNetPolicyProtocol,
-    PreparedGFlowNetBatch,
-    PreparedSearchBatch,
-    RootState,
-    RootActionDistribution,
-    SearchPolicyProtocol,
-    SearchState,
-)
+"""Curated public API for the GFlowNet package.
+
+Low-level utilities now live in explicit modules such as `prefix_state`,
+`prefix_policy`, and `subgraph.*`. Keep this package surface small so callers
+do not accidentally depend on internal helper layout.
+"""
+
+from . import subgraph
+from .module_factory import GFlowNetPolicyFactory
+from .prefix_losses import SubTrajectoryBalanceLoss
+from .prefix_policy import BaseSearchPolicy, GFlowNetPolicy
+from .prefix_sampler import ForwardTrajectoryGFNSampler
+from .prefix_state import SearchState
+from .subgraph.losses import SubgraphSubTrajectoryBalanceLoss
+from .subgraph.mdp import SubgraphEnv
+from .subgraph.policy import SubgraphPolicy
+from .subgraph.sampler import SubgraphSampler
+from .subgraph.search import beam_search_subgraphs
+from .subgraph.state import SubgraphAction, SubgraphState
 
 __all__ = [
-    "AnswerReachabilityTrajectorySupervisor",
-    "ActionPriorCache",
-    "ActionPriorScheduler",
     "BaseSearchPolicy",
-    "ConstrainedForwardStep",
-    "ConstrainedPolicyStep",
-    "EmptyStartCandidatesError",
-    "ForwardActionDistribution",
     "ForwardTrajectoryGFNSampler",
     "GFlowNetPolicy",
-    "GFlowNetPolicyProtocol",
-    "InvalidStartCandidatesError",
-    "PreparedGFlowNetBatch",
-    "PreparedSearchBatch",
-    "ReplayGraphPayload",
-    "ReplayTrajectoryBatch",
-    "ReplayTrajectoryRecord",
-    "RootState",
-    "RootActionDistribution",
-    "RootActionDistributionError",
-    "SamplingTemperatureScheduler",
-    "SearchActionPrior",
-    "SearchPolicyProtocol",
+    "GFlowNetPolicyFactory",
     "SearchState",
     "SubTrajectoryBalanceLoss",
-    "SubTrajectoryBalanceLossOutput",
-    "SuccessReplayBuffer",
-    "TerminalTransitionBatch",
-    "TrainingScheduleContext",
-    "TrajectoryGFNSampleBatch",
-    "TrajectoryRolloutSupervisorProtocol",
-    "TrajectorySamplerProtocol",
-    "apply_forward_constraints",
-    "compute_constrained_forward_step",
-    "compute_constrained_policy_step",
-    "compute_embedding_log_heuristic",
-    "compute_question_node_prior",
-    "compute_question_relation_prior",
-    "compute_topology_log_heuristic",
-    "compute_topology_node_prior",
-    "normalize_scheduler_interval",
-    "resolve_start_candidates",
+    "SubgraphAction",
+    "SubgraphEnv",
+    "SubgraphPolicy",
+    "SubgraphSampler",
+    "SubgraphState",
+    "SubgraphSubTrajectoryBalanceLoss",
+    "beam_search_subgraphs",
+    "subgraph",
 ]

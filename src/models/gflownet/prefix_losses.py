@@ -8,19 +8,48 @@ import torch
 from src.models.configs import AnswerQuotientConfig, SubTrajectoryBalanceConfig
 
 if TYPE_CHECKING:
-    from .sampler import TrajectoryGFNSampleBatch
+    from .prefix_sampler import TrajectoryGFNSampleBatch
 
 
 def _zero_metric_tensor() -> torch.Tensor:
     return torch.tensor(0.0, dtype=torch.float32)
 
 
-def _select_unique_terminal_path_indices(
+def _require_termination_action_steps(
     sample_batch: "TrajectoryGFNSampleBatch",
 ) -> torch.Tensor:
     termination_steps = getattr(sample_batch, "termination_action_steps", None)
     if termination_steps is None:
-        termination_steps = sample_batch.terminal_num_steps
+        raise ValueError(
+            "SubTB requires explicit termination_action_steps; terminal_num_steps "
+            "counts only graph moves and cannot substitute for the terminal STOP action."
+        )
+    termination_steps = termination_steps.to(dtype=torch.long)
+    terminal_num_steps = sample_batch.terminal_num_steps.to(dtype=torch.long)
+    if tuple(termination_steps.shape) != tuple(terminal_num_steps.shape):
+        raise ValueError(
+            "termination_action_steps must match terminal_num_steps shape for SubTB. "
+            f"termination_action_steps={tuple(termination_steps.shape)} "
+            f"terminal_num_steps={tuple(terminal_num_steps.shape)}."
+        )
+    if bool((termination_steps <= 0).any().item()):
+        raise ValueError(
+            "SubTB requires positive termination_action_steps because they index the "
+            "explicit terminal STOP action."
+        )
+    expected_termination_steps = terminal_num_steps + 1
+    if not bool((termination_steps == expected_termination_steps).all().item()):
+        raise ValueError(
+            "SubTB requires explicit STOP-index semantics: termination_action_steps "
+            "must equal terminal_num_steps + 1."
+        )
+    return termination_steps
+
+
+def _select_unique_terminal_path_indices(
+    sample_batch: "TrajectoryGFNSampleBatch",
+) -> torch.Tensor:
+    termination_steps = _require_termination_action_steps(sample_batch)
     trace_stop_mask = sample_batch.trace_stop_mask
     if trace_stop_mask is None:
         trace_stop_mask = torch.zeros_like(
@@ -355,11 +384,7 @@ class SubTrajectoryBalanceLoss:
         forward_prefix = self._build_step_prefix(step_values=log_pf_steps)
         reward_prefix = self._build_step_prefix(step_values=log_reward_steps)
 
-        terminal_counts = getattr(sample_batch, "termination_action_steps", None)
-        if terminal_counts is None:
-            terminal_index = sample_batch.terminal_num_steps.to(dtype=torch.long)
-        else:
-            terminal_index = terminal_counts.to(dtype=torch.long)
+        terminal_index = _require_termination_action_steps(sample_batch)
         if bool((terminal_index < 0).any().item()) or bool(
             (terminal_index >= sequence_horizon).any().item()
         ):

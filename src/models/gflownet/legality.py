@@ -6,7 +6,41 @@ from .repetition import (
     build_entity_revisit_mask,
     build_entity_revisit_mask_from_flat_state,
 )
-from .types import ForwardActionDistribution, SearchState
+from .prefix_state import ForwardActionDistribution, SearchState
+
+
+def build_legal_forward_move_keep_mask(
+    *,
+    flat_current_abs_nodes: torch.Tensor,
+    flat_num_steps: torch.Tensor,
+    flat_path_token_ids: torch.Tensor | None,
+    node_entity_ids_by_abs_node: torch.Tensor,
+    num_nodes: int,
+    candidate_target_abs_nodes: torch.Tensor,
+    candidate_agent_indices: torch.Tensor,
+    child_num_steps: torch.Tensor,
+    max_steps: int,
+) -> torch.Tensor:
+    """Keep only forward moves that stay inside the legal prefix state space.
+
+    A graph move is legal iff it stays within the horizon and lands on an
+    entity that has not appeared earlier in that state's exact prefix history.
+    This is a hard support restriction, not reward shaping.
+    """
+
+    if int(candidate_target_abs_nodes.numel()) == 0:
+        return torch.zeros_like(candidate_target_abs_nodes, dtype=torch.bool)
+    within_horizon = child_num_steps.to(dtype=torch.long) <= int(max_steps)
+    revisit_mask = build_entity_revisit_mask_from_flat_state(
+        flat_current_abs_nodes=flat_current_abs_nodes,
+        flat_num_steps=flat_num_steps,
+        flat_path_token_ids=flat_path_token_ids,
+        node_entity_ids_by_abs_node=node_entity_ids_by_abs_node,
+        num_nodes=num_nodes,
+        candidate_target_abs_nodes=candidate_target_abs_nodes,
+        candidate_agent_indices=candidate_agent_indices,
+    )
+    return within_horizon & (~revisit_mask)
 
 
 def build_unique_forward_candidate_keep_mask(
@@ -21,10 +55,9 @@ def build_unique_forward_candidate_keep_mask(
     child_num_steps: torch.Tensor,
     max_steps: int,
 ) -> torch.Tensor:
-    if int(candidate_target_abs_nodes.numel()) == 0:
-        return torch.zeros_like(candidate_target_abs_nodes, dtype=torch.bool)
-    within_horizon = child_num_steps.to(dtype=torch.long) <= int(max_steps)
-    revisit_mask = build_entity_revisit_mask_from_flat_state(
+    """Backward-compatible alias for ``build_legal_forward_move_keep_mask``."""
+
+    return build_legal_forward_move_keep_mask(
         flat_current_abs_nodes=flat_current_abs_nodes,
         flat_num_steps=flat_num_steps,
         flat_path_token_ids=flat_path_token_ids,
@@ -32,8 +65,9 @@ def build_unique_forward_candidate_keep_mask(
         num_nodes=num_nodes,
         candidate_target_abs_nodes=candidate_target_abs_nodes,
         candidate_agent_indices=candidate_agent_indices,
+        child_num_steps=child_num_steps,
+        max_steps=max_steps,
     )
-    return within_horizon & (~revisit_mask)
 
 
 def build_forward_invalid_action_mask(
@@ -71,6 +105,8 @@ def apply_forward_legality(
     state: SearchState,
     max_steps: int,
 ) -> ForwardActionDistribution:
+    """Hard-mask forward actions that leave the legal prefix state space."""
+
     edge_logits = distribution.edge_logits
     if int(edge_logits.numel()) == 0:
         return distribution
@@ -104,6 +140,7 @@ def apply_forward_legality(
 
 __all__ = [
     "apply_forward_legality",
+    "build_legal_forward_move_keep_mask",
     "build_forward_invalid_action_mask",
     "build_unique_forward_candidate_keep_mask",
 ]

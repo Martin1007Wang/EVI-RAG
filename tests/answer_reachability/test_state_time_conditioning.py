@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.gflownet import SearchState
+from src.models.gflownet.prefix_state import SearchState
 from src.models.gflownet.path import (
     STOP_TOKEN_ID,
     append_stop_token_inplace,
@@ -128,7 +128,50 @@ def test_non_root_state_without_path_history_is_rejected() -> None:
         num_steps=torch.ones((1, 1), dtype=torch.long),
     )
 
+    assert invalid_state.requires_exact_prefix_history() is True
     with pytest.raises(ValueError, match="exact path_token_ids"):
+        policy.compute_log_state_scores(prepared_batch, invalid_state)
+
+
+def test_root_state_without_history_stays_inside_root_prefix_boundary() -> None:
+    batch = make_toy_batch()
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    root_state = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[0]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.zeros((1, 1), dtype=torch.long),
+    )
+
+    assert root_state.requires_exact_prefix_history() is False
+    assert torch.equal(
+        root_state.resolve_path_token_ids(max_steps=2),
+        initialize_path_token_ids(
+            start_nodes=torch.tensor([[0]], dtype=torch.long),
+            max_steps=2,
+        ),
+    )
+
+
+def test_cached_control_state_does_not_replace_exact_non_root_prefix() -> None:
+    batch = make_toy_batch()
+    policy = make_policy(max_steps=2)
+    prepared_batch = policy.prepare_batch(batch)
+    hidden_dim = int(prepared_batch.question_tokens.size(-1))
+    invalid_state = SearchState(
+        topology=prepared_batch.topology,
+        observation=prepared_batch.observation,
+        current_nodes=torch.tensor([[1]], dtype=torch.long),
+        done_mask=torch.zeros((1, 1), dtype=torch.bool),
+        num_steps=torch.ones((1, 1), dtype=torch.long),
+        control_state=torch.zeros((1, 1, hidden_dim), dtype=torch.float32),
+    )
+
+    with pytest.raises(
+        ValueError, match="exact path_token_ids even when control_state"
+    ):
         policy.compute_log_state_scores(prepared_batch, invalid_state)
 
 

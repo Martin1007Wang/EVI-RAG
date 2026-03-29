@@ -12,11 +12,9 @@ from torchmetrics import MeanMetric
 from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labels
 from src.graph import TrajectoryBatch
 from src.models.configs import SearchEvalConfig
-from src.models.gflownet import (
-    RootActionDistributionError,
-    SearchPolicyProtocol,
-    TrajectorySamplerProtocol,
-)
+from src.models.gflownet.prefix_policy import RootActionDistributionError
+from src.models.gflownet.prefix_sampler import TrajectorySamplerProtocol
+from src.models.gflownet.prefix_state import SearchPolicyProtocol
 from src.utils.metrics_io import to_serializable
 
 from .base import BaseMetricRuntime
