@@ -10,7 +10,6 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from src.models.configs import BackboneConfig
 from src.utils.nn_init import init_linear_xavier
 from src.utils.precision_utils import align_float_input_dtype
 
@@ -77,21 +76,39 @@ class EmbeddingBackbone(nn.Module):
     3. 输出供策略层消费的节点/关系/问题表征
     """
 
-    def __init__(self, config: BackboneConfig) -> None:
+    def __init__(
+        self,
+        *,
+        embedding_dim: int = 1024,
+        hidden_dim: int = 512,
+        use_adapter: bool = True,
+        adapter_dim: int = 128,
+        adapter_dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.emb_dim = config.embedding_dim
-        self.hidden_dim = config.hidden_dim
-        self.use_adapter = config.use_adapter
+        self.emb_dim = int(embedding_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.use_adapter = bool(use_adapter)
+        adapter_dim = int(adapter_dim)
+        adapter_dropout = float(adapter_dropout)
+        if self.emb_dim < 1:
+            raise ValueError("backbone.embedding_dim must be >= 1.")
+        if self.hidden_dim < 1:
+            raise ValueError("backbone.hidden_dim must be >= 1.")
+        if adapter_dim < 1:
+            raise ValueError("backbone.adapter_dim must be >= 1.")
+        if adapter_dropout < 0.0 or adapter_dropout >= 1.0:
+            raise ValueError("backbone.adapter_dropout must be in [0, 1).")
         if self.use_adapter:
             self.node_adapter = EmbeddingAdapter(
                 emb_dim=self.emb_dim,
-                adapter_dim=config.adapter_dim,
-                dropout=config.adapter_dropout,
+                adapter_dim=adapter_dim,
+                dropout=adapter_dropout,
             )
             self.rel_adapter = EmbeddingAdapter(
                 emb_dim=self.emb_dim,
-                adapter_dim=config.adapter_dim,
-                dropout=config.adapter_dropout,
+                adapter_dim=adapter_dim,
+                dropout=adapter_dropout,
             )
         else:
             self.node_adapter = self.rel_adapter = None

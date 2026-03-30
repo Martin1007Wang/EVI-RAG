@@ -9,7 +9,7 @@ import pytest
 import torch
 from omegaconf import open_dict
 
-from src.models.gflownet.schedules import TrainingScheduleContext
+from src.utils.training_schedules import TrainingScheduleContext
 from src.utils.entrypoint_utils import _strip_instantiate_metadata
 from src.utils.fit_schedule import (
     apply_resolved_pass_fit_schedule,
@@ -110,14 +110,12 @@ def _build_real_train_batch_and_model():
 
 def _measure_gradient_mass_diagnostics(*, model, batch) -> GradientMassDiagnostics:
     prepared_batch = model.policy.prepare_batch(batch)
-    trajectory_batch = batch.without_raw_features()
     sample_batch = model.sampler.sample(
-        batch=trajectory_batch,
         policy=model.policy,
         prepared_batch=prepared_batch,
         rollouts_per_graph=int(model.cfg.training_cfg.rollouts_per_graph),
         temperature=model._resolve_sampling_temperature(global_step=0),
-        action_prior_scale=model._resolve_action_prior_scale(global_step=0),
+        proposal_bias_scale=model._resolve_proposal_bias_scale(global_step=0),
     )
     sample_batch.state_log_flows.retain_grad()
     sample_batch.log_pf_actions.retain_grad()

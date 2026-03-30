@@ -61,6 +61,7 @@ from src.utils.logging_utils import log_event
 class _WorkerState:
     entity_lookup: EntityLookup
     relation_lookup: RelationLookup
+    path_mode: str
     dedup_edges: bool
     validate_graph_edges: bool
     remove_self_loops: bool
@@ -92,6 +93,7 @@ def _build_graph_worker(sample: Sample) -> Optional[GraphRecord]:
         state.entity_lookup,
         state.relation_lookup,
         graph_id,
+        path_mode=state.path_mode,
         dedup_edges=state.dedup_edges,
         validate_graph_edges=state.validate_graph_edges,
         remove_self_loops=state.remove_self_loops,
@@ -110,25 +112,27 @@ def _dedup_preserve_order(values: Sequence[str]) -> List[str]:
     return out
 
 
-def _load_q_entity_blacklist(cfg) -> set[str]:
+def _load_question_entity_blacklist(cfg) -> set[str]:
     if cfg is None:
         return set()
-    raw_list = cfg.get("q_entity_blacklist") or []
-    path = cfg.get("q_entity_blacklist_path")
+    raw_list = (
+        cfg.get("question_entity_blacklist", cfg.get("q_entity_blacklist", [])) or []
+    )
+    path = cfg.get("question_entity_blacklist_path", cfg.get("q_entity_blacklist_path"))
     entries: List[str] = []
     if isinstance(raw_list, (list, tuple, set)):
         entries.extend(str(x).strip() for x in raw_list if str(x).strip())
     if path:
         path = Path(str(path))
         if not path.exists():
-            raise FileNotFoundError(f"q_entity_blacklist_path not found: {path}")
+            raise FileNotFoundError(f"question_entity_blacklist_path not found: {path}")
         if path.suffix.lower() == ".json":
             payload = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(payload, list):
                 entries.extend(str(x).strip() for x in payload if str(x).strip())
             else:
                 raise ValueError(
-                    "q_entity_blacklist_path JSON must contain a list of entity ids."
+                    "question_entity_blacklist_path JSON must contain a list of entity ids."
                 )
         else:
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -139,23 +143,63 @@ def _load_q_entity_blacklist(cfg) -> set[str]:
     return {str(x) for x in entries if str(x)}
 
 
-def _apply_q_entity_blacklist(
+def _resolve_stark_source_cfg(ctx: PreprocessContext) -> Dict[str, object]:
+    stark_cfg = ctx.cfg.get("stark")
+    if stark_cfg is None:
+        raise ValueError(
+            "dataset_source='stark' requires a `stark` config block in the preprocess config."
+        )
+    root = stark_cfg.get("root")
+    cache_dir = stark_cfg.get("cache_dir")
+    linker_cfg = stark_cfg.get("linker") or {}
+    local_graph_cfg = stark_cfg.get("local_graph") or {}
+    return {
+        "dataset": str(stark_cfg.get("dataset") or ctx.dataset_name),
+        "root": str(ctx.resolve_path(root)) if root else None,
+        "cache_dir": str(ctx.resolve_path(cache_dir)) if cache_dir else None,
+        "download_processed": bool(stark_cfg.get("download_processed", True)),
+        "indirected": bool(stark_cfg.get("indirected", False)),
+        "linker": {
+            "backend": str(linker_cfg.get("backend") or "keyword"),
+            "model": linker_cfg.get("model"),
+            "tensor_parallel_size": linker_cfg.get("tensor_parallel_size"),
+            "max_model_len": linker_cfg.get("max_model_len"),
+            "max_tokens": linker_cfg.get("max_tokens"),
+            "temperature": linker_cfg.get("temperature"),
+            "top_p": linker_cfg.get("top_p"),
+            "seed": linker_cfg.get("seed"),
+            "pretrim_to_budget": linker_cfg.get("pretrim_to_budget"),
+            "budget_margin": linker_cfg.get("budget_margin"),
+            "max_candidates": linker_cfg.get("max_candidates"),
+            "max_entities": linker_cfg.get("max_entities"),
+        },
+        "local_graph": {
+            "num_hops": local_graph_cfg.get("num_hops"),
+            "direction": local_graph_cfg.get("direction"),
+            "max_nodes": local_graph_cfg.get("max_nodes"),
+            "max_edges": local_graph_cfg.get("max_edges"),
+            "include_inverse_edges": local_graph_cfg.get("include_inverse_edges"),
+        },
+    }
+
+
+def _apply_question_entity_blacklist(
     sample: Sample,
     blacklist: set[str],
     stats: Optional[Dict[str, int]] = None,
 ) -> Sample:
     if not blacklist:
         return sample
-    q_entities = list(sample.q_entity or [])
-    filtered = [ent for ent in q_entities if ent not in blacklist]
+    question_entities = list(sample.question_entities or [])
+    filtered = [ent for ent in question_entities if ent not in blacklist]
     if stats is not None:
-        removed = len(q_entities) - len(filtered)
+        removed = len(question_entities) - len(filtered)
         if removed > 0:
             stats["blacklist_removed_entities"] += removed
             stats["blacklist_reduced_samples"] += 1
             if not filtered:
                 stats["blacklist_empty_samples"] += 1
-    if filtered == q_entities:
+    if filtered == question_entities:
         return sample
     return Sample(
         dataset=sample.dataset,
@@ -164,8 +208,8 @@ def _apply_q_entity_blacklist(
         kb=sample.kb,
         question=sample.question,
         graph=sample.graph,
-        q_entity=filtered,
-        a_entity=sample.a_entity,
+        question_entities=filtered,
+        answer_entities=sample.answer_entities,
         answer_texts=sample.answer_texts,
         graph_iso_type=sample.graph_iso_type,
         redundant=sample.redundant,
@@ -263,6 +307,121 @@ def _compute_target_reachable_nodes(
     return {label for label, idx in node_index.items() if visited[idx]}
 
 
+def _all_anchors_reachable_targets_by_index(
+    *,
+    num_nodes: int,
+    edge_src: Sequence[int],
+    edge_dst: Sequence[int],
+    anchor_local_indices: Sequence[int],
+    target_local_indices: Sequence[int],
+    path_mode: str,
+) -> List[int]:
+    anchor_ids = sorted(
+        {int(idx) for idx in anchor_local_indices if 0 <= int(idx) < num_nodes}
+    )
+    target_ids = sorted(
+        {int(idx) for idx in target_local_indices if 0 <= int(idx) < num_nodes}
+    )
+    if num_nodes <= 0 or not anchor_ids or not target_ids:
+        return []
+    reachable_intersection: Optional[Set[int]] = None
+    for anchor_id in anchor_ids:
+        reachable = set(
+            reachable_targets_by_index(
+                num_nodes=num_nodes,
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+                seeds=[anchor_id],
+                targets=target_ids,
+                path_mode=path_mode,
+            )
+        )
+        if reachable_intersection is None:
+            reachable_intersection = reachable
+        else:
+            reachable_intersection &= reachable
+        if not reachable_intersection:
+            return []
+    if reachable_intersection is None:
+        return []
+    return [
+        target_id for target_id in target_ids if target_id in reachable_intersection
+    ]
+
+
+def _all_anchors_reachable_targets(
+    *,
+    edges: Sequence[Tuple[str, str, str]],
+    anchors: Sequence[str],
+    targets: Sequence[str],
+    path_mode: str,
+) -> List[str]:
+    anchor_labels = _dedup_preserve_order(anchors)
+    target_labels = _dedup_preserve_order(targets)
+    if not edges or not anchor_labels or not target_labels:
+        return []
+    node_index: Dict[str, int] = {}
+    edge_src: List[int] = []
+    edge_dst: List[int] = []
+
+    def _local_idx(node: str) -> int:
+        idx = node_index.get(node)
+        if idx is not None:
+            return idx
+        idx = len(node_index)
+        node_index[node] = idx
+        return idx
+
+    for head, _, tail in edges:
+        edge_src.append(_local_idx(head))
+        edge_dst.append(_local_idx(tail))
+    anchor_ids = []
+    for anchor in anchor_labels:
+        anchor_id = node_index.get(anchor)
+        if anchor_id is None:
+            return []
+        anchor_ids.append(anchor_id)
+    target_pairs = [
+        (target, node_index[target]) for target in target_labels if target in node_index
+    ]
+    if not target_pairs:
+        return []
+    legal_target_ids = set(
+        _all_anchors_reachable_targets_by_index(
+            num_nodes=len(node_index),
+            edge_src=edge_src,
+            edge_dst=edge_dst,
+            anchor_local_indices=anchor_ids,
+            target_local_indices=[target_id for _, target_id in target_pairs],
+            path_mode=path_mode,
+        )
+    )
+    return [
+        target_label
+        for target_label, target_id in target_pairs
+        if target_id in legal_target_ids
+    ]
+
+
+def _filter_answer_texts_for_entities(
+    sample: Sample, *, kept_entities: Sequence[str]
+) -> List[str]:
+    kept_labels = set(str(value) for value in kept_entities)
+    if not kept_labels:
+        return []
+    if len(sample.answer_texts) != len(sample.answer_entities):
+        return list(sample.answer_texts)
+    filtered_texts: List[str] = []
+    seen_entities: Set[str] = set()
+    for entity, answer_text in zip(sample.answer_entities, sample.answer_texts):
+        entity = str(entity)
+        if entity not in kept_labels or entity in seen_entities:
+            continue
+        filtered_texts.append(str(answer_text))
+        seen_entities.add(entity)
+    return filtered_texts
+
+
 def preprocess(ctx: PreprocessContext) -> None:
     cfg = ctx.cfg
     logger = ctx.logger
@@ -279,9 +438,12 @@ def preprocess(ctx: PreprocessContext) -> None:
     hf_cache_dir_cfg = cfg.get("hf_cache_dir")
     hf_cache_dir = ctx.resolve_path(hf_cache_dir_cfg) if hf_cache_dir_cfg else None
     hf_offline = bool(cfg.get("hf_offline", False))
-    if dataset_source != "hf":
+    stark_cfg = None
+    if dataset_source == "stark":
+        stark_cfg = _resolve_stark_source_cfg(ctx)
+    elif dataset_source != "hf":
         raise ValueError(
-            "dataset_source must be 'hf'; raw parquet ingestion is disabled."
+            "dataset_source must be one of {'hf', 'stark'} for preprocess."
         )
     train_filter, eval_filter, override_filters = ctx.preprocess_filters
     path_mode = _validate_path_mode(str(cfg.get("path_mode", _PATH_MODE_UNDIRECTED)))
@@ -297,7 +459,7 @@ def preprocess(ctx: PreprocessContext) -> None:
     parquet_chunk_size = ctx.parquet_chunk_size
     parquet_num_workers = ctx.parquet_num_workers
     reuse_embeddings_if_exists = bool(cfg.get("reuse_embeddings_if_exists", False))
-    q_entity_blacklist = _load_q_entity_blacklist(cfg)
+    question_entity_blacklist = _load_question_entity_blacklist(cfg)
 
     ensure_dir(out_dir)
     entity_vocab = EntityVocab(kb=kb, text_cfg=text_cfg, cvt_cfg=cvt_cfg)
@@ -311,9 +473,9 @@ def preprocess(ctx: PreprocessContext) -> None:
         split: {
             "total_samples": 0,
             "kept_samples": 0,
-            "missing_q_any_samples": 0,
-            "missing_q_all_samples": 0,
-            "missing_q_partial_samples": 0,
+            "missing_question_entity_any_samples": 0,
+            "missing_question_entity_all_samples": 0,
+            "missing_question_entity_partial_samples": 0,
             "missing_a_any_samples": 0,
             "missing_a_all_samples": 0,
             "missing_a_partial_samples": 0,
@@ -321,10 +483,15 @@ def preprocess(ctx: PreprocessContext) -> None:
             "unreachable_a_all_samples": 0,
             "unreachable_a_partial_samples": 0,
             "no_path_samples": 0,
-            "missing_q_entities": 0,
+            "missing_question_entities": 0,
             "missing_a_entities": 0,
             "reachable_a_entities": 0,
             "unreachable_a_entities": 0,
+            "all_anchors_reachable_a_entities": 0,
+            "dropped_non_intersection_a_entities": 0,
+            "non_intersection_a_any_samples": 0,
+            "non_intersection_a_all_samples": 0,
+            "non_intersection_a_partial_samples": 0,
             "overlap_samples": {},
         }
         for split in splits
@@ -332,19 +499,22 @@ def preprocess(ctx: PreprocessContext) -> None:
     qa_clean_stats: Dict[str, Dict[str, int]] = {
         split: {
             "samples_total": 0,
-            "q_total_before": 0,
-            "q_total_after": 0,
-            "q_samples_reduced": 0,
-            "q_samples_empty": 0,
-            "q_samples_all_present": 0,
-            "q_samples_partial_missing": 0,
-            "q_samples_all_missing": 0,
+            "question_entity_total_before": 0,
+            "question_entity_total_after": 0,
+            "question_entity_samples_reduced": 0,
+            "question_entity_samples_empty": 0,
+            "question_entity_samples_all_present": 0,
+            "question_entity_samples_partial_missing": 0,
+            "question_entity_samples_all_missing": 0,
             "a_total_before": 0,
+            "a_total_present": 0,
             "a_total_after": 0,
             "a_samples_reduced": 0,
             "a_samples_all_present": 0,
             "a_samples_partial_missing": 0,
             "a_samples_all_missing": 0,
+            "a_samples_intersection_reduced": 0,
+            "a_pseudo_answers_dropped": 0,
             "reachable_all_samples": 0,
             "reachable_partial_samples": 0,
             "reachable_none_samples": 0,
@@ -376,6 +546,7 @@ def preprocess(ctx: PreprocessContext) -> None:
         splits=splits,
         dataset_source=dataset_source,
         hf_dataset=hf_dataset,
+        stark_dataset=stark_cfg.get("dataset") if stark_cfg else None,
         path_mode=path_mode,
         target_reachable_pruning=target_reachable_pruning,
         dedup_edges=dedup_edges,
@@ -383,12 +554,12 @@ def preprocess(ctx: PreprocessContext) -> None:
         parquet_chunk_size=parquet_chunk_size,
         parquet_num_workers=parquet_num_workers,
     )
-    if q_entity_blacklist:
+    if question_entity_blacklist:
         log_event(
             logger,
-            "q_entity_blacklist_loaded",
-            count=len(q_entity_blacklist),
-            examples=sorted(list(q_entity_blacklist))[:20],
+            "question_entity_blacklist_loaded",
+            count=len(question_entity_blacklist),
+            examples=sorted(list(question_entity_blacklist))[:20],
         )
     log_event(logger, "vocab_start", stage="vocab")
     for sample in tqdm(
@@ -404,10 +575,11 @@ def preprocess(ctx: PreprocessContext) -> None:
             hf_dataset=hf_dataset,
             hf_cache_dir=hf_cache_dir,
             hf_offline=hf_offline,
+            stark_cfg=stark_cfg,
         ),
         desc=f"Vocab from {dataset}",
     ):
-        sample = _apply_q_entity_blacklist(sample, q_entity_blacklist)
+        sample = _apply_question_entity_blacklist(sample, question_entity_blacklist)
         graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
         total_by_split[sample.split] = total_by_split.get(sample.split, 0) + 1
         kept_edges = _prepare_graph_edges(
@@ -446,7 +618,7 @@ def preprocess(ctx: PreprocessContext) -> None:
         for h, r, t in kept_edges:
             entity_vocab.add_entity(h)
             entity_vocab.add_entity(t)
-        for ent in sample.q_entity + sample.a_entity:
+        for ent in sample.question_entities + sample.answer_entities:
             entity_vocab.add_entity(ent)
 
         split_filter = _resolve_split_filter(
@@ -463,8 +635,8 @@ def preprocess(ctx: PreprocessContext) -> None:
         if outcome.keep:
             kept_by_split[sample.split] = kept_by_split.get(sample.split, 0) + 1
         else:
-            if split_filter.skip_no_topic and not outcome.has_topic:
-                filter_stats[sample.split]["dropped_no_topic"] += 1
+            if split_filter.skip_no_question_entity and not outcome.has_question_entity:
+                filter_stats[sample.split]["dropped_no_question_entity"] += 1
             if split_filter.skip_no_ans and not outcome.has_answer:
                 filter_stats[sample.split]["dropped_no_answer"] += 1
             if split_filter.skip_no_path and not outcome.has_path:
@@ -510,7 +682,9 @@ def preprocess(ctx: PreprocessContext) -> None:
             samples_total=split_total,
             samples_kept=kept_by_split.get(split, 0),
             samples_empty_graph=empty_graph_by_split.get(split, 0),
-            dropped_no_topic=filter_stats[split]["dropped_no_topic"],
+            dropped_no_question_entity=filter_stats[split][
+                "dropped_no_question_entity"
+            ],
             dropped_no_answer=filter_stats[split]["dropped_no_answer"],
             dropped_no_path=filter_stats[split]["dropped_no_path"],
             raw_edges=edge_stats[split]["raw_edges"],
@@ -679,6 +853,7 @@ def preprocess(ctx: PreprocessContext) -> None:
                     entity_vocab,
                     relation_lookup,
                     f"{sample.dataset}/{sample.split}/{sample.question_id}",
+                    path_mode=path_mode,
                     dedup_edges=dedup_edges,
                     validate_graph_edges=validate_graph_edges,
                     remove_self_loops=remove_self_loops,
@@ -712,53 +887,85 @@ def preprocess(ctx: PreprocessContext) -> None:
             split_key = sample.split
             stats_clean = qa_clean_stats[split_key]
             label_to_idx = {label: idx for idx, label in enumerate(graph.node_labels)}
-            q_entities_raw = _dedup_preserve_order(sample.q_entity or [])
-            a_entities_raw = _dedup_preserve_order(sample.a_entity or [])
-            q_in_graph = [ent for ent in q_entities_raw if ent in label_to_idx]
-            a_in_graph = [ent for ent in a_entities_raw if ent in label_to_idx]
-            q_total = len(q_entities_raw)
-            a_total = len(a_entities_raw)
-            q_in_graph_count = len(q_in_graph)
-            a_in_graph_count = len(a_in_graph)
-            stats_clean["samples_total"] += 1
-            stats_clean["q_total_before"] += q_total
-            stats_clean["q_total_after"] += q_in_graph_count
-            stats_clean["a_total_before"] += a_total
-            stats_clean["a_total_after"] += a_in_graph_count
-            if q_in_graph_count < q_total:
-                stats_clean["q_samples_reduced"] += 1
-            if q_in_graph_count == 0:
-                stats_clean["q_samples_empty"] += 1
-            if q_in_graph_count == q_total and q_total > 0:
-                stats_clean["q_samples_all_present"] += 1
-            elif q_in_graph_count == 0:
-                stats_clean["q_samples_all_missing"] += 1
-            else:
-                stats_clean["q_samples_partial_missing"] += 1
-            if a_in_graph_count < a_total:
-                stats_clean["a_samples_reduced"] += 1
-            if a_in_graph_count == 0:
-                stats_clean["a_samples_all_missing"] += 1
-            elif a_in_graph_count == a_total and a_total > 0:
-                stats_clean["a_samples_all_present"] += 1
-            else:
-                stats_clean["a_samples_partial_missing"] += 1
-            q_local = [label_to_idx[ent] for ent in q_in_graph]
-            a_local = [label_to_idx[ent] for ent in a_in_graph]
-            reachable_count = 0
-            if q_in_graph_count > 0 and a_in_graph_count > 0:
-                reachable_targets = reachable_targets_by_index(
+            question_entities_raw = _dedup_preserve_order(
+                sample.question_entities or []
+            )
+            answer_entities_raw = _dedup_preserve_order(sample.answer_entities or [])
+            question_entities_in_graph = [
+                ent for ent in question_entities_raw if ent in label_to_idx
+            ]
+            answer_entities_in_graph = [
+                ent for ent in answer_entities_raw if ent in label_to_idx
+            ]
+            question_entity_total = len(question_entities_raw)
+            a_total = len(answer_entities_raw)
+            question_entities_in_graph_count = len(question_entities_in_graph)
+            a_in_graph_count = len(answer_entities_in_graph)
+            missing_question_entity_any = (
+                question_entity_total == 0
+                or question_entities_in_graph_count < question_entity_total
+            )
+            missing_a_any = (a_total == 0) or (a_in_graph_count < a_total)
+            anchor_local_indices = [
+                label_to_idx[ent] for ent in question_entities_in_graph
+            ]
+            a_local = [label_to_idx[ent] for ent in answer_entities_in_graph]
+            legal_a_local = []
+            if (not missing_question_entity_any) and a_in_graph_count > 0:
+                legal_a_local = _all_anchors_reachable_targets_by_index(
                     num_nodes=len(graph.node_labels),
                     edge_src=graph.edge_src,
                     edge_dst=graph.edge_dst,
-                    seeds=q_local,
-                    targets=a_local,
+                    anchor_local_indices=anchor_local_indices,
+                    target_local_indices=a_local,
                     path_mode=path_mode,
                 )
-                reachable_count = len(reachable_targets)
-                if reachable_count == a_in_graph_count:
+            legal_a_local_set = set(legal_a_local)
+            legal_a_in_graph = [
+                ent
+                for ent in answer_entities_in_graph
+                if label_to_idx[ent] in legal_a_local_set
+            ]
+            legal_answer_count = len(legal_a_in_graph)
+            non_intersection_answer_count = max(
+                a_in_graph_count - legal_answer_count, 0
+            )
+            stats_clean["samples_total"] += 1
+            stats_clean["question_entity_total_before"] += question_entity_total
+            stats_clean["question_entity_total_after"] += (
+                question_entities_in_graph_count
+            )
+            stats_clean["a_total_before"] += a_total
+            stats_clean["a_total_present"] += a_in_graph_count
+            stats_clean["a_total_after"] += legal_answer_count
+            if question_entities_in_graph_count < question_entity_total:
+                stats_clean["question_entity_samples_reduced"] += 1
+            if question_entities_in_graph_count == 0:
+                stats_clean["question_entity_samples_empty"] += 1
+            if (
+                question_entities_in_graph_count == question_entity_total
+                and question_entity_total > 0
+            ):
+                stats_clean["question_entity_samples_all_present"] += 1
+            elif question_entities_in_graph_count == 0:
+                stats_clean["question_entity_samples_all_missing"] += 1
+            else:
+                stats_clean["question_entity_samples_partial_missing"] += 1
+            if a_in_graph_count < a_total or legal_answer_count < a_in_graph_count:
+                stats_clean["a_samples_reduced"] += 1
+            if non_intersection_answer_count > 0:
+                stats_clean["a_samples_intersection_reduced"] += 1
+            stats_clean["a_pseudo_answers_dropped"] += non_intersection_answer_count
+            if legal_answer_count == 0:
+                stats_clean["a_samples_all_missing"] += 1
+            elif legal_answer_count == a_total and a_total > 0:
+                stats_clean["a_samples_all_present"] += 1
+            else:
+                stats_clean["a_samples_partial_missing"] += 1
+            if (not missing_question_entity_any) and a_in_graph_count > 0:
+                if legal_answer_count == a_in_graph_count:
                     stats_clean["reachable_all_samples"] += 1
-                elif reachable_count == 0:
+                elif legal_answer_count == 0:
                     stats_clean["reachable_none_samples"] += 1
                 else:
                     stats_clean["reachable_partial_samples"] += 1
@@ -767,61 +974,101 @@ def preprocess(ctx: PreprocessContext) -> None:
             if emit_sub_filter:
                 stats = sub_filter_stats[split_key]
                 stats["total_samples"] += 1
-                missing_q_entities = max(q_total - q_in_graph_count, 0)
+                missing_question_entities = max(
+                    question_entity_total - question_entities_in_graph_count, 0
+                )
                 missing_a_entities = max(a_total - a_in_graph_count, 0)
-                stats["missing_q_entities"] += missing_q_entities
+                stats["missing_question_entities"] += missing_question_entities
                 stats["missing_a_entities"] += missing_a_entities
-                missing_q_any = (q_total == 0) or (q_in_graph_count < q_total)
+                missing_question_entity_any = (
+                    question_entity_total == 0
+                    or question_entities_in_graph_count < question_entity_total
+                )
                 missing_a_any = (a_total == 0) or (a_in_graph_count < a_total)
-                missing_q_all = q_in_graph_count == 0
+                missing_question_entity_all = question_entities_in_graph_count == 0
                 missing_a_all = a_in_graph_count == 0
-                missing_q_partial = missing_q_any and not missing_q_all
+                missing_question_entity_partial = (
+                    missing_question_entity_any and not missing_question_entity_all
+                )
                 missing_a_partial = missing_a_any and not missing_a_all
-                stats["missing_q_any_samples"] += 1 if missing_q_any else 0
-                stats["missing_q_all_samples"] += 1 if missing_q_all else 0
-                stats["missing_q_partial_samples"] += 1 if missing_q_partial else 0
+                stats["missing_question_entity_any_samples"] += (
+                    1 if missing_question_entity_any else 0
+                )
+                stats["missing_question_entity_all_samples"] += (
+                    1 if missing_question_entity_all else 0
+                )
+                stats["missing_question_entity_partial_samples"] += (
+                    1 if missing_question_entity_partial else 0
+                )
                 stats["missing_a_any_samples"] += 1 if missing_a_any else 0
                 stats["missing_a_all_samples"] += 1 if missing_a_all else 0
                 stats["missing_a_partial_samples"] += 1 if missing_a_partial else 0
-                unreachable_count = a_in_graph_count - reachable_count
+                unreachable_count = a_in_graph_count - legal_answer_count
                 if unreachable_count < 0:
                     unreachable_count = 0
-                stats["reachable_a_entities"] += reachable_count
+                stats["reachable_a_entities"] += legal_answer_count
                 stats["unreachable_a_entities"] += unreachable_count
-                unreachable_a_any = (
-                    a_in_graph_count > 0 and reachable_count < a_in_graph_count
+                stats["all_anchors_reachable_a_entities"] += legal_answer_count
+                stats["dropped_non_intersection_a_entities"] += (
+                    non_intersection_answer_count
                 )
-                unreachable_a_all = a_in_graph_count > 0 and reachable_count == 0
+                unreachable_a_any = (
+                    a_in_graph_count > 0 and legal_answer_count < a_in_graph_count
+                )
+                unreachable_a_all = a_in_graph_count > 0 and legal_answer_count == 0
                 unreachable_a_partial = (
-                    a_in_graph_count > 0 and 0 < reachable_count < a_in_graph_count
+                    a_in_graph_count > 0 and 0 < legal_answer_count < a_in_graph_count
                 )
                 no_path = (
-                    q_in_graph_count > 0
+                    (not missing_question_entity_any)
                     and a_in_graph_count > 0
-                    and reachable_count == 0
+                    and legal_answer_count == 0
                 )
                 stats["unreachable_a_any_samples"] += 1 if unreachable_a_any else 0
                 stats["unreachable_a_all_samples"] += 1 if unreachable_a_all else 0
                 stats["unreachable_a_partial_samples"] += (
                     1 if unreachable_a_partial else 0
                 )
+                stats["non_intersection_a_any_samples"] += (
+                    1 if non_intersection_answer_count > 0 else 0
+                )
+                stats["non_intersection_a_all_samples"] += (
+                    1 if a_in_graph_count > 0 and legal_answer_count == 0 else 0
+                )
+                stats["non_intersection_a_partial_samples"] += (
+                    1
+                    if a_in_graph_count > 0
+                    and 0 < legal_answer_count < a_in_graph_count
+                    else 0
+                )
                 stats["no_path_samples"] += 1 if no_path else 0
                 overlap_flags: List[str] = []
-                if missing_q_any:
-                    overlap_flags.append("missing_q")
+                if missing_question_entity_any:
+                    overlap_flags.append("missing_question_entity")
                 if missing_a_any:
                     overlap_flags.append("missing_a")
                 if unreachable_a_any:
                     overlap_flags.append("unreachable_a")
+                if non_intersection_answer_count > 0:
+                    overlap_flags.append("non_intersection_a")
                 overlap_key = "+".join(overlap_flags) if overlap_flags else "ok"
                 overlap = stats["overlap_samples"]
                 overlap[overlap_key] = overlap.get(overlap_key, 0) + 1
-                if not (missing_q_any or missing_a_any or unreachable_a_any):
+                if (
+                    not missing_question_entity_any
+                    and not missing_a_any
+                    and legal_answer_count > 0
+                ):
                     sub_sample_ids.append(graph.graph_id)
                     sub_by_split[split_key] = sub_by_split.get(split_key, 0) + 1
                     stats["kept_samples"] += 1
-            if q_in_graph_count == 0:
+            if missing_question_entity_any or missing_a_any or legal_answer_count == 0:
                 continue
+            # Multi-anchor questions are conjunctive: only answers reachable from
+            # every retained anchor remain valid supervision targets.
+            answer_texts = _filter_answer_texts_for_entities(
+                sample, kept_entities=legal_a_in_graph
+            )
             question = build_question_record(
                 sample,
                 entity_vocab,
@@ -829,8 +1076,9 @@ def preprocess(ctx: PreprocessContext) -> None:
                 question_emb=question_emb,
                 question_ctx=question_ctx,
                 question_ctx_mask=question_ctx_mask,
-                q_entities=q_in_graph,
-                a_entities=a_in_graph,
+                question_entities=question_entities_in_graph,
+                answer_entities=legal_a_in_graph,
+                answer_texts=answer_texts,
             )
             base_writer.append(graph, question)
             graphs_written_by_split[split_key] += 1
@@ -856,11 +1104,12 @@ def preprocess(ctx: PreprocessContext) -> None:
                 hf_dataset=hf_dataset,
                 hf_cache_dir=hf_cache_dir,
                 hf_offline=hf_offline,
+                stark_cfg=stark_cfg,
             ),
             desc=f"Graphs from {dataset}",
         ):
-            q_entities_raw = list(sample.q_entity or [])
-            sample = _apply_q_entity_blacklist(sample, q_entity_blacklist)
+            question_entities_raw = list(sample.question_entities or [])
+            sample = _apply_question_entity_blacklist(sample, question_entity_blacklist)
             graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
             if graph_id in empty_graph_id_set:
                 continue
@@ -876,13 +1125,15 @@ def preprocess(ctx: PreprocessContext) -> None:
             )
             if not outcome.keep:
                 continue
-            if q_entity_blacklist:
-                removed = len(q_entities_raw) - len(sample.q_entity or [])
+            if question_entity_blacklist:
+                removed = len(question_entities_raw) - len(
+                    sample.question_entities or []
+                )
                 if removed > 0:
                     stats = qa_clean_stats[sample.split]
                     stats["blacklist_removed_entities"] += int(removed)
                     stats["blacklist_reduced_samples"] += 1
-                    if not sample.q_entity:
+                    if not sample.question_entities:
                         stats["blacklist_empty_samples"] += 1
             pending_samples.append(sample)
             if len(pending_samples) >= chunk_size:
@@ -896,6 +1147,7 @@ def preprocess(ctx: PreprocessContext) -> None:
         worker_state = _WorkerState(
             entity_lookup=entity_vocab.to_lookup(),
             relation_lookup=relation_lookup,
+            path_mode=path_mode,
             dedup_edges=dedup_edges,
             validate_graph_edges=validate_graph_edges,
             remove_self_loops=remove_self_loops,
@@ -940,7 +1192,9 @@ def preprocess(ctx: PreprocessContext) -> None:
             "criteria": {
                 "require_all_questions_present": True,
                 "require_all_answers_present": True,
-                "require_all_answers_reachable": True,
+                "require_nonempty_legal_answer_set": True,
+                "require_legal_answers_all_anchors_reachable": True,
+                "answer_legality": "all_anchors_reachable_intersection",
                 "path_mode": path_mode,
             },
             "stats": sub_filter_stats,
@@ -963,20 +1217,37 @@ def preprocess(ctx: PreprocessContext) -> None:
                 total=total,
                 kept=kept,
                 filtered=total - kept,
-                missing_q_any=int(stats["missing_q_any_samples"]),
-                missing_q_all=int(stats["missing_q_all_samples"]),
-                missing_q_partial=int(stats["missing_q_partial_samples"]),
+                missing_question_entity_any=int(
+                    stats["missing_question_entity_any_samples"]
+                ),
+                missing_question_entity_all=int(
+                    stats["missing_question_entity_all_samples"]
+                ),
+                missing_question_entity_partial=int(
+                    stats["missing_question_entity_partial_samples"]
+                ),
                 missing_a_any=int(stats["missing_a_any_samples"]),
                 missing_a_all=int(stats["missing_a_all_samples"]),
                 missing_a_partial=int(stats["missing_a_partial_samples"]),
                 unreachable_a_any=int(stats["unreachable_a_any_samples"]),
                 unreachable_a_all=int(stats["unreachable_a_all_samples"]),
                 unreachable_a_partial=int(stats["unreachable_a_partial_samples"]),
+                non_intersection_a_any=int(stats["non_intersection_a_any_samples"]),
+                non_intersection_a_all=int(stats["non_intersection_a_all_samples"]),
+                non_intersection_a_partial=int(
+                    stats["non_intersection_a_partial_samples"]
+                ),
                 no_path=int(stats["no_path_samples"]),
-                missing_q_entities=int(stats["missing_q_entities"]),
+                missing_question_entities=int(stats["missing_question_entities"]),
                 missing_a_entities=int(stats["missing_a_entities"]),
                 reachable_a_entities=int(stats["reachable_a_entities"]),
                 unreachable_a_entities=int(stats["unreachable_a_entities"]),
+                all_anchors_reachable_a_entities=int(
+                    stats["all_anchors_reachable_a_entities"]
+                ),
+                dropped_non_intersection_a_entities=int(
+                    stats["dropped_non_intersection_a_entities"]
+                ),
                 overlap=stats["overlap_samples"],
             )
         for split in splits:
@@ -987,23 +1258,43 @@ def preprocess(ctx: PreprocessContext) -> None:
                 "qa_entity_cleaning_stats",
                 split=split,
                 samples=total,
-                q_total_before=int(stats["q_total_before"]),
-                q_total_after=int(stats["q_total_after"]),
-                q_avg_before=_safe_div(int(stats["q_total_before"]), total),
-                q_avg_after=_safe_div(int(stats["q_total_after"]), total),
-                q_samples_reduced=int(stats["q_samples_reduced"]),
-                q_samples_empty=int(stats["q_samples_empty"]),
-                q_samples_all_present=int(stats["q_samples_all_present"]),
-                q_samples_partial_missing=int(stats["q_samples_partial_missing"]),
-                q_samples_all_missing=int(stats["q_samples_all_missing"]),
+                question_entity_total_before=int(stats["question_entity_total_before"]),
+                question_entity_total_after=int(stats["question_entity_total_after"]),
+                question_entity_avg_before=_safe_div(
+                    int(stats["question_entity_total_before"]), total
+                ),
+                question_entity_avg_after=_safe_div(
+                    int(stats["question_entity_total_after"]), total
+                ),
+                question_entity_samples_reduced=int(
+                    stats["question_entity_samples_reduced"]
+                ),
+                question_entity_samples_empty=int(
+                    stats["question_entity_samples_empty"]
+                ),
+                question_entity_samples_all_present=int(
+                    stats["question_entity_samples_all_present"]
+                ),
+                question_entity_samples_partial_missing=int(
+                    stats["question_entity_samples_partial_missing"]
+                ),
+                question_entity_samples_all_missing=int(
+                    stats["question_entity_samples_all_missing"]
+                ),
                 a_total_before=int(stats["a_total_before"]),
+                a_total_present=int(stats["a_total_present"]),
                 a_total_after=int(stats["a_total_after"]),
                 a_avg_before=_safe_div(int(stats["a_total_before"]), total),
+                a_avg_present=_safe_div(int(stats["a_total_present"]), total),
                 a_avg_after=_safe_div(int(stats["a_total_after"]), total),
                 a_samples_reduced=int(stats["a_samples_reduced"]),
                 a_samples_all_present=int(stats["a_samples_all_present"]),
                 a_samples_partial_missing=int(stats["a_samples_partial_missing"]),
                 a_samples_all_missing=int(stats["a_samples_all_missing"]),
+                a_samples_intersection_reduced=int(
+                    stats["a_samples_intersection_reduced"]
+                ),
+                a_pseudo_answers_dropped=int(stats["a_pseudo_answers_dropped"]),
                 reachable_all=int(stats["reachable_all_samples"]),
                 reachable_partial=int(stats["reachable_partial_samples"]),
                 reachable_none=int(stats["reachable_none_samples"]),
@@ -1020,6 +1311,7 @@ def build_graph(
     relation_vocab: RelationVocab | RelationLookup,
     graph_id: str,
     *,
+    path_mode: str = _PATH_MODE_UNDIRECTED,
     dedup_edges: bool = True,
     validate_graph_edges: bool = _VALIDATE_GRAPH_EDGES_DEFAULT,
     remove_self_loops: bool = _REMOVE_SELF_LOOPS_DEFAULT,
@@ -1044,19 +1336,27 @@ def build_graph(
     edge_src: List[int] = []
     edge_dst: List[int] = []
     edge_relation_ids: List[int] = []
-    # sample.graph must be derived only from q_entity (e.g., PPR on the full graph) with no answer-conditioned steps,
-    # per prior work by rmanluo.
+    # sample.graph must be derived only from question_entities (e.g., PPR on the
+    # full graph) with no answer-conditioned steps, per prior work by rmanluo.
     kept_edges = _prepare_graph_edges(
         sample.graph,
         remove_self_loops=remove_self_loops,
         dedup_edges=dedup_edges,
     )
     if target_reachable_pruning:
-        reachable_nodes = _compute_target_reachable_nodes(kept_edges, sample.a_entity)
+        legal_answers = _all_anchors_reachable_targets(
+            edges=kept_edges,
+            anchors=sample.question_entities,
+            targets=sample.answer_entities,
+            path_mode=path_mode,
+        )
+        reachable_nodes = _compute_target_reachable_nodes(kept_edges, legal_answers)
         if not reachable_nodes:
             return None
-        start_reachable = any(ent in reachable_nodes for ent in sample.q_entity)
-        if not start_reachable:
+        all_anchors_reachable = all(
+            ent in reachable_nodes for ent in sample.question_entities
+        )
+        if not all_anchors_reachable:
             return None
         kept_edges = [
             edge
@@ -1098,21 +1398,33 @@ def build_question_record(
     question_emb: Optional[Sequence[float]] = None,
     question_ctx: Optional[Sequence[Sequence[float]]] = None,
     question_ctx_mask: Optional[Sequence[bool]] = None,
-    q_entities: Optional[Sequence[str]] = None,
-    a_entities: Optional[Sequence[str]] = None,
+    question_entities: Optional[Sequence[str]] = None,
+    answer_entities: Optional[Sequence[str]] = None,
+    answer_texts: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
-    q_entities = list(sample.q_entity) if q_entities is None else list(q_entities)
-    a_entities = list(sample.a_entity) if a_entities is None else list(a_entities)
-    seed_entity_ids = [entity_vocab.entity_id(ent) for ent in q_entities]
-    answer_entity_ids = [entity_vocab.entity_id(ent) for ent in a_entities]
+    question_entities = (
+        list(sample.question_entities)
+        if question_entities is None
+        else list(question_entities)
+    )
+    answer_entities = (
+        list(sample.answer_entities)
+        if answer_entities is None
+        else list(answer_entities)
+    )
+    answer_texts = (
+        list(sample.answer_texts) if answer_texts is None else list(answer_texts)
+    )
+    question_entity_ids = [entity_vocab.entity_id(ent) for ent in question_entities]
+    answer_entity_ids = [entity_vocab.entity_id(ent) for ent in answer_entities]
     record = {
         "dataset": sample.dataset,
         "split": sample.split,
         "kb": sample.kb,
         "question": sample.question,
-        "seed_entity_ids": seed_entity_ids,
+        "question_entity_ids": question_entity_ids,
         "answer_entity_ids": answer_entity_ids,
-        "answer_texts": sample.answer_texts,
+        "answer_texts": answer_texts,
         "graph_id": graph_id,
     }
     if question_emb is not None:

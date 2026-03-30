@@ -47,44 +47,36 @@ callbacks:
     min_delta: 0.002
 
 model:
-  action_prior_cfg:
-    root_beta: 1.0
-    edge_beta: 0.75
-    node_embedding_weight: 0.25
-    relation_embedding_weight: 0.75
-    target_node_weight: 0.0
-    progress_weight: 0.0
-    shortest_path_edge_weight: 1.0
-    answer_distance_weight: 0.5
   policy_cfg:
     state_mode: subgraph
-    transition_head:
-      enabled: false
   training_cfg:
     rollouts_per_graph: 32
     potential_reward:
       answer_distance_weight: 0.0
+    subgraph_reward:
+      beta_answer_bits: 0.2
+      beta_answer_full: 0.5
     subgraph_proposal:
       oracle_answer_distance_weight: 0.5
       prior_question_similarity_weight: 0.75
       prior_component_merge_weight: 1.0
       stop_hit_bias: 0.25
-    action_prior_schedule:
+    proposal_bias_schedule:
       # Start with stronger subgraph proposal bias, then anneal it away so the
       # late-stage rollout policy realigns with the target policy.
       type: cosine
       initial_scale: 0.8
       final_scale: 0.0
       hold_steps: 1000
-    transition_bias_schedule:
-      type: cosine
-      final_scale: 0.0
-      hold_steps: 1000
     success_replay:
-      mix_alpha: 0.0
-      capacity: 512
+      mix_alpha: 0.2
+      capacity: 128
+      min_buffer_size: 16
       replay_trajectories_per_step: 64
-      add_shortest_path_guidance: false
+      add_shortest_path_guidance: true
+      expand_imitation_weight: 1.0
+      expand_imitation_from_anchor_bonus: 2.0
+      expand_imitation_answer_finish_bonus: 4.0
     replay_mix_schedule:
       type: cosine
       final_alpha: 0.0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from src.data.io.runtime_sample_metadata import save_runtime_sample_metadata
@@ -33,7 +34,7 @@ def test_build_data_synthesizes_question_context_from_question_embedding(
         "node_entity_ids": torch.tensor([0, 1], dtype=torch.long),
         "node_embedding_ids": torch.tensor([0, 0], dtype=torch.long),
         "question_emb": torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
-        "q_local_indices": torch.tensor([0], dtype=torch.long),
+        "anchor_local_indices": torch.tensor([0], dtype=torch.long),
         "a_local_indices": torch.tensor([1], dtype=torch.long),
         "answer_entity_ids": torch.tensor([1], dtype=torch.long),
     }
@@ -103,7 +104,7 @@ def test_build_data_uses_runtime_sample_metadata_question_text(tmp_path: Path) -
         "node_entity_ids": torch.tensor([0, 1], dtype=torch.long),
         "node_embedding_ids": torch.tensor([0, 0], dtype=torch.long),
         "question_emb": torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
-        "q_local_indices": torch.tensor([0], dtype=torch.long),
+        "anchor_local_indices": torch.tensor([0], dtype=torch.long),
         "a_local_indices": torch.tensor([1], dtype=torch.long),
         "answer_entity_ids": torch.tensor([1], dtype=torch.long),
     }
@@ -111,3 +112,21 @@ def test_build_data_uses_runtime_sample_metadata_question_text(tmp_path: Path) -
     data = dataset._build_data(raw, "unit/train/q1")
 
     assert data.question == "What is the question text?"
+
+
+def test_build_data_rejects_legacy_q_local_indices_field(tmp_path: Path) -> None:
+    dataset = _build_dataset_shell(tmp_path)
+    raw = {
+        "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+        "edge_attr": torch.tensor([0], dtype=torch.long),
+        "num_nodes": torch.tensor(2, dtype=torch.long),
+        "node_entity_ids": torch.tensor([0, 1], dtype=torch.long),
+        "node_embedding_ids": torch.tensor([0, 0], dtype=torch.long),
+        "question_emb": torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
+        "q_local_indices": torch.tensor([0], dtype=torch.long),
+        "a_local_indices": torch.tensor([1], dtype=torch.long),
+        "answer_entity_ids": torch.tensor([1], dtype=torch.long),
+    }
+
+    with pytest.raises(ValueError, match="legacy q_local_indices"):
+        dataset._build_data(raw, "unit/train/q1")

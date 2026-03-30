@@ -270,29 +270,29 @@ def _iter_answer_candidates(
 
 
 def _filter_zero_hop_answers(
-    q_vals: torch.Tensor,
+    anchor_vals: torch.Tensor,
     a_vals: torch.Tensor,
     answer_vals: torch.Tensor,
     *,
     filter_zero_hop: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not filter_zero_hop or q_vals.numel() == 0 or a_vals.numel() == 0:
+    if not filter_zero_hop or anchor_vals.numel() == 0 or a_vals.numel() == 0:
         return a_vals, answer_vals
-    keep_mask = ~(q_vals.view(-1, 1) == a_vals.view(1, -1)).any(dim=0)
+    keep_mask = ~(anchor_vals.view(-1, 1) == a_vals.view(1, -1)).any(dim=0)
     if bool(keep_mask.all().item()):
         return a_vals, answer_vals
     return a_vals[keep_mask], answer_vals[keep_mask]
 
 
 def _should_skip_zero_hop(
-    q_vals: torch.Tensor,
+    anchor_vals: torch.Tensor,
     a_val: torch.Tensor,
     *,
     filter_zero_hop: bool,
 ) -> bool:
-    if not filter_zero_hop or q_vals.numel() == 0 or a_val.numel() == 0:
+    if not filter_zero_hop or anchor_vals.numel() == 0 or a_val.numel() == 0:
         return False
-    return bool((q_vals.view(-1, 1) == a_val.view(1, -1)).any().item())
+    return bool((anchor_vals.view(-1, 1) == a_val.view(1, -1)).any().item())
 
 
 def _expand_answer_samples(
@@ -305,11 +305,11 @@ def _expand_answer_samples(
         return batch_list
     expanded: list[Any] = []
     for data in batch_list:
-        q_local = _require_long_tensor(data, "q_local_indices")
+        anchor_local = _require_long_tensor(data, "anchor_local_indices")
         a_local = _require_long_tensor(data, "a_local_indices")
         answer_ids = _require_long_tensor(data, "answer_entity_ids")
         node_entity_ids = _maybe_long_tensor(data, "node_entity_ids")
-        q_vals = q_local.view(-1)
+        anchor_vals = anchor_local.view(-1)
         a_vals = a_local.view(-1)
         answer_vals = _resolve_answer_values(
             a_vals=a_vals,
@@ -318,7 +318,7 @@ def _expand_answer_samples(
         )
         if not expand_multi_answer:
             a_vals, answer_vals = _filter_zero_hop_answers(
-                q_vals,
+                anchor_vals,
                 a_vals,
                 answer_vals,
                 filter_zero_hop=filter_zero_hop,
@@ -332,7 +332,9 @@ def _expand_answer_samples(
         )
         base_id = str(getattr(data, "sample_id", ""))
         for a_val, ans_val, a_idx in a_candidates:
-            if _should_skip_zero_hop(q_vals, a_val, filter_zero_hop=filter_zero_hop):
+            if _should_skip_zero_hop(
+                anchor_vals, a_val, filter_zero_hop=filter_zero_hop
+            ):
                 continue
             clone = data.clone()
             clone.a_local_indices = a_val
@@ -370,28 +372,28 @@ def _attach_answer_ids(batch: Any) -> None:
 def _attach_qa_ptrs(batch: Any) -> None:
     slice_dict = getattr(batch, "_slice_dict", None)
     if not isinstance(slice_dict, dict):
-        raise AttributeError("Batch missing _slice_dict required for q_ptr/a_ptr.")
-    q_ptr = slice_dict.get("q_local_indices")
+        raise AttributeError("Batch missing _slice_dict required for anchor_ptr/a_ptr.")
+    anchor_ptr = slice_dict.get("anchor_local_indices")
     a_ptr = slice_dict.get("a_local_indices")
-    if q_ptr is None or a_ptr is None:
+    if anchor_ptr is None or a_ptr is None:
         raise AttributeError(
-            "Batch _slice_dict missing q_local_indices/a_local_indices pointers."
+            "Batch _slice_dict missing anchor_local_indices/a_local_indices pointers."
         )
-    batch.q_ptr = _as_1d_long(q_ptr, device=torch.device("cpu"))
+    batch.anchor_ptr = _as_1d_long(anchor_ptr, device=torch.device("cpu"))
     batch.a_ptr = _as_1d_long(a_ptr, device=torch.device("cpu"))
 
 
 def _attach_local_indices(batch: Any) -> None:
-    if not hasattr(batch, "q_local_indices"):
+    if not hasattr(batch, "anchor_local_indices"):
         raise AttributeError(
-            "Batch missing q_local_indices required for graph alignment."
+            "Batch missing anchor_local_indices required for graph alignment."
         )
     if not hasattr(batch, "a_local_indices"):
         raise AttributeError(
             "Batch missing a_local_indices required for graph alignment."
         )
-    batch.q_local_indices = _as_1d_long(
-        batch.q_local_indices, device=torch.device("cpu")
+    batch.anchor_local_indices = _as_1d_long(
+        batch.anchor_local_indices, device=torch.device("cpu")
     )
     batch.a_local_indices = _as_1d_long(
         batch.a_local_indices, device=torch.device("cpu")
@@ -442,21 +444,21 @@ def _validate_ptrs(batch: Any) -> None:
     num_graphs = getattr(batch, "num_graphs", None)
     if not isinstance(num_graphs, int) or num_graphs <= 0:
         raise ValueError("Batch missing valid num_graphs; cannot validate ptrs.")
-    q_ptr = getattr(batch, "q_ptr", None)
+    anchor_ptr = getattr(batch, "anchor_ptr", None)
     a_ptr = getattr(batch, "a_ptr", None)
     answer_ptr = getattr(batch, "answer_ptr", None)
-    if q_ptr is None or a_ptr is None or answer_ptr is None:
+    if anchor_ptr is None or a_ptr is None or answer_ptr is None:
         raise AttributeError(
-            "Batch missing q_ptr/a_ptr/answer_ptr required for validation."
+            "Batch missing anchor_ptr/a_ptr/answer_ptr required for validation."
         )
-    if q_ptr.numel() != num_graphs + 1:
-        raise ValueError("q_ptr length mismatch with num_graphs.")
+    if anchor_ptr.numel() != num_graphs + 1:
+        raise ValueError("anchor_ptr length mismatch with num_graphs.")
     if a_ptr.numel() != num_graphs + 1:
         raise ValueError("a_ptr length mismatch with num_graphs.")
     if answer_ptr.numel() != num_graphs + 1:
         raise ValueError("answer_ptr length mismatch with num_graphs.")
-    if int(q_ptr[-1].item()) != int(batch.q_local_indices.numel()):
-        raise ValueError("q_ptr[-1] mismatch q_local_indices length.")
+    if int(anchor_ptr[-1].item()) != int(batch.anchor_local_indices.numel()):
+        raise ValueError("anchor_ptr[-1] mismatch anchor_local_indices length.")
     if int(a_ptr[-1].item()) != int(batch.a_local_indices.numel()):
         raise ValueError("a_ptr[-1] mismatch a_local_indices length.")
     if int(answer_ptr[-1].item()) != int(batch.answer_entity_ids.numel()):

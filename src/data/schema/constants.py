@@ -26,8 +26,12 @@ _EDGE_STAT_KEYS = (
     "raw_nodes",
     "kept_nodes",
 )
-_FILTER_STAT_KEYS = ("dropped_no_topic", "dropped_no_answer", "dropped_no_path")
-_FILTER_MISSING_START_FILENAME = "filter_missing_start.json"
+_FILTER_STAT_KEYS = (
+    "dropped_no_question_entity",
+    "dropped_no_answer",
+    "dropped_no_path",
+)
+_FILTER_MISSING_ANCHOR_FILENAME = "filter_missing_anchor.json"
 _FILTER_MISSING_ANSWER_FILENAME = "filter_missing_answer.json"
 _DISTANCE_PROGRESS_DISABLED = 0
 _DISTANCE_MIN_WORKERS = 1
@@ -67,7 +71,7 @@ class QuestionFields:
     SPLIT = "split"
     KB = "kb"
     QUESTION = "question"
-    SEED_ENTITY_IDS = "seed_entity_ids"
+    QUESTION_ENTITY_IDS = "question_entity_ids"
     ANSWER_ENTITY_IDS = "answer_entity_ids"
     ANSWER_TEXTS = "answer_texts"
     GRAPH_ID = "graph_id"
@@ -115,7 +119,7 @@ _QUESTION_PARQUET_FIELDS = (
     QuestionFields.SPLIT,
     QuestionFields.KB,
     QuestionFields.QUESTION,
-    QuestionFields.SEED_ENTITY_IDS,
+    QuestionFields.QUESTION_ENTITY_IDS,
     QuestionFields.ANSWER_ENTITY_IDS,
     QuestionFields.ANSWER_TEXTS,
     QuestionFields.GRAPH_ID,

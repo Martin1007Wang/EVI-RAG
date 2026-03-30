@@ -29,8 +29,8 @@ def test_create_graph_retrieval_dataset_uses_runtime_filter_missing_keys(
 ) -> None:
     cfg = _base_dataset_cfg(tmp_path)
     processed_dir = Path(cfg["paths"]["processed"])  # type: ignore[index]
-    (processed_dir / "filter_missing_start.json").write_text("{}", encoding="utf-8")
-    cfg["runtime_filter_missing_start"] = {"train": True}
+    (processed_dir / "filter_missing_anchor.json").write_text("{}", encoding="utf-8")
+    cfg["runtime_filter_missing_anchor"] = {"train": True}
     cfg["runtime_filter_missing_answer"] = {"train": False}
     captured: dict[str, object] = {}
 
@@ -44,14 +44,26 @@ def test_create_graph_retrieval_dataset_uses_runtime_filter_missing_keys(
     dataset_module.create_graph_retrieval_dataset(cfg, "train")
 
     sample_filter_path = captured["sample_filter_path"]
-    assert sample_filter_path == [processed_dir / "filter_missing_start.json"]
+    assert sample_filter_path == [processed_dir / "filter_missing_anchor.json"]
 
 
 def test_create_graph_retrieval_dataset_rejects_renamed_filter_keys(
     tmp_path: Path,
 ) -> None:
     cfg = _base_dataset_cfg(tmp_path)
-    cfg["filter_missing_start"] = {"train": True}
+    cfg["filter_missing_anchor"] = {"train": True}
 
     with pytest.raises(ValueError, match="Renamed dataset config keys detected"):
+        dataset_module.create_graph_retrieval_dataset(cfg, "train")
+
+
+def test_create_graph_retrieval_dataset_rejects_legacy_runtime_filter_key(
+    tmp_path: Path,
+) -> None:
+    cfg = _base_dataset_cfg(tmp_path)
+    cfg["runtime_filter_missing_start"] = {"train": True}
+
+    with pytest.raises(
+        ValueError, match="runtime_filter_missing_start->runtime_filter_missing_anchor"
+    ):
         dataset_module.create_graph_retrieval_dataset(cfg, "train")

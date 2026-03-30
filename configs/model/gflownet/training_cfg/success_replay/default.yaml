@@ -1,0 +1,12 @@
+# @package model.training_cfg.success_replay
+
+mix_alpha: 0.0
+capacity: 1024
+min_buffer_size: 64
+replay_trajectories_per_step: null
+deduplicate: true
+add_shortest_path_guidance: false
+expand_imitation_weight: 0.0
+expand_imitation_from_anchor_bonus: 0.0
+expand_imitation_answer_finish_bonus: 0.0
+mask_stop_loss: true

@@ -30,7 +30,7 @@ from src.data.io.runtime_sample_metadata import (
 )
 from src.data.schema.constants import (
     _FILTER_MISSING_ANSWER_FILENAME,
-    _FILTER_MISSING_START_FILENAME,
+    _FILTER_MISSING_ANCHOR_FILENAME,
 )
 from src.data.utils.validation import _assert_allowed_split_name
 from src.utils.logging_utils import get_logger, log_event
@@ -47,14 +47,16 @@ _REMOVED_DATASET_KEYS = (
     "edge_dropout_degree_power",
 )
 _RENAMED_DATASET_KEYS = {
-    "filter_missing_start": "runtime_filter_missing_start",
+    "filter_missing_start": "runtime_filter_missing_anchor",
+    "filter_missing_anchor": "runtime_filter_missing_anchor",
     "filter_missing_answer": "runtime_filter_missing_answer",
+    "runtime_filter_missing_start": "runtime_filter_missing_anchor",
 }
 
 
 class GraphRetrievalData(GraphData):
     def __inc__(self, key: str, value: Any, *args, **kwargs) -> int:
-        if key in {"q_local_indices", "a_local_indices"}:
+        if key in {"anchor_local_indices", "a_local_indices"}:
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
@@ -241,7 +243,16 @@ class GraphRetrievalDataset(Dataset):
 
         answer_ids = raw["answer_entity_ids"]
 
-        q_local_indices = raw["q_local_indices"]
+        if "anchor_local_indices" not in raw and "q_local_indices" in raw:
+            raise ValueError(
+                "LMDB sample still uses legacy q_local_indices; rebuild LMDB to emit "
+                f"anchor_local_indices for sample_id={sample_id}."
+            )
+        anchor_local_indices = raw.get("anchor_local_indices")
+        if anchor_local_indices is None:
+            raise ValueError(
+                f"LMDB sample missing anchor_local_indices for sample_id={sample_id}."
+            )
         a_local_indices = raw["a_local_indices"]
         a_entity_in_graph = bool(torch.as_tensor(a_local_indices).numel() > 0)
         data_kwargs: Dict[str, Any] = {
@@ -251,7 +262,7 @@ class GraphRetrievalDataset(Dataset):
             "node_entity_ids": node_entity_ids,
             "node_embedding_ids": node_embedding_ids,
             "question_emb": question_emb,
-            "q_local_indices": q_local_indices,
+            "anchor_local_indices": anchor_local_indices,
             "a_local_indices": a_local_indices,
             "answer_entity_ids": answer_ids,
             "sample_id": sample_id,
@@ -516,8 +527,8 @@ def create_graph_retrieval_dataset(
     if isinstance(cfg.get("paths"), dict):
         heuristic_log_v_path = cfg["paths"].get("heuristic_log_v")
     sample_limit = _resolve_sample_limit(cfg, split_name)
-    runtime_filter_missing_start = _resolve_split_bool(
-        cfg, split_name, "runtime_filter_missing_start", True
+    runtime_filter_missing_anchor = _resolve_split_bool(
+        cfg, split_name, "runtime_filter_missing_anchor", True
     )
     runtime_filter_missing_answer = _resolve_split_bool(
         cfg, split_name, "runtime_filter_missing_answer", True
@@ -531,7 +542,7 @@ def create_graph_retrieval_dataset(
     missing_filters = _resolve_missing_filter_paths(
         cfg,
         split_name=split_name,
-        runtime_filter_missing_start=runtime_filter_missing_start,
+        runtime_filter_missing_anchor=runtime_filter_missing_anchor,
         runtime_filter_missing_answer=runtime_filter_missing_answer,
     )
     if missing_filters:
@@ -578,7 +589,10 @@ def _assert_no_removed_dataset_keys(cfg: Dict[str, Any]) -> None:
 
 
 def _resolve_split_bool(
-    cfg: Dict[str, Any], split_name: str, key: str, default: bool
+    cfg: Dict[str, Any],
+    split_name: str,
+    key: str,
+    default: bool,
 ) -> bool:
     value = cfg.get(key, default)
     if isinstance(value, dict):
@@ -603,10 +617,10 @@ def _resolve_missing_filter_paths(
     cfg: Dict[str, Any],
     *,
     split_name: str,
-    runtime_filter_missing_start: bool,
+    runtime_filter_missing_anchor: bool,
     runtime_filter_missing_answer: bool,
 ) -> list[Path]:
-    if not (runtime_filter_missing_start or runtime_filter_missing_answer):
+    if not (runtime_filter_missing_anchor or runtime_filter_missing_answer):
         return []
     paths = cfg.get("paths")
     if not isinstance(paths, dict) or not paths.get("processed"):
@@ -615,8 +629,8 @@ def _resolve_missing_filter_paths(
         )
     processed_dir = Path(paths["processed"])
     filter_paths: list[Path] = []
-    if runtime_filter_missing_start:
-        filter_paths.append(processed_dir / _FILTER_MISSING_START_FILENAME)
+    if runtime_filter_missing_anchor:
+        filter_paths.append(processed_dir / _FILTER_MISSING_ANCHOR_FILENAME)
     if runtime_filter_missing_answer:
         filter_paths.append(processed_dir / _FILTER_MISSING_ANSWER_FILENAME)
     missing = [str(path) for path in filter_paths if not path.exists()]

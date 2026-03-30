@@ -30,19 +30,19 @@ def test_should_keep_sample_uses_full_non_self_loop_graph() -> None:
         kb="freebase",
         question="what nationality is the person?",
         graph=[("m.topic", "people.person.nationality", "m.country")],
-        q_entity=["m.topic"],
-        a_entity=["m.country"],
+        question_entities=["m.topic"],
+        answer_entities=["m.country"],
         answer_texts=["country"],
     )
 
     outcome = _should_keep_sample(
         sample,
-        SplitFilter(skip_no_topic=True, skip_no_ans=True, skip_no_path=True),
+        SplitFilter(skip_no_question_entity=True, skip_no_ans=True, skip_no_path=True),
         {},
         remove_self_loops=True,
     )
 
     assert outcome.keep is True
-    assert outcome.has_topic is True
+    assert outcome.has_question_entity is True
     assert outcome.has_answer is True
     assert outcome.has_path is True

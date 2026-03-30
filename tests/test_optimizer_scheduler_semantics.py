@@ -9,26 +9,22 @@ import torch
 from torch.nn import Parameter
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
-from src.models.configs import (
-    ActionPriorConfig,
-    ActionPriorScheduleConfig,
-    AnswerQuotientConfig,
-    GFlowNetTrainingConfig,
-    OptimizerConfig,
-    PotentialRewardConfig,
-    ReplayMixScheduleConfig,
-    SamplingTemperatureScheduleConfig,
-    SchedulerConfig,
-    TransitionBiasScheduleConfig,
+from src.models.gflownet.config_utils import (
+    answer_quotient_active,
+    answer_quotient_direct_entity_ranking_active,
+    answer_quotient_stop_allocation_active,
+    normalize_answer_quotient_cfg,
+    normalize_potential_reward_cfg,
+    normalize_training_cfg,
+    potential_reward_active,
 )
-from src.models.gflownet.schedules import (
-    ActionPriorScheduler,
+from src.utils.optimizer_utils import build_optimizer_and_scheduler
+from src.utils.training_schedules import (
+    ProposalBiasScheduler,
     ReplayMixScheduler,
     SamplingTemperatureScheduler,
     TrainingScheduleContext,
-    TransitionBiasScheduler,
 )
-from src.models.gflownet_module import GFlowNetModule
 
 
 def _build_optimizer_config(
@@ -40,7 +36,7 @@ def _build_optimizer_config(
     trainer_max_steps: int | None = None,
     trainer_max_epochs: int | None = None,
 ) -> dict[str, Any]:
-    return GFlowNetModule._build_optimizer_and_scheduler(
+    return build_optimizer_and_scheduler(
         model_parameters=model_parameters,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
@@ -80,6 +76,34 @@ def _build_conditioned_log_z_named_parameters() -> tuple[
 ]:
     model = _ConditionedLogZToyModel()
     return model, model.named_parameters()
+
+
+def _default_optimizer_cfg(**overrides: Any) -> dict[str, Any]:
+    cfg = {
+        "type": "adamw",
+        "lr": 1.0e-4,
+        "log_z_head_lr_multiplier": 5.0,
+        "weight_decay": 1.0e-4,
+        "betas": (0.9, 0.999),
+        "no_decay_on_bias_and_norm": True,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _default_scheduler_cfg(**overrides: Any) -> dict[str, Any]:
+    cfg = {
+        "type": "cosine",
+        "interval": "step",
+        "t_max": None,
+        "t_mult": 1,
+        "eta_min": 1.0e-6,
+        "pct_start": 0.3,
+        "anneal": "cos",
+        "lr": None,
+    }
+    cfg.update(overrides)
+    return cfg
 
 
 def test_onecycle_scheduler_uses_t_max_total_steps() -> None:
@@ -276,7 +300,8 @@ def test_optimizer_can_scale_conditioned_log_z_head_learning_rate() -> None:
 def test_linear_sampling_temperature_scheduler_uses_training_horizon() -> None:
     scheduler = SamplingTemperatureScheduler(
         base_temperature=2.0,
-        config=SamplingTemperatureScheduleConfig(type="linear", final_temperature=0.5),
+        type="linear",
+        final_temperature=0.5,
     )
     schedule_context = TrainingScheduleContext(
         estimated_stepping_batches=1_000_000,
@@ -294,7 +319,8 @@ def test_linear_sampling_temperature_scheduler_uses_training_horizon() -> None:
 def test_annealed_sampling_temperature_scheduler_requires_known_horizon() -> None:
     scheduler = SamplingTemperatureScheduler(
         base_temperature=2.0,
-        config=SamplingTemperatureScheduleConfig(type="cosine", final_temperature=0.5),
+        type="cosine",
+        final_temperature=0.5,
     )
     schedule_context = TrainingScheduleContext(estimated_stepping_batches=None)
 
@@ -302,10 +328,11 @@ def test_annealed_sampling_temperature_scheduler_requires_known_horizon() -> Non
         scheduler.value(global_step=0, schedule_context=schedule_context)
 
 
-def test_linear_action_prior_scheduler_uses_training_horizon() -> None:
-    scheduler = ActionPriorScheduler(
+def test_linear_proposal_bias_scheduler_uses_training_horizon() -> None:
+    scheduler = ProposalBiasScheduler(
         base_scale=1.0,
-        config=ActionPriorScheduleConfig(type="linear", final_scale=0.25),
+        type="linear",
+        final_scale=0.25,
     )
     schedule_context = TrainingScheduleContext(
         estimated_stepping_batches=1_000_000,
@@ -320,16 +347,14 @@ def test_linear_action_prior_scheduler_uses_training_horizon() -> None:
     ) == pytest.approx(0.25)
 
 
-def test_action_prior_scheduler_supports_initial_hold_steps() -> None:
-    scheduler = ActionPriorScheduler(
+def test_proposal_bias_scheduler_supports_initial_hold_steps() -> None:
+    scheduler = ProposalBiasScheduler(
         base_scale=1.0,
-        config=ActionPriorScheduleConfig(
-            type="cosine",
-            initial_scale=0.8,
-            final_scale=0.0,
-            total_steps=4,
-            hold_steps=1,
-        ),
+        type="cosine",
+        initial_scale=0.8,
+        final_scale=0.0,
+        total_steps=4,
+        hold_steps=1,
     )
     schedule_context = TrainingScheduleContext(estimated_stepping_batches=4)
 
@@ -343,10 +368,11 @@ def test_action_prior_scheduler_supports_initial_hold_steps() -> None:
     assert 0.0 < mid_value < 0.8
 
 
-def test_annealed_action_prior_scheduler_requires_known_horizon() -> None:
-    scheduler = ActionPriorScheduler(
+def test_annealed_proposal_bias_scheduler_requires_known_horizon() -> None:
+    scheduler = ProposalBiasScheduler(
         base_scale=1.0,
-        config=ActionPriorScheduleConfig(type="cosine", final_scale=0.25),
+        type="cosine",
+        final_scale=0.25,
     )
     schedule_context = TrainingScheduleContext(estimated_stepping_batches=None)
 
@@ -354,33 +380,13 @@ def test_annealed_action_prior_scheduler_requires_known_horizon() -> None:
         scheduler.value(global_step=0, schedule_context=schedule_context)
 
 
-def test_transition_bias_scheduler_uses_training_horizon() -> None:
-    scheduler = TransitionBiasScheduler(
-        base_scale=1.0,
-        config=TransitionBiasScheduleConfig(type="linear", final_scale=0.0),
-    )
-    schedule_context = TrainingScheduleContext(
-        estimated_stepping_batches=1_000_000,
-        trainer_max_steps=4,
-    )
-
-    assert scheduler.value(
-        global_step=0, schedule_context=schedule_context
-    ) == pytest.approx(1.0)
-    assert scheduler.value(
-        global_step=3, schedule_context=schedule_context
-    ) == pytest.approx(0.0)
-
-
 def test_replay_mix_scheduler_uses_base_alpha_and_hold_steps() -> None:
     scheduler = ReplayMixScheduler(
         base_alpha=0.5,
-        config=ReplayMixScheduleConfig(
-            type="cosine",
-            final_alpha=0.0,
-            total_steps=4,
-            hold_steps=1,
-        ),
+        type="cosine",
+        final_alpha=0.0,
+        total_steps=4,
+        hold_steps=1,
     )
     schedule_context = TrainingScheduleContext(estimated_stepping_batches=4)
 
@@ -394,93 +400,175 @@ def test_replay_mix_scheduler_uses_base_alpha_and_hold_steps() -> None:
     assert 0.0 < mid_value < 0.5
 
 
-def test_intent_alignment_prior_requires_nonzero_action_features() -> None:
-    with pytest.raises(ValueError, match="intent_alignment_weight requires"):
-        ActionPriorConfig(
-            root_beta=0.5,
-            edge_beta=0.5,
-            intent_alignment_weight=1.0,
-            intent_relation_weight=0.0,
-            intent_target_weight=0.0,
+def test_normalize_training_cfg_exposes_direct_step_log_penalty() -> None:
+    training_cfg = normalize_training_cfg({"step_log_penalty": log(0.5)})
+
+    assert training_cfg["step_log_penalty"] == pytest.approx(log(0.5))
+
+
+def test_normalize_training_cfg_default_step_log_penalty_is_neutral() -> None:
+    assert normalize_training_cfg({})["step_log_penalty"] == pytest.approx(0.0)
+
+
+def test_normalize_training_cfg_validates_replay_expand_imitation_weight() -> None:
+    training_cfg = normalize_training_cfg(
+        {
+            "success_replay": {
+                "expand_imitation_weight": 0.75,
+                "expand_imitation_from_anchor_bonus": 1.25,
+                "expand_imitation_answer_finish_bonus": 2.5,
+            }
+        }
+    )
+
+    assert training_cfg["success_replay"]["expand_imitation_weight"] == pytest.approx(
+        0.75
+    )
+    assert training_cfg["success_replay"][
+        "expand_imitation_from_anchor_bonus"
+    ] == pytest.approx(1.25)
+    assert training_cfg["success_replay"][
+        "expand_imitation_answer_finish_bonus"
+    ] == pytest.approx(2.5)
+    with pytest.raises(ValueError, match="expand_imitation_weight"):
+        normalize_training_cfg({"success_replay": {"expand_imitation_weight": -0.1}})
+    with pytest.raises(ValueError, match="expand_imitation_from_anchor_bonus"):
+        normalize_training_cfg(
+            {"success_replay": {"expand_imitation_from_anchor_bonus": -0.1}}
+        )
+    with pytest.raises(ValueError, match="expand_imitation_answer_finish_bonus"):
+        normalize_training_cfg(
+            {"success_replay": {"expand_imitation_answer_finish_bonus": -0.1}}
         )
 
 
-def test_gflownet_training_config_exposes_direct_step_log_penalty() -> None:
-    training_cfg = GFlowNetTrainingConfig(step_log_penalty=log(0.5))
+def test_optimizer_defaults_weight_decay_to_model_config_value() -> None:
+    model, named_parameters = _build_linear_named_parameters()
+    config = _build_optimizer_config(
+        model_parameters=named_parameters,
+        optimizer_cfg={"type": "adamw", "lr": 1e-4},
+        scheduler_cfg={"type": "cosine", "t_max": 8},
+        estimated_stepping_batches=8,
+    )
 
-    assert training_cfg.step_log_penalty == pytest.approx(log(0.5))
+    optimizer = config["optimizer"]
+
+    assert any(
+        float(group["weight_decay"]) == pytest.approx(1.0e-4)
+        for group in optimizer.param_groups
+    )
 
 
-def test_gflownet_training_config_default_step_log_penalty_is_neutral() -> None:
-    assert GFlowNetTrainingConfig().step_log_penalty == pytest.approx(0.0)
+def test_optimizer_defaults_conditioned_log_z_lr_multiplier_to_model_config_value() -> (
+    None
+):
+    model, named_parameters = _build_conditioned_log_z_named_parameters()
+    config = _build_optimizer_config(
+        model_parameters=named_parameters,
+        optimizer_cfg={"type": "adamw", "lr": 1e-4},
+        scheduler_cfg={"type": "cosine", "t_max": 8},
+        estimated_stepping_batches=8,
+    )
+
+    optimizer = config["optimizer"]
+    grouped_lrs = {
+        str(group["group_name"]): float(group["lr"]) for group in optimizer.param_groups
+    }
+
+    assert grouped_lrs["log_z_head_decay"] == pytest.approx(5.0e-4)
+    assert grouped_lrs["log_z_head_no_decay"] == pytest.approx(5.0e-4)
 
 
-def test_optimizer_config_default_weight_decay_matches_model_config() -> None:
-    assert OptimizerConfig().weight_decay == pytest.approx(1.0e-4)
+def test_optimizer_validates_conditioned_log_z_lr_multiplier() -> None:
+    model, named_parameters = _build_conditioned_log_z_named_parameters()
 
-
-def test_optimizer_config_validates_conditioned_log_z_lr_multiplier() -> None:
-    assert OptimizerConfig().log_z_head_lr_multiplier == pytest.approx(5.0)
     with pytest.raises(ValueError, match="log_z_head_lr_multiplier"):
-        OptimizerConfig(log_z_head_lr_multiplier=0.0)
+        _build_optimizer_config(
+            model_parameters=named_parameters,
+            optimizer_cfg={
+                "type": "adamw",
+                "lr": 1e-4,
+                "log_z_head_lr_multiplier": 0.0,
+            },
+            scheduler_cfg={"type": "cosine", "t_max": 8},
+            estimated_stepping_batches=8,
+        )
 
 
-def test_scheduler_config_default_eta_min_matches_model_config() -> None:
-    assert SchedulerConfig().eta_min == pytest.approx(1.0e-6)
+def test_scheduler_defaults_eta_min_to_model_config_value() -> None:
+    model, named_parameters = _build_linear_named_parameters()
+    config = _build_optimizer_config(
+        model_parameters=named_parameters,
+        optimizer_cfg={"type": "adamw", "lr": 1e-4, "weight_decay": 0.0},
+        scheduler_cfg={"type": "cosine", "t_max": 8},
+        estimated_stepping_batches=8,
+    )
+
+    scheduler = config["lr_scheduler"]["scheduler"]
+
+    assert isinstance(scheduler, CosineAnnealingLR)
+    assert float(scheduler.eta_min) == pytest.approx(1.0e-6)
 
 
-def test_gflownet_training_config_validates_answer_stop_bonus() -> None:
-    training_cfg = GFlowNetTrainingConfig(answer_stop_log_reward_bonus=0.75)
+def test_normalize_training_cfg_validates_answer_stop_bonus() -> None:
+    training_cfg = normalize_training_cfg({"answer_stop_log_reward_bonus": 0.75})
 
-    assert training_cfg.answer_stop_log_reward_bonus == pytest.approx(0.75)
+    assert training_cfg["answer_stop_log_reward_bonus"] == pytest.approx(0.75)
     with pytest.raises(ValueError, match="answer_stop_log_reward_bonus"):
-        GFlowNetTrainingConfig(answer_stop_log_reward_bonus=-0.1)
+        normalize_training_cfg({"answer_stop_log_reward_bonus": -0.1})
 
 
-def test_answer_quotient_config_validates_terminal_replacement_weight() -> None:
-    cfg = AnswerQuotientConfig(enabled=True, weight=0.25, replace_terminal_loss=False)
+def test_answer_quotient_cfg_validates_terminal_replacement_weight() -> None:
+    cfg = normalize_answer_quotient_cfg(
+        {"enabled": True, "weight": 0.25, "replace_terminal_loss": False}
+    )
 
-    assert cfg.active is True
-    assert cfg.stop_allocation_active is False
+    assert answer_quotient_active(cfg) is True
+    assert answer_quotient_stop_allocation_active(cfg) is False
     with pytest.raises(ValueError, match="replace_terminal_loss requires weight > 0"):
-        AnswerQuotientConfig(enabled=True, weight=0.0, replace_terminal_loss=True)
+        normalize_answer_quotient_cfg(
+            {"enabled": True, "weight": 0.0, "replace_terminal_loss": True}
+        )
 
 
-def test_answer_quotient_config_exposes_stop_allocation_flag() -> None:
-    cfg = AnswerQuotientConfig(enabled=True, allocate_stop_mass=True)
+def test_answer_quotient_cfg_exposes_stop_allocation_flag() -> None:
+    cfg = normalize_answer_quotient_cfg({"enabled": True, "allocate_stop_mass": True})
 
-    assert cfg.active is False
-    assert cfg.stop_allocation_active is True
-
-
-def test_answer_quotient_config_exposes_direct_entity_ranking_flag() -> None:
-    cfg = AnswerQuotientConfig(enabled=True, direct_entity_ranking_weight=0.25)
-
-    assert cfg.active is False
-    assert cfg.direct_entity_ranking_active is True
+    assert answer_quotient_active(cfg) is False
+    assert answer_quotient_stop_allocation_active(cfg) is True
 
 
-def test_answer_quotient_config_validates_direct_entity_ranking_weight() -> None:
+def test_answer_quotient_cfg_exposes_direct_entity_ranking_flag() -> None:
+    cfg = normalize_answer_quotient_cfg(
+        {"enabled": True, "direct_entity_ranking_weight": 0.25}
+    )
+
+    assert answer_quotient_active(cfg) is False
+    assert answer_quotient_direct_entity_ranking_active(cfg) is True
+
+
+def test_answer_quotient_cfg_validates_direct_entity_ranking_weight() -> None:
     with pytest.raises(ValueError, match="direct_entity_ranking_weight must be >= 0"):
-        AnswerQuotientConfig(enabled=True, direct_entity_ranking_weight=-0.1)
+        normalize_answer_quotient_cfg(
+            {"enabled": True, "direct_entity_ranking_weight": -0.1}
+        )
     with pytest.raises(
         ValueError,
         match="direct_entity_ranking_weight requires enabled=True",
     ):
-        AnswerQuotientConfig(direct_entity_ranking_weight=0.1)
+        normalize_answer_quotient_cfg({"direct_entity_ranking_weight": 0.1})
 
 
-def test_potential_reward_config_exposes_answer_distance_flag() -> None:
-    cfg = PotentialRewardConfig(answer_distance_weight=0.5)
+def test_potential_reward_cfg_exposes_answer_distance_flag() -> None:
+    cfg = normalize_potential_reward_cfg({"answer_distance_weight": 0.5})
 
-    assert cfg.active is True
+    assert potential_reward_active(cfg) is True
 
 
-def test_potential_reward_config_validates_weight_and_unreachable_distance() -> None:
+def test_potential_reward_cfg_validates_weight_and_unreachable_distance() -> None:
     with pytest.raises(ValueError, match="answer_distance_weight must be >= 0"):
-        PotentialRewardConfig(answer_distance_weight=-0.1)
+        normalize_potential_reward_cfg({"answer_distance_weight": -0.1})
     with pytest.raises(ValueError, match="unreachable_distance must be >= 0"):
-        PotentialRewardConfig(
-            answer_distance_weight=0.5,
-            unreachable_distance=-1,
+        normalize_potential_reward_cfg(
+            {"answer_distance_weight": 0.5, "unreachable_distance": -1}
         )

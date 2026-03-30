@@ -18,10 +18,11 @@ parquet_num_workers: 8
 progress_bar: true
 fp16: null
 pipeline_log_path: null
-dataset_source: hf
+dataset_source: ${dataset.dataset_source}
 hf_dataset: ${dataset.hf_dataset}
 hf_cache_dir: ${paths.hf_datasets_cache}
 hf_offline: true
+stark: ${dataset.stark}
 pipeline_stage: all
 
 # === Stage 1: normalize raw parquet into retrieval parquet ===

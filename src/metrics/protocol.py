@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from src.graph import TrajectoryBatch
-from src.models.configs import GFlowNetTrainingConfig, HorizonConfig, SearchEvalConfig
 
 from .prediction_io import PredictionCodecProtocol
 
@@ -127,9 +126,9 @@ class MetricRuntimeFactoryProtocol(Protocol):
     def build_runtime(
         self,
         *,
-        horizon_cfg: HorizonConfig,
-        training_cfg: GFlowNetTrainingConfig,
-        eval_cfg: SearchEvalConfig,
+        horizon_cfg: dict[str, Any],
+        training_cfg: dict[str, Any],
+        eval_cfg: dict[str, Any],
         policy: Any,
     ) -> MetricRuntimeProtocol: ...
 

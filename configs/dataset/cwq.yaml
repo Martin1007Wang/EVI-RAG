@@ -15,7 +15,7 @@ runtime_filter_missing_answer:
   validation: false
   test: false
 
-q_entity_blacklist:
+question_entity_blacklist:
   - Country
   - US State
   - College/University

@@ -258,8 +258,9 @@ class TrajectoryBatch:
     question_emb: torch.Tensor | None
     question_ctx: torch.Tensor | None
     question_ctx_mask: torch.Tensor | None
-    q_local_indices: torch.Tensor
-    q_ptr: torch.Tensor
+    # These are the in-graph grounded question entities that seed rollout.
+    anchor_local_indices: torch.Tensor
+    anchor_ptr: torch.Tensor
     a_local_indices: torch.Tensor
     a_ptr: torch.Tensor
     answer_entity_ids: torch.Tensor
@@ -323,8 +324,8 @@ class TrajectoryBatch:
             question_emb=None,
             question_ctx=None,
             question_ctx_mask=None,
-            q_local_indices=self.q_local_indices,
-            q_ptr=self.q_ptr,
+            anchor_local_indices=self.anchor_local_indices,
+            anchor_ptr=self.anchor_ptr,
             a_local_indices=self.a_local_indices,
             a_ptr=self.a_ptr,
             answer_entity_ids=self.answer_entity_ids,
@@ -343,8 +344,8 @@ class TrajectoryBatch:
             raise ValueError("TrajectoryBatch.num_graphs must be >= 1.")
         if int(self.node_ptr.numel()) != self.num_graphs + 1:
             raise ValueError("node_ptr must have length num_graphs + 1.")
-        if int(self.q_ptr.numel()) != self.num_graphs + 1:
-            raise ValueError("q_ptr must have length num_graphs + 1.")
+        if int(self.anchor_ptr.numel()) != self.num_graphs + 1:
+            raise ValueError("anchor_ptr must have length num_graphs + 1.")
         if int(self.a_ptr.numel()) != self.num_graphs + 1:
             raise ValueError("a_ptr must have length num_graphs + 1.")
         if int(self.answer_ptr.numel()) != self.num_graphs + 1:
@@ -369,10 +370,10 @@ class TrajectoryBatch:
             raise ValueError("edge_batch mismatch with edge_index/node_ptr.")
         if not torch.equal(actual_edge_ptr, computed_edge_ptr):
             raise ValueError("edge_ptr mismatch with edge_batch.")
-        if int(self.q_local_indices.numel()) != int(
-            (self.q_ptr[1:] - self.q_ptr[:-1]).sum().item()
+        if int(self.anchor_local_indices.numel()) != int(
+            (self.anchor_ptr[1:] - self.anchor_ptr[:-1]).sum().item()
         ):
-            raise ValueError("q_ptr mismatch with q_local_indices length.")
+            raise ValueError("anchor_ptr mismatch with anchor_local_indices length.")
         if int(self.a_local_indices.numel()) != int(
             (self.a_ptr[1:] - self.a_ptr[:-1]).sum().item()
         ):
@@ -527,8 +528,8 @@ class TrajectoryBatch:
             question_emb=question_emb,
             question_ctx=question_ctx,
             question_ctx_mask=question_ctx_mask,
-            q_local_indices=self.q_local_indices.to(device=target_device),
-            q_ptr=self.q_ptr.to(device=target_device),
+            anchor_local_indices=self.anchor_local_indices.to(device=target_device),
+            anchor_ptr=self.anchor_ptr.to(device=target_device),
             a_local_indices=self.a_local_indices.to(device=target_device),
             a_ptr=self.a_ptr.to(device=target_device),
             answer_entity_ids=self.answer_entity_ids.to(device=target_device),
@@ -618,13 +619,13 @@ class TrajectoryBatch:
             name="question_ctx_mask",
             device=device,
         )
-        q_local_indices = _require_1d_long(
-            getattr(batch, "q_local_indices", None),
-            name="q_local_indices",
+        anchor_local_indices = _require_1d_long(
+            getattr(batch, "anchor_local_indices", None),
+            name="anchor_local_indices",
             device=device,
         )
-        q_ptr = _require_1d_long(
-            getattr(batch, "q_ptr", None), name="q_ptr", device=device
+        anchor_ptr = _require_1d_long(
+            getattr(batch, "anchor_ptr", None), name="anchor_ptr", device=device
         )
         a_local_indices = _require_1d_long(
             getattr(batch, "a_local_indices", None),
@@ -664,8 +665,8 @@ class TrajectoryBatch:
             question_emb=question_emb,
             question_ctx=question_ctx,
             question_ctx_mask=question_ctx_mask,
-            q_local_indices=q_local_indices,
-            q_ptr=q_ptr,
+            anchor_local_indices=anchor_local_indices,
+            anchor_ptr=anchor_ptr,
             a_local_indices=a_local_indices,
             a_ptr=a_ptr,
             answer_entity_ids=answer_entity_ids,
@@ -712,7 +713,7 @@ class TrajectoryBatch:
         num_graphs = 0
         node_offset = 0
         node_ptr_values = [0]
-        q_ptr_values = [0]
+        anchor_ptr_values = [0]
         a_ptr_values = [0]
         answer_ptr_values = [0]
 
@@ -727,7 +728,7 @@ class TrajectoryBatch:
         question_emb_parts: list[torch.Tensor] = []
         question_ctx_parts: list[torch.Tensor] = []
         question_ctx_mask_parts: list[torch.Tensor] = []
-        q_local_parts: list[torch.Tensor] = []
+        anchor_local_parts: list[torch.Tensor] = []
         a_local_parts: list[torch.Tensor] = []
         answer_entity_parts: list[torch.Tensor] = []
         node_entity_parts: list[torch.Tensor] = []
@@ -771,14 +772,14 @@ class TrajectoryBatch:
                 )
 
             node_counts = (batch.node_ptr[1:] - batch.node_ptr[:-1]).tolist()
-            q_counts = (batch.q_ptr[1:] - batch.q_ptr[:-1]).tolist()
+            anchor_counts = (batch.anchor_ptr[1:] - batch.anchor_ptr[:-1]).tolist()
             a_counts = (batch.a_ptr[1:] - batch.a_ptr[:-1]).tolist()
             answer_counts = (batch.answer_ptr[1:] - batch.answer_ptr[:-1]).tolist()
 
             for count in node_counts:
                 node_ptr_values.append(node_ptr_values[-1] + int(count))
-            for count in q_counts:
-                q_ptr_values.append(q_ptr_values[-1] + int(count))
+            for count in anchor_counts:
+                anchor_ptr_values.append(anchor_ptr_values[-1] + int(count))
             for count in a_counts:
                 a_ptr_values.append(a_ptr_values[-1] + int(count))
             for count in answer_counts:
@@ -810,7 +811,7 @@ class TrajectoryBatch:
                 )
                 relation_global_parts.append(compact_relation_ids)
                 relation_embedding_parts.append(compact_relation_embeddings)
-            q_local_parts.append(batch.q_local_indices)
+            anchor_local_parts.append(batch.anchor_local_indices)
             a_local_parts.append(batch.a_local_indices)
             answer_entity_parts.append(batch.answer_entity_ids)
             node_entity_parts.append(batch.node_entity_ids)
@@ -869,8 +870,8 @@ class TrajectoryBatch:
             question_emb=question_emb,
             question_ctx=question_ctx,
             question_ctx_mask=question_ctx_mask,
-            q_local_indices=torch.cat(q_local_parts, dim=0),
-            q_ptr=torch.tensor(q_ptr_values, device=device, dtype=torch.long),
+            anchor_local_indices=torch.cat(anchor_local_parts, dim=0),
+            anchor_ptr=torch.tensor(anchor_ptr_values, device=device, dtype=torch.long),
             a_local_indices=torch.cat(a_local_parts, dim=0),
             a_ptr=torch.tensor(a_ptr_values, device=device, dtype=torch.long),
             answer_entity_ids=torch.cat(answer_entity_parts, dim=0),
@@ -911,8 +912,8 @@ class TrajectoryBatch:
                 edge_rel_local=relation_edge_rel_local,
             )
         num_nodes = node_end - node_start
-        q_start = int(self.q_ptr[graph_idx].item())
-        q_end = int(self.q_ptr[graph_idx + 1].item())
+        anchor_start = int(self.anchor_ptr[graph_idx].item())
+        anchor_end = int(self.anchor_ptr[graph_idx + 1].item())
         a_start = int(self.a_ptr[graph_idx].item())
         a_end = int(self.a_ptr[graph_idx + 1].item())
         answer_start = int(self.answer_ptr[graph_idx].item())
@@ -950,9 +951,11 @@ class TrajectoryBatch:
             question_emb=question_emb,
             question_ctx=question_ctx,
             question_ctx_mask=question_ctx_mask,
-            q_local_indices=self.q_local_indices[q_start:q_end],
-            q_ptr=torch.tensor(
-                [0, q_end - q_start], device=self.q_ptr.device, dtype=torch.long
+            anchor_local_indices=self.anchor_local_indices[anchor_start:anchor_end],
+            anchor_ptr=torch.tensor(
+                [0, anchor_end - anchor_start],
+                device=self.anchor_ptr.device,
+                dtype=torch.long,
             ),
             a_local_indices=self.a_local_indices[a_start:a_end],
             a_ptr=torch.tensor(

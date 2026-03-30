@@ -1,0 +1,3 @@
+# @package model.horizon_cfg
+
+max_steps: ${dataset.max_steps}

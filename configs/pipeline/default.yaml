@@ -12,16 +12,16 @@ target_reachable_pruning: false
 # Preprocess-time sample retention rules before parquet/LMDB materialization.
 preprocess_filter:
   train:
-    skip_no_topic: true
+    skip_no_question_entity: true
     skip_no_ans: false
     skip_no_path: false
   eval:
-    skip_no_topic: true
+    skip_no_question_entity: true
     skip_no_ans: false
     skip_no_path: false
 
-q_entity_blacklist: []
-q_entity_blacklist_path: null
+question_entity_blacklist: []
+question_entity_blacklist_path: null
 
 embeddings_out_dir: ${dataset.materialized_dir}/embeddings
 # Mainline uses token-level question context; set 0 to disable and fall back to pooled question_emb only.

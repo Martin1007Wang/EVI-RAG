@@ -19,6 +19,7 @@ from src.data.schema.types import (
 _QID_IN_PARENS_RE = re.compile(r"(Q\d+)")
 _LABEL_QID_RE = re.compile(r"(.+)\s+\((Q\d+)\)$")
 _DATA_SOURCE_HF = "hf"
+_DATA_SOURCE_STARK = "stark"
 _HF_DATASET_BY_FAMILY = {
     "cwq": "rmanluo/RoG-cwq",
     "webqsp": "rmanluo/RoG-webqsp",
@@ -27,6 +28,10 @@ _HF_DATASET_ALLOWED = tuple(_HF_DATASET_BY_FAMILY.values())
 _SRC_DIR = Path(__file__).resolve().parents[2]
 _LOCAL_DATASETS_INIT = _SRC_DIR / "datasets" / "__init__.py"
 _HF_DATASETS_MODULE: ModuleType | None = None
+_LEGACY_COLUMN_MAP_KEYS = {
+    "q_entity_field": "question_entity_field",
+    "a_entity_field": "answer_entity_field",
+}
 
 
 def _module_file_path(module: ModuleType) -> Path | None:
@@ -120,6 +125,19 @@ def build_cvt_entity_config(cfg: DictConfig) -> CvtEntityConfig:
     return CvtEntityConfig(mode=mode, prefixes=prefixes, regex=regex)
 
 
+def _assert_no_legacy_column_map_keys(column_map: Mapping[str, str]) -> None:
+    renamed = {
+        old: new for old, new in _LEGACY_COLUMN_MAP_KEYS.items() if old in column_map
+    }
+    if not renamed:
+        return
+    details = ", ".join(f"{old}->{new}" for old, new in renamed.items())
+    raise ValueError(
+        "Legacy column_map keys detected: "
+        f"{details}. Update dataset column_map to use question_entity_field/answer_entity_field."
+    )
+
+
 def normalize_entity(entity: str, mode: str) -> str:
     if mode == "qid_in_parentheses":
         match = _QID_IN_PARENS_RE.search(entity)
@@ -206,8 +224,8 @@ def _register_label_qid(label_to_qid: Dict[str, str], raw_value: object) -> None
 def _build_label_to_qid_lookup(
     graph_raw: Sequence[object],
     *,
-    q_entities_raw: Sequence[str],
-    a_entities_raw: Sequence[str],
+    question_entities_raw: Sequence[str],
+    answer_entities_raw: Sequence[str],
     entity_normalization: str,
 ) -> Dict[str, str]:
     if entity_normalization != "qid_in_parentheses":
@@ -220,9 +238,9 @@ def _build_label_to_qid_lookup(
             continue
         _register_label_qid(label_to_qid, tr[0])
         _register_label_qid(label_to_qid, tr[2])
-    for entity in q_entities_raw:
+    for entity in question_entities_raw:
         _register_label_qid(label_to_qid, entity)
-    for entity in a_entities_raw:
+    for entity in answer_entities_raw:
         _register_label_qid(label_to_qid, entity)
     return label_to_qid
 
@@ -236,17 +254,20 @@ def _row_to_sample(
     column_map: Dict[str, str],
     entity_normalization: str,
 ) -> Sample:
+    _assert_no_legacy_column_map_keys(column_map)
     graph_raw_value = row.get(column_map["graph_field"])
     if isinstance(graph_raw_value, (list, tuple)):
         graph_raw: list[object] = list(graph_raw_value)
     else:
         graph_raw = []
-    q_entities_raw = to_list(row.get(column_map["q_entity_field"]))
-    a_entities_raw = to_list(row.get(column_map["a_entity_field"]))
+    question_entity_field = column_map.get("question_entity_field", "q_entity")
+    answer_entity_field = column_map.get("answer_entity_field", "a_entity")
+    question_entities_raw = to_list(row.get(question_entity_field))
+    answer_entities_raw = to_list(row.get(answer_entity_field))
     label_to_qid = _build_label_to_qid_lookup(
         graph_raw,
-        q_entities_raw=q_entities_raw,
-        a_entities_raw=a_entities_raw,
+        question_entities_raw=question_entities_raw,
+        answer_entities_raw=answer_entities_raw,
         entity_normalization=entity_normalization,
     )
     graph: List[tuple[str, str, str]] = []
@@ -261,13 +282,13 @@ def _row_to_sample(
             t = normalize_entity_with_lookup(t_raw, entity_normalization, label_to_qid)
             graph.append((h, r, t))
 
-    q_entities = [
+    question_entities = [
         normalize_entity_with_lookup(ent, entity_normalization, label_to_qid)
-        for ent in q_entities_raw
+        for ent in question_entities_raw
     ]
-    a_entities = [
+    answer_entities = [
         normalize_entity_with_lookup(ent, entity_normalization, label_to_qid)
-        for ent in a_entities_raw
+        for ent in answer_entities_raw
     ]
     answer_texts = to_list(row.get(column_map["answer_text_field"]))
     graph_iso_type = None
@@ -292,8 +313,8 @@ def _row_to_sample(
         kb=kb,
         question=str(row.get(column_map["question_field"]) or ""),
         graph=graph,
-        q_entity=q_entities,
-        a_entity=a_entities,
+        question_entities=question_entities,
+        answer_entities=answer_entities,
         answer_texts=answer_texts,
         graph_iso_type=graph_iso_type,
         redundant=redundant,
@@ -314,13 +335,31 @@ def iter_samples(
     hf_dataset: Optional[str] = None,
     hf_cache_dir: Optional[Path] = None,
     hf_offline: bool = False,
+    stark_cfg: Optional[Mapping[str, object]] = None,
 ) -> Iterable[Sample]:
     del raw_root
+    source = str(dataset_source).strip().lower()
+    if source == _DATA_SOURCE_STARK:
+        if stark_cfg is None:
+            raise ValueError(
+                "dataset_source='stark' requires a non-empty stark config."
+            )
+        from src.data.io.stark_adapter import iter_stark_samples
+
+        yield from iter_stark_samples(
+            dataset=dataset,
+            kb=kb,
+            splits=splits,
+            stark_cfg=stark_cfg,
+        )
+        return
     for split in splits:
-        source = str(dataset_source).strip().lower()
         if source != _DATA_SOURCE_HF:
             raise ValueError(
-                f"Unsupported dataset_source={dataset_source!r}; expected '{_DATA_SOURCE_HF}'."
+                "Unsupported dataset_source={value!r}; expected one of {allowed}.".format(
+                    value=dataset_source,
+                    allowed=(_DATA_SOURCE_HF, _DATA_SOURCE_STARK),
+                )
             )
         dataset_id = _resolve_hf_dataset_id(dataset, dataset_family, hf_dataset)
         dataset_obj = _load_hf_split(

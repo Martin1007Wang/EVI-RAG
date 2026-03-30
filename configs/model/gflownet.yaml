@@ -1,66 +1,15 @@
 defaults:
   - _self_
+  - gflownet/horizon_cfg: default
+  - gflownet/training_cfg: default
+  - gflownet/policy_cfg: default
+  - gflownet/eval_cfg: default
+  - gflownet/optimizer_cfg: default
+  - gflownet/scheduler_cfg: default
 
 _target_: src.models.gflownet_module.GFlowNetModule
 _recursive_: true
+_convert_: all
 
 metric_runtime_factory:
   _target_: src.metrics.runtime_factory.GraphTaskRuntimeFactory
-
-horizon_cfg:
-  _target_: src.models.configs.gflownet.HorizonConfig
-  max_steps: ${dataset.max_steps}
-
-training_cfg:
-  _target_: src.models.configs.gflownet.GFlowNetTrainingConfig
-  sampling_temperature_schedule:
-    _target_: src.models.configs.gflownet.SamplingTemperatureScheduleConfig
-  action_prior_schedule:
-    _target_: src.models.configs.gflownet.ActionPriorScheduleConfig
-  transition_bias_schedule:
-    _target_: src.models.configs.gflownet.TransitionBiasScheduleConfig
-  success_replay:
-    _target_: src.models.configs.gflownet.SuccessReplayConfig
-  replay_mix_schedule:
-    _target_: src.models.configs.gflownet.ReplayMixScheduleConfig
-  answer_quotient:
-    _target_: src.models.configs.gflownet.AnswerQuotientConfig
-  potential_reward:
-    _target_: src.models.configs.gflownet.PotentialRewardConfig
-  subgraph_reward:
-    _target_: src.models.configs.gflownet.SubgraphRewardConfig
-  subgraph_proposal:
-    _target_: src.models.configs.gflownet.SubgraphProposalConfig
-  subtb:
-    _target_: src.models.configs.gflownet.SubTrajectoryBalanceConfig
-
-action_prior_cfg:
-  _target_: src.models.configs.gflownet.ActionPriorConfig
-
-policy_cfg:
-  _target_: src.models.configs.policy.PolicyConfig
-  state_mode: subgraph
-  backbone:
-    _target_: src.models.configs.backbone.BackboneConfig
-  state_score_head:
-    _target_: src.models.configs.policy.StateScoreHeadConfig
-  transition_head:
-    _target_: src.models.configs.policy.TransitionHeadConfig
-  subgraph_state_encoder:
-    _target_: src.models.configs.policy.SubgraphStateEncoderConfig
-  subgraph_action_head:
-    _target_: src.models.configs.policy.SubgraphActionHeadConfig
-
-eval_cfg:
-  _target_: src.models.configs.gflownet.SearchEvalConfig
-  flow_frontier:
-    _target_: src.models.configs.gflownet.FlowFrontierEvalConfig
-  monte_carlo:
-    _target_: src.models.configs.gflownet.MonteCarloEvalConfig
-
-optimizer_cfg:
-  _target_: src.models.configs.training.OptimizerConfig
-
-scheduler_cfg:
-  _target_: src.models.configs.training.SchedulerConfig
-  t_max: ${oc.select:trainer.max_steps,null}

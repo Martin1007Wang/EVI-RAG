@@ -7,12 +7,11 @@ from typing import Any, Callable
 import torch
 
 from src.graph import TrajectoryBatch
-from src.models.configs import SearchEvalConfig
-from src.models.gflownet.subgraph.answers import resolve_subgraph_answer_entities
-from src.models.gflownet.subgraph.policy import SubgraphPolicy
-from src.models.gflownet.subgraph.sampler import SubgraphSampler
-from src.models.gflownet.subgraph.search import beam_search_subgraphs
-from src.models.gflownet.subgraph.state import SubgraphAnalysis
+from src.models.gflownet.policy import SubgraphPolicy
+from src.models.gflownet.reward import resolve_subgraph_answer_entities
+from src.models.gflownet.sampler import SubgraphSampler
+from src.models.gflownet.search import beam_search_subgraphs
+from src.models.gflownet.state import SubgraphAnalysis
 
 from .base import BaseMetricRuntime
 from .protocol import MetricEvaluationOutput
@@ -94,7 +93,7 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
     def __init__(
         self,
         *,
-        eval_cfg: SearchEvalConfig,
+        eval_cfg: dict[str, Any],
         policy: SubgraphPolicy,
         sampler: SubgraphSampler,
     ) -> None:
@@ -187,7 +186,7 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
                     ),
                 }
                 for terminal_subgraph in terminal_subgraphs[
-                    : int(self.eval_cfg.edge_emit_top_k)
+                    : int(self.eval_cfg["edge_emit_top_k"])
                 ]
                 for answer_entities in [
                     resolve_subgraph_answer_entities(
@@ -236,7 +235,7 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
             _topk_metrics(
                 predicted_entities=list(result["predicted_answer_entity_ids"]),
                 gold_entities=list(result["gold_answer_entity_ids"]),
-                top_ks=tuple(int(k) for k in self.eval_cfg.answer_top_ks),
+                top_ks=tuple(int(k) for k in self.eval_cfg["answer_top_ks"]),
             )
             for result in results
         ]
@@ -303,7 +302,7 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
             _topk_metrics(
                 predicted_entities=list(result.get("predicted_answer_entity_ids", [])),
                 gold_entities=list(result.get("gold_answer_entity_ids", [])),
-                top_ks=tuple(int(k) for k in self.eval_cfg.answer_top_ks),
+                top_ks=tuple(int(k) for k in self.eval_cfg["answer_top_ks"]),
             )
             for result in predict_results
         ]

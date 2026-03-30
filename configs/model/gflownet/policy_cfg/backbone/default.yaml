@@ -1,0 +1,7 @@
+# @package model.policy_cfg.backbone
+
+embedding_dim: 1024
+hidden_dim: 512
+use_adapter: true
+adapter_dim: 128
+adapter_dropout: 0.1

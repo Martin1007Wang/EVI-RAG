@@ -92,7 +92,7 @@ class GraphObservation:
     question_embedding: torch.Tensor
     question_context: torch.Tensor
     question_valid_mask: torch.Tensor
-    q_local_indices: GroupedLocalNodeIndex
+    anchor_local_indices: GroupedLocalNodeIndex
     sample_ids: tuple[str, ...]
 
     @property
@@ -170,9 +170,9 @@ class GraphObservation:
                 "sample_ids length mismatch with topology.num_graphs in graph observation: "
                 f"sample_ids={len(self.sample_ids)}, num_graphs={int(topology.num_graphs)}."
             )
-        self.q_local_indices.validate(
+        self.anchor_local_indices.validate(
             num_groups=topology.num_graphs,
-            field_name="q_local_indices",
+            field_name="anchor_local_indices",
         )
         if int(topology.edge_type.numel()) > 0 and int(
             self.relation_features.size(0)
@@ -187,7 +187,7 @@ class SearchObservation:
     """Lightweight observation metadata needed after encoding finishes."""
 
     node_entity_ids: torch.Tensor
-    q_local_indices: GroupedLocalNodeIndex
+    anchor_local_indices: GroupedLocalNodeIndex
     sample_ids: tuple[str, ...]
 
     @classmethod
@@ -196,7 +196,7 @@ class SearchObservation:
     ) -> "SearchObservation":
         return cls(
             node_entity_ids=observation.node_entity_ids,
-            q_local_indices=observation.q_local_indices,
+            anchor_local_indices=observation.anchor_local_indices,
             sample_ids=tuple(str(sample_id) for sample_id in observation.sample_ids),
         )
 

@@ -52,7 +52,7 @@ def _build_split(
                 continue
             labels = compute_shortest_path_labels(
                 edge_index=torch.as_tensor(data.edge_index, dtype=torch.long),
-                q_local_indices=torch.as_tensor(data.q_local_indices, dtype=torch.long),
+                anchor_local_indices=torch.as_tensor(data.anchor_local_indices, dtype=torch.long),
                 a_local_indices=torch.as_tensor(data.a_local_indices, dtype=torch.long),
                 num_nodes=int(data.num_nodes),
             )

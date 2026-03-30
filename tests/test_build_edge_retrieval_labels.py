@@ -19,7 +19,7 @@ class _DummyLabelDataset:
         return SimpleNamespace(
             sample_id="sample-1",
             edge_index=torch.tensor([[0], [1]], dtype=torch.long),
-            q_local_indices=torch.tensor([0], dtype=torch.long),
+            anchor_local_indices=torch.tensor([0], dtype=torch.long),
             a_local_indices=torch.tensor([1], dtype=torch.long),
             num_nodes=2,
         )

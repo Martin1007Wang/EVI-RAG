@@ -28,10 +28,23 @@ class ShortestPathLabels:
 class ForwardShortestPathTrajectory:
     """Deterministic forward shortest path used for guidance replay."""
 
-    start_node: int
+    anchor_node: int
     path_nodes: tuple[int, ...]
     path_edge_ids: tuple[int, ...]
     hop_length: int
+
+
+@dataclass(frozen=True)
+class ForwardMultiAnchorUnionTrajectory:
+    """Deterministic forward teacher subgraph that covers all anchors to one answer."""
+
+    answer_node: int
+    anchor_nodes: tuple[int, ...]
+    anchor_path_nodes: tuple[tuple[int, ...], ...]
+    anchor_path_edge_ids: tuple[tuple[int, ...], ...]
+    ordered_edge_ids: tuple[int, ...]
+    union_edge_ids: tuple[int, ...]
+    total_hop_length: int
 
 
 def _unique_valid_indices(raw: torch.Tensor, *, num_nodes: int) -> list[int]:
@@ -139,11 +152,59 @@ def _build_forward_adjacency_with_edges(
     return outgoing, [sorted(values) for values in incoming_sets]
 
 
+def _resolve_forward_shortest_path_to_target(
+    *,
+    outgoing: list[list[tuple[int, int]]],
+    anchor_node: int,
+    target_node: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    if anchor_node == target_node:
+        return ((int(anchor_node),), ())
+    parent_node: dict[int, int | None] = {int(anchor_node): None}
+    parent_edge: dict[int, int] = {}
+    queue: deque[int] = deque([int(anchor_node)])
+    while queue:
+        current = int(queue.popleft())
+        if current == int(target_node):
+            break
+        for edge_id, neighbor in outgoing[current]:
+            neighbor = int(neighbor)
+            if neighbor in parent_node:
+                continue
+            parent_node[neighbor] = current
+            parent_edge[neighbor] = int(edge_id)
+            queue.append(neighbor)
+    if int(target_node) not in parent_node:
+        return None
+    path_nodes = [int(target_node)]
+    path_edge_ids: list[int] = []
+    current = int(target_node)
+    while parent_node[current] is not None:
+        path_edge_ids.append(int(parent_edge[current]))
+        current = int(parent_node[current])
+        path_nodes.append(current)
+    path_nodes.reverse()
+    path_edge_ids.reverse()
+    return tuple(path_nodes), tuple(path_edge_ids)
+
+
+def _dedup_preserve_order(values: list[int]) -> tuple[int, ...]:
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for value in values:
+        value = int(value)
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return tuple(ordered)
+
+
 def _precompute_dist_maps(
     *,
     adjacency: list[list[int]],
     rev_adjacency: list[list[int]],
-    q_nodes: list[int],
+    anchor_nodes: list[int],
     a_nodes: list[int],
 ) -> tuple[
     dict[int, list[int]],
@@ -151,11 +212,13 @@ def _precompute_dist_maps(
     dict[int, list[int]],
     dict[int, list[int]],
 ]:
-    dist_from_q = {q: _bfs_dist(adjacency, q) for q in q_nodes}
-    dist_to_q = {q: _bfs_dist(rev_adjacency, q) for q in q_nodes}
+    dist_from_anchor = {anchor: _bfs_dist(adjacency, anchor) for anchor in anchor_nodes}
+    dist_to_anchor = {
+        anchor: _bfs_dist(rev_adjacency, anchor) for anchor in anchor_nodes
+    }
     dist_from_a = {a: _bfs_dist(adjacency, a) for a in a_nodes}
     dist_to_a = {a: _bfs_dist(rev_adjacency, a) for a in a_nodes}
-    return dist_from_q, dist_to_q, dist_from_a, dist_to_a
+    return dist_from_anchor, dist_to_anchor, dist_from_a, dist_to_a
 
 
 def _resolve_min_direction(
@@ -197,19 +260,19 @@ def _collect_edges_on_shortest_paths(
 def _label_edges_for_pair(
     *,
     pair_to_edge: dict[tuple[int, int], int],
-    dist_from_q: dict[int, list[int]],
-    dist_to_q: dict[int, list[int]],
+    dist_from_anchor: dict[int, list[int]],
+    dist_to_anchor: dict[int, list[int]],
     dist_from_a: dict[int, list[int]],
     dist_to_a: dict[int, list[int]],
-    q: int,
+    anchor: int,
     a: int,
 ) -> tuple[set[int], Optional[int]]:
-    dq = dist_from_q[q]
-    dtq = dist_to_q[q]
+    dist_anchor_to_nodes = dist_from_anchor[anchor]
+    dist_nodes_to_anchor = dist_to_anchor[anchor]
     da = dist_from_a[a]
     dta = dist_to_a[a]
     use_f, use_b, min_len = _resolve_min_direction(
-        forward_len=int(dq[a]), backward_len=int(da[q])
+        forward_len=int(dist_anchor_to_nodes[a]), backward_len=int(da[anchor])
     )
     if min_len == _DIST_UNREACHABLE:
         return set(), None
@@ -217,16 +280,16 @@ def _label_edges_for_pair(
     if use_f:
         edges |= _collect_edges_on_shortest_paths(
             pair_to_edge=pair_to_edge,
-            dist_from_src=dq,
+            dist_from_src=dist_anchor_to_nodes,
             dist_to_dst=dta,
-            target_len=int(dq[a]),
+            target_len=int(dist_anchor_to_nodes[a]),
         )
     if use_b:
         edges |= _collect_edges_on_shortest_paths(
             pair_to_edge=pair_to_edge,
             dist_from_src=da,
-            dist_to_dst=dtq,
-            target_len=int(da[q]),
+            dist_to_dst=dist_nodes_to_anchor,
+            target_len=int(da[anchor]),
         )
     return edges, int(min_len)
 
@@ -234,24 +297,24 @@ def _label_edges_for_pair(
 def _label_edges_for_pairs(
     *,
     pair_to_edge: dict[tuple[int, int], int],
-    dist_from_q: dict[int, list[int]],
-    dist_to_q: dict[int, list[int]],
+    dist_from_anchor: dict[int, list[int]],
+    dist_to_anchor: dict[int, list[int]],
     dist_from_a: dict[int, list[int]],
     dist_to_a: dict[int, list[int]],
-    q_nodes: list[int],
+    anchor_nodes: list[int],
     a_nodes: list[int],
 ) -> tuple[set[int], Optional[int]]:
     pos_edge_ids: set[int] = set()
     max_len: Optional[int] = None
-    for q in q_nodes:
+    for anchor in anchor_nodes:
         for a in a_nodes:
             edges, min_len = _label_edges_for_pair(
                 pair_to_edge=pair_to_edge,
-                dist_from_q=dist_from_q,
-                dist_to_q=dist_to_q,
+                dist_from_anchor=dist_from_anchor,
+                dist_to_anchor=dist_to_anchor,
                 dist_from_a=dist_from_a,
                 dist_to_a=dist_to_a,
-                q=q,
+                anchor=anchor,
                 a=a,
             )
             if min_len is None:
@@ -267,7 +330,7 @@ def _label_edges_for_pairs(
 def compute_shortest_path_labels(
     *,
     edge_index: torch.Tensor,
-    q_local_indices: torch.Tensor,
+    anchor_local_indices: torch.Tensor,
     a_local_indices: torch.Tensor,
     num_nodes: int,
 ) -> ShortestPathLabels:
@@ -275,7 +338,8 @@ def compute_shortest_path_labels(
 
     Key properties (to match the original implementation):
     - Collapse multi-edges by treating the graph as a DiGraph (u->v keeps last edge id).
-    - For each (q, a), consider directed shortest paths q->a and a->q; if both exist,
+    - For each (anchor, answer), consider directed shortest paths anchor->answer and
+      answer->anchor; if both exist,
       keep only the direction(s) with smaller length.
     - Mark an edge as positive iff it lies on at least one kept shortest path.
     """
@@ -288,13 +352,13 @@ def compute_shortest_path_labels(
             max_path_length=None,
         )
 
-    q_nodes = _unique_valid_indices(
-        torch.as_tensor(q_local_indices), num_nodes=num_nodes
+    anchor_nodes = _unique_valid_indices(
+        torch.as_tensor(anchor_local_indices), num_nodes=num_nodes
     )
     a_nodes = _unique_valid_indices(
         torch.as_tensor(a_local_indices), num_nodes=num_nodes
     )
-    if not q_nodes or not a_nodes:
+    if not anchor_nodes or not a_nodes:
         return ShortestPathLabels(
             num_edges=num_edges,
             positive_edge_ids=torch.empty((0,), dtype=torch.long),
@@ -304,19 +368,19 @@ def compute_shortest_path_labels(
     pair_to_edge, adjacency, rev_adjacency = _build_digraph_overwrite(
         edge_index, num_nodes=num_nodes
     )
-    dist_from_q, dist_to_q, dist_from_a, dist_to_a = _precompute_dist_maps(
+    dist_from_anchor, dist_to_anchor, dist_from_a, dist_to_a = _precompute_dist_maps(
         adjacency=adjacency,
         rev_adjacency=rev_adjacency,
-        q_nodes=q_nodes,
+        anchor_nodes=anchor_nodes,
         a_nodes=a_nodes,
     )
     pos_edge_ids, max_len = _label_edges_for_pairs(
         pair_to_edge=pair_to_edge,
-        dist_from_q=dist_from_q,
-        dist_to_q=dist_to_q,
+        dist_from_anchor=dist_from_anchor,
+        dist_to_anchor=dist_to_anchor,
         dist_from_a=dist_from_a,
         dist_to_a=dist_to_a,
-        q_nodes=q_nodes,
+        anchor_nodes=anchor_nodes,
         a_nodes=a_nodes,
     )
     positive = torch.as_tensor(sorted(pos_edge_ids), dtype=torch.long)
@@ -350,20 +414,20 @@ def compute_forward_answer_distances(
 def compute_forward_shortest_path_edge_mask(
     *,
     edge_index: torch.Tensor,
-    q_local_indices: torch.Tensor,
+    anchor_local_indices: torch.Tensor,
     a_local_indices: torch.Tensor,
     num_nodes: int,
 ) -> torch.Tensor:
-    """Mark executable forward edges that lie on a shortest q->answer path."""
+    """Mark executable forward edges that lie on a shortest anchor->answer path."""
 
     edge_index, num_edges = _validate_edge_index(edge_index)
     num_nodes = int(num_nodes)
     if num_nodes <= 0 or num_edges == 0:
         return torch.zeros((num_edges,), dtype=torch.bool)
-    q_nodes = _unique_valid_indices(
-        torch.as_tensor(q_local_indices), num_nodes=num_nodes
+    anchor_nodes = _unique_valid_indices(
+        torch.as_tensor(anchor_local_indices), num_nodes=num_nodes
     )
-    if not q_nodes:
+    if not anchor_nodes:
         return torch.zeros((num_edges,), dtype=torch.bool)
     answer_dist = compute_forward_answer_distances(
         edge_index=edge_index,
@@ -371,7 +435,9 @@ def compute_forward_shortest_path_edge_mask(
         num_nodes=num_nodes,
     ).tolist()
     reachable_starts = [
-        int(start) for start in q_nodes if answer_dist[int(start)] != _DIST_UNREACHABLE
+        int(start)
+        for start in anchor_nodes
+        if answer_dist[int(start)] != _DIST_UNREACHABLE
     ]
     if not reachable_starts:
         return torch.zeros((num_edges,), dtype=torch.bool)
@@ -401,7 +467,7 @@ def compute_forward_shortest_path_edge_mask(
 def resolve_forward_shortest_path_trajectory(
     *,
     edge_index: torch.Tensor,
-    q_local_indices: torch.Tensor,
+    anchor_local_indices: torch.Tensor,
     a_local_indices: torch.Tensor,
     num_nodes: int,
 ) -> ForwardShortestPathTrajectory | None:
@@ -411,10 +477,10 @@ def resolve_forward_shortest_path_trajectory(
     num_nodes = int(num_nodes)
     if num_nodes <= 0:
         return None
-    q_nodes = _unique_valid_indices(
-        torch.as_tensor(q_local_indices), num_nodes=num_nodes
+    anchor_nodes = _unique_valid_indices(
+        torch.as_tensor(anchor_local_indices), num_nodes=num_nodes
     )
-    if not q_nodes:
+    if not anchor_nodes:
         return None
     answer_dist_tensor = compute_forward_answer_distances(
         edge_index=edge_index,
@@ -424,7 +490,7 @@ def resolve_forward_shortest_path_trajectory(
     answer_dist = answer_dist_tensor.tolist()
     best_start: int | None = None
     best_hop: int | None = None
-    for start in q_nodes:
+    for start in anchor_nodes:
         hop = int(answer_dist[start])
         if hop == _DIST_UNREACHABLE:
             continue
@@ -456,11 +522,88 @@ def resolve_forward_shortest_path_trajectory(
         current = int(dst)
         remaining -= 1
     return ForwardShortestPathTrajectory(
-        start_node=int(best_start),
+        anchor_node=int(best_start),
         path_nodes=tuple(path_nodes),
         path_edge_ids=tuple(path_edge_ids),
         hop_length=int(best_hop),
     )
+
+
+def resolve_forward_multi_anchor_union_trajectory(
+    *,
+    edge_index: torch.Tensor,
+    anchor_local_indices: torch.Tensor,
+    a_local_indices: torch.Tensor,
+    num_nodes: int,
+) -> ForwardMultiAnchorUnionTrajectory | None:
+    """Return a deterministic executable union of shortest anchor-to-answer paths."""
+
+    edge_index, _ = _validate_edge_index(edge_index)
+    num_nodes = int(num_nodes)
+    if num_nodes <= 0:
+        return None
+    anchor_nodes = _unique_valid_indices(
+        torch.as_tensor(anchor_local_indices), num_nodes=num_nodes
+    )
+    a_nodes = _unique_valid_indices(
+        torch.as_tensor(a_local_indices), num_nodes=num_nodes
+    )
+    if not anchor_nodes or not a_nodes:
+        return None
+    outgoing, _ = _build_forward_adjacency_with_edges(edge_index, num_nodes=num_nodes)
+    best_candidate: (
+        tuple[
+            tuple[int, int, int],
+            ForwardMultiAnchorUnionTrajectory,
+        ]
+        | None
+    ) = None
+    for answer_node in a_nodes:
+        anchor_path_nodes: list[tuple[int, ...]] = []
+        anchor_path_edge_ids: list[tuple[int, ...]] = []
+        total_hop_length = 0
+        feasible = True
+        for anchor_node in anchor_nodes:
+            resolved = _resolve_forward_shortest_path_to_target(
+                outgoing=outgoing,
+                anchor_node=int(anchor_node),
+                target_node=int(answer_node),
+            )
+            if resolved is None:
+                feasible = False
+                break
+            path_nodes, path_edge_ids = resolved
+            anchor_path_nodes.append(path_nodes)
+            anchor_path_edge_ids.append(path_edge_ids)
+            total_hop_length += int(len(path_edge_ids))
+        if not feasible:
+            continue
+        concatenated_edges: list[int] = []
+        for path_edge_ids in anchor_path_edge_ids:
+            concatenated_edges.extend(int(edge_id) for edge_id in path_edge_ids)
+        ordered_edge_ids = _dedup_preserve_order(concatenated_edges)
+        union_edge_ids = tuple(
+            sorted(set(int(edge_id) for edge_id in ordered_edge_ids))
+        )
+        trajectory = ForwardMultiAnchorUnionTrajectory(
+            answer_node=int(answer_node),
+            anchor_nodes=tuple(int(node_id) for node_id in anchor_nodes),
+            anchor_path_nodes=tuple(anchor_path_nodes),
+            anchor_path_edge_ids=tuple(anchor_path_edge_ids),
+            ordered_edge_ids=tuple(int(edge_id) for edge_id in ordered_edge_ids),
+            union_edge_ids=union_edge_ids,
+            total_hop_length=int(total_hop_length),
+        )
+        ranking_key = (
+            int(len(trajectory.union_edge_ids)),
+            int(trajectory.total_hop_length),
+            int(trajectory.answer_node),
+        )
+        if best_candidate is None or ranking_key < best_candidate[0]:
+            best_candidate = (ranking_key, trajectory)
+    if best_candidate is None:
+        return None
+    return best_candidate[1]
 
 
 # ---------------------------------------------------------------------------
@@ -521,11 +664,13 @@ class EdgeLabelStore:
 
 
 __all__ = [
+    "ForwardMultiAnchorUnionTrajectory",
     "ForwardShortestPathTrajectory",
     "ShortestPathLabels",
     "compute_forward_answer_distances",
     "compute_forward_shortest_path_edge_mask",
     "resolve_forward_shortest_path_trajectory",
+    "resolve_forward_multi_anchor_union_trajectory",
     "compute_shortest_path_labels",
     "EdgeLabelEntry",
     "EdgeLabelStore",

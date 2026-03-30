@@ -4,7 +4,6 @@ import torch
 
 from src.models.components import EmbeddingBackbone
 from src.models.components.embedding import BackboneInput
-from src.models.configs import BackboneConfig
 from src.graph import build_graph_batch
 
 from .conftest import make_toy_batch
@@ -13,13 +12,11 @@ from .conftest import make_toy_batch
 def test_embedding_backbone_encode_matches_manual_projection_pipeline() -> None:
     topology, observation = build_graph_batch(make_toy_batch())
     backbone = EmbeddingBackbone(
-        BackboneConfig(
-            embedding_dim=8,
-            hidden_dim=8,
-            use_adapter=False,
-            adapter_dim=4,
-            adapter_dropout=0.0,
-        )
+        embedding_dim=8,
+        hidden_dim=8,
+        use_adapter=False,
+        adapter_dim=4,
+        adapter_dropout=0.0,
     )
     manual_node_tokens = backbone.project_node_embeddings(observation.node_features)
     manual_relation_tokens = backbone.project_relation_embeddings(
@@ -48,13 +45,11 @@ def test_embedding_backbone_encode_matches_manual_projection_pipeline() -> None:
 def test_embedding_backbone_forward_accepts_structured_inputs() -> None:
     topology, observation = build_graph_batch(make_toy_batch())
     backbone = EmbeddingBackbone(
-        BackboneConfig(
-            embedding_dim=8,
-            hidden_dim=8,
-            use_adapter=False,
-            adapter_dim=4,
-            adapter_dropout=0.0,
-        )
+        embedding_dim=8,
+        hidden_dim=8,
+        use_adapter=False,
+        adapter_dim=4,
+        adapter_dropout=0.0,
     )
 
     encoded = backbone(
@@ -76,13 +71,11 @@ def test_embedding_backbone_forward_accepts_structured_inputs() -> None:
 def test_embedding_backbone_aligns_bfloat16_inputs_without_autocast() -> None:
     topology, observation = build_graph_batch(make_toy_batch())
     backbone = EmbeddingBackbone(
-        BackboneConfig(
-            embedding_dim=8,
-            hidden_dim=8,
-            use_adapter=True,
-            adapter_dim=4,
-            adapter_dropout=0.0,
-        )
+        embedding_dim=8,
+        hidden_dim=8,
+        use_adapter=True,
+        adapter_dim=4,
+        adapter_dropout=0.0,
     )
 
     encoded = backbone.encode(
@@ -106,13 +99,11 @@ def test_embedding_backbone_aligns_bfloat16_inputs_without_autocast() -> None:
 def test_embedding_backbone_autocast_keeps_bfloat16_outputs() -> None:
     topology, observation = build_graph_batch(make_toy_batch())
     backbone = EmbeddingBackbone(
-        BackboneConfig(
-            embedding_dim=8,
-            hidden_dim=8,
-            use_adapter=True,
-            adapter_dim=4,
-            adapter_dropout=0.0,
-        )
+        embedding_dim=8,
+        hidden_dim=8,
+        use_adapter=True,
+        adapter_dim=4,
+        adapter_dropout=0.0,
     )
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):

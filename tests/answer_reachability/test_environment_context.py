@@ -25,8 +25,8 @@ def _make_two_graph_protocol_batch() -> SimpleNamespace:
         question_emb=torch.randn(2, emb_dim),
         question_ctx=torch.randn(2, 2, emb_dim),
         question_ctx_mask=torch.tensor([[True, True], [True, False]], dtype=torch.bool),
-        q_local_indices=torch.tensor([0, 2, 1], dtype=torch.long),
-        q_ptr=torch.tensor([0, 2, 3], dtype=torch.long),
+        anchor_local_indices=torch.tensor([0, 2, 1], dtype=torch.long),
+        anchor_ptr=torch.tensor([0, 2, 3], dtype=torch.long),
         node_entity_ids=torch.tensor([100, 101, 102, 200, 201], dtype=torch.long),
         sample_ids=["graph-0", "graph-1"],
     )
@@ -55,8 +55,8 @@ def test_build_graph_batch_compacts_relations_and_builds_csr() -> None:
         torch.tensor([0, 1, 2], dtype=torch.long),
     )
     start_node_index, start_graph_index = topology.resolve_local_node_indices(
-        observation.q_local_indices,
-        field_name="q_local_indices",
+        observation.anchor_local_indices,
+        field_name="anchor_local_indices",
     )
     assert torch.equal(start_node_index, torch.tensor([0], dtype=torch.long))
     assert torch.equal(start_graph_index, torch.tensor([0], dtype=torch.long))
@@ -66,8 +66,8 @@ def test_topology_derives_graph_ids_without_exposing_batch_vectors() -> None:
     topology, observation = build_graph_batch(_make_two_graph_protocol_batch())
 
     start_node_index, start_graph_index = topology.resolve_local_node_indices(
-        observation.q_local_indices,
-        field_name="q_local_indices",
+        observation.anchor_local_indices,
+        field_name="anchor_local_indices",
     )
 
     assert torch.equal(start_node_index, torch.tensor([0, 2, 4], dtype=torch.long))
@@ -97,8 +97,8 @@ def test_build_graph_batch_uses_relation_table_without_per_edge_embeddings() -> 
         question_emb=torch.randn(1, emb_dim),
         question_ctx=torch.randn(1, 2, emb_dim),
         question_ctx_mask=torch.tensor([[True, True]], dtype=torch.bool),
-        q_local_indices=torch.tensor([0], dtype=torch.long),
-        q_ptr=torch.tensor([0, 1], dtype=torch.long),
+        anchor_local_indices=torch.tensor([0], dtype=torch.long),
+        anchor_ptr=torch.tensor([0, 1], dtype=torch.long),
         node_entity_ids=torch.tensor([100, 101, 102], dtype=torch.long),
         sample_ids=["graph-0"],
     )
@@ -114,9 +114,9 @@ def test_build_graph_batch_uses_relation_table_without_per_edge_embeddings() -> 
     )
 
 
-def test_build_graph_batch_rejects_out_of_range_q_local_indices() -> None:
+def test_build_graph_batch_rejects_out_of_range_anchor_local_indices() -> None:
     batch = make_toy_batch()
-    batch.q_local_indices[0] = 3
+    batch.anchor_local_indices[0] = 3
 
     with pytest.raises(ValueError, match="out-of-range local node indices"):
         build_graph_batch(batch)
@@ -144,8 +144,8 @@ def test_topology_build_node_membership_mask_uses_batch_offsets() -> None:
     topology, observation = build_graph_batch(_make_two_graph_protocol_batch())
 
     mask = topology.build_node_membership_mask(
-        observation.q_local_indices,
-        field_name="q_local_indices",
+        observation.anchor_local_indices,
+        field_name="anchor_local_indices",
     )
 
     assert torch.equal(mask, torch.tensor([True, False, True, False, True]))
@@ -160,14 +160,14 @@ def test_topology_build_node_membership_mask_debug_checks_are_opt_in() -> None:
 
     mask = topology.build_node_membership_mask(
         local_node_index,
-        field_name="q_local_indices",
+        field_name="anchor_local_indices",
     )
 
     assert int(mask.sum().item()) == 2
     with pytest.raises(ValueError, match="non-decreasing"):
         topology.build_node_membership_mask(
             local_node_index,
-            field_name="q_local_indices",
+            field_name="anchor_local_indices",
             debug_checks=True,
         )
 
@@ -182,7 +182,7 @@ def test_topology_build_node_membership_mask_rejects_negative_local_indices() ->
     with pytest.raises(ValueError, match="out of range"):
         topology.build_node_membership_mask(
             local_node_index,
-            field_name="q_local_indices",
+            field_name="anchor_local_indices",
         )
 
 

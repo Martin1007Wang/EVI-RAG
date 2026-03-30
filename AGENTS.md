@@ -138,6 +138,15 @@ If repo behavior and this file disagree, follow the source files and update this
 - When working near Hydra configs, preserve the `defaults:` ordering because override order matters.
 - When editing docs or Markdown, expect `mdformat` to normalize numbering and tables.
 
+## Terminology memo
+
+- Treat the math view and the implementation view as two aligned descriptions of the same state, not as competing definitions.
+- Theoretical/MDP language may describe the state as a full semantic subgraph with node semantics/features; implementation code factorizes that state into static graph context plus a lightweight dynamic trace for memory efficiency.
+- When explaining `SubgraphState`, make it clear that stored `edge_ids` are the dynamic handle used to reconstruct the full Markov state on demand from the prepared batch.
+- Use two naming layers consistently: `question_*` for question-linked entities before/at data materialization, and `anchor_*` for the in-graph grounded start nodes used by rollout/search.
+- Avoid reviving legacy synonyms such as `topic`, bare `start`, or `q_entity`/`seed_entity_ids` in new code unless you are intentionally handling backward-compatibility.
+- The checked-in `docs/` directory is intentionally obsolete; do not recreate stale repo Markdown docs when updating semantics. Put durable repo guidance in `AGENTS.md` comments/memos instead.
+
 ## Practical agent checklist
 
 - Read the relevant Hydra config before changing training or evaluation behavior.

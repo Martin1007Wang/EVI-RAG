@@ -191,8 +191,8 @@ class ParquetDatasetWriter:
                     [row[QuestionFields.QUESTION] for row in self.questions],
                     type=pa.string(),
                 ),
-                QuestionFields.SEED_ENTITY_IDS: pa.array(
-                    [row[QuestionFields.SEED_ENTITY_IDS] for row in self.questions],
+                QuestionFields.QUESTION_ENTITY_IDS: pa.array(
+                    [row[QuestionFields.QUESTION_ENTITY_IDS] for row in self.questions],
                     type=pa.list_(pa.int64()),
                 ),
                 QuestionFields.ANSWER_ENTITY_IDS: pa.array(
@@ -300,8 +300,8 @@ def write_questions(rows: List[Dict[str, object]], output_path: Path) -> None:
         QuestionFields.QUESTION: pa.array(
             [row[QuestionFields.QUESTION] for row in rows], type=pa.string()
         ),
-        QuestionFields.SEED_ENTITY_IDS: pa.array(
-            [row[QuestionFields.SEED_ENTITY_IDS] for row in rows],
+        QuestionFields.QUESTION_ENTITY_IDS: pa.array(
+            [row[QuestionFields.QUESTION_ENTITY_IDS] for row in rows],
             type=pa.list_(pa.int64()),
         ),
         QuestionFields.ANSWER_ENTITY_IDS: pa.array(

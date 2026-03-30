@@ -2,23 +2,24 @@ from __future__ import annotations
 
 """Curated public API for the subgraph GFlowNet package."""
 
-from . import subgraph
-from .module_factory import GFlowNetPolicyFactory
-from .subgraph.losses import SubgraphSubTrajectoryBalanceLoss
-from .subgraph.mdp import SubgraphEnv
-from .subgraph.policy import SubgraphPolicy
-from .subgraph.sampler import SubgraphSampler
-from .subgraph.search import beam_search_subgraphs
-from .subgraph.state import SubgraphAction, SubgraphState
+from .actor import SubgraphActor
+from .losses import SubgraphSubTrajectoryBalanceLoss
+from .policy import SubgraphPolicy
+from .replay import SubgraphReplayRecord, SubgraphSuccessReplayBuffer
+from .reward import SubgraphRewardModel
+from .sampler import SubgraphSampler
+from .search import beam_search_subgraphs
+from .state import SubgraphAction, SubgraphState
 
 __all__ = [
-    "GFlowNetPolicyFactory",
+    "SubgraphActor",
     "SubgraphAction",
-    "SubgraphEnv",
     "SubgraphPolicy",
+    "SubgraphReplayRecord",
+    "SubgraphRewardModel",
     "SubgraphSampler",
+    "SubgraphSuccessReplayBuffer",
     "SubgraphState",
     "SubgraphSubTrajectoryBalanceLoss",
     "beam_search_subgraphs",
-    "subgraph",
 ]

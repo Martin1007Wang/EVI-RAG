@@ -6,8 +6,10 @@ dataset_scope: ???
 # Total step budget (real edges only; super edges are internal).
 max_steps: ???
 hf_dataset: ???
+dataset_source: hf
 run_test_after_fit: false
 kb: freebase
+stark: null
 
 out_dir: ${paths.data_dir}/${dataset.dataset_family}/normalized
 materialized_dir: ${paths.data_dir}/${dataset.dataset_family}/materialized
@@ -23,7 +25,7 @@ paths:
 lmdb_readahead: true
 sequential_sample_ids: true
 # Runtime-only masks applied when loading already materialized samples.
-runtime_filter_missing_start:
+runtime_filter_missing_anchor:
   train: true
   validation: true
   test: true
@@ -44,8 +46,8 @@ column_map:
   question_id_field: id
   question_field: question
   answer_text_field: answer
-  q_entity_field: q_entity
-  a_entity_field: a_entity
+  question_entity_field: q_entity
+  answer_entity_field: a_entity
   graph_field: graph
 
 # Training length and validation cadence are resolved from `fit_schedule` after

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from src.data.preprocess.config import build_preprocess_filters
 from src.data.preprocess.main import run_preprocess_pipeline
 from src.preprocess import _run_preprocess
 
@@ -62,7 +63,7 @@ def test_run_preprocess_pipeline_rejects_removed_preprocess_keys() -> None:
         {
             "dataset": {"name": "webqsp"},
             "pipeline_stage": "all",
-            "filter": {"train": {"skip_no_topic": True}},
+            "filter": {"train": {"skip_no_question_entity": True}},
         }
     )
 
@@ -83,6 +84,13 @@ def test_run_preprocess_pipeline_rejects_removed_dataset_preprocess_keys() -> No
 
     with pytest.raises(ValueError, match="Removed dataset preprocess config keys"):
         run_preprocess_pipeline(cfg)
+
+
+def test_build_preprocess_filters_rejects_legacy_skip_no_topic_key() -> None:
+    cfg = OmegaConf.create({"preprocess_filter": {"train": {"skip_no_topic": True}}})
+
+    with pytest.raises(ValueError, match="skip_no_topic->skip_no_question_entity"):
+        build_preprocess_filters(cfg)
 
 
 @pytest.mark.parametrize(

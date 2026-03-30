@@ -10,7 +10,7 @@ from src.data.schema.constants import _NON_TEXT_EMBEDDING_ID
 
 @dataclass(frozen=True)
 class SplitFilter:
-    skip_no_topic: bool
+    skip_no_question_entity: bool
     skip_no_ans: bool
     skip_no_path: bool
 
@@ -34,8 +34,8 @@ class Sample:
     kb: str
     question: str
     graph: List[Tuple[str, str, str]]
-    q_entity: List[str]
-    a_entity: List[str]
+    question_entities: List[str]
+    answer_entities: List[str]
     answer_texts: List[str]
     graph_iso_type: Optional[str] = None
     redundant: Optional[bool] = None
@@ -45,7 +45,7 @@ class Sample:
 @dataclass(frozen=True)
 class SampleFilterOutcome:
     keep: bool
-    has_topic: bool
+    has_question_entity: bool
     has_answer: bool
     has_path: bool
 

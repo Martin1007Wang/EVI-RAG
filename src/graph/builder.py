@@ -93,13 +93,13 @@ def _validate_graph_batch_protocol(
             value=batch.question_ctx_mask,
             name="question_ctx_mask",
         ),
-        "q_local_indices": _require_1d_long(
-            value=batch.q_local_indices,
-            name="q_local_indices",
+        "anchor_local_indices": _require_1d_long(
+            value=batch.anchor_local_indices,
+            name="anchor_local_indices",
         ),
-        "q_ptr": _require_1d_long(
-            value=batch.q_ptr,
-            name="q_ptr",
+        "anchor_ptr": _require_1d_long(
+            value=batch.anchor_ptr,
+            name="anchor_ptr",
         ),
         "node_entity_ids": _resolve_node_entity_ids(batch=batch),
     }
@@ -214,10 +214,10 @@ def _validate_graph_batch_protocol(
         )
 
     GroupedLocalNodeIndex.from_group_ptr(
-        local_indices=tensors["q_local_indices"],
-        group_ptr=tensors["q_ptr"],
+        local_indices=tensors["anchor_local_indices"],
+        group_ptr=tensors["anchor_ptr"],
         num_groups=num_graphs,
-        field_name="q_local_indices",
+        field_name="anchor_local_indices",
     )
     return tensors
 
@@ -339,8 +339,8 @@ def build_graph_batch(
             "question_emb": batch.question_emb,
             "question_ctx": batch.question_ctx,
             "question_ctx_mask": batch.question_ctx_mask,
-            "q_local_indices": batch.q_local_indices,
-            "q_ptr": batch.q_ptr,
+            "anchor_local_indices": batch.anchor_local_indices,
+            "anchor_ptr": batch.anchor_ptr,
             "node_entity_ids": batch.node_entity_ids,
         }
     else:
@@ -357,8 +357,8 @@ def build_graph_batch(
     question_emb = tensors["question_emb"]
     question_ctx = tensors["question_ctx"]
     question_ctx_mask = tensors["question_ctx_mask"]
-    q_local_indices_tensor = tensors["q_local_indices"]
-    q_ptr = tensors["q_ptr"]
+    anchor_local_indices_tensor = tensors["anchor_local_indices"]
+    anchor_ptr = tensors["anchor_ptr"]
     node_entity_ids = tensors["node_entity_ids"]
     assert node_ptr is not None
     assert edge_index is not None
@@ -366,15 +366,15 @@ def build_graph_batch(
     assert question_emb is not None
     assert question_ctx is not None
     assert question_ctx_mask is not None
-    assert q_local_indices_tensor is not None
-    assert q_ptr is not None
+    assert anchor_local_indices_tensor is not None
+    assert anchor_ptr is not None
     assert node_entity_ids is not None
     num_nodes = int(node_ptr[-1].item())
-    q_local_indices = GroupedLocalNodeIndex.from_group_ptr(
-        local_indices=q_local_indices_tensor,
-        group_ptr=q_ptr,
+    anchor_local_indices = GroupedLocalNodeIndex.from_group_ptr(
+        local_indices=anchor_local_indices_tensor,
+        group_ptr=anchor_ptr,
         num_groups=batch.num_graphs,
-        field_name="q_local_indices",
+        field_name="anchor_local_indices",
     )
     sample_ids = tuple(str(sample_id) for sample_id in batch.sample_ids)
     if len(sample_ids) != int(batch.num_graphs):
@@ -405,7 +405,7 @@ def build_graph_batch(
         question_embedding=question_emb,
         question_context=question_ctx,
         question_valid_mask=question_ctx_mask,
-        q_local_indices=q_local_indices,
+        anchor_local_indices=anchor_local_indices,
         sample_ids=sample_ids,
     )
 
@@ -413,8 +413,8 @@ def build_graph_batch(
         topology.validate()
         observation.validate(topology=topology)
         topology.resolve_local_node_indices(
-            observation.q_local_indices,
-            field_name="q_local_indices",
+            observation.anchor_local_indices,
+            field_name="anchor_local_indices",
             validate_grouping=False,
         )
     return topology, observation

@@ -47,24 +47,27 @@ def _should_keep_sample(
             remove_self_loops=remove_self_loops,
         )
     node_strings = {h for h, _, t in kept_edges} | {t for _, _, t in kept_edges}
-    has_topic = any(ent in node_strings for ent in sample.q_entity)
-    has_answer = any(ent in node_strings for ent in sample.a_entity)
+    has_question_entity = any(ent in node_strings for ent in sample.question_entities)
+    has_answer = any(ent in node_strings for ent in sample.answer_entities)
 
     cache_key = (sample.dataset, sample.split, sample.question_id)
     has_path = connectivity_cache.get(cache_key)
     if has_path is None:
         if split_filter.skip_no_path:
             has_path = has_connectivity(
-                kept_edges, sample.q_entity, sample.a_entity, path_mode=path_mode
+                kept_edges,
+                sample.question_entities,
+                sample.answer_entities,
+                path_mode=path_mode,
             )
         else:
             has_path = True
         connectivity_cache[cache_key] = has_path
 
-    if split_filter.skip_no_topic and not has_topic:
-        return SampleFilterOutcome(False, has_topic, has_answer, has_path)
+    if split_filter.skip_no_question_entity and not has_question_entity:
+        return SampleFilterOutcome(False, has_question_entity, has_answer, has_path)
     if split_filter.skip_no_ans and not has_answer:
-        return SampleFilterOutcome(False, has_topic, has_answer, has_path)
+        return SampleFilterOutcome(False, has_question_entity, has_answer, has_path)
     if split_filter.skip_no_path and not has_path:
-        return SampleFilterOutcome(False, has_topic, has_answer, has_path)
-    return SampleFilterOutcome(True, has_topic, has_answer, has_path)
+        return SampleFilterOutcome(False, has_question_entity, has_answer, has_path)
+    return SampleFilterOutcome(True, has_question_entity, has_answer, has_path)

@@ -110,16 +110,11 @@ def test_eval_edge_retrieval_inherits_rankflow_eval_stack() -> None:
             ],
         )
 
-    action_prior_cfg = instantiate(cfg.model.action_prior_cfg)
-
     assert cfg.run.name == "rankflow"
     assert cfg.run.artifact_subdir == "eval_edge_retrieval"
     assert cfg.run.artifact_name == "eval_edge_retrieval"
     assert list(cfg.run.tags) == ["eval", "edge_retrieval"]
-    assert "root_beta" not in cfg.model.action_prior_cfg
-    assert "edge_beta" not in cfg.model.action_prior_cfg
-    assert action_prior_cfg.root_beta == pytest.approx(0.0)
-    assert action_prior_cfg.edge_beta == pytest.approx(0.0)
+    assert "action_prior_cfg" not in cfg.model
     assert cfg.model.eval_cfg.task == "edge_retrieval"
     assert cfg.model.eval_cfg.report_profile == "rank_only"
     assert cfg.model.eval_cfg.answer_posterior_backend == "monte_carlo"
@@ -185,7 +180,6 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
             ],
         )
 
-    action_prior_cfg = instantiate(cfg.model.action_prior_cfg)
     training_cfg = instantiate(cfg.model.training_cfg)
 
     assert cfg.run.test is False
@@ -204,20 +198,12 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
     assert cfg.model.eval_cfg.flow_frontier.max_expansions == 20000
     assert cfg.model.eval_cfg.flow_frontier.max_frontier_size == 4096
-    assert action_prior_cfg.root_beta == pytest.approx(1.0)
-    assert action_prior_cfg.edge_beta == pytest.approx(0.75)
-    assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
-    assert action_prior_cfg.answer_distance_weight == pytest.approx(0.5)
-    assert "step_log_penalty" not in cfg.model.training_cfg
-    assert training_cfg.action_prior_schedule.type == "cosine"
-    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.8)
-    assert training_cfg.action_prior_schedule.final_scale == pytest.approx(0.0)
-    assert training_cfg.action_prior_schedule.hold_steps == 1000
+    assert "action_prior_cfg" not in cfg.model
+    assert training_cfg.proposal_bias_schedule.type == "cosine"
+    assert training_cfg.proposal_bias_schedule.initial_scale == pytest.approx(0.8)
+    assert training_cfg.proposal_bias_schedule.final_scale == pytest.approx(0.0)
+    assert training_cfg.proposal_bias_schedule.hold_steps == 1000
     assert cfg.model.policy_cfg.state_mode == "subgraph"
-    assert cfg.model.policy_cfg.transition_head.enabled is False
-    assert training_cfg.transition_bias_schedule.type == "cosine"
-    assert training_cfg.transition_bias_schedule.final_scale == pytest.approx(0.0)
-    assert training_cfg.transition_bias_schedule.hold_steps == 1000
     assert training_cfg.step_log_penalty == pytest.approx(0.0)
     assert training_cfg.potential_reward.answer_distance_weight == pytest.approx(0.0)
     assert (
@@ -257,7 +243,6 @@ def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> No
             ],
         )
 
-    action_prior_cfg = instantiate(cfg.model.action_prior_cfg)
     training_cfg = instantiate(cfg.model.training_cfg)
 
     assert cfg.data.batch_size == 64
@@ -282,20 +267,12 @@ def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> No
     assert cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
     assert cfg.model.eval_cfg.flow_frontier.max_expansions == 500000
     assert cfg.model.eval_cfg.flow_frontier.max_frontier_size == 65536
-    assert action_prior_cfg.root_beta == pytest.approx(1.0)
-    assert action_prior_cfg.edge_beta == pytest.approx(0.75)
-    assert action_prior_cfg.shortest_path_edge_weight == pytest.approx(1.0)
-    assert action_prior_cfg.answer_distance_weight == pytest.approx(0.5)
-    assert "step_log_penalty" not in cfg.model.training_cfg
-    assert training_cfg.action_prior_schedule.type == "cosine"
-    assert training_cfg.action_prior_schedule.initial_scale == pytest.approx(0.8)
-    assert training_cfg.action_prior_schedule.final_scale == pytest.approx(0.0)
-    assert training_cfg.action_prior_schedule.hold_steps == 1000
+    assert "action_prior_cfg" not in cfg.model
+    assert training_cfg.proposal_bias_schedule.type == "cosine"
+    assert training_cfg.proposal_bias_schedule.initial_scale == pytest.approx(0.8)
+    assert training_cfg.proposal_bias_schedule.final_scale == pytest.approx(0.0)
+    assert training_cfg.proposal_bias_schedule.hold_steps == 1000
     assert cfg.model.policy_cfg.state_mode == "subgraph"
-    assert cfg.model.policy_cfg.transition_head.enabled is False
-    assert training_cfg.transition_bias_schedule.type == "cosine"
-    assert training_cfg.transition_bias_schedule.final_scale == pytest.approx(0.0)
-    assert training_cfg.transition_bias_schedule.hold_steps == 1000
     assert training_cfg.step_log_penalty == pytest.approx(0.0)
     assert training_cfg.potential_reward.answer_distance_weight == pytest.approx(0.0)
     assert (
@@ -309,14 +286,26 @@ def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> No
     assert training_cfg.subgraph_proposal.prior_component_merge_weight == pytest.approx(
         1.0
     )
-    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.0)
+    assert training_cfg.subgraph_reward.beta_answer_bits == pytest.approx(0.2)
+    assert training_cfg.subgraph_reward.beta_answer_full == pytest.approx(0.5)
+    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.2)
     assert training_cfg.replay_mix_schedule.type == "cosine"
     assert training_cfg.replay_mix_schedule.final_alpha == pytest.approx(0.0)
     assert training_cfg.replay_mix_schedule.hold_steps == 2000
-    assert training_cfg.success_replay.min_buffer_size == 64
-    assert training_cfg.success_replay.capacity == 512
+    assert training_cfg.success_replay.min_buffer_size == 16
+    assert training_cfg.success_replay.capacity == 128
     assert training_cfg.success_replay.replay_trajectories_per_step == 64
-    assert training_cfg.success_replay.add_shortest_path_guidance is False
+    assert training_cfg.success_replay.add_shortest_path_guidance is True
+    assert training_cfg.success_replay.expand_imitation_weight == pytest.approx(1.0)
+    assert (
+        training_cfg.success_replay.expand_imitation_from_anchor_bonus
+        == pytest.approx(2.0)
+    )
+    assert (
+        training_cfg.success_replay.expand_imitation_answer_finish_bonus
+        == pytest.approx(4.0)
+    )
+    assert training_cfg.success_replay.mask_stop_loss is True
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.run.test is True

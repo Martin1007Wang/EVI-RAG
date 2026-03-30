@@ -11,7 +11,7 @@ from omegaconf import DictConfig, OmegaConf
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.models.configs import SearchEvalConfig
+from src.metrics.search_eval_utils import normalize_search_eval_cfg
 from src.runs.common import resolve_execution_mode
 from src.utils.entrypoint_utils import (
     instantiate_lightning_task_objects,
@@ -98,18 +98,8 @@ def _configure_eval_split(datamodule: Any, run_cfg: DictConfig) -> str:
     return split
 
 
-def _coerce_eval_cfg(eval_cfg: Any) -> SearchEvalConfig:
-    if isinstance(eval_cfg, SearchEvalConfig):
-        return eval_cfg
-    if isinstance(eval_cfg, DictConfig):
-        container = OmegaConf.to_container(eval_cfg, resolve=True)
-    elif isinstance(eval_cfg, dict):
-        container = dict(eval_cfg)
-    else:
-        raise TypeError(f"Unsupported eval_cfg type: {type(eval_cfg)!r}.")
-    if not isinstance(container, dict):
-        raise TypeError("Expected eval_cfg to resolve to a mapping.")
-    return SearchEvalConfig(**container)
+def _coerce_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
+    return normalize_search_eval_cfg(eval_cfg)
 
 
 def _load_checkpoint_into_model_if_needed(model: Any, *, ckpt_path: str | None) -> None:

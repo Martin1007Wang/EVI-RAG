@@ -100,8 +100,8 @@ def main() -> None:
             raw_sample = dataset._load_raw_sample(sample_id)
             shortest_path = resolve_forward_shortest_path_trajectory(
                 edge_index=torch.as_tensor(raw_sample["edge_index"], dtype=torch.long),
-                q_local_indices=torch.as_tensor(
-                    raw_sample["q_local_indices"], dtype=torch.long
+                anchor_local_indices=torch.as_tensor(
+                    raw_sample["anchor_local_indices"], dtype=torch.long
                 ),
                 a_local_indices=torch.as_tensor(
                     raw_sample["a_local_indices"], dtype=torch.long

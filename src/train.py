@@ -28,7 +28,11 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
-from src.models.configs import SearchEvalConfig
+from src.metrics.search_eval_utils import (
+    FLOW_FRONTIER_BACKEND,
+    normalize_search_eval_cfg,
+    search_eval_is_answer_task,
+)
 from src.runs.answer_reachability import AnswerReachabilityEvalReporter
 from src.runs.common import (
     DatasetVariantSpec,
@@ -146,45 +150,35 @@ def _clone_cfg_node(node: Any) -> Any:
     return OmegaConf.create(node)
 
 
-def _coerce_search_eval_cfg(eval_cfg: Any) -> SearchEvalConfig:
-    if isinstance(eval_cfg, SearchEvalConfig):
-        return eval_cfg
-    if isinstance(eval_cfg, DictConfig):
-        container = OmegaConf.to_container(eval_cfg, resolve=True)
-    elif isinstance(eval_cfg, dict):
-        container = dict(eval_cfg)
-    else:
-        raise TypeError(f"Unsupported eval_cfg type: {type(eval_cfg)!r}.")
-    if not isinstance(container, dict):
-        raise TypeError("Expected eval_cfg to resolve to a mapping.")
-    return SearchEvalConfig(**container)
+def _coerce_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
+    return normalize_search_eval_cfg(eval_cfg)
 
 
-def _format_answer_posterior_config(eval_cfg: SearchEvalConfig) -> str:
-    backend = str(eval_cfg.answer_posterior_backend)
-    if backend == "flow_frontier":
-        flow_cfg = eval_cfg.flow_frontier
+def _format_answer_posterior_config(eval_cfg: dict[str, Any]) -> str:
+    backend = str(eval_cfg["answer_posterior_backend"])
+    if backend == FLOW_FRONTIER_BACKEND:
+        flow_cfg = eval_cfg["flow_frontier"]
         return (
             "flow_frontier("
-            f"prune_epsilon={float(flow_cfg.prune_epsilon):.6g}, "
-            f"max_expansions={int(flow_cfg.max_expansions)}, "
-            f"max_frontier_size={int(flow_cfg.max_frontier_size)}"
+            f"prune_epsilon={float(flow_cfg['prune_epsilon']):.6g}, "
+            f"max_expansions={int(flow_cfg['max_expansions'])}, "
+            f"max_frontier_size={int(flow_cfg['max_frontier_size'])}"
             ")"
         )
-    return f"monte_carlo(rollouts={int(eval_cfg.monte_carlo.rollouts)})"
+    return f"monte_carlo(rollouts={int(eval_cfg['monte_carlo']['rollouts'])})"
 
 
-def _answer_posterior_signature(eval_cfg: SearchEvalConfig) -> tuple[Any, ...]:
-    backend = str(eval_cfg.answer_posterior_backend)
-    if backend == "flow_frontier":
-        flow_cfg = eval_cfg.flow_frontier
+def _answer_posterior_signature(eval_cfg: dict[str, Any]) -> tuple[Any, ...]:
+    backend = str(eval_cfg["answer_posterior_backend"])
+    if backend == FLOW_FRONTIER_BACKEND:
+        flow_cfg = eval_cfg["flow_frontier"]
         return (
             backend,
-            float(flow_cfg.prune_epsilon),
-            int(flow_cfg.max_expansions),
-            int(flow_cfg.max_frontier_size),
+            float(flow_cfg["prune_epsilon"]),
+            int(flow_cfg["max_expansions"]),
+            int(flow_cfg["max_frontier_size"]),
         )
-    return (backend, int(eval_cfg.monte_carlo.rollouts))
+    return (backend, int(eval_cfg["monte_carlo"]["rollouts"]))
 
 
 def _compose_final_eval_template(
@@ -222,7 +216,9 @@ def _validate_answer_posterior_alignment(
 ) -> None:
     train_eval_cfg = _coerce_search_eval_cfg(cfg.model.eval_cfg)
     final_eval_cfg = _coerce_search_eval_cfg(eval_template.model.eval_cfg)
-    if not train_eval_cfg.is_answer_task or not final_eval_cfg.is_answer_task:
+    if not search_eval_is_answer_task(train_eval_cfg) or not search_eval_is_answer_task(
+        final_eval_cfg
+    ):
         return
 
     train_signature = _answer_posterior_signature(train_eval_cfg)

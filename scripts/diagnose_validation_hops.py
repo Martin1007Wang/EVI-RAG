@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import math
 from collections import Counter, defaultdict
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,6 @@ from omegaconf import DictConfig, OmegaConf
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.metrics.answer_metrics import AnswerPosteriorRecord, SupportWindowResult
-from src.models.configs import SearchEvalConfig
 from src.models.gflownet.path import (
     append_relation_and_node_tokens_inplace,
     initialize_path_token_ids,
@@ -185,7 +184,7 @@ def _reverse_distances_to_answers(
 
 def _resolve_shortest_path(batch: Any) -> dict[str, Any] | None:
     outgoing, incoming = _build_graph_lists(batch)
-    start_nodes = sorted({int(value) for value in batch.q_local_indices.tolist()})
+    start_nodes = sorted({int(value) for value in batch.anchor_local_indices.tolist()})
     answer_nodes = sorted({int(value) for value in batch.a_local_indices.tolist()})
     if not start_nodes or not answer_nodes:
         return None
@@ -228,7 +227,7 @@ def _resolve_shortest_path(batch: Any) -> dict[str, Any] | None:
         remaining -= 1
     return {
         "hop": int(best_hop),
-        "start_node": int(best_start),
+        "anchor_node": int(best_start),
         "path_nodes": path_nodes,
         "path_edge_ids": path_edge_ids,
         "distances_to_answer": distances,
@@ -303,7 +302,7 @@ def _compute_teacher_forced_shortest_path_stats(
     root_distribution = policy.compute_root_action_distribution(prepared_batch)
     candidate_nodes = root_distribution.candidate_nodes_abs.to(dtype=torch.long)
     root_match = torch.nonzero(
-        candidate_nodes == int(graph_info["start_node"]),
+        candidate_nodes == int(graph_info["anchor_node"]),
         as_tuple=False,
     ).view(-1)
     if int(root_match.numel()) != 1:
@@ -354,7 +353,7 @@ def _compute_teacher_forced_shortest_path_stats(
             )
 
     current_nodes = torch.tensor(
-        [[int(graph_info["start_node"])]],
+        [[int(graph_info["anchor_node"])]],
         device=device,
         dtype=torch.long,
     )
@@ -482,7 +481,7 @@ def _compute_teacher_forced_shortest_path_stats(
         "sample_id": sample_id,
         "path_found": True,
         "hop": int(hop),
-        "start_node": int(graph_info["start_node"]),
+        "anchor_node": int(graph_info["anchor_node"]),
         "path_nodes": path_nodes,
         "path_edge_ids": path_edge_ids,
         "root_prob": root_prob,
@@ -634,7 +633,7 @@ def _run_prediction_pass(
     model: Any,
     device: torch.device,
     split: str,
-    eval_cfg: SearchEvalConfig,
+    eval_cfg: dict[str, Any],
     sample_limit: int | None,
 ) -> dict[str, dict[str, Any]]:
     model.reconfigure_evaluation(eval_cfg=eval_cfg)
@@ -785,38 +784,36 @@ def _aggregate_by_hop(
     }
 
 
-def _build_eval_cfgs(base_eval_cfg: SearchEvalConfig) -> dict[str, SearchEvalConfig]:
+def _build_eval_cfgs(base_eval_cfg: Any) -> dict[str, dict[str, Any]]:
+    base_cfg = OmegaConf.to_container(base_eval_cfg, resolve=True)
+    if not isinstance(base_cfg, dict):
+        raise TypeError("model.cfg.eval_cfg must resolve to a mapping.")
+
+    monte_carlo_256 = deepcopy(base_cfg)
+    monte_carlo_256["report_profile"] = "rank_only"
+    monte_carlo_256["answer_posterior_backend"] = "monte_carlo"
+    monte_carlo_256["monte_carlo"]["rollouts"] = 256
+
+    monte_carlo_4096 = deepcopy(base_cfg)
+    monte_carlo_4096["report_profile"] = "rank_only"
+    monte_carlo_4096["answer_posterior_backend"] = "monte_carlo"
+    monte_carlo_4096["monte_carlo"]["rollouts"] = 4096
+
+    flow_frontier_prune1e3 = deepcopy(base_cfg)
+    flow_frontier_prune1e3["report_profile"] = "full"
+    flow_frontier_prune1e3["answer_posterior_backend"] = "flow_frontier"
+    flow_frontier_prune1e3["flow_frontier"]["prune_epsilon"] = 1.0e-3
+
+    flow_frontier_prune0 = deepcopy(base_cfg)
+    flow_frontier_prune0["report_profile"] = "full"
+    flow_frontier_prune0["answer_posterior_backend"] = "flow_frontier"
+    flow_frontier_prune0["flow_frontier"]["prune_epsilon"] = 0.0
+
     return {
-        "monte_carlo_256_rank_only": replace(
-            base_eval_cfg,
-            report_profile="rank_only",
-            answer_posterior_backend="monte_carlo",
-            monte_carlo=replace(base_eval_cfg.monte_carlo, rollouts=256),
-        ),
-        "monte_carlo_4096_rank_only": replace(
-            base_eval_cfg,
-            report_profile="rank_only",
-            answer_posterior_backend="monte_carlo",
-            monte_carlo=replace(base_eval_cfg.monte_carlo, rollouts=4096),
-        ),
-        "flow_frontier_prune1e-3_full": replace(
-            base_eval_cfg,
-            report_profile="full",
-            answer_posterior_backend="flow_frontier",
-            flow_frontier=replace(
-                base_eval_cfg.flow_frontier,
-                prune_epsilon=1.0e-3,
-            ),
-        ),
-        "flow_frontier_prune0_full": replace(
-            base_eval_cfg,
-            report_profile="full",
-            answer_posterior_backend="flow_frontier",
-            flow_frontier=replace(
-                base_eval_cfg.flow_frontier,
-                prune_epsilon=0.0,
-            ),
-        ),
+        "monte_carlo_256_rank_only": monte_carlo_256,
+        "monte_carlo_4096_rank_only": monte_carlo_4096,
+        "flow_frontier_prune1e-3_full": flow_frontier_prune1e3,
+        "flow_frontier_prune0_full": flow_frontier_prune0,
     }
 
 
@@ -887,16 +884,18 @@ def main() -> None:
         "sample_limit": args.sample_limit,
         "eval_cfgs": {
             name: {
-                "report_profile": eval_cfg.report_profile,
-                "answer_posterior_backend": eval_cfg.answer_posterior_backend,
+                "report_profile": str(eval_cfg["report_profile"]),
+                "answer_posterior_backend": str(eval_cfg["answer_posterior_backend"]),
                 "flow_frontier": {
-                    "prune_epsilon": float(eval_cfg.flow_frontier.prune_epsilon),
-                    "max_expansions": int(eval_cfg.flow_frontier.max_expansions),
-                    "max_frontier_size": int(eval_cfg.flow_frontier.max_frontier_size),
+                    "prune_epsilon": float(eval_cfg["flow_frontier"]["prune_epsilon"]),
+                    "max_expansions": int(eval_cfg["flow_frontier"]["max_expansions"]),
+                    "max_frontier_size": int(
+                        eval_cfg["flow_frontier"]["max_frontier_size"]
+                    ),
                 },
                 "monte_carlo": {
-                    "rollouts": int(eval_cfg.monte_carlo.rollouts),
-                    "confidence": float(eval_cfg.monte_carlo.confidence),
+                    "rollouts": int(eval_cfg["monte_carlo"]["rollouts"]),
+                    "confidence": float(eval_cfg["monte_carlo"]["confidence"]),
                 },
             }
             for name, eval_cfg in eval_cfgs.items()

@@ -7,6 +7,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
+import pytest
 
 from src.data.io import raw_loader
 
@@ -74,8 +75,8 @@ def test_import_hf_datasets_module_replaces_local_shadow(monkeypatch) -> None:
 def test_row_to_sample_resolves_plain_labels_after_qid_lookup() -> None:
     column_map = {
         "graph_field": "graph",
-        "q_entity_field": "q_entity",
-        "a_entity_field": "a_entity",
+        "question_entity_field": "q_entity",
+        "answer_entity_field": "a_entity",
         "answer_text_field": "answer_text",
         "question_id_field": "question_id",
         "question_field": "question",
@@ -102,5 +103,32 @@ def test_row_to_sample_resolves_plain_labels_after_qid_lookup() -> None:
     )
 
     assert sample.graph == [("Q1", "rel", "Q2"), ("Q1", "rel", "Q2")]
-    assert sample.q_entity == ["Q1"]
-    assert sample.a_entity == ["Q2"]
+    assert sample.question_entities == ["Q1"]
+    assert sample.answer_entities == ["Q2"]
+
+
+def test_row_to_sample_rejects_legacy_column_map_keys() -> None:
+    column_map = {
+        "graph_field": "graph",
+        "q_entity_field": "legacy_question_entities",
+        "answer_text_field": "answer_text",
+        "question_id_field": "question_id",
+        "question_field": "question",
+    }
+    row = {
+        "graph": [],
+        "legacy_question_entities": ["Q1"],
+        "answer_text": ["beta"],
+        "question_id": "q1",
+        "question": "Which beta?",
+    }
+
+    with pytest.raises(ValueError, match="q_entity_field->question_entity_field"):
+        raw_loader._row_to_sample(
+            row,
+            dataset="unit",
+            split="train",
+            kb="freebase",
+            column_map=column_map,
+            entity_normalization="none",
+        )

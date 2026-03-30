@@ -13,7 +13,7 @@ from src.datasets.graph_retrieval_collate import (
 
 @dataclass
 class _CloneableSample:
-    q_local_indices: torch.Tensor
+    anchor_local_indices: torch.Tensor
     a_local_indices: torch.Tensor
     answer_entity_ids: torch.Tensor
     node_entity_ids: torch.Tensor
@@ -21,7 +21,7 @@ class _CloneableSample:
 
     def clone(self) -> "_CloneableSample":
         return _CloneableSample(
-            q_local_indices=self.q_local_indices.clone(),
+            anchor_local_indices=self.anchor_local_indices.clone(),
             a_local_indices=self.a_local_indices.clone(),
             answer_entity_ids=self.answer_entity_ids.clone(),
             node_entity_ids=self.node_entity_ids.clone(),
@@ -33,7 +33,7 @@ def test_expand_answer_samples_filters_only_zero_hop_answers_when_not_expanding(
     None
 ):
     sample = _CloneableSample(
-        q_local_indices=torch.tensor([0], dtype=torch.long),
+        anchor_local_indices=torch.tensor([0], dtype=torch.long),
         a_local_indices=torch.tensor([0, 1], dtype=torch.long),
         answer_entity_ids=torch.tensor([100, 101], dtype=torch.long),
         node_entity_ids=torch.tensor([100, 101], dtype=torch.long),

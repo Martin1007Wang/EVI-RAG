@@ -22,6 +22,15 @@ _AUTO_EMBEDDING_DEVICE = "auto"
 _DEFAULT_GPU_BATCH_SIZE = 256
 
 
+def _assert_no_legacy_split_filter_keys(section: Any, *, scope: str) -> None:
+    if section is None or "skip_no_topic" not in section:
+        return
+    raise ValueError(
+        "Legacy preprocess filter key detected in "
+        f"{scope}: skip_no_topic->skip_no_question_entity. Update preprocess_filter overrides."
+    )
+
+
 def resolve_embedding_device(raw_device: Any) -> str:
     device = str(raw_device or _AUTO_EMBEDDING_DEVICE).strip().lower()
     if device in {"", _AUTO_EMBEDDING_DEVICE}:
@@ -120,15 +129,19 @@ def build_preprocess_filters(
     cfg,
 ) -> Tuple[SplitFilter, SplitFilter, dict[str, SplitFilter]]:
     default_filter = SplitFilter(
-        skip_no_topic=False, skip_no_ans=False, skip_no_path=False
+        skip_no_question_entity=False, skip_no_ans=False, skip_no_path=False
     )
     filter_cfg = cfg.get("preprocess_filter")
     if filter_cfg is None:
         return default_filter, default_filter, {}
     train_section = filter_cfg.get("train")
     eval_section = filter_cfg.get("eval")
+    _assert_no_legacy_split_filter_keys(train_section, scope="preprocess_filter.train")
+    _assert_no_legacy_split_filter_keys(eval_section, scope="preprocess_filter.eval")
     train_filter = SplitFilter(
-        skip_no_topic=bool(train_section.get("skip_no_topic", False))
+        skip_no_question_entity=bool(
+            train_section.get("skip_no_question_entity", False)
+        )
         if train_section is not None
         else False,
         skip_no_ans=bool(train_section.get("skip_no_ans", False))
@@ -139,7 +152,7 @@ def build_preprocess_filters(
         else False,
     )
     eval_filter = SplitFilter(
-        skip_no_topic=bool(eval_section.get("skip_no_topic", False))
+        skip_no_question_entity=bool(eval_section.get("skip_no_question_entity", False))
         if eval_section is not None
         else False,
         skip_no_ans=bool(eval_section.get("skip_no_ans", False))
@@ -154,8 +167,9 @@ def build_preprocess_filters(
         if key in {"train", "eval"}:
             continue
         section = filter_cfg.get(key)
+        _assert_no_legacy_split_filter_keys(section, scope=f"preprocess_filter.{key}")
         overrides[str(key)] = SplitFilter(
-            skip_no_topic=bool(section.get("skip_no_topic", False)),
+            skip_no_question_entity=bool(section.get("skip_no_question_entity", False)),
             skip_no_ans=bool(section.get("skip_no_ans", False)),
             skip_no_path=bool(section.get("skip_no_path", False)),
         )

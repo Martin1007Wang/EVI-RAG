@@ -30,8 +30,8 @@ def _build_mlp(
     return nn.Sequential(*layers)
 
 
-class NodeFlowHead(nn.Module):
-    """Question-conditioned critic head over state features."""
+class StateFlowHead(nn.Module):
+    """Question-conditioned log-flow head over state features."""
 
     def __init__(
         self,
@@ -49,7 +49,7 @@ class NodeFlowHead(nn.Module):
         self.conditioning = str(conditioning)
         if self.conditioning not in {"concat", "none"}:
             raise ValueError(
-                "NodeFlowHead conditioning must be one of {'concat', 'none'}."
+                "StateFlowHead conditioning must be one of {'concat', 'none'}."
             )
         input_dim = self.node_dim
         if self.conditioning == "concat":
@@ -71,16 +71,16 @@ class NodeFlowHead(nn.Module):
     ) -> torch.Tensor:
         if tuple(node_features.shape[:-1]) != tuple(question_features.shape[:-1]):
             raise ValueError(
-                "question_features must match node_features batch shape in NodeFlowHead."
+                "question_features must match node_features batch shape in StateFlowHead."
             )
         if int(node_features.size(-1)) != self.node_dim:
             raise ValueError(
-                "node_features last dimension mismatch in NodeFlowHead. "
+                "node_features last dimension mismatch in StateFlowHead. "
                 f"Expected {self.node_dim}, got {int(node_features.size(-1))}."
             )
         if int(question_features.size(-1)) != self.question_dim:
             raise ValueError(
-                "question_features last dimension mismatch in NodeFlowHead. "
+                "question_features last dimension mismatch in StateFlowHead. "
                 f"Expected {self.question_dim}, got {int(question_features.size(-1))}."
             )
         if self.conditioning == "none":
@@ -100,15 +100,8 @@ class NodeFlowHead(nn.Module):
         return self.critic(critic_inputs).squeeze(-1)
 
 
-class TransitionPolicyHead(nn.Module):
-    """Proposal-policy edge bias head over recurrent state queries and edge keys.
-
-    The strict target policy stays successor-flow only; this head is reserved for
-    off-policy proposal shaping. By default the head stays end-to-end
-    differentiable so proposal gradients can shape the shared encoder. The
-    legacy detached behavior remains available as an explicit ablation via
-    ``detach_input_features=True``.
-    """
+class ActionScoringHead(nn.Module):
+    """Score candidate actions from a state query and candidate edge features."""
 
     def __init__(
         self,
@@ -122,7 +115,7 @@ class TransitionPolicyHead(nn.Module):
     ) -> None:
         super().__init__()
         if num_layers < 1:
-            raise ValueError("transition_head.num_layers must be >= 1.")
+            raise ValueError("action_scoring_head.num_layers must be >= 1.")
         self.detach_input_features = bool(detach_input_features)
         self.actor_dim = int(state_dim)
         self.query_norm = nn.LayerNorm(self.actor_dim)
@@ -151,13 +144,13 @@ class TransitionPolicyHead(nn.Module):
     ) -> None:
         if candidate_state_features.shape != current_state_features.shape:
             raise ValueError(
-                "candidate_state_features must match current_state_features shape in TransitionPolicyHead."
+                "candidate_state_features must match current_state_features shape in ActionScoringHead."
             )
         if tuple(relation_features.shape[:-1]) != tuple(
             current_state_features.shape[:-1]
         ):
             raise ValueError(
-                "relation_features batch shape must match current_state_features in TransitionPolicyHead."
+                "relation_features batch shape must match current_state_features in ActionScoringHead."
             )
 
     def forward(
@@ -192,4 +185,13 @@ class TransitionPolicyHead(nn.Module):
         return logits / math.sqrt(float(max(self.actor_dim, 1)))
 
 
-__all__ = ["NodeFlowHead", "TransitionPolicyHead"]
+NodeFlowHead = StateFlowHead
+TransitionPolicyHead = ActionScoringHead
+
+
+__all__ = [
+    "ActionScoringHead",
+    "NodeFlowHead",
+    "StateFlowHead",
+    "TransitionPolicyHead",
+]

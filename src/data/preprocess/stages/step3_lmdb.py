@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 from collections import deque
 
 import json
@@ -38,7 +38,7 @@ from src.data.io.runtime_sample_metadata import (
 from src.data.preprocess.labels.edge_retrieval import compute_shortest_path_labels
 from src.data.schema.constants import (
     _FILTER_MISSING_ANSWER_FILENAME,
-    _FILTER_MISSING_START_FILENAME,
+    _FILTER_MISSING_ANCHOR_FILENAME,
 )
 from src.data.preprocess.config import (
     _resolve_parquet_chunk_size,
@@ -106,10 +106,10 @@ def _count_reachable_any_direction(
     num_nodes: int,
     edge_src: List[int],
     edge_dst: List[int],
-    q_nodes: List[int],
+    anchor_nodes: List[int],
     a_nodes: List[int],
 ) -> int:
-    if num_nodes <= 0 or not q_nodes or not a_nodes:
+    if num_nodes <= 0 or not anchor_nodes or not a_nodes:
         return 0
     adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
     rev_adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
@@ -123,14 +123,30 @@ def _count_reachable_any_direction(
         nbrs.sort()
     for nbrs in rev_adjacency:
         nbrs.sort()
-    dist_fwd = _bfs_multi(num_nodes, adjacency, q_nodes)
-    dist_rev = _bfs_multi(num_nodes, rev_adjacency, q_nodes)
+    dist_fwd = _bfs_multi(num_nodes, adjacency, anchor_nodes)
+    dist_rev = _bfs_multi(num_nodes, rev_adjacency, anchor_nodes)
     reachable = 0
     for a_raw in a_nodes:
         a = int(a_raw)
         if 0 <= a < num_nodes and (dist_fwd[a] >= 0 or dist_rev[a] >= 0):
             reachable += 1
     return reachable
+
+
+def _require_question_entity_ids_column(
+    q_batch_dict: Dict[str, Sequence[object]],
+) -> Sequence[object]:
+    if "question_entity_ids" in q_batch_dict:
+        return q_batch_dict["question_entity_ids"]
+    if "seed_entity_ids" in q_batch_dict:
+        raise ValueError(
+            "questions.parquet still uses legacy seed_entity_ids; rebuild parquet outputs "
+            "to emit question_entity_ids before LMDB materialization."
+        )
+    raise ValueError(
+        "questions.parquet is missing question_entity_ids; rebuild parquet outputs before "
+        "LMDB materialization."
+    )
 
 
 def _expected_entity_embedding_rows(entity_vocab: Dict[str, List[object]]) -> int:
@@ -163,6 +179,15 @@ def _take_graph_batch_columns(
         row_idx: local_idx for local_idx, row_idx in enumerate(unique_row_indices)
     }
     return row_lookup, graph_batch.to_pydict()
+
+
+def _resolve_local_entity_indices(
+    node_entity_ids: Sequence[object],
+    target_entity_ids: Sequence[object],
+) -> List[int]:
+    node_entity_id_list = [int(value) for value in list(node_entity_ids)]
+    target_entity_id_list = [int(value) for value in list(target_entity_ids)]
+    return _local_indices(node_entity_id_list, target_entity_id_list)
 
 
 def build_dataset(ctx: PreprocessContext) -> None:
@@ -383,7 +408,7 @@ def build_dataset(ctx: PreprocessContext) -> None:
                 "reachable_all_samples": 0,
                 "reachable_partial_samples": 0,
                 "reachable_none_samples": 0,
-                "q_empty_samples": 0,
+                "anchor_empty_samples": 0,
                 "a_empty_samples": 0,
             }
             for split in all_splits
@@ -431,13 +456,16 @@ def build_dataset(ctx: PreprocessContext) -> None:
 
         pbar = tqdm(question_batches, total=int(total_batches) + 1, desc="Writing LMDB")
         missing_graph_ids: List[str] = []
-        keep_start_ids: List[str] = []
+        keep_anchor_ids: List[str] = []
         keep_answer_ids: List[str] = []
-        missing_start = 0
+        missing_anchor = 0
         missing_answer = 0
 
         for q_batch in pbar:
             q_batch_dict = q_batch.to_pydict()
+            question_entity_ids_column = _require_question_entity_ids_column(
+                q_batch_dict
+            )
             q_batch_ctx = None
             q_batch_ctx_mask = None
             if use_precomputed_questions:
@@ -563,27 +591,34 @@ def build_dataset(ctx: PreprocessContext) -> None:
                         "Fix raw parquet/filters and rebuild; empty edge_index is unsupported."
                     )
                 num_nodes_tensor = torch.tensor(num_nodes, dtype=torch.long)
+                question_entity_ids = question_entity_ids_column[i] or []
+                answer_entity_ids_raw = q_batch_dict["answer_entity_ids"][i] or []
+                anchor_local_indices = _resolve_local_entity_indices(
+                    node_entity_ids, question_entity_ids
+                )
+                a_local = _resolve_local_entity_indices(
+                    node_entity_ids, answer_entity_ids_raw
+                )
+
                 node_entity_ids = torch.tensor(node_entity_ids, dtype=torch.long)
                 node_emb_ids = torch.tensor(node_embedding_ids, dtype=torch.long)
                 edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
                 edge_attr = torch.tensor(edge_rel, dtype=torch.long)
 
-                q_entities = q_batch_dict["seed_entity_ids"][i] or []
-                a_entities = q_batch_dict["answer_entity_ids"][i] or []
-                if q_entities is None or len(q_entities) == 0:
-                    missing_start += 1
+                if question_entity_ids is None or len(question_entity_ids) == 0:
+                    missing_anchor += 1
                     continue
-                q_local = _local_indices(node_entity_ids, q_entities)
-                if not q_local:
-                    missing_start += 1
+                if not anchor_local_indices:
+                    missing_anchor += 1
                     continue
-                a_local = _local_indices(node_entity_ids, a_entities)
                 if not a_local:
                     missing_answer += 1
-                keep_start_ids.append(graph_id)
+                keep_anchor_ids.append(graph_id)
                 if a_local:
                     keep_answer_ids.append(graph_id)
-                answer_entity_ids = torch.as_tensor(a_entities, dtype=torch.long)
+                answer_entity_ids = torch.as_tensor(
+                    answer_entity_ids_raw, dtype=torch.long
+                )
                 if (
                     emit_edge_retrieval_labels
                     and label_entries is not None
@@ -594,7 +629,9 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     stats = label_stats[split_key]
                     labels = compute_shortest_path_labels(
                         edge_index=edge_index,
-                        q_local_indices=torch.as_tensor(q_local, dtype=torch.long),
+                        anchor_local_indices=torch.as_tensor(
+                            anchor_local_indices, dtype=torch.long
+                        ),
                         a_local_indices=torch.as_tensor(a_local, dtype=torch.long),
                         num_nodes=int(num_nodes),
                     )
@@ -608,15 +645,15 @@ def build_dataset(ctx: PreprocessContext) -> None:
                         stats["no_path_samples"] += 1
                     elif int(labels.max_path_length) == 0:
                         stats["zero_hop_samples"] += 1
-                    if not q_local:
-                        stats["q_empty_samples"] += 1
+                    if not anchor_local_indices:
+                        stats["anchor_empty_samples"] += 1
                     if not a_local:
                         stats["a_empty_samples"] += 1
                     reachable_count = _count_reachable_any_direction(
                         num_nodes,
                         edge_src,
                         edge_dst,
-                        q_local,
+                        anchor_local_indices,
                         a_local,
                     )
                     if a_local:
@@ -649,7 +686,9 @@ def build_dataset(ctx: PreprocessContext) -> None:
                     "node_entity_ids": node_entity_ids,
                     "node_embedding_ids": node_emb_ids,
                     "question_emb": q_batch_emb[i].unsqueeze(0),
-                    "q_local_indices": torch.as_tensor(q_local, dtype=torch.long),
+                    "anchor_local_indices": torch.as_tensor(
+                        anchor_local_indices, dtype=torch.long
+                    ),
                     "a_local_indices": torch.as_tensor(a_local, dtype=torch.long),
                     "answer_entity_ids": answer_entity_ids,
                 }
@@ -756,9 +795,9 @@ def build_dataset(ctx: PreprocessContext) -> None:
             processed_dir = ctx.output_dir / "processed"
             ensure_dir(processed_dir)
             _write_sample_filter(
-                processed_dir / _FILTER_MISSING_START_FILENAME,
+                processed_dir / _FILTER_MISSING_ANCHOR_FILENAME,
                 dataset=dataset_name,
-                sample_ids=keep_start_ids,
+                sample_ids=keep_anchor_ids,
             )
             _write_sample_filter(
                 processed_dir / _FILTER_MISSING_ANSWER_FILENAME,
@@ -768,9 +807,9 @@ def build_dataset(ctx: PreprocessContext) -> None:
             log_event(
                 logger,
                 "missing_anchor_filters_written",
-                missing_start=missing_start,
+                missing_anchor=missing_anchor,
                 missing_answer=missing_answer,
-                keep_start=len(keep_start_ids),
+                keep_anchor=len(keep_anchor_ids),
                 keep_answer=len(keep_answer_ids),
                 path=str(processed_dir),
             )
@@ -820,7 +859,9 @@ def build_dataset(ctx: PreprocessContext) -> None:
                             "reachable_none_samples": int(
                                 stats.get("reachable_none_samples", 0)
                             ),
-                            "q_empty_samples": int(stats.get("q_empty_samples", 0)),
+                            "anchor_empty_samples": int(
+                                stats.get("anchor_empty_samples", 0)
+                            ),
                             "a_empty_samples": int(stats.get("a_empty_samples", 0)),
                         },
                         "entries": entries,

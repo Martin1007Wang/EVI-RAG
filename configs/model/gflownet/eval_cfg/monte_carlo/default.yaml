@@ -1,0 +1,4 @@
+# @package model.eval_cfg.monte_carlo
+
+rollouts: 4096
+confidence: 0.95

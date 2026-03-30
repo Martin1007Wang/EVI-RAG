@@ -1,0 +1,10 @@
+# @package model.policy_cfg
+
+defaults:
+  - _self_
+  - backbone: default
+  - flow_head: default
+  - state_encoder: default
+  - actor: default
+
+state_mode: subgraph

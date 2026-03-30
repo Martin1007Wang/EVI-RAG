@@ -47,7 +47,7 @@ def test_migrate_legacy_node_entity_ids_lmdb_renames_sample_field(
                         "question_emb": torch.tensor(
                             [[0.1, 0.2, 0.3]], dtype=torch.float32
                         ),
-                        "q_local_indices": torch.tensor([0], dtype=torch.long),
+                        "anchor_local_indices": torch.tensor([0], dtype=torch.long),
                         "a_local_indices": torch.tensor([1], dtype=torch.long),
                         "answer_entity_ids": torch.tensor([1], dtype=torch.long),
                     }
