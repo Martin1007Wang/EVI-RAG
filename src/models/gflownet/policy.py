@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import nn
@@ -213,6 +213,7 @@ class SubgraphPolicy(nn.Module):
         prepared_batch: SubgraphPreparedBatch,
         rollout_batch: SubgraphRolloutBatch,
         analyses: tuple[SubgraphAnalysis, ...] | None = None,
+        action_pruning: Mapping[str, Any] | None = None,
     ) -> SubgraphActionDistribution:
         analyses, state_features = self._encode_policy_state(
             prepared_batch=prepared_batch,
@@ -224,6 +225,7 @@ class SubgraphPolicy(nn.Module):
             rollout_batch=rollout_batch,
             analyses=analyses,
             state_features=state_features,
+            action_pruning=action_pruning,
         )
 
     @staticmethod

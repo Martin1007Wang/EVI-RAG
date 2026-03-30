@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -78,6 +78,22 @@ class SubgraphActionDistribution:
     target_nodes: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _CandidateEdgeMetadata:
+    edge_idx: int
+    src: int
+    dst: int
+    relation_id: int
+    is_new_node: float
+    merge_flag: float
+    next_components: int
+    new_bit_gain: int
+    candidate_full_answers: int
+    current_oracle_distance: float
+    target_oracle_distance: float
+    question_similarity: float
+
+
 class SubgraphActor(nn.Module):
     def __init__(
         self,
@@ -112,6 +128,34 @@ class SubgraphActor(nn.Module):
             detach_input_features=False,
         )
 
+    @staticmethod
+    def _question_similarity(
+        *,
+        relation_features: torch.Tensor,
+        dst_features: torch.Tensor,
+        question_features: torch.Tensor,
+    ) -> float:
+        similarity = F.cosine_similarity(
+            (relation_features + dst_features).unsqueeze(0).to(dtype=torch.float32),
+            question_features.unsqueeze(0).to(dtype=torch.float32),
+            dim=-1,
+        )
+        return float(similarity.item())
+
+    @staticmethod
+    def _rank_candidate_edges(
+        candidates: list[_CandidateEdgeMetadata],
+        *,
+        limit: int | None,
+    ) -> list[_CandidateEdgeMetadata]:
+        if limit is None or len(candidates) <= int(limit):
+            return candidates
+        ranked = sorted(
+            candidates,
+            key=lambda item: (-float(item.question_similarity), int(item.edge_idx)),
+        )
+        return ranked[: int(limit)]
+
     def build_action_distribution(
         self,
         *,
@@ -119,6 +163,7 @@ class SubgraphActor(nn.Module):
         rollout_batch: SubgraphRolloutBatch,
         analyses: tuple[SubgraphAnalysis, ...],
         state_features: torch.Tensor,
+        action_pruning: Mapping[str, Any] | None = None,
     ) -> SubgraphActionDistribution:
         device = prepared_batch.device
         active_state_indices = rollout_batch.active_state_indices()
@@ -165,6 +210,11 @@ class SubgraphActor(nn.Module):
             active_state_indices, device=device, dtype=torch.long
         )
         active_state_features = state_features.index_select(0, active_state_tensor)
+        per_node_top_k = None
+        per_state_top_k = None
+        if action_pruning is not None:
+            per_node_top_k = int(action_pruning.get("per_node_top_k", 0)) or None
+            per_state_top_k = int(action_pruning.get("per_state_top_k", 0)) or None
         for local_state_idx, flat_state_idx in enumerate(active_state_indices):
             graph_idx = int(rollout_batch.graph_ids[flat_state_idx].item())
             state = rollout_batch.states[flat_state_idx]
@@ -190,57 +240,104 @@ class SubgraphActor(nn.Module):
                 analysis=analysis,
             )
             outgoing_map = prepared_batch.graph_outgoing_edge_ids[graph_idx]
+            question_features = prepared_batch.question_tokens[graph_idx]
             if int(state.num_edges) < self.max_steps:
-                candidate_edge_ids: list[int] = []
+                seen_candidate_edges: set[int] = set()
+                candidate_edges: list[_CandidateEdgeMetadata] = []
                 for node_id in analysis.selected_node_ids:
+                    node_candidates: list[_CandidateEdgeMetadata] = []
                     for edge_id in outgoing_map.get(int(node_id), ()):
                         edge_id = int(edge_id)
-                        if edge_id in selected_edge_set:
-                            continue
-                        candidate_edge_ids.append(edge_id)
-                for edge_id in dict.fromkeys(candidate_edge_ids):
-                    edge_idx = int(edge_id)
-                    src = int(prepared_batch.topology.edge_index[0, edge_idx].item())
-                    dst = int(prepared_batch.topology.edge_index[1, edge_idx].item())
-                    relation_id = int(
-                        prepared_batch.topology.edge_type[edge_idx].item()
-                    )
-                    is_new_node = 1.0 if int(dst) not in selected_node_set else 0.0
-                    merge_flag = 0.0
-                    next_components = current_components
-                    if int(dst) in selected_node_set:
-                        src_component = int(analysis.component_labels.get(src, -1))
-                        dst_component = int(analysis.component_labels.get(dst, -1))
                         if (
-                            src_component >= 0
-                            and dst_component >= 0
-                            and src_component != dst_component
+                            edge_id in selected_edge_set
+                            or edge_id in seen_candidate_edges
                         ):
-                            merge_flag = 1.0
-                            next_components = max(current_components - 1, 1)
-                    new_bit_gain = _bit_count(
-                        int(analysis.reachability_bits.get(src, 0))
-                        & ~int(analysis.reachability_bits.get(dst, 0))
+                            continue
+                        seen_candidate_edges.add(edge_id)
+                        edge_idx = int(edge_id)
+                        src = int(
+                            prepared_batch.topology.edge_index[0, edge_idx].item()
+                        )
+                        dst = int(
+                            prepared_batch.topology.edge_index[1, edge_idx].item()
+                        )
+                        relation_id = int(
+                            prepared_batch.topology.edge_type[edge_idx].item()
+                        )
+                        is_new_node = 1.0 if int(dst) not in selected_node_set else 0.0
+                        merge_flag = 0.0
+                        next_components = current_components
+                        if int(dst) in selected_node_set:
+                            src_component = int(analysis.component_labels.get(src, -1))
+                            dst_component = int(analysis.component_labels.get(dst, -1))
+                            if (
+                                src_component >= 0
+                                and dst_component >= 0
+                                and src_component != dst_component
+                            ):
+                                merge_flag = 1.0
+                                next_components = max(current_components - 1, 1)
+                        new_bit_gain = _bit_count(
+                            int(analysis.reachability_bits.get(src, 0))
+                            & ~int(analysis.reachability_bits.get(dst, 0))
+                        )
+                        full_mask = int(
+                            prepared_batch.graph_anchor_full_mask[graph_idx]
+                        )
+                        dst_bits_after = int(
+                            analysis.reachability_bits.get(dst, 0)
+                        ) | int(analysis.reachability_bits.get(src, 0))
+                        candidate_full_answers = (
+                            1 if full_mask > 0 and dst_bits_after == full_mask else 0
+                        )
+                        relation_features = prepared_batch.relation_tokens[relation_id]
+                        dst_features = prepared_batch.node_tokens[dst]
+                        node_candidates.append(
+                            _CandidateEdgeMetadata(
+                                edge_idx=edge_idx,
+                                src=src,
+                                dst=dst,
+                                relation_id=relation_id,
+                                is_new_node=float(is_new_node),
+                                merge_flag=float(merge_flag),
+                                next_components=int(next_components),
+                                new_bit_gain=int(new_bit_gain),
+                                candidate_full_answers=int(candidate_full_answers),
+                                current_oracle_distance=float(current_oracle_distance),
+                                target_oracle_distance=float(
+                                    oracle_distance_map.get(dst, -1)
+                                ),
+                                question_similarity=self._question_similarity(
+                                    relation_features=relation_features,
+                                    dst_features=dst_features,
+                                    question_features=question_features,
+                                ),
+                            )
+                        )
+                    candidate_edges.extend(
+                        self._rank_candidate_edges(
+                            node_candidates,
+                            limit=per_node_top_k,
+                        )
                     )
-                    full_mask = int(prepared_batch.graph_anchor_full_mask[graph_idx])
-                    dst_bits_after = int(analysis.reachability_bits.get(dst, 0)) | int(
-                        analysis.reachability_bits.get(src, 0)
-                    )
-                    candidate_full_answers = (
-                        1 if full_mask > 0 and dst_bits_after == full_mask else 0
-                    )
-                    relation_features = prepared_batch.relation_tokens[relation_id]
-                    dst_features = prepared_batch.node_tokens[dst]
-                    src_features = prepared_batch.node_tokens[src]
-                    question_features = prepared_batch.question_tokens[graph_idx]
+                candidate_edges = self._rank_candidate_edges(
+                    candidate_edges,
+                    limit=per_state_top_k,
+                )
+                for candidate in candidate_edges:
+                    relation_features = prepared_batch.relation_tokens[
+                        candidate.relation_id
+                    ]
+                    dst_features = prepared_batch.node_tokens[candidate.dst]
+                    src_features = prepared_batch.node_tokens[candidate.src]
                     action_struct = torch.tensor(
                         [
-                            float(is_new_node),
-                            float(merge_flag),
-                            float(new_bit_gain),
+                            float(candidate.is_new_node),
+                            float(candidate.merge_flag),
+                            float(candidate.new_bit_gain),
                             float(current_components),
-                            float(next_components),
-                            float(candidate_full_answers),
+                            float(candidate.next_components),
+                            float(candidate.candidate_full_answers),
                         ],
                         device=device,
                         dtype=torch.float32,
@@ -257,28 +354,25 @@ class SubgraphActor(nn.Module):
                         )
                     )
                     relation_rows.append(relation_features)
-                    actions.append(SubgraphAction.add_edge(edge_idx))
-                    edge_ids.append(edge_idx)
-                    target_nodes.append(dst)
+                    actions.append(SubgraphAction.add_edge(candidate.edge_idx))
+                    edge_ids.append(candidate.edge_idx)
+                    target_nodes.append(candidate.dst)
                     stop_flags.append(False)
                     segment_ids.append(local_state_idx)
                     current_component_counts.append(current_components)
-                    next_component_counts.append(next_components)
-                    merge_bonus.append(float(merge_flag))
-                    action_new_bit_gain.append(float(new_bit_gain))
-                    candidate_answer_counts.append(int(candidate_full_answers))
-                    current_best_answer_distance.append(float(current_oracle_distance))
+                    next_component_counts.append(candidate.next_components)
+                    merge_bonus.append(float(candidate.merge_flag))
+                    action_new_bit_gain.append(float(candidate.new_bit_gain))
+                    candidate_answer_counts.append(
+                        int(candidate.candidate_full_answers)
+                    )
+                    current_best_answer_distance.append(
+                        float(candidate.current_oracle_distance)
+                    )
                     target_answer_distance.append(
-                        float(oracle_distance_map.get(dst, -1))
+                        float(candidate.target_oracle_distance)
                     )
-                    similarity = F.cosine_similarity(
-                        (relation_features + dst_features)
-                        .unsqueeze(0)
-                        .to(dtype=torch.float32),
-                        question_features.unsqueeze(0).to(dtype=torch.float32),
-                        dim=-1,
-                    )
-                    question_similarity.append(float(similarity.item()))
+                    question_similarity.append(float(candidate.question_similarity))
             state_feature = active_state_features[local_state_idx]
             stop_logit = (
                 self.stop_head(state_feature).squeeze(-1).to(dtype=torch.float32)

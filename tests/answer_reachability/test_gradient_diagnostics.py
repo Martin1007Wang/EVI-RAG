@@ -9,6 +9,10 @@ import pytest
 import torch
 from omegaconf import open_dict
 
+from src.data.schema.constants import (
+    _FILTER_MISSING_ANCHOR_FILENAME,
+    _FILTER_MISSING_ANSWER_FILENAME,
+)
 from src.utils.training_schedules import TrainingScheduleContext
 from src.utils.entrypoint_utils import _strip_instantiate_metadata
 from src.utils.fit_schedule import (
@@ -18,6 +22,25 @@ from src.utils.fit_schedule import (
 
 _HYDRA_TEST_OVERRIDES = ["hydra/job_logging=stdout", "hydra/hydra_logging=none"]
 _WEBQSP_DATA_ROOT = Path("/mnt/data/retrieval_dataset/webqsp")
+
+
+def _skip_when_required_filter_artifacts_are_missing(cfg) -> None:  # type: ignore[no-untyped-def]
+    processed_dir = Path(cfg.dataset.paths.processed)
+    missing_paths: list[Path] = []
+
+    if bool(cfg.dataset.runtime_filter_missing_anchor.train):
+        anchor_filter_path = processed_dir / _FILTER_MISSING_ANCHOR_FILENAME
+        if not anchor_filter_path.exists():
+            missing_paths.append(anchor_filter_path)
+
+    if bool(cfg.dataset.runtime_filter_missing_answer.train):
+        answer_filter_path = processed_dir / _FILTER_MISSING_ANSWER_FILENAME
+        if not answer_filter_path.exists():
+            missing_paths.append(answer_filter_path)
+
+    if missing_paths:
+        missing_text = ", ".join(str(path) for path in missing_paths)
+        pytest.skip(f"requires local runtime filter artifacts: {missing_text}")
 
 
 @dataclass(frozen=True)
@@ -81,6 +104,8 @@ def _build_real_train_batch_and_model():
         cfg.data.multiprocessing_context = None
         cfg.data.eval_multiprocessing_context = None
         cfg.model.training_cfg.rollouts_per_graph = 4
+
+    _skip_when_required_filter_artifacts_are_missing(cfg)
 
     datamodule = instantiate(_strip_instantiate_metadata(cfg.data))
     datamodule.setup("fit")

@@ -10,8 +10,6 @@ from omegaconf import DictConfig, OmegaConf
 ANSWER_TASKS = frozenset({"answer_ranking"})
 EDGE_RETRIEVAL_TASK = "edge_retrieval"
 RUNTIME_ANSWER_TASK = "answer_search"
-FLOW_FRONTIER_BACKEND = "flow_frontier"
-MONTE_CARLO_BACKEND = "monte_carlo"
 FULL_REPORT = "full"
 RANK_ONLY_REPORT = "rank_only"
 
@@ -24,16 +22,25 @@ _DEFAULT_SEARCH_EVAL_CFG: dict[str, Any] = {
     "answer_top_ks": (1, 5, 10),
     "edge_top_ks": (1, 5, 10, 25, 50),
     "edge_emit_top_k": 25,
-    "answer_posterior_backend": FLOW_FRONTIER_BACKEND,
-    "flow_frontier": {
-        "prune_epsilon": 1.0e-3,
-        "max_expansions": 20000,
-        "max_frontier_size": 4096,
-    },
     "monte_carlo": {
         "rollouts": 4096,
+        "batch_rollouts": 256,
+        "temperature": 1.0,
         "confidence": 0.95,
+        "early_stop": {
+            "enabled": True,
+            "min_rollouts": 512,
+            "stability_top_k": 1,
+        },
+        "action_pruning": {
+            "per_node_top_k": 100,
+            "per_state_top_k": 256,
+        },
     },
+}
+_LEGACY_SEARCH_EVAL_KEYS = {
+    "answer_posterior_backend": "Remove eval_cfg.answer_posterior_backend; Monte Carlo is now the only posterior estimator.",
+    "flow_frontier": "Remove eval_cfg.flow_frontier; exact frontier search is no longer supported.",
 }
 
 
@@ -60,19 +67,36 @@ def _deep_merge(
     return merged
 
 
+def _assert_no_legacy_search_eval_keys(eval_cfg: Mapping[str, Any]) -> None:
+    legacy_messages = [
+        f"{key}: {message}"
+        for key, message in _LEGACY_SEARCH_EVAL_KEYS.items()
+        if key in eval_cfg
+    ]
+    if not legacy_messages:
+        return
+    raise ValueError(
+        "Legacy exact answer-posterior config detected. " + " ".join(legacy_messages)
+    )
+
+
 def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
-    cfg = _deep_merge(
-        base=_DEFAULT_SEARCH_EVAL_CFG,
-        override=_to_plain_mapping(eval_cfg, field_name="eval_cfg"),
-    )
-    flow_frontier = _to_plain_mapping(
-        cfg.get("flow_frontier", {}), field_name="eval_cfg.flow_frontier"
-    )
+    plain_eval_cfg = _to_plain_mapping(eval_cfg, field_name="eval_cfg")
+    _assert_no_legacy_search_eval_keys(plain_eval_cfg)
+    cfg = _deep_merge(base=_DEFAULT_SEARCH_EVAL_CFG, override=plain_eval_cfg)
     monte_carlo = _to_plain_mapping(
         cfg.get("monte_carlo", {}), field_name="eval_cfg.monte_carlo"
     )
-    cfg["flow_frontier"] = flow_frontier
     cfg["monte_carlo"] = monte_carlo
+    early_stop = _to_plain_mapping(
+        monte_carlo.get("early_stop", {}), field_name="eval_cfg.monte_carlo.early_stop"
+    )
+    monte_carlo["early_stop"] = early_stop
+    action_pruning = _to_plain_mapping(
+        monte_carlo.get("action_pruning", {}),
+        field_name="eval_cfg.monte_carlo.action_pruning",
+    )
+    monte_carlo["action_pruning"] = action_pruning
 
     report_profile = str(cfg.get("report_profile", FULL_REPORT))
     if report_profile not in {FULL_REPORT, RANK_ONLY_REPORT}:
@@ -88,22 +112,9 @@ def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
         )
     cfg["task"] = task
 
-    answer_posterior_backend = str(
-        cfg.get("answer_posterior_backend", FLOW_FRONTIER_BACKEND)
-    )
-    if answer_posterior_backend not in {FLOW_FRONTIER_BACKEND, MONTE_CARLO_BACKEND}:
-        raise ValueError(
-            "evaluation.answer_posterior_backend must be one of {'flow_frontier', 'monte_carlo'}."
-        )
-    cfg["answer_posterior_backend"] = answer_posterior_backend
-
     if task == EDGE_RETRIEVAL_TASK and report_profile != RANK_ONLY_REPORT:
         raise ValueError(
             "edge_retrieval only supports evaluation.report_profile='rank_only'."
-        )
-    if task == EDGE_RETRIEVAL_TASK and answer_posterior_backend != MONTE_CARLO_BACKEND:
-        raise ValueError(
-            "edge_retrieval only supports evaluation.answer_posterior_backend='monte_carlo'."
         )
 
     answer_mass_threshold = float(cfg.get("answer_mass_threshold", 0.9))
@@ -136,32 +147,103 @@ def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
         raise ValueError("evaluation.edge_emit_top_k must be >= 1.")
     cfg["edge_emit_top_k"] = edge_emit_top_k
 
-    prune_epsilon = float(flow_frontier.get("prune_epsilon", 1.0e-3))
-    if not 0.0 <= prune_epsilon <= 1.0:
-        raise ValueError("evaluation.flow_frontier.prune_epsilon must be in [0, 1].")
-    flow_frontier["prune_epsilon"] = prune_epsilon
-
-    max_expansions = int(flow_frontier.get("max_expansions", 20000))
-    if max_expansions < 1:
-        raise ValueError("evaluation.flow_frontier.max_expansions must be >= 1.")
-    flow_frontier["max_expansions"] = max_expansions
-
-    max_frontier_size = int(flow_frontier.get("max_frontier_size", 4096))
-    if max_frontier_size < 1:
-        raise ValueError("evaluation.flow_frontier.max_frontier_size must be >= 1.")
-    flow_frontier["max_frontier_size"] = max_frontier_size
-
     rollouts = int(monte_carlo.get("rollouts", 4096))
     if rollouts < 1:
         raise ValueError("evaluation.monte_carlo.rollouts must be >= 1.")
     monte_carlo["rollouts"] = rollouts
+
+    batch_rollouts = int(monte_carlo.get("batch_rollouts", 256))
+    if batch_rollouts < 1:
+        raise ValueError("evaluation.monte_carlo.batch_rollouts must be >= 1.")
+    monte_carlo["batch_rollouts"] = batch_rollouts
+
+    temperature = float(monte_carlo.get("temperature", 1.0))
+    if temperature <= 0.0:
+        raise ValueError("evaluation.monte_carlo.temperature must be > 0.")
+    monte_carlo["temperature"] = temperature
 
     confidence = float(monte_carlo.get("confidence", 0.95))
     if not 0.0 < confidence < 1.0:
         raise ValueError("evaluation.monte_carlo.confidence must be in (0, 1).")
     monte_carlo["confidence"] = confidence
 
+    early_stop_enabled = bool(early_stop.get("enabled", True))
+    early_stop["enabled"] = early_stop_enabled
+
+    early_stop_min_rollouts = int(early_stop.get("min_rollouts", 512))
+    if early_stop_min_rollouts < 1:
+        raise ValueError("evaluation.monte_carlo.early_stop.min_rollouts must be >= 1.")
+    early_stop["min_rollouts"] = early_stop_min_rollouts
+
+    stability_top_k = int(early_stop.get("stability_top_k", 1))
+    if stability_top_k < 1:
+        raise ValueError(
+            "evaluation.monte_carlo.early_stop.stability_top_k must be >= 1."
+        )
+    early_stop["stability_top_k"] = stability_top_k
+
+    per_node_top_k = int(action_pruning.get("per_node_top_k", 100))
+    if per_node_top_k < 1:
+        raise ValueError(
+            "evaluation.monte_carlo.action_pruning.per_node_top_k must be >= 1."
+        )
+    action_pruning["per_node_top_k"] = per_node_top_k
+
+    per_state_top_k = int(action_pruning.get("per_state_top_k", 256))
+    if per_state_top_k < 1:
+        raise ValueError(
+            "evaluation.monte_carlo.action_pruning.per_state_top_k must be >= 1."
+        )
+    action_pruning["per_state_top_k"] = per_state_top_k
+
     return cfg
+
+
+def search_eval_monte_carlo_cfg(eval_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = normalize_search_eval_cfg(eval_cfg)
+    monte_carlo = normalized["monte_carlo"]
+    if not isinstance(monte_carlo, dict):
+        raise TypeError(
+            "normalize_search_eval_cfg must return a mapping for monte_carlo."
+        )
+    return monte_carlo
+
+
+def format_search_eval_answer_posterior(eval_cfg: Mapping[str, Any]) -> str:
+    monte_carlo_cfg = search_eval_monte_carlo_cfg(eval_cfg)
+    early_stop_cfg = monte_carlo_cfg["early_stop"]
+    action_pruning_cfg = monte_carlo_cfg["action_pruning"]
+    return (
+        "monte_carlo("
+        f"rollouts={int(monte_carlo_cfg['rollouts'])}, "
+        f"batch_rollouts={int(monte_carlo_cfg['batch_rollouts'])}, "
+        f"temperature={float(monte_carlo_cfg['temperature'])}, "
+        f"early_stop={bool(early_stop_cfg['enabled'])}@{float(monte_carlo_cfg['confidence'])}/"
+        f"min={int(early_stop_cfg['min_rollouts'])}/topk={int(early_stop_cfg['stability_top_k'])}, "
+        f"prune=node:{int(action_pruning_cfg['per_node_top_k'])},"
+        f"state:{int(action_pruning_cfg['per_state_top_k'])}"
+        ")"
+    )
+
+
+def search_eval_answer_posterior_signature(
+    eval_cfg: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    monte_carlo_cfg = search_eval_monte_carlo_cfg(eval_cfg)
+    early_stop_cfg = monte_carlo_cfg["early_stop"]
+    action_pruning_cfg = monte_carlo_cfg["action_pruning"]
+    return (
+        "monte_carlo",
+        int(monte_carlo_cfg["rollouts"]),
+        int(monte_carlo_cfg["batch_rollouts"]),
+        float(monte_carlo_cfg["temperature"]),
+        float(monte_carlo_cfg["confidence"]),
+        bool(early_stop_cfg["enabled"]),
+        int(early_stop_cfg["min_rollouts"]),
+        int(early_stop_cfg["stability_top_k"]),
+        int(action_pruning_cfg["per_node_top_k"]),
+        int(action_pruning_cfg["per_state_top_k"]),
+    )
 
 
 def search_eval_runtime_task(eval_cfg: Mapping[str, Any]) -> str:
@@ -180,13 +262,14 @@ def search_eval_include_answer_support(eval_cfg: Mapping[str, Any]) -> bool:
 
 __all__ = [
     "EDGE_RETRIEVAL_TASK",
-    "FLOW_FRONTIER_BACKEND",
     "FULL_REPORT",
-    "MONTE_CARLO_BACKEND",
     "RANK_ONLY_REPORT",
     "RUNTIME_ANSWER_TASK",
+    "format_search_eval_answer_posterior",
     "normalize_search_eval_cfg",
+    "search_eval_answer_posterior_signature",
     "search_eval_include_answer_support",
     "search_eval_is_answer_task",
+    "search_eval_monte_carlo_cfg",
     "search_eval_runtime_task",
 ]

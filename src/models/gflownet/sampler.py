@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import torch
 
@@ -59,6 +60,7 @@ class SubgraphSampler:
         rollouts_per_graph: int,
         temperature: float,
         proposal_bias_scale: float = 1.0,
+        action_pruning: Mapping[str, Any] | None = None,
     ) -> SubgraphTrajectorySampleBatch:
         num_graphs = int(prepared_batch.num_graphs)
         num_rollouts = int(rollouts_per_graph)
@@ -110,6 +112,7 @@ class SubgraphSampler:
                 prepared_batch=prepared_batch,
                 rollout_batch=rollout_batch,
                 analyses=analyses,
+                action_pruning=action_pruning,
             )
             if int(distribution.logits.numel()) == 0:
                 break

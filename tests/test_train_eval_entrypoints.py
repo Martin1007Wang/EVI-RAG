@@ -13,6 +13,7 @@ from src.eval import (
     _enforce_inprocess_eval_precision,
     _enforce_single_gpu_eval,
 )
+from src.metrics.search_eval_utils import normalize_search_eval_cfg
 from src.train import (
     _build_final_eval_cfg,
     _maybe_load_model_weights,
@@ -117,7 +118,47 @@ def test_eval_edge_retrieval_inherits_rankflow_eval_stack() -> None:
     assert "action_prior_cfg" not in cfg.model
     assert cfg.model.eval_cfg.task == "edge_retrieval"
     assert cfg.model.eval_cfg.report_profile == "rank_only"
-    assert cfg.model.eval_cfg.answer_posterior_backend == "monte_carlo"
+    assert cfg.model.eval_cfg.monte_carlo.rollouts == 4096
+    assert cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
+    assert cfg.model.eval_cfg.monte_carlo.temperature == pytest.approx(1.0)
+
+
+def test_normalize_search_eval_cfg_rejects_legacy_exact_keys() -> None:
+    with pytest.raises(ValueError, match="Legacy exact answer-posterior config"):
+        normalize_search_eval_cfg(
+            OmegaConf.create(
+                {
+                    "report_profile": "full",
+                    "answer_posterior_backend": "flow_frontier",
+                    "flow_frontier": {"max_expansions": 1},
+                }
+            )
+        )
+
+
+def test_normalize_search_eval_cfg_populates_runtime_sampling_knobs() -> None:
+    cfg = normalize_search_eval_cfg(
+        OmegaConf.create(
+            {
+                "report_profile": "rank_only",
+                "monte_carlo": {"rollouts": 128},
+            }
+        )
+    )
+
+    assert cfg["monte_carlo"]["rollouts"] == 128
+    assert cfg["monte_carlo"]["batch_rollouts"] == 256
+    assert cfg["monte_carlo"]["temperature"] == pytest.approx(1.0)
+    assert cfg["monte_carlo"]["confidence"] == pytest.approx(0.95)
+    assert cfg["monte_carlo"]["early_stop"] == {
+        "enabled": True,
+        "min_rollouts": 512,
+        "stability_top_k": 1,
+    }
+    assert cfg["monte_carlo"]["action_pruning"] == {
+        "per_node_top_k": 100,
+        "per_state_top_k": 256,
+    }
 
 
 def test_configure_eval_split_updates_datamodule_when_supported() -> None:
@@ -195,9 +236,14 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert cfg.data.eval_feature_dtype == "auto"
     assert cfg.model.training_cfg.rollouts_per_graph == 32
     assert cfg.model.eval_cfg.report_profile == "rank_only"
-    assert cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
-    assert cfg.model.eval_cfg.flow_frontier.max_expansions == 20000
-    assert cfg.model.eval_cfg.flow_frontier.max_frontier_size == 4096
+    assert cfg.model.eval_cfg.monte_carlo.rollouts == 256
+    assert cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
+    assert cfg.model.eval_cfg.monte_carlo.temperature == pytest.approx(1.0)
+    assert cfg.model.eval_cfg.monte_carlo.early_stop.enabled is True
+    assert cfg.model.eval_cfg.monte_carlo.early_stop.min_rollouts == 512
+    assert cfg.model.eval_cfg.monte_carlo.early_stop.stability_top_k == 1
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 100
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_state_top_k == 256
     assert "action_prior_cfg" not in cfg.model
     assert training_cfg.proposal_bias_schedule.type == "cosine"
     assert training_cfg.proposal_bias_schedule.initial_scale == pytest.approx(0.8)
@@ -227,7 +273,7 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert "guided" not in list(cfg.run.tags)
 
 
-def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> None:
+def test_train_rankflow_experiment_uses_canonical_monte_carlo_selector() -> None:
     config_dir = Path(__file__).resolve().parents[1] / "configs"
 
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
@@ -264,9 +310,12 @@ def test_train_rankflow_experiment_uses_canonical_flow_frontier_selector() -> No
     assert cfg.trainer.log_every_n_steps == 32
     assert cfg.model.training_cfg.rollouts_per_graph == 32
     assert cfg.model.eval_cfg.report_profile == "rank_only"
-    assert cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
-    assert cfg.model.eval_cfg.flow_frontier.max_expansions == 500000
-    assert cfg.model.eval_cfg.flow_frontier.max_frontier_size == 65536
+    assert cfg.model.eval_cfg.monte_carlo.rollouts == 4096
+    assert cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
+    assert cfg.model.eval_cfg.monte_carlo.temperature == pytest.approx(1.0)
+    assert cfg.model.eval_cfg.monte_carlo.early_stop.enabled is True
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 100
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_state_top_k == 256
     assert "action_prior_cfg" not in cfg.model
     assert training_cfg.proposal_bias_schedule.type == "cosine"
     assert training_cfg.proposal_bias_schedule.initial_scale == pytest.approx(0.8)
@@ -363,11 +412,7 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
                 "policy_cfg": {"backbone": {"hidden_dim": 512}},
                 "eval_cfg": {
                     "report_profile": "rank_only",
-                    "answer_posterior_backend": "flow_frontier",
-                    "flow_frontier": {
-                        "max_expansions": 500000,
-                        "max_frontier_size": 65536,
-                    },
+                    "monte_carlo": {"rollouts": 4096, "batch_rollouts": 256},
                 },
             },
             "run": {
@@ -392,11 +437,7 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
             "model": {
                 "eval_cfg": {
                     "report_profile": "full",
-                    "answer_posterior_backend": "flow_frontier",
-                    "flow_frontier": {
-                        "max_expansions": 500000,
-                        "max_frontier_size": 65536,
-                    },
+                    "monte_carlo": {"rollouts": 4096, "batch_rollouts": 256},
                 }
             },
             "trainer": {"accelerator": "gpu", "devices": 1},
@@ -424,15 +465,19 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
     assert final_eval_cfg.dataset.name == "webqsp-sub"
     assert final_eval_cfg.model.policy_cfg.backbone.hidden_dim == 512
     assert final_eval_cfg.model.eval_cfg.report_profile == "full"
-    assert final_eval_cfg.model.eval_cfg.answer_posterior_backend == "flow_frontier"
-    assert final_eval_cfg.model.eval_cfg.flow_frontier.max_expansions == 500000
-    assert final_eval_cfg.model.eval_cfg.flow_frontier.max_frontier_size == 65536
+    assert final_eval_cfg.model.eval_cfg.monte_carlo.rollouts == 4096
+    assert final_eval_cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
+    assert final_eval_cfg.model.eval_cfg.monte_carlo.temperature == pytest.approx(1.0)
+    assert final_eval_cfg.model.eval_cfg.monte_carlo.early_stop.enabled is True
+    assert (
+        final_eval_cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 100
+    )
     assert final_eval_cfg.trainer.devices == 1
     assert list(final_eval_cfg.callbacks.keys()) == []
     assert list(final_eval_cfg.logger.keys()) == []
 
 
-def test_build_final_eval_cfg_rejects_answer_posterior_backend_mismatch(
+def test_build_final_eval_cfg_rejects_monte_carlo_rollout_mismatch(
     monkeypatch, tmp_path
 ) -> None:
     train_cfg = OmegaConf.create(
@@ -450,7 +495,7 @@ def test_build_final_eval_cfg_rejects_answer_posterior_backend_mismatch(
             "model": {
                 "eval_cfg": {
                     "report_profile": "rank_only",
-                    "answer_posterior_backend": "monte_carlo",
+                    "monte_carlo": {"rollouts": 256, "batch_rollouts": 128},
                 },
             },
             "run": {
@@ -475,11 +520,7 @@ def test_build_final_eval_cfg_rejects_answer_posterior_backend_mismatch(
             "model": {
                 "eval_cfg": {
                     "report_profile": "full",
-                    "answer_posterior_backend": "flow_frontier",
-                    "flow_frontier": {
-                        "max_expansions": 500000,
-                        "max_frontier_size": 65536,
-                    },
+                    "monte_carlo": {"rollouts": 4096, "batch_rollouts": 256},
                 }
             },
             "trainer": {"accelerator": "gpu", "devices": 1},
@@ -502,7 +543,7 @@ def test_build_final_eval_cfg_rejects_answer_posterior_backend_mismatch(
         _build_final_eval_cfg(train_cfg, ckpt_path="/tmp/best.ckpt")
 
 
-def test_build_final_eval_cfg_rejects_flow_frontier_budget_mismatch(
+def test_build_final_eval_cfg_rejects_monte_carlo_batch_rollout_mismatch(
     monkeypatch, tmp_path
 ) -> None:
     train_cfg = OmegaConf.create(
@@ -520,10 +561,76 @@ def test_build_final_eval_cfg_rejects_flow_frontier_budget_mismatch(
             "model": {
                 "eval_cfg": {
                     "report_profile": "rank_only",
-                    "answer_posterior_backend": "flow_frontier",
-                    "flow_frontier": {
-                        "max_expansions": 100000,
-                        "max_frontier_size": 32768,
+                    "monte_carlo": {"rollouts": 4096, "batch_rollouts": 128},
+                },
+            },
+            "run": {
+                "final_eval_experiment": "rankflow",
+                "final_eval_split": "test",
+                "final_eval_output_subdir": "final_eval",
+            },
+        }
+    )
+    eval_template = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "template"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp",
+                "dataset_family": "webqsp",
+                "dataset_scope": "full",
+            },
+            "data": {"batch_size": 64},
+            "model": {
+                "eval_cfg": {
+                    "report_profile": "full",
+                    "monte_carlo": {"rollouts": 4096, "batch_rollouts": 256},
+                }
+            },
+            "trainer": {"accelerator": "gpu", "devices": 1},
+            "run": {
+                "name": "rankflow",
+                "split": "test",
+                "execution_mode": "predict",
+                "dataset_variants": [
+                    "${dataset.dataset_family}",
+                    "${dataset.dataset_family}-sub",
+                ],
+                "ckpt_path": "${ckpt.gflownet}",
+            },
+        }
+    )
+
+    monkeypatch.setattr("src.train.compose_config", lambda **_: eval_template)
+
+    with pytest.raises(ValueError, match="same answer-posterior estimator"):
+        _build_final_eval_cfg(train_cfg, ckpt_path="/tmp/best.ckpt")
+
+
+def test_build_final_eval_cfg_rejects_monte_carlo_temperature_mismatch(
+    monkeypatch, tmp_path
+) -> None:
+    train_cfg = OmegaConf.create(
+        {
+            "paths": {
+                "output_dir": str(tmp_path / "train-run"),
+                "data_dir": "/mnt/data/retrieval_dataset",
+            },
+            "dataset": {
+                "name": "webqsp-sub",
+                "dataset_family": "webqsp",
+                "dataset_scope": "sub",
+            },
+            "data": {"batch_size": 32, "num_workers": 4},
+            "model": {
+                "eval_cfg": {
+                    "report_profile": "rank_only",
+                    "monte_carlo": {
+                        "rollouts": 4096,
+                        "batch_rollouts": 256,
+                        "temperature": 0.8,
                     },
                 },
             },
@@ -549,10 +656,10 @@ def test_build_final_eval_cfg_rejects_flow_frontier_budget_mismatch(
             "model": {
                 "eval_cfg": {
                     "report_profile": "full",
-                    "answer_posterior_backend": "flow_frontier",
-                    "flow_frontier": {
-                        "max_expansions": 500000,
-                        "max_frontier_size": 65536,
+                    "monte_carlo": {
+                        "rollouts": 4096,
+                        "batch_rollouts": 256,
+                        "temperature": 1.0,
                     },
                 }
             },

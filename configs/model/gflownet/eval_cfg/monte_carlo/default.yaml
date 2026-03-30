@@ -1,4 +1,16 @@
 # @package model.eval_cfg.monte_carlo
 
 rollouts: 4096
+# Run large Monte Carlo budgets in smaller chunks so eval stays within memory.
+batch_rollouts: 256
+temperature: 1.0
 confidence: 0.95
+early_stop:
+  enabled: true
+  min_rollouts: 512
+  stability_top_k: 1
+action_pruning:
+  # Cap high-degree expansion sets during eval so validation and final test stay
+  # on the same bounded action surface.
+  per_node_top_k: 100
+  per_state_top_k: 256

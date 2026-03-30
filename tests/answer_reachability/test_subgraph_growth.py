@@ -6,18 +6,12 @@ import pytest
 import torch
 
 from src.graph import TrajectoryBatch
-from src.metrics import subgraph_answer_search_runtime as subgraph_runtime_module
 from src.metrics.runtime_factory import GraphTaskRuntimeFactory
 from src.metrics.subgraph_answer_search_runtime import SubgraphAnswerSearchRuntime
 from src.models.gflownet import SubgraphSuccessReplayBuffer
 from src.models.gflownet.losses import SubgraphSubTrajectoryBalanceLoss
 from src.models.gflownet.policy import SUBGRAPH_STATE_MODE, SubgraphPolicy
-from src.models.gflownet.sampler import SubgraphSampler
-from src.models.gflownet.search import (
-    SubgraphBeamSearchResult,
-    SubgraphTerminalSubgraph,
-    beam_search_subgraphs,
-)
+from src.models.gflownet.sampler import SubgraphSampler, SubgraphTrajectorySampleBatch
 from src.models.gflownet.state import SubgraphAction, SubgraphState
 from src.models.gflownet_module import GFlowNetModule
 
@@ -126,13 +120,21 @@ def _make_eval_cfg(**overrides: object) -> dict[str, object]:
         "answer_top_ks": (1, 5, 10),
         "edge_top_ks": (1, 5, 10, 25, 50),
         "edge_emit_top_k": 25,
-        "answer_posterior_backend": "flow_frontier",
-        "flow_frontier": {
-            "prune_epsilon": 1.0e-3,
-            "max_expansions": 20000,
-            "max_frontier_size": 4096,
+        "monte_carlo": {
+            "rollouts": 32,
+            "batch_rollouts": 16,
+            "temperature": 1.0,
+            "confidence": 0.95,
+            "early_stop": {
+                "enabled": True,
+                "min_rollouts": 512,
+                "stability_top_k": 1,
+            },
+            "action_pruning": {
+                "per_node_top_k": 100,
+                "per_state_top_k": 256,
+            },
         },
-        "monte_carlo": {"rollouts": 4096, "confidence": 0.95},
     }
     eval_cfg.update(overrides)
     return eval_cfg
@@ -467,84 +469,143 @@ def test_success_replay_buffer_stores_local_edge_ids() -> None:
     assert [record.edge_ids for record in records] == [(0, 1), (0, 1)]
 
 
-def test_beam_search_keeps_only_explicit_stop_terminals(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    batch = _make_bridge_batch()
-    policy = _make_subgraph_policy(max_steps=2)
-    prepared_batch = policy.prepare_batch(batch)
-    eval_cfg = _make_eval_cfg(
-        report_profile="rank_only",
-        flow_frontier={"max_frontier_size": 1, "max_expansions": 1},
-    )
-
-    def _prefer_expand_over_stop(distribution: object) -> torch.Tensor:
-        if not hasattr(distribution, "is_stop_action"):
-            raise AssertionError("unexpected distribution type")
-        stop_mask = distribution.is_stop_action  # type: ignore[attr-defined]
-        return torch.where(
-            stop_mask,
-            torch.full_like(stop_mask, -20.0, dtype=torch.float32),
-            torch.zeros_like(stop_mask, dtype=torch.float32),
-        )
-
-    monkeypatch.setattr(policy, "compute_target_log_probs", _prefer_expand_over_stop)
-
-    search_result = beam_search_subgraphs(
-        policy=policy,
-        eval_cfg=eval_cfg,
-        prepared_batch=prepared_batch,
-    )
-
-    assert search_result.terminal_subgraphs == ()
-    assert search_result.frontier_state_count == 1
-    assert search_result.frontier_answering_state_count == 0
-
-
-def test_subgraph_runtime_splits_terminal_mass_across_answers(
+def test_subgraph_runtime_tracks_full_vote_answer_marginals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = _make_multi_answer_bridge_batch()
     policy = _make_subgraph_policy(max_steps=4)
     runtime = SubgraphAnswerSearchRuntime(
-        eval_cfg=_make_eval_cfg(report_profile="rank_only"),
+        eval_cfg=_make_eval_cfg(
+            report_profile="rank_only",
+            monte_carlo={"rollouts": 4, "batch_rollouts": 4, "confidence": 0.95},
+        ),
         policy=policy,
         sampler=SubgraphSampler(max_steps=4),
     )
 
-    def _fake_beam_search(**kwargs: object) -> SubgraphBeamSearchResult:
-        prepared_batch = kwargs["prepared_batch"]
-        if prepared_batch is None:
-            raise AssertionError("prepared_batch is required")
-        return SubgraphBeamSearchResult(
-            terminal_subgraphs=(
-                SubgraphTerminalSubgraph(
-                    edge_ids=(0, 1, 2, 3),
-                    log_mass=math.log(0.8),
-                    selected_node_ids=(0, 1, 2, 3),
-                    reachability_bits={0: 1, 1: 3, 2: 2, 3: 3},
-                    answer_count=2,
-                ),
+    def _fake_sample(**kwargs: object) -> SubgraphTrajectorySampleBatch:
+        del kwargs
+        return SubgraphTrajectorySampleBatch(
+            state_log_flows=torch.zeros((1, 4, 5), dtype=torch.float32),
+            log_pf_actions=torch.zeros((1, 4, 5), dtype=torch.float32),
+            log_reward_actions=torch.zeros((1, 4, 5), dtype=torch.float32),
+            action_mask=torch.zeros((1, 4, 5), dtype=torch.bool),
+            termination_action_steps=torch.tensor([[5, 5, 5, 5]], dtype=torch.long),
+            chosen_edge_ids=torch.full((1, 4, 4), -1, dtype=torch.long),
+            stop_actions=torch.zeros((1, 4, 5), dtype=torch.bool),
+            terminal_answer_counts=torch.tensor([[2, 2, 0, 0]], dtype=torch.long),
+            terminal_hit_mask=torch.tensor(
+                [[True, True, False, False]], dtype=torch.bool
             ),
-            frontier_state_count=3,
-            frontier_answering_state_count=1,
+            terminal_component_counts=torch.tensor([[1, 1, 1, 2]], dtype=torch.long),
+            terminal_edge_ids=((0, 1, 2, 3), (0, 1, 2, 3), (0, 1), (0,)),
+            terminal_node_ids=((0, 1, 2, 3), (0, 1, 2, 3), (0, 1, 2), (0, 2)),
+            terminal_reachability_bits=(
+                {0: 1, 1: 3, 2: 2, 3: 3},
+                {0: 1, 1: 3, 2: 2, 3: 3},
+                {0: 1, 1: 3, 2: 2},
+                {0: 1, 2: 2},
+            ),
+            sample_ids=("multi-answer-bridge",),
+            question_ids=("multi-answer-bridge",),
+            num_graphs=1,
+            num_rollouts=4,
         )
 
-    monkeypatch.setattr(
-        subgraph_runtime_module, "beam_search_subgraphs", _fake_beam_search
-    )
+    monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
 
     result = runtime._predict_single_graph(batch=batch, include_answer_support=True)
 
     assert result["predicted_answer_entity_ids"] == [101, 103]
-    assert result["answer_log_masses"] == pytest.approx(
-        [math.log(0.8) - math.log(2.0), math.log(0.8) - math.log(2.0)]
-    )
-    assert result["frontier_state_count"] == 3
-    assert result["frontier_answering_state_count"] == 1
+    assert result["answer_log_masses"] == pytest.approx([math.log(0.75), math.log(0.5)])
+    assert result["requested_rollout_count"] == 4
+    assert result["rollout_count"] == 4
+    assert result["answering_rollout_count"] == 3
+    assert result["hit_rollout_count"] == 2
+    assert result["terminal_subgraph_count"] == 3
+    assert result["stopped_early"] is False
+    assert result["top_subgraph_probability"] == pytest.approx(0.5)
+    assert result["terminal_subgraphs"][0]["sample_count"] == 2
     assert result["terminal_subgraphs"][0]["per_answer_log_mass"] == pytest.approx(
-        math.log(0.8) - math.log(2.0)
+        math.log(0.5)
     )
+
+
+def test_subgraph_runtime_stops_early_when_top_answer_is_statistically_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _make_bridge_batch()
+    policy = _make_subgraph_policy(max_steps=2)
+    runtime = SubgraphAnswerSearchRuntime(
+        eval_cfg=_make_eval_cfg(
+            report_profile="rank_only",
+            monte_carlo={
+                "rollouts": 20,
+                "batch_rollouts": 4,
+                "temperature": 0.7,
+                "confidence": 0.95,
+                "early_stop": {
+                    "enabled": True,
+                    "min_rollouts": 12,
+                    "stability_top_k": 1,
+                },
+                "action_pruning": {
+                    "per_node_top_k": 5,
+                    "per_state_top_k": 7,
+                },
+            },
+        ),
+        policy=policy,
+        sampler=SubgraphSampler(max_steps=2),
+    )
+    seen_calls: list[dict[str, object]] = []
+
+    def _fake_sample(**kwargs: object) -> SubgraphTrajectorySampleBatch:
+        seen_calls.append(dict(kwargs))
+        return SubgraphTrajectorySampleBatch(
+            state_log_flows=torch.zeros((1, 4, 3), dtype=torch.float32),
+            log_pf_actions=torch.zeros((1, 4, 3), dtype=torch.float32),
+            log_reward_actions=torch.zeros((1, 4, 3), dtype=torch.float32),
+            action_mask=torch.zeros((1, 4, 3), dtype=torch.bool),
+            termination_action_steps=torch.tensor([[3, 3, 3, 3]], dtype=torch.long),
+            chosen_edge_ids=torch.full((1, 4, 2), -1, dtype=torch.long),
+            stop_actions=torch.zeros((1, 4, 3), dtype=torch.bool),
+            terminal_answer_counts=torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+            terminal_hit_mask=torch.tensor(
+                [[True, True, True, True]], dtype=torch.bool
+            ),
+            terminal_component_counts=torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+            terminal_edge_ids=((0, 1), (0, 1), (0, 1), (0, 1)),
+            terminal_node_ids=((0, 1, 2), (0, 1, 2), (0, 1, 2), (0, 1, 2)),
+            terminal_reachability_bits=(
+                {0: 1, 1: 3, 2: 2},
+                {0: 1, 1: 3, 2: 2},
+                {0: 1, 1: 3, 2: 2},
+                {0: 1, 1: 3, 2: 2},
+            ),
+            sample_ids=("bridge-subgraph",),
+            question_ids=("bridge-subgraph",),
+            num_graphs=1,
+            num_rollouts=4,
+        )
+
+    monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
+
+    result = runtime._predict_single_graph(batch=batch, include_answer_support=False)
+
+    assert len(seen_calls) == 3
+    assert seen_calls[0]["temperature"] == pytest.approx(0.7)
+    assert seen_calls[0]["action_pruning"] == {
+        "per_node_top_k": 5,
+        "per_state_top_k": 7,
+    }
+    assert result["requested_rollout_count"] == 20
+    assert result["rollout_count"] == 12
+    assert result["stopped_early"] is True
+    assert result["early_stop_margin"] is not None
+    assert result["early_stop_margin"] > 0.0
+    assert result["predicted_answer_entity_ids"] == [101]
+    assert result["answer_log_masses"] == pytest.approx([0.0])
 
 
 def test_gflownet_module_subgraph_mode_uses_subgraph_runtime() -> None:

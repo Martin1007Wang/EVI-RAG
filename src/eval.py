@@ -11,7 +11,10 @@ from omegaconf import DictConfig, OmegaConf
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.metrics.search_eval_utils import normalize_search_eval_cfg
+from src.metrics.search_eval_utils import (
+    format_search_eval_answer_posterior,
+    normalize_search_eval_cfg,
+)
 from src.runs.common import resolve_execution_mode
 from src.utils.entrypoint_utils import (
     instantiate_lightning_task_objects,
@@ -206,8 +209,14 @@ def evaluate_model_inprocess(
         raise TypeError(
             "Existing model does not support `reconfigure_evaluation()` for in-process eval."
         )
-    reconfigure_evaluation(eval_cfg=_coerce_eval_cfg(cfg.model.eval_cfg))
+    eval_cfg = _coerce_eval_cfg(cfg.model.eval_cfg)
+    reconfigure_evaluation(eval_cfg=eval_cfg)
     execution_mode = resolve_execution_mode(run_cfg)
+    log.info(
+        "Eval config: report_profile=%s answer_posterior=%s",
+        eval_cfg.get("report_profile"),
+        format_search_eval_answer_posterior(eval_cfg),
+    )
     if execution_mode == "test":
         log.info("Running in-process trainer.test() on split=%s...", split)
         trainer.test(
@@ -256,6 +265,12 @@ def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     execution_mode = resolve_execution_mode(run_cfg)
     split = _configure_eval_split(datamodule, run_cfg)
     ckpt_path = cfg.get("ckpt_path")
+    eval_cfg = _coerce_eval_cfg(cfg.model.eval_cfg)
+    log.info(
+        "Eval config: report_profile=%s answer_posterior=%s",
+        eval_cfg.get("report_profile"),
+        format_search_eval_answer_posterior(eval_cfg),
+    )
     if execution_mode == "test":
         log.info("Running trainer.test() on split=%s...", split)
         trainer.test(

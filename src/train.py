@@ -29,8 +29,9 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
 
 from src.metrics.search_eval_utils import (
-    FLOW_FRONTIER_BACKEND,
+    format_search_eval_answer_posterior,
     normalize_search_eval_cfg,
+    search_eval_answer_posterior_signature,
     search_eval_is_answer_task,
 )
 from src.runs.answer_reachability import AnswerReachabilityEvalReporter
@@ -154,33 +155,6 @@ def _coerce_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
     return normalize_search_eval_cfg(eval_cfg)
 
 
-def _format_answer_posterior_config(eval_cfg: dict[str, Any]) -> str:
-    backend = str(eval_cfg["answer_posterior_backend"])
-    if backend == FLOW_FRONTIER_BACKEND:
-        flow_cfg = eval_cfg["flow_frontier"]
-        return (
-            "flow_frontier("
-            f"prune_epsilon={float(flow_cfg['prune_epsilon']):.6g}, "
-            f"max_expansions={int(flow_cfg['max_expansions'])}, "
-            f"max_frontier_size={int(flow_cfg['max_frontier_size'])}"
-            ")"
-        )
-    return f"monte_carlo(rollouts={int(eval_cfg['monte_carlo']['rollouts'])})"
-
-
-def _answer_posterior_signature(eval_cfg: dict[str, Any]) -> tuple[Any, ...]:
-    backend = str(eval_cfg["answer_posterior_backend"])
-    if backend == FLOW_FRONTIER_BACKEND:
-        flow_cfg = eval_cfg["flow_frontier"]
-        return (
-            backend,
-            float(flow_cfg["prune_epsilon"]),
-            int(flow_cfg["max_expansions"]),
-            int(flow_cfg["max_frontier_size"]),
-        )
-    return (backend, int(eval_cfg["monte_carlo"]["rollouts"]))
-
-
 def _compose_final_eval_template(
     cfg: DictConfig,
     *,
@@ -221,8 +195,8 @@ def _validate_answer_posterior_alignment(
     ):
         return
 
-    train_signature = _answer_posterior_signature(train_eval_cfg)
-    final_signature = _answer_posterior_signature(final_eval_cfg)
+    train_signature = search_eval_answer_posterior_signature(train_eval_cfg)
+    final_signature = search_eval_answer_posterior_signature(final_eval_cfg)
     if train_signature == final_signature:
         return
 
@@ -233,15 +207,15 @@ def _validate_answer_posterior_alignment(
     raise ValueError(
         "Training-time answer-ranking checkpoint selection and post-fit final eval "
         "must use the same answer-posterior estimator. "
-        f"Got train eval_cfg={_format_answer_posterior_config(train_eval_cfg)} but "
+        f"Got train eval_cfg={format_search_eval_answer_posterior(train_eval_cfg)} but "
         f"final eval experiment={final_eval_experiment!r} uses "
-        f"{_format_answer_posterior_config(final_eval_cfg)}. "
+        f"{format_search_eval_answer_posterior(final_eval_cfg)}. "
         "This would pick checkpoints under one answer posterior and score final "
         "eval under another. Keep the answer-posterior config aligned between "
-        "train validation and final eval (the canonical RankFlow pair is "
-        "`flow_frontier(prune_epsilon=0.001, max_expansions=500000, "
-        "max_frontier_size=65536)` in both places), or disable post-fit final "
-        "eval and run the alternate configuration explicitly via `python src/eval.py ...`."
+        "train validation and final eval (the canonical RankFlow pair uses the "
+        "same Monte Carlo rollout budget in both places), or disable post-fit "
+        "final eval and run the alternate configuration explicitly via "
+        "`python src/eval.py ...`."
     )
 
 
@@ -304,9 +278,13 @@ def _build_final_eval_cfg(
     _validate_answer_posterior_alignment(cfg, eval_template=eval_template)
 
     eval_cfg = _clone_cfg_node(eval_template)
-    merged_eval_cfg = OmegaConf.merge(
-        _clone_cfg_node(cfg.model.eval_cfg),
-        _clone_cfg_node(eval_template.model.eval_cfg),
+    merged_eval_cfg = OmegaConf.create(
+        _coerce_search_eval_cfg(
+            OmegaConf.merge(
+                _clone_cfg_node(cfg.model.eval_cfg),
+                _clone_cfg_node(eval_template.model.eval_cfg),
+            )
+        )
     )
 
     model_cfg = _clone_cfg_node(cfg.model)
@@ -387,8 +365,8 @@ def _run_final_eval_suite(
     final_metrics: Dict[str, Any] = {}
     split = str(cfg.run.get("split") or "test")
     report_profile = str(cfg.model.eval_cfg.get("report_profile") or "")
-    answer_posterior_backend = str(
-        cfg.model.eval_cfg.get("answer_posterior_backend") or ""
+    answer_posterior_cfg = format_search_eval_answer_posterior(
+        _coerce_search_eval_cfg(cfg.model.eval_cfg)
     )
     can_reuse_eval_stack = (
         trainer is not None and model is not None and datamodule is not None
@@ -396,11 +374,11 @@ def _run_final_eval_suite(
     released_original_state = False
     for variant in variants:
         log.info(
-            "Final evaluation: dataset_variant=%s split=%s report_profile=%s answer_posterior_backend=%s",
+            "Final evaluation: dataset_variant=%s split=%s report_profile=%s answer_posterior=%s",
             variant.label,
             split,
             report_profile,
-            answer_posterior_backend,
+            answer_posterior_cfg,
         )
         with temporary_cfg_overrides(
             cfg,
@@ -533,9 +511,11 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     run_cfg = cfg.get("run") or {}
     log.info(
-        "Training-time validation report_profile=%s answer_posterior_backend=%s",
+        "Training-time validation report_profile=%s answer_posterior=%s",
         cfg.model.eval_cfg.get("report_profile"),
-        cfg.model.eval_cfg.get("answer_posterior_backend"),
+        format_search_eval_answer_posterior(
+            _coerce_search_eval_cfg(cfg.model.eval_cfg)
+        ),
     )
     if bool(run_cfg.get("test", False)):
         final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()

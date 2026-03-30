@@ -8,7 +8,6 @@ from .policy import SubgraphPolicy
 from .replay import SubgraphReplayRecord, SubgraphSuccessReplayBuffer
 from .reward import SubgraphRewardModel
 from .sampler import SubgraphSampler
-from .search import beam_search_subgraphs
 from .state import SubgraphAction, SubgraphState
 
 __all__ = [
@@ -21,5 +20,4 @@ __all__ = [
     "SubgraphSuccessReplayBuffer",
     "SubgraphState",
     "SubgraphSubTrajectoryBalanceLoss",
-    "beam_search_subgraphs",
 ]

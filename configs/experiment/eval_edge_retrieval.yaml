@@ -16,7 +16,6 @@ model:
   eval_cfg:
     task: edge_retrieval
     report_profile: rank_only
-    answer_posterior_backend: monte_carlo
 
 run:
   artifact_subdir: eval_edge_retrieval

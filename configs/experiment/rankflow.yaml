@@ -22,9 +22,5 @@ defaults:
 model:
   eval_cfg:
     report_profile: full
-    answer_posterior_backend: flow_frontier
-    # Final eval uses the same canonical frontier posterior as checkpoint
+    # Final eval uses the same canonical Monte Carlo posterior as checkpoint
     # selection, but emits the full support-window report surface.
-    flow_frontier:
-      max_expansions: 500000
-      max_frontier_size: 65536

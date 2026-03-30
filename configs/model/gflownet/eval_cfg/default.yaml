@@ -2,7 +2,6 @@
 
 defaults:
   - _self_
-  - flow_frontier: default
   - monte_carlo: default
 
 report_profile: full
@@ -13,4 +12,3 @@ support_path_overlap_penalty: 0.25
 answer_top_ks: [1, 5, 10]
 edge_top_ks: [1, 5, 10, 25, 50]
 edge_emit_top_k: 25
-answer_posterior_backend: flow_frontier

@@ -685,17 +685,17 @@ def _build_sample_cases(
     limit: int,
 ) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    flow_key = "flow_frontier_prune0_full"
-    mc_key = "monte_carlo_256_rank_only"
+    mc_high_key = "monte_carlo_4096_full"
+    mc_low_key = "monte_carlo_256_rank_only"
     for sample_id, teacher in teacher_records.items():
         if not teacher.get("path_found"):
             continue
         hop = teacher.get("hop")
         if hop is None or int(hop) < 2:
             continue
-        flow_record = prediction_records.get(flow_key, {}).get(sample_id)
-        mc_record = prediction_records.get(mc_key, {}).get(sample_id)
-        if flow_record is None or mc_record is None:
+        mc_high_record = prediction_records.get(mc_high_key, {}).get(sample_id)
+        mc_low_record = prediction_records.get(mc_low_key, {}).get(sample_id)
+        if mc_high_record is None or mc_low_record is None:
             continue
         answer_rank_t0 = teacher.get("answer_rank_t0")
         bridge_rank_t0 = teacher.get("bridge_rank_t0")
@@ -710,13 +710,13 @@ def _build_sample_cases(
                 "bridge_minus_answer_rank": int(bridge_rank_t0) - int(answer_rank_t0),
                 "total_path_prob": float(teacher["total_path_prob"]),
                 "step_records": teacher.get("step_records", []),
-                "flow_frontier_prune0_hit10": float(flow_record["hit@10"]),
-                "flow_frontier_prune0_gold_answer_mass": float(
-                    flow_record["gold_answer_mass"]
+                "monte_carlo_4096_hit10": float(mc_high_record["hit@10"]),
+                "monte_carlo_4096_gold_answer_mass": float(
+                    mc_high_record["gold_answer_mass"]
                 ),
-                "monte_carlo_256_hit10": float(mc_record["hit@10"]),
+                "monte_carlo_256_hit10": float(mc_low_record["hit@10"]),
                 "monte_carlo_256_gold_answer_mass": float(
-                    mc_record["gold_answer_mass"]
+                    mc_low_record["gold_answer_mass"]
                 ),
             }
         )
@@ -791,29 +791,17 @@ def _build_eval_cfgs(base_eval_cfg: Any) -> dict[str, dict[str, Any]]:
 
     monte_carlo_256 = deepcopy(base_cfg)
     monte_carlo_256["report_profile"] = "rank_only"
-    monte_carlo_256["answer_posterior_backend"] = "monte_carlo"
     monte_carlo_256["monte_carlo"]["rollouts"] = 256
+    monte_carlo_256["monte_carlo"]["batch_rollouts"] = 256
 
     monte_carlo_4096 = deepcopy(base_cfg)
-    monte_carlo_4096["report_profile"] = "rank_only"
-    monte_carlo_4096["answer_posterior_backend"] = "monte_carlo"
+    monte_carlo_4096["report_profile"] = "full"
     monte_carlo_4096["monte_carlo"]["rollouts"] = 4096
-
-    flow_frontier_prune1e3 = deepcopy(base_cfg)
-    flow_frontier_prune1e3["report_profile"] = "full"
-    flow_frontier_prune1e3["answer_posterior_backend"] = "flow_frontier"
-    flow_frontier_prune1e3["flow_frontier"]["prune_epsilon"] = 1.0e-3
-
-    flow_frontier_prune0 = deepcopy(base_cfg)
-    flow_frontier_prune0["report_profile"] = "full"
-    flow_frontier_prune0["answer_posterior_backend"] = "flow_frontier"
-    flow_frontier_prune0["flow_frontier"]["prune_epsilon"] = 0.0
+    monte_carlo_4096["monte_carlo"]["batch_rollouts"] = 256
 
     return {
         "monte_carlo_256_rank_only": monte_carlo_256,
-        "monte_carlo_4096_rank_only": monte_carlo_4096,
-        "flow_frontier_prune1e-3_full": flow_frontier_prune1e3,
-        "flow_frontier_prune0_full": flow_frontier_prune0,
+        "monte_carlo_4096_full": monte_carlo_4096,
     }
 
 
@@ -885,16 +873,9 @@ def main() -> None:
         "eval_cfgs": {
             name: {
                 "report_profile": str(eval_cfg["report_profile"]),
-                "answer_posterior_backend": str(eval_cfg["answer_posterior_backend"]),
-                "flow_frontier": {
-                    "prune_epsilon": float(eval_cfg["flow_frontier"]["prune_epsilon"]),
-                    "max_expansions": int(eval_cfg["flow_frontier"]["max_expansions"]),
-                    "max_frontier_size": int(
-                        eval_cfg["flow_frontier"]["max_frontier_size"]
-                    ),
-                },
                 "monte_carlo": {
                     "rollouts": int(eval_cfg["monte_carlo"]["rollouts"]),
+                    "batch_rollouts": int(eval_cfg["monte_carlo"]["batch_rollouts"]),
                     "confidence": float(eval_cfg["monte_carlo"]["confidence"]),
                 },
             }

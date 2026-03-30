@@ -1,5 +1,0 @@
-# @package model.eval_cfg.flow_frontier
-
-prune_epsilon: 1.0e-3
-max_expansions: 20000
-max_frontier_size: 4096

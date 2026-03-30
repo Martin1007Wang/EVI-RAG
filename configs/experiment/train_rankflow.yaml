@@ -82,12 +82,8 @@ model:
       final_alpha: 0.0
       hold_steps: 2000
   eval_cfg:
-    # Keep training-time checkpoint selection on the same flow-frontier answer
+    # Keep training-time checkpoint selection on the same Monte Carlo answer
     # posterior that final eval uses; only the report surface stays rank-only.
     report_profile: rank_only
-    answer_posterior_backend: flow_frontier
-    flow_frontier:
-      max_expansions: 500000
-      max_frontier_size: 65536
   optimizer_cfg:
     lr: 5.0e-5
