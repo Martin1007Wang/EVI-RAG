@@ -218,14 +218,22 @@ def analyze_subgraph_rollout_batch(
     prepared_batch: SubgraphPreparedBatch,
     rollout_batch: SubgraphRolloutBatch,
 ) -> tuple[SubgraphAnalysis, ...]:
-    return tuple(
-        analyze_subgraph_state(
-            prepared_batch=prepared_batch,
-            graph_idx=int(rollout_batch.graph_ids[state_idx].item()),
-            state=rollout_batch.states[state_idx],
-        )
-        for state_idx in range(rollout_batch.num_states)
-    )
+    cache: dict[tuple[int, tuple[int, ...]], SubgraphAnalysis] = {}
+    analyses: list[SubgraphAnalysis] = []
+    for state_idx in range(rollout_batch.num_states):
+        graph_idx = int(rollout_batch.graph_ids[state_idx].item())
+        state = rollout_batch.states[state_idx]
+        cache_key = (graph_idx, state.edge_ids)
+        analysis = cache.get(cache_key)
+        if analysis is None:
+            analysis = analyze_subgraph_state(
+                prepared_batch=prepared_batch,
+                graph_idx=graph_idx,
+                state=state,
+            )
+            cache[cache_key] = analysis
+        analyses.append(analysis)
+    return tuple(analyses)
 
 
 def transition_subgraph_rollout_batch(

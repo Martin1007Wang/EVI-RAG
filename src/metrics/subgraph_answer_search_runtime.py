@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import importlib
 import math
 from pathlib import Path
 from typing import Any, Callable
 
 from src.graph import TrajectoryBatch
+from src.metrics.prediction_io import append_jsonl_records
 from src.metrics.search_eval_utils import normalize_search_eval_cfg
+from src.data.schema.constants import EntityVocabFields, RelationVocabFields
 from src.models.gflownet.policy import SubgraphPolicy
 from src.models.gflownet.reward import resolve_subgraph_answer_entities
 from src.models.gflownet.sampler import SubgraphSampler
@@ -43,6 +46,34 @@ class _TerminalSampleAggregate:
     reachability_bits: dict[int, int]
     answer_entities: tuple[int, ...]
     sample_count: int = 0
+
+
+@dataclass
+class _GraphPredictionAccumulator:
+    original_graph_idx: int
+    sample_id: str
+    question: str
+    gold_answer_entity_ids: list[int]
+    a_entity_in_graph: bool
+    candidate_answer_upper_bound: int
+    answer_vote_counts: dict[int, int] = field(default_factory=dict)
+    terminal_subgraphs: dict[tuple[int, ...], _TerminalSampleAggregate] = field(
+        default_factory=dict
+    )
+    answering_rollout_count: int = 0
+    hit_rollout_count: int = 0
+    total_stop_steps: float = 0.0
+    total_terminal_component_count: float = 0.0
+    rollout_count: int = 0
+    early_stop_margin: float | None = None
+    stopped_early: bool = False
+
+
+@dataclass
+class _PredictMetricsAccumulator:
+    count: int = 0
+    primary_sums: dict[str, float] = field(default_factory=dict)
+    secondary_sums: dict[str, float] = field(default_factory=dict)
 
 
 def _topk_metrics(
@@ -134,64 +165,139 @@ def _topk_metrics_from_result(
     )
 
 
-def _summarize_result_rows(
-    *, results: list[dict[str, Any]], answer_top_ks: tuple[int, ...]
-) -> tuple[dict[str, float], dict[str, float]]:
-    metric_rows = [
-        _topk_metrics_from_result(result=result, top_ks=answer_top_ks)
-        for result in results
+def _support_mass_metrics_from_result(
+    *, result: dict[str, Any], edge_top_ks: tuple[int, ...]
+) -> dict[str, float]:
+    support_probabilities = [
+        float(value) for value in result.get("support_probabilities", [])
     ]
-    primary_metrics = _mean_metric_dict(metric_rows)
-    secondary_metrics = {
-        "subgraph/requested_rollout_count": float(
-            sum(
-                int(result.get("requested_rollout_count", result["rollout_count"]))
-                for result in results
-            )
-        )
-        / float(max(len(results), 1)),
-        "subgraph/rollout_count": float(
-            sum(int(result["rollout_count"]) for result in results)
-        )
-        / float(max(len(results), 1)),
-        "subgraph/early_stop_rate": float(
-            sum(1.0 for result in results if bool(result.get("stopped_early", False)))
-        )
-        / float(max(len(results), 1)),
-        "subgraph/terminal_count": float(
-            sum(int(result["terminal_subgraph_count"]) for result in results)
-        )
-        / float(max(len(results), 1)),
-        "subgraph/answering_rollout_rate": float(
-            sum(
-                float(result["answering_rollout_count"])
-                / float(max(int(result["rollout_count"]), 1))
-                for result in results
-            )
-        )
-        / float(max(len(results), 1)),
-        "subgraph/hit_rollout_rate": float(
-            sum(
-                float(result["hit_rollout_count"])
-                / float(max(int(result["rollout_count"]), 1))
-                for result in results
-            )
-        )
-        / float(max(len(results), 1)),
-        "subgraph/mean_stop_step": float(
-            sum(float(result["mean_stop_step"]) for result in results)
-        )
-        / float(max(len(results), 1)),
-        "subgraph/mean_terminal_component_count": float(
-            sum(float(result["mean_terminal_component_count"]) for result in results)
-        )
-        / float(max(len(results), 1)),
-        "subgraph/predicted_answer_count": float(
-            sum(len(result["predicted_answer_entity_ids"]) for result in results)
-        )
-        / float(max(len(results), 1)),
+    return {
+        f"support/mass@{int(k)}": float(sum(support_probabilities[: int(k)]))
+        for k in edge_top_ks
     }
-    return primary_metrics, secondary_metrics
+
+
+def _secondary_metrics_from_result(
+    *, result: dict[str, Any], edge_top_ks: tuple[int, ...]
+) -> dict[str, float]:
+    rollout_count = float(max(int(result["rollout_count"]), 1))
+    secondary = {
+        "subgraph/requested_rollout_count": float(
+            result.get("requested_rollout_count", result["rollout_count"])
+        ),
+        "subgraph/rollout_count": float(result["rollout_count"]),
+        "subgraph/early_stop_rate": 1.0
+        if bool(result.get("stopped_early", False))
+        else 0.0,
+        "subgraph/terminal_count": float(result["terminal_subgraph_count"]),
+        "subgraph/answering_rollout_rate": float(result["answering_rollout_count"])
+        / rollout_count,
+        "subgraph/hit_rollout_rate": float(result["hit_rollout_count"]) / rollout_count,
+        "subgraph/mean_stop_step": float(result["mean_stop_step"]),
+        "subgraph/mean_terminal_component_count": float(
+            result["mean_terminal_component_count"]
+        ),
+        "subgraph/predicted_answer_count": float(
+            len(result["predicted_answer_entity_ids"])
+        ),
+    }
+    secondary.update(
+        _support_mass_metrics_from_result(result=result, edge_top_ks=edge_top_ks)
+    )
+    return secondary
+
+
+def _accumulate_metric_sums(
+    totals: dict[str, float], row: dict[str, float]
+) -> dict[str, float]:
+    for key, value in row.items():
+        totals[key] = float(totals.get(key, 0.0)) + float(value)
+    return totals
+
+
+def _average_metric_sums(totals: dict[str, float], *, count: int) -> dict[str, float]:
+    if count <= 0:
+        return {}
+    return {key: float(value) / float(count) for key, value in sorted(totals.items())}
+
+
+def _edge_overlap_ratio(
+    edge_ids: tuple[int, ...], other_edge_ids: tuple[int, ...]
+) -> float:
+    edge_set = set(int(edge_id) for edge_id in edge_ids)
+    other_set = set(int(edge_id) for edge_id in other_edge_ids)
+    if not edge_set or not other_set:
+        return 0.0
+    return float(len(edge_set.intersection(other_set))) / float(
+        len(edge_set.union(other_set))
+    )
+
+
+def _select_terminal_support(
+    *,
+    ranked_terminals: list[_TerminalSampleAggregate],
+    executed_rollouts: int,
+    edge_emit_top_k: int,
+    support_mass_threshold: float,
+    support_path_overlap_penalty: float,
+) -> list[_TerminalSampleAggregate]:
+    if edge_emit_top_k < 1 or not ranked_terminals:
+        return []
+    selected: list[_TerminalSampleAggregate] = []
+    remaining = list(ranked_terminals)
+    accumulated_mass = 0.0
+    while remaining and len(selected) < int(edge_emit_top_k):
+        if accumulated_mass >= float(support_mass_threshold) and selected:
+            break
+        if not selected or support_path_overlap_penalty <= 0.0:
+            chosen_idx = 0
+        else:
+            best_score = float("-inf")
+            chosen_idx = 0
+            for idx, payload in enumerate(remaining):
+                probability = float(payload.sample_count) / float(
+                    max(executed_rollouts, 1)
+                )
+                max_overlap = max(
+                    _edge_overlap_ratio(payload.edge_ids, chosen.edge_ids)
+                    for chosen in selected
+                )
+                score = float(probability) - (
+                    float(support_path_overlap_penalty) * float(max_overlap)
+                )
+                if score > best_score:
+                    best_score = score
+                    chosen_idx = idx
+        chosen = remaining.pop(chosen_idx)
+        selected.append(chosen)
+        accumulated_mass += float(chosen.sample_count) / float(
+            max(executed_rollouts, 1)
+        )
+    return selected
+
+
+def _summarize_result_rows(
+    *,
+    results: list[dict[str, Any]],
+    answer_top_ks: tuple[int, ...],
+    edge_top_ks: tuple[int, ...],
+) -> tuple[dict[str, float], dict[str, float]]:
+    primary_sums: dict[str, float] = {}
+    secondary_sums: dict[str, float] = {}
+    for result in results:
+        _accumulate_metric_sums(
+            primary_sums,
+            _topk_metrics_from_result(result=result, top_ks=answer_top_ks),
+        )
+        _accumulate_metric_sums(
+            secondary_sums,
+            _secondary_metrics_from_result(result=result, edge_top_ks=edge_top_ks),
+        )
+    count = len(results)
+    return (
+        _average_metric_sums(primary_sums, count=count),
+        _average_metric_sums(secondary_sums, count=count),
+    )
 
 
 def _build_analysis(
@@ -208,6 +314,269 @@ def _build_analysis(
         anchor_component_count=int(anchor_component_count),
         num_selected_edges=int(num_selected_edges),
     )
+
+
+def _edge_records_from_terminal(
+    *, batch: TrajectoryBatch, graph_idx: int, edge_ids: tuple[int, ...]
+) -> list[dict[str, int]]:
+    edge_start = int(batch.edge_ptr[graph_idx].item())
+    records: list[dict[str, int]] = []
+    for edge_id in edge_ids:
+        edge_idx = int(edge_start + int(edge_id))
+        src_node = int(batch.edge_index[0, edge_idx].item())
+        dst_node = int(batch.edge_index[1, edge_idx].item())
+        records.append(
+            {
+                "edge_id": int(edge_id),
+                "src_entity_id": int(batch.node_entity_ids[src_node].item()),
+                "relation_id": int(batch.edge_rel_global[edge_idx].item()),
+                "dst_entity_id": int(batch.node_entity_ids[dst_node].item()),
+            }
+        )
+    return records
+
+
+def _trajectory_text_from_edge_records(edge_records: list[dict[str, int]]) -> str:
+    if not edge_records:
+        return "(start_only)"
+    return " ; ".join(
+        (f"{edge['src_entity_id']} --{edge['relation_id']}--> {edge['dst_entity_id']}")
+        for edge in edge_records
+    )
+
+
+def _build_support_records(
+    *,
+    batch: TrajectoryBatch,
+    graph_idx: int,
+    support_payloads: list[_TerminalSampleAggregate],
+    executed_rollouts: int,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path_rank, payload in enumerate(support_payloads, start=1):
+        probability = float(payload.sample_count) / float(max(executed_rollouts, 1))
+        edge_records = _edge_records_from_terminal(
+            batch=batch,
+            graph_idx=graph_idx,
+            edge_ids=payload.edge_ids,
+        )
+        terminal_entity_id = (
+            payload.answer_entities[0] if payload.answer_entities else None
+        )
+        records.append(
+            {
+                "path_rank": int(path_rank),
+                "edge_ids": [int(edge_id) for edge_id in payload.edge_ids],
+                "selected_node_ids": [
+                    int(node_id) for node_id in payload.selected_node_ids
+                ],
+                "answer_entities": [
+                    int(entity_id) for entity_id in payload.answer_entities
+                ],
+                "sample_count": int(payload.sample_count),
+                "probability": float(probability),
+                "prob": float(probability),
+                "per_answer_log_mass": _split_terminal_answer_log_mass(
+                    probability_mass=probability,
+                    answer_entities=payload.answer_entities,
+                ),
+                "edges": edge_records,
+                "trajectory_text": (
+                    _trajectory_text_from_edge_records(edge_records)
+                    if edge_records
+                    else (
+                        f"(start_only) {int(terminal_entity_id)}"
+                        if terminal_entity_id is not None
+                        else "(start_only)"
+                    )
+                ),
+                "terminal_entity_id": (
+                    None if terminal_entity_id is None else int(terminal_entity_id)
+                ),
+            }
+        )
+    return records
+
+
+def _build_graph_prediction_accumulator(
+    *,
+    batch: TrajectoryBatch,
+    prepared_batch: Any,
+    graph_idx: int,
+    original_graph_idx: int,
+) -> _GraphPredictionAccumulator:
+    gold_answer_entity_ids = [
+        int(value)
+        for value in batch.answer_entity_ids[
+            int(batch.answer_ptr[graph_idx].item()) : int(
+                batch.answer_ptr[graph_idx + 1].item()
+            )
+        ].tolist()
+    ]
+    graph_node_entities = prepared_batch.graph_node_entities[graph_idx]
+    return _GraphPredictionAccumulator(
+        original_graph_idx=int(original_graph_idx),
+        sample_id=str(batch.sample_ids[graph_idx]),
+        question=str(batch.questions[graph_idx]),
+        gold_answer_entity_ids=gold_answer_entity_ids,
+        a_entity_in_graph=bool(
+            set(int(entity_id) for entity_id in gold_answer_entity_ids).intersection(
+                graph_node_entities
+            )
+        ),
+        candidate_answer_upper_bound=_graph_candidate_answer_upper_bound(
+            prepared_batch=prepared_batch,
+            graph_idx=graph_idx,
+        ),
+    )
+
+
+def _finalize_graph_result(
+    *,
+    accumulator: _GraphPredictionAccumulator,
+    batch: TrajectoryBatch,
+    include_answer_support: bool,
+    edge_emit_top_k: int,
+    support_mass_threshold: float,
+    support_path_overlap_penalty: float,
+    requested_rollouts: int,
+) -> dict[str, Any]:
+    executed_rollouts = max(int(accumulator.rollout_count), 1)
+    ranked_answers = sorted(
+        accumulator.answer_vote_counts.items(),
+        key=lambda item: (-int(item[1]), int(item[0])),
+    )
+    ranked_terminals = sorted(
+        accumulator.terminal_subgraphs.values(),
+        key=lambda item: (-int(item.sample_count), item.edge_ids),
+    )
+    top_subgraph = ranked_terminals[0] if ranked_terminals else None
+    selected_support = _select_terminal_support(
+        ranked_terminals=ranked_terminals,
+        executed_rollouts=executed_rollouts,
+        edge_emit_top_k=int(edge_emit_top_k),
+        support_mass_threshold=float(support_mass_threshold),
+        support_path_overlap_penalty=float(support_path_overlap_penalty),
+    )
+    support_records = _build_support_records(
+        batch=batch,
+        graph_idx=int(accumulator.original_graph_idx),
+        support_payloads=selected_support,
+        executed_rollouts=executed_rollouts,
+    )
+    result: dict[str, Any] = {
+        "sample_id": str(accumulator.sample_id),
+        "question": str(accumulator.question),
+        "gold_answer_entity_ids": list(accumulator.gold_answer_entity_ids),
+        "predicted_answer_entity_ids": [
+            int(entity_id) for entity_id, _ in ranked_answers
+        ],
+        "answer_log_masses": [
+            float(math.log(float(votes) / float(executed_rollouts)))
+            for _, votes in ranked_answers
+        ],
+        "requested_rollout_count": int(requested_rollouts),
+        "rollout_count": int(accumulator.rollout_count),
+        "answering_rollout_count": int(accumulator.answering_rollout_count),
+        "hit_rollout_count": int(accumulator.hit_rollout_count),
+        "terminal_subgraph_count": int(len(ranked_terminals)),
+        "mean_stop_step": float(accumulator.total_stop_steps)
+        / float(executed_rollouts),
+        "mean_terminal_component_count": float(
+            accumulator.total_terminal_component_count
+        )
+        / float(executed_rollouts),
+        "stopped_early": bool(accumulator.stopped_early),
+        "early_stop_margin": accumulator.early_stop_margin,
+        "a_entity_in_graph": bool(accumulator.a_entity_in_graph),
+        "support_probabilities": [
+            float(record["probability"]) for record in support_records
+        ],
+    }
+    if top_subgraph is not None:
+        top_probability = float(top_subgraph.sample_count) / float(executed_rollouts)
+        result["top_subgraph_edge_ids"] = [
+            int(edge_id) for edge_id in top_subgraph.edge_ids
+        ]
+        result["top_subgraph_node_ids"] = [
+            int(node_id) for node_id in top_subgraph.selected_node_ids
+        ]
+        result["top_subgraph_probability"] = float(top_probability)
+        result["top_subgraph_sample_count"] = int(top_subgraph.sample_count)
+    if include_answer_support:
+        result["terminal_subgraphs"] = support_records
+        result["support_probability_mass"] = float(
+            sum(float(record["probability"]) for record in support_records)
+        )
+    return result
+
+
+def _load_vocab_label_map(
+    *, path: str | Path | None, id_field: str, label_field: str
+) -> dict[int, str]:
+    if path in (None, ""):
+        return {}
+    try:
+        pq_module = importlib.import_module("pyarrow.parquet")
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional at runtime
+        raise ModuleNotFoundError(
+            "pyarrow is required to load prediction artifact vocab files."
+        ) from exc
+    resolved = Path(str(path))
+    if not resolved.exists():
+        raise FileNotFoundError(f"Missing vocab parquet: {resolved}")
+    table = pq_module.read_table(resolved)
+    payload = table.to_pydict()
+    ids = payload.get(id_field, [])
+    labels = payload.get(label_field, [])
+    return {
+        int(entity_id): str(label)
+        for entity_id, label in zip(ids, labels)
+        if entity_id is not None
+    }
+
+
+def _decorate_trajectory_records(
+    *,
+    trajectories: list[dict[str, Any]],
+    entity_labels: dict[int, str],
+    relation_labels: dict[int, str],
+) -> list[dict[str, Any]]:
+    decorated: list[dict[str, Any]] = []
+    for trajectory in trajectories:
+        edges = [dict(edge) for edge in trajectory.get("edges", [])]
+        for edge in edges:
+            src_entity_id = edge.get("src_entity_id")
+            relation_id = edge.get("relation_id")
+            dst_entity_id = edge.get("dst_entity_id")
+            if src_entity_id is not None:
+                edge["src_text"] = str(
+                    entity_labels.get(int(src_entity_id), str(src_entity_id))
+                )
+            if relation_id is not None:
+                edge["relation_text"] = str(
+                    relation_labels.get(int(relation_id), str(relation_id))
+                )
+            if dst_entity_id is not None:
+                edge["dst_text"] = str(
+                    entity_labels.get(int(dst_entity_id), str(dst_entity_id))
+                )
+        terminal_entity_id = trajectory.get("terminal_entity_id")
+        decorated_trajectory = dict(trajectory)
+        decorated_trajectory["edges"] = edges
+        if terminal_entity_id is not None:
+            decorated_trajectory["terminal_entity_text"] = str(
+                entity_labels.get(int(terminal_entity_id), str(terminal_entity_id))
+            )
+        if edges:
+            decorated_trajectory["trajectory_text"] = " ; ".join(
+                f"{edge.get('src_text', edge.get('src_entity_id'))} --"
+                f"{edge.get('relation_text', edge.get('relation_id'))}--> "
+                f"{edge.get('dst_text', edge.get('dst_entity_id'))}"
+                for edge in edges
+            )
+        decorated.append(decorated_trajectory)
+    return decorated
 
 
 class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
@@ -232,7 +601,17 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         batch: TrajectoryBatch,
         include_answer_support: bool,
     ) -> dict[str, Any]:
-        prepared_batch = self.policy.prepare_batch(batch)
+        return self._predict_batch_results(
+            batch=batch,
+            include_answer_support=include_answer_support,
+        )[0]
+
+    def _predict_batch_results(
+        self,
+        *,
+        batch: TrajectoryBatch,
+        include_answer_support: bool,
+    ) -> list[dict[str, Any]]:
         monte_carlo_cfg = self.eval_cfg["monte_carlo"]
         requested_rollouts = int(monte_carlo_cfg["rollouts"])
         batch_rollouts = min(
@@ -249,185 +628,165 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         )
         stability_top_k = int(early_stop_cfg["stability_top_k"])
         action_pruning_cfg = monte_carlo_cfg["action_pruning"]
-        candidate_answer_upper_bound = _graph_candidate_answer_upper_bound(
-            prepared_batch=prepared_batch,
-            graph_idx=0,
-        )
 
-        answer_vote_counts: dict[int, int] = {}
-        terminal_subgraphs: dict[tuple[int, ...], _TerminalSampleAggregate] = {}
-        answering_rollout_count = 0
-        hit_rollout_count = 0
-        total_stop_steps = 0.0
-        total_terminal_component_count = 0.0
-        early_stop_margin: float | None = None
-
-        processed_rollouts = 0
-        while processed_rollouts < requested_rollouts:
-            current_rollouts = min(
-                batch_rollouts, requested_rollouts - processed_rollouts
+        active_graph_indices = list(range(int(batch.num_graphs)))
+        active_batch = batch
+        active_prepared_batch = self.policy.prepare_batch(active_batch)
+        accumulators = {
+            int(graph_idx): _build_graph_prediction_accumulator(
+                batch=batch,
+                prepared_batch=active_prepared_batch,
+                graph_idx=int(graph_idx),
+                original_graph_idx=int(graph_idx),
             )
+            for graph_idx in active_graph_indices
+        }
+
+        while active_graph_indices:
+            processed_rollouts = accumulators[active_graph_indices[0]].rollout_count
+            remaining_rollouts = int(requested_rollouts) - int(processed_rollouts)
+            if remaining_rollouts <= 0:
+                break
+            current_rollouts = min(int(batch_rollouts), int(remaining_rollouts))
             sample_batch = self.sampler.sample(
                 policy=self.policy,
-                prepared_batch=prepared_batch,
+                prepared_batch=active_prepared_batch,
                 rollouts_per_graph=current_rollouts,
                 temperature=temperature,
                 proposal_bias_scale=0.0,
                 action_pruning=action_pruning_cfg,
             )
-            stop_steps = (
-                sample_batch.termination_action_steps[0].detach().cpu().tolist()
-            )
-            terminal_component_counts = (
-                sample_batch.terminal_component_counts[0].detach().cpu().tolist()
-            )
-            hit_mask = sample_batch.terminal_hit_mask[0].detach().cpu().tolist()
-            total_stop_steps += float(sum(int(step) for step in stop_steps))
-            total_terminal_component_count += float(
-                sum(int(count) for count in terminal_component_counts)
-            )
-            hit_rollout_count += int(sum(bool(value) for value in hit_mask))
+            next_active_graph_indices: list[int] = []
+            for local_graph_idx, original_graph_idx in enumerate(active_graph_indices):
+                accumulator = accumulators[original_graph_idx]
+                active_node_start = int(active_batch.node_ptr[local_graph_idx].item())
+                active_edge_start = int(active_batch.edge_ptr[local_graph_idx].item())
+                stop_steps = (
+                    sample_batch.termination_action_steps[local_graph_idx]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                terminal_component_counts = (
+                    sample_batch.terminal_component_counts[local_graph_idx]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                hit_mask = (
+                    sample_batch.terminal_hit_mask[local_graph_idx]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                accumulator.total_stop_steps += float(
+                    sum(int(step) for step in stop_steps)
+                )
+                accumulator.total_terminal_component_count += float(
+                    sum(int(count) for count in terminal_component_counts)
+                )
+                accumulator.hit_rollout_count += int(
+                    sum(bool(value) for value in hit_mask)
+                )
 
-            for rollout_idx in range(current_rollouts):
-                edge_ids = tuple(
-                    int(edge_id)
-                    for edge_id in sample_batch.terminal_edge_ids[rollout_idx]
-                )
-                selected_node_ids = tuple(
-                    int(node_id)
-                    for node_id in sample_batch.terminal_node_ids[rollout_idx]
-                )
-                reachability_bits = {
-                    int(node_id): int(bits)
-                    for node_id, bits in sample_batch.terminal_reachability_bits[
-                        rollout_idx
-                    ].items()
-                }
-                analysis = _build_analysis(
-                    selected_node_ids=selected_node_ids,
-                    reachability_bits=reachability_bits,
-                    anchor_component_count=int(terminal_component_counts[rollout_idx]),
-                    num_selected_edges=len(edge_ids),
-                )
-                answer_entities = tuple(
-                    int(entity_id)
-                    for entity_id in resolve_subgraph_answer_entities(
-                        prepared_batch=prepared_batch,
-                        graph_idx=0,
-                        analysis=analysis,
+                for rollout_idx in range(current_rollouts):
+                    flat_rollout_idx = (
+                        local_graph_idx * current_rollouts
+                    ) + rollout_idx
+                    edge_ids = tuple(
+                        int(edge_id) - int(active_edge_start)
+                        for edge_id in sample_batch.terminal_edge_ids[flat_rollout_idx]
                     )
-                )
-                if answer_entities:
-                    answering_rollout_count += 1
-                    for entity_id in dict.fromkeys(answer_entities):
-                        answer_vote_counts[int(entity_id)] = (
-                            int(answer_vote_counts.get(int(entity_id), 0)) + 1
-                        )
-                payload = terminal_subgraphs.get(edge_ids)
-                if payload is None:
-                    payload = _TerminalSampleAggregate(
-                        edge_ids=edge_ids,
+                    selected_node_ids = tuple(
+                        int(node_id) - int(active_node_start)
+                        for node_id in sample_batch.terminal_node_ids[flat_rollout_idx]
+                    )
+                    reachability_bits = {
+                        int(node_id) - int(active_node_start): int(bits)
+                        for node_id, bits in sample_batch.terminal_reachability_bits[
+                            flat_rollout_idx
+                        ].items()
+                    }
+                    analysis = _build_analysis(
                         selected_node_ids=selected_node_ids,
                         reachability_bits=reachability_bits,
-                        answer_entities=answer_entities,
+                        anchor_component_count=int(
+                            terminal_component_counts[rollout_idx]
+                        ),
+                        num_selected_edges=len(edge_ids),
                     )
-                    terminal_subgraphs[edge_ids] = payload
-                payload.sample_count += 1
-            processed_rollouts += current_rollouts
+                    answer_entities = tuple(
+                        int(entity_id)
+                        for entity_id in resolve_subgraph_answer_entities(
+                            prepared_batch=active_prepared_batch,
+                            graph_idx=local_graph_idx,
+                            analysis=analysis,
+                        )
+                    )
+                    if answer_entities:
+                        accumulator.answering_rollout_count += 1
+                        for entity_id in dict.fromkeys(answer_entities):
+                            accumulator.answer_vote_counts[int(entity_id)] = (
+                                int(
+                                    accumulator.answer_vote_counts.get(
+                                        int(entity_id), 0
+                                    )
+                                )
+                                + 1
+                            )
+                    payload = accumulator.terminal_subgraphs.get(edge_ids)
+                    if payload is None:
+                        payload = _TerminalSampleAggregate(
+                            edge_ids=edge_ids,
+                            selected_node_ids=selected_node_ids,
+                            reachability_bits=reachability_bits,
+                            answer_entities=answer_entities,
+                        )
+                        accumulator.terminal_subgraphs[edge_ids] = payload
+                    payload.sample_count += 1
 
-            if early_stop_enabled and processed_rollouts >= early_stop_min_rollouts:
-                early_stop_margin = _topk_stability_margin(
-                    answer_vote_counts=answer_vote_counts,
-                    executed_rollouts=processed_rollouts,
-                    candidate_answer_upper_bound=candidate_answer_upper_bound,
+                accumulator.rollout_count += int(current_rollouts)
+                if accumulator.rollout_count >= int(requested_rollouts):
+                    continue
+                if not early_stop_enabled or accumulator.rollout_count < int(
+                    early_stop_min_rollouts
+                ):
+                    next_active_graph_indices.append(int(original_graph_idx))
+                    continue
+                accumulator.early_stop_margin = _topk_stability_margin(
+                    answer_vote_counts=accumulator.answer_vote_counts,
+                    executed_rollouts=accumulator.rollout_count,
+                    candidate_answer_upper_bound=accumulator.candidate_answer_upper_bound,
                     confidence=confidence,
                     stability_top_k=stability_top_k,
                 )
-                if early_stop_margin is not None and early_stop_margin > 0.0:
-                    break
+                if (
+                    accumulator.early_stop_margin is not None
+                    and accumulator.early_stop_margin > 0.0
+                ):
+                    accumulator.stopped_early = True
+                    continue
+                next_active_graph_indices.append(int(original_graph_idx))
 
-        executed_rollouts = max(processed_rollouts, 1)
-        stopped_early = processed_rollouts < requested_rollouts
+            if next_active_graph_indices == active_graph_indices:
+                continue
+            active_graph_indices = next_active_graph_indices
+            if not active_graph_indices:
+                break
+            active_batch = batch.select_graphs(active_graph_indices, validate=False)
+            active_prepared_batch = self.policy.prepare_batch(active_batch)
 
-        ranked_answers = sorted(
-            answer_vote_counts.items(),
-            key=lambda item: (-int(item[1]), int(item[0])),
-        )
-        ranked_terminals = sorted(
-            terminal_subgraphs.values(),
-            key=lambda item: (-int(item.sample_count), item.edge_ids),
-        )
-        gold_answers = [
-            int(value) for value in batch.answer_entity_ids.detach().cpu().tolist()
-        ]
-        top_subgraph = ranked_terminals[0] if ranked_terminals else None
-        result: dict[str, Any] = {
-            "sample_id": str(batch.sample_ids[0]),
-            "question": str(batch.questions[0]),
-            "gold_answer_entity_ids": gold_answers,
-            "predicted_answer_entity_ids": [
-                int(entity_id) for entity_id, _ in ranked_answers
-            ],
-            "answer_log_masses": [
-                float(math.log(float(votes) / float(executed_rollouts)))
-                for _, votes in ranked_answers
-            ],
-            "requested_rollout_count": int(requested_rollouts),
-            "rollout_count": int(processed_rollouts),
-            "answering_rollout_count": int(answering_rollout_count),
-            "hit_rollout_count": int(hit_rollout_count),
-            "terminal_subgraph_count": int(len(ranked_terminals)),
-            "mean_stop_step": float(total_stop_steps) / float(executed_rollouts),
-            "mean_terminal_component_count": float(total_terminal_component_count)
-            / float(executed_rollouts),
-            "stopped_early": bool(stopped_early),
-            "early_stop_margin": early_stop_margin,
-        }
-        if top_subgraph is not None:
-            top_probability = float(top_subgraph.sample_count) / float(
-                executed_rollouts
-            )
-            result["top_subgraph_edge_ids"] = [
-                int(edge_id) for edge_id in top_subgraph.edge_ids
-            ]
-            result["top_subgraph_node_ids"] = [
-                int(node_id) for node_id in top_subgraph.selected_node_ids
-            ]
-            result["top_subgraph_probability"] = float(top_probability)
-            result["top_subgraph_sample_count"] = int(top_subgraph.sample_count)
-        if include_answer_support:
-            result["terminal_subgraphs"] = [
-                {
-                    "edge_ids": [int(edge_id) for edge_id in payload.edge_ids],
-                    "selected_node_ids": [
-                        int(node_id) for node_id in payload.selected_node_ids
-                    ],
-                    "answer_entities": [
-                        int(entity_id) for entity_id in payload.answer_entities
-                    ],
-                    "sample_count": int(payload.sample_count),
-                    "probability": float(payload.sample_count)
-                    / float(executed_rollouts),
-                    "per_answer_log_mass": _split_terminal_answer_log_mass(
-                        probability_mass=float(payload.sample_count)
-                        / float(executed_rollouts),
-                        answer_entities=payload.answer_entities,
-                    ),
-                }
-                for payload in ranked_terminals[: int(self.eval_cfg["edge_emit_top_k"])]
-            ]
-        return result
-
-    def _predict_batch_results(
-        self,
-        *,
-        batch: TrajectoryBatch,
-        include_answer_support: bool,
-    ) -> list[dict[str, Any]]:
         return [
-            self._predict_single_graph(
-                batch=batch.select_graph(graph_idx, validate=False),
+            _finalize_graph_result(
+                accumulator=accumulators[graph_idx],
+                batch=batch,
                 include_answer_support=include_answer_support,
+                edge_emit_top_k=int(self.eval_cfg["edge_emit_top_k"]),
+                support_mass_threshold=float(self.eval_cfg["support_mass_threshold"]),
+                support_path_overlap_penalty=float(
+                    self.eval_cfg["support_path_overlap_penalty"]
+                ),
+                requested_rollouts=int(requested_rollouts),
             )
             for graph_idx in range(int(batch.num_graphs))
         ]
@@ -448,6 +807,7 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         primary_metrics, secondary_metrics = _summarize_result_rows(
             results=results,
             answer_top_ks=tuple(int(k) for k in self.eval_cfg["answer_top_ks"]),
+            edge_top_ks=tuple(int(k) for k in self.eval_cfg["edge_top_ks"]),
         )
         return MetricEvaluationOutput(
             model_metrics={},
@@ -477,7 +837,9 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         return [
             {
                 "sample_id": str(output["sample_id"]),
+                "question": str(output["question"]),
                 "gold_answer_entity_ids": list(output["gold_answer_entity_ids"]),
+                "a_entity_in_graph": bool(output.get("a_entity_in_graph", False)),
             }
             for output in outputs
         ]
@@ -489,11 +851,62 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         report_profile: str,
     ) -> dict[str, float]:
         del report_profile
-        primary_metrics, _ = _summarize_result_rows(
+        primary_metrics, secondary_metrics = _summarize_result_rows(
             results=[dict(result) for result in predict_results],
             answer_top_ks=tuple(int(k) for k in self.eval_cfg["answer_top_ks"]),
+            edge_top_ks=tuple(int(k) for k in self.eval_cfg["edge_top_ks"]),
         )
-        return primary_metrics
+        return {**primary_metrics, **secondary_metrics}
+
+    def initialize_predict_metrics_accumulator(
+        self,
+        *,
+        report_profile: str,
+    ) -> _PredictMetricsAccumulator:
+        del report_profile
+        return _PredictMetricsAccumulator()
+
+    def update_predict_metrics_accumulator(
+        self,
+        *,
+        accumulator: _PredictMetricsAccumulator,
+        predict_results: list[Any],
+        report_profile: str,
+    ) -> None:
+        del report_profile
+        for result in [dict(item) for item in predict_results]:
+            accumulator.count += 1
+            _accumulate_metric_sums(
+                accumulator.primary_sums,
+                _topk_metrics_from_result(
+                    result=result,
+                    top_ks=tuple(int(k) for k in self.eval_cfg["answer_top_ks"]),
+                ),
+            )
+            _accumulate_metric_sums(
+                accumulator.secondary_sums,
+                _secondary_metrics_from_result(
+                    result=result,
+                    edge_top_ks=tuple(int(k) for k in self.eval_cfg["edge_top_ks"]),
+                ),
+            )
+
+    def finalize_predict_metrics_accumulator(
+        self,
+        *,
+        accumulator: _PredictMetricsAccumulator,
+        report_profile: str,
+    ) -> dict[str, float]:
+        del report_profile
+        primary_metrics = _average_metric_sums(
+            accumulator.primary_sums,
+            count=accumulator.count,
+        )
+        secondary_metrics = _average_metric_sums(
+            accumulator.secondary_sums,
+            count=accumulator.count,
+        )
+        return {**primary_metrics, **secondary_metrics}
 
     def write_prediction_artifacts(
         self,
@@ -509,19 +922,110 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         questions_path: str | Path | None,
         overwrite: bool,
     ) -> dict[str, Path] | None:
-        del (
-            results,
-            labels,
-            output_dir,
-            split,
-            artifact_name,
-            schema_version,
-            entity_vocab_path,
-            relation_vocab_path,
-            questions_path,
-            overwrite,
+        del artifact_name, schema_version, questions_path
+        if not results:
+            return None
+        output_root = Path(str(output_dir))
+        output_root.mkdir(parents=True, exist_ok=True)
+        results_path = output_root / f"{split}.jsonl"
+        labels_path = output_root / f"{split}.labels.jsonl"
+        if overwrite:
+            for path in (results_path, labels_path):
+                if path.exists():
+                    path.unlink()
+
+        entity_labels = _load_vocab_label_map(
+            path=entity_vocab_path,
+            id_field=EntityVocabFields.ENTITY_ID,
+            label_field=EntityVocabFields.LABEL,
         )
-        return None
+        relation_labels = _load_vocab_label_map(
+            path=relation_vocab_path,
+            id_field=RelationVocabFields.RELATION_ID,
+            label_field=RelationVocabFields.LABEL,
+        )
+
+        serialized_results: list[dict[str, Any]] = []
+        serialized_labels: list[dict[str, Any]] = []
+        label_by_sample_id = {
+            str(label["sample_id"]): dict(label)
+            for label in [dict(item) for item in labels]
+        }
+        for result in [dict(item) for item in results]:
+            sample_id = str(result["sample_id"])
+            trajectories = _decorate_trajectory_records(
+                trajectories=[
+                    dict(item) for item in result.get("terminal_subgraphs", [])
+                ],
+                entity_labels=entity_labels,
+                relation_labels=relation_labels,
+            )
+            serialized_results.append(
+                {
+                    "sample_id": sample_id,
+                    "question": str(result["question"]),
+                    "predicted_answer_entity_ids": list(
+                        result.get("predicted_answer_entity_ids", [])
+                    ),
+                    "answer_log_masses": list(result.get("answer_log_masses", [])),
+                    "requested_rollout_count": int(
+                        result.get("requested_rollout_count", result["rollout_count"])
+                    ),
+                    "rollout_count": int(result["rollout_count"]),
+                    "answering_rollout_count": int(result["answering_rollout_count"]),
+                    "hit_rollout_count": int(result["hit_rollout_count"]),
+                    "stopped_early": bool(result.get("stopped_early", False)),
+                    "support_probability_mass": float(
+                        result.get(
+                            "support_probability_mass",
+                            sum(
+                                float(item.get("probability", 0.0))
+                                for item in trajectories
+                            ),
+                        )
+                    ),
+                    "trajectories": trajectories,
+                }
+            )
+            label_record = label_by_sample_id.get(
+                sample_id,
+                {
+                    "sample_id": sample_id,
+                    "question": str(result["question"]),
+                    "gold_answer_entity_ids": list(result["gold_answer_entity_ids"]),
+                    "a_entity_in_graph": bool(result.get("a_entity_in_graph", False)),
+                },
+            )
+            gold_answer_entity_ids = [
+                int(entity_id)
+                for entity_id in label_record.get(
+                    "gold_answer_entity_ids", result["gold_answer_entity_ids"]
+                )
+            ]
+            serialized_labels.append(
+                {
+                    "sample_id": sample_id,
+                    "question": str(label_record.get("question", result["question"])),
+                    "answer_entity_ids": gold_answer_entity_ids,
+                    "answer_texts": [
+                        str(entity_labels.get(int(entity_id), str(entity_id)))
+                        for entity_id in gold_answer_entity_ids
+                    ],
+                    "a_entity_in_graph": bool(
+                        label_record.get(
+                            "a_entity_in_graph", result.get("a_entity_in_graph", False)
+                        )
+                    ),
+                }
+            )
+
+        append_jsonl_records(results_path, records=serialized_results)
+        append_jsonl_records(labels_path, records=serialized_labels)
+        return {
+            "prompt_path": results_path,
+            "results_path": results_path,
+            "labels_path": labels_path,
+        }
 
 
 __all__ = ["SubgraphAnswerSearchRuntime"]

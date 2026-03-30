@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from src.models.components import ActionScoringHead
@@ -129,20 +128,6 @@ class SubgraphActor(nn.Module):
         )
 
     @staticmethod
-    def _question_similarity(
-        *,
-        relation_features: torch.Tensor,
-        dst_features: torch.Tensor,
-        question_features: torch.Tensor,
-    ) -> float:
-        similarity = F.cosine_similarity(
-            (relation_features + dst_features).unsqueeze(0).to(dtype=torch.float32),
-            question_features.unsqueeze(0).to(dtype=torch.float32),
-            dim=-1,
-        )
-        return float(similarity.item())
-
-    @staticmethod
     def _rank_candidate_edges(
         candidates: list[_CandidateEdgeMetadata],
         *,
@@ -240,13 +225,18 @@ class SubgraphActor(nn.Module):
                 analysis=analysis,
             )
             outgoing_map = prepared_batch.graph_outgoing_edge_ids[graph_idx]
-            question_features = prepared_batch.question_tokens[graph_idx]
             if int(state.num_edges) < self.max_steps:
                 seen_candidate_edges: set[int] = set()
                 candidate_edges: list[_CandidateEdgeMetadata] = []
                 for node_id in analysis.selected_node_ids:
                     node_candidates: list[_CandidateEdgeMetadata] = []
-                    for edge_id in outgoing_map.get(int(node_id), ()):
+                    for edge_rank, edge_id in enumerate(
+                        outgoing_map.get(int(node_id), ())
+                    ):
+                        if per_node_top_k is not None and edge_rank >= int(
+                            per_node_top_k
+                        ):
+                            break
                         edge_id = int(edge_id)
                         if (
                             edge_id in selected_edge_set
@@ -290,8 +280,6 @@ class SubgraphActor(nn.Module):
                         candidate_full_answers = (
                             1 if full_mask > 0 and dst_bits_after == full_mask else 0
                         )
-                        relation_features = prepared_batch.relation_tokens[relation_id]
-                        dst_features = prepared_batch.node_tokens[dst]
                         node_candidates.append(
                             _CandidateEdgeMetadata(
                                 edge_idx=edge_idx,
@@ -307,19 +295,14 @@ class SubgraphActor(nn.Module):
                                 target_oracle_distance=float(
                                     oracle_distance_map.get(dst, -1)
                                 ),
-                                question_similarity=self._question_similarity(
-                                    relation_features=relation_features,
-                                    dst_features=dst_features,
-                                    question_features=question_features,
+                                question_similarity=float(
+                                    prepared_batch.edge_question_similarity[
+                                        edge_idx
+                                    ].item()
                                 ),
                             )
                         )
-                    candidate_edges.extend(
-                        self._rank_candidate_edges(
-                            node_candidates,
-                            limit=per_node_top_k,
-                        )
-                    )
+                    candidate_edges.extend(node_candidates)
                 candidate_edges = self._rank_candidate_edges(
                     candidate_edges,
                     limit=per_state_top_k,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from src.data.preprocess.labels.edge_retrieval import (
     resolve_forward_multi_anchor_union_trajectory,
@@ -83,7 +84,9 @@ class SubgraphPreparedBatch:
     graph_anchor_abs_node_ids: tuple[tuple[int, ...], ...]
     graph_anchor_full_mask: tuple[int, ...]
     graph_outgoing_edge_ids: tuple[dict[int, tuple[int, ...]], ...]
+    edge_question_similarity: torch.Tensor
     graph_answer_entities: tuple[frozenset[int], ...]
+    graph_node_entities: tuple[frozenset[int], ...]
     graph_oracle_answer_distance: tuple[dict[int, int], ...]
     graph_teacher_action_edge_ids: tuple[tuple[int, ...] | None, ...]
     graph_teacher_edge_count: tuple[int | None, ...]
@@ -108,9 +111,15 @@ def build_subgraph_prepared_batch(
     graph_anchor_full_mask: list[int] = []
     graph_outgoing_edge_ids: list[dict[int, tuple[int, ...]]] = []
     graph_answer_entities: list[frozenset[int]] = []
+    graph_node_entities: list[frozenset[int]] = []
     graph_oracle_answer_distance: list[dict[int, int]] = []
     graph_teacher_action_edge_ids: list[tuple[int, ...] | None] = []
     graph_teacher_edge_count: list[int | None] = []
+    edge_question_similarity = torch.zeros(
+        (int(topology.edge_index.size(1)),),
+        device=encoded.question_tokens.device,
+        dtype=torch.float32,
+    )
     for graph_idx in range(int(batch.num_graphs)):
         node_start = int(batch.node_ptr[graph_idx].item())
         node_end = int(batch.node_ptr[graph_idx + 1].item())
@@ -132,15 +141,51 @@ def build_subgraph_prepared_batch(
         graph_anchor_full_mask.append(
             (1 << len(anchor_abs_node_ids)) - 1 if anchor_abs_node_ids else 0
         )
+        local_node_entities = frozenset(
+            int(value) for value in batch.node_entity_ids[node_start:node_end].tolist()
+        )
+        graph_node_entities.append(local_node_entities)
         outgoing: dict[int, list[int]] = {}
         local_edge_src = (
             topology.edge_index[0, edge_start:edge_end].detach().cpu().tolist()
         )
+        local_relation_ids = topology.edge_type[edge_start:edge_end]
+        local_edge_ids = torch.arange(
+            edge_start,
+            edge_end,
+            device=encoded.question_tokens.device,
+            dtype=torch.long,
+        )
+        if int(local_edge_ids.numel()) > 0:
+            local_similarity = F.cosine_similarity(
+                (
+                    encoded.relation_tokens.index_select(0, local_relation_ids)
+                    + encoded.node_tokens.index_select(
+                        0,
+                        topology.edge_index[1, edge_start:edge_end],
+                    )
+                ).to(dtype=torch.float32),
+                encoded.question_tokens[graph_idx]
+                .unsqueeze(0)
+                .expand(int(local_edge_ids.numel()), -1)
+                .to(dtype=torch.float32),
+                dim=-1,
+            )
+            edge_question_similarity.index_copy_(0, local_edge_ids, local_similarity)
         for edge_id, src in enumerate(local_edge_src, start=edge_start):
             outgoing.setdefault(int(src), []).append(int(edge_id))
         graph_outgoing_edge_ids.append(
             {
-                int(node_id): tuple(int(edge_id) for edge_id in edge_ids)
+                int(node_id): tuple(
+                    int(edge_id)
+                    for edge_id in sorted(
+                        edge_ids,
+                        key=lambda value: (
+                            -float(edge_question_similarity[int(value)].item()),
+                            int(value),
+                        ),
+                    )
+                )
                 for node_id, edge_ids in outgoing.items()
             }
         )
@@ -151,8 +196,10 @@ def build_subgraph_prepared_batch(
         graph_answer_entities.append(answer_entities)
         answer_nodes: list[int] = []
         if answer_entities:
-            local_node_entities = batch.node_entity_ids[node_start:node_end].tolist()
-            for local_idx, entity_id in enumerate(local_node_entities):
+            local_node_entity_values = batch.node_entity_ids[
+                node_start:node_end
+            ].tolist()
+            for local_idx, entity_id in enumerate(local_node_entity_values):
                 if int(entity_id) in answer_entities:
                     answer_nodes.append(int(node_start + local_idx))
         graph_oracle_answer_distance.append(
@@ -213,7 +260,9 @@ def build_subgraph_prepared_batch(
         graph_anchor_abs_node_ids=tuple(graph_anchor_abs_node_ids),
         graph_anchor_full_mask=tuple(graph_anchor_full_mask),
         graph_outgoing_edge_ids=tuple(graph_outgoing_edge_ids),
+        edge_question_similarity=edge_question_similarity,
         graph_answer_entities=tuple(graph_answer_entities),
+        graph_node_entities=tuple(graph_node_entities),
         graph_oracle_answer_distance=tuple(graph_oracle_answer_distance),
         graph_teacher_action_edge_ids=tuple(graph_teacher_action_edge_ids),
         graph_teacher_edge_count=tuple(graph_teacher_edge_count),

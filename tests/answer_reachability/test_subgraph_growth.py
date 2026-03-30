@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -114,7 +115,6 @@ def _make_eval_cfg(**overrides: object) -> dict[str, object]:
     eval_cfg: dict[str, object] = {
         "report_profile": "full",
         "task": "answer_ranking",
-        "answer_mass_threshold": 0.9,
         "support_mass_threshold": 0.9,
         "support_path_overlap_penalty": 0.25,
         "answer_top_ks": (1, 5, 10),
@@ -606,6 +606,306 @@ def test_subgraph_runtime_stops_early_when_top_answer_is_statistically_stable(
     assert result["early_stop_margin"] > 0.0
     assert result["predicted_answer_entity_ids"] == [101]
     assert result["answer_log_masses"] == pytest.approx([0.0])
+
+
+def test_subgraph_runtime_batches_graphs_and_shrinks_active_eval_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = TrajectoryBatch.concatenate(
+        [_make_bridge_batch(sample_id="g0"), _make_bridge_batch(sample_id="g1")]
+    )
+    policy = _make_subgraph_policy(max_steps=2)
+    runtime = SubgraphAnswerSearchRuntime(
+        eval_cfg=_make_eval_cfg(
+            report_profile="rank_only",
+            monte_carlo={
+                "rollouts": 8,
+                "batch_rollouts": 4,
+                "temperature": 1.0,
+                "confidence": 0.95,
+                "early_stop": {
+                    "enabled": True,
+                    "min_rollouts": 4,
+                    "stability_top_k": 1,
+                },
+                "action_pruning": {
+                    "per_node_top_k": 5,
+                    "per_state_top_k": 7,
+                },
+            },
+        ),
+        policy=policy,
+        sampler=SubgraphSampler(max_steps=2),
+    )
+    seen_num_graphs: list[int] = []
+
+    def _fake_sample(**kwargs: object) -> SubgraphTrajectorySampleBatch:
+        prepared_batch = kwargs["prepared_batch"]
+        num_graphs = int(prepared_batch.num_graphs)
+        seen_num_graphs.append(num_graphs)
+        if num_graphs == 2:
+            return SubgraphTrajectorySampleBatch(
+                state_log_flows=torch.zeros((2, 4, 3), dtype=torch.float32),
+                log_pf_actions=torch.zeros((2, 4, 3), dtype=torch.float32),
+                log_reward_actions=torch.zeros((2, 4, 3), dtype=torch.float32),
+                action_mask=torch.zeros((2, 4, 3), dtype=torch.bool),
+                termination_action_steps=torch.tensor(
+                    [[3, 3, 3, 3], [3, 3, 3, 3]], dtype=torch.long
+                ),
+                chosen_edge_ids=torch.full((2, 4, 2), -1, dtype=torch.long),
+                stop_actions=torch.zeros((2, 4, 3), dtype=torch.bool),
+                terminal_answer_counts=torch.tensor(
+                    [[1, 1, 1, 1], [0, 0, 0, 0]], dtype=torch.long
+                ),
+                terminal_hit_mask=torch.tensor(
+                    [[True, True, True, True], [False, False, False, False]],
+                    dtype=torch.bool,
+                ),
+                terminal_component_counts=torch.tensor(
+                    [[1, 1, 1, 1], [2, 2, 2, 2]], dtype=torch.long
+                ),
+                terminal_edge_ids=(
+                    (0, 1),
+                    (0, 1),
+                    (0, 1),
+                    (0, 1),
+                    (0,),
+                    (0,),
+                    (0,),
+                    (0,),
+                ),
+                terminal_node_ids=(
+                    (0, 1, 2),
+                    (0, 1, 2),
+                    (0, 1, 2),
+                    (0, 1, 2),
+                    (3, 5),
+                    (3, 5),
+                    (3, 5),
+                    (3, 5),
+                ),
+                terminal_reachability_bits=(
+                    {0: 1, 1: 3, 2: 2},
+                    {0: 1, 1: 3, 2: 2},
+                    {0: 1, 1: 3, 2: 2},
+                    {0: 1, 1: 3, 2: 2},
+                    {3: 1, 5: 2},
+                    {3: 1, 5: 2},
+                    {3: 1, 5: 2},
+                    {3: 1, 5: 2},
+                ),
+                sample_ids=("g0", "g1"),
+                question_ids=("g0", "g1"),
+                num_graphs=2,
+                num_rollouts=4,
+            )
+        return SubgraphTrajectorySampleBatch(
+            state_log_flows=torch.zeros((1, 4, 3), dtype=torch.float32),
+            log_pf_actions=torch.zeros((1, 4, 3), dtype=torch.float32),
+            log_reward_actions=torch.zeros((1, 4, 3), dtype=torch.float32),
+            action_mask=torch.zeros((1, 4, 3), dtype=torch.bool),
+            termination_action_steps=torch.tensor([[3, 3, 3, 3]], dtype=torch.long),
+            chosen_edge_ids=torch.full((1, 4, 2), -1, dtype=torch.long),
+            stop_actions=torch.zeros((1, 4, 3), dtype=torch.bool),
+            terminal_answer_counts=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+            terminal_hit_mask=torch.tensor(
+                [[False, False, False, False]], dtype=torch.bool
+            ),
+            terminal_component_counts=torch.tensor([[2, 2, 2, 2]], dtype=torch.long),
+            terminal_edge_ids=((0,), (0,), (0,), (0,)),
+            terminal_node_ids=((0, 2), (0, 2), (0, 2), (0, 2)),
+            terminal_reachability_bits=(
+                {0: 1, 2: 2},
+                {0: 1, 2: 2},
+                {0: 1, 2: 2},
+                {0: 1, 2: 2},
+            ),
+            sample_ids=("g1",),
+            question_ids=("g1",),
+            num_graphs=1,
+            num_rollouts=4,
+        )
+
+    def _fake_stability_margin(**kwargs: object) -> float | None:
+        return 1.0 if kwargs["answer_vote_counts"] else None
+
+    monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
+    monkeypatch.setattr(
+        "src.metrics.subgraph_answer_search_runtime._topk_stability_margin",
+        _fake_stability_margin,
+    )
+
+    results = runtime._predict_batch_results(batch=batch, include_answer_support=False)
+
+    assert seen_num_graphs == [2, 1]
+    assert [result["sample_id"] for result in results] == ["g0", "g1"]
+    assert results[0]["rollout_count"] == 4
+    assert results[0]["stopped_early"] is True
+    assert results[1]["rollout_count"] == 8
+    assert results[1]["stopped_early"] is False
+
+
+def test_subgraph_runtime_applies_support_mass_threshold_and_overlap_penalty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _make_multi_answer_bridge_batch()
+    policy = _make_subgraph_policy(max_steps=4)
+    runtime = SubgraphAnswerSearchRuntime(
+        eval_cfg=_make_eval_cfg(
+            report_profile="full",
+            support_mass_threshold=0.6,
+            support_path_overlap_penalty=1.0,
+            edge_emit_top_k=3,
+            monte_carlo={
+                "rollouts": 4,
+                "batch_rollouts": 4,
+                "temperature": 1.0,
+                "confidence": 0.95,
+                "early_stop": {
+                    "enabled": False,
+                    "min_rollouts": 4,
+                    "stability_top_k": 1,
+                },
+                "action_pruning": {
+                    "per_node_top_k": 100,
+                    "per_state_top_k": 256,
+                },
+            },
+        ),
+        policy=policy,
+        sampler=SubgraphSampler(max_steps=4),
+    )
+
+    def _fake_sample(**kwargs: object) -> SubgraphTrajectorySampleBatch:
+        del kwargs
+        return SubgraphTrajectorySampleBatch(
+            state_log_flows=torch.zeros((1, 4, 5), dtype=torch.float32),
+            log_pf_actions=torch.zeros((1, 4, 5), dtype=torch.float32),
+            log_reward_actions=torch.zeros((1, 4, 5), dtype=torch.float32),
+            action_mask=torch.zeros((1, 4, 5), dtype=torch.bool),
+            termination_action_steps=torch.tensor([[5, 5, 5, 5]], dtype=torch.long),
+            chosen_edge_ids=torch.full((1, 4, 4), -1, dtype=torch.long),
+            stop_actions=torch.zeros((1, 4, 5), dtype=torch.bool),
+            terminal_answer_counts=torch.tensor([[2, 0, 0, 1]], dtype=torch.long),
+            terminal_hit_mask=torch.tensor(
+                [[True, False, False, True]], dtype=torch.bool
+            ),
+            terminal_component_counts=torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+            terminal_edge_ids=((0, 1), (0, 1), (0, 1, 2), (3,)),
+            terminal_node_ids=((0, 1, 2), (0, 1, 2), (0, 1, 2, 3), (0, 2, 3)),
+            terminal_reachability_bits=(
+                {0: 1, 1: 3, 2: 2},
+                {0: 1, 1: 3, 2: 2},
+                {0: 1, 1: 3, 2: 2, 3: 3},
+                {0: 1, 2: 2, 3: 3},
+            ),
+            sample_ids=("multi-answer-bridge",),
+            question_ids=("multi-answer-bridge",),
+            num_graphs=1,
+            num_rollouts=4,
+        )
+
+    monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
+
+    result = runtime._predict_single_graph(batch=batch, include_answer_support=True)
+    metrics = runtime.summarize_predict_epoch(
+        predict_results=[result],
+        report_profile="full",
+    )
+
+    assert [entry["edge_ids"] for entry in result["terminal_subgraphs"]] == [
+        [0, 1],
+        [3],
+    ]
+    assert result["support_probabilities"] == pytest.approx([0.5, 0.25])
+    assert result["support_probability_mass"] == pytest.approx(0.75)
+    assert metrics["support/mass@1"] == pytest.approx(0.5)
+    assert metrics["subgraph/rollout_count"] == pytest.approx(4.0)
+
+
+def test_subgraph_runtime_writes_prediction_artifacts(tmp_path) -> None:
+    runtime = SubgraphAnswerSearchRuntime(
+        eval_cfg=_make_eval_cfg(report_profile="full"),
+        policy=_make_subgraph_policy(max_steps=2),
+        sampler=SubgraphSampler(max_steps=2),
+    )
+    results = [
+        {
+            "sample_id": "s1",
+            "question": "Where was X born?",
+            "gold_answer_entity_ids": [101],
+            "predicted_answer_entity_ids": [101],
+            "answer_log_masses": [0.0],
+            "requested_rollout_count": 4,
+            "rollout_count": 4,
+            "answering_rollout_count": 4,
+            "hit_rollout_count": 4,
+            "terminal_subgraph_count": 1,
+            "mean_stop_step": 2.0,
+            "mean_terminal_component_count": 1.0,
+            "stopped_early": False,
+            "a_entity_in_graph": True,
+            "support_probability_mass": 1.0,
+            "terminal_subgraphs": [
+                {
+                    "path_rank": 1,
+                    "edge_ids": [0, 1],
+                    "probability": 1.0,
+                    "prob": 1.0,
+                    "trajectory_text": "1 --2--> 3 ; 3 --4--> 101",
+                    "edges": [
+                        {"src_entity_id": 1, "relation_id": 2, "dst_entity_id": 3},
+                        {
+                            "src_entity_id": 3,
+                            "relation_id": 4,
+                            "dst_entity_id": 101,
+                        },
+                    ],
+                    "terminal_entity_id": 101,
+                }
+            ],
+        }
+    ]
+    labels = runtime.build_predict_labels(
+        _make_bridge_batch(sample_id="s1"),
+        outputs=results,
+    )
+
+    paths = runtime.write_prediction_artifacts(
+        results=results,
+        labels=labels,
+        output_dir=tmp_path,
+        split="test",
+        artifact_name="rankflow",
+        schema_version=1,
+        entity_vocab_path=None,
+        relation_vocab_path=None,
+        questions_path=None,
+        overwrite=True,
+    )
+
+    assert paths == {
+        "prompt_path": tmp_path / "test.jsonl",
+        "results_path": tmp_path / "test.jsonl",
+        "labels_path": tmp_path / "test.labels.jsonl",
+    }
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "test.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    label_records = [
+        json.loads(line)
+        for line in (tmp_path / "test.labels.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert (
+        records[0]["trajectories"][0]["trajectory_text"] == "1 --2--> 3 ; 3 --4--> 101"
+    )
+    assert label_records[0]["answer_texts"] == ["101"]
+    assert label_records[0]["a_entity_in_graph"] is True
 
 
 def test_gflownet_module_subgraph_mode_uses_subgraph_runtime() -> None:

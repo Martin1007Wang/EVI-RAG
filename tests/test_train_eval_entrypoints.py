@@ -136,6 +136,18 @@ def test_normalize_search_eval_cfg_rejects_legacy_exact_keys() -> None:
         )
 
 
+def test_normalize_search_eval_cfg_rejects_removed_answer_mass_threshold() -> None:
+    with pytest.raises(ValueError, match="Removed search-eval config"):
+        normalize_search_eval_cfg(
+            OmegaConf.create(
+                {
+                    "report_profile": "full",
+                    "answer_mass_threshold": 0.9,
+                }
+            )
+        )
+
+
 def test_normalize_search_eval_cfg_populates_runtime_sampling_knobs() -> None:
     cfg = normalize_search_eval_cfg(
         OmegaConf.create(

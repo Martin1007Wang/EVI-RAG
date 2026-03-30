@@ -6,7 +6,6 @@ defaults:
 
 report_profile: full
 task: answer_ranking
-answer_mass_threshold: 0.9
 support_mass_threshold: 0.9
 support_path_overlap_penalty: 0.25
 answer_top_ks: [1, 5, 10]

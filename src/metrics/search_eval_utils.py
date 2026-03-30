@@ -16,7 +16,6 @@ RANK_ONLY_REPORT = "rank_only"
 _DEFAULT_SEARCH_EVAL_CFG: dict[str, Any] = {
     "report_profile": FULL_REPORT,
     "task": "answer_ranking",
-    "answer_mass_threshold": 0.9,
     "support_mass_threshold": 0.9,
     "support_path_overlap_penalty": 0.25,
     "answer_top_ks": (1, 5, 10),
@@ -41,6 +40,12 @@ _DEFAULT_SEARCH_EVAL_CFG: dict[str, Any] = {
 _LEGACY_SEARCH_EVAL_KEYS = {
     "answer_posterior_backend": "Remove eval_cfg.answer_posterior_backend; Monte Carlo is now the only posterior estimator.",
     "flow_frontier": "Remove eval_cfg.flow_frontier; exact frontier search is no longer supported.",
+}
+_REMOVED_SEARCH_EVAL_KEYS = {
+    "answer_mass_threshold": (
+        "Remove eval_cfg.answer_mass_threshold; full-vote answer marginals are not a "
+        "normalized posterior mass budget, so this threshold is no longer well-defined."
+    ),
 }
 
 
@@ -73,11 +78,20 @@ def _assert_no_legacy_search_eval_keys(eval_cfg: Mapping[str, Any]) -> None:
         for key, message in _LEGACY_SEARCH_EVAL_KEYS.items()
         if key in eval_cfg
     ]
-    if not legacy_messages:
-        return
-    raise ValueError(
-        "Legacy exact answer-posterior config detected. " + " ".join(legacy_messages)
-    )
+    removed_messages = [
+        f"{key}: {message}"
+        for key, message in _REMOVED_SEARCH_EVAL_KEYS.items()
+        if key in eval_cfg
+    ]
+    if legacy_messages:
+        raise ValueError(
+            "Legacy exact answer-posterior config detected. "
+            + " ".join(legacy_messages)
+        )
+    if removed_messages:
+        raise ValueError(
+            "Removed search-eval config detected. " + " ".join(removed_messages)
+        )
 
 
 def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
@@ -116,11 +130,6 @@ def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
         raise ValueError(
             "edge_retrieval only supports evaluation.report_profile='rank_only'."
         )
-
-    answer_mass_threshold = float(cfg.get("answer_mass_threshold", 0.9))
-    if not 0.0 < answer_mass_threshold <= 1.0:
-        raise ValueError("evaluation.answer_mass_threshold must be in (0, 1].")
-    cfg["answer_mass_threshold"] = answer_mass_threshold
 
     support_mass_threshold = float(cfg.get("support_mass_threshold", 0.9))
     if not 0.0 < support_mass_threshold <= 1.0:

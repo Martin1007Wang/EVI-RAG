@@ -979,5 +979,17 @@ class TrajectoryBatch:
             sub_batch.validate()
         return sub_batch
 
+    def select_graphs(
+        self, graph_indices: list[int] | tuple[int, ...], *, validate: bool = True
+    ) -> "TrajectoryBatch":
+        if not graph_indices:
+            raise ValueError("graph_indices must be non-empty.")
+        selected = [
+            self.select_graph(int(graph_idx), validate=False)
+            for graph_idx in graph_indices
+        ]
+        combined = TrajectoryBatch.concatenate(selected, validate=validate)
+        return combined
+
 
 __all__ = ["TrajectoryBatch"]
