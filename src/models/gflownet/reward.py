@@ -7,7 +7,7 @@ from .state import SubgraphAnalysis
 
 
 @dataclass(frozen=True)
-class AdmissibleAnswerCommitSet:
+class AdmissibleAnswerSet:
     entities: tuple[int, ...]
     gold_entities: tuple[int, ...]
     full_anchor_mask: int
@@ -27,17 +27,17 @@ class AdmissibleAnswerCommitSet:
         return int(entity_id) in self.gold_entities
 
 
-def resolve_admissible_answer_commit_set(
+def resolve_admissible_answer_set(
     *,
     prepared_batch: SubgraphPreparedBatch,
     graph_idx: int,
     analysis: SubgraphAnalysis,
-) -> AdmissibleAnswerCommitSet:
-    # This is the structurally admissible commit set induced by multi-anchor
+) -> AdmissibleAnswerSet:
+    # This is the structurally admissible answer set induced by multi-anchor
     # reachability, not a guarantee of semantic correctness.
     full_mask = int(prepared_batch.graph_anchor_full_mask[int(graph_idx)])
     if full_mask <= 0:
-        return AdmissibleAnswerCommitSet(
+        return AdmissibleAnswerSet(
             entities=(),
             gold_entities=(),
             full_anchor_mask=int(full_mask),
@@ -55,10 +55,23 @@ def resolve_admissible_answer_commit_set(
         for entity_id in admissible_entities
         if int(entity_id) in gold_answers
     )
-    return AdmissibleAnswerCommitSet(
+    return AdmissibleAnswerSet(
         entities=admissible_entities,
         gold_entities=gold_entities,
         full_anchor_mask=int(full_mask),
+    )
+
+
+def resolve_admissible_answer_commit_set(
+    *,
+    prepared_batch: SubgraphPreparedBatch,
+    graph_idx: int,
+    analysis: SubgraphAnalysis,
+) -> AdmissibleAnswerSet:
+    return resolve_admissible_answer_set(
+        prepared_batch=prepared_batch,
+        graph_idx=graph_idx,
+        analysis=analysis,
     )
 
 
@@ -72,9 +85,18 @@ def _redundancy_edge_count(analysis: SubgraphAnalysis) -> int:
 class SubgraphTerminalReward:
     log_reward: float
     hit: bool
-    chosen_answer_entity_id: int | None
-    admissible_commit_set: AdmissibleAnswerCommitSet
+    answer_set: AdmissibleAnswerSet
     redundancy_edges: int
+
+    @property
+    def answer_entities(self) -> tuple[int, ...]:
+        return tuple(int(entity_id) for entity_id in self.answer_set.entities)
+
+    @property
+    def chosen_answer_entity_id(self) -> int | None:
+        if len(self.answer_set.entities) != 1:
+            return None
+        return int(self.answer_set.entities[0])
 
 
 class SubgraphRewardModel:
@@ -109,14 +131,27 @@ class SubgraphRewardModel:
         if self.component_penalty < 0.0:
             raise ValueError("training.answer_reward.component_penalty must be >= 0.")
 
+    def admissible_answer_set(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_idx: int,
+        analysis: SubgraphAnalysis,
+    ) -> AdmissibleAnswerSet:
+        return resolve_admissible_answer_set(
+            prepared_batch=prepared_batch,
+            graph_idx=graph_idx,
+            analysis=analysis,
+        )
+
     def admissible_answer_commit_set(
         self,
         *,
         prepared_batch: SubgraphPreparedBatch,
         graph_idx: int,
         analysis: SubgraphAnalysis,
-    ) -> AdmissibleAnswerCommitSet:
-        return resolve_admissible_answer_commit_set(
+    ) -> AdmissibleAnswerSet:
+        return self.admissible_answer_set(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
             analysis=analysis,
@@ -129,12 +164,12 @@ class SubgraphRewardModel:
         graph_idx: int,
         analysis: SubgraphAnalysis,
     ) -> tuple[int, bool]:
-        commit_set = self.admissible_answer_commit_set(
+        answer_set = self.admissible_answer_set(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
             analysis=analysis,
         )
-        gold_count = int(commit_set.gold_count)
+        gold_count = int(answer_set.gold_count)
         return gold_count, bool(gold_count > 0)
 
     def compute_terminal_log_reward(
@@ -143,9 +178,10 @@ class SubgraphRewardModel:
         prepared_batch: SubgraphPreparedBatch,
         graph_idx: int,
         analysis: SubgraphAnalysis,
-        answer_entity_id: int | None,
+        answer_entity_id: int | None = None,
     ) -> SubgraphTerminalReward:
-        commit_set = self.admissible_answer_commit_set(
+        del answer_entity_id
+        answer_set = self.admissible_answer_set(
             prepared_batch=prepared_batch,
             graph_idx=int(graph_idx),
             analysis=analysis,
@@ -157,29 +193,24 @@ class SubgraphRewardModel:
             + float(self.component_penalty)
             * float(max(int(analysis.anchor_component_count) - 1, 0))
         )
-        if answer_entity_id is None:
+        if int(answer_set.gold_count) > 0:
             return SubgraphTerminalReward(
-                log_reward=float(-self.failure_penalty - structure_penalty),
-                hit=False,
-                chosen_answer_entity_id=None,
-                admissible_commit_set=commit_set,
+                log_reward=float(self.gold_answer_bonus - structure_penalty),
+                hit=True,
+                answer_set=answer_set,
                 redundancy_edges=int(redundancy_edges),
             )
-        chosen_answer = int(answer_entity_id)
-        if not commit_set.contains(chosen_answer):
-            raise ValueError(
-                "Stop-answer actions must commit to an admissible answer entity. "
-                f"graph_idx={graph_idx} answer_entity_id={chosen_answer}"
+        if int(answer_set.count) > 0:
+            return SubgraphTerminalReward(
+                log_reward=float(-self.wrong_answer_penalty - structure_penalty),
+                hit=False,
+                answer_set=answer_set,
+                redundancy_edges=int(redundancy_edges),
             )
-        hit = bool(commit_set.is_gold(chosen_answer))
-        answer_bonus = (
-            float(self.gold_answer_bonus) if hit else -float(self.wrong_answer_penalty)
-        )
         return SubgraphTerminalReward(
-            log_reward=float(answer_bonus - structure_penalty),
-            hit=hit,
-            chosen_answer_entity_id=chosen_answer,
-            admissible_commit_set=commit_set,
+            log_reward=float(-self.failure_penalty - structure_penalty),
+            hit=False,
+            answer_set=answer_set,
             redundancy_edges=int(redundancy_edges),
         )
 
@@ -205,7 +236,12 @@ class SubgraphRewardModel:
 
 __all__ = [
     "AdmissibleAnswerCommitSet",
+    "AdmissibleAnswerSet",
     "SubgraphRewardModel",
     "SubgraphTerminalReward",
+    "resolve_admissible_answer_set",
     "resolve_admissible_answer_commit_set",
 ]
+
+
+AdmissibleAnswerCommitSet = AdmissibleAnswerSet

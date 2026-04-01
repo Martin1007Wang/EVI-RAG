@@ -11,7 +11,7 @@ from src.graph import TrajectoryBatch
 from .actor import SubgraphActionDistribution, SubgraphActor
 from .encoder import SubgraphEncoder
 from .prepared_batch import SubgraphPreparedBatch
-from .reward import AdmissibleAnswerCommitSet, SubgraphRewardModel
+from .reward import AdmissibleAnswerSet, SubgraphRewardModel, SubgraphTerminalReward
 from .state import (
     SubgraphAction,
     SubgraphAnalysis,
@@ -104,14 +104,27 @@ class SubgraphPolicy(nn.Module):
             rollout_batch=rollout_batch,
         )
 
+    def admissible_answer_set(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_idx: int,
+        analysis: SubgraphAnalysis,
+    ) -> AdmissibleAnswerSet:
+        return self.reward_model.admissible_answer_set(
+            prepared_batch=prepared_batch,
+            graph_idx=graph_idx,
+            analysis=analysis,
+        )
+
     def admissible_answer_commit_set(
         self,
         *,
         prepared_batch: SubgraphPreparedBatch,
         graph_idx: int,
         analysis: SubgraphAnalysis,
-    ) -> AdmissibleAnswerCommitSet:
-        return self.reward_model.admissible_answer_commit_set(
+    ) -> AdmissibleAnswerSet:
+        return self.admissible_answer_set(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
             analysis=analysis,
@@ -184,7 +197,7 @@ class SubgraphPolicy(nn.Module):
     ) -> float:
         # We use the paper-facing fixed backward policy: uniformly delete one
         # forward-valid removable edge. This closes the trajectory semantics when
-        # several edge-orderings reach the same committed witness.
+        # several edge-orderings reach the same terminal witness subgraph.
         removable_edge_ids = forward_valid_removable_edge_ids(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
@@ -200,6 +213,21 @@ class SubgraphPolicy(nn.Module):
     def backward_policy_name(self) -> str:
         return "uniform_forward_valid_edge_deletion"
 
+    def compute_terminal_reward(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_idx: int,
+        analysis: SubgraphAnalysis,
+        answer_entity_id: int | None = None,
+    ) -> SubgraphTerminalReward:
+        return self.reward_model.compute_terminal_log_reward(
+            prepared_batch=prepared_batch,
+            graph_idx=graph_idx,
+            analysis=analysis,
+            answer_entity_id=answer_entity_id,
+        )
+
     def compute_terminal_log_reward(
         self,
         *,
@@ -208,8 +236,8 @@ class SubgraphPolicy(nn.Module):
         analysis: SubgraphAnalysis,
         answer_entity_id: int | None = None,
     ) -> tuple[float, int, int, bool]:
-        # Returns (log_reward, admissible_commit_count, gold_admissible_count, hit).
-        terminal_reward = self.reward_model.compute_terminal_log_reward(
+        # Returns (log_reward, admissible_answer_count, gold_admissible_count, hit).
+        terminal_reward = self.compute_terminal_reward(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
             analysis=analysis,
@@ -217,8 +245,8 @@ class SubgraphPolicy(nn.Module):
         )
         return (
             float(terminal_reward.log_reward),
-            int(terminal_reward.admissible_commit_set.count),
-            int(terminal_reward.admissible_commit_set.gold_count),
+            int(terminal_reward.answer_set.count),
+            int(terminal_reward.answer_set.gold_count),
             bool(terminal_reward.hit),
         )
 

@@ -248,10 +248,10 @@ def _fake_sample_batch(
     terminal_gold_answer_counts: torch.Tensor,
     terminal_hit_mask: torch.Tensor,
     terminal_component_counts: torch.Tensor,
-    chosen_answer_entity_ids: torch.Tensor,
     terminal_edge_ids: tuple[tuple[int, ...], ...],
     terminal_node_ids: tuple[tuple[int, ...], ...],
     terminal_reachability_bits: tuple[dict[int, int], ...],
+    terminal_answer_entity_ids: tuple[tuple[int, ...], ...],
 ) -> SubgraphTrajectorySampleBatch:
     return SubgraphTrajectorySampleBatch(
         state_log_flows=torch.zeros(
@@ -280,10 +280,10 @@ def _fake_sample_batch(
         terminal_gold_answer_counts=terminal_gold_answer_counts,
         terminal_hit_mask=terminal_hit_mask,
         terminal_component_counts=terminal_component_counts,
-        chosen_answer_entity_ids=chosen_answer_entity_ids,
         terminal_edge_ids=terminal_edge_ids,
         terminal_node_ids=terminal_node_ids,
         terminal_reachability_bits=terminal_reachability_bits,
+        terminal_answer_entity_ids=terminal_answer_entity_ids,
         sample_ids=sample_ids,
         question_ids=question_ids,
         num_graphs=num_graphs,
@@ -320,11 +320,16 @@ def test_subgraph_transition_semantically_merges_answer_entity() -> None:
     assert analysis.anchor_component_count == 1
 
 
-def test_answer_commit_reward_prefers_gold_answer_over_failure() -> None:
+def test_state_reward_prefers_gold_answer_state_over_failure_state() -> None:
     batch = _make_bridge_batch()
     policy = _make_subgraph_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
-    analysis = policy.analyze_state(
+    partial_analysis = policy.analyze_state(
+        prepared_batch=prepared_batch,
+        graph_idx=0,
+        state=_build_state_from_edges((0,)),
+    )
+    gold_analysis = policy.analyze_state(
         prepared_batch=prepared_batch,
         graph_idx=0,
         state=_build_state_from_edges((0, 1)),
@@ -334,29 +339,27 @@ def test_answer_commit_reward_prefers_gold_answer_over_failure() -> None:
         policy.compute_stop_log_reward(
             prepared_batch=prepared_batch,
             graph_idx=0,
-            analysis=analysis,
-            answer_entity_id=None,
+            analysis=partial_analysis,
         )
     )
     gold_reward, gold_commit_count, gold_gold_count, gold_hit = (
         policy.compute_stop_log_reward(
             prepared_batch=prepared_batch,
             graph_idx=0,
-            analysis=analysis,
-            answer_entity_id=101,
+            analysis=gold_analysis,
         )
     )
 
     assert failure_hit is False
-    assert failure_commit_count == 1
-    assert failure_gold_count == 1
+    assert failure_commit_count == 0
+    assert failure_gold_count == 0
     assert gold_hit is True
     assert gold_commit_count == 1
     assert gold_gold_count == 1
     assert gold_reward > failure_reward
 
 
-def test_invalid_answer_commit_is_rejected_before_answer_ready() -> None:
+def test_stop_reward_depends_only_on_state_not_selected_answer_id() -> None:
     batch = _make_bridge_batch()
     policy = _make_subgraph_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -366,13 +369,19 @@ def test_invalid_answer_commit_is_rejected_before_answer_ready() -> None:
         state=_build_state_from_edges((0,)),
     )
 
-    with pytest.raises(ValueError, match="admissible answer entity"):
-        policy.compute_stop_log_reward(
-            prepared_batch=prepared_batch,
-            graph_idx=0,
-            analysis=analysis,
-            answer_entity_id=101,
-        )
+    base_reward = policy.compute_stop_log_reward(
+        prepared_batch=prepared_batch,
+        graph_idx=0,
+        analysis=analysis,
+    )
+    ignored_answer_reward = policy.compute_stop_log_reward(
+        prepared_batch=prepared_batch,
+        graph_idx=0,
+        analysis=analysis,
+        answer_entity_id=101,
+    )
+
+    assert ignored_answer_reward == base_reward
 
 
 def test_backward_policy_rejects_non_forward_valid_parent_states() -> None:
@@ -405,7 +414,7 @@ def test_teacher_guidance_uses_multi_anchor_union_path() -> None:
     assert prepared_batch.graph_teacher_edge_count == (4,)
 
 
-def test_teacher_forced_union_guidance_commits_to_gold_answer() -> None:
+def test_teacher_forced_union_guidance_reaches_gold_answer_state() -> None:
     batch = _make_two_hop_multi_anchor_batch()
     policy = _make_subgraph_policy(max_steps=4)
     prepared_batch = policy.prepare_batch(batch)
@@ -421,7 +430,7 @@ def test_teacher_forced_union_guidance_commits_to_gold_answer() -> None:
     assert sample_batch.terminal_commit_candidate_counts[0, 0].item() == 1
     assert sample_batch.terminal_gold_answer_counts[0, 0].item() == 1
     assert sample_batch.chosen_edge_ids[0, 0].tolist() == [0, 1, 2, 3]
-    assert sample_batch.chosen_answer_entity_ids[0, 0].item() == 101
+    assert sample_batch.terminal_answer_entity_ids == ((101,),)
 
 
 def test_guidance_replay_reindexes_edge_ids_across_records() -> None:
@@ -490,10 +499,10 @@ def test_success_replay_buffer_keeps_only_hit_rollouts() -> None:
         terminal_gold_answer_counts=torch.tensor([[0]], dtype=torch.long),
         terminal_hit_mask=torch.tensor([[False]], dtype=torch.bool),
         terminal_component_counts=torch.tensor([[2]], dtype=torch.long),
-        chosen_answer_entity_ids=torch.tensor([[-1]], dtype=torch.long),
         terminal_edge_ids=((0,),),
         terminal_node_ids=((0, 2),),
         terminal_reachability_bits=({0: 1, 2: 2},),
+        terminal_answer_entity_ids=((),),
     )
     replay_buffer = SubgraphSuccessReplayBuffer(capacity=4, deduplicate=True)
 
@@ -550,6 +559,7 @@ def test_subtb_loss_reports_true_residual_variance() -> None:
         terminal_edge_ids=((0, 1),),
         terminal_node_ids=((0, 1),),
         terminal_reachability_bits=({},),
+        terminal_answer_entity_ids=((101,),),
         sample_ids=("sample-1",),
         question_ids=("question-1",),
         num_graphs=1,
@@ -611,7 +621,7 @@ def test_sampler_deduplicates_identical_active_states_per_step(
     assert sample_batch.termination_action_steps[0].tolist() == [1, 1, 1, 1]
 
 
-def test_runtime_counts_committed_answers_instead_of_all_ready_answers(
+def test_runtime_counts_terminal_answer_sets_instead_of_committed_answers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = _make_multi_answer_bridge_batch()
@@ -639,12 +649,9 @@ def test_runtime_counts_committed_answers_instead_of_all_ready_answers(
             ),
             terminal_gold_answer_counts=torch.tensor([[2, 2, 0, 0]], dtype=torch.long),
             terminal_hit_mask=torch.tensor(
-                [[True, True, False, False]], dtype=torch.bool
+                [[True, True, True, False]], dtype=torch.bool
             ),
             terminal_component_counts=torch.tensor([[1, 1, 1, 2]], dtype=torch.long),
-            chosen_answer_entity_ids=torch.tensor(
-                [[101, 101, 103, -1]], dtype=torch.long
-            ),
             terminal_edge_ids=((0, 1, 2, 3), (0, 1, 2, 3), (0, 1), (0,)),
             terminal_node_ids=((0, 1, 2, 3), (0, 1, 2, 3), (0, 1, 2), (0, 2)),
             terminal_reachability_bits=(
@@ -653,6 +660,7 @@ def test_runtime_counts_committed_answers_instead_of_all_ready_answers(
                 {0: 1, 1: 3, 2: 2},
                 {0: 1, 2: 2},
             ),
+            terminal_answer_entity_ids=((101, 103), (101, 103), (101,), ()),
         )
 
     monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
@@ -662,8 +670,8 @@ def test_runtime_counts_committed_answers_instead_of_all_ready_answers(
     assert result["predicted_answer_entity_ids"] == [101, 103]
     assert result["answer_log_masses"] == pytest.approx([math.log(0.5), math.log(0.25)])
     assert result["answering_rollout_count"] == 3
-    assert result["hit_rollout_count"] == 2
-    assert result["top_subgraph_answer_entity_id"] == 101
+    assert result["hit_rollout_count"] == 3
+    assert result["top_subgraph_answer_entity_ids"] == [101, 103]
 
 
 def test_runtime_stops_early_when_top_answer_is_statistically_stable(
@@ -709,9 +717,6 @@ def test_runtime_stops_early_when_top_answer_is_statistically_stable(
                 [[True, True, True, True]], dtype=torch.bool
             ),
             terminal_component_counts=torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
-            chosen_answer_entity_ids=torch.tensor(
-                [[101, 101, 101, 101]], dtype=torch.long
-            ),
             terminal_edge_ids=((0, 1), (0, 1), (0, 1), (0, 1)),
             terminal_node_ids=((0, 1, 2), (0, 1, 2), (0, 1, 2), (0, 1, 2)),
             terminal_reachability_bits=(
@@ -720,6 +725,7 @@ def test_runtime_stops_early_when_top_answer_is_statistically_stable(
                 {0: 1, 1: 3, 2: 2},
                 {0: 1, 1: 3, 2: 2},
             ),
+            terminal_answer_entity_ids=((101,), (101,), (101,), (101,)),
         )
 
     monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
@@ -811,9 +817,6 @@ def test_runtime_batches_graphs_and_shrinks_active_eval_set(
                 terminal_component_counts=torch.tensor(
                     [[1, 1, 1, 1], [2, 2, 2, 2]], dtype=torch.long
                 ),
-                chosen_answer_entity_ids=torch.tensor(
-                    [[101, 101, 101, 101], [-1, -1, -1, -1]], dtype=torch.long
-                ),
                 terminal_edge_ids=(
                     (0, 1),
                     (0, 1),
@@ -844,6 +847,16 @@ def test_runtime_batches_graphs_and_shrinks_active_eval_set(
                     {3: 1, 5: 2},
                     {3: 1, 5: 2},
                 ),
+                terminal_answer_entity_ids=(
+                    (101,),
+                    (101,),
+                    (101,),
+                    (101,),
+                    (),
+                    (),
+                    (),
+                    (),
+                ),
             )
         return _fake_sample_batch(
             num_graphs=1,
@@ -861,7 +874,6 @@ def test_runtime_batches_graphs_and_shrinks_active_eval_set(
                 [[False, False, False, False]], dtype=torch.bool
             ),
             terminal_component_counts=torch.tensor([[2, 2, 2, 2]], dtype=torch.long),
-            chosen_answer_entity_ids=torch.tensor([[-1, -1, -1, -1]], dtype=torch.long),
             terminal_edge_ids=((2,), (2,), (2,), (2,)),
             terminal_node_ids=((3, 5), (3, 5), (3, 5), (3, 5)),
             terminal_reachability_bits=(
@@ -870,6 +882,7 @@ def test_runtime_batches_graphs_and_shrinks_active_eval_set(
                 {3: 1, 5: 2},
                 {3: 1, 5: 2},
             ),
+            terminal_answer_entity_ids=((), (), (), ()),
         )
 
     def _fake_stability_margin(**kwargs: object) -> float | None:
@@ -939,9 +952,6 @@ def test_runtime_applies_support_mass_threshold_and_overlap_penalty(
                 [[True, False, False, True]], dtype=torch.bool
             ),
             terminal_component_counts=torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
-            chosen_answer_entity_ids=torch.tensor(
-                [[101, 101, -1, 103]], dtype=torch.long
-            ),
             terminal_edge_ids=((0, 1), (0, 1), (0, 1, 2), (3,)),
             terminal_node_ids=((0, 1, 2), (0, 1, 2), (0, 1, 2, 3), (0, 2, 3)),
             terminal_reachability_bits=(
@@ -950,6 +960,7 @@ def test_runtime_applies_support_mass_threshold_and_overlap_penalty(
                 {0: 1, 1: 3, 2: 2, 3: 3},
                 {0: 1, 2: 2, 3: 3},
             ),
+            terminal_answer_entity_ids=((101,), (101,), (), (103,)),
         )
 
     monkeypatch.setattr(runtime.sampler, "sample", _fake_sample)
@@ -964,11 +975,9 @@ def test_runtime_applies_support_mass_threshold_and_overlap_penalty(
         [0, 1],
         [3],
     ]
-    assert [
-        entry["chosen_answer_entity_id"] for entry in result["terminal_subgraphs"]
-    ] == [
-        101,
-        103,
+    assert [entry["answer_entities"] for entry in result["terminal_subgraphs"]] == [
+        [101],
+        [103],
     ]
     assert result["support_probabilities"] == pytest.approx([0.5, 0.25])
     assert result["support_probability_mass"] == pytest.approx(0.75)

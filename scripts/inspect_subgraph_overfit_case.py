@@ -602,13 +602,7 @@ def _trace_training_rollouts(
         proposal_bias_scale=float(model._resolve_proposal_bias_scale()),
     )
     rollout_records = []
-    chosen_answer_ids = sample_batch.chosen_answer_entity_ids
     for rollout_idx in range(int(sample_batch.num_rollouts)):
-        chosen_answer = None
-        if chosen_answer_ids is not None:
-            chosen_answer_value = int(chosen_answer_ids[0, rollout_idx].item())
-            if chosen_answer_value >= 0:
-                chosen_answer = int(chosen_answer_value)
         rollout_records.append(
             {
                 "rollout_index": int(rollout_idx),
@@ -617,7 +611,12 @@ def _trace_training_rollouts(
                     for edge_id in sample_batch.chosen_edge_ids[0, rollout_idx].tolist()
                     if int(edge_id) >= 0
                 ],
-                "chosen_answer_entity_id": chosen_answer,
+                "terminal_answer_entity_ids": [
+                    int(entity_id)
+                    for entity_id in sample_batch.terminal_answer_entity_ids[
+                        int(rollout_idx)
+                    ]
+                ],
                 "admissible_commit_count": int(
                     sample_batch.terminal_commit_candidate_counts[0, rollout_idx].item()
                 ),
@@ -666,12 +665,6 @@ def _run_teacher_force_summary(
         prepared_batch=prepared_batch,
         edge_sequences=(selected.teacher_edge_ids,),
     )
-    chosen_answer_ids = sample_batch.chosen_answer_entity_ids
-    chosen_answer = None
-    if chosen_answer_ids is not None:
-        chosen_answer_value = int(chosen_answer_ids[0, 0].item())
-        if chosen_answer_value >= 0:
-            chosen_answer = int(chosen_answer_value)
     print(
         json.dumps(
             {
@@ -679,7 +672,10 @@ def _run_teacher_force_summary(
                     int(edge_id)
                     for edge_id in sample_batch.chosen_edge_ids[0, 0].tolist()
                 ],
-                "chosen_answer_entity_id": chosen_answer,
+                "terminal_answer_entity_ids": [
+                    int(entity_id)
+                    for entity_id in sample_batch.terminal_answer_entity_ids[0]
+                ],
                 "admissible_commit_count": int(
                     sample_batch.terminal_commit_candidate_counts[0, 0].item()
                 ),

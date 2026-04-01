@@ -698,6 +698,12 @@ class GFlowNetModule(LightningModule):
                 .to(dtype=torch.float32)
                 .mean()
             )
+        else:
+            mean_answer_commit_rate = (
+                (sample_batch.terminal_commit_candidate_counts > 0)
+                .to(dtype=torch.float32)
+                .mean()
+            )
         return {
             "loss": total_loss.detach(),
             "objective/subtb_loss": loss_output.subtb_loss.detach(),

@@ -159,10 +159,8 @@ class HierarchicalStateActionDistribution:
     current_oracle_distance: float
 
     def _stop_answer_entity_id(self, stop_choice_idx: int) -> int | None:
-        answer_entity_id = int(
-            self.stop_choice_answer_entity_ids[int(stop_choice_idx)].item()
-        )
-        return None if answer_entity_id < 0 else int(answer_entity_id)
+        del stop_choice_idx
+        return None
 
     def relation_slice(self, node_choice_idx: int) -> slice:
         start = int(self.node_relation_ptr[int(node_choice_idx)].item())
@@ -175,7 +173,8 @@ class HierarchicalStateActionDistribution:
         return slice(start, end)
 
     def build_stop_action(self, stop_choice_idx: int) -> SubgraphAction:
-        return SubgraphAction.stop(self._stop_answer_entity_id(int(stop_choice_idx)))
+        del stop_choice_idx
+        return SubgraphAction.stop()
 
     def build_edge_action(self, edge_choice_idx: int) -> SubgraphAction:
         edge_choice_idx = int(edge_choice_idx)
@@ -1298,43 +1297,15 @@ class SubgraphActor(nn.Module):
             per_node_top_k=per_node_top_k,
             per_state_top_k=per_state_top_k,
         )
-        answer_ready_entities = tuple(
-            int(entity_id) for entity_id in commit_set.entities
+        answer_choice_answer_entity_ids = torch.empty(
+            (0,), device=device, dtype=torch.long
         )
-        if answer_ready_entities:
-            answer_features: list[torch.Tensor] = []
-            support_node_counts: list[int] = []
-            for answer_entity_id in answer_ready_entities:
-                answer_feature, support_node_count = _answer_ready_entity_pool(
-                    prepared_batch=prepared_batch,
-                    analysis=analysis,
-                    entity_id=int(answer_entity_id),
-                    full_mask=full_mask,
-                    device=device,
-                )
-                answer_features.append(answer_feature)
-                support_node_counts.append(int(support_node_count))
-            answer_choice_answer_entity_ids = torch.tensor(
-                answer_ready_entities,
-                device=device,
-                dtype=torch.long,
-            )
-            answer_choice_support_node_counts = torch.tensor(
-                support_node_counts,
-                device=device,
-                dtype=torch.long,
-            )
-            answer_choice_features = torch.stack(answer_features, dim=0)
-        else:
-            answer_choice_answer_entity_ids = torch.empty(
-                (0,), device=device, dtype=torch.long
-            )
-            answer_choice_support_node_counts = torch.empty(
-                (0,), device=device, dtype=torch.long
-            )
-            answer_choice_features = prepared_batch.node_tokens.new_empty(
-                (0, int(prepared_batch.node_tokens.size(-1)))
-            )
+        answer_choice_support_node_counts = torch.empty(
+            (0,), device=device, dtype=torch.long
+        )
+        answer_choice_features = prepared_batch.node_tokens.new_empty(
+            (0, int(prepared_batch.node_tokens.size(-1)))
+        )
         return _StateDistributionContext(
             flat_state_index=flat_state_idx,
             current_components=current_components,
@@ -1435,49 +1406,26 @@ class SubgraphActor(nn.Module):
         else:
             edge_choice_logits = state_feature.new_empty((0,), dtype=torch.float32)
 
-        failure_stop_logit = self._build_failure_stop_logit(
+        stop_readiness_logit = self._build_failure_stop_logit(
             state_feature=state_feature,
-            num_answer_ready=int(context.answer_choice_answer_entity_ids.numel()),
+            num_answer_ready=int(context.current_commit_candidate_count),
             current_components=context.current_components,
             current_edges=context.state_num_edges,
             device=device,
         )
         stop_choice_answer_entity_ids = torch.full(
-            (1,), fill_value=-1, device=device, dtype=torch.long
+            (1,), -1, device=device, dtype=torch.long
         )
-        stop_choice_support_node_counts = torch.zeros(
-            (1,), device=device, dtype=torch.long
+        stop_choice_support_node_counts = torch.tensor(
+            [int(context.current_commit_candidate_count)],
+            device=device,
+            dtype=torch.long,
         )
-        stop_choice_logits = failure_stop_logit.unsqueeze(0)
-        if int(context.answer_choice_answer_entity_ids.numel()) > 0:
-            answer_stop_logits = self._build_stop_choice_logits_batch(
-                state_feature=state_feature,
-                answer_features=context.answer_choice_features,
-                support_node_counts=context.answer_choice_support_node_counts,
-                current_components=context.current_components,
-                current_edges=context.state_num_edges,
-            )
-            stop_choice_answer_entity_ids = torch.cat(
-                (
-                    stop_choice_answer_entity_ids,
-                    context.answer_choice_answer_entity_ids,
-                ),
-                dim=0,
-            )
-            stop_choice_support_node_counts = torch.cat(
-                (
-                    stop_choice_support_node_counts,
-                    context.answer_choice_support_node_counts,
-                ),
-                dim=0,
-            )
-            stop_choice_logits = torch.cat(
-                (stop_choice_logits, answer_stop_logits),
-                dim=0,
-            )
+        stop_choice_logits = torch.zeros((1,), device=device, dtype=torch.float32)
 
         stop_logit = self.stop_head(state_feature.unsqueeze(0)).squeeze(0).squeeze(-1)
         stop_logit = stop_logit.to(dtype=torch.float32)
+        stop_logit = stop_logit + stop_readiness_logit.to(dtype=torch.float32)
         continue_logit = (
             self.continue_head(state_feature.unsqueeze(0)).squeeze(0).squeeze(-1)
         )
@@ -1586,11 +1534,11 @@ class SubgraphActor(nn.Module):
             device=device,
             dtype=torch.long,
         )
-        answer_choice_counts = [
-            int(context.answer_choice_answer_entity_ids.numel()) for context in contexts
+        answer_ready_counts = [
+            int(context.current_commit_candidate_count) for context in contexts
         ]
-        answer_choice_count_tensor = torch.tensor(
-            answer_choice_counts,
+        answer_ready_count_tensor = torch.tensor(
+            answer_ready_counts,
             device=device,
             dtype=torch.long,
         )
@@ -1602,9 +1550,9 @@ class SubgraphActor(nn.Module):
             .squeeze(-1)
             .to(dtype=torch.float32)
         )
-        failure_stop_logits = self._build_failure_stop_logits(
+        stop_logits = stop_logits + self._build_failure_stop_logits(
             state_features=active_state_features,
-            num_answer_ready=answer_choice_count_tensor,
+            num_answer_ready=answer_ready_count_tensor,
             current_components=current_components,
             current_edges=state_num_edges,
         )
@@ -1866,42 +1814,6 @@ class SubgraphActor(nn.Module):
                 (0,), dtype=torch.float32
             )
 
-        answer_offsets = _offsets(answer_choice_counts)
-        if answer_offsets[-1] > 0:
-            answer_state_indices = torch.repeat_interleave(
-                torch.arange(num_states, device=device, dtype=torch.long),
-                answer_choice_count_tensor,
-            )
-            answer_choice_logits = self._build_stop_choice_logits(
-                state_features=active_state_features.index_select(
-                    0, answer_state_indices
-                ),
-                answer_features=torch.cat(
-                    [
-                        context.answer_choice_features
-                        for context in contexts
-                        if int(context.answer_choice_features.size(0)) > 0
-                    ],
-                    dim=0,
-                ),
-                support_node_counts=torch.cat(
-                    [
-                        context.answer_choice_support_node_counts
-                        for context in contexts
-                        if int(context.answer_choice_support_node_counts.numel()) > 0
-                    ],
-                    dim=0,
-                ),
-                current_components=current_components.index_select(
-                    0, answer_state_indices
-                ),
-                current_edges=state_num_edges.index_select(0, answer_state_indices),
-            )
-        else:
-            answer_choice_logits = active_state_features.new_empty(
-                (0,), dtype=torch.float32
-            )
-
         state_distributions: list[HierarchicalStateActionDistribution] = []
         total_raw_candidates = 0
         max_raw_candidates = 0
@@ -1920,41 +1832,15 @@ class SubgraphActor(nn.Module):
                 int(edge_offsets[local_state_idx]),
                 int(edge_offsets[local_state_idx + 1]),
             )
-            answer_choice_slice = slice(
-                int(answer_offsets[local_state_idx]),
-                int(answer_offsets[local_state_idx + 1]),
-            )
             stop_choice_answer_entity_ids = torch.full(
-                (1,), fill_value=-1, device=device, dtype=torch.long
+                (1,), -1, device=device, dtype=torch.long
             )
-            stop_choice_support_node_counts = torch.zeros(
-                (1,), device=device, dtype=torch.long
+            stop_choice_support_node_counts = torch.tensor(
+                [int(context.current_commit_candidate_count)],
+                device=device,
+                dtype=torch.long,
             )
-            stop_choice_logits = failure_stop_logits[
-                local_state_idx : local_state_idx + 1
-            ]
-            if int(context.answer_choice_answer_entity_ids.numel()) > 0:
-                stop_choice_answer_entity_ids = torch.cat(
-                    (
-                        stop_choice_answer_entity_ids,
-                        context.answer_choice_answer_entity_ids,
-                    ),
-                    dim=0,
-                )
-                stop_choice_support_node_counts = torch.cat(
-                    (
-                        stop_choice_support_node_counts,
-                        context.answer_choice_support_node_counts,
-                    ),
-                    dim=0,
-                )
-                stop_choice_logits = torch.cat(
-                    (
-                        stop_choice_logits,
-                        answer_choice_logits[answer_choice_slice],
-                    ),
-                    dim=0,
-                )
+            stop_choice_logits = torch.zeros((1,), device=device, dtype=torch.float32)
             continue_logit = continue_logits[local_state_idx]
             if (
                 int(context.linearized.node_choice_graph_node_ids.numel()) <= 0

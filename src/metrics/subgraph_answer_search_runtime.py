@@ -43,7 +43,6 @@ class _TerminalSampleAggregate:
     edge_ids: tuple[int, ...]
     selected_node_ids: tuple[int, ...]
     reachability_bits: dict[int, int]
-    chosen_answer_entity_id: int | None
     answer_entities: tuple[int, ...]
     sample_count: int = 0
 
@@ -56,10 +55,10 @@ class _GraphPredictionAccumulator:
     gold_answer_entity_ids: list[int]
     a_entity_in_graph: bool
     candidate_answer_upper_bound: int
-    answer_vote_counts: dict[int, int] = field(default_factory=dict)
-    terminal_subgraphs: dict[
-        tuple[tuple[int, ...], int | None], _TerminalSampleAggregate
-    ] = field(default_factory=dict)
+    answer_vote_counts: dict[int, float] = field(default_factory=dict)
+    terminal_subgraphs: dict[tuple[int, ...], _TerminalSampleAggregate] = field(
+        default_factory=dict
+    )
     answering_rollout_count: int = 0
     hit_rollout_count: int = 0
     total_stop_steps: float = 0.0
@@ -110,7 +109,7 @@ def _split_terminal_answer_log_mass(
 ) -> float | None:
     if probability_mass <= 0.0 or not answer_entities:
         return None
-    return float(math.log(float(probability_mass)))
+    return float(math.log(float(probability_mass) / float(len(answer_entities))))
 
 
 def _graph_candidate_answer_upper_bound(*, prepared_batch: Any, graph_idx: int) -> int:
@@ -121,7 +120,7 @@ def _graph_candidate_answer_upper_bound(*, prepared_batch: Any, graph_idx: int) 
 
 def _topk_stability_margin(
     *,
-    answer_vote_counts: dict[int, int],
+    answer_vote_counts: dict[int, float],
     executed_rollouts: int,
     candidate_answer_upper_bound: int,
     confidence: float,
@@ -131,7 +130,7 @@ def _topk_stability_margin(
         return None
     ranked_counts = sorted(
         answer_vote_counts.items(),
-        key=lambda item: (-int(item[1]), int(item[0])),
+        key=lambda item: (-float(item[1]), int(item[0])),
     )
     if len(ranked_counts) < int(stability_top_k):
         return None
@@ -345,7 +344,6 @@ def _build_support_records(
             graph_idx=graph_idx,
             edge_ids=payload.edge_ids,
         )
-        terminal_entity_id = payload.chosen_answer_entity_id
         records.append(
             {
                 "path_rank": int(path_rank),
@@ -357,7 +355,9 @@ def _build_support_records(
                     int(entity_id) for entity_id in payload.answer_entities
                 ],
                 "chosen_answer_entity_id": (
-                    None if terminal_entity_id is None else int(terminal_entity_id)
+                    int(payload.answer_entities[0])
+                    if len(payload.answer_entities) == 1
+                    else None
                 ),
                 "sample_count": int(payload.sample_count),
                 "probability": float(probability),
@@ -370,14 +370,7 @@ def _build_support_records(
                 "trajectory_text": (
                     _trajectory_text_from_edge_records(edge_records)
                     if edge_records
-                    else (
-                        f"(start_only) {int(terminal_entity_id)}"
-                        if terminal_entity_id is not None
-                        else "(start_only)"
-                    )
-                ),
-                "terminal_entity_id": (
-                    None if terminal_entity_id is None else int(terminal_entity_id)
+                    else "(start_only)"
                 ),
             }
         )
@@ -430,7 +423,7 @@ def _finalize_graph_result(
     executed_rollouts = max(int(accumulator.rollout_count), 1)
     ranked_answers = sorted(
         accumulator.answer_vote_counts.items(),
-        key=lambda item: (-int(item[1]), int(item[0])),
+        key=lambda item: (-float(item[1]), int(item[0])),
     )
     ranked_terminals = sorted(
         accumulator.terminal_subgraphs.values(),
@@ -489,10 +482,13 @@ def _finalize_graph_result(
         ]
         result["top_subgraph_probability"] = float(top_probability)
         result["top_subgraph_sample_count"] = int(top_subgraph.sample_count)
+        result["top_subgraph_answer_entity_ids"] = [
+            int(entity_id) for entity_id in top_subgraph.answer_entities
+        ]
         result["top_subgraph_answer_entity_id"] = (
-            None
-            if top_subgraph.chosen_answer_entity_id is None
-            else int(top_subgraph.chosen_answer_entity_id)
+            int(top_subgraph.answer_entities[0])
+            if len(top_subgraph.answer_entities) == 1
+            else None
         )
     if include_answer_support:
         result["terminal_subgraphs"] = support_records
@@ -719,56 +715,33 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
                             flat_rollout_idx
                         ].items()
                     }
-                    chosen_answer_entity_id = -1
-                    if sample_batch.chosen_answer_entity_ids is not None:
-                        chosen_answer_entity_id = int(
-                            sample_batch.chosen_answer_entity_ids[
-                                local_graph_idx, rollout_idx
-                            ].item()
-                        )
-                    answer_entities = (
-                        ()
-                        if chosen_answer_entity_id < 0
-                        else (int(chosen_answer_entity_id),)
+                    answer_entities = tuple(
+                        int(entity_id)
+                        for entity_id in sample_batch.terminal_answer_entity_ids[
+                            flat_rollout_idx
+                        ]
                     )
-                    if chosen_answer_entity_id >= 0:
+                    if answer_entities:
                         accumulator.answering_rollout_count += 1
-                        accumulator.answer_vote_counts[int(chosen_answer_entity_id)] = (
-                            int(
-                                accumulator.answer_vote_counts.get(
-                                    int(chosen_answer_entity_id), 0
+                        per_answer_mass = 1.0 / float(len(answer_entities))
+                        for answer_entity_id in answer_entities:
+                            accumulator.answer_vote_counts[int(answer_entity_id)] = (
+                                float(
+                                    accumulator.answer_vote_counts.get(
+                                        int(answer_entity_id), 0.0
+                                    )
                                 )
+                                + float(per_answer_mass)
                             )
-                            + 1
-                        )
-                    payload = accumulator.terminal_subgraphs.get(
-                        (
-                            edge_ids,
-                            None
-                            if chosen_answer_entity_id < 0
-                            else chosen_answer_entity_id,
-                        )
-                    )
+                    payload = accumulator.terminal_subgraphs.get(edge_ids)
                     if payload is None:
                         payload = _TerminalSampleAggregate(
                             edge_ids=edge_ids,
                             selected_node_ids=selected_node_ids,
                             reachability_bits=reachability_bits,
-                            chosen_answer_entity_id=(
-                                None
-                                if chosen_answer_entity_id < 0
-                                else int(chosen_answer_entity_id)
-                            ),
                             answer_entities=answer_entities,
                         )
-                        accumulator.terminal_subgraphs[
-                            (
-                                edge_ids,
-                                None
-                                if chosen_answer_entity_id < 0
-                                else int(chosen_answer_entity_id),
-                            )
-                        ] = payload
+                        accumulator.terminal_subgraphs[edge_ids] = payload
                     payload.sample_count += 1
 
                 accumulator.rollout_count += int(current_rollouts)

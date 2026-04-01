@@ -94,7 +94,7 @@ def test_strict_state_starts_with_anchor_nodes() -> None:
     assert analysis.anchor_component_count == 2
 
 
-def test_strict_answer_stop_commits_to_answer_ready_entity() -> None:
+def test_strict_stop_exposes_answer_set_from_terminal_topology() -> None:
     batch = _make_bridge_batch()
     policy = _make_subgraph_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -116,28 +116,24 @@ def test_strict_answer_stop_commits_to_answer_ready_entity() -> None:
     )
     state_distribution = distribution.state_distributions[0]
 
-    answer_stop_choices = {
-        choice.answer_entity_id for choice in state_distribution.stop_choices
-    }
-
-    assert answer_stop_choices == {None, 101}
+    assert len(state_distribution.stop_choices) == 1
+    assert state_distribution.stop_choices[0].answer_entity_id is None
     analysis = policy.analyze_rollout_batch(
         prepared_batch=prepared_batch,
         rollout_batch=rollout_batch,
     )[0]
-    commit_set = policy.admissible_answer_commit_set(
+    answer_set = policy.admissible_answer_set(
         prepared_batch=prepared_batch,
         graph_idx=0,
         analysis=analysis,
     )
 
-    assert commit_set.entities == (101,)
-    assert commit_set.gold_entities == (101,)
+    assert answer_set.entities == (101,)
+    assert answer_set.gold_entities == (101,)
     reward, commit_count, gold_count, hit = policy.compute_stop_log_reward(
         prepared_batch=prepared_batch,
         graph_idx=0,
         analysis=analysis,
-        answer_entity_id=101,
     )
     assert hit is True
     assert commit_count == 1
@@ -161,7 +157,7 @@ def test_backward_policy_is_uniform_over_forward_valid_parent_edges() -> None:
     assert removable == pytest.approx(-math.log(2.0))
 
 
-def test_teacher_force_commits_to_gold_answer_when_available() -> None:
+def test_teacher_force_marks_gold_answer_state_when_available() -> None:
     batch = _make_bridge_batch()
     policy = _make_subgraph_policy(max_steps=2)
     prepared_batch = policy.prepare_batch(batch)
@@ -177,7 +173,7 @@ def test_teacher_force_commits_to_gold_answer_when_available() -> None:
     assert sample_batch.terminal_hit_mask[0, 0].item() is True
     assert sample_batch.terminal_commit_candidate_counts[0, 0].item() == 1
     assert sample_batch.terminal_gold_answer_counts[0, 0].item() == 1
-    assert sample_batch.chosen_answer_entity_ids[0, 0].item() == 101
+    assert sample_batch.terminal_answer_entity_ids == ((101,),)
 
 
 def test_strict_paper_defaults_disable_action_pruning() -> None:

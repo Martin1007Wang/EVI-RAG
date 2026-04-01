@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import torch
@@ -11,6 +11,7 @@ from src.utils.cuda_memory import profile_cuda_memory
 from .actor import HierarchicalStateActionDistribution
 from .policy import SubgraphPolicy
 from .prepared_batch import SubgraphPreparedBatch
+from .reward import SubgraphTerminalReward
 from .state import SubgraphAction, SubgraphAnalysis, SubgraphRolloutBatch, SubgraphState
 
 
@@ -35,6 +36,9 @@ class SubgraphTrajectorySampleBatch:
     question_ids: tuple[str, ...]
     num_graphs: int
     num_rollouts: int
+    terminal_answer_entity_ids: tuple[tuple[int, ...], ...] = field(
+        default_factory=tuple
+    )
     chosen_answer_entity_ids: torch.Tensor | None = None
     chosen_source_graph_nodes: torch.Tensor | None = None
     state_component_counts: torch.Tensor | None = None
@@ -64,6 +68,32 @@ class SubgraphTrajectorySampleBatch:
             self.state_component_counts.shape
         ) != tuple(self.state_log_flows.shape):
             raise ValueError("state_component_counts shape mismatch.")
+        expected_flat = int(self.num_graphs) * int(self.num_rollouts)
+        if len(self.terminal_edge_ids) != expected_flat:
+            raise ValueError("terminal_edge_ids length mismatch.")
+        if len(self.terminal_node_ids) != expected_flat:
+            raise ValueError("terminal_node_ids length mismatch.")
+        if len(self.terminal_reachability_bits) != expected_flat:
+            raise ValueError("terminal_reachability_bits length mismatch.")
+        if len(self.terminal_answer_entity_ids) == 0:
+            derived_answer_entities: list[tuple[int, ...]] = []
+            if self.chosen_answer_entity_ids is not None:
+                for value in (
+                    self.chosen_answer_entity_ids.view(-1).detach().cpu().tolist()
+                ):
+                    answer_entity_id = int(value)
+                    derived_answer_entities.append(
+                        () if answer_entity_id < 0 else (int(answer_entity_id),)
+                    )
+            else:
+                derived_answer_entities = [() for _ in range(expected_flat)]
+            object.__setattr__(
+                self,
+                "terminal_answer_entity_ids",
+                tuple(derived_answer_entities),
+            )
+        if len(self.terminal_answer_entity_ids) != expected_flat:
+            raise ValueError("terminal_answer_entity_ids length mismatch.")
 
     @property
     def success_rate(self) -> torch.Tensor:
@@ -210,30 +240,22 @@ def _lookup_backward_log_prob(
     return float(cached)
 
 
-def _lookup_terminal_log_reward(
+def _lookup_terminal_reward(
     *,
     policy: SubgraphPolicy,
     prepared_batch: SubgraphPreparedBatch,
     graph_idx: int,
     state: SubgraphState,
     analysis: SubgraphAnalysis,
-    answer_entity_id: int | None,
-    terminal_reward_cache: dict[
-        tuple[int, tuple[Any, ...], int | None], tuple[float, int, int, bool]
-    ],
-) -> tuple[float, int, int, bool]:
-    cache_key = (
-        int(graph_idx),
-        state.key(),
-        None if answer_entity_id is None else int(answer_entity_id),
-    )
+    terminal_reward_cache: dict[tuple[int, tuple[Any, ...]], SubgraphTerminalReward],
+) -> SubgraphTerminalReward:
+    cache_key = (int(graph_idx), state.key())
     cached = terminal_reward_cache.get(cache_key)
     if cached is None:
-        cached = policy.compute_terminal_log_reward(
+        cached = policy.compute_terminal_reward(
             prepared_batch=prepared_batch,
             graph_idx=int(graph_idx),
             analysis=analysis,
-            answer_entity_id=answer_entity_id,
         )
         terminal_reward_cache[cache_key] = cached
     return cached
@@ -427,26 +449,10 @@ def _stop_logits(
 
 
 def _select_stop_choice(
-    *,
-    state_distribution: HierarchicalStateActionDistribution,
-    preferred_answer_entities: set[int],
+    *, state_distribution: HierarchicalStateActionDistribution
 ) -> int:
-    for stop_idx in range(
-        int(state_distribution.stop_choice_answer_entity_ids.numel())
-    ):
-        answer_entity_id = int(
-            state_distribution.stop_choice_answer_entity_ids[int(stop_idx)].item()
-        )
-        if answer_entity_id >= 0 and int(answer_entity_id) in preferred_answer_entities:
-            return int(stop_idx)
-    for stop_idx in range(
-        int(state_distribution.stop_choice_answer_entity_ids.numel())
-    ):
-        answer_entity_id = int(
-            state_distribution.stop_choice_answer_entity_ids[int(stop_idx)].item()
-        )
-        if answer_entity_id < 0:
-            return int(stop_idx)
+    if int(state_distribution.stop_choice_logits.numel()) <= 0:
+        raise RuntimeError("Stop distributions must expose at least one stop choice.")
     return 0
 
 
@@ -459,9 +465,8 @@ def _sample_state_action(
     gate_idx, _ = _sample_index(gate_logits, temperature=temperature)
     gate_log_prob = _log_softmax_choice(gate_logits, gate_idx)
     if gate_idx == 0 or int(state_distribution.node_choice_logits.numel()) <= 0:
-        # STOP is normalized over the failure sink and the admissible answer-commit
-        # sinks for this state, so commit probabilities stay in the same local
-        # decision simplex as the failure action.
+        # STOP now terminates the current subgraph directly. Any answer supervision
+        # is derived from the terminal topology, not from a separate answer choice.
         stop_logits = _stop_logits(state_distribution)
         stop_idx, _ = _sample_index(stop_logits, temperature=temperature)
         stop_log_prob = _log_softmax_choice(stop_logits, stop_idx)
@@ -494,21 +499,10 @@ def _teacher_forced_state_action(
     *,
     state_distribution: HierarchicalStateActionDistribution,
     planned_edge_id: int | None,
-    preferred_answer_entities: set[int] | None = None,
 ) -> tuple[SubgraphAction, torch.Tensor, int]:
     gate_logits = _gate_logits(state_distribution)
     if planned_edge_id is None:
-        # Teacher forcing keeps the same stop normalization as online sampling and
-        # simply picks the preferred admissible answer sink among the available
-        # stop choices.
-        stop_idx = _select_stop_choice(
-            state_distribution=state_distribution,
-            preferred_answer_entities=(
-                set()
-                if preferred_answer_entities is None
-                else {int(entity_id) for entity_id in preferred_answer_entities}
-            ),
-        )
+        stop_idx = _select_stop_choice(state_distribution=state_distribution)
         stop_logits = _stop_logits(state_distribution)
         return (
             state_distribution.build_stop_action(int(stop_idx)),
@@ -585,7 +579,7 @@ class SubgraphSampler:
         analysis_cache: dict[tuple[int, tuple[Any, ...]], SubgraphAnalysis] = {}
         backward_log_prob_cache: dict[tuple[int, tuple[Any, ...]], float] = {}
         terminal_reward_cache: dict[
-            tuple[int, tuple[Any, ...], int | None], tuple[float, int, int, bool]
+            tuple[int, tuple[Any, ...]], SubgraphTerminalReward
         ] = {}
         with profile_cuda_memory(
             "sampler.sample.initialize_rollout_batch",
@@ -629,12 +623,6 @@ class SubgraphSampler:
                 device=prepared_batch.device,
                 dtype=torch.long,
             )
-            chosen_answer_entity_ids = torch.full(
-                (flat_states,),
-                fill_value=-1,
-                device=prepared_batch.device,
-                dtype=torch.long,
-            )
             stop_actions = torch.zeros(
                 (flat_states, max_actions),
                 device=prepared_batch.device,
@@ -651,6 +639,9 @@ class SubgraphSampler:
                 termination_action_steps, dtype=torch.bool
             )
             terminal_component_counts = torch.zeros_like(termination_action_steps)
+            terminal_answer_entity_ids: list[tuple[int, ...]] = [
+                () for _ in range(flat_states)
+            ]
         for action_step in range(max_actions):
             active_state_indices = rollout_batch.active_state_indices()
             active_states = int(len(active_state_indices))
@@ -706,32 +697,30 @@ class SubgraphSampler:
                     dtype=torch.float32
                 )
                 if action.is_stop:
-                    reward_value, commit_candidate_count, gold_answer_count, hit = (
-                        _lookup_terminal_log_reward(
-                            policy=policy,
-                            prepared_batch=prepared_batch,
-                            graph_idx=graph_idx,
-                            state=current_state,
-                            analysis=current_analysis,
-                            answer_entity_id=action.answer_entity_id,
-                            terminal_reward_cache=terminal_reward_cache,
-                        )
+                    terminal_reward = _lookup_terminal_reward(
+                        policy=policy,
+                        prepared_batch=prepared_batch,
+                        graph_idx=graph_idx,
+                        state=current_state,
+                        analysis=current_analysis,
+                        terminal_reward_cache=terminal_reward_cache,
                     )
                     log_reward_actions[flat_state_idx, action_step] = float(
-                        reward_value
+                        terminal_reward.log_reward
                     )
-                    if action.answer_entity_id is not None:
-                        chosen_answer_entity_ids[flat_state_idx] = int(
-                            action.answer_entity_id
-                        )
                     termination_action_steps[flat_state_idx] = int(action_step + 1)
                     terminal_commit_candidate_counts[flat_state_idx] = int(
-                        commit_candidate_count
+                        terminal_reward.answer_set.count
                     )
-                    terminal_gold_answer_counts[flat_state_idx] = int(gold_answer_count)
-                    terminal_hit_mask[flat_state_idx] = bool(hit)
+                    terminal_gold_answer_counts[flat_state_idx] = int(
+                        terminal_reward.answer_set.gold_count
+                    )
+                    terminal_hit_mask[flat_state_idx] = bool(terminal_reward.hit)
                     terminal_component_counts[flat_state_idx] = int(
                         current_analysis.anchor_component_count
+                    )
+                    terminal_answer_entity_ids[flat_state_idx] = tuple(
+                        int(entity_id) for entity_id in terminal_reward.answer_entities
                     )
                     continue
                 if action_step >= self.max_steps:
@@ -819,12 +808,10 @@ class SubgraphSampler:
             terminal_component_counts=terminal_component_counts.view(
                 num_graphs, num_rollouts
             ),
-            chosen_answer_entity_ids=chosen_answer_entity_ids.view(
-                num_graphs, num_rollouts
-            ),
             terminal_edge_ids=terminal_edge_ids,
             terminal_node_ids=terminal_node_ids,
             terminal_reachability_bits=terminal_reachability_bits,
+            terminal_answer_entity_ids=tuple(terminal_answer_entity_ids),
             sample_ids=prepared_batch.sample_ids,
             question_ids=prepared_batch.sample_ids,
             num_graphs=num_graphs,
@@ -848,7 +835,7 @@ class SubgraphSampler:
         analysis_cache: dict[tuple[int, tuple[Any, ...]], SubgraphAnalysis] = {}
         backward_log_prob_cache: dict[tuple[int, tuple[Any, ...]], float] = {}
         terminal_reward_cache: dict[
-            tuple[int, tuple[Any, ...], int | None], tuple[float, int, int, bool]
+            tuple[int, tuple[Any, ...]], SubgraphTerminalReward
         ] = {}
         rollout_batch = policy.initialize_rollout_batch(
             prepared_batch=prepared_batch,
@@ -876,12 +863,6 @@ class SubgraphSampler:
             device=prepared_batch.device,
             dtype=torch.long,
         )
-        chosen_answer_entity_ids = torch.full(
-            (flat_states,),
-            fill_value=-1,
-            device=prepared_batch.device,
-            dtype=torch.long,
-        )
         stop_actions = torch.zeros(
             (flat_states, max_actions),
             device=prepared_batch.device,
@@ -894,6 +875,9 @@ class SubgraphSampler:
         terminal_gold_answer_counts = torch.zeros_like(termination_action_steps)
         terminal_hit_mask = torch.zeros_like(termination_action_steps, dtype=torch.bool)
         terminal_component_counts = torch.zeros_like(termination_action_steps)
+        terminal_answer_entity_ids: list[tuple[int, ...]] = [
+            () for _ in range(flat_states)
+        ]
         for action_step in range(max_actions):
             active_state_indices = rollout_batch.active_state_indices()
             active_states = int(len(active_state_indices))
@@ -938,12 +922,6 @@ class SubgraphSampler:
                 action, log_pf, _next_components = _teacher_forced_state_action(
                     state_distribution=state_distribution,
                     planned_edge_id=planned_edge_id,
-                    preferred_answer_entities=set(
-                        int(entity_id)
-                        for entity_id in prepared_batch.graph_answer_entities[
-                            int(rollout_batch.graph_ids[flat_state_idx].item())
-                        ]
-                    ),
                 )
                 action_mask[flat_state_idx, action_step] = True
                 chosen_actions[flat_state_idx] = action
@@ -952,32 +930,30 @@ class SubgraphSampler:
                     dtype=torch.float32
                 )
                 if action.is_stop:
-                    reward_value, commit_candidate_count, gold_answer_count, hit = (
-                        _lookup_terminal_log_reward(
-                            policy=policy,
-                            prepared_batch=prepared_batch,
-                            graph_idx=graph_idx,
-                            state=current_state,
-                            analysis=current_analysis,
-                            answer_entity_id=action.answer_entity_id,
-                            terminal_reward_cache=terminal_reward_cache,
-                        )
+                    terminal_reward = _lookup_terminal_reward(
+                        policy=policy,
+                        prepared_batch=prepared_batch,
+                        graph_idx=graph_idx,
+                        state=current_state,
+                        analysis=current_analysis,
+                        terminal_reward_cache=terminal_reward_cache,
                     )
                     log_reward_actions[flat_state_idx, action_step] = float(
-                        reward_value
+                        terminal_reward.log_reward
                     )
-                    if action.answer_entity_id is not None:
-                        chosen_answer_entity_ids[flat_state_idx] = int(
-                            action.answer_entity_id
-                        )
                     termination_action_steps[flat_state_idx] = int(action_step + 1)
                     terminal_commit_candidate_counts[flat_state_idx] = int(
-                        commit_candidate_count
+                        terminal_reward.answer_set.count
                     )
-                    terminal_gold_answer_counts[flat_state_idx] = int(gold_answer_count)
-                    terminal_hit_mask[flat_state_idx] = bool(hit)
+                    terminal_gold_answer_counts[flat_state_idx] = int(
+                        terminal_reward.answer_set.gold_count
+                    )
+                    terminal_hit_mask[flat_state_idx] = bool(terminal_reward.hit)
                     terminal_component_counts[flat_state_idx] = int(
                         current_analysis.anchor_component_count
+                    )
+                    terminal_answer_entity_ids[flat_state_idx] = tuple(
+                        int(entity_id) for entity_id in terminal_reward.answer_entities
                     )
                     continue
                 if action.edge_id is None:
@@ -1043,10 +1019,10 @@ class SubgraphSampler:
             terminal_gold_answer_counts=terminal_gold_answer_counts.view(num_graphs, 1),
             terminal_hit_mask=terminal_hit_mask.view(num_graphs, 1),
             terminal_component_counts=terminal_component_counts.view(num_graphs, 1),
-            chosen_answer_entity_ids=chosen_answer_entity_ids.view(num_graphs, 1),
             terminal_edge_ids=terminal_edge_ids,
             terminal_node_ids=terminal_node_ids,
             terminal_reachability_bits=terminal_reachability_bits,
+            terminal_answer_entity_ids=tuple(terminal_answer_entity_ids),
             sample_ids=prepared_batch.sample_ids,
             question_ids=prepared_batch.sample_ids,
             num_graphs=num_graphs,

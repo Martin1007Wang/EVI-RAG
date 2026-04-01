@@ -90,15 +90,12 @@ class SubgraphAction:
     source_graph_node: int | None = None
     relation_id: int | None = None
     target_graph_node: int | None = None
-    answer_entity_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"add_edge", "stop"}:
             raise ValueError("SubgraphAction.kind must be 'add_edge' or 'stop'.")
         if self.kind == "add_edge" and self.edge_id is None:
             raise ValueError("add_edge actions require edge_id.")
-        if self.kind == "add_edge" and self.answer_entity_id is not None:
-            raise ValueError("add_edge actions must not carry answer_entity_id.")
         if self.kind == "stop" and any(
             value is not None
             for value in (
@@ -135,13 +132,8 @@ class SubgraphAction:
         )
 
     @staticmethod
-    def stop(answer_entity_id: int | None = None) -> SubgraphAction:
-        return SubgraphAction(
-            kind="stop",
-            answer_entity_id=(
-                None if answer_entity_id is None else int(answer_entity_id)
-            ),
-        )
+    def stop() -> SubgraphAction:
+        return SubgraphAction(kind="stop")
 
 
 @dataclass(frozen=True)
