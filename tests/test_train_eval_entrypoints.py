@@ -168,8 +168,8 @@ def test_normalize_search_eval_cfg_populates_runtime_sampling_knobs() -> None:
         "stability_top_k": 1,
     }
     assert cfg["monte_carlo"]["action_pruning"] == {
-        "per_node_top_k": 100,
-        "per_state_top_k": 256,
+        "per_node_top_k": 0,
+        "per_state_top_k": 0,
     }
 
 
@@ -236,7 +236,7 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     training_cfg = instantiate(cfg.model.training_cfg)
 
     assert cfg.run.test is False
-    assert cfg.data.eval_batch_size == 64
+    assert cfg.data.eval_batch_size == 16
     assert cfg.data.num_workers == 8
     assert cfg.data.multiprocessing_context == "spawn"
     assert cfg.data.prefetch_factor == 2
@@ -246,7 +246,9 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert cfg.data.eval_multiprocessing_context == "spawn"
     assert cfg.data.train_feature_dtype == "auto"
     assert cfg.data.eval_feature_dtype == "auto"
-    assert cfg.model.training_cfg.rollouts_per_graph == 32
+    assert cfg.model.training_cfg.rollouts_per_graph == 16
+    assert training_cfg.action_pruning.per_node_top_k == 0
+    assert training_cfg.action_pruning.per_state_top_k == 0
     assert cfg.model.eval_cfg.report_profile == "rank_only"
     assert cfg.model.eval_cfg.monte_carlo.rollouts == 256
     assert cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
@@ -254,35 +256,87 @@ def test_train_rankflow_fastiter_experiment_disables_heavy_eval() -> None:
     assert cfg.model.eval_cfg.monte_carlo.early_stop.enabled is True
     assert cfg.model.eval_cfg.monte_carlo.early_stop.min_rollouts == 512
     assert cfg.model.eval_cfg.monte_carlo.early_stop.stability_top_k == 1
-    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 100
-    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_state_top_k == 256
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 0
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_state_top_k == 0
     assert "action_prior_cfg" not in cfg.model
-    assert training_cfg.proposal_bias_schedule.type == "cosine"
-    assert training_cfg.proposal_bias_schedule.initial_scale == pytest.approx(0.8)
-    assert training_cfg.proposal_bias_schedule.final_scale == pytest.approx(0.0)
-    assert training_cfg.proposal_bias_schedule.hold_steps == 1000
+    assert training_cfg.auxiliary.proposal.enabled is False
+    assert training_cfg.auxiliary.proposal.schedule.type == "constant"
     assert cfg.model.policy_cfg.state_mode == "subgraph"
-    assert training_cfg.step_log_penalty == pytest.approx(0.0)
-    assert training_cfg.potential_reward.answer_distance_weight == pytest.approx(0.0)
     assert (
-        training_cfg.subgraph_proposal.oracle_answer_distance_weight
-        == pytest.approx(0.5)
+        training_cfg.auxiliary.proposal.prior.oracle_answer_distance_weight
+        == pytest.approx(0.0)
     )
     assert (
-        training_cfg.subgraph_proposal.prior_question_similarity_weight
-        == pytest.approx(0.75)
+        training_cfg.auxiliary.proposal.prior.prior_question_similarity_weight
+        == pytest.approx(0.0)
     )
-    assert training_cfg.subgraph_proposal.prior_component_merge_weight == pytest.approx(
-        1.0
+    assert (
+        training_cfg.auxiliary.proposal.prior.prior_component_merge_weight
+        == pytest.approx(0.0)
     )
-    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.0)
-    assert training_cfg.replay_mix_schedule.type == "cosine"
-    assert training_cfg.replay_mix_schedule.final_alpha == pytest.approx(0.0)
-    assert training_cfg.replay_mix_schedule.hold_steps == 2000
+    assert training_cfg.auxiliary.replay.enabled is False
+    assert training_cfg.auxiliary.replay.mix_alpha == pytest.approx(0.0)
+    assert training_cfg.auxiliary.replay.schedule.type == "constant"
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
     assert "guided" not in list(cfg.run.tags)
+
+
+def test_train_rankflow_guided_experiment_enables_replay_guidance() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "experiment=train_rankflow_guided",
+                "dataset=webqsp-sub",
+                "logger=none",
+                "extras.enforce_tags=false",
+                "extras.print_config=false",
+                *_HYDRA_TEST_OVERRIDES,
+            ],
+        )
+
+    training_cfg = instantiate(cfg.model.training_cfg)
+
+    assert cfg.run.name == "train_rankflow_guided"
+    assert "guided" in list(cfg.run.tags)
+    assert training_cfg.auxiliary.replay.enabled is True
+    assert training_cfg.auxiliary.replay.mix_alpha == pytest.approx(0.25)
+    assert training_cfg.auxiliary.replay.guidance.add_shortest_path_guidance is True
+    assert (
+        training_cfg.auxiliary.replay.guidance.expand_imitation_weight
+        == pytest.approx(0.10)
+    )
+    assert training_cfg.auxiliary.replay.buffer.replay_trajectories_per_step == 32
+
+
+def test_train_rankflow_ablate_answer_commit_experiment_weakens_stop_penalties() -> (
+    None
+):
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "experiment=train_rankflow_ablate_answer_commit",
+                "dataset=webqsp-sub",
+                "logger=none",
+                "extras.enforce_tags=false",
+                "extras.print_config=false",
+                *_HYDRA_TEST_OVERRIDES,
+            ],
+        )
+
+    training_cfg = instantiate(cfg.model.training_cfg)
+
+    assert cfg.run.name == "train_rankflow_ablate_answer_commit"
+    assert "ablation" in list(cfg.run.tags)
+    assert training_cfg.answer_reward.wrong_answer_penalty == pytest.approx(0.0)
+    assert training_cfg.answer_reward.failure_penalty == pytest.approx(0.0)
 
 
 def test_train_rankflow_experiment_uses_canonical_monte_carlo_selector() -> None:
@@ -303,8 +357,8 @@ def test_train_rankflow_experiment_uses_canonical_monte_carlo_selector() -> None
 
     training_cfg = instantiate(cfg.model.training_cfg)
 
-    assert cfg.data.batch_size == 64
-    assert cfg.data.eval_batch_size == 32
+    assert cfg.data.batch_size == 8
+    assert cfg.data.eval_batch_size == 8
     assert cfg.data.num_workers == 8
     assert cfg.data.multiprocessing_context == "spawn"
     assert cfg.data.prefetch_factor == 2
@@ -319,54 +373,39 @@ def test_train_rankflow_experiment_uses_canonical_monte_carlo_selector() -> None
     assert "train_max_nodes_per_batch" not in cfg.data
     assert cfg.fit_schedule.val_every_passes == pytest.approx(8.0)
     assert cfg.fit_schedule.early_stopping_patience_passes == pytest.approx(96.0)
-    assert cfg.trainer.log_every_n_steps == 32
-    assert cfg.model.training_cfg.rollouts_per_graph == 32
+    assert cfg.trainer.accumulate_grad_batches == 8
+    assert cfg.trainer.log_every_n_steps == 16
+    assert cfg.model.training_cfg.rollouts_per_graph == 16
+    assert training_cfg.action_pruning.per_node_top_k == 0
+    assert training_cfg.action_pruning.per_state_top_k == 0
     assert cfg.model.eval_cfg.report_profile == "rank_only"
     assert cfg.model.eval_cfg.monte_carlo.rollouts == 4096
     assert cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
     assert cfg.model.eval_cfg.monte_carlo.temperature == pytest.approx(1.0)
     assert cfg.model.eval_cfg.monte_carlo.early_stop.enabled is True
-    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 100
-    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_state_top_k == 256
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 0
+    assert cfg.model.eval_cfg.monte_carlo.action_pruning.per_state_top_k == 0
     assert "action_prior_cfg" not in cfg.model
-    assert training_cfg.proposal_bias_schedule.type == "cosine"
-    assert training_cfg.proposal_bias_schedule.initial_scale == pytest.approx(0.8)
-    assert training_cfg.proposal_bias_schedule.final_scale == pytest.approx(0.0)
-    assert training_cfg.proposal_bias_schedule.hold_steps == 1000
+    assert training_cfg.auxiliary.proposal.enabled is False
+    assert training_cfg.auxiliary.proposal.schedule.type == "constant"
     assert cfg.model.policy_cfg.state_mode == "subgraph"
-    assert training_cfg.step_log_penalty == pytest.approx(0.0)
-    assert training_cfg.potential_reward.answer_distance_weight == pytest.approx(0.0)
     assert (
-        training_cfg.subgraph_proposal.oracle_answer_distance_weight
-        == pytest.approx(0.5)
+        training_cfg.auxiliary.proposal.prior.oracle_answer_distance_weight
+        == pytest.approx(0.0)
     )
     assert (
-        training_cfg.subgraph_proposal.prior_question_similarity_weight
-        == pytest.approx(0.75)
-    )
-    assert training_cfg.subgraph_proposal.prior_component_merge_weight == pytest.approx(
-        1.0
-    )
-    assert training_cfg.subgraph_reward.beta_answer_bits == pytest.approx(0.2)
-    assert training_cfg.subgraph_reward.beta_answer_full == pytest.approx(0.5)
-    assert training_cfg.success_replay.mix_alpha == pytest.approx(0.2)
-    assert training_cfg.replay_mix_schedule.type == "cosine"
-    assert training_cfg.replay_mix_schedule.final_alpha == pytest.approx(0.0)
-    assert training_cfg.replay_mix_schedule.hold_steps == 2000
-    assert training_cfg.success_replay.min_buffer_size == 16
-    assert training_cfg.success_replay.capacity == 128
-    assert training_cfg.success_replay.replay_trajectories_per_step == 64
-    assert training_cfg.success_replay.add_shortest_path_guidance is True
-    assert training_cfg.success_replay.expand_imitation_weight == pytest.approx(1.0)
-    assert (
-        training_cfg.success_replay.expand_imitation_from_anchor_bonus
-        == pytest.approx(2.0)
+        training_cfg.auxiliary.proposal.prior.prior_question_similarity_weight
+        == pytest.approx(0.0)
     )
     assert (
-        training_cfg.success_replay.expand_imitation_answer_finish_bonus
-        == pytest.approx(4.0)
+        training_cfg.auxiliary.proposal.prior.prior_component_merge_weight
+        == pytest.approx(0.0)
     )
-    assert training_cfg.success_replay.mask_stop_loss is True
+    assert training_cfg.answer_reward.gold_answer_bonus == pytest.approx(3.0)
+    assert training_cfg.answer_reward.component_penalty == pytest.approx(0.75)
+    assert training_cfg.auxiliary.replay.enabled is False
+    assert training_cfg.auxiliary.replay.mix_alpha == pytest.approx(0.0)
+    assert training_cfg.auxiliary.replay.schedule.type == "constant"
     assert cfg.callbacks.model_checkpoint.monitor == cfg.optimized_metric
     assert cfg.callbacks.early_stopping.monitor == cfg.optimized_metric
     assert cfg.run.test is True
@@ -375,7 +414,13 @@ def test_train_rankflow_experiment_uses_canonical_monte_carlo_selector() -> None
 
 @pytest.mark.parametrize(
     "experiment_name",
-    ["train_rankflow"],
+    [
+        "train_rankflow",
+        "train_rankflow_fastiter",
+        "train_rankflow_guided",
+        "train_rankflow_guided_fastiter",
+        "train_rankflow_ablate_answer_commit",
+    ],
 )
 def test_train_experiments_keep_model_training_config_instantiable(
     experiment_name: str,
@@ -481,9 +526,7 @@ def test_build_final_eval_cfg_uses_eval_template_and_preserves_model_shape(
     assert final_eval_cfg.model.eval_cfg.monte_carlo.batch_rollouts == 256
     assert final_eval_cfg.model.eval_cfg.monte_carlo.temperature == pytest.approx(1.0)
     assert final_eval_cfg.model.eval_cfg.monte_carlo.early_stop.enabled is True
-    assert (
-        final_eval_cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 100
-    )
+    assert final_eval_cfg.model.eval_cfg.monte_carlo.action_pruning.per_node_top_k == 0
     assert final_eval_cfg.trainer.devices == 1
     assert list(final_eval_cfg.callbacks.keys()) == []
     assert list(final_eval_cfg.logger.keys()) == []

@@ -45,5 +45,11 @@ dependencies:
       - hydra-colorlog
       - rootutils
       - pytorch-metric-learning>=2.0.0
+      - pyarrow
+      - datasets
+      - transformers
+      - tqdm
+      - sentencepiece
       - safetensors
       - jsonschema
+      - muon-optimizer @ git+https://github.com/KellerJordan/Muon

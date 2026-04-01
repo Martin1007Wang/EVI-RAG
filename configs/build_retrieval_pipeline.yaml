@@ -21,7 +21,7 @@ pipeline_log_path: null
 dataset_source: ${dataset.dataset_source}
 hf_dataset: ${dataset.hf_dataset}
 hf_cache_dir: ${paths.hf_datasets_cache}
-hf_offline: true
+hf_offline: false
 stark: ${dataset.stark}
 pipeline_stage: all
 

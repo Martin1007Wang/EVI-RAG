@@ -131,11 +131,13 @@ def _target_rank_from_tensor(
 
 
 def _answer_topk_hit(result: SupportWindowResult, *, k: int) -> bool:
-    posterior = sorted(
+    committed_answer_posterior = sorted(
         result.answer_posterior,
         key=lambda record: (-float(record.prob), int(record.answer_entity_id)),
     )
-    top_ids = {int(record.answer_entity_id) for record in posterior[: int(k)]}
+    top_ids = {
+        int(record.answer_entity_id) for record in committed_answer_posterior[: int(k)]
+    }
     gold_ids = {int(value) for value in result.gold_answer_entity_ids}
     return bool(top_ids & gold_ids)
 
@@ -780,7 +782,7 @@ def _aggregate_by_hop(
     return {
         "hop_distribution": dict(sorted(hop_counts.items(), key=lambda item: item[0])),
         "prediction_experiments": predictions_by_experiment,
-        "teacher_forced_shortest_path": teacher_summary,
+        "teacher_forced_answer_commit_path": teacher_summary,
     }
 
 
@@ -806,7 +808,9 @@ def _build_eval_cfgs(base_eval_cfg: Any) -> dict[str, dict[str, Any]]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Diagnose validation hop behavior.")
+    parser = argparse.ArgumentParser(
+        description="Diagnose validation-hop behavior under answer-committed RankFlow."
+    )
     parser.add_argument("--config-path", type=Path, required=True)
     parser.add_argument("--ckpt-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)

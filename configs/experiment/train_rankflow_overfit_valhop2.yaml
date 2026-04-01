@@ -16,7 +16,7 @@ run:
 
 data:
   # Train and validate on the same validation subset so we can see whether the
-  # current objective can memorize multi-hop bridge behavior at all.
+  # current answer-committed objective can memorize multi-hop bridge behavior at all.
   splits:
     train: validation
     validation: validation
@@ -47,3 +47,9 @@ fit_schedule:
 trainer:
   log_every_n_steps: 1
   max_time: "00:00:20:00"
+
+model:
+  eval_cfg:
+    monte_carlo:
+      rollouts: 32
+      batch_rollouts: 32

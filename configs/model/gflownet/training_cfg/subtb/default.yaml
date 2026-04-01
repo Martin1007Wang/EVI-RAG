@@ -1,7 +1,4 @@
 # @package model.training_cfg.subtb
 
 lambda_weight: 1.0
-normalize: true
-root_loss_weight: 1.0
-pairwise_loss_weight: 1.0
-terminal_loss_weight: 1.0
+topology_weight_alpha: 0.0

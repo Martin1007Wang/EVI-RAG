@@ -1,0 +1,6 @@
+# @package model.training_cfg.auxiliary
+
+defaults:
+  - _self_
+  - proposal: default
+  - replay: default

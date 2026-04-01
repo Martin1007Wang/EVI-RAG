@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Evaluate a RankFlow checkpoint on test split (full + sub) with one command.
+# Evaluate an answer-committed RankFlow checkpoint on test split (full + sub).
 # Usage:
 #   python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt
 #
@@ -22,5 +22,5 @@ defaults:
 model:
   eval_cfg:
     report_profile: full
-    # Final eval uses the same canonical Monte Carlo posterior as checkpoint
-    # selection, but emits the full support-window report surface.
+    # Final eval uses the same canonical answer-committed Monte Carlo posterior as
+    # checkpoint selection, but emits the full support-window report surface.

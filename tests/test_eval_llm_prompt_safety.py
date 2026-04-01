@@ -6,8 +6,12 @@ import pytest
 
 from src.llm.eval_llm import (
     _iter_requests,
+    _prepare_llm_run,
     _resolve_input_labels_path,
+    _resolve_output_spec,
     _resolve_prompt_spec,
+    _resolve_schema_spec,
+    _validate_dataset_scope,
     _validate_topk_against_prompt_limits,
     run_llm_eval,
 )
@@ -221,6 +225,57 @@ def test_run_llm_eval_fails_fast_when_sidecar_missing(tmp_path) -> None:
         FileNotFoundError, match="Input labels JSONL not found for metrics"
     ):
         run_llm_eval(cfg)
+
+
+def test_validate_dataset_scope_rejects_sub_scope_without_suffix() -> None:
+    with pytest.raises(ValueError, match="full datasets only"):
+        _validate_dataset_scope(
+            {"name": "prime", "dataset_scope": "sub"},
+            allow_sub=False,
+        )
+
+
+def test_prepare_llm_run_rejects_resume_mismatch(tmp_path) -> None:
+    input_path = tmp_path / "predict.jsonl"
+    input_path.write_text("", encoding="utf-8")
+    llm_cfg = {
+        "resume": True,
+        "batch_size": 1,
+        "prompt": {"system": "You are a test model."},
+        "output": {},
+        "schema": {"enabled": False},
+    }
+    prompt_spec = _resolve_prompt_spec(llm_cfg)
+    output_spec = _resolve_output_spec(llm_cfg)
+    schema_spec = _resolve_schema_spec(llm_cfg, prompt_spec)
+
+    output_path, *_ = _prepare_llm_run(
+        llm_cfg,
+        tmp_path,
+        "test",
+        1,
+        "openai",
+        input_path=input_path,
+        provider_cfg={"model": "gpt-4o-mini", "temperature": 0.0},
+        prompt_spec=prompt_spec,
+        output_spec=output_spec,
+        schema_spec=schema_spec,
+    )
+    output_path.write_text('{"sample_id": "s1", "answer": "Paris"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different settings"):
+        _prepare_llm_run(
+            llm_cfg,
+            tmp_path,
+            "test",
+            1,
+            "openai",
+            input_path=input_path,
+            provider_cfg={"model": "gpt-4o-mini", "temperature": 0.7},
+            prompt_spec=prompt_spec,
+            output_spec=output_spec,
+            schema_spec=schema_spec,
+        )
 
 
 def test_validate_topk_against_prompt_limits_fails_on_implicit_clip() -> None:

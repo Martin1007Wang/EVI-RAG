@@ -21,7 +21,10 @@ from src.runs.common import compose_config  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a sample-id filter for graph samples above a hop threshold."
+        description=(
+            "Build a sample-id filter for answer-committed RankFlow probes above a "
+            "hop threshold."
+        )
     )
     parser.add_argument(
         "--dataset", required=True, help="Dataset config name, e.g. webqsp-sub"

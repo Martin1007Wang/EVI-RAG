@@ -11,6 +11,7 @@ from src.data.preprocess.stages.step3_lmdb import (
     _resolve_local_entity_indices,
     _take_graph_batch_columns,
 )
+from src.data.io.lmdb_utils import _prepare_lmdb_dir
 
 
 def test_expected_entity_embedding_rows_keeps_reserved_zero_row() -> None:
@@ -42,6 +43,14 @@ def test_resolve_local_entity_indices_accepts_tensor_node_ids() -> None:
     local_indices = _resolve_local_entity_indices(node_entity_ids, [20, 30])
 
     assert local_indices == [1, 2]
+
+
+def test_prepare_lmdb_dir_rejects_existing_dir_without_overwrite(tmp_path) -> None:
+    target = tmp_path / "dataset.lmdb"
+    target.mkdir()
+
+    with pytest.raises(FileExistsError, match="overwrite_lmdb=true"):
+        _prepare_lmdb_dir(target, overwrite=False)
 
 
 def test_require_question_entity_ids_column_rejects_legacy_seed_entity_ids() -> None:

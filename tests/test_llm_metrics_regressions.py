@@ -6,6 +6,7 @@ import pytest
 
 from src.llm.metrics import (
     _subgraphrag_get_pred_lines,
+    _subgraphrag_match,
     _subgraphrag_no_answer,
     compute_llm_metrics,
     write_llm_metrics_artifacts,
@@ -24,6 +25,14 @@ def test_no_answer_true_when_only_no_answer_markers() -> None:
     pred_lines = _subgraphrag_get_pred_lines(prediction)
     assert pred_lines == []
     assert _subgraphrag_no_answer(prediction, pred_lines) is True
+
+
+def test_subgraphrag_match_avoids_short_substring_false_positive() -> None:
+    assert _subgraphrag_match("ans: Dallas", "LA") is False
+
+
+def test_subgraphrag_match_allows_standalone_year_token() -> None:
+    assert _subgraphrag_match("ans: 2014 World Series", "2014") is True
 
 
 def test_sub_hal_score_is_computed_from_sub_scope_samples(tmp_path) -> None:

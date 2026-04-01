@@ -374,7 +374,7 @@ def _run_final_eval_suite(
     released_original_state = False
     for variant in variants:
         log.info(
-            "Final evaluation: dataset_variant=%s split=%s report_profile=%s answer_posterior=%s",
+            "Final evaluation: dataset_variant=%s split=%s report_profile=%s answer_posterior_surrogate=%s",
             variant.label,
             split,
             report_profile,
@@ -511,7 +511,7 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     run_cfg = cfg.get("run") or {}
     log.info(
-        "Training-time validation report_profile=%s answer_posterior=%s",
+        "Training-time validation report_profile=%s answer_posterior_surrogate=%s",
         cfg.model.eval_cfg.get("report_profile"),
         format_search_eval_answer_posterior(
             _coerce_search_eval_cfg(cfg.model.eval_cfg)

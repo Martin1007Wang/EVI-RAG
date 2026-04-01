@@ -632,7 +632,26 @@ def _subgraphrag_normalize(text: str) -> str:
 def _subgraphrag_match(s1: str, s2: str) -> bool:
     left = _subgraphrag_normalize(s1)
     right = _subgraphrag_normalize(s2)
-    return bool(right) and right in left
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    left_tokens = left.split()
+    right_tokens = right.split()
+    if not right_tokens:
+        return False
+    if len(right_tokens) == 1:
+        token = right_tokens[0]
+        if not token:
+            return False
+        if token.isdigit() or len(token) >= 4:
+            return token in left_tokens
+        return False
+    window = len(right_tokens)
+    for start in range(len(left_tokens) - window + 1):
+        if left_tokens[start : start + window] == right_tokens:
+            return True
+    return False
 
 
 def _subgraphrag_get_pred_lines(prediction: str) -> List[str]:

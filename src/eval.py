@@ -213,7 +213,7 @@ def evaluate_model_inprocess(
     reconfigure_evaluation(eval_cfg=eval_cfg)
     execution_mode = resolve_execution_mode(run_cfg)
     log.info(
-        "Eval config: report_profile=%s answer_posterior=%s",
+        "Eval config: report_profile=%s answer_posterior_surrogate=%s",
         eval_cfg.get("report_profile"),
         format_search_eval_answer_posterior(eval_cfg),
     )
@@ -267,7 +267,7 @@ def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     ckpt_path = cfg.get("ckpt_path")
     eval_cfg = _coerce_eval_cfg(cfg.model.eval_cfg)
     log.info(
-        "Eval config: report_profile=%s answer_posterior=%s",
+        "Eval config: report_profile=%s answer_posterior_surrogate=%s",
         eval_cfg.get("report_profile"),
         format_search_eval_answer_posterior(eval_cfg),
     )

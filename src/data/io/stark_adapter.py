@@ -179,6 +179,30 @@ def _extract_json_dict(text: str) -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _stable_signature_json(payload: Mapping[str, object]) -> str:
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _build_sample_cache_signature(
+    *,
+    dataset: str,
+    kb: str,
+    indirected: bool,
+    linker_cfg: Mapping[str, object],
+    local_graph_cfg: Mapping[str, object],
+) -> str:
+    payload = {
+        "dataset": str(dataset),
+        "kb": str(kb),
+        "indirected": bool(indirected),
+        "linker": _mapping_to_plain_dict(linker_cfg),
+        "local_graph": _mapping_to_plain_dict(local_graph_cfg),
+    }
+    return _stable_signature_json(payload)
+
+
 def _require_cached_payload_list(
     payload: Mapping[str, object],
     *,
@@ -271,6 +295,13 @@ class StarkPrimeAdapter:
         self.indirected = bool(stark_cfg.get("indirected", False))
         self.linker_cfg = dict(_as_mapping(stark_cfg.get("linker")))
         self.local_graph_cfg = dict(_as_mapping(stark_cfg.get("local_graph")))
+        self._sample_cache_signature = _build_sample_cache_signature(
+            dataset=self.dataset,
+            kb=self.kb,
+            indirected=self.indirected,
+            linker_cfg=self.linker_cfg,
+            local_graph_cfg=self.local_graph_cfg,
+        )
         self._sample_cache: Dict[tuple[str, str], Sample] = {}
         self._vllm_generate = None
         self._qa_dataset, self._skb = _load_prime_resources(
@@ -445,9 +476,11 @@ class StarkPrimeAdapter:
             return cached
         cache_path = self._sample_cache_path(split=split, question_id=question_id)
         if cache_path is not None and cache_path.exists():
-            sample = self._load_cached_sample(cache_path)
-            self._sample_cache[cache_key] = sample
-            return sample
+            payload = self._load_cached_payload(cache_path)
+            if self._payload_cache_signature_matches(payload):
+                sample = self._sample_from_payload(payload, cache_path=cache_path)
+                self._sample_cache[cache_key] = sample
+                return sample
         sample, metadata = self._build_sample(
             split=split,
             question_id=question_id,
@@ -470,19 +503,29 @@ class StarkPrimeAdapter:
         filename = f"{_sanitize_fs_component(question_id)}.json"
         return self.cache_dir / "samples" / split / filename
 
-    def _load_cached_sample(self, path: Path) -> Sample:
+    def _payload_cache_signature_matches(self, payload: Mapping[str, object]) -> bool:
+        return str(payload.get("cache_signature") or "") == self._sample_cache_signature
+
+    def _load_cached_payload(self, path: Path) -> Dict[str, object]:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Cached STaRK sample at {path} must be a JSON object.")
+        return payload
+
+    def _sample_from_payload(
+        self, payload: Mapping[str, object], *, cache_path: Path
+    ) -> Sample:
         question_entities = _require_cached_payload_list(
             payload,
             field_name="question_entities",
             legacy_field_name="q_entity",
-            cache_path=path,
+            cache_path=cache_path,
         )
         answer_entities = _require_cached_payload_list(
             payload,
             field_name="answer_entities",
             legacy_field_name="a_entity",
-            cache_path=path,
+            cache_path=cache_path,
         )
         graph = [
             (str(edge[0]), str(edge[1]), str(edge[2]))
@@ -501,6 +544,10 @@ class StarkPrimeAdapter:
             answer_texts=[str(item) for item in payload.get("answer_texts", [])],
         )
 
+    def _load_cached_sample(self, path: Path) -> Sample:
+        payload = self._load_cached_payload(path)
+        return self._sample_from_payload(payload, cache_path=path)
+
     def _sample_to_payload(self, sample: Sample) -> Dict[str, object]:
         return {
             "dataset": sample.dataset,
@@ -512,6 +559,7 @@ class StarkPrimeAdapter:
             "question_entities": list(sample.question_entities),
             "answer_entities": list(sample.answer_entities),
             "answer_texts": list(sample.answer_texts),
+            "cache_signature": self._sample_cache_signature,
         }
 
     def _build_sample(

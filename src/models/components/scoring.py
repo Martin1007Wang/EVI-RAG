@@ -153,6 +153,57 @@ class ActionScoringHead(nn.Module):
                 "relation_features batch shape must match current_state_features in ActionScoringHead."
             )
 
+    def encode_query(self, current_state_features: torch.Tensor) -> torch.Tensor:
+        actor_query_inputs = align_float_input_dtype(
+            current_state_features, module=self.query_norm
+        )
+        actor_query_inputs = self.query_norm(actor_query_inputs)
+        actor_query_inputs = align_float_input_dtype(
+            actor_query_inputs, module=self.query_mlp[0]
+        )
+        return self.query_mlp(actor_query_inputs)
+
+    def encode_edge_keys(
+        self,
+        *,
+        candidate_state_features: torch.Tensor,
+        relation_features: torch.Tensor,
+    ) -> torch.Tensor:
+        edge_inputs = torch.cat((relation_features, candidate_state_features), dim=-1)
+        edge_inputs = align_float_input_dtype(edge_inputs, module=self.edge_norm)
+        edge_inputs = self.edge_norm(edge_inputs)
+        edge_inputs = align_float_input_dtype(edge_inputs, module=self.edge_mlp[0])
+        return self.edge_mlp(edge_inputs)
+
+    def score_from_encoded(
+        self,
+        *,
+        actor_query: torch.Tensor,
+        edge_key: torch.Tensor,
+    ) -> torch.Tensor:
+        if tuple(actor_query.shape[:-1]) != tuple(edge_key.shape[:-1]):
+            if int(actor_query.size(0)) == 1 and actor_query.dim() == edge_key.dim():
+                actor_query = actor_query.expand_as(edge_key)
+            else:
+                raise ValueError(
+                    "actor_query batch shape must match edge_key in ActionScoringHead."
+                )
+        logits = (actor_query * edge_key).sum(dim=-1)
+        return logits / math.sqrt(float(max(self.actor_dim, 1)))
+
+    def score_from_query(
+        self,
+        *,
+        actor_query: torch.Tensor,
+        candidate_state_features: torch.Tensor,
+        relation_features: torch.Tensor,
+    ) -> torch.Tensor:
+        edge_key = self.encode_edge_keys(
+            candidate_state_features=candidate_state_features,
+            relation_features=relation_features,
+        )
+        return self.score_from_encoded(actor_query=actor_query, edge_key=edge_key)
+
     def forward(
         self,
         current_state_features: torch.Tensor,
@@ -168,21 +219,12 @@ class ActionScoringHead(nn.Module):
             current_state_features = current_state_features.detach()
             relation_features = relation_features.detach()
             candidate_state_features = candidate_state_features.detach()
-        actor_query_inputs = align_float_input_dtype(
-            current_state_features, module=self.query_norm
+        actor_query = self.encode_query(current_state_features)
+        return self.score_from_query(
+            actor_query=actor_query,
+            candidate_state_features=candidate_state_features,
+            relation_features=relation_features,
         )
-        actor_query_inputs = self.query_norm(actor_query_inputs)
-        actor_query_inputs = align_float_input_dtype(
-            actor_query_inputs, module=self.query_mlp[0]
-        )
-        actor_query = self.query_mlp(actor_query_inputs)
-        edge_inputs = torch.cat((relation_features, candidate_state_features), dim=-1)
-        edge_inputs = align_float_input_dtype(edge_inputs, module=self.edge_norm)
-        edge_inputs = self.edge_norm(edge_inputs)
-        edge_inputs = align_float_input_dtype(edge_inputs, module=self.edge_mlp[0])
-        edge_key = self.edge_mlp(edge_inputs)
-        logits = (actor_query * edge_key).sum(dim=-1)
-        return logits / math.sqrt(float(max(self.actor_dim, 1)))
 
 
 NodeFlowHead = StateFlowHead

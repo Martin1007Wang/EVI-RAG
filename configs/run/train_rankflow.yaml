@@ -7,7 +7,7 @@ defaults:
 
 name: train_rankflow
 task_name: "train/rankflow"
-tags: ["rankflow", "gflownet"]
+tags: ["rankflow", "gflownet", "answer-commit"]
 test: true
 final_eval_experiment: rankflow
 final_eval_split: test

@@ -10,7 +10,7 @@ early_stop:
   min_rollouts: 512
   stability_top_k: 1
 action_pruning:
-  # Cap high-degree expansion sets during eval so validation and final test stay
-  # on the same bounded action surface.
-  per_node_top_k: 100
-  per_state_top_k: 256
+  # The strict paper-style mainline disables pruning by default so Monte Carlo
+  # support matches the full hierarchical action space.
+  per_node_top_k: 0
+  per_state_top_k: 0

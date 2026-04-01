@@ -17,6 +17,7 @@ def test_embedding_backbone_encode_matches_manual_projection_pipeline() -> None:
         use_adapter=False,
         adapter_dim=4,
         adapter_dropout=0.0,
+        gnn_num_layers=0,
     )
     manual_node_tokens = backbone.project_node_embeddings(observation.node_features)
     manual_relation_tokens = backbone.project_relation_embeddings(
@@ -50,6 +51,7 @@ def test_embedding_backbone_forward_accepts_structured_inputs() -> None:
         use_adapter=False,
         adapter_dim=4,
         adapter_dropout=0.0,
+        gnn_num_layers=0,
     )
 
     encoded = backbone(
@@ -68,6 +70,44 @@ def test_embedding_backbone_forward_accepts_structured_inputs() -> None:
     assert tuple(encoded.question_tokens.shape) == (topology.num_graphs, 8)
 
 
+def test_embedding_backbone_gnn_uses_graph_structure() -> None:
+    topology, observation = build_graph_batch(make_toy_batch())
+    backbone = EmbeddingBackbone(
+        embedding_dim=8,
+        hidden_dim=8,
+        use_adapter=False,
+        adapter_dim=4,
+        adapter_dropout=0.0,
+        gnn_num_layers=1,
+        gnn_dropout=0.0,
+    )
+
+    encoded = backbone.encode(
+        BackboneInput(
+            node_features=observation.node_features,
+            relation_features=observation.relation_features,
+            question_embedding=observation.question_embedding,
+            edge_index=topology.edge_index,
+            edge_relations=topology.edge_type,
+            num_nodes=topology.num_nodes,
+            node_graph_index=topology.all_node_graph_index(),
+        )
+    )
+    edge_free = backbone.encode(
+        BackboneInput(
+            node_features=observation.node_features,
+            relation_features=observation.relation_features,
+            question_embedding=observation.question_embedding,
+            edge_index=torch.empty((2, 0), dtype=torch.long),
+            edge_relations=torch.empty((0,), dtype=torch.long),
+            num_nodes=topology.num_nodes,
+            node_graph_index=topology.all_node_graph_index(),
+        )
+    )
+
+    assert not torch.allclose(encoded.node_tokens, edge_free.node_tokens)
+
+
 def test_embedding_backbone_aligns_bfloat16_inputs_without_autocast() -> None:
     topology, observation = build_graph_batch(make_toy_batch())
     backbone = EmbeddingBackbone(
@@ -76,6 +116,7 @@ def test_embedding_backbone_aligns_bfloat16_inputs_without_autocast() -> None:
         use_adapter=True,
         adapter_dim=4,
         adapter_dropout=0.0,
+        gnn_num_layers=0,
     )
 
     encoded = backbone.encode(
@@ -104,6 +145,7 @@ def test_embedding_backbone_autocast_keeps_bfloat16_outputs() -> None:
         use_adapter=True,
         adapter_dim=4,
         adapter_dropout=0.0,
+        gnn_num_layers=0,
     )
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):

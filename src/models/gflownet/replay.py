@@ -49,7 +49,7 @@ class SubgraphSuccessReplayBuffer:
         self.capacity = int(capacity)
         self.deduplicate = bool(deduplicate)
         if self.capacity < 1:
-            raise ValueError("training.success_replay.capacity must be >= 1.")
+            raise ValueError("training.auxiliary.replay.buffer.capacity must be >= 1.")
         self._records: deque[SubgraphReplayRecord] = deque()
         self._signatures: set[tuple[str, tuple[int, ...]]] = set()
 

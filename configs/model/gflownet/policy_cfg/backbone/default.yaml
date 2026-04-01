@@ -5,3 +5,6 @@ hidden_dim: 512
 use_adapter: true
 adapter_dim: 128
 adapter_dropout: 0.1
+gnn_num_layers: 1
+gnn_dropout: 0.1
+gnn_use_question_conditioning: true

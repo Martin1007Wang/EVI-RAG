@@ -135,7 +135,10 @@ def test_raw_loader_supports_stark_prime_keyword_preprocess(
     assert any("EGFR" in entity for entity in sample.question_entities)
     assert sample.answer_texts == ["MAPK signaling pathway"]
     assert any(edge[1] == "linked to" for edge in sample.graph)
-    assert (tmp_path / "cache" / "samples" / "validation" / "102.json").exists()
+    cache_path = tmp_path / "cache" / "samples" / "validation" / "102.json"
+    assert cache_path.exists()
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["cache_signature"]
 
 
 def test_raw_loader_supports_stark_prime_vllm_entity_selection(
@@ -174,6 +177,62 @@ def test_raw_loader_supports_stark_prime_vllm_entity_selection(
     assert any("EGFR" in entity for entity in sample.question_entities)
     assert any("AKT1" in entity for entity in sample.question_entities)
     assert any(edge[1] == "inverse::target" for edge in sample.graph)
+
+
+def test_stark_sample_cache_rebuilds_when_config_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_prime_resources(monkeypatch)
+
+    list(
+        raw_loader.iter_samples(
+            dataset="prime",
+            kb="prime",
+            raw_root=None,
+            splits=["test"],
+            column_map={},
+            entity_normalization="none",
+            dataset_source="stark",
+            stark_cfg=_build_stark_cfg(tmp_path, backend="keyword"),
+        )
+    )
+    cache_path = tmp_path / "cache" / "samples" / "test" / "103.json"
+    initial_signature = json.loads(cache_path.read_text(encoding="utf-8"))[
+        "cache_signature"
+    ]
+
+    vllm_calls: list[str] = []
+
+    def _fake_generate(messages_batch):  # type: ignore[no-untyped-def]
+        prompt = messages_batch[0][-1]["content"]
+        assert "AKT1" in prompt
+        vllm_calls.append(prompt)
+        return ['{"selected_candidate_ids": [2, 0], "mentions": ["AKT1", "EGFR"]}']
+
+    monkeypatch.setattr(
+        stark_adapter.StarkPrimeAdapter,
+        "_get_vllm_generate",
+        lambda self: _fake_generate,
+    )
+
+    vllm_samples = list(
+        raw_loader.iter_samples(
+            dataset="prime",
+            kb="prime",
+            raw_root=None,
+            splits=["test"],
+            column_map={},
+            entity_normalization="none",
+            dataset_source="stark",
+            stark_cfg=_build_stark_cfg(tmp_path, backend="vllm"),
+        )
+    )
+
+    assert len(vllm_samples[0].question_entities) == 2
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert len(vllm_calls) == 1
+    assert payload["cache_signature"] != initial_signature
+    assert payload["question_entities"] == list(vllm_samples[0].question_entities)
 
 
 def test_build_retrieval_pipeline_prime_resolves_stark_source() -> None:

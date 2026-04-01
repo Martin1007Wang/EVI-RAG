@@ -1,0 +1,16 @@
+# @package model.training_cfg.auxiliary.proposal
+
+enabled: false
+
+prior:
+  oracle_answer_distance_weight: 0.0
+  prior_question_similarity_weight: 0.0
+  prior_component_merge_weight: 0.0
+  stop_hit_bias: 0.0
+
+schedule:
+  type: constant
+  initial_scale: null
+  final_scale: null
+  total_steps: null
+  hold_steps: 0

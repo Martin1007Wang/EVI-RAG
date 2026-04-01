@@ -86,6 +86,24 @@ class PredictionArtifactSettings:
         candidate = dataset_out_dir / "questions.parquet"
         return candidate if candidate.exists() else None
 
+    def cache_key(self) -> tuple[Any, ...]:
+        return (
+            bool(self.enabled),
+            str(self.execution_mode),
+            normalize_optional_path(self.output_root),
+            str(self.artifact_subdir),
+            str(self.artifact_name),
+            int(self.schema_version),
+            str(self.split),
+            None if self.dataset_scope in (None, "") else str(self.dataset_scope),
+            None if self.dataset_variant in (None, "") else str(self.dataset_variant),
+            normalize_optional_path(self.entity_vocab_path),
+            normalize_optional_path(self.relation_vocab_path),
+            normalize_optional_path(self.questions_path),
+            normalize_optional_path(self.dataset_out_dir),
+            bool(self.overwrite),
+        )
+
 
 def write_metrics_snapshot(
     *,
@@ -122,11 +140,17 @@ def write_prediction_artifacts(
     *,
     settings: PredictionArtifactSettings,
 ) -> dict[str, Path] | None:
-    existing_paths = getattr(model, "predict_artifact_paths", None)
-    if isinstance(existing_paths, dict) and existing_paths:
-        return existing_paths
     if not settings.enabled or settings.execution_mode != "predict":
         return None
+    cache_key = settings.cache_key()
+    existing_paths = getattr(model, "predict_artifact_paths", None)
+    existing_cache_key = getattr(model, "predict_artifact_settings_cache_key", None)
+    if (
+        isinstance(existing_paths, dict)
+        and existing_paths
+        and existing_cache_key == cache_key
+    ):
+        return existing_paths
     write_fn = getattr(model, "write_prediction_artifacts", None)
     if not callable(write_fn):
         return None
@@ -143,6 +167,7 @@ def write_prediction_artifacts(
     if not isinstance(paths, dict):
         return None
     setattr(model, "predict_artifact_paths", paths)
+    setattr(model, "predict_artifact_settings_cache_key", cache_key)
     return paths
 
 

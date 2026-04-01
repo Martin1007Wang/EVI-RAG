@@ -3,18 +3,10 @@
 defaults:
   - _self_
   - sampling_temperature_schedule: default
-  - proposal_bias_schedule: default
-  - success_replay: default
-  - replay_mix_schedule: default
-  - answer_quotient: default
-  - potential_reward: default
-  - subgraph_reward: default
-  - subgraph_proposal: default
+  - action_pruning: default
+  - answer_reward: default
   - subtb: default
+  - auxiliary: default
 
 rollouts_per_graph: 8
 sampling_temperature: 1.0
-force_stop_on_answer_hit: false
-terminal_failure_log_reward: -3.0
-step_log_penalty: 0.0
-answer_stop_log_reward_bonus: 0.0

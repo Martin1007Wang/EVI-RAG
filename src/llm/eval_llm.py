@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -48,6 +48,7 @@ _DEFAULT_OUTPUT_SUBDIR = "eval_llm"
 _DEFAULT_INPUT_LABELS_SUFFIX = ".labels.jsonl"
 _DEFAULT_FILENAME_TEMPLATE = "{split}_k{k}_{provider}.jsonl"
 _DEFAULT_METRICS_FILENAME_TEMPLATE = "{split}_k{k}_{provider}.metrics.json"
+_RESUME_METADATA_SUFFIX = ".meta.json"
 _DEFAULT_ANSWER_KEY = "answer"
 _DEFAULT_ANSWER_SEPARATOR = " | "
 _DEFAULT_ALLOW_EMPTY_PROMPT_ANSWER = True
@@ -76,6 +77,7 @@ _FIELD_SCHEMA_RETRIES = "schema_retries"
 _FIELD_DC_RETRIES = "dc_retries"
 
 _LOG_PROGRESS_EVERY = 200
+_RESUME_SECRET_KEY_MARKERS = ("key", "token", "secret", "password")
 
 
 @dataclass(frozen=True)
@@ -143,8 +145,9 @@ def run_llm_eval(cfg: Any) -> None:
 
 
 def _validate_dataset_scope(dataset_cfg: Any, allow_sub: bool) -> None:
+    scope = str(dataset_cfg.get("dataset_scope") or "").strip().lower()
     name = str(dataset_cfg.get("name") or "")
-    if not allow_sub and name.endswith("-sub"):
+    if not allow_sub and (scope == "sub" or name.endswith("-sub")):
         raise ValueError(
             "eval_llm is configured for full datasets only; set llm.allow_sub=true to override."
         )
@@ -467,7 +470,16 @@ def _run_provider_topk(
     if not input_path.exists():
         raise FileNotFoundError(f"Input JSONL not found: {input_path}")
     output_path, seen, batch_size, max_samples, file_mode = _prepare_llm_run(
-        llm_cfg, output_dir, split, top_k, provider
+        llm_cfg,
+        output_dir,
+        split,
+        top_k,
+        provider,
+        input_path=input_path,
+        provider_cfg=provider_cfg,
+        prompt_spec=prompt_spec,
+        output_spec=output_spec,
+        schema_spec=schema_spec,
     )
     _log_llm_start(provider, provider_cfg, split, top_k, output_path)
     processed, written = _run_llm_batches(
@@ -528,6 +540,12 @@ def _prepare_llm_run(
     split: str,
     top_k: int,
     provider: str,
+    *,
+    input_path: Path,
+    provider_cfg: Any,
+    prompt_spec: PromptSpec,
+    output_spec: OutputSpec,
+    schema_spec: SchemaSpec,
 ) -> Tuple[Path, set[str], int, Optional[int], str]:
     filename_template = str(
         llm_cfg.get("output_filename_template") or _DEFAULT_FILENAME_TEMPLATE
@@ -536,6 +554,19 @@ def _prepare_llm_run(
         split=split, k=top_k, provider=provider
     )
     resume = bool(llm_cfg.get("resume", True))
+    signature = _build_llm_run_signature(
+        input_path=input_path,
+        split=split,
+        top_k=top_k,
+        provider=provider,
+        provider_cfg=provider_cfg,
+        prompt_spec=prompt_spec,
+        output_spec=output_spec,
+        schema_spec=schema_spec,
+    )
+    _ensure_llm_resume_metadata(
+        output_path=output_path, resume=resume, signature=signature
+    )
     seen = _load_seen_ids(output_path) if resume else set()
     batch_size = int(llm_cfg.get("batch_size") or _ONE)
     max_samples = llm_cfg.get("max_samples")
@@ -546,6 +577,101 @@ def _prepare_llm_run(
         batch_size,
         int(max_samples) if max_samples is not None else None,
         file_mode,
+    )
+
+
+def _stable_json_dumps(payload: Dict[str, Any]) -> str:
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _sanitize_resume_value(value: Any, *, key_hint: str = "") -> Any:
+    lowered_key = str(key_hint).lower()
+    if any(marker in lowered_key for marker in _RESUME_SECRET_KEY_MARKERS):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_resume_value(item, key_hint=str(key))
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_resume_value(item, key_hint=key_hint) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _build_llm_run_signature(
+    *,
+    input_path: Path,
+    split: str,
+    top_k: int,
+    provider: str,
+    provider_cfg: Any,
+    prompt_spec: PromptSpec,
+    output_spec: OutputSpec,
+    schema_spec: SchemaSpec,
+) -> Dict[str, Any]:
+    return {
+        "input_path": str(input_path),
+        "split": str(split),
+        "top_k": int(top_k),
+        "provider": str(provider),
+        "provider_cfg": _sanitize_resume_value(dict(provider_cfg or {})),
+        "prompt_spec": _sanitize_resume_value(asdict(prompt_spec)),
+        "output_spec": _sanitize_resume_value(asdict(output_spec)),
+        "schema_spec": {
+            "enabled": bool(schema_spec.enabled),
+            "max_retries": int(schema_spec.max_retries),
+            "allow_coerce": bool(schema_spec.allow_coerce),
+            "max_retry_chars": int(schema_spec.max_retry_chars),
+            "schema_json": str(schema_spec.schema_json),
+        },
+    }
+
+
+def _resume_metadata_path(output_path: Path) -> Path:
+    return output_path.with_name(output_path.name + _RESUME_METADATA_SUFFIX)
+
+
+def _read_resume_metadata(metadata_path: Path) -> Dict[str, Any] | None:
+    if not metadata_path.exists():
+        return None
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid LLM resume metadata file: {metadata_path}")
+    signature = payload.get("signature")
+    if not isinstance(signature, dict):
+        raise ValueError(f"Invalid LLM resume metadata signature in: {metadata_path}")
+    return payload
+
+
+def _ensure_llm_resume_metadata(
+    *, output_path: Path, resume: bool, signature: Dict[str, Any]
+) -> None:
+    metadata_path = _resume_metadata_path(output_path)
+    output_exists = output_path.exists()
+    if resume and output_exists:
+        output_nonempty = output_path.stat().st_size > 0
+        existing_metadata = _read_resume_metadata(metadata_path)
+        if existing_metadata is None and output_nonempty:
+            raise ValueError(
+                "Refusing to resume an existing LLM output without resume metadata. "
+                f"Delete {output_path}, set llm.resume=false, or regenerate the output with the new metadata format."
+            )
+        if existing_metadata is not None:
+            existing_signature = existing_metadata["signature"]
+            if _stable_json_dumps(existing_signature) != _stable_json_dumps(signature):
+                raise ValueError(
+                    "Refusing to resume an existing LLM output created with different settings. "
+                    f"Delete {output_path}, change llm.output_dir, or set llm.resume=false."
+                )
+    metadata_path.write_text(
+        json.dumps({"signature": signature}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
 

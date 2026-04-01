@@ -1,7 +1,0 @@
-# @package model.training_cfg.replay_mix_schedule
-
-type: constant
-initial_alpha: null
-final_alpha: null
-total_steps: null
-hold_steps: 0

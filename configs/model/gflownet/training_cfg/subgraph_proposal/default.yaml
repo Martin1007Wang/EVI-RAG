@@ -1,6 +1,0 @@
-# @package model.training_cfg.subgraph_proposal
-
-oracle_answer_distance_weight: 0.0
-prior_question_similarity_weight: 0.0
-prior_component_merge_weight: 0.0
-stop_hit_bias: 0.0

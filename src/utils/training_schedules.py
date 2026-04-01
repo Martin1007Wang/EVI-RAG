@@ -190,25 +190,27 @@ class ProposalBiasScheduler:
         schedule_type = str(type)
         _validate_schedule_type(
             schedule_type=schedule_type,
-            field_name="training.proposal_bias_schedule",
+            field_name="training.auxiliary.proposal.schedule",
         )
         if initial_scale is not None and float(initial_scale) < 0.0:
             raise ValueError(
-                "training.proposal_bias_schedule.initial_scale must be >= 0."
+                "training.auxiliary.proposal.schedule.initial_scale must be >= 0."
             )
         if final_scale is not None and float(final_scale) < 0.0:
             raise ValueError(
-                "training.proposal_bias_schedule.final_scale must be >= 0."
+                "training.auxiliary.proposal.schedule.final_scale must be >= 0."
             )
         if total_steps is not None and int(total_steps) < 1:
             raise ValueError(
-                "training.proposal_bias_schedule.total_steps must be >= 1."
+                "training.auxiliary.proposal.schedule.total_steps must be >= 1."
             )
         if int(hold_steps) < 0:
-            raise ValueError("training.proposal_bias_schedule.hold_steps must be >= 0.")
+            raise ValueError(
+                "training.auxiliary.proposal.schedule.hold_steps must be >= 0."
+            )
         if schedule_type != "constant" and final_scale is None:
             raise ValueError(
-                "training.proposal_bias_schedule.final_scale must be set for annealed schedules."
+                "training.auxiliary.proposal.schedule.final_scale must be set for annealed schedules."
             )
         self.schedule_type = schedule_type
         self.initial_scale = None if initial_scale is None else float(initial_scale)
@@ -236,7 +238,7 @@ class ProposalBiasScheduler:
             raise RuntimeError(
                 "proposal-bias schedule requires a known step horizon. Set trainer.max_steps, "
                 "ensure estimated_stepping_batches is available, or configure "
-                "training.proposal_bias_schedule.total_steps explicitly."
+                "training.auxiliary.proposal.schedule.total_steps explicitly."
             )
 
         final_scale_value = self.final_scale
@@ -272,23 +274,27 @@ class ReplayMixScheduler:
         schedule_type = str(type)
         _validate_schedule_type(
             schedule_type=schedule_type,
-            field_name="training.replay_mix_schedule",
+            field_name="training.auxiliary.replay.schedule",
         )
         if initial_alpha is not None and not 0.0 <= float(initial_alpha) < 1.0:
             raise ValueError(
-                "training.replay_mix_schedule.initial_alpha must be in [0, 1)."
+                "training.auxiliary.replay.schedule.initial_alpha must be in [0, 1)."
             )
         if final_alpha is not None and not 0.0 <= float(final_alpha) < 1.0:
             raise ValueError(
-                "training.replay_mix_schedule.final_alpha must be in [0, 1)."
+                "training.auxiliary.replay.schedule.final_alpha must be in [0, 1)."
             )
         if total_steps is not None and int(total_steps) < 1:
-            raise ValueError("training.replay_mix_schedule.total_steps must be >= 1.")
+            raise ValueError(
+                "training.auxiliary.replay.schedule.total_steps must be >= 1."
+            )
         if int(hold_steps) < 0:
-            raise ValueError("training.replay_mix_schedule.hold_steps must be >= 0.")
+            raise ValueError(
+                "training.auxiliary.replay.schedule.hold_steps must be >= 0."
+            )
         if schedule_type != "constant" and final_alpha is None:
             raise ValueError(
-                "training.replay_mix_schedule.final_alpha must be set for annealed schedules."
+                "training.auxiliary.replay.schedule.final_alpha must be set for annealed schedules."
             )
         self.schedule_type = schedule_type
         self.initial_alpha = None if initial_alpha is None else float(initial_alpha)
@@ -316,7 +322,7 @@ class ReplayMixScheduler:
             raise RuntimeError(
                 "replay-mix schedule requires a known step horizon. Set trainer.max_steps, "
                 "ensure estimated_stepping_batches is available, or configure "
-                "training.replay_mix_schedule.total_steps explicitly."
+                "training.auxiliary.replay.schedule.total_steps explicitly."
             )
 
         final_alpha_value = self.final_alpha

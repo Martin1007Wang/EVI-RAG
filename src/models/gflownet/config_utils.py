@@ -10,10 +10,6 @@ from omegaconf import DictConfig, OmegaConf
 _DEFAULT_TRAINING_CFG: dict[str, Any] = {
     "rollouts_per_graph": 8,
     "sampling_temperature": 1.0,
-    "force_stop_on_answer_hit": False,
-    "terminal_failure_log_reward": -3.0,
-    "step_log_penalty": 0.0,
-    "answer_stop_log_reward_bonus": 0.0,
     "sampling_temperature_schedule": {
         "type": "constant",
         "initial_temperature": None,
@@ -21,67 +17,84 @@ _DEFAULT_TRAINING_CFG: dict[str, Any] = {
         "total_steps": None,
         "hold_steps": 0,
     },
-    "proposal_bias_schedule": {
-        "type": "constant",
-        "initial_scale": None,
-        "final_scale": None,
-        "total_steps": None,
-        "hold_steps": 0,
+    "action_pruning": {
+        "per_node_top_k": 0,
+        "per_state_top_k": 0,
     },
-    "success_replay": {
-        "mix_alpha": 0.0,
-        "capacity": 1024,
-        "min_buffer_size": 64,
-        "replay_trajectories_per_step": None,
-        "deduplicate": True,
-        "add_shortest_path_guidance": False,
-        "expand_imitation_weight": 0.0,
-        "expand_imitation_from_anchor_bonus": 0.0,
-        "expand_imitation_answer_finish_bonus": 0.0,
-        "mask_stop_loss": True,
-    },
-    "replay_mix_schedule": {
-        "type": "constant",
-        "initial_alpha": None,
-        "final_alpha": None,
-        "total_steps": None,
-        "hold_steps": 0,
-    },
-    "answer_quotient": {
-        "enabled": False,
-        "weight": 0.0,
-        "direct_entity_ranking_weight": 0.0,
-        "replace_terminal_loss": False,
-        "gold_reward_mode": "shared",
-        "allocate_stop_mass": False,
-    },
-    "potential_reward": {
-        "answer_distance_weight": 0.0,
-        "unreachable_distance": None,
-    },
-    "subgraph_reward": {
-        "c_step": 0.1,
-        "lambda_conn": 0.5,
-        "beta_answer_bits": 0.0,
-        "beta_answer_full": 0.0,
-        "beta_hit": 2.0,
-        "beta_cnt": 0.25,
-        "beta_early": 1.0,
-        "min_stop_edges": 1,
-    },
-    "subgraph_proposal": {
-        "oracle_answer_distance_weight": 0.0,
-        "prior_question_similarity_weight": 0.0,
-        "prior_component_merge_weight": 0.0,
-        "stop_hit_bias": 0.0,
+    "answer_reward": {
+        "gold_answer_bonus": 2.0,
+        "wrong_answer_penalty": 2.0,
+        "failure_penalty": 4.0,
+        "size_penalty": 0.1,
+        "redundancy_penalty": 0.25,
+        "component_penalty": 0.5,
     },
     "subtb": {
         "lambda_weight": 1.0,
-        "normalize": True,
-        "root_loss_weight": 1.0,
-        "pairwise_loss_weight": 1.0,
-        "terminal_loss_weight": 1.0,
+        "topology_weight_alpha": 0.0,
     },
+    "auxiliary": {
+        "proposal": {
+            "enabled": False,
+            "prior": {
+                "oracle_answer_distance_weight": 0.0,
+                "prior_question_similarity_weight": 0.0,
+                "prior_component_merge_weight": 0.0,
+                "stop_hit_bias": 0.0,
+            },
+            "schedule": {
+                "type": "constant",
+                "initial_scale": None,
+                "final_scale": None,
+                "total_steps": None,
+                "hold_steps": 0,
+            },
+        },
+        "replay": {
+            "enabled": False,
+            "mix_alpha": 0.0,
+            "buffer": {
+                "capacity": 1024,
+                "min_buffer_size": 64,
+                "replay_trajectories_per_step": None,
+                "deduplicate": True,
+            },
+            "guidance": {
+                "add_shortest_path_guidance": False,
+                "expand_imitation_weight": 0.0,
+                "expand_imitation_from_anchor_bonus": 0.0,
+                "expand_imitation_answer_finish_bonus": 0.0,
+                "mask_stop_loss": True,
+            },
+            "schedule": {
+                "type": "constant",
+                "initial_alpha": None,
+                "final_alpha": None,
+                "total_steps": None,
+                "hold_steps": 0,
+            },
+        },
+    },
+}
+
+_REMOVED_TRAINING_KEYS: dict[str, str] = {
+    "proposal_bias_schedule": "use training_cfg.auxiliary.proposal.schedule",
+    "subgraph_proposal": "use training_cfg.auxiliary.proposal.prior",
+    "success_replay": "use training_cfg.auxiliary.replay",
+    "replay_mix_schedule": "use training_cfg.auxiliary.replay.schedule",
+    "answer_quotient": "answer-quotient configs were removed; answer selection is now part of the main stop action",
+    "potential_reward": "potential-reward shaping was removed from the mainline",
+    "force_stop_on_answer_hit": "legacy stop shaping was removed from the mainline",
+    "terminal_failure_log_reward": "configure training_cfg.answer_reward.failure_penalty instead",
+    "step_log_penalty": "step penalties were removed from the mainline",
+    "answer_stop_log_reward_bonus": "answer-stop bonuses were removed from the mainline",
+}
+
+_REMOVED_SUBTB_KEYS: dict[str, str] = {
+    "normalize": "subtb normalization is always derived from the active trajectory weights",
+    "root_loss_weight": "root/pairwise/terminal loss reweighting was removed from the mainline",
+    "pairwise_loss_weight": "root/pairwise/terminal loss reweighting was removed from the mainline",
+    "terminal_loss_weight": "root/pairwise/terminal loss reweighting was removed from the mainline",
 }
 
 
@@ -108,170 +121,244 @@ def _deep_merge(
     return merged
 
 
-def normalize_answer_quotient_cfg(answer_quotient_cfg: Any) -> dict[str, Any]:
+def _validate_non_negative(
+    *, cfg: dict[str, Any], field_names: tuple[str, ...], prefix: str
+) -> None:
+    for field_name in field_names:
+        cfg[field_name] = float(cfg.get(field_name, 0.0))
+        if cfg[field_name] < 0.0:
+            raise ValueError(f"{prefix}.{field_name} must be >= 0.")
+
+
+def _raise_on_removed_training_keys(training_cfg: Mapping[str, Any]) -> None:
+    removed = [
+        f"{key}: {message}"
+        for key, message in _REMOVED_TRAINING_KEYS.items()
+        if key in training_cfg
+    ]
+    if removed:
+        raise ValueError(
+            "Removed training config detected in the answer-centric mainline. "
+            + " ".join(sorted(removed))
+        )
+
+
+def _raise_on_removed_subtb_keys(subtb_cfg: Mapping[str, Any]) -> None:
+    removed = [
+        f"{key}: {message}"
+        for key, message in _REMOVED_SUBTB_KEYS.items()
+        if key in subtb_cfg
+    ]
+    if removed:
+        raise ValueError(
+            "Removed SubTB config detected in the answer-centric mainline. "
+            + " ".join(sorted(removed))
+        )
+
+
+def normalize_training_action_pruning_cfg(action_pruning_cfg: Any) -> dict[str, Any]:
     cfg = _deep_merge(
-        base=_DEFAULT_TRAINING_CFG["answer_quotient"],
+        base=_DEFAULT_TRAINING_CFG["action_pruning"],
         override=_to_plain_mapping(
-            answer_quotient_cfg,
-            field_name="training_cfg.answer_quotient",
+            action_pruning_cfg,
+            field_name="training_cfg.action_pruning",
         ),
     )
-    cfg["enabled"] = bool(cfg.get("enabled", False))
-    cfg["weight"] = float(cfg.get("weight", 0.0))
-    if cfg["weight"] < 0.0:
-        raise ValueError("training.answer_quotient.weight must be >= 0.")
-    cfg["direct_entity_ranking_weight"] = float(
-        cfg.get("direct_entity_ranking_weight", 0.0)
-    )
-    if cfg["direct_entity_ranking_weight"] < 0.0:
-        raise ValueError(
-            "training.answer_quotient.direct_entity_ranking_weight must be >= 0."
-        )
-    cfg["replace_terminal_loss"] = bool(cfg.get("replace_terminal_loss", False))
-    cfg["allocate_stop_mass"] = bool(cfg.get("allocate_stop_mass", False))
-    cfg["gold_reward_mode"] = str(cfg.get("gold_reward_mode", "shared"))
-    if cfg["gold_reward_mode"] not in {"shared", "unit"}:
-        raise ValueError(
-            "training.answer_quotient.gold_reward_mode must be one of {'shared', 'unit'}."
-        )
-    if cfg["direct_entity_ranking_weight"] > 0.0 and not cfg["enabled"]:
-        raise ValueError(
-            "training.answer_quotient.direct_entity_ranking_weight requires enabled=True."
-        )
-    if cfg["replace_terminal_loss"] and not cfg["enabled"]:
-        raise ValueError(
-            "training.answer_quotient.replace_terminal_loss requires enabled=True."
-        )
-    if cfg["replace_terminal_loss"] and cfg["weight"] <= 0.0:
-        raise ValueError(
-            "training.answer_quotient.replace_terminal_loss requires weight > 0."
-        )
+    cfg["per_node_top_k"] = int(cfg.get("per_node_top_k", 0))
+    if cfg["per_node_top_k"] < 0:
+        raise ValueError("training.action_pruning.per_node_top_k must be >= 0.")
+    cfg["per_state_top_k"] = int(cfg.get("per_state_top_k", 0))
+    if cfg["per_state_top_k"] < 0:
+        raise ValueError("training.action_pruning.per_state_top_k must be >= 0.")
     return cfg
 
 
-def answer_quotient_active(answer_quotient_cfg: Mapping[str, Any]) -> bool:
-    return bool(answer_quotient_cfg.get("enabled", False)) and (
-        float(answer_quotient_cfg.get("weight", 0.0)) > 0.0
-        or bool(answer_quotient_cfg.get("replace_terminal_loss", False))
-    )
-
-
-def answer_quotient_stop_allocation_active(
-    answer_quotient_cfg: Mapping[str, Any],
-) -> bool:
-    return bool(answer_quotient_cfg.get("enabled", False)) and bool(
-        answer_quotient_cfg.get("allocate_stop_mass", False)
-    )
-
-
-def answer_quotient_direct_entity_ranking_active(
-    answer_quotient_cfg: Mapping[str, Any],
-) -> bool:
-    return bool(answer_quotient_cfg.get("enabled", False)) and (
-        float(answer_quotient_cfg.get("direct_entity_ranking_weight", 0.0)) > 0.0
-    )
-
-
-def normalize_potential_reward_cfg(potential_reward_cfg: Any) -> dict[str, Any]:
+def normalize_auxiliary_cfg(auxiliary_cfg: Any) -> dict[str, Any]:
     cfg = _deep_merge(
-        base=_DEFAULT_TRAINING_CFG["potential_reward"],
+        base=_DEFAULT_TRAINING_CFG["auxiliary"],
         override=_to_plain_mapping(
-            potential_reward_cfg,
-            field_name="training_cfg.potential_reward",
+            auxiliary_cfg,
+            field_name="training_cfg.auxiliary",
         ),
     )
-    cfg["answer_distance_weight"] = float(cfg.get("answer_distance_weight", 0.0))
-    if cfg["answer_distance_weight"] < 0.0:
+    proposal_cfg = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["proposal"],
+        override=_to_plain_mapping(
+            cfg["proposal"],
+            field_name="training_cfg.auxiliary.proposal",
+        ),
+    )
+    proposal_cfg["enabled"] = bool(proposal_cfg.get("enabled", False))
+    proposal_cfg["prior"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["proposal"]["prior"],
+        override=_to_plain_mapping(
+            proposal_cfg["prior"],
+            field_name="training_cfg.auxiliary.proposal.prior",
+        ),
+    )
+    _validate_non_negative(
+        cfg=proposal_cfg["prior"],
+        field_names=(
+            "oracle_answer_distance_weight",
+            "prior_question_similarity_weight",
+            "prior_component_merge_weight",
+            "stop_hit_bias",
+        ),
+        prefix="training.auxiliary.proposal.prior",
+    )
+    proposal_cfg["schedule"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["proposal"]["schedule"],
+        override=_to_plain_mapping(
+            proposal_cfg["schedule"],
+            field_name="training_cfg.auxiliary.proposal.schedule",
+        ),
+    )
+    if proposal_cfg["enabled"]:
         raise ValueError(
-            "training.potential_reward.answer_distance_weight must be >= 0."
+            "training.auxiliary.proposal.enabled=true is not supported in the answer-centric "
+            "mainline yet; disable it until proposal bias is implemented end-to-end."
         )
-    unreachable_distance = cfg.get("unreachable_distance")
-    if unreachable_distance is not None:
-        cfg["unreachable_distance"] = int(unreachable_distance)
-        if cfg["unreachable_distance"] < 0:
+
+    replay_cfg = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["replay"],
+        override=_to_plain_mapping(
+            cfg["replay"],
+            field_name="training_cfg.auxiliary.replay",
+        ),
+    )
+    replay_cfg["enabled"] = bool(replay_cfg.get("enabled", False))
+    replay_cfg["mix_alpha"] = float(replay_cfg.get("mix_alpha", 0.0))
+    if not 0.0 <= replay_cfg["mix_alpha"] < 1.0:
+        raise ValueError("training.auxiliary.replay.mix_alpha must be in [0, 1).")
+    replay_cfg["buffer"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["replay"]["buffer"],
+        override=_to_plain_mapping(
+            replay_cfg["buffer"],
+            field_name="training_cfg.auxiliary.replay.buffer",
+        ),
+    )
+    replay_cfg["buffer"]["capacity"] = int(replay_cfg["buffer"].get("capacity", 1024))
+    if replay_cfg["buffer"]["capacity"] < 1:
+        raise ValueError("training.auxiliary.replay.buffer.capacity must be >= 1.")
+    replay_cfg["buffer"]["min_buffer_size"] = int(
+        replay_cfg["buffer"].get("min_buffer_size", 64)
+    )
+    if replay_cfg["buffer"]["min_buffer_size"] < 0:
+        raise ValueError(
+            "training.auxiliary.replay.buffer.min_buffer_size must be >= 0."
+        )
+    replay_trajectories_per_step = replay_cfg["buffer"].get(
+        "replay_trajectories_per_step"
+    )
+    if replay_trajectories_per_step is not None:
+        replay_cfg["buffer"]["replay_trajectories_per_step"] = int(
+            replay_trajectories_per_step
+        )
+        if replay_cfg["buffer"]["replay_trajectories_per_step"] < 0:
             raise ValueError(
-                "training.potential_reward.unreachable_distance must be >= 0 when set."
+                "training.auxiliary.replay.buffer.replay_trajectories_per_step must be >= 0 when set."
             )
-    return cfg
+    replay_cfg["buffer"]["deduplicate"] = bool(
+        replay_cfg["buffer"].get("deduplicate", True)
+    )
+    replay_cfg["guidance"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["replay"]["guidance"],
+        override=_to_plain_mapping(
+            replay_cfg["guidance"],
+            field_name="training_cfg.auxiliary.replay.guidance",
+        ),
+    )
+    replay_cfg["guidance"]["add_shortest_path_guidance"] = bool(
+        replay_cfg["guidance"].get("add_shortest_path_guidance", False)
+    )
+    _validate_non_negative(
+        cfg=replay_cfg["guidance"],
+        field_names=(
+            "expand_imitation_weight",
+            "expand_imitation_from_anchor_bonus",
+            "expand_imitation_answer_finish_bonus",
+        ),
+        prefix="training.auxiliary.replay.guidance",
+    )
+    replay_cfg["guidance"]["mask_stop_loss"] = bool(
+        replay_cfg["guidance"].get("mask_stop_loss", True)
+    )
+    replay_cfg["schedule"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["auxiliary"]["replay"]["schedule"],
+        override=_to_plain_mapping(
+            replay_cfg["schedule"],
+            field_name="training_cfg.auxiliary.replay.schedule",
+        ),
+    )
 
-
-def potential_reward_active(potential_reward_cfg: Mapping[str, Any]) -> bool:
-    return float(potential_reward_cfg.get("answer_distance_weight", 0.0)) > 0.0
+    return {
+        "proposal": proposal_cfg,
+        "replay": replay_cfg,
+    }
 
 
 def normalize_training_cfg(training_cfg: Any) -> dict[str, Any]:
-    cfg = _deep_merge(
-        base=_DEFAULT_TRAINING_CFG,
-        override=_to_plain_mapping(training_cfg, field_name="training_cfg"),
-    )
+    training_cfg_mapping = _to_plain_mapping(training_cfg, field_name="training_cfg")
+    _raise_on_removed_training_keys(training_cfg_mapping)
+    cfg = _deep_merge(base=_DEFAULT_TRAINING_CFG, override=training_cfg_mapping)
     cfg["rollouts_per_graph"] = int(cfg.get("rollouts_per_graph", 8))
     if cfg["rollouts_per_graph"] < 1:
         raise ValueError("training.rollouts_per_graph must be >= 1.")
     cfg["sampling_temperature"] = float(cfg.get("sampling_temperature", 1.0))
     if cfg["sampling_temperature"] <= 0.0:
         raise ValueError("training.sampling_temperature must be > 0.")
-    cfg["force_stop_on_answer_hit"] = bool(cfg.get("force_stop_on_answer_hit", False))
-    cfg["terminal_failure_log_reward"] = float(
-        cfg.get("terminal_failure_log_reward", -3.0)
+    cfg["sampling_temperature_schedule"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["sampling_temperature_schedule"],
+        override=_to_plain_mapping(
+            cfg["sampling_temperature_schedule"],
+            field_name="training_cfg.sampling_temperature_schedule",
+        ),
     )
-    if cfg["terminal_failure_log_reward"] > 0.0:
-        raise ValueError("training.terminal_failure_log_reward must be <= 0.")
-    cfg["step_log_penalty"] = float(cfg.get("step_log_penalty", 0.0))
-    if cfg["step_log_penalty"] > 0.0:
-        raise ValueError("training.step_log_penalty must be <= 0.")
-    cfg["answer_stop_log_reward_bonus"] = float(
-        cfg.get("answer_stop_log_reward_bonus", 0.0)
+    cfg["action_pruning"] = normalize_training_action_pruning_cfg(
+        cfg.get("action_pruning", {})
     )
-    if cfg["answer_stop_log_reward_bonus"] < 0.0:
-        raise ValueError("training.answer_stop_log_reward_bonus must be >= 0.")
-    cfg["answer_quotient"] = normalize_answer_quotient_cfg(cfg["answer_quotient"])
-    cfg["potential_reward"] = normalize_potential_reward_cfg(cfg["potential_reward"])
-    for key in (
-        "sampling_temperature_schedule",
-        "proposal_bias_schedule",
-        "success_replay",
-        "replay_mix_schedule",
-        "subgraph_reward",
-        "subgraph_proposal",
-        "subtb",
-    ):
-        cfg[key] = _deep_merge(
-            base=_DEFAULT_TRAINING_CFG[key],
-            override=_to_plain_mapping(cfg[key], field_name=f"training_cfg.{key}"),
-        )
-    cfg["success_replay"]["expand_imitation_weight"] = float(
-        cfg["success_replay"].get("expand_imitation_weight", 0.0)
+    cfg["answer_reward"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["answer_reward"],
+        override=_to_plain_mapping(
+            cfg["answer_reward"],
+            field_name="training_cfg.answer_reward",
+        ),
     )
-    if cfg["success_replay"]["expand_imitation_weight"] < 0.0:
-        raise ValueError(
-            "training.success_replay.expand_imitation_weight must be >= 0."
-        )
-    cfg["success_replay"]["expand_imitation_from_anchor_bonus"] = float(
-        cfg["success_replay"].get("expand_imitation_from_anchor_bonus", 0.0)
+    _validate_non_negative(
+        cfg=cfg["answer_reward"],
+        field_names=(
+            "gold_answer_bonus",
+            "wrong_answer_penalty",
+            "failure_penalty",
+            "size_penalty",
+            "redundancy_penalty",
+            "component_penalty",
+        ),
+        prefix="training.answer_reward",
     )
-    if cfg["success_replay"]["expand_imitation_from_anchor_bonus"] < 0.0:
-        raise ValueError(
-            "training.success_replay.expand_imitation_from_anchor_bonus must be >= 0."
-        )
-    cfg["success_replay"]["expand_imitation_answer_finish_bonus"] = float(
-        cfg["success_replay"].get("expand_imitation_answer_finish_bonus", 0.0)
+    subtb_cfg = _to_plain_mapping(
+        cfg["subtb"],
+        field_name="training_cfg.subtb",
     )
-    if cfg["success_replay"]["expand_imitation_answer_finish_bonus"] < 0.0:
-        raise ValueError(
-            "training.success_replay.expand_imitation_answer_finish_bonus must be >= 0."
-        )
-    cfg["success_replay"]["mask_stop_loss"] = bool(
-        cfg["success_replay"].get("mask_stop_loss", True)
+    _raise_on_removed_subtb_keys(subtb_cfg)
+    cfg["subtb"] = _deep_merge(
+        base=_DEFAULT_TRAINING_CFG["subtb"],
+        override=subtb_cfg,
     )
+    cfg["subtb"]["lambda_weight"] = float(cfg["subtb"].get("lambda_weight", 1.0))
+    if not 0.0 <= cfg["subtb"]["lambda_weight"] <= 1.0:
+        raise ValueError("training.subtb.lambda_weight must be in [0, 1].")
+    cfg["subtb"]["topology_weight_alpha"] = float(
+        cfg["subtb"].get("topology_weight_alpha", 0.0)
+    )
+    if cfg["subtb"]["topology_weight_alpha"] < 0.0:
+        raise ValueError("training.subtb.topology_weight_alpha must be >= 0.")
+    cfg["auxiliary"] = normalize_auxiliary_cfg(cfg.get("auxiliary", {}))
     return cfg
 
 
 __all__ = [
-    "answer_quotient_active",
-    "answer_quotient_direct_entity_ranking_active",
-    "answer_quotient_stop_allocation_active",
-    "normalize_answer_quotient_cfg",
-    "normalize_potential_reward_cfg",
+    "normalize_auxiliary_cfg",
+    "normalize_training_action_pruning_cfg",
     "normalize_training_cfg",
-    "potential_reward_active",
 ]

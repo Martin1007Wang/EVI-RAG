@@ -1,0 +1,8 @@
+# @package model.training_cfg.answer_reward
+
+gold_answer_bonus: 2.0
+wrong_answer_penalty: 2.0
+failure_penalty: 4.0
+size_penalty: 0.1
+redundancy_penalty: 0.25
+component_penalty: 0.5

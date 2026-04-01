@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -11,7 +12,12 @@ from src.models.components.embedding import BackboneInput
 from src.utils.precision_utils import align_float_input_dtype
 
 from .prepared_batch import SubgraphPreparedBatch, build_subgraph_prepared_batch
-from .state import SubgraphAnalysis, SubgraphRolloutBatch
+from .state import (
+    SubgraphAnalysis,
+    SubgraphRolloutBatch,
+    SubgraphState,
+    _dedup_preserve_order,
+)
 
 
 def _build_mlp(
@@ -40,24 +46,76 @@ def _bit_count(bits: int) -> int:
     return int(int(bits).bit_count())
 
 
-def _selected_node_pool(
+def _normalize_state_indices(
     *,
-    node_tokens: torch.Tensor,
-    selected_nodes: tuple[int, ...],
+    state_indices: list[int] | tuple[int, ...] | torch.Tensor | None,
+    num_states: int,
+) -> list[int]:
+    if state_indices is None:
+        return list(range(int(num_states)))
+    if torch.is_tensor(state_indices):
+        values = state_indices.detach().cpu().view(-1).tolist()
+    else:
+        values = list(state_indices)
+    normalized = [int(state_idx) for state_idx in values]
+    for state_idx in normalized:
+        if state_idx < 0 or state_idx >= int(num_states):
+            raise IndexError(f"state_idx out of range: {state_idx}.")
+    return normalized
+
+
+def _question_attention_pool(
+    *,
+    token_table: torch.Tensor,
+    token_ids: tuple[int, ...],
+    query_token: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    if not selected_nodes:
-        return node_tokens.new_zeros(
-            (int(node_tokens.size(-1)),), dtype=node_tokens.dtype
+    if not token_ids:
+        return token_table.new_zeros(
+            (int(token_table.size(-1)),), dtype=token_table.dtype
         )
-    indices = torch.tensor(selected_nodes, device=device, dtype=torch.long)
-    return node_tokens.index_select(0, indices).mean(dim=0)
+    indices = torch.tensor(token_ids, device=device, dtype=torch.long)
+    tokens = token_table.index_select(0, indices)
+    scores = torch.matmul(
+        tokens.to(dtype=torch.float32), query_token.to(dtype=torch.float32)
+    )
+    weights = torch.softmax(scores, dim=0).to(dtype=tokens.dtype)
+    return (tokens * weights.unsqueeze(-1)).sum(dim=0)
+
+
+def _frontier_node_ids(
+    *,
+    prepared_batch: SubgraphPreparedBatch,
+    graph_idx: int,
+    state: SubgraphState,
+    analysis: SubgraphAnalysis,
+) -> tuple[int, ...]:
+    frontier_node_ids: list[int] = []
+    for graph_node_id in analysis.selected_node_ids:
+        outgoing = prepared_batch.graph_outgoing_edge_ids[int(graph_idx)].get(
+            int(graph_node_id), ()
+        )
+        if any(not state.contains_edge(int(edge_id)) for edge_id in outgoing):
+            frontier_node_ids.append(int(graph_node_id))
+    return tuple(_dedup_preserve_order(frontier_node_ids))
+
+
+def _answer_ready_node_ids(
+    *, analysis: SubgraphAnalysis, full_mask: int
+) -> tuple[int, ...]:
+    return tuple(
+        int(node_id)
+        for node_id in analysis.selected_node_ids
+        if int(analysis.reachability_bits.get(int(node_id), 0)) == int(full_mask)
+    )
 
 
 def _selected_relation_pool(
     *,
     prepared_batch: SubgraphPreparedBatch,
     edge_ids: tuple[int, ...],
+    query_token: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
     if not edge_ids:
@@ -67,12 +125,21 @@ def _selected_relation_pool(
         )
     edge_indices = torch.tensor(edge_ids, device=device, dtype=torch.long)
     relation_ids = prepared_batch.topology.edge_type.index_select(0, edge_indices)
-    return prepared_batch.relation_tokens.index_select(0, relation_ids).mean(dim=0)
+    relation_tokens = prepared_batch.relation_tokens.index_select(0, relation_ids)
+    relation_scores = torch.matmul(
+        relation_tokens.to(dtype=torch.float32), query_token.to(dtype=torch.float32)
+    )
+    relation_weights = torch.softmax(relation_scores, dim=0).to(
+        dtype=relation_tokens.dtype
+    )
+    return (relation_tokens * relation_weights.unsqueeze(-1)).sum(dim=0)
 
 
 def _coverage_features(
     *,
+    prepared_batch: SubgraphPreparedBatch,
     graph_idx: int,
+    state: SubgraphState,
     analysis: SubgraphAnalysis,
     full_mask: int,
 ) -> torch.Tensor:
@@ -88,14 +155,40 @@ def _coverage_features(
     else:
         mean_coverage = 0.0
         max_coverage = 0.0
+    frontier_edge_count = 0
+    for graph_node_id in analysis.selected_node_ids:
+        frontier_edge_count += sum(
+            1
+            for edge_id in prepared_batch.graph_outgoing_edge_ids[int(graph_idx)].get(
+                int(graph_node_id), ()
+            )
+            if not state.contains_edge(int(edge_id))
+        )
+    redundancy_edges = max(
+        int(analysis.num_selected_edges)
+        - max(
+            int(len(analysis.selected_node_ids)) - int(analysis.anchor_component_count),
+            0,
+        ),
+        0,
+    )
+    full_coverage_nodes = float(
+        sum(
+            1
+            for node_id in analysis.selected_node_ids
+            if int(analysis.reachability_bits.get(int(node_id), 0)) == int(full_mask)
+        )
+    )
     return torch.tensor(
         [
-            float(graph_idx),
             float(len(analysis.selected_node_ids)),
             float(analysis.num_selected_edges),
             float(analysis.anchor_component_count),
             float(mean_coverage),
             float(max_coverage),
+            float(frontier_edge_count),
+            float(redundancy_edges),
+            float(full_coverage_nodes),
         ],
         dtype=torch.float32,
     )
@@ -111,11 +204,11 @@ class SubgraphEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_dim = int(backbone["hidden_dim"])
-        state_struct_dim = 6
+        state_struct_dim = 8
         self.backbone = EmbeddingBackbone(**backbone)
-        self.state_encoder_norm = nn.LayerNorm((3 * self.hidden_dim) + state_struct_dim)
+        self.state_encoder_norm = nn.LayerNorm((6 * self.hidden_dim) + state_struct_dim)
         self.state_encoder = _build_mlp(
-            input_dim=(3 * self.hidden_dim) + state_struct_dim,
+            input_dim=(6 * self.hidden_dim) + state_struct_dim,
             output_dim=self.hidden_dim,
             hidden_dim=int(state_encoder["hidden_dim"]),
             num_layers=int(state_encoder["num_layers"]),
@@ -142,6 +235,9 @@ class SubgraphEncoder(nn.Module):
                 edge_index=topology.edge_index,
                 edge_relations=topology.edge_type,
                 num_nodes=topology.num_nodes,
+                node_graph_index=topology.all_node_graph_index(
+                    device=topology.edge_index.device
+                ),
             )
         )
         return build_subgraph_prepared_batch(
@@ -156,31 +252,81 @@ class SubgraphEncoder(nn.Module):
         *,
         prepared_batch: SubgraphPreparedBatch,
         rollout_batch: SubgraphRolloutBatch,
-        analyses: tuple[SubgraphAnalysis, ...],
+        analyses: tuple[SubgraphAnalysis, ...] | Mapping[int, SubgraphAnalysis],
+        state_indices: list[int] | tuple[int, ...] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         features: list[torch.Tensor] = []
         device = prepared_batch.device
-        for state_idx, state in enumerate(rollout_batch.states):
+        selected_state_indices = _normalize_state_indices(
+            state_indices=state_indices,
+            num_states=len(rollout_batch.states),
+        )
+        for state_idx in selected_state_indices:
+            state = rollout_batch.states[int(state_idx)]
             graph_idx = int(rollout_batch.graph_ids[state_idx].item())
-            analysis = analyses[state_idx]
-            node_pool = _selected_node_pool(
-                node_tokens=prepared_batch.node_tokens,
-                selected_nodes=analysis.selected_node_ids,
+            if isinstance(analyses, Mapping):
+                analysis = analyses[int(state_idx)]
+            else:
+                analysis = analyses[int(state_idx)]
+            question_pool = prepared_batch.question_tokens[graph_idx]
+            node_pool = _question_attention_pool(
+                token_table=prepared_batch.node_tokens,
+                token_ids=analysis.selected_node_ids,
+                query_token=question_pool,
+                device=device,
+            )
+            frontier_pool = _question_attention_pool(
+                token_table=prepared_batch.node_tokens,
+                token_ids=_frontier_node_ids(
+                    prepared_batch=prepared_batch,
+                    graph_idx=graph_idx,
+                    state=state,
+                    analysis=analysis,
+                ),
+                query_token=question_pool,
+                device=device,
+            )
+            answer_ready_pool = _question_attention_pool(
+                token_table=prepared_batch.node_tokens,
+                token_ids=_answer_ready_node_ids(
+                    analysis=analysis,
+                    full_mask=int(prepared_batch.graph_anchor_full_mask[graph_idx]),
+                ),
+                query_token=question_pool,
+                device=device,
+            )
+            anchor_pool = _question_attention_pool(
+                token_table=prepared_batch.node_tokens,
+                token_ids=prepared_batch.graph_anchor_abs_node_ids[graph_idx],
+                query_token=question_pool,
                 device=device,
             )
             relation_pool = _selected_relation_pool(
                 prepared_batch=prepared_batch,
                 edge_ids=state.edge_ids,
+                query_token=question_pool,
                 device=device,
             )
-            question_pool = prepared_batch.question_tokens[graph_idx]
             struct = _coverage_features(
+                prepared_batch=prepared_batch,
                 graph_idx=graph_idx,
+                state=state,
                 analysis=analysis,
                 full_mask=int(prepared_batch.graph_anchor_full_mask[graph_idx]),
             ).to(device=device)
             features.append(
-                torch.cat((node_pool, relation_pool, question_pool, struct), dim=0)
+                torch.cat(
+                    (
+                        node_pool,
+                        frontier_pool,
+                        answer_ready_pool,
+                        anchor_pool,
+                        relation_pool,
+                        question_pool,
+                        struct,
+                    ),
+                    dim=0,
+                )
             )
         if not features:
             return prepared_batch.node_tokens.new_empty((0, self.hidden_dim))
@@ -197,14 +343,39 @@ class SubgraphEncoder(nn.Module):
         rollout_batch: SubgraphRolloutBatch,
         state_features: torch.Tensor,
     ) -> torch.Tensor:
+        return self.compute_log_flows_for_graph_ids(
+            prepared_batch=prepared_batch,
+            graph_ids=rollout_batch.graph_ids,
+            state_features=state_features,
+            done_mask=rollout_batch.done_mask,
+        )
+
+    def compute_log_flows_for_graph_ids(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_ids: torch.Tensor,
+        state_features: torch.Tensor,
+        done_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if int(state_features.size(0)) != int(graph_ids.numel()):
+            raise ValueError(
+                "state_features must align with graph_ids in SubgraphEncoder.compute_log_flows_for_graph_ids."
+            )
         question_features = prepared_batch.question_tokens.index_select(
-            0, rollout_batch.graph_ids
+            0, graph_ids.to(device=prepared_batch.device, dtype=torch.long)
         )
         log_flows = self.flow_head(state_features, question_features).to(
             dtype=torch.float32
         )
+        if done_mask is None:
+            return log_flows
+        if tuple(done_mask.shape) != tuple(graph_ids.shape):
+            raise ValueError(
+                "done_mask must align with graph_ids in SubgraphEncoder.compute_log_flows_for_graph_ids."
+            )
         return torch.where(
-            rollout_batch.done_mask,
+            done_mask.to(device=log_flows.device, dtype=torch.bool),
             torch.zeros_like(log_flows, dtype=torch.float32),
             log_flows,
         )

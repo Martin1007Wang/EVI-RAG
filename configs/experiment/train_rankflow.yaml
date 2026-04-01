@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Canonical RankFlow training bundle for answer ranking.
+# Canonical answer-committed RankFlow training bundle for answer ranking.
 # Usage:
 #   python src/train.py experiment=train_rankflow dataset=webqsp-sub
 #
@@ -19,10 +19,12 @@ defaults:
 optimized_metric: "val/sub/answer/recall@10"
 
 data:
-  # Raise rollouts per graph aggressively, then shrink the number of graphs per
-  # optimizer step so per-step memory stays in a workable range.
-  batch_size: 64
-  eval_batch_size: 32
+  # The structured backbone now performs real sparse graph propagation during
+  # batch preparation, so the previous 64x32 train-time rollout surface no
+  # longer fits on a 48 GiB A6000. Keep the graph batch modest and recover a
+  # larger effective batch with gradient accumulation instead of raw VRAM.
+  batch_size: 8
+  eval_batch_size: 8
 
 fit_schedule:
   # With large batches, validation every 2 passes becomes too chatty. Keep the
@@ -33,9 +35,12 @@ fit_schedule:
 
 trainer:
   max_time: "00:08:00:00"
-  # Even after shrinking the graph batch for higher rollout density, logging
-  # every 32 steps still lands often enough to show sub-pass training movement.
-  log_every_n_steps: 32
+  # Accumulate gradients to preserve a stable optimizer batch without bringing
+  # back the full in-memory rollout surface.
+  accumulate_grad_batches: 8
+  # Smaller per-step batches make progress harder to read if logging stays too
+  # sparse, so tighten the logging cadence slightly.
+  log_every_n_steps: 16
   gradient_clip_val: 0.5
 
 callbacks:
@@ -50,37 +55,10 @@ model:
   policy_cfg:
     state_mode: subgraph
   training_cfg:
-    rollouts_per_graph: 32
-    potential_reward:
-      answer_distance_weight: 0.0
-    subgraph_reward:
-      beta_answer_bits: 0.2
-      beta_answer_full: 0.5
-    subgraph_proposal:
-      oracle_answer_distance_weight: 0.5
-      prior_question_similarity_weight: 0.75
-      prior_component_merge_weight: 1.0
-      stop_hit_bias: 0.25
-    proposal_bias_schedule:
-      # Start with stronger subgraph proposal bias, then anneal it away so the
-      # late-stage rollout policy realigns with the target policy.
-      type: cosine
-      initial_scale: 0.8
-      final_scale: 0.0
-      hold_steps: 1000
-    success_replay:
-      mix_alpha: 0.2
-      capacity: 128
-      min_buffer_size: 16
-      replay_trajectories_per_step: 64
-      add_shortest_path_guidance: true
-      expand_imitation_weight: 1.0
-      expand_imitation_from_anchor_bonus: 2.0
-      expand_imitation_answer_finish_bonus: 4.0
-    replay_mix_schedule:
-      type: cosine
-      final_alpha: 0.0
-      hold_steps: 2000
+    rollouts_per_graph: 16
+    answer_reward:
+      gold_answer_bonus: 3.0
+      component_penalty: 0.75
   eval_cfg:
     # Keep training-time checkpoint selection on the same Monte Carlo answer
     # posterior that final eval uses; only the report surface stays rank-only.

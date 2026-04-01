@@ -1,8 +1,0 @@
-# @package model.training_cfg.answer_quotient
-
-enabled: false
-weight: 0.0
-direct_entity_ranking_weight: 0.0
-replace_terminal_loss: false
-gold_reward_mode: shared
-allocate_stop_mass: false

@@ -63,11 +63,52 @@ def test_append_stage_metrics_can_write_custom_train_record_kind(
 def test_write_prediction_artifacts_reuses_existing_model_paths(tmp_path: Path) -> None:
     model = type("_Model", (), {})()
     existing_paths = {"prompt_path": tmp_path / "existing.jsonl"}
+    settings = PredictionArtifactSettings(
+        enabled=True,
+        output_root=tmp_path,
+        dataset_scope="sub",
+    )
     setattr(model, "predict_artifact_paths", existing_paths)
+    setattr(model, "predict_artifact_settings_cache_key", settings.cache_key())
 
     paths = write_prediction_artifacts(
         model,
-        settings=PredictionArtifactSettings(enabled=True, output_root=tmp_path),
+        settings=settings,
     )
 
     assert paths == existing_paths
+
+
+def test_write_prediction_artifacts_refreshes_cache_when_settings_change(
+    tmp_path: Path,
+) -> None:
+    calls: list[Path] = []
+
+    class _Model:
+        def write_prediction_artifacts(self, **kwargs):  # type: ignore[no-untyped-def]
+            output_dir = Path(str(kwargs["output_dir"]))
+            calls.append(output_dir)
+            return {"prompt_path": output_dir / "fresh.jsonl"}
+
+    model = _Model()
+    old_settings = PredictionArtifactSettings(
+        enabled=True,
+        output_root=tmp_path,
+        dataset_scope="full",
+    )
+    setattr(model, "predict_artifact_paths", {"prompt_path": tmp_path / "old.jsonl"})
+    setattr(model, "predict_artifact_settings_cache_key", old_settings.cache_key())
+
+    new_settings = PredictionArtifactSettings(
+        enabled=True,
+        output_root=tmp_path,
+        dataset_scope="sub",
+    )
+    paths = write_prediction_artifacts(model, settings=new_settings)
+
+    assert calls == [tmp_path / "rankflow" / "sub"]
+    assert paths == {"prompt_path": tmp_path / "rankflow" / "sub" / "fresh.jsonl"}
+    assert (
+        getattr(model, "predict_artifact_settings_cache_key")
+        == new_settings.cache_key()
+    )

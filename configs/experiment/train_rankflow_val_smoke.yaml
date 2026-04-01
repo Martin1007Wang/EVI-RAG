@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Validation-on-validation smoke bundle for checking stability on the current
+# answer-committed RankFlow stack with bounded train-time action scoring.
+
+defaults:
+  - train_rankflow_fastiter
+  - _self_
+
+run:
+  test: false
+
+data:
+  splits:
+    train: validation
+    validation: validation
+    test: validation
+  # Validation graphs can still expose 1k+ candidate edges from the initial
+  # anchor set, so keep the smoke batch conservative even with train pruning.
+  batch_size: 4
+  # Eval uses MC chunks already, so a slightly larger eval batch is still safe.
+  eval_batch_size: 8
+
+fit_schedule:
+  # One short fit slice plus one validation pass keeps the smoke useful while
+  # still finishing in minutes instead of hours.
+  max_passes: 0.10
+  val_every_passes: 0.10
+  early_stopping_patience_passes: 0.50
+
+trainer:
+  log_every_n_steps: 1
+
+model:
+  training_cfg:
+    # Rollout count is the main train-time memory multiplier because every
+    # rollout replicates the candidate action surface inside the actor.
+    rollouts_per_graph: 16
+  eval_cfg:
+    monte_carlo:
+      rollouts: 32
+      batch_rollouts: 32

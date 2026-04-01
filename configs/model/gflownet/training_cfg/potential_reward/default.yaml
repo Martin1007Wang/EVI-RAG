@@ -1,4 +1,0 @@
-# @package model.training_cfg.potential_reward
-
-answer_distance_weight: 0.0
-unreachable_distance: null

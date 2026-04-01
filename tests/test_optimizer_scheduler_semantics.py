@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from math import log
+import math
 from typing import Any
 
 import pytest
@@ -10,13 +10,7 @@ from torch.nn import Parameter
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
 from src.models.gflownet.config_utils import (
-    answer_quotient_active,
-    answer_quotient_direct_entity_ranking_active,
-    answer_quotient_stop_allocation_active,
-    normalize_answer_quotient_cfg,
-    normalize_potential_reward_cfg,
     normalize_training_cfg,
-    potential_reward_active,
 )
 from src.utils.optimizer_utils import build_optimizer_and_scheduler
 from src.utils.training_schedules import (
@@ -400,45 +394,89 @@ def test_replay_mix_scheduler_uses_base_alpha_and_hold_steps() -> None:
     assert 0.0 < mid_value < 0.5
 
 
-def test_normalize_training_cfg_exposes_direct_step_log_penalty() -> None:
-    training_cfg = normalize_training_cfg({"step_log_penalty": log(0.5)})
+def test_normalize_training_cfg_exposes_direct_failure_penalty() -> None:
+    training_cfg = normalize_training_cfg(
+        {"answer_reward": {"failure_penalty": math.e}}
+    )
 
-    assert training_cfg["step_log_penalty"] == pytest.approx(log(0.5))
+    assert training_cfg["answer_reward"]["failure_penalty"] == pytest.approx(math.e)
 
 
-def test_normalize_training_cfg_default_step_log_penalty_is_neutral() -> None:
-    assert normalize_training_cfg({})["step_log_penalty"] == pytest.approx(0.0)
+def test_normalize_training_cfg_default_failure_penalty_is_stable() -> None:
+    assert normalize_training_cfg({})["answer_reward"][
+        "failure_penalty"
+    ] == pytest.approx(4.0)
+
+
+def test_normalize_training_cfg_populates_train_action_pruning_defaults() -> None:
+    training_cfg = normalize_training_cfg({})
+
+    assert training_cfg["action_pruning"] == {
+        "per_node_top_k": 0,
+        "per_state_top_k": 0,
+    }
+
+
+def test_normalize_training_cfg_allows_disabling_train_action_pruning() -> None:
+    training_cfg = normalize_training_cfg(
+        {"action_pruning": {"per_node_top_k": 0, "per_state_top_k": 0}}
+    )
+
+    assert training_cfg["action_pruning"] == {
+        "per_node_top_k": 0,
+        "per_state_top_k": 0,
+    }
+    with pytest.raises(ValueError, match="training.action_pruning.per_node_top_k"):
+        normalize_training_cfg({"action_pruning": {"per_node_top_k": -1}})
+    with pytest.raises(ValueError, match="training.action_pruning.per_state_top_k"):
+        normalize_training_cfg({"action_pruning": {"per_state_top_k": -1}})
 
 
 def test_normalize_training_cfg_validates_replay_expand_imitation_weight() -> None:
     training_cfg = normalize_training_cfg(
         {
-            "success_replay": {
-                "expand_imitation_weight": 0.75,
-                "expand_imitation_from_anchor_bonus": 1.25,
-                "expand_imitation_answer_finish_bonus": 2.5,
+            "auxiliary": {
+                "replay": {
+                    "guidance": {
+                        "expand_imitation_weight": 0.75,
+                        "expand_imitation_from_anchor_bonus": 1.25,
+                        "expand_imitation_answer_finish_bonus": 2.5,
+                    }
+                }
             }
         }
     )
 
-    assert training_cfg["success_replay"]["expand_imitation_weight"] == pytest.approx(
-        0.75
-    )
-    assert training_cfg["success_replay"][
+    assert training_cfg["auxiliary"]["replay"]["guidance"][
+        "expand_imitation_weight"
+    ] == pytest.approx(0.75)
+    assert training_cfg["auxiliary"]["replay"]["guidance"][
         "expand_imitation_from_anchor_bonus"
     ] == pytest.approx(1.25)
-    assert training_cfg["success_replay"][
+    assert training_cfg["auxiliary"]["replay"]["guidance"][
         "expand_imitation_answer_finish_bonus"
     ] == pytest.approx(2.5)
     with pytest.raises(ValueError, match="expand_imitation_weight"):
-        normalize_training_cfg({"success_replay": {"expand_imitation_weight": -0.1}})
+        normalize_training_cfg(
+            {"auxiliary": {"replay": {"guidance": {"expand_imitation_weight": -0.1}}}}
+        )
     with pytest.raises(ValueError, match="expand_imitation_from_anchor_bonus"):
         normalize_training_cfg(
-            {"success_replay": {"expand_imitation_from_anchor_bonus": -0.1}}
+            {
+                "auxiliary": {
+                    "replay": {"guidance": {"expand_imitation_from_anchor_bonus": -0.1}}
+                }
+            }
         )
     with pytest.raises(ValueError, match="expand_imitation_answer_finish_bonus"):
         normalize_training_cfg(
-            {"success_replay": {"expand_imitation_answer_finish_bonus": -0.1}}
+            {
+                "auxiliary": {
+                    "replay": {
+                        "guidance": {"expand_imitation_answer_finish_bonus": -0.1}
+                    }
+                }
+            }
         )
 
 
@@ -510,65 +548,41 @@ def test_scheduler_defaults_eta_min_to_model_config_value() -> None:
     assert float(scheduler.eta_min) == pytest.approx(1.0e-6)
 
 
-def test_normalize_training_cfg_validates_answer_stop_bonus() -> None:
-    training_cfg = normalize_training_cfg({"answer_stop_log_reward_bonus": 0.75})
-
-    assert training_cfg["answer_stop_log_reward_bonus"] == pytest.approx(0.75)
-    with pytest.raises(ValueError, match="answer_stop_log_reward_bonus"):
-        normalize_training_cfg({"answer_stop_log_reward_bonus": -0.1})
+def test_normalize_training_cfg_rejects_removed_top_level_keys() -> None:
+    with pytest.raises(ValueError, match="Removed training config detected"):
+        normalize_training_cfg({"success_replay": {"mix_alpha": 0.2}})
 
 
-def test_answer_quotient_cfg_validates_terminal_replacement_weight() -> None:
-    cfg = normalize_answer_quotient_cfg(
-        {"enabled": True, "weight": 0.25, "replace_terminal_loss": False}
+def test_normalize_training_cfg_rejects_removed_legacy_reward_shaping() -> None:
+    with pytest.raises(ValueError, match="answer-quotient configs were removed"):
+        normalize_training_cfg({"answer_quotient": {"enabled": True}})
+    with pytest.raises(ValueError, match="potential-reward shaping was removed"):
+        normalize_training_cfg({"potential_reward": {"answer_distance_weight": 0.5}})
+
+
+def test_normalize_training_cfg_rejects_removed_subtb_knobs() -> None:
+    with pytest.raises(ValueError, match="Removed SubTB config detected"):
+        normalize_training_cfg({"subtb": {"root_loss_weight": 0.5}})
+
+
+def test_normalize_training_cfg_rejects_enabled_proposal_auxiliary() -> None:
+    with pytest.raises(ValueError, match="proposal.enabled=true"):
+        normalize_training_cfg({"auxiliary": {"proposal": {"enabled": True}}})
+
+
+def test_normalize_training_cfg_validates_answer_reward() -> None:
+    training_cfg = normalize_training_cfg(
+        {
+            "answer_reward": {
+                "gold_answer_bonus": 3.5,
+                "wrong_answer_penalty": 1.5,
+                "failure_penalty": 5.0,
+            }
+        }
     )
 
-    assert answer_quotient_active(cfg) is True
-    assert answer_quotient_stop_allocation_active(cfg) is False
-    with pytest.raises(ValueError, match="replace_terminal_loss requires weight > 0"):
-        normalize_answer_quotient_cfg(
-            {"enabled": True, "weight": 0.0, "replace_terminal_loss": True}
-        )
-
-
-def test_answer_quotient_cfg_exposes_stop_allocation_flag() -> None:
-    cfg = normalize_answer_quotient_cfg({"enabled": True, "allocate_stop_mass": True})
-
-    assert answer_quotient_active(cfg) is False
-    assert answer_quotient_stop_allocation_active(cfg) is True
-
-
-def test_answer_quotient_cfg_exposes_direct_entity_ranking_flag() -> None:
-    cfg = normalize_answer_quotient_cfg(
-        {"enabled": True, "direct_entity_ranking_weight": 0.25}
-    )
-
-    assert answer_quotient_active(cfg) is False
-    assert answer_quotient_direct_entity_ranking_active(cfg) is True
-
-
-def test_answer_quotient_cfg_validates_direct_entity_ranking_weight() -> None:
-    with pytest.raises(ValueError, match="direct_entity_ranking_weight must be >= 0"):
-        normalize_answer_quotient_cfg(
-            {"enabled": True, "direct_entity_ranking_weight": -0.1}
-        )
-    with pytest.raises(
-        ValueError,
-        match="direct_entity_ranking_weight requires enabled=True",
-    ):
-        normalize_answer_quotient_cfg({"direct_entity_ranking_weight": 0.1})
-
-
-def test_potential_reward_cfg_exposes_answer_distance_flag() -> None:
-    cfg = normalize_potential_reward_cfg({"answer_distance_weight": 0.5})
-
-    assert potential_reward_active(cfg) is True
-
-
-def test_potential_reward_cfg_validates_weight_and_unreachable_distance() -> None:
-    with pytest.raises(ValueError, match="answer_distance_weight must be >= 0"):
-        normalize_potential_reward_cfg({"answer_distance_weight": -0.1})
-    with pytest.raises(ValueError, match="unreachable_distance must be >= 0"):
-        normalize_potential_reward_cfg(
-            {"answer_distance_weight": 0.5, "unreachable_distance": -1}
-        )
+    assert training_cfg["answer_reward"]["gold_answer_bonus"] == pytest.approx(3.5)
+    assert training_cfg["answer_reward"]["wrong_answer_penalty"] == pytest.approx(1.5)
+    assert training_cfg["answer_reward"]["failure_penalty"] == pytest.approx(5.0)
+    with pytest.raises(ValueError, match="wrong_answer_penalty"):
+        normalize_training_cfg({"answer_reward": {"wrong_answer_penalty": -0.1}})

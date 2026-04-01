@@ -1,7 +1,0 @@
-# @package model.training_cfg.proposal_bias_schedule
-
-type: constant
-initial_scale: null
-final_scale: null
-total_steps: null
-hold_steps: 0

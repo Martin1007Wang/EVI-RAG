@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping as MappingABC
 from typing import Any, Mapping
 
 import torch
 from torch import nn
 
 from src.graph import TrajectoryBatch
-from src.utils.segment_ops import segment_logsumexp_1d
-
 from .actor import SubgraphActionDistribution, SubgraphActor
 from .encoder import SubgraphEncoder
 from .prepared_batch import SubgraphPreparedBatch
-from .reward import SubgraphRewardModel
+from .reward import AdmissibleAnswerCommitSet, SubgraphRewardModel
 from .state import (
     SubgraphAction,
     SubgraphAnalysis,
@@ -19,6 +19,7 @@ from .state import (
     SubgraphState,
     analyze_subgraph_rollout_batch,
     analyze_subgraph_state,
+    forward_valid_removable_edge_ids,
     initial_subgraph_state,
     initialize_subgraph_rollout_batch,
     transition_subgraph_rollout_batch,
@@ -37,8 +38,8 @@ class SubgraphPolicy(nn.Module):
         flow_head: dict[str, Any],
         state_encoder: dict[str, Any],
         actor: dict[str, Any],
-        subgraph_reward: dict[str, Any],
-        subgraph_proposal: dict[str, Any],
+        answer_reward: dict[str, Any],
+        proposal_prior: dict[str, Any],
         max_steps: int,
     ) -> None:
         super().__init__()
@@ -53,14 +54,12 @@ class SubgraphPolicy(nn.Module):
             state_encoder=state_encoder,
             flow_head=flow_head,
         )
-        self.reward_model = SubgraphRewardModel(
-            max_steps=self.max_steps, **subgraph_reward
-        )
+        self.reward_model = SubgraphRewardModel(**answer_reward)
         self.actor = SubgraphActor(
             hidden_dim=int(backbone["hidden_dim"]),
             max_steps=self.max_steps,
             actor=actor,
-            subgraph_proposal=subgraph_proposal,
+            proposal_prior=proposal_prior,
         )
 
     def prepare_batch(self, batch: TrajectoryBatch) -> SubgraphPreparedBatch:
@@ -105,14 +104,27 @@ class SubgraphPolicy(nn.Module):
             rollout_batch=rollout_batch,
         )
 
-    def count_gold_answers(
+    def admissible_answer_commit_set(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_idx: int,
+        analysis: SubgraphAnalysis,
+    ) -> AdmissibleAnswerCommitSet:
+        return self.reward_model.admissible_answer_commit_set(
+            prepared_batch=prepared_batch,
+            graph_idx=graph_idx,
+            analysis=analysis,
+        )
+
+    def count_gold_admissible_answers(
         self,
         *,
         prepared_batch: SubgraphPreparedBatch,
         graph_idx: int,
         analysis: SubgraphAnalysis,
     ) -> tuple[int, bool]:
-        return self.reward_model.count_gold_answers(
+        return self.reward_model.count_gold_admissible_answers(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
             analysis=analysis,
@@ -148,19 +160,66 @@ class SubgraphPolicy(nn.Module):
         )
         return analyses, state_features
 
-    def compute_expand_log_reward(
+    def encode_state_features(
         self,
         *,
-        current_analysis: SubgraphAnalysis,
-        next_analysis: SubgraphAnalysis,
-        prepared_batch: SubgraphPreparedBatch | None = None,
-        graph_idx: int | None = None,
+        prepared_batch: SubgraphPreparedBatch,
+        rollout_batch: SubgraphRolloutBatch,
+        analyses: tuple[SubgraphAnalysis, ...] | MappingABC[int, SubgraphAnalysis],
+        state_indices: list[int] | tuple[int, ...] | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.encoder.encode_states(
+            prepared_batch=prepared_batch,
+            rollout_batch=rollout_batch,
+            analyses=analyses,
+            state_indices=state_indices,
+        )
+
+    def compute_backward_log_prob(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_idx: int,
+        state: SubgraphState,
     ) -> float:
-        return self.reward_model.compute_expand_log_reward(
-            current_analysis=current_analysis,
-            next_analysis=next_analysis,
+        # We use the paper-facing fixed backward policy: uniformly delete one
+        # forward-valid removable edge. This closes the trajectory semantics when
+        # several edge-orderings reach the same committed witness.
+        removable_edge_ids = forward_valid_removable_edge_ids(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
+            state=state,
+        )
+        if not removable_edge_ids:
+            raise RuntimeError(
+                "Backward policy requires at least one forward-valid removable edge. "
+                f"graph_idx={graph_idx} state={state.edge_ids}"
+            )
+        return -math.log(float(len(removable_edge_ids)))
+
+    def backward_policy_name(self) -> str:
+        return "uniform_forward_valid_edge_deletion"
+
+    def compute_terminal_log_reward(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        graph_idx: int,
+        analysis: SubgraphAnalysis,
+        answer_entity_id: int | None = None,
+    ) -> tuple[float, int, int, bool]:
+        # Returns (log_reward, admissible_commit_count, gold_admissible_count, hit).
+        terminal_reward = self.reward_model.compute_terminal_log_reward(
+            prepared_batch=prepared_batch,
+            graph_idx=graph_idx,
+            analysis=analysis,
+            answer_entity_id=answer_entity_id,
+        )
+        return (
+            float(terminal_reward.log_reward),
+            int(terminal_reward.admissible_commit_set.count),
+            int(terminal_reward.admissible_commit_set.gold_count),
+            bool(terminal_reward.hit),
         )
 
     def compute_stop_log_reward(
@@ -169,11 +228,13 @@ class SubgraphPolicy(nn.Module):
         prepared_batch: SubgraphPreparedBatch,
         graph_idx: int,
         analysis: SubgraphAnalysis,
-    ) -> tuple[float, int, bool]:
-        return self.reward_model.compute_stop_log_reward(
+        answer_entity_id: int | None = None,
+    ) -> tuple[float, int, int, bool]:
+        return self.compute_terminal_log_reward(
             prepared_batch=prepared_batch,
             graph_idx=graph_idx,
             analysis=analysis,
+            answer_entity_id=answer_entity_id,
         )
 
     def oracle_distance(
@@ -207,6 +268,68 @@ class SubgraphPolicy(nn.Module):
             state_features=state_features,
         )
 
+    def compute_log_flows_from_state_features(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        state_features: torch.Tensor,
+        rollout_batch: SubgraphRolloutBatch | None = None,
+        graph_ids: torch.Tensor | None = None,
+        done_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if rollout_batch is not None:
+            return self.encoder.compute_log_flows(
+                prepared_batch=prepared_batch,
+                rollout_batch=rollout_batch,
+                state_features=state_features,
+            )
+        if graph_ids is None:
+            raise ValueError(
+                "compute_log_flows_from_state_features requires rollout_batch or graph_ids."
+            )
+        return self.encoder.compute_log_flows_for_graph_ids(
+            prepared_batch=prepared_batch,
+            graph_ids=graph_ids,
+            state_features=state_features,
+            done_mask=done_mask,
+        )
+
+    def build_state_action_distribution(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        rollout_batch: SubgraphRolloutBatch,
+        flat_state_index: int,
+        analysis: SubgraphAnalysis,
+        state_feature: torch.Tensor,
+        action_pruning: Mapping[str, Any] | None = None,
+    ):
+        return self.actor.build_state_distribution(
+            prepared_batch=prepared_batch,
+            rollout_batch=rollout_batch,
+            flat_state_index=flat_state_index,
+            analysis=analysis,
+            state_feature=state_feature,
+            action_pruning=action_pruning,
+        )
+
+    def build_action_distribution_from_state_features(
+        self,
+        *,
+        prepared_batch: SubgraphPreparedBatch,
+        rollout_batch: SubgraphRolloutBatch,
+        analyses: tuple[SubgraphAnalysis, ...],
+        state_features: torch.Tensor,
+        action_pruning: Mapping[str, Any] | None = None,
+    ) -> SubgraphActionDistribution:
+        return self.actor.build_action_distribution(
+            prepared_batch=prepared_batch,
+            rollout_batch=rollout_batch,
+            analyses=analyses,
+            state_features=state_features,
+            action_pruning=action_pruning,
+        )
+
     def compute_action_distribution(
         self,
         *,
@@ -220,7 +343,7 @@ class SubgraphPolicy(nn.Module):
             rollout_batch=rollout_batch,
             analyses=analyses,
         )
-        return self.actor.build_action_distribution(
+        return self.build_action_distribution_from_state_features(
             prepared_batch=prepared_batch,
             rollout_batch=rollout_batch,
             analyses=analyses,
@@ -232,17 +355,11 @@ class SubgraphPolicy(nn.Module):
     def compute_target_log_probs(
         distribution: SubgraphActionDistribution,
     ) -> torch.Tensor:
-        if int(distribution.logits.numel()) == 0:
-            return distribution.logits
-        lse, _ = segment_logsumexp_1d(
-            values=distribution.logits,
-            segment_ids=distribution.segment_ids,
-            num_segments=int(distribution.flat_state_indices.numel()),
-            dtype=torch.float32,
-            ignore_non_finite=True,
-            empty_value=float("-inf"),
+        del distribution
+        raise RuntimeError(
+            "Flat action log-prob computation is not available in the strict "
+            "hierarchical policy. The sampler computes staged log-probs directly."
         )
-        return distribution.logits - lse.index_select(0, distribution.segment_ids)
 
     def compute_proposal_bias(
         self,

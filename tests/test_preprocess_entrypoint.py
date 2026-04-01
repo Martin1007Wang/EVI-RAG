@@ -51,8 +51,10 @@ def test_build_retrieval_pipeline_uses_hydra_logging_defaults() -> None:
 
     assert {"hydra": "default"} in defaults
     assert cfg.task_name == "preprocess"
+    assert cfg.hf_offline is False
     assert cfg.get("filter") is None
     assert pipeline_cfg.get("preprocess_filter") is not None
+    assert pipeline_cfg.overwrite_lmdb is False
     assert cfg.get("keep_start_adjacent_edges") is None
     assert cfg.get("canonicalize_relations") is None
     assert cfg.get("skip_parquet_stage") is None

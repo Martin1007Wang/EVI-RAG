@@ -102,8 +102,8 @@ class GFlowNetModule(LightningModule):
             flow_head=dict(policy_cfg["flow_head"]),
             state_encoder=dict(policy_cfg["state_encoder"]),
             actor=dict(policy_cfg["actor"]),
-            subgraph_reward=dict(training_cfg["subgraph_reward"]),
-            subgraph_proposal=dict(training_cfg["subgraph_proposal"]),
+            answer_reward=dict(training_cfg["answer_reward"]),
+            proposal_prior=dict(training_cfg["auxiliary"]["proposal"]["prior"]),
             max_steps=int(horizon_cfg["max_steps"]),
         )
         self.metric_runtime_factory = metric_runtime_factory
@@ -120,21 +120,28 @@ class GFlowNetModule(LightningModule):
         )
         self.sampler = self.runtime_controller.sampler
         self.loss_fn = SubgraphSubTrajectoryBalanceLoss(**dict(training_cfg["subtb"]))
+        proposal_aux_cfg = dict(training_cfg["auxiliary"]["proposal"])
+        replay_aux_cfg = dict(training_cfg["auxiliary"]["replay"])
+        replay_buffer_cfg = dict(replay_aux_cfg["buffer"])
         self.sampling_temperature_scheduler = SamplingTemperatureScheduler(
             base_temperature=float(training_cfg["sampling_temperature"]),
             **dict(training_cfg["sampling_temperature_schedule"]),
         )
         self.proposal_bias_scheduler = ProposalBiasScheduler(
-            base_scale=1.0,
-            **dict(training_cfg["proposal_bias_schedule"]),
+            base_scale=1.0 if bool(proposal_aux_cfg.get("enabled", False)) else 0.0,
+            **dict(proposal_aux_cfg["schedule"]),
         )
         self.replay_mix_scheduler = ReplayMixScheduler(
-            base_alpha=float(training_cfg["success_replay"].get("mix_alpha", 0.0)),
-            **dict(training_cfg["replay_mix_schedule"]),
+            base_alpha=(
+                float(replay_aux_cfg.get("mix_alpha", 0.0))
+                if bool(replay_aux_cfg.get("enabled", False))
+                else 0.0
+            ),
+            **dict(replay_aux_cfg["schedule"]),
         )
         self.success_replay_buffer = SubgraphSuccessReplayBuffer(
-            capacity=int(training_cfg["success_replay"].get("capacity", 1024)),
-            deduplicate=bool(training_cfg["success_replay"].get("deduplicate", True)),
+            capacity=int(replay_buffer_cfg.get("capacity", 1024)),
+            deduplicate=bool(replay_buffer_cfg.get("deduplicate", True)),
         )
         self.search = self.runtime_controller.search
         self._fit_schedule: ResolvedPassFitSchedule | None = None
@@ -149,32 +156,10 @@ class GFlowNetModule(LightningModule):
         training_cfg: dict[str, Any],
         eval_cfg: dict[str, Any],
     ) -> None:
+        del training_cfg
         if str(policy_cfg["state_mode"]) != SUBGRAPH_STATE_MODE:
             raise ValueError(
                 "GFlowNetModule supports only policy.state_mode='subgraph'."
-            )
-        answer_quotient_cfg = dict(training_cfg["answer_quotient"])
-        if bool(answer_quotient_cfg.get("enabled", False)) and (
-            float(answer_quotient_cfg.get("weight", 0.0)) > 0.0
-            or bool(answer_quotient_cfg.get("replace_terminal_loss", False))
-        ):
-            raise ValueError(
-                "Subgraph mode does not support answer_quotient yet; disable training.answer_quotient."
-            )
-        if (
-            bool(answer_quotient_cfg.get("enabled", False))
-            and float(answer_quotient_cfg.get("direct_entity_ranking_weight", 0.0))
-            > 0.0
-        ):
-            raise ValueError(
-                "Subgraph mode does not support direct entity ranking yet."
-            )
-        if (
-            float(training_cfg["potential_reward"].get("answer_distance_weight", 0.0))
-            > 0.0
-        ):
-            raise ValueError(
-                "Subgraph mode does not support legacy potential_reward shaping; use training.subgraph_reward instead."
             )
         if search_eval_runtime_task(eval_cfg) != RUNTIME_ANSWER_TASK:
             raise ValueError(
@@ -380,6 +365,34 @@ class GFlowNetModule(LightningModule):
             schedule_context=self._trainer_schedule_context(),
         )
 
+    def _auxiliary_cfg(self) -> Mapping[str, Any]:
+        return self.cfg.training_cfg["auxiliary"]
+
+    def _auxiliary_proposal_cfg(self) -> Mapping[str, Any]:
+        return self._auxiliary_cfg()["proposal"]
+
+    def _auxiliary_replay_cfg(self) -> Mapping[str, Any]:
+        return self._auxiliary_cfg()["replay"]
+
+    def _auxiliary_replay_buffer_cfg(self) -> Mapping[str, Any]:
+        return self._auxiliary_replay_cfg()["buffer"]
+
+    def _auxiliary_replay_guidance_cfg(self) -> Mapping[str, Any]:
+        return self._auxiliary_replay_cfg()["guidance"]
+
+    def _training_action_pruning_cfg(self) -> Mapping[str, Any] | None:
+        action_pruning_cfg = self.cfg.training_cfg.get("action_pruning")
+        if action_pruning_cfg is None:
+            return None
+        per_node_top_k = int(action_pruning_cfg.get("per_node_top_k", 0))
+        per_state_top_k = int(action_pruning_cfg.get("per_state_top_k", 0))
+        if per_node_top_k <= 0 and per_state_top_k <= 0:
+            return None
+        return {
+            "per_node_top_k": per_node_top_k,
+            "per_state_top_k": per_state_top_k,
+        }
+
     def _resolve_schedule_step(self, *, global_step: int | None = None) -> int:
         trainer = getattr(self, "_trainer", None)
         current_step = 0 if trainer is None else int(trainer.global_step)
@@ -393,7 +406,7 @@ class GFlowNetModule(LightningModule):
         return self.sampler
 
     def _replay_trajectory_budget(self, *, batch: TrajectoryBatch) -> int:
-        configured = self.cfg.training_cfg["success_replay"].get(
+        configured = self._auxiliary_replay_buffer_cfg().get(
             "replay_trajectories_per_step"
         )
         if configured is None:
@@ -412,27 +425,31 @@ class GFlowNetModule(LightningModule):
         prepared_batch: Any,
         sample_batch: SubgraphTrajectorySampleBatch,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        guidance_cfg = self._auxiliary_replay_guidance_cfg()
         from_anchor_bonus = float(
-            self.cfg.training_cfg["success_replay"].get(
-                "expand_imitation_from_anchor_bonus", 0.0
-            )
+            guidance_cfg.get("expand_imitation_from_anchor_bonus", 0.0)
         )
         answer_finish_bonus = float(
-            self.cfg.training_cfg["success_replay"].get(
-                "expand_imitation_answer_finish_bonus", 0.0
-            )
+            guidance_cfg.get("expand_imitation_answer_finish_bonus", 0.0)
         )
         weighted_log_probs: list[torch.Tensor] = []
         weight_values: list[float] = []
         from_anchor_steps = 0.0
         answer_finish_steps = 0.0
+        if sample_batch.chosen_source_graph_nodes is None:
+            raise RuntimeError(
+                "Replay expand imitation requires chosen_source_graph_nodes metadata."
+            )
         for graph_idx in range(int(sample_batch.num_graphs)):
             anchor_nodes = {
                 int(node_id)
                 for node_id in prepared_batch.graph_anchor_abs_node_ids[int(graph_idx)]
             }
             for rollout_idx in range(int(sample_batch.num_rollouts)):
-                state = self.policy.initial_state()
+                state = self.policy.initialize_rollout_batch(
+                    prepared_batch=prepared_batch,
+                    num_rollouts=1,
+                ).states[int(graph_idx)]
                 for action_step in range(int(self.policy.max_steps)):
                     edge_id = int(
                         sample_batch.chosen_edge_ids[
@@ -442,6 +459,15 @@ class GFlowNetModule(LightningModule):
                         .item()
                     )
                     if edge_id < 0:
+                        continue
+                    source_graph_node = int(
+                        sample_batch.chosen_source_graph_nodes[
+                            graph_idx, rollout_idx, action_step
+                        ]
+                        .detach()
+                        .item()
+                    )
+                    if source_graph_node < 0:
                         continue
                     current_analysis = self.policy.analyze_state(
                         prepared_batch=prepared_batch,
@@ -455,21 +481,27 @@ class GFlowNetModule(LightningModule):
                         state=next_state,
                     )
                     weight = 1.0
-                    src = int(prepared_batch.topology.edge_index[0, edge_id].item())
+                    src = int(source_graph_node)
                     if src in anchor_nodes:
                         weight += from_anchor_bonus
                         from_anchor_steps += 1.0
-                    current_answer_count, _ = self.policy.count_gold_answers(
-                        prepared_batch=prepared_batch,
-                        graph_idx=int(graph_idx),
-                        analysis=current_analysis,
+                    current_gold_admissible_count, _ = (
+                        self.policy.count_gold_admissible_answers(
+                            prepared_batch=prepared_batch,
+                            graph_idx=int(graph_idx),
+                            analysis=current_analysis,
+                        )
                     )
-                    next_answer_count, _ = self.policy.count_gold_answers(
-                        prepared_batch=prepared_batch,
-                        graph_idx=int(graph_idx),
-                        analysis=next_analysis,
+                    next_gold_admissible_count, _ = (
+                        self.policy.count_gold_admissible_answers(
+                            prepared_batch=prepared_batch,
+                            graph_idx=int(graph_idx),
+                            analysis=next_analysis,
+                        )
                     )
-                    if int(next_answer_count) > int(current_answer_count):
+                    if int(next_gold_admissible_count) > int(
+                        current_gold_admissible_count
+                    ):
                         weight += answer_finish_bonus
                         answer_finish_steps += 1.0
                     weighted_log_probs.append(
@@ -520,9 +552,8 @@ class GFlowNetModule(LightningModule):
         if max_records <= 0:
             return []
         if not bool(
-            self.cfg.training_cfg["success_replay"].get(
-                "add_shortest_path_guidance",
-                False,
+            self._auxiliary_replay_guidance_cfg().get(
+                "add_shortest_path_guidance", False
             )
         ):
             return []
@@ -566,7 +597,7 @@ class GFlowNetModule(LightningModule):
         self, *, max_records: int
     ) -> list[SubgraphReplayRecord]:
         min_buffer_size = int(
-            self.cfg.training_cfg["success_replay"].get("min_buffer_size", 0)
+            self._auxiliary_replay_buffer_cfg().get("min_buffer_size", 0)
         )
         if len(self.success_replay_buffer) < min_buffer_size:
             return []
@@ -660,66 +691,84 @@ class GFlowNetModule(LightningModule):
         mean_termination_action_step = sample_batch.termination_action_steps.to(
             dtype=torch.float32
         ).mean()
+        mean_answer_commit_rate = total_loss.new_zeros((), dtype=torch.float32)
+        if sample_batch.chosen_answer_entity_ids is not None:
+            mean_answer_commit_rate = (
+                (sample_batch.chosen_answer_entity_ids >= 0)
+                .to(dtype=torch.float32)
+                .mean()
+            )
         return {
             "loss": total_loss.detach(),
-            "actor_loss": total_loss.detach(),
-            "subtb_loss": loss_output.subtb_loss.detach(),
-            "subtb_residual": loss_output.residual_abs.detach(),
-            "subtb_residual_variance_per_batch": loss_output.residual_variance.detach(),
-            "subtb_root": loss_output.root_abs.detach(),
-            "rollout_success": loss_output.success_rate.detach(),
-            "terminal_answer_count": loss_output.average_terminal_answer_count.detach(),
-            "terminal_component_count": loss_output.average_terminal_component_count.detach(),
-            "log_z_mean": loss_output.log_z_mean.detach(),
-            "log_z_variance": loss_output.log_z_variance.detach(),
-            "mean_selected_edges": mean_selected_edges.detach(),
-            "mean_termination_action_step": mean_termination_action_step.detach(),
-            "rollouts_per_graph": float(rollouts_per_graph),
-            "sampling_temperature": float(sampling_temperature),
-            "proposal_bias_scale": float(proposal_bias_scale),
-            "subgraph_reward_c_step": float(
-                self.cfg.training_cfg["subgraph_reward"]["c_step"]
+            "objective/subtb_loss": loss_output.subtb_loss.detach(),
+            "objective/subtb_residual_abs": loss_output.residual_abs.detach(),
+            "objective/subtb_residual_variance": loss_output.residual_variance.detach(),
+            "objective/subtb_root_abs": loss_output.root_abs.detach(),
+            "answer_commit/gold_commit_rate": loss_output.success_rate.detach(),
+            "answer_commit/admissible_count": (
+                loss_output.average_terminal_commit_candidate_count.detach()
             ),
-            "subgraph_reward_lambda_conn": float(
-                self.cfg.training_cfg["subgraph_reward"]["lambda_conn"]
+            "answer_commit/gold_admissible_count": (
+                loss_output.average_terminal_gold_answer_count.detach()
             ),
-            "subgraph_reward_beta_answer_bits": float(
-                self.cfg.training_cfg["subgraph_reward"].get("beta_answer_bits", 0.0)
+            "witness/anchor_component_count": (
+                loss_output.average_terminal_component_count.detach()
             ),
-            "subgraph_reward_beta_answer_full": float(
-                self.cfg.training_cfg["subgraph_reward"].get("beta_answer_full", 0.0)
+            "flow/log_z_mean": loss_output.log_z_mean.detach(),
+            "flow/log_z_variance": loss_output.log_z_variance.detach(),
+            "witness/selected_edge_count": mean_selected_edges.detach(),
+            "rollout/stop_step": mean_termination_action_step.detach(),
+            "answer_commit/commit_rate": mean_answer_commit_rate.detach(),
+            "rollout/rollouts_per_graph": float(rollouts_per_graph),
+            "rollout/sampling_temperature": float(sampling_temperature),
+            "rollout/proposal_bias_scale": float(proposal_bias_scale),
+            "reward/gold_answer_bonus": float(
+                self.cfg.training_cfg["answer_reward"]["gold_answer_bonus"]
             ),
-            "subgraph_reward_beta_hit": float(
-                self.cfg.training_cfg["subgraph_reward"]["beta_hit"]
+            "reward/wrong_answer_penalty": float(
+                self.cfg.training_cfg["answer_reward"]["wrong_answer_penalty"]
             ),
-            "subgraph_reward_beta_cnt": float(
-                self.cfg.training_cfg["subgraph_reward"]["beta_cnt"]
+            "reward/failure_penalty": float(
+                self.cfg.training_cfg["answer_reward"]["failure_penalty"]
             ),
-            "subgraph_reward_beta_early": float(
-                self.cfg.training_cfg["subgraph_reward"]["beta_early"]
+            "reward/size_penalty": float(
+                self.cfg.training_cfg["answer_reward"]["size_penalty"]
+            ),
+            "reward/redundancy_penalty": float(
+                self.cfg.training_cfg["answer_reward"]["redundancy_penalty"]
+            ),
+            "reward/component_penalty": float(
+                self.cfg.training_cfg["answer_reward"]["component_penalty"]
             ),
         }
 
     def _training_step_subgraph(self, batch: TrajectoryBatch) -> torch.Tensor:
         sampler = self._require_subgraph_sampler()
         prepared_batch = self.policy.prepare_batch(batch)
+        replay_cfg = self._auxiliary_replay_cfg()
+        replay_guidance_cfg = self._auxiliary_replay_guidance_cfg()
+        action_pruning_cfg = self._training_action_pruning_cfg()
         rollouts_per_graph = int(self.cfg.training_cfg["rollouts_per_graph"])
         sampling_temperature = self._resolve_sampling_temperature()
         proposal_bias_scale = self._resolve_proposal_bias_scale()
         replay_mix_alpha = self._resolve_replay_mix_alpha()
         trajectory_batch = batch.without_raw_features()
+        if not bool(replay_cfg.get("enabled", False)):
+            batch = trajectory_batch
         sample_batch = sampler.sample(
             policy=self.policy,
             prepared_batch=prepared_batch,
             rollouts_per_graph=rollouts_per_graph,
             temperature=sampling_temperature,
             proposal_bias_scale=proposal_bias_scale,
+            action_pruning=action_pruning_cfg,
         )
         online_loss_output = self.loss_fn.compute(sample_batch)
-        self.success_replay_buffer.add_successful_trajectories(
-            batch=batch,
-            sample_batch=sample_batch,
-        )
+        if bool(replay_cfg.get("enabled", False)):
+            self.success_replay_buffer.add_successful_trajectories(
+                batch=batch,
+                sample_batch=sample_batch,
+            )
         replay_payload = None
         replay_loss_output: SubgraphSubTrajectoryBalanceLossOutput | None = None
         replay_expand_imitation_loss: torch.Tensor | None = None
@@ -738,11 +787,9 @@ class GFlowNetModule(LightningModule):
             "multi_anchor_over_budget": 0.0,
         }
         replay_expand_imitation_weight = float(
-            self.cfg.training_cfg["success_replay"].get("expand_imitation_weight", 0.0)
+            replay_guidance_cfg.get("expand_imitation_weight", 0.0)
         )
-        replay_mask_stop_loss = bool(
-            self.cfg.training_cfg["success_replay"].get("mask_stop_loss", True)
-        )
+        replay_mask_stop_loss = bool(replay_guidance_cfg.get("mask_stop_loss", True))
         if float(replay_mix_alpha) > 0.0:
             replay_payload = self._build_replay_batch(
                 batch=batch,
@@ -800,50 +847,57 @@ class GFlowNetModule(LightningModule):
             sampling_temperature=sampling_temperature,
             proposal_bias_scale=proposal_bias_scale,
         )
-        metrics["replay_mix_alpha"] = float(replay_mix_alpha)
-        metrics["replay_buffer_size"] = float(len(self.success_replay_buffer))
-        metrics["replay_guidance_records"] = float(
+        metrics["replay/mix_alpha"] = float(replay_mix_alpha)
+        metrics["replay/buffer_size"] = float(len(self.success_replay_buffer))
+        metrics["replay/guidance_records"] = float(
             replay_metadata.get("guidance_records", 0.0)
         )
-        metrics["replay_buffer_records"] = float(
+        metrics["replay/buffer_records"] = float(
             replay_metadata.get("buffer_records", 0.0)
         )
-        metrics["multi_anchor_over_budget"] = float(
+        metrics["replay/multi_anchor_over_budget"] = float(
             replay_metadata.get("multi_anchor_over_budget", 0.0)
         )
-        metrics["teacher_unavailable"] = float(
+        metrics["replay/teacher_unavailable"] = float(
             replay_metadata.get("teacher_unavailable", 0.0)
         )
-        metrics["teacher_over_budget"] = float(
+        metrics["replay/teacher_over_budget"] = float(
             replay_metadata.get("teacher_over_budget", 0.0)
         )
-        metrics["replay_mask_stop_loss"] = float(replay_mask_stop_loss)
-        metrics["replay_stop_loss_masked_count"] = float(replay_stop_loss_masked_count)
-        metrics["replay_expand_imitation_weight"] = float(
-            replay_expand_imitation_weight
-        )
-        metrics["replay_expand_imitation_from_anchor_steps"] = float(
+        metrics["replay/stop_loss_mask_enabled"] = float(replay_mask_stop_loss)
+        metrics["replay/stop_loss_masked_count"] = float(replay_stop_loss_masked_count)
+        metrics["replay/imitation_weight"] = float(replay_expand_imitation_weight)
+        metrics["replay/imitation_from_anchor_steps"] = float(
             replay_expand_imitation_stats.get("from_anchor_steps", 0.0)
         )
-        metrics["replay_expand_imitation_answer_finish_steps"] = float(
+        metrics["replay/imitation_answer_finish_steps"] = float(
             replay_expand_imitation_stats.get("answer_finish_steps", 0.0)
         )
-        metrics["replay_expand_imitation_mean_weight"] = float(
+        metrics["replay/imitation_mean_weight"] = float(
             replay_expand_imitation_stats.get("mean_weight", 0.0)
         )
+        metrics["auxiliary/proposal_enabled"] = float(
+            bool(self._auxiliary_proposal_cfg().get("enabled", False))
+        )
+        metrics["auxiliary/replay_enabled"] = float(
+            bool(replay_cfg.get("enabled", False))
+        )
         if replay_loss_output is not None:
-            metrics["replay_loss"] = replay_loss_output.loss.detach()
-            metrics["replay_success"] = replay_loss_output.success_rate.detach()
-            metrics["replay_terminal_answer_count"] = (
-                replay_loss_output.average_terminal_answer_count.detach()
+            metrics["replay/loss"] = replay_loss_output.loss.detach()
+            metrics["replay/answer_commit/gold_commit_rate"] = (
+                replay_loss_output.success_rate.detach()
+            )
+            metrics["replay/answer_commit/admissible_count"] = (
+                replay_loss_output.average_terminal_commit_candidate_count.detach()
+            )
+            metrics["replay/answer_commit/gold_admissible_count"] = (
+                replay_loss_output.average_terminal_gold_answer_count.detach()
             )
         if replay_expand_imitation_loss is not None:
-            metrics["replay_expand_imitation_loss"] = (
-                replay_expand_imitation_loss.detach()
-            )
+            metrics["replay/imitation_loss"] = replay_expand_imitation_loss.detach()
         effective_pass = self._resolve_effective_pass(after_current_step=True)
         if effective_pass is not None:
-            metrics["effective_pass"] = float(effective_pass)
+            metrics["rollout/effective_pass"] = float(effective_pass)
         self._latest_train_metrics = self._build_train_metrics_payload(metrics)
         self._log_metric_bundle(
             metrics=metrics,

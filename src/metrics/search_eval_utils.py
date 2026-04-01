@@ -32,8 +32,8 @@ _DEFAULT_SEARCH_EVAL_CFG: dict[str, Any] = {
             "stability_top_k": 1,
         },
         "action_pruning": {
-            "per_node_top_k": 100,
-            "per_state_top_k": 256,
+            "per_node_top_k": 0,
+            "per_state_top_k": 0,
         },
     },
 }
@@ -43,8 +43,9 @@ _LEGACY_SEARCH_EVAL_KEYS = {
 }
 _REMOVED_SEARCH_EVAL_KEYS = {
     "answer_mass_threshold": (
-        "Remove eval_cfg.answer_mass_threshold; full-vote answer marginals are not a "
-        "normalized posterior mass budget, so this threshold is no longer well-defined."
+        "Remove eval_cfg.answer_mass_threshold; the answer-committed Monte Carlo "
+        "runtime reports ranked answer posteriors directly and does not support a "
+        "separate mass-threshold config."
     ),
 }
 
@@ -191,17 +192,19 @@ def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
         )
     early_stop["stability_top_k"] = stability_top_k
 
-    per_node_top_k = int(action_pruning.get("per_node_top_k", 100))
-    if per_node_top_k < 1:
+    per_node_top_k = int(action_pruning.get("per_node_top_k", 0))
+    if per_node_top_k < 0:
         raise ValueError(
-            "evaluation.monte_carlo.action_pruning.per_node_top_k must be >= 1."
+            "evaluation.monte_carlo.action_pruning.per_node_top_k must be >= 0. "
+            "Set both pruning knobs to 0 to disable eval pruning."
         )
     action_pruning["per_node_top_k"] = per_node_top_k
 
-    per_state_top_k = int(action_pruning.get("per_state_top_k", 256))
-    if per_state_top_k < 1:
+    per_state_top_k = int(action_pruning.get("per_state_top_k", 0))
+    if per_state_top_k < 0:
         raise ValueError(
-            "evaluation.monte_carlo.action_pruning.per_state_top_k must be >= 1."
+            "evaluation.monte_carlo.action_pruning.per_state_top_k must be >= 0. "
+            "Set both pruning knobs to 0 to disable eval pruning."
         )
     action_pruning["per_state_top_k"] = per_state_top_k
 
@@ -219,9 +222,19 @@ def search_eval_monte_carlo_cfg(eval_cfg: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def format_search_eval_answer_posterior(eval_cfg: Mapping[str, Any]) -> str:
+    """Formats the Monte Carlo answer-posterior surrogate configuration."""
     monte_carlo_cfg = search_eval_monte_carlo_cfg(eval_cfg)
     early_stop_cfg = monte_carlo_cfg["early_stop"]
     action_pruning_cfg = monte_carlo_cfg["action_pruning"]
+    prune_text = (
+        "off"
+        if int(action_pruning_cfg["per_node_top_k"]) <= 0
+        and int(action_pruning_cfg["per_state_top_k"]) <= 0
+        else (
+            f"node:{int(action_pruning_cfg['per_node_top_k'])},"
+            f"state:{int(action_pruning_cfg['per_state_top_k'])}"
+        )
+    )
     return (
         "monte_carlo("
         f"rollouts={int(monte_carlo_cfg['rollouts'])}, "
@@ -229,8 +242,7 @@ def format_search_eval_answer_posterior(eval_cfg: Mapping[str, Any]) -> str:
         f"temperature={float(monte_carlo_cfg['temperature'])}, "
         f"early_stop={bool(early_stop_cfg['enabled'])}@{float(monte_carlo_cfg['confidence'])}/"
         f"min={int(early_stop_cfg['min_rollouts'])}/topk={int(early_stop_cfg['stability_top_k'])}, "
-        f"prune=node:{int(action_pruning_cfg['per_node_top_k'])},"
-        f"state:{int(action_pruning_cfg['per_state_top_k'])}"
+        f"prune={prune_text}"
         ")"
     )
 
@@ -238,6 +250,7 @@ def format_search_eval_answer_posterior(eval_cfg: Mapping[str, Any]) -> str:
 def search_eval_answer_posterior_signature(
     eval_cfg: Mapping[str, Any],
 ) -> tuple[Any, ...]:
+    """Builds a cache/signature key for the answer-posterior surrogate runtime."""
     monte_carlo_cfg = search_eval_monte_carlo_cfg(eval_cfg)
     early_stop_cfg = monte_carlo_cfg["early_stop"]
     action_pruning_cfg = monte_carlo_cfg["action_pruning"]

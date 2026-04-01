@@ -1,0 +1,33 @@
+# @package _global_
+#
+# Answer-committed RankFlow with replay guidance enabled.
+# Usage:
+#   python src/train.py experiment=train_rankflow_guided dataset=webqsp-sub
+#
+# This is the main research bundle for testing whether teacher-guided replay and
+# expand-imitation help the answer-commit objective on multi-anchor KGQA.
+
+defaults:
+  - train_rankflow
+  - _self_
+
+run:
+  name: train_rankflow_guided
+  task_name: "train/rankflow_guided"
+  tags: ["rankflow", "gflownet", "answer-commit", "guided", "replay"]
+
+model:
+  training_cfg:
+    auxiliary:
+      replay:
+        enabled: true
+        mix_alpha: 0.25
+        buffer:
+          min_buffer_size: 32
+          replay_trajectories_per_step: 32
+        guidance:
+          add_shortest_path_guidance: true
+          expand_imitation_weight: 0.10
+          expand_imitation_from_anchor_bonus: 0.25
+          expand_imitation_answer_finish_bonus: 0.50
+          mask_stop_loss: true

@@ -11,9 +11,8 @@ from src.metrics.prediction_io import append_jsonl_records
 from src.metrics.search_eval_utils import normalize_search_eval_cfg
 from src.data.schema.constants import EntityVocabFields, RelationVocabFields
 from src.models.gflownet.policy import SubgraphPolicy
-from src.models.gflownet.reward import resolve_subgraph_answer_entities
 from src.models.gflownet.sampler import SubgraphSampler
-from src.models.gflownet.state import SubgraphAnalysis
+from src.utils.cuda_memory import profile_cuda_memory
 
 from .base import BaseMetricRuntime
 from .protocol import MetricEvaluationOutput
@@ -44,6 +43,7 @@ class _TerminalSampleAggregate:
     edge_ids: tuple[int, ...]
     selected_node_ids: tuple[int, ...]
     reachability_bits: dict[int, int]
+    chosen_answer_entity_id: int | None
     answer_entities: tuple[int, ...]
     sample_count: int = 0
 
@@ -57,9 +57,9 @@ class _GraphPredictionAccumulator:
     a_entity_in_graph: bool
     candidate_answer_upper_bound: int
     answer_vote_counts: dict[int, int] = field(default_factory=dict)
-    terminal_subgraphs: dict[tuple[int, ...], _TerminalSampleAggregate] = field(
-        default_factory=dict
-    )
+    terminal_subgraphs: dict[
+        tuple[tuple[int, ...], int | None], _TerminalSampleAggregate
+    ] = field(default_factory=dict)
     answering_rollout_count: int = 0
     hit_rollout_count: int = 0
     total_stop_steps: float = 0.0
@@ -182,23 +182,24 @@ def _secondary_metrics_from_result(
 ) -> dict[str, float]:
     rollout_count = float(max(int(result["rollout_count"]), 1))
     secondary = {
-        "subgraph/requested_rollout_count": float(
+        "answer_commit/requested_rollout_count": float(
             result.get("requested_rollout_count", result["rollout_count"])
         ),
-        "subgraph/rollout_count": float(result["rollout_count"]),
-        "subgraph/early_stop_rate": 1.0
+        "answer_commit/rollout_count": float(result["rollout_count"]),
+        "answer_commit/early_stop_rate": 1.0
         if bool(result.get("stopped_early", False))
         else 0.0,
-        "subgraph/terminal_count": float(result["terminal_subgraph_count"]),
-        "subgraph/answering_rollout_rate": float(result["answering_rollout_count"])
+        "answer_commit/commit_rate": float(result["answering_rollout_count"])
         / rollout_count,
-        "subgraph/hit_rollout_rate": float(result["hit_rollout_count"]) / rollout_count,
-        "subgraph/mean_stop_step": float(result["mean_stop_step"]),
-        "subgraph/mean_terminal_component_count": float(
-            result["mean_terminal_component_count"]
-        ),
-        "subgraph/predicted_answer_count": float(
+        "answer_commit/gold_commit_rate": float(result["hit_rollout_count"])
+        / rollout_count,
+        "answer_commit/predicted_answer_count": float(
             len(result["predicted_answer_entity_ids"])
+        ),
+        "witness/terminal_count": float(result["terminal_subgraph_count"]),
+        "witness/mean_stop_step": float(result["mean_stop_step"]),
+        "witness/mean_anchor_component_count": float(
+            result["mean_terminal_component_count"]
         ),
     }
     secondary.update(
@@ -300,22 +301,6 @@ def _summarize_result_rows(
     )
 
 
-def _build_analysis(
-    *,
-    selected_node_ids: tuple[int, ...],
-    reachability_bits: dict[int, int],
-    anchor_component_count: int,
-    num_selected_edges: int,
-) -> SubgraphAnalysis:
-    return SubgraphAnalysis(
-        selected_node_ids=selected_node_ids,
-        reachability_bits=dict(reachability_bits),
-        component_labels={},
-        anchor_component_count=int(anchor_component_count),
-        num_selected_edges=int(num_selected_edges),
-    )
-
-
 def _edge_records_from_terminal(
     *, batch: TrajectoryBatch, graph_idx: int, edge_ids: tuple[int, ...]
 ) -> list[dict[str, int]]:
@@ -360,9 +345,7 @@ def _build_support_records(
             graph_idx=graph_idx,
             edge_ids=payload.edge_ids,
         )
-        terminal_entity_id = (
-            payload.answer_entities[0] if payload.answer_entities else None
-        )
+        terminal_entity_id = payload.chosen_answer_entity_id
         records.append(
             {
                 "path_rank": int(path_rank),
@@ -373,6 +356,9 @@ def _build_support_records(
                 "answer_entities": [
                     int(entity_id) for entity_id in payload.answer_entities
                 ],
+                "chosen_answer_entity_id": (
+                    None if terminal_entity_id is None else int(terminal_entity_id)
+                ),
                 "sample_count": int(payload.sample_count),
                 "probability": float(probability),
                 "prob": float(probability),
@@ -503,6 +489,11 @@ def _finalize_graph_result(
         ]
         result["top_subgraph_probability"] = float(top_probability)
         result["top_subgraph_sample_count"] = int(top_subgraph.sample_count)
+        result["top_subgraph_answer_entity_id"] = (
+            None
+            if top_subgraph.chosen_answer_entity_id is None
+            else int(top_subgraph.chosen_answer_entity_id)
+        )
     if include_answer_support:
         result["terminal_subgraphs"] = support_records
         result["support_probability_mass"] = float(
@@ -630,12 +621,20 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
         action_pruning_cfg = monte_carlo_cfg["action_pruning"]
 
         active_graph_indices = list(range(int(batch.num_graphs)))
-        active_batch = batch
-        active_prepared_batch = self.policy.prepare_batch(active_batch)
+        with profile_cuda_memory(
+            "eval.prepare_batch.initial",
+            device=batch.edge_index.device,
+            extra=(
+                f"num_graphs={int(batch.num_graphs)} requested_rollouts={requested_rollouts} "
+                f"batch_rollouts={batch_rollouts}"
+            ),
+        ):
+            full_prepared_batch = self.policy.prepare_batch(batch)
+        active_prepared_batch = full_prepared_batch
         accumulators = {
             int(graph_idx): _build_graph_prediction_accumulator(
                 batch=batch,
-                prepared_batch=active_prepared_batch,
+                prepared_batch=full_prepared_batch,
                 graph_idx=int(graph_idx),
                 original_graph_idx=int(graph_idx),
             )
@@ -648,19 +647,28 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
             if remaining_rollouts <= 0:
                 break
             current_rollouts = min(int(batch_rollouts), int(remaining_rollouts))
-            sample_batch = self.sampler.sample(
-                policy=self.policy,
-                prepared_batch=active_prepared_batch,
-                rollouts_per_graph=current_rollouts,
-                temperature=temperature,
-                proposal_bias_scale=0.0,
-                action_pruning=action_pruning_cfg,
+            chunk_extra = (
+                f"active_graphs={len(active_graph_indices)} current_rollouts={current_rollouts} "
+                f"processed_rollouts={processed_rollouts}"
             )
+            with profile_cuda_memory(
+                "eval.sampler.sample",
+                device=active_prepared_batch.device,
+                extra=chunk_extra,
+            ):
+                sample_batch = self.sampler.sample(
+                    policy=self.policy,
+                    prepared_batch=active_prepared_batch,
+                    rollouts_per_graph=current_rollouts,
+                    temperature=temperature,
+                    proposal_bias_scale=0.0,
+                    action_pruning=action_pruning_cfg,
+                )
             next_active_graph_indices: list[int] = []
             for local_graph_idx, original_graph_idx in enumerate(active_graph_indices):
                 accumulator = accumulators[original_graph_idx]
-                active_node_start = int(active_batch.node_ptr[local_graph_idx].item())
-                active_edge_start = int(active_batch.edge_ptr[local_graph_idx].item())
+                original_node_start = int(batch.node_ptr[original_graph_idx].item())
+                original_edge_start = int(batch.edge_ptr[original_graph_idx].item())
                 stop_steps = (
                     sample_batch.termination_action_steps[local_graph_idx]
                     .detach()
@@ -693,56 +701,74 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
                     flat_rollout_idx = (
                         local_graph_idx * current_rollouts
                     ) + rollout_idx
-                    edge_ids = tuple(
-                        int(edge_id) - int(active_edge_start)
+                    global_edge_ids = tuple(
+                        int(edge_id)
                         for edge_id in sample_batch.terminal_edge_ids[flat_rollout_idx]
                     )
+                    edge_ids = tuple(
+                        int(edge_id) - int(original_edge_start)
+                        for edge_id in global_edge_ids
+                    )
                     selected_node_ids = tuple(
-                        int(node_id) - int(active_node_start)
+                        int(node_id) - int(original_node_start)
                         for node_id in sample_batch.terminal_node_ids[flat_rollout_idx]
                     )
                     reachability_bits = {
-                        int(node_id) - int(active_node_start): int(bits)
+                        int(node_id) - int(original_node_start): int(bits)
                         for node_id, bits in sample_batch.terminal_reachability_bits[
                             flat_rollout_idx
                         ].items()
                     }
-                    analysis = _build_analysis(
-                        selected_node_ids=selected_node_ids,
-                        reachability_bits=reachability_bits,
-                        anchor_component_count=int(
-                            terminal_component_counts[rollout_idx]
-                        ),
-                        num_selected_edges=len(edge_ids),
+                    chosen_answer_entity_id = -1
+                    if sample_batch.chosen_answer_entity_ids is not None:
+                        chosen_answer_entity_id = int(
+                            sample_batch.chosen_answer_entity_ids[
+                                local_graph_idx, rollout_idx
+                            ].item()
+                        )
+                    answer_entities = (
+                        ()
+                        if chosen_answer_entity_id < 0
+                        else (int(chosen_answer_entity_id),)
                     )
-                    answer_entities = tuple(
-                        int(entity_id)
-                        for entity_id in resolve_subgraph_answer_entities(
-                            prepared_batch=active_prepared_batch,
-                            graph_idx=local_graph_idx,
-                            analysis=analysis,
+                    if chosen_answer_entity_id >= 0:
+                        accumulator.answering_rollout_count += 1
+                        accumulator.answer_vote_counts[int(chosen_answer_entity_id)] = (
+                            int(
+                                accumulator.answer_vote_counts.get(
+                                    int(chosen_answer_entity_id), 0
+                                )
+                            )
+                            + 1
+                        )
+                    payload = accumulator.terminal_subgraphs.get(
+                        (
+                            edge_ids,
+                            None
+                            if chosen_answer_entity_id < 0
+                            else chosen_answer_entity_id,
                         )
                     )
-                    if answer_entities:
-                        accumulator.answering_rollout_count += 1
-                        for entity_id in dict.fromkeys(answer_entities):
-                            accumulator.answer_vote_counts[int(entity_id)] = (
-                                int(
-                                    accumulator.answer_vote_counts.get(
-                                        int(entity_id), 0
-                                    )
-                                )
-                                + 1
-                            )
-                    payload = accumulator.terminal_subgraphs.get(edge_ids)
                     if payload is None:
                         payload = _TerminalSampleAggregate(
                             edge_ids=edge_ids,
                             selected_node_ids=selected_node_ids,
                             reachability_bits=reachability_bits,
+                            chosen_answer_entity_id=(
+                                None
+                                if chosen_answer_entity_id < 0
+                                else int(chosen_answer_entity_id)
+                            ),
                             answer_entities=answer_entities,
                         )
-                        accumulator.terminal_subgraphs[edge_ids] = payload
+                        accumulator.terminal_subgraphs[
+                            (
+                                edge_ids,
+                                None
+                                if chosen_answer_entity_id < 0
+                                else int(chosen_answer_entity_id),
+                            )
+                        ] = payload
                     payload.sample_count += 1
 
                 accumulator.rollout_count += int(current_rollouts)
@@ -773,8 +799,14 @@ class SubgraphAnswerSearchRuntime(BaseMetricRuntime):
             active_graph_indices = next_active_graph_indices
             if not active_graph_indices:
                 break
-            active_batch = batch.select_graphs(active_graph_indices, validate=False)
-            active_prepared_batch = self.policy.prepare_batch(active_batch)
+            with profile_cuda_memory(
+                "eval.prepared_batch.select_graphs",
+                device=full_prepared_batch.device,
+                extra=f"active_graphs={len(active_graph_indices)}",
+            ):
+                active_prepared_batch = full_prepared_batch.select_graphs(
+                    active_graph_indices
+                )
 
         return [
             _finalize_graph_result(
