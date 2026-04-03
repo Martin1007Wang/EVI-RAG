@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from src.datasets.graph_retrieval_collate import (
+from src.data.retrieval.collate import (
     _InstrumentedDataLoader,
     _expand_answer_samples,
 )
@@ -63,7 +63,7 @@ def test_instrumented_dataloader_logs_iterator_startup(
     def _capture(_logger, event: str, **fields: object) -> None:  # type: ignore[no-untyped-def]
         events.append((event, dict(fields)))
 
-    monkeypatch.setattr("src.datasets.graph_retrieval_collate.log_event", _capture)
+    monkeypatch.setattr("src.data.retrieval.collate.log_event", _capture)
 
     loader = _InstrumentedDataLoader(
         [1, 2, 3],

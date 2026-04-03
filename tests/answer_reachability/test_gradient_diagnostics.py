@@ -13,12 +13,12 @@ from src.data.schema.constants import (
     _FILTER_MISSING_ANCHOR_FILENAME,
     _FILTER_MISSING_ANSWER_FILENAME,
 )
-from src.utils.training_schedules import TrainingScheduleContext
-from src.utils.entrypoint_utils import _strip_instantiate_metadata
-from src.utils.fit_schedule import (
+from src.subgraph_gflownet.core.schedules import TrainingScheduleContext
+from src.runs.fit_schedule import (
     apply_resolved_pass_fit_schedule,
     resolve_pass_fit_schedule,
 )
+from src.runs.lightning import resolve_instantiate_config
 
 _HYDRA_TEST_OVERRIDES = ["hydra/job_logging=stdout", "hydra/hydra_logging=none"]
 _WEBQSP_DATA_ROOT = Path("/mnt/data/retrieval_dataset/webqsp")
@@ -107,7 +107,7 @@ def _build_real_train_batch_and_model():
 
     _skip_when_required_filter_artifacts_are_missing(cfg)
 
-    datamodule = instantiate(_strip_instantiate_metadata(cfg.data))
+    datamodule = instantiate(resolve_instantiate_config(cfg.data))
     datamodule.setup("fit")
     resolved_schedule = resolve_pass_fit_schedule(
         fit_schedule_cfg=cfg.fit_schedule,
@@ -122,7 +122,7 @@ def _build_real_train_batch_and_model():
     batch = datamodule.on_after_batch_transfer(raw_batch, 0)
 
     torch.manual_seed(42)
-    model = instantiate(_strip_instantiate_metadata(cfg.model))
+    model = instantiate(resolve_instantiate_config(cfg.model))
     model.set_training_schedule_context(
         TrainingScheduleContext(
             estimated_stepping_batches=resolved_schedule.max_steps,
@@ -140,7 +140,6 @@ def _measure_gradient_mass_diagnostics(*, model, batch) -> GradientMassDiagnosti
         prepared_batch=prepared_batch,
         rollouts_per_graph=int(model.cfg.training_cfg.rollouts_per_graph),
         temperature=model._resolve_sampling_temperature(global_step=0),
-        proposal_bias_scale=model._resolve_proposal_bias_scale(global_step=0),
     )
     sample_batch.state_log_flows.retain_grad()
     sample_batch.log_pf_actions.retain_grad()

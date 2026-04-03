@@ -1,12 +1,12 @@
 # @package _global_
 #
-# Fast-iteration answer-committed RankFlow bundle for quick idea validation.
+# Fast-iteration RankFlow bundle for quick idea validation.
 # Usage:
 #   python src/train.py experiment=train_rankflow_fastiter dataset=webqsp-sub
 #
-# Contract:
+# Notes:
 # - keeps the RankFlow train path but makes validation/test intentionally cheap
-# - disables post-fit heavy eval and keeps the canonical answer-commit objective
+# - disables post-fit heavy eval and keeps the canonical Detailed Balance objective
 
 defaults:
   - train_rankflow
@@ -31,7 +31,7 @@ trainer:
 
 model:
   eval_cfg:
-    # Fast iteration keeps the same answer-committed Monte Carlo posterior
+    # Fast iteration keeps the same Monte Carlo answer-posterior
     # semantics as the canonical train/eval path, but trims the rollout budget.
     monte_carlo:
       rollouts: 256

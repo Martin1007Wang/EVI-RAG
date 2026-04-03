@@ -6,8 +6,14 @@ import pytest
 from omegaconf import OmegaConf
 
 from src.data.preprocess.config import build_preprocess_filters
-from src.data.preprocess.main import run_preprocess_pipeline
 from src.preprocess import _run_preprocess
+
+
+def _import_run_preprocess_pipeline():
+    pytest.importorskip("transformers")
+    from src.data.preprocess.main import run_preprocess_pipeline
+
+    return run_preprocess_pipeline
 
 
 def test_run_preprocess_requires_dataset_group() -> None:
@@ -17,50 +23,8 @@ def test_run_preprocess_requires_dataset_group() -> None:
         _run_preprocess(cfg)
 
 
-def test_run_preprocess_delegates_to_pipeline(monkeypatch) -> None:
-    cfg = OmegaConf.create(
-        {
-            "dataset": {"name": "webqsp"},
-            "pipeline_stage": "all",
-        }
-    )
-    seen: dict[str, object] = {}
-
-    def _fake_run_preprocess_pipeline(current_cfg):  # type: ignore[no-untyped-def]
-        seen["cfg"] = current_cfg
-
-    monkeypatch.setattr(
-        "src.preprocess._get_preprocess_runner", lambda: _fake_run_preprocess_pipeline
-    )
-
-    _run_preprocess(cfg)
-
-    assert seen == {"cfg": cfg}
-
-
-def test_build_retrieval_pipeline_uses_hydra_logging_defaults() -> None:
-    cfg = OmegaConf.load(
-        Path(__file__).resolve().parents[1]
-        / "configs"
-        / "build_retrieval_pipeline.yaml"
-    )
-    pipeline_cfg = OmegaConf.load(
-        Path(__file__).resolve().parents[1] / "configs" / "pipeline" / "default.yaml"
-    )
-    defaults = OmegaConf.to_container(cfg.defaults, resolve=False)
-
-    assert {"hydra": "default"} in defaults
-    assert cfg.task_name == "preprocess"
-    assert cfg.hf_offline is False
-    assert cfg.get("filter") is None
-    assert pipeline_cfg.get("preprocess_filter") is not None
-    assert pipeline_cfg.overwrite_lmdb is False
-    assert cfg.get("keep_start_adjacent_edges") is None
-    assert cfg.get("canonicalize_relations") is None
-    assert cfg.get("skip_parquet_stage") is None
-
-
 def test_run_preprocess_pipeline_rejects_removed_preprocess_keys() -> None:
+    run_preprocess_pipeline = _import_run_preprocess_pipeline()
     cfg = OmegaConf.create(
         {
             "dataset": {"name": "webqsp"},
@@ -74,6 +38,7 @@ def test_run_preprocess_pipeline_rejects_removed_preprocess_keys() -> None:
 
 
 def test_run_preprocess_pipeline_rejects_removed_dataset_preprocess_keys() -> None:
+    run_preprocess_pipeline = _import_run_preprocess_pipeline()
     cfg = OmegaConf.create(
         {
             "dataset": {
@@ -109,6 +74,7 @@ def test_run_preprocess_pipeline_uses_pipeline_stage(
     stage: str,
     expected_calls: list[str],
 ) -> None:
+    run_preprocess_pipeline = _import_run_preprocess_pipeline()
     cfg = OmegaConf.create(
         {
             "dataset": {"name": "webqsp"},

@@ -4,7 +4,7 @@
 # Usage:
 #   python src/eval.py experiment=eval_llm llm.input_path=/path/to/test.jsonl
 #
-# Contract:
+# Notes:
 # - overrides `/run`, `/trainer`, `/logger`, `/callbacks`
 # - does not require `/dataset`
 # - does require `/llm`, typically supplied entirely by this experiment bundle

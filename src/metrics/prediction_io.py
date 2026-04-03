@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
 
-from src.utils.metrics_io import to_serializable
+from src.metrics.serialization import to_serializable
 
 
 class PredictionCodecProtocol(Protocol):
@@ -27,7 +27,7 @@ def append_jsonl_records(path: str | Path, *, records: Iterable[Any]) -> None:
         for record in records:
             payload = record
             if is_dataclass(record):
-                payload = asdict(record)
+                payload = asdict(record)  # type: ignore[arg-type]
             handle.write(json.dumps(to_serializable(payload), ensure_ascii=True) + "\n")
 
 

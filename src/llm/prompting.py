@@ -29,6 +29,12 @@ _FIELD_TRAJECTORY = "trajectory_text"
 _FIELD_EDGES = "edges"
 _FIELD_PROB = "prob"
 _FIELD_PATH_RANK = "path_rank"
+_FIELD_SINGLETON_TERMINAL_ANSWER_SET_ENTITY_ID = (
+    "singleton_terminal_answer_set_entity_id"
+)
+_FIELD_SINGLETON_TERMINAL_ANSWER_SET_ENTITY_TEXT = (
+    "singleton_terminal_answer_set_entity_text"
+)
 _FIELD_EVIDENCE_TRAJECTORY_IDS = "evidence_trajectory_ids"
 _FIELD_ABSTAIN_REASON = "abstain_reason"
 _FIELD_BEST_GUESS = "best_guess"
@@ -125,9 +131,9 @@ def _trajectory_text(trajectory: Dict[str, Any]) -> str:
         return text.strip()
     edges = trajectory.get(_FIELD_EDGES)
     if not isinstance(edges, list) or not edges:
-        stop_node = trajectory.get("terminal_entity_text")
+        stop_node = trajectory.get(_FIELD_SINGLETON_TERMINAL_ANSWER_SET_ENTITY_TEXT)
         if stop_node is None:
-            stop_node = trajectory.get("terminal_entity_id")
+            stop_node = trajectory.get(_FIELD_SINGLETON_TERMINAL_ANSWER_SET_ENTITY_ID)
         # Some trajectories terminate immediately (no edges). We still surface the terminal node so the LLM can
         # pick a non-empty answer (numeric entity id) and metrics can score it.
         if stop_node is None:
@@ -141,9 +147,9 @@ def _trajectory_text(trajectory: Dict[str, Any]) -> str:
     parts = [p for p in parts if p]
     if parts:
         return " ; ".join(parts)
-    stop_node = trajectory.get("terminal_entity_text")
+    stop_node = trajectory.get(_FIELD_SINGLETON_TERMINAL_ANSWER_SET_ENTITY_TEXT)
     if stop_node is None:
-        stop_node = trajectory.get("terminal_entity_id")
+        stop_node = trajectory.get(_FIELD_SINGLETON_TERMINAL_ANSWER_SET_ENTITY_ID)
     if stop_node is None:
         return ""
     stop_text = str(stop_node).strip()

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from src.data.io.runtime_sample_metadata import save_runtime_sample_metadata
-from src.datasets.graph_retrieval_dataset import GraphRetrievalDataset
+from src.data.retrieval.dataset import GraphRetrievalDataset
 
 
 def _build_dataset_shell(tmp_path: Path) -> GraphRetrievalDataset:

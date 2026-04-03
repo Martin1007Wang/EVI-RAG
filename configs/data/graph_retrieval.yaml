@@ -1,14 +1,6 @@
 # configs/data/graph_retrieval.yaml
 
-_target_: src.datasets.graph_retrieval_datamodule.GraphRetrievalDataModule
-
-# Data contract metadata. This block is stripped before hydra instantiation.
-contract:
-  requires_dataset_cfg: true
-  intended_entrypoints: [train, eval]
-  expand_multi_answer: false
-  retains_zero_hop: true
-  embeddings_device_default: cpu
+_target_: src.data.retrieval.datamodule.GraphRetrievalDataModule
 
 dataset_cfg: ${dataset}
 

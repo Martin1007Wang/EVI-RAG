@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.datasets import graph_retrieval_dataset as dataset_module
+from src.data.retrieval import dataset as dataset_module
 
 
 def _base_dataset_cfg(tmp_path: Path) -> dict[str, object]:

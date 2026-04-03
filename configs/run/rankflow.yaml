@@ -1,26 +1,18 @@
 # Canonical RankFlow eval run.
-# Contract: use with `python src/eval.py ...`; requires `/dataset` and
-# `ckpt.gflownet`. The default `dataset_variants` expand one dataset family
-# root (for example `webqsp`) into the paired `full + sub` evaluation passes.
+# Use with `python src/eval.py ...`; requires `/dataset` and `ckpt.gflownet`.
+# The default `dataset_variants` expand one dataset family root (for example
+# `webqsp`) into the paired `full + sub` evaluation passes.
 defaults:
   - default
   - _self_
 
-_target_: src.runs.answer_reachability.AnswerReachabilityEvalRunner
 name: rankflow
 task_name: "eval/rankflow"
 tags: ["eval", "rankflow"]
-contract:
-  required_groups: [dataset]
-  recommended_experiment: rankflow
-  supports_dataset_variants: true
 ckpt_path: ${ckpt.gflownet}
 write_artifacts: true
 artifact_subdir: rankflow
-artifact_name: rankflow
-artifact_schema_version: 1
 artifact_overwrite: true
-questions_path: null
 dataset_variants:
   # Optional rich form per variant:
   # - label: full_eval

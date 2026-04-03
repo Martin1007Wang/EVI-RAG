@@ -5,242 +5,20 @@ from functools import cached_property
 from typing import Any
 
 import torch
-
-
-def _require_tensor(value: Any, *, name: str, device: torch.device) -> torch.Tensor:
-    if not torch.is_tensor(value):
-        raise TypeError(f"{name} must be a torch.Tensor, got {type(value)!r}.")
-    if value.device != device:
-        raise ValueError(f"{name} must be on {device}, got {value.device}.")
-    return value
-
-
-def _require_1d_long(value: Any, *, name: str, device: torch.device) -> torch.Tensor:
-    tensor = _require_tensor(value, name=name, device=device)
-    if tensor.dtype != torch.long or tensor.dim() != 1:
-        raise ValueError(
-            f"{name} must be 1D torch.long, got {tensor.dtype} {tuple(tensor.shape)}."
-        )
-    return tensor
-
-
-def _require_2d_float(value: Any, *, name: str, device: torch.device) -> torch.Tensor:
-    tensor = _require_tensor(value, name=name, device=device)
-    if not torch.is_floating_point(tensor) or tensor.dim() != 2:
-        raise ValueError(
-            f"{name} must be 2D floating point, got {tensor.dtype} {tuple(tensor.shape)}."
-        )
-    return tensor
-
-
-def _require_3d_float(value: Any, *, name: str, device: torch.device) -> torch.Tensor:
-    tensor = _require_tensor(value, name=name, device=device)
-    if not torch.is_floating_point(tensor) or tensor.dim() != 3:
-        raise ValueError(
-            f"{name} must be 3D floating point, got {tensor.dtype} {tuple(tensor.shape)}."
-        )
-    return tensor
-
-
-def _require_bool_2d(value: Any, *, name: str, device: torch.device) -> torch.Tensor:
-    tensor = _require_tensor(value, name=name, device=device)
-    if tensor.dtype != torch.bool or tensor.dim() != 2:
-        raise ValueError(
-            f"{name} must be 2D bool, got {tensor.dtype} {tuple(tensor.shape)}."
-        )
-    return tensor
-
-
-def _move_float_feature(
-    tensor: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype | None,
-) -> torch.Tensor:
-    if dtype is not None and torch.is_floating_point(tensor):
-        return tensor.to(device=device, dtype=dtype)
-    return tensor.to(device=device)
-
-
-def _compact_relation_table(
-    *,
-    edge_rel_global: torch.Tensor,
-    relation_embeddings: torch.Tensor,
-    edge_rel_local: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    rel_dim = int(relation_embeddings.size(-1))
-    if int(edge_rel_local.numel()) == 0:
-        return (
-            edge_rel_global.new_empty((0,)),
-            relation_embeddings.new_empty((0, rel_dim)),
-            edge_rel_local.new_empty((0,)),
-        )
-    used_local_ids, compact_edge_rel_local = torch.unique(
-        edge_rel_local, sorted=True, return_inverse=True
-    )
-    first_occ = torch.full(
-        (int(used_local_ids.numel()),),
-        fill_value=int(edge_rel_local.numel()),
-        device=edge_rel_local.device,
-        dtype=torch.long,
-    )
-    edge_ids = torch.arange(
-        int(edge_rel_local.numel()), device=edge_rel_local.device, dtype=torch.long
-    )
-    first_occ.scatter_reduce_(
-        0,
-        compact_edge_rel_local,
-        edge_ids,
-        reduce="amin",
-        include_self=True,
-    )
-    return (
-        edge_rel_global.index_select(0, first_occ),
-        relation_embeddings.index_select(0, used_local_ids),
-        compact_edge_rel_local,
-    )
-
-
-def _build_relation_table_from_rows(
-    *,
-    relation_global_ids: torch.Tensor,
-    relation_embeddings: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rel_dim = int(relation_embeddings.size(-1))
-    if int(relation_global_ids.numel()) == 0:
-        return relation_global_ids.new_empty((0,)), relation_embeddings.new_empty(
-            (0, rel_dim)
-        )
-    unique_relation_ids, relation_inverse = torch.unique(
-        relation_global_ids, sorted=True, return_inverse=True
-    )
-    first_occ = torch.full(
-        (int(unique_relation_ids.numel()),),
-        fill_value=int(relation_global_ids.numel()),
-        device=relation_global_ids.device,
-        dtype=torch.long,
-    )
-    relation_row_ids = torch.arange(
-        int(relation_global_ids.numel()),
-        device=relation_global_ids.device,
-        dtype=torch.long,
-    )
-    first_occ.scatter_reduce_(
-        0,
-        relation_inverse,
-        relation_row_ids,
-        reduce="amin",
-        include_self=True,
-    )
-    return unique_relation_ids, relation_embeddings.index_select(0, first_occ)
-
-
-def _require_edge_index(value: Any, *, device: torch.device) -> torch.Tensor:
-    tensor = _require_tensor(value, name="edge_index", device=device)
-    if tensor.dtype != torch.long or tensor.dim() != 2 or int(tensor.size(0)) != 2:
-        raise ValueError(
-            f"edge_index must be [2, E] torch.long, got {tensor.dtype} {tuple(tensor.shape)}."
-        )
-    return tensor
-
-
-def compute_edge_batch_and_ptr(
-    edge_index: torch.Tensor,
-    *,
-    node_ptr: torch.Tensor,
-    num_graphs: int,
-    device: torch.device,
-    validate: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if node_ptr.numel() != num_graphs + 1:
-        raise ValueError(
-            f"node_ptr length mismatch: got {node_ptr.numel()} expected {num_graphs + 1}."
-        )
-    edge_batch = torch.bucketize(edge_index[0], node_ptr[1:], right=True)
-    if validate:
-        tail_batch = torch.bucketize(edge_index[1], node_ptr[1:], right=True)
-        if edge_batch.numel() > 0:
-            min_idx = int(edge_batch.min().item())
-            max_idx = int(edge_batch.max().item())
-            if min_idx < 0 or max_idx >= num_graphs:
-                raise ValueError(
-                    "edge_batch contains out-of-range indices; "
-                    f"min={min_idx} max={max_idx} num_graphs={num_graphs}."
-                )
-        if not torch.equal(edge_batch, tail_batch):
-            raise ValueError(
-                "edge_index crosses graph boundaries; head/tail graph assignments differ."
-            )
-        if edge_batch.numel() > 1 and not bool(
-            (edge_batch[:-1] <= edge_batch[1:]).all().item()
-        ):
-            raise ValueError(
-                "edge_batch is not non-decreasing along the flattened edge list, "
-                "which breaks per-graph slicing; ensure edges are concatenated per-graph."
-            )
-    edge_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
-    edge_counts.scatter_add_(
-        0, edge_batch, torch.ones_like(edge_batch, dtype=torch.long)
-    )
-    edge_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
-    edge_ptr[1:] = edge_counts.cumsum(0)
-    return edge_batch, edge_ptr
-
-
-def _build_edge_ptr_from_edge_batch(
-    edge_batch: torch.Tensor,
-    *,
-    num_graphs: int,
-    device: torch.device,
-    validate: bool,
-) -> torch.Tensor:
-    if edge_batch.dtype != torch.long or edge_batch.dim() != 1:
-        raise ValueError(
-            f"edge_batch must be 1D torch.long, got {edge_batch.dtype} {tuple(edge_batch.shape)}."
-        )
-    if int(edge_batch.numel()) == 0:
-        return torch.zeros((num_graphs + 1,), dtype=torch.long, device=device)
-    if validate:
-        min_idx = int(edge_batch.min().item())
-        max_idx = int(edge_batch.max().item())
-        if min_idx < 0 or max_idx >= num_graphs:
-            raise ValueError(
-                "edge_batch contains out-of-range indices; "
-                f"min={min_idx} max={max_idx} num_graphs={num_graphs}."
-            )
-        if edge_batch.numel() > 1 and not bool(
-            (edge_batch[:-1] <= edge_batch[1:]).all().item()
-        ):
-            raise ValueError(
-                "edge_batch is not non-decreasing along the flattened edge list, "
-                "which breaks per-graph slicing; ensure edges are concatenated per-graph."
-            )
-    edge_counts = torch.zeros(num_graphs, dtype=torch.long, device=device)
-    edge_counts.scatter_add_(
-        0, edge_batch, torch.ones_like(edge_batch, dtype=torch.long)
-    )
-    edge_ptr = torch.zeros((num_graphs + 1,), dtype=torch.long, device=device)
-    edge_ptr[1:] = edge_counts.cumsum(0)
-    return edge_ptr
-
-
-def _coerce_str_list(value: Any, *, expected_size: int, name: str) -> list[str]:
-    if value is None:
-        return ["" for _ in range(expected_size)]
-    if isinstance(value, str):
-        if expected_size != 1:
-            raise ValueError(
-                f"{name} single string cannot represent {expected_size} items."
-            )
-        return [value]
-    if not isinstance(value, (list, tuple)):
-        raise TypeError(f"{name} must be list/tuple[str], got {type(value)!r}.")
-    values = [str(item or "") for item in value]
-    if len(values) != expected_size:
-        raise ValueError(
-            f"{name} length mismatch: expected {expected_size}, got {len(values)}."
-        )
-    return values
+from .batch_utils import (
+    build_edge_ptr_from_edge_batch,
+    build_relation_table_from_rows,
+    coerce_str_list,
+    compact_relation_table,
+    compute_edge_batch_and_ptr,
+    move_float_feature,
+    require_1d_long,
+    require_2d_float,
+    require_3d_float,
+    require_bool_2d,
+    require_edge_index,
+    require_tensor,
+)
 
 
 @dataclass(frozen=True)
@@ -279,7 +57,7 @@ class TrajectoryBatch:
 
     @cached_property
     def edge_ptr(self) -> torch.Tensor:
-        return _build_edge_ptr_from_edge_batch(
+        return build_edge_ptr_from_edge_batch(
             self.edge_batch,
             num_graphs=self.num_graphs,
             device=self.edge_batch.device,
@@ -470,35 +248,35 @@ class TrajectoryBatch:
         target_device = torch.device(device)
         heuristic_log_v = None
         if self.heuristic_log_v is not None:
-            heuristic_log_v = _move_float_feature(
+            heuristic_log_v = move_float_feature(
                 self.heuristic_log_v,
                 device=target_device,
                 dtype=feature_dtype,
             )
         node_embeddings = None
         if self.node_embeddings is not None:
-            node_embeddings = _move_float_feature(
+            node_embeddings = move_float_feature(
                 self.node_embeddings,
                 device=target_device,
                 dtype=feature_dtype,
             )
         edge_embeddings = None
         if self.edge_embeddings is not None:
-            edge_embeddings = _move_float_feature(
+            edge_embeddings = move_float_feature(
                 self.edge_embeddings,
                 device=target_device,
                 dtype=feature_dtype,
             )
         question_emb = None
         if self.question_emb is not None:
-            question_emb = _move_float_feature(
+            question_emb = move_float_feature(
                 self.question_emb,
                 device=target_device,
                 dtype=feature_dtype,
             )
         question_ctx = None
         if self.question_ctx is not None:
-            question_ctx = _move_float_feature(
+            question_ctx = move_float_feature(
                 self.question_ctx,
                 device=target_device,
                 dtype=feature_dtype,
@@ -508,7 +286,7 @@ class TrajectoryBatch:
             question_ctx_mask = self.question_ctx_mask.to(device=target_device)
         relation_embeddings = None
         if self.relation_embeddings is not None:
-            relation_embeddings = _move_float_feature(
+            relation_embeddings = move_float_feature(
                 self.relation_embeddings,
                 device=target_device,
                 dtype=feature_dtype,
@@ -554,13 +332,13 @@ class TrajectoryBatch:
         num_graphs = int(getattr(batch, "num_graphs", 0))
         if num_graphs < 1:
             raise ValueError("PyG batch must define num_graphs >= 1.")
-        node_ptr = _require_1d_long(
+        node_ptr = require_1d_long(
             getattr(batch, "node_ptr", None), name="node_ptr", device=device
         )
-        edge_index = _require_edge_index(
+        edge_index = require_edge_index(
             getattr(batch, "edge_index", None), device=device
         )
-        edge_rel_global = _require_1d_long(
+        edge_rel_global = require_1d_long(
             getattr(batch, "edge_attr", None), name="edge_attr", device=device
         )
         edge_batch_value = getattr(batch, "edge_batch", None)
@@ -573,13 +351,13 @@ class TrajectoryBatch:
                 validate=True,
             )
         else:
-            edge_batch = _require_1d_long(
+            edge_batch = require_1d_long(
                 edge_batch_value, name="edge_batch", device=device
             )
-        node_batch = _require_1d_long(
+        node_batch = require_1d_long(
             getattr(batch, "batch", None), name="batch", device=device
         )
-        node_embeddings = _require_2d_float(
+        node_embeddings = require_2d_float(
             getattr(batch, "node_embeddings", None),
             name="node_embeddings",
             device=device,
@@ -587,7 +365,7 @@ class TrajectoryBatch:
         edge_embeddings_value = getattr(batch, "edge_embeddings", None)
         edge_embeddings = None
         if edge_embeddings_value is not None:
-            edge_embeddings = _require_2d_float(
+            edge_embeddings = require_2d_float(
                 edge_embeddings_value,
                 name="edge_embeddings",
                 device=device,
@@ -595,7 +373,7 @@ class TrajectoryBatch:
         relation_embeddings_value = getattr(batch, "relation_embeddings", None)
         relation_embeddings = None
         if relation_embeddings_value is not None:
-            relation_embeddings = _require_2d_float(
+            relation_embeddings = require_2d_float(
                 relation_embeddings_value,
                 name="relation_embeddings",
                 device=device,
@@ -603,54 +381,54 @@ class TrajectoryBatch:
         edge_rel_local_value = getattr(batch, "edge_rel_local", None)
         edge_rel_local = None
         if edge_rel_local_value is not None:
-            edge_rel_local = _require_1d_long(
+            edge_rel_local = require_1d_long(
                 edge_rel_local_value,
                 name="edge_rel_local",
                 device=device,
             )
-        question_emb = _require_2d_float(
+        question_emb = require_2d_float(
             getattr(batch, "question_emb", None), name="question_emb", device=device
         )
-        question_ctx = _require_3d_float(
+        question_ctx = require_3d_float(
             getattr(batch, "question_ctx", None), name="question_ctx", device=device
         )
-        question_ctx_mask = _require_bool_2d(
+        question_ctx_mask = require_bool_2d(
             getattr(batch, "question_ctx_mask", None),
             name="question_ctx_mask",
             device=device,
         )
-        anchor_local_indices = _require_1d_long(
+        anchor_local_indices = require_1d_long(
             getattr(batch, "anchor_local_indices", None),
             name="anchor_local_indices",
             device=device,
         )
-        anchor_ptr = _require_1d_long(
+        anchor_ptr = require_1d_long(
             getattr(batch, "anchor_ptr", None), name="anchor_ptr", device=device
         )
-        a_local_indices = _require_1d_long(
+        a_local_indices = require_1d_long(
             getattr(batch, "a_local_indices", None),
             name="a_local_indices",
             device=device,
         )
-        a_ptr = _require_1d_long(
+        a_ptr = require_1d_long(
             getattr(batch, "a_ptr", None), name="a_ptr", device=device
         )
-        answer_entity_ids = _require_1d_long(
+        answer_entity_ids = require_1d_long(
             getattr(batch, "answer_entity_ids", None),
             name="answer_entity_ids",
             device=device,
         )
-        answer_ptr = _require_1d_long(
+        answer_ptr = require_1d_long(
             getattr(batch, "answer_ptr", None), name="answer_ptr", device=device
         )
-        node_entity_ids = _require_1d_long(
+        node_entity_ids = require_1d_long(
             getattr(batch, "node_entity_ids", None),
             name="node_entity_ids",
             device=device,
         )
         heuristic_log_v = getattr(batch, "heuristic_log_v", None)
         if heuristic_log_v is not None:
-            heuristic_log_v = _require_tensor(
+            heuristic_log_v = require_tensor(
                 heuristic_log_v, name="heuristic_log_v", device=device
             )
         trajectory_batch = cls(
@@ -672,12 +450,12 @@ class TrajectoryBatch:
             answer_entity_ids=answer_entity_ids,
             answer_ptr=answer_ptr,
             node_entity_ids=node_entity_ids,
-            sample_ids=_coerce_str_list(
+            sample_ids=coerce_str_list(
                 getattr(batch, "sample_id", None),
                 expected_size=num_graphs,
                 name="sample_id",
             ),
-            questions=_coerce_str_list(
+            questions=coerce_str_list(
                 getattr(batch, "question", None),
                 expected_size=num_graphs,
                 name="question",
@@ -803,7 +581,7 @@ class TrajectoryBatch:
                 and batch.edge_rel_local is not None
             ):
                 compact_relation_ids, compact_relation_embeddings, _ = (
-                    _compact_relation_table(
+                    compact_relation_table(
                         edge_rel_global=batch.edge_rel_global,
                         relation_embeddings=batch.relation_embeddings,
                         edge_rel_local=batch.edge_rel_local,
@@ -839,7 +617,7 @@ class TrajectoryBatch:
         elif has_relation_tables:
             flat_relation_global_ids = torch.cat(relation_global_parts, dim=0)
             flat_relation_embeddings = torch.cat(relation_embedding_parts, dim=0)
-            relation_ids, relation_embeddings = _build_relation_table_from_rows(
+            relation_ids, relation_embeddings = build_relation_table_from_rows(
                 relation_global_ids=flat_relation_global_ids,
                 relation_embeddings=flat_relation_embeddings,
             )
@@ -906,7 +684,7 @@ class TrajectoryBatch:
         edge_rel_local = None
         if self.relation_embeddings is not None and self.edge_rel_local is not None:
             relation_edge_rel_local = self.edge_rel_local[edge_start:edge_end]
-            _, relation_embeddings, edge_rel_local = _compact_relation_table(
+            _, relation_embeddings, edge_rel_local = compact_relation_table(
                 edge_rel_global=edge_rel_global,
                 relation_embeddings=self.relation_embeddings,
                 edge_rel_local=relation_edge_rel_local,

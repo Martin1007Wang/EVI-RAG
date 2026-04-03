@@ -15,7 +15,7 @@ def _base_question_row() -> dict[str, object]:
         QuestionFields.SPLIT: "train",
         QuestionFields.KB: "kb",
         QuestionFields.QUESTION: "who directed interstellar?",
-        QuestionFields.SEED_ENTITY_IDS: [1],
+        QuestionFields.QUESTION_ENTITY_IDS: [1],
         QuestionFields.ANSWER_ENTITY_IDS: [2],
         QuestionFields.ANSWER_TEXTS: ["christopher nolan"],
         QuestionFields.GRAPH_ID: "g_0",

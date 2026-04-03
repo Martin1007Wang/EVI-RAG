@@ -21,15 +21,15 @@ from src.data.preprocess.labels.edge_retrieval import (  # noqa: E402
     resolve_forward_multi_anchor_union_trajectory,
     resolve_forward_shortest_path_trajectory,
 )
-from src.datasets.components.embeddings import attach_embeddings_to_batch  # noqa: E402
-from src.datasets.components.shared_resources import SharedDataResources  # noqa: E402
-from src.datasets.graph_retrieval_collate import BatchAugmenter  # noqa: E402
-from src.datasets.graph_retrieval_dataset import create_graph_retrieval_dataset  # noqa: E402
+from src.data.retrieval.collate import BatchAugmenter  # noqa: E402
+from src.data.retrieval.components.embeddings import attach_embeddings_to_batch  # noqa: E402
+from src.data.retrieval.components.shared_resources import SharedDataResources  # noqa: E402
+from src.data.retrieval.dataset import create_graph_retrieval_dataset  # noqa: E402
 from src.graph import TrajectoryBatch  # noqa: E402
-from src.metrics.subgraph_answer_search_runtime import (  # noqa: E402
+from src.subgraph_gflownet.application.evaluation import (  # noqa: E402
     SubgraphAnswerSearchRuntime,
 )
-from src.models.gflownet.state import SubgraphAction, SubgraphState  # noqa: E402
+from src.subgraph_gflownet.core.state import SubgraphAction, SubgraphState  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -39,15 +39,15 @@ class SelectedSample:
     question: str | None
     data: Any
     raw_sample: dict[str, Any]
-    teacher_name: str
-    teacher_edge_ids: tuple[int, ...]
+    reference_trajectory_name: str
+    reference_edge_ids: tuple[int, ...]
     shortest_path: ForwardShortestPathTrajectory | None
     union_trajectory: ForwardMultiAnchorUnionTrajectory | None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect one answer-committed RankFlow sample end-to-end."
+        description="Inspect one answer-set RankFlow sample end-to-end."
     )
     parser.add_argument(
         "--run-dir",
@@ -165,18 +165,18 @@ def _select_sample(cfg: DictConfig, *, sample_id: str | None) -> SelectedSample:
                 a_local_indices=a_local_indices,
                 num_nodes=num_nodes,
             )
-            teacher_name = "shortest_path"
-            teacher_edge_ids: tuple[int, ...] = ()
+            reference_trajectory_name = "shortest_path"
+            reference_edge_ids: tuple[int, ...] = ()
             if union_trajectory is not None:
-                teacher_name = "multi_anchor_union"
-                teacher_edge_ids = tuple(
+                reference_trajectory_name = "multi_anchor_union"
+                reference_edge_ids = tuple(
                     int(edge_id) for edge_id in union_trajectory.ordered_edge_ids
                 )
             elif shortest_path is not None:
-                teacher_edge_ids = tuple(
+                reference_edge_ids = tuple(
                     int(edge_id) for edge_id in shortest_path.path_edge_ids
                 )
-            if len(teacher_edge_ids) < 2:
+            if len(reference_edge_ids) < 2:
                 continue
             data = dataset.get(idx)
             question = getattr(data, "question", None)
@@ -186,8 +186,8 @@ def _select_sample(cfg: DictConfig, *, sample_id: str | None) -> SelectedSample:
                 question=None if question is None else str(question),
                 data=data,
                 raw_sample=raw_sample,
-                teacher_name=teacher_name,
-                teacher_edge_ids=teacher_edge_ids,
+                reference_trajectory_name=reference_trajectory_name,
+                reference_edge_ids=reference_edge_ids,
                 shortest_path=shortest_path,
                 union_trajectory=union_trajectory,
             )
@@ -248,13 +248,15 @@ def _edge_payload(prepared_batch: Any, edge_id: int) -> dict[str, Any]:
     }
 
 
-def _teacher_summary_payload(selected: SelectedSample) -> dict[str, Any]:
+def _reference_trajectory_payload(selected_sample: SelectedSample) -> dict[str, Any]:
     return {
-        "sample_id": selected.sample_id,
-        "question": selected.question,
-        "teacher_name": selected.teacher_name,
-        "teacher_edge_ids": [int(edge_id) for edge_id in selected.teacher_edge_ids],
-        "teacher_length": int(len(selected.teacher_edge_ids)),
+        "sample_id": selected_sample.sample_id,
+        "question": selected_sample.question,
+        "reference_trajectory_name": selected_sample.reference_trajectory_name,
+        "reference_edge_ids": [
+            int(edge_id) for edge_id in selected_sample.reference_edge_ids
+        ],
+        "reference_trajectory_length": int(len(selected_sample.reference_edge_ids)),
     }
 
 
@@ -276,12 +278,7 @@ def _action_log_prob_summary(state_distribution: Any) -> list[dict[str, Any]]:
         records.append(
             {
                 "kind": "stop",
-                "answer_entity_id": (
-                    None
-                    if stop_choice.answer_entity_id is None
-                    else int(stop_choice.answer_entity_id)
-                ),
-                "support_node_count": int(stop_choice.support_node_count),
+                "terminal_answer_set_size": int(stop_choice.support_node_count),
                 "log_prob": total_log_prob,
                 "prob": float(math.exp(total_log_prob)),
             }
@@ -322,8 +319,8 @@ def _action_log_prob_summary(state_distribution: Any) -> list[dict[str, Any]]:
                         "relation_id": int(relation_choice.relation_id),
                         "target_graph_node": int(edge_choice.target_graph_node),
                         "next_component_count": int(edge_choice.next_component_count),
-                        "candidate_commit_count": int(
-                            edge_choice.candidate_commit_count
+                        "answer_candidate_count": int(
+                            edge_choice.answer_candidate_count
                         ),
                         "log_prob": total_log_prob,
                         "prob": float(math.exp(total_log_prob)),
@@ -332,75 +329,61 @@ def _action_log_prob_summary(state_distribution: Any) -> list[dict[str, Any]]:
     return sorted(records, key=lambda item: -float(item["log_prob"]))
 
 
-def _ready_answer_payload(
+def _terminal_answer_set_payload(
     *, policy: Any, prepared_batch: Any, analysis: Any, graph_idx: int
 ) -> dict[str, Any]:
-    commit_set = policy.admissible_answer_commit_set(
+    answer_set = policy.admissible_answer_set(
         prepared_batch=prepared_batch,
         graph_idx=int(graph_idx),
         analysis=analysis,
     )
     return {
-        "admissible_commit_entities": [
-            int(entity_id) for entity_id in commit_set.entities
+        "terminal_answer_set_entity_ids": [
+            int(entity_id) for entity_id in answer_set.entities
         ],
-        "gold_admissible_commit_entities": [
-            int(entity_id) for entity_id in commit_set.gold_entities
+        "gold_answer_entities_in_terminal_answer_set": [
+            int(entity_id) for entity_id in answer_set.gold_entities
         ],
-        "non_gold_admissible_commit_entities": [
+        "non_gold_answer_entities_in_terminal_answer_set": [
             int(entity_id)
-            for entity_id in commit_set.entities
-            if int(entity_id) not in commit_set.gold_entities
+            for entity_id in answer_set.entities
+            if int(entity_id) not in answer_set.gold_entities
         ],
     }
 
 
-def _commit_reward_payload(
+def _terminal_reward_payload(
     *, policy: Any, prepared_batch: Any, graph_idx: int, analysis: Any
 ) -> dict[str, Any]:
-    ready_payload = _ready_answer_payload(
-        policy=policy,
+    terminal_reward = policy.compute_terminal_reward(
         prepared_batch=prepared_batch,
+        graph_idx=int(graph_idx),
         analysis=analysis,
-        graph_idx=graph_idx,
     )
-    failure_reward, admissible_count, gold_count, failure_hit = (
-        policy.compute_stop_log_reward(
+    return {
+        **_terminal_answer_set_payload(
+            policy=policy,
             prepared_batch=prepared_batch,
-            graph_idx=int(graph_idx),
             analysis=analysis,
-            answer_entity_id=None,
-        )
-    )
-    payload: dict[str, Any] = {
-        **ready_payload,
-        "failure_stop": {
-            "log_reward": float(failure_reward),
-            "admissible_commit_count": int(admissible_count),
-            "gold_admissible_commit_count": int(gold_count),
-            "gold_hit": bool(failure_hit),
+            graph_idx=graph_idx,
+        ),
+        "gold_answer_entities_in_state": [
+            int(entity_id)
+            for entity_id in terminal_reward.gold_answer_entities_in_graph
+        ],
+        "terminal_reward_summary": {
+            "log_reward": float(terminal_reward.log_reward),
+            "gold_answer_in_state": bool(terminal_reward.hit),
+            "terminal_answer_set_size": int(terminal_reward.answer_set.count),
+            "gold_answer_entities_in_state_count": int(
+                terminal_reward.gold_answer_count
+            ),
+            "frontier_hits_gold_answer": bool(terminal_reward.frontier_hit),
+            "anchor_coverage": float(terminal_reward.anchor_coverage),
+            "utility": float(terminal_reward.utility),
+            "redundancy_edge_count": int(terminal_reward.redundancy_edges),
         },
     }
-    if ready_payload["gold_admissible_commit_entities"]:
-        gold_answer = int(ready_payload["gold_admissible_commit_entities"][0])
-        reward_value, admissible_count, gold_count, hit = (
-            policy.compute_stop_log_reward(
-                prepared_batch=prepared_batch,
-                graph_idx=int(graph_idx),
-                analysis=analysis,
-                answer_entity_id=gold_answer,
-            )
-        )
-        payload["gold_commit"] = {
-            "answer_entity_id": int(gold_answer),
-            "log_reward": float(reward_value),
-            "admissible_commit_count": int(admissible_count),
-            "gold_admissible_commit_count": int(gold_count),
-            "gold_hit": bool(hit),
-        }
-    else:
-        payload["gold_commit"] = None
-    return payload
 
 
 def _initial_action_summary(
@@ -420,19 +403,24 @@ def _initial_action_summary(
         "current_anchor_component_count": int(
             state_distribution.current_component_count
         ),
-        "current_admissible_commit_count": int(
-            state_distribution.current_commit_candidate_count
+        "current_terminal_answer_set_size": int(
+            state_distribution.current_answer_candidate_count
         ),
-        "top_actions": _action_log_prob_summary(state_distribution)[: int(top_k)],
+        "top_action_candidates": _action_log_prob_summary(state_distribution)[
+            : int(top_k)
+        ],
     }
 
 
-def _trace_teacher_path(
-    model: Any, batch: TrajectoryBatch, selected: SelectedSample, top_k: int
+def _trace_reference_trajectory(
+    model: Any,
+    batch: TrajectoryBatch,
+    selected_sample: SelectedSample,
+    top_k: int,
 ) -> None:
-    print("\n=== Teacher Path under Answer-Committed Policy ===")
+    print("\n=== Reference Trajectory Trace ===")
     prepared_batch = model.policy.prepare_batch(batch)
-    print(json.dumps(_teacher_summary_payload(selected), ensure_ascii=True))
+    print(json.dumps(_reference_trajectory_payload(selected_sample), ensure_ascii=True))
     print(
         json.dumps(
             _initial_action_summary(
@@ -445,7 +433,7 @@ def _trace_teacher_path(
         prepared_batch=prepared_batch,
         num_rollouts=1,
     )
-    for step_idx, teacher_edge_id in enumerate(selected.teacher_edge_ids):
+    for step_idx, reference_edge_id in enumerate(selected_sample.reference_edge_ids):
         analyses = model.policy.analyze_rollout_batch(
             prepared_batch=prepared_batch,
             rollout_batch=rollout_batch,
@@ -457,15 +445,15 @@ def _trace_teacher_path(
             action_pruning=model._training_action_pruning_cfg(),
         ).state_distributions[0]
         action_candidates = _action_log_prob_summary(state_distribution)
-        teacher_rank = next(
+        reference_rank = next(
             (
                 int(rank)
                 for rank, candidate in enumerate(action_candidates, start=1)
-                if candidate.get("edge_id") == int(teacher_edge_id)
+                if candidate.get("edge_id") == int(reference_edge_id)
             ),
             None,
         )
-        chosen_action = SubgraphAction.add_edge(int(teacher_edge_id))
+        chosen_action = SubgraphAction.add_edge(int(reference_edge_id))
         rollout_batch = model.policy.transition(
             rollout_batch=rollout_batch,
             chosen_actions=(chosen_action,),
@@ -477,22 +465,26 @@ def _trace_teacher_path(
         print(
             json.dumps(
                 {
-                    "step": int(step_idx),
-                    "teacher_edge": _edge_payload(prepared_batch, int(teacher_edge_id)),
-                    "teacher_edge_rank_before_step": (
-                        None if teacher_rank is None else int(teacher_rank)
+                    "step_index": int(step_idx),
+                    "reference_edge": _edge_payload(
+                        prepared_batch, int(reference_edge_id)
                     ),
-                    "top_actions_before_step": action_candidates[: int(top_k)],
-                    "next_selected_edge_ids": [
+                    "reference_edge_rank_before_step": (
+                        None if reference_rank is None else int(reference_rank)
+                    ),
+                    "top_action_candidates_before_step": action_candidates[
+                        : int(top_k)
+                    ],
+                    "next_state_edge_ids": [
                         int(edge_id) for edge_id in rollout_batch.states[0].edge_ids
                     ],
-                    "next_selected_node_ids": [
+                    "next_state_node_ids": [
                         int(node_id) for node_id in next_analysis.selected_node_ids
                     ],
                     "next_anchor_component_count": int(
                         next_analysis.anchor_component_count
                     ),
-                    **_commit_reward_payload(
+                    **_terminal_reward_payload(
                         policy=model.policy,
                         prepared_batch=prepared_batch,
                         graph_idx=0,
@@ -504,10 +496,10 @@ def _trace_teacher_path(
         )
 
 
-def _run_prediction_analysis(
+def _run_posterior_surrogate_analysis(
     model: Any, cfg: DictConfig, batch: TrajectoryBatch, top_k: int
 ) -> None:
-    print("\n=== Validation-Time Answer-Commit Search Output ===")
+    print("\n=== Validation-Time Posterior-Surrogate Output ===")
     runtime = SubgraphAnswerSearchRuntime(
         eval_cfg=_plain_mapping(cfg.model.eval_cfg),
         policy=model.policy,
@@ -521,13 +513,24 @@ def _run_prediction_analysis(
                 "predicted_answer_entity_ids": result["predicted_answer_entity_ids"][
                     :top_k
                 ],
-                "answer_log_masses": result["answer_log_masses"][:top_k],
-                "answering_rollout_count": int(result["answering_rollout_count"]),
-                "hit_rollout_count": int(result["hit_rollout_count"]),
-                "terminal_witness_count": int(result["terminal_subgraph_count"]),
-                "frontier_state_count": int(result["frontier_state_count"]),
-                "frontier_answer_ready_state_count": int(
-                    result["frontier_answering_state_count"]
+                "answer_log_posterior_surrogate_masses": result[
+                    "answer_log_posterior_surrogate_masses"
+                ][:top_k],
+                "posterior_surrogate_aggregation_backend": result[
+                    "posterior_surrogate_aggregation_backend"
+                ],
+                "requested_rollout_count": int(result["requested_rollout_count"]),
+                "executed_rollout_count": int(result["rollout_count"]),
+                "nonempty_terminal_answer_set_rollout_count": int(
+                    result["nonempty_terminal_answer_set_rollout_count"]
+                ),
+                "gold_answer_in_state_rollout_count": int(
+                    result["gold_answer_in_state_rollout_count"]
+                ),
+                "terminal_witness_count": int(result["terminal_witness_count"]),
+                "mean_stop_step": float(result["mean_stop_step"]),
+                "mean_anchor_component_count": float(
+                    result["mean_terminal_component_count"]
                 ),
             },
             ensure_ascii=True,
@@ -536,7 +539,7 @@ def _run_prediction_analysis(
     print(
         json.dumps(
             {
-                "committed_supports_head": result.get("terminal_subgraphs", [])[
+                "witness_support_head": result.get("witness_supports", [])[
                     : min(5, top_k)
                 ]
             },
@@ -568,7 +571,7 @@ def _param_grad_summary(model: Any) -> dict[str, float]:
     return summaries
 
 
-def _trace_training_rollouts(
+def _run_training_rollout_diagnostics(
     model: Any,
     batch: TrajectoryBatch,
     *,
@@ -577,7 +580,7 @@ def _trace_training_rollouts(
     top_k: int,
 ) -> None:
     del top_k
-    print("\n=== Sampled Training Rollouts + Backprop ===")
+    print("\n=== Sampled Training Rollouts + Gradient Diagnostics ===")
     torch.manual_seed(int(seed))
     model.train()
     model.zero_grad(set_to_none=True)
@@ -601,9 +604,9 @@ def _trace_training_rollouts(
         sampling_temperature=float(model._resolve_sampling_temperature()),
         proposal_bias_scale=float(model._resolve_proposal_bias_scale()),
     )
-    rollout_records = []
+    terminal_rollout_summaries = []
     for rollout_idx in range(int(sample_batch.num_rollouts)):
-        rollout_records.append(
+        terminal_rollout_summaries.append(
             {
                 "rollout_index": int(rollout_idx),
                 "chosen_edge_ids": [
@@ -611,19 +614,21 @@ def _trace_training_rollouts(
                     for edge_id in sample_batch.chosen_edge_ids[0, rollout_idx].tolist()
                     if int(edge_id) >= 0
                 ],
-                "terminal_answer_entity_ids": [
+                "terminal_answer_set_entity_ids": [
                     int(entity_id)
-                    for entity_id in sample_batch.terminal_answer_entity_ids[
+                    for entity_id in sample_batch.terminal_answer_set_entity_ids[
                         int(rollout_idx)
                     ]
                 ],
-                "admissible_commit_count": int(
-                    sample_batch.terminal_commit_candidate_counts[0, rollout_idx].item()
+                "terminal_answer_set_size": int(
+                    sample_batch.terminal_answer_candidate_counts[0, rollout_idx].item()
                 ),
-                "gold_admissible_commit_count": int(
+                "gold_answer_entities_in_state_count": int(
                     sample_batch.terminal_gold_answer_counts[0, rollout_idx].item()
                 ),
-                "gold_hit": bool(sample_batch.terminal_hit_mask[0, rollout_idx].item()),
+                "gold_answer_in_state": bool(
+                    sample_batch.terminal_hit_mask[0, rollout_idx].item()
+                ),
                 "anchor_component_count": int(
                     sample_batch.terminal_component_counts[0, rollout_idx].item()
                 ),
@@ -635,7 +640,7 @@ def _trace_training_rollouts(
     print(
         json.dumps(
             {
-                "train_metrics": {
+                "training_metrics": {
                     key: (
                         float(value.detach().item())
                         if torch.is_tensor(value)
@@ -643,7 +648,7 @@ def _trace_training_rollouts(
                     )
                     for key, value in metric_payload.items()
                 },
-                "rollout_records": rollout_records,
+                "rollout_terminal_summaries": terminal_rollout_summaries,
             },
             ensure_ascii=True,
         )
@@ -655,34 +660,38 @@ def _trace_training_rollouts(
     )
 
 
-def _run_teacher_force_summary(
-    model: Any, batch: TrajectoryBatch, selected: SelectedSample
+def _run_reference_trajectory_forced_replay_summary(
+    model: Any,
+    batch: TrajectoryBatch,
+    selected_sample: SelectedSample,
 ) -> None:
-    print("\n=== Teacher-Forced Answer Commit Summary ===")
+    print("\n=== Forced Reference-Trajectory Replay Summary ===")
     prepared_batch = model.policy.prepare_batch(batch)
     sample_batch = model.sampler.teacher_force(
         policy=model.policy,
         prepared_batch=prepared_batch,
-        edge_sequences=(selected.teacher_edge_ids,),
+        edge_sequences=(selected_sample.reference_edge_ids,),
     )
     print(
         json.dumps(
             {
-                "teacher_edge_ids": [
+                "reference_edge_ids": [
                     int(edge_id)
                     for edge_id in sample_batch.chosen_edge_ids[0, 0].tolist()
                 ],
-                "terminal_answer_entity_ids": [
+                "terminal_answer_set_entity_ids": [
                     int(entity_id)
-                    for entity_id in sample_batch.terminal_answer_entity_ids[0]
+                    for entity_id in sample_batch.terminal_answer_set_entity_ids[0]
                 ],
-                "admissible_commit_count": int(
-                    sample_batch.terminal_commit_candidate_counts[0, 0].item()
+                "terminal_answer_set_size": int(
+                    sample_batch.terminal_answer_candidate_counts[0, 0].item()
                 ),
-                "gold_admissible_commit_count": int(
+                "gold_answer_entities_in_state_count": int(
                     sample_batch.terminal_gold_answer_counts[0, 0].item()
                 ),
-                "gold_hit": bool(sample_batch.terminal_hit_mask[0, 0].item()),
+                "gold_answer_in_state": bool(
+                    sample_batch.terminal_hit_mask[0, 0].item()
+                ),
                 "anchor_component_count": int(
                     sample_batch.terminal_component_counts[0, 0].item()
                 ),
@@ -708,19 +717,19 @@ def main() -> None:
         if args.device is None
         else torch.device(args.device)
     )
-    selected = _select_sample(cfg, sample_id=args.sample_id)
+    selected_sample = _select_sample(cfg, sample_id=args.sample_id)
     model = _instantiate_model(cfg, ckpt_path=ckpt_path, device=device)
     batch = _build_single_graph_batch(
-        selected,
+        selected_sample,
         cfg,
         device=device,
         dataset_scope=str(cfg.dataset.dataset_scope),
     )
     model.eval()
-    _trace_teacher_path(model, batch, selected, top_k=int(args.top_k))
-    _run_teacher_force_summary(model, batch, selected)
-    _run_prediction_analysis(model, cfg, batch, top_k=int(args.top_k))
-    _trace_training_rollouts(
+    _trace_reference_trajectory(model, batch, selected_sample, top_k=int(args.top_k))
+    _run_reference_trajectory_forced_replay_summary(model, batch, selected_sample)
+    _run_posterior_surrogate_analysis(model, cfg, batch, top_k=int(args.top_k))
+    _run_training_rollout_diagnostics(
         model,
         batch,
         rollouts_per_graph=int(

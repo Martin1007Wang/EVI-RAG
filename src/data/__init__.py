@@ -9,13 +9,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
+    "GraphRetrievalDataModule",
+    "GraphRetrievalDataset",
     "PreprocessContext",
+    "create_graph_retrieval_dataset",
     "run_preprocess_pipeline",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
     from .preprocess.context import PreprocessContext
     from .preprocess.main import run_preprocess_pipeline
+    from .retrieval import (
+        GraphRetrievalDataModule,
+        GraphRetrievalDataset,
+        create_graph_retrieval_dataset,
+    )
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
@@ -27,6 +35,22 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from .preprocess.main import run_preprocess_pipeline
 
         return run_preprocess_pipeline
+    if name in {
+        "GraphRetrievalDataModule",
+        "GraphRetrievalDataset",
+        "create_graph_retrieval_dataset",
+    }:
+        from .retrieval import (
+            GraphRetrievalDataModule,
+            GraphRetrievalDataset,
+            create_graph_retrieval_dataset,
+        )
+
+        return {
+            "GraphRetrievalDataModule": GraphRetrievalDataModule,
+            "GraphRetrievalDataset": GraphRetrievalDataset,
+            "create_graph_retrieval_dataset": create_graph_retrieval_dataset,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

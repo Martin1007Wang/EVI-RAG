@@ -1,6 +1,6 @@
 # @package _global_
 
-# Entrypoint contract for `python src/train.py ...`
+# Entrypoint rules for `python src/train.py ...`
 # - `/run` must be a train-oriented run config (`run.name` cannot be `eval_*`).
 # - Current training flows in this repo require `/dataset`; the canonical CLI is
 #   `python src/train.py experiment=train_rankflow dataset=webqsp-sub`.

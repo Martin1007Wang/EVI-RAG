@@ -1,15 +1,10 @@
 # Canonical LLM post-hoc evaluation run.
-# Contract: use with `python src/eval.py ...`; `/dataset` is optional, but `/llm`
+# Use with `python src/eval.py ...`; `/dataset` is optional, but `/llm`
 # must be configured (typically via `experiment=eval_llm`).
 defaults:
   - default
   - _self_
 
-_target_: src.llm.runner.LlmEvalRunner
 name: eval_llm
 task_name: "eval/llm"
 tags: ["eval", "llm"]
-contract:
-  required_groups: [llm]
-  optional_groups: [dataset]
-  recommended_experiment: eval_llm

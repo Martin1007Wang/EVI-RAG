@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, Optional, Protocol, Tuple, cast
+from typing import Any, Dict, Optional, Tuple
 
 import hydra
-import lightning as L
 import rootutils
-import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -16,31 +14,31 @@ from src.metrics.search_eval_utils import (
     normalize_search_eval_cfg,
 )
 from src.runs.common import resolve_execution_mode
-from src.utils.entrypoint_utils import (
-    instantiate_lightning_task_objects,
-    instantiate_task_runner,
-    require_run_target_config,
+from src.runs.entrypoints import validate_eval_entrypoint
+from src.runs.hydra import extras
+from src.runs.llm import (
+    LLM_EVAL_RUN,
+    run_eval as run_llm_eval,
+    validate_eval_config as validate_llm_eval_config,
 )
-from src.utils.entrypoint_contracts import validate_eval_entry_contract
-from src.utils.hydra_utils import extras
+from src.runs.lightning import (
+    finalize_task,
+    instantiate_lightning_task_objects,
+    seed_everything_if_needed,
+    select_logged_metrics,
+)
+from src.runs.rankflow import (
+    RANKFLOW_EVAL_RUN,
+    run_eval as run_rankflow_eval,
+    validate_eval_config as validate_rankflow_eval_config,
+)
 from src.utils.logging_utils import RankedLogger
-from src.utils.precision_utils import normalize_precision
-from src.utils.task_utils import task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
 _ALLOW_CPU_EVAL_ENV = "DUAL_FLOW_ALLOW_CPU_EVAL"
 _ALLOW_CPU_EVAL_ON = "1"
 _ALLOW_CPU_EVAL_OFF = "0"
-
-
-EvaluateModelFn = Callable[[DictConfig], Tuple[Dict[str, Any], Dict[str, Any]]]
-
-
-class EvalRunnerProtocol(Protocol):
-    def validate(self, cfg: DictConfig) -> None: ...
-
-    def run(self, *, cfg: DictConfig, evaluate_model: EvaluateModelFn) -> None: ...
 
 
 def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
@@ -93,229 +91,91 @@ def _enforce_single_gpu_eval(trainer_cfg: DictConfig) -> None:
         )
 
 
-def _configure_eval_split(datamodule: Any, run_cfg: DictConfig) -> str:
-    split = str(run_cfg.get("split") or "test").strip() or "test"
-    setter = getattr(datamodule, "set_eval_split", None)
-    if callable(setter):
-        setter(split)
-    return split
-
-
 def _coerce_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
     return normalize_search_eval_cfg(eval_cfg)
 
 
-def _load_checkpoint_into_model_if_needed(model: Any, *, ckpt_path: str | None) -> None:
-    if ckpt_path in (None, ""):
-        return
-    resolved_ckpt = str(ckpt_path)
-    if getattr(model, "_rankflow_loaded_eval_ckpt_path", None) == resolved_ckpt:
-        return
-    checkpoint = torch.load(resolved_ckpt, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    if not isinstance(state_dict, dict):
-        raise TypeError(
-            "ckpt_path must point to a checkpoint containing a `state_dict`."
-        )
-    loader = getattr(model, "load_state_dict", None)
-    if not callable(loader):
-        raise TypeError("Existing evaluation model does not support `load_state_dict`.")
-    incompatible = loader(state_dict, strict=False)
-    missing = sorted(getattr(incompatible, "missing_keys", []))
-    unexpected = sorted(getattr(incompatible, "unexpected_keys", []))
-    log.info(
-        "Loaded evaluation checkpoint into existing model: %s (missing=%d, unexpected=%d)",
-        resolved_ckpt,
-        len(missing),
-        len(unexpected),
-    )
-    if missing:
-        log.warning("Missing keys when loading ckpt_path for eval: %s", missing)
-    if unexpected:
-        log.warning("Unexpected keys when loading ckpt_path for eval: %s", unexpected)
-    setattr(model, "_rankflow_loaded_eval_ckpt_path", resolved_ckpt)
-
-
-def _trainer_supports_inprocess_eval(trainer: Any) -> bool:
-    num_devices = getattr(trainer, "num_devices", None)
-    if num_devices is not None and int(num_devices) != 1:
-        return False
-    strategy = getattr(trainer, "strategy", None)
-    strategy_name = str(getattr(strategy, "strategy_name", "") or "").lower()
-    if any(tag in strategy_name for tag in ("ddp", "fsdp", "deepspeed")):
-        return False
-    root_device = getattr(strategy, "root_device", None)
-    if isinstance(root_device, torch.device):
-        device = cast(torch.device, root_device)
-        return device.type == "cuda"
-    return True
-
-
-def _enforce_inprocess_eval_precision(cfg: DictConfig, *, trainer: Any) -> None:
-    trainer_cfg = cfg.get("trainer")
-    if trainer_cfg is None:
-        return
-    requested_precision = normalize_precision(trainer_cfg.get("precision"))
-    active_precision = normalize_precision(getattr(trainer, "precision", None))
-    if (
-        requested_precision is None
-        or active_precision is None
-        or requested_precision == active_precision
-    ):
-        return
-    raise ValueError(
-        "In-process final eval precision mismatch: "
-        f"active trainer.precision={active_precision!r} requested eval precision={requested_precision!r}. "
-        "Use a fresh eval stack so Lightning can instantiate the requested precision plugin."
-    )
-
-
-def _select_evaluation_metrics(trainer: Any, *, execution_mode: str) -> dict[str, Any]:
-    callback_metrics = dict(getattr(trainer, "callback_metrics", {}) or {})
-    if execution_mode == "predict":
-        return {}
-    return {
-        key: value
-        for key, value in callback_metrics.items()
-        if str(key).startswith("test/")
-    }
-
-
-def evaluate_model_inprocess(
-    cfg: DictConfig,
-    *,
-    trainer: Any,
-    datamodule: Any,
-    model: Any,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    if not _trainer_supports_inprocess_eval(trainer):
-        raise ValueError(
-            "In-process final eval requires a single-device non-distributed trainer."
-        )
-    _enforce_inprocess_eval_precision(cfg, trainer=trainer)
-    run_cfg = cfg.get("run")
-    if run_cfg is None:
-        raise ValueError("Missing required config group: `run`.")
-    replace_dataset_cfg = getattr(datamodule, "replace_dataset_cfg", None)
-    if not callable(replace_dataset_cfg):
-        raise TypeError(
-            "Existing datamodule does not support `replace_dataset_cfg()` for in-process eval."
-        )
-    split = str(run_cfg.get("split") or "test").strip() or "test"
-    replace_dataset_cfg(cfg.dataset, eval_split=split)
-    _load_checkpoint_into_model_if_needed(model, ckpt_path=cfg.get("ckpt_path"))
-    reconfigure_evaluation = getattr(model, "reconfigure_evaluation", None)
-    if not callable(reconfigure_evaluation):
-        raise TypeError(
-            "Existing model does not support `reconfigure_evaluation()` for in-process eval."
-        )
-    eval_cfg = _coerce_eval_cfg(cfg.model.eval_cfg)
-    reconfigure_evaluation(eval_cfg=eval_cfg)
-    execution_mode = resolve_execution_mode(run_cfg)
-    log.info(
-        "Eval config: report_profile=%s answer_posterior_surrogate=%s",
-        eval_cfg.get("report_profile"),
-        format_search_eval_answer_posterior(eval_cfg),
-    )
-    if execution_mode == "test":
-        log.info("Running in-process trainer.test() on split=%s...", split)
-        trainer.test(
-            model=model,
-            datamodule=datamodule,
-            ckpt_path=None,
-            verbose=False,
-        )
-    else:
-        log.info("Running in-process trainer.predict() on split=%s...", split)
-        trainer.predict(
-            model=model,
-            datamodule=datamodule,
-            ckpt_path=None,
-            return_predictions=False,
-        )
-    return _select_evaluation_metrics(trainer, execution_mode=execution_mode), {
-        "cfg": cfg,
-        "datamodule": datamodule,
-        "model": model,
-        "trainer": trainer,
-    }
-
-
-@task_wrapper
 def evaluate_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    if cfg.get("seed") is not None:
-        L.seed_everything(int(cfg.seed), workers=True)
+    try:
+        seed_everything_if_needed(cfg)
 
-    run_cfg = cfg.get("run")
-    if run_cfg is None:
-        raise ValueError(
-            "Missing required config group: `run`. Example: "
-            "`python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt`."
+        run_cfg = cfg.get("run")
+        if run_cfg is None:
+            raise ValueError(
+                "Missing required config group: `run`. Example: "
+                "`python src/eval.py experiment=eval_rankflow ckpt.gflownet=/path/to/model.ckpt`."
+            )
+        log.info("Run: %s", run_cfg.get("name"))
+
+        _enforce_single_gpu_eval(cfg.trainer)
+
+        objects = instantiate_lightning_task_objects(cfg, log=log)
+        datamodule = objects.datamodule
+        model = objects.model
+        trainer = objects.trainer
+        object_dict = objects.as_dict()
+
+        execution_mode = resolve_execution_mode(run_cfg)
+        split = str(run_cfg.get("split") or "test").strip() or "test"
+        ckpt_path = cfg.get("ckpt_path")
+        eval_cfg = _coerce_eval_cfg(cfg.model.eval_cfg)
+        log.info(
+            "Eval config: report_profile=%s answer_posterior_surrogate=%s",
+            eval_cfg.get("report_profile"),
+            format_search_eval_answer_posterior(eval_cfg),
         )
-    log.info("Run: %s", run_cfg.get("name"))
+        if execution_mode == "test":
+            log.info("Running trainer.test() on split=%s...", split)
+            trainer.test(
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+                verbose=False,
+            )
+        else:
+            log.info("Running trainer.predict() on split=%s...", split)
+            trainer.predict(
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+                return_predictions=False,
+            )
 
-    _enforce_single_gpu_eval(cfg.trainer)
-
-    objects = instantiate_lightning_task_objects(cfg, log=log)
-    datamodule = objects.datamodule
-    model = objects.model
-    trainer = objects.trainer
-    object_dict = objects.as_dict()
-
-    execution_mode = resolve_execution_mode(run_cfg)
-    split = _configure_eval_split(datamodule, run_cfg)
-    ckpt_path = cfg.get("ckpt_path")
-    eval_cfg = _coerce_eval_cfg(cfg.model.eval_cfg)
-    log.info(
-        "Eval config: report_profile=%s answer_posterior_surrogate=%s",
-        eval_cfg.get("report_profile"),
-        format_search_eval_answer_posterior(eval_cfg),
-    )
-    if execution_mode == "test":
-        log.info("Running trainer.test() on split=%s...", split)
-        trainer.test(
-            model=model,
-            datamodule=datamodule,
-            ckpt_path=ckpt_path,
-            verbose=False,
+        metrics = (
+            {}
+            if execution_mode == "predict"
+            else select_logged_metrics(trainer, prefix="test/")
         )
-    else:
-        log.info("Running trainer.predict() on split=%s...", split)
-        trainer.predict(
-            model=model,
-            datamodule=datamodule,
-            ckpt_path=ckpt_path,
-            return_predictions=False,
-        )
-
-    return _select_evaluation_metrics(
-        trainer, execution_mode=execution_mode
-    ), object_dict
+        return metrics, object_dict
+    except Exception:
+        log.exception("")
+        raise
+    finally:
+        finalize_task(cfg=cfg, log=log)
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="eval.yaml")
 def main(cfg: DictConfig) -> None:
-    require_run_target_config(
-        cfg,
-        missing_run_message=(
+    run_cfg = cfg.get("run")
+    if run_cfg is None:
+        raise ValueError(
             "Missing required config group: `run`. "
             "Fix: pass `run=<group>` or use an eval experiment that overrides `/run`."
-        ),
-        missing_target_message=(
-            "Missing required run target: `run._target_`. "
-            "Fix: use a concrete run config such as `run=rankflow` or `run=eval_llm`."
-        ),
-    )
-    validate_eval_entry_contract(cfg)
+        )
+    validate_eval_entrypoint(cfg)
     extras(cfg)
-    runner = cast(
-        EvalRunnerProtocol,
-        instantiate_task_runner(
-            cfg.run, run_signature="run(cfg=..., evaluate_model=...)"
-        ),
+    run_name = str(run_cfg.get("name") or "").strip()
+    if run_name == RANKFLOW_EVAL_RUN:
+        validate_rankflow_eval_config(cfg)
+        run_rankflow_eval(cfg, evaluate_model=evaluate_model)
+        return
+    if run_name == LLM_EVAL_RUN:
+        validate_llm_eval_config(cfg)
+        run_llm_eval(cfg)
+        return
+    raise ValueError(
+        f"Unsupported eval run.name={run_name!r}. Supported runs: {RANKFLOW_EVAL_RUN}, {LLM_EVAL_RUN}."
     )
-    runner.validate(cfg)
-    runner.run(cfg=cfg, evaluate_model=evaluate_model)
 
 
 if __name__ == "__main__":

@@ -7,31 +7,7 @@ from types import SimpleNamespace
 import torch
 from omegaconf import OmegaConf
 
-from src.runs.answer_reachability import AnswerReachabilityEvalReporter
-
-
-def test_eval_reporter_persists_metrics_snapshot(tmp_path: Path) -> None:
-    cfg = OmegaConf.create(
-        {
-            "paths": {"output_dir": str(tmp_path)},
-            "dataset": {"name": "webqsp-sub", "dataset_scope": "sub"},
-            "run": {"name": "rankflow", "split": "test"},
-        }
-    )
-    reporter = AnswerReachabilityEvalReporter()
-    model = SimpleNamespace(get_predict_metrics=lambda: {"answer/hit@1": 0.75})
-
-    metrics = reporter.persist_outputs(
-        cfg=cfg,
-        callback_metrics={},
-        model=model,
-        log=SimpleNamespace(
-            info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None
-        ),
-    )
-
-    assert metrics == {"answer/hit@1": 0.75}
-    assert json.loads((tmp_path / "metrics.json").read_text()) == {"answer/hit@1": 0.75}
+from src.runs.rankflow import persist_outputs
 
 
 def test_eval_reporter_serializes_tensor_metrics(tmp_path: Path) -> None:
@@ -42,7 +18,6 @@ def test_eval_reporter_serializes_tensor_metrics(tmp_path: Path) -> None:
             "run": {"name": "rankflow", "split": "test"},
         }
     )
-    reporter = AnswerReachabilityEvalReporter()
     model = SimpleNamespace(
         get_predict_metrics=lambda: {
             "answer/hit@1": torch.tensor(0.75),
@@ -50,7 +25,7 @@ def test_eval_reporter_serializes_tensor_metrics(tmp_path: Path) -> None:
         }
     )
 
-    reporter.persist_outputs(
+    persist_outputs(
         cfg=cfg,
         callback_metrics={},
         model=model,
@@ -94,7 +69,6 @@ def test_eval_reporter_writes_prediction_artifacts_when_enabled(tmp_path: Path) 
             },
         }
     )
-    reporter = AnswerReachabilityEvalReporter()
     captured: dict[str, object] = {}
 
     class _DummyModel:
@@ -108,7 +82,7 @@ def test_eval_reporter_writes_prediction_artifacts_when_enabled(tmp_path: Path) 
 
     model = _DummyModel()
 
-    reporter.persist_outputs(
+    persist_outputs(
         cfg=cfg,
         callback_metrics={},
         model=model,

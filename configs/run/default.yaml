@@ -1,13 +1,8 @@
 # Abstract eval run base.
 # Use a concrete run such as `run=rankflow` or `run=eval_llm`.
-_target_: null
 name: null
 task_name: "eval"
 tags: []
-contract:
-  entrypoint: eval
-  required_groups: []
-  supports_dataset_variants: false
 split: test
 run_all_splits: false
 splits: [train, validation, test]

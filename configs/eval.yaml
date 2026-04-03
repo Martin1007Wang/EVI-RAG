@@ -1,4 +1,4 @@
-# Entrypoint contract for `python src/eval.py ...`
+# Entrypoint rules for `python src/eval.py ...`
 # - `/run` must be an eval-oriented run config (`run.name` cannot be `train_*`).
 # - Dataset requirements are run-specific:
 #   - `run=rankflow` requires `/dataset` and a checkpoint.

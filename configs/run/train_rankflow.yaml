@@ -1,5 +1,5 @@
 # Canonical RankFlow training run.
-# Contract: use with `python src/train.py ...`; requires a `-sub` dataset and is
+# Use with `python src/train.py ...`; requires a `-sub` dataset and is
 # usually selected via `experiment=train_rankflow dataset=webqsp-sub`.
 defaults:
   - train_default
@@ -7,8 +7,8 @@ defaults:
 
 name: train_rankflow
 task_name: "train/rankflow"
-tags: ["rankflow", "gflownet", "answer-commit"]
+tags: ["rankflow", "gflownet", "detailed-balance"]
 test: true
-final_eval_experiment: rankflow
+final_eval_experiment: eval_rankflow
 final_eval_split: test
 final_eval_output_subdir: final_eval

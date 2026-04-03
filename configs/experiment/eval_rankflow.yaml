@@ -1,0 +1,13 @@
+# @package _global_
+#
+# Explicit RankFlow test/eval bundle for checkpoint evaluation.
+# Usage:
+#   python src/eval.py experiment=eval_rankflow ckpt.gflownet=/path/to/model.ckpt
+#
+# Notes:
+# - canonical user-facing eval bundle for the current model
+# - train-time `run.final_eval_experiment` should point here
+
+defaults:
+  - rankflow
+  - _self_

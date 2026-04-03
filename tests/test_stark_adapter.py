@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from hydra import compose, initialize_config_dir
 import json
 import pytest
 import torch
@@ -233,21 +232,6 @@ def test_stark_sample_cache_rebuilds_when_config_changes(
     assert len(vllm_calls) == 1
     assert payload["cache_signature"] != initial_signature
     assert payload["question_entities"] == list(vllm_samples[0].question_entities)
-
-
-def test_build_retrieval_pipeline_prime_resolves_stark_source() -> None:
-    config_dir = Path(__file__).resolve().parents[1] / "configs"
-
-    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
-        cfg = compose(
-            config_name="build_retrieval_pipeline.yaml",
-            overrides=["dataset=prime"],
-        )
-
-    assert cfg.dataset_source == "stark"
-    assert cfg.stark.dataset == "prime"
-    assert cfg.stark.linker.backend == "vllm"
-    assert cfg.stark.local_graph.include_inverse_edges is True
 
 
 def test_load_cached_sample_rejects_legacy_entity_fields(tmp_path: Path) -> None:

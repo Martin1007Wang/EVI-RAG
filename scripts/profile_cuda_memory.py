@@ -17,14 +17,14 @@ from omegaconf import DictConfig
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from src.runs.common import compose_config  # noqa: E402
-from src.utils.cuda_memory import (  # noqa: E402
+from src.subgraph_gflownet.core.cuda_memory import (  # noqa: E402
     format_cuda_bytes,
     get_cuda_memory_records,
     profile_cuda_memory,
     reset_cuda_memory_records,
 )
-from src.utils.entrypoint_utils import _strip_instantiate_metadata  # noqa: E402
+from src.runs.hydra import compose_config  # noqa: E402
+from src.runs.lightning import resolve_instantiate_config  # noqa: E402
 from src.utils.precision_utils import normalize_precision  # noqa: E402
 
 
@@ -95,8 +95,8 @@ def _compose_train_cfg(overrides: list[str]) -> DictConfig:
 
 
 def _instantiate_objects(cfg: DictConfig) -> tuple[Any, Any]:
-    data_cfg = _strip_instantiate_metadata(cfg.data)
-    model_cfg = _strip_instantiate_metadata(cfg.model)
+    data_cfg = resolve_instantiate_config(cfg.data)
+    model_cfg = resolve_instantiate_config(cfg.model)
     datamodule = hydra.utils.instantiate(data_cfg)
     model = hydra.utils.instantiate(model_cfg)
     return datamodule, model

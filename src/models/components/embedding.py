@@ -10,8 +10,13 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from src.utils.nn_init import init_linear_xavier
-from src.utils.precision_utils import align_float_input_dtype
+from .dtypes import align_float_input_dtype
+
+
+def _init_linear_xavier(layer: nn.Linear) -> None:
+    nn.init.xavier_uniform_(layer.weight)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,7 @@ def _build_mlp(
     mlp = nn.Sequential(*layers)
     for module in mlp:
         if isinstance(module, nn.Linear):
-            init_linear_xavier(module)
+            _init_linear_xavier(module)
     return mlp
 
 
@@ -127,10 +132,10 @@ class _GraphPropagationLayer(nn.Module):
         )
         self.dropout = nn.Dropout(float(dropout))
         self.question_proj = None
-        init_linear_xavier(self.relation_gate)
+        _init_linear_xavier(self.relation_gate)
         if self.use_question_conditioning:
             self.question_proj = nn.Linear(self.hidden_dim, 1)
-            init_linear_xavier(self.question_proj)
+            _init_linear_xavier(self.question_proj)
 
     @staticmethod
     def _build_sparse_adjacency(
@@ -242,7 +247,7 @@ class EmbeddingAdapter(nn.Module):
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
 
-        init_linear_xavier(self.down)
+        _init_linear_xavier(self.down)
         # 向上投影初始化为 0，确保训练初期表现等价于恒等映射 (Identity)
         nn.init.zeros_(self.up.weight)
         if self.up.bias is not None:
@@ -318,9 +323,9 @@ class EmbeddingBackbone(nn.Module):
         self.node_proj = nn.Linear(self.emb_dim, self.hidden_dim)
         self.rel_proj = nn.Linear(self.emb_dim, self.hidden_dim)
         self.q_proj = nn.Linear(self.emb_dim, self.hidden_dim)
-        init_linear_xavier(self.node_proj)
-        init_linear_xavier(self.rel_proj)
-        init_linear_xavier(self.q_proj)
+        _init_linear_xavier(self.node_proj)
+        _init_linear_xavier(self.rel_proj)
+        _init_linear_xavier(self.q_proj)
         self.graph_layers = nn.ModuleList(
             _GraphPropagationLayer(
                 hidden_dim=self.hidden_dim,

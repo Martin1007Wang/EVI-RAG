@@ -4,10 +4,12 @@
 root_dir: ${oc.env:PROJECT_ROOT,${oc.env:PWD}}
 
 # path to data directory (absolute to avoid ambiguity)
-data_dir: ${oc.env:EVI_RAG_DATA_DIR,${paths.root_dir}/data}
+# data_dir: ${oc.env:EVI_RAG_DATA_DIR,${paths.root_dir}/data}
+data_dir: /mnt/data/retrieval
 
 # huggingface cache root (datasets expects ${paths.hf_home}/datasets)
-hf_home: ${oc.env:HF_HOME,${paths.root_dir}/.cache/huggingface}
+# hf_home: ${oc.env:HF_HOME,${paths.root_dir}/.cache/huggingface}
+hf_home: /mnt/data/huggingface
 hf_datasets_cache: ${paths.hf_home}/datasets
 
 # path to logging directory

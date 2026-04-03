@@ -5,6 +5,10 @@ rollouts: 4096
 batch_rollouts: 256
 temperature: 1.0
 confidence: 0.95
+answer_aggregation:
+  # `vote` uses a count-based posterior surrogate; weighted backends can
+  # emphasize higher-reward or higher-probability terminal witnesses.
+  backend: vote
 early_stop:
   enabled: true
   min_rollouts: 512

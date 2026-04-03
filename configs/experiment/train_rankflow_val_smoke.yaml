@@ -1,7 +1,7 @@
 # @package _global_
 #
 # Validation-on-validation smoke bundle for checking stability on the current
-# answer-committed RankFlow stack with bounded train-time action scoring.
+# paper-aligned RankFlow stack with bounded train-time action scoring.
 
 defaults:
   - train_rankflow_fastiter

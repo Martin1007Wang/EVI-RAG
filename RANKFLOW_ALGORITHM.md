@@ -1,385 +1,517 @@
-# RankFlow 方法节草稿：Answer-Committed Witness GFlowNet for KGQA
+# RankFlow 方法节草稿：Detailed-Balance Witness GFlowNet with Terminal Answer Sets for KGQA
 
-本文档按论文方法节的写法重构，用于给当前主线提供更严谨的理论叙述。核心目标有两点：
+本文档按当前主线代码重写，目标是给论文方法节提供一份与实现一致的算法说明。它严格对应现在的主线：
 
-1. 说明当前算法为什么是一个合法且自洽的 GFlowNet 实例；
-2. 主动收紧 claim，避免把 reward-induced posterior 误写成真实后验。
+1. 终止对象是 witness 子图状态本身，而不是“状态-答案”联合终止对象；
+2. 训练目标是单步 Detailed Balance；
+3. `terminal answer set` 是终止状态导出的可答实体集合，用于评估、监控和动作建模，但不是一个单独的 stop 子动作标签。
 
-文中的公式均保持 LaTeX 友好，可直接整理进论文正文。
+文中的公式保持 LaTeX 友好，可直接整理进论文正文。
 
 
 ## 1. 方法总述
 
-我们将多锚点知识图谱问答（multi-anchor KGQA）建模为一个带潜在证据结构的答案后验近似问题。给定问题 `q`、局部候选图 `G`、锚点集合 `A` 与金答案集合 `Y^*`，模型并不直接输出一个静态答案分数，而是通过一个条件 GFlowNet 逐步构造潜在 witness 子图，并在终止时显式提交（commit）到一个答案实体。
+我们将多锚点知识图谱问答（multi-anchor KGQA）建模为一个条件 GFlowNet 上的证据子图构造问题。给定问题 `q`、局部候选图 `G`、锚点集合 `A` 与金答案集合 `Y^*`，模型从锚点出发逐步扩展一张 witness 子图，并在某一步执行唯一的 `stop` 动作终止 rollout。
 
-与标准 graph-object GFlowNet 的关键区别在于，终止对象不再是无标签图结构 `z`，而是联合对象 `(z, y)`，其中 `z` 为 witness 子图，`y` 为 stop 时提交的答案实体。因此，我们学习的不是单纯的 `P(z | q)`，而是一个终止联合分布：
+与旧版叙述不同，当前主线并不在 stop 时再额外“选择一个答案实体”。相反，终止后的 witness 状态 `S_T` 会导出一个 `terminal answer set`：
 
 $$
-P_T(z, y \mid q, G, A) \propto R(z, y \mid q, G, A).
+\mathcal Y_{adm}(S_T),
 $$
 
-这样设计的动机是：KGQA 的监督与评测都落在答案实体上，而不是落在子图本身上。answer commitment 使终止流分配直接对齐于答案决策，同时保留 GFlowNet 对多模态 witness 的探索优势。
+它表示在当前结构约束下、从所有锚点都可达的实体集合。这个集合随后用于：
+
+- 训练日志中的 answer-side 诊断；
+- actor 对 stop readiness / edge usefulness 的建模；
+- Monte Carlo 评估时对答案后验 surrogate 的聚合。
+
+因此，当前方法学习的是一个对高质量终止 witness 状态赋流的策略，而答案分布是由终止状态诱导出来的边缘统计量，而不是 stop 动作里显式分类出的标签。
 
 
-## 2. 问题定义
+## 2. 问题设定
 
-对于每个样本，我们假设已知：
+对每个样本，已知：
 
 - 一个问题 `q`；
 - 一个局部候选知识图 `G = (V, E)`；
 - 一个已接地的锚点集合
-  $$
-  A = \{a_1, a_2, \dots, a_k\};
-  $$
-- 一个金答案集合
-  $$
-  Y^* \subseteq V.
-  $$
 
-我们的建模目标是学习一个答案分布近似：
+$$
+A = \{a_1, a_2, \dots, a_k\};
+$$
+
+- 一个金答案实体集合
+
+$$
+Y^* \subseteq V.
+$$
+
+我们的直接建模对象不是静态答案分数，而是条件于 `(q, G, A)` 的 witness 构造过程。模型输出的最终可观测量包括：
+
+- 终止 witness 子图 `S_T`；
+- 由该状态导出的 `terminal answer set`
+
+$$
+\mathcal Y_{adm}(S_T) \subseteq V;
+$$
+
+- 一个由终止 reward 与 Monte Carlo rollout 共同诱导的答案 posterior surrogate。
+
+因此，文中的答案分布应解释为：
 
 $$
 Q_R(y \mid q, G, A),
 $$
 
-其中下标 `R` 强调该分布由终止奖励所诱导，而不是天然等于真实 Bayesian posterior。更具体地，若 `z` 表示潜在 witness 子图，则：
+其中下标 `R` 强调它是 reward-induced / rollout-induced surrogate，而不宣称等于真实 Bayesian posterior。
+
+
+## 3. 状态：语义子图的轻量句柄表示
+
+### 3.1 动态状态
+
+当前实现将 rollout 的动态状态记为已选边集合：
 
 $$
-Q_R(y \mid q, G, A)
-= \sum_{z \in \mathcal Z(q, G, A)} P_T(z, y \mid q, G, A)
-\propto \sum_{z \in \mathcal Z(q, G, A)} R(z, y \mid q, G, A).
+S_t = E_t^{sel} \subseteq E.
 $$
 
-因此，本文中的答案分布应解释为 **reward-calibrated posterior surrogate**，而不是“恢复真实答案后验”的严格统计陈述。
+代码中，`SubgraphState` 只存储 `edge_ids`。这只是实现层面的轻量句柄，不是语义上的降级定义。
 
+### 3.2 语义状态的恢复
 
-## 3. 为什么不能只做终止子图生成
-
-若直接采用 graph-object GFlowNet，把终止对象定义为 witness 子图 `z`，再在推理时从 `z` 后处理得到答案，则会遇到两个问题：
-
-1. 同一终止子图可能同时支持多个 answer-ready 实体；
-2. 同一答案往往对应大量近似等价的 witness 变体。
-
-这会把“证据多样性”与“答案概率”混在一起。特别地，若直接做后处理投票，则一个答案可能仅仅因为支持它的 witness 变体更多而获得更大质量。为此，我们引入显式 answer commitment，把原本失控的 post-hoc 映射问题，转化成对联合终止对象 `(z, y)` 的显式边缘化。
-
-需要强调的是，这种设计**缓解了** witness multiplicity 问题，但并未从理论上彻底消除它。答案边缘仍然满足：
-
-$$
-Q_R(y \mid q, G, A) \propto \sum_z R(z, y \mid q, G, A),
-$$
-
-因此若某个答案对应特别多高分 witness，它仍可能得到更大的边缘质量。本文的贡献不在于“完全解耦 witness diversity and answer probability”，而在于把这一问题从无控制的后处理误差，转化为显式、可分析、可设计的 reward-induced marginalization。
-
-
-## 4. 状态：潜在 witness 的轻量表示
-
-### 4.1 动态状态
-
-我们将 rollout 的动态状态定义为已选择边集合：
-
-$$
-S_t = E_t^{\mathrm{sel}} \subseteq E.
-$$
-
-这意味着实现层面只保存 `edge_ids`，而不显式保存完整子图对象。这样做并不是在削弱状态语义，而是在利用知识图谱上下文的静态性来节省内存。
-
-### 4.2 从轻量句柄恢复语义 witness
-
-虽然动态状态只存储边集合，但完整 witness 可由以下三部分恢复：
+给定静态图上下文 `(G, A)` 和动态 `edge_ids`，完整 witness 语义可由以下节点恢复：
 
 - 所有 anchor 节点；
 - 所有被选边的源节点；
 - 所有被选边的目标节点。
 
-因此，算法层面的 Markov state 仍然是一个语义 witness，只是采用“静态图上下文 + 动态边句柄”的分解来实现。该实现同时支持实体级 reachability、连通分量分析以及终止奖励计算。
+于是，算法层面的 Markov state 仍然是一张语义证据子图，只是在实现上被分解为：
+
+- 静态上下文：`SubgraphBatch` / `GraphSubgraphContext`；
+- 动态句柄：`SubgraphState.edge_ids`。
+
+这种分解允许我们在不复制整张图的前提下，持续恢复：
+
+- 状态节点集合；
+- anchor reachability；
+- 连通分量；
+- 可答实体集合；
+- 终止奖励相关统计量。
 
 
-## 5. 多锚点可达性与 admissible commit set
+## 4. Reachability 与 Terminal Answer Set
 
-### 5.1 多锚点 bitmask 传播
+### 4.1 多锚点 bitmask 传播
 
-为了判断当前状态是否支持某个候选答案，我们对每个 anchor 分配一个 bit：
+为了判断一个实体是否同时由所有锚点支持，我们给第 `i` 个锚点分配一个 bit：
 
 $$
 b(a_i) = 2^{i-1}.
 $$
 
-bitmask 沿当前 witness 中的有向边传播；若多个选中节点映射到同一实体，则在实体层面做按位或聚合。定义完整 anchor mask 为：
+这些 bit 沿当前 witness 中的有向边传播；若多个状态节点映射到同一实体，则在实体层面做按位或聚合。记完整 anchor mask 为：
 
 $$
 M = 2^k - 1.
 $$
 
-对任意实体 `y`，若其实体级聚合 bitmask 满足
+若某实体 `y` 的实体级 reachability bit 满足
 
 $$
 b_{entity}(y) = M,
 $$
 
-则说明该实体已经从所有锚点吸收到了信息。
+则说明该实体已经在当前 witness 中吸收了所有锚点的信息。
 
-### 5.2 `admissible commit set` 而不是真值答案集合
+### 4.2 Terminal Answer Set
 
-基于上述条件，我们定义状态 `S` 的可提交答案集合：
+基于上述条件，我们定义终止状态 `S` 的可答实体集合：
 
 $$
 \mathcal Y_{adm}(S) = \{y : b_{entity}(y) = M\}.
 $$
 
-这里我们故意使用 `adm`（admissible）而不是直接称它为“正确答案集合”。原因在于，这个集合是一个**结构上可提交的候选集合**，而不是语义上绝对正确的答案真值。它依赖于当前图、方向约束、entity-level merge 以及 witness 的结构近似。因此，`\mathcal Y_{adm}(S)` 是一个 task-specific approximation，是算法主动引入的归纳偏置，而不是语义 oracle。
+这里的 `adm` 表示 `admissible`，强调这是一种结构上可答的候选集合，而不是真值 oracle。它依赖于：
 
-这一点在论文中必须写清楚：模型在 stop 时选择的是 admissible answer sink，而不是保证语义无歧义的真值答案。
+- 当前 witness 的有向结构；
+- 多锚点 reachability 传播；
+- 实体级 merge；
+- 局部候选图本身的质量。
+
+因此，`terminal answer set` 是算法诱导出来的结构性可答集合，不应被误写为“模型在 stop 时选择出的最终答案标签”。
+
+### 4.3 与 Gold 命中的区别
+
+当前主线同时区分三个互相关联但不等价的量：
+
+1. `terminal answer set`：`\mathcal Y_{adm}(S)`；
+2. `gold answer in graph`：终止状态节点中是否已经包含金答案实体；
+3. `frontier hit`：当前状态尚未包含金答案，但 frontier 上一步可达金答案。
+
+这三者的区别很重要：一个状态可以已经包含金答案实体，但仍未形成完整的 `terminal answer set`；也可以尚未命中金答案，但 frontier 已经暴露出正确扩展方向。
 
 
-## 6. 动作空间与 stop 归一化
+## 5. 动作空间：`node -> relation -> edge -> stop`
 
-### 6.1 继续扩展分支
+### 5.1 继续扩展分支
 
-若模型选择继续扩展，则动作被严格分解为三步：
+若模型选择继续扩展，则动作被严格分解为三层：
 
 1. 选择当前 witness 中的源节点 `v`；
 2. 选择该节点上的关系类型 `r`；
 3. 选择一条具体边 `e = (v, r, u)`。
 
-因此，continue 分支的前向策略可以写为：
+因此 continue 分支的前向策略分解为：
 
 $$
-P_F(e \mid S, q, \mathrm{continue})
+P_F(e \mid S, q, \text{continue})
 = P_F(v \mid S, q)
   P_F(r \mid S, q, v)
   P_F(e \mid S, q, v, r).
 $$
 
-### 6.2 终止提交分支
+这部分仍然是当前系统的主干，并由 `action_surface.py` 与 `actor.py` 共同实现。
 
-若模型选择 stop，则 stop 并不是单一动作，而是在如下集合上归一化：
+### 5.2 唯一的 Stop 动作
 
-- 一个 failure sink `\bot`；
-- 对每个 `y \in \mathcal Y_{adm}(S)` 分配一个 answer-commit sink。
-
-于是，stop 分支实际建模的是：
+当前主线的 stop 分支不再枚举多个答案 sink。它只有一个 stop 动作：
 
 $$
-P_F(y \mid S, q, \mathrm{stop}),
-\qquad y \in \{\bot\} \cup \mathcal Y_{adm}(S).
+a = \text{stop}.
 $$
 
-### 6.3 完整前向策略分解
-
-因此，完整前向策略可写为：
+因此完整前向策略可写为：
 
 $$
 P_F(a \mid S, q) =
 \begin{cases}
-P_F(g=\mathrm{stop} \mid S, q)
-P_F(y \mid S, q, g=\mathrm{stop}),
-& a = \mathrm{commit}(y), \\
-P_F(g=\mathrm{continue} \mid S, q)
+P_F(g = \text{stop} \mid S, q), & a = \text{stop}, \\
+P_F(g = \text{continue} \mid S, q)
 P_F(v \mid S, q)
 P_F(r \mid S, q, v)
-P_F(e \mid S, q, v, r),
-& a = \mathrm{add}(e).
+P_F(e \mid S, q, v, r), & a = \text{add}(e).
 \end{cases}
 $$
 
-这一定义说明：stop mass 与 continue mass 处于同一个决策体系中，而 failure sink 与 admissible answer sink 又在 stop 分支内部共享同一个 masked softmax 归一化。这样可以避免“两阶段不一致分类器”式的理论歧义。
+换句话说，当前系统把“何时终止”作为一个策略决策，但不把“终止后选哪个答案”建模成额外动作。
+
+### 5.3 Answer-Set Statistics 在动作中的作用
+
+虽然 stop 不是 answer-specific 分类，`terminal answer set` 仍然会进入动作建模：
+
+- `current_answer_candidate_count` 用于 stop readiness 特征；
+- 每条候选边还会估计一步扩展后是否可能形成 answer-ready entity，用于 edge scoring；
+- 可选的 question-similarity pruning / oracle-distance 先验也可参与候选排序。
+
+因此，答案语义并没有被移除，而是从“stop 分类标签”改成了“状态与动作价值的结构性信号”。
 
 
-## 7. Backward policy：多轨迹到同对象时的闭环定义
+## 6. 状态转移与 Backward Policy
 
-由于同一个 `(z, y)` 可能由不同加边顺序到达，必须明确 backward policy，否则轨迹概率分配不闭环。当前主线采用固定 backward policy：
+### 6.1 Forward Transition
 
-- 仅允许删除 **forward-valid removable edges**；
-- 在所有这类可删边上采用均匀分布。
+- 若执行 `add_edge(e)`，则新状态为
 
-记当前状态 `S` 上所有 forward-valid removable edges 的集合为 `\mathcal R(S)`，则：
+$$
+S' = S \cup \{e\};
+$$
+
+- 若执行 `stop`，则 rollout 在当前状态终止。
+
+代码中的 `SubgraphAction` 也只保留这两类动作：`add_edge` 与 `stop`。
+
+### 6.2 Backward Policy
+
+由于同一终止状态可能由不同加边顺序到达，必须明确 backward policy 才能定义闭环 Detailed Balance。当前主线采用固定 backward policy：
+
+- 只允许删除 `forward-valid removable edges`；
+- 在这些可删边上使用均匀分布。
+
+记状态 `S` 上所有 forward-valid removable edges 的集合为 `\mathcal R(S)`，则：
 
 $$
 P_B(S \setminus \{e\} \mid S)
-= \frac{1}{|\mathcal R(S)|},
-\qquad e \in \mathcal R(S).
+= \frac{1}{|\mathcal R(S)|}, \qquad e \in \mathcal R(S).
 $$
 
-这一定义与当前代码实现一致，也保证了在多种边添加顺序通向同一 committed witness 时，trajectory semantics 是明确的。
+这一定义保证：
+
+- backward 边只在语义合法的父状态上定义；
+- 多条构造顺序通向同一 witness 时，Detailed Balance 仍有明确参照分布。
 
 
-## 8. 终止奖励
+## 7. 终止奖励：定义在状态 `S_T` 上，而不是 `(S_T, y)` 上
 
-### 8.1 奖励定义在 `(S_T, y)` 上
+这是当前主线与早期原型叙述的最大区别之一。
 
-终止奖励不是定义在单独 witness 上，而是定义在 witness 与 committed answer 的联合对象上：
+### 7.1 Reward 目标
 
-$$
-R(S_T, y).
-$$
-
-这意味着：当前方法不是在回答“哪个 witness 更好”，而是在回答“哪个 witness 支持哪个答案更值得被终止流赋质量”。
-
-### 8.2 答案效用项
-
-若 `y` 为金答案，给予正奖励；若 `y` 为 admissible 但非金答案，则给予 wrong-answer penalty；若选择 failure sink，则给予 failure penalty。记答案效用项为：
+当前终止奖励是一个纯状态函数：
 
 $$
-U(y, Y^*) =
+R(S_T).
+$$
+
+它不再依赖某个被显式选中的答案实体 `y`。终止后的 answer set 会被记录下来，但不是 reward 的索引参数。
+
+### 7.2 Utility 项
+
+设：
+
+- `hit(S)`：当前终止状态是否已经包含至少一个金答案实体；
+- `frontier(S)`：当前尚未命中金答案，但 frontier 是否一步可达金答案；
+- `cov(S)`：anchor coverage ratio。
+
+则当前代码中的 utility 部分为：
+
+$$
+U(S)
+= \alpha_{hit} \cdot \mathbf 1[hit(S)]
++ \alpha_{frontier} \cdot \mathbf 1[frontier(S) \land \neg hit(S)]
++ \alpha_{cov} \cdot cov(S).
+$$
+
+默认超参数对应：
+
+- `hit_bonus = 5.0`
+- `frontier_bonus = 1.0`
+- `coverage_bonus = 0.2`
+
+### 7.3 结构惩罚
+
+当前主线使用两个结构惩罚项：
+
+$$
+\Psi(S)
+= \beta_{size} |E(S)|
++ \beta_{comp} (K(S) - 1)_+,
+$$
+
+其中：
+
+- `|E(S)|` 是已选边数；
+- `K(S)` 是 anchor 相关连通分量数。
+
+默认超参数对应：
+
+- `size_penalty = 0.1`
+- `component_penalty = 0.5`
+
+### 7.4 最终对数奖励
+
+因此，当前终止对数奖励为：
+
+$$
+\log R(S_T) = U(S_T) - \Psi(S_T).
+$$
+
+### 7.5 冗余边数的角色
+
+代码中仍会计算 `redundancy_edges`，但它当前是诊断量，不直接进入 reward。换句话说：
+
+- `redundancy_edges` 会被记录；
+- 但旧版那种单独的 redundancy penalty 已不在主线 reward 中。
+
+
+## 8. 单步 Detailed Balance 训练目标
+
+### 8.1 非终止动作
+
+对一条非终止扩展动作 `a_t`，当前主线约束：
+
+$$
+F_\theta(S_t)
++ \log P_F(a_t \mid S_t)
+\approx
+F_\theta(S_{t+1})
++ \log P_B(S_t \mid S_{t+1}).
+$$
+
+### 8.2 终止动作
+
+对 stop 动作，Detailed Balance 约束变为：
+
+$$
+F_\theta(S_t)
++ \log P_F(\text{stop} \mid S_t)
+\approx
+\log R(S_t).
+$$
+
+这正是当前 `losses.py` 中 terminal residual 的实现逻辑。
+
+### 8.3 损失形式
+
+设每个有效 action step 上的 DB residual 为 `\delta_t`，则当前主线损失就是对所有有效 step 做均方：
+
+$$
+\mathcal L_{DB}
+= \frac{1}{|\mathcal T_{valid}|}
+\sum_{t \in \mathcal T_{valid}} \delta_t^2.
+$$
+
+系统同时记录：
+
+- `db_loss`
+- `residual_abs`
+- `residual_variance`
+- `root_abs`
+- `log_z_mean`
+- `log_z_variance`
+
+但这些都是诊断量；主目标本身就是单步 Detailed Balance。
+
+### 8.4 明确不是旧的轨迹级平衡目标
+
+当前主线已经不再使用旧的轨迹级平衡目标：
+
+- 没有旧的 trajectory-level 主损失；
+- 没有旧的 trajectory-balance 配置支线；
+- 没有把旧的轨迹分段平衡目标作为论文主张的一部分。
+
+因此，论文叙述必须避免再把当前系统描述成早期那套“联合终止对象 + 轨迹级平衡”算法。那已经不是现在的主线了。
+
+
+## 9. 辅助训练信号：可选，但不改变主目标
+
+当前代码还支持若干辅助机制，它们服务于优化稳定性和样本效率，但不改变主线数学对象：
+
+1. `reference-sequence imitation`
+   - 对 reference sequence bank 里的代表性边序列做前缀 imitation；
+2. `success action supervision`
+   - 在 reference success subgraph 上对候选边做 BCE 风格的“成功动作”监督；
+3. `success replay / reference-path replay`
+   - 将命中 rollout 或 shortest-path reference path 重新做 forced replay；
+4. `expand imitation`
+   - 对 replay 轨迹中的扩展动作做附加 imitation 加权。
+
+这些辅助项只是在 DB 主损失之外叠加的 regularization / curriculum 信号。论文中若要介绍它们，应明确写成 “auxiliary supervision” 而不是重新定义主训练目标。
+
+
+## 10. 预测：从终止状态到答案 posterior surrogate
+
+### 10.1 Monte Carlo 终止状态采样
+
+评估时，系统执行 Monte Carlo rollout，得到一组终止状态：
+
+$$
+S_T^{(1)}, S_T^{(2)}, \dots, S_T^{(N)}.
+$$
+
+对每个终止状态，提取：
+
+- 终止 witness 子图；
+- `terminal answer set = \mathcal Y_{adm}(S_T)`；
+- 终止 reward；
+- 轨迹前向概率 / 终止 flow 等统计量。
+
+### 10.2 由 Answer Set 向答案边缘分配质量
+
+若某个 rollout 的终止 answer set 为 `\mathcal Y_{adm}(S_T)`，其 support weight 为 `w(S_T)`，则系统把该 rollout 的质量平均分配给集合中的每个实体：
+
+$$
+w_y(S_T) =
 \begin{cases}
-+\alpha_{gold}, & y \in Y^*, \\
--\alpha_{wrong}, & y \notin Y^*, y \neq \bot, \\
--\alpha_{fail}, & y = \bot.
+\frac{w(S_T)}{|\mathcal Y_{adm}(S_T)|}, & y \in \mathcal Y_{adm}(S_T), \\
+0, & \text{otherwise.}
 \end{cases}
 $$
 
-### 8.3 Witness 先验项
-
-为了避免无约束膨胀，我们加入结构正则项：
+然后在所有 rollout 上累加：
 
 $$
-\Psi(S_T) =
-\beta_{size}|E_T|
-+ \beta_{red} \cdot \mathrm{red}(S_T)
-+ \beta_{comp} \cdot (K_T - 1)_+,
+score(y) = \sum_{i=1}^{N} w_y\bigl(S_T^{(i)}\bigr).
 $$
 
-其中 `red(S_T)` 表示相对最小 anchor-connecting forest 的冗余边数，`K_T` 表示与 anchor 有关的连通分量数。
+这一步非常关键：当前答案 posterior surrogate 是由终止状态导出的 answer set 统计出来的，而不是 stop 时一次性分类出来的。
 
-因此，最终对数奖励写为：
+### 10.3 支持的聚合后端
 
-$$
-\log R(S_T, y) = U(y, Y^*) - \Psi(S_T).
-$$
+当前 Monte Carlo runtime 支持五种 support weighting backend：
 
-### 8.4 关于 failure sink 的解释
+- `vote`
+- `terminal_reward`
+- `trajectory_prob`
+- `terminal_flow`
+- `hybrid`
 
-`\alpha_{fail}` 并不是一个无关紧要的实现细节，而是当前方法中的一个 calibration knob。它直接影响：
+其中：
 
-- 模型何时倾向于 abstain；
-- failure stop 与 wrong answer commit 的相对偏好；
-- commit rate 的整体校准。
+- `vote`：每条终止 rollout 的 support weight 都为 1；
+- `terminal_reward`：按终止 reward 指数权重；
+- `trajectory_prob`：按整条轨迹的前向概率权重；
+- `terminal_flow`：按终止动作所在状态流权重；
+- `hybrid`：组合 trajectory probability 与 terminal reward。
 
-因此，我们建议在论文中明确把 failure sink 解释为 **selective answering / abstention-aware KGQA** 的一部分，而不是单纯的负奖励项。
+### 10.4 Early Stop 与 Support Selection
 
+当前评估还支持两个与效率/可解释性相关的机制：
 
-## 9. 训练目标：SubTB on committed terminal objects
+1. `early_stop`
+   - 只在 `vote` backend 下启用；
+   - 根据 top-k 稳定性边界决定是否提前停止 rollout。
+2. `support selection`
+   - 从高分终止 witness 中选出 support 子图；
+   - 使用 `support_mass_threshold` 与 path overlap penalty 控制输出集。
 
-在训练上，我们仍然使用 GFlowNet 的平衡思想。区别不在于是否使用 GFlowNet，而在于终止监督已经从单纯的终止子图质量，变成了 committed terminal object 的质量。理想目标为：
-
-$$
-P_T(S_T, y \mid q, G, A) \propto R(S_T, y \mid q, G, A).
-$$
-
-实现中，我们采用 Subtrajectory Balance (SubTB)。对一条从初始状态到 `(S_T, y)` 的轨迹 `\tau`，最后一个 stop step 的 reward contribution 为：
-
-$$
-\log R_t = \log R(S_T, y).
-$$
-
-因此，SubTB 负责在轨迹层面约束流守恒，而终止奖励则把终止流与答案提交直接绑定起来。
+因此，推理阶段返回的不仅是答案排序，还包括一组经质量筛选的 witness supports。
 
 
-## 10. 推理：Monte Carlo posterior surrogate over committed answers
+## 11. 当前方法的准确 claim
 
-推理阶段，我们从前向策略中进行 Monte Carlo rollout。每条 rollout 最多只向一个答案实体分配质量：
+为了避免再次把系统说成一个并不存在的模型，这里明确当前主线真正声称的内容。
 
-- 若 rollout 终止并提交 `y`，则为 `y` 增加一次计数；
-- 若 rollout 终止于 failure sink，则不为任何答案分配质量。
+### 11.1 我们可以声称什么
 
-令 `v_y` 表示提交到 `y` 的 rollout 数，`N` 为总 rollout 数，则我们返回：
+- 这是一个合法的层次化 witness-construction GFlowNet；
+- 它使用单步 Detailed Balance 约束 state flow、forward policy、backward policy 与 terminal reward；
+- 它通过终止状态导出的 `terminal answer set` 构造答案 posterior surrogate；
+- 它把“答案可答性”作为状态语义与评估边缘，而不是 stop 分类标签。
 
-$$
-\mathrm{score}(y) = \log \frac{v_y}{N}.
-$$
+### 11.2 我们不应声称什么
 
-这里的 `score(y)` 应解释为 **terminal-flow-induced posterior surrogate**。它来源于 committed terminal objects 的 Monte Carlo 频率，而不是对真实贝叶斯后验的直接恢复。
-
-
-## 11. 本文 claim 的边界
-
-为了避免过度宣称，论文中建议采用如下边界清晰的说法。
-
-### 11.1 可以强 claim 的部分
-
-我们可以合理声称：
-
-- 当前方法是 GFlowNet 框架下的一个合法实例；
-- 终止对象 `(z, y)` 的设计比“终止子图后处理答案”更贴近 KGQA 目标；
-- Monte Carlo commit frequency 为答案分布提供了更清晰的估计语义；
-- 当前主线保留了 latent witness 的多模态探索能力。
-
-### 11.2 应避免的过强表述
-
-不建议写：
-
-- “recover the true answer posterior”；
-- “eliminate witness multiplicity bias”；
-- “answer-ready entities are the semantically correct answer set”。
-
-更稳妥的写法应为：
-
-- reward-induced posterior surrogate；
-- explicit marginalization over committed terminal objects；
-- structurally admissible commit set。
+- 不应说当前系统在 stop 时显式选择一个答案实体；
+- 不应说主线 reward 是定义在“状态-答案”联合对象上；
+- 不应说当前训练仍然是旧的轨迹级平衡目标；
+- 不应把 Monte Carlo answer ranking 说成真实 Bayesian posterior 恢复；
+- 不应把 `terminal answer set` 说成语义 oracle，它只是结构约束下的 admissible set。
 
 
-## 12. 可直接放进论文的核心方法表述
+## 12. 数学视图与实现视图的对应
 
-下面给出一段可以直接整理进论文正文的浓缩版描述。
+当前重构后的代码边界与上面的理论描述是一致的：
 
-> We cast multi-anchor KGQA as answer posterior estimation with latent witness flows. Instead of
-> terminating in an unlabeled witness subgraph, our GFlowNet terminates in a committed object
-> `(z, y)`, where `z` is a latent witness and `y` is an explicitly selected answer entity. The
-> policy therefore allocates terminal flow directly over answer-committed witnesses. This yields a
-> reward-induced posterior surrogate over answers through marginalization over latent witnesses,
-> while preserving the multi-modal exploration advantages of GFlowNets.
+- `src/subgraph_gflownet/core/subgraph_batch.py`
+  - `SubgraphBatch` 与 `GraphSubgraphContext`；
+  - 静态图上下文、锚点、answer entities、reference sequence bank、可选 question similarity / oracle distance；
+- `src/subgraph_gflownet/core/state.py` + `src/subgraph_gflownet/core/state_kernel.py`
+  - `SubgraphState`、状态恢复、reachability、连通分量、forward-valid removable edges；
+- `src/subgraph_gflownet/core/semantic_oracles.py`
+  - `terminal answer set`、`gold_answer_in_graph`、frontier hit、coverage 与 terminal reward；
+- `src/subgraph_gflownet/core/action_surface.py`
+  - 分层 continue 动作候选面与 terminal-answer-set readiness 特征；
+- `src/subgraph_gflownet/core/actor.py` + `actor_distribution.py` + `actor_scoring.py` + `actor_types.py`
+  - gate / node / relation / edge / stop scoring；
+  - 分层动作分布构造与 actor 侧特征打分；
+- `src/subgraph_gflownet/core/rollout_engine.py` + `rollout_context.py` + `rollout_actions.py`
+  - 统一 rollout、forced replay、terminal statistics 记录；
+  - 唯一状态布局、分析缓存、teacher-force / sampling 动作选择；
+- `src/subgraph_gflownet/core/losses.py`
+  - 单步 Detailed Balance 残差与损失；
+- `src/subgraph_gflownet/application/evaluation/answer_search_runtime.py`
+  - Monte Carlo answer posterior surrogate 与 support selection。
 
+与运行时数据侧对应的实现边界现在位于：
 
-## 13. 可直接放进实验章节的写法
+- `src/data/retrieval/dataset.py` + `datamodule.py` + `collate.py`
+  - `TrajectoryBatch` 的运行时构造、Lightning DataModule 与批处理装配；
+- `src/graph/batch.py` + `src/graph/batch_utils.py`
+  - 运行时 `TrajectoryBatch` 及其张量校验、edge batch/ptr、relation-table 紧致化工具。
 
-### 13.1 主模型
-
-我们的方法 `Answer-Committed RankFlow` 是一个层次化 GFlowNet。模型从所有锚点出发逐步扩展 witness 子图，并在终止时从 failure sink 与 admissible answer sinks 中做出选择。终止奖励同时考虑答案正确性与 witness 紧凑性；训练采用 SubTB；推理通过 Monte Carlo rollout 估计 committed answers 的经验频率。
-
-### 13.2 主实验组
-
-当前仓库中可直接复现实验的主配置包括：
-
-- `experiment=train_rankflow`：标准主线；
-- `experiment=train_rankflow_fastiter`：快速迭代版；
-- `experiment=train_rankflow_guided`：加入 replay guidance 与 imitation；
-- `experiment=train_rankflow_guided_fastiter`：guided 快速版；
-- `experiment=train_rankflow_ablate_answer_commit`：削弱 wrong-answer / failure penalty 的弱提交消融。
-
-### 13.3 最关键的实验问题
-
-我们建议将论文主问题明确成以下两个：
-
-1. **显式 answer commitment 是否优于纯 witness 终止后处理？**
-2. **teacher-guided replay 是否能进一步提升 answer commitment 的质量，尤其是在多锚点多跳样本上？**
+因此，论文叙述应尽量沿着这些模块边界来组织，而不要再回退到旧的“联合终止对象 + 轨迹级平衡”语言。
 
 
-## 14. 代码实现映射
+## 13. 一句话版本
 
-当前实现与上述理论要素的对应关系如下：
-
-- witness 状态与可达性分析：`src/models/gflownet/state.py`
-- admissible commit set 与终止奖励：`src/models/gflownet/reward.py`
-- stop/continue 分层 actor：`src/models/gflownet/actor.py`
-- rollout 采样与 stop 归一化：`src/models/gflownet/sampler.py`
-- backward policy 与策略封装：`src/models/gflownet/policy.py`
-- SubTB 与训练日志：`src/models/gflownet/losses.py`、`src/models/gflownet_module.py`
-- Monte Carlo posterior surrogate：`src/metrics/subgraph_answer_search_runtime.py`
-
-
-## 15. 当前局限与后续扩展
-
-当前方法已经构成一个较完整的主线，但仍有明显可扩展空间：
-
-1. **Role-aware commitment**：当前 entity-level merge 仍未显式区分 query role；
-2. **Answer-normalized witness prior**：未来可进一步削弱 witness multiplicity 对答案边缘的影响；
-3. **Commit calibration**：failure sink 与 stop entropy 的显式校准值得单独研究；
-4. **Constraint-aware replay**：可以针对 harder multi-anchor joins 做更有针对性的 replay。
-
-
-## 16. 一句话版本
-
-如果需要用一句话概括本文方法，建议写成：
-
-> 我们将多锚点 KGQA 建模为一个由奖励诱导的答案后验近似问题，并通过在层次化 GFlowNet 中引入显式 answer-commit stop sink，把终止流分配从一般子图生成转化为对 committed answer-witness 对象的建模。
+> 我们将多锚点 KGQA 建模为一个层次化 witness-construction GFlowNet：模型从锚点出发逐步扩展证据子图，并通过唯一的 stop 动作终止到一个 witness 状态；训练使用单步 Detailed Balance，终止 reward 定义在状态本身上；评估时再从终止状态导出 `terminal answer set`，通过 Monte Carlo rollout 聚合出 reward-induced answer posterior surrogate。

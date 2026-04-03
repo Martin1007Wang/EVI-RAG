@@ -5,7 +5,7 @@ defaults:
   - sampling_temperature_schedule: default
   - action_pruning: default
   - answer_reward: default
-  - subtb: default
+  - detailed_balance: default
   - auxiliary: default
 
 rollouts_per_graph: 8

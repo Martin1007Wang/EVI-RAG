@@ -43,11 +43,7 @@ def _run_preprocess(cfg: DictConfig) -> None:
     _get_preprocess_runner()(cfg)
 
 
-@hydra.main(
-    version_base="1.3",
-    config_path="../configs",
-    config_name="build_retrieval_pipeline",
-)
+@hydra.main(version_base="1.3", config_path="../configs", config_name="preprocess.yaml")
 def main(cfg: DictConfig) -> None:
     _run_preprocess(cfg)
 

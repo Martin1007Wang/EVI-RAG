@@ -16,7 +16,7 @@ run:
 
 data:
   # Train and validate on the same validation subset so we can see whether the
-  # current answer-committed objective can memorize multi-hop bridge behavior at all.
+  # current Detailed Balance objective can memorize multi-hop bridge behavior at all.
   splits:
     train: validation
     validation: validation

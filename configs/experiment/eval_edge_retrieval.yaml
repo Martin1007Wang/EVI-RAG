@@ -4,7 +4,7 @@
 # Usage:
 #   python src/eval.py experiment=eval_edge_retrieval ckpt.gflownet=/path/to/model.ckpt
 #
-# Contract:
+# Notes:
 # - inherits the RankFlow eval runner and dataset family expansion
 # - only changes the inference view/profile and artifact naming
 

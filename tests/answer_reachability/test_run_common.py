@@ -14,12 +14,19 @@ from src.runs.common import (
 )
 
 
+_HYDRA_TEST_OVERRIDES = [
+    "hydra/job_logging=stdout",
+    "hydra/hydra_logging=none",
+]
+
+
 def test_load_dataset_config_by_name_merges_base_and_resolves_paths(
     tmp_path: Path,
 ) -> None:
     dataset_cfg = load_dataset_config_by_name(
         "webqsp-sub",
         OmegaConf.create({"data_dir": str(tmp_path)}),
+        overrides=_HYDRA_TEST_OVERRIDES,
     )
 
     assert dataset_cfg.name == "webqsp-sub"
@@ -37,8 +44,15 @@ def test_resolve_dataset_variants_loads_each_requested_dataset(tmp_path: Path) -
             "paths": {"data_dir": str(tmp_path)},
             "run": {
                 "dataset_variants": [
-                    {"label": "full", "dataset": "webqsp"},
-                    {"dataset": "webqsp-sub"},
+                    {
+                        "label": "full",
+                        "dataset": "webqsp",
+                        "overrides": _HYDRA_TEST_OVERRIDES,
+                    },
+                    {
+                        "dataset": "webqsp-sub",
+                        "overrides": _HYDRA_TEST_OVERRIDES,
+                    },
                 ]
             },
         }
@@ -65,6 +79,7 @@ def test_resolve_dataset_variants_applies_dataset_and_run_overrides(
                     {
                         "label": "full_custom",
                         "dataset": "webqsp",
+                        "overrides": _HYDRA_TEST_OVERRIDES,
                         "dataset_overrides": {"artifact_dir": str(artifact_dir)},
                         "run_overrides": {
                             "split": "validation",
@@ -121,29 +136,6 @@ def test_resolve_dataset_variants_rejects_removed_compose_overrides_key(
         match="use `overrides`, not the removed `compose_overrides` key",
     ):
         resolve_dataset_variants(cfg)
-
-
-def test_train_defaults_target_rankflow_run() -> None:
-    cfg = OmegaConf.load(Path(__file__).resolve().parents[2] / "configs" / "train.yaml")
-    defaults = OmegaConf.to_container(cfg.defaults, resolve=False)
-
-    assert {"run": "train_rankflow"} in defaults
-
-
-def test_default_callbacks_monitor_current_rank_metric() -> None:
-    callbacks_cfg = OmegaConf.load(
-        Path(__file__).resolve().parents[2] / "configs" / "callbacks" / "default.yaml"
-    )
-    callbacks_dict = OmegaConf.to_container(callbacks_cfg, resolve=False)
-
-    assert (
-        callbacks_dict["model_checkpoint"]["monitor"]
-        == "val/${dataset.dataset_scope}/answer/recall@10"
-    )
-    assert (
-        callbacks_dict["early_stopping"]["monitor"]
-        == "val/${dataset.dataset_scope}/answer/recall@10"
-    )
 
 
 def test_resolve_execution_mode_accepts_execution_mode_key() -> None:

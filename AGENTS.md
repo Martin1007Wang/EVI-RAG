@@ -62,7 +62,7 @@ If repo behavior and this file disagree, follow the source files and update this
 - Build edge retriever labels: `python src/datasets/build_edge_retrieval_labels.py dataset=webqsp-sub`.
 - `make train` runs `python src/train.py` with the default config.
 - Training expects an explicit `dataset=<name>` for supported training models.
-- Training currently uses the single mainline `src.models.gflownet_module.GFlowNetModule`, and only on `-sub` datasets.
+- Training currently uses the single mainline `src.subgraph_gflownet.adapters.lightning.module.GFlowNetModule`, and only on `-sub` datasets.
 - Evaluation defaults to single-GPU predict mode via `configs/trainer/predict.yaml`.
 - `src/eval.py` rejects CPU eval and multi-GPU eval unless you intentionally override behavior.
 - CPU eval escape hatch for debugging only: `DUAL_FLOW_ALLOW_CPU_EVAL=1 python src/eval.py ...`.

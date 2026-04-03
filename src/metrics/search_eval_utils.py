@@ -26,6 +26,9 @@ _DEFAULT_SEARCH_EVAL_CFG: dict[str, Any] = {
         "batch_rollouts": 256,
         "temperature": 1.0,
         "confidence": 0.95,
+        "answer_aggregation": {
+            "backend": "vote",
+        },
         "early_stop": {
             "enabled": True,
             "min_rollouts": 512,
@@ -37,13 +40,23 @@ _DEFAULT_SEARCH_EVAL_CFG: dict[str, Any] = {
         },
     },
 }
+_ANSWER_AGGREGATION_ALIASES = {
+    "vote": "vote",
+    "reward": "terminal_reward",
+    "terminal_reward": "terminal_reward",
+    "trajectory_prob": "trajectory_prob",
+    "trajectory_probability": "trajectory_prob",
+    "flow": "terminal_flow",
+    "terminal_flow": "terminal_flow",
+    "hybrid": "hybrid",
+}
 _LEGACY_SEARCH_EVAL_KEYS = {
     "answer_posterior_backend": "Remove eval_cfg.answer_posterior_backend; Monte Carlo is now the only posterior estimator.",
     "flow_frontier": "Remove eval_cfg.flow_frontier; exact frontier search is no longer supported.",
 }
 _REMOVED_SEARCH_EVAL_KEYS = {
     "answer_mass_threshold": (
-        "Remove eval_cfg.answer_mass_threshold; the answer-committed Monte Carlo "
+        "Remove eval_cfg.answer_mass_threshold; the Monte Carlo "
         "runtime reports ranked answer posteriors directly and does not support a "
         "separate mass-threshold config."
     ),
@@ -112,6 +125,23 @@ def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
         field_name="eval_cfg.monte_carlo.action_pruning",
     )
     monte_carlo["action_pruning"] = action_pruning
+    answer_aggregation = _deep_merge(
+        base=_DEFAULT_SEARCH_EVAL_CFG["monte_carlo"]["answer_aggregation"],
+        override=_to_plain_mapping(
+            monte_carlo.get("answer_aggregation", {}),
+            field_name="eval_cfg.monte_carlo.answer_aggregation",
+        ),
+    )
+    backend = str(answer_aggregation.get("backend", "vote")).strip().lower()
+    canonical_backend = _ANSWER_AGGREGATION_ALIASES.get(backend)
+    if canonical_backend is None:
+        supported = ", ".join(sorted(_ANSWER_AGGREGATION_ALIASES))
+        raise ValueError(
+            "evaluation.monte_carlo.answer_aggregation.backend must be one of "
+            f"{{{supported}}}."
+        )
+    answer_aggregation["backend"] = canonical_backend
+    monte_carlo["answer_aggregation"] = answer_aggregation
 
     report_profile = str(cfg.get("report_profile", FULL_REPORT))
     if report_profile not in {FULL_REPORT, RANK_ONLY_REPORT}:
@@ -178,6 +208,8 @@ def normalize_search_eval_cfg(eval_cfg: Any) -> dict[str, Any]:
     monte_carlo["confidence"] = confidence
 
     early_stop_enabled = bool(early_stop.get("enabled", True))
+    if canonical_backend != "vote":
+        early_stop_enabled = False
     early_stop["enabled"] = early_stop_enabled
 
     early_stop_min_rollouts = int(early_stop.get("min_rollouts", 512))
@@ -226,6 +258,7 @@ def format_search_eval_answer_posterior(eval_cfg: Mapping[str, Any]) -> str:
     monte_carlo_cfg = search_eval_monte_carlo_cfg(eval_cfg)
     early_stop_cfg = monte_carlo_cfg["early_stop"]
     action_pruning_cfg = monte_carlo_cfg["action_pruning"]
+    answer_aggregation_cfg = monte_carlo_cfg["answer_aggregation"]
     prune_text = (
         "off"
         if int(action_pruning_cfg["per_node_top_k"]) <= 0
@@ -240,6 +273,7 @@ def format_search_eval_answer_posterior(eval_cfg: Mapping[str, Any]) -> str:
         f"rollouts={int(monte_carlo_cfg['rollouts'])}, "
         f"batch_rollouts={int(monte_carlo_cfg['batch_rollouts'])}, "
         f"temperature={float(monte_carlo_cfg['temperature'])}, "
+        f"aggregation={str(answer_aggregation_cfg['backend'])}, "
         f"early_stop={bool(early_stop_cfg['enabled'])}@{float(monte_carlo_cfg['confidence'])}/"
         f"min={int(early_stop_cfg['min_rollouts'])}/topk={int(early_stop_cfg['stability_top_k'])}, "
         f"prune={prune_text}"
@@ -254,11 +288,13 @@ def search_eval_answer_posterior_signature(
     monte_carlo_cfg = search_eval_monte_carlo_cfg(eval_cfg)
     early_stop_cfg = monte_carlo_cfg["early_stop"]
     action_pruning_cfg = monte_carlo_cfg["action_pruning"]
+    answer_aggregation_cfg = monte_carlo_cfg["answer_aggregation"]
     return (
         "monte_carlo",
         int(monte_carlo_cfg["rollouts"]),
         int(monte_carlo_cfg["batch_rollouts"]),
         float(monte_carlo_cfg["temperature"]),
+        str(answer_aggregation_cfg["backend"]),
         float(monte_carlo_cfg["confidence"]),
         bool(early_stop_cfg["enabled"]),
         int(early_stop_cfg["min_rollouts"]),

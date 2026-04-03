@@ -1,10 +1,10 @@
 # @package _global_
 #
-# Canonical answer-committed RankFlow training bundle for answer ranking.
+# Canonical paper-aligned RankFlow training bundle for evidence-subgraph generation.
 # Usage:
 #   python src/train.py experiment=train_rankflow dataset=webqsp-sub
 #
-# Contract:
+# Notes:
 # - overrides `/run`, `/trainer`, `/model`, `/callbacks`, `/logger`
 # - still requires the caller to choose `/dataset`
 
@@ -56,12 +56,14 @@ model:
     state_mode: subgraph
   training_cfg:
     rollouts_per_graph: 16
-    answer_reward:
-      gold_answer_bonus: 3.0
-      component_penalty: 0.75
   eval_cfg:
     # Keep training-time checkpoint selection on the same Monte Carlo answer
     # posterior that final eval uses; only the report surface stays rank-only.
     report_profile: rank_only
   optimizer_cfg:
     lr: 5.0e-5
+
+run:
+  # Use the explicit eval alias so post-fit testing points at a dedicated
+  # experiment bundle instead of the more generic legacy name.
+  final_eval_experiment: eval_rankflow

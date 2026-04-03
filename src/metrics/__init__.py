@@ -5,8 +5,8 @@ from .protocol import (
     MetricRuntimeFactoryProtocol,
     MetricRuntimeProtocol,
 )
-from .runtime_factory import GraphTaskRuntimeFactory
-from .subgraph_answer_search_runtime import SubgraphAnswerSearchRuntime
+from src.subgraph_gflownet.adapters.runtime import GraphTaskRuntimeFactory
+from src.subgraph_gflownet.application.evaluation import SubgraphAnswerSearchRuntime
 
 __all__ = [
     "BaseMetricRuntime",

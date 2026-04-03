@@ -1,4 +1,0 @@
-# @package model.training_cfg.subtb
-
-lambda_weight: 1.0
-topology_weight_alpha: 0.0

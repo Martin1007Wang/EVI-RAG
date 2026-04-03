@@ -13,7 +13,6 @@ from src.llm.eval_llm import (
     _resolve_schema_spec,
     _validate_dataset_scope,
     _validate_topk_against_prompt_limits,
-    run_llm_eval,
 )
 from src.llm.prompting import (
     _enforce_candidate_answers,
@@ -30,7 +29,7 @@ def test_trajectory_text_filters_super_source_edges_in_fallback() -> None:
             {"src_entity_id": -1, "relation_id": 7, "dst_entity_id": 11},
             {"src_entity_id": 11, "relation_id": 9, "dst_entity_id": 13},
         ],
-        "terminal_entity_id": 13,
+        "singleton_terminal_answer_set_entity_id": 13,
     }
     assert _trajectory_text(trajectory) == "11 --9--> 13"
 
@@ -40,7 +39,7 @@ def test_trajectory_text_uses_stop_node_when_only_super_source_edges() -> None:
         "edges": [
             {"src_entity_id": -1, "relation_id": 7, "dst_entity_id": 11},
         ],
-        "terminal_entity_id": 11,
+        "singleton_terminal_answer_set_entity_id": 11,
     }
     assert _trajectory_text(trajectory) == "(start_only) 11"
 
@@ -204,27 +203,6 @@ def test_resolve_input_labels_path_requires_sidecar_when_enabled(tmp_path) -> No
         _resolve_input_labels_path(
             input_path=input_path, llm_cfg={}, require_labels=True
         )
-
-
-def test_run_llm_eval_fails_fast_when_sidecar_missing(tmp_path) -> None:
-    input_path = tmp_path / "predict.jsonl"
-    input_path.write_text("", encoding="utf-8")
-    cfg = {
-        "dataset": {"name": "webqsp", "artifact_dir": str(tmp_path)},
-        "run": {"split": "test"},
-        "llm": {
-            "providers": ["openai"],
-            "topk_list": [1],
-            "compute_metrics": True,
-            "input_path": str(input_path),
-            "prompt": {"system": "You are a test model."},
-            "schema": {"enabled": False},
-        },
-    }
-    with pytest.raises(
-        FileNotFoundError, match="Input labels JSONL not found for metrics"
-    ):
-        run_llm_eval(cfg)
 
 
 def test_validate_dataset_scope_rejects_sub_scope_without_suffix() -> None:

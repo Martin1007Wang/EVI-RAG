@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from src.utils.metrics_io import write_metrics_json, write_metrics_jsonl
+from src.metrics.serialization import write_metrics_json, write_metrics_jsonl
 
 _ZERO = 0
 _ONE = 1
@@ -35,7 +35,7 @@ class _EvalSample:
     pred_text: str
     pred_lines: List[str]
     double_check: bool
-    a_entity_in_graph: Optional[bool]
+    gold_answer_in_graph: Optional[bool]
     trajectories: Optional[List[Dict[str, Any]]]
 
 
@@ -207,7 +207,7 @@ def compute_llm_metrics(
         else:
             trajectory_count_min = min(trajectory_count_min, trajectory_count)
         _accumulate(full_acc, sample, result, include_hal=True)
-        if sample.a_entity_in_graph is True:
+        if sample.gold_answer_in_graph is True:
             _accumulate(sub_acc, sample, result, include_hal=True)
     unknown_pred_ids = sorted(set(pred_map.keys()) - input_sample_ids)
     if unknown_pred_ids:
@@ -365,7 +365,7 @@ def _build_eval_sample(
             pred_text, answer_separator=answer_separator
         )
     double_check = _subgraphrag_is_double_check(question)
-    a_entity_in_graph = _resolve_a_entity_in_graph(record)
+    gold_answer_in_graph = _resolve_gold_answer_in_graph(record)
     trajectories = record.get("trajectories")
     trajectories = trajectories if isinstance(trajectories, list) else None
     return _EvalSample(
@@ -375,13 +375,13 @@ def _build_eval_sample(
         pred_text=str(pred_text or ""),
         pred_lines=pred_lines,
         double_check=double_check,
-        a_entity_in_graph=a_entity_in_graph,
+        gold_answer_in_graph=gold_answer_in_graph,
         trajectories=trajectories,
     )
 
 
-def _resolve_a_entity_in_graph(record: Dict[str, Any]) -> Optional[bool]:
-    value = record.get("a_entity_in_graph")
+def _resolve_gold_answer_in_graph(record: Dict[str, Any]) -> Optional[bool]:
+    value = record.get("gold_answer_in_graph")
     if isinstance(value, bool):
         return value
     return None
@@ -446,7 +446,7 @@ def _accumulate(
             predictions=sample.pred_lines,
             answers=sample.answers,
             double_check=sample.double_check,
-            good_sample=bool(sample.a_entity_in_graph),
+            good_sample=bool(sample.gold_answer_in_graph),
             no_ans=result.no_ans,
             subgraph_entities=entities,
             stats=acc.hal_stats,

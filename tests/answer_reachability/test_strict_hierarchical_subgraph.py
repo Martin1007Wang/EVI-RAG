@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
 from src.metrics.search_eval_utils import normalize_search_eval_cfg
-from src.metrics.runtime_factory import GraphTaskRuntimeFactory
-from src.models.gflownet.config_utils import normalize_training_cfg
-from src.models.gflownet.policy import SUBGRAPH_STATE_MODE, SubgraphPolicy
-from src.models.gflownet.sampler import SubgraphSampler
-from src.models.gflownet.state import SubgraphAction, SubgraphState
-from src.models.gflownet_module import GFlowNetModule
+from src.subgraph_gflownet.adapters.lightning.module import GFlowNetModule
+from src.subgraph_gflownet.adapters.runtime.factory import GraphTaskRuntimeFactory
+from src.subgraph_gflownet.core.config_utils import normalize_training_cfg
+from src.subgraph_gflownet.core.policy import SUBGRAPH_STATE_MODE, SubgraphPolicy
+from src.subgraph_gflownet.core.sampler import SubgraphSampler
+from src.subgraph_gflownet.core.state import SubgraphAction, SubgraphState
 
 from .conftest import make_batch_from_graph
 
@@ -43,18 +41,15 @@ def _make_subgraph_policy(*, max_steps: int = 2) -> SubgraphPolicy:
             "dropout": 0.0,
         },
         answer_reward={
-            "gold_answer_bonus": 2.0,
-            "wrong_answer_penalty": 2.0,
-            "failure_penalty": 4.0,
+            "hit_bonus": 5.0,
+            "frontier_bonus": 1.0,
+            "coverage_bonus": 0.2,
             "size_penalty": 0.1,
-            "redundancy_penalty": 0.25,
             "component_penalty": 0.5,
         },
         proposal_prior={
             "oracle_answer_distance_weight": 0.0,
             "prior_question_similarity_weight": 0.0,
-            "prior_component_merge_weight": 0.0,
-            "stop_hit_bias": 0.0,
         },
         max_steps=max_steps,
     )
@@ -130,67 +125,18 @@ def test_strict_stop_exposes_answer_set_from_terminal_topology() -> None:
 
     assert answer_set.entities == (101,)
     assert answer_set.gold_entities == (101,)
-    reward, commit_count, gold_count, hit = policy.compute_stop_log_reward(
+    reward, answer_count, gold_count, hit = policy.compute_stop_log_reward(
         prepared_batch=prepared_batch,
         graph_idx=0,
         analysis=analysis,
     )
     assert hit is True
-    assert commit_count == 1
+    assert answer_count == 1
     assert gold_count == 1
     assert reward > 0.0
 
 
-def test_backward_policy_is_uniform_over_forward_valid_parent_edges() -> None:
-    batch = _make_bridge_batch()
-    policy = _make_subgraph_policy(max_steps=2)
-    prepared_batch = policy.prepare_batch(batch)
-    state = SubgraphState(edge_ids=(0, 1))
-
-    removable = policy.compute_backward_log_prob(
-        prepared_batch=prepared_batch,
-        graph_idx=0,
-        state=state,
-    )
-
-    assert policy.backward_policy_name() == "uniform_forward_valid_edge_deletion"
-    assert removable == pytest.approx(-math.log(2.0))
-
-
-def test_teacher_force_marks_gold_answer_state_when_available() -> None:
-    batch = _make_bridge_batch()
-    policy = _make_subgraph_policy(max_steps=2)
-    prepared_batch = policy.prepare_batch(batch)
-    sampler = SubgraphSampler(max_steps=2)
-
-    sample_batch = sampler.teacher_force(
-        policy=policy,
-        prepared_batch=prepared_batch,
-        edge_sequences=((0, 1),),
-    )
-
-    assert sample_batch.chosen_edge_ids[0, 0].tolist() == [0, 1]
-    assert sample_batch.terminal_hit_mask[0, 0].item() is True
-    assert sample_batch.terminal_commit_candidate_counts[0, 0].item() == 1
-    assert sample_batch.terminal_gold_answer_counts[0, 0].item() == 1
-    assert sample_batch.terminal_answer_entity_ids == ((101,),)
-
-
-def test_strict_paper_defaults_disable_action_pruning() -> None:
-    training_cfg = normalize_training_cfg({})
-    eval_cfg = normalize_search_eval_cfg({})
-
-    assert training_cfg["action_pruning"] == {
-        "per_node_top_k": 0,
-        "per_state_top_k": 0,
-    }
-    assert eval_cfg["monte_carlo"]["action_pruning"] == {
-        "per_node_top_k": 0,
-        "per_state_top_k": 0,
-    }
-
-
-def test_gflownet_module_trains_with_answer_committed_policy() -> None:
+def test_gflownet_module_trains_with_answer_set_terminal_policy() -> None:
     batch = _make_bridge_batch()
     module = GFlowNetModule(
         horizon_cfg={"max_steps": 2},

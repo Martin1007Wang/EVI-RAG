@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Fast-iteration bundle for the guided answer-committed mainline.
+# Fast-iteration bundle for the reference-path replay ablation.
 
 defaults:
   - train_rankflow_guided
@@ -10,7 +10,7 @@ defaults:
 run:
   name: train_rankflow_guided_fastiter
   task_name: "train/rankflow_guided_fastiter"
-  tags: ["rankflow", "gflownet", "answer-commit", "guided", "replay", "fastiter"]
+  tags: ["rankflow", "gflownet", "guided", "replay", "ablation", "fastiter"]
 
 model:
   training_cfg:

@@ -10,6 +10,7 @@ buffer:
   deduplicate: true
 
 guidance:
+  # Reference-path replay and expand-imitation controls.
   add_shortest_path_guidance: false
   expand_imitation_weight: 0.0
   expand_imitation_from_anchor_bonus: 0.0

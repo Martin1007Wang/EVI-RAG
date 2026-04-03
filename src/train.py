@@ -1,7 +1,6 @@
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Protocol, Tuple, cast
+from typing import Any, Dict, Optional, Tuple, cast
 
-import lightning as L
 import hydra
 import rootutils
 import torch
@@ -34,44 +33,48 @@ from src.metrics.search_eval_utils import (
     search_eval_answer_posterior_signature,
     search_eval_is_answer_task,
 )
-from src.runs.answer_reachability import AnswerReachabilityEvalReporter
 from src.runs.common import (
-    DatasetVariantSpec,
-    compose_config,
     normalize_dataset_scope,
-    resolve_dataset_variants,
-    temporary_cfg_overrides,
 )
-from src.utils.entrypoint_utils import (
-    instantiate_lightning_task_objects,
-    instantiate_task_runner,
-    require_run_target_config,
-)
-from src.utils.entrypoint_contracts import validate_train_entry_contract
-from src.utils.fit_schedule import (
+from src.runs.entrypoints import validate_train_entrypoint
+from src.runs.fit_schedule import (
     ResolvedPassFitSchedule,
     apply_resolved_pass_fit_schedule,
     resolve_pass_fit_schedule,
 )
-from src.utils.hydra_utils import apply_run_name, extras
+from src.runs.hydra import apply_run_name, compose_config, extras
+from src.runs.lightning import (
+    finalize_task,
+    instantiate_lightning_task_objects,
+    seed_everything_if_needed,
+)
+from src.runs.rankflow import (
+    RANKFLOW_TRAIN_RUN_PREFIX,
+    is_rankflow_train_run,
+    run_eval as run_rankflow_eval,
+    validate_train_config,
+)
 from src.utils.logging_utils import RankedLogger
-from src.utils.task_utils import get_metric_value, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-TrainModelFn = Callable[[DictConfig], Tuple[Dict[str, Any], Dict[str, Any]]]
-
-
-class TrainRunnerProtocol(Protocol):
-    def validate(self, cfg: DictConfig) -> None: ...
-
-    def run(
-        self,
-        *,
-        cfg: DictConfig,
-        train_model: TrainModelFn,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]: ...
+def _get_metric_value(
+    metric_dict: dict[str, Any], metric_name: str | None
+) -> float | None:
+    if not metric_name:
+        log.info("Metric name is None! Skipping metric value retrieval...")
+        return None
+    if metric_name not in metric_dict:
+        raise ValueError(
+            f"Metric value not found! <metric_name={metric_name}>\n"
+            "Make sure metric name logged in LightningModule is correct!\n"
+            "Make sure `optimized_metric` name in `hparams_search` config is correct!"
+        )
+    value = metric_dict[metric_name]
+    metric_value = value.detach().tolist() if torch.is_tensor(value) else float(value)
+    log.info("Retrieved metric value! <%s=%s>", metric_name, metric_value)
+    return metric_value
 
 
 def _maybe_load_model_weights(model: LightningModule, cfg: DictConfig) -> None:
@@ -168,7 +171,7 @@ def _compose_final_eval_template(
         raise ValueError("Final eval requires `dataset.name` to be populated.")
 
     final_eval_experiment = str(
-        run_cfg.get("final_eval_experiment") or "rankflow"
+        run_cfg.get("final_eval_experiment") or "eval_rankflow"
     ).strip()
     return compose_config(
         config_name="eval.yaml",
@@ -201,8 +204,10 @@ def _validate_answer_posterior_alignment(
         return
 
     final_eval_experiment = (
-        str((cfg.get("run") or {}).get("final_eval_experiment") or "rankflow").strip()
-        or "rankflow"
+        str(
+            (cfg.get("run") or {}).get("final_eval_experiment") or "eval_rankflow"
+        ).strip()
+        or "eval_rankflow"
     )
     raise ValueError(
         "Training-time answer-ranking checkpoint selection and post-fit final eval "
@@ -311,126 +316,49 @@ def _build_final_eval_cfg(
     return eval_cfg
 
 
-def _namespace_final_eval_metrics(
-    *,
-    metrics: Dict[str, Any],
-    dataset_variant: str,
-    split: str,
-) -> Dict[str, Any]:
-    prefix = f"final_eval/{dataset_variant}/{split}"
-    return {f"{prefix}/{name}": value for name, value in metrics.items()}
-
-
-def _default_final_eval_variant(cfg: DictConfig) -> DatasetVariantSpec:
-    dataset_cfg = _clone_cfg_node(cfg.dataset)
-    label = str(dataset_cfg.get("name") or normalize_dataset_scope(dataset_cfg))
-    return DatasetVariantSpec(
-        label=label,
-        dataset_name=label,
-        dataset_cfg=dataset_cfg,
-        run_overrides={},
-    )
-
-
 def _release_post_fit_runtime_state(
     *,
     model: LightningModule | None,
     datamodule: Any | None,
 ) -> None:
-    if model is not None:
-        reset_prediction_state = getattr(model, "reset_prediction_state", None)
-        if callable(reset_prediction_state):
-            reset_prediction_state()
     if datamodule is not None:
         teardown = getattr(datamodule, "teardown", None)
         if callable(teardown):
             teardown()
 
 
-def _run_final_eval_suite(
-    cfg: DictConfig,
-    *,
-    trainer: Any | None = None,
-    model: LightningModule | None = None,
-    datamodule: Any | None = None,
-) -> Dict[str, Any]:
+def _run_final_eval_suite(cfg: DictConfig) -> Dict[str, Any]:
     from src.eval import evaluate_model as evaluate_model_fn
-    from src.eval import evaluate_model_inprocess as evaluate_model_inprocess_fn
 
-    reporter = AnswerReachabilityEvalReporter()
-    variants = resolve_dataset_variants(cfg)
-    if not variants:
-        variants = [_default_final_eval_variant(cfg)]
-
-    final_metrics: Dict[str, Any] = {}
-    split = str(cfg.run.get("split") or "test")
     report_profile = str(cfg.model.eval_cfg.get("report_profile") or "")
     answer_posterior_cfg = format_search_eval_answer_posterior(
         _coerce_search_eval_cfg(cfg.model.eval_cfg)
     )
-    can_reuse_eval_stack = (
-        trainer is not None and model is not None and datamodule is not None
-    )
-    released_original_state = False
-    for variant in variants:
+
+    def _evaluate_once(current_cfg: DictConfig):
+        current_run = current_cfg.get("run") or {}
+        current_dataset = current_cfg.get("dataset") or {}
+        dataset_variant = str(
+            current_run.get("dataset_variant")
+            or current_dataset.get("name")
+            or normalize_dataset_scope(current_dataset)
+        )
+        split = str(current_run.get("split") or "test")
         log.info(
             "Final evaluation: dataset_variant=%s split=%s report_profile=%s answer_posterior_surrogate=%s",
-            variant.label,
+            dataset_variant,
             split,
             report_profile,
             answer_posterior_cfg,
         )
-        with temporary_cfg_overrides(
-            cfg,
-            dataset_cfg=variant.dataset_cfg,
-            run_overrides={
-                **variant.run_overrides,
-                "dataset_variant": variant.label,
-            },
-        ):
-            if can_reuse_eval_stack:
-                try:
-                    metric_dict, object_dict = evaluate_model_inprocess_fn(
-                        cfg,
-                        trainer=trainer,
-                        datamodule=datamodule,
-                        model=model,
-                    )
-                except (TypeError, ValueError) as exc:
-                    log.warning(
-                        "In-process final eval reuse unavailable (%s); falling back to a fresh eval stack.",
-                        exc,
-                    )
-                    can_reuse_eval_stack = False
-                    if not released_original_state:
-                        _release_post_fit_runtime_state(
-                            model=model,
-                            datamodule=datamodule,
-                        )
-                        released_original_state = True
-                    metric_dict, object_dict = evaluate_model_fn(cfg)
-            else:
-                if not released_original_state:
-                    _release_post_fit_runtime_state(
-                        model=model,
-                        datamodule=datamodule,
-                    )
-                    released_original_state = True
-                metric_dict, object_dict = evaluate_model_fn(cfg)
-            persisted_metrics = reporter.persist_outputs(
-                cfg=cfg,
-                callback_metrics=metric_dict,
-                model=object_dict["model"],
-                log=log,
-            )
-            final_metrics.update(
-                _namespace_final_eval_metrics(
-                    metrics=persisted_metrics,
-                    dataset_variant=variant.label,
-                    split=split,
-                )
-            )
-    return final_metrics
+        return evaluate_model_fn(current_cfg)
+
+    return run_rankflow_eval(
+        cfg,
+        evaluate_model=_evaluate_once,
+        allow_default_dataset_variant=True,
+        metric_namespace_prefix="final_eval",
+    )
 
 
 def _run_inprocess_test(
@@ -462,24 +390,12 @@ def _run_post_fit_evaluation(
         final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
         if final_eval_experiment:
             if ckpt_path is None:
-                log.warning(
-                    "Final eval experiment=%s requested without a resolved checkpoint path; "
-                    "falling back to in-process trainer.test().",
-                    final_eval_experiment,
-                )
-                return _run_inprocess_test(
-                    trainer=trainer,
-                    model=model,
-                    datamodule=datamodule,
-                    ckpt_path=ckpt_path,
+                raise RuntimeError(
+                    "Final eval experiment requires a resolved checkpoint path. "
+                    "Set `test_ckpt_path`, enable checkpointing, or disable `run.final_eval_experiment`."
                 )
             final_eval_cfg = _build_final_eval_cfg(cfg, ckpt_path=ckpt_path)
-            return _run_final_eval_suite(
-                final_eval_cfg,
-                trainer=trainer,
-                model=model,
-                datamodule=datamodule,
-            )
+            return _run_final_eval_suite(final_eval_cfg)
 
         return _run_inprocess_test(
             trainer=trainer,
@@ -491,7 +407,6 @@ def _run_post_fit_evaluation(
         _release_post_fit_runtime_state(model=model, datamodule=datamodule)
 
 
-@task_wrapper
 def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
     training.
@@ -502,24 +417,26 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :param cfg: A DictConfig configuration composed by Hydra.
     :return: A tuple with metrics and dict with all instantiated objects.
     """
-    # set seed for random number generators in pytorch, numpy and python.random
-    if cfg.get("seed"):
-        L.seed_everything(cfg.seed, workers=True)
+    try:
 
-    resolved_run_name = apply_run_name(cfg)
-    log.info(f"Resolved run name: {resolved_run_name}")
-
-    run_cfg = cfg.get("run") or {}
-    log.info(
-        "Training-time validation report_profile=%s answer_posterior_surrogate=%s",
-        cfg.model.eval_cfg.get("report_profile"),
-        format_search_eval_answer_posterior(
-            _coerce_search_eval_cfg(cfg.model.eval_cfg)
-        ),
-    )
-    if bool(run_cfg.get("test", False)):
-        final_eval_experiment = str(run_cfg.get("final_eval_experiment") or "").strip()
-        if final_eval_experiment:
+        def _log_post_fit_eval_plan(run_cfg: Any) -> None:
+            log.info(
+                "Training-time validation report_profile=%s answer_posterior_surrogate=%s",
+                cfg.model.eval_cfg.get("report_profile"),
+                format_search_eval_answer_posterior(
+                    _coerce_search_eval_cfg(cfg.model.eval_cfg)
+                ),
+            )
+            if not bool(run_cfg.get("test", False)):
+                return
+            final_eval_experiment = str(
+                run_cfg.get("final_eval_experiment") or ""
+            ).strip()
+            if not final_eval_experiment:
+                log.info(
+                    "Post-fit evaluation is enabled via in-process trainer.test()."
+                )
+                return
             output_subdir = str(
                 run_cfg.get("final_eval_output_subdir") or "final_eval"
             ).strip()
@@ -539,54 +456,65 @@ def train_model(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 run_cfg.get("final_eval_split") or "test",
                 run_cfg.get("final_eval_output_subdir") or "final_eval",
             )
-        else:
-            log.info("Post-fit evaluation is enabled via in-process trainer.test().")
 
-    resolved_fit_schedule: ResolvedPassFitSchedule | None = None
+        seed_everything_if_needed(cfg)
 
-    def _on_datamodule_instantiated(datamodule: Any) -> None:
-        nonlocal resolved_fit_schedule
+        resolved_run_name = apply_run_name(cfg)
+        log.info("Resolved run name: %s", resolved_run_name)
+
+        run_cfg = cfg.get("run") or {}
+        _log_post_fit_eval_plan(run_cfg)
+
+        resolved_fit_schedule: ResolvedPassFitSchedule | None = None
+
+        def _on_datamodule_instantiated(datamodule: Any) -> None:
+            nonlocal resolved_fit_schedule
+            if bool(run_cfg.get("train", True)):
+                resolved_fit_schedule = _configure_pass_fit_schedule(
+                    cfg,
+                    datamodule=datamodule,
+                )
+
+        def _on_model_instantiated(model: Any) -> None:
+            _maybe_load_model_weights(model=model, cfg=cfg)
+            if resolved_fit_schedule is None:
+                return
+            setter = getattr(model, "set_fit_schedule", None)
+            if callable(setter):
+                setter(resolved_fit_schedule)
+
+        objects = instantiate_lightning_task_objects(
+            cfg,
+            log=log,
+            on_datamodule_instantiated=_on_datamodule_instantiated,
+            on_model_instantiated=_on_model_instantiated,
+        )
+        datamodule = objects.datamodule
+        model = cast(LightningModule, objects.model)
+        trainer = objects.trainer
+        object_dict = objects.as_dict()
+
         if bool(run_cfg.get("train", True)):
-            resolved_fit_schedule = _configure_pass_fit_schedule(
-                cfg,
+            log.info("Starting training!")
+            trainer.fit(
+                model=model,
                 datamodule=datamodule,
+                ckpt_path=cfg.get("ckpt_path"),
             )
 
-    def _on_model_instantiated(model: Any) -> None:
-        _maybe_load_model_weights(model=model, cfg=cfg)
-        if resolved_fit_schedule is None:
-            return
-        setter = getattr(model, "set_fit_schedule", None)
-        if callable(setter):
-            setter(resolved_fit_schedule)
-
-    objects = instantiate_lightning_task_objects(
-        cfg,
-        log=log,
-        on_datamodule_instantiated=_on_datamodule_instantiated,
-        on_model_instantiated=_on_model_instantiated,
-    )
-    datamodule = objects.datamodule
-    model = cast(LightningModule, objects.model)
-    trainer = objects.trainer
-    object_dict = objects.as_dict()
-
-    if bool(run_cfg.get("train", True)):
-        log.info("Starting training!")
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
-
-    train_metrics = dict(trainer.callback_metrics)
-    test_metrics = _run_post_fit_evaluation(
-        cfg=cfg,
-        trainer=trainer,
-        model=model,
-        datamodule=datamodule,
-    )
-
-    # merge train and test metrics
-    metric_dict = {**train_metrics, **test_metrics}
-
-    return metric_dict, object_dict
+        train_metrics = dict(trainer.callback_metrics)
+        test_metrics = _run_post_fit_evaluation(
+            cfg=cfg,
+            trainer=trainer,
+            model=model,
+            datamodule=datamodule,
+        )
+        return {**train_metrics, **test_metrics}, object_dict
+    except Exception:
+        log.exception("")
+        raise
+    finally:
+        finalize_task(cfg=cfg, log=log)
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
@@ -598,29 +526,25 @@ def main(cfg: DictConfig) -> Optional[float]:
     """
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
-    require_run_target_config(
-        cfg,
-        missing_run_message=(
+    run_cfg = cfg.get("run")
+    if run_cfg is None:
+        raise ValueError(
             "Missing required config group: `run`. "
             "Fix: use a train config that sets `/run`, for example `experiment=train_rankflow`."
-        ),
-        missing_target_message=(
-            "Missing required run target: `run._target_`. "
-            "Fix: use a concrete run config such as `run=train_rankflow`."
-        ),
-    )
-    validate_train_entry_contract(cfg)
+        )
+    validate_train_entrypoint(cfg)
     extras(cfg)
-    runner = cast(
-        TrainRunnerProtocol,
-        instantiate_task_runner(cfg.run, run_signature="run(cfg=..., train_model=...)"),
-    )
-    runner.validate(cfg)
+    run_name = str(run_cfg.get("name") or "").strip()
+    if not is_rankflow_train_run(run_name):
+        raise ValueError(
+            f"Unsupported train run.name={run_name!r}. Expected a `{RANKFLOW_TRAIN_RUN_PREFIX}*` run."
+        )
+    validate_train_config(cfg)
 
-    metric_dict, _ = runner.run(cfg=cfg, train_model=train_model)
+    metric_dict, _ = train_model(cfg)
 
     # safely retrieve metric value for hydra-based hyperparameter optimization
-    return get_metric_value(
+    return _get_metric_value(
         metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
     )
 

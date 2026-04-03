@@ -15,14 +15,14 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from src.data.preprocess.labels.edge_retrieval import (  # noqa: E402
     resolve_forward_shortest_path_trajectory,
 )
-from src.datasets.graph_retrieval_dataset import create_graph_retrieval_dataset  # noqa: E402
-from src.runs.common import compose_config  # noqa: E402
+from src.data.retrieval.dataset import create_graph_retrieval_dataset  # noqa: E402
+from src.runs.hydra import compose_config  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a sample-id filter for answer-committed RankFlow probes above a "
+            "Build a sample-id filter for answer-set RankFlow probes above a "
             "hop threshold."
         )
     )
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         "--min-hop",
         type=int,
         default=2,
-        help="Keep samples whose shortest reachable answer path has hop >= min-hop.",
+        help="Keep samples whose shortest answer-reaching path has hop >= min-hop.",
     )
     parser.add_argument(
         "--output-path",
@@ -125,12 +125,14 @@ def main() -> None:
     output = {
         "dataset": str(args.dataset),
         "split": str(args.split),
-        "min_hop": int(args.min_hop),
-        "total_samples": int(total_samples),
-        "kept_samples": int(len(kept_sample_ids)),
-        "unreachable_samples": int(unreachable_count),
-        "hop_histogram": dict(sorted(hop_histogram.items(), key=lambda item: item[0])),
-        "sample_ids": kept_sample_ids,
+        "min_answer_path_hop": int(args.min_hop),
+        "total_sample_count": int(total_samples),
+        "kept_sample_count": int(len(kept_sample_ids)),
+        "unreachable_sample_count": int(unreachable_count),
+        "shortest_answer_path_hop_histogram": dict(
+            sorted(hop_histogram.items(), key=lambda item: item[0])
+        ),
+        "kept_sample_ids": kept_sample_ids,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(

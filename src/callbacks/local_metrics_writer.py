@@ -5,7 +5,7 @@ from typing import Any
 
 from lightning.pytorch.callbacks import Callback
 
-from src.utils.output_sinks import StageMetricsSettings, append_stage_metrics
+from src.runs.output import append_stage_metrics
 
 
 class LocalMetricsWriter(Callback):
@@ -160,20 +160,18 @@ class LocalMetricsWriter(Callback):
             return
         output_dir = self._ensure_output_dir(trainer)
         append_stage_metrics(
-            metrics=payload,
-            settings=StageMetricsSettings(
-                output_dir=output_dir,
-                stage=stage,
-                step=(
-                    int(getattr(trainer, "global_step", 0))
-                    if step_override is None
-                    else int(step_override)
-                ),
-                epoch=self._resolve_epoch(trainer),
-                record_kind=record_kind,
-                metadata=metadata,
-                file_name=file_name,
+            output_dir=output_dir,
+            stage=stage,
+            step=(
+                int(getattr(trainer, "global_step", 0))
+                if step_override is None
+                else int(step_override)
             ),
+            metrics=payload,
+            epoch=self._resolve_epoch(trainer),
+            record_kind=record_kind,
+            metadata=metadata,
+            file_name=file_name,
         )
 
     def _resolve_output_dir(self, trainer) -> Path:

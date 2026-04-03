@@ -2,62 +2,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import src.runs.lightning as entrypoint_utils
 from lightning.pytorch.callbacks import ModelCheckpoint
-import pytest
 from omegaconf import OmegaConf
-
-import src.utils.entrypoint_utils as entrypoint_utils
-
-
-def test_require_run_target_config_rejects_missing_run_group() -> None:
-    cfg = OmegaConf.create({})
-
-    with pytest.raises(ValueError, match="Missing required config group"):
-        entrypoint_utils.require_run_target_config(
-            cfg,
-            missing_run_message="Missing required config group: `run`.",
-            missing_target_message="Missing required run target: `run._target_`.",
-        )
-
-
-def test_require_run_target_config_rejects_missing_target() -> None:
-    cfg = OmegaConf.create({"run": {}})
-
-    with pytest.raises(ValueError, match="Missing required run target"):
-        entrypoint_utils.require_run_target_config(
-            cfg,
-            missing_run_message="Missing required config group: `run`.",
-            missing_target_message="Missing required run target: `run._target_`.",
-        )
-
-
-def test_instantiate_task_runner_requires_validate_and_run(monkeypatch) -> None:
-    cfg = OmegaConf.create({"run": {"_target_": "tests.Runner"}})
-
-    monkeypatch.setattr(
-        entrypoint_utils.hydra.utils,
-        "instantiate",
-        lambda run_cfg, **kwargs: SimpleNamespace(validate=lambda current_cfg: None),
-    )
-
-    with pytest.raises(TypeError, match="run\(cfg=..., train_model=...\)"):
-        entrypoint_utils.instantiate_task_runner(
-            cfg.run,
-            run_signature="run(cfg=..., train_model=...)",
-        )
 
 
 def test_instantiate_lightning_task_objects_wires_components(monkeypatch) -> None:
     cfg = OmegaConf.create(
         {
-            "data": {
-                "_target_": "tests.DataModule",
-                "contract": {"requires_dataset_cfg": True},
-            },
-            "model": {
-                "_target_": "tests.Model",
-                "contract": {"task_family": "answer_ranking"},
-            },
+            "data": {"_target_": "tests.DataModule"},
+            "model": {"_target_": "tests.Model"},
             "trainer": {"_target_": "tests.Trainer"},
             "callbacks": {"writer": {"_target_": "tests.Callback"}},
             "logger": {"csv": {"_target_": "tests.Logger"}},
@@ -72,7 +26,6 @@ def test_instantiate_lightning_task_objects_wires_components(monkeypatch) -> Non
 
     def _fake_instantiate(config, **kwargs):  # type: ignore[no-untyped-def]
         target = str(config.get("_target_"))
-        assert "contract" not in config
         if target == "tests.DataModule":
             return datamodule
         if target == "tests.Model":
@@ -119,13 +72,11 @@ def test_instantiate_lightning_task_objects_resolves_root_interpolations(
             "run": {"split": "validation"},
             "data": {
                 "_target_": "tests.DataModule",
-                "contract": {"requires_dataset_cfg": True},
                 "dataset_cfg": "${dataset}",
                 "eval_split": "${oc.select:run.split,test}",
             },
             "model": {
                 "_target_": "tests.Model",
-                "contract": {"task_family": "answer_ranking"},
                 "horizon_cfg": {"max_steps": "${dataset.max_steps}"},
             },
             "trainer": {"_target_": "tests.Trainer"},
@@ -216,22 +167,6 @@ def test_instantiate_lightning_task_objects_allows_datamodule_hook_to_mutate_cfg
         "_target_": "tests.Model",
         "horizon_cfg": {"max_steps": 7},
     }
-
-
-def test_normalize_trainer_cfg_rewrites_null_max_steps_for_instantiation() -> None:
-    trainer_cfg = OmegaConf.create(
-        {
-            "_target_": "tests.Trainer",
-            "accelerator": "gpu",
-            "devices": 1,
-            "max_steps": None,
-        }
-    )
-
-    normalized = entrypoint_utils._normalize_trainer_cfg(trainer_cfg)
-
-    assert normalized.max_steps == -1
-    assert trainer_cfg.max_steps is None
 
 
 def test_instantiate_lightning_task_objects_normalizes_trainer_max_steps(

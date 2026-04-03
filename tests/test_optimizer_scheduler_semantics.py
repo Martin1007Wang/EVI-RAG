@@ -9,12 +9,11 @@ import torch
 from torch.nn import Parameter
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
-from src.models.gflownet.config_utils import (
+from src.subgraph_gflownet.core.config_utils import (
     normalize_training_cfg,
 )
-from src.utils.optimizer_utils import build_optimizer_and_scheduler
-from src.utils.training_schedules import (
-    ProposalBiasScheduler,
+from src.subgraph_gflownet.core.optimization import build_optimizer_and_scheduler
+from src.subgraph_gflownet.core.schedules import (
     ReplayMixScheduler,
     SamplingTemperatureScheduler,
     TrainingScheduleContext,
@@ -322,58 +321,6 @@ def test_annealed_sampling_temperature_scheduler_requires_known_horizon() -> Non
         scheduler.value(global_step=0, schedule_context=schedule_context)
 
 
-def test_linear_proposal_bias_scheduler_uses_training_horizon() -> None:
-    scheduler = ProposalBiasScheduler(
-        base_scale=1.0,
-        type="linear",
-        final_scale=0.25,
-    )
-    schedule_context = TrainingScheduleContext(
-        estimated_stepping_batches=1_000_000,
-        trainer_max_steps=4,
-    )
-
-    assert scheduler.value(
-        global_step=0, schedule_context=schedule_context
-    ) == pytest.approx(1.0)
-    assert scheduler.value(
-        global_step=3, schedule_context=schedule_context
-    ) == pytest.approx(0.25)
-
-
-def test_proposal_bias_scheduler_supports_initial_hold_steps() -> None:
-    scheduler = ProposalBiasScheduler(
-        base_scale=1.0,
-        type="cosine",
-        initial_scale=0.8,
-        final_scale=0.0,
-        total_steps=4,
-        hold_steps=1,
-    )
-    schedule_context = TrainingScheduleContext(estimated_stepping_batches=4)
-
-    assert scheduler.value(
-        global_step=0, schedule_context=schedule_context
-    ) == pytest.approx(0.8)
-    assert scheduler.value(
-        global_step=3, schedule_context=schedule_context
-    ) == pytest.approx(0.0)
-    mid_value = scheduler.value(global_step=1, schedule_context=schedule_context)
-    assert 0.0 < mid_value < 0.8
-
-
-def test_annealed_proposal_bias_scheduler_requires_known_horizon() -> None:
-    scheduler = ProposalBiasScheduler(
-        base_scale=1.0,
-        type="cosine",
-        final_scale=0.25,
-    )
-    schedule_context = TrainingScheduleContext(estimated_stepping_batches=None)
-
-    with pytest.raises(RuntimeError, match="known step horizon"):
-        scheduler.value(global_step=0, schedule_context=schedule_context)
-
-
 def test_replay_mix_scheduler_uses_base_alpha_and_hold_steps() -> None:
     scheduler = ReplayMixScheduler(
         base_alpha=0.5,
@@ -394,18 +341,10 @@ def test_replay_mix_scheduler_uses_base_alpha_and_hold_steps() -> None:
     assert 0.0 < mid_value < 0.5
 
 
-def test_normalize_training_cfg_exposes_direct_failure_penalty() -> None:
-    training_cfg = normalize_training_cfg(
-        {"answer_reward": {"failure_penalty": math.e}}
-    )
-
-    assert training_cfg["answer_reward"]["failure_penalty"] == pytest.approx(math.e)
-
-
-def test_normalize_training_cfg_default_failure_penalty_is_stable() -> None:
+def test_normalize_training_cfg_default_frontier_bonus_is_stable() -> None:
     assert normalize_training_cfg({})["answer_reward"][
-        "failure_penalty"
-    ] == pytest.approx(4.0)
+        "frontier_bonus"
+    ] == pytest.approx(1.0)
 
 
 def test_normalize_training_cfg_populates_train_action_pruning_defaults() -> None:
@@ -415,6 +354,22 @@ def test_normalize_training_cfg_populates_train_action_pruning_defaults() -> Non
         "per_node_top_k": 0,
         "per_state_top_k": 0,
     }
+
+
+def test_normalize_training_cfg_rejects_removed_proposal_bias_switches() -> None:
+    with pytest.raises(ValueError, match="proposal.enabled was removed"):
+        normalize_training_cfg({"auxiliary": {"proposal": {"enabled": False}}})
+
+    with pytest.raises(ValueError, match="proposal.schedule was removed"):
+        normalize_training_cfg(
+            {
+                "auxiliary": {
+                    "proposal": {
+                        "schedule": {"type": "constant"},
+                    }
+                }
+            }
+        )
 
 
 def test_normalize_training_cfg_allows_disabling_train_action_pruning() -> None:
@@ -561,12 +516,19 @@ def test_normalize_training_cfg_rejects_removed_legacy_reward_shaping() -> None:
 
 
 def test_normalize_training_cfg_rejects_removed_subtb_knobs() -> None:
-    with pytest.raises(ValueError, match="Removed SubTB config detected"):
+    with pytest.raises(ValueError, match="SubTB was removed"):
         normalize_training_cfg({"subtb": {"root_loss_weight": 0.5}})
 
 
+def test_normalize_training_cfg_rejects_removed_answer_reward_keys() -> None:
+    with pytest.raises(ValueError, match="gold_answer_bonus"):
+        normalize_training_cfg({"answer_reward": {"gold_answer_bonus": 3.0}})
+    with pytest.raises(ValueError, match="wrong-answer penalties were removed"):
+        normalize_training_cfg({"answer_reward": {"wrong_answer_penalty": 0.5}})
+
+
 def test_normalize_training_cfg_rejects_enabled_proposal_auxiliary() -> None:
-    with pytest.raises(ValueError, match="proposal.enabled=true"):
+    with pytest.raises(ValueError, match="proposal.enabled was removed"):
         normalize_training_cfg({"auxiliary": {"proposal": {"enabled": True}}})
 
 
@@ -574,15 +536,15 @@ def test_normalize_training_cfg_validates_answer_reward() -> None:
     training_cfg = normalize_training_cfg(
         {
             "answer_reward": {
-                "gold_answer_bonus": 3.5,
-                "wrong_answer_penalty": 1.5,
-                "failure_penalty": 5.0,
+                "hit_bonus": 3.5,
+                "frontier_bonus": 1.5,
+                "coverage_bonus": 0.25,
             }
         }
     )
 
-    assert training_cfg["answer_reward"]["gold_answer_bonus"] == pytest.approx(3.5)
-    assert training_cfg["answer_reward"]["wrong_answer_penalty"] == pytest.approx(1.5)
-    assert training_cfg["answer_reward"]["failure_penalty"] == pytest.approx(5.0)
-    with pytest.raises(ValueError, match="wrong_answer_penalty"):
-        normalize_training_cfg({"answer_reward": {"wrong_answer_penalty": -0.1}})
+    assert training_cfg["answer_reward"]["hit_bonus"] == pytest.approx(3.5)
+    assert training_cfg["answer_reward"]["frontier_bonus"] == pytest.approx(1.5)
+    assert training_cfg["answer_reward"]["coverage_bonus"] == pytest.approx(0.25)
+    with pytest.raises(ValueError, match="frontier_bonus"):
+        normalize_training_cfg({"answer_reward": {"frontier_bonus": -0.1}})

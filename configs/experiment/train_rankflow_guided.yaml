@@ -1,11 +1,11 @@
 # @package _global_
 #
-# Answer-committed RankFlow with replay guidance enabled.
+# Ablation: enable reference-path replay on top of the paper-aligned RankFlow mainline.
 # Usage:
 #   python src/train.py experiment=train_rankflow_guided dataset=webqsp-sub
 #
-# This is the main research bundle for testing whether teacher-guided replay and
-# expand-imitation help the answer-commit objective on multi-anchor KGQA.
+# Use this only as an auxiliary ablation when comparing against the plain
+# Detailed-Balance training objective.
 
 defaults:
   - train_rankflow
@@ -14,7 +14,7 @@ defaults:
 run:
   name: train_rankflow_guided
   task_name: "train/rankflow_guided"
-  tags: ["rankflow", "gflownet", "answer-commit", "guided", "replay"]
+  tags: ["rankflow", "gflownet", "guided", "replay", "ablation"]
 
 model:
   training_cfg:

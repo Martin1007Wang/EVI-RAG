@@ -42,7 +42,7 @@ def test_sub_hal_score_is_computed_from_sub_scope_samples(tmp_path) -> None:
         "sample_id": "s1",
         "question": "Where was X born?",
         "answer_texts": ["Paris"],
-        "a_entity_in_graph": True,
+        "gold_answer_in_graph": True,
         "trajectories": [
             {
                 "edges": [
@@ -80,7 +80,7 @@ def test_metrics_use_structured_answer_field_not_raw_response(tmp_path) -> None:
         "sample_id": "s1",
         "question": "Where was X born?",
         "answer_texts": ["Paris"],
-        "a_entity_in_graph": True,
+        "gold_answer_in_graph": True,
         "trajectories": [],
     }
     output_record = {
@@ -118,7 +118,7 @@ def test_metrics_can_read_gold_labels_from_sidecar(tmp_path) -> None:
         "sample_id": "s1",
         "question": "Where was X born?",
         "answer_texts": ["Paris"],
-        "a_entity_in_graph": True,
+        "gold_answer_in_graph": True,
     }
     output_record = {"sample_id": "s1", "answer": "Paris"}
     input_path.write_text(json.dumps(input_record) + "\n", encoding="utf-8")
@@ -174,8 +174,16 @@ def test_metrics_fail_fast_on_duplicate_label_sample_id(tmp_path) -> None:
         "trajectories": [],
     }
     labels_records = [
-        {"sample_id": "s1", "answer_texts": ["Paris"], "a_entity_in_graph": True},
-        {"sample_id": "s1", "answer_texts": ["London"], "a_entity_in_graph": True},
+        {
+            "sample_id": "s1",
+            "answer_texts": ["Paris"],
+            "gold_answer_in_graph": True,
+        },
+        {
+            "sample_id": "s1",
+            "answer_texts": ["London"],
+            "gold_answer_in_graph": True,
+        },
     ]
     output_record = {"sample_id": "s1", "answer": "Paris"}
     input_path.write_text(json.dumps(input_record) + "\n", encoding="utf-8")
@@ -206,7 +214,7 @@ def test_metrics_artifacts_keep_json_and_jsonl_together(tmp_path) -> None:
         "sample_id": "s1",
         "question": "Where was X born?",
         "answer_texts": ["Paris"],
-        "a_entity_in_graph": True,
+        "gold_answer_in_graph": True,
         "trajectories": [],
     }
     output_record = {"sample_id": "s1", "answer": "Paris"}

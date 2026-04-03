@@ -7,9 +7,9 @@ defaults:
   - gflownet/optimizer_cfg: default
   - gflownet/scheduler_cfg: default
 
-_target_: src.models.gflownet_module.GFlowNetModule
+_target_: src.subgraph_gflownet.adapters.lightning.module.GFlowNetModule
 _recursive_: true
 _convert_: all
 
 metric_runtime_factory:
-  _target_: src.metrics.runtime_factory.GraphTaskRuntimeFactory
+  _target_: src.subgraph_gflownet.adapters.runtime.factory.GraphTaskRuntimeFactory

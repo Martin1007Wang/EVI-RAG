@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from src.utils.precision_utils import align_float_input_dtype
+from .dtypes import align_float_input_dtype
 
 
 def _build_mlp(

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from src.datasets.graph_retrieval_datamodule import (
+from src.data.retrieval.datamodule import (
     GraphRetrievalDataModule,
     StepDrivenTrainSampler,
     _resolve_embedding_attachment_device,
@@ -121,16 +121,16 @@ def test_graph_retrieval_datamodule_predict_stage_uses_requested_eval_split(
     created_splits: list[str] = []
 
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        "src.data.retrieval.datamodule.SharedDataResources",
         lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        "src.data.retrieval.datamodule.create_graph_retrieval_dataset",
         lambda **kwargs: created_splits.append(str(kwargs["split_name"]))
         or _DummyDataset(str(kwargs["split_name"])),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
+        "src.data.retrieval.datamodule.build_retrieval_dataloader",
         lambda dataset, **kwargs: {
             "split": dataset.split,
             "shuffle": kwargs["shuffle"],
@@ -207,15 +207,15 @@ def test_graph_retrieval_datamodule_train_loader_uses_step_driven_sampler(
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        "src.data.retrieval.datamodule.SharedDataResources",
         lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        "src.data.retrieval.datamodule.create_graph_retrieval_dataset",
         lambda **kwargs: _DummyDataset(str(kwargs["split_name"]), size=4),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
+        "src.data.retrieval.datamodule.build_retrieval_dataloader",
         lambda dataset, **kwargs: captured.update(
             {"dataset": dataset, "kwargs": kwargs}
         )
@@ -253,15 +253,15 @@ def test_graph_retrieval_datamodule_train_loader_uses_fixed_batch_size(
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        "src.data.retrieval.datamodule.SharedDataResources",
         lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        "src.data.retrieval.datamodule.create_graph_retrieval_dataset",
         lambda **kwargs: _DummyDataset(str(kwargs["split_name"]), size=4),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
+        "src.data.retrieval.datamodule.build_retrieval_dataloader",
         lambda dataset, **kwargs: captured.update(
             {"dataset": dataset, "kwargs": kwargs}
         )
@@ -292,11 +292,11 @@ def test_graph_retrieval_datamodule_train_loader_is_unsized_but_eval_loader_is_s
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        "src.data.retrieval.datamodule.SharedDataResources",
         lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        "src.data.retrieval.datamodule.create_graph_retrieval_dataset",
         lambda **kwargs: _DummyDataset(str(kwargs["split_name"]), size=4),
     )
 
@@ -321,51 +321,6 @@ def test_graph_retrieval_datamodule_train_loader_is_unsized_but_eval_loader_is_s
     assert len(val_loader) == 2
 
 
-def test_graph_retrieval_datamodule_set_eval_split_invalidates_cached_dataset(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    created_splits: list[str] = []
-
-    monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
-        lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
-    )
-    monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
-        lambda **kwargs: created_splits.append(str(kwargs["split_name"]))
-        or _DummyDataset(str(kwargs["split_name"])),
-    )
-    monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
-        lambda dataset, **kwargs: {
-            "split": dataset.split,
-            "shuffle": kwargs["shuffle"],
-            "batch_size": kwargs["batch_size"],
-        },
-    )
-
-    datamodule = GraphRetrievalDataModule(
-        dataset_cfg=_write_dataset_paths(tmp_path),
-        batch_size=2,
-        eval_batch_size=7,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=False,
-        train_shuffle=False,
-        prefetch_factor=None,
-        persistent_workers=False,
-        eval_split="validation",
-    )
-
-    datamodule.setup(stage="predict")
-    datamodule.set_eval_split("test")
-    loader = datamodule.predict_dataloader()
-
-    assert created_splits == ["validation", "test"]
-    assert loader == {"split": "test", "shuffle": False, "batch_size": 7}
-
-
 def test_graph_retrieval_datamodule_uses_eval_worker_overrides(
     tmp_path: Path,
     monkeypatch,
@@ -379,11 +334,11 @@ def test_graph_retrieval_datamodule_uses_eval_worker_overrides(
     eval_context = "spawn" if "spawn" in supported_methods else supported_methods[0]
 
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.SharedDataResources",
+        "src.data.retrieval.datamodule.SharedDataResources",
         lambda **kwargs: SimpleNamespace(clear=lambda: None, **kwargs),
     )
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.create_graph_retrieval_dataset",
+        "src.data.retrieval.datamodule.create_graph_retrieval_dataset",
         lambda **kwargs: _DummyDataset(str(kwargs["split_name"]), size=4),
     )
 
@@ -392,7 +347,7 @@ def test_graph_retrieval_datamodule_uses_eval_worker_overrides(
         return {"split": dataset.split, "num_workers": kwargs["num_workers"]}
 
     monkeypatch.setattr(
-        "src.datasets.graph_retrieval_datamodule.build_retrieval_dataloader",
+        "src.data.retrieval.datamodule.build_retrieval_dataloader",
         _build_loader,
     )
 
