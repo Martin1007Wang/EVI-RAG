@@ -1,17 +1,15 @@
 # https://wandb.ai
 
-wandb:
-  _target_: lightning.pytorch.loggers.wandb.WandbLogger
-  name: ${oc.select:hydra.runtime.choices.experiment,${task_name}}
-  save_dir: "${paths.output_dir}"
-  offline: False
-  id: null # pass correct id to resume experiment!
-  anonymous: null # enable anonymous logging
-  # set these according to README instructions or export WANDB_PROJECT/WANDB_ENTITY
-  project: ${oc.env:WANDB_PROJECT, "your_project_name"}
-  log_model: False # upload lightning ckpts
-  prefix: "" # a string to put at the beginning of metric keys
-  entity: ${oc.env:WANDB_ENTITY, null}
-  group: ""
-  tags: []
-  job_type: ""
+_target_: lightning.pytorch.loggers.wandb.WandbLogger
+name: ${run_name}
+save_dir: "${paths.output_dir}"
+offline: False
+id: null
+anonymous: null
+project: ${oc.env:WANDB_PROJECT, "your_project_name"}
+log_model: False
+prefix: ""
+entity: ${oc.env:WANDB_ENTITY, null}
+group: ""
+tags: []
+job_type: ""

@@ -1,9 +1,0 @@
-# @package model.training_cfg.auxiliary.proposal
-
-# This subtree only exposes feature hints that affect which optional graph
-# annotations are materialized during training-time batch preparation.
-# It is not a trainable proposal-bias mechanism in the current mainline.
-
-prior:
-  oracle_answer_distance_weight: 0.0
-  prior_question_similarity_weight: 0.0

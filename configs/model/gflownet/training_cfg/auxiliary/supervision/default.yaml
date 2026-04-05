@@ -1,8 +1,0 @@
-# @package model.training_cfg.auxiliary.supervision
-
-enabled: true
-warmup_steps: 0
-warmup_db_weight: 0.0
-db_weight: 1.0
-imitation_weight: 0.0
-success_action_weight: 0.0

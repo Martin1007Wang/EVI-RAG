@@ -1,5 +1,0 @@
-# @package model.training_cfg.action_pruning
-
-# The strict paper-style mainline keeps the full support by default.
-per_node_top_k: 0
-per_state_top_k: 0

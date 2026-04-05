@@ -1,5 +1,0 @@
-# @package model.policy_cfg.state_encoder
-
-hidden_dim: 256
-num_layers: 2
-dropout: 0.0

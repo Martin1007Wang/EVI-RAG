@@ -10,27 +10,14 @@
 # Order of defaults determines the order in which configs override each other.
 defaults:
   - _self_
-  - ckpt: default
-  - run: train_rankflow
   - dataset: null
-  - data: graph_retrieval
+  - data: datamodule
   - model: gflownet
   - callbacks: default
-  - logger: null
+  - logger: wandb
   - trainer: default
-  - fit_schedule: pass
   - paths: default
-  - extras: default
   - hydra: default
   - experiment: null 
 
-# Task name and tags are run-driven, matching the eval entrypoint structure.
-task_name: ${run.task_name}
-tags: ${run.tags}
-
-# Run-driven checkpoints.
-ckpt_path: ${run.ckpt_path}
-init_ckpt_path: ${run.init_ckpt_path}
-
-# Seed for random number generators in pytorch, numpy and python.random.
 seed: 42

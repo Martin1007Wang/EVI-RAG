@@ -2,46 +2,13 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-min_epochs: 0
-max_epochs: -1
 max_steps: 100000
 
-# let Lightning pick the right accelerator/devices unless overridden
 accelerator: auto
 devices: auto
-profiler: null
 
-# mixed precision for throughput; prefer bf16 on supported GPUs
 precision: bf16-mixed
+accumulate_grad_batches: 8
 
-# gradient accumulation to trade throughput for memory
-accumulate_grad_batches: 1
-
-# cudnn autotune for stable input shapes (disable if shapes vary wildly)
-benchmark: true
-
-# automatic clipping handled by Lightning optimization loop
-gradient_clip_val: 1.0
-
-# Train runs may override these from `fit_schedule` once the filtered train-set
-# size is known.
 val_check_interval: 1000
-check_val_every_n_epoch: null
-
-# Custom train sampler handles DDP-aware step-driven sampling.
-use_distributed_sampler: false
-
-# skip sanity validation to avoid cold-start stalls on large datasets
-num_sanity_val_steps: 0
-
-# optional batch limits for profiling/debugging
-limit_train_batches: null
-limit_val_batches: null
-limit_test_batches: null
-
-# log interval (steps)
-log_every_n_steps: 50
-
-# set True to to ensure deterministic results
-# makes training slower but gives more reproducibility than just setting seeds
-deterministic: False
+num_sanity_val_steps: 2

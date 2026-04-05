@@ -16,9 +16,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from lightning import LightningModule
 
 
-def init_logging(
-    *, level: int = _DEFAULT_LOG_LEVEL, log_path: Optional[Path] = None
-) -> None:
+def init_logging(*, level: int = _DEFAULT_LOG_LEVEL, log_path: Optional[Path] = None) -> None:
     global _LOGGING_INITIALIZED
     root = logging.getLogger()
     if not _LOGGING_INITIALIZED:
@@ -35,9 +33,7 @@ def init_logging(
                 if Path(handler.baseFilename).resolve() == resolved:
                     return
         file_handler = logging.FileHandler(resolved)
-        file_handler.setFormatter(
-            logging.Formatter(_DEFAULT_LOG_FORMAT, datefmt=_DEFAULT_LOG_DATEFMT)
-        )
+        file_handler.setFormatter(logging.Formatter(_DEFAULT_LOG_FORMAT, datefmt=_DEFAULT_LOG_DATEFMT))
         root.addHandler(file_handler)
 
 
@@ -84,9 +80,7 @@ class RankedLogger(logging.LoggerAdapter):
         super().__init__(logger=logger, extra=extra)
         self.rank_zero_only = rank_zero_only
 
-    def log(
-        self, level: int, msg: str, *args, rank: Optional[int] = None, **kwargs
-    ) -> None:
+    def log(self, level: int, msg: str, *args, rank: Optional[int] = None, **kwargs) -> None:
         if self.isEnabledFor(level):
             from lightning_utilities.core.rank_zero import (
                 rank_prefixed_message,
@@ -96,9 +90,7 @@ class RankedLogger(logging.LoggerAdapter):
             msg, kwargs = self.process(msg, kwargs)
             current_rank = getattr(rank_zero_only, "rank", None)
             if current_rank is None:
-                raise RuntimeError(
-                    "The `rank_zero_only.rank` needs to be set before use"
-                )
+                raise RuntimeError("The `rank_zero_only.rank` needs to be set before use")
             msg = rank_prefixed_message(msg, current_rank)
             if self.rank_zero_only:
                 if current_rank == 0:
@@ -130,12 +122,8 @@ def _collect_model_param_counts(model: Any) -> Dict[str, int]:
     params = list(model.parameters())
     return {
         "model/params/total": sum(_safe_numel(p) for p in params),
-        "model/params/trainable": sum(
-            _safe_numel(p) for p in params if p.requires_grad
-        ),
-        "model/params/non_trainable": sum(
-            _safe_numel(p) for p in params if not p.requires_grad
-        ),
+        "model/params/trainable": sum(_safe_numel(p) for p in params if p.requires_grad),
+        "model/params/non_trainable": sum(_safe_numel(p) for p in params if not p.requires_grad),
     }
 
 
@@ -145,9 +133,7 @@ def _resolve_cfg_container(cfg: Any) -> Dict[str, Any]:
     try:
         from omegaconf import OmegaConf
     except ModuleNotFoundError as exc:  # pragma: no cover
-        raise ModuleNotFoundError(
-            "OmegaConf is required for log_hyperparameters."
-        ) from exc
+        raise ModuleNotFoundError("OmegaConf is required for log_hyperparameters.") from exc
     container = OmegaConf.to_container(cfg)
     if not isinstance(container, dict):
         raise TypeError("log_hyperparameters expects cfg to resolve to a dict")
@@ -159,9 +145,7 @@ def _collect_cfg_sections(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "model": cfg.get("model"),
         "data": cfg.get("data"),
         "trainer": cfg.get("trainer"),
-        "fit_schedule": cfg.get("fit_schedule"),
         "callbacks": cfg.get("callbacks"),
-        "extras": cfg.get("extras"),
         "task_name": cfg.get("task_name"),
         "tags": cfg.get("tags"),
         "ckpt_path": cfg.get("ckpt_path"),

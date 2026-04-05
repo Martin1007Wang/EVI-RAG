@@ -1,0 +1,14 @@
+# configs/data/graph_retrieval.yaml
+
+_target_: src.data.datamodule.RetrievalDataModule
+
+dataset_cfg: ${dataset}
+
+# === Dataloader 逻辑参数 ===
+batch_size: 32
+num_workers: 8
+eval_batch_size: 16
+eval_num_workers: 8
+pin_memory: true
+train_shuffle: true
+train_num_samples: 1024

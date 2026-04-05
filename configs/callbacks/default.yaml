@@ -2,32 +2,22 @@
 model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
-  filename: "step_{step:07d}"
+  filename: "step_{step:07d}-recall10_{recall10:.4f}"
   monitor: "val/${dataset.dataset_scope}/answer/recall@10"
-  verbose: False
-  save_last: True
-  save_top_k: 1
-  mode: "max"
-  auto_insert_metric_name: False
-  save_weights_only: False
-  every_n_train_steps: null
-  train_time_interval: null
-  every_n_epochs: null
-  save_on_train_epoch_end: null
+  save_top_k: 3
+  save_last: true
+  mode: max
+  every_n_train_steps: 1000 
 
 early_stopping:
-  _target_: src.callbacks.step_early_stopping.LoggedMetricEarlyStopping
+  _target_: lightning.pytorch.callbacks.EarlyStopping
   monitor: "val/${dataset.dataset_scope}/answer/recall@10"
-  min_delta: 0.0
-  # Train runs can rewrite this from `fit_schedule` before callback instantiation.
+  min_delta: 0.001
   patience: 10
-  verbose: False
-  mode: "max"
-  strict: True
+  verbose: true
+  mode: max
+  strict: true
   check_finite: True
-  stopping_threshold: null
-  divergence_threshold: null
-  check_on_train_epoch_end: false
 
 model_summary:
   _target_: lightning.pytorch.callbacks.RichModelSummary
@@ -35,8 +25,3 @@ model_summary:
 
 rich_progress_bar:
   _target_: lightning.pytorch.callbacks.RichProgressBar
-
-local_metrics_writer:
-  _target_: src.callbacks.local_metrics_writer.LocalMetricsWriter
-  output_dir: ${paths.output_dir}/metrics
-  enabled: true

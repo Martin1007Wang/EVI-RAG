@@ -1,7 +1,0 @@
-# @package model.training_cfg.sampling_temperature_schedule
-
-type: constant
-initial_temperature: null
-final_temperature: null
-total_steps: null
-hold_steps: 0

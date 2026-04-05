@@ -1,8 +1,0 @@
-# @package model.optimizer_cfg
-
-type: adamw
-lr: 1.0e-4
-log_z_head_lr_multiplier: 5.0
-weight_decay: 1.0e-4
-betas: [0.9, 0.999]
-no_decay_on_bias_and_norm: true

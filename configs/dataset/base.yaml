@@ -18,13 +18,11 @@ artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.na
 paths:
   embeddings: ${dataset.materialized_dir}/embeddings
   processed: ${dataset.materialized_dir}/processed
-  entity_vocab: ${dataset.out_dir}/entity_vocab.parquet
-  relation_vocab: ${dataset.out_dir}/relation_vocab.parquet
-  heuristic_log_v: null
+  entity_metadata: ${dataset.materialized_dir}/embeddings/entity_metadata.pt
 
 lmdb_readahead: true
 sequential_sample_ids: true
-# Runtime-only masks applied when loading already materialized samples.
+
 runtime_filter_missing_anchor:
   train: true
   validation: true
@@ -49,6 +47,3 @@ column_map:
   question_entity_field: q_entity
   answer_entity_field: a_entity
   graph_field: graph
-
-# Training length and validation cadence are resolved from `fit_schedule` after
-# the filtered train split size is known.

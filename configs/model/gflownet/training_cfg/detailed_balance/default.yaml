@@ -1,6 +1,0 @@
-# @package model.training_cfg.detailed_balance
-
-# Detailed Balance does not require additional loss-shaping knobs in the
-# paper-aligned mainline. Keep the section explicit so experiment configs can
-# depend on the canonical single-step objective directly.
-{}

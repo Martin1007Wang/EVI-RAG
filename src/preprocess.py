@@ -1,3 +1,4 @@
+# src/preprocess.py
 from __future__ import annotations
 
 import sys
@@ -5,10 +6,7 @@ from pathlib import Path
 
 import hydra
 import rootutils
-from omegaconf import DictConfig
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path = [entry for entry in sys.path if Path(entry or ".").resolve() != _SCRIPT_DIR]
+from omegaconf import DictConfig, OmegaConf
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -18,35 +16,32 @@ log = get_logger(__name__)
 
 
 def _require_dataset_config(cfg: DictConfig) -> None:
-    if cfg.get("dataset") is not None:
-        return
-    raise ValueError(
-        "Missing required config group: `dataset`. "
-        "Fix: run `python src/preprocess.py dataset=<name>` such as `dataset=webqsp`."
-    )
-
-
-def _get_preprocess_runner():
-    from src.data.preprocess.main import run_preprocess_pipeline
-
-    return run_preprocess_pipeline
-
-
-def _run_preprocess(cfg: DictConfig) -> None:
-    _require_dataset_config(cfg)
-    dataset_cfg = cfg.get("dataset") or {}
-    log.info(
-        "Starting preprocess pipeline: dataset=%s stage=%s",
-        dataset_cfg.get("name"),
-        cfg.get("pipeline_stage", "all"),
-    )
-    _get_preprocess_runner()(cfg)
+    if "dataset" not in cfg or cfg.dataset is None:
+        raise ValueError(
+            "Missing required config group: `dataset`. "
+            "Fix: run `python src/preprocess.py dataset=<name>` such as `dataset=webqsp`."
+        )
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="preprocess.yaml")
 def main(cfg: DictConfig) -> None:
-    _run_preprocess(cfg)
+    # 1. 结构验证
+    _require_dataset_config(cfg)
+
+    # 2. 冻结配置，防止运行时被意外修改 (Hydra 最佳实践)
+    OmegaConf.resolve(cfg)
+
+    dataset_name = cfg.dataset.get("name", "Unknown")
+    stage = cfg.get("pipeline_stage", "all")
+
+    log.info(f"Starting preprocess pipeline: dataset={dataset_name} stage={stage}")
+
+    # 3. 延迟导入，避免不必要的依赖加载阻塞 CLI 报错
+    from src.data.preprocess import run_preprocess_pipeline
+
+    # 4. 传递给下一层进行强类型实例化
+    run_preprocess_pipeline(cfg)
 
 
 if __name__ == "__main__":
-    main()  # type: ignore[call-arg]
+    main()

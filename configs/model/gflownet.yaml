@@ -1,15 +1,60 @@
-defaults:
-  - _self_
-  - gflownet/horizon_cfg: default
-  - gflownet/training_cfg: default
-  - gflownet/policy_cfg: default
-  - gflownet/eval_cfg: default
-  - gflownet/optimizer_cfg: default
-  - gflownet/scheduler_cfg: default
+# @package model
+# GFlowNet 配置 - 完全扁平化，无嵌套结构
 
-_target_: src.subgraph_gflownet.adapters.lightning.module.GFlowNetModule
+_target_: src.models.gflownet.GFlowNetModule
 _recursive_: true
 _convert_: all
 
-metric_runtime_factory:
-  _target_: src.subgraph_gflownet.adapters.runtime.factory.GraphTaskRuntimeFactory
+# 核心训练参数
+max_steps: 20
+rollouts_per_graph: 8
+
+# 温度调度
+sampling_temperature_schedule:
+  schedule_type: linear
+  initial_value: 2.0
+  final_value: 0.5
+  total_steps: 10000
+
+# 策略网络
+backbone:
+  hidden_dim: 512
+  gnn_num_layers: 2
+  gnn_dropout: 0.1
+
+policy_hidden_dim: 512
+eval_num_rollouts: 36
+# 奖励模型
+answer_reward:
+  hit_reward: 10.0
+  miss_reward: 0.0001
+  lambda_1: 0.1
+  lambda_2: 1.0
+
+# 优化器
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+# 学习率调度器
+scheduler:
+  type: cosine
+  T_max: 10000
+  eta_min: 0.00001
+
+# 验证评估（快速模式）
+validation_eval_cfg:
+  mode: validation
+  num_rollouts: 128
+  aggregation: vote
+  early_stop: false
+
+# 测试评估（准确模式）
+test_eval_cfg:
+  mode: testing
+  num_rollouts: 4096
+  aggregation: reward_weighted
+  early_stop: true
+  confidence_threshold: 0.95
+  max_rollouts: 8192
