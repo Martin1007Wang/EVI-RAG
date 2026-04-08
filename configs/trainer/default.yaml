@@ -2,13 +2,15 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-max_steps: 100000
+max_epochs: 100000
 
 accelerator: auto
 devices: auto
 
 precision: bf16-mixed
+# precision: 32-true
 accumulate_grad_batches: 8
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
 
-val_check_interval: 1000
-num_sanity_val_steps: 2
+val_check_interval: 1.0

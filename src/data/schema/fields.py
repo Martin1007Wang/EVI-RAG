@@ -14,8 +14,6 @@ class SampleFields:
 
     # --- 问题 ---
     QUESTION_EMB = "question_emb"
-    QUESTION_CTX = "question_ctx"
-    QUESTION_CTX_MASK = "question_ctx_mask"
     QUESTION_TEXT = "question"
 
     # --- 答案 / 锚点 (核心修改：从局部索引改为布尔掩码) ---
@@ -59,12 +57,7 @@ class SampleFields:
             NUM_NODES,
         }
     )
-    STORAGE_OPTIONAL: FrozenSet[str] = frozenset(
-        {
-            QUESTION_CTX,
-            QUESTION_CTX_MASK,
-        }
-    )
+    STORAGE_OPTIONAL: FrozenSet[str] = frozenset()
     STORAGE_ALLOWED: FrozenSet[str] = STORAGE_REQUIRED | STORAGE_OPTIONAL
 
 
@@ -77,9 +70,3 @@ class StorageSchema:
         unexpected = data.keys() - SampleFields.STORAGE_ALLOWED
         if unexpected:
             raise KeyError(f"LMDB sample has unexpected keys: {sorted(unexpected)}")
-        has_ctx = SampleFields.QUESTION_CTX in data
-        has_ctx_mask = SampleFields.QUESTION_CTX_MASK in data
-        if has_ctx != has_ctx_mask:
-            raise KeyError(
-                "LMDB sample must write question_ctx and question_ctx_mask together."
-            )

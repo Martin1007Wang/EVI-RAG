@@ -51,8 +51,6 @@ class RetrievalDataset(Dataset):
             question_emb=torch.as_tensor(
                 raw[SampleFields.QUESTION_EMB], dtype=torch.float32
             ),
-            question_ctx=raw.get(SampleFields.QUESTION_CTX),
-            question_ctx_mask=raw.get(SampleFields.QUESTION_CTX_MASK),
             is_anchor_mask=raw[SampleFields.IS_ANCHOR_MASK],
             is_target_mask=raw[SampleFields.IS_TARGET_MASK],
             answer_entity_ids_global=raw[SampleFields.ANSWER_ENTITY_IDS_GLOBAL],

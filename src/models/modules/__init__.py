@@ -1,4 +1,4 @@
 from .backbone import GNNBackbone
-from .heads import FlowHead, ActionHead
+from .heads import ActionHead, ZHead
 
-__all__ = ["GNNBackbone", "FlowHead", "ActionHead"]
+__all__ = ["GNNBackbone", "ActionHead", "ZHead"]

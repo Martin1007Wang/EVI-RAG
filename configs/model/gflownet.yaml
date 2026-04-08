@@ -6,15 +6,16 @@ _recursive_: true
 _convert_: all
 
 # 核心训练参数
-max_steps: 20
-rollouts_per_graph: 8
+max_steps: ${dataset.max_steps}
+num_rollout: 8
+strict_on_policy: true
 
 # 温度调度
 sampling_temperature_schedule:
   schedule_type: linear
-  initial_value: 2.0
-  final_value: 0.5
-  total_steps: 10000
+  initial_value: 1.0
+  final_value: 1.0
+  total_steps: 1
 
 # 策略网络
 backbone:
@@ -23,38 +24,42 @@ backbone:
   gnn_dropout: 0.1
 
 policy_hidden_dim: 512
-eval_num_rollouts: 36
-# 奖励模型
-answer_reward:
-  hit_reward: 10.0
-  miss_reward: 0.0001
-  lambda_1: 0.1
-  lambda_2: 1.0
 
-# 优化器
-optimizer:
+relation_prior:
+  prior_lambda_init: 10.0
+  learnable_prior_scale: true
+  positive_prior_scale: true
+  zero_init_type_output: true
+  zero_init_expand_edge_output: true
+
+answer_reward:
+  hit_reward_base: 5.0
+  hit_reward_max: 50.0
+  miss_reward: 0.01
+  penalty_step: 0.98
+  penalty_dead: 0.2
+
+teacher_warmstart:
+  path_mode: undirected
+  stop_on_first_hit: true
+
+training_curriculum:
+  warmup_steps: 2000
+  blend_steps: 3000
+  edge_teacher_weight: 1.0
+  stop_teacher_weight: 3.0
+  tb_final_weight: 1.0
+
+optimizer_cfg:
+  type: adamw
   lr: 0.0001
   weight_decay: 0.01
   betas: [0.9, 0.999]
+  log_z_head_lr_multiplier: 1.0
 
-# 学习率调度器
-scheduler:
-  type: cosine
-  T_max: 10000
-  eta_min: 0.00001
-
-# 验证评估（快速模式）
-validation_eval_cfg:
-  mode: validation
-  num_rollouts: 128
-  aggregation: vote
-  early_stop: false
-
-# 测试评估（准确模式）
-test_eval_cfg:
-  mode: testing
-  num_rollouts: 4096
-  aggregation: reward_weighted
-  early_stop: true
-  confidence_threshold: 0.95
-  max_rollouts: 8192
+scheduler_cfg:
+  type: onecycle
+  interval: step         # 必须改为 step
+  lr: 0.0001             # 这里是 max_lr，与 optimizer 保持一致即可
+  pct_start: 0.1         # 前 10% 的训练步数用于 Warmup (非常关键)
+  anneal: cos            # 衰减策略

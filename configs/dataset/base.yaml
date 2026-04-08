@@ -8,6 +8,10 @@ max_steps: ???
 hf_dataset: ???
 dataset_source: hf
 run_test_after_fit: false
+train_split: train
+val_split: validation
+eval_split: test
+predict_split: ${dataset.eval_split}
 kb: freebase
 stark: null
 
@@ -17,20 +21,10 @@ artifact_dir: ${paths.data_dir}/${dataset.dataset_family}/artifacts/${dataset.na
 
 paths:
   embeddings: ${dataset.materialized_dir}/embeddings
-  processed: ${dataset.materialized_dir}/processed
   entity_metadata: ${dataset.materialized_dir}/embeddings/entity_metadata.pt
 
 lmdb_readahead: true
 sequential_sample_ids: true
-
-runtime_filter_missing_anchor:
-  train: true
-  validation: true
-  test: true
-runtime_filter_missing_answer:
-  train: true
-  validation: true
-  test: true
 
 entity_normalization: none
 entity_text_mode: regex

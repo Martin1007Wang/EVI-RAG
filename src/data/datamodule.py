@@ -75,6 +75,10 @@ class RetrievalDataModule(LightningDataModule):  # ← 改名
             )
 
         emb_dir = Path(self.dataset_cfg["paths"]["embeddings"])
+        train_split = self.dataset_cfg.get("train_split", "train")
+        val_split = self.dataset_cfg.get("val_split", "validation")
+        test_split = self.dataset_cfg.get("eval_split", "test")
+        predict_split = self.dataset_cfg.get("predict_split", test_split)
 
         def _build_split(split_name: str) -> RetrievalDataset:
             lmdb_paths = resolve_core_lmdb_paths(emb_dir, split_name)
@@ -95,20 +99,18 @@ class RetrievalDataModule(LightningDataModule):  # ← 改名
             )
 
         if stage in (None, "fit"):
-            self.train_dataset = _build_split("train")
-            self.val_dataset = _build_split("validation")
+            self.train_dataset = _build_split(train_split)
+            self.val_dataset = _build_split(val_split)
 
         if stage in (None, "validate"):  # ← Lightning 的 validate stage
             if self.val_dataset is None:
-                self.val_dataset = _build_split("validation")
+                self.val_dataset = _build_split(val_split)
 
         if stage in (None, "test"):
-            self.test_dataset = _build_split(self.dataset_cfg.get("eval_split", "test"))
+            self.test_dataset = _build_split(test_split)
 
         if stage == "predict":
-            self.predict_dataset = _build_split(
-                self.dataset_cfg.get("predict_split", "test")
-            )
+            self.predict_dataset = _build_split(predict_split)
 
     def _get_filter_paths(self, split_name: str) -> List[Path]:
         filter_paths = [
@@ -118,18 +120,6 @@ class RetrievalDataModule(LightningDataModule):  # ← 改名
         sample_filter_path = self.dataset_cfg.get("sample_filter_path")
         if sample_filter_path not in (None, ""):
             filter_paths.append(Path(sample_filter_path))
-        processed_dir = (self.dataset_cfg.get("paths") or {}).get("processed")
-        if processed_dir not in (None, ""):
-            runtime_filter_missing_anchor = self.dataset_cfg.get(
-                "runtime_filter_missing_anchor", {}
-            )
-            runtime_filter_missing_answer = self.dataset_cfg.get(
-                "runtime_filter_missing_answer", {}
-            )
-            if bool(runtime_filter_missing_anchor.get(split_name, False)):
-                filter_paths.append(Path(processed_dir) / "filter_missing_anchor.json")
-            if bool(runtime_filter_missing_answer.get(split_name, False)):
-                filter_paths.append(Path(processed_dir) / "filter_missing_answer.json")
         return filter_paths
 
     # ------------------------------------------------------------------ #

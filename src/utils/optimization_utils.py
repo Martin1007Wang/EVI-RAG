@@ -16,16 +16,13 @@ Usage inside a LightningModule::
             return build_optimizer_and_scheduler(
                 module=self,
                 optimizer_cfg=self.hparams.optimizer,
-                scheduler_cfg=self.hparams.scheduler,
+                scheduler_cfg=self.hparams.get("scheduler"), # Allow None
             )
-
-The returned dict is exactly the format Lightning's ``configure_optimizers``
-expects: ``{"optimizer": ..., "lr_scheduler": {"scheduler": ..., "interval": ...}}``.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 from torch.optim import AdamW
@@ -34,10 +31,8 @@ from torch.optim.lr_scheduler import (
     CosineAnnealingWarmRestarts,
     OneCycleLR,
 )
-
-if TYPE_CHECKING:
-    from lightning import LightningModule
-
+from lightning import LightningModule
+from lightning.pytorch.utilities.types import OptimizerLRScheduler, LRSchedulerConfig
 
 # ---------------------------------------------------------------------------
 # Parameter-group helpers
@@ -50,7 +45,9 @@ def _is_no_decay(name: str, param: torch.nn.Parameter) -> bool:
 
 
 def _is_log_z_head(name: str) -> bool:
-    return "root_flow_" in name
+    return (
+        "root_flow_" in name or ".z_head." in name or name.startswith("policy.z_head.")
+    )
 
 
 def build_param_groups(
@@ -64,8 +61,8 @@ def build_param_groups(
     """
     Split trainable parameters into up to four AdamW param groups:
 
-    - ``decay``             — normal lr, normal wd
-    - ``no_decay``          — normal lr, wd=0
+    - ``decay``           — normal lr, normal wd
+    - ``no_decay``        — normal lr, wd=0
     - ``log_z_head_decay``  — boosted lr, normal wd
     - ``log_z_head_no_decay`` — boosted lr, wd=0
     """
@@ -124,7 +121,11 @@ def _resolve_horizon(
             return esb
         return None
     else:
-        return trainer.max_epochs if trainer.max_epochs and trainer.max_epochs > 0 else None
+        return (
+            trainer.max_epochs
+            if trainer.max_epochs and trainer.max_epochs > 0
+            else None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -136,27 +137,18 @@ def build_optimizer_and_scheduler(
     module: LightningModule,
     *,
     optimizer_cfg: dict[str, Any],
-    scheduler_cfg: dict[str, Any],
-) -> dict[str, Any]:
+    scheduler_cfg: dict[str, Any] | None = None,
+) -> OptimizerLRScheduler:
     """
-    Build an AdamW optimizer + optional LR scheduler and return the dict that
-    Lightning's ``configure_optimizers`` expects.
-
-    Supported scheduler types
-    -------------------------
-    ``cosine``               → ``CosineAnnealingLR``
-    ``cosine_warm_restarts`` → ``CosineAnnealingWarmRestarts``
-    ``onecycle``             → ``OneCycleLR``  (interval must be ``"step"``)
-
-    All scheduler types require a resolvable horizon (``trainer.max_steps``,
-    ``trainer.estimated_stepping_batches``, or an explicit ``t_max`` in the
-    scheduler config).  If no horizon can be resolved the scheduler is skipped
-    and only the optimizer is returned.
+    Build an AdamW optimizer + optional LR scheduler and return the structure
+    that Lightning's ``configure_optimizers`` expects (OptimizerLRScheduler).
     """
     # --- validate optimizer type early ---
     opt_type = str(optimizer_cfg.get("type", "adamw")).lower()
     if opt_type != "adamw":
-        raise ValueError(f"Unsupported optimizer type: {opt_type!r}.  Only 'adamw' is supported.")
+        raise ValueError(
+            f"Unsupported optimizer type: {opt_type!r}.  Only 'adamw' is supported."
+        )
 
     # --- parse optimizer hyper-parameters ---
     base_lr = float(optimizer_cfg.get("lr", 1e-4))
@@ -190,20 +182,30 @@ def build_optimizer_and_scheduler(
         weight_decay=weight_decay,
         no_decay_on_bias_and_norm=no_decay_split,
     )
-    optimizer = AdamW(param_groups, lr=base_lr, weight_decay=weight_decay, betas=(beta1, beta2))
+    optimizer = AdamW(
+        param_groups, lr=base_lr, weight_decay=weight_decay, betas=(beta1, beta2)
+    )
+
+    # 如果未提供 scheduler_cfg，直接返回 optimizer 本身
+    if not scheduler_cfg:
+        return optimizer
 
     # --- build scheduler ---
     raw_interval = str(scheduler_cfg.get("interval", "step")).lower()
     if raw_interval not in {"step", "epoch"}:
-        raise ValueError(f"scheduler.interval must be 'step' or 'epoch', got {raw_interval!r}.")
+        raise ValueError(
+            f"scheduler.interval must be 'step' or 'epoch', got {raw_interval!r}."
+        )
     interval: Literal["step", "epoch"] = raw_interval  # type: ignore[assignment]
 
-    explicit_t_max = int(scheduler_cfg["t_max"]) if scheduler_cfg.get("t_max") is not None else None
+    explicit_t_max = (
+        int(scheduler_cfg["t_max"]) if scheduler_cfg.get("t_max") is not None else None
+    )
     horizon = _resolve_horizon(module, explicit_t_max=explicit_t_max, interval=interval)
 
     if horizon is None:
         # No horizon available — return optimizer only.
-        return {"optimizer": optimizer}
+        return optimizer
 
     scheduler_type = str(scheduler_cfg.get("type", "cosine")).lower()
     eta_min = float(scheduler_cfg.get("eta_min", 1e-6))
@@ -240,10 +242,27 @@ def build_optimizer_and_scheduler(
 
     else:
         raise ValueError(
-            f"Unsupported scheduler type: {scheduler_type!r}.  " "Expected one of 'cosine', 'cosine_warm_restarts', 'onecycle'."
+            f"Unsupported scheduler type: {scheduler_type!r}.  "
+            "Expected one of 'cosine', 'cosine_warm_restarts', 'onecycle'."
         )
 
-    return {
-        "optimizer": optimizer,
-        "lr_scheduler": {"scheduler": scheduler, "interval": interval},
+    config_dict: dict[str, Any] = {
+        "scheduler": scheduler,
+        "interval": interval,
     }
+    if "monitor" in scheduler_cfg:
+        config_dict["monitor"] = scheduler_cfg["monitor"]
+    if "frequency" in scheduler_cfg:
+        config_dict["frequency"] = scheduler_cfg["frequency"]
+    if "strict" in scheduler_cfg:
+        config_dict["strict"] = scheduler_cfg["strict"]
+
+    lr_scheduler_config = cast(LRSchedulerConfig, config_dict)
+
+    return cast(
+        OptimizerLRScheduler,
+        {
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler_config,
+        },
+    )

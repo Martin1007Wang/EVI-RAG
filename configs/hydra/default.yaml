@@ -1,9 +1,10 @@
 # https://hydra.cc/docs/configure_hydra/intro/
 
-# enable color logging
+# Use built-in Hydra logging configs so train/eval compose works even when the
+# optional colorlog plugin is not installed in the current environment.
 defaults:
-  - override hydra_logging: colorlog
-  - override job_logging: colorlog
+  - override hydra_logging: default
+  - override job_logging: default
 
 # output directory, generated dynamically on each run
 # Uses: experiment name + dataset name

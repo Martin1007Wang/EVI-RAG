@@ -1,94 +1,114 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 from .rollout import RolloutBatch
 
 
-def _zero_metric_tensor() -> torch.Tensor:
+def _zero() -> torch.Tensor:
     return torch.tensor(0.0, dtype=torch.float32)
 
 
 @dataclass(frozen=True)
-class DetailedBalanceLossOutput:
+class TrajectoryBalanceLossOutput:
+    """
+    TB loss 的所有输出量。
+
+    核心量：
+        loss            — 用于反向传播的标量
+        tb_loss         — 与 loss 相同（预留给未来加正则项时区分）
+        residual_abs    — |residual| 均值，直观反映 TB 违约程度
+        residual_variance — residual 方差，衡量不同轨迹间的不一致性
+
+    监控量（detach，不参与梯度）：
+        log_z_mean / log_z_variance — Z 的估计稳定性
+        log_reward_mean             — reward 分布
+        trajectory_length_mean      — 平均轨迹长度
+    """
+
     loss: torch.Tensor
-    db_loss: torch.Tensor
+    tb_loss: torch.Tensor
     residual_abs: torch.Tensor
-    success_rate: torch.Tensor
-    average_terminal_answer_candidate_count: torch.Tensor
-    average_terminal_gold_answer_count: torch.Tensor
-    average_terminal_component_count: torch.Tensor
-    residual_variance: torch.Tensor = field(default_factory=_zero_metric_tensor)
-    root_abs: torch.Tensor = field(default_factory=_zero_metric_tensor)
-    log_z_mean: torch.Tensor = field(default_factory=_zero_metric_tensor)
-    log_z_variance: torch.Tensor = field(default_factory=_zero_metric_tensor)
+    residual_variance: torch.Tensor = field(default_factory=_zero)
+    log_z_mean: torch.Tensor = field(default_factory=_zero)
+    log_z_variance: torch.Tensor = field(default_factory=_zero)
+    log_reward_mean: torch.Tensor = field(default_factory=_zero)
+    trajectory_length_mean: torch.Tensor = field(default_factory=_zero)
 
 
-class DetailedBalanceLoss(nn.Module):
-    def __init__(self, **_: object) -> None:
+class TrajectoryBalanceLoss(nn.Module):
+    """
+    Trajectory Balance Loss (Malkin et al., 2022)。
+
+    TB 目标：
+        log Z + Σ log P_F(aₜ|sₜ) = log R(s_T) + Σ log P_B(sₜ|sₜ₊₁)
+
+    residual = log Z + Σ log P_F − log R − Σ log P_B
+    L_TB     = E_τ[residual²]
+    """
+
+    def __init__(self, log_reward_clip_min: float = -100.0) -> None:
+        """
+        Args:
+            log_reward_clip_min: 对 log_reward 做下截断，防止 reward=0 时
+                                 出现 -inf 导致 loss=nan。默认 -100 对应
+                                 e^{-100} ≈ 0 的极小 reward，实践中足够安全。
+        """
         super().__init__()
+        self.log_reward_clip_min = log_reward_clip_min
 
-    # [修改2] 参数类型和名称改为 rollout_batch: "RolloutBatch"
-    def compute(self, rollout_batch: "RolloutBatch") -> DetailedBalanceLossOutput:
-        # [修改3] 内部所有调用统一替换为 rollout_batch
-        log_pf = rollout_batch.log_pf_actions.float()
-        log_pb = rollout_batch.log_pb_actions.float()
-        log_reward = rollout_batch.log_reward_actions.float()
-        state_log_flow = rollout_batch.state_log_flows.float()
-        action_mask = rollout_batch.action_mask.bool()
-        termination = rollout_batch.termination_action_steps.long()
-        max_actions = log_pf.size(-1)
+    def forward(self, rollout_batch: RolloutBatch) -> TrajectoryBalanceLossOutput:
+        trajectory_log_pf = rollout_batch.trajectory_log_pf.float()  # (B,)
+        trajectory_log_pb = rollout_batch.trajectory_log_pb.float()  # (B,)
+        log_reward = rollout_batch.terminal_log_rewards.float()  # (B,)
+        log_z = rollout_batch.root_log_z.float()  # (B,)
+        trajectory_lengths = rollout_batch.termination_action_steps.float()
 
-        step_indices = torch.arange(1, max_actions + 1, device=log_pf.device).view(1, 1, -1)
-        is_terminal = action_mask & (termination.unsqueeze(-1) == step_indices)
-        is_nonterminal = action_mask & ~is_terminal
-
-        next_state_log_flow = torch.zeros_like(state_log_flow)
-        if max_actions > 1:
-            next_state_log_flow[..., :-1] = state_log_flow[..., 1:]
-
-        # --- DB Loss 核心向量化计算 ---
-        forward_term = state_log_flow + log_pf
-        backward_term_nonterminal = next_state_log_flow + log_pb
-        backward_term_terminal = log_reward
-
-        target_backward = torch.where(is_terminal, backward_term_terminal, backward_term_nonterminal)
-        residual = forward_term - target_backward
-
-        valid_residuals = residual[action_mask]
-
-        if valid_residuals.numel() <= 0:
-            db_loss = torch.tensor(0.0, device=log_pf.device, requires_grad=True)
-            residual_abs = torch.tensor(0.0, device=log_pf.device)
-            residual_variance = torch.tensor(0.0, device=log_pf.device)
-        else:
-            db_loss = valid_residuals.square().mean()
-            residual_abs = valid_residuals.abs().mean()
-            residual_variance = (
-                valid_residuals.var(unbiased=False) if valid_residuals.numel() > 1 else torch.tensor(0.0, device=log_pf.device)
+        # ── 防御性检查：捕获上游 rollout 的静默错误 ──
+        if not trajectory_lengths.gt(0).any():
+            # 所有轨迹都没有有效步，通常意味着 rollout 引擎有 bug
+            raise ValueError(
+                "termination_action_steps are all zero: no valid steps in any trajectory. "
+                "Check rollout engine for off-by-one errors around Stop action masking."
             )
 
-        root_log_flows = state_log_flow[:, :, 0]
-        centered_root = root_log_flows - root_log_flows.mean()
+        # ── 截断 log_reward，防止 reward=0 导致 -inf 污染 loss ──
+        log_reward_safe = log_reward.clamp(min=self.log_reward_clip_min)
 
-        return DetailedBalanceLossOutput(
-            loss=db_loss,
-            db_loss=db_loss,
-            residual_abs=residual_abs,
-            residual_variance=residual_variance,
-            root_abs=root_log_flows.abs().mean(),
-            success_rate=rollout_batch.success_rate.float(),
-            log_z_mean=root_log_flows.mean(),
-            log_z_variance=centered_root.square().mean(),
-            average_terminal_answer_candidate_count=rollout_batch.terminal_answer_candidate_counts.float().mean(),
-            average_terminal_gold_answer_count=rollout_batch.terminal_gold_answer_counts.float().mean(),
-            average_terminal_component_count=rollout_batch.terminal_component_counts.float().mean(),
+        # ── 核心 TB residual ──
+        residual = (
+            log_z + trajectory_log_pf - log_reward_safe - trajectory_log_pb
+        )  # (B,)
+        tb_loss = residual.square().mean()
+
+        # ── 辅助指标（全部 detach，不污染计算图）──
+        with torch.no_grad():
+            residual_abs = residual.abs().mean()
+            residual_variance = (
+                residual.var(unbiased=False)  # 与 tb_loss 语义一致，有偏估计
+                if residual.numel() > 1
+                else torch.zeros((), device=trajectory_log_pf.device)
+            )
+            log_z_variance = (
+                log_z.var(unbiased=False)
+                if log_z.numel() > 1
+                else torch.zeros((), device=log_z.device)  # 与上面统一用有偏版本
+            )
+
+        return TrajectoryBalanceLossOutput(
+            loss=tb_loss,
+            tb_loss=tb_loss,
+            residual_abs=residual_abs.detach(),
+            residual_variance=residual_variance.detach(),
+            log_z_mean=log_z.mean().detach(),
+            log_z_variance=log_z_variance.detach(),
+            log_reward_mean=log_reward.mean().detach(),  # 用原始值监控，不用 clamp 后的
+            trajectory_length_mean=trajectory_lengths.mean().detach(),
         )
 
 
 __all__ = [
-    "DetailedBalanceLoss",
-    "DetailedBalanceLossOutput",
+    "TrajectoryBalanceLoss",
+    "TrajectoryBalanceLossOutput",
 ]

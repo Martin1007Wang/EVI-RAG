@@ -16,7 +16,7 @@ encoder:
   model_name: Alibaba-NLP/gte-large-en-v1.5
   device: auto
   precision: bf16
-  batch_size: 1024
+  batch_size: 512
   reuse_embeddings_if_exists: false
 
 hf_env:

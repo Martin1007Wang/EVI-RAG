@@ -39,7 +39,7 @@ configs/model/gflownet.yaml  # 单个文件，所有配置扁平化
 | 旧版配置路径 | 新版配置参数 | 说明 |
 |-------------|-------------|------|
 | `horizon_cfg.max_steps` | `max_steps` | 直接扁平化 |
-| `training_cfg.rollouts_per_graph` | `rollouts_per_graph` | 直接扁平化 |
+| `training_cfg.num_rollout` | `num_rollout` | 直接扁平化 |
 | `training_cfg.sampling_temperature` | `sampling_temperature` | 直接扁平化 |
 | `training_cfg.sampling_temperature_schedule` | `sampling_temperature_schedule` | 直接扁平化 |
 | `policy_cfg.backbone` | `backbone` | 直接扁平化 |
@@ -85,7 +85,7 @@ def __init__(
     *,
     # 核心超参数
     max_steps: int = 20,
-    rollouts_per_graph: int = 8,
+    num_rollout: int = 8,
     sampling_temperature: float = 1.0,
     sampling_temperature_schedule: dict[str, Any] | None = None,
     

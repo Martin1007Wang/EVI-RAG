@@ -49,8 +49,7 @@ def run_monte_carlo_sampling(
             num_rollouts=current_batch,
             temperature=temperature,
         )
-
-        results.append(rollout_batch)
+        results.extend(rollout_batch)
 
     return results
 

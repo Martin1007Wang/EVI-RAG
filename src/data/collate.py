@@ -44,6 +44,94 @@ class RetrievalCollator:
                 batch.edge_relation_ids_global.long()
             )
         )
+        batch.node_tokens = _resolve_non_text_node_tokens(
+            node_tokens=batch.node_tokens,
+            edge_relation_tokens=batch.edge_relation_tokens,
+            edge_index=batch.edge_index,
+            embedding_ids=emb_ids,
+        )
+
+
+def _resolve_non_text_node_tokens(
+    *,
+    node_tokens: torch.Tensor,
+    edge_relation_tokens: torch.Tensor,
+    edge_index: torch.Tensor,
+    embedding_ids: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Give emb_id==0 nodes a local DeepSets-style initialisation.
+
+    Priority:
+    1. Mean of 1-hop textual neighbour embeddings.
+    2. If none exists, mean of incident relation embeddings.
+    3. If the node is isolated, keep the original zero-row embedding.
+    """
+    if node_tokens.numel() == 0:
+        return node_tokens
+
+    non_text_mask = embedding_ids.eq(0)
+    if not bool(non_text_mask.any().item()):
+        return node_tokens
+
+    if edge_index.numel() == 0:
+        return node_tokens
+
+    resolved = node_tokens.clone()
+    base_node_tokens = node_tokens
+    num_nodes = int(node_tokens.size(0))
+    feature_dim = int(node_tokens.size(1))
+    device = node_tokens.device
+    src = edge_index[0].to(device=device, dtype=torch.long)
+    dst = edge_index[1].to(device=device, dtype=torch.long)
+    text_mask = ~non_text_mask
+
+    text_sum = base_node_tokens.new_zeros((num_nodes, feature_dim))
+    text_count = base_node_tokens.new_zeros(num_nodes)
+
+    dst_is_text = text_mask.index_select(0, dst)
+    if bool(dst_is_text.any().item()):
+        text_sum.index_add_(0, src[dst_is_text], base_node_tokens[dst[dst_is_text]])
+        text_count.index_add_(
+            0,
+            src[dst_is_text],
+            torch.ones_like(src[dst_is_text], dtype=text_count.dtype),
+        )
+
+    src_is_text = text_mask.index_select(0, src)
+    if bool(src_is_text.any().item()):
+        text_sum.index_add_(0, dst[src_is_text], base_node_tokens[src[src_is_text]])
+        text_count.index_add_(
+            0,
+            dst[src_is_text],
+            torch.ones_like(dst[src_is_text], dtype=text_count.dtype),
+        )
+
+    has_text_neighbour = text_count.gt(0)
+    if bool((non_text_mask & has_text_neighbour).any().item()):
+        text_mean = text_sum / text_count.clamp_min(1.0).unsqueeze(-1)
+        target_mask = non_text_mask & has_text_neighbour
+        resolved[target_mask] = text_mean[target_mask]
+
+    remaining_mask = non_text_mask & ~has_text_neighbour
+    if not bool(remaining_mask.any().item()):
+        return resolved
+
+    rel_sum = edge_relation_tokens.new_zeros((num_nodes, feature_dim))
+    rel_count = edge_relation_tokens.new_zeros(num_nodes)
+    rel_sum.index_add_(0, src, edge_relation_tokens)
+    rel_sum.index_add_(0, dst, edge_relation_tokens)
+    ones = torch.ones_like(src, dtype=rel_count.dtype)
+    rel_count.index_add_(0, src, ones)
+    rel_count.index_add_(0, dst, ones)
+
+    has_relation_context = rel_count.gt(0)
+    if bool((remaining_mask & has_relation_context).any().item()):
+        rel_mean = rel_sum / rel_count.clamp_min(1.0).unsqueeze(-1)
+        target_mask = remaining_mask & has_relation_context
+        resolved[target_mask] = rel_mean[target_mask]
+
+    return resolved
 
 
 def _attach_graph_stats(batch: RetrievalBatch) -> None:

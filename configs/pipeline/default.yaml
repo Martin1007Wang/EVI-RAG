@@ -24,8 +24,6 @@ question_entity_blacklist: []
 question_entity_blacklist_path: null
 
 embeddings_out_dir: ${dataset.materialized_dir}/embeddings
-# Mainline uses token-level question context; set 0 to disable and fall back to pooled question_emb only.
-question_ctx_max_tokens: 64
 
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json
@@ -40,7 +38,6 @@ map_size_gb: 128
 map_growth_gb: 32
 map_growth_factor: 1.5
 map_max_gb: null
-overwrite_lmdb: false
+overwrite_lmdb: true
 txn_size: 512
 seed: 42
-deterministic: false

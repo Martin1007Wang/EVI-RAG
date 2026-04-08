@@ -1,5 +1,5 @@
 # configs/experiment/train_rankflow.yaml
-# @package _global_  # 必须有，让它能覆盖根节点的 model 等组
+# @package _global_
 
 name: train
 variant: baseline

@@ -26,7 +26,7 @@ def materialize_preprocessed_data(
     relation_vocab: RelationVocab,
     encoded: Dict[str, Any],  # 替换 object 为 Any，明确这是个多态字典
     embeddings_dir: Path,
-    overwrite_lmdb: bool = False,
+    overwrite_lmdb: bool = True,
     lmdb_shards: int = 1,
     map_size_gb: float = 128,
 ) -> None:
@@ -45,8 +45,6 @@ def materialize_preprocessed_data(
     # 1. 提取安全的强类型张量
     entity_metadata: Dict[str, Any] = encoded["entity_metadata"]
     question_embeddings: torch.Tensor = encoded["question_embeddings"]
-    question_contexts: torch.Tensor | None = encoded.get("question_contexts")
-    question_context_masks: torch.Tensor | None = encoded.get("question_context_masks")
 
     # 2. 保存静态词表与 Embedding
     torch.save(
@@ -178,14 +176,6 @@ def materialize_preprocessed_data(
                 ),
             }
 
-            if question_contexts is not None and question_context_masks is not None:
-                sample_dict[SampleFields.QUESTION_CTX] = (
-                    question_contexts[idx].unsqueeze(0).contiguous()
-                )
-                sample_dict[SampleFields.QUESTION_CTX_MASK] = (
-                    question_context_masks[idx].unsqueeze(0).contiguous()
-                )
-
             StorageSchema.validate(sample_dict)
 
             # 5. 落盘写入 LMDB
@@ -202,13 +192,7 @@ def materialize_preprocessed_data(
                 len(edge_relation_ids_global)
             )
 
-            # 计算有效的问题 Token 数量
-            q_len = (
-                int(question_context_masks[idx].sum().item())
-                if question_context_masks is not None
-                else 1
-            )
-            runtime_metadata[split_name]["question_tokens"].append(q_len)
+            runtime_metadata[split_name]["question_tokens"].append(1)
 
     finally:
         # 确保安全关闭所有数据库连接

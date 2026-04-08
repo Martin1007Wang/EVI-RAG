@@ -23,8 +23,6 @@ class RetrievalBatch(Batch):
         edge_relation_ids_global: torch.Tensor
         node_entity_ids_global: torch.Tensor
         question_emb: torch.Tensor
-        question_ctx: torch.Tensor
-        question_ctx_mask: torch.Tensor
 
         # 核心修改：直接承接拼接后的全局布尔掩码 (shape: [Total_Nodes])
         is_anchor_mask: torch.Tensor

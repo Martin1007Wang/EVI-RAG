@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -6,22 +7,69 @@ import torch
 from torch_scatter import scatter_max, scatter_sum
 
 from src.data.schema import RetrievalBatch
+from src.utils.graph_utils import compute_valid_backward_removals
+from src.utils.reward_utils import build_anchor_induced_edge_mask
 from .policy import Policy
+from .subgraph_state import SubgraphState
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+
+def _safe_masked_logit_value(logits: torch.Tensor) -> float:
+    """返回当前 dtype 下最小的有限浮点数，用于 logit masking。"""
+    if not torch.is_floating_point(logits):
+        raise TypeError("logits must be floating-point tensors.")
+    return torch.finfo(logits.dtype).min
+
+
+def _scatter_log_softmax(
+    logits: torch.Tensor,
+    batch_idx: torch.Tensor,
+    num_segments: int,
+) -> torch.Tensor:
+    """
+    数值稳定的分段 log-softmax。
+
+    修复点：
+    - 使用 scatter_max 做 max-shift，避免 exp 溢出。
+    - sum_exp 用 clamp(min=eps) 而非固定 1e-10，
+      eps 随 dtype 自适应，fp16 下不会直接下溢为 0。
+    - 返回每个元素的 log P，而非仅采样位置的值。
+    """
+    eps = torch.finfo(logits.dtype).tiny  # fp16: ~6e-5，fp32: ~1.2e-38
+
+    max_logits, _ = scatter_max(
+        logits.detach(), batch_idx, dim=0, dim_size=num_segments
+    )
+    # out-of-place：不修改原始 logits 计算图
+    shifted = logits - max_logits[batch_idx]
+    exp_shifted = torch.exp(shifted)
+    sum_exp = scatter_sum(exp_shifted, batch_idx, dim=0, dim_size=num_segments)
+    log_z = max_logits + torch.log(sum_exp.clamp(min=eps))
+
+    return logits - log_z[batch_idx]  # (E,) 每条边的 log P
+
+
+# ---------------------------------------------------------------------------
+# 数据结构
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class RolloutBatch:
-    """GFlowNet 采样轨迹张量组 (B: num_graphs, T: max_steps)"""
+    """GFlowNet 采样轨迹张量组 (B: num_graphs)。"""
 
-    action_mask: torch.Tensor
+    root_log_z: torch.Tensor
     termination_action_steps: torch.Tensor
-    state_log_flows: torch.Tensor
-    log_pf_actions: torch.Tensor
-    log_pb_actions: torch.Tensor
-    log_reward_actions: torch.Tensor
+    trajectory_log_pf: torch.Tensor
+    trajectory_log_pb: torch.Tensor
+    terminal_log_rewards: torch.Tensor
+    root_active_edges: Optional[torch.Tensor] = None
     terminal_active_nodes: Optional[torch.Tensor] = None
     terminal_active_edges: Optional[torch.Tensor] = None
-    terminal_sinks: Optional[torch.Tensor] = None
 
     def to(self, device: torch.device) -> "RolloutBatch":
         return RolloutBatch(
@@ -32,212 +80,360 @@ class RolloutBatch:
         )
 
 
-class RolloutEngine:
-    """增量式子图 MDP 轨迹引擎"""
+@dataclass
+class RolloutState:
+    """Mutable rollout state advanced step-by-step by the environment."""
 
-    def __init__(self, max_steps: int):
+    root_active_edges: torch.Tensor
+    active_nodes: torch.Tensor
+    active_edges: torch.Tensor
+
+    @classmethod
+    def initialize(cls, base_graph: RetrievalBatch) -> "RolloutState":
+        root_active_nodes = base_graph.is_anchor_mask.clone()
+        root_active_edges = build_anchor_induced_edge_mask(
+            base_graph.edge_index, root_active_nodes
+        )
+        return cls(
+            root_active_edges=root_active_edges,
+            active_nodes=root_active_nodes.clone(),
+            active_edges=root_active_edges.clone(),
+        )
+
+    def snapshot(self) -> SubgraphState:
+        return SubgraphState.from_tensors(self.active_nodes, self.active_edges)
+
+    def apply_expansion(
+        self,
+        *,
+        chosen_edges: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+    ) -> None:
+        if chosen_edges.numel() == 0:
+            return
+
+        chosen_src = src[chosen_edges]
+        chosen_dst = dst[chosen_edges]
+        chosen_src_active = self.active_nodes[chosen_src]
+        chosen_dst_active = self.active_nodes[chosen_dst]
+
+        activate_dst = chosen_src_active & ~chosen_dst_active
+        activate_src = ~chosen_src_active & chosen_dst_active
+
+        self.active_edges[chosen_edges] = True
+        if activate_dst.any():
+            self.active_nodes[chosen_dst[activate_dst]] = True
+        if activate_src.any():
+            self.active_nodes[chosen_src[activate_src]] = True
+
+
+# ---------------------------------------------------------------------------
+# 采样引擎
+# ---------------------------------------------------------------------------
+
+
+class RolloutEngine:
+    """增量式子图 MDP 轨迹引擎。"""
+
+    def __init__(self, max_steps: int) -> None:
+        if max_steps < 0:
+            raise ValueError(f"max_steps must be >= 0, got {max_steps}.")
         self.max_steps = max_steps
+
+    # ------------------------------------------------------------------
+    # 核心采样：分段 Gumbel-max + log P_F（T=1）
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _segmented_gumbel_sample(
-        logits: torch.Tensor, batch_idx: torch.Tensor, num_segments: int
+        logits: torch.Tensor,
+        batch_idx: torch.Tensor,
+        num_segments: int,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """利用 Gumbel-Max trick 在变长分段中进行高效并行采样"""
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-10)))
-        noisy_logits = logits + gumbel_noise
+        """
+        分段 Gumbel-Max 采样，返回 (sampled_local_idx, log_prob_under_behavior_policy)。
 
+        当前版本严格 on-policy：采样分布与记录到 TB 的 log P_F 使用同一组
+        temperature-scaled logits。
+        """
+        eps = torch.finfo(logits.dtype).tiny  # 修复：随 dtype 自适应
+        behavior_logits = logits / temperature
+
+        # ── 行为策略：带温度的 Gumbel-max（detach，不参与反向传播）──
+        sample_logits = behavior_logits.detach()
+        u = torch.rand_like(sample_logits).clamp(min=eps)  # 修复：eps 随 dtype
+        gumbel_noise = -torch.log(-torch.log(u))
+        noisy_logits = sample_logits + gumbel_noise
         _, sampled_idx = scatter_max(
             noisy_logits, batch_idx, dim=0, dim_size=num_segments
         )
 
-        max_logits, _ = scatter_max(logits, batch_idx, dim=0, dim_size=num_segments)
-        exp_logits = torch.exp(logits - max_logits[batch_idx])
-        sum_exp = scatter_sum(exp_logits, batch_idx, dim=0, dim_size=num_segments)
-        log_sum_exp = max_logits + torch.log(sum_exp.clamp(min=1e-10))
+        # ── 目标策略：与采样一致的 on-policy log P（挂梯度）──
+        log_probs = _scatter_log_softmax(behavior_logits, batch_idx, num_segments)
+        log_prob_sampled = log_probs[sampled_idx]  # (num_segments,)
 
-        log_prob = logits[sampled_idx] - log_sum_exp
-        return sampled_idx, log_prob
+        return sampled_idx, log_prob_sampled
+
+    # ------------------------------------------------------------------
+    # 公共接口
+    # ------------------------------------------------------------------
 
     def run_exploration(
         self,
         policy: Policy,
         base_graph: RetrievalBatch,
         reward_model: Any,
-    ) -> RolloutBatch:
-        """
-        单次探索：每个图采样一次
-        """
-        return self._run_single_exploration(policy, base_graph, reward_model)
-
-    def run_multiple_exploration(
-        self,
-        policy: Policy,
-        base_graph: RetrievalBatch,
-        reward_model: Any,
         num_rollouts: int = 1,
         temperature: float = 1.0,
+        collect_terminal_state: bool = True,
+        terminal_state_device: torch.device | str | None = None,
     ) -> list[RolloutBatch]:
-        """
-        多次探索：每个图采样多次
-
-        Args:
-            num_rollouts: 每个图的采样次数
-            temperature: 采样温度（目前未使用，保留接口）
-
-        Returns:
-            采样结果列表，每个元素是一个 RolloutBatch
-        """
+        """统一探索接口：始终返回 rollout 列表。"""
+        if num_rollouts < 1:
+            raise ValueError(f"num_rollouts must be >= 1, got {num_rollouts}.")
         return [
-            self._run_single_exploration(policy, base_graph, reward_model)
+            self._run_exploration_once(
+                policy=policy,
+                base_graph=base_graph,
+                reward_model=reward_model,
+                temperature=temperature,
+                collect_terminal_state=collect_terminal_state,
+                terminal_state_device=terminal_state_device,
+            )
             for _ in range(num_rollouts)
         ]
 
-    def _run_single_exploration(
+    @staticmethod
+    def _maybe_store_tensor(
+        tensor: torch.Tensor,
+        *,
+        collect: bool,
+        device: torch.device | str | None,
+    ) -> torch.Tensor | None:
+        if not collect:
+            return None
+        snapshot = tensor.detach().clone()
+        if device is not None:
+            snapshot = snapshot.to(device)
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # 单次轨迹展开
+    # ------------------------------------------------------------------
+
+    def _run_exploration_once(
         self,
         policy: Policy,
         base_graph: RetrievalBatch,
         reward_model: Any,
+        temperature: float = 1.0,
+        collect_terminal_state: bool = True,
+        terminal_state_device: torch.device | str | None = None,
     ) -> RolloutBatch:
         B = int(base_graph.ptr.numel()) - 1
         device = base_graph.node_tokens.device
-
-        active_nodes = base_graph.is_anchor_mask.clone()
-        active_edges = torch.zeros(
-            base_graph.edge_index.size(1), dtype=torch.bool, device=device
-        )
-
-        is_terminated = torch.zeros(B, dtype=torch.bool, device=device)
-        termination_steps = torch.full(
-            (B,), self.max_steps, dtype=torch.long, device=device
-        )
-
-        records_mask, records_log_flow = [], []
-        records_log_pf, records_log_pb, records_log_reward = [], [], []
-
         src, dst = base_graph.edge_index[0], base_graph.edge_index[1]
         edge_batch_idx = base_graph.edge_batch
-        sampled_sinks = torch.full((B,), -1, dtype=torch.long, device=device)
 
-        for t in range(self.max_steps):
-            if is_terminated.all():
+        # ── 初始子图：锚点诱导子图 ──
+        rollout_state = RolloutState.initialize(base_graph)
+
+        is_terminated = torch.zeros(B, dtype=torch.bool, device=device)
+        termination_steps = torch.zeros(B, dtype=torch.long, device=device)
+        terminal_log_rewards = torch.zeros(B, device=device)
+        trajectory_log_pf = torch.zeros(B, device=device)
+        trajectory_log_pb = torch.zeros(B, device=device)
+
+        # ── Step 0：共享前向（计算 root log Z）──
+        root_step_output = policy(base_graph, rollout_state.snapshot())
+        root_log_z = policy.root_log_z(
+            question_h=root_step_output.question_h,
+            root_subgraph_h=root_step_output.subgraph_h,
+        )
+
+        # type_mask_tensor 在循环外预分配，避免每步重复创建小 tensor
+        # shape (1, 2)，broadcastable 到 (B, 2)
+        expand_col_mask = torch.tensor([[True, False]], device=device)  # mask Expand
+        stop_col_mask = torch.tensor([[False, True]], device=device)  # mask Stop
+
+        for t in range(self.max_steps + 1):
+            active_graphs = ~is_terminated
+            if not active_graphs.any():
                 break
 
-            log_flows, action_logits = policy(base_graph, active_nodes, active_edges)
-
-            # --- MDP 物理掩码约束 ---
-            valid_edges_mask = active_nodes[src] & ~active_edges
-            valid_sinks_mask = active_nodes & ~base_graph.is_anchor_mask
-
-            has_valid_edges = (
-                scatter_max(valid_edges_mask.int(), edge_batch_idx, dim=0, dim_size=B)[
-                    0
-                ]
-                > 0
+            step_output = (
+                root_step_output
+                if t == 0
+                else policy(base_graph, rollout_state.snapshot())
             )
-            has_valid_sinks = (
-                scatter_max(
-                    valid_sinks_mask.int(), base_graph.batch, dim=0, dim_size=B
-                )[0]
-                > 0
+            action_logits = step_output.action_logits
+
+            # ── MDP 物理约束：有效扩展边 ──
+            src_active = rollout_state.active_nodes[src]
+            dst_active = rollout_state.active_nodes[dst]
+            valid_edges_mask = (src_active | dst_active) & ~rollout_state.active_edges
+
+            has_valid_edges = scatter_sum(
+                valid_edges_mask.int(), edge_batch_idx, dim=0, dim_size=B
+            ).bool()
+
+            step_mask = active_graphs
+
+            # ── 宏观决策：Expand(0) vs Stop(1) ──
+            raw_type_logits = action_logits["type_logits"]  # (B, 2)
+            expand_forbidden = ~has_valid_edges | ~step_mask | (t >= self.max_steps)
+            stop_forbidden = ~step_mask
+
+            type_logits = raw_type_logits.masked_fill(
+                expand_forbidden.unsqueeze(1) & expand_col_mask,
+                _safe_masked_logit_value(raw_type_logits),
             )
+            type_logits = type_logits.masked_fill(
+                stop_forbidden.unsqueeze(1) & stop_col_mask,
+                _safe_masked_logit_value(raw_type_logits),
+            )
+            behavior_type_logits = type_logits / temperature
 
-            # 边界安全防护：如果图陷入死胡同 (无路可走且无法沉汇)，强制终止
-            dead_end = ~has_valid_edges & ~has_valid_sinks
-            if dead_end.any():
-                is_terminated |= dead_end
-                termination_steps[dead_end & (termination_steps == self.max_steps)] = t
-                if is_terminated.all():
-                    break
+            # 行为策略采样（带温度），并用同一分布记录 log P_F
+            action_type = torch.distributions.Categorical(
+                logits=behavior_type_logits.detach()
+            ).sample()
 
-            # --- 宏观决策：Expand vs Sink ---
-            type_logits = action_logits["type_logits"]
-            type_logits[~has_valid_edges | is_terminated, 0] = -1e9
-            type_logits[~has_valid_sinks | is_terminated, 1] = -1e9
+            type_log_prob = torch.distributions.Categorical(
+                logits=behavior_type_logits
+            ).log_prob(action_type)
 
-            type_dist = torch.distributions.Categorical(logits=type_logits)
-            action_type = type_dist.sample()
-            type_log_prob = type_dist.log_prob(action_type)
-
+            # 修复：改为直接索引赋值，语义清晰且避免 masked_scatter 的
+            # 隐式展平顺序依赖（形状不匹配时 masked_scatter 静默错位，
+            # 而索引赋值会直接报错）
             step_log_pf = torch.zeros(B, device=device)
             step_log_pb = torch.zeros(B, device=device)
-            step_log_reward = torch.zeros(B, device=device)
-            step_mask = ~is_terminated.clone()
 
-            # --- 拓扑扩张 (Expand: action_type == 0) ---
+            # ── Expand 分支 ──
             expand_mask = (action_type == 0) & step_mask
             if expand_mask.any():
-                joint_edge_logits = (
-                    action_logits["expand_u_logits"][src]
-                    + action_logits["expand_edge_rel_logits"]
-                    + action_logits["expand_v_logits"][dst]
-                )
+                raw_edge_logits = action_logits["expand_edge_logits"]  # (E,)
 
                 valid_edge_candidates = valid_edges_mask & expand_mask[edge_batch_idx]
-                joint_edge_logits[~valid_edge_candidates] = -1e9
 
-                sampled_edges, edge_log_prob = self._segmented_gumbel_sample(
-                    logits=joint_edge_logits, batch_idx=edge_batch_idx, num_segments=B
+                candidate_counts = scatter_sum(
+                    valid_edge_candidates.int(), edge_batch_idx, dim=0, dim_size=B
                 )
 
-                active_edges[sampled_edges[expand_mask]] = True
-                active_nodes[dst[sampled_edges[expand_mask]]] = True
+                # 防御性检查：Expand 被采样但无候选边（理论上不应出现）
+                invalid_expand = expand_mask & candidate_counts.eq(0)
+                if invalid_expand.any():
+                    bad = torch.nonzero(invalid_expand, as_tuple=False).view(-1)
+                    raise RuntimeError(
+                        "Expand sampled for graphs without valid candidate edges: "
+                        f"{bad.tolist()}."
+                    )
 
-                step_log_pf[expand_mask] = (
-                    type_log_prob[expand_mask] + edge_log_prob[expand_mask]
+                expand_graph_ids = torch.nonzero(expand_mask, as_tuple=False).view(-1)
+                candidate_edge_ids = torch.nonzero(
+                    valid_edge_candidates, as_tuple=False
+                ).view(-1)
+
+                # 修复：expand_graph_remap 改用 scatter 方式构造，
+                # 避免 torch.full(B) + arange 在 B 较大时的冗余内存分配
+                expand_graph_remap = torch.empty(B, dtype=torch.long, device=device)
+                expand_graph_remap[expand_graph_ids] = torch.arange(
+                    expand_graph_ids.numel(), dtype=torch.long, device=device
                 )
-                current_e_counts = scatter_sum(
-                    active_edges.int(), edge_batch_idx, dim=0, dim_size=B
+                candidate_batch_idx = expand_graph_remap[
+                    edge_batch_idx[candidate_edge_ids]
+                ]
+
+                sampled_local_edges, edge_log_prob = self._segmented_gumbel_sample(
+                    logits=raw_edge_logits[candidate_edge_ids],
+                    batch_idx=candidate_batch_idx,
+                    num_segments=expand_graph_ids.numel(),
+                    temperature=temperature,
                 )
-                step_log_pb[expand_mask] = -torch.log(
-                    current_e_counts[expand_mask].float().clamp(min=1.0)
+                chosen_edges = candidate_edge_ids[sampled_local_edges]
+
+                # 状态转移
+                rollout_state.apply_expansion(
+                    chosen_edges=chosen_edges, src=src, dst=dst
                 )
 
-            # --- 终止汇聚 (Sink: action_type == 1) ---
-            sink_mask = (action_type == 1) & step_mask
-            if sink_mask.any():
-                sink_y_logits = action_logits["sink_logits"]
-                valid_sink_candidates = valid_sinks_mask & sink_mask[base_graph.batch]
-                sink_y_logits[~valid_sink_candidates] = -1e9
+                # log P_F = log P(Expand) + log P(chosen edge)
+                # 修复：直接索引赋值，替代 masked_scatter
+                step_log_pf[expand_mask] = type_log_prob[expand_mask] + edge_log_prob
 
-                sampled_sink_candidates, sink_log_prob = self._segmented_gumbel_sample(
-                    logits=sink_y_logits, batch_idx=base_graph.batch, num_segments=B
+                # log P_B = −log |可合法反向移除的边数|
+                _, removable_counts = compute_valid_backward_removals(
+                    active_nodes=rollout_state.active_nodes,
+                    active_edges=rollout_state.active_edges,
+                    root_active_edges=rollout_state.root_active_edges,
+                    edge_index=base_graph.edge_index,
+                    is_anchor_mask=base_graph.is_anchor_mask,
+                    node_batch=base_graph.batch,
+                    edge_batch=edge_batch_idx,
+                    num_graphs=B,
                 )
-                sampled_sinks[sink_mask] = sampled_sink_candidates[sink_mask]
 
-                is_terminated[sink_mask] = True
-                termination_steps[sink_mask] = t
-
-                step_log_pf[sink_mask] = (
-                    type_log_prob[sink_mask] + sink_log_prob[sink_mask]
+                # 修复：用 assert 代替 clamp 静默掩盖 removable_counts=0 的 bug
+                rc_expand = removable_counts[expand_mask]
+                assert (rc_expand >= 1).all(), (
+                    "removable_counts must be >= 1 after expansion; "
+                    "got zeros — check compute_valid_backward_removals."
                 )
-                step_log_pb[sink_mask] = 0.0
+                step_log_pb[expand_mask] = -torch.log(rc_expand.float())
+
+            # ── Stop 分支 ──
+            stop_mask = (action_type == 1) & step_mask
+            if stop_mask.any():
+                is_terminated[stop_mask] = True
+                termination_steps[stop_mask] = t + 1
+
+                # log P_F(Stop) = log P(type=1)，log P_B(Stop) = 0（约定）
+                step_log_pf[stop_mask] = type_log_prob[stop_mask]
+                # step_log_pb[stop_mask] 已初始化为 0，无需赋值
 
                 reward_tensor = reward_model(
                     base_graph=base_graph,
-                    sampled_sinks=sampled_sinks,
-                    active_nodes=active_nodes,
-                    active_edges=active_edges,
+                    active_nodes=rollout_state.active_nodes,
+                    active_edges=rollout_state.active_edges,
+                    root_active_edges=rollout_state.root_active_edges,
                 )
-                step_log_reward[sink_mask] = reward_tensor[sink_mask]
+                terminal_log_rewards[stop_mask] = reward_tensor[stop_mask]
 
-            # --- 轨迹记录 ---
-            records_mask.append(step_mask)
-            records_log_flow.append(log_flows)
-            records_log_pf.append(step_log_pf)
-            records_log_pb.append(step_log_pb)
-            records_log_reward.append(step_log_reward)
+            trajectory_log_pf = trajectory_log_pf + step_log_pf
+            trajectory_log_pb = trajectory_log_pb + step_log_pb
+
+        # ── 防御性检查：强制 Stop 后不应再有未终止图 ──
+        unfinished = ~is_terminated
+        if unfinished.any():
+            raise RuntimeError(
+                "Rollout ended with unfinished graphs after the forced-Stop horizon. "
+                "Check Stop action masking in RolloutEngine."
+            )
 
         return RolloutBatch(
-            action_mask=torch.stack(records_mask, dim=1),
+            root_log_z=root_log_z,
             termination_action_steps=termination_steps,
-            state_log_flows=torch.stack(records_log_flow, dim=1),
-            log_pf_actions=torch.stack(records_log_pf, dim=1),
-            log_pb_actions=torch.stack(records_log_pb, dim=1),
-            log_reward_actions=torch.stack(records_log_reward, dim=1),
-            terminal_active_nodes=active_nodes.clone(),
-            terminal_active_edges=active_edges.clone(),
-            terminal_sinks=sampled_sinks.clone(),
+            trajectory_log_pf=trajectory_log_pf,
+            trajectory_log_pb=trajectory_log_pb,
+            terminal_log_rewards=terminal_log_rewards,
+            root_active_edges=self._maybe_store_tensor(
+                rollout_state.root_active_edges,
+                collect=collect_terminal_state,
+                device=terminal_state_device,
+            ),
+            terminal_active_nodes=self._maybe_store_tensor(
+                rollout_state.active_nodes,
+                collect=collect_terminal_state,
+                device=terminal_state_device,
+            ),
+            terminal_active_edges=self._maybe_store_tensor(
+                rollout_state.active_edges,
+                collect=collect_terminal_state,
+                device=terminal_state_device,
+            ),
         )
 
 
-__all__ = ["RolloutBatch", "RolloutEngine"]
+__all__ = ["RolloutBatch", "RolloutEngine", "RolloutState"]

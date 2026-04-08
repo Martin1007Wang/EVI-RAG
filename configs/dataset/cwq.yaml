@@ -10,11 +10,6 @@ dataset_family: cwq
 max_steps: 4
 hf_dataset: rmanluo/RoG-cwq
 
-runtime_filter_missing_answer:
-  train: false
-  validation: false
-  test: false
-
 question_entity_blacklist:
   - Country
   - US State

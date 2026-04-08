@@ -20,7 +20,6 @@ def collect_and_filter_graphs(
     sample_iter: Iterable[RawSample],
     *,
     out_dir: Path,
-    processed_dir: Path,
     dataset_name: str,
     split_filters: dict[str, SplitFilter],
     is_text_entity_fn: Callable[[str], bool],
@@ -45,8 +44,6 @@ def collect_and_filter_graphs(
     relation_vocab = RelationVocab()
 
     prepared_samples: list[PreparedSample] = []
-    keep_anchor_ids: list[str] = []
-    keep_answer_ids: list[str] = []
     sub_sample_ids: list[str] = []
 
     for sample in sample_iter:
@@ -111,8 +108,6 @@ def collect_and_filter_graphs(
             node_index[entity] for entity in answer_entities_in_graph
         ]
         graph_id = f"{sample.dataset}/{sample.split}/{sample.question_id}"
-        if question_entities_in_graph:
-            keep_anchor_ids.append(graph_id)
 
         num_nodes_in_graph = len(node_index)
         edge_index_tensor = torch.tensor([edge_src, edge_dst], dtype=torch.long)
@@ -143,7 +138,6 @@ def collect_and_filter_graphs(
             if node_index[entity] in legal_answer_local_set
         )
         if legal_answer_entities:
-            keep_answer_ids.append(graph_id)
             sub_sample_ids.append(graph_id)
 
         prepared_samples.append(
@@ -166,16 +160,6 @@ def collect_and_filter_graphs(
             "No samples remained after preprocessing; nothing to materialize."
         )
 
-    _write_sample_filter(
-        processed_dir / "filter_missing_anchor.json",
-        dataset=dataset_name,
-        sample_ids=keep_anchor_ids,
-    )
-    _write_sample_filter(
-        processed_dir / "filter_missing_answer.json",
-        dataset=dataset_name,
-        sample_ids=keep_answer_ids,
-    )
     if emit_sub_filter:
         _write_sample_filter(
             out_dir / sub_filter_filename,

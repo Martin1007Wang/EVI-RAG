@@ -34,7 +34,9 @@ def _compile_entity_matcher(
     def _matcher(entity: str) -> bool:
         value = str(entity or "").strip()
         if resolved_mode in {"", "none"}:
-            return default_result if default_result and compiled_regex is None else False
+            return (
+                default_result if default_result and compiled_regex is None else False
+            )
         if resolved_mode in {"prefix", "prefix_allowlist"}:
             return bool(prefix_tuple) and value.startswith(prefix_tuple)
         if resolved_mode == "regex":
@@ -62,32 +64,40 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
     dataset_name = str(dataset_cfg.get("name", ""))
     dataset_scope = str(dataset_cfg.get("dataset_scope", "")).strip().lower()
     if dataset_scope == "sub" or dataset_name.endswith("-sub"):
-        raise ValueError("Sub datasets are runtime filters only. Build the full dataset and use sub_filter.json.")
+        raise ValueError(
+            "Sub datasets are runtime filters only. Build the full dataset and use sub_filter.json."
+        )
 
     paths_cfg = dataset_cfg.get("paths", {})
     out_dir = _resolve_path(dataset_cfg.get("out_dir"))
     embeddings_dir = _resolve_path(paths_cfg.get("embeddings"))
-    processed_dir = _resolve_path(paths_cfg.get("processed"))
     out_dir.mkdir(parents=True, exist_ok=True)
     embeddings_dir.mkdir(parents=True, exist_ok=True)
-    processed_dir.mkdir(parents=True, exist_ok=True)
 
     encoder_cfg = raw_cfg.get("encoder", {})
-    encoder_name = str(encoder_cfg.get("model_name", encoder_cfg.get("name", ""))).strip()
+    encoder_name = str(
+        encoder_cfg.get("model_name", encoder_cfg.get("name", ""))
+    ).strip()
     device = str(encoder_cfg.get("device", "auto")) or "auto"
     precision = str(encoder_cfg.get("precision"))
     batch_size = int(encoder_cfg.get("batch_size"))
-    reuse_embeddings_if_exists = bool(encoder_cfg.get("reuse_embeddings_if_exists", False))
+    reuse_embeddings_if_exists = bool(
+        encoder_cfg.get("reuse_embeddings_if_exists", False)
+    )
 
     dataset_source = str(dataset_cfg.get("dataset_source", "hf")).strip().lower()
     if dataset_source not in {"hf", "stark"}:
-        raise ValueError(f"Unsupported dataset_source={dataset_source!r}; expected 'hf' or 'stark'.")
+        raise ValueError(
+            f"Unsupported dataset_source={dataset_source!r}; expected 'hf' or 'stark'."
+        )
     hf_dataset = str(dataset_cfg.get("hf_dataset"))
     stark_cfg = dataset_cfg.get("stark")
     if dataset_source == "hf" and hf_dataset is None:
         raise ValueError("dataset_source=hf requires a non-empty dataset.hf_dataset.")
     if dataset_source == "stark" and stark_cfg is None:
-        raise ValueError("dataset_source=stark requires a non-empty dataset.stark mapping.")
+        raise ValueError(
+            "dataset_source=stark requires a non-empty dataset.stark mapping."
+        )
 
     hf_env = raw_cfg.get("hf_env", {})
     hf_cache_raw = hf_env.get("cache_dir") or raw_cfg.get("hf_cache_dir")
@@ -96,7 +106,9 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
     filter_cfg = raw_cfg.get("preprocess_filter", {})
     split_filters = {
         "train": _build_split_filter(filter_cfg.get("train")),
-        "validation": _build_split_filter(filter_cfg.get("validation") or filter_cfg.get("eval")),
+        "validation": _build_split_filter(
+            filter_cfg.get("validation") or filter_cfg.get("eval")
+        ),
         "test": _build_split_filter(filter_cfg.get("test") or filter_cfg.get("eval")),
     }
 
@@ -115,15 +127,23 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
 
     blacklist_path_raw = raw_cfg.get("question_entity_blacklist_path")
     blacklist = load_question_entity_blacklist(
-        inline_list=list(raw_cfg.get("question_entity_blacklist", [])) + list(dataset_cfg.get("question_entity_blacklist", [])),
-        file_path=(None if blacklist_path_raw in (None, "") else _resolve_path(blacklist_path_raw)),
+        inline_list=list(raw_cfg.get("question_entity_blacklist", []))
+        + list(dataset_cfg.get("question_entity_blacklist", [])),
+        file_path=(
+            None
+            if blacklist_path_raw in (None, "")
+            else _resolve_path(blacklist_path_raw)
+        ),
     )
 
     sample_iter = iter_samples(
         dataset=dataset_name,
         kb=str(dataset_cfg.get("kb", "freebase")),
         splits=("train", "validation", "test"),
-        column_map={str(key): str(value) for key, value in dict(dataset_cfg.get("column_map", {})).items()},
+        column_map={
+            str(key): str(value)
+            for key, value in dict(dataset_cfg.get("column_map", {})).items()
+        },
         entity_normalization=str(dataset_cfg.get("entity_normalization", "none")),
         dataset_source=dataset_source,
         hf_dataset=hf_dataset,
@@ -134,7 +154,6 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
     prepared_samples, entity_vocab, relation_vocab = collect_and_filter_graphs(
         sample_iter=sample_iter,
         out_dir=out_dir,
-        processed_dir=processed_dir,
         dataset_name=dataset_name,
         split_filters=split_filters,
         is_text_entity_fn=is_text_entity_fn,
@@ -157,7 +176,6 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
         precision=precision,
         batch_size=batch_size,
         progress_bar=bool(raw_cfg.get("progress_bar", True)),
-        question_ctx_max_tokens=int(raw_cfg.get("question_ctx_max_tokens", 0)),
         reuse_embeddings_if_exists=reuse_embeddings_if_exists,
     )
 

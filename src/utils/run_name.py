@@ -195,7 +195,22 @@ def generate_run_name(cfg: DictConfig) -> str:
 
 
 def set_run_name_in_config(cfg: DictConfig) -> str:
-    run_name = f"{cfg.experiment.name}-{cfg.dataset.name}-{cfg.experiment.variant or 'default'}"
+    experiment_cfg = cfg.get("experiment")
+
+    if experiment_cfg is not None and hasattr(experiment_cfg, "get"):
+        experiment_name = str(experiment_cfg.get("name") or cfg.get("name") or "run")
+        variant = str(experiment_cfg.get("variant") or cfg.get("variant") or "default")
+    else:
+        experiment_name = str(cfg.get("name") or "run")
+        variant = str(cfg.get("variant") or "default")
+
+    dataset_cfg = cfg.get("dataset")
+    if dataset_cfg is not None and hasattr(dataset_cfg, "get"):
+        dataset_name = str(dataset_cfg.get("name") or "unknown")
+    else:
+        dataset_name = "unknown"
+
+    run_name = f"{experiment_name}-{dataset_name}-{variant}"
     with open_dict(cfg):
         cfg.run_name = run_name
     return run_name
