@@ -7,7 +7,7 @@ import torch
 
 from src.data.schema import RetrievalBatch
 from src.models.reward import RewardModel
-from src.models.rollout import RolloutState
+from src.models.state import State
 from src.utils.path_utils import compute_shortest_path_labels
 
 
@@ -44,7 +44,7 @@ def build_teacher_hit_graph(
     *,
     path_mode: str = "qa_directed",
     stop_on_first_hit: bool = True,
-) -> tuple[str, RolloutState]:
+) -> tuple[str, State]:
     sp_labels = compute_shortest_path_labels(
         edge_index=batch.edge_index.cpu(),
         is_anchor_mask=batch.is_anchor_mask.cpu(),
@@ -53,7 +53,7 @@ def build_teacher_hit_graph(
         path_mode=path_mode,
     )
 
-    rollout_state = RolloutState.initialize(batch)
+    rollout_state = State.create_initial(batch)
     target_active = rollout_state.active_nodes & batch.is_target_mask
     if bool(target_active.any().item()):
         return "root_hit", rollout_state
@@ -63,9 +63,10 @@ def build_teacher_hit_graph(
         or sp_labels.reachable_target_node_ids.numel() == 0
     ):
         return "skipped_no_path", rollout_state
-
     positive_edge_mask = torch.zeros(
-        batch.edge_index.size(1), dtype=torch.bool, device=batch.edge_index.device
+        batch.edge_index.size(1),
+        dtype=torch.bool,
+        device=batch.edge_index.device,
     )
     positive_edge_mask[
         sp_labels.positive_edge_ids.long().to(batch.edge_index.device)
@@ -141,7 +142,6 @@ def evaluate_hit_graph_reward(
         base_graph=batch,
         active_nodes=rollout_state.active_nodes,
         active_edges=rollout_state.active_edges,
-        root_active_edges=rollout_state.root_active_edges,
     )
     active_gold = rollout_state.active_nodes & batch.is_target_mask
     recall = active_gold.sum().float() / batch.is_target_mask.sum().clamp(min=1).float()

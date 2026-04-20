@@ -7,7 +7,6 @@ defaults:
 name: cwq
 dataset_scope: full
 dataset_family: cwq
-max_steps: 4
 hf_dataset: rmanluo/RoG-cwq
 
 question_entity_blacklist:

@@ -6,22 +6,11 @@ Design notes
 so all trainer state — ``estimated_stepping_batches``, ``max_steps``,
 ``max_epochs`` — is available directly via ``self.trainer``.  There is no need
 to serialise these into a separate dataclass before calling this helper.
-
-Usage inside a LightningModule::
-
-    from .optimization import build_optimizer_and_scheduler
-
-    class MyModel(LightningModule):
-        def configure_optimizers(self):
-            return build_optimizer_and_scheduler(
-                module=self,
-                optimizer_cfg=self.hparams.optimizer,
-                scheduler_cfg=self.hparams.get("scheduler"), # Allow None
-            )
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal, cast
 
 import torch
@@ -29,6 +18,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
+    LambdaLR,
     OneCycleLR,
 )
 from lightning import LightningModule
@@ -46,7 +36,11 @@ def _is_no_decay(name: str, param: torch.nn.Parameter) -> bool:
 
 def _is_log_z_head(name: str) -> bool:
     return (
-        "root_flow_" in name or ".z_head." in name or name.startswith("policy.z_head.")
+        "root_flow_" in name
+        or ".z_head." in name
+        or name.startswith("policy.z_head.")
+        or ".flow_head." in name
+        or name.startswith("policy.flow_head.")
     )
 
 
@@ -59,12 +53,7 @@ def build_param_groups(
     no_decay_on_bias_and_norm: bool,
 ) -> list[dict[str, Any]]:
     """
-    Split trainable parameters into up to four AdamW param groups:
-
-    - ``decay``           — normal lr, normal wd
-    - ``no_decay``        — normal lr, wd=0
-    - ``log_z_head_decay``  — boosted lr, normal wd
-    - ``log_z_head_no_decay`` — boosted lr, wd=0
+    Split trainable parameters into up to four AdamW param groups.
     """
     groups: dict[tuple[bool, bool], list[torch.nn.Parameter]] = {}
     for name, param in module.named_parameters():
@@ -96,7 +85,7 @@ def build_param_groups(
 
 
 # ---------------------------------------------------------------------------
-# Horizon resolution — uses the trainer directly
+# Horizon resolution
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +105,6 @@ def _resolve_horizon(
         if trainer.max_steps and trainer.max_steps > 0:
             return trainer.max_steps
         esb = trainer.estimated_stepping_batches
-        # Lightning returns ``float("inf")`` when it cannot estimate; treat as unknown.
         if isinstance(esb, int) and esb > 0:
             return esb
         return None
@@ -147,7 +135,7 @@ def build_optimizer_and_scheduler(
     opt_type = str(optimizer_cfg.get("type", "adamw")).lower()
     if opt_type != "adamw":
         raise ValueError(
-            f"Unsupported optimizer type: {opt_type!r}.  Only 'adamw' is supported."
+            f"Unsupported optimizer type: {opt_type!r}. Only 'adamw' is supported."
         )
 
     # --- parse optimizer hyper-parameters ---
@@ -163,15 +151,8 @@ def build_optimizer_and_scheduler(
     if len(raw_betas) != 2:
         raise ValueError("optimizer.betas must contain exactly two values.")
     beta1, beta2 = float(raw_betas[0]), float(raw_betas[1])
-    if not 0.0 <= beta1 < 1.0:
-        raise ValueError("optimizer.betas[0] must be in [0, 1).")
-    if not 0.0 <= beta2 < 1.0:
-        raise ValueError("optimizer.betas[1] must be in [0, 1).")
 
     log_z_mult = float(optimizer_cfg.get("log_z_head_lr_multiplier", 5.0))
-    if log_z_mult <= 0.0:
-        raise ValueError("optimizer.log_z_head_lr_multiplier must be > 0.")
-
     no_decay_split = bool(optimizer_cfg.get("no_decay_on_bias_and_norm", True))
 
     # --- build optimizer ---
@@ -186,7 +167,6 @@ def build_optimizer_and_scheduler(
         param_groups, lr=base_lr, weight_decay=weight_decay, betas=(beta1, beta2)
     )
 
-    # 如果未提供 scheduler_cfg，直接返回 optimizer 本身
     if not scheduler_cfg:
         return optimizer
 
@@ -196,7 +176,7 @@ def build_optimizer_and_scheduler(
         raise ValueError(
             f"scheduler.interval must be 'step' or 'epoch', got {raw_interval!r}."
         )
-    interval: Literal["step", "epoch"] = raw_interval  # type: ignore[assignment]
+    interval: Literal["step", "epoch"] = raw_interval
 
     explicit_t_max = (
         int(scheduler_cfg["t_max"]) if scheduler_cfg.get("t_max") is not None else None
@@ -204,7 +184,6 @@ def build_optimizer_and_scheduler(
     horizon = _resolve_horizon(module, explicit_t_max=explicit_t_max, interval=interval)
 
     if horizon is None:
-        # No horizon available — return optimizer only.
         return optimizer
 
     scheduler_type = str(scheduler_cfg.get("type", "cosine")).lower()
@@ -224,14 +203,9 @@ def build_optimizer_and_scheduler(
     elif scheduler_type == "onecycle":
         if interval != "step":
             raise ValueError("OneCycleLR requires scheduler.interval='step'.")
-        # Guard against t_max being shorter than the full training run.
         esb = module.trainer.estimated_stepping_batches
         if isinstance(esb, int) and esb > 0 and horizon < esb:
-            raise ValueError(
-                f"OneCycleLR would exhaust before training ends: "
-                f"t_max={horizon}, estimated_stepping_batches={esb}.  "
-                "Set trainer.max_steps and scheduler.t_max consistently."
-            )
+            raise ValueError("OneCycleLR would exhaust before training ends.")
         scheduler = OneCycleLR(
             optimizer,
             max_lr=float(scheduler_cfg.get("lr", base_lr)),
@@ -240,22 +214,38 @@ def build_optimizer_and_scheduler(
             anneal_strategy=scheduler_cfg.get("anneal", "cos"),
         )
 
+    # 🚨 新增：支持 Hugging Face 风格的 cosine_with_warmup 🚨
+    elif scheduler_type == "cosine_with_warmup":
+        if interval != "step":
+            raise ValueError("cosine_with_warmup requires scheduler.interval='step'.")
+
+        num_warmup_steps = int(scheduler_cfg.get("num_warmup_steps", 500))
+
+        def lr_lambda(current_step: int) -> float:
+            # 1. 线性预热阶段
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            # 2. 余弦衰减阶段
+            progress = float(current_step - num_warmup_steps) / float(
+                max(1, horizon - num_warmup_steps)
+            )
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
     else:
         raise ValueError(
-            f"Unsupported scheduler type: {scheduler_type!r}.  "
-            "Expected one of 'cosine', 'cosine_warm_restarts', 'onecycle'."
+            f"Unsupported scheduler type: {scheduler_type!r}. "
+            "Expected 'cosine', 'cosine_warm_restarts', 'onecycle', or 'cosine_with_warmup'."
         )
 
     config_dict: dict[str, Any] = {
         "scheduler": scheduler,
         "interval": interval,
     }
-    if "monitor" in scheduler_cfg:
-        config_dict["monitor"] = scheduler_cfg["monitor"]
-    if "frequency" in scheduler_cfg:
-        config_dict["frequency"] = scheduler_cfg["frequency"]
-    if "strict" in scheduler_cfg:
-        config_dict["strict"] = scheduler_cfg["strict"]
+    for key in ["monitor", "frequency", "strict"]:
+        if key in scheduler_cfg:
+            config_dict[key] = scheduler_cfg[key]
 
     lr_scheduler_config = cast(LRSchedulerConfig, config_dict)
 

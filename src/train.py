@@ -47,9 +47,10 @@ def main(cfg: DictConfig) -> float | None:
     # 0. Global PyTorch settings                                           #
     # ------------------------------------------------------------------ #
     torch.set_float32_matmul_precision("high")
-    if cfg.get("detect_anomaly", False):
-        torch.autograd.set_detect_anomaly(True)
-        log.warning("Anomaly detection is ON — expect significant slowdown.")
+    detect_anomaly = bool(cfg.get("detect_anomaly", False))
+    torch.autograd.set_detect_anomaly(detect_anomaly)
+    if detect_anomaly:
+        log.warning("Anomaly detection is ON; expect significant slowdown.")
 
     # ------------------------------------------------------------------ #
     # 1. Reproducibility & run identity                                   #
@@ -117,14 +118,9 @@ def main(cfg: DictConfig) -> float | None:
             if _best_checkpoint_available(trainer):
                 ckpt_path = "best"
             else:
-                log.warning(
-                    "ModelCheckpoint is configured but no best checkpoint was saved; "
-                    "testing with current in-memory weights."
-                )
+                log.warning("ModelCheckpoint is configured but no best checkpoint was saved; " "testing with current in-memory weights.")
         else:
-            log.warning(
-                "No ModelCheckpoint callback found; testing with current in-memory weights."
-            )
+            log.warning("No ModelCheckpoint callback found; testing with current in-memory weights.")
         trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
 
     # ------------------------------------------------------------------ #

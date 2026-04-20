@@ -2,32 +2,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 
-_metadata_VERSION = 1
+# 内部版本号，用于防止加载了旧版本数据结构导致崩溃
+_MANIFEST_VERSION = 1
 
 
 @dataclass(frozen=True)
-class RuntimeSampleMetadata:
+class DatasetManifest:
+    """
+    数据集的全局索引清单。
+    提供 O(1) 的数据集长度以及静态图特征（节点数、边数），
+    支撑 DataLoader 进行零硬盘 IO 的 Smart/Dynamic Batching。
+    """
+
     split: str
     sample_ids: list[str]
     questions: list[str]
-    num_nodes: torch.Tensor
-    num_edges: torch.Tensor
-    question_tokens: torch.Tensor
+    num_nodes: torch.Tensor  # [num_samples] int32
+    num_edges: torch.Tensor  # [num_samples] int32
+    question_tokens: torch.Tensor  # [num_samples] int32
 
     @property
     def num_samples(self) -> int:
         return len(self.sample_ids)
 
 
-def metadata_path(embeddings_dir: Path, split: str) -> Path:
-    return Path(embeddings_dir) / f"{str(split)}.metadata.pt"
+def manifest_path(embeddings_dir: Path, split: str) -> Path:
+    return Path(embeddings_dir) / f"{str(split)}.manifest.pt"
 
 
-def save_metadata(
+def save_manifest(
     path: Path,
     *,
     split: str,
@@ -37,7 +44,7 @@ def save_metadata(
     num_edges: Sequence[int],
     question_tokens: Sequence[int],
 ) -> None:
-    payload = _build_metadata_payload(
+    payload = _build_manifest_payload(
         split=split,
         sample_ids=sample_ids,
         questions=questions,
@@ -49,21 +56,28 @@ def save_metadata(
     torch.save(payload, path)
 
 
-def load_metadata(path: Path) -> RuntimeSampleMetadata:
-    payload = torch.load(path, map_location="cpu")
+def load_manifest(path: Path) -> DatasetManifest:
+    # 使用 weights_only=False 因为这里包含 list[str] 等基础 Python 类型，
+    # 而不是纯模型权重，但由于是本地预处理生成的数据，安全性可控。
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+
     if not isinstance(payload, dict):
-        raise ValueError(f"Runtime sample metadata at {path} must decode to a dict, got {type(payload)!r}.")
+        raise ValueError(f"Dataset manifest at {path} must decode to a dict, got {type(payload)!r}.")
+
     version = int(payload.get("version", -1))
-    if version != _metadata_VERSION:
-        raise ValueError(
-            "Unsupported runtime sample metadata version: " f"expected {_metadata_VERSION}, got {version}."
-        )
+    if version != _MANIFEST_VERSION:
+        raise ValueError(f"Unsupported dataset manifest version: expected {_MANIFEST_VERSION}, got {version}.")
+
     split = str(payload.get("split", ""))
-    sample_ids = [str(value) for value in list(payload.get("sample_ids", []))]
-    questions = [str(value) for value in list(payload.get("questions", []))]
+
+    # 消除冗余的 list() 强转
+    sample_ids = [str(value) for value in payload.get("sample_ids", [])]
+    questions = [str(value) for value in payload.get("questions", [])]
+
     num_nodes = _coerce_int_tensor(payload.get("num_nodes"), name="num_nodes")
     num_edges = _coerce_int_tensor(payload.get("num_edges"), name="num_edges")
     question_tokens = _coerce_int_tensor(payload.get("question_tokens"), name="question_tokens")
+
     _validate_lengths(
         sample_ids=sample_ids,
         questions=questions,
@@ -72,7 +86,8 @@ def load_metadata(path: Path) -> RuntimeSampleMetadata:
         question_tokens=question_tokens,
     )
     _validate_unique_sample_ids(sample_ids)
-    return RuntimeSampleMetadata(
+
+    return DatasetManifest(
         split=split,
         sample_ids=sample_ids,
         questions=questions,
@@ -82,7 +97,7 @@ def load_metadata(path: Path) -> RuntimeSampleMetadata:
     )
 
 
-def _build_metadata_payload(
+def _build_manifest_payload(
     *,
     split: str,
     sample_ids: Sequence[str],
@@ -90,37 +105,41 @@ def _build_metadata_payload(
     num_nodes: Sequence[int],
     num_edges: Sequence[int],
     question_tokens: Sequence[int],
-) -> dict[str, object]:
-    sample_ids = [str(value) for value in sample_ids]
-    questions = [str(value) for value in questions]
+) -> dict[str, Any]:
+    sample_ids_list = [str(value) for value in sample_ids]
+    questions_list = [str(value) for value in questions]
+
+    # 强制统一使用 int32 节约内存，百万级样本也仅占用几 MB
     num_nodes_tensor = torch.as_tensor(list(num_nodes), dtype=torch.int32)
     num_edges_tensor = torch.as_tensor(list(num_edges), dtype=torch.int32)
     question_tokens_tensor = torch.as_tensor(list(question_tokens), dtype=torch.int32)
+
     _validate_lengths(
-        sample_ids=sample_ids,
-        questions=questions,
+        sample_ids=sample_ids_list,
+        questions=questions_list,
         num_nodes=num_nodes_tensor,
         num_edges=num_edges_tensor,
         question_tokens=question_tokens_tensor,
     )
-    _validate_unique_sample_ids(sample_ids)
+    _validate_unique_sample_ids(sample_ids_list)
+
     return {
-        "version": _metadata_VERSION,
+        "version": _MANIFEST_VERSION,
         "split": str(split),
-        "sample_ids": sample_ids,
-        "questions": questions,
+        "sample_ids": sample_ids_list,
+        "questions": questions_list,
         "num_nodes": num_nodes_tensor,
         "num_edges": num_edges_tensor,
         "question_tokens": question_tokens_tensor,
     }
 
 
-def _coerce_int_tensor(value: object, *, name: str) -> torch.Tensor:
+def _coerce_int_tensor(value: Any, *, name: str) -> torch.Tensor:
     if value is None:
-        raise ValueError(f"Runtime sample metadata missing required field {name!r}.")
+        raise ValueError(f"Dataset manifest missing required field {name!r}.")
     tensor = torch.as_tensor(value, device="cpu")
     if tensor.dim() != 1:
-        raise ValueError(f"Runtime sample metadata field {name!r} must be 1D, got {tuple(tensor.shape)}.")
+        raise ValueError(f"Dataset manifest field {name!r} must be 1D, got {tuple(tensor.shape)}.")
     if tensor.dtype not in (
         torch.int8,
         torch.int16,
@@ -128,7 +147,7 @@ def _coerce_int_tensor(value: object, *, name: str) -> torch.Tensor:
         torch.int64,
         torch.uint8,
     ):
-        raise TypeError(f"Runtime sample metadata field {name!r} must be integral, got {tensor.dtype}.")
+        raise TypeError(f"Dataset manifest field {name!r} must be integral, got {tensor.dtype}.")
     return tensor
 
 
@@ -149,26 +168,34 @@ def _validate_lengths(
     }
     mismatched = {name: actual for name, actual in actual_lengths.items() if actual != expected}
     if mismatched:
-        raise ValueError("Runtime sample metadata length mismatch: " f"expected {expected} entries, got {mismatched}.")
+        raise ValueError(f"Dataset manifest length mismatch: expected {expected} entries, got {mismatched}.")
 
 
 def _validate_unique_sample_ids(sample_ids: Sequence[str]) -> None:
+    """
+    O(1) 极速去重校验。利用 C 底层的 set() 长度判定作为 Fast-path。
+    只有在发生重复时，才进入较慢的 Python for 循环寻找具体重复项进行报错。
+    """
+    if len(sample_ids) == len(set(sample_ids)):
+        return  # Fast-path: 无重复，瞬间通过
+
     seen: set[str] = set()
     duplicates: list[str] = []
     for sample_id in sample_ids:
         if sample_id in seen:
-            duplicates.append(sample_id)
+            if sample_id not in duplicates:
+                duplicates.append(sample_id)
             if len(duplicates) >= 3:
                 break
             continue
         seen.add(sample_id)
-    if duplicates:
-        raise ValueError("Runtime sample metadata contains duplicate sample_ids, examples: " f"{duplicates}.")
+
+    raise ValueError(f"Dataset manifest contains duplicate sample_ids, examples: {duplicates}.")
 
 
 __all__ = [
-    "RuntimeSampleMetadata",
-    "load_metadata",
-    "metadata_path",
-    "save_metadata",
+    "DatasetManifest",
+    "load_manifest",
+    "manifest_path",
+    "save_manifest",
 ]

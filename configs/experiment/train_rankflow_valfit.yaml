@@ -7,11 +7,6 @@ defaults:
 name: train
 variant: rankflow_valfit
 
-# Run test after fit so train/val/test all execute against the same debug split.
-test: true
-optimized_metric: val/high_reward/oracle_max_recall@8
-ckpt_path: null
-
 dataset:
   train_split: validation
   val_split: validation

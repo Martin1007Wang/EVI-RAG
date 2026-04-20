@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from .metrics import (
-    build_union_context_graph,
+    UnionSubgraphMasks,
+    compute_union_subgraph_masks,
     compute_distribution_expectations,
     compute_exploration_diversity,
     compute_high_reward_discovery,
@@ -9,7 +10,8 @@ from .metrics import (
 from .sampling import run_monte_carlo_sampling, run_early_stop_sampling
 
 __all__ = [
-    "build_union_context_graph",
+    "UnionSubgraphMasks",
+    "compute_union_subgraph_masks",
     "compute_distribution_expectations",
     "compute_high_reward_discovery",
     "compute_exploration_diversity",

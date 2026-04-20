@@ -21,3 +21,4 @@ defaults:
   - experiment: null 
 
 seed: 42
+detect_anomaly: false

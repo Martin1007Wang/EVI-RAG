@@ -1,65 +1,80 @@
-# @package model
-# GFlowNet 配置 - 完全扁平化，无嵌套结构
-
 _target_: src.models.gflownet.GFlowNetModule
 _recursive_: true
 _convert_: all
 
-# 核心训练参数
-max_steps: ${dataset.max_steps}
+max_steps: 3
 num_rollout: 8
-strict_on_policy: true
+eval_num_rollout: 8
+rollout_chunk_size: 4
+eval_rollout_chunk_size: 4
+eval_budgets: [1, 2, 4, 8]
+temperature: 0.45
+temperature_schedule:
+  start: 0.45
+  end: 0.45
+  warmup_steps: 999999
 
-# 温度调度
-sampling_temperature_schedule:
-  schedule_type: linear
-  initial_value: 1.0
-  final_value: 1.0
-  total_steps: 1
-
-# 策略网络
 backbone:
-  hidden_dim: 512
-  gnn_num_layers: 2
+  hidden_dim: 1024
+  gnn_num_layers: 3
   gnn_dropout: 0.1
+  dde_max_distance: 4
 
-policy_hidden_dim: 512
+policy_hidden_dim: 1024
 
-relation_prior:
-  prior_lambda_init: 10.0
-  learnable_prior_scale: true
-  positive_prior_scale: true
-  zero_init_type_output: true
-  zero_init_expand_edge_output: true
+action_head:
+  zero_init_type_output: false
 
-answer_reward:
-  hit_reward_base: 5.0
-  hit_reward_max: 50.0
-  miss_reward: 0.01
-  penalty_step: 0.98
-  penalty_dead: 0.2
+edge_scorer:
+  prior_scale_init: 5.0
+  prior_scale_trainable: false
 
-teacher_warmstart:
-  path_mode: undirected
-  stop_on_first_hit: true
+reward:
+  log_r_min: -5.0
+  semantic_fallback_scale: 0.25
+  relation_shaping_scale: 0.0
+  positive_coverage_shaping_scale: 0.0
+  distance_progress_shaping_scale: 0.0
 
-training_curriculum:
-  warmup_steps: 2000
-  blend_steps: 3000
-  edge_teacher_weight: 1.0
-  stop_teacher_weight: 3.0
-  tb_final_weight: 1.0
+loss:
+  variant: fl_subtb
+  subtb_lambda: 0.9
+  log_reward_clip_min: -10.0
+  reward_matching_coef: 1.0
+
+teacher:
+  enabled: true
+  mode: bounded_path
+  score_exponent: 0.5
+  fallback_to_policy: true
+
+schedule:
+  warmup_steps: 200
+  decay_steps: 1800
+  initial_teacher_prob: 1.0
+  final_teacher_prob: 0.0
+
+replay:
+  enabled: true
+  capacity: 4096
+  sample_size: 2
+  warmup_steps: 200
+  min_size: 64
+  loss_coef: 0.2
+  reset_on_fit_start: true
+  priority_epsilon: 1.0e-6
+  priority_exponent: 0.6
+  importance_sampling_exponent: 0.4
+  age_decay: 0.999
 
 optimizer_cfg:
   type: adamw
   lr: 0.0001
-  weight_decay: 0.01
+  weight_decay: 0.0001
   betas: [0.9, 0.999]
-  log_z_head_lr_multiplier: 1.0
+  log_z_head_lr_multiplier: 5.0
 
 scheduler_cfg:
-  type: onecycle
-  interval: step         # 必须改为 step
-  lr: 0.0001             # 这里是 max_lr，与 optimizer 保持一致即可
-  pct_start: 0.1         # 前 10% 的训练步数用于 Warmup (非常关键)
-  anneal: cos            # 衰减策略
+  type: cosine_with_warmup
+  interval: step
+  num_warmup_steps: 1000

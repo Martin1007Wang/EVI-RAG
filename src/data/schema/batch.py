@@ -1,46 +1,53 @@
-# src/schema/batch.py
 from __future__ import annotations
-from typing import Any, TYPE_CHECKING
+
+from typing import TYPE_CHECKING, Any
 import torch
-from torch_geometric.data import Batch
+from torch_geometric.data.batch import Batch
+
 from .fields import SampleFields
 
 
 class RetrievalBatch(Batch):
-    """
-    知识图谱检索的全局批次数据结构。
-    核心哲学：环境拓扑与状态掩码在维度上天然对齐，由 PyG 原生 cat 机制接管。
-    """
-
     if TYPE_CHECKING:
-        # --- PyG 原生内置属性 ---
         ptr: torch.Tensor
         batch: torch.Tensor
         edge_index: torch.Tensor
         num_nodes: int
 
-        # --- 从 LMDB 加载的原始全局语义张量 ---
         edge_relation_ids_global: torch.Tensor
         node_entity_ids_global: torch.Tensor
         question_emb: torch.Tensor
 
-        # 核心修改：直接承接拼接后的全局布尔掩码 (shape: [Total_Nodes])
         is_anchor_mask: torch.Tensor
         is_target_mask: torch.Tensor
+        anchor_signed_distance: torch.Tensor
         answer_entity_ids_global: torch.Tensor
+        positive_edge_mask: torch.Tensor
+        node_to_target_distance: torch.Tensor
+        shortest_suffix_count: torch.Tensor
+        bounded_suffix_count: torch.Tensor
+        max_path_length: torch.Tensor
 
-        # --- Collator 附加的、与计算轴对齐的张量 ---
         node_tokens: torch.Tensor
-        edge_relation_tokens: torch.Tensor
+        non_text_node_mask: torch.Tensor
+        relation_tokens: torch.Tensor
         is_cvt: torch.Tensor
         heuristic_log_v: torch.Tensor
 
-        # --- Collator 附加的辅助统计 ---
         node_ptr: torch.Tensor
         edge_batch: torch.Tensor
         edge_ptr: torch.Tensor
 
+    def __cat_dim__(self, key: str, value: Any, *args, **kwargs) -> Any:
+        if key == SampleFields.BOUNDED_SUFFIX_COUNT:
+            return 1
+        return super().__cat_dim__(key, value, *args, **kwargs)  # type: ignore[attr-defined]
+
+    def __inc__(self, key: str, value: Any, *args, **kwargs) -> Any:
+        if key in SampleFields.NO_INCREMENT_KEYS:
+            return 0
+        return super().__inc__(key, value, *args, **kwargs) # type: ignore[attr-defined]
+
     @property
     def num_nodes_total(self) -> int:
-        """安全地获取全局总节点数"""
-        return self.num_nodes
+        return int(self.num_nodes)

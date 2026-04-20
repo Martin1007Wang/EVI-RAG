@@ -7,12 +7,14 @@ from typing import TYPE_CHECKING, Any
 __all__ = [
     "LoggedMetricEarlyStopping",
     "LocalMetricsWriter",
+    "PriorWeightMonitor",
     "StepEarlyStopping",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover
     from .step_early_stopping import LoggedMetricEarlyStopping
     from .local_metrics_writer import LocalMetricsWriter
+    from .prior_weight_monitor import PriorWeightMonitor
     from .step_early_stopping import StepEarlyStopping
 
 
@@ -25,6 +27,10 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from .local_metrics_writer import LocalMetricsWriter
 
         return LocalMetricsWriter
+    if name == "PriorWeightMonitor":
+        from .prior_weight_monitor import PriorWeightMonitor
+
+        return PriorWeightMonitor
     if name == "StepEarlyStopping":
         from .step_early_stopping import StepEarlyStopping
 

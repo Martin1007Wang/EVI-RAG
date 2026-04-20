@@ -7,5 +7,4 @@ defaults:
 name: webqsp
 dataset_scope: full
 dataset_family: webqsp
-max_steps: 4
 hf_dataset: rmanluo/RoG-webqsp

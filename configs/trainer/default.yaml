@@ -7,10 +7,8 @@ max_epochs: 100000
 accelerator: auto
 devices: auto
 
+# Default GPU training uses Lightning's bf16 mixed precision. Use 32-true only
+# for CPU runs or when doing numerical debugging / parity checks.
 precision: bf16-mixed
-# precision: 32-true
-accumulate_grad_batches: 8
-gradient_clip_val: 1.0
-gradient_clip_algorithm: norm
 
 val_check_interval: 1.0

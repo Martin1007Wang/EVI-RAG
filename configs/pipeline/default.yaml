@@ -27,6 +27,7 @@ embeddings_out_dir: ${dataset.materialized_dir}/embeddings
 
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json
+teacher_budget_max_steps: 3
 
 
 output_dir: ${dataset.materialized_dir}

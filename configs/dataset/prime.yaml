@@ -7,7 +7,6 @@ defaults:
 name: prime
 dataset_scope: sub
 dataset_family: stark_prime
-max_steps: 4
 hf_dataset: null
 dataset_source: stark
 kb: prime
@@ -19,16 +18,7 @@ stark:
   indirected: false
   cache_dir: ${dataset.artifact_dir}/stark_cache
   linker:
-    backend: vllm
-    model: ${oc.env:STARK_VLLM_MODEL,""}
-    tensor_parallel_size: 1
-    max_model_len: null
-    max_tokens: 192
-    temperature: 0.0
-    top_p: 1.0
-    seed: null
-    pretrim_to_budget: true
-    budget_margin: 0
+    backend: keyword
     max_candidates: 12
     max_entities: 4
   local_graph:
@@ -36,4 +26,3 @@ stark:
     direction: both
     max_nodes: 64
     max_edges: 256
-    include_inverse_edges: true

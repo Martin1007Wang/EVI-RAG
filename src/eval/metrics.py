@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch_scatter import scatter_sum
-
+from dataclasses import dataclass
 from src.data.schema import RetrievalBatch
 from src.models.rollout import RolloutBatch
 from src.utils.reward_utils import (
@@ -11,44 +11,46 @@ from src.utils.reward_utils import (
     prune_to_protected_core,
 )
 
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+@dataclass
+class UnionSubgraphMasks:
+    """Terminal subgraph union across all rollouts, aligned to the full batch graph."""
+
+    union_nodes: torch.Tensor  # BoolTensor [num_nodes]
+    union_edges: torch.Tensor  # BoolTensor [num_edges]
 
 
-def _terminal_active_nodes(rollout: RolloutBatch) -> torch.Tensor:
-    nodes = rollout.terminal_active_nodes
-    if nodes is None:
+def _require_terminal_field(rollout: RolloutBatch, field: str) -> torch.Tensor:
+    """
+    Extract a required terminal field from a rollout, raising a clear error if missing.
+    Consolidates previously duplicated logic for nodes and edges.
+    """
+    value = getattr(rollout, field, None)
+    if value is None:
         raise ValueError(
-            "Evaluation metrics require terminal_active_nodes. "
+            f"Evaluation requires rollout.{field}. "
             "Call run_exploration(..., collect_terminal_state=True)."
         )
-    return nodes
-
-
-def _terminal_active_edges(rollout: RolloutBatch) -> torch.Tensor:
-    edges = rollout.terminal_active_edges
-    if edges is None:
-        raise ValueError(
-            "Evaluation metrics require terminal_active_edges. "
-            "Call run_exploration(..., collect_terminal_state=True)."
-        )
-    return edges
+    return value
 
 
 def _validate_rollouts(rollouts: list[RolloutBatch]) -> torch.device:
     """
     Validate that all rollouts expose terminal state and return their device.
-    Eagerly triggers the missing-terminal-state error with a clear message
+    Eagerly triggers the missing-terminal-state error across the entire list
     rather than letting it surface later inside a tensor operation.
     """
     if not rollouts:
         return torch.device("cpu")
 
-    # Trigger validation on the first rollout; subsequent ones are checked
-    # lazily when accessed, which is consistent with the existing contract.
-    first_nodes = _terminal_active_nodes(rollouts[0])
-    return first_nodes.device
+    # Full validation upfront to avoid mid-loop failures
+    for rollout in rollouts:
+        _require_terminal_field(rollout, "terminal_active_nodes")
+
+    return _require_terminal_field(rollouts[0], "terminal_active_nodes").device
 
 
 def _stack_terminal_nodes(
@@ -56,7 +58,13 @@ def _stack_terminal_nodes(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    return torch.stack([_terminal_active_nodes(r).to(device) for r in rollouts], dim=0)
+    return torch.stack(
+        [
+            _require_terminal_field(r, "terminal_active_nodes").to(device)
+            for r in rollouts
+        ],
+        dim=0,
+    )
 
 
 def _stack_terminal_edges(
@@ -64,7 +72,13 @@ def _stack_terminal_edges(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    return torch.stack([_terminal_active_edges(r).to(device) for r in rollouts], dim=0)
+    return torch.stack(
+        [
+            _require_terminal_field(r, "terminal_active_edges").to(device)
+            for r in rollouts
+        ],
+        dim=0,
+    )
 
 
 def _compute_recall_matrix(
@@ -93,20 +107,26 @@ def _compute_recall_matrix(
     hit_nodes = stacked_nodes & target_mask.unsqueeze(0)  # [N, V]
 
     expanded_batch_idx = batch_index.unsqueeze(0).expand(N, -1)  # [N, V]
-    hits_per_graph = scatter_sum(hit_nodes.float(), expanded_batch_idx, dim=1, dim_size=B)  # [N, B]
-    gold_per_graph = scatter_sum(target_mask.float(), batch_index, dim=0, dim_size=B)  # [B]
+    hits_per_graph = scatter_sum(
+        hit_nodes.float(), expanded_batch_idx, dim=1, dim_size=B
+    )  # [N, B]
+    gold_per_graph = scatter_sum(
+        target_mask.float(), batch_index, dim=0, dim_size=B
+    )  # [B]
 
     valid_graph_mask = gold_per_graph > 0  # [B]
 
     recall_matrix = torch.zeros((N, B), dtype=torch.float32, device=device)
     if valid_graph_mask.any():
-        recall_matrix[:, valid_graph_mask] = hits_per_graph[:, valid_graph_mask] / gold_per_graph[
-            valid_graph_mask
-        ].unsqueeze(0)
+        recall_matrix[:, valid_graph_mask] = hits_per_graph[
+            :, valid_graph_mask
+        ] / gold_per_graph[valid_graph_mask].unsqueeze(0)
     return recall_matrix, valid_graph_mask
 
 
-def _mean_over_valid_graphs(values: torch.Tensor, valid_graph_mask: torch.Tensor) -> float:
+def _mean_over_valid_graphs(
+    values: torch.Tensor, valid_graph_mask: torch.Tensor
+) -> float:
     """
     Average ``values`` restricted to graphs where recall is well-defined.
 
@@ -136,8 +156,14 @@ def _per_rollout_mean_nodes(
     batch_index = batch.batch.to(device)
     total = 0.0
     for rollout in rollouts:
-        active_nodes = _terminal_active_nodes(rollout).to(device)
-        total += scatter_sum(active_nodes.float(), batch_index, dim=0, dim_size=B).mean().item()
+        active_nodes = _require_terminal_field(rollout, "terminal_active_nodes").to(
+            device
+        )
+        total += (
+            scatter_sum(active_nodes.float(), batch_index, dim=0, dim_size=B)
+            .mean()
+            .item()
+        )
     return total / max(len(rollouts), 1)
 
 
@@ -171,8 +197,12 @@ def _expected_dangling_ratio(
     valid_pairs = 0  # (graph, rollout) pairs where added_edges > 0
 
     for rollout in rollouts:
-        active_nodes = _terminal_active_nodes(rollout).to(device)
-        active_edges = _terminal_active_edges(rollout).to(device)
+        active_nodes = _require_terminal_field(rollout, "terminal_active_nodes").to(
+            device
+        )
+        active_edges = _require_terminal_field(rollout, "terminal_active_edges").to(
+            device
+        )
 
         active_gold = active_nodes & target_mask
         protected_nodes = anchor_mask | active_gold
@@ -186,12 +216,18 @@ def _expected_dangling_ratio(
         added_edges = active_edges & ~root_edges
         dangling_edges = added_edges & ~core_edges
 
-        dangling_count = per_graph_mask_count(dangling_edges, edge_batch, B, dtype=torch.float32)
-        added_count = per_graph_mask_count(added_edges, edge_batch, B, dtype=torch.float32)
+        dangling_count = per_graph_mask_count(
+            dangling_edges, edge_batch, B, dtype=torch.float32
+        )
+        added_count = per_graph_mask_count(
+            added_edges, edge_batch, B, dtype=torch.float32
+        )
 
         valid_mask = added_count > 0
         if valid_mask.any():
-            total_ratio += (dangling_count[valid_mask] / added_count[valid_mask]).sum().item()
+            total_ratio += (
+                (dangling_count[valid_mask] / added_count[valid_mask]).sum().item()
+            )
             valid_pairs += int(valid_mask.sum().item())
 
     if valid_pairs == 0:
@@ -204,13 +240,14 @@ def _expected_dangling_ratio(
 # ---------------------------------------------------------------------------
 
 
-def build_union_context_graph(rollouts: list[RolloutBatch], batch: RetrievalBatch) -> dict[str, torch.Tensor]:
+def compute_union_subgraph_masks(
+    rollouts: list[RolloutBatch], batch: RetrievalBatch
+) -> UnionSubgraphMasks:
     """
-    Merge terminal rollout subgraphs into one union context graph.
+    Merge terminal rollout subgraphs into union node/edge boolean masks.
 
-    Sizes are derived from ``batch`` (not from rollout tensors) so that the
-    returned tensors are always aligned with the full candidate graph,
-    regardless of whether any rollout happens to cover every node/edge.
+    Tensor sizes are derived from ``batch`` to stay aligned with the full
+    candidate graph regardless of rollout coverage.
 
     This helper is part of the public inference surface: downstream RAG
     callers may want the union graph even when the main evaluation metrics
@@ -218,7 +255,7 @@ def build_union_context_graph(rollouts: list[RolloutBatch], batch: RetrievalBatc
     """
     device = _validate_rollouts(rollouts)
 
-    # FIX: use batch dimensions as the authoritative size source so that
+    # Use batch dimensions as the authoritative size source so that
     # union tensors are correctly shaped even when rollouts is empty or when
     # terminal_active_* tensors happen to be shorter than the full graph.
     num_nodes = batch.num_nodes
@@ -228,10 +265,14 @@ def build_union_context_graph(rollouts: list[RolloutBatch], batch: RetrievalBatc
     union_edges = torch.zeros(num_edges, dtype=torch.bool, device=device)
 
     for rollout in rollouts:
-        union_nodes |= _terminal_active_nodes(rollout).to(device)
-        union_edges |= _terminal_active_edges(rollout).to(device)
+        union_nodes |= _require_terminal_field(rollout, "terminal_active_nodes").to(
+            device
+        )
+        union_edges |= _require_terminal_field(rollout, "terminal_active_edges").to(
+            device
+        )
 
-    return {"union_nodes": union_nodes, "union_edges": union_edges}
+    return UnionSubgraphMasks(union_nodes=union_nodes, union_edges=union_edges)
 
 
 def compute_distribution_expectations(
@@ -262,11 +303,15 @@ def compute_distribution_expectations(
             "expected_dangling_ratio": 0.0,
         }
 
-    recall_matrix, valid_graph_mask = _compute_recall_matrix(rollouts, batch, device=device)
+    recall_matrix, valid_graph_mask = _compute_recall_matrix(
+        rollouts, batch, device=device
+    )
     return {
         "expected_recall": _mean_over_valid_graphs(recall_matrix, valid_graph_mask),
         "expected_nodes": _per_rollout_mean_nodes(rollouts, batch, device=device),
-        "expected_dangling_ratio": _expected_dangling_ratio(rollouts, batch, device=device),
+        "expected_dangling_ratio": _expected_dangling_ratio(
+            rollouts, batch, device=device
+        ),
     }
 
 
@@ -279,15 +324,15 @@ def compute_high_reward_discovery(
     """
     Best-of-K discovery metrics under a fixed sampling budget.
 
-    ``oracle_max_recall@K`` is the best recall found within the first K
-    independent samples. ``success@K`` is the perfect-recall hit rate,
+    ``oracle_max_recall_at_K`` is the best recall found within the first K
+    independent samples. ``success_at_K`` is the perfect-recall hit rate,
     analogous to Pass@K reporting.
 
     Parameters
     ----------
     ks : list[int] | None
         Values of K to evaluate. Defaults to ``[1]`` so that the returned
-        keys are always stable (``oracle_max_recall@1``, ``success@1``).
+        keys are always stable (``oracle_max_recall_at_1``, ``success_at_1``).
         Values larger than ``len(rollouts)`` are silently clamped away.
 
     Notes
@@ -307,18 +352,26 @@ def compute_high_reward_discovery(
         effective_ks = [1]
 
     if N == 0:
-        return {f"oracle_max_recall@{k}": 0.0 for k in effective_ks} | {f"success@{k}": 0.0 for k in effective_ks}
+        return {f"oracle_max_recall_at_{k}": 0.0 for k in effective_ks} | {
+            f"success_at_{k}": 0.0 for k in effective_ks
+        }
 
-    recall_matrix, valid_graph_mask = _compute_recall_matrix(rollouts, batch, device=device)
+    recall_matrix, valid_graph_mask = _compute_recall_matrix(
+        rollouts, batch, device=device
+    )
 
     metrics: dict[str, float] = {}
     for k in effective_ks:
         best_recall = recall_matrix[:k].max(dim=0).values  # [B]
-        metrics[f"oracle_max_recall@{k}"] = _mean_over_valid_graphs(best_recall, valid_graph_mask)
+        metrics[f"oracle_max_recall_at_{k}"] = _mean_over_valid_graphs(
+            best_recall, valid_graph_mask
+        )
         if valid_graph_mask.any():
-            metrics[f"success@{k}"] = float((best_recall[valid_graph_mask] == 1.0).float().mean().item())
+            metrics[f"success_at_{k}"] = float(
+                (best_recall[valid_graph_mask] == 1.0).float().mean().item()
+            )
         else:
-            metrics[f"success@{k}"] = 0.0
+            metrics[f"success_at_{k}"] = 0.0
     return metrics
 
 
@@ -348,7 +401,9 @@ def compute_exploration_diversity(
     stacked_edges = _stack_terminal_edges(rollouts, device=device)  # [N, E]
 
     # Upper-triangular mask selects each unordered pair exactly once.
-    triu_mask = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
+    triu_mask = torch.triu(
+        torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1
+    )
 
     graph_diversities: list[float] = []
     for b in range(B):
@@ -370,13 +425,6 @@ def compute_exploration_diversity(
         graph_diversities.append(float(jaccard_dist[triu_mask].mean().item()))
 
     return {
-        "edge_jaccard_diversity": sum(graph_diversities) / max(len(graph_diversities), 1),
+        "edge_jaccard_diversity": sum(graph_diversities)
+        / max(len(graph_diversities), 1),
     }
-
-
-__all__ = [
-    "build_union_context_graph",
-    "compute_distribution_expectations",
-    "compute_high_reward_discovery",
-    "compute_exploration_diversity",
-]

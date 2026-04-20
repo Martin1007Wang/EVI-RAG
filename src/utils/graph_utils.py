@@ -94,30 +94,110 @@ def _components_all_anchor_reachable(
     return bool(membership.any(dim=1).all().item())
 
 
+def _is_forward_reachable_state(
+    *,
+    active_nodes: torch.Tensor,
+    active_edges: torch.Tensor,
+    edge_index: torch.Tensor,
+    is_anchor_mask: torch.Tensor,
+) -> bool:
+    """
+    Return whether a state is reachable by the forward edge-expansion MDP.
+
+    In the current MDP, a state is forward-reachable iff every active connected
+    component contains at least one anchor. This helper gives that contract a
+    name so backward-parent checks can be phrased as exact inverse-transition
+    checks rather than only as a structural heuristic.
+    """
+    return _components_all_anchor_reachable(
+        active_nodes=active_nodes,
+        active_edges=active_edges,
+        edge_index=edge_index,
+        is_anchor_mask=is_anchor_mask,
+    )
+
+
+def _is_exact_forward_parent(
+    *,
+    child_active_nodes: torch.Tensor,
+    child_active_edges: torch.Tensor,
+    edge_index: torch.Tensor,
+    is_anchor_mask: torch.Tensor,
+    removed_edge_pos: int,
+) -> bool:
+    """
+    Check whether deleting one edge yields an exact one-step forward parent.
+
+    The returned parent must satisfy all of the following:
+    1. The parent state is itself forward-reachable.
+    2. The removed edge is a legal frontier expansion from that parent, i.e. at
+       least one endpoint is already active in the parent state.
+    3. Re-applying that one forward expansion reconstructs the exact child
+       state, including the rebuilt active-node mask.
+    """
+    parent_active_edges = child_active_edges.clone()
+    parent_active_edges[removed_edge_pos] = False
+    parent_active_nodes = _rebuild_active_nodes_from_edges(
+        active_edges=parent_active_edges,
+        edge_index=edge_index,
+        is_anchor_mask=is_anchor_mask,
+    )
+
+    if not _is_forward_reachable_state(
+        active_nodes=parent_active_nodes,
+        active_edges=parent_active_edges,
+        edge_index=edge_index,
+        is_anchor_mask=is_anchor_mask,
+    ):
+        return False
+
+    removed_src = int(edge_index[0, removed_edge_pos].item())
+    removed_dst = int(edge_index[1, removed_edge_pos].item())
+    if not bool(parent_active_nodes[removed_src] | parent_active_nodes[removed_dst]):
+        return False
+
+    reconstructed_child_edges = parent_active_edges.clone()
+    reconstructed_child_edges[removed_edge_pos] = True
+    reconstructed_child_nodes = _rebuild_active_nodes_from_edges(
+        active_edges=reconstructed_child_edges,
+        edge_index=edge_index,
+        is_anchor_mask=is_anchor_mask,
+    )
+    return torch.equal(reconstructed_child_edges, child_active_edges) and torch.equal(
+        reconstructed_child_nodes, child_active_nodes
+    )
+
+
 def compute_valid_backward_removals(
     *,
     active_nodes: torch.Tensor,
     active_edges: torch.Tensor,
-    root_active_edges: torch.Tensor,
     edge_index: torch.Tensor,
     is_anchor_mask: torch.Tensor,
     node_batch: torch.Tensor,
     edge_batch: torch.Tensor,
     num_graphs: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return removable non-root edges whose parent state stays forward-reachable.
+    """Return the exact one-step forward parents of the current child state.
 
-    A candidate edge is backward-removable iff deleting it and rebuilding the
-    parent active-node set (anchors plus endpoints of the remaining active
-    edges) leaves every active connected component anchored.
+    A non-root active edge is backward-removable iff deleting it yields a parent
+    state that is forward-reachable and the removed edge is a legal one-step
+    frontier expansion from that parent. This is the precise inverse-transition
+    relation needed by the trajectory-balance backward policy.
+
+    root_active_edges（锚点诱导子图边）由函数内部从 is_anchor_mask 重建，
+    不再作为外部参数传入——调用方不需要持有或传递这个不变量。
     """
     if active_nodes.dtype != torch.bool:
         raise TypeError("active_nodes must be a torch.bool tensor.")
     if active_edges.dtype != torch.bool:
         raise TypeError("active_edges must be a torch.bool tensor.")
-    if root_active_edges.dtype != torch.bool:
-        raise TypeError("root_active_edges must be a torch.bool tensor.")
+    if is_anchor_mask.dtype != torch.bool:
+        raise TypeError("is_anchor_mask must be a torch.bool tensor.")
+
+    # 从 is_anchor_mask 内部重建 root_active_edges，无需外部传入
+    src_global, dst_global = edge_index[0], edge_index[1]
+    root_active_edges = is_anchor_mask[src_global] & is_anchor_mask[dst_global]
 
     removable_mask = torch.zeros_like(active_edges)
     candidate_mask = active_edges & ~root_active_edges
@@ -128,8 +208,12 @@ def compute_valid_backward_removals(
         return removable_mask, removable_counts
 
     for graph_idx in range(num_graphs):
-        graph_edge_ids = torch.nonzero(edge_batch == graph_idx, as_tuple=False).view(-1)
-        graph_node_ids = torch.nonzero(node_batch == graph_idx, as_tuple=False).view(-1)
+        graph_edge_ids = torch.nonzero(
+            edge_batch == graph_idx, as_tuple=False
+        ).view(-1)
+        graph_node_ids = torch.nonzero(
+            node_batch == graph_idx, as_tuple=False
+        ).view(-1)
         if graph_edge_ids.numel() == 0 or graph_node_ids.numel() == 0:
             continue
 
@@ -157,18 +241,12 @@ def compute_valid_backward_removals(
             local_edge_pos = int(
                 (graph_edge_ids == edge_id).nonzero(as_tuple=False)[0].item()
             )
-            parent_active_edges = local_active_edges.clone()
-            parent_active_edges[local_edge_pos] = False
-            parent_active_nodes = _rebuild_active_nodes_from_edges(
-                active_edges=parent_active_edges,
+            if _is_exact_forward_parent(
+                child_active_nodes=expected_active_nodes,
+                child_active_edges=local_active_edges,
                 edge_index=local_edge_index,
                 is_anchor_mask=local_anchor_mask,
-            )
-            if _components_all_anchor_reachable(
-                active_nodes=parent_active_nodes,
-                active_edges=parent_active_edges,
-                edge_index=local_edge_index,
-                is_anchor_mask=local_anchor_mask,
+                removed_edge_pos=local_edge_pos,
             ):
                 removable_mask[edge_id] = True
 

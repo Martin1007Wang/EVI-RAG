@@ -1,516 +1,357 @@
-"""
-GNN backbone for GFlowNet-based knowledge-graph retrieval.
-
-Optimisations over the original version
-----------------------------------------
-1. EmbeddingAdapter and backbone MLPs rely on autocast instead of manually
-   forcing large activations to parameter dtype.
-2. _GNNLayer:
-   - Softmax-based edge-weight normalisation via PyG's built-in
-     ``torch_geometric.utils.softmax`` (replaces hand-written sigmoid +
-     sum-normalise; more stable gradients, no clamp needed).
-   - Edge features updated every layer with a lightweight residual MLP so
-     that multi-hop reasoning can condition on context-aware relation
-     representations (previously edges were static across all GNN layers).
-   - Forward and reverse neighbourhoods are aggregated explicitly so the node
-     update MLP can consume them as separate feature blocks.
-   - Named constants replace magic multipliers (3×/4× hidden_dim).
-3. GNNBackbone:
-   - active_edges mask applied once; augmented index built from the result.
-   - Minor readability fixes (named variables, inline comments).
-4. All hand-written index_add_ / clamp_min_ normalisation removed.
-"""
-
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import softmax as pyg_softmax
+from torch_scatter import scatter_softmax, scatter_sum
 
 from src.data.schema import RetrievalBatch
+from src.utils.nn_utils import (
+    init_xavier,
+    validate_bool_mask,
+)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PreparedGNNInput:
+    """Static features computed once per batch / rollout.
 
+    All tensors live in the same encoder semantic space because the
+    preprocessing pipeline already emits aligned L2-normalized text
+    embeddings for nodes, relations, and queries. Cosine similarities
+    between node_h, rel_h, and query_h are therefore meaningful from step 0.
 
-def _init_xavier(layer: nn.Linear) -> None:
-    nn.init.xavier_uniform_(layer.weight)
-    if layer.bias is not None:
-        nn.init.zeros_(layer.bias)
+    node_h:       [N, H]  node semantics in encoder space
+    rel_h:        [E, H]  forward relation semantics in encoder space
+    query_h:      [G, H]  query semantics in encoder space
+    node_input_h: [N, H]  NBF initial states after anchor-gated query fusion
 
-
-def _build_mlp(
-    input_dim: int,
-    hidden_dim: int,
-    output_dim: int,
-    dropout: float,
-) -> nn.Sequential:
-    layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dim), nn.GELU()]
-    if dropout > 0.0:
-        layers.append(nn.Dropout(dropout))
-    layers.append(nn.Linear(hidden_dim, output_dim))
-    mlp = nn.Sequential(*layers)
-    for m in mlp.modules():
-        if isinstance(m, nn.Linear):
-            _init_xavier(m)
-    return mlp
-
-
-# ---------------------------------------------------------------------------
-# EmbeddingAdapter
-# ---------------------------------------------------------------------------
-
-
-class EmbeddingAdapter(nn.Module):
-    """
-    Low-rank residual adapter: x' = x + W_up(GELU(W_down(Norm(x)))).
-
-    ``up`` is zero-initialised so the adapter is an identity map at the start
-    of training, keeping activations on the pre-trained manifold.
-
-    Large activations are left in their current dtype so AMP/autocast can pick
-    the execution dtype instead of being forced back to parameter precision.
+    NOTE: inv_rel_h removed. The dataset contains only directed edges with no
+    inverse-relation augmentation. Injecting a backward pass over non-existent
+    edges would fabricate directional signals absent from the data.
     """
 
-    def __init__(self, *, emb_dim: int, adapter_dim: int, dropout: float) -> None:
+    node_h: torch.Tensor
+    rel_h: torch.Tensor
+    query_h: torch.Tensor
+    node_input_h: torch.Tensor
+
+
+class _NBFLayer(nn.Module):
+    """One untied NBF-style Bellman-Ford message-passing layer.
+
+    Changes vs. original:
+    - Removed bwd_msg_mlp and inv_rel_h: dataset is strictly directed; backward
+      messages over non-existent edges introduce spurious gradients.
+    - Replaced scatter_mean with query-conditioned softmax attention aggregation:
+      scatter_mean dilutes sparse correct-path signals on high-degree hub nodes
+      (common in Freebase PPR subgraphs). Attention lets the model upweight
+      query-relevant neighbours regardless of degree.
+    """
+
+    def __init__(self, *, hidden_dim: int, dropout: float) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(emb_dim)
-        self.down = nn.Linear(emb_dim, adapter_dim)
-        self.up = nn.Linear(adapter_dim, emb_dim)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-
-        _init_xavier(self.down)
-        nn.init.zeros_(self.up.weight)
-        if self.up.bias is not None:
-            nn.init.zeros_(self.up.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0:
-            return x
-        return x + self.drop(self.up(self.act(self.down(self.norm(x)))))
-
-
-# ---------------------------------------------------------------------------
-# GNN message-passing layer
-# ---------------------------------------------------------------------------
-
-# Number of feature groups concatenated before the update MLP.
-# [self, agg_fwd, agg_rev] = 3, plus optional [question] = 4.
-_AGG_GROUPS_BASE = 3
-_AGG_GROUPS_WITH_Q = 4
-
-
-class _GNNLayer(MessagePassing):
-    """
-    Single GNN layer with:
-      - Relation- and question-gated edge weights (softmax-normalised via PyG).
-      - Separate incoming/outgoing aggregations for node updates.
-      - Per-layer edge feature update (residual MLP) so relation
-        representations can accumulate structural context across hops.
-
-    Aggregation scheme
-    ------------------
-    Incoming and outgoing neighbourhoods are propagated separately so the
-    update MLP sees them as distinct feature groups. This costs one extra
-    propagate relative to a packed representation, but keeps the node update
-    path simple and explicit.
-    """
-
-    def __init__(
-        self,
-        *,
-        hidden_dim: int,
-        dropout: float,
-        use_question_conditioning: bool,
-    ) -> None:
-        super().__init__(aggr="add")
-        self.hidden_dim = hidden_dim
-        self.use_question_conditioning = use_question_conditioning
-
-        # Edge logit: relation contribution.
-        self.relation_gate = nn.Linear(hidden_dim, 1, bias=False)
-        _init_xavier(self.relation_gate)
-
-        # Edge logit: question contribution (optional).
-        self.question_proj: Optional[nn.Linear] = None
-        if use_question_conditioning:
-            self.question_proj = nn.Linear(hidden_dim, 1, bias=False)
-            _init_xavier(self.question_proj)
-
-        # Node update MLP input:
-        #   [node_self | agg_fwd | agg_rev | (question)]
-        # Each agg block has hidden_dim; fwd+rev are packed in one propagate
-        # output of size 2*hidden_dim, so split later.
-        n_groups = _AGG_GROUPS_WITH_Q if use_question_conditioning else _AGG_GROUPS_BASE
-        update_width = hidden_dim * n_groups
-        self.update_norm = nn.LayerNorm(update_width)
-        self.update_mlp = _build_mlp(
-            input_dim=update_width,
-            hidden_dim=hidden_dim * 2,
-            output_dim=hidden_dim,
-            dropout=dropout,
+        # Forward message MLP: [src_node, rel, query] → message
+        self.fwd_msg_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        self.node_dropout = nn.Dropout(dropout)
+        # Attention scoring: projects message to scalar logit
+        self.attn_score = nn.Linear(hidden_dim, 1, bias=False)
 
-        # Edge update MLP: relation_h' = relation_h + MLP([relation_h, src_h, dst_h])
-        edge_update_width = hidden_dim * 3  # relation | src | dst
-        self.edge_update_norm = nn.LayerNorm(edge_update_width)
-        self.edge_update_mlp = _build_mlp(
-            input_dim=edge_update_width,
-            hidden_dim=hidden_dim * 2,
-            output_dim=hidden_dim,
-            dropout=dropout,
-        )
-        self.edge_dropout = nn.Dropout(dropout)
+        self.update = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
 
-    # ------------------------------------------------------------------
-    # PyG message hook
-    # ------------------------------------------------------------------
-
-    def message(  # type: ignore[override]
-        self,
-        x_j: torch.Tensor,  # [E_aug, hidden_dim]  source node features
-        edge_weight: torch.Tensor,  # [E_aug]
-    ) -> torch.Tensor:
-        return edge_weight.unsqueeze(-1) * x_j  # [E_aug, hidden_dim]
-
-    # ------------------------------------------------------------------
-    # Edge weight computation
-    # ------------------------------------------------------------------
-
-    def _compute_edge_logits(
-        self,
-        edge_relation_tokens: torch.Tensor,  # [E, hidden_dim]
-        question_tokens: torch.Tensor,  # [G, hidden_dim]
-        src: torch.Tensor,  # [E]
-        node_graph_index: torch.Tensor,  # [N]
-    ) -> torch.Tensor:
-        """Return unnormalised logits of shape [E]."""
-        logits = self.relation_gate(edge_relation_tokens).squeeze(-1)  # [E]
-
-        if self.use_question_conditioning:
-            assert self.question_proj is not None
-            graph_per_src = node_graph_index[src]  # [E]
-            q_per_edge = question_tokens[graph_per_src]  # [E, hidden_dim]
-            logits = logits + self.question_proj(q_per_edge).squeeze(-1)
-
-        return logits  # [E]
-
-    # ------------------------------------------------------------------
-    # Edge feature update
-    # ------------------------------------------------------------------
-
-    def _update_edge_features(
-        self,
-        edge_relation_h: torch.Tensor,  # [E, hidden_dim]
-        node_h: torch.Tensor,  # [N, hidden_dim]
-        src: torch.Tensor,  # [E]  long
-        dst: torch.Tensor,  # [E]  long
-    ) -> torch.Tensor:
-        """Residual update: edge_h' = edge_h + MLP([edge_h | src_h | dst_h])."""
-        combined = torch.cat([edge_relation_h, node_h[src], node_h[dst]], dim=-1)
-        combined = self.edge_update_norm(combined)
-        delta = self.edge_dropout(self.edge_update_mlp(combined))
-        return edge_relation_h + delta.to(edge_relation_h.dtype)
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+        for m in self.fwd_msg_mlp:
+            if isinstance(m, nn.Linear):
+                init_xavier(m)
+        init_xavier(self.attn_score)
+        init_xavier(self.update)
 
     def forward(
         self,
         *,
-        node_tokens: torch.Tensor,  # [N, hidden_dim]
-        edge_relation_tokens: torch.Tensor,  # [E, hidden_dim]
-        question_tokens: torch.Tensor,  # [G, hidden_dim]
-        edge_index: torch.Tensor,  # [2, E]
-        node_graph_index: torch.Tensor,  # [N]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        node_h_new        : [N, hidden_dim]
-        edge_relation_new : [E, hidden_dim]
-        """
-        num_nodes = node_tokens.size(0)
-        num_edges = edge_index.size(1)
-
-        if num_nodes == 0 or num_edges == 0:
-            return node_tokens, edge_relation_tokens
+        node_h: torch.Tensor,
+        rel_h: torch.Tensor,
+        query_h: torch.Tensor,
+        edge_index: torch.Tensor,
+        node_graph_index: torch.Tensor,
+        edge_state_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_nodes = int(node_h.size(0))
+        if num_nodes == 0 or edge_index.size(1) == 0:
+            return node_h
 
         src = edge_index[0].long()
         dst = edge_index[1].long()
 
-        # ---- edge logits & softmax normalisation (per destination node) ----
-        logits = self._compute_edge_logits(
-            edge_relation_tokens, question_tokens, src, node_graph_index
-        )  # [E]
+        if edge_state_ids is not None:
+            if edge_state_ids.dtype != torch.long:
+                raise TypeError("edge_state_ids must be torch.long.")
+            if edge_state_ids.shape != (edge_index.size(1),):
+                raise ValueError(
+                    f"edge_state_ids shape mismatch: expected ({edge_index.size(1)},), "
+                    f"got {tuple(edge_state_ids.shape)}."
+                )
+            # state=0 (inactive): fully masked — irrelevant to current subgraph.
+            # state=1 (frontier): included — lets policy sense reachable neighbours.
+            # state=2 (traversed): included — propagates established path context.
+            active_mask = edge_state_ids > 0
+            if not bool(active_mask.any()):
+                return node_h
+            src = src[active_mask]
+            dst = dst[active_mask]
+            rel_h = rel_h[active_mask]
 
-        # PyG softmax: for each destination node, weights over its incoming edges sum to 1.
-        # Compute in float32 for stability, cast back for mixed-precision safety.
-        fwd_weight = pyg_softmax(logits.float(), dst, num_nodes=num_nodes).to(
-            node_tokens.dtype
-        )
+        query_per_edge = query_h.index_select(0, node_graph_index.index_select(0, src))
 
-        # Reversed edges share the same logits but normalise per *source* node.
-        rev_weight = pyg_softmax(logits.float(), src, num_nodes=num_nodes).to(
-            node_tokens.dtype
-        )
+        # Compute forward messages: [src_node || rel || query] → [E, H]
+        msg_fwd = self.fwd_msg_mlp(torch.cat([node_h.index_select(0, src), rel_h, query_per_edge], dim=-1))
 
-        # ---- we need separate fwd / rev aggregations for the MLP ----
-        # Two lightweight propagates (no MLP yet; just weighted sums). The
-        # earlier augmented-edge path was unused and only increased memory.
-        incoming = self.propagate(
-            edge_index=torch.stack([src, dst]),
-            x=node_tokens,
-            edge_weight=fwd_weight,
-            size=(num_nodes, num_nodes),
-        )
-        outgoing = self.propagate(
-            edge_index=torch.stack([dst, src]),
-            x=node_tokens,
-            edge_weight=rev_weight,
-            size=(num_nodes, num_nodes),
-        )
+        # Query-conditioned softmax attention over incoming neighbours.
+        # attn_logit: scalar per edge; softmax normalises over all edges sharing dst.
+        # This prevents hub nodes from diluting sparse query-relevant signals.
+        attn_logit = self.attn_score(msg_fwd)  # [E, 1]
+        attn_weight = scatter_softmax(attn_logit, dst, dim=0)  # [E, 1]
+        agg = scatter_sum(msg_fwd * attn_weight, dst, dim=0, dim_size=num_nodes)  # [N, H]
 
-        # ---- node update ----
-        parts = [node_tokens, incoming, outgoing]
-        if self.use_question_conditioning:
-            parts.append(question_tokens[node_graph_index])
-
-        combined = torch.cat(parts, dim=-1)
-        combined = self.update_norm(combined)
-        node_h_new = node_tokens + self.node_dropout(self.update_mlp(combined))
-
-        # ---- edge feature update ----
-        edge_relation_new = self._update_edge_features(
-            edge_relation_tokens, node_tokens, src, dst
-        )
-
-        return node_h_new, edge_relation_new
+        return self.norm(node_h + self.dropout(self.update(agg)))
 
 
-# ---------------------------------------------------------------------------
-# GNNBackbone
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BackboneOutput:
+    node_h: torch.Tensor
+    rel_h: torch.Tensor
+    query_h: torch.Tensor
+    feature_bank: PreparedGNNInput
+    edge_state_ids: torch.Tensor
+
+    def as_triple(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.node_h, self.rel_h, self.query_h
+
+    def __iter__(self):
+        yield from self.as_triple()
 
 
-class GNNBackbone(nn.Module):
-    """
-    Graph feature encoder for the GFlowNet retrieval agent.
-
-    Consumes a ``RetrievalBatch`` produced by the data module and an optional
-    boolean or index mask ``active_edges`` that restricts the visible subgraph
-    to the MDP's current state (no information leakage across time steps).
-
-    Returns
-    -------
-    node_h          : Tensor  [TotalNodes, hidden_dim]
-    edge_relation_h : Tensor  [TotalEdges, hidden_dim]  (context-updated per layer)
-    q_h             : Tensor  [NumGraphs,  hidden_dim]
-    """
-
+class NBFBackbone(nn.Module):
     def __init__(
         self,
         *,
         embedding_dim: int = 1024,
-        hidden_dim: int = 512,
-        use_adapter: bool = True,
-        adapter_dim: int = 128,
-        adapter_dropout: float = 0.1,
-        gnn_num_layers: int = 0,
+        hidden_dim: int = 1024,
+        gnn_num_layers: int = 3,
         gnn_dropout: float = 0.1,
-        gnn_use_question_conditioning: bool = True,
+        dde_max_distance: int = 4,
     ) -> None:
         super().__init__()
-        self.emb_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.gnn_num_layers = gnn_num_layers
+        self.emb_dim = int(embedding_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.gnn_num_layers = int(gnn_num_layers)
+        self.dde_max_distance = int(dde_max_distance)
 
-        # ---- optional pre-trained embedding adapters ----
-        if use_adapter:
-            self.node_adapter: Optional[EmbeddingAdapter] = EmbeddingAdapter(
-                emb_dim=embedding_dim, adapter_dim=adapter_dim, dropout=adapter_dropout
+        if self.gnn_num_layers < 0:
+            raise ValueError(f"gnn_num_layers must be >= 0, got {self.gnn_num_layers}.")
+        if self.dde_max_distance < 0:
+            raise ValueError(f"dde_max_distance must be >= 0, got {self.dde_max_distance}.")
+        if self.hidden_dim != self.emb_dim:
+            raise ValueError(
+                "NBFBackbone no longer applies a shared projection, so "
+                f"hidden_dim must equal embedding_dim. Got hidden_dim={self.hidden_dim} "
+                f"and embedding_dim={self.emb_dim}."
             )
-            self.rel_adapter: Optional[EmbeddingAdapter] = EmbeddingAdapter(
-                emb_dim=embedding_dim, adapter_dim=adapter_dim, dropout=adapter_dropout
+        self.non_text_embedding = nn.Parameter(torch.randn(self.emb_dim) * 0.02)
+        self.anchor_gate = nn.Linear(self.hidden_dim * 3, self.hidden_dim)
+        self.nbf_layers = nn.ModuleList(
+            _NBFLayer(hidden_dim=self.hidden_dim, dropout=gnn_dropout) for _ in range(self.gnn_num_layers)
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+        init_xavier(self.anchor_gate)
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _project(self, x: torch.Tensor) -> torch.Tensor:
+        """Preprocessed embeddings are already aligned in encoder space."""
+        return x
+
+    def _resolve_node_tokens(self, batch: RetrievalBatch) -> torch.Tensor:
+        tokens = batch.node_tokens
+        mask = getattr(batch, "non_text_node_mask", None)
+        if mask is None or not bool(mask.any()):
+            return tokens
+        if mask.dtype != torch.bool:
+            raise TypeError("non_text_node_mask must be torch.bool.")
+        if mask.shape != (tokens.size(0),):
+            raise ValueError(
+                f"non_text_node_mask shape mismatch: expected ({tokens.size(0)},), " f"got {tuple(mask.shape)}."
             )
-        else:
-            self.node_adapter = None
-            self.rel_adapter = None
+        placeholder = self.non_text_embedding.to(device=tokens.device, dtype=tokens.dtype)
+        return torch.where(mask.unsqueeze(-1), placeholder.view(1, -1), tokens)
 
-        # ---- input projections ----
-        self.node_norm = nn.LayerNorm(embedding_dim)
-        self.rel_norm = nn.LayerNorm(embedding_dim)
-        self.node_proj = nn.Linear(embedding_dim, hidden_dim)
-        self.rel_proj = nn.Linear(embedding_dim, hidden_dim)
-        self.q_proj = nn.Linear(embedding_dim, hidden_dim)
-        for proj in (self.node_proj, self.rel_proj, self.q_proj):
-            _init_xavier(proj)
-
-        # ---- early question fusion ----
-        # Applied before GNN layers so step-0 node representations already
-        # carry question semantics even when no edge has been activated yet.
-        fusion_width = hidden_dim * 2  # [node_h | q_h]
-        self.node_question_fusion_norm = nn.LayerNorm(fusion_width)
-        self.node_question_fusion = _build_mlp(
-            input_dim=fusion_width,
-            hidden_dim=hidden_dim * 2,
-            output_dim=hidden_dim,
-            dropout=gnn_dropout,
-        )
-        self.node_question_fusion_dropout = nn.Dropout(gnn_dropout)
-
-        # ---- GNN layers ----
-        self.graph_layers = nn.ModuleList(
-            [
-                _GNNLayer(
-                    hidden_dim=hidden_dim,
-                    dropout=gnn_dropout,
-                    use_question_conditioning=gnn_use_question_conditioning,
-                )
-                for _ in range(gnn_num_layers)
-            ]
-        )
-
-    # ------------------------------------------------------------------
-    # Projection helpers
-    # ------------------------------------------------------------------
-
-    def _project_nodes(self, node_tokens: torch.Tensor) -> torch.Tensor:
-        if self.node_adapter is not None:
-            node_tokens = self.node_adapter(node_tokens)
-        return self.node_proj(self.node_norm(node_tokens))
-
-    def _project_edge_relations(
-        self, edge_relation_tokens: torch.Tensor
+    def _build_node_input_h(
+        self,
+        *,
+        node_h: torch.Tensor,
+        query_h: torch.Tensor,
+        batch_index: torch.Tensor,
+        anchor_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.rel_adapter is not None:
-            edge_relation_tokens = self.rel_adapter(edge_relation_tokens)
-        return self.rel_proj(self.rel_norm(edge_relation_tokens))
+        node_input_h = node_h.clone()
+        if anchor_mask is None:
+            return node_input_h
+        if anchor_mask.dtype != torch.bool:
+            raise TypeError("is_anchor_mask must be torch.bool.")
+        if anchor_mask.shape != (node_h.size(0),):
+            raise ValueError(
+                f"is_anchor_mask shape mismatch: expected ({node_h.size(0)},), " f"got {tuple(anchor_mask.shape)}."
+            )
+        if not bool(anchor_mask.any()):
+            return node_input_h
+        anchor_idx = torch.nonzero(anchor_mask, as_tuple=False).view(-1)
+        anchor_batch_idx = batch_index.index_select(0, anchor_idx)
+        anchor_node_h = node_h.index_select(0, anchor_idx)
+        anchor_query_h = query_h.index_select(0, anchor_batch_idx)
+        anchor_gate = torch.sigmoid(
+            self.anchor_gate(
+                torch.cat(
+                    [anchor_node_h, anchor_query_h, anchor_node_h * anchor_query_h],
+                    dim=-1,
+                )
+            )
+        )
+        fused_anchor_h = (1.0 - anchor_gate) * anchor_node_h + anchor_gate * anchor_query_h
+        node_input_h[anchor_mask] = F.normalize(fused_anchor_h, p=2, dim=-1)
+        return node_input_h
 
-    def _project_question(self, question_emb: torch.Tensor) -> torch.Tensor:
-        return self.q_proj(question_emb)
-
-    def _snapshot_active_edges(
+    def _derive_edge_state_ids(
         self,
         *,
         batch: RetrievalBatch,
-        active_edges: torch.Tensor,
+        active_edges: Optional[torch.Tensor],
+        active_nodes: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Snapshot the caller-provided active-edge mask at the backbone boundary.
-
-        Policy already passes a `SubgraphState` snapshot, but backbone is also a
-        public module and may be called directly in tests or future utilities.
-        Cloning here prevents direct callers from leaking a live rollout mask
-        into autograd-tracked indexing inside this forward path.
-        """
-        if active_edges.dtype != torch.bool:
-            raise TypeError("active_edges must be a torch.bool tensor.")
-        if active_edges.dim() != 1:
-            raise ValueError("active_edges must be a 1D tensor.")
-        if active_edges.device != batch.edge_index.device:
-            raise ValueError(
-                "active_edges and batch.edge_index must live on the same device."
-            )
-
         num_edges = int(batch.edge_index.size(1))
-        if int(active_edges.numel()) != num_edges:
-            raise ValueError(
-                f"active_edges length mismatch: expected {num_edges}, got {active_edges.numel()}."
-            )
+        device = batch.edge_index.device
 
-        return active_edges.detach().clone()
+        if num_edges == 0 or (active_edges is None and active_nodes is None):
+            return torch.zeros(num_edges, dtype=torch.long, device=device)
 
-    # ------------------------------------------------------------------
-    # Early question fusion
-    # ------------------------------------------------------------------
+        if active_edges is None:
+            active_edges = torch.zeros(num_edges, dtype=torch.bool, device=device)
 
-    def _fuse_question_into_nodes(
+        if active_nodes is None:
+            if not hasattr(batch, "is_anchor_mask"):
+                raise ValueError(
+                    "_derive_edge_state_ids: active_nodes=None but batch has no "
+                    "is_anchor_mask. Cannot infer visited nodes."
+                )
+            visited = batch.is_anchor_mask.clone()
+            if active_edges.any():
+                visited[batch.edge_index[0][active_edges]] = True
+                visited[batch.edge_index[1][active_edges]] = True
+        else:
+            visited = validate_bool_mask(active_nodes, int(batch.num_nodes), "active_nodes", batch.batch.device)
+
+        traversed = validate_bool_mask(active_edges, num_edges, "active_edges", device)
+        src, dst = batch.edge_index[0], batch.edge_index[1]
+        frontier = (~traversed) & (visited[src] | visited[dst])
+
+        state_ids = torch.zeros(num_edges, dtype=torch.long, device=device)
+        state_ids[frontier] = 1
+        state_ids[traversed] = 2
+        return state_ids
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def project(self, batch: RetrievalBatch) -> PreparedGNNInput:
+        """Prepare node / relation / query features once per batch.
+
+        The preprocessing pipeline already produces aligned L2-normalized
+        embeddings, so the backbone now consumes them directly without an
+        additional shared LayerNorm or projection.
+        """
+        node_h = self._project(self._resolve_node_tokens(batch))
+        rel_h = self._project(batch.relation_tokens)
+        query_h = self._project(batch.question_emb)
+        node_input_h = self._build_node_input_h(
+            node_h=node_h,
+            query_h=query_h,
+            batch_index=batch.batch,
+            anchor_mask=getattr(batch, "is_anchor_mask", None),
+        )
+        return PreparedGNNInput(
+            node_h=node_h,
+            rel_h=rel_h,
+            query_h=query_h,
+            node_input_h=node_input_h,
+        )
+
+    def run_layers(
         self,
-        node_h: torch.Tensor,
-        question_h: torch.Tensor,
+        *,
+        feature_bank: PreparedGNNInput,
+        edge_index: torch.Tensor,
         node_graph_index: torch.Tensor,
+        edge_state_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if node_h.numel() == 0:
-            return node_h
+        node_h = feature_bank.node_input_h
+        for layer in self.nbf_layers:
+            node_h = layer(
+                node_h=node_h,
+                rel_h=feature_bank.rel_h,
+                query_h=feature_bank.query_h,
+                edge_index=edge_index,
+                node_graph_index=node_graph_index,
+                edge_state_ids=edge_state_ids,
+            )
+        return self.output_norm(node_h)
 
-        # Broadcast graph-level question embedding to each node.
-        node_q_h = question_h[node_graph_index]  # [N, hidden_dim]
-        combined = torch.cat([node_h, node_q_h], dim=-1)  # [N, 2*hidden_dim]
-
-        combined = self.node_question_fusion_norm(combined)
-
-        delta = self.node_question_fusion_dropout(self.node_question_fusion(combined))
-        return node_h + delta.to(node_h.dtype)
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    # Alias kept for call-site compatibility.
+    def precompute_static(self, batch: RetrievalBatch) -> PreparedGNNInput:
+        return self.project(batch)
 
     def forward(
         self,
         batch: RetrievalBatch,
         active_edges: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Encode the batch under an optional active-edge mask snapshot.
+        active_nodes: Optional[torch.Tensor] = None,
+        static_context: Optional[PreparedGNNInput] = None,
+    ) -> BackboneOutput:
+        fb = static_context if static_context is not None else self.project(batch)
 
-        If `active_edges` is provided, backbone snapshots it defensively before
-        any masked gather/scatter so callers cannot pass a live mutable rollout
-        mask that will later be updated in-place.
-        """
-        # Project all modalities into the shared hidden space.
-        node_h = self._project_nodes(batch.node_tokens)
-        edge_relation_h = self._project_edge_relations(batch.edge_relation_tokens)
-        q_h = self._project_question(batch.question_emb)
-
-        # Early question fusion: inject query semantics into node features
-        # before any edge is activated (critical for GFlowNet step 0).
-        node_h = self._fuse_question_into_nodes(node_h, q_h, batch.batch)
-
-        if self.gnn_num_layers == 0:
-            return node_h, edge_relation_h, q_h
-
-        edge_mask = None
-        if active_edges is not None:
-            edge_mask = self._snapshot_active_edges(
-                batch=batch, active_edges=active_edges
+        if not (fb.node_input_h.shape[-1] == fb.rel_h.shape[-1] == fb.query_h.shape[-1] == self.hidden_dim):
+            raise ValueError(
+                f"Feature dim mismatch: node={fb.node_input_h.shape[-1]}, "
+                f"rel={fb.rel_h.shape[-1]}, query={fb.query_h.shape[-1]}, "
+                f"expected={self.hidden_dim}."
             )
 
-        # Apply the active-edge mask once; both node and edge tensors use it.
-        if edge_mask is not None:
-            edge_index = batch.edge_index[:, edge_mask]
-            gnn_edge_relation_h = edge_relation_h[edge_mask]
-        else:
-            edge_index = batch.edge_index
-            gnn_edge_relation_h = edge_relation_h
-
-        # Iterative graph propagation with per-layer edge updates.
-        for layer in self.graph_layers:
-            node_h, gnn_edge_relation_h = layer(
-                node_tokens=node_h,
-                edge_relation_tokens=gnn_edge_relation_h,
-                question_tokens=q_h,
-                edge_index=edge_index,
-                node_graph_index=batch.batch,
-            )
-
-        # Write updated edge features back to the full edge_relation_h tensor.
-        if edge_mask is not None:
-            edge_relation_h = edge_relation_h.clone()
-            edge_relation_h[edge_mask] = gnn_edge_relation_h
-        else:
-            edge_relation_h = gnn_edge_relation_h
-
-        return node_h, edge_relation_h, q_h
+        edge_state_ids = self._derive_edge_state_ids(
+            batch=batch,
+            active_edges=active_edges,
+            active_nodes=active_nodes,
+        )
+        node_h = self.run_layers(
+            feature_bank=fb,
+            edge_index=batch.edge_index,
+            node_graph_index=batch.batch,
+            edge_state_ids=edge_state_ids,
+        )
+        return BackboneOutput(
+            node_h=node_h,
+            rel_h=fb.rel_h,
+            query_h=fb.query_h,
+            feature_bank=fb,
+            edge_state_ids=edge_state_ids,
+        )
 
 
-__all__ = ["EmbeddingAdapter", "GNNBackbone"]
+__all__ = [
+    "PreparedGNNInput",
+    "BackboneOutput",
+    "NBFBackbone",
+]

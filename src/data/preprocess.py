@@ -1,18 +1,18 @@
 from __future__ import annotations
-
+import logging
 import re
 from pathlib import Path
-from typing import Callable, Mapping
-
+from typing import Callable, Mapping, Any
 import hydra
 from omegaconf import DictConfig
-
 from .preprocess_steps.graph_collect import (
     collect_and_filter_graphs,
     load_question_entity_blacklist,
 )
-from .preprocess_steps.sample_loader import iter_samples
-from .preprocess_steps.sample_types import SplitFilter
+from .preprocess_steps.source import iter_samples
+from .preprocess_steps.samples import SplitFilter
+
+log = logging.getLogger(__name__)
 
 
 def _resolve_path(raw_path: object) -> Path:
@@ -34,9 +34,7 @@ def _compile_entity_matcher(
     def _matcher(entity: str) -> bool:
         value = str(entity or "").strip()
         if resolved_mode in {"", "none"}:
-            return (
-                default_result if default_result and compiled_regex is None else False
-            )
+            return default_result if default_result and compiled_regex is None else False
         if resolved_mode in {"prefix", "prefix_allowlist"}:
             return bool(prefix_tuple) and value.startswith(prefix_tuple)
         if resolved_mode == "regex":
@@ -46,7 +44,7 @@ def _compile_entity_matcher(
     return _matcher
 
 
-def _build_split_filter(section: Mapping[str, object] | None) -> SplitFilter:
+def _build_split_filter(section: Mapping[str, Any] | None) -> SplitFilter:
     section = section or {}
     return SplitFilter(
         skip_no_question_entity=bool(section.get("skip_no_question_entity", False)),
@@ -55,102 +53,77 @@ def _build_split_filter(section: Mapping[str, object] | None) -> SplitFilter:
     )
 
 
+def _resolve_path_mode(raw_value: object) -> str:
+    path_mode = str(raw_value or "qa_directed").strip().lower()
+    if path_mode not in {"undirected", "qa_directed"}:
+        raise ValueError(f"Unsupported path_mode={path_mode!r}; expected one of ('undirected', 'qa_directed').")
+    return path_mode
+
+
+def _validate_split_filters_require_anchors(
+    split_filters: Mapping[str, SplitFilter],
+) -> None:
+    invalid_splits = [
+        split_name for split_name, split_filter in split_filters.items() if not split_filter.skip_no_question_entity
+    ]
+    if invalid_splits:
+        raise ValueError(
+            "preprocess_filter.*.skip_no_question_entity must be true because materialization "
+            f"requires at least one in-graph question entity; invalid splits: {sorted(invalid_splits)}."
+        )
+
+
 def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
-    """Run preprocessing directly from the composed Hydra config."""
     from .preprocess_steps.materialize import materialize_preprocessed_data
     from .preprocess_steps.text_encode import encode_preprocessed_features
 
     dataset_cfg = raw_cfg.dataset
     dataset_name = str(dataset_cfg.get("name", ""))
-    dataset_scope = str(dataset_cfg.get("dataset_scope", "")).strip().lower()
-    if dataset_scope == "sub" or dataset_name.endswith("-sub"):
-        raise ValueError(
-            "Sub datasets are runtime filters only. Build the full dataset and use sub_filter.json."
-        )
-
-    paths_cfg = dataset_cfg.get("paths", {})
     out_dir = _resolve_path(dataset_cfg.get("out_dir"))
-    embeddings_dir = _resolve_path(paths_cfg.get("embeddings"))
+    embeddings_dir = _resolve_path(dataset_cfg.paths.get("embeddings"))
+    path_mode = _resolve_path_mode(raw_cfg.get("path_mode", "qa_directed"))
     out_dir.mkdir(parents=True, exist_ok=True)
     embeddings_dir.mkdir(parents=True, exist_ok=True)
-
-    encoder_cfg = raw_cfg.get("encoder", {})
-    encoder_name = str(
-        encoder_cfg.get("model_name", encoder_cfg.get("name", ""))
-    ).strip()
-    device = str(encoder_cfg.get("device", "auto")) or "auto"
-    precision = str(encoder_cfg.get("precision"))
-    batch_size = int(encoder_cfg.get("batch_size"))
-    reuse_embeddings_if_exists = bool(
-        encoder_cfg.get("reuse_embeddings_if_exists", False)
-    )
-
-    dataset_source = str(dataset_cfg.get("dataset_source", "hf")).strip().lower()
-    if dataset_source not in {"hf", "stark"}:
-        raise ValueError(
-            f"Unsupported dataset_source={dataset_source!r}; expected 'hf' or 'stark'."
-        )
-    hf_dataset = str(dataset_cfg.get("hf_dataset"))
-    stark_cfg = dataset_cfg.get("stark")
-    if dataset_source == "hf" and hf_dataset is None:
-        raise ValueError("dataset_source=hf requires a non-empty dataset.hf_dataset.")
-    if dataset_source == "stark" and stark_cfg is None:
-        raise ValueError(
-            "dataset_source=stark requires a non-empty dataset.stark mapping."
-        )
-
-    hf_env = raw_cfg.get("hf_env", {})
-    hf_cache_raw = hf_env.get("cache_dir") or raw_cfg.get("hf_cache_dir")
-    hf_cache_dir = None if hf_cache_raw in (None, "") else Path(str(hf_cache_raw))
-
-    filter_cfg = raw_cfg.get("preprocess_filter", {})
-    split_filters = {
-        "train": _build_split_filter(filter_cfg.get("train")),
-        "validation": _build_split_filter(
-            filter_cfg.get("validation") or filter_cfg.get("eval")
-        ),
-        "test": _build_split_filter(filter_cfg.get("test") or filter_cfg.get("eval")),
-    }
-
     is_text_entity_fn = _compile_entity_matcher(
         mode=str(dataset_cfg.get("entity_text_mode", "regex")),
-        prefixes=[str(value) for value in dataset_cfg.get("text_prefixes", [])],
-        regex_value=str(dataset_cfg.get("text_regex")),
+        prefixes=[str(v) for v in dataset_cfg.get("text_prefixes", [])],
+        regex_value=dataset_cfg.get("text_regex") or None,
         default_result=True,
     )
     is_cvt_entity_fn = _compile_entity_matcher(
         mode=str(dataset_cfg.get("cvt_entity_mode", "none")),
-        prefixes=[str(value) for value in dataset_cfg.get("cvt_prefixes", [])],
-        regex_value=str(dataset_cfg.get("cvt_regex")),
+        prefixes=[str(v) for v in dataset_cfg.get("cvt_prefixes", [])],
+        regex_value=dataset_cfg.get("cvt_regex") or None,
         default_result=False,
     )
-
-    blacklist_path_raw = raw_cfg.get("question_entity_blacklist_path")
     blacklist = load_question_entity_blacklist(
         inline_list=list(raw_cfg.get("question_entity_blacklist", []))
         + list(dataset_cfg.get("question_entity_blacklist", [])),
         file_path=(
-            None
-            if blacklist_path_raw in (None, "")
-            else _resolve_path(blacklist_path_raw)
+            _resolve_path(raw_cfg.question_entity_blacklist_path)
+            if raw_cfg.get("question_entity_blacklist_path")
+            else None
         ),
     )
-
     sample_iter = iter_samples(
         dataset=dataset_name,
         kb=str(dataset_cfg.get("kb", "freebase")),
         splits=("train", "validation", "test"),
-        column_map={
-            str(key): str(value)
-            for key, value in dict(dataset_cfg.get("column_map", {})).items()
-        },
+        column_map=dict(dataset_cfg.get("column_map", {})),
         entity_normalization=str(dataset_cfg.get("entity_normalization", "none")),
-        dataset_source=dataset_source,
-        hf_dataset=hf_dataset,
-        hf_cache_dir=hf_cache_dir,
-        stark_cfg=stark_cfg,
+        dataset_source=str(dataset_cfg.get("dataset_source", "hf")).strip().lower(),
+        hf_dataset=dataset_cfg.get("hf_dataset"),
+        hf_cache_dir=raw_cfg.get("hf_env", {}).get("cache_dir"),
+        stark_cfg=dataset_cfg.get("stark"),
     )
-
+    split_filters = {
+        "train": _build_split_filter(raw_cfg.preprocess_filter.get("train")),
+        "validation": _build_split_filter(
+            raw_cfg.preprocess_filter.get("validation") or raw_cfg.preprocess_filter.get("eval")
+        ),
+        "test": _build_split_filter(raw_cfg.preprocess_filter.get("test") or raw_cfg.preprocess_filter.get("eval")),
+    }
+    _validate_split_filters_require_anchors(split_filters)
     prepared_samples, entity_vocab, relation_vocab = collect_and_filter_graphs(
         sample_iter=sample_iter,
         out_dir=out_dir,
@@ -159,36 +132,35 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
         is_text_entity_fn=is_text_entity_fn,
         is_cvt_entity_fn=is_cvt_entity_fn,
         blacklist=blacklist,
-        path_mode=str(raw_cfg.get("path_mode", "undirected")).strip().lower(),
+        path_mode=path_mode,
+        teacher_budget_max_steps=int(raw_cfg.get("teacher_budget_max_steps", 0)),
         dedup_edges=bool(raw_cfg.get("dedup_edges", True)),
         remove_self_loops=bool(raw_cfg.get("remove_self_loops", True)),
         emit_sub_filter=bool(raw_cfg.get("emit_sub_filter", True)),
         sub_filter_filename=str(raw_cfg.get("sub_filter_filename", "sub_filter.json")),
     )
-
-    encoded = encode_preprocessed_features(
+    encoded_payload = encode_preprocessed_features(
         prepared_samples=prepared_samples,
         entity_vocab=entity_vocab,
         relation_vocab=relation_vocab,
         embeddings_dir=embeddings_dir,
-        encoder_name=encoder_name,
-        device=device,
-        precision=precision,
-        batch_size=batch_size,
+        encoder_name=str(raw_cfg.encoder.model_name),
+        device=str(raw_cfg.encoder.get("device", "auto")),
+        batch_size=int(raw_cfg.encoder.batch_size),
         progress_bar=bool(raw_cfg.get("progress_bar", True)),
-        reuse_embeddings_if_exists=reuse_embeddings_if_exists,
     )
-
     materialize_preprocessed_data(
         prepared_samples=prepared_samples,
         entity_vocab=entity_vocab,
         relation_vocab=relation_vocab,
-        encoded=encoded,
+        payload=encoded_payload,
         embeddings_dir=embeddings_dir,
+        path_mode=path_mode,
         overwrite_lmdb=bool(raw_cfg.get("overwrite_lmdb", False)),
         lmdb_shards=int(raw_cfg.get("lmdb_shards", 1)),
         map_size_gb=float(raw_cfg.get("map_size_gb", 128)),
     )
+    log.info(f"Successfully preprocessed and materialized dataset: {dataset_name}")
 
 
 __all__ = ["run_preprocess_pipeline"]
