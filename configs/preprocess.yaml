@@ -1,17 +1,20 @@
-# configs/preprocess.yaml
+# @package _global_
 defaults:
   - _self_
   - paths: default
-  - dataset: null  # 强制要求命令行传入 dataset=XXX
+  - dataset: null
   - pipeline: default
   - hydra: default
+
 task_name: preprocess
-pipeline_stage: all
+
 progress_bar: true
+
 encoder:
-  model_name: BAAI/bge-large-en-v1.5  # ← 换模型
+  model_name: BAAI/bge-large-en-v1.5
   device: auto
   batch_size: 512
+
 hf_env:
   cache_dir: ${paths.hf_datasets_cache}
   offline: false

@@ -9,4 +9,4 @@ dataset_scope: sub
 dataset_family: webqsp
 hf_dataset: rmanluo/RoG-webqsp
 
-sample_filter_path: ${dataset.out_dir}/sub_filter.json
+sample_filter_path: ${dataset.out_dir}/sub_filter.json  # Prepared subset with at least one in-graph answer path.

@@ -15,7 +15,6 @@ stark:
   dataset: prime
   root: ${paths.data_dir}/stark
   download_processed: true
-  indirected: false
   cache_dir: ${dataset.artifact_dir}/stark_cache
   linker:
     backend: keyword

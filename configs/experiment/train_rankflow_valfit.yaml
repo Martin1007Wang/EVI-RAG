@@ -11,4 +11,3 @@ dataset:
   train_split: validation
   val_split: validation
   eval_split: validation
-  predict_split: validation

@@ -4,17 +4,20 @@ import logging
 import shutil
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import lmdb
 import torch
 
 from src.data.schema import SampleFields, StorageSchema
 from src.utils.lmdb_utils import assign_lmdb_shard, serialize_sample
-from src.utils.path_utils import compute_signed_anchor_distances
+from src.utils.path_utils import (
+    compute_shortest_path_teacher_targets,
+    compute_signed_anchor_distances,
+)
 
 from .manifest import manifest_path, save_manifest
-from .samples import EncodedPayload, PreparedSample
+from .samples import EncodedPayload, PreparedSample, SplitFilter
 from .vocab import EntityVocab, RelationVocab
 
 log = logging.getLogger(__name__)
@@ -25,16 +28,20 @@ ALLOWED_SPLITS = ("train", "validation", "test")
 def materialize_preprocessed_data(
     *,
     prepared_samples: Sequence[PreparedSample],
+    split_filters: Mapping[str, SplitFilter],
     entity_vocab: EntityVocab,
     relation_vocab: RelationVocab,
     payload: EncodedPayload,
     embeddings_dir: Path,
+    expand_budget: int,
     path_mode: str = "qa_directed",
     overwrite_lmdb: bool = True,
     lmdb_shards: int = 1,
     map_size_gb: float = 128,
     commit_frequency: int = 1000,
 ) -> None:
+    if expand_budget < 0:
+        raise ValueError(f"expand_budget must be >= 0, got {expand_budget}.")
     if lmdb_shards < 1:
         raise ValueError(f"lmdb_shards must be >= 1, got {lmdb_shards}.")
     if commit_frequency < 1:
@@ -74,13 +81,12 @@ def materialize_preprocessed_data(
     runtime_manifest: dict[str, dict[str, list[Any]]] = {
         split: {
             "sample_ids": [],
-            "questions": [],
             "num_nodes": [],
             "num_edges": [],
-            "question_tokens": [],
         }
         for split in ALLOWED_SPLITS
     }
+    dropped_no_train_target = {split: 0 for split in ALLOWED_SPLITS}
 
     with ExitStack() as stack:
         envs: dict[tuple[str, int], lmdb.Environment] = {}
@@ -143,28 +149,78 @@ def materialize_preprocessed_data(
                 if ent in node_index
             ]
             if anchor_local_indices:
-                is_anchor_mask[torch.as_tensor(anchor_local_indices, dtype=torch.long)] = True
+                is_anchor_mask[
+                    torch.as_tensor(anchor_local_indices, dtype=torch.long)
+                ] = True
             if not is_anchor_mask.any():
                 raise RuntimeError(
                     f"Prepared sample {entry.sample_id!r} has no in-graph question entities to materialize."
                 )
 
-            is_target_mask = torch.zeros((num_nodes,), dtype=torch.bool)
-            answer_local_indices = [
-                node_index[ent]
-                for ent in entry.legal_answer_entities
-                if ent in node_index
-            ]
-            if answer_local_indices:
-                is_target_mask[torch.as_tensor(answer_local_indices, dtype=torch.long)] = True
-
             local_edge_index = torch.as_tensor([edge_src, edge_dst], dtype=torch.long)
+            anchor_local_index_tensor = torch.as_tensor(
+                anchor_local_indices, dtype=torch.long
+            )
             anchor_signed_distance = compute_signed_anchor_distances(
                 edge_index=local_edge_index,
                 is_anchor_mask=is_anchor_mask,
                 num_nodes=num_nodes,
                 path_mode=path_mode,
             )
+
+            all_target_node_ids = entry.all_target_node_ids.long()
+            num_targets = int(all_target_node_ids.numel())
+            if (
+                entry.target_node_distance_flat.numel() != num_targets * num_nodes
+            ):
+                raise RuntimeError(
+                    "Prepared target_node_distance_flat shape is inconsistent with "
+                    f"sample {entry.sample_id!r}: got {entry.target_node_distance_flat.numel()} "
+                    f"values for {num_targets} targets x {num_nodes} nodes."
+                )
+
+            if num_targets > 0:
+                target_node_distance = entry.target_node_distance_flat.view(num_targets, num_nodes)
+                target_root_distances = target_node_distance.index_select(
+                    1, anchor_local_index_tensor
+                ).amin(dim=1)
+            else:
+                target_root_distances = torch.empty((0,), dtype=torch.long)
+
+            min_target_dist = (
+                int(target_root_distances.min().item())
+                if target_root_distances.numel() > 0
+                else -1
+            )
+            budget_feasible = target_root_distances.le(expand_budget)
+            train_target_mask = torch.zeros((num_nodes,), dtype=torch.bool)
+            if budget_feasible.numel() > 0 and bool(budget_feasible.any().item()):
+                train_target_mask[all_target_node_ids[budget_feasible]] = True
+
+            split_name = sample.split
+            if split_name not in ALLOWED_SPLITS:
+                raise ValueError(
+                    f"Unsupported split {split_name!r}; expected one of {ALLOWED_SPLITS}."
+                )
+            split_filter = split_filters[split_name]
+            if split_filter.skip_no_train_target and not bool(
+                train_target_mask.any().item()
+            ):
+                dropped_no_train_target[split_name] += 1
+                continue
+
+            teacher_targets = compute_shortest_path_teacher_targets(
+                edge_index=local_edge_index,
+                is_anchor_mask=is_anchor_mask,
+                target_mask=train_target_mask,
+                num_nodes=num_nodes,
+                path_mode=path_mode,
+            )
+            train_target_node_ids = teacher_targets.target_node_ids.long()
+            train_target_entity_ids_global = [
+                node_entity_ids[int(local_idx)]
+                for local_idx in train_target_node_ids.tolist()
+            ]
 
             sample_dict = {
                 SampleFields.EDGE_INDEX: local_edge_index,
@@ -175,31 +231,43 @@ def materialize_preprocessed_data(
                     node_entity_ids, dtype=torch.long
                 ),
                 SampleFields.NUM_NODES: torch.as_tensor(num_nodes, dtype=torch.long),
-                SampleFields.QUESTION_EMB: question_embeddings[idx].reshape(-1).contiguous(),
+                SampleFields.QUESTION_EMB: question_embeddings[idx]
+                .reshape(-1)
+                .contiguous(),
                 SampleFields.IS_ANCHOR_MASK: is_anchor_mask,
-                SampleFields.IS_TARGET_MASK: is_target_mask,
+                SampleFields.TRAIN_TARGET_MASK: train_target_mask,
                 SampleFields.ANCHOR_SIGNED_DISTANCE: anchor_signed_distance,
                 SampleFields.ANSWER_ENTITY_IDS_GLOBAL: torch.as_tensor(
-                    [entity_vocab.entity_id(ent) for ent in entry.legal_answer_entities],
+                    train_target_entity_ids_global,
                     dtype=torch.long,
                 ),
-                SampleFields.POSITIVE_EDGE_MASK: entry.positive_edge_mask,
-                SampleFields.NODE_TO_TARGET_DISTANCE: entry.node_to_target_distance,
-                SampleFields.SHORTEST_SUFFIX_COUNT: entry.shortest_suffix_count,
-                SampleFields.BOUNDED_SUFFIX_COUNT: entry.bounded_suffix_count,
+                SampleFields.TRAIN_TARGET_NODE_IDS: train_target_node_ids,
+                SampleFields.TARGET_NODE_DISTANCE_FLAT: teacher_targets.target_node_distance_flat,
+                SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT: (
+                    teacher_targets.target_shortest_path_count_flat
+                ),
+                SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT: (
+                    teacher_targets.target_shortest_path_edge_mask_flat
+                ),
+                SampleFields.shortest_path_edge_mask: _build_shortest_path_edge_mask(
+                    num_edges=int(local_edge_index.size(1)),
+                    positive_edge_ids=teacher_targets.positive_edge_ids,
+                ),
+                SampleFields.NODE_TO_TARGET_DISTANCE: teacher_targets.node_to_target_distance,
+                SampleFields.shortest_path_count: teacher_targets.shortest_path_count,
+                SampleFields.MIN_TARGET_DIST: torch.as_tensor(
+                    min_target_dist,
+                    dtype=torch.long,
+                ),
                 SampleFields.MAX_PATH_LENGTH: torch.as_tensor(
-                    -1 if entry.max_path_length is None else int(entry.max_path_length),
+                    -1
+                    if teacher_targets.max_path_length is None
+                    else int(teacher_targets.max_path_length),
                     dtype=torch.long,
                 ),
             }
 
             StorageSchema.validate(sample_dict)
-
-            split_name = sample.split
-            if split_name not in ALLOWED_SPLITS:
-                raise ValueError(
-                    f"Unsupported split {split_name!r}; expected one of {ALLOWED_SPLITS}."
-                )
 
             shard_id = assign_lmdb_shard(entry.sample_id, lmdb_shards)
             env_key = (split_name, shard_id)
@@ -214,10 +282,10 @@ def materialize_preprocessed_data(
                 uncommitted_counts[env_key] = 0
 
             runtime_manifest[split_name]["sample_ids"].append(entry.sample_id)
-            runtime_manifest[split_name]["questions"].append(sample.question)
             runtime_manifest[split_name]["num_nodes"].append(num_nodes)
-            runtime_manifest[split_name]["num_edges"].append(len(edge_relation_ids_global))
-            runtime_manifest[split_name]["question_tokens"].append(1)
+            runtime_manifest[split_name]["num_edges"].append(
+                len(edge_relation_ids_global)
+            )
 
         for txn in txns.values():
             txn.commit()
@@ -227,15 +295,32 @@ def materialize_preprocessed_data(
             continue
         save_manifest(
             manifest_path(embeddings_dir, split_name),
-            split=split_name,
             sample_ids=m["sample_ids"],
-            questions=m["questions"],
             num_nodes=m["num_nodes"],
             num_edges=m["num_edges"],
-            question_tokens=m["question_tokens"],
         )
 
+    for split_name, dropped in dropped_no_train_target.items():
+        if dropped > 0:
+            log.info(
+                "Skipped %s %s samples with no train targets inside expand_budget=%s.",
+                dropped,
+                split_name,
+                expand_budget,
+            )
+
     log.info("Materialization complete.")
+
+
+def _build_shortest_path_edge_mask(
+    *,
+    num_edges: int,
+    positive_edge_ids: torch.Tensor,
+) -> torch.Tensor:
+    mask = torch.zeros((num_edges,), dtype=torch.bool)
+    if positive_edge_ids.numel() > 0:
+        mask[positive_edge_ids.long()] = True
+    return mask
 
 
 def _lmdb_path(

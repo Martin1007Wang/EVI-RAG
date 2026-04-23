@@ -44,7 +44,9 @@ class LossOutput:
             for key, value in out.metrics.items():
                 if ref_device is None:
                     ref_device = value.device
-                aggregated[key] = value if key not in aggregated else aggregated[key] + value
+                aggregated[key] = (
+                    value if key not in aggregated else aggregated[key] + value
+                )
 
         if count == 0:
             device = ref_device if ref_device is not None else torch.device("cpu")
@@ -56,6 +58,11 @@ class LossOutput:
             avg_metrics.get("fl_subtb_loss", torch.zeros((), device=ref_device)),
         )
         return cls(loss=avg_loss, metrics=avg_metrics, per_trajectory_loss=None)
+
+
+# ---------------------------------------------------------------------------
+# Small numeric helpers
+# ---------------------------------------------------------------------------
 
 
 def _safe_var(t: torch.Tensor, *, unbiased: bool = False) -> torch.Tensor:
@@ -72,16 +79,25 @@ def _safe_mean(t: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
 
 
 def _build_entry_mask(lengths: torch.Tensor, T: int) -> torch.Tensor:
-    """(B, T, T) bool mask: True iff i <= j and both steps are within traj length."""
+    """(B, T, T) bool mask — True iff i ≤ j and both steps are within the trajectory.
+
+    A trajectory of length L has valid *step indices* 0 … L-1 (the Stop step
+    is recorded at index L-1).  entry_mask[b, i, j] is True when:
+      - i ≤ j  (upper-triangular → sub-trajectory starts no later than it ends)
+      - i < L  (start step within trajectory)
+      - j < L  (end step within trajectory, including the terminal Stop step)
+    """
     device = lengths.device
     idx = torch.arange(T, device=device)
-    step_valid = idx.unsqueeze(0) < lengths.unsqueeze(1)  # (B, T)
+    step_valid = idx.unsqueeze(0) < lengths.unsqueeze(1)  # (B, T): True iff step t is valid
     triu = torch.ones(T, T, device=device, dtype=torch.bool).triu()
+    # step_valid[:, j] → unsqueeze(2) gives column mask (j axis)
+    # step_valid[:, i] → unsqueeze(1) gives row mask (i axis)
     return triu.unsqueeze(0) & step_valid.unsqueeze(2) & step_valid.unsqueeze(1)
 
 
 # ---------------------------------------------------------------------------
-# Core math helpers
+# Weight / shape matrices (pre-computed, stored as buffers)
 # ---------------------------------------------------------------------------
 
 
@@ -92,8 +108,11 @@ def _subtb_weight_matrix(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Upper-triangular W[i,j] = lambda^(j-i).
-    lam=0 → Detailed Balance; lam=inf → Trajectory Balance.
+    """Upper-triangular W[i,j] = λ^(j-i).
+
+    Special cases:
+      lam = 0   → identity (Detailed Balance: only diagonal entries survive)
+      lam = inf → only the full-trajectory entry [0, T-1] survives (Trajectory Balance)
     """
     if math.isinf(lam):
         W = torch.zeros(T, T, device=device, dtype=dtype)
@@ -107,51 +126,70 @@ def _subtb_weight_matrix(
 
 
 def _subtraj_length_matrix(T: int, *, device: torch.device) -> torch.Tensor:
-    """Upper-triangular (T, T): entry [i,j] = j - i + 1."""
+    """Upper-triangular (T, T): entry [i,j] = j - i + 1 (sub-trajectory length)."""
     idx = torch.arange(T, device=device)
     return (idx.unsqueeze(0) - idx.unsqueeze(1) + 1).triu()
 
 
+# ---------------------------------------------------------------------------
+# Core FL-SubTB math
+# ---------------------------------------------------------------------------
+
+
 def _compute_residuals(
     state_log_flows: torch.Tensor,  # (B, T)
-    net_log_ratio: torch.Tensor,  # (B, T)  log_pf - log_pb + step_shaping
-    log_rewards: torch.Tensor,  # (B,)
-    lengths: torch.Tensor,  # (B,) long
-    entry_mask: torch.Tensor,  # (B, T, T) bool
+    net_log_ratio: torch.Tensor,    # (B, T)  η_t = log P_F - log P_B
+    log_rewards: torch.Tensor,      # (B,)
+    lengths: torch.Tensor,          # (B,) long — number of steps incl. Stop
+    entry_mask: torch.Tensor,       # (B, T, T) bool
 ) -> torch.Tensor:
-    """FL-SubTB residual matrices, shape (B, T, T).
+    """Compute FL-SubTB residual matrices, shape (B, T, T).
 
-    delta(i, j) = F~(s_i) + sum_{t=i}^{j} (log_pf - log_pb + shaping)_t - target(j)
+    δ(i, j) = F̃(s_i) + Σ_{t=i}^{j} η_t  −  target(j)
 
-    target(j) = F~(s_{j+1})   for non-terminal j
-    target(j) = log R(x)      for terminal j   [potential shaping telescopes out]
+    where
+        target(j) = F̃(s_{j+1})   for non-terminal j
+        target(j) = log R(x)      for the terminal step j = L-1
+
+    The residual is zeroed outside entry_mask.
     """
     B, T = state_log_flows.shape
     device = state_log_flows.device
     dtype = state_log_flows.dtype
 
-    cumsum = torch.cumsum(net_log_ratio, dim=1)  # (B, T)
-    cumsum_prev = torch.cat([torch.zeros(B, 1, device=device, dtype=dtype), cumsum[:, :-1]], dim=1)
-    cross = cumsum.unsqueeze(1) - cumsum_prev.unsqueeze(2)  # (B, T, T)
+    # Σ_{t=i}^{j} η_t = cumsum[j] - cumsum[i-1]
+    cumsum      = torch.cumsum(net_log_ratio, dim=1)                              # (B, T)
+    cumsum_prev = torch.cat(
+        [torch.zeros(B, 1, device=device, dtype=dtype), cumsum[:, :-1]], dim=1
+    )                                                                              # (B, T)
+    cross = cumsum.unsqueeze(1) - cumsum_prev.unsqueeze(2)                        # (B, T, T)
 
+    # Build target tensor: default = next-step flow; terminal = log R
     targets = torch.zeros_like(state_log_flows)
     if T > 1:
         targets[:, :-1] = state_log_flows[:, 1:]
     term_idx = lengths.clamp(min=1, max=T) - 1
     targets[torch.arange(B, device=device), term_idx] = log_rewards
 
-    residuals = state_log_flows.unsqueeze(2) - targets.unsqueeze(1) + cross  # (B, T, T)
-    return residuals * entry_mask
+    # Residual: (B, T, 1) - (B, 1, T) + (B, T, T)
+    residuals = state_log_flows.unsqueeze(2) - targets.unsqueeze(1) + cross       # (B, T, T)
+
+    return residuals * entry_mask  # zero out padding
 
 
 def _weighted_mse(
-    residuals: torch.Tensor,  # (B, T, T)
-    weights: torch.Tensor,  # (T, T)
+    residuals: torch.Tensor,   # (B, T, T)
+    weights: torch.Tensor,     # (T, T)   broadcast weight matrix W
     entry_mask: torch.Tensor,  # (B, T, T) bool
     *,
     global_normalize: bool = True,
 ) -> torch.Tensor:
-    w = weights.unsqueeze(0) * entry_mask.float()
+    """Weighted MSE of residuals.
+
+    global_normalize=True  → scalar: Σ(w·δ²) / Σw          (used for batch loss)
+    global_normalize=False → (B,)  : Σ(w·δ²)[b] / Σw[b]    (used for per-traj loss)
+    """
+    w = weights.unsqueeze(0) * entry_mask.float()  # (B, T, T)
     if global_normalize:
         total_w = w.sum().clamp_min(torch.finfo(w.dtype).eps)
         return (w * residuals.square()).sum() / total_w
@@ -162,12 +200,14 @@ def _weighted_mse(
 
 def _reward_matching_loss(
     state_log_flows: torch.Tensor,  # (B, T)
-    log_rewards: torch.Tensor,  # (B,)
-    lengths: torch.Tensor,  # (B,) long
+    log_rewards: torch.Tensor,       # (B,)
+    lengths: torch.Tensor,           # (B,) long
     T: int,
 ) -> torch.Tensor:
-    """Anchor terminal-state flow to log R(x) to eliminate the additive-constant
-    degree of freedom in FL-SubTB."""
+    """Anchor terminal-state flow to log R(x).
+
+    Eliminates the additive-constant degree of freedom in FL-SubTB.
+    """
     B = state_log_flows.shape[0]
     device = state_log_flows.device
     term_idx = lengths.clamp(min=1, max=T) - 1
@@ -181,23 +221,25 @@ def _reward_matching_loss(
 
 
 class SubTrajectoryBalanceLoss(nn.Module):
-    """Forward-Looking SubTrajectoryBalance(λ) loss.
+    """Forward-Looking SubTrajectoryBalance(λ) loss for GFlowNet training.
 
     Minimises for every sub-trajectory [i, j]:
 
-        ( F~(s_i) + Σ_{t=i}^{j} (log P_F - log P_B + shaping_t) - target(j) )²
+        ( F̃(s_i) + Σ_{t=i}^{j} (log P_F − log P_B) − target(j) )²
 
-    weighted by λ^(j-i), where:
-        target(j) = log F~(s_{j+1})   non-terminal j
+    weighted by λ^(j−i), where
+        target(j) = log F̃(s_{j+1})   non-terminal j
         target(j) = log R(x)          terminal j
 
-    The step_shaping term is the potential difference ϕ(s_{t+1}) - ϕ(s_t),
-    which telescopes to ϕ(x) - ϕ(s_0) over the full trajectory — a pure
-    function of the terminal state — preserving flow conservation.
+    Special cases controlled by subtb_lambda
+    -----------------------------------------
+    λ = 0   → Detailed Balance  (lowest variance, highest bias)
+    λ = ∞   → Trajectory Balance (lowest bias, highest variance)
+    0 < λ < ∞ → interpolation  (λ ≈ 0.9 is a good default)
 
     Reward-Matching regularisation (reward_matching_coef > 0) anchors the
     absolute scale of flow estimates to log R(x), eliminating the additive
-    constant degree of freedom in the SubTB objective.
+    constant degree of freedom that SubTB alone cannot resolve.
     """
 
     _subtb_weight: torch.Tensor
@@ -244,46 +286,32 @@ class SubTrajectoryBalanceLoss(nn.Module):
             _subtraj_length_matrix(max_trajectory_len, device=torch.device("cpu")).float(),
         )
 
-    def forward(
-        self,
-        rollout_batch: RolloutBatch,
-        *,
-        trajectory_weights: torch.Tensor | None = None,
-    ) -> LossOutput:
-        lengths = rollout_batch.traj_len.long()
+    # ------------------------------------------------------------------
+
+    def forward(self,rollout_batch: RolloutBatch,trajectory_weights: torch.Tensor | None = None,) -> LossOutput:
+        stats  = rollout_batch.stats
+        traces = rollout_batch.traces
+        lengths    = stats.traj_len.long()
         valid_mask = lengths.gt(0)
+        slf = traces.state_log_flows   # (B, T)
+        pf  = traces.step_log_pf       # (B, T)
+        pb  = traces.step_log_pb       # (B, T)
 
-        if not valid_mask.any():
-            raise ValueError(
-                "All traj_len are zero — no valid trajectories. " "Check the rollout engine for off-by-one errors around the Stop action."
-            )
-
-        if (
-            rollout_batch.state_log_flows is None
-            or rollout_batch.step_log_pf is None
-            or rollout_batch.step_log_pb is None
-            or rollout_batch.step_log_shaping is None
-        ):
-            raise ValueError("FL-SubTB loss requires: state_log_flows, step_log_pf, " "step_log_pb, step_log_shaping.")
-
-        slf = rollout_batch.state_log_flows
-        pf = rollout_batch.step_log_pf
-        pb = rollout_batch.step_log_pb
-        shaping = rollout_batch.step_log_shaping
-
-        log_reward = rollout_batch.terminal_log_rewards.float()
+        # Keep raw log_reward for unbiased logging; use clamped version for loss.
+        log_reward         = stats.terminal_log_rewards.float()
         log_reward_clamped = log_reward.clamp(min=self.log_reward_clip_min)
 
         B, T = slf.shape
         if T > self.max_trajectory_len:
             raise ValueError(f"T={T} exceeds max_trajectory_len={self.max_trajectory_len}.")
 
-        W = self._subtb_weight[:T, :T]
+        # Slice pre-computed buffers to actual trajectory length T
+        W           = self._subtb_weight[:T, :T]
         subtraj_len = self._subtraj_len[:T, :T]
-        entry_mask = _build_entry_mask(lengths, T)
+        entry_mask  = _build_entry_mask(lengths, T)
 
-        # eta_t = log P_F - log P_B + [ϕ(s_{t+1}) - ϕ(s_t)]
-        net_log_ratio = pf - pb + shaping
+        # η_t = log P_F(a_t|s_t) − log P_B(a_{t-1}|s_t)
+        net_log_ratio = pf - pb
 
         residuals = _compute_residuals(
             state_log_flows=slf,
@@ -291,39 +319,36 @@ class SubTrajectoryBalanceLoss(nn.Module):
             log_rewards=log_reward_clamped,
             lengths=lengths,
             entry_mask=entry_mask,
-        )
+        )  # (B, T, T)
 
-        traj_fl_losses = _weighted_mse(
-            residuals,
-            W,
-            entry_mask,
-            global_normalize=False,
-        )
-        term_idx_all = lengths.clamp(min=1, max=T) - 1
-        terminal_flows_all = slf[
-            torch.arange(B, device=slf.device),
-            term_idx_all,
-        ]
-        traj_rm_losses = (terminal_flows_all - log_reward_clamped).square()
-        traj_total_losses = traj_fl_losses + self.reward_matching_coef * traj_rm_losses
+        # Per-trajectory FL and RM losses (used for weighted aggregation and logging)
+        traj_fl_losses = _weighted_mse(residuals, W, entry_mask, global_normalize=False)  # (B,)
 
+        term_idx_all      = lengths.clamp(min=1, max=T) - 1
+        terminal_flows_all = slf[torch.arange(B, device=slf.device), term_idx_all]
+        traj_rm_losses    = (terminal_flows_all - log_reward_clamped).square()             # (B,)
+        traj_total_losses = traj_fl_losses + self.reward_matching_coef * traj_rm_losses    # (B,)
+
+        # ── Aggregate to scalar loss ───────────────────────────────────
         if trajectory_weights is not None:
             if trajectory_weights.shape != (B,):
                 raise ValueError(
-                    "trajectory_weights must have shape "
-                    f"({B},), got {tuple(trajectory_weights.shape)}."
+                    f"trajectory_weights must have shape ({B},), "
+                    f"got {tuple(trajectory_weights.shape)}."
                 )
-            valid_weights = trajectory_weights.to(device=slf.device, dtype=slf.dtype)[
-                valid_mask
-            ].clamp_min(0.0)
-            denom = valid_weights.sum().clamp_min(torch.finfo(valid_weights.dtype).eps)
-            fl_loss = (traj_fl_losses[valid_mask] * valid_weights).sum() / denom
+            valid_w = (
+                trajectory_weights.to(device=slf.device, dtype=slf.dtype)[valid_mask]
+                .clamp_min(0.0)
+            )
+            denom   = valid_w.sum().clamp_min(torch.finfo(valid_w.dtype).eps)
+
+            fl_loss = (traj_fl_losses[valid_mask] * valid_w).sum() / denom
             if self.reward_matching_coef > 0.0:
-                rm_loss = (traj_rm_losses[valid_mask] * valid_weights).sum() / denom
-                loss = (traj_total_losses[valid_mask] * valid_weights).sum() / denom
+                rm_loss = (traj_rm_losses[valid_mask] * valid_w).sum() / denom
+                loss    = (traj_total_losses[valid_mask] * valid_w).sum() / denom
             else:
                 rm_loss = slf.new_zeros(())
-                loss = fl_loss
+                loss    = fl_loss
         else:
             if self.global_normalize:
                 fl_loss = _weighted_mse(
@@ -345,52 +370,70 @@ class SubTrajectoryBalanceLoss(nn.Module):
                 loss = fl_loss + self.reward_matching_coef * rm_loss
             else:
                 rm_loss = slf.new_zeros(())
-                loss = fl_loss
+                loss    = fl_loss
 
+        # ── Monitoring metrics (no-grad) ───────────────────────────────
         with torch.no_grad():
-            entry_mask_valid = entry_mask[valid_mask]
-            n_valid = entry_mask_valid.shape[0]
+            entry_mask_valid = entry_mask[valid_mask]   # (V, T, T)
+            n_valid          = entry_mask_valid.shape[0]
 
-            v_slf = slf[valid_mask]
-            v_pf = rollout_batch.trajectory_log_pf.float()[valid_mask]
-            v_pb = rollout_batch.trajectory_log_pb.float()[valid_mask]
-            v_log_z = rollout_batch.root_log_z.float()[valid_mask]
-            v_reward = log_reward_clamped[valid_mask]
-            v_shaping = shaping[valid_mask]
-            v_len = lengths.float()[valid_mask]
+            v_slf    = slf[valid_mask]
+            v_pf     = stats.trajectory_log_pf.float()[valid_mask]
+            v_pb     = stats.trajectory_log_pb.float()[valid_mask]
+            v_log_z  = stats.root_log_z.float()[valid_mask]
+            # Use CLAMPED reward for all loss-related metrics (matches what the
+            # loss was actually computed against), but log the RAW reward mean
+            # separately so monitoring reflects true reward distribution.
+            v_reward_clamped = log_reward_clamped[valid_mask]
+            v_reward_raw     = log_reward[valid_mask]
+            v_len            = lengths.float()[valid_mask]
 
-            step_valid_v = torch.arange(T, device=slf.device).unsqueeze(0) < lengths[valid_mask].unsqueeze(1)
+            step_valid_v = (
+                torch.arange(T, device=slf.device).unsqueeze(0)
+                < lengths[valid_mask].unsqueeze(1)
+            )  # (V, T) bool
 
-            valid_residuals = residuals[valid_mask][entry_mask_valid]
-            valid_flows = v_slf[step_valid_v]
-            valid_step_shaping = v_shaping[step_valid_v]
-            valid_subtraj_len = subtraj_len.unsqueeze(0).expand(n_valid, -1, -1)[entry_mask_valid].float()
-            subtrajectory_count = entry_mask_valid.sum(dim=(1, 2)).float()
+            valid_residuals    = residuals[valid_mask][entry_mask_valid]    # (N_entries,)
+            valid_flows        = v_slf[step_valid_v]                        # (N_steps,)
+            # Expand subtraj_len to (n_valid, T, T) and index with entry_mask
+            valid_subtraj_len  = (
+                subtraj_len.unsqueeze(0).expand(n_valid, -1, -1)[entry_mask_valid].float()
+            )
+            subtrajectory_count = entry_mask_valid.sum(dim=(1, 2)).float()  # (V,)
 
-            term_idx_v = lengths[valid_mask].clamp(min=1, max=T) - 1
+            term_idx_v      = lengths[valid_mask].clamp(min=1, max=T) - 1
             terminal_flows_v = v_slf[torch.arange(n_valid, device=slf.device), term_idx_v]
 
             fallback = slf.new_zeros(())
             metrics: dict[str, torch.Tensor] = {
-                "loss": loss.detach(),
-                "fl_subtb_loss": fl_loss.detach(),
-                "reward_matching_loss": rm_loss.detach(),
-                "residual_abs_mean": _safe_mean(valid_residuals.abs(), fallback).detach(),
-                "residual_variance": _safe_var(valid_residuals).detach(),
-                "log_z_mean": v_log_z.mean().detach(),
-                "log_z_variance": _safe_var(v_log_z).detach(),
-                "terminal_flow_mean": terminal_flows_v.mean().detach(),
-                "terminal_flow_vs_reward": (terminal_flows_v - v_reward).mean().detach(),
-                "log_reward_mean": v_reward.mean().detach(),
-                "step_log_shaping_mean": _safe_mean(valid_step_shaping, fallback).detach(),
-                "log_pf_mean": v_pf.mean().detach(),
-                "log_pb_mean": v_pb.mean().detach(),
-                "trajectory_length_mean": v_len.mean().detach(),
-                "valid_trajectory_ratio": valid_mask.float().mean().detach(),
-                "state_flow_mean": _safe_mean(valid_flows, fallback).detach(),
-                "state_flow_variance": _safe_var(valid_flows).detach(),
+                # --- primary loss signals ---
+                "loss":                    loss.detach(),
+                "fl_subtb_loss":           fl_loss.detach(),
+                "reward_matching_loss":    rm_loss.detach(),
+                # --- residual diagnostics ---
+                "residual_abs_mean":       _safe_mean(valid_residuals.abs(), fallback).detach(),
+                "residual_variance":       _safe_var(valid_residuals).detach(),
+                # --- flow diagnostics ---
+                "log_z_mean":              v_log_z.mean().detach(),
+                "log_z_variance":          _safe_var(v_log_z).detach(),
+                "terminal_flow_mean":      terminal_flows_v.mean().detach(),
+                "terminal_flow_vs_reward": (terminal_flows_v - v_reward_clamped).mean().detach(),
+                "state_flow_mean":         _safe_mean(valid_flows, fallback).detach(),
+                "state_flow_variance":     _safe_var(valid_flows).detach(),
+                # --- reward diagnostics (raw = unclipped, for faithful monitoring) ---
+                "log_reward_mean":         v_reward_raw.mean().detach(),
+                "log_reward_clamped_mean": v_reward_clamped.mean().detach(),
+                # Fraction of trajectories whose reward hit the clip floor
+                "log_reward_clipped_ratio": (
+                    (v_reward_raw < self.log_reward_clip_min).float().mean().detach()
+                ),
+                # --- policy / trajectory diagnostics ---
+                "log_pf_mean":               v_pf.mean().detach(),
+                "log_pb_mean":               v_pb.mean().detach(),
+                "trajectory_length_mean":    v_len.mean().detach(),
+                "valid_trajectory_ratio":    valid_mask.float().mean().detach(),
                 "subtrajectory_length_mean": _safe_mean(valid_subtraj_len, fallback).detach(),
-                "subtrajectory_count_mean": subtrajectory_count.mean().detach(),
+                "subtrajectory_count_mean":  subtrajectory_count.mean().detach(),
             }
 
         return LossOutput(

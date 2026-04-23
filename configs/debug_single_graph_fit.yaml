@@ -15,8 +15,8 @@ split: ${dataset.val_split}
 dataset_index: 0
 
 device: auto
-path_mode: undirected
-stop_on_first_hit: true
+path_mode: qa_directed
+expand_budget: ${model.expand_budget}
 
 overfit_steps: 60
 eval_every: 10

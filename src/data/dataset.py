@@ -2,10 +2,12 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 import torch
-from torch_geometric.data import Data, Dataset
-from src.data.schema import SampleFields, StorageSchema
+from torch_geometric.data import Dataset
+from src.data.schema import RetrievalData, SampleFields, StorageSchema
 from src.utils.lmdb_utils import assign_lmdb_shard
 from .retrieval import LMDBSampleStore
+
+
 class RetrievalDataset(Dataset):
     def __init__(
         self,
@@ -29,6 +31,7 @@ class RetrievalDataset(Dataset):
         self.sample_num_edges = self._coerce_optional_sizes(
             sample_num_edges, name="sample_num_edges"
         )
+
     def _coerce_optional_sizes(
         self,
         values: Optional[Sequence[int]],
@@ -43,6 +46,7 @@ class RetrievalDataset(Dataset):
                 f"{name} length mismatch: expected {len(self.sample_ids)}, got {len(coerced)}."
             )
         return coerced
+
     def _get_stores(self) -> List[LMDBSampleStore]:
         if self._sample_stores is None:
             self._sample_stores = [
@@ -50,21 +54,26 @@ class RetrievalDataset(Dataset):
                 for p in self._lmdb_paths
             ]
         return self._sample_stores
+
     def len(self) -> int:
         return len(self.sample_ids)
-    def get(self, idx: int) -> Data:
+
+    def get(self, idx: int) -> RetrievalData:
         sample_id = self.sample_ids[idx]
         shard_id = assign_lmdb_shard(sample_id, self._num_shards)
         raw = self._get_stores()[shard_id].load_sample(sample_id)
         StorageSchema.validate(raw)
         return self._build_sample(raw, sample_id)
+
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
         state["_sample_stores"] = None
         return state
+
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
-    def _build_sample(self, raw: Dict[str, Any], sample_id: str) -> Data:
+
+    def _build_sample(self, raw: Dict[str, Any], sample_id: str) -> RetrievalData:
         question_emb = torch.as_tensor(
             raw[SampleFields.QUESTION_EMB], dtype=torch.float32
         )
@@ -73,6 +82,9 @@ class RetrievalDataset(Dataset):
                 f"Sample {sample_id!r} has non-finite question_emb. "
                 "The materialized preprocessing artifacts are corrupted; rebuild preprocess outputs."
             )
+        train_target_mask = torch.as_tensor(
+            raw[SampleFields.TRAIN_TARGET_MASK], dtype=torch.bool
+        )
         sample_kwargs: Dict[str, Any] = {
             "sample_id": sample_id,
             "num_nodes": int(raw[SampleFields.NUM_NODES]),
@@ -81,27 +93,33 @@ class RetrievalDataset(Dataset):
             "node_entity_ids_global": raw[SampleFields.NODE_ENTITY_IDS_GLOBAL],
             "question_emb": question_emb,
             "is_anchor_mask": raw[SampleFields.IS_ANCHOR_MASK],
-            "is_target_mask": raw[SampleFields.IS_TARGET_MASK],
+            "train_target_mask": train_target_mask,
             "anchor_signed_distance": raw[SampleFields.ANCHOR_SIGNED_DISTANCE],
             "answer_entity_ids_global": raw[SampleFields.ANSWER_ENTITY_IDS_GLOBAL],
-            "gold_answer_in_graph": bool(raw[SampleFields.IS_TARGET_MASK].any().item()),
+            "gold_answer_in_graph": bool(train_target_mask.any().item()),
         }
         optional_tensor_fields = {
-            SampleFields.POSITIVE_EDGE_MASK: torch.bool,
+            SampleFields.TRAIN_TARGET_NODE_IDS: torch.long,
+            SampleFields.TARGET_NODE_DISTANCE_FLAT: torch.long,
+            SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT: torch.float32,
+            SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT: torch.bool,
+            SampleFields.shortest_path_edge_mask: torch.bool,
             SampleFields.NODE_TO_TARGET_DISTANCE: torch.long,
-            SampleFields.SHORTEST_SUFFIX_COUNT: torch.float32,
-            SampleFields.BOUNDED_SUFFIX_COUNT: torch.float32,
+            SampleFields.shortest_path_count: torch.float32,
+            SampleFields.MIN_TARGET_DIST: torch.long,
             SampleFields.MAX_PATH_LENGTH: torch.long,
         }
         for field_name, dtype in optional_tensor_fields.items():
             value = raw.get(field_name)
             if value is not None:
                 sample_kwargs[field_name] = torch.as_tensor(value, dtype=dtype)
-        return Data(**sample_kwargs)
+        return RetrievalData(**sample_kwargs)
+
     def close(self) -> None:
         if self._sample_stores is not None:
             for store in self._sample_stores:
                 store.close()
             self._sample_stores = None
+
     def __del__(self) -> None:
         self.close()

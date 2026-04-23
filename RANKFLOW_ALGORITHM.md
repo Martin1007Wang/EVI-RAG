@@ -90,7 +90,7 @@ $$
 - `question_emb`，记为问题条件向量 `q`
 - `is_anchor_mask`，对应锚点集合 $A \subseteq V$
 - `is_target_mask`，对应图中可见金答案集合 $Y \subseteq V$
-- `positive_edge_mask`，对应 teacher 正边集合 $E^+ \subseteq E$
+- `shortest_path_edge_mask`，对应 teacher 正边集合 $E^+ \subseteq E$
 
 因此模型学习的对象不是完整知识图上的答案后验，而是候选图内部的终止子图分布：
 
@@ -102,7 +102,7 @@ $$
 
 ### 2.2 正边弱监督
 
-`positive_edge_mask` 来自 `src/utils/path_utils.py::compute_shortest_path_teacher_targets`。默认预处理配置 `configs/pipeline/default.yaml` 中：
+`shortest_path_edge_mask` 来自 `src/utils/path_utils.py::compute_shortest_path_teacher_targets`。默认预处理配置 `configs/pipeline/default.yaml` 中：
 
 ```yaml
 path_mode: qa_directed
@@ -175,18 +175,12 @@ $$
 \left\{e=(u,v)\in E\setminus E_t\mid u\in V_t\ \text{or}\ v\in V_t\right\}.
 $$
 
-同时，`Policy` 默认 `undirected=True`，会额外施加 `src < dst` 的去重条件。因此更精确地，当前真正参与 expand 采样的集合是：
-
-$$
-\mathcal C_{\mathrm{canon}}(s_t)
-=
-\left\{e=(u,v)\in E\setminus E_t\mid (u\in V_t\lor v\in V_t),\ u<v\right\}.
-$$
+知识图谱边在主线实现中始终保持有向语义，不再做任何无向去重或对称化。
 
 于是动作空间可以写为：
 
 $$
-\mathcal A(s_t)=\{\mathrm{stop}\}\cup\{\mathrm{add}(e):e\in \mathcal C_{\mathrm{canon}}(s_t)\}.
+\mathcal A(s_t)=\{\mathrm{stop}\}\cup\{\mathrm{add}(e):e\in \mathcal C(s_t)\}.
 $$
 
 ### 3.4 状态转移
@@ -674,7 +668,7 @@ $$
 
 ## 10. 训练时的正边 bonus
 
-训练 rollout 时，若当前 expand 的边属于 `positive_edge_mask`，则会给该步加入一个 forward-looking bonus。默认配置中：
+训练 rollout 时，若当前 expand 的边属于 `shortest_path_edge_mask`，则会给该步加入一个 forward-looking bonus。默认配置中：
 
 ```yaml
 positive_edge_bonus: 1.0
@@ -988,11 +982,11 @@ subtb_lambda: 0.9
 
 - `anchor_signed_distance`
 - `node_to_target_distance`
-- `shortest_suffix_count`
+- `shortest_path_count`
 - `max_path_length`
 - `heuristic_log_v`
 
-但在当前主线训练代码中，真正进入优化目标的 teacher 信号主要是 `positive_edge_mask -> positive_edge_bonus`。其它字段目前未进入主线损失。
+但在当前主线训练代码中，真正进入优化目标的 teacher 信号主要是 `shortest_path_edge_mask -> positive_edge_bonus`。其它字段目前未进入主线损失。
 
 ### 18.3 `Policy.max_steps` 与 `RolloutEngine.max_steps` 当前没有对齐
 

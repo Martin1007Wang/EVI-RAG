@@ -7,7 +7,7 @@ from typing import Any, Sequence
 import torch
 
 # 内部版本号，用于防止加载了旧版本数据结构导致崩溃
-_MANIFEST_VERSION = 1
+_MANIFEST_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -18,12 +18,9 @@ class DatasetManifest:
     支撑 DataLoader 进行零硬盘 IO 的 Smart/Dynamic Batching。
     """
 
-    split: str
     sample_ids: list[str]
-    questions: list[str]
     num_nodes: torch.Tensor  # [num_samples] int32
     num_edges: torch.Tensor  # [num_samples] int32
-    question_tokens: torch.Tensor  # [num_samples] int32
 
     @property
     def num_samples(self) -> int:
@@ -37,20 +34,14 @@ def manifest_path(embeddings_dir: Path, split: str) -> Path:
 def save_manifest(
     path: Path,
     *,
-    split: str,
     sample_ids: Sequence[str],
-    questions: Sequence[str],
     num_nodes: Sequence[int],
     num_edges: Sequence[int],
-    question_tokens: Sequence[int],
 ) -> None:
     payload = _build_manifest_payload(
-        split=split,
         sample_ids=sample_ids,
-        questions=questions,
         num_nodes=num_nodes,
         num_edges=num_edges,
-        question_tokens=question_tokens,
     )
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
@@ -68,69 +59,49 @@ def load_manifest(path: Path) -> DatasetManifest:
     if version != _MANIFEST_VERSION:
         raise ValueError(f"Unsupported dataset manifest version: expected {_MANIFEST_VERSION}, got {version}.")
 
-    split = str(payload.get("split", ""))
-
-    # 消除冗余的 list() 强转
     sample_ids = [str(value) for value in payload.get("sample_ids", [])]
-    questions = [str(value) for value in payload.get("questions", [])]
 
     num_nodes = _coerce_int_tensor(payload.get("num_nodes"), name="num_nodes")
     num_edges = _coerce_int_tensor(payload.get("num_edges"), name="num_edges")
-    question_tokens = _coerce_int_tensor(payload.get("question_tokens"), name="question_tokens")
 
     _validate_lengths(
         sample_ids=sample_ids,
-        questions=questions,
         num_nodes=num_nodes,
         num_edges=num_edges,
-        question_tokens=question_tokens,
     )
     _validate_unique_sample_ids(sample_ids)
 
     return DatasetManifest(
-        split=split,
         sample_ids=sample_ids,
-        questions=questions,
         num_nodes=num_nodes,
         num_edges=num_edges,
-        question_tokens=question_tokens,
     )
 
 
 def _build_manifest_payload(
     *,
-    split: str,
     sample_ids: Sequence[str],
-    questions: Sequence[str],
     num_nodes: Sequence[int],
     num_edges: Sequence[int],
-    question_tokens: Sequence[int],
 ) -> dict[str, Any]:
     sample_ids_list = [str(value) for value in sample_ids]
-    questions_list = [str(value) for value in questions]
 
     # 强制统一使用 int32 节约内存，百万级样本也仅占用几 MB
     num_nodes_tensor = torch.as_tensor(list(num_nodes), dtype=torch.int32)
     num_edges_tensor = torch.as_tensor(list(num_edges), dtype=torch.int32)
-    question_tokens_tensor = torch.as_tensor(list(question_tokens), dtype=torch.int32)
 
     _validate_lengths(
         sample_ids=sample_ids_list,
-        questions=questions_list,
         num_nodes=num_nodes_tensor,
         num_edges=num_edges_tensor,
-        question_tokens=question_tokens_tensor,
     )
     _validate_unique_sample_ids(sample_ids_list)
 
     return {
         "version": _MANIFEST_VERSION,
-        "split": str(split),
         "sample_ids": sample_ids_list,
-        "questions": questions_list,
         "num_nodes": num_nodes_tensor,
         "num_edges": num_edges_tensor,
-        "question_tokens": question_tokens_tensor,
     }
 
 
@@ -154,17 +125,13 @@ def _coerce_int_tensor(value: Any, *, name: str) -> torch.Tensor:
 def _validate_lengths(
     *,
     sample_ids: list[str],
-    questions: list[str],
     num_nodes: torch.Tensor,
     num_edges: torch.Tensor,
-    question_tokens: torch.Tensor,
 ) -> None:
     expected = len(sample_ids)
     actual_lengths = {
-        "questions": len(questions),
         "num_nodes": int(num_nodes.numel()),
         "num_edges": int(num_edges.numel()),
-        "question_tokens": int(question_tokens.numel()),
     }
     mismatched = {name: actual for name, actual in actual_lengths.items() if actual != expected}
     if mismatched:

@@ -24,7 +24,15 @@ class EmbeddingStore:
             raise ValueError("relation_embeddings must be a 2D tensor.")
 
     def get_entity_embeddings(self, entity_ids: torch.Tensor) -> torch.Tensor:
-        return self.entity_embeddings.index_select(0, entity_ids.long())
+        entity_ids = entity_ids.long()
+        embeddings = self.entity_embeddings.index_select(0, entity_ids)
+
+        non_text_mask = entity_ids.eq(0)
+        if bool(non_text_mask.any()):
+            embeddings = embeddings.clone()
+            embeddings[non_text_mask] = 0.0
+
+        return embeddings
 
     def get_relation_embeddings(self, relation_ids: torch.Tensor) -> torch.Tensor:
         return self.relation_embeddings.index_select(0, relation_ids.long())

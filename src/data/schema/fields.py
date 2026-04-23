@@ -15,13 +15,17 @@ class SampleFields:
     QUESTION_TEXT = "question"
 
     IS_ANCHOR_MASK = "is_anchor_mask"
-    IS_TARGET_MASK = "is_target_mask"
+    TRAIN_TARGET_MASK = "train_target_mask"
     ANCHOR_SIGNED_DISTANCE = "anchor_signed_distance"
     ANSWER_ENTITY_IDS_GLOBAL = "answer_entity_ids_global"
-    POSITIVE_EDGE_MASK = "positive_edge_mask"
+    TRAIN_TARGET_NODE_IDS = "train_target_node_ids"
+    TARGET_NODE_DISTANCE_FLAT = "target_node_distance_flat"
+    TARGET_SHORTEST_PATH_COUNT_FLAT = "target_shortest_path_count_flat"
+    TARGET_SHORTEST_PATH_EDGE_MASK_FLAT = "target_shortest_path_edge_mask_flat"
+    shortest_path_edge_mask = "shortest_path_edge_mask"
     NODE_TO_TARGET_DISTANCE = "node_to_target_distance"
-    SHORTEST_SUFFIX_COUNT = "shortest_suffix_count"
-    BOUNDED_SUFFIX_COUNT = "bounded_suffix_count"
+    shortest_path_count = "shortest_path_count"
+    MIN_TARGET_DIST = "min_target_dist"
     MAX_PATH_LENGTH = "max_path_length"
 
     NODE_TOKENS = "node_tokens"
@@ -39,11 +43,14 @@ class SampleFields:
             ANSWER_ENTITY_IDS_GLOBAL,
             EDGE_RELATION_IDS_GLOBAL,
             IS_ANCHOR_MASK,
-            IS_TARGET_MASK,
-            POSITIVE_EDGE_MASK,
+            TRAIN_TARGET_MASK,
+            TARGET_NODE_DISTANCE_FLAT,
+            TARGET_SHORTEST_PATH_COUNT_FLAT,
+            TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
+            shortest_path_edge_mask,
             NODE_TO_TARGET_DISTANCE,
-            SHORTEST_SUFFIX_COUNT,
-            BOUNDED_SUFFIX_COUNT,
+            shortest_path_count,
+            MIN_TARGET_DIST,
             MAX_PATH_LENGTH,
         }
     )
@@ -55,7 +62,7 @@ class SampleFields:
             EDGE_RELATION_IDS_GLOBAL,
             QUESTION_EMB,
             IS_ANCHOR_MASK,
-            IS_TARGET_MASK,
+            TRAIN_TARGET_MASK,
             ANCHOR_SIGNED_DISTANCE,
             ANSWER_ENTITY_IDS_GLOBAL,
             NUM_NODES,
@@ -64,11 +71,16 @@ class SampleFields:
 
     STORAGE_OPTIONAL: FrozenSet[str] = frozenset(
         {
-            POSITIVE_EDGE_MASK,
+            TRAIN_TARGET_MASK,
+            TRAIN_TARGET_NODE_IDS,
+            MIN_TARGET_DIST,
+            shortest_path_edge_mask,
             NODE_TO_TARGET_DISTANCE,
-            SHORTEST_SUFFIX_COUNT,
-            BOUNDED_SUFFIX_COUNT,
+            shortest_path_count,
             MAX_PATH_LENGTH,
+            TARGET_NODE_DISTANCE_FLAT,
+            TARGET_SHORTEST_PATH_COUNT_FLAT,
+            TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
         }
     )
 
@@ -87,7 +99,11 @@ class StorageSchema:
             raise KeyError(f"LMDB sample has unexpected keys: {sorted(unexpected)}")
 
         edge_index = data[SampleFields.EDGE_INDEX]
-        if not hasattr(edge_index, "shape") or edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        if (
+            not hasattr(edge_index, "shape")
+            or edge_index.ndim != 2
+            or edge_index.shape[0] != 2
+        ):
             raise ValueError(
                 f"{SampleFields.EDGE_INDEX} must have shape [2, E], got {getattr(edge_index, 'shape', None)}"
             )
@@ -101,13 +117,15 @@ class StorageSchema:
             )
 
         anchor_mask = data[SampleFields.IS_ANCHOR_MASK]
-        target_mask = data[SampleFields.IS_TARGET_MASK]
+        train_target_mask = data[SampleFields.TRAIN_TARGET_MASK]
         for name, value in (
             (SampleFields.IS_ANCHOR_MASK, anchor_mask),
-            (SampleFields.IS_TARGET_MASK, target_mask),
+            (SampleFields.TRAIN_TARGET_MASK, train_target_mask),
         ):
-            if hasattr(value, "ndim") and value.ndim != 1:
-                raise ValueError(f"{name} must be 1D, got shape {getattr(value, 'shape', None)}")
+            if value is not None and hasattr(value, "ndim") and value.ndim != 1:
+                raise ValueError(
+                    f"{name} must be 1D, got shape {getattr(value, 'shape', None)}"
+                )
 
         question_emb = data[SampleFields.QUESTION_EMB]
         if hasattr(question_emb, "ndim") and question_emb.ndim != 1:
@@ -115,15 +133,18 @@ class StorageSchema:
                 f"{SampleFields.QUESTION_EMB} must be 1D, got shape {getattr(question_emb, 'shape', None)}"
             )
 
-        bounded_suffix = data.get(SampleFields.BOUNDED_SUFFIX_COUNT)
-        if bounded_suffix is not None and hasattr(bounded_suffix, "ndim"):
-            if bounded_suffix.ndim != 2:
+        for name in (
+            SampleFields.TRAIN_TARGET_MASK,
+            SampleFields.TRAIN_TARGET_NODE_IDS,
+            SampleFields.TARGET_NODE_DISTANCE_FLAT,
+            SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT,
+            SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
+            SampleFields.shortest_path_edge_mask,
+            SampleFields.NODE_TO_TARGET_DISTANCE,
+            SampleFields.shortest_path_count,
+        ):
+            value = data.get(name)
+            if value is not None and hasattr(value, "ndim") and value.ndim != 1:
                 raise ValueError(
-                    f"{SampleFields.BOUNDED_SUFFIX_COUNT} must be 2D, got shape "
-                    f"{getattr(bounded_suffix, 'shape', None)}"
-                )
-            if bounded_suffix.shape[1] != num_nodes:
-                raise ValueError(
-                    f"{SampleFields.BOUNDED_SUFFIX_COUNT} second dim must match num_nodes: "
-                    f"{bounded_suffix.shape[1]} != {num_nodes}"
+                    f"{name} must be 1D, got shape {getattr(value, 'shape', None)}"
                 )

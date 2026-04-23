@@ -17,7 +17,7 @@ split: ${dataset.val_split}
 max_graphs: 1000
 
 # Match shortest-path supervision to the rollout geometry by default.
-path_mode: undirected
+path_mode: qa_directed
 
 # Compare several semantic baselines in one pass.
 scoring_methods:

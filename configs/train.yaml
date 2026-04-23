@@ -1,13 +1,5 @@
 # @package _global_
 
-# Entrypoint rules for `python src/train.py ...`
-# - `/run` must be a train-oriented run config (`run.name` cannot be `eval_*`).
-# - Current training flows in this repo require `/dataset`; the canonical CLI is
-#   `python src/train.py experiment=train_rankflow dataset=webqsp-sub`.
-# - Prefer `experiment=...` over ad hoc `/run + /trainer + /model` overrides so the
-#   full training bundle stays aligned.
-#
-# Order of defaults determines the order in which configs override each other.
 defaults:
   - _self_
   - dataset: null

@@ -17,9 +17,9 @@ split: ${dataset.val_split}
 max_graphs: 1000
 
 # Match oracle rollout geometry to the main GFlowNet setup by default.
-path_mode: undirected
+path_mode: qa_directed
 
-# If true, stop once the teacher subgraph first reaches any target node.
-stop_on_first_hit: true
+# Teacher oracle uses the same coverage-aware stop rule as training guidance.
+expand_budget: ${model.expand_budget}
 
 answer_reward: ${model.answer_reward}

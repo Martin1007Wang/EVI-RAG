@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch_scatter import scatter_sum
 
 from src.utils.nn_utils import (
     build_mlp,
@@ -12,6 +13,7 @@ from src.utils.nn_utils import (
     require_finite,
     zero_last_linear,
 )
+from .backbone import BackboneOutput
 
 
 class _ProjectedDotScalar(nn.Module):
@@ -35,7 +37,6 @@ class _ProjectedDotScalar(nn.Module):
             num_residual_layers,
             dropout,
         )
-
         init_xavier(self.q_proj)
         init_xavier(self.k_proj)
         if zero_init:
@@ -52,79 +53,89 @@ class _ProjectedDotScalar(nn.Module):
 
 
 class ZHead(_ProjectedDotScalar):
-    """log Z(q, s0)."""
+    """log Z(q, s0) 估计器：图级别的条件配分函数常量，由查询和根状态学习而来。"""
 
     def forward(self, query_h: torch.Tensor, root_state_h: torch.Tensor) -> torch.Tensor:
         return self._score(query_h, root_state_h)
 
 
 class FlowHead(_ProjectedDotScalar):
-    """log F(s | q)."""
+    """log F(s | q) 估计器：严格马尔可夫的边缘流量评估。"""
 
     def forward(self, query_h: torch.Tensor, state_h: torch.Tensor) -> torch.Tensor:
         return self._score(query_h, state_h)
 
 
-@dataclass
+@dataclass(frozen=True)
 class EdgeScorerInputs:
-    """Inputs for ExpandEdgeScorer.forward.
+    """ExpandEdgeScorer 的严格输入契约（仅包含候选边切片数据）。
 
-    src_dyn_node_h : [E, H]  dynamic source-node state from backbone_out.node_h[src]
-    edge_batch_index: [E]    graph index per edge
-    dst_stat_node_h: [E, H]  static destination entity semantics from feature_bank.node_h[dst]
-    rel_h          : [E, H]  relation semantics
-    query_h        : [G, H]  query semantics
+    src_dyn_node_h : 候选边起点的动态表示，来自 backbone node_h_policy 通道
+                     （frontier-aware，已聚合候选边邻域信息）。
+    dst_stat_node_h: 候选边终点的静态表示，来自 feature_bank.node_h
+                     （dst 尚未激活，无动态表示可用；先验分不依赖拓扑状态）。
     """
-
-    src_dyn_node_h: torch.Tensor
-    edge_batch_index: torch.Tensor
-    dst_stat_node_h: torch.Tensor
-    rel_h: torch.Tensor
-    query_h: torch.Tensor
+    src_dyn_node_h: torch.Tensor    # [C, H] 候选边起点（policy 通道动态特征）
+    edge_batch_index: torch.Tensor  # [C]    候选边的图归属索引
+    dst_stat_node_h: torch.Tensor   # [C, H] 候选边终点（静态/环境特征）
+    rel_h: torch.Tensor             # [C, H] 候选边的关系语义（静态）
+    query_h: torch.Tensor           # [B, H] 全局查询语义
 
 
 @dataclass(frozen=True)
 class EdgeScoreBreakdown:
-    relation_only_logits: torch.Tensor
+    """边打分的物理量分解，用于后续的分析、正则化或消融实验。"""
+    prior_logits: torch.Tensor
     residual_logits: torch.Tensor
     final_logits: torch.Tensor
 
 
 class ExpandEdgeScorer(nn.Module):
-    """Candidate-edge scorer.
-
-    Design principle
-    ----------------
-    The task is retrieval: find the 1-2 semantically relevant edges among
-    ~5000 candidates.  The dominant signal is semantic similarity between
-    the query and the relation semantics.
-
-    The relation-only cosine prior stays as the dominant zero-shot signal.
-    A zero-initialized residual MLP consumes explicit first-principles edge
-    factors ``[query, src_dyn, rel, dst_stat]`` to learn context-sensitive
-    reranking without destroying the prior at initialization.
-    """
+    """候选边价值打分器 (Prior-Regularized Topology Reranker)."""
 
     def __init__(
         self,
         hidden_dim: int,
         prior_scale_init: float = 5.0,
         prior_scale_trainable: bool = True,
+        residual_scale: float = 1.0,
         num_residual_layers: int = 2,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
+        self.residual_scale = float(residual_scale)
+        if self.residual_scale < 0.0:
+            raise ValueError(f"residual_scale must be >= 0, got {self.residual_scale}.")
+
         self.prior_scale = nn.Parameter(torch.tensor(float(prior_scale_init)))
         self.prior_scale.requires_grad_(bool(prior_scale_trainable))
+
         self.residual_scorer = build_mlp(
-            self.hidden_dim * 4,
+            self.hidden_dim * 4 + 1,
             1,
             self.hidden_dim,
             num_residual_layers,
             dropout,
         )
         zero_last_linear(self.residual_scorer)
+
+    @staticmethod
+    def _center_scores_per_graph(
+        scores: torch.Tensor,
+        batch_index: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        if scores.numel() == 0:
+            return scores
+        per_graph_sum = scatter_sum(scores, batch_index, dim=0, dim_size=num_graphs)
+        per_graph_count = (
+            torch.bincount(batch_index, minlength=num_graphs)
+            .to(dtype=scores.dtype, device=scores.device)
+            .clamp_min(1.0)
+        )
+        per_graph_mean = per_graph_sum / per_graph_count
+        return scores - per_graph_mean.index_select(0, batch_index)
 
     def forward(
         self,
@@ -137,40 +148,46 @@ class ExpandEdgeScorer(nn.Module):
             if not return_breakdown:
                 return empty
             return EdgeScoreBreakdown(
-                relation_only_logits=empty,
-                residual_logits=empty,
-                final_logits=empty,
+                prior_logits=empty, residual_logits=empty, final_logits=empty
             )
 
-        query_h = inp.query_h
-        rel_h = inp.rel_h
+        query_per_edge = inp.query_h.index_select(0, inp.edge_batch_index)  # [C, H]
 
-        query_per_edge = query_h.index_select(0, inp.edge_batch_index)  # [E, H]
-        relation_only_logits = self.prior_scale * F.cosine_similarity(
-            query_per_edge,
-            rel_h,
-            dim=-1,
-        )
-        residual_logits = self.residual_scorer(
-            torch.cat(
-                [query_per_edge, inp.src_dyn_node_h, inp.rel_h, inp.dst_stat_node_h],
-                dim=-1,
-            )
+        prior_ctx = F.normalize(query_per_edge, p=2, dim=-1)
+        prior_logits = self.prior_scale * F.cosine_similarity(prior_ctx, inp.rel_h, dim=-1)
+
+        residual_delta = self.residual_scorer(
+            torch.cat([
+                inp.src_dyn_node_h,
+                inp.dst_stat_node_h,
+                query_per_edge * inp.src_dyn_node_h,
+                query_per_edge * inp.dst_stat_node_h,
+                prior_logits.unsqueeze(-1),
+            ], dim=-1)
         ).squeeze(-1)
-        final_logits = relation_only_logits + residual_logits
+
+        residual_logits = self.residual_scale * torch.tanh(
+            self._center_scores_per_graph(
+                residual_delta, inp.edge_batch_index, inp.query_h.size(0)
+            )
+        )
+
+        final_logits = prior_logits + residual_logits
+
         if not return_breakdown:
             return final_logits
+
         return EdgeScoreBreakdown(
-            relation_only_logits=relation_only_logits,
+            prior_logits=prior_logits,
             residual_logits=residual_logits,
             final_logits=final_logits,
         )
 
 
 class ActionHead(nn.Module):
-    """Graph-level action-type scorer returning (B, 2) logits.
+    """图级别的二元决策打分器 (Expand vs Stop)
 
-    Column convention: col 0 = expand, col 1 = stop.
+    返回 (B, 2) logits，其中 col 0 = Expand, col 1 = Stop。
     """
 
     def __init__(
@@ -185,6 +202,7 @@ class ActionHead(nn.Module):
         if type_feature_dim < 0:
             raise ValueError(f"type_feature_dim must be >= 0, got {type_feature_dim}.")
         self.type_feature_dim = int(type_feature_dim)
+
         self.type_scorer = build_mlp(
             hidden_dim + self.type_feature_dim,
             2,
@@ -201,36 +219,50 @@ class ActionHead(nn.Module):
         type_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         finite_state_h = require_finite(state_h, name="action_state_h")
+
         if self.type_feature_dim > 0:
             if type_features is None:
-                raise ValueError(f"type_feature_dim={self.type_feature_dim} but type_features is None.")
+                raise ValueError(
+                    f"type_feature_dim={self.type_feature_dim} but type_features is None."
+                )
             if type_features.shape != (state_h.size(0), self.type_feature_dim):
                 raise ValueError(
-                    f"type_features shape mismatch: expected " f"({state_h.size(0)}, {self.type_feature_dim}), " f"got {tuple(type_features.shape)}."
+                    f"type_features shape mismatch: expected "
+                    f"({state_h.size(0)}, {self.type_feature_dim}), "
+                    f"got {tuple(type_features.shape)}."
                 )
             type_ctx = torch.cat(
-                [finite_state_h, require_finite(type_features.to(finite_state_h.dtype), name="type_features")],
+                [
+                    finite_state_h,
+                    require_finite(
+                        type_features.to(finite_state_h.dtype), name="type_features"
+                    ),
+                ],
                 dim=-1,
             )
         else:
             type_ctx = finite_state_h
+
         return {"type_logits": self.type_scorer(type_ctx)}
 
 
 def build_edge_scorer_inputs(
-    backbone_out,
+    backbone_out: BackboneOutput,
     edge_index: torch.Tensor,
     edge_batch_index: torch.Tensor,
 ) -> EdgeScorerInputs:
-    """Construct EdgeScorerInputs from a BackboneOutput.
+    """根据 BackboneOutput 全量构建 EdgeScorerInputs。
 
-    Single authoritative mapping from backbone tensors to scorer fields.
-    Call once per rollout step.
+    此函数用于全量转换场景（非 rollout 热路径）。
+    热路径中 policy.py 的 _encode_edges 直接传入 candidate_mask 切片以节省显存。
+
+    src_dyn_node_h 使用 node_h_policy（frontier-aware 通道），
+    与热路径行为保持一致。
     """
     src = edge_index[0]
     dst = edge_index[1]
     return EdgeScorerInputs(
-        src_dyn_node_h=backbone_out.node_h.index_select(0, src),
+        src_dyn_node_h=backbone_out.node_h_policy.index_select(0, src),  # ← CHANGED
         edge_batch_index=edge_batch_index,
         dst_stat_node_h=backbone_out.feature_bank.node_h.index_select(0, dst),
         rel_h=backbone_out.rel_h,
@@ -247,4 +279,3 @@ __all__ = [
     "ZHead",
     "build_edge_scorer_inputs",
 ]
- 

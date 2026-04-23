@@ -2,71 +2,53 @@ _target_: src.models.gflownet.GFlowNetModule
 _recursive_: true
 _convert_: all
 
-max_steps: 3
+# ── 1. 基础探索设置 ──
+expand_budget: 3
 num_rollout: 8
 eval_num_rollout: 8
 rollout_chunk_size: 4
 eval_rollout_chunk_size: 4
 eval_budgets: [1, 2, 4, 8]
-temperature: 0.45
-temperature_schedule:
-  start: 0.45
-  end: 0.45
-  warmup_steps: 999999
+temperature: 0.45 
 
-backbone:
+# ── 2. 网络架构 ──
+policy_hidden_dim: 1024
+
+backbone_cfg:
   hidden_dim: 1024
   gnn_num_layers: 3
   gnn_dropout: 0.1
-  dde_max_distance: 4
 
-policy_hidden_dim: 1024
-
-action_head:
+action_head_cfg:
   zero_init_type_output: false
 
-edge_scorer:
+edge_scorer_cfg:
   prior_scale_init: 5.0
   prior_scale_trainable: false
 
-reward:
-  log_r_min: -5.0
-  semantic_fallback_scale: 0.25
-  relation_shaping_scale: 0.0
-  positive_coverage_shaping_scale: 0.0
-  distance_progress_shaping_scale: 0.0
+# ── 3. 奖励与损失函数 ──
+reward_cfg:
+  log_r_min: -5.0  # terminal reward floor; part of reward semantics, not shaping
+  zero_f1_edge_bonus_scale: 0.25  # weak zero-F1 tie-breaker on selected non-root edge relations
 
-loss:
+loss_cfg:
   variant: fl_subtb
   subtb_lambda: 0.9
   log_reward_clip_min: -10.0
   reward_matching_coef: 1.0
 
-teacher:
-  enabled: true
-  mode: bounded_path
-  score_exponent: 0.5
-  fallback_to_policy: true
+# ── 4. 导师引导与余弦退火调度 ──
+teacher_cfg:
+  teacher_enabled: true
+  teacher_score_exponent: 1.0
 
-schedule:
-  warmup_steps: 200
-  decay_steps: 1800
-  initial_teacher_prob: 1.0
-  final_teacher_prob: 0.0
+curriculum_cfg:
+  curriculum_warmup_steps: 200         
+  curriculum_decay_steps: 2000            
+  curriculum_initial_prob: 0.95
+  curriculum_final_prob: 0.05
 
-replay:
-  enabled: true
-  capacity: 4096
-  sample_size: 2
-  warmup_steps: 200
-  min_size: 64
-  loss_coef: 0.2
-  reset_on_fit_start: true
-  priority_epsilon: 1.0e-6
-  priority_exponent: 0.6
-  importance_sampling_exponent: 0.4
-  age_decay: 0.999
-
+# ── 5. 优化器与学习率 ──
 optimizer_cfg:
   type: adamw
   lr: 0.0001

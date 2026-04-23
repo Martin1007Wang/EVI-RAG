@@ -6,9 +6,10 @@ from typing import Any
 import torch
 
 from src.data.schema import RetrievalBatch
+from src.models.guidance import TeacherGuidance
+from src.models.policy import CandidateEdges
 from src.models.reward import RewardModel
 from src.models.state import State
-from src.utils.path_utils import compute_shortest_path_labels
 
 
 @dataclass(frozen=True)
@@ -22,93 +23,114 @@ class HitGraphRewardResult:
 def _choose_teacher_edge(
     *,
     gold_edge_ids: torch.Tensor,
-    active_nodes: torch.Tensor,
-    edge_index: torch.Tensor,
+    teacher_scores: torch.Tensor,
 ) -> torch.Tensor:
     if gold_edge_ids.numel() == 0:
         raise ValueError("gold_edge_ids must be non-empty.")
+    if teacher_scores.numel() != gold_edge_ids.numel():
+        raise ValueError(
+            "teacher_scores must align with gold_edge_ids: "
+            f"{teacher_scores.numel()} != {gold_edge_ids.numel()}."
+        )
+    chosen_pos = int(torch.argmax(teacher_scores).item())
+    return gold_edge_ids[chosen_pos : chosen_pos + 1]
 
-    src = edge_index[0].index_select(0, gold_edge_ids)
-    dst = edge_index[1].index_select(0, gold_edge_ids)
-    src_active = active_nodes.index_select(0, src)
-    dst_active = active_nodes.index_select(0, dst)
-    activates_new_node = (src_active & ~dst_active) | (dst_active & ~src_active)
-    preferred = gold_edge_ids[activates_new_node]
-    if preferred.numel() == 0:
-        preferred = gold_edge_ids
-    return preferred[:1]
+
+def _build_frontier_candidates(batch: RetrievalBatch, state: State) -> CandidateEdges:
+    src = batch.edge_index[0]
+    dst = batch.edge_index[1]
+    valid_edges = (
+        state.active_nodes[src] & ~state.active_nodes[dst] & ~state.active_edges
+    )
+    candidate_edge_ids = torch.nonzero(valid_edges, as_tuple=False).view(-1)
+    return CandidateEdges(
+        edge_ids=candidate_edge_ids,
+        expand_logits=torch.zeros(
+            candidate_edge_ids.numel(),
+            dtype=torch.float32,
+            device=batch.edge_index.device,
+        ),
+        batch_index=torch.zeros(
+            candidate_edge_ids.numel(), dtype=torch.long, device=batch.edge_index.device
+        ),
+    )
 
 
 def build_teacher_hit_graph(
     batch: RetrievalBatch,
     *,
+    teacher_guidance: TeacherGuidance | None = None,
     path_mode: str = "qa_directed",
-    stop_on_first_hit: bool = True,
+    expand_budget: int | None = None,
 ) -> tuple[str, State]:
-    sp_labels = compute_shortest_path_labels(
-        edge_index=batch.edge_index.cpu(),
-        is_anchor_mask=batch.is_anchor_mask.cpu(),
-        is_target_mask=batch.is_target_mask.cpu(),
-        num_nodes=batch.num_nodes,
-        path_mode=path_mode,
-    )
+    if str(path_mode or "qa_directed").strip().lower() != "qa_directed":
+        raise ValueError(
+            "build_teacher_hit_graph only supports path_mode='qa_directed'."
+        )
+    if batch.num_graphs != 1:
+        raise ValueError(
+            f"build_teacher_hit_graph expects a single-graph batch, got {batch.num_graphs}."
+        )
 
-    rollout_state = State.create_initial(batch)
-    target_active = rollout_state.active_nodes & batch.is_target_mask
-    if bool(target_active.any().item()):
+    guidance = teacher_guidance or TeacherGuidance(score_exponent=1.0)
+    resolved_expand_budget = (
+        int(batch.edge_index.size(1)) if expand_budget is None else int(expand_budget)
+    )
+    rollout_state = State.create_initial(batch, expand_budget=resolved_expand_budget)
+    train_target_mask = _get_train_target_mask(batch)
+    train_target_node_ids = _get_train_target_node_ids(batch)
+    if bool((rollout_state.active_nodes & train_target_mask).any().item()):
         return "root_hit", rollout_state
 
-    if (
-        sp_labels.positive_edge_ids.numel() == 0
-        or sp_labels.reachable_target_node_ids.numel() == 0
-    ):
-        return "skipped_no_path", rollout_state
-    positive_edge_mask = torch.zeros(
-        batch.edge_index.size(1),
-        dtype=torch.bool,
-        device=batch.edge_index.device,
-    )
-    positive_edge_mask[
-        sp_labels.positive_edge_ids.long().to(batch.edge_index.device)
-    ] = True
+    if not hasattr(batch, "target_node_distance_flat"):
+        return "missing_teacher_labels", rollout_state
 
     src = batch.edge_index[0]
     dst = batch.edge_index[1]
-    for _ in range(int(batch.edge_index.size(1)) + 1):
-        target_active = rollout_state.active_nodes & batch.is_target_mask
-        if bool(target_active.any().item()):
-            return "ok", rollout_state
 
-        valid_edges = (
-            rollout_state.active_nodes[src] | rollout_state.active_nodes[dst]
-        ) & ~rollout_state.active_edges
-        candidate_edge_ids = torch.nonzero(valid_edges, as_tuple=False).view(-1)
-        if candidate_edge_ids.numel() == 0:
+    for num_expands in range(resolved_expand_budget + 1):
+        rollout_state.num_expands = num_expands
+        candidates = _build_frontier_candidates(batch, rollout_state)
+        should_stop = guidance.graph_should_stop(
+            retrieval_batch=batch,
+            state=rollout_state,
+            candidates=candidates,
+            remaining_expand_budget=resolved_expand_budget - (num_expands + 1),
+            num_graphs=1,
+        )
+        if bool(should_stop[0].item()) or num_expands >= resolved_expand_budget:
+            active_gold = rollout_state.active_nodes & train_target_mask
+            if bool(active_gold.any().item()):
+                return "ok", rollout_state
+            if train_target_node_ids.numel() == 0:
+                return "skipped_no_path", rollout_state
+            return "stalled_before_hit", rollout_state
+
+        valid_mask, teacher_scores = guidance.candidate_scores(
+            retrieval_batch=batch,
+            state=rollout_state,
+            candidates=candidates,
+            remaining_expand_budget=resolved_expand_budget - (num_expands + 1),
+        )
+        teacher_gold_edges = candidates.edge_ids[valid_mask]
+        if teacher_gold_edges.numel() == 0:
             break
 
-        gold_mask_in_candidates = positive_edge_mask.index_select(0, candidate_edge_ids)
-        if not bool(gold_mask_in_candidates.any().item()):
-            break
-
-        teacher_gold_edges = candidate_edge_ids[gold_mask_in_candidates]
         chosen_teacher_edge = _choose_teacher_edge(
             gold_edge_ids=teacher_gold_edges,
-            active_nodes=rollout_state.active_nodes,
-            edge_index=batch.edge_index,
+            teacher_scores=teacher_scores[valid_mask],
         )
         rollout_state.apply_expansion(
             chosen_edges=chosen_teacher_edge,
             src=src,
             dst=dst,
         )
-        if stop_on_first_hit:
-            target_active = rollout_state.active_nodes & batch.is_target_mask
-            if bool(target_active.any().item()):
-                return "ok", rollout_state
 
-    target_active = rollout_state.active_nodes & batch.is_target_mask
-    if bool(target_active.any().item()):
+    active_gold = rollout_state.active_nodes & train_target_mask
+    if bool(active_gold.any().item()):
         return "ok", rollout_state
+    if train_target_node_ids.numel() == 0:
+        return "skipped_no_path", rollout_state
     return "stalled_before_hit", rollout_state
 
 
@@ -117,8 +139,9 @@ def evaluate_hit_graph_reward(
     batch: RetrievalBatch,
     *,
     reward_model: RewardModel,
+    teacher_guidance: TeacherGuidance | None = None,
     path_mode: str = "qa_directed",
-    stop_on_first_hit: bool = True,
+    expand_budget: int | None = None,
 ) -> HitGraphRewardResult:
     if batch.num_graphs != 1:
         raise ValueError(
@@ -127,10 +150,11 @@ def evaluate_hit_graph_reward(
 
     status, rollout_state = build_teacher_hit_graph(
         batch,
+        teacher_guidance=teacher_guidance,
         path_mode=path_mode,
-        stop_on_first_hit=stop_on_first_hit,
+        expand_budget=expand_budget,
     )
-    if status not in {"ok", "root_hit"}:
+    if status == "missing_teacher_labels":
         return HitGraphRewardResult(
             status=status,
             log_reward=None,
@@ -139,12 +163,14 @@ def evaluate_hit_graph_reward(
         )
 
     log_reward = reward_model(
-        base_graph=batch,
+        retrieval_batch=batch,
         active_nodes=rollout_state.active_nodes,
         active_edges=rollout_state.active_edges,
+        state=rollout_state,
     )
-    active_gold = rollout_state.active_nodes & batch.is_target_mask
-    recall = active_gold.sum().float() / batch.is_target_mask.sum().clamp(min=1).float()
+    train_target_mask = _get_train_target_mask(batch)
+    active_gold = rollout_state.active_nodes & train_target_mask
+    recall = active_gold.sum().float() / train_target_mask.sum().clamp(min=1).float()
     added_edges = int(
         (rollout_state.active_edges & ~rollout_state.root_active_edges).sum().item()
     )
@@ -199,3 +225,11 @@ __all__ = [
     "evaluate_hit_graph_reward",
     "summarize_hit_graph_rewards",
 ]
+
+
+def _get_train_target_mask(batch: RetrievalBatch) -> torch.Tensor:
+    return batch.train_target_mask
+
+
+def _get_train_target_node_ids(batch: RetrievalBatch) -> torch.Tensor:
+    return batch.train_target_node_ids.long()

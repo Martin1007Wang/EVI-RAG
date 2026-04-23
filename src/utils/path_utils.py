@@ -2,37 +2,51 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Sequence, Set
+from typing import Sequence
 
 import torch
 
-_DIST_UNREACHABLE = -1
-_PATH_MODE_UNDIRECTED = "undirected"
-_PATH_MODE_QA_DIRECTED = "qa_directed"
-SIGNED_ANCHOR_DISTANCE_UNREACHABLE = 1_000_000_000
+
+signed_anchor_unreachable = 1_000_000_000
+unreachable_distance = -1
 
 
 @dataclass(frozen=True)
-class ShortestPathLabels:
-    """SubgraphRAG 风格的弱监督标签"""
+class ReachableTargets:
+    """
+    Reachable answer targets discovered from anchors before any budget filtering.
 
-    num_edges: int
-    positive_edge_ids: torch.Tensor  # 位于最短路径上的边索引
-    reachable_target_node_ids: torch.Tensor
-    max_path_length: Optional[int]
+    Semantics:
+    - `target_node_ids` contains local node ids of reachable answer targets.
+    - `target_node_distances_flat` is a flattened tensor with shape semantics
+      (num_targets, num_nodes).
+    - The order of `target_node_ids` matches the first dimension of
+      `target_node_distances_flat`.
+    """
+
+    target_node_ids: torch.Tensor
+    target_node_distances_flat: torch.Tensor
 
 
 @dataclass(frozen=True)
-class ShortestPathTeacherTargets:
-    """Teacher targets for state-conditioned shortest-path supervision."""
+class TeacherLabels:
+    """
+    Final train-target-conditioned shortest-path supervision.
 
-    num_edges: int
-    positive_edge_ids: torch.Tensor
-    reachable_target_node_ids: torch.Tensor
-    node_to_target_distance: torch.Tensor
-    shortest_suffix_count: torch.Tensor
-    bounded_suffix_count: torch.Tensor
-    max_path_length: Optional[int]
+    Semantics:
+    - `target_node_ids` contains local node ids of the final train targets.
+    - `target_node_distances_flat` has shape semantics (num_targets, num_nodes).
+    - `target_shortest_path_count_flat` has shape semantics (num_targets, num_nodes).
+    - `target_shortest_path_edge_mask_flat` has shape semantics
+      (num_targets, num_edges).
+    - The order of `target_node_ids` matches the first dimension of all flattened
+      per-target tensors in this object.
+    """
+
+    target_node_ids: torch.Tensor
+    target_node_distances_flat: torch.Tensor
+    target_shortest_path_count_flat: torch.Tensor
+    target_shortest_path_edge_mask_flat: torch.Tensor
 
 
 def compute_signed_anchor_distances(
@@ -40,260 +54,316 @@ def compute_signed_anchor_distances(
     edge_index: torch.Tensor,
     is_anchor_mask: torch.Tensor,
     num_nodes: int,
-    path_mode: str = _PATH_MODE_QA_DIRECTED,
 ) -> torch.Tensor:
-    """Compute signed directed distances to the nearest anchor."""
-    path_mode = str(path_mode or _PATH_MODE_QA_DIRECTED).strip().lower()
-    if path_mode not in {_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED}:
-        raise ValueError(
-            f"Unsupported path_mode={path_mode!r}; expected one of "
-            f"{(_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)}."
-        )
+    """
+    Compute signed directed distances relative to the nearest anchor.
 
+    Output semantics:
+    - 0: anchor node
+    - positive: reachable from an anchor in the forward graph
+    - negative: can reach an anchor in the reverse graph
+    - signed_anchor_unreachable: disconnected from all anchors both ways
+    """
     if num_nodes <= 0:
         return torch.empty((0,), dtype=torch.long)
 
     signed = torch.full(
         (num_nodes,),
-        SIGNED_ANCHOR_DISTANCE_UNREACHABLE,
+        signed_anchor_unreachable,
         dtype=torch.long,
     )
-    if edge_index.numel() == 0:
-        anchor_ids = torch.nonzero(is_anchor_mask.view(-1), as_tuple=False).view(-1)
-        if anchor_ids.numel() > 0:
-            signed[anchor_ids] = 0
-        return signed
 
-    anchor_nodes = (
-        torch.nonzero(is_anchor_mask.view(-1), as_tuple=False).view(-1).tolist()
-    )
+    anchor_nodes = torch.nonzero(
+        is_anchor_mask.view(-1), as_tuple=False
+    ).view(-1).tolist()
     if not anchor_nodes:
         return signed
 
-    src = edge_index[0].tolist()
-    dst = edge_index[1].tolist()
+    if edge_index.numel() == 0:
+        signed[torch.as_tensor(anchor_nodes, dtype=torch.long)] = 0
+        return signed
+
     adjacency, reverse_adjacency = _build_adjacency(
         num_nodes=num_nodes,
-        src=src,
-        dst=dst,
-        path_mode=path_mode,
+        src=edge_index[0].tolist(),
+        dst=edge_index[1].tolist(),
     )
+
     forward_dist = _multi_source_bfs_dist(adjacency, anchor_nodes)
     backward_dist = _multi_source_bfs_dist(reverse_adjacency, anchor_nodes)
 
     for node_idx in range(num_nodes):
         fwd = forward_dist[node_idx]
         bwd = backward_dist[node_idx]
+
         if fwd == 0 or bwd == 0:
             signed[node_idx] = 0
+        elif fwd == unreachable_distance and bwd == unreachable_distance:
             continue
-        if fwd == _DIST_UNREACHABLE and bwd == _DIST_UNREACHABLE:
-            continue
-        if bwd == _DIST_UNREACHABLE:
+        elif bwd == unreachable_distance:
             signed[node_idx] = int(fwd)
-            continue
-        if fwd == _DIST_UNREACHABLE:
+        elif fwd == unreachable_distance:
             signed[node_idx] = -int(bwd)
-            continue
-        signed[node_idx] = int(fwd) if fwd <= bwd else -int(bwd)
+        else:
+            signed[node_idx] = int(fwd) if fwd <= bwd else -int(bwd)
+
     return signed
 
 
-def compute_shortest_path_teacher_targets(
+def compute_reachable_targets(
     *,
     edge_index: torch.Tensor,
-    is_anchor_mask: torch.Tensor,
-    is_target_mask: torch.Tensor,
+    anchor_node_ids: torch.Tensor,
+    answer_node_ids: torch.Tensor,
     num_nodes: int,
-    path_mode: str = _PATH_MODE_QA_DIRECTED,
-    budget_max_steps: int | None = None,
-) -> ShortestPathTeacherTargets:
-    """Compute shortest-path teacher targets and suffix statistics."""
-    path_mode = str(path_mode or _PATH_MODE_QA_DIRECTED).strip().lower()
-    if path_mode not in {_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED}:
-        raise ValueError(
-            f"Unsupported path_mode={path_mode!r}; expected one of "
-            f"{(_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)}."
-        )
+) -> ReachableTargets:
+    """
+    Discover reachable answer targets and compute per-target node distances.
 
-    node_to_target_distance = torch.full(
-        (num_nodes,), _DIST_UNREACHABLE, dtype=torch.long
-    )
-    shortest_suffix_count = torch.zeros((num_nodes,), dtype=torch.float32)
-    resolved_budget_max_steps = _resolve_budget_max_steps(
-        budget_max_steps=budget_max_steps
-    )
-    bounded_suffix_count = torch.zeros(
-        (resolved_budget_max_steps + 1, max(num_nodes, 0)), dtype=torch.float32
-    )
-    if edge_index.numel() == 0 or num_nodes <= 0:
-        return ShortestPathTeacherTargets(
-            num_edges=0,
-            positive_edge_ids=torch.empty((0,), dtype=torch.long),
-            reachable_target_node_ids=torch.empty((0,), dtype=torch.long),
-            node_to_target_distance=node_to_target_distance,
-            shortest_suffix_count=shortest_suffix_count,
-            bounded_suffix_count=bounded_suffix_count,
-            max_path_length=None,
-        )
+    Intended use:
+    - graph collection
+    - prepared-sample construction
 
-    anchor_nodes = torch.nonzero(is_anchor_mask.view(-1)).view(-1).tolist()
-    answer_nodes = torch.nonzero(is_target_mask.view(-1)).view(-1).tolist()
-    if not anchor_nodes or not answer_nodes:
-        return ShortestPathTeacherTargets(
-            num_edges=edge_index.size(1),
-            positive_edge_ids=torch.empty((0,), dtype=torch.long),
-            reachable_target_node_ids=torch.empty((0,), dtype=torch.long),
-            node_to_target_distance=node_to_target_distance,
-            shortest_suffix_count=shortest_suffix_count,
-            bounded_suffix_count=bounded_suffix_count,
-            max_path_length=None,
-        )
+    This function does not compute shortest-path counts or edge masks.
+    """
+    if num_nodes <= 0 or edge_index.numel() == 0:
+        return _empty_reachable_targets()
 
-    src = edge_index[0].tolist()
-    dst = edge_index[1].tolist()
-    adj, rev_adj = _build_adjacency(
+    anchors = _unique_valid_node_ids(anchor_node_ids, num_nodes=num_nodes)
+    answers = _unique_valid_node_ids(answer_node_ids, num_nodes=num_nodes)
+
+    if not anchors or not answers:
+        return _empty_reachable_targets()
+
+    adjacency, reverse_adjacency = _build_adjacency(
         num_nodes=num_nodes,
-        src=src,
-        dst=dst,
-        path_mode=path_mode,
+        src=edge_index[0].tolist(),
+        dst=edge_index[1].tolist(),
     )
 
-    dist_from_anchors = {a: _bfs_dist(adj, a) for a in anchor_nodes}
+    dist_from_anchors = {anchor: _bfs_dist(adjacency, anchor) for anchor in anchors}
+
     reachable_target_ids = sorted(
         {
             target
-            for target in answer_nodes
+            for target in answers
             if any(
-                dist_from_anchors[anchor][target] != _DIST_UNREACHABLE
-                for anchor in anchor_nodes
+                dist_from_anchors[anchor][target] != unreachable_distance
+                for anchor in anchors
             )
         }
     )
     if not reachable_target_ids:
-        return ShortestPathTeacherTargets(
-            num_edges=edge_index.size(1),
-            positive_edge_ids=torch.empty((0,), dtype=torch.long),
-            reachable_target_node_ids=torch.empty((0,), dtype=torch.long),
-            node_to_target_distance=node_to_target_distance,
-            shortest_suffix_count=shortest_suffix_count,
-            bounded_suffix_count=bounded_suffix_count,
-            max_path_length=None,
-        )
+        return _empty_reachable_targets()
 
-    dist_to_answers = {ans: _bfs_dist(rev_adj, ans) for ans in reachable_target_ids}
-    for node_idx in range(num_nodes):
-        best_distance: Optional[int] = None
-        for target in reachable_target_ids:
-            distance = dist_to_answers[target][node_idx]
-            if distance == _DIST_UNREACHABLE:
-                continue
-            best_distance = (
-                distance if best_distance is None else min(best_distance, distance)
-            )
-        if best_distance is not None:
-            node_to_target_distance[node_idx] = int(best_distance)
-
-    positive_edge_ids: Set[int] = set()
-    max_len: Optional[int] = None
-    undirected = path_mode == _PATH_MODE_UNDIRECTED
-    for anchor in anchor_nodes:
-        for ans in reachable_target_ids:
-            d_total = dist_from_anchors[anchor][ans]
-            if d_total == _DIST_UNREACHABLE:
-                continue
-            max_len = d_total if max_len is None else max(max_len, d_total)
-            for e_id, (u, v) in enumerate(zip(src, dst)):
-                if (
-                    dist_from_anchors[anchor][u] != _DIST_UNREACHABLE
-                    and dist_to_answers[ans][v] != _DIST_UNREACHABLE
-                    and dist_from_anchors[anchor][u] + 1 + dist_to_answers[ans][v]
-                    == d_total
-                ):
-                    positive_edge_ids.add(e_id)
-                    continue
-                if (
-                    undirected
-                    and dist_from_anchors[anchor][v] != _DIST_UNREACHABLE
-                    and dist_to_answers[ans][u] != _DIST_UNREACHABLE
-                    and dist_from_anchors[anchor][v] + 1 + dist_to_answers[ans][u]
-                    == d_total
-                ):
-                    positive_edge_ids.add(e_id)
-
-    shortest_suffix_count = _count_shortest_suffixes(
-        adjacency=adj,
-        node_to_target_distance=node_to_target_distance.tolist(),
-        reachable_target_ids=reachable_target_ids,
+    target_node_distances = _compute_target_node_distance_matrix(
+        reverse_adjacency=reverse_adjacency,
+        target_node_ids=reachable_target_ids,
+        num_nodes=num_nodes,
     )
-    bounded_suffix_count = compute_bounded_suffix_count(
-        adjacency=adj,
-        is_target_mask=is_target_mask,
-        budget_max_steps=resolved_budget_max_steps,
-    )
-    return ShortestPathTeacherTargets(
-        num_edges=edge_index.size(1),
-        positive_edge_ids=torch.as_tensor(sorted(positive_edge_ids), dtype=torch.long),
-        reachable_target_node_ids=torch.as_tensor(
-            reachable_target_ids, dtype=torch.long
-        ),
-        node_to_target_distance=node_to_target_distance,
-        shortest_suffix_count=shortest_suffix_count,
-        bounded_suffix_count=bounded_suffix_count,
-        max_path_length=max_len,
+
+    return ReachableTargets(
+        target_node_ids=torch.as_tensor(reachable_target_ids, dtype=torch.long),
+        target_node_distances_flat=target_node_distances.reshape(-1).contiguous(),
     )
 
 
-def compute_shortest_path_labels(
+def compute_teacher_labels(
     *,
     edge_index: torch.Tensor,
-    is_anchor_mask: torch.Tensor,
-    is_target_mask: torch.Tensor,
+    anchor_node_ids: torch.Tensor,
+    target_node_ids: torch.Tensor,
     num_nodes: int,
-    path_mode: str = _PATH_MODE_QA_DIRECTED,
-) -> ShortestPathLabels:
+) -> TeacherLabels:
     """
-    计算严格的最短路径标签。
-    算法逻辑：
-    1. 建立有向图索引。
-    2. 计算所有锚点到所有答案的双向最短距离。
-    3. 标记所有满足 d(anchor, u) + 1 + d(v, answer) == d(anchor, answer) 的边 (u, v)。
+    Compute final train-target-conditioned shortest-path supervision.
+
+    Intended use:
+    - materialization after budget filtering
+    - final teacher guidance labels
+
+    Only returns the per-target labels actually needed by downstream teacher guidance.
     """
-    path_mode = str(path_mode or _PATH_MODE_QA_DIRECTED).strip().lower()
-    if path_mode not in {_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED}:
-        raise ValueError(
-            f"Unsupported path_mode={path_mode!r}; expected one of "
-            f"{(_PATH_MODE_UNDIRECTED, _PATH_MODE_QA_DIRECTED)}."
+    if num_nodes <= 0 or edge_index.numel() == 0:
+        return _empty_teacher_labels()
+
+    anchors = _unique_valid_node_ids(anchor_node_ids, num_nodes=num_nodes)
+    targets = _unique_valid_node_ids(target_node_ids, num_nodes=num_nodes)
+
+    if not anchors or not targets:
+        return _empty_teacher_labels()
+
+    adjacency, reverse_adjacency = _build_adjacency(
+        num_nodes=num_nodes,
+        src=edge_index[0].tolist(),
+        dst=edge_index[1].tolist(),
+    )
+
+    dist_from_anchors = {anchor: _bfs_dist(adjacency, anchor) for anchor in anchors}
+
+    reachable_targets = sorted(
+        {
+            target
+            for target in targets
+            if any(
+                dist_from_anchors[anchor][target] != unreachable_distance
+                for anchor in anchors
+            )
+        }
+    )
+    if not reachable_targets:
+        return _empty_teacher_labels()
+
+    target_node_distances = _compute_target_node_distance_matrix(
+        reverse_adjacency=reverse_adjacency,
+        target_node_ids=reachable_targets,
+        num_nodes=num_nodes,
+    )
+
+    target_shortest_path_edge_mask = _compute_target_shortest_path_edge_mask(
+        src=edge_index[0].tolist(),
+        dst=edge_index[1].tolist(),
+        dist_from_anchors=dist_from_anchors,
+        target_node_ids=reachable_targets,
+        target_node_distances=target_node_distances,
+    )
+
+    target_shortest_path_count = _compute_target_shortest_path_counts(
+        adjacency=adjacency,
+        target_node_ids=reachable_targets,
+        target_node_distances=target_node_distances,
+    )
+
+    return TeacherLabels(
+        target_node_ids=torch.as_tensor(reachable_targets, dtype=torch.long),
+        target_node_distances_flat=target_node_distances.reshape(-1).contiguous(),
+        target_shortest_path_count_flat=target_shortest_path_count.reshape(-1).contiguous(),
+        target_shortest_path_edge_mask_flat=target_shortest_path_edge_mask.reshape(-1).contiguous(),
+    )
+
+
+def _empty_reachable_targets() -> ReachableTargets:
+    return ReachableTargets(
+        target_node_ids=torch.empty((0,), dtype=torch.long),
+        target_node_distances_flat=torch.empty((0,), dtype=torch.long),
+    )
+
+
+def _empty_teacher_labels() -> TeacherLabels:
+    return TeacherLabels(
+        target_node_ids=torch.empty((0,), dtype=torch.long),
+        target_node_distances_flat=torch.empty((0,), dtype=torch.long),
+        target_shortest_path_count_flat=torch.empty((0,), dtype=torch.float32),
+        target_shortest_path_edge_mask_flat=torch.empty((0,), dtype=torch.bool),
+    )
+
+
+def _compute_target_node_distance_matrix(
+    *,
+    reverse_adjacency: list[list[int]],
+    target_node_ids: Sequence[int],
+    num_nodes: int,
+) -> torch.Tensor:
+    """
+    Return a tensor with shape [num_targets, num_nodes], where row t stores the
+    shortest directed distance from every node to target t.
+    """
+    target_node_distances = torch.full(
+        (len(target_node_ids), num_nodes),
+        unreachable_distance,
+        dtype=torch.long,
+    )
+
+    for target_pos, target in enumerate(target_node_ids):
+        target_node_distances[target_pos] = torch.as_tensor(
+            _bfs_dist(reverse_adjacency, int(target)),
+            dtype=torch.long,
         )
 
-    teacher_targets = compute_shortest_path_teacher_targets(
-        edge_index=edge_index,
-        is_anchor_mask=is_anchor_mask,
-        is_target_mask=is_target_mask,
-        num_nodes=num_nodes,
-        path_mode=path_mode,
-    )
-    return ShortestPathLabels(
-        num_edges=teacher_targets.num_edges,
-        positive_edge_ids=teacher_targets.positive_edge_ids,
-        reachable_target_node_ids=teacher_targets.reachable_target_node_ids,
-        max_path_length=teacher_targets.max_path_length,
-    )
+    return target_node_distances
+
+
+def _compute_target_shortest_path_edge_mask(
+    *,
+    src: Sequence[int],
+    dst: Sequence[int],
+    dist_from_anchors: dict[int, list[int]],
+    target_node_ids: Sequence[int],
+    target_node_distances: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Return a tensor with shape [num_targets, num_edges], where entry [t, e] is True
+    iff edge e lies on at least one shortest path from any anchor to target t.
+    """
+    num_edges = len(src)
+    mask = torch.zeros((len(target_node_ids), num_edges), dtype=torch.bool)
+
+    distance_rows = target_node_distances.tolist()
+
+    for anchor_distances in dist_from_anchors.values():
+        for target_pos, target in enumerate(target_node_ids):
+            total_distance = anchor_distances[int(target)]
+            if total_distance == unreachable_distance:
+                continue
+
+            target_distances = distance_rows[target_pos]
+            for edge_id, (u, v) in enumerate(zip(src, dst)):
+                if (
+                    anchor_distances[int(u)] != unreachable_distance
+                    and target_distances[int(v)] != unreachable_distance
+                    and anchor_distances[int(u)] + 1 + target_distances[int(v)] == total_distance
+                ):
+                    mask[target_pos, edge_id] = True
+
+    return mask
+
+
+def _compute_target_shortest_path_counts(
+    *,
+    adjacency: list[list[int]],
+    target_node_ids: Sequence[int],
+    target_node_distances: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Return a tensor with shape [num_targets, num_nodes], where entry [t, v] is the
+    number of shortest suffix paths from node v to target t.
+    """
+    counts = torch.zeros((len(target_node_ids), len(adjacency)), dtype=torch.float32)
+
+    distance_rows = target_node_distances.tolist()
+    for target_pos, target in enumerate(target_node_ids):
+        counts[target_pos] = _count_shortest_suffixes(
+            adjacency=adjacency,
+            node_to_target_distance=distance_rows[target_pos],
+            target_node_ids=[int(target)],
+        )
+
+    return counts
 
 
 def _count_shortest_suffixes(
     *,
     adjacency: list[list[int]],
     node_to_target_distance: Sequence[int],
-    reachable_target_ids: Sequence[int],
+    target_node_ids: Sequence[int],
 ) -> torch.Tensor:
+    """
+    Count shortest suffix paths to the provided target set under a fixed distance field.
+
+    For a single target:
+    - suffix_count[target] = 1
+    - suffix_count[node] = sum of suffix_count[neighbor] over outgoing neighbors that
+      move exactly one step closer to the target
+    """
     suffix_count = torch.zeros((len(adjacency),), dtype=torch.float32)
-    for target in reachable_target_ids:
+
+    for target in target_node_ids:
         if 0 <= int(target) < suffix_count.numel():
             suffix_count[int(target)] = 1.0
 
     max_distance = max(
-        (distance for distance in node_to_target_distance if distance >= 0), default=-1
+        (distance for distance in node_to_target_distance if distance >= 0),
+        default=unreachable_distance,
     )
     if max_distance <= 0:
         return suffix_count
@@ -302,78 +372,38 @@ def _count_shortest_suffixes(
         for node_idx, node_distance in enumerate(node_to_target_distance):
             if node_distance != distance:
                 continue
+
             total = 0.0
             for neighbor in adjacency[node_idx]:
                 if node_to_target_distance[neighbor] == distance - 1:
                     total += float(suffix_count[neighbor].item())
+
             suffix_count[node_idx] = total
+
     return suffix_count
 
 
-def compute_bounded_suffix_count(
+def _unique_valid_node_ids(
+    node_ids: torch.Tensor,
     *,
-    adjacency: Sequence[Sequence[int]],
-    is_target_mask: torch.Tensor,
-    budget_max_steps: int,
-) -> torch.Tensor:
-    """Count answer-reaching suffix mass within each remaining budget.
-
-    ``bounded_suffix_count[b, u]`` is the number of answer-reaching suffixes that
-    can start from node ``u`` and terminate within at most ``b`` additional
-    expansion steps. Answer nodes are treated as absorbing terminals: once the
-    rollout reaches an answer-bearing node, the teacher may stop immediately, so
-    each target contributes a base mass of 1 for every budget.
-
-    This tensor is intentionally a static graph-level teacher score rather than a
-    full dynamic-state oracle. It ignores the visited-set/history component of
-    the rollout state and therefore approximates bounded simple-path support by a
-    budget-conditioned suffix mass over the static graph.
+    num_nodes: int,
+) -> list[int]:
     """
-    if budget_max_steps < 0:
-        raise ValueError(
-            f"budget_max_steps must be >= 0, got {budget_max_steps}."
-        )
-    num_nodes = len(adjacency)
-    counts = torch.zeros(
-        (budget_max_steps + 1, num_nodes),
-        dtype=torch.float32,
-    )
-    if num_nodes == 0:
-        return counts
+    Keep valid local node ids, remove duplicates, preserve first-seen order.
+    """
+    seen: set[int] = set()
+    ordered: list[int] = []
 
-    target_mask = is_target_mask.view(-1).bool()
-    if target_mask.numel() != num_nodes:
-        raise ValueError(
-            "is_target_mask length must match adjacency size, got "
-            f"{target_mask.numel()} and {num_nodes}."
-        )
+    for raw in node_ids.view(-1).tolist():
+        node_id = int(raw)
+        if not (0 <= node_id < num_nodes):
+            continue
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        ordered.append(node_id)
 
-    counts[:, target_mask] = 1.0
-    if budget_max_steps == 0:
-        return counts
-
-    for budget in range(1, budget_max_steps + 1):
-        prev = counts[budget - 1]
-        for node_idx, neighbors in enumerate(adjacency):
-            if bool(target_mask[node_idx].item()):
-                continue
-            total = 0.0
-            for neighbor in neighbors:
-                if 0 <= int(neighbor) < num_nodes:
-                    total += float(prev[int(neighbor)].item())
-            counts[budget, node_idx] = total
-    return counts
-
-
-def _resolve_budget_max_steps(*, budget_max_steps: int | None) -> int:
-    if budget_max_steps is None:
-        return 0
-    resolved = int(budget_max_steps)
-    if resolved < 0:
-        raise ValueError(
-            f"budget_max_steps must be >= 0 when set, got {resolved}."
-        )
-    return resolved
+    return ordered
 
 
 def _build_adjacency(
@@ -381,11 +411,10 @@ def _build_adjacency(
     num_nodes: int,
     src: Sequence[int],
     dst: Sequence[int],
-    path_mode: str,
 ) -> tuple[list[list[int]], list[list[int]]]:
     adjacency: list[list[int]] = [[] for _ in range(num_nodes)]
     reverse_adjacency: list[list[int]] = [[] for _ in range(num_nodes)]
-    undirected = path_mode == _PATH_MODE_UNDIRECTED
+
     for src_raw, dst_raw in zip(src, dst):
         u = int(src_raw)
         v = int(dst_raw)
@@ -393,54 +422,57 @@ def _build_adjacency(
             continue
         adjacency[u].append(v)
         reverse_adjacency[v].append(u)
-        if undirected and u != v:
-            adjacency[v].append(u)
-            reverse_adjacency[u].append(v)
+
     return adjacency, reverse_adjacency
 
 
 def _bfs_dist(adjacency: list[list[int]], start: int) -> list[int]:
     num_nodes = len(adjacency)
-    dist = [_DIST_UNREACHABLE] * num_nodes
+    dist = [unreachable_distance] * num_nodes
     dist[start] = 0
-    q = deque([start])
-    while q:
-        u = q.popleft()
-        d_next = dist[u] + 1
-        for v in adjacency[u]:
-            if dist[v] == _DIST_UNREACHABLE:
-                dist[v] = d_next
-                q.append(v)
+
+    queue = deque([start])
+    while queue:
+        node = queue.popleft()
+        next_distance = dist[node] + 1
+        for neighbor in adjacency[node]:
+            if dist[neighbor] == unreachable_distance:
+                dist[neighbor] = next_distance
+                queue.append(neighbor)
+
     return dist
 
 
 def _multi_source_bfs_dist(
-    adjacency: list[list[int]], starts: Sequence[int]
+    adjacency: list[list[int]],
+    starts: Sequence[int],
 ) -> list[int]:
     num_nodes = len(adjacency)
-    dist = [_DIST_UNREACHABLE] * num_nodes
-    q = deque()
+    dist = [unreachable_distance] * num_nodes
+    queue = deque()
+
     for start in starts:
-        start_idx = int(start)
-        if 0 <= start_idx < num_nodes and dist[start_idx] == _DIST_UNREACHABLE:
-            dist[start_idx] = 0
-            q.append(start_idx)
-    while q:
-        u = q.popleft()
-        d_next = dist[u] + 1
-        for v in adjacency[u]:
-            if dist[v] == _DIST_UNREACHABLE:
-                dist[v] = d_next
-                q.append(v)
+        node = int(start)
+        if 0 <= node < num_nodes and dist[node] == unreachable_distance:
+            dist[node] = 0
+            queue.append(node)
+
+    while queue:
+        node = queue.popleft()
+        next_distance = dist[node] + 1
+        for neighbor in adjacency[node]:
+            if dist[neighbor] == unreachable_distance:
+                dist[neighbor] = next_distance
+                queue.append(neighbor)
+
     return dist
 
 
 __all__ = [
-    "SIGNED_ANCHOR_DISTANCE_UNREACHABLE",
-    "compute_bounded_suffix_count",
-    "compute_shortest_path_labels",
-    "compute_shortest_path_teacher_targets",
+    "signed_anchor_unreachable",
+    "ReachableTargets",
+    "TeacherLabels",
+    "compute_reachable_targets",
+    "compute_teacher_labels",
     "compute_signed_anchor_distances",
-    "ShortestPathLabels",
-    "ShortestPathTeacherTargets",
 ]

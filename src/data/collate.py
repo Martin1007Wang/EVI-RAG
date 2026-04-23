@@ -19,13 +19,10 @@ class RetrievalCollator:
         exclude_keys: Optional[List[str]] = None,
     ) -> None:
         self.data_resource = data_resource
-        resolved_exclude_keys = list(exclude_keys or [])
-        if SampleFields.BOUNDED_SUFFIX_COUNT not in resolved_exclude_keys:
-            resolved_exclude_keys.append(SampleFields.BOUNDED_SUFFIX_COUNT)
         self._pyg_collater = Collater(
             dataset=cast(Dataset, None),
             follow_batch=follow_batch,
-            exclude_keys=resolved_exclude_keys,
+            exclude_keys=list(exclude_keys or []),
         )
 
     def __call__(self, batch_list: list[Any]) -> RetrievalBatch:
@@ -43,22 +40,6 @@ class RetrievalCollator:
         if batch.question_emb.ndim != 2:
             raise ValueError(
                 f"question_emb must be 2D after collation, got shape {tuple(batch.question_emb.shape)}."
-            )
-
-        bounded_suffix_values = [
-            getattr(sample, SampleFields.BOUNDED_SUFFIX_COUNT, None) for sample in batch_list
-        ]
-        if any(value is not None for value in bounded_suffix_values):
-            if not all(value is not None for value in bounded_suffix_values):
-                raise ValueError(
-                    "bounded_suffix_count must be present for all samples in a batch or none of them."
-                )
-            batch.bounded_suffix_count = torch.cat(
-                [
-                    torch.as_tensor(value, dtype=torch.float32)
-                    for value in bounded_suffix_values
-                ],
-                dim=1,
             )
 
         self._attach_embeddings(batch)

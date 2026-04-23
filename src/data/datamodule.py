@@ -49,7 +49,7 @@ class RetrievalDataModule(LightningDataModule):
         self._train_sample_id_to_index: dict[str, int] = {}
     def prepare_data(self) -> None:
         paths = self.dataset_cfg["paths"]
-        for key in ("entity_metadata", "embeddings"):
+        for key in ("entity_metadata_dir", "embeddings_dir"):
             p = Path(paths[key])
             if not p.exists():
                 raise FileNotFoundError(f"Critical data path missing: {p}")
@@ -66,7 +66,6 @@ class RetrievalDataModule(LightningDataModule):
             "train":    cfg.get("train_split",   "train"),
             "val":      cfg.get("val_split",      "validation"),
             "test":     cfg.get("eval_split",     "test"),
-            "predict":  cfg.get("predict_split",  cfg.get("eval_split", "test")),
         }
         def build(split_name: str) -> RetrievalDataset:
             lmdb_paths = resolve_core_lmdb_paths(emb_dir, split_name)

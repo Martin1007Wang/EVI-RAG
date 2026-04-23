@@ -137,6 +137,9 @@ def encode_preprocessed_features(
         float("nan"),
         dtype=torch.float32,
     )
+    # embedding_id=0 is the reserved non-text sentinel. Keep it finite so old-style
+    # placeholder lookups never inject NaNs into the batch.
+    entity_embeddings[0].zero_()
     entity_embeddings[entity_catalog.text_embedding_ids] = flat_entity_embs
 
     relation_embeddings = encoder.encode(

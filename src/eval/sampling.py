@@ -44,7 +44,7 @@ def run_monte_carlo_sampling(
         # 目前先使用单次采样，后续需要扩展
         rollout_batch = engine.run_exploration(
             policy=policy,
-            base_graph=base_graph,
+            retrieval_batch=base_graph,
             reward_model=reward_model,
             num_rollouts=current_batch,
             temperature=temperature,

@@ -160,12 +160,17 @@ class StarkPrimeAdapter:
         self.dataset_id = dataset
         self.kb_id = kb
         self.local_graph_cfg = _resolve_local_graph_config(stark_cfg.get("local_graph"))
+        if bool(stark_cfg.get("indirected", False)):
+            raise ValueError(
+                "dataset.stark.indirected is not supported: PRIME knowledge graphs "
+                "must preserve directed relations."
+            )
 
         # 资源加载
         self._qa, self._skb = _load_prime_resources(
             stark_cfg.get("root"),
             stark_cfg.get("download_processed", True),
-            stark_cfg.get("indirected", False),
+            False,
         )
 
         # 节点属性归档

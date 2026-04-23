@@ -1,44 +1,27 @@
 # @package _global_
-# Core pipeline invariants and performance defaults.
-
-reuse_embeddings_if_exists: false
 validate_graph_edges: true
-
-path_mode: qa_directed
 dedup_edges: true
 remove_self_loops: true
-target_reachable_pruning: false
+expand_budget: 3
 
-# Preprocess-time sample retention rules before parquet/LMDB materialization.
+# Preprocess-time sample retention rules before LMDB materialization.
 preprocess_filter:
   train:
     skip_no_question_entity: true
     skip_no_ans: false
     skip_no_path: false
+    skip_no_train_target: true
   eval:
     skip_no_question_entity: true
     skip_no_ans: false
     skip_no_path: false
+    skip_no_train_target: false
 
-question_entity_blacklist: []
-question_entity_blacklist_path: null
-
-embeddings_out_dir: ${dataset.materialized_dir}/embeddings
-
+# For *-sub datasets: emit a prepared-sample filter containing only
+# samples with an in-graph answer path.
 emit_sub_filter: true
 sub_filter_filename: sub_filter.json
-teacher_budget_max_steps: 3
 
-
-output_dir: ${dataset.materialized_dir}
-use_precomputed_embeddings: true
-use_precomputed_questions: true
 lmdb_shards: 1
-
 map_size_gb: 128
-map_growth_gb: 32
-map_growth_factor: 1.5
-map_max_gb: null
 overwrite_lmdb: true
-txn_size: 512
-seed: 42

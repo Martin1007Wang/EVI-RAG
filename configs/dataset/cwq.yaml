@@ -8,14 +8,3 @@ name: cwq
 dataset_scope: full
 dataset_family: cwq
 hf_dataset: rmanluo/RoG-cwq
-
-question_entity_blacklist:
-  - Country
-  - US State
-  - College/University
-  - UK constituent country
-  - Film
-  - Male
-  - Marriage
-  - United States Senator
-  - United States Senate

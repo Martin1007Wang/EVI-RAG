@@ -40,7 +40,35 @@ def serialize_sample(sample: Dict[str, torch.Tensor]) -> bytes:
             raise TypeError(
                 f"LMDB sample field {key!r} must be a torch.Tensor, got {type(value)!r}."
             )
-    return save(sample)
+    return save(_clone_shared_storage_tensors(sample))
+
+
+def _clone_shared_storage_tensors(
+    sample: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Detach later tensor aliases so safetensors can serialize the payload."""
+    detached: Dict[str, torch.Tensor] = {}
+    seen_storage_keys: set[tuple[str, Optional[int], int]] = set()
+
+    for key, value in sample.items():
+        storage_key = _tensor_storage_key(value)
+        if storage_key is not None and storage_key in seen_storage_keys:
+            detached[key] = value.clone()
+            continue
+
+        detached[key] = value
+        if storage_key is not None:
+            seen_storage_keys.add(storage_key)
+
+    return detached
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> Optional[tuple[str, Optional[int], int]]:
+    if tensor.numel() == 0:
+        return None
+
+    storage = tensor.untyped_storage()
+    return (tensor.device.type, tensor.device.index, int(storage.data_ptr()))
 
 
 # ------------------------------------------------------------------ #
