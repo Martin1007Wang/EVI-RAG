@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-from .metrics import (
-    UnionSubgraphMasks,
-    compute_union_subgraph_masks,
-    compute_distribution_expectations,
+from src.eval.compactness import compute_compactness_expectations
+from src.eval.diversity import (
     compute_exploration_diversity,
-    compute_high_reward_discovery,
+    compute_exploration_diversity_at_ks,
 )
-from .sampling import run_monte_carlo_sampling, run_early_stop_sampling
+from src.eval.groups import MetricDict, MetricGroups, flatten_metric_groups
+from src.eval.node_retrieval import (
+    compute_best_of_k_node_retrieval_quality,
+    compute_expected_node_retrieval_quality,
+    compute_node_retrieval_matrix,
+    compute_sample_retrieval_metrics,
+)
 
 __all__ = [
-    "UnionSubgraphMasks",
-    "compute_union_subgraph_masks",
-    "compute_distribution_expectations",
-    "compute_high_reward_discovery",
+    "MetricDict",
+    "MetricGroups",
+    "compute_best_of_k_node_retrieval_quality",
+    "compute_compactness_expectations",
+    "compute_expected_node_retrieval_quality",
     "compute_exploration_diversity",
-    "run_monte_carlo_sampling",
-    "run_early_stop_sampling",
+    "compute_exploration_diversity_at_ks",
+    "compute_node_retrieval_matrix",
+    "compute_sample_retrieval_metrics",
+    "flatten_metric_groups",
 ]

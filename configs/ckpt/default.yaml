@@ -1,6 +1,6 @@
-# Default checkpoint references.
-#
-# This config exists to satisfy Hydra's `ckpt: default` group and to
-# centralize checkpoint paths for evaluation runs.
+# @package ckpt
 
-gflownet: null
+fit: null
+path: null
+pretrained: null
+strict_pretrained_load: false

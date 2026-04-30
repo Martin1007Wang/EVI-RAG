@@ -1,150 +1,293 @@
 from __future__ import annotations
-
 from typing import FrozenSet
+import torch
 
 
 class SampleFields:
-    """LMDB 存储字段与 PyG 批字段的唯一来源。"""
-
-    EDGE_INDEX = "edge_index"
-    EDGE_RELATION_IDS_GLOBAL = "edge_relation_ids_global"
-    NODE_ENTITY_IDS_GLOBAL = "node_entity_ids_global"
-    NUM_NODES = "num_nodes"
-
-    QUESTION_EMB = "question_emb"
-    QUESTION_TEXT = "question"
-
-    IS_ANCHOR_MASK = "is_anchor_mask"
-    TRAIN_TARGET_MASK = "train_target_mask"
-    ANCHOR_SIGNED_DISTANCE = "anchor_signed_distance"
-    ANSWER_ENTITY_IDS_GLOBAL = "answer_entity_ids_global"
-    TRAIN_TARGET_NODE_IDS = "train_target_node_ids"
-    TARGET_NODE_DISTANCE_FLAT = "target_node_distance_flat"
-    TARGET_SHORTEST_PATH_COUNT_FLAT = "target_shortest_path_count_flat"
-    TARGET_SHORTEST_PATH_EDGE_MASK_FLAT = "target_shortest_path_edge_mask_flat"
-    shortest_path_edge_mask = "shortest_path_edge_mask"
-    NODE_TO_TARGET_DISTANCE = "node_to_target_distance"
-    shortest_path_count = "shortest_path_count"
-    MIN_TARGET_DIST = "min_target_dist"
-    MAX_PATH_LENGTH = "max_path_length"
-
-    NODE_TOKENS = "node_tokens"
-    RELATION_TOKENS = "relation_tokens"
-    IS_CVT = "is_cvt"
-    HEURISTIC_LOG_V = "heuristic_log_v"
-
-    EDGE_ATTR = EDGE_RELATION_IDS_GLOBAL
-    NODE_ENTITY_IDS = NODE_ENTITY_IDS_GLOBAL
-    ANSWER_IDS = ANSWER_ENTITY_IDS_GLOBAL
-
+    EDGE_INDEX = "edge_index"  # LongTensor [2, num_edges]
+    NODE_ENTITY_CATALOG_IDS = "node_entity_catalog_ids"  # LongTensor [num_nodes]
+    EDGE_RELATION_CATALOG_IDS = "edge_relation_catalog_ids"  # LongTensor [num_edges]
+    NUM_NODES = "num_nodes"  # scalar LongTensor
+    NUM_EDGES = "num_edges"  # scalar LongTensor
+    QUESTION_EMB = "question_emb"  # FloatTensor [hidden_dim]
+    ANCHOR_NODE_IDS = "anchor_node_ids"  # LongTensor [num_anchors]
+    TARGET_NODE_IDS = "target_node_ids"  # LongTensor [num_answers_in_graph]
+    REACHABLE_TARGET_NODE_IDS = (
+        "reachable_target_node_ids"  # LongTensor [num_reachable_targets]
+    )
+    ANCHOR_NODE_FORWARD_DISTANCE_FLAT = (
+        "anchor_node_forward_distances_flat"  # LongTensor [num_nodes]
+    )
+    ANCHOR_NODE_BACKWARD_DISTANCE_FLAT = (
+        "anchor_node_backward_distances_flat"  # LongTensor [num_nodes]
+    )
+    NODE_TARGET_DISTANCE = "node_target_distance"  # LongTensor [num_nodes]
+    TARGET_NODE_DISTANCE_FLAT = (
+        "target_node_distances_flat"  # LongTensor [T * num_nodes]
+    )
+    TARGET_SHORTEST_PATH_COUNT_FLAT = (
+        "target_shortest_path_count_flat"  # FloatTensor [T * num_nodes]
+    )
+    TARGET_SHORTEST_PATH_EDGE_MASK_FLAT = (
+        "target_shortest_path_edge_mask_flat"  # BoolTensor [T * num_edges]
+    )
+    NODE_ID_KEYS: FrozenSet[str] = frozenset(
+        {
+            ANCHOR_NODE_IDS,
+            TARGET_NODE_IDS,
+            REACHABLE_TARGET_NODE_IDS,
+        }
+    )
     NO_INCREMENT_KEYS: FrozenSet[str] = frozenset(
         {
-            NODE_ENTITY_IDS_GLOBAL,
-            ANSWER_ENTITY_IDS_GLOBAL,
-            EDGE_RELATION_IDS_GLOBAL,
-            IS_ANCHOR_MASK,
-            TRAIN_TARGET_MASK,
+            NODE_ENTITY_CATALOG_IDS,
+            EDGE_RELATION_CATALOG_IDS,
+            NUM_NODES,
+            NUM_EDGES,
+            QUESTION_EMB,
+            ANCHOR_NODE_FORWARD_DISTANCE_FLAT,
+            ANCHOR_NODE_BACKWARD_DISTANCE_FLAT,
+            NODE_TARGET_DISTANCE,
             TARGET_NODE_DISTANCE_FLAT,
             TARGET_SHORTEST_PATH_COUNT_FLAT,
             TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
-            shortest_path_edge_mask,
-            NODE_TO_TARGET_DISTANCE,
-            shortest_path_count,
-            MIN_TARGET_DIST,
-            MAX_PATH_LENGTH,
         }
     )
-
     STORAGE_REQUIRED: FrozenSet[str] = frozenset(
         {
             EDGE_INDEX,
-            NODE_ENTITY_IDS_GLOBAL,
-            EDGE_RELATION_IDS_GLOBAL,
-            QUESTION_EMB,
-            IS_ANCHOR_MASK,
-            TRAIN_TARGET_MASK,
-            ANCHOR_SIGNED_DISTANCE,
-            ANSWER_ENTITY_IDS_GLOBAL,
+            NODE_ENTITY_CATALOG_IDS,
+            EDGE_RELATION_CATALOG_IDS,
             NUM_NODES,
-        }
-    )
-
-    STORAGE_OPTIONAL: FrozenSet[str] = frozenset(
-        {
-            TRAIN_TARGET_MASK,
-            TRAIN_TARGET_NODE_IDS,
-            MIN_TARGET_DIST,
-            shortest_path_edge_mask,
-            NODE_TO_TARGET_DISTANCE,
-            shortest_path_count,
-            MAX_PATH_LENGTH,
+            NUM_EDGES,
+            QUESTION_EMB,
+            ANCHOR_NODE_IDS,
+            TARGET_NODE_IDS,
+            REACHABLE_TARGET_NODE_IDS,
+            ANCHOR_NODE_FORWARD_DISTANCE_FLAT,
+            ANCHOR_NODE_BACKWARD_DISTANCE_FLAT,
+            NODE_TARGET_DISTANCE,
             TARGET_NODE_DISTANCE_FLAT,
             TARGET_SHORTEST_PATH_COUNT_FLAT,
             TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
         }
     )
-
-    STORAGE_ALLOWED: FrozenSet[str] = STORAGE_REQUIRED | STORAGE_OPTIONAL
+    STORAGE_ALLOWED: FrozenSet[str] = STORAGE_REQUIRED
 
 
 class StorageSchema:
     @staticmethod
-    def validate(data: dict) -> None:
+    def validate(data: dict[str, torch.Tensor]) -> None:
         missing = SampleFields.STORAGE_REQUIRED - data.keys()
         if missing:
-            raise KeyError(f"LMDB sample missing required keys: {sorted(missing)}")
-
+            raise KeyError(f"Missing required keys: {sorted(missing)}")
         unexpected = data.keys() - SampleFields.STORAGE_ALLOWED
         if unexpected:
-            raise KeyError(f"LMDB sample has unexpected keys: {sorted(unexpected)}")
-
-        edge_index = data[SampleFields.EDGE_INDEX]
-        if (
-            not hasattr(edge_index, "shape")
-            or edge_index.ndim != 2
-            or edge_index.shape[0] != 2
-        ):
+            raise KeyError(f"Unexpected keys: {sorted(unexpected)}")
+        edge_index = _require_tensor(
+            data[SampleFields.EDGE_INDEX],
+            name=SampleFields.EDGE_INDEX,
+            ndim=2,
+            dtype=torch.long,
+        )
+        if edge_index.shape[0] != 2:
             raise ValueError(
-                f"{SampleFields.EDGE_INDEX} must have shape [2, E], got {getattr(edge_index, 'shape', None)}"
+                f"{SampleFields.EDGE_INDEX} must have shape [2, num_edges], "
+                f"got {tuple(edge_index.shape)}"
             )
-
-        num_nodes = int(data[SampleFields.NUM_NODES])
-        node_ids = data[SampleFields.NODE_ENTITY_IDS_GLOBAL]
-        if hasattr(node_ids, "shape") and node_ids.shape[0] != num_nodes:
+        num_nodes = _scalar_int(
+            data[SampleFields.NUM_NODES],
+            name=SampleFields.NUM_NODES,
+        )
+        num_edges = _scalar_int(
+            data[SampleFields.NUM_EDGES],
+            name=SampleFields.NUM_EDGES,
+        )
+        if num_nodes <= 0:
+            raise ValueError(f"{SampleFields.NUM_NODES} must be positive")
+        if num_edges <= 0:
+            raise ValueError(f"{SampleFields.NUM_EDGES} must be positive")
+        if int(edge_index.shape[1]) != num_edges:
             raise ValueError(
-                f"{SampleFields.NODE_ENTITY_IDS_GLOBAL} length must match num_nodes: "
-                f"{node_ids.shape[0]} != {num_nodes}"
+                f"{SampleFields.EDGE_INDEX} edge count mismatch: "
+                f"{int(edge_index.shape[1])} != {num_edges}"
             )
+        _require_1d_length(
+            data[SampleFields.NODE_ENTITY_CATALOG_IDS],
+            name=SampleFields.NODE_ENTITY_CATALOG_IDS,
+            length=num_nodes,
+            dtype=torch.long,
+        )
+        _require_1d_length(
+            data[SampleFields.EDGE_RELATION_CATALOG_IDS],
+            name=SampleFields.EDGE_RELATION_CATALOG_IDS,
+            length=num_edges,
+            dtype=torch.long,
+        )
+        _require_tensor(
+            data[SampleFields.QUESTION_EMB],
+            name=SampleFields.QUESTION_EMB,
+            ndim=1,
+            dtype=torch.float32,
+        )
+        anchor_node_ids = _require_1d(
+            data[SampleFields.ANCHOR_NODE_IDS],
+            name=SampleFields.ANCHOR_NODE_IDS,
+            dtype=torch.long,
+        )
+        target_node_ids = _require_1d(
+            data[SampleFields.TARGET_NODE_IDS],
+            name=SampleFields.TARGET_NODE_IDS,
+            dtype=torch.long,
+        )
+        reachable_target_node_ids = _require_1d(
+            data[SampleFields.REACHABLE_TARGET_NODE_IDS],
+            name=SampleFields.REACHABLE_TARGET_NODE_IDS,
+            dtype=torch.long,
+        )
+        _require_1d_length(
+            data[SampleFields.ANCHOR_NODE_FORWARD_DISTANCE_FLAT],
+            name=SampleFields.ANCHOR_NODE_FORWARD_DISTANCE_FLAT,
+            length=num_nodes,
+            dtype=torch.long,
+        )
+        _require_1d_length(
+            data[SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT],
+            name=SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT,
+            length=num_nodes,
+            dtype=torch.long,
+        )
+        _require_1d_length(
+            data[SampleFields.NODE_TARGET_DISTANCE],
+            name=SampleFields.NODE_TARGET_DISTANCE,
+            length=num_nodes,
+            dtype=torch.long,
+        )
+        num_reachable_targets = int(reachable_target_node_ids.numel())
+        _require_1d_length(
+            data[SampleFields.TARGET_NODE_DISTANCE_FLAT],
+            name=SampleFields.TARGET_NODE_DISTANCE_FLAT,
+            length=num_reachable_targets * num_nodes,
+            dtype=torch.long,
+        )
+        _require_1d_length(
+            data[SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT],
+            name=SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT,
+            length=num_reachable_targets * num_nodes,
+            dtype=torch.float32,
+        )
+        _require_1d_length(
+            data[SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT],
+            name=SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
+            length=num_reachable_targets * num_edges,
+            dtype=torch.bool,
+        )
+        _validate_node_ids(
+            anchor_node_ids,
+            name=SampleFields.ANCHOR_NODE_IDS,
+            num_nodes=num_nodes,
+        )
+        _validate_node_ids(
+            target_node_ids,
+            name=SampleFields.TARGET_NODE_IDS,
+            num_nodes=num_nodes,
+        )
+        _validate_node_ids(
+            reachable_target_node_ids,
+            name=SampleFields.REACHABLE_TARGET_NODE_IDS,
+            num_nodes=num_nodes,
+        )
+        _validate_subset(
+            subset=reachable_target_node_ids,
+            superset=target_node_ids,
+            subset_name=SampleFields.REACHABLE_TARGET_NODE_IDS,
+            superset_name=SampleFields.TARGET_NODE_IDS,
+        )
 
-        anchor_mask = data[SampleFields.IS_ANCHOR_MASK]
-        train_target_mask = data[SampleFields.TRAIN_TARGET_MASK]
-        for name, value in (
-            (SampleFields.IS_ANCHOR_MASK, anchor_mask),
-            (SampleFields.TRAIN_TARGET_MASK, train_target_mask),
-        ):
-            if value is not None and hasattr(value, "ndim") and value.ndim != 1:
-                raise ValueError(
-                    f"{name} must be 1D, got shape {getattr(value, 'shape', None)}"
-                )
 
-        question_emb = data[SampleFields.QUESTION_EMB]
-        if hasattr(question_emb, "ndim") and question_emb.ndim != 1:
+def _require_tensor(
+    value: object,
+    *,
+    name: str,
+    ndim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    if value.ndim != ndim:
+        raise ValueError(f"{name} must be {ndim}D, got shape {tuple(value.shape)}")
+    if value.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {value.dtype}")
+    return value
+
+
+def _require_1d(
+    value: object,
+    *,
+    name: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return _require_tensor(value, name=name, ndim=1, dtype=dtype)
+
+
+def _require_1d_length(
+    value: object,
+    *,
+    name: str,
+    length: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    tensor = _require_1d(value, name=name, dtype=dtype)
+    if int(tensor.numel()) != length:
+        raise ValueError(f"{name} length mismatch: {int(tensor.numel())} != {length}")
+    return tensor
+
+
+def _scalar_int(value: object, *, name: str) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0:
             raise ValueError(
-                f"{SampleFields.QUESTION_EMB} must be 1D, got shape {getattr(question_emb, 'shape', None)}"
+                f"{name} must be a scalar tensor, got {tuple(value.shape)}"
             )
+        if value.dtype != torch.long:
+            raise TypeError(f"{name} must have dtype torch.long, got {value.dtype}")
+        return int(value.item())
+    if isinstance(value, int):
+        return value
+    raise TypeError(
+        f"{name} must be an int or scalar LongTensor, got {type(value).__name__}"
+    )
 
-        for name in (
-            SampleFields.TRAIN_TARGET_MASK,
-            SampleFields.TRAIN_TARGET_NODE_IDS,
-            SampleFields.TARGET_NODE_DISTANCE_FLAT,
-            SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT,
-            SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
-            SampleFields.shortest_path_edge_mask,
-            SampleFields.NODE_TO_TARGET_DISTANCE,
-            SampleFields.shortest_path_count,
-        ):
-            value = data.get(name)
-            if value is not None and hasattr(value, "ndim") and value.ndim != 1:
-                raise ValueError(
-                    f"{name} must be 1D, got shape {getattr(value, 'shape', None)}"
-                )
+
+def _validate_node_ids(
+    value: torch.Tensor,
+    *,
+    name: str,
+    num_nodes: int,
+) -> None:
+    if value.numel() == 0:
+        return
+    min_id = int(value.min().item())
+    max_id = int(value.max().item())
+    if min_id < 0 or max_id >= num_nodes:
+        raise ValueError(f"{name} contains node ids outside [0, {num_nodes})")
+
+
+def _validate_subset(
+    *,
+    subset: torch.Tensor,
+    superset: torch.Tensor,
+    subset_name: str,
+    superset_name: str,
+) -> None:
+    if subset.numel() == 0:
+        return
+    superset_values = set(int(x) for x in superset.view(-1).tolist())
+    missing = [
+        int(x) for x in subset.view(-1).tolist() if int(x) not in superset_values
+    ]
+    if missing:
+        raise ValueError(
+            f"{subset_name} must be a subset of {superset_name}; "
+            f"missing values: {sorted(set(missing))}"
+        )

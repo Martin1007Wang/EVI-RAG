@@ -8,7 +8,7 @@ from lightning.pytorch.callbacks import Callback
 from src.utils.logging_utils import log_metric
 
 if TYPE_CHECKING:
-    from src.models.modules.heads import ExpandEdgeScorer
+    from src.weaver.nn.edge_scorer import ExpandEdgeScorer
 
 
 class PriorWeightMonitor(Callback):

@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - override /dataset: webqsp
+  - override /model: weaver
+  - override /trainer: gpu
+  - override /callbacks: eval
+  - override /logger: wandb
+  - _self_
+
+task_name: debug_valfit
+
+dataset:
+  splits:
+    train: validation
+    validation: validation
+    test: validation

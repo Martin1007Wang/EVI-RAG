@@ -1,0 +1,22 @@
+# @package callbacks
+
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.ckpt_dir}
+  filename: "epoch_{epoch:03d}-step_{step:07d}"
+  monitor: val/sample/expected_recall
+  mode: max
+  save_top_k: 3
+  save_last: true
+
+learning_rate_monitor:
+  _target_: lightning.pytorch.callbacks.LearningRateMonitor
+  logging_interval: step
+
+early_stopping:
+  _target_: lightning.pytorch.callbacks.EarlyStopping
+  monitor: val/sample/expected_recall
+  mode: max
+  patience: 10
+  min_delta: 0.0
+  strict: true

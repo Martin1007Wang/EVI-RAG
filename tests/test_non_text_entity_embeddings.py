@@ -58,9 +58,9 @@ if "torch_scatter" not in sys.modules:
     torch_scatter_stub.scatter_max = _scatter_max
     sys.modules["torch_scatter"] = torch_scatter_stub
 
-from src.data.preprocess_steps.samples import PreparedSample, RawSample
-from src.data.preprocess_steps.text_encode import encode_preprocessed_features
-from src.data.preprocess_steps.vocab import EntityVocab, RelationVocab
+from src.data.preprocess.samples import PreparedSample, RawSample
+from src.data.preprocess.text_encode import encode_preprocessed_features
+from src.data.preprocess.vocab import EntityVocab, RelationVocab
 from src.data.retrieval.embedding_store import EmbeddingStore
 
 
@@ -94,7 +94,7 @@ def test_encode_preprocessed_features_keeps_non_text_sentinel_finite(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(
-        "src.data.preprocess_steps.text_encode.TextEncoder", _DummyTextEncoder
+        "src.data.preprocess.text_encode.TextEncoder", _DummyTextEncoder
     )
 
     entity_vocab = EntityVocab(
@@ -167,7 +167,7 @@ def test_embedding_store_masks_legacy_nan_non_text_rows(tmp_path: Path) -> None:
 
 
 def test_reward_model_zero_f1_edge_bonus_ignores_root_edges() -> None:
-    from src.models.reward import RewardModel
+    from src.weaver.reward import RewardModel
 
     reward_model = RewardModel(log_r_min=-5.0, zero_f1_edge_bonus_scale=1.0)
     retrieval_batch = types.SimpleNamespace(
@@ -190,7 +190,7 @@ def test_reward_model_zero_f1_edge_bonus_ignores_root_edges() -> None:
 
 
 def test_reward_model_zero_f1_edge_bonus_uses_best_selected_non_root_edge() -> None:
-    from src.models.reward import RewardModel
+    from src.weaver.reward import RewardModel
 
     reward_model = RewardModel(log_r_min=-5.0, zero_f1_edge_bonus_scale=0.5)
     retrieval_batch = types.SimpleNamespace(
@@ -216,7 +216,7 @@ def test_reward_model_zero_f1_edge_bonus_uses_best_selected_non_root_edge() -> N
 
 
 def test_reward_model_positive_f1_does_not_use_zero_f1_edge_bonus() -> None:
-    from src.models.reward import RewardModel
+    from src.weaver.reward import RewardModel
 
     reward_model = RewardModel(log_r_min=-5.0, zero_f1_edge_bonus_scale=1.0)
     retrieval_batch = types.SimpleNamespace(
@@ -240,7 +240,7 @@ def test_reward_model_positive_f1_does_not_use_zero_f1_edge_bonus() -> None:
 
 
 def test_reward_model_uses_train_target_mask() -> None:
-    from src.models.reward import RewardModel
+    from src.weaver.reward import RewardModel
 
     reward_model = RewardModel(log_r_min=-5.0, zero_f1_edge_bonus_scale=0.0)
     retrieval_batch = types.SimpleNamespace(

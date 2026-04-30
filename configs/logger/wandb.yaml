@@ -1,13 +1,13 @@
-# https://wandb.ai
+# @package logger
 
 _target_: lightning.pytorch.loggers.wandb.WandbLogger
-name: ${run_name}
-save_dir: "${paths.output_dir}"
-offline: False
+project: evi-rag
+name: ${task_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+save_dir: ${paths.log_dir}
+offline: false
 id: null
 anonymous: null
-project: ${oc.env:WANDB_PROJECT, "your_project_name"}
-log_model: False
+log_model: false
 prefix: ""
 entity: ${oc.env:WANDB_ENTITY, null}
 group: ""

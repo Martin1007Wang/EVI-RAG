@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - paths: default
+  - hydra: default
+  - dataset: webqsp
+  - datamodule: default
+  - model: weaver
+  - eval_metric: default
+  - trainer: gpu
+  - callbacks: eval
+  - logger: wandb
+  - ckpt: default
+  - _self_
+  - experiment: null
+
+task_name: evaluate
+seed: 42
+print_config: false
+
+validate: true
+test: true
+
+trainer:
+  enable_checkpointing: false
+
+ckpt_path: ${ckpt.path}

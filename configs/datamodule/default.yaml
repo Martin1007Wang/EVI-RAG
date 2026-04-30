@@ -1,0 +1,19 @@
+# @package datamodule
+
+_target_: src.data.datamodule.RetrievalDataModule
+
+dataset_cfg: ${dataset}
+
+batch_size: 8
+num_workers: 8
+
+eval_batch_size: 8
+eval_num_workers: 8
+
+pin_memory: true
+train_shuffle: true
+drop_last: false
+eval_drop_last: false
+
+lmdb_readahead: true
+max_readers: 256

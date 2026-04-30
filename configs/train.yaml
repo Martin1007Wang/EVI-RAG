@@ -1,16 +1,30 @@
 # @package _global_
 
 defaults:
-  - _self_
-  - dataset: null
-  - data: datamodule
-  - model: gflownet
-  - callbacks: default
-  - logger: wandb
-  - trainer: default
   - paths: default
   - hydra: default
-  - experiment: null 
+  - dataset: webqsp
+  - datamodule: default
+  - model: weaver
+  - eval_metric: default
+  - optimizer: adamw
+  - scheduler: cosine_warmup
+  - trainer: gpu
+  - callbacks: train
+  - logger: wandb
+  - ckpt: default
+  - _self_
+  - experiment: null
 
+task_name: train
 seed: 42
-detect_anomaly: false
+print_config: false
+test_after_fit: false
+
+model:
+  optimizer_cfg: ${optimizer}
+  scheduler_cfg: ${scheduler}
+
+fit_ckpt_path: ${ckpt.fit}
+pretrained_ckpt_path: ${ckpt.pretrained}
+strict_pretrained_load: ${ckpt.strict_pretrained_load}

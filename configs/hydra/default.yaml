@@ -1,23 +1,20 @@
-# https://hydra.cc/docs/configure_hydra/intro/
+# @package hydra
 
-# Use built-in Hydra logging configs so train/eval compose works even when the
-# optional colorlog plugin is not installed in the current environment.
 defaults:
   - override hydra_logging: default
   - override job_logging: default
 
-# output directory, generated dynamically on each run
-# Uses: experiment name + dataset name
 run:
-  dir: ${paths.log_dir}/runs/${oc.select:hydra.runtime.choices.experiment,train}_${oc.select:hydra.runtime.choices.dataset,${oc.select:dataset.name,unknown}}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  dir: ${paths.run_dir}
+
 sweep:
-  dir: ${paths.log_dir}/multiruns/${oc.select:hydra.runtime.choices.experiment,train}_${oc.select:hydra.runtime.choices.dataset,${oc.select:dataset.name,unknown}}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  dir: ${paths.output_dir}/multirun/${task_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   subdir: ${hydra.job.num}
+
+job:
+  chdir: false
 
 job_logging:
   handlers:
     file:
-      # Incorporates fix from https://github.com/facebookresearch/hydra/pull/2242
-      # NOTE: `task_name` may contain `/` (e.g., "eval/rankflow"), which would be interpreted as a subdirectory
-      # and crash unless we pre-create it. Use a safe filename; the run directory already encodes the experiment.
       filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log

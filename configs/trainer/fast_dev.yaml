@@ -1,0 +1,14 @@
+# @package trainer
+
+_target_: lightning.pytorch.trainer.Trainer
+
+default_root_dir: ${paths.output_dir}
+accelerator: auto
+devices: 1
+precision: 32-true
+
+fast_dev_run: true
+use_distributed_sampler: false
+enable_checkpointing: false
+enable_progress_bar: true
+detect_anomaly: true

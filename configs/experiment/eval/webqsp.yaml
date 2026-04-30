@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - override /dataset: webqsp
+  - override /model: weaver
+  - override /trainer: gpu
+  - override /logger: wandb
+  - _self_
+
+task_name: eval_webqsp
+
+logger:
+  tags: [weaver, eval, webqsp]

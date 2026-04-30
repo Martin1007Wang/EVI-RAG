@@ -1,0 +1,102 @@
+# @package model
+
+_target_: src.weaver.module.WeaverModule
+
+policy_cfg:
+  hidden_dim: 1024
+  state_readout_dropout: 0.0
+
+  feature_encoder:
+    embedding_dim: 1024
+    anchor_distance_max: 3
+    non_text_init_std: 0.02
+    normalize: true
+
+  stop_scorer:
+    use_frontier_summary: true
+    detach_frontier_summary: true
+    stop_bias_init: 0.0
+    expand_bias_init: 0.0
+    dropout: 0.0
+    trainable_bias: true
+
+  edge_scorer:
+    use_residual: true
+    entity_weight_init: 0.1
+    logit_scale_init: 5.0
+    residual_scale_init: 0.05
+    residual_dropout: 0.0
+    trainable_scales: true
+
+  flow_head:
+    num_layers: 1
+    dropout: 0.0
+    zero_init: true
+
+rollout_cfg:
+  expand_budget: 3
+  train_num_rollout: 8
+  eval_num_rollout: 8
+  train_chunk_size: null
+  eval_chunk_size: null
+
+eval_cfg: ${eval_metric}
+
+schedule_cfg:
+  temperature: 1.0
+  eval_temperature: 1.0
+
+  temperature_cfg:
+    temperature_start: 1.0
+    temperature_end: 1.0
+    temperature_warmup_steps: 1
+
+reward_cfg:
+  utility_epsilon: 1.0e-4
+  log_reward_clip_min: -30.0
+  answer_weight: 0.7
+  minimality_tolerance: 0.02
+  edge_cost: 0.03
+  minimality_gap_cost: 0.15
+  zero_utility_minimality: true
+  debug_checks: false
+
+loss_cfg:
+  max_trajectory_len: null
+
+  # Main GFlowNet objective.
+  subtb_lambda: 0.9
+
+  # Stop terminal-edge balance.
+  stop_tb_coef: 0.1
+  stop_tb_positive_only: false
+
+  # VIGOR: reward-improvement local transition regularization.
+  advantage_aux_coef_start: 1.0
+  advantage_aux_coef_end: 0.05
+  advantage_aux_anneal_steps: 3000
+  advantage_teacher_temperature: 0.15
+
+  # Candidate pool for local reward-gain teacher.
+  advantage_top_k: 32
+  advantage_topk_prior: 16
+  advantage_topk_final: 16
+  advantage_random_k: 8
+
+diagnostic_cfg:
+  train_rollout_diagnostics: false
+  train_rollout_diagnostics_interval: 0
+  train_stop_counterfactual: true
+  train_policy_diagnostics: false
+  train_validate_rollout_depth: false
+
+  eval_stop_counterfactual: true
+  eval_validate_rollout_depth: false
+
+  grad_norm_interval: 0
+
+optimizer_cfg: ${optimizer}
+scheduler_cfg: ${scheduler}
+
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm

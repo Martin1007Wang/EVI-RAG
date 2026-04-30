@@ -30,7 +30,7 @@ setup(
     entry_points={
         "console_scripts": [
             "train_command = src.train:main",
-            "eval_command = src.eval:main",
+            "evaluate_command = src.evaluate:main",
             "preprocess_command = src.preprocess:main",
         ]
     },

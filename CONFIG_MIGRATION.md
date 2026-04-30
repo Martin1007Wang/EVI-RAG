@@ -125,26 +125,24 @@ def __init__(
 
 **旧版:**
 ```bash
-python src/train.py experiment=train_rankflow dataset=webqsp-sub
+python src/train.py experiment=train/webqsp_baseline
 ```
 
 **新版:**
 ```bash
-# 命令不变，但内部使用新的扁平化配置
-python src/train.py experiment=train_rankflow dataset=webqsp-sub
+python src/train.py experiment=train/webqsp_baseline
 ```
 
 ### 步骤2：更新评估命令
 
 **旧版:**
 ```bash
-python src/eval.py experiment=eval_rankflow ckpt.gflownet=/path/to/model.ckpt
+python src/evaluate.py experiment=eval/webqsp ckpt.path=/path/to/model.ckpt
 ```
 
 **新版:**
 ```bash
-# 命令不变，但评估使用新的双速系统
-python src/eval.py experiment=eval_rankflow ckpt.gflownet=/path/to/model.ckpt
+python src/evaluate.py experiment=eval/webqsp ckpt.path=/path/to/model.ckpt
 ```
 
 ### 步骤3：自定义配置

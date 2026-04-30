@@ -83,18 +83,19 @@ F1 over all answer nodes
 这些量被 materialize 到 RetrievalBatch。见 src/data/preprocess_steps/materialize.py:167-191、src/data/schema/batch.py:10-38。
 MDP 定义
 状态：
-s_t = (V_t, E_t, t)
+s_t = (V(E_t), E_t)
 其中：
-- V_t 是当前 active nodes
 - E_t 是当前 active edges
+- V(E_t) = A ∪ {u, v : (u, r, v) ∈ E_t}
+- rollout depth / budget feature 由 |E_t \ E_0| 派生，不是独立状态分量
 - 初始状态 s_0：
-  - V_0 = A
   - E_0 = anchor-induced edges
+  - V(E_0) 由 anchors 与 root edges 共同确定
 见 src/models/state.py:17-42
 动作有两类：
 a_t ∈ { expand(e), stop }
 其中 expand(e) 只允许选 frontier edge：
-Frontier(s_t) = { e ∈ E \ E_t : 至少有一个端点在 V_t 中 }
+Frontier(s_t) = { e ∈ E \ E_t : 至少有一个端点在 V(E_t) 中 }
 见 src/models/policy.py:411-418。
 转移：
 expand(e=(u,v)):
@@ -142,6 +143,7 @@ actor  看 frontier-aware 通道
 损失函数推导
 设一条轨迹为：
 s_0 --a_0--> s_1 --a_1--> ... --a_{L-2}--> s_{L-1} --stop--> x
+这里 rollout 明确保留 trajectory 作为训练载体，但每个 s_t 都是 canonical subgraph state，而不是把 history 本身塞进状态定义里。
 注意这里：
 - L = traj_len
 - traj_len 包含最后的 stop 动作

@@ -1,0 +1,27 @@
+# @package preprocess
+
+dedup_edges: true
+remove_self_loops: true
+
+preprocess_filter:
+  train:
+    require_answer_in_graph: true
+    require_reachable_answer: true
+  validation:
+    require_answer_in_graph: true
+    require_reachable_answer: true
+  test:
+    require_answer_in_graph: false
+    require_reachable_answer: false
+
+map_size_gb: 128
+overwrite_lmdb: true
+progress_bar: true
+
+encoder:
+  model_name: BAAI/bge-large-en-v1.5
+  device: auto
+  batch_size: 512
+
+hf_env:
+  cache_dir: ${paths.hf_datasets_cache}

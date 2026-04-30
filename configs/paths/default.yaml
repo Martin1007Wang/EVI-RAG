@@ -1,24 +1,15 @@
-# path to root directory.
-# Prefer PROJECT_ROOT exported by rootutils (entrypoints call rootutils.setup_root before Hydra composes configs).
-# Fall back to PWD for compose-only contexts (e.g., pytest that loads configs without running entrypoints).
+# @package paths
+
 root_dir: ${oc.env:PROJECT_ROOT,${oc.env:PWD}}
+data_dir: ${oc.env:DATA_DIR,${paths.root_dir}/data}
+output_dir: ${paths.root_dir}/outputs
 
-# path to data directory (absolute to avoid ambiguity)
-# data_dir: ${oc.env:EVI_RAG_DATA_DIR,${paths.root_dir}/data}
-data_dir: /mnt/data/retrieval
+run_dir: ${paths.output_dir}/${task_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+log_dir: ${paths.run_dir}/logs
+ckpt_dir: ${paths.run_dir}/checkpoints
+artifact_dir: ${paths.run_dir}/artifacts
 
-# huggingface cache root (datasets expects ${paths.hf_home}/datasets)
-# hf_home: ${oc.env:HF_HOME,${paths.root_dir}/.cache/huggingface}
-hf_home: /mnt/data/huggingface
-hf_datasets_cache: ${paths.hf_home}/datasets
-
-# path to logging directory
-log_dir: ${paths.root_dir}/logs/
-
-# path to output directory, created dynamically by hydra
-# path generation pattern is specified in `configs/hydra/default.yaml`
-# use it to store all files generated during the run, like ckpts and metrics
-output_dir: ${hydra:runtime.output_dir}
-
-# path to working directory
+hf_home: ${oc.env:HF_HOME,${paths.root_dir}/.cache/huggingface}
+hf_datasets_cache: ${oc.env:HF_DATASETS_CACHE,${paths.hf_home}/datasets}
+cache_dir: ${paths.hf_home}
 work_dir: ${hydra:runtime.cwd}

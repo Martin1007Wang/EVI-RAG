@@ -7,7 +7,7 @@ If repo behavior and this file disagree, follow the source files and update this
 ## Scope and rule files
 
 - Repository type: Python ML/research codebase built around Hydra, Lightning, PyTorch, and pytest.
-- Main runtime entrypoints live in `src/train.py`, `src/eval.py`, `src/preprocess.py`, and `src/datasets/build_edge_retrieval_labels.py`.
+- Main runtime entrypoints live in `src/train.py`, `src/evaluate.py`, `src/preprocess.py`, and `src/datasets/build_edge_retrieval_labels.py`.
 - Config composition is centralized in `configs/`.
 - Tests live in `tests/` and `tests/answer_reachability/`.
 - No existing top-level `AGENTS.md`, `.cursorrules`, `.cursor/rules/`, or `.github/copilot-instructions.md` were found when this file was created.
@@ -21,7 +21,7 @@ If repo behavior and this file disagree, follow the source files and update this
 - `pyupgrade --py38-plus` is part of pre-commit, so Python 3.8+ idioms are acceptable.
 - CI bootstrap: `python -m pip install --upgrade pip` then `pip install -r requirements.txt`.
 - Conda bootstrap: `conda env create -f environment.yaml` then `conda activate myenv`.
-- Editable install is optional: `pip install -e .` adds `train_command` and `eval_command` from `setup.py`.
+- Editable install is optional: `pip install -e .` adds `train_command`, `evaluate_command`, and `preprocess_command` from `setup.py`.
 - The repo contains a local `rootutils` stub for tests; do not replace it casually.
 - `.env` exists at repo root; treat it as sensitive and do not commit or rewrite it unless explicitly asked.
 
@@ -56,18 +56,15 @@ If repo behavior and this file disagree, follow the source files and update this
 
 - When training or evaluation needs GPU, first attach the existing tmux session with `tmux attach -t train` and run the command inside that session.
 - Do not launch GPU training/eval jobs from a fresh shell when the `train` tmux session is available; use that session as the default execution context.
-- Train via Hydra: `python src/train.py experiment=train_rankflow dataset=webqsp-sub`.
-- Evaluate a RankFlow checkpoint: `python src/eval.py experiment=rankflow ckpt.gflownet=/path/to/model.ckpt`.
+- Train via Hydra: `python src/train.py experiment=train/webqsp_baseline`.
+- Evaluate a checkpoint: `python src/evaluate.py experiment=eval/webqsp ckpt.path=/path/to/model.ckpt`.
 - Rebuild retrieval preprocess outputs: `python src/preprocess.py dataset=webqsp`.
 - Build edge retriever labels: `python src/datasets/build_edge_retrieval_labels.py dataset=webqsp-sub`.
 - `make train` runs `python src/train.py` with the default config.
-- Training expects an explicit `dataset=<name>` for supported training models.
-- Training currently uses the single mainline `src.subgraph_gflownet.adapters.lightning.module.GFlowNetModule`, and only on `-sub` datasets.
-- Evaluation defaults to single-GPU predict mode via `configs/trainer/predict.yaml`.
-- `src/eval.py` rejects CPU eval and multi-GPU eval unless you intentionally override behavior.
-- CPU eval escape hatch for debugging only: `DUAL_FLOW_ALLOW_CPU_EVAL=1 python src/eval.py ...`.
+- Training defaults to `dataset=webqsp`; override the dataset group explicitly when needed.
+- Evaluation uses `configs/evaluate.yaml` and the shared `trainer` group.
 - Hydra config mutation should use `open_dict`, not raw attribute writes on frozen/structured configs.
-- `configs/extras/default.yaml` has `enforce_tags: True` and `print_config: True`; for non-interactive scripted runs, pass tags or disable the prompt explicitly.
+- `print_config` now lives at the root task config (`train.yaml`, `evaluate.yaml`, `preprocess.yaml`).
 
 ## Formatting and import rules
 

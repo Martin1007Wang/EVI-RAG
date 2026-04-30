@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - override /dataset: webqsp
+  - override /model: weaver
+  - override /trainer: gpu
+  - override /logger: wandb
+  - override /scheduler: none
+  - _self_
+
+task_name: train_webqsp_baseline
+
+logger:
+  tags: [weaver, baseline, webqsp]
