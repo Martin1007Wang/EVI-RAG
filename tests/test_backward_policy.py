@@ -91,7 +91,8 @@ if "torch_scatter" not in sys.modules:
     torch_scatter_stub.scatter_softmax = _scatter_softmax
     sys.modules["torch_scatter"] = torch_scatter_stub
 
-from src.graph.ops import compute_uniform_nonroot_backward_removals
+from src.graph.ops import compute_uniform_nonroot_backward_removals, rebuild_active_nodes
+from src.weaver.state import State
 
 
 def test_backward_removals_exclude_edges_that_break_reachability() -> None:
@@ -103,7 +104,7 @@ def test_backward_removals_exclude_edges_that_break_reachability() -> None:
         dtype=torch.long,
     )
     active_edges = torch.tensor([True, True, True])
-    root_active_edges = torch.tensor([True, False, False])
+    root_edges = torch.tensor([True, False, False])
     anchor_mask = torch.tensor([True, True, False, False])
     edge_batch = torch.zeros(3, dtype=torch.long)
 
@@ -113,7 +114,7 @@ def test_backward_removals_exclude_edges_that_break_reachability() -> None:
         is_anchor_mask=anchor_mask,
         edge_batch=edge_batch,
         num_graphs=1,
-        root_active_edges=root_active_edges,
+        root_edges=root_edges,
     )
 
     assert torch.equal(removable_mask, torch.tensor([False, False, True]))
@@ -130,7 +131,7 @@ def test_backward_removal_count_matches_number_of_valid_parents() -> None:
     )
     edge_batch = torch.zeros(3, dtype=torch.long)
     anchor_mask = torch.tensor([True, True, False, False])
-    root_active_edges = torch.tensor([True, False, False])
+    root_edges = torch.tensor([True, False, False])
     active_edges = torch.tensor([True, True, True])
 
     removable_mask, removable_counts = compute_uniform_nonroot_backward_removals(
@@ -139,8 +140,70 @@ def test_backward_removal_count_matches_number_of_valid_parents() -> None:
         is_anchor_mask=anchor_mask,
         edge_batch=edge_batch,
         num_graphs=1,
-        root_active_edges=root_active_edges,
+        root_edges=root_edges,
     )
 
     assert torch.equal(removable_mask, torch.tensor([False, True, True]))
     assert torch.equal(removable_counts, torch.tensor([2]))
+
+
+def test_backward_removal_inverts_one_step_forward_expansion() -> None:
+    edge_index = torch.tensor(
+        [
+            [0, 1, 2, 1],
+            [1, 2, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    edge_batch = torch.zeros(4, dtype=torch.long)
+    anchor_mask = torch.tensor([True, True, False, False, False], dtype=torch.bool)
+    root_edges = torch.tensor([True, False, False, False], dtype=torch.bool)
+    parent_edges = torch.tensor([True, True, False, False], dtype=torch.bool)
+    parent_nodes = rebuild_active_nodes(
+        active_edges=parent_edges,
+        edge_index=edge_index,
+        anchor_mask=anchor_mask,
+    )
+    parent = State(
+        active_nodes=parent_nodes,
+        active_edges=parent_edges,
+        root_edges=root_edges,
+        expand_budget=3,
+    )
+
+    src, dst = edge_index
+    frontier_mask = (
+        parent.active_nodes.index_select(0, src)
+        | parent.active_nodes.index_select(0, dst)
+    ) & ~parent.active_edges
+    frontier_edge_ids = frontier_mask.nonzero(as_tuple=False).view(-1)
+    assert torch.equal(frontier_edge_ids, torch.tensor([2, 3], dtype=torch.long))
+
+    for selected_edge in frontier_edge_ids:
+        child = parent.detach()
+        child.apply_expansion(
+            chosen_edges=selected_edge.view(1),
+            edge_index=edge_index,
+        )
+
+        removable_mask, _ = compute_uniform_nonroot_backward_removals(
+            active_edges=child.active_edges,
+            edge_index=edge_index,
+            anchor_mask=anchor_mask,
+            edge_batch=edge_batch,
+            num_graphs=1,
+            root_edges=root_edges,
+        )
+
+        assert bool(removable_mask[selected_edge])
+
+        restored_edges = child.active_edges.clone()
+        restored_edges[selected_edge] = False
+        restored_nodes = rebuild_active_nodes(
+            active_edges=restored_edges,
+            edge_index=edge_index,
+            anchor_mask=anchor_mask,
+        )
+
+        assert torch.equal(restored_edges, parent.active_edges)
+        assert torch.equal(restored_nodes, parent.active_nodes)

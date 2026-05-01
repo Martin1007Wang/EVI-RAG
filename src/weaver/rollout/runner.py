@@ -6,29 +6,55 @@ from dataclasses import dataclass
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.weaver.losses import LossOutput, SubTrajectoryBalanceLoss
+from src.weaver.loss import LossOutput, SubTrajectoryBalanceLoss
 from src.weaver.policy import Policy
 from src.weaver.reward import RewardModel
 
-from .engine import RolloutEngine
+from .engine import RewardMode, RolloutEngine, StepAuxiliary
 from .schema import RolloutBatch, RolloutStats, RolloutTraces
-
 
 BackwardFn = Callable[[torch.Tensor], None]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrainingRolloutResult:
     loss_output: LossOutput
     rollouts: tuple[RolloutBatch, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class RolloutRewardRequirements:
+    stop_now: bool
+    terminal_only: bool
+
+    def __post_init__(self) -> None:
+        if bool(self.stop_now) == bool(self.terminal_only):
+            raise ValueError(
+                "Exactly one rollout reward requirement must be selected: "
+                "stop_now or terminal_only."
+            )
+
+    @classmethod
+    def from_stop_now_required(cls, required: bool) -> "RolloutRewardRequirements":
+        return cls(stop_now=bool(required), terminal_only=not bool(required))
+
+    @property
+    def reward_mode(self) -> RewardMode:
+        if self.stop_now:
+            return RewardMode.EAGER_STOP_NOW
+        return RewardMode.LAZY_TERMINAL
+
+
+@dataclass(frozen=True, slots=True)
 class RolloutRunConfig:
     temperature: float
     collect_stop_counterfactual: bool
     collect_policy_diagnostics: bool
     validate_synchronous_depth: bool
+    reward_mode: RewardMode
+    use_static_batch_rollouts: bool
+    use_fused_static_batch_rollouts: bool
+    edge_logit_mode: str = "final"
 
 
 class RolloutRunner:
@@ -39,20 +65,15 @@ class RolloutRunner:
         1. split rollout requests into memory-safe chunks;
         2. call RolloutEngine to generate policy rollouts;
         3. compute loss per chunk and backpropagate with stable normalization;
-        4. concatenate rollout chunks for logging/evaluation.
+        4. concatenate rollout chunks for logging / evaluation.
 
     Non-responsibilities:
-        - no coverage proposal;
-        - no behavior-policy teacher;
-        - no shortest-path guide;
-        - no VIGOR teacher configuration;
-        - no action sampling logic;
+        - no action sampling;
+        - no environment transition;
         - no reward definition;
-        - no SubTB internals.
-
-    VIGOR, StopTB, and SubTB are owned by SubTrajectoryBalanceLoss and the
-    rollout/loss data it consumes. This runner only executes chunks and applies
-    backward.
+        - no policy computation;
+        - no SubTB / StopTB / StopAdv internals;
+        - no coverage teacher / proposal intervention.
     """
 
     def __init__(
@@ -63,11 +84,16 @@ class RolloutRunner:
         eval_num_rollout: int,
         train_chunk_size: int,
         eval_chunk_size: int,
+        use_static_batch_rollouts: bool = False,
+        use_fused_static_batch_rollouts: bool = False,
     ) -> None:
         self.train_num_rollout = positive_int(train_num_rollout, "train_num_rollout")
         self.eval_num_rollout = positive_int(eval_num_rollout, "eval_num_rollout")
         self.train_chunk_size = positive_int(train_chunk_size, "train_chunk_size")
         self.eval_chunk_size = positive_int(eval_chunk_size, "eval_chunk_size")
+        self.use_static_batch_rollouts = bool(use_static_batch_rollouts)
+        self.use_fused_static_batch_rollouts = bool(use_fused_static_batch_rollouts)
+
         self.engine = RolloutEngine(expand_budget=int(expand_budget))
 
     def run_training_rollouts_and_backward(
@@ -80,19 +106,21 @@ class RolloutRunner:
         batch: RetrievalBatch,
         rollout_temperature: float,
         accumulation_batches: int,
+        auxiliary: StepAuxiliary | None = None,
         collect_stop_counterfactual: bool = True,
         collect_policy_diagnostics: bool = False,
         validate_synchronous_depth: bool = False,
+        reward_mode: RewardMode | str | None = None,
     ) -> TrainingRolloutResult:
         """
-        Run one training step worth of rollouts and backpropagate chunk losses.
+        Run one training-step worth of rollouts and backpropagate chunk losses.
 
         Loss normalization uses:
 
             train_num_rollout * accumulation_batches
 
-        This must not depend on chunk size. Otherwise changing chunk_size would
-        silently change the effective learning rate.
+        It must not depend on chunk size. Otherwise changing chunk_size silently
+        changes the effective learning rate.
         """
         accumulation_batches = positive_int(
             accumulation_batches,
@@ -105,6 +133,15 @@ class RolloutRunner:
             collect_stop_counterfactual=bool(collect_stop_counterfactual),
             collect_policy_diagnostics=bool(collect_policy_diagnostics),
             validate_synchronous_depth=bool(validate_synchronous_depth),
+            reward_mode=resolve_rollout_reward_requirements(
+                reward_mode=reward_mode,
+                loss_fn=loss_fn,
+                auxiliary=auxiliary,
+                collect_stop_counterfactual=collect_stop_counterfactual,
+            ).reward_mode,
+            use_static_batch_rollouts=self.use_static_batch_rollouts,
+            use_fused_static_batch_rollouts=self.use_fused_static_batch_rollouts,
+            edge_logit_mode="final",
         )
 
         rollouts: list[RolloutBatch] = []
@@ -120,6 +157,7 @@ class RolloutRunner:
                 batch=batch,
                 num_rollouts=current_size,
                 config=config,
+                auxiliary=auxiliary,
             )
 
             loss_output = backward_rollouts(
@@ -149,8 +187,13 @@ class RolloutRunner:
         collect_stop_counterfactual: bool = True,
         collect_policy_diagnostics: bool = True,
         validate_synchronous_depth: bool = False,
+        reward_mode: RewardMode | str | None = None,
     ) -> list[RolloutBatch]:
-        total = self.eval_num_rollout if num_rollouts is None else int(num_rollouts)
+        total = (
+            self.eval_num_rollout
+            if num_rollouts is None
+            else non_negative_int(num_rollouts, "num_rollouts")
+        )
 
         return self.generate_rollouts(
             policy=policy,
@@ -162,6 +205,7 @@ class RolloutRunner:
             collect_stop_counterfactual=collect_stop_counterfactual,
             collect_policy_diagnostics=collect_policy_diagnostics,
             validate_synchronous_depth=validate_synchronous_depth,
+            reward_mode=reward_mode,
         )
 
     @torch.no_grad()
@@ -177,6 +221,7 @@ class RolloutRunner:
         collect_stop_counterfactual: bool = True,
         collect_policy_diagnostics: bool = True,
         validate_synchronous_depth: bool = False,
+        reward_mode: RewardMode | str | None = None,
     ) -> list[RolloutBatch]:
         total = non_negative_int(num_rollouts, "num_rollouts")
         if total == 0:
@@ -193,6 +238,13 @@ class RolloutRunner:
             collect_stop_counterfactual=bool(collect_stop_counterfactual),
             collect_policy_diagnostics=bool(collect_policy_diagnostics),
             validate_synchronous_depth=bool(validate_synchronous_depth),
+            reward_mode=resolve_rollout_reward_requirements(
+                reward_mode=reward_mode,
+                collect_stop_counterfactual=collect_stop_counterfactual,
+            ).reward_mode,
+            use_static_batch_rollouts=self.use_static_batch_rollouts,
+            use_fused_static_batch_rollouts=self.use_fused_static_batch_rollouts,
+            edge_logit_mode="final",
         )
 
         rollouts: list[RolloutBatch] = []
@@ -204,6 +256,7 @@ class RolloutRunner:
                     batch=batch,
                     num_rollouts=current_size,
                     config=config,
+                    auxiliary=None,
                 )
             )
 
@@ -217,6 +270,7 @@ class RolloutRunner:
         batch: RetrievalBatch,
         num_rollouts: int,
         config: RolloutRunConfig,
+        auxiliary: StepAuxiliary | None,
     ) -> list[RolloutBatch]:
         num_rollouts = positive_int(num_rollouts, "num_rollouts")
 
@@ -226,9 +280,14 @@ class RolloutRunner:
             reward_model=reward_model,
             num_rollouts=num_rollouts,
             temperature=float(config.temperature),
+            auxiliary=auxiliary,
             collect_stop_counterfactual=config.collect_stop_counterfactual,
             collect_policy_diagnostics=config.collect_policy_diagnostics,
             validate_synchronous_depth=config.validate_synchronous_depth,
+            edge_logit_mode=config.edge_logit_mode,
+            reward_mode=config.reward_mode,
+            use_static_batch_rollouts=config.use_static_batch_rollouts,
+            use_fused_static_batch_rollouts=config.use_fused_static_batch_rollouts,
         )
 
 
@@ -273,147 +332,147 @@ def concat_rollout_batches(rollouts: Sequence[RolloutBatch]) -> RolloutBatch:
 
 def concat_rollout_stats(rollouts: Sequence[RolloutBatch]) -> RolloutStats:
     return RolloutStats(
-        root_log_z=_cat_stat(rollouts, lambda rollout: rollout.stats.root_log_z),
-        trajectory_length=_cat_stat(
+        root_log_z=_cat(rollouts, lambda rollout: rollout.stats.root_log_z),
+        trajectory_length=_cat(
             rollouts,
             lambda rollout: rollout.stats.trajectory_length,
         ),
-        terminal_log_reward=_cat_stat(
+        terminal_log_reward=_cat(
             rollouts,
             lambda rollout: rollout.stats.terminal_log_reward,
         ),
-        terminal_answer_f1=_cat_stat(
+        terminal_answer_f1=_cat(
             rollouts,
             lambda rollout: rollout.stats.terminal_answer_f1,
         ),
-        proposal_intervention_count=_cat_optional_or_zero_stat(
-            rollouts,
-            lambda rollout: rollout.stats.proposal_intervention_count,
-        ),
-        edge_action_entropy=_cat_stat(
+        edge_action_entropy=_cat(
             rollouts,
             lambda rollout: rollout.stats.edge_action_entropy,
         ),
-        edge_action_entropy_valid_mask=_cat_stat(
+        edge_action_count=_cat(
             rollouts,
-            lambda rollout: rollout.stats.edge_action_entropy_valid_mask,
+            lambda rollout: rollout.stats.edge_action_count,
         ),
-        terminal_edge_penalty=_cat_optional_stat(
+        terminal_complexity_penalty=_cat_optional(
             rollouts,
-            lambda rollout: rollout.stats.terminal_edge_penalty,
+            lambda rollout: rollout.stats.terminal_complexity_penalty,
         ),
-        terminal_base_log_reward=_cat_optional_stat(
+        terminal_base_log_reward=_cat_optional(
             rollouts,
             lambda rollout: rollout.stats.terminal_base_log_reward,
         ),
-        terminal_utility=_cat_optional_stat(
+        terminal_utility=_cat_optional(
             rollouts,
             lambda rollout: rollout.stats.terminal_utility,
         ),
-        terminal_expanded_edge_count=_cat_optional_stat(
+        terminal_expanded_edge_count=_cat_optional(
             rollouts,
             lambda rollout: rollout.stats.terminal_expanded_edge_count,
         ),
-        terminal_minimal_edge_count=_cat_optional_stat(
+        terminal_answer_degree_excess=_cat_optional(
             rollouts,
-            lambda rollout: rollout.stats.terminal_minimal_edge_count,
-        ),
-        terminal_minimality_gap=_cat_optional_stat(
-            rollouts,
-            lambda rollout: rollout.stats.terminal_minimality_gap,
-        ),
-        terminal_minimality_penalty=_cat_optional_stat(
-            rollouts,
-            lambda rollout: rollout.stats.terminal_minimality_penalty,
+            lambda rollout: rollout.stats.terminal_answer_degree_excess,
         ),
     )
 
 
 def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
     return RolloutTraces(
-        state_log_flows=_cat_stat(
+        state_log_flows=_cat(
             rollouts,
             lambda rollout: rollout.traces.state_log_flows,
         ),
-        log_pf=_cat_stat(rollouts, lambda rollout: rollout.traces.log_pf),
-        log_pb=_cat_stat(rollouts, lambda rollout: rollout.traces.log_pb),
-        action_type=_cat_stat(rollouts, lambda rollout: rollout.traces.action_type),
-        continue_mask=_cat_stat(
+        log_pf=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.log_pf,
+        ),
+        log_pb=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.log_pb,
+        ),
+        action_type=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.action_type,
+        ),
+        continue_mask=_cat(
             rollouts,
             lambda rollout: rollout.traces.continue_mask,
         ),
-        stop_mask=_cat_stat(rollouts, lambda rollout: rollout.traces.stop_mask),
-        selected_edge_ids=_cat_stat(
+        stop_mask=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.stop_mask,
+        ),
+        selected_edge_ids=_cat(
             rollouts,
             lambda rollout: rollout.traces.selected_edge_ids,
         ),
-        stop_now_log_reward=_cat_stat(
+        stop_now_log_reward=_cat(
             rollouts,
             lambda rollout: rollout.traces.stop_now_log_reward,
         ),
-        stop_now_answer_f1=_cat_stat(
+        stop_now_answer_f1=_cat(
             rollouts,
             lambda rollout: rollout.traces.stop_now_answer_f1,
         ),
-        stop_now_valid_mask=_cat_stat(
+        stop_now_valid_mask=_cat(
             rollouts,
             lambda rollout: rollout.traces.stop_now_valid_mask,
         ),
-        stop_log_pf=_cat_stat(
+        stop_log_pf=_cat(
             rollouts,
             lambda rollout: rollout.traces.stop_log_pf,
         ),
-        stop_tb_valid_mask=_cat_stat(
+        stop_tb_valid_mask=_cat(
             rollouts,
             lambda rollout: rollout.traces.stop_tb_valid_mask,
         ),
-        target_stop_prob=_cat_stat(
+        target_stop_prob=_cat(
             rollouts,
             lambda rollout: rollout.traces.target_stop_prob,
         ),
-        target_continue_prob=_cat_stat(
+        target_continue_prob=_cat(
             rollouts,
             lambda rollout: rollout.traces.target_continue_prob,
         ),
-        policy_action_valid_mask=_cat_stat(
+        policy_action_valid_mask=_cat(
             rollouts,
             lambda rollout: rollout.traces.policy_action_valid_mask,
         ),
-        edge_action_entropy=_cat_stat(
+        edge_action_entropy=_cat(
             rollouts,
             lambda rollout: rollout.traces.edge_action_entropy,
         ),
-        edge_action_entropy_valid_mask=_cat_stat(
+        edge_action_entropy_valid_mask=_cat(
             rollouts,
             lambda rollout: rollout.traces.edge_action_entropy_valid_mask,
         ),
-        advantage_aux_loss=_cat_stat(
-            rollouts,
-            lambda rollout: rollout.traces.advantage_aux_loss,
-        ),
-        advantage_aux_valid_mask=_cat_stat(
-            rollouts,
-            lambda rollout: rollout.traces.advantage_aux_valid_mask,
-        ),
-        proposal_intervention_mask=_cat_optional_or_zero_stat(
-            rollouts,
-            lambda rollout: rollout.traces.proposal_intervention_mask,
-        ),
-        budget_exhausted_mask=_cat_optional_stat(
+        budget_exhausted_mask=_cat_optional(
             rollouts,
             lambda rollout: rollout.traces.budget_exhausted_mask,
+        ),
+        stop_adv_target=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.stop_adv_target,
+        ),
+        stop_adv_valid_mask=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.stop_adv_valid_mask,
+        ),
+        stop_adv_continue_log_reward=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.stop_adv_continue_log_reward,
         ),
     )
 
 
-def _cat_stat(
+def _cat(
     rollouts: Sequence[RolloutBatch],
     getter: Callable[[RolloutBatch], torch.Tensor],
 ) -> torch.Tensor:
     return torch.cat([getter(rollout) for rollout in rollouts], dim=0)
 
 
-def _cat_optional_stat(
+def _cat_optional(
     rollouts: Sequence[RolloutBatch],
     getter: Callable[[RolloutBatch], torch.Tensor | None],
 ) -> torch.Tensor | None:
@@ -429,29 +488,42 @@ def _cat_optional_stat(
     return torch.cat([value for value in values if value is not None], dim=0)
 
 
-def _cat_optional_or_zero_stat(
-    rollouts: Sequence[RolloutBatch],
-    getter: Callable[[RolloutBatch], torch.Tensor | None],
-) -> torch.Tensor:
-    values = [getter(rollout) for rollout in rollouts]
-    first_present = next((value for value in values if value is not None), None)
+def resolve_rollout_reward_requirements(
+    *,
+    reward_mode: RewardMode | str | None = None,
+    loss_fn: object | None = None,
+    auxiliary: StepAuxiliary | None = None,
+    collect_stop_counterfactual: bool = False,
+) -> RolloutRewardRequirements:
+    if reward_mode is not None:
+        return RolloutRewardRequirements.from_stop_now_required(
+            _coerce_reward_mode(reward_mode) == RewardMode.EAGER_STOP_NOW
+        )
 
-    if first_present is None:
-        first = values[0]
-        if first is None:
-            # Fallback shape follows trajectory length when no proposal field exists.
-            reference = rollouts[0].stats.trajectory_length
-            return torch.zeros_like(reference)
+    stop_now_required = bool(collect_stop_counterfactual)
+    if loss_fn is not None:
+        stop_now_required = stop_now_required or bool(
+            getattr(loss_fn, "requires_stop_now_reward", False)
+        )
+    if auxiliary is not None:
+        stop_now_required = stop_now_required or bool(
+            getattr(auxiliary, "requires_stop_now_reward", True)
+        )
 
-    materialized = []
-    for rollout, value in zip(rollouts, values):
-        if value is None:
-            reference = rollout.stats.trajectory_length
-            materialized.append(torch.zeros_like(reference))
-        else:
-            materialized.append(value)
+    return RolloutRewardRequirements.from_stop_now_required(stop_now_required)
 
-    return torch.cat(materialized, dim=0)
+
+def _coerce_reward_mode(reward_mode: RewardMode | str) -> RewardMode:
+    if isinstance(reward_mode, RewardMode):
+        return reward_mode
+
+    try:
+        return RewardMode(str(reward_mode))
+    except ValueError as exc:
+        raise ValueError(
+            "reward_mode must be 'eager_stop_now' or 'lazy_terminal', "
+            f"got {reward_mode!r}."
+        ) from exc
 
 
 def rollout_chunk_sizes(
@@ -484,10 +556,14 @@ def non_negative_int(value: int, name: str) -> int:
 
 __all__ = [
     "BackwardFn",
+    "RolloutRewardRequirements",
     "RolloutRunConfig",
     "RolloutRunner",
     "TrainingRolloutResult",
     "backward_rollouts",
     "concat_rollout_batches",
+    "concat_rollout_stats",
+    "concat_rollout_traces",
+    "resolve_rollout_reward_requirements",
     "rollout_chunk_sizes",
 ]

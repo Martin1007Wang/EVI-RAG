@@ -8,25 +8,47 @@ policy_cfg:
 
   feature_encoder:
     embedding_dim: 1024
-    anchor_distance_max: 3
+    hidden_dim: 1024
+    dde:
+      enabled: true
+      num_forward_rounds: 2
+      num_backward_rounds: 2
+      include_anchor_indicator: true
+    role_projection: linear_layernorm
+    role_projection_init: identity
     non_text_init_std: 0.02
-    normalize: true
+
+  state_readout:
+    num_layers: 1
+    dropout: 0.0
+    use_path_memory: true
+    use_frontier_summary: true
+
+  transition_features: {}
 
   stop_scorer:
+    use_progress: true
     use_frontier_summary: true
-    detach_frontier_summary: true
     stop_bias_init: 0.0
     expand_bias_init: 0.0
+    progress_penalty_init: 0.0
     dropout: 0.0
     trainable_bias: true
 
   edge_scorer:
-    use_residual: true
+    type: semantic_prior_residual
+    action_dropout: 0.0
     entity_weight_init: 0.1
     logit_scale_init: 5.0
-    residual_scale_init: 0.05
-    residual_dropout: 0.0
-    trainable_scales: true
+    residual_scale_init: 1.0
+    residual_warmup_start_step: 500
+    residual_warmup_steps: 1500
+    residual_max_multiplier: 1.0
+    freeze_residual_until_step: 0
+    zero_init_residual_output: true
+    trainable_entity_weight: false
+    trainable_logit_scale: false
+    trainable_residual: true
 
   flow_head:
     num_layers: 1
@@ -37,8 +59,19 @@ rollout_cfg:
   expand_budget: 3
   train_num_rollout: 8
   eval_num_rollout: 8
-  train_chunk_size: null
-  eval_chunk_size: null
+  train_chunk_size: 8
+  eval_chunk_size: 8
+  use_static_batch_rollouts: false
+  use_fused_static_batch_rollouts: false
+
+  stop_adv:
+    enabled: false
+    topk_by_semantic: 8
+    topk_by_final: 8
+    random_k: 8
+    continue_pool: max
+    continue_pool_temperature: 0.5
+    label_temperature: 0.5
 
 eval_cfg: ${eval_metric}
 
@@ -54,43 +87,25 @@ schedule_cfg:
 reward_cfg:
   utility_epsilon: 1.0e-4
   log_reward_clip_min: -30.0
-  answer_weight: 0.7
-  minimality_tolerance: 0.02
-  edge_cost: 0.03
-  minimality_gap_cost: 0.15
-  zero_utility_minimality: true
+  edge_cost: 0.10
   debug_checks: false
 
 loss_cfg:
   max_trajectory_len: null
-
-  # Main GFlowNet objective.
   subtb_lambda: 0.9
-
-  # Stop terminal-edge balance.
-  stop_tb_coef: 0.1
-  stop_tb_positive_only: false
-
-  # VIGOR: reward-improvement local transition regularization.
-  advantage_aux_coef_start: 1.0
-  advantage_aux_coef_end: 0.05
-  advantage_aux_anneal_steps: 3000
-  advantage_teacher_temperature: 0.15
-
-  # Candidate pool for local reward-gain teacher.
-  advantage_top_k: 32
-  advantage_topk_prior: 16
-  advantage_topk_final: 16
-  advantage_random_k: 8
+  subtb_coef: 1.0
+  stop_tb_coef: 1.0
+  stop_adv_coef: 0.0
+  debug: false
 
 diagnostic_cfg:
   train_rollout_diagnostics: false
   train_rollout_diagnostics_interval: 0
-  train_stop_counterfactual: true
-  train_policy_diagnostics: false
+  train_stop_counterfactual: false
+  train_policy_diagnostics: true
   train_validate_rollout_depth: false
 
-  eval_stop_counterfactual: true
+  eval_stop_counterfactual: false
   eval_validate_rollout_depth: false
 
   grad_norm_interval: 0
@@ -98,5 +113,5 @@ diagnostic_cfg:
 optimizer_cfg: ${optimizer}
 scheduler_cfg: ${scheduler}
 
-gradient_clip_val: 1.0
-gradient_clip_algorithm: norm
+gradient_clip_val: null
+gradient_clip_algorithm: null

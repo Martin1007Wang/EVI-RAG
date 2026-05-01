@@ -78,8 +78,10 @@ from src.weaver.state import State
 
 def _build_state(*, active_edges: torch.Tensor, expand_budget: int = 3) -> State:
     return State(
-        root_active_edges=torch.tensor([True, False, False, True, False], dtype=torch.bool),
-        active_nodes=torch.tensor([True, True, True, True, False, False], dtype=torch.bool),
+        root_edges=torch.tensor([True, False, False, True, False], dtype=torch.bool),
+        active_nodes=torch.tensor(
+            [True, True, True, True, False, False], dtype=torch.bool
+        ),
         active_edges=active_edges,
         expand_budget=expand_budget,
     )
@@ -104,7 +106,9 @@ def test_state_derives_per_graph_budget_from_non_root_edges() -> None:
 
     assert torch.equal(counts, torch.tensor([1, 0], dtype=torch.long))
     assert torch.equal(remaining_budget, torch.tensor([2, 3], dtype=torch.long))
-    assert torch.allclose(expand_ratio, torch.tensor([1.0 / 3.0, 0.0], dtype=torch.float32))
+    assert torch.allclose(
+        expand_ratio, torch.tensor([1.0 / 3.0, 0.0], dtype=torch.float32)
+    )
     assert not state.is_root_state
 
 
@@ -121,7 +125,9 @@ def test_synchronous_rollout_depth_checks_unfinished_graphs_only() -> None:
         == 1
     )
 
-    mismatched = _build_state(active_edges=torch.tensor([True, True, False, True, False]))
+    mismatched = _build_state(
+        active_edges=torch.tensor([True, True, False, True, False])
+    )
     with pytest.raises(RuntimeError, match="Synchronous rollout depth"):
         mismatched.synchronous_rollout_depth(
             edge_batch=edge_batch,
@@ -143,7 +149,18 @@ def test_state_detach_clones_root_active_edges() -> None:
     state = _build_state(active_edges=torch.tensor([True, False, False, True, False]))
 
     detached = state.detach()
-    detached.root_active_edges[0] = False
+    detached.root_edges[0] = False
 
-    assert bool(state.root_active_edges[0])
-    assert not bool(detached.root_active_edges[0])
+    assert bool(state.root_edges[0])
+    assert not bool(detached.root_edges[0])
+
+
+def test_create_initial_rejects_out_of_range_anchor_ids_by_default() -> None:
+    batch = types.SimpleNamespace(
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        anchor_node_ids=torch.tensor([0, 3], dtype=torch.long),
+        num_nodes_total=3,
+    )
+
+    with pytest.raises(ValueError, match="anchor_node_ids"):
+        State.create_initial(batch, expand_budget=1)

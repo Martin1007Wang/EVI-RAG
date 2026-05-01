@@ -6,7 +6,7 @@ from src.training.metric_utils import scalar_float
 
 if TYPE_CHECKING:
     from src.data.schema import RetrievalBatch
-    from src.weaver.losses import LossOutput
+    from src.weaver.loss import LossOutput
     from src.weaver.policy import Policy
     from src.weaver.rollout.schema import RolloutBatch
 
@@ -18,14 +18,20 @@ class TrainingDiagnosticsCollector:
         "loss/total": "loss/total",
         "loss/subtb": "loss/subtb",
         "loss/stop_tb": "loss/stop_tb",
-        "loss/advantage_aux": "loss/advantage_aux",
-        "loss/advantage_aux_coef": "loss/advantage_aux_coef",
+        "loss/stop_adv": "loss/stop_adv",
+        "loss/potential_coef": "loss/potential_coef",
         "subtb/residual_abs_mean": "loss/residual_abs_mean",
         "subtb/residual_square_mean": "loss/residual_square_mean",
         "subtb/residual_mean": "loss/residual_mean",
         "stop_tb/residual_abs_mean": "stop_tb/residual_abs_mean",
         "stop_tb/residual_square_mean": "stop_tb/residual_square_mean",
         "stop_tb/residual_mean": "stop_tb/residual_mean",
+        "stop_adv/valid_count_mean": "stop_adv/valid_count_mean",
+        "stop_adv/target_mean": "stop_adv/target_mean",
+        "stop_adv/stop_now_better_ratio": "stop_adv/stop_now_better_ratio",
+        "stop_adv/continue_minus_stop_log_reward_mean": (
+            "stop_adv/continue_minus_stop_log_reward_mean"
+        ),
         "flow/log_z_mean": "flow/root_log_z_mean",
         "flow/log_z_std": "flow/root_log_z_std",
         "flow/state_log_flow_mean": "flow/state_log_flow_mean",
@@ -39,7 +45,10 @@ class TrainingDiagnosticsCollector:
         "subtb/residual_std": "debug/residual_std",
         "stop_tb/residual_std": "debug/stop_tb_residual_std",
         "stop_tb/valid_count_mean": "debug/stop_tb_valid_count_mean",
-        "advantage_aux/valid_count_mean": "debug/advantage_aux_valid_count_mean",
+        "potential/valid_count_mean": "debug/potential_valid_count_mean",
+        "potential/delta_mean": "debug/potential_delta_mean",
+        "potential/delta_abs_mean": "debug/potential_delta_abs_mean",
+        "potential/delta_std": "debug/potential_delta_std",
         "diagnostic/terminal_stop_balance_mse": "debug/terminal_stop_balance_mse",
         "diagnostic/terminal_stop_residual_abs_mean": (
             "debug/terminal_stop_residual_abs_mean"
@@ -57,10 +66,12 @@ class TrainingDiagnosticsCollector:
         debug: bool,
         rollout_diagnostics: bool = True,
         rollout_diagnostics_interval: int = 1,
+        policy_diagnostics: bool = False,
     ) -> None:
         self.debug = bool(debug)
         self.rollout_diagnostics = bool(rollout_diagnostics)
         self.rollout_diagnostics_interval = int(rollout_diagnostics_interval)
+        self.policy_diagnostics = bool(policy_diagnostics)
         if self.rollout_diagnostics_interval < 0:
             raise ValueError(
                 "rollout_diagnostics_interval must be >= 0, "
@@ -73,15 +84,18 @@ class TrainingDiagnosticsCollector:
         loss_output: "LossOutput",
         batch: RetrievalBatch | None = None,
         online_rollouts: tuple["RolloutBatch", ...] = (),
-        coverage_rollouts: tuple["RolloutBatch", ...] = (),
-        proposal_rollouts: tuple["RolloutBatch", ...] = (),
         policy: "Policy | None" = None,
         root_expand_budget: int = 3,
         global_step: int | None = None,
     ) -> dict[str, float]:
-        del proposal_rollouts
         metrics = self._loss_metrics(loss_output)
-        all_rollouts = coverage_rollouts + online_rollouts
+        all_rollouts = online_rollouts
+        if all_rollouts:
+            from src.training.rollout_diagnostics import (
+                compute_terminal_reward_diagnostics,
+            )
+
+            metrics.update(compute_terminal_reward_diagnostics(all_rollouts))
         collect_rollout_diagnostics = (
             batch is not None and self._should_collect_rollout_diagnostics(global_step)
         )
@@ -97,7 +111,7 @@ class TrainingDiagnosticsCollector:
                     debug=self.debug,
                 )
             )
-        if collect_rollout_diagnostics and policy is not None and batch is not None:
+        if self.policy_diagnostics and policy is not None and batch is not None:
             from src.training.rollout_diagnostics import (
                 compute_root_answer_edge_ranking_diagnostics,
             )

@@ -6,7 +6,7 @@ from src.eval.diversity import (
     compute_exploration_diversity_at_ks,
 )
 from src.eval.groups import MetricDict, MetricGroups, flatten_metric_groups
-from src.eval.node_retrieval import (
+from src.eval.retrieval import (
     compute_best_of_k_node_retrieval_quality,
     compute_expected_node_retrieval_quality,
     compute_node_retrieval_matrix,

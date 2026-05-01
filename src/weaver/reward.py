@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
 
 import torch
 from torch import nn
 from torch_scatter import scatter_sum
 
 from src.data.schema import RetrievalBatch
+from src.graph.ops import build_anchor_induced_edge_mask
 from src.weaver.state import State
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AnswerStats:
     hits: torch.Tensor
     gold: torch.Tensor
@@ -21,72 +21,67 @@ class AnswerStats:
     f1: torch.Tensor
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SupportStats:
-    support: torch.Tensor
-    supported_targets: torch.Tensor
-    reachable_targets: torch.Tensor
+    supported_answer_recall: torch.Tensor
+    supported_answer_count: torch.Tensor
+    reward_answer_count: torch.Tensor
 
 
-@dataclass(frozen=True)
-class MinimalityStats:
-    minimal_edge_count: torch.Tensor
-    minimality_gap: torch.Tensor
+@dataclass(frozen=True, slots=True)
+class CompactnessStats:
     expanded_edge_count: torch.Tensor
+    answer_degree_excess: torch.Tensor
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TerminalRewardOutput:
     log_reward: torch.Tensor
 
     utility: torch.Tensor
     base_log_reward: torch.Tensor
 
+    supported_answer_recall: torch.Tensor
+    supported_answer_count: torch.Tensor
+    reward_answer_count: torch.Tensor
+
+    expanded_edge_count: torch.Tensor
+    complexity_penalty: torch.Tensor
+
+    # Diagnostics only. These fields do not enter terminal reward.
     answer_f1: torch.Tensor
     answer_precision: torch.Tensor
     answer_recall: torch.Tensor
     answer_hits: torch.Tensor
     answer_gold: torch.Tensor
     retrieved_node_count: torch.Tensor
-
-    answer_support: torch.Tensor
-    supported_targets: torch.Tensor
-    reachable_targets: torch.Tensor
-
-    expanded_edge_count: torch.Tensor
-    minimal_edge_count: torch.Tensor
-    minimality_gap: torch.Tensor
-
-    edge_penalty: torch.Tensor
-    minimality_penalty: torch.Tensor
+    answer_degree_excess: torch.Tensor
 
 
 class RewardModel(nn.Module):
     """
-    Verified Minimal Sufficient Evidence reward.
+    Anchor-supported answer evidence reward.
 
-    Terminal subgraph x is rewarded by verifiable answer utility and penalized
-    by avoidable redundancy.
+    Terminal subgraph x is scored by:
 
-        U(x)
-            = answer_weight * F1_A(x)
-            + (1 - answer_weight) * Support_reach(x)
+        U(x, q)
+            = fraction of reward answer nodes that are present and connected
+              to at least one active anchor inside x.
 
-        m_delta(x)
-            = min |E(x') \\ E0|
-              subject to x' subset x and U(x') >= U(x) - delta
+        B(x)
+            = |E_x \\ E_0|, the number of learned expanded non-root edges.
 
-        MinGap_delta(x)
-            = |E(x) \\ E0| - m_delta(x)
+    Reward:
 
         log R(x)
-            = log(eps + U(x))
-              - edge_cost * |E(x) \\ E0|
-              - minimality_gap_cost * MinGap_delta(x)
+            = log(eps + U(x, q)) - edge_cost * B(x)
 
-    The reward is terminal-only. It does not expose target distances or shortest
-    path labels to the policy. Gold-derived information is used only as a
-    verifier for terminal rollout quality.
+    The reward is a terminal verifier. It does not expose target distances,
+    shortest-path labels, teacher paths, or rollout-time decisions to the policy.
+    Answer degree and F1-style statistics are diagnostics only.
+
+    Recommended first setting:
+        edge_cost = 0.08 ~ 0.12
     """
 
     def __init__(
@@ -94,22 +89,14 @@ class RewardModel(nn.Module):
         *,
         utility_epsilon: float = 1.0e-4,
         log_reward_clip_min: float = -30.0,
-        answer_weight: float = 0.7,
-        minimality_tolerance: float = 0.02,
-        edge_cost: float = 0.03,
-        minimality_gap_cost: float = 0.15,
-        zero_utility_minimality: bool = True,
+        edge_cost: float = 0.10,
         debug_checks: bool = False,
     ) -> None:
         super().__init__()
 
         self.utility_epsilon = float(utility_epsilon)
         self.log_reward_clip_min = float(log_reward_clip_min)
-        self.answer_weight = float(answer_weight)
-        self.minimality_tolerance = float(minimality_tolerance)
         self.edge_cost = float(edge_cost)
-        self.minimality_gap_cost = float(minimality_gap_cost)
-        self.zero_utility_minimality = bool(zero_utility_minimality)
         self.debug_checks = bool(debug_checks)
 
         if self.utility_epsilon <= 0.0:
@@ -120,20 +107,8 @@ class RewardModel(nn.Module):
             raise ValueError(
                 f"log_reward_clip_min must be < 0, got {self.log_reward_clip_min}."
             )
-        if not 0.0 <= self.answer_weight <= 1.0:
-            raise ValueError(
-                f"answer_weight must be in [0, 1], got {self.answer_weight}."
-            )
-        if self.minimality_tolerance < 0.0:
-            raise ValueError(
-                f"minimality_tolerance must be >= 0, got {self.minimality_tolerance}."
-            )
         if self.edge_cost < 0.0:
             raise ValueError(f"edge_cost must be >= 0, got {self.edge_cost}.")
-        if self.minimality_gap_cost < 0.0:
-            raise ValueError(
-                f"minimality_gap_cost must be >= 0, got {self.minimality_gap_cost}."
-            )
 
     @torch.no_grad()
     def forward(
@@ -159,6 +134,97 @@ class RewardModel(nn.Module):
         active_edges: torch.Tensor,
         state: State | None = None,
     ) -> TerminalRewardOutput:
+        if active_nodes.ndim == 2 or active_edges.ndim == 2:
+            return self.evaluate_rollout_terminal_states(
+                retrieval_batch=retrieval_batch,
+                active_nodes=active_nodes,
+                active_edges=active_edges,
+                state=state,
+            )
+
+        return self._evaluate_single_terminal_state(
+            retrieval_batch=retrieval_batch,
+            active_nodes=active_nodes,
+            active_edges=active_edges,
+            state=state,
+        )
+
+    @torch.no_grad()
+    def evaluate_rollout_terminal_states(
+        self,
+        *,
+        retrieval_batch: RetrievalBatch,
+        active_nodes: torch.Tensor,
+        active_edges: torch.Tensor,
+        state: object | None = None,
+    ) -> TerminalRewardOutput:
+        if active_nodes.dtype != torch.bool:
+            raise TypeError(f"active_nodes must be bool, got {active_nodes.dtype}.")
+        if active_edges.dtype != torch.bool:
+            raise TypeError(f"active_edges must be bool, got {active_edges.dtype}.")
+        if active_nodes.ndim != 2:
+            raise ValueError(
+                f"active_nodes must have shape [R, N], got {tuple(active_nodes.shape)}."
+            )
+        if active_edges.ndim != 2:
+            raise ValueError(
+                f"active_edges must have shape [R, E], got {tuple(active_edges.shape)}."
+            )
+        if active_nodes.size(0) != active_edges.size(0):
+            raise ValueError(
+                "active_nodes and active_edges must have the same rollout dimension: "
+                f"{active_nodes.size(0)} != {active_edges.size(0)}."
+            )
+
+        rollout_to_graph = getattr(state, "rollout_to_graph", None)
+        if not isinstance(rollout_to_graph, torch.Tensor):
+            raise TypeError(
+                "2D rollout reward evaluation requires state.rollout_to_graph."
+            )
+
+        device = active_nodes.device
+        rollout_to_graph = rollout_to_graph.to(device=device, dtype=torch.long).view(-1)
+        num_rollouts = int(active_nodes.size(0))
+        if rollout_to_graph.shape != (num_rollouts,):
+            raise ValueError(
+                f"rollout_to_graph must have shape [{num_rollouts}], "
+                f"got {tuple(rollout_to_graph.shape)}."
+            )
+
+        fields: dict[str, list[torch.Tensor]] = {
+            name: [] for name in TerminalRewardOutput.__dataclass_fields__
+        }
+
+        for rollout_id in range(num_rollouts):
+            graph_id = int(rollout_to_graph[rollout_id].item())
+            reward = self._evaluate_single_terminal_state(
+                retrieval_batch=retrieval_batch,
+                active_nodes=active_nodes[rollout_id],
+                active_edges=active_edges[rollout_id],
+                state=None,
+            )
+            for name in fields:
+                value = getattr(reward, name).index_select(
+                    0,
+                    torch.tensor([graph_id], dtype=torch.long, device=device),
+                )[0]
+                fields[name].append(value)
+
+        stacked = {
+            name: torch.stack(values, dim=0) if values else active_nodes.new_empty((0,))
+            for name, values in fields.items()
+        }
+
+        return TerminalRewardOutput(**stacked)
+
+    def _evaluate_single_terminal_state(
+        self,
+        *,
+        retrieval_batch: RetrievalBatch,
+        active_nodes: torch.Tensor,
+        active_edges: torch.Tensor,
+        state: State | None = None,
+    ) -> TerminalRewardOutput:
         if active_nodes.dtype != torch.bool:
             raise TypeError(f"active_nodes must be bool, got {active_nodes.dtype}.")
         if active_edges.dtype != torch.bool:
@@ -167,22 +233,22 @@ class RewardModel(nn.Module):
         device = active_nodes.device
         dtype = torch.float32
 
-        num_nodes = int(retrieval_batch.num_nodes_total)
-        num_edges = int(retrieval_batch.num_edges_total)
-        num_graphs = int(retrieval_batch.num_graphs)
-
-        if active_nodes.numel() != num_nodes:
-            raise ValueError(
-                f"active_nodes length mismatch: {active_nodes.numel()} != {num_nodes}."
-            )
-        if active_edges.numel() != num_edges:
-            raise ValueError(
-                f"active_edges length mismatch: {active_edges.numel()} != {num_edges}."
-            )
-
         edge_index = retrieval_batch.edge_index.to(device=device, dtype=torch.long)
         node_batch = retrieval_batch.batch.to(device=device, dtype=torch.long)
         edge_batch = retrieval_batch.edge_batch.to(device=device, dtype=torch.long)
+
+        num_nodes = int(retrieval_batch.num_nodes_total)
+        num_edges = int(edge_index.size(1))
+        num_graphs = int(retrieval_batch.num_graphs)
+
+        _validate_shapes(
+            active_nodes=active_nodes,
+            active_edges=active_edges,
+            node_batch=node_batch,
+            edge_batch=edge_batch,
+            num_nodes=num_nodes,
+            num_edges=num_edges,
+        )
 
         anchor_mask = node_mask(
             retrieval_batch.anchor_node_ids,
@@ -193,22 +259,20 @@ class RewardModel(nn.Module):
         )
 
         target_mask = node_mask(
-            target_ids(retrieval_batch),
+            reward_target_ids(retrieval_batch),
             num_nodes=num_nodes,
             device=device,
             debug_checks=self.debug_checks,
-            name="target_node_ids",
+            name="reward_target_node_ids",
         )
 
-        if state is None:
-            root_edges = torch.zeros(num_edges, dtype=torch.bool, device=device)
-        else:
-            root_edges = state.root_active_edges.to(device=device, dtype=torch.bool)
-
-        if root_edges.numel() != num_edges:
-            raise ValueError(
-                f"root edge mask length mismatch: {root_edges.numel()} != {num_edges}."
-            )
+        root_edges = root_edge_mask(
+            edge_index=edge_index,
+            anchor_mask=anchor_mask,
+            state=state,
+            num_edges=num_edges,
+            device=device,
+        )
 
         answer = answer_stats(
             active_nodes=active_nodes,
@@ -231,28 +295,23 @@ class RewardModel(nn.Module):
             dtype=dtype,
         )
 
-        utility = self.utility(answer.f1, support.support)
-
-        minimality = minimality_stats(
+        compactness = compactness_stats(
             edge_index=edge_index,
             active_edges=active_edges,
             root_edges=root_edges,
-            anchor_mask=anchor_mask,
             target_mask=target_mask,
             node_batch=node_batch,
             edge_batch=edge_batch,
             num_graphs=num_graphs,
-            answer_weight=self.answer_weight,
-            tolerance=self.minimality_tolerance,
-            zero_utility_minimality=self.zero_utility_minimality,
             dtype=dtype,
         )
 
+        utility = support.supported_answer_recall
         base_log_reward = (utility + self.utility_epsilon).log()
-        edge_penalty = self.edge_cost * minimality.expanded_edge_count
-        minimality_penalty = self.minimality_gap_cost * minimality.minimality_gap
 
-        log_reward = (base_log_reward - edge_penalty - minimality_penalty).clamp_min(
+        complexity_penalty = self.edge_cost * compactness.expanded_edge_count
+
+        log_reward = (base_log_reward - complexity_penalty).clamp_min(
             self.log_reward_clip_min
         )
 
@@ -260,24 +319,44 @@ class RewardModel(nn.Module):
             log_reward=log_reward,
             utility=utility,
             base_log_reward=base_log_reward,
+            supported_answer_recall=support.supported_answer_recall,
+            supported_answer_count=support.supported_answer_count,
+            reward_answer_count=support.reward_answer_count,
+            expanded_edge_count=compactness.expanded_edge_count,
+            complexity_penalty=complexity_penalty,
             answer_f1=answer.f1,
             answer_precision=answer.precision,
             answer_recall=answer.recall,
             answer_hits=answer.hits,
             answer_gold=answer.gold,
             retrieved_node_count=answer.retrieved,
-            answer_support=support.support,
-            supported_targets=support.supported_targets,
-            reachable_targets=support.reachable_targets,
-            expanded_edge_count=minimality.expanded_edge_count,
-            minimal_edge_count=minimality.minimal_edge_count,
-            minimality_gap=minimality.minimality_gap,
-            edge_penalty=edge_penalty,
-            minimality_penalty=minimality_penalty,
+            answer_degree_excess=compactness.answer_degree_excess,
         )
 
-    def utility(self, answer_f1: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-        return self.answer_weight * answer_f1 + (1.0 - self.answer_weight) * support
+
+def root_edge_mask(
+    *,
+    edge_index: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    state: State | None,
+    num_edges: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if state is not None:
+        root_edges = state.root_edges.to(device=device, dtype=torch.bool)
+    else:
+        root_edges = build_anchor_induced_edge_mask(
+            edge_index=edge_index,
+            anchor_mask=anchor_mask.to(device=device, dtype=torch.bool),
+        )
+
+    if root_edges.shape != (int(num_edges),):
+        raise ValueError(
+            f"root_edges must have shape [{int(num_edges)}], "
+            f"got {tuple(root_edges.shape)}."
+        )
+
+    return root_edges
 
 
 def answer_stats(
@@ -290,13 +369,13 @@ def answer_stats(
     dtype: torch.dtype,
 ) -> AnswerStats:
     """
-    Answer retrieval quality.
+    Diagnostic answer retrieval quality.
 
-    Non-answer anchors are excluded from the retrieved denominator. Anchors are
-    query conditions, not retrieved answers. If an anchor is also a target, it is
-    still counted as retrieved.
+    This is no longer the reward utility. It is retained for metrics.
+    Non-answer anchors are excluded from the retrieved denominator.
     """
     device = active_nodes.device
+    num_graphs = int(num_graphs)
 
     active_gold = active_nodes & target_mask
     retrieved = active_nodes & (~anchor_mask | target_mask)
@@ -316,6 +395,7 @@ def answer_stats(
 
     denom = precision + recall
     f1 = torch.zeros(num_graphs, dtype=dtype, device=device)
+
     valid = denom > 0.0
     f1[valid] = 2.0 * precision[valid] * recall[valid] / denom[valid]
 
@@ -342,17 +422,21 @@ def anchor_answer_support(
     dtype: torch.dtype,
 ) -> SupportStats:
     """
-    Fraction of reachable target nodes connected to at least one active anchor
-    inside the selected terminal subgraph.
+    Anchor-supported answer coverage.
 
-    Connectivity is undirected by design. This judges whether the generated
-    evidence subgraph supports an answer entity from the anchor context.
+        supported_answer_recall[g]
+            = # target nodes connected to an active anchor inside selected subgraph
+              / # target nodes
+
+    Connectivity is undirected. That is intentional: this is evidence support,
+    not directed logical entailment.
     """
     device = active_nodes.device
+    num_graphs = int(num_graphs)
 
-    support = torch.zeros(num_graphs, dtype=dtype, device=device)
-    supported_targets = torch.zeros(num_graphs, dtype=dtype, device=device)
-    reachable_targets = count_by_graph(
+    supported_answer_recall = torch.zeros(num_graphs, dtype=dtype, device=device)
+    supported_answer_count = torch.zeros(num_graphs, dtype=dtype, device=device)
+    reward_answer_count = count_by_graph(
         target_mask,
         node_batch,
         num_graphs,
@@ -361,18 +445,19 @@ def anchor_answer_support(
 
     for graph_id in range(num_graphs):
         graph_nodes = node_batch.eq(graph_id)
-        graph_targets = (target_mask & graph_nodes).nonzero(as_tuple=False).view(-1)
+
+        graph_targets = (target_mask & graph_nodes).nonzero(as_tuple=False).flatten()
         if graph_targets.numel() == 0:
             continue
 
         graph_anchors = (
-            (anchor_mask & active_nodes & graph_nodes).nonzero(as_tuple=False).view(-1)
+            (anchor_mask & active_nodes & graph_nodes).nonzero(as_tuple=False).flatten()
         )
         if graph_anchors.numel() == 0:
             continue
 
         graph_edges = (
-            (active_edges & edge_batch.eq(graph_id)).nonzero(as_tuple=False).view(-1)
+            (active_edges & edge_batch.eq(graph_id)).nonzero(as_tuple=False).flatten()
         )
 
         reached = connected_nodes_from_anchors(
@@ -384,42 +469,47 @@ def anchor_answer_support(
         if not reached:
             continue
 
-        hit = sum(int(node_id) in reached for node_id in graph_targets.tolist())
-        supported_targets[graph_id] = float(hit)
-        support[graph_id] = float(hit) / float(max(1, int(graph_targets.numel())))
+        hits = sum(int(node_id) in reached for node_id in graph_targets.tolist())
+        supported_answer_count[graph_id] = float(hits)
+        supported_answer_recall[graph_id] = float(hits) / float(
+            max(1, int(graph_targets.numel()))
+        )
 
     return SupportStats(
-        support=support,
-        supported_targets=supported_targets,
-        reachable_targets=reachable_targets,
+        supported_answer_recall=supported_answer_recall,
+        supported_answer_count=supported_answer_count,
+        reward_answer_count=reward_answer_count,
     )
 
 
-def minimality_stats(
+def compactness_stats(
     *,
     edge_index: torch.Tensor,
     active_edges: torch.Tensor,
     root_edges: torch.Tensor,
-    anchor_mask: torch.Tensor,
     target_mask: torch.Tensor,
     node_batch: torch.Tensor,
     edge_batch: torch.Tensor,
     num_graphs: int,
-    answer_weight: float,
-    tolerance: float,
-    zero_utility_minimality: bool,
     dtype: torch.dtype,
-) -> MinimalityStats:
+) -> CompactnessStats:
     """
-    Exact minimal sufficient subset search over selected non-root edges.
+    Compactness prior inputs and diagnostics.
 
-    For each terminal subgraph x, enumerate all subsets of selected expanded
-    edges and find the smallest subset preserving utility within tolerance.
+    expanded_edge_count:
+        |E_s \\ E_0| per graph.
 
-    This is exact and cheap when expand_budget is small. If budget becomes large,
-    this function should be replaced by beam/rejection subset search.
+    answer_degree_excess:
+        mean_y max(0, deg_s(y) - 1) over gold target nodes per graph.
+        Diagnostic only; it does not enter the reward.
     """
-    device = active_edges.device
+    num_graphs = int(num_graphs)
+    num_edges = int(edge_index.size(1))
+
+    if root_edges.shape != (num_edges,):
+        raise ValueError(
+            f"root_edges must have shape [{num_edges}], got {tuple(root_edges.shape)}."
+        )
 
     expanded_edges = active_edges & ~root_edges
     expanded_edge_count = count_by_graph(
@@ -429,159 +519,69 @@ def minimality_stats(
         dtype=dtype,
     )
 
-    minimal_edge_count = expanded_edge_count.clone()
+    answer_degree_excess = answer_degree_excess_by_graph(
+        edge_index=edge_index,
+        active_edges=active_edges,
+        target_mask=target_mask,
+        node_batch=node_batch,
+        num_graphs=num_graphs,
+        dtype=dtype,
+    )
 
-    for graph_id in range(num_graphs):
-        graph_expanded = (
-            (expanded_edges & edge_batch.eq(graph_id)).nonzero(as_tuple=False).view(-1)
-        )
-
-        if graph_expanded.numel() == 0:
-            minimal_edge_count[graph_id] = 0.0
-            continue
-
-        full_edges = (
-            (active_edges & edge_batch.eq(graph_id)).nonzero(as_tuple=False).view(-1)
-        )
-
-        full_utility = graph_utility(
-            edge_index=edge_index,
-            selected_edges=full_edges,
-            root_edges=root_edges,
-            candidate_extra_edges=graph_expanded,
-            kept_extra_edge_ids=graph_expanded,
-            anchor_mask=anchor_mask,
-            target_mask=target_mask,
-            node_batch=node_batch,
-            graph_id=graph_id,
-            answer_weight=answer_weight,
-            dtype=dtype,
-        )
-
-        if zero_utility_minimality and full_utility <= 0.0:
-            minimal_edge_count[graph_id] = float(graph_expanded.numel())
-            continue
-
-        threshold = max(0.0, full_utility - float(tolerance))
-        best_size = int(graph_expanded.numel())
-
-        expanded_list = [int(edge_id) for edge_id in graph_expanded.tolist()]
-
-        for subset_size in range(best_size + 1):
-            found = False
-            for subset in combinations(expanded_list, subset_size):
-                kept = torch.tensor(subset, dtype=torch.long, device=device)
-                utility = graph_utility(
-                    edge_index=edge_index,
-                    selected_edges=full_edges,
-                    root_edges=root_edges,
-                    candidate_extra_edges=graph_expanded,
-                    kept_extra_edge_ids=kept,
-                    anchor_mask=anchor_mask,
-                    target_mask=target_mask,
-                    node_batch=node_batch,
-                    graph_id=graph_id,
-                    answer_weight=answer_weight,
-                    dtype=dtype,
-                )
-
-                if utility >= threshold:
-                    best_size = subset_size
-                    found = True
-                    break
-
-            if found:
-                break
-
-        minimal_edge_count[graph_id] = float(best_size)
-
-    minimality_gap = (expanded_edge_count - minimal_edge_count).clamp_min(0.0)
-
-    return MinimalityStats(
-        minimal_edge_count=minimal_edge_count,
-        minimality_gap=minimality_gap,
+    return CompactnessStats(
         expanded_edge_count=expanded_edge_count,
+        answer_degree_excess=answer_degree_excess,
     )
 
 
-def graph_utility(
+def answer_degree_excess_by_graph(
     *,
     edge_index: torch.Tensor,
-    selected_edges: torch.Tensor,
-    root_edges: torch.Tensor,
-    candidate_extra_edges: torch.Tensor,
-    kept_extra_edge_ids: torch.Tensor,
-    anchor_mask: torch.Tensor,
+    active_edges: torch.Tensor,
     target_mask: torch.Tensor,
     node_batch: torch.Tensor,
-    graph_id: int,
-    answer_weight: float,
+    num_graphs: int,
     dtype: torch.dtype,
-) -> float:
+) -> torch.Tensor:
     """
-    Utility of a graph-local subset.
+    Average excess active degree around target nodes.
 
-    The subset always keeps root edges from the original terminal state and
-    keeps only the proposed non-root edge subset. Active nodes are reconstructed
-    from graph anchors and selected edge endpoints.
+        D_Y = mean_y max(0, deg_s(y) - 1)
+
+    This is diagnostic only. It is intentionally not part of the terminal
+    reward, which is limited to supported recall times the complexity prior.
     """
-    device = edge_index.device
+    device = active_edges.device
+    num_nodes = int(node_batch.numel())
+    num_graphs = int(num_graphs)
 
-    graph_nodes = node_batch.eq(int(graph_id))
-    graph_anchors = (anchor_mask & graph_nodes).nonzero(as_tuple=False).view(-1)
-    graph_targets = (target_mask & graph_nodes).nonzero(as_tuple=False).view(-1)
+    active_degree = torch.zeros(num_nodes, dtype=dtype, device=device)
 
-    if graph_targets.numel() == 0:
-        return 0.0
+    if bool(active_edges.any()):
+        src = edge_index[0, active_edges]
+        dst = edge_index[1, active_edges]
 
-    graph_root_edges = (
-        (root_edges & edge_ids_to_mask(selected_edges, int(edge_index.size(1)), device))
-        .nonzero(as_tuple=False)
-        .view(-1)
+        ones = torch.ones(src.numel(), dtype=dtype, device=device)
+        active_degree.index_add_(0, src, ones)
+        active_degree.index_add_(0, dst, ones)
+
+    target_excess = (active_degree - 1.0).clamp_min(0.0) * target_mask.to(dtype=dtype)
+
+    excess_sum = scatter_sum(
+        target_excess,
+        node_batch.to(device=device, dtype=torch.long),
+        dim=0,
+        dim_size=num_graphs,
     )
 
-    if kept_extra_edge_ids.numel() == 0:
-        graph_edges = graph_root_edges
-    elif graph_root_edges.numel() == 0:
-        graph_edges = kept_extra_edge_ids
-    else:
-        graph_edges = torch.cat([graph_root_edges, kept_extra_edge_ids], dim=0)
+    target_count = count_by_graph(
+        target_mask,
+        node_batch,
+        num_graphs,
+        dtype=dtype,
+    ).clamp_min(1.0)
 
-    active_node_set = {int(node_id) for node_id in graph_anchors.tolist()}
-
-    if graph_edges.numel() > 0:
-        src = edge_index[0].index_select(0, graph_edges).tolist()
-        dst = edge_index[1].index_select(0, graph_edges).tolist()
-        for left, right in zip(src, dst):
-            active_node_set.add(int(left))
-            active_node_set.add(int(right))
-
-    hits = sum(int(node_id) in active_node_set for node_id in graph_targets.tolist())
-
-    retrieved = [
-        node_id
-        for node_id in active_node_set
-        if (not bool(anchor_mask[node_id].item())) or bool(target_mask[node_id].item())
-    ]
-
-    precision = float(hits) / float(len(retrieved)) if retrieved else 0.0
-    recall = float(hits) / float(max(1, int(graph_targets.numel())))
-
-    if precision + recall > 0.0:
-        f1 = 2.0 * precision * recall / (precision + recall)
-    else:
-        f1 = 0.0
-
-    reached = connected_nodes_from_anchors(
-        edge_index=edge_index,
-        edge_ids=graph_edges,
-        anchors=graph_anchors,
-    )
-
-    support_hits = sum(int(node_id) in reached for node_id in graph_targets.tolist())
-    support = float(support_hits) / float(max(1, int(graph_targets.numel())))
-
-    return float(answer_weight) * f1 + (1.0 - float(answer_weight)) * support
+    return excess_sum / target_count
 
 
 def connected_nodes_from_anchors(
@@ -602,6 +602,7 @@ def connected_nodes_from_anchors(
         for left, right in zip(src, dst):
             left_id = int(left)
             right_id = int(right)
+
             adjacency.setdefault(left_id, []).append(right_id)
             adjacency.setdefault(right_id, []).append(left_id)
 
@@ -616,12 +617,26 @@ def connected_nodes_from_anchors(
     return visited
 
 
-def target_ids(batch: RetrievalBatch) -> torch.Tensor:
+def reward_target_ids(batch: RetrievalBatch) -> torch.Tensor:
+    """
+    Answer targets used by the terminal reward.
+
+    Reachable targets are preferred and are not replaced by all answers when
+    the tensor exists but is empty. That keeps reward aligned with retriever
+    responsibility: unreachable answers should not become training penalties.
+    """
     reachable = getattr(batch, "reachable_target_node_ids", None)
-    if isinstance(reachable, torch.Tensor) and reachable.numel() > 0:
+    if isinstance(reachable, torch.Tensor):
         return reachable
 
     return batch.target_node_ids
+
+
+def target_ids(batch: RetrievalBatch) -> torch.Tensor:
+    """
+    Backward-compatible alias for reward target ids.
+    """
+    return reward_target_ids(batch)
 
 
 def node_mask(
@@ -637,21 +652,11 @@ def node_mask(
     if debug_checks:
         check_ids_in_range(ids, upper=int(num_nodes), name=name)
 
-    mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+    mask = torch.zeros(int(num_nodes), dtype=torch.bool, device=device)
+
     if ids.numel() > 0:
         mask[ids] = True
 
-    return mask
-
-
-def edge_ids_to_mask(
-    edge_ids: torch.Tensor,
-    num_edges: int,
-    device: torch.device,
-) -> torch.Tensor:
-    mask = torch.zeros(int(num_edges), dtype=torch.bool, device=device)
-    if edge_ids.numel() > 0:
-        mask[edge_ids.to(device=device, dtype=torch.long)] = True
     return mask
 
 
@@ -664,7 +669,7 @@ def count_by_graph(
 ) -> torch.Tensor:
     return scatter_sum(
         mask.to(dtype=dtype),
-        batch_index,
+        batch_index.to(device=mask.device, dtype=torch.long),
         dim=0,
         dim_size=int(num_graphs),
     )
@@ -680,7 +685,7 @@ def check_ids_in_range(
     Debug-only id range check.
 
     This uses .item(), so it synchronizes GPU execution.
-    Keep debug_checks=False in normal training.
+    Keep debug_checks=False during normal training.
     """
     if ids.numel() == 0:
         return
@@ -695,14 +700,51 @@ def check_ids_in_range(
         )
 
 
+def _validate_shapes(
+    *,
+    active_nodes: torch.Tensor,
+    active_edges: torch.Tensor,
+    node_batch: torch.Tensor,
+    edge_batch: torch.Tensor,
+    num_nodes: int,
+    num_edges: int,
+) -> None:
+    if active_nodes.shape != (int(num_nodes),):
+        raise ValueError(
+            f"active_nodes must have shape [{int(num_nodes)}], "
+            f"got {tuple(active_nodes.shape)}."
+        )
+
+    if active_edges.shape != (int(num_edges),):
+        raise ValueError(
+            f"active_edges must have shape [{int(num_edges)}], "
+            f"got {tuple(active_edges.shape)}."
+        )
+
+    if node_batch.numel() != int(num_nodes):
+        raise ValueError(
+            f"batch node vector length mismatch: {node_batch.numel()} != {num_nodes}."
+        )
+
+    if edge_batch.numel() != int(num_edges):
+        raise ValueError(
+            f"edge_batch length mismatch: {edge_batch.numel()} != {num_edges}."
+        )
+
+
 __all__ = [
     "AnswerStats",
-    "SupportStats",
-    "MinimalityStats",
-    "TerminalRewardOutput",
+    "CompactnessStats",
     "RewardModel",
-    "answer_stats",
+    "SupportStats",
+    "TerminalRewardOutput",
     "anchor_answer_support",
-    "minimality_stats",
+    "answer_degree_excess_by_graph",
+    "answer_stats",
+    "compactness_stats",
+    "connected_nodes_from_anchors",
     "count_by_graph",
+    "reward_target_ids",
+    "root_edge_mask",
+    "target_ids",
 ]

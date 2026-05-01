@@ -3,13 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pytest
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.data.datamodule import _extract_entity_embedding_map
+from src.data.datamodule import _extract_entity_embedding_map, _validate_model_resources
 from src.data.preprocess.materialize import _entity_text_embedding_ids_to_map
 
 
@@ -39,3 +40,33 @@ def test_entity_text_embedding_ids_to_map_uses_minus_one_non_text_sentinel() -> 
         entity_embedding_map,
         torch.tensor([-1, 2, 0, -1, 1], dtype=torch.long),
     )
+
+
+def test_validate_model_resources_accepts_l2_normalized_embeddings() -> None:
+    _validate_model_resources(
+        entity_text_embeddings=torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0]],
+            dtype=torch.float32,
+        ),
+        entity_embedding_map=torch.tensor([0, 1, -1], dtype=torch.long),
+        relation_embeddings=torch.tensor(
+            [[2.0**-0.5, 2.0**-0.5]],
+            dtype=torch.float32,
+        ),
+    )
+
+
+def test_validate_model_resources_rejects_unnormalized_embeddings() -> None:
+    with pytest.raises(ValueError, match="entity_text_embeddings rows must be L2"):
+        _validate_model_resources(
+            entity_text_embeddings=torch.tensor([[2.0, 0.0]], dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0], dtype=torch.long),
+            relation_embeddings=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        )
+
+    with pytest.raises(ValueError, match="relation_embeddings rows must be L2"):
+        _validate_model_resources(
+            entity_text_embeddings=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0], dtype=torch.long),
+            relation_embeddings=torch.tensor([[0.0, 3.0]], dtype=torch.float32),
+        )

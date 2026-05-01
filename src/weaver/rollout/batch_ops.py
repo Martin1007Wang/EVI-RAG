@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import fields
+
 import torch
 
 from src.data.schema import RetrievalBatch
@@ -14,17 +16,16 @@ def split_repeated_rollout_batch(
     repeats: int,
 ) -> list[RolloutBatch]:
     """
-    Split rollout over a repeated RetrievalBatch back into logical rollout batches.
+    Split rollouts from a repeated RetrievalBatch back into logical rollout batches.
 
-    Requires repeat_retrieval_batch layout:
+    Required repeat layout:
 
         repeated_graph_id = repeat_id * B + graph_id
         repeated_edge_id  = repeat_id * E + original_edge_id
 
     After splitting, selected_edge_ids are mapped back to original-batch edge ids.
-    STOP actions remain -1.
+    STOP / non-expand actions remain -1.
     """
-
     repeats = int(repeats)
     if repeats < 1:
         raise ValueError(f"repeats must be >= 1, got {repeats}.")
@@ -43,6 +44,43 @@ def split_repeated_rollout_batch(
             rollout=rollout,
             graph_slice=slice(i * num_graphs, (i + 1) * num_graphs),
             edge_offset=i * num_edges,
+        )
+        for i in range(repeats)
+    ]
+
+
+def split_static_rollout_batch(
+    *,
+    rollout: RolloutBatch,
+    original_batch: RetrievalBatch,
+    repeats: int,
+) -> list[RolloutBatch]:
+    """
+    Split fused static-batch rollouts back into logical rollout batches.
+
+    Required layout:
+
+        rollout_row = repeat_id * B + graph_id
+        selected_edge_id = original-batch edge id
+
+    Unlike physical repeat, edge ids are already in original coordinates.
+    """
+    repeats = int(repeats)
+    if repeats < 1:
+        raise ValueError(f"repeats must be >= 1, got {repeats}.")
+
+    num_graphs = _num_graphs(original_batch)
+    expected_graphs = num_graphs * repeats
+    _validate_rollout_first_dim(
+        rollout=rollout,
+        expected_graphs=expected_graphs,
+    )
+
+    return [
+        _slice_rollout_batch(
+            rollout=rollout,
+            graph_slice=slice(i * num_graphs, (i + 1) * num_graphs),
+            edge_offset=0,
         )
         for i in range(repeats)
     ]
@@ -73,34 +111,23 @@ def _slice_stats(
         trajectory_length=stats.trajectory_length[graph_slice],
         terminal_log_reward=stats.terminal_log_reward[graph_slice],
         terminal_answer_f1=stats.terminal_answer_f1[graph_slice],
-        proposal_intervention_count=stats.proposal_intervention_count[graph_slice],
         edge_action_entropy=stats.edge_action_entropy[graph_slice],
-        edge_action_entropy_valid_mask=stats.edge_action_entropy_valid_mask[
-            graph_slice
-        ],
-        terminal_edge_penalty=_slice_optional_stat(
-            stats.terminal_edge_penalty,
+        edge_action_count=stats.edge_action_count[graph_slice],
+        terminal_complexity_penalty=_slice_optional(
+            stats.terminal_complexity_penalty,
             graph_slice,
         ),
-        terminal_base_log_reward=_slice_optional_stat(
+        terminal_base_log_reward=_slice_optional(
             stats.terminal_base_log_reward,
             graph_slice,
         ),
-        terminal_utility=_slice_optional_stat(stats.terminal_utility, graph_slice),
-        terminal_expanded_edge_count=_slice_optional_stat(
+        terminal_utility=_slice_optional(stats.terminal_utility, graph_slice),
+        terminal_expanded_edge_count=_slice_optional(
             stats.terminal_expanded_edge_count,
             graph_slice,
         ),
-        terminal_minimal_edge_count=_slice_optional_stat(
-            stats.terminal_minimal_edge_count,
-            graph_slice,
-        ),
-        terminal_minimality_gap=_slice_optional_stat(
-            stats.terminal_minimality_gap,
-            graph_slice,
-        ),
-        terminal_minimality_penalty=_slice_optional_stat(
-            stats.terminal_minimality_penalty,
+        terminal_answer_degree_excess=_slice_optional(
+            stats.terminal_answer_degree_excess,
             graph_slice,
         ),
     )
@@ -119,7 +146,7 @@ def _slice_traces(
         action_type=traces.action_type[graph_slice],
         continue_mask=traces.continue_mask[graph_slice],
         stop_mask=traces.stop_mask[graph_slice],
-        selected_edge_ids=_shift_selected_edge_ids(
+        selected_edge_ids=_unrepeat_edge_ids(
             traces.selected_edge_ids[graph_slice],
             edge_offset=edge_offset,
         ),
@@ -135,29 +162,52 @@ def _slice_traces(
         edge_action_entropy_valid_mask=traces.edge_action_entropy_valid_mask[
             graph_slice
         ],
-        advantage_aux_loss=traces.advantage_aux_loss[graph_slice],
-        advantage_aux_valid_mask=traces.advantage_aux_valid_mask[graph_slice],
-        proposal_intervention_mask=traces.proposal_intervention_mask[graph_slice],
-        budget_exhausted_mask=(
-            None
-            if traces.budget_exhausted_mask is None
-            else traces.budget_exhausted_mask[graph_slice]
+        budget_exhausted_mask=_slice_optional(
+            traces.budget_exhausted_mask,
+            graph_slice,
+        ),
+        stop_adv_target=_slice_optional(
+            traces.stop_adv_target,
+            graph_slice,
+        ),
+        stop_adv_valid_mask=_slice_optional(
+            traces.stop_adv_valid_mask,
+            graph_slice,
+        ),
+        stop_adv_continue_log_reward=_slice_optional(
+            traces.stop_adv_continue_log_reward,
+            graph_slice,
         ),
     )
 
 
-def _shift_selected_edge_ids(
+def _unrepeat_edge_ids(
     selected_edge_ids: torch.Tensor,
     *,
     edge_offset: int,
 ) -> torch.Tensor:
+    """
+    Map repeated-batch edge ids back to original-batch edge ids.
+
+    Non-expand actions use negative ids and are left unchanged.
+    """
+    edge_offset = int(edge_offset)
     if edge_offset == 0:
         return selected_edge_ids
 
-    shifted = selected_edge_ids.clone()
-    valid = shifted.ge(0)
-    shifted[valid] -= int(edge_offset)
-    return shifted
+    out = selected_edge_ids.clone()
+    valid = out.ge(0)
+    out[valid] -= edge_offset
+    return out
+
+
+def _slice_optional(
+    tensor: torch.Tensor | None,
+    graph_slice: slice,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor[graph_slice]
 
 
 def _validate_rollout_first_dim(
@@ -165,71 +215,17 @@ def _validate_rollout_first_dim(
     rollout: RolloutBatch,
     expected_graphs: int,
 ) -> None:
-    checks = {
-        "stats.root_log_z": rollout.stats.root_log_z,
-        "stats.trajectory_length": rollout.stats.trajectory_length,
-        "stats.terminal_log_reward": rollout.stats.terminal_log_reward,
-        "stats.terminal_answer_f1": rollout.stats.terminal_answer_f1,
-        "stats.proposal_intervention_count": rollout.stats.proposal_intervention_count,
-        "stats.edge_action_entropy": rollout.stats.edge_action_entropy,
-        "stats.edge_action_entropy_valid_mask": rollout.stats.edge_action_entropy_valid_mask,
-        "traces.state_log_flows": rollout.traces.state_log_flows,
-        "traces.log_pf": rollout.traces.log_pf,
-        "traces.log_pb": rollout.traces.log_pb,
-        "traces.action_type": rollout.traces.action_type,
-        "traces.continue_mask": rollout.traces.continue_mask,
-        "traces.stop_mask": rollout.traces.stop_mask,
-        "traces.selected_edge_ids": rollout.traces.selected_edge_ids,
-        "traces.stop_now_log_reward": rollout.traces.stop_now_log_reward,
-        "traces.stop_now_answer_f1": rollout.traces.stop_now_answer_f1,
-        "traces.stop_now_valid_mask": rollout.traces.stop_now_valid_mask,
-        "traces.stop_log_pf": rollout.traces.stop_log_pf,
-        "traces.stop_tb_valid_mask": rollout.traces.stop_tb_valid_mask,
-        "traces.target_stop_prob": rollout.traces.target_stop_prob,
-        "traces.target_continue_prob": rollout.traces.target_continue_prob,
-        "traces.policy_action_valid_mask": rollout.traces.policy_action_valid_mask,
-        "traces.edge_action_entropy": rollout.traces.edge_action_entropy,
-        "traces.edge_action_entropy_valid_mask": (
-            rollout.traces.edge_action_entropy_valid_mask
-        ),
-        "traces.proposal_intervention_mask": rollout.traces.proposal_intervention_mask,
-    }
-    if rollout.traces.budget_exhausted_mask is not None:
-        checks["traces.budget_exhausted_mask"] = rollout.traces.budget_exhausted_mask
-    if rollout.stats.terminal_edge_penalty is not None:
-        checks["stats.terminal_edge_penalty"] = rollout.stats.terminal_edge_penalty
-    if rollout.stats.terminal_base_log_reward is not None:
-        checks[
-            "stats.terminal_base_log_reward"
-        ] = rollout.stats.terminal_base_log_reward
-    if rollout.stats.terminal_utility is not None:
-        checks["stats.terminal_utility"] = rollout.stats.terminal_utility
-    if rollout.stats.terminal_expanded_edge_count is not None:
-        checks[
-            "stats.terminal_expanded_edge_count"
-        ] = rollout.stats.terminal_expanded_edge_count
-    if rollout.stats.terminal_minimal_edge_count is not None:
-        checks[
-            "stats.terminal_minimal_edge_count"
-        ] = rollout.stats.terminal_minimal_edge_count
-    if rollout.stats.terminal_minimality_gap is not None:
-        checks["stats.terminal_minimality_gap"] = rollout.stats.terminal_minimality_gap
-    if rollout.stats.terminal_minimality_penalty is not None:
-        checks[
-            "stats.terminal_minimality_penalty"
-        ] = rollout.stats.terminal_minimality_penalty
+    expected_graphs = int(expected_graphs)
 
-    for name, tensor in checks.items():
-        _validate_first_dim(tensor, expected_graphs, name)
+    for field in fields(RolloutStats):
+        value = getattr(rollout.stats, field.name)
+        if value is not None:
+            _validate_first_dim(value, expected_graphs, f"stats.{field.name}")
 
-
-def _slice_optional_stat(
-    tensor: torch.Tensor | None,
-    graph_slice: slice,
-) -> torch.Tensor | None:
-    if tensor is None:
-        return None
-    return tensor[graph_slice]
+    for field in fields(RolloutTraces):
+        value = getattr(rollout.traces, field.name)
+        if value is not None:
+            _validate_first_dim(value, expected_graphs, f"traces.{field.name}")
 
 
 def _validate_first_dim(
@@ -241,20 +237,18 @@ def _validate_first_dim(
         raise ValueError(f"{name} must have at least one dimension.")
 
     actual = int(tensor.size(0))
-    expected = int(expected)
-
-    if actual != expected:
+    if actual != int(expected):
         raise ValueError(
             f"{name} first dimension mismatch: expected {expected}, got {actual}."
         )
 
 
 def _num_graphs(batch: RetrievalBatch) -> int:
-    return int(batch.ptr.numel()) - 1
+    return int(batch.num_graphs)
 
 
 def _num_edges(batch: RetrievalBatch) -> int:
     return int(batch.edge_index.size(1))
 
 
-__all__ = ["split_repeated_rollout_batch"]
+__all__ = ["split_repeated_rollout_batch", "split_static_rollout_batch"]

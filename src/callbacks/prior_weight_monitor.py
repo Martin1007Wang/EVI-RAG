@@ -8,7 +8,7 @@ from lightning.pytorch.callbacks import Callback
 from src.utils.logging_utils import log_metric
 
 if TYPE_CHECKING:
-    from src.weaver.nn.edge_scorer import ExpandEdgeScorer
+    from src.weaver.nn.edge_scorer import EdgeScorer
 
 
 class PriorWeightMonitor(Callback):
@@ -33,13 +33,13 @@ class PriorWeightMonitor(Callback):
     @classmethod
     @torch.no_grad()
     def get_weights(cls, scorer: Any) -> dict[str, float]:
-        prior_scale = getattr(scorer, "prior_scale", None)
-        if not isinstance(prior_scale, torch.Tensor) or prior_scale.shape != ():
+        logit_scale = getattr(scorer, "logit_scale", None)
+        if not isinstance(logit_scale, torch.Tensor) or logit_scale.shape != ():
             raise ValueError(
-                "prior_scale must be a scalar tensor, "
-                f"got {None if prior_scale is None else tuple(prior_scale.shape)}."
+                "logit_scale must be a scalar tensor, "
+                f"got {None if logit_scale is None else tuple(logit_scale.shape)}."
             )
-        return {f"prior_w/{cls.PRIOR_NAMES[0]}": prior_scale.detach().item()}
+        return {f"prior_w/{cls.PRIOR_NAMES[0]}": logit_scale.detach().item()}
 
     @classmethod
     @torch.no_grad()
@@ -53,13 +53,13 @@ class PriorWeightMonitor(Callback):
                 "prior_bank must have shape "
                 f"(E, {len(cls.PRIOR_NAMES)}), got {tuple(prior_bank.shape)}."
             )
-        prior_scale = getattr(scorer, "prior_scale", None)
-        if not isinstance(prior_scale, torch.Tensor) or prior_scale.shape != ():
+        logit_scale = getattr(scorer, "logit_scale", None)
+        if not isinstance(logit_scale, torch.Tensor) or logit_scale.shape != ():
             raise ValueError(
-                "prior_scale must be a scalar tensor, "
-                f"got {None if prior_scale is None else tuple(prior_scale.shape)}."
+                "logit_scale must be a scalar tensor, "
+                f"got {None if logit_scale is None else tuple(logit_scale.shape)}."
             )
-        scale = prior_scale.detach().to(
+        scale = logit_scale.detach().to(
             device=prior_bank.device,
             dtype=prior_bank.dtype,
         )
@@ -101,12 +101,12 @@ class PriorWeightMonitor(Callback):
     @staticmethod
     def _resolve_scorer(pl_module: Any) -> Any:
         policy = getattr(pl_module, "policy", None)
-        scorer = getattr(policy, "expand_edge_scorer", None)
-        prior_scale = getattr(scorer, "prior_scale", None)
-        if not isinstance(prior_scale, torch.Tensor):
+        scorer = getattr(policy, "edge_scorer", None)
+        logit_scale = getattr(scorer, "logit_scale", None)
+        if not isinstance(logit_scale, torch.Tensor):
             raise TypeError(
-                "PriorWeightMonitor expects pl_module.policy.expand_edge_scorer "
-                "to expose a scalar prior_scale tensor. "
+                "PriorWeightMonitor expects pl_module.policy.edge_scorer "
+                "to expose a scalar logit_scale tensor. "
                 f"Got {type(scorer).__name__}."
             )
         return scorer

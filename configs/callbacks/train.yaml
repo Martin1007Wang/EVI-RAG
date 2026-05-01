@@ -20,3 +20,8 @@ early_stopping:
   patience: 10
   min_delta: 0.0
   strict: true
+
+local_metrics_writer:
+  _target_: src.callbacks.local_metrics_writer.LocalMetricsWriter
+  output_dir: ${paths.artifact_dir}/metrics
+  enabled: true

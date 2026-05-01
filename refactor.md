@@ -198,7 +198,7 @@ z_e\approx f(q,e)
 [
 \text{FeatureBank}
 \rightarrow
-\text{EvidenceContext}(q,G_t)
+\text{StateContext}(q,G_t)
 \rightarrow
 \text{Action/Transition Flow}
 ]
@@ -221,14 +221,14 @@ class PolicyOutput:
     state_log_flow: torch.Tensor       # [B]
     stop_logits: torch.Tensor          # [B]
     edge_logits: torch.Tensor          # [num_candidates]
-    context: EvidenceContext
+    context: StateContext
 ```
 
 再定义：
 
 ```python
 @dataclass(frozen=True)
-class EvidenceContext:
+class StateContext:
     query_h: torch.Tensor          # [B, H]
     state_h: torch.Tensor          # [B, H]
     node_h: torch.Tensor           # [num_nodes, H]
@@ -236,7 +236,7 @@ class EvidenceContext:
     progress: torch.Tensor         # [B]
 ```
 
-不要在 `Policy` 里散落各种 `node_pool`, `edge_pool`, `state_summary` 的半成品。`Policy` 只认一个 `EvidenceContext`。
+不要在 `Policy` 里散落各种 `node_pool`, `edge_pool`, `state_summary` 的半成品。`Policy` 只认一个 `StateContext`。
 
 从职责上讲：
 
@@ -257,7 +257,7 @@ Policy
 
 ## 原先负责什么
 
-`SemanticFeatureEncoder` 现在负责构造 `FeatureBank`：
+`FeatureEncoder` 现在负责构造 `FeatureBank`：
 
 [
 h_q,\ h_v,\ h_r
@@ -382,7 +382,7 @@ h_s=\mathrm{EvidenceReadout}_\theta(q,G_t)
 
 ```python
 @dataclass(frozen=True)
-class EvidenceContext:
+class StateContext:
     query_h: torch.Tensor
     state_h: torch.Tensor
     node_h: torch.Tensor
@@ -408,7 +408,7 @@ progress
 输出：
 
 ```python
-EvidenceContext
+StateContext
 ```
 
 内部做四件事。
@@ -699,7 +699,7 @@ P(\text{STOP}|s)
 P(e|s,\text{Continue})
 ]
 
-那 STOP 至少要从 `EvidenceContext` 来：
+那 STOP 至少要从 `StateContext` 来：
 
 [
 \ell_{\text{stop}}=
@@ -754,7 +754,7 @@ y_{\text{stop}}(s)=
 
 ```text
 action_head.py
-输入 EvidenceContext 和 progress。
+输入 StateContext 和 progress。
 输出 stop logit。
 不直接读 gold reward。
 不计算 edge logits。
@@ -797,7 +797,7 @@ Z_\theta(s)
 \sum_{x\succeq s} R(x)
 ]
 
-它要和 edge scorer 共享同一个 `EvidenceContext`。这样论文里可以说：
+它要和 edge scorer 共享同一个 `StateContext`。这样论文里可以说：
 
 > The same evidence state representation parameterizes both the state flow and the transition residual.
 
@@ -1383,7 +1383,7 @@ log_pb
 terminal_log_reward
 ```
 
-但不要保存整个 `EvidenceContext`。那会浪费内存，也让 buffer 变成模型内部状态仓库。
+但不要保存整个 `StateContext`。那会浪费内存，也让 buffer 变成模型内部状态仓库。
 
 ## 怎么改
 
@@ -1520,7 +1520,7 @@ auxiliary:
 
 | 模块                      | 原先职责                                   | 问题                                              | 新职责                                         | 修改重点                                                             |
 | ----------------------- | -------------------------------------- | ----------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------- |
-| `policy.py`             | 拼 backbone/readout/head/scorer         | 表面 state-conditioned，实质 edge 不看 state           | 组装 evidence-flow policy                     | 输出 `EvidenceContext`，edge/stop/flow 共用 `state_h`                 |
+| `policy.py`             | 拼 backbone/readout/head/scorer         | 表面 state-conditioned，实质 edge 不看 state           | 组装 evidence-flow policy                     | 输出 `StateContext`，edge/stop/flow 共用 `state_h`                 |
 | `backbone.py`           | 构造 q/node/relation embedding，附带一些结构特征  | 静态语义和结构状态混在一起                                   | 只做 static semantic feature bank             | 保留 `query_h,node_h,rel_h,anchor_mask,node_is_non_text`           |
 | `state_readout.py`      | mean pooling anchor/node/edge，主要给 flow | 不 query-conditioned；不进入 edge scorer             | query-conditioned evidence graph readout    | selected edge attention + node attention + progress -> `state_h` |
 | `edge_scorer.py`        | relation cosine + new text cosine      | `del state_h`，不是 reasoning                      | semantic prior + state-conditioned residual | `z = prior + MLP([h_s,h_q,edge_h])`                              |

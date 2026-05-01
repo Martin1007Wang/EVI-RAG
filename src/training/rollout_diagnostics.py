@@ -109,10 +109,9 @@ def compute_root_answer_edge_ranking_diagnostics(
         return_edge_breakdown=True,
     )
 
-    candidates = step_out.candidates
-    edge_ids = candidates.edge_ids.view(-1)
-    edge_batch = candidates.batch_index.view(-1)
-    logits = candidates.expand_logits.view(-1)
+    edge_ids = step_out.candidate_edge_ids.view(-1)
+    edge_batch = step_out.candidate_batch_ids.view(-1)
+    final_logits = step_out.edge_logits.view(-1)
     breakdown = step_out.edge_score_breakdown
 
     if edge_ids.numel() == 0:
@@ -137,56 +136,95 @@ def compute_root_answer_edge_ranking_diagnostics(
 
     answer_edge = target.index_select(0, src) | target.index_select(0, dst)
     answer_edge_counts = scatter_sum(
-        answer_edge.to(dtype=logits.dtype),
+        answer_edge.to(dtype=final_logits.dtype),
         edge_batch,
         dim=0,
         dim_size=num_graphs,
     )
     candidate_counts = scatter_sum(
-        torch.ones_like(logits),
+        torch.ones_like(final_logits),
         edge_batch,
         dim=0,
         dim_size=num_graphs,
     )
-    best_answer_logit, _ = scatter_max(
-        logits.masked_fill(~answer_edge, -float("inf")),
-        edge_batch,
-        dim=0,
-        dim_size=num_graphs,
+    prior_logits = breakdown.semantic_logits.view(-1).to(
+        device=final_logits.device,
+        dtype=final_logits.dtype,
     )
-    has_answer = torch.isfinite(best_answer_logit)
-
-    ranks = logits.new_zeros((0,))
-    if bool(has_answer.any()):
-        threshold = best_answer_logit.index_select(0, edge_batch)
-        better = logits > threshold
-        ranks = 1.0 + scatter_sum(
-            better.to(dtype=logits.dtype),
-            edge_batch,
-            dim=0,
-            dim_size=num_graphs,
-        )
-        ranks = ranks[has_answer]
+    residual_logits = breakdown.residual_scale.to(
+        device=final_logits.device, dtype=final_logits.dtype
+    ) * breakdown.residual_logits.view(-1).to(
+        device=final_logits.device,
+        dtype=final_logits.dtype,
+    )
+    prior_ranks, has_answer = _best_answer_edge_ranks(
+        logits=prior_logits,
+        answer_edge=answer_edge,
+        edge_batch=edge_batch,
+        num_graphs=num_graphs,
+    )
+    final_ranks, _ = _best_answer_edge_ranks(
+        logits=final_logits,
+        answer_edge=answer_edge,
+        edge_batch=edge_batch,
+        num_graphs=num_graphs,
+    )
+    rank_delta = final_ranks - prior_ranks
+    base_logit_std = _tensor_std(prior_logits)
+    residual_logit_std = _tensor_std(residual_logits)
 
     metrics = {
+        "edge/base_logit_std": base_logit_std,
+        "edge/residual_logit_std": residual_logit_std,
+        "edge/residual_to_base_std_ratio": _safe_ratio(
+            residual_logit_std,
+            base_logit_std,
+        ),
+        "edge/prior_rank_vs_final_rank_kendall": _tensor_mean(
+            _kendall_tau_by_graph(
+                prior_logits=prior_logits,
+                final_logits=final_logits,
+                edge_batch=edge_batch,
+                num_graphs=num_graphs,
+            )
+        ),
+        "edge/answer_edge_prior_rank": _tensor_mean(prior_ranks),
+        "edge/answer_edge_final_rank": _tensor_mean(final_ranks),
         "root/frontier_answer_edge_rate": _tensor_mean(
             has_answer.to(dtype=torch.float32)
         ),
         "root/frontier_answer_edge_count_mean": _tensor_mean(answer_edge_counts),
         "root/frontier_candidate_count_mean": _tensor_mean(candidate_counts),
-        "root/policy_answer_edge_best_rank_mean": _tensor_mean(ranks),
-        "root/policy_answer_edge_best_rank_median": _tensor_median(ranks),
+        "root/prior_answer_edge_best_rank_mean": _tensor_mean(prior_ranks),
+        "root/prior_answer_edge_best_rank_median": _tensor_median(prior_ranks),
+        "root/prior_answer_edge_top1_rate": _tensor_mean(
+            prior_ranks.le(1.0).to(dtype=torch.float32)
+        ),
+        "root/prior_answer_edge_top5_rate": _tensor_mean(
+            prior_ranks.le(5.0).to(dtype=torch.float32)
+        ),
+        "root/prior_answer_edge_mrr": _tensor_mean(1.0 / prior_ranks.clamp_min(1.0)),
+        "root/policy_answer_edge_best_rank_mean": _tensor_mean(final_ranks),
+        "root/policy_answer_edge_best_rank_median": _tensor_median(final_ranks),
         "root/policy_answer_edge_top1_rate": _tensor_mean(
-            ranks.le(1.0).to(dtype=torch.float32)
+            final_ranks.le(1.0).to(dtype=torch.float32)
         ),
         "root/policy_answer_edge_top5_rate": _tensor_mean(
-            ranks.le(5.0).to(dtype=torch.float32)
+            final_ranks.le(5.0).to(dtype=torch.float32)
         ),
-        "root/policy_answer_edge_mrr": _tensor_mean(1.0 / ranks.clamp_min(1.0)),
-        "root/answer_edge_q_rel_mean": _masked_mean_1d(breakdown.q_rel, answer_edge),
-        "root/answer_edge_q_new_mean": _masked_mean_1d(breakdown.q_new, answer_edge),
+        "root/policy_answer_edge_mrr": _tensor_mean(1.0 / final_ranks.clamp_min(1.0)),
+        "root/answer_edge_rank_delta_mean": _tensor_mean(rank_delta),
+        "root/final_worse_than_prior_rate": _tensor_mean(
+            rank_delta.gt(0.0).to(dtype=torch.float32)
+        ),
+        "root/answer_edge_q_rel_mean": _masked_mean_1d(
+            breakdown.query_relation_score, answer_edge
+        ),
+        "root/answer_edge_q_new_mean": _masked_mean_1d(
+            breakdown.query_new_node_score, answer_edge
+        ),
         "root/answer_edge_q_candidate_mean": _masked_mean_1d(
-            breakdown.q_candidate,
+            breakdown.semantic_score,
             answer_edge,
         ),
         "root/answer_edge_new_text_rate": _masked_mean_1d(
@@ -198,15 +236,15 @@ def compute_root_answer_edge_ranking_diagnostics(
             answer_edge,
         ),
         "root/nonanswer_edge_q_rel_mean": _masked_mean_1d(
-            breakdown.q_rel,
+            breakdown.query_relation_score,
             ~answer_edge,
         ),
         "root/nonanswer_edge_q_new_mean": _masked_mean_1d(
-            breakdown.q_new,
+            breakdown.query_new_node_score,
             ~answer_edge,
         ),
         "root/nonanswer_edge_q_candidate_mean": _masked_mean_1d(
-            breakdown.q_candidate,
+            breakdown.semantic_score,
             ~answer_edge,
         ),
         "root/nonanswer_edge_new_text_rate": _masked_mean_1d(
@@ -222,6 +260,132 @@ def compute_root_answer_edge_ranking_diagnostics(
     return default
 
 
+def _kendall_tau_by_graph(
+    *,
+    prior_logits: torch.Tensor,
+    final_logits: torch.Tensor,
+    edge_batch: torch.Tensor,
+    num_graphs: int,
+) -> torch.Tensor:
+    prior_logits = prior_logits.view(-1)
+    final_logits = final_logits.to(
+        device=prior_logits.device, dtype=prior_logits.dtype
+    ).view(-1)
+    edge_batch = edge_batch.to(device=prior_logits.device, dtype=torch.long).view(-1)
+
+    if (
+        prior_logits.numel() == 0
+        or final_logits.numel() != prior_logits.numel()
+        or edge_batch.numel() != prior_logits.numel()
+    ):
+        return prior_logits.new_zeros((0,))
+
+    values: list[torch.Tensor] = []
+    prior_cpu = prior_logits.detach().float().cpu()
+    final_cpu = final_logits.detach().float().cpu()
+    edge_batch_cpu = edge_batch.detach().cpu()
+    for graph_id in range(int(num_graphs)):
+        mask = edge_batch_cpu.eq(graph_id)
+        if int(mask.sum().item()) < 2:
+            continue
+
+        tau = _kendall_tau_1d(prior_cpu[mask], final_cpu[mask])
+        if tau is None:
+            continue
+
+        values.append(prior_logits.new_tensor(float(tau)))
+
+    if not values:
+        return prior_logits.new_zeros((0,))
+    return torch.stack(values, dim=0).to(dtype=prior_logits.dtype)
+
+
+def _kendall_tau_1d(
+    prior: torch.Tensor,
+    final: torch.Tensor,
+) -> float | None:
+    pairs = [
+        (float(prior_value), float(final_value))
+        for prior_value, final_value in zip(
+            prior.view(-1).tolist(), final.view(-1).tolist()
+        )
+    ]
+    if len(pairs) < 2:
+        return None
+
+    final_values = sorted({final_value for _, final_value in pairs})
+    final_rank = {value: index + 1 for index, value in enumerate(final_values)}
+    tree = [0] * (len(final_values) + 2)
+
+    def add(index: int, value: int) -> None:
+        while index < len(tree):
+            tree[index] += int(value)
+            index += index & -index
+
+    def prefix_sum(index: int) -> int:
+        total = 0
+        while index > 0:
+            total += tree[index]
+            index -= index & -index
+        return total
+
+    pairs.sort(key=lambda item: (item[0], item[1]))
+    numerator = 0.0
+    denominator = 0.0
+    seen = 0
+    start = 0
+    while start < len(pairs):
+        end = start + 1
+        while end < len(pairs) and pairs[end][0] == pairs[start][0]:
+            end += 1
+
+        for _, final_value in pairs[start:end]:
+            rank = final_rank[final_value]
+            less = prefix_sum(rank - 1)
+            greater = seen - prefix_sum(rank)
+            numerator += float(less - greater)
+            denominator += float(less + greater)
+
+        for _, final_value in pairs[start:end]:
+            add(final_rank[final_value], 1)
+            seen += 1
+
+        start = end
+
+    if denominator <= 0.0:
+        return None
+    return numerator / denominator
+
+
+def _best_answer_edge_ranks(
+    *,
+    logits: torch.Tensor,
+    answer_edge: torch.Tensor,
+    edge_batch: torch.Tensor,
+    num_graphs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    best_answer_logit, _ = scatter_max(
+        logits.masked_fill(~answer_edge, -float("inf")),
+        edge_batch,
+        dim=0,
+        dim_size=int(num_graphs),
+    )
+    has_answer = torch.isfinite(best_answer_logit)
+
+    if not bool(has_answer.any()):
+        return logits.new_zeros((0,)), has_answer
+
+    threshold = best_answer_logit.index_select(0, edge_batch)
+    better = logits > threshold
+    ranks = 1.0 + scatter_sum(
+        better.to(dtype=logits.dtype),
+        edge_batch,
+        dim=0,
+        dim_size=int(num_graphs),
+    )
+    return ranks[has_answer], has_answer
+
+
 def compute_terminal_reward_diagnostics(
     rollouts: tuple[RolloutBatch, ...],
     *,
@@ -230,9 +394,9 @@ def compute_terminal_reward_diagnostics(
     del batch
     f1_values = _cat_stat(rollouts, lambda rollout: rollout.stats.terminal_answer_f1)
     log_rewards = _cat_stat(rollouts, lambda rollout: rollout.stats.terminal_log_reward)
-    edge_penalties = _cat_optional_stat(
+    complexity_penalties = _cat_optional_stat(
         rollouts,
-        lambda rollout: getattr(rollout.stats, "terminal_edge_penalty", None),
+        lambda rollout: getattr(rollout.stats, "terminal_complexity_penalty", None),
     )
     base_log_rewards = _cat_optional_stat(
         rollouts,
@@ -246,20 +410,13 @@ def compute_terminal_reward_diagnostics(
         rollouts,
         lambda rollout: getattr(rollout.stats, "terminal_expanded_edge_count", None),
     )
-    minimal_edge_counts = _cat_optional_stat(
+    answer_degree_excess = _cat_optional_stat(
         rollouts,
-        lambda rollout: getattr(rollout.stats, "terminal_minimal_edge_count", None),
-    )
-    minimality_gaps = _cat_optional_stat(
-        rollouts,
-        lambda rollout: getattr(rollout.stats, "terminal_minimality_gap", None),
-    )
-    minimality_penalties = _cat_optional_stat(
-        rollouts,
-        lambda rollout: getattr(rollout.stats, "terminal_minimality_penalty", None),
+        lambda rollout: getattr(rollout.stats, "terminal_answer_degree_excess", None),
     )
 
     return {
+        "reward/log_reward_mean": _tensor_mean(log_rewards),
         "reward/terminal_answer_f1_mean": _tensor_mean(f1_values),
         "reward/nonzero_f1_rate": _tensor_mean(
             f1_values.gt(0.0).to(dtype=torch.float32)
@@ -271,13 +428,14 @@ def compute_terminal_reward_diagnostics(
         ),
         "reward/terminal_log_reward_mean": _tensor_mean(log_rewards),
         "reward/log_reward_std": _tensor_std(log_rewards),
+        "reward/log_reward_p90": _tensor_quantile(log_rewards, 0.90),
+        "reward/log_reward_max": _tensor_max(log_rewards),
         "reward/base_log_reward_mean": _tensor_mean(base_log_rewards),
-        "reward/edge_penalty_mean": _tensor_mean(edge_penalties),
+        "reward/complexity_penalty_mean": _tensor_mean(complexity_penalties),
         "reward/utility_mean": _tensor_mean(utilities),
+        "reward/supported_answer_recall_mean": _tensor_mean(utilities),
         "reward/expanded_edge_count_mean": _tensor_mean(expanded_edge_counts),
-        "reward/minimal_edge_count_mean": _tensor_mean(minimal_edge_counts),
-        "reward/minimality_gap_mean": _tensor_mean(minimality_gaps),
-        "reward/minimality_penalty_mean": _tensor_mean(minimality_penalties),
+        "reward/answer_degree_excess_mean": _tensor_mean(answer_degree_excess),
     }
 
 
@@ -366,38 +524,6 @@ def compute_stop_behavior_diagnostics(
         )
 
     return metrics
-
-
-def compute_proposal_diagnostics(
-    rollouts: tuple[RolloutBatch, ...],
-) -> dict[str, float]:
-    intervention = _cat_trace(
-        rollouts,
-        lambda rollout: rollout.traces.proposal_intervention_mask,
-    ).bool()
-    continue_mask = _cat_trace(
-        rollouts, lambda rollout: rollout.traces.continue_mask
-    ).bool()
-    stop_mask = _cat_trace(rollouts, lambda rollout: rollout.traces.stop_mask).bool()
-    valid = _cat_trace(
-        rollouts, lambda rollout: rollout.traces.policy_action_valid_mask
-    ).bool()
-
-    denom = float(valid.sum().item()) if valid.numel() > 0 else 0.0
-    return {
-        "proposal/intervention_rate": _safe_ratio(
-            float((intervention & valid).sum().item()),
-            denom,
-        ),
-        "proposal/forced_continue_rate": _safe_ratio(
-            float((intervention & continue_mask & valid).sum().item()),
-            denom,
-        ),
-        "proposal/forced_stop_rate": _safe_ratio(
-            float((intervention & stop_mask & valid).sum().item()),
-            denom,
-        ),
-    }
 
 
 def compute_after_hit_diagnostics(
@@ -522,7 +648,6 @@ def collect_training_rollout_diagnostics(
         **compute_stop_behavior_diagnostics(rollouts),
         **compute_stop_and_teacher_diagnostics(rollouts, batch=batch),
         **compute_policy_behavior_diagnostics(rollouts),
-        **compute_proposal_diagnostics(rollouts),
         **compute_after_hit_diagnostics(rollouts),
     }
 
@@ -1030,6 +1155,18 @@ def _tensor_std(values: torch.Tensor) -> float:
     return float(values.float().std(unbiased=False).item())
 
 
+def _tensor_quantile(values: torch.Tensor, q: float) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return float(torch.quantile(values.float(), float(q)).item())
+
+
+def _tensor_max(values: torch.Tensor) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return float(values.float().max().item())
+
+
 def _masked_mean_1d(values: torch.Tensor, mask: torch.Tensor) -> float:
     values = values.view(-1)
     mask = mask.to(device=values.device, dtype=torch.bool).view(-1)
@@ -1045,14 +1182,27 @@ def _masked_mean_1d(values: torch.Tensor, mask: torch.Tensor) -> float:
 
 def _root_answer_edge_rank_default_metrics() -> dict[str, float]:
     return {
+        "edge/base_logit_std": 0.0,
+        "edge/residual_logit_std": 0.0,
+        "edge/residual_to_base_std_ratio": 0.0,
+        "edge/prior_rank_vs_final_rank_kendall": 0.0,
+        "edge/answer_edge_prior_rank": 0.0,
+        "edge/answer_edge_final_rank": 0.0,
         "root/frontier_answer_edge_rate": 0.0,
         "root/frontier_answer_edge_count_mean": 0.0,
         "root/frontier_candidate_count_mean": 0.0,
+        "root/prior_answer_edge_best_rank_mean": 0.0,
+        "root/prior_answer_edge_best_rank_median": 0.0,
+        "root/prior_answer_edge_top1_rate": 0.0,
+        "root/prior_answer_edge_top5_rate": 0.0,
+        "root/prior_answer_edge_mrr": 0.0,
         "root/policy_answer_edge_best_rank_mean": 0.0,
         "root/policy_answer_edge_best_rank_median": 0.0,
         "root/policy_answer_edge_top1_rate": 0.0,
         "root/policy_answer_edge_top5_rate": 0.0,
         "root/policy_answer_edge_mrr": 0.0,
+        "root/answer_edge_rank_delta_mean": 0.0,
+        "root/final_worse_than_prior_rate": 0.0,
         "root/answer_edge_q_rel_mean": 0.0,
         "root/answer_edge_q_new_mean": 0.0,
         "root/answer_edge_q_candidate_mean": 0.0,
@@ -1082,7 +1232,6 @@ __all__ = [
     "compute_debug_rollout_diagnostics",
     "compute_eval_rollout_diagnostics",
     "compute_policy_behavior_diagnostics",
-    "compute_proposal_diagnostics",
     "compute_root_answer_edge_ranking_diagnostics",
     "compute_stop_and_teacher_diagnostics",
     "compute_stop_behavior_diagnostics",

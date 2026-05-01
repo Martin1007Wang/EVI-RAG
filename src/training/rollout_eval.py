@@ -6,7 +6,7 @@ from src.data.schema import RetrievalBatch
 from src.eval.compactness import compute_compactness_expectations
 from src.eval.diversity import compute_exploration_diversity_at_ks
 from src.eval.groups import MetricGroups
-from src.eval.node_retrieval import (
+from src.eval.retrieval import (
     compute_best_of_k_node_retrieval_quality,
     compute_expected_node_retrieval_quality,
 )
@@ -60,6 +60,28 @@ def evaluate_rollouts(
             expected_target_f1=sample_metrics["expected_target_f1"],
         )
     )
+    all_answer_sample_metrics: dict[str, float] | None = None
+    all_answer_best_of_k_metrics: dict[str, float] | None = None
+    if use_reachable_targets:
+        all_answer_sample_metrics = compute_expected_node_retrieval_quality(
+            rollouts,
+            batch,
+            exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
+            use_reachable_targets=False,
+        )
+        all_answer_best_of_k_metrics = compute_best_of_k_node_retrieval_quality(
+            rollouts,
+            batch,
+            ks=eval_budgets,
+            exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
+            use_reachable_targets=False,
+        )
+        all_answer_best_of_k_metrics.update(
+            _compute_best_of_k_gain_metrics(
+                best_of_k_metrics=all_answer_best_of_k_metrics,
+                expected_target_f1=all_answer_sample_metrics["expected_target_f1"],
+            )
+        )
 
     include_dangling = debug_metrics or stage == "val"
     metrics: MetricGroups = {
@@ -71,6 +93,12 @@ def evaluate_rollouts(
             include_dangling=include_dangling,
         ),
     }
+    if (
+        all_answer_sample_metrics is not None
+        and all_answer_best_of_k_metrics is not None
+    ):
+        metrics["sample_all_answers"] = all_answer_sample_metrics
+        metrics["best_of_k_all_answers"] = all_answer_best_of_k_metrics
 
     diversity_ks = _diversity_ks(eval_budgets=eval_budgets, stage=stage)
     if diversity_ks:

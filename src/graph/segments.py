@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 import torch
-from torch_scatter import scatter_logsumexp, scatter_max
+from torch_scatter import scatter_max
 
 
 def _validate_segmented_inputs(
@@ -63,11 +64,14 @@ def scatter_log_softmax(
     )
     if logits.numel() == 0:
         return logits.new_empty((0,))
-    log_z = scatter_logsumexp(
-        logits,
-        segment_ids,
+    log_z = torch.stack(
+        [
+            torch.logsumexp(logits[segment_ids == segment_id], dim=0)
+            if bool((segment_ids == segment_id).any())
+            else logits.new_full((), -torch.inf)
+            for segment_id in range(int(num_segments))
+        ],
         dim=0,
-        dim_size=int(num_segments),
     )
     return logits - log_z.index_select(0, segment_ids)
 

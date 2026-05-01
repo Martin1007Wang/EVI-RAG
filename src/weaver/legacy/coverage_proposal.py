@@ -6,9 +6,18 @@ from typing import Any
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.weaver.policy import CandidateEdges
 from src.weaver.reward import RewardModel, TerminalRewardOutput
 from src.weaver.state import State
+
+
+@dataclass(frozen=True)
+class CandidateEdges:
+    edge_ids: torch.Tensor
+    expand_logits: torch.Tensor
+    batch_index: torch.Tensor
+
+    def __len__(self) -> int:
+        return int(self.edge_ids.numel())
 
 
 @dataclass(frozen=True)

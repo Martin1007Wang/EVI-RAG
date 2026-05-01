@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass
 from typing import Sequence
+
 import torch
 
 unreachable_distance = -1
@@ -207,11 +209,18 @@ def _shortest_suffix_counts(
     if node_to_target_dist[target_node_id] != 0:
         return counts
     counts[target_node_id] = 1.0
-    max_dist = max((d for d in node_to_target_dist if d >= 0), default=0)
+
+    buckets: list[list[int]] = []
+    for node_id, dist in enumerate(node_to_target_dist):
+        if dist < 0:
+            continue
+        while len(buckets) <= dist:
+            buckets.append([])
+        buckets[dist].append(node_id)
+
+    max_dist = len(buckets) - 1
     for dist in range(1, max_dist + 1):
-        for u, u_dist in enumerate(node_to_target_dist):
-            if u_dist != dist:
-                continue
+        for u in buckets[dist]:
             total = 0.0
             for v in adjacency[u]:
                 if node_to_target_dist[v] == dist - 1:
@@ -232,20 +241,71 @@ def _shortest_path_edge_mask(
     Mark edges lying on at least one anchor-to-target shortest path.
     """
     mask = torch.zeros((len(target_node_ids), len(src)), dtype=torch.bool)
-    target_distance_rows = target_distances.tolist()
+    if not target_node_ids or not src or not anchor_distances:
+        return mask
+    if target_distances.ndim != 2 or target_distances.size(0) != len(target_node_ids):
+        raise ValueError(
+            "target_distances must have shape "
+            f"[num_targets, num_nodes], got {tuple(target_distances.shape)}."
+        )
+
+    num_nodes = int(target_distances.size(1))
+    src_tensor = torch.tensor(src, dtype=torch.long)
+    dst_tensor = torch.tensor(dst, dtype=torch.long)
+    valid_edges = (
+        src_tensor.ge(0)
+        & src_tensor.lt(num_nodes)
+        & dst_tensor.ge(0)
+        & dst_tensor.lt(num_nodes)
+    )
+    if not bool(valid_edges.any()):
+        return mask
+
+    edge_ids = torch.nonzero(valid_edges, as_tuple=False).view(-1)
+    valid_src = src_tensor[edge_ids]
+    valid_dst = dst_tensor[edge_ids]
+    anchor_matrix = torch.tensor(anchor_distances, dtype=torch.long)
+    if anchor_matrix.ndim != 2 or anchor_matrix.size(1) != num_nodes:
+        raise ValueError(
+            "anchor_distances must have shape "
+            f"[num_anchors, num_nodes], got {tuple(anchor_matrix.shape)}."
+        )
+
+    max_elements_per_chunk = 4_000_000
     for target_idx, target in enumerate(target_node_ids):
-        node_to_target = target_distance_rows[target_idx]
-        for anchor_to_node in anchor_distances:
-            anchor_to_target = anchor_to_node[int(target)]
-            if anchor_to_target == unreachable_distance:
-                continue
-            for edge_id, (u, v) in enumerate(zip(src, dst)):
-                if anchor_to_node[u] == unreachable_distance:
-                    continue
-                if node_to_target[v] == unreachable_distance:
-                    continue
-                if anchor_to_node[u] + 1 + node_to_target[v] == anchor_to_target:
-                    mask[target_idx, edge_id] = True
+        target_id = int(target)
+        if not 0 <= target_id < num_nodes:
+            continue
+
+        edge_to_target = target_distances[target_idx, valid_dst]
+        edge_can_reach_target = edge_to_target.ne(unreachable_distance)
+        if not bool(edge_can_reach_target.any()):
+            continue
+
+        active_edge_ids = edge_ids[edge_can_reach_target]
+        active_src = valid_src[edge_can_reach_target]
+        active_edge_to_target = edge_to_target[edge_can_reach_target]
+
+        anchor_to_target = anchor_matrix[:, target_id]
+        anchor_can_reach_target = anchor_to_target.ne(unreachable_distance)
+        if not bool(anchor_can_reach_target.any()):
+            continue
+
+        active_anchor_distances = anchor_matrix[anchor_can_reach_target]
+        active_anchor_to_target = anchor_to_target[anchor_can_reach_target]
+        num_active_anchors = int(active_anchor_distances.size(0))
+        chunk_size = max(1, max_elements_per_chunk // max(1, num_active_anchors))
+
+        for start in range(0, int(active_src.numel()), chunk_size):
+            end = min(start + chunk_size, int(active_src.numel()))
+            src_chunk = active_src[start:end]
+            suffix_chunk = active_edge_to_target[start:end]
+            anchor_to_src = active_anchor_distances[:, src_chunk]
+            on_path = anchor_to_src.ne(unreachable_distance) & (
+                anchor_to_src + 1 + suffix_chunk.unsqueeze(0)
+                == active_anchor_to_target.unsqueeze(1)
+            )
+            mask[target_idx, active_edge_ids[start:end]] = on_path.any(dim=0)
     return mask
 
 

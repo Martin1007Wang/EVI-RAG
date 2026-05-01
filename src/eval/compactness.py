@@ -82,7 +82,7 @@ def compactness_from_masks(
     edge_batch = batch.edge_batch.to(device=device, dtype=torch.long)
 
     anchors = anchor_node_mask(batch, device=device)
-    roots = root_edge_mask(batch, anchors=anchors, device=device)
+    roots = root_edge_mask(batch, anchor_mask=anchors, device=device)
 
     node_counts = per_graph_counts(
         node_masks,
@@ -132,7 +132,7 @@ def dangling_edge_ratio_from_masks(
 
     anchors = anchor_node_mask(batch, device=device)
     targets = eval_target_node_mask(batch, device=device, use_reachable_targets=True)
-    roots = root_edge_mask(batch, anchors=anchors, device=device)
+    roots = root_edge_mask(batch, anchor_mask=anchors, device=device)
 
     ratios: list[torch.Tensor] = []
 
@@ -193,7 +193,9 @@ def per_graph_counts(
 
     batch_index = batch_index.to(device=masks.device, dtype=torch.long)
     num_rollouts = int(masks.size(0))
-    row_offsets = torch.arange(num_rollouts, device=masks.device).unsqueeze(1) * int(num_graphs)
+    row_offsets = torch.arange(num_rollouts, device=masks.device).unsqueeze(1) * int(
+        num_graphs
+    )
     flat_index = (batch_index.unsqueeze(0) + row_offsets).reshape(-1)
 
     counts = scatter_sum(

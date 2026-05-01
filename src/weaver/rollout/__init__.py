@@ -4,12 +4,19 @@ from importlib import import_module
 from typing import Any
 
 __all__ = [
+    "RewardMode",
     "RolloutBatch",
+    "RolloutRewardRequirements",
     "RolloutRunner",
 ]
 
 _EXPORTS = {
+    "RewardMode": ("src.weaver.rollout.engine", "RewardMode"),
     "RolloutBatch": ("src.weaver.rollout.schema", "RolloutBatch"),
+    "RolloutRewardRequirements": (
+        "src.weaver.rollout.runner",
+        "RolloutRewardRequirements",
+    ),
     "RolloutRunner": ("src.weaver.rollout.runner", "RolloutRunner"),
 }
 

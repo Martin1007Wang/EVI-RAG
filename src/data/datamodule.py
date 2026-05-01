@@ -13,6 +13,9 @@ from .collate import RetrievalCollator
 from .dataset import RetrievalDataset
 
 
+_EMBEDDING_NORM_ATOL = 1.0e-3
+
+
 @dataclass(frozen=True)
 class ModelResources:
     """
@@ -395,6 +398,15 @@ def _validate_model_resources(
             f"relation_embeddings dim={relation_dim}."
         )
 
+    _validate_l2_normalized_rows(
+        entity_text_embeddings,
+        name="entity_text_embeddings",
+    )
+    _validate_l2_normalized_rows(
+        relation_embeddings,
+        name="relation_embeddings",
+    )
+
     if entity_embedding_map.numel() > 0:
         min_id = int(entity_embedding_map.min().item())
         max_id = int(entity_embedding_map.max().item())
@@ -411,6 +423,33 @@ def _validate_model_resources(
                 "entity_text_embeddings: "
                 f"max={max_id}, table_size={int(entity_text_embeddings.size(0))}."
             )
+
+
+def _validate_l2_normalized_rows(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    atol: float = _EMBEDDING_NORM_ATOL,
+) -> None:
+    if tensor.numel() == 0:
+        return
+
+    if not bool(torch.isfinite(tensor).all()):
+        raise ValueError(f"{name} must contain only finite values.")
+
+    norms = torch.linalg.vector_norm(tensor.to(dtype=torch.float32), ord=2, dim=1)
+    deviation = (norms - 1.0).abs()
+    max_deviation = float(deviation.max().item())
+    if max_deviation <= float(atol):
+        return
+
+    row = int(deviation.argmax().item())
+    norm = float(norms[row].item())
+    raise ValueError(
+        f"{name} rows must be L2-normalized within atol={float(atol):g}; "
+        f"row {row} has norm={norm:.6g}. Rebuild embeddings with "
+        "`python src/preprocess.py dataset=<name>`."
+    )
 
 
 def _path_from_dataset_cfg(cfg: Mapping[str, Any], key: str) -> Path:

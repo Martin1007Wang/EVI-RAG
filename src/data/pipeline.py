@@ -1,18 +1,21 @@
 from __future__ import annotations
+
 import logging
 from pathlib import Path
 from typing import Any, Mapping
+
 import hydra
 import torch
 from omegaconf import DictConfig
+
+from .preprocess.graph_collect import collect_and_filter_graphs
+from .preprocess.samples import PreparedSample, SplitFilter
+from .preprocess.source import iter_samples
 from .preprocess.vocab import (
     EntityCatalog,
     EntityTyping,
     RelationCatalog,
 )
-from .preprocess.graph_collect import collect_and_filter_graphs
-from .preprocess.samples import PreparedSample, SplitFilter
-from .preprocess.source import iter_samples
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +113,14 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
     relation_catalog = RelationCatalog.build(relation_vocab)
     log.info("Stage 2/3: text encoding")
     question_texts = [s.question for s in prepared_samples]
+    encoder_cache_dir = None
+    if bool(preprocess_cfg.encoder.get("cache_enabled", True)):
+        configured_cache_dir = preprocess_cfg.encoder.get("cache_dir")
+        encoder_cache_dir = (
+            _resolve_path(configured_cache_dir, name="preprocess.encoder.cache_dir")
+            if configured_cache_dir not in (None, "")
+            else resolved_paths["embeddings_dir"] / "text_encode_cache"
+        )
     encoded = encode_text_features(
         entity_text_labels=entity_catalog.entity_text_labels,
         relation_text_labels=relation_catalog.relation_text_labels,
@@ -118,6 +129,7 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> None:
         device=str(preprocess_cfg.encoder.get("device", "auto")),
         batch_size=int(preprocess_cfg.encoder.batch_size),
         progress_bar=bool(preprocess_cfg.get("progress_bar", True)),
+        cache_dir=encoder_cache_dir,
     )
     log.info("Stage 2 complete")
     log.info("Stage 3/3: materialize")

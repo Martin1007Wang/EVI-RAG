@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch
 
 from src.graph.segments import scatter_log_softmax
-from src.weaver.policy import CandidateEdges, PolicyStepOutput
-from src.weaver.rollout.buffers import RolloutBuffer
-from src.weaver.rollout.executor import budget_exhausted_mask, has_candidate
+from src.weaver.policy import PolicyOutput
+from src.weaver.rollout.buffer import RolloutBuffer
+from src.weaver.rollout.executor import StepContext
 from src.weaver.rollout.sampling import (
     EXPAND_OPTION_INDEX,
     STOP_OPTION_INDEX,
@@ -16,11 +16,9 @@ from src.weaver.rollout.sampling import (
 def write_policy_diagnostics(
     *,
     buffer: RolloutBuffer,
-    step_out: PolicyStepOutput,
-    active: torch.Tensor,
-    t: int,
+    step_out: PolicyOutput,
+    step_context: StepContext,
     num_graphs: int,
-    remaining_budget: torch.Tensor,
 ) -> None:
     """
     Write target-policy diagnostics.
@@ -32,26 +30,14 @@ def write_policy_diagnostics(
         H[P(edge | s, Expand)]
     """
     device = step_out.stop_logits.device
-    active = active.to(device=device, dtype=torch.bool)
-
-    has_edge = has_candidate(
-        candidate_batch_index=step_out.candidates.batch_index,
-        num_graphs=int(num_graphs),
-        device=device,
-    )
-
-    exhausted = budget_exhausted_mask(
-        remaining_budget,
-        num_graphs=int(num_graphs),
-        device=device,
-    )
-
-    can_expand = active & has_edge & ~exhausted
+    active = step_context.active_mask.to(device=device, dtype=torch.bool)
+    can_expand = step_context.can_expand.to(device=device, dtype=torch.bool)
 
     type_logp, edge_logp = option_action_log_probs(
         stop_logits=step_out.stop_logits,
         expand_logits=step_out.expand_logits,
-        candidates=step_out.candidates,
+        edge_logits=step_out.edge_logits,
+        candidate_batch_ids=step_out.candidate_batch_ids,
         can_expand=can_expand,
         batch_size=int(num_graphs),
     )
@@ -72,16 +58,15 @@ def write_policy_diagnostics(
     stop_log_pf = type_logp[:, STOP_OPTION_INDEX]
 
     edge_entropy, edge_entropy_valid = edge_entropy_by_graph(
-        candidates=step_out.candidates,
-        active=active,
-        has_candidate_edge=has_edge,
-        remaining_budget=remaining_budget,
+        edge_logits=step_out.edge_logits,
+        candidate_batch_ids=step_out.candidate_batch_ids,
+        step_context=step_context,
         num_graphs=int(num_graphs),
         device=device,
     )
 
     buffer.write_policy_step_diagnostics(
-        t=t,
+        t=step_context.t,
         active=active,
         target_stop_prob=target_stop_prob.to(dtype=torch.float32),
         target_continue_prob=target_continue_prob.to(dtype=torch.float32),
@@ -90,16 +75,18 @@ def write_policy_diagnostics(
         stop_tb_valid_mask=can_expand,
         edge_action_entropy=edge_entropy,
         edge_action_entropy_valid_mask=edge_entropy_valid,
-        budget_exhausted_mask=exhausted,
+        budget_exhausted_mask=step_context.budget_exhausted.to(
+            device=device,
+            dtype=torch.bool,
+        ),
     )
 
 
 def edge_entropy_by_graph(
     *,
-    candidates: CandidateEdges,
-    active: torch.Tensor,
-    has_candidate_edge: torch.Tensor,
-    remaining_budget: torch.Tensor,
+    edge_logits: torch.Tensor,
+    candidate_batch_ids: torch.Tensor,
+    step_context: StepContext,
     num_graphs: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -110,19 +97,15 @@ def edge_entropy_by_graph(
 
     entropy = torch.zeros(num_graphs, dtype=torch.float32, device=device)
 
-    valid = active.to(device=device, dtype=torch.bool)
-    valid = valid & has_candidate_edge.to(device=device, dtype=torch.bool)
-    valid = valid & ~budget_exhausted_mask(
-        remaining_budget,
-        num_graphs=num_graphs,
-        device=device,
-    )
+    valid = step_context.active_mask.to(device=device, dtype=torch.bool)
+    valid = valid & step_context.has_candidate.to(device=device, dtype=torch.bool)
+    valid = valid & ~step_context.budget_exhausted.to(device=device, dtype=torch.bool)
 
-    if len(candidates) == 0 or not bool(valid.any()):
+    if edge_logits.numel() == 0 or not bool(valid.any()):
         return entropy, valid
 
-    edge_batch = candidates.batch_index.to(device=device, dtype=torch.long)
-    logits = candidates.expand_logits.to(device=device, dtype=torch.float32)
+    edge_batch = candidate_batch_ids.to(device=device, dtype=torch.long)
+    logits = edge_logits.to(device=device, dtype=torch.float32)
 
     log_probs = scatter_log_softmax(
         logits,

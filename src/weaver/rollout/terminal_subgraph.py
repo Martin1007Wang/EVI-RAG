@@ -1,4 +1,3 @@
-# src/weaver/rollout/terminal_subgraph.py
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -11,7 +10,7 @@ from src.graph.ops import build_anchor_induced_edge_mask
 from src.weaver.rollout.schema import RolloutBatch
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UnionSubgraphMasks:
     """
     Union of terminal subgraphs over rollout samples.
@@ -35,14 +34,6 @@ def batch_num_graphs(batch: RetrievalBatch) -> int:
     return int(batch.num_graphs)
 
 
-def batch_num_nodes(batch: RetrievalBatch) -> int:
-    return int(batch.num_nodes_total)
-
-
-def batch_num_edges(batch: RetrievalBatch) -> int:
-    return int(batch.num_edges_total)
-
-
 def node_mask_from_ids(
     ids: torch.Tensor,
     *,
@@ -51,12 +42,12 @@ def node_mask_from_ids(
     name: str,
 ) -> torch.Tensor:
     ids = ids.to(device=device, dtype=torch.long).view(-1)
-    mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
 
+    mask = torch.zeros(int(num_nodes), dtype=torch.bool, device=device)
     if ids.numel() == 0:
         return mask
 
-    _check_id_range(ids, upper=num_nodes, name=name)
+    _check_id_range(ids, upper=int(num_nodes), name=name)
     mask[ids] = True
     return mask
 
@@ -68,7 +59,7 @@ def anchor_node_mask(
 ) -> torch.Tensor:
     return node_mask_from_ids(
         batch.anchor_node_ids,
-        num_nodes=batch_num_nodes(batch),
+        num_nodes=int(batch.num_nodes_total),
         device=device,
         name="anchor_node_ids",
     )
@@ -84,22 +75,22 @@ def eval_target_node_mask(
     Build target-node mask for retrieval evaluation.
 
     If use_reachable_targets=True and reachable_target_node_ids exists, metrics
-    are computed over reachable/teachable targets. If False, metrics use all
-    target_node_ids present in the graph.
+    are computed over reachable / teachable targets even when that tensor is
+    empty. Otherwise metrics use all target_node_ids present in the graph.
     """
     if use_reachable_targets:
         reachable = getattr(batch, "reachable_target_node_ids", None)
-        if isinstance(reachable, torch.Tensor) and reachable.numel() > 0:
+        if isinstance(reachable, torch.Tensor):
             return node_mask_from_ids(
                 reachable,
-                num_nodes=batch_num_nodes(batch),
+                num_nodes=int(batch.num_nodes_total),
                 device=device,
                 name="reachable_target_node_ids",
             )
 
     return node_mask_from_ids(
         batch.target_node_ids,
-        num_nodes=batch_num_nodes(batch),
+        num_nodes=int(batch.num_nodes_total),
         device=device,
         name="target_node_ids",
     )
@@ -108,15 +99,24 @@ def eval_target_node_mask(
 def root_edge_mask(
     batch: RetrievalBatch,
     *,
-    anchors: torch.Tensor,
+    anchor_mask: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
+    """
+    Build E_0 = {(u,r,v): u in A and v in A}.
+    """
     edge_index = batch.edge_index.to(device=device, dtype=torch.long)
-    mask = build_anchor_induced_edge_mask(edge_index, anchors)
 
-    expected_shape = (batch_num_edges(batch),)
+    mask = build_anchor_induced_edge_mask(
+        edge_index=edge_index,
+        anchor_mask=anchor_mask.to(device=device, dtype=torch.bool),
+    )
+
+    expected_shape = (int(batch.edge_index.size(1)),)
     if mask.shape != expected_shape:
-        raise ValueError(f"root_edge_mask must have shape {expected_shape}, " f"got {tuple(mask.shape)}.")
+        raise ValueError(
+            f"root_edge_mask must have shape {expected_shape}, got {tuple(mask.shape)}."
+        )
 
     return mask
 
@@ -131,46 +131,59 @@ def terminal_subgraph_mask(
     Reconstruct the terminal subgraph represented by one RolloutBatch.
 
     Returned masks are over the full physical batched graph:
-    - node_mask: [N]
-    - edge_mask: [E]
+        node_mask: [N]
+        edge_mask: [E]
 
     Initial active state:
-    - anchor nodes are active;
-    - anchor-induced root edges are active.
+        V_0 = anchor nodes
+        E_0 = anchor-induced root edges
 
-    Then every valid expanded selected edge is added, together with its endpoints.
+    Then every valid Expand edge is added with its endpoints.
 
     Coordinate convention:
-    - rollout.traces.selected_edge_ids are physical edge ids in this batch.
-    - STOP keeps selected_edge_ids = -1.
+        rollout.traces.selected_edge_ids are physical edge ids in this batch.
+        STOP keeps selected_edge_ids = -1.
     """
-
-    num_graphs = batch_num_graphs(batch)
-    num_nodes = batch_num_nodes(batch)
-    num_edges = batch_num_edges(batch)
+    num_graphs = int(batch.num_graphs)
+    num_nodes = int(batch.num_nodes_total)
+    num_edges = int(batch.edge_index.size(1))
 
     edge_index = batch.edge_index.to(device=device, dtype=torch.long)
 
     node_mask = anchor_node_mask(batch, device=device)
-    edge_mask = root_edge_mask(batch, anchors=node_mask, device=device)
+    edge_mask = root_edge_mask(
+        batch,
+        anchor_mask=node_mask,
+        device=device,
+    )
 
     selected_edge_ids = rollout.traces.selected_edge_ids.to(
         device=device,
         dtype=torch.long,
     )
-    continue_mask = rollout.traces.continue_mask.to(device=device, dtype=torch.bool)
+    continue_mask = rollout.traces.continue_mask.to(
+        device=device,
+        dtype=torch.bool,
+    )
 
     if selected_edge_ids.ndim != 2:
-        raise ValueError(f"selected_edge_ids must have shape [B, T], " f"got {tuple(selected_edge_ids.shape)}.")
+        raise ValueError(
+            f"selected_edge_ids must have shape [B, T], "
+            f"got {tuple(selected_edge_ids.shape)}."
+        )
 
     if continue_mask.shape != selected_edge_ids.shape:
         raise ValueError(
-            "continue_mask must have the same shape as selected_edge_ids: " f"{tuple(continue_mask.shape)} != {tuple(selected_edge_ids.shape)}."
+            "continue_mask must have the same shape as selected_edge_ids: "
+            f"{tuple(continue_mask.shape)} != {tuple(selected_edge_ids.shape)}."
         )
 
     batch_size, horizon = selected_edge_ids.shape
     if batch_size != num_graphs:
-        raise ValueError(f"rollout batch size must match batch.num_graphs: " f"{batch_size} != {num_graphs}.")
+        raise ValueError(
+            "rollout batch size must match batch.num_graphs: "
+            f"{batch_size} != {num_graphs}."
+        )
 
     trajectory_length = rollout.stats.trajectory_length.to(
         device=device,
@@ -178,7 +191,10 @@ def terminal_subgraph_mask(
     ).view(-1)
 
     if trajectory_length.shape != (num_graphs,):
-        raise ValueError(f"trajectory_length must have shape [{num_graphs}], " f"got {tuple(trajectory_length.shape)}.")
+        raise ValueError(
+            f"trajectory_length must have shape [{num_graphs}], "
+            f"got {tuple(trajectory_length.shape)}."
+        )
 
     step_ids = torch.arange(horizon, device=device).unsqueeze(0)
     valid_steps = step_ids < trajectory_length.unsqueeze(1)
@@ -209,14 +225,13 @@ def stack_terminal_subgraph_masks(
     Stack terminal subgraph masks for rollout samples.
 
     Returns:
-    - node_masks: [R, N]
-    - edge_masks: [R, E]
+        node_masks: [R, N]
+        edge_masks: [R, E]
     """
-    if device is None:
-        device = default_eval_device()
+    device = default_eval_device() if device is None else device
 
-    num_nodes = batch_num_nodes(batch)
-    num_edges = batch_num_edges(batch)
+    num_nodes = int(batch.num_nodes_total)
+    num_edges = int(batch.edge_index.size(1))
 
     if not rollouts:
         return (
@@ -224,19 +239,19 @@ def stack_terminal_subgraph_masks(
             torch.zeros((0, num_edges), dtype=torch.bool, device=device),
         )
 
-    node_masks: list[torch.Tensor] = []
-    edge_masks: list[torch.Tensor] = []
+    nodes: list[torch.Tensor] = []
+    edges: list[torch.Tensor] = []
 
     for rollout in rollouts:
-        nodes, edges = terminal_subgraph_mask(
+        node_mask, edge_mask = terminal_subgraph_mask(
             batch=batch,
             rollout=rollout,
             device=device,
         )
-        node_masks.append(nodes)
-        edge_masks.append(edges)
+        nodes.append(node_mask)
+        edges.append(edge_mask)
 
-    return torch.stack(node_masks, dim=0), torch.stack(edge_masks, dim=0)
+    return torch.stack(nodes, dim=0), torch.stack(edges, dim=0)
 
 
 def compute_union_subgraph_masks(
@@ -246,10 +261,9 @@ def compute_union_subgraph_masks(
     device: torch.device | None = None,
 ) -> UnionSubgraphMasks:
     """
-    Compute node/edge union over terminal subgraphs from rollout samples.
+    Compute node / edge union over terminal subgraphs from rollout samples.
     """
-    if device is None:
-        device = default_eval_device()
+    device = default_eval_device() if device is None else device
 
     node_masks, edge_masks = stack_terminal_subgraph_masks(
         rollouts,
@@ -260,12 +274,12 @@ def compute_union_subgraph_masks(
     if node_masks.numel() == 0:
         return UnionSubgraphMasks(
             node_mask=torch.zeros(
-                batch_num_nodes(batch),
+                int(batch.num_nodes_total),
                 dtype=torch.bool,
                 device=device,
             ),
             edge_mask=torch.zeros(
-                batch_num_edges(batch),
+                int(batch.edge_index.size(1)),
                 dtype=torch.bool,
                 device=device,
             ),
@@ -290,15 +304,16 @@ def _check_id_range(
     max_id = int(ids.max())
 
     if min_id < 0 or max_id >= int(upper):
-        raise ValueError(f"{name} contains ids outside range [0, {upper}): " f"min={min_id}, max={max_id}.")
+        raise ValueError(
+            f"{name} contains ids outside range [0, {upper}): "
+            f"min={min_id}, max={max_id}."
+        )
 
 
 __all__ = [
     "UnionSubgraphMasks",
     "anchor_node_mask",
-    "batch_num_edges",
     "batch_num_graphs",
-    "batch_num_nodes",
     "compute_union_subgraph_masks",
     "default_eval_device",
     "eval_target_node_mask",

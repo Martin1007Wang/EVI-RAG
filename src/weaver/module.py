@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -11,61 +10,24 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from src.data.schema import RetrievalBatch
 from src.eval.groups import flatten_metric_groups
+from src.training.checkpoint import filter_compatible_state_dict
 from src.training.diagnostics import TrainingDiagnosticsCollector
 from src.training.optimization import build_optimizer_and_scheduler
 from src.training.rollout_eval import evaluate_rollouts
 from src.training.schedule import TemperatureSchedule
-from src.weaver.losses import SubTrajectoryBalanceLoss
+from src.weaver.config import (
+    build_diagnostics_runtime_config,
+    build_eval_runtime_config,
+    build_policy_runtime_config,
+    build_rollout_runtime_config,
+    build_schedule_runtime_config,
+)
+from src.weaver.loss import SubTrajectoryBalanceLoss
 from src.weaver.policy import Policy
 from src.weaver.reward import RewardModel
-from src.weaver.rollout import RolloutRunner
+from src.weaver.rollout import RewardMode, RolloutRunner
+from src.weaver.rollout.stop_advantage import StopAdvantageAuxiliary
 from src.weaver.rollout.terminal_subgraph import compute_union_subgraph_masks
-
-
-@dataclass(frozen=True)
-class PolicyRuntimeConfig:
-    hidden_dim: int
-    feature_encoder_cfg: dict[str, Any]
-    state_readout_dropout: float
-    stop_scorer_cfg: dict[str, Any]
-    edge_scorer_cfg: dict[str, Any]
-    flow_head_cfg: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class RolloutRuntimeConfig:
-    expand_budget: int
-    train_num_rollout: int
-    eval_num_rollout: int
-    train_chunk_size: int
-    eval_chunk_size: int
-
-
-@dataclass(frozen=True)
-class EvalRuntimeConfig:
-    budgets: tuple[int, ...]
-    debug_metrics: bool
-    exclude_anchors_from_retrieved: bool
-    use_reachable_targets: bool
-
-
-@dataclass(frozen=True)
-class ScheduleRuntimeConfig:
-    temperature: float
-    eval_temperature: float
-    temperature_cfg: dict[str, Any] | None
-
-
-@dataclass(frozen=True)
-class DiagnosticsRuntimeConfig:
-    train_rollout_diagnostics: bool
-    train_rollout_diagnostics_interval: int
-    train_stop_counterfactual: bool
-    train_policy_diagnostics: bool
-    train_validate_rollout_depth: bool
-    eval_stop_counterfactual: bool
-    eval_validate_rollout_depth: bool
-    grad_norm_interval: int
 
 
 class WeaverModule(LightningModule):
@@ -75,13 +37,12 @@ class WeaverModule(LightningModule):
     Main path:
         policy rollout
         -> terminal RewardModel
-        -> SubTB + StopTB + VIGOR auxiliary loss
+        -> SubTB + StopTB + potential-guided loss
         -> manual backward
         -> manual optimizer step
 
     This module intentionally does not own coverage guides, rollout proposals,
-    or external teachers. VIGOR is a loss-level reward-improvement objective,
-    not a behavior-policy guide.
+    or external teachers.
     """
 
     def __init__(
@@ -156,6 +117,8 @@ class WeaverModule(LightningModule):
             feature_encoder_cfg=policy_runtime.feature_encoder_cfg,
             hidden_dim=policy_runtime.hidden_dim,
             state_readout_dropout=policy_runtime.state_readout_dropout,
+            state_readout_cfg=policy_runtime.state_readout_cfg,
+            transition_features_cfg=policy_runtime.transition_features_cfg,
             stop_scorer_cfg=policy_runtime.stop_scorer_cfg,
             edge_scorer_cfg=policy_runtime.edge_scorer_cfg,
             flow_head_cfg=policy_runtime.flow_head_cfg,
@@ -163,8 +126,10 @@ class WeaverModule(LightningModule):
 
         self.reward_model = RewardModel(**dict(reward_cfg or {}))
 
-        loss_kwargs = dict(loss_cfg or {})
-        loss_kwargs.setdefault("max_trajectory_len", rollout_runtime.expand_budget + 1)
+        loss_kwargs = normalize_loss_config(
+            loss_cfg=loss_cfg,
+            max_trajectory_len=rollout_runtime.expand_budget + 1,
+        )
         self.loss_fn = SubTrajectoryBalanceLoss(**loss_kwargs)
 
         self.temperature_schedule = TemperatureSchedule(
@@ -179,15 +144,25 @@ class WeaverModule(LightningModule):
             eval_num_rollout=rollout_runtime.eval_num_rollout,
             train_chunk_size=rollout_runtime.train_chunk_size,
             eval_chunk_size=rollout_runtime.eval_chunk_size,
+            use_static_batch_rollouts=rollout_runtime.use_static_batch_rollouts,
+            use_fused_static_batch_rollouts=(
+                rollout_runtime.use_fused_static_batch_rollouts
+            ),
         )
 
         self.expand_budget = rollout_runtime.expand_budget
         self.train_num_rollout = rollout_runtime.train_num_rollout
+        self.stop_adv_auxiliary = (
+            StopAdvantageAuxiliary(rollout_runtime.stop_advantage_cfg)
+            if rollout_runtime.stop_advantage_cfg.enabled
+            else None
+        )
 
         self.train_metrics = TrainingDiagnosticsCollector(
             debug=self.debug_metrics,
             rollout_diagnostics=diagnostics_runtime.train_rollout_diagnostics,
             rollout_diagnostics_interval=diagnostics_runtime.train_rollout_diagnostics_interval,
+            policy_diagnostics=diagnostics_runtime.train_policy_diagnostics,
         )
 
         self.automatic_optimization = False
@@ -214,8 +189,10 @@ class WeaverModule(LightningModule):
         optimizer = self.optimizer()
         accumulation_batches = self.accumulation_batches()
 
+        residual_schedule_metrics = self.policy.edge_scorer.update_residual_schedule(
+            step=int(self.global_step)
+        )
         temperature = self.temperature_schedule.current(self.global_step)
-        self.loss_fn.set_global_step(int(self.global_step))
 
         result = self.rollout_runner.run_training_rollouts_and_backward(
             policy=self.policy,
@@ -225,6 +202,7 @@ class WeaverModule(LightningModule):
             batch=batch,
             rollout_temperature=temperature,
             accumulation_batches=accumulation_batches,
+            auxiliary=self.stop_adv_auxiliary,
             collect_stop_counterfactual=self.train_stop_counterfactual,
             collect_policy_diagnostics=self.train_policy_diagnostics,
             validate_synchronous_depth=self.train_validate_rollout_depth,
@@ -244,6 +222,7 @@ class WeaverModule(LightningModule):
             optimizer=optimizer,
             temperature=temperature,
             grad_norm=grad_norm,
+            residual_schedule_metrics=residual_schedule_metrics,
         )
 
         return {"loss": result.loss_output.loss.detach()}
@@ -304,12 +283,15 @@ class WeaverModule(LightningModule):
             else self.temperature_schedule.eval_temperature
         )
 
-        rollouts = self.rollout_runner.generate_online_rollouts(
+        rollouts = self.rollout_runner.generate_rollouts(
             policy=self.policy,
             reward_model=self.reward_model,
             batch=batch,
             num_rollouts=num_rollouts,
             temperature=rollout_temperature,
+            collect_stop_counterfactual=False,
+            collect_policy_diagnostics=False,
+            reward_mode=RewardMode.LAZY_TERMINAL,
         )
 
         return compute_union_subgraph_masks(
@@ -335,49 +317,14 @@ class WeaverModule(LightningModule):
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
         state_dict = checkpoint.get("state_dict", checkpoint)
-        state_dict = self._filter_pretrained_state_dict(state_dict, strict=strict)
+        state_dict = filter_compatible_state_dict(
+            state_dict=state_dict,
+            current_state=self.state_dict(),
+            strict=strict,
+        )
         incompatible = self.load_state_dict(state_dict, strict=strict)
 
         return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
-
-    def _filter_pretrained_state_dict(
-        self,
-        state_dict: dict[str, Any],
-        *,
-        strict: bool,
-    ) -> dict[str, Any]:
-        if strict:
-            return state_dict
-
-        current_state = self.state_dict()
-        filtered: dict[str, Any] = {}
-        reset_stop_gate = False
-
-        for key, value in state_dict.items():
-            current_value = current_state.get(key)
-            if (
-                isinstance(value, torch.Tensor)
-                and isinstance(current_value, torch.Tensor)
-                and value.shape != current_value.shape
-            ):
-                if key.startswith("policy.action_scorer.gate.0."):
-                    reset_stop_gate = True
-                continue
-            filtered[key] = value
-
-        if reset_stop_gate:
-            stop_gate_prefixes = (
-                "policy.action_scorer.gate.",
-                "policy.action_scorer.stop_bias",
-                "policy.action_scorer.expand_bias",
-            )
-            filtered = {
-                key: value
-                for key, value in filtered.items()
-                if not key.startswith(stop_gate_prefixes)
-            }
-
-        return filtered
 
     def eval_step(
         self,
@@ -425,12 +372,12 @@ class WeaverModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         temperature: float,
         grad_norm: float | None,
+        residual_schedule_metrics: dict[str, float] | None = None,
     ) -> None:
         metrics = self.train_metrics.collect(
             loss_output=result.loss_output,
             batch=batch,
-            online_rollouts=tuple(result.rollouts.online),
-            coverage_rollouts=(),
+            online_rollouts=tuple(result.rollouts),
             policy=self.policy,
             root_expand_budget=self.expand_budget,
             global_step=int(self.global_step),
@@ -444,6 +391,8 @@ class WeaverModule(LightningModule):
         )
         if grad_norm is not None:
             metrics["train/optim/grad_norm"] = float(grad_norm)
+        for key, value in (residual_schedule_metrics or {}).items():
+            metrics[f"train/optim/{key}"] = float(value)
 
         self.log_dict(
             metrics,
@@ -538,241 +487,15 @@ class WeaverModule(LightningModule):
         )
 
 
-def build_policy_runtime_config(
+def normalize_loss_config(
     *,
-    policy_cfg: dict[str, Any] | None,
-    entity_text_embeddings: torch.Tensor,
-    entity_embedding_map: torch.Tensor,
-    relation_embeddings: torch.Tensor,
-) -> PolicyRuntimeConfig:
-    cfg = dict(policy_cfg or {})
-
-    hidden_dim = int(cfg.pop("hidden_dim", 1024))
-    state_readout_dropout = float(cfg.pop("state_readout_dropout", 0.0))
-
-    feature_encoder_cfg = dict(cfg.pop("feature_encoder", {}))
-    stop_scorer_cfg = dict(cfg.pop("stop_scorer", {}))
-    edge_scorer_cfg = dict(cfg.pop("edge_scorer", {}))
-    flow_head_cfg = dict(cfg.pop("flow_head", {}))
-
-    if cfg:
-        raise ValueError(f"Unused policy_cfg keys: {sorted(cfg)}.")
-
-    feature_encoder_cfg = build_feature_encoder_config(
-        cfg=feature_encoder_cfg,
-        entity_text_embeddings=entity_text_embeddings,
-        entity_embedding_map=entity_embedding_map,
-        relation_embeddings=relation_embeddings,
-        hidden_dim=hidden_dim,
-    )
-
-    return PolicyRuntimeConfig(
-        hidden_dim=hidden_dim,
-        feature_encoder_cfg=feature_encoder_cfg,
-        state_readout_dropout=state_readout_dropout,
-        stop_scorer_cfg=stop_scorer_cfg,
-        edge_scorer_cfg=edge_scorer_cfg,
-        flow_head_cfg=flow_head_cfg,
-    )
-
-
-def build_rollout_runtime_config(
-    rollout_cfg: dict[str, Any] | None,
-) -> RolloutRuntimeConfig:
-    cfg = dict(rollout_cfg or {})
-
-    expand_budget = int(cfg.pop("expand_budget", 3))
-    train_num_rollout = int(cfg.pop("train_num_rollout", 8))
-    eval_num_rollout = int(cfg.pop("eval_num_rollout", 8))
-
-    train_chunk_size = cfg.pop("train_chunk_size", train_num_rollout)
-    eval_chunk_size = cfg.pop("eval_chunk_size", eval_num_rollout)
-
-    if cfg:
-        raise ValueError(f"Unused rollout_cfg keys: {sorted(cfg)}.")
-
-    validate_rollout_counts(
-        expand_budget=expand_budget,
-        train_num_rollout=train_num_rollout,
-        eval_num_rollout=eval_num_rollout,
-    )
-
-    return RolloutRuntimeConfig(
-        expand_budget=expand_budget,
-        train_num_rollout=train_num_rollout,
-        eval_num_rollout=eval_num_rollout,
-        train_chunk_size=normalize_chunk_size(
-            train_chunk_size,
-            fallback=train_num_rollout,
-            name="train_chunk_size",
-        ),
-        eval_chunk_size=normalize_chunk_size(
-            eval_chunk_size,
-            fallback=eval_num_rollout,
-            name="eval_chunk_size",
-        ),
-    )
-
-
-def build_eval_runtime_config(
-    *,
-    eval_cfg: dict[str, Any] | None,
-    eval_num_rollout: int,
-) -> EvalRuntimeConfig:
-    cfg = dict(eval_cfg or {})
-
-    raw_budgets = cfg.pop("budgets", (1, 2, 4, 8))
-    debug_metrics = bool(cfg.pop("debug_metrics", False))
-    exclude_anchors_from_retrieved = bool(
-        cfg.pop("exclude_anchors_from_retrieved", True)
-    )
-    use_reachable_targets = bool(cfg.pop("use_reachable_targets", True))
-
-    if cfg:
-        raise ValueError(f"Unused eval_cfg keys: {sorted(cfg)}.")
-
-    budgets = tuple(sorted({int(k) for k in raw_budgets}))
-
-    if not budgets:
-        raise ValueError("eval_cfg.budgets must be non-empty.")
-    if any(k < 1 for k in budgets):
-        raise ValueError(f"eval_cfg.budgets must all be >= 1, got {budgets}.")
-    if max(budgets) > int(eval_num_rollout):
-        raise ValueError(
-            f"max(eval_cfg.budgets)={max(budgets)} cannot exceed "
-            f"eval_num_rollout={eval_num_rollout}."
-        )
-
-    return EvalRuntimeConfig(
-        budgets=budgets,
-        debug_metrics=debug_metrics,
-        exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
-        use_reachable_targets=use_reachable_targets,
-    )
-
-
-def build_schedule_runtime_config(
-    schedule_cfg: dict[str, Any] | None,
-) -> ScheduleRuntimeConfig:
-    cfg = dict(schedule_cfg or {})
-
-    temperature = float(cfg.pop("temperature", 1.0))
-    eval_temperature = float(cfg.pop("eval_temperature", temperature))
-    temperature_cfg = cfg.pop("temperature_cfg", None)
-
-    if cfg:
-        raise ValueError(f"Unused schedule_cfg keys: {sorted(cfg)}.")
-
-    return ScheduleRuntimeConfig(
-        temperature=temperature,
-        eval_temperature=eval_temperature,
-        temperature_cfg=dict(temperature_cfg) if temperature_cfg is not None else None,
-    )
-
-
-def build_diagnostics_runtime_config(
-    diagnostic_cfg: dict[str, Any] | None,
-) -> DiagnosticsRuntimeConfig:
-    cfg = dict(diagnostic_cfg or {})
-
-    train_rollout_diagnostics = bool(cfg.pop("train_rollout_diagnostics", False))
-    train_rollout_diagnostics_interval = int(
-        cfg.pop("train_rollout_diagnostics_interval", 0)
-    )
-    train_stop_counterfactual = bool(cfg.pop("train_stop_counterfactual", True))
-    train_policy_diagnostics = bool(cfg.pop("train_policy_diagnostics", False))
-    train_validate_rollout_depth = bool(cfg.pop("train_validate_rollout_depth", False))
-    eval_stop_counterfactual = bool(cfg.pop("eval_stop_counterfactual", True))
-    eval_validate_rollout_depth = bool(cfg.pop("eval_validate_rollout_depth", False))
-    grad_norm_interval = int(cfg.pop("grad_norm_interval", 0))
-
-    if cfg:
-        raise ValueError(f"Unused diagnostic_cfg keys: {sorted(cfg)}.")
-    if train_rollout_diagnostics_interval < 0:
-        raise ValueError(
-            "diagnostic_cfg.train_rollout_diagnostics_interval must be >= 0, "
-            f"got {train_rollout_diagnostics_interval}."
-        )
-    if grad_norm_interval < 0:
-        raise ValueError(
-            f"diagnostic_cfg.grad_norm_interval must be >= 0, got {grad_norm_interval}."
-        )
-
-    return DiagnosticsRuntimeConfig(
-        train_rollout_diagnostics=train_rollout_diagnostics,
-        train_rollout_diagnostics_interval=train_rollout_diagnostics_interval,
-        train_stop_counterfactual=train_stop_counterfactual,
-        train_policy_diagnostics=train_policy_diagnostics,
-        train_validate_rollout_depth=train_validate_rollout_depth,
-        eval_stop_counterfactual=eval_stop_counterfactual,
-        eval_validate_rollout_depth=eval_validate_rollout_depth,
-        grad_norm_interval=grad_norm_interval,
-    )
-
-
-def build_feature_encoder_config(
-    *,
-    cfg: dict[str, Any],
-    entity_text_embeddings: torch.Tensor,
-    entity_embedding_map: torch.Tensor,
-    relation_embeddings: torch.Tensor,
-    hidden_dim: int,
+    loss_cfg: dict[str, Any] | None,
+    max_trajectory_len: int,
 ) -> dict[str, Any]:
-    cfg = dict(cfg)
-    cfg.setdefault("hidden_dim", int(hidden_dim))
-
-    forbidden = {
-        "entity_text_embeddings",
-        "entity_embedding_map",
-        "relation_embeddings",
-    }
-
-    overlap = forbidden.intersection(cfg)
-    if overlap:
-        raise ValueError(
-            "policy_cfg.feature_encoder must not contain runtime embedding tensors: "
-            f"{sorted(overlap)}."
-        )
-
-    cfg.update(
-        {
-            "entity_text_embeddings": entity_text_embeddings,
-            "entity_embedding_map": entity_embedding_map,
-            "relation_embeddings": relation_embeddings,
-        }
-    )
-
+    cfg = dict(loss_cfg or {})
+    if cfg.get("max_trajectory_len") is None:
+        cfg["max_trajectory_len"] = int(max_trajectory_len)
     return cfg
-
-
-def validate_rollout_counts(
-    *,
-    expand_budget: int,
-    train_num_rollout: int,
-    eval_num_rollout: int,
-) -> None:
-    if expand_budget < 0:
-        raise ValueError(f"expand_budget must be >= 0, got {expand_budget}.")
-    if train_num_rollout < 1:
-        raise ValueError(f"train_num_rollout must be >= 1, got {train_num_rollout}.")
-    if eval_num_rollout < 1:
-        raise ValueError(f"eval_num_rollout must be >= 1, got {eval_num_rollout}.")
-
-
-def normalize_chunk_size(
-    value: Any,
-    *,
-    fallback: int,
-    name: str,
-) -> int:
-    if value is None:
-        return int(fallback)
-
-    value = int(value)
-    if value < 1:
-        raise ValueError(f"{name} must be >= 1 or None, got {value}.")
-
-    return value
 
 
 __all__ = ["WeaverModule"]

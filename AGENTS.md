@@ -16,7 +16,7 @@ If repo behavior and this file disagree, follow the source files and update this
 ## Environment and setup
 
 - Preferred local Python from `environment.yaml` is Python 3.10.
-- Default conda environment for this repo is `pog`; when running Python commands, assume `conda activate pog` unless the user says otherwise.
+- Default conda environment for this repo is `kgrag`; when running Python commands, assume `conda activate kgrag` unless the user says otherwise.
 - CI runs tests on Python 3.8, 3.9, and 3.10, so avoid using syntax newer than Python 3.8 without checking compatibility.
 - `pyupgrade --py38-plus` is part of pre-commit, so Python 3.8+ idioms are acceptable.
 - CI bootstrap: `python -m pip install --upgrade pip` then `pip install -r requirements.txt`.

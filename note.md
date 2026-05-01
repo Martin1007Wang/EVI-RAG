@@ -1,206 +1,892 @@
-1. RewardModel 的 precision 定义在 anchor 与 target 有重叠时是错误的，甚至可能导致 F1 > 1
-文件：src/models/reward.py:129-159
-代码当前做的是：
-hits        = |active_nodes ∩ target_nodes|
-retrieved   = |active_nodes \ anchor_nodes|
-precision   = hits / retrieved
-recall      = hits / gold
-F1          = 2PR / (P+R)
-这里分子 hits 把 anchor 上的 target 也算进去了，但分母 retrieved 又把 anchor 全部排除了。
-这会造成两个悖论：
-- 若答案节点本身就是 anchor，且模型一开始就 stop：
-  - recall = 1
-  - retrieved = 0，代码把 precision = 0
-  - 最终 F1 = 0
-  - 这在语义上明显不对，因为答案明明已经在根状态里。
-- 若有多个答案都在 anchor 中，而模型又额外扩了一点点非 anchor 节点：
-  - hits 可能大于 retrieved
-  - 导致 precision > 1
-  - 进而 F1 > 1
-  - 这在数学上直接不合法。
-如果数据保证 anchor ∩ target = ∅，这个 bug 不会触发；但我在预处理代码里没看到这种排除。reachable_answer_entities 只是按图中可达答案构建，没有去除 question entities。见 src/data/preprocess_steps/graph_collect.py:147-177、src/data/preprocess_steps/materialize.py:150-190。
-这是一类真正的逻辑错误，不只是“理论近似”。
+# Weaver 特征工程重设计：数据约束下的 KGQA 子图搜索方案
 
+## 0. 先把边界定死
 
-2. teacher forcing 是 off-policy 的，但损失没有做任何校正
-文件：src/models/rollout/sampling.py:118-153，src/models/rollout/executor.py:78-160，src/models/losses.py:313-370
-实现里真实采样分布不是纯模型前向策略：
-- 动作类型采样先按 behavior_logits 采样
-- 之后可能被 teacher 强行改写
-- 边采样也可能走 teacher sampler
-- 另外 expand 采样还带温度 temperature
-但写入 loss 的 step_log_pf 却始终是“未加温度、未做行为修正的 target policy log-prob”。
-也就是说：
-轨迹是按 behavior policy 采出来的
-loss 却按 target policy 的 log P_F 在做 SubTB
-且没有 importance weighting
-因此，这不是严格意义上的 on-policy GFlowNet/SubTB 训练，而是“teacher-guided / tempered off-policy approximation”。
-这不一定导致代码跑错，但如果你要问“数学上是不是严格对应标准 GFlowNet 目标”，答案是否定的。
+当前数据不是完整 semantic parsing 数据，也不是人工标注 query graph 数据。它是 WebQSP/CWQ 风格的 KGQA 检索训练数据，清洗后进入 LMDB 的字段主要是：
 
-3. 配置里有 reward shaping，但训练时根本没用上
-文件：configs/model/gflownet.yaml:30-41，src/models/reward.py:410-474，src/models/rollout/executor.py:152-160
-RewardModel 里实现了：
-- potential(...)
-- step_shaping(...)
-配置里也暴露了：
-- relation_shaping_scale
-- positive_coverage_shaping_scale
-- distance_progress_shaping_scale
-但 rollout/executor 实际只在 stop 时调用了终止奖励：
-reward_model(...)
-没有任何地方调用 step_shaping()。
-所以当前实现里，这几个 shaping 配置项是“看起来能用，实际上无效”的。  
-这是实现与配置语义不一致。
+```text
+edge_index                         # $2, E$
+node_entity_catalog_ids            # $N$
+edge_relation_catalog_ids          # $E$
+question_emb                       # $D$
+anchor_node_ids                    # $A$
+target_node_ids                    # $Y$
+reachable_target_node_ids          # $Y_reach$
+anchor_node_forward_distances_flat
+anchor_node_backward_distances_flat
+target_node_distances_flat
+target_shortest_path_count_flat
+target_shortest_path_edge_mask_flat
+```
 
-4. teacher 的 stop 条件和 reward 优化目标不一致
-文件：src/models/guidance.py:107-118，src/models/reward.py:18-33,129-159
-teacher 的 stop 判据是：
-只要当前 active subgraph 里出现任意一个 target，就可以 stop
-但 reward 的主目标是所有答案实体上的 F1，不是“命中任一答案”：
-recall = |active_gold| / |gold|
-precision = ...
-F1 over all answer nodes
-因此在多答案问题上，teacher 会偏向过早停止，而 reward 期望继续扩展以覆盖更多答案。  
-这会造成 supervision signal 和 final objective 不完全一致。
+全局可用资源是：
 
-5. 数据可达性与 rollout horizon 没对齐
-文件：configs/model/gflownet.yaml:6，src/utils/path_utils.py:183-214，src/data/preprocess_steps/graph_collect.py:141-177，configs/pipeline/default.yaml:13-21
-当前 max_steps = 3。  
-但预处理保留样本时，默认并没有要求“答案必须在 3 步内可达”，只要求“至少有路径”或者在 *-sub 数据集中“至少有 reachable in-graph answer”。
-这意味着很多样本可能：
-- 理论上答案在图中可达
-- 但在当前 rollout budget 下根本不可能到达
-这不是代码 bug，但会让奖励上界被结构性压低，也会让 teacher guidance 在剩余 budget 条件下经常失效。
+```text
+entity_catalog.pt
+relation_catalog.pt
+entity_embeddings.pt
+relation_embeddings.pt
+```
 
-算法主线
-把每个问题对应的候选知识图记作 G = (V, E)。
-预处理阶段先从图里构造几个监督/引导信号：
-- anchor 集合 A：问题实体在图中的节点，见 src/data/preprocess_steps/graph_collect.py:97-119
-- target 集合 Y：答案实体中“在图中且从 anchor 可达”的那些节点，见 src/utils/path_utils.py:149-214
-- shortest_path_edge_mask：所有 anchor 到 reachable target 的最短路径边并集
-- node_to_target_distance(v)：节点到任意 reachable target 的最短有向距离
-- shortest_path_count(v)：从该节点沿最短路走到 target 的最短后缀条数
-这些量被 materialize 到 RetrievalBatch。见 src/data/preprocess_steps/materialize.py:167-191、src/data/schema/batch.py:10-38。
-MDP 定义
+重要限制：
+
+1. LMDB 中默认没有自然语言 question text。
+2. 没有人工 query graph role 标注。
+3. 没有显式 answer type 标注。
+4. 没有完整 Freebase schema ontology。
+5. 没有人工证明链，只有自动计算的 shortest-path / target-distance 监督。
+6. 训练时有 target / shortest-path labels；测试时不能把 target-derived labels 编进 policy feature。
+
+所以，任何依赖以下信息的特征都不能作为默认方案：
+
+```text
+question text pattern
+wh-word answer type
+人工 query graph role
+人工 constraint label
+完整 relation taxonomy
+答案类型标签
+teacher path 作为 policy 输入
+```
+
+上一版提出的 `g_constraint`、`g_type`、复杂 query-graph role taxonomy 太理想化。它们可以作为未来扩展，但不是当前仓库能直接落地的第一版。
+
+当前真正可做、也最应该做的是：
+
+$
+\boxed{
+\text{PLM L2 semantic atoms}
++\text{anchor-conditioned structural coordinates}
++\text{state-local action geometry}
++\text{frontier-value Stop gate}
+}
+$
+
+目标不是凭空构造 query graph parser，而是在现有 tensor schema 下，把 sequential subgraph search 的 proposal geometry 做对。
+
+---
+
+## 1. 当前数据实际支持哪些特征？
+
+给定单条样本：
+
+$
+G=(V,E),\qquad e=(u,r,v)\in E
+$
+
+已知：
+
+$
+q\in\mathbb{R}^{D}
+$
+
+来自 `question_emb`。
+
+节点全局 id：
+
+$
+c_v=\texttt{node\_entity\_catalog\_ids}[v]
+$
+
+边关系全局 id：
+
+$
+c_r=\texttt{edge\_relation\_catalog\_ids}[e]
+$
+
+通过 catalog 和 embedding 表可查：
+
+$
+x_v,\quad x_r
+$
+
+anchor：
+
+$
+A\subseteq V
+$
+
+训练时还知道 target / shortest-path labels：
+
+$
+Y\subseteq V
+$
+
+以及 target-distance、shortest-path edge mask。但这些只能用于 reward、teacher、diagnostics、auxiliary loss，不能进入 policy feature，否则测试不可用且会泄漏答案。
+
+因此 policy feature 的合法输入只有：
+
+```text
+question_emb
+node/entity embeddings
+relation embeddings
+edge_index
+anchor_node_ids
+current rollout state s=(V_s,E_s)
+frontier C(s)
+图结构统计，如 degree、frontier size、是否 active、是否 root、是否 internal edge
+```
+
+---
+
+## 2. 设计原则：不要造不存在的信息
+
+当前数据下，特征工程的核心原则应改成四条。
+
+### 2.1 从 anchor 出发，而不是从全图语义相似度出发
+
+KGQA 检索的基本约束是：答案子图必须从 question entity / anchor 出发可达。
+
+所以节点和边的第一类特征必须表达：
+
+$
+\text{这个节点/边相对于 anchor 在什么结构位置？}
+$
+
+当前 shortest-distance bucket 可以表达“几跳远”，但 DDE 更适合作为结构坐标，因为它表达正反向传播强度，而不仅是离散距离。
+
+### 2.2 单边语义相似度只能是弱信号
+
+可以使用：
+
+$
+\langle q,x_r\rangle,
+\quad
+\langle q,x_u\rangle,
+\quad
+\langle q,x_v\rangle
+$
+
+但这些只能是 feature，不能再作为手写主 logit。因为 KGQA 的正确边不一定文本上最像问题，尤其是中间桥接边、CVT 边、第二跳 relation。
+
+### 2.3 当前能做的“role”只能是图结构 role，不是语义 role
+
+没有 question text、answer type、人工 role label，就不要写 `person/location/date constraint` 这种特征。
+
+当前可以可靠构造的是：
+
+```text
+is_outgoing_from_active
+is_incoming_to_active
+is_internal_edge
+introduces_new_node
+new_node_degree
+relation_frequency
+frontier_growth
+DDE transition
+path relation history similarity
+```
+
+这些是数据真实支持的 action role。
+
+### 2.4 Stop 必须看 frontier
+
+Stop 的问题不是“当前用了几步”，而是：
+
+$
+\text{继续扩展是否还有足够高价值的 frontier edge？}
+$
+
+所以 Stop/Expand gate 必须把 expand logit 定义为 frontier continuation value，而不是由 MLP 单独猜。
+
+---
+
+## 3. 静态语义特征
+
+对每个节点：
+
+$
+x_v=
+\begin{cases}
+\text{entity PLM embedding}(c_v), & v\text{ is text entity}\
+e_{nontext}, & v\text{ is non-text / CVT}
+\end{cases}
+$
+
+这里保留当前 non-text shared embedding，不做 CVT schema pooling。
+
+对每条边：
+
+$
+x_{r_e}=\text{relation PLM embedding}(c_r)
+$
+
+问题：
+
+$
+q=\texttt{question_emb}
+$
+
+如果上游已经 L2 normalize，保持即可；但训练启动时应 assert norm 分布，避免 dot product 被 embedding norm 污染。
+
+---
+
+## 4. DDE：anchor-conditioned structural coordinate
+
+定义 anchor one-hot：
+
+$
+a_0(v)=\mathbf{1}$v\in A$
+$
+
+正向传播：
+
+$
+a_{k+1}^{+}(v)=
+\operatorname{mean}_{(u,r,v)\in E}a_k^{+}(u)
+$
+
+反向传播：
+
+$
+a_{k+1}^{-}(v)=
+\operatorname{mean}_{(v,r,u)\in E}a_k^{-}(u)
+$
+
+最终：
+
+$
+d_v=$a_0(v),a_1^+(v),\ldots,a_{K_f}^+(v),a_1^-(v),\ldots,a_{K_b}^-(v)$
+$
+
+(d_v) 是节点相对于 anchor 的结构坐标。它是 answer-agnostic，可以在 train/val/test 一致使用。
+
+这一步替代或至少优先于当前 anchor shortest-distance bucket embedding。
+
+---
+
+## 5. FeatureEncoder：只做静态表示
+
+节点：
+
+$
+h_v=\operatorname{LN}(W_xx_v+W_dd_v)
+$
+
+关系：
+
+$
+h_r=\operatorname{LN}(W_rx_r)
+$
+
+问题：
+
+$
+h_q=\operatorname{LN}(W_qq)
+$
+
+FeatureBank 应包含：
+
+```python
+@dataclass(frozen=True)
+class FeatureBank:
+    node_sem: torch.Tensor      # $N, D$
+    rel_sem: torch.Tensor       # $E, D$
+    query_sem: torch.Tensor     # $B, D$
+
+    node_h: torch.Tensor        # $N, H$
+    rel_h: torch.Tensor         # $E, H$
+    query_h: torch.Tensor       # $B, H$
+
+    node_dde: torch.Tensor      # $N, D_dde$
+```
+
+注意：DDE 已经进入 (h_v)，后面不要无意义重复拼。只有当某个 action feature 明确需要 (d_u\rightarrow d_v) 的结构转移时，才显式使用 raw DDE。
+
+---
+
+## 6. EdgeEncoder：只表示 directed fact
+
+边表示负责回答：
+
+$
+(u,r,v)\text{ 是什么事实？}
+$
+
+定义：
+
+$
+\phi_e=\operatorname{EdgeEnc}(h_u,h_{r_e},h_v)
+$
+
+最小实现：
+
+$
+\phi_e=\operatorname{LN}(W_e$h_u,h_{r_e},h_v$)
+$
+
+不要在 EdgeEncoder 里输入 (h_q)。不要在 EdgeEncoder 里直接算 action score。不要在 EdgeEncoder 里默认重复拼 (d_u,d_v)。
+
+---
+
+## 7. 当前数据下可实现的 action features
+
+候选边：
+
+$
+e=(u,r,v)\in C(s)
+$
+
 状态：
-s_t = (V(E_t), E_t)
+
+$
+s=(V_s,E_s)
+$
+
+frontier：
+
+$
+C(s)={e\in E\setminus E_s:u\in V_s\lor v\in V_s}
+$
+
+ActionFeatureBuilder 构造：
+
+$
+\chi(e,s)=
+$
+g_{geom}(e,s),
+g_{sem}(e),
+g_{path}(e,s),
+g_{branch}(e,s),
+g_{status}(e,s)
+$
+$
+
+这五类都能从现有 tensor schema 得到。
+
+### 7.1 几何/结构转移特征 (g_{geom})
+
+表达这条边相对于当前 active subgraph 的结构移动：
+
+$
+g_{geom}(e,s)=
+$
+\mathbf{1}$u\in V_s,v\notin V_s$,
+\mathbf{1}$v\in V_s,u\notin V_s$,
+\mathbf{1}$u\in V_s,v\in V_s$,
+\mathbf{1}$u\notin V_s,v\notin V_s$
+$
+$
+
+最后一项理论上对 frontier 应为 0，但保留可作为 sanity check。
+
+如果使用 DDE transition：
+
+$
+$d_u,d_v,d_v-d_u,d_u\odot d_v$
+$
+
+这有明确意义：它描述从 active 端点到新端点的 anchor-conditioned structural movement。
+
+### 7.2 语义先验与 residual 复用特征
+
+使用已有 PLM L2 特征：
+
+$
+g_{sem}(e)=
+$
+\langle q,x_{r_e}\rangle,
+\langle q,x_u\rangle,
+\langle q,x_v\rangle
+$
+$
+
+这些分数首先构成强 semantic prior：
+
+$
+b_e=\tau(\langle q,x_{r_e}\rangle+\alpha\langle q,x_{n(e,s)}\rangle)
+$
+
+同时它们也可以作为 residual 的输入特征。这里的角色不是让 MLP 从零学习边排序，而是在一个已经有效的 semantic prior 上学习状态相关上调/下调。
+
+如果担心 non-text entity 的 cosine 无意义，可加入 mask：
+
+$
+\mathbf{1}$u\text{ is text}$,\quad \mathbf{1}$v\text{ is text}$
+$
+
+并令 non-text cosine 为 0 或 learned default。
+
+### 7.3 Path/history 特征 (g_{path})
+
+当前状态已经选中的非 root 关系集合：
+
+$
+R_s={r_e:e\in E_s\setminus E_0}
+$
+
+构造 relation history：
+
+$
+p_s=\operatorname{Pool}{h_{r_e}:e\in E_s\setminus E_0}
+$
+
+第一版用 mean / attention pool，不要先上复杂 GRU。
+
+候选 relation 与当前 relation history 的交互：
+
+$
+g_{path}(e,s)=
+$
+\langle h_q,h_{r_e}\rangle,
+\langle p_s,h_{r_e}\rangle,
+\langle h_q,p_s\rangle
+$
+$
+
+如果状态还没有非 root edge，则 (p_s) 使用 learned empty vector 或零向量。
+
+这里的意义：不要只看单边 relation 和 question；要看候选 relation 是否和当前 partial path 一致。
+
+### 7.4 Branching / hub-risk 特征 (g_{branch})
+
+从图结构可直接得到：
+
+$
+g_{branch}(e,s)=
+$
+\log(1+\deg(u)),
+\log(1+\deg(v)),
+\log(1+\deg_{out}(u)),
+\log(1+\deg_{out}(v)),
+\log(1+\operatorname{freq}(r_e))
+$
+$
+
+可选加入 frontier growth estimate：
+
+$
+\widehat{\Delta |C|}(e,s)=|C(s+e)|-|C(s)|
+$
+
+这项能惩罚 hub drift。很多错误扩展不是语义不相关，而是把搜索带进高分支噪声区。
+
+### 7.5 状态/动作标记特征 (g_{status})
+
+包括：
+
+$
+g_{status}(e,s)=
+$
+\mathbf{1}$e\in E_0$,
+\mathbf{1}$e\in E_s$,
+\rho_s,
+|E_s\setminus E_0|,
+|V_s|
+$
+$
+
+对 frontier edge，(e\in E_s) 应为 0；保留这些特征主要用于 sanity 和统一接口。
+
+---
+
+## 8. Edge action scorer
+
+新的 edge scorer 是：
+
+$
+z_e(s)=b_e+\lambda_{\mathrm{eff}}\Delta_\theta(h_s,\phi_e,\chi(e,s),b_e)
+$
+
 其中：
-- E_t 是当前 active edges
-- V(E_t) = A ∪ {u, v : (u, r, v) ∈ E_t}
-- rollout depth / budget feature 由 |E_t \ E_0| 派生，不是独立状态分量
-- 初始状态 s_0：
-  - E_0 = anchor-induced edges
-  - V(E_0) 由 anchors 与 root edges 共同确定
-见 src/models/state.py:17-42
-动作有两类：
-a_t ∈ { expand(e), stop }
-其中 expand(e) 只允许选 frontier edge：
-Frontier(s_t) = { e ∈ E \ E_t : 至少有一个端点在 V(E_t) 中 }
-见 src/models/policy.py:411-418。
-转移：
-expand(e=(u,v)):
-  E_{t+1} = E_t ∪ {e}
-  V_{t+1} = V_t ∪ {u,v}
-stop:
-  trajectory terminates
-见 src/models/state.py:54-68。
-前向策略分解
-实现里把前向策略拆成两层：
-P_F(a_t | s_t)
-= P_type(c_t | s_t) *
-  P_edge(e_t | s_t, c_t = expand)
-其中：
-- P_type 是 Expand vs Stop 的图级二分类，见 ActionHead
-- P_edge 是在 candidate frontier 上按 softmax 选边，见 ExpandEdgeScorer
-代码位置：
-- src/models/policy.py:433-456
-- src/models/modules/heads.py:93-185
-- src/models/modules/heads.py:187-247
-边打分又拆成：
-logit(e) = prior(q, rel_e) + residual(src_dyn, dst_static, q)
-其中 prior 基本是 query 和 relation 的 cosine prior，residual 是学习到的修正项。  
-见 src/models/modules/heads.py:154-176。
-反向策略
-反向策略不是学出来的，而是精确构造的：
-P_B(s_t | s_{t+1}) = 1 / |Parents(s_{t+1})|
-这里 Parents(s_{t+1}) 不是“任意删一条边”，而是“删掉一条非 root edge 后，得到的状态仍然是合法前驱，并且把这条边重新加回去恰好能恢复当前子图”的那些状态。  
-见 src/utils/graph_utils.py:120-256。
-这一点实现得其实很认真，是本仓库数学上比较扎实的部分。
+
+* (h_s)：当前 partial subgraph 状态；
+* (\phi_e)：候选 directed fact 表示；
+* (\chi(e,s))：当前数据实际支持的 action geometry / semantic / path / branch features；
+* (b_e)：PLM semantic prior base logit；
+* (\Delta_\theta)：只负责修正 prior 的 residual。
+
+这保留了诊断中已经有效的 semantic prior，同时让当前 partial evidence graph 影响下一步边选择。它不再采用纯 action MLP：
+
+$
+z_e=f_\theta(h_s,\phi_e,\chi(e,s))
+$
+
+作为默认主路径，因为随机 residual/MLP 初期会破坏 prior ranking。
+
+也不要使用：
+
+$
+z_e=\langle W_qh_q,W_e\phi_e\rangle
+$
+
+作为主方案。(h_q) 和 (\phi_e) 不天然处在同一个“越相似越应该扩展”的物理空间。KGQA 需要的是结构化 action utility，而不是 query-edge embedding similarity。
+
 ---
-双通道网络的数学意义
-这是本实现最关键的设计：
-- node_h_state：只沿 active_edges 做消息传递，供 FlowHead 使用
-- node_h_policy：沿 active_edges ∪ frontier_edges 做消息传递，供 actor/edge scorer 使用
-见 src/models/modules/backbone.py:27-60,261-355。
-直觉上：
-- 流函数 F(s) 必须是严格的状态函数，不能偷偷看到“frontier 的未来信息”
-- 但 actor 如果只看 active subgraph，又会对候选边感知不足
-所以它做了一个分离：
-critic 看 Markov-faithful 通道
-actor  看 frontier-aware 通道
-这在数学上是合理的，也和代码注释的意图一致。
+
+## 9. StateReadout：状态要看 active subgraph 和 frontier
+
+状态读出包含：
+
+$
+m_V(s)=\operatorname{AttnPool}_{h_q}{h_v:v\in V_s}
+$
+
+$
+m_E(s)=\operatorname{AttnPool}_{h_q}{\phi_e:e\in E_s}
+$
+
+relation history：
+
+$
+p_s=\operatorname{Pool}{h_{r_e}:e\in E_s\setminus E_0}
+$
+
+frontier summary 可以先用一个 preliminary/base edge score，也可以用纯结构/语义 summary。第一版建议用 action feature 中的弱 score 形成 summary：
+
+$
+m_C(s)=
+$
+\max_{e\in C(s)} \tilde{z}*e,
+\operatorname{logmeanexp}*{e\in C(s)}\tilde{z}_e,
+\log(1+|C(s)|)
+$
+$
+
+其中 (\tilde{z}_e) 可以是一个不依赖 (h_s) 的 lightweight base scorer：
+
+$
+\tilde{z}*e=f*{base}(\phi_e,g_{sem}(e),g_{geom}(e,s),g_{branch}(e,s))
+$
+
+注意：这是为了给状态读出提供 frontier summary，不是最终 action logit。
+
+progress：
+
+$
+\rho_s=\frac{|E_s\setminus E_0|}{B}
+$
+
+最终：
+
+$
+h_s=\operatorname{LN}(W_s$h_q,m_V(s),m_E(s),p_s,m_C(s),\rho_s$)
+$
+
 ---
-损失函数推导
-设一条轨迹为：
-s_0 --a_0--> s_1 --a_1--> ... --a_{L-2}--> s_{L-1} --stop--> x
-这里 rollout 明确保留 trajectory 作为训练载体，但每个 s_t 都是 canonical subgraph state，而不是把 history 本身塞进状态定义里。
-注意这里：
-- L = traj_len
-- traj_len 包含最后的 stop 动作
-- 所以若有 k 次扩张后停止，则 L = k + 1
-代码中 state_log_flows 的实际含义是：
-u_0 = root_log_z = log Z_theta(q)
-u_t = log F_theta(s_t | q),  t = 1, ..., L-1
-也就是说，第一列不是普通 FlowHead(s_0)，而是单独的 ZHead 输出。  
-见 src/models/rollout/engine.py:79-99、src/models/policy.py:375-381。
-每一步记录：
-η_t = log P_F(a_t | s_t) - log P_B(s_t | s_{t+1})
-那么 forward-looking SubTB 的子轨迹残差就是：
-δ(i,j) = u_i + Σ_{t=i}^j η_t - target(j)
-其中：
-target(j) = u_{j+1},      if j < L-1
-target(j) = log R(x),     if j = L-1
-于是：
-δ(i,j)
-= u_i + Σ_{t=i}^j [log P_F(a_t|s_t) - log P_B(s_t|s_{t+1})] - u_{j+1},   j < L-1
-δ(i,L-1)
-= u_i + Σ_{t=i}^{L-1} [log P_F(a_t|s_t) - log P_B(s_t|s_{t+1})] - log R(x)
-损失为：
-L_SubTB
-= Σ_{i<=j} λ^(j-i) * δ(i,j)^2
-再加一个 reward matching 项来消除 flow 的加法常数自由度：
-L_RM = (u_{L-1} - log R(x))^2
-L = L_SubTB + α * L_RM
-对应代码：
-- 残差构造：src/models/losses.py:139-177
-- 权重矩阵：src/models/losses.py:104-132
-- 总损失：src/models/losses.py:223-443
-我专门检查了这里的索引关系，结论是：没有发现 off-by-one bug。
-一个细节是，代码注释里对 P_B 的记号略混乱，但张量本身和 loss 对齐是对的。
+
+## 10. Stop gate：frontier continuation value
+
+最终 edge logits：
+
+$
+z_e(s)=f_\theta(h_s,\phi_e,\chi(e,s))
+$
+
+Expand 价值：
+
+$
+z_{expand}(s)=\operatorname{logsumexp}_{e\in C(s)}z_e(s)-c_B\rho_s
+$
+
+Stop 价值：
+
+$
+z_{stop}(s)=v_\theta(h_s,m_C(s),\rho_s)
+$
+
+Policy：
+
+$
+P(Stop/Expand\mid s)=\operatorname{softmax}(z_{stop},z_{expand})
+$
+
+$
+P(e\mid s,Expand)=\operatorname{softmax}_{e\in C(s)}z_e(s)
+$
+
+完整：
+
+$
+P_F(Expand(e)\mid s)=P(Expand\mid s)P(e\mid s,Expand)
+$
+
+无 frontier、inactive、budget exhausted 时强制 Stop。
+
 ---
-终止奖励的数学逻辑
-当前终止奖励定义为：
-recall    = |V_t ∩ Y| / |Y|
-precision = |V_t ∩ Y| / |V_t \ A|
-F1        = 2PR / (P+R)
-log R     = log(F1), if F1 > 0
-         = log_r_min + semantic_bonus, otherwise
-见 src/models/reward.py:13-179。
-如果 F1 = 0，它会回退到一个语义 bonus：
-semantic_bonus
-= η * max_{v ∈ active nodes} cosine(h_v, mean(h_targets))
-见 src/models/reward.py:185-264。
-这个设计的本意是对的：避免所有失败轨迹都拿到完全相同的奖励下界。  
-问题不在这里，而在前面 precision 的定义混合了“hits 含 anchor / denominator 不含 anchor”。
+
+## 11. 训练中可用但不能进 policy 的监督信息
+
+当前数据有 target 和 shortest-path labels。它们很有价值，但角色必须清楚。
+
+可以用于：
+
+```text
+terminal reward
+coverage reward
+teacher/proposal sampling
+auxiliary diagnostics
+edge-rank diagnostics
+stop oracle diagnostics
+```
+
+不应该用于：
+
+```text
+FeatureEncoder 输入
+ActionFeatureBuilder 输入
+StateReadout 输入
+Policy inference 输入
+```
+
+例如：
+
+```text
+target_shortest_path_edge_mask_flat
+```
+
+可以用来计算 `policy_answer_edge_rank_at_root`、teacher sampling、edge auxiliary loss，但不能作为 edge feature。
+
+否则训练和测试分布不一致，且本质上泄漏答案。
+
 ---
-实现上成立的部分
-这些部分我认为是“数学逻辑基本正确”的：
-- rollout 与 SubTB loss 的索引是一致的，见 src/models/rollout/engine.py:80-105 与 src/models/losses.py:139-177
-- horizon 强制 stop 的处理是自洽的，见 src/models/rollout/executor.py:58-76,140-150
-- backward policy 不是拍脑袋的 uniform，而是 exact parent uniform，见 src/utils/graph_utils.py:171-256
-- node_h_state / node_h_policy 分离很合理，避免把 frontier 信息污染到 flow estimation，见 src/models/modules/backbone.py:297-355
+
+## 12. 模块修改
+
+### 12.1 `src/weaver/nn/dde.py`：新增
+
+```python
+class DirectionalDDE(nn.Module):
+    def __init__(
+        self,
+        num_forward_rounds: int = 2,
+        num_backward_rounds: int = 2,
+        include_anchor_indicator: bool = True,
+    ) -> None:
+        ...
+
+    def forward(
+        self,
+        edge_index: torch.Tensor,
+        anchor_node_ids: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        ...
+```
+
+用 `scatter_mean` 实现正反向传播。
+
+### 12.2 `src/weaver/nn/feature_encoder.py`：修改
+
+新增 DDE。关闭旧 anchor distance embedding。
+
+输出 `FeatureBank.node_dde`。
+
+### 12.3 `src/weaver/nn/edge_encoder.py`：收紧
+
+只做：
+
+```python
+phi_e = EdgeEnc(node_h$src$, rel_h$edge$, node_h$dst$)
+```
+
+### 12.4 `src/weaver/nn/action_features.py`：新增
+
+职责：从 state、frontier、FeatureBank、图结构统计构造：
+
+```text
+g_geom
+g_sem
+g_path
+g_branch
+g_status
+```
+
+第一版不要实现不可得的 answer type / natural-language constraint features。
+
+### 12.5 `src/weaver/nn/edge_scorer.py`：重写
+
+职责：
+
+```python
+frontier_logits = EdgeScorer(h_s, phi_frontier, action_features)
+```
+
+删除手写主 logit：
+
+```python
+q_rel_cos + alpha * q_new_entity_cos
+```
+
+### 12.6 `src/weaver/nn/state_readout.py`：修改
+
+加入：
+
+```text
+path memory
+frontier summary
+progress
+```
+
+### 12.7 `src/weaver/nn/stop_gate.py`：重写
+
+```python
+expand_logit = segmented_logsumexp(frontier_logits, graph_ids) - progress_penalty
+stop_logit = stop_value_mlp($h_s, frontier_summary, progress$)
+```
+
+### 12.8 `src/weaver/policy.py`：重排
+
+```text
+FeatureEncoder
+EdgeEncoder
+Preliminary frontier summary / base scorer
+StateReadout
+ActionFeatureBuilder
+EdgeScorer
+StopGate
+FlowHead
+```
+
+### 12.9 `src/weaver/loss.py`：不改主体
+
+SubTB 仍然训练 GFlowNet balance。当前重点是 proposal geometry，不是 loss。
+
 ---
-次要代码味道
-这些不是核心数学 bug，但说明代码还有未清理的设计残留：
-- anchor_signed_distance 预处理出来了，但下游几乎没用到。见 src/data/preprocess_steps/materialize.py:159-190、src/data/dataset.py:76-98
-- State.phase / apply_stop() 在 batched rollout 中实际上没被使用，真实的终止状态是 RolloutBuffer.is_terminated。见 src/models/state.py:54-80、src/models/rollout/buffers.py:65-88
+
+## 13. 配置建议
+
+```yaml
+feature_encoder_cfg:
+  hidden_dim: 1024
+  normalize_semantic: false
+  use_anchor_distance_embedding: false
+  dde:
+    enabled: true
+    num_forward_rounds: 2
+    num_backward_rounds: 2
+    include_anchor_indicator: true
+  non_text:
+    type: shared_embedding
+    init_std: 0.02
+```
+
+```yaml
+action_feature_cfg:
+  use_geom: true
+  use_semantic_weak_features: true
+  use_path_history: true
+  use_branching: true
+  use_status: true
+  use_answer_type: false
+  use_nl_constraint: false
+```
+
+```yaml
+state_readout_cfg:
+  use_active_node_pool: true
+  use_active_edge_pool: true
+  use_path_memory: true
+  use_frontier_summary: true
+  frontier_summary:
+    stats: $max, logmeanexp, log_size$
+```
+
+```yaml
+edge_scorer_cfg:
+  type: semantic_prior_residual
+  hidden_dim: 1024
+  residual_warmup_start_step: 500
+  residual_warmup_steps: 1500
+  zero_init_residual_output: true
+```
+
+```yaml
+stop_gate_cfg:
+  type: frontier_value
+  expand_logit: frontier_logsumexp
+  use_progress_penalty: true
+  progress_penalty_init: 0.0
+```
+
+---
+
+## 14. 最小迁移顺序
+
+第一步：实现 DDE，替换旧 anchor distance bucket。先不改 edge scorer。
+
+第二步：收紧 EdgeEncoder，只输出 directed fact representation。
+
+第三步：实现 ActionFeatureBuilder 的最小集合：
+
+```text
+g_geom
+g_sem
+g_path
+g_branch
+g_status
+```
+
+第四步：重写 EdgeScorer，从纯 action MLP 改成 semantic-prior residual：
+
+$
+b_e=\tau(s_r(e)+\alpha s_n(e,s))
+$
+
+$
+\Delta_\theta(s,e)=f_\theta(h_s,\phi_e,\chi(e,s),b_e)
+$
+
+$
+z_e(s)=b_e+\lambda_{\mathrm{eff}}\Delta_\theta(s,e)
+$
+
+residual head 最后一层 zero-init，warmup 前 $\lambda_{\mathrm{eff}}=0$，保证初始化时 $z_e(s)\approx b_e$。
+
+第五步：改 StopGate：
+
+$
+z_{expand}=\operatorname{LSE}_{e\in C(s)}z_e(s)
+$
+
+第六步：只用数据已有监督做 diagnostics，不泄漏进 policy feature。
+
+重点指标：
+
+```text
+prior_answer_edge_rank_at_root
+policy_answer_edge_rank_at_root
+answer_edge_rank_delta_mean
+final_worse_than_prior_rate
+residual_to_prior_std_ratio
+root_frontier_contains_answer_edge_rate
+teacher_answer_edge_sampling_rate
+budget_exhaust_ratio
+stop_depth_hist
+frontier_logsumexp_mean
+hub_drift_rate
+frontier_branch_growth
+path_edge_recall_by_depth
+```
+
+---
+
+## 15. 最终判断
+
+这版方案比上一版更受数据约束。它不再假设有自然语言 question text、answer type、人工 constraint label 或 schema taxonomy。
+
+当前数据最可靠的信息是：
+
+```text
+anchor
+candidate graph
+entity/relation PLM embeddings
+question embedding
+图结构
+rollout state
+训练期 target/shortest-path labels
+```
+
+所以特征工程必须围绕这些信息设计。
+
+最终新 Weaver 应该是：
+
+$
+\text{old Weaver}=\text{unconstrained action scorer}+\text{GFlowNet shell}
+$
+
+$
+\text{new Weaver}=\text{semantic prior preservation}+\text{state-conditioned residual}+\text{frontier value stop}
+$
+
+这才符合当前 WebQSP/CWQ tensor schema，也更接近 KGQA 检索真正需要的归纳偏置。
