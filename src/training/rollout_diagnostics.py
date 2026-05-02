@@ -102,11 +102,20 @@ def compute_root_answer_edge_ranking_diagnostics(
 
     state = State.create_initial(batch, expand_budget=int(expand_budget))
     rollout_context = policy.prepare_rollout_context(batch)  # type: ignore[attr-defined]
+    policy_kwargs = {
+        "rollout_context": rollout_context,
+        "return_edge_breakdown": True,
+    }
+    if bool(getattr(policy, "requires_stop_log_reward", False)):
+        policy_kwargs["stop_log_reward"] = torch.zeros(
+            num_graphs,
+            dtype=torch.float32,
+            device=batch.edge_index.device,
+        )
     step_out = policy(  # type: ignore[operator]
         batch,
         state,
-        rollout_context=rollout_context,
-        return_edge_breakdown=True,
+        **policy_kwargs,
     )
 
     edge_ids = step_out.candidate_edge_ids.view(-1)
@@ -151,12 +160,6 @@ def compute_root_answer_edge_ranking_diagnostics(
         device=final_logits.device,
         dtype=final_logits.dtype,
     )
-    residual_logits = breakdown.residual_scale.to(
-        device=final_logits.device, dtype=final_logits.dtype
-    ) * breakdown.residual_logits.view(-1).to(
-        device=final_logits.device,
-        dtype=final_logits.dtype,
-    )
     prior_ranks, has_answer = _best_answer_edge_ranks(
         logits=prior_logits,
         answer_edge=answer_edge,
@@ -171,15 +174,9 @@ def compute_root_answer_edge_ranking_diagnostics(
     )
     rank_delta = final_ranks - prior_ranks
     base_logit_std = _tensor_std(prior_logits)
-    residual_logit_std = _tensor_std(residual_logits)
 
     metrics = {
         "edge/base_logit_std": base_logit_std,
-        "edge/residual_logit_std": residual_logit_std,
-        "edge/residual_to_base_std_ratio": _safe_ratio(
-            residual_logit_std,
-            base_logit_std,
-        ),
         "edge/prior_rank_vs_final_rank_kendall": _tensor_mean(
             _kendall_tau_by_graph(
                 prior_logits=prior_logits,
@@ -1183,8 +1180,6 @@ def _masked_mean_1d(values: torch.Tensor, mask: torch.Tensor) -> float:
 def _root_answer_edge_rank_default_metrics() -> dict[str, float]:
     return {
         "edge/base_logit_std": 0.0,
-        "edge/residual_logit_std": 0.0,
-        "edge/residual_to_base_std_ratio": 0.0,
         "edge/prior_rank_vs_final_rank_kendall": 0.0,
         "edge/answer_edge_prior_rank": 0.0,
         "edge/answer_edge_final_rank": 0.0,

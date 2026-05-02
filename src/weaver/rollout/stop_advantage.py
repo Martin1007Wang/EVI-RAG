@@ -51,22 +51,23 @@ class StopAdvantageConfig:
     @classmethod
     def from_dict(cls, cfg: dict[str, object] | None) -> "StopAdvantageConfig":
         cfg = dict(cfg or {})
+        defaults = cls()
 
         enabled = bool(cfg.pop("enabled", False))
         topk_by_semantic = _non_negative_int(
-            cfg.pop("topk_by_semantic", cls.topk_by_semantic),
+            cfg.pop("topk_by_semantic", defaults.topk_by_semantic),
             "topk_by_semantic",
         )
         topk_by_final = _non_negative_int(
-            cfg.pop("topk_by_final", cls.topk_by_final),
+            cfg.pop("topk_by_final", defaults.topk_by_final),
             "topk_by_final",
         )
         random_k = _non_negative_int(
-            cfg.pop("random_k", cls.random_k),
+            cfg.pop("random_k", defaults.random_k),
             "random_k",
         )
 
-        continue_pool = str(cfg.pop("continue_pool", cls.continue_pool))
+        continue_pool = str(cfg.pop("continue_pool", defaults.continue_pool))
         if continue_pool not in {"max", "softmax", "logmeanexp"}:
             raise ValueError(
                 "continue_pool must be one of {'max', 'softmax', 'logmeanexp'}, "
@@ -74,11 +75,14 @@ class StopAdvantageConfig:
             )
 
         continue_pool_temperature = _positive_float(
-            cfg.pop("continue_pool_temperature", cls.continue_pool_temperature),
+            cfg.pop(
+                "continue_pool_temperature",
+                defaults.continue_pool_temperature,
+            ),
             "continue_pool_temperature",
         )
         label_temperature = _positive_float(
-            cfg.pop("label_temperature", cls.label_temperature),
+            cfg.pop("label_temperature", defaults.label_temperature),
             "label_temperature",
         )
 

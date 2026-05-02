@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch_scatter import scatter_logsumexp
 
 from src.utils.nn_utils import zero_last_linear
 
 
 class StopExpandGate(nn.Module):
     """
-    Option-level Stop/Expand gate.
+    Option-level Stop/Continue gate.
 
-    Expand is valued by the segmented logsumexp of final frontier edge logits.
-    Stop is scored by a state-value head over state, progress, and frontier
-    summary features. Rollout logic still forces Stop when no Expand action is
-    legal.
+    Stop and Continue are scored by a learned two-logit head over state,
+    progress, and frontier summary features. Raw frontier edge logits are not
+    summed into the Continue option; edge logits are only used later by the
+    conditional edge policy P(edge | state, Continue). Rollout logic still
+    forces Stop when no Continue action is legal.
     """
 
     def __init__(
@@ -60,7 +60,7 @@ class StopExpandGate(nn.Module):
             nn.Linear(input_dim, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(float(dropout)),
-            nn.Linear(self.hidden_dim, 1),
+            nn.Linear(self.hidden_dim, 2),
         )
 
         self.reset_parameters()
@@ -86,6 +86,8 @@ class StopExpandGate(nn.Module):
         edge_log_size: torch.Tensor | None = None,
         has_candidate_edge: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del edge_logits, edge_batch_index
+
         if state_h.ndim != 2:
             raise ValueError(
                 f"state_h must have shape [B, H], got {tuple(state_h.shape)}."
@@ -142,62 +144,25 @@ class StopExpandGate(nn.Module):
 
             scalars.extend([max_value, logmeanexp, log_size])
 
-        stop_input = state_h
+        option_input = state_h
         if scalars:
             scalar_h = torch.stack(scalars, dim=-1)
             if self.scalar_norm is not None:
                 scalar_h = self.scalar_norm(scalar_h)
-            stop_input = torch.cat([state_h, scalar_h], dim=-1)
+            option_input = torch.cat([state_h, scalar_h], dim=-1)
 
-        stop_logit = self.net(stop_input).squeeze(-1) + self.stop_bias.to(
-            device=device,
-            dtype=dtype,
-        )
-
-        expand_logit = self._expand_logit(
-            edge_logits=edge_logits,
-            edge_batch_index=edge_batch_index,
-            batch_size=batch_size,
+        option_logits = self.net(option_input)
+        stop_logit = option_logits[:, 0] + self.stop_bias.to(
             device=device,
             dtype=dtype,
         )
         expand_logit = (
-            expand_logit
+            option_logits[:, 1]
             + self.expand_bias.to(device=device, dtype=dtype)
             - self.progress_penalty.to(device=device, dtype=dtype) * progress
         )
 
         return stop_logit, expand_logit
-
-    @staticmethod
-    def _expand_logit(
-        *,
-        edge_logits: torch.Tensor | None,
-        edge_batch_index: torch.Tensor | None,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if edge_logits is None or edge_batch_index is None:
-            return torch.zeros(batch_size, device=device, dtype=dtype)
-
-        edge_logits = edge_logits.to(device=device, dtype=dtype).view(-1)
-        edge_batch_index = edge_batch_index.to(device=device, dtype=torch.long).view(-1)
-        if edge_logits.numel() != edge_batch_index.numel():
-            raise ValueError(
-                "edge_logits and edge_batch_index length mismatch: "
-                f"{edge_logits.numel()} != {edge_batch_index.numel()}."
-            )
-
-        if edge_logits.numel() == 0:
-            return torch.full((batch_size,), -torch.inf, device=device, dtype=dtype)
-
-        return scatter_logsumexp(
-            edge_logits,
-            edge_batch_index,
-            dim=0,
-            dim_size=int(batch_size),
-        )
 
 
 def _resolve_frontier_summary(

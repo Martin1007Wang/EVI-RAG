@@ -380,7 +380,13 @@ def ranking_metrics_for_state(
     prefix: str,
 ) -> dict[str, float]:
     context = policy.prepare_rollout_context(batch)
-    out = policy(batch, state, rollout_context=context, return_edge_breakdown=True)
+    out = policy(
+        batch,
+        state,
+        rollout_context=context,
+        return_edge_breakdown=True,
+        edge_logit_mode="semantic",
+    )
     logits = out.edge_score_breakdown.semantic_logits
     valid = valid_progress_mask(
         batch=batch,
@@ -432,7 +438,19 @@ def one_step_reward_oracle_metrics(
     prefix: str,
 ) -> dict[str, float]:
     context = policy.prepare_rollout_context(batch)
-    out = policy(batch, state, rollout_context=context, return_edge_breakdown=True)
+    current = reward_model.evaluate_terminal_state(
+        retrieval_batch=batch,
+        active_nodes=state.active_nodes,
+        active_edges=state.active_edges,
+        state=state,
+    )
+    out = policy(
+        batch,
+        state,
+        rollout_context=context,
+        return_edge_breakdown=True,
+        stop_log_reward=current.log_reward,
+    )
     logits = out.edge_logits.detach()
     candidate_edge_ids = out.candidate_edge_ids.detach()
     candidate_batch_ids = out.candidate_batch_ids.detach()
@@ -440,13 +458,6 @@ def one_step_reward_oracle_metrics(
     metrics = _empty_one_step_reward_oracle_metrics(prefix)
     if candidate_edge_ids.numel() == 0:
         return metrics
-
-    current = reward_model.evaluate_terminal_state(
-        retrieval_batch=batch,
-        active_nodes=state.active_nodes,
-        active_edges=state.active_edges,
-        state=state,
-    )
     child_rewards = _evaluate_child_rewards(
         batch=batch,
         state=state,
@@ -459,6 +470,8 @@ def one_step_reward_oracle_metrics(
     best_child_gains: list[float] = []
     best_child_supports: list[float] = []
     best_child_ranks: list[float] = []
+    best_child_edge_probs: list[float] = []
+    best_child_8sample_hits: list[float] = []
     top1_supports: list[float] = []
     top5_supports: list[float] = []
     candidate_counts: list[float] = []
@@ -477,6 +490,8 @@ def one_step_reward_oracle_metrics(
         best_reward = graph_child_log_reward[best_reward_pos]
         best_support = graph_child_support[best_reward_pos]
         rank = int((graph_logits > graph_logits[best_reward_pos]).sum().item()) + 1
+        graph_edge_prob = torch.softmax(graph_logits.float(), dim=0)
+        best_child_prob = float(graph_edge_prob[best_reward_pos].item())
 
         top_k = min(5, int(pos.numel()))
         _, logit_order = torch.topk(graph_logits, k=top_k)
@@ -491,6 +506,8 @@ def one_step_reward_oracle_metrics(
         best_child_gains.append(float(best_reward.item()) - stop_value)
         best_child_supports.append(float(best_support.item()))
         best_child_ranks.append(float(rank))
+        best_child_edge_probs.append(best_child_prob)
+        best_child_8sample_hits.append(1.0 - (1.0 - best_child_prob) ** 8)
         candidate_counts.append(float(pos.numel()))
 
     metrics.update(
@@ -500,6 +517,8 @@ def one_step_reward_oracle_metrics(
             f"{prefix}_best_child_minus_stop_log_reward": _mean(best_child_gains),
             f"{prefix}_best_child_support": _mean(best_child_supports),
             f"{prefix}_answer_edge_rank_by_policy": _mean(best_child_ranks),
+            f"{prefix}_best_child_edge_prob": _mean(best_child_edge_probs),
+            f"{prefix}_best_child_8sample_hit_rate": _mean(best_child_8sample_hits),
             f"{prefix}_policy_top1_child_support": _mean(top1_supports),
             f"{prefix}_policy_top5_child_support": _mean(top5_supports),
             f"{prefix}_candidate_count": _mean(candidate_counts),
@@ -535,7 +554,7 @@ def _evaluate_child_rewards(
         active_edges=state.active_edges,
         state=state,
     )
-    child_support = current.answer_support.index_select(
+    child_support = current.supported_answer_recall.index_select(
         0, batch.edge_batch.index_select(0, candidate_edge_ids).long()
     ).to(dtype=torch.float32)
 
@@ -696,6 +715,10 @@ def _rank_metrics(
 ) -> dict[str, float]:
     exists = 0
     ranks: list[float] = []
+    best_valid_probs: list[float] = []
+    valid_prob_masses: list[float] = []
+    valid_8sample_hits: list[float] = []
+    candidate_counts: list[float] = []
     for graph_id in range(num_graphs):
         mask = candidate_batch.eq(graph_id)
         if not bool(mask.any()):
@@ -708,13 +731,26 @@ def _rank_metrics(
         valid_logits = graph_logits[graph_valid]
         best_valid_logit = valid_logits.max()
         rank = int((graph_logits > best_valid_logit).sum().item()) + 1
+        graph_edge_prob = torch.softmax(graph_logits.float(), dim=0)
+        valid_mass = float(graph_edge_prob[graph_valid].sum().item())
+        best_valid_prob = float(
+            graph_edge_prob[graph_logits.eq(best_valid_logit)].max().item()
+        )
         ranks.append(float(rank))
+        best_valid_probs.append(best_valid_prob)
+        valid_prob_masses.append(valid_mass)
+        valid_8sample_hits.append(1.0 - (1.0 - valid_mass) ** 8)
+        candidate_counts.append(float(graph_logits.numel()))
 
     denom = float(num_graphs)
     return {
         f"{prefix}_valid_edge_exists_rate": _rate(float(exists), denom),
+        f"{prefix}_candidate_count_mean": _mean(candidate_counts),
         f"{prefix}_best_valid_rank_mean": _mean(ranks),
         f"{prefix}_best_valid_rank_median": _median(ranks),
+        f"{prefix}_best_valid_prob_mean": _mean(best_valid_probs),
+        f"{prefix}_valid_edge_prob_mass_mean": _mean(valid_prob_masses),
+        f"{prefix}_valid_edge_8sample_hit_rate": _mean(valid_8sample_hits),
         f"{prefix}_valid_edge_top1_rate": _rate(
             float(sum(r <= 1 for r in ranks)), float(len(ranks))
         ),
@@ -810,7 +846,9 @@ def policy_rollout_metrics(rollouts: list[RolloutBatch]) -> dict[str, float]:
     utility = stats.terminal_utility.float()
     log_reward = stats.terminal_log_reward.float()
     expanded = stats.terminal_expanded_edge_count.float()
-    min_gap = stats.terminal_minimality_gap.float()
+    min_gap = getattr(
+        stats, "terminal_minimality_gap", torch.zeros_like(log_reward)
+    ).float()
     stop_mask = traces.stop_mask.bool()
     continue_mask = traces.continue_mask.bool()
     stop_now_f1 = traces.stop_now_answer_f1.float()
@@ -914,6 +952,23 @@ def reward_sanity_metrics(rollouts: list[RolloutBatch]) -> dict[str, float]:
     rollout = concat_rollout_batches(rollouts)
     traces = rollout.traces
     stats = rollout.stats
+    zero = torch.zeros_like(stats.terminal_log_reward.float())
+    minimality_gap = getattr(stats, "terminal_minimality_gap", zero).float()
+    minimality_penalty = getattr(
+        stats,
+        "terminal_minimality_penalty",
+        (
+            stats.terminal_complexity_penalty
+            if stats.terminal_complexity_penalty is not None
+            else zero
+        ),
+    ).float()
+    minimal_edge_count = getattr(stats, "terminal_minimal_edge_count", zero).float()
+    expanded_edge_count = (
+        stats.terminal_expanded_edge_count.float()
+        if stats.terminal_expanded_edge_count is not None
+        else zero
+    )
     first_hit_rewards: list[float] = []
     final_rewards: list[float] = []
     final_better = 0
@@ -943,17 +998,15 @@ def reward_sanity_metrics(rollouts: list[RolloutBatch]) -> dict[str, float]:
         "reward/final_better_than_first_hit_rate": _rate(
             float(final_better), float(len(first_hit_rewards))
         ),
-        "reward/minimality_gap_at_final_mean": _safe_float(
-            stats.terminal_minimality_gap.float().mean()
-        ),
+        "reward/minimality_gap_at_final_mean": _safe_float(minimality_gap.mean()),
         "reward/minimality_penalty_at_final_mean": _safe_float(
-            stats.terminal_minimality_penalty.float().mean()
+            minimality_penalty.mean()
         ),
         "reward/expanded_edge_count_at_final_mean": _safe_float(
-            stats.terminal_expanded_edge_count.float().mean()
+            expanded_edge_count.mean()
         ),
         "reward/minimal_edge_count_at_final_mean": _safe_float(
-            stats.terminal_minimal_edge_count.float().mean()
+            minimal_edge_count.mean()
         ),
     }
 
@@ -1043,7 +1096,7 @@ def oracle_rollout_metrics(
             ),
             "oracle/answer_f1_mean": _safe_float(final_reward.answer_f1.float().mean()),
             "oracle/support_mean": _safe_float(
-                final_reward.answer_support.float().mean()
+                final_reward.supported_answer_recall.float().mean()
             ),
             "oracle/log_reward_mean": _safe_float(
                 final_reward.log_reward.float().mean()
@@ -1051,12 +1104,216 @@ def oracle_rollout_metrics(
             "oracle/expanded_edge_count_mean": _safe_float(
                 final_reward.expanded_edge_count.float().mean()
             ),
-            "oracle/minimality_gap_mean": _safe_float(
-                final_reward.minimality_gap.float().mean()
-            ),
+            "oracle/minimality_gap_mean": 0.0,
         }
     )
     return hist
+
+
+@torch.no_grad()
+def oracle_path_probability_metrics(
+    *,
+    policy: Policy,
+    batch: RetrievalBatch,
+    reward_model: RewardModel,
+    expand_budget: int,
+    num_rollouts: int,
+) -> dict[str, float]:
+    """
+    Follow the reward teacher greedily, then score that exact path under policy.
+
+    This answers a different question from rank diagnostics: even if every chosen
+    edge is ranked well locally, the sampled trajectory probability is the
+    product of option probabilities and conditional edge probabilities.
+    """
+    state = State.create_initial(batch, expand_budget=expand_budget)
+    context = policy.prepare_rollout_context(batch)
+    teacher = MinimalSufficiencyTeacher(gain_margin=0.02)
+    device = batch.edge_index.device
+    num_graphs = int(batch.num_graphs)
+
+    active = torch.ones(num_graphs, dtype=torch.bool, device=device)
+    log_path_prob = torch.zeros(num_graphs, dtype=torch.float32, device=device)
+    selected_edge_count = torch.zeros(num_graphs, dtype=torch.float32, device=device)
+
+    chosen_edge_probs: list[float] = []
+    chosen_continue_probs: list[float] = []
+    chosen_edge_ranks: list[float] = []
+    terminal_stop_probs: list[float] = []
+    agg = MeanAgg()
+
+    for depth in range(expand_budget + 1):
+        if not bool(active.any()):
+            break
+
+        current = reward_model.evaluate_terminal_state(
+            retrieval_batch=batch,
+            active_nodes=state.active_nodes,
+            active_edges=state.active_edges,
+            state=state,
+        )
+        out = policy(
+            batch,
+            state,
+            rollout_context=context,
+            return_edge_breakdown=True,
+            stop_log_reward=current.log_reward,
+        )
+        remaining_budget = state.remaining_budget_per_graph(
+            edge_batch=batch.edge_batch,
+            num_graphs=num_graphs,
+        )
+        has_edge = has_candidate(
+            candidate_batch_ids=out.candidate_batch_ids,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        exhausted = budget_exhausted_mask(
+            remaining_budget,
+            num_graphs=num_graphs,
+            device=device,
+        )
+        can_expand = active & has_edge & ~exhausted
+        stop_prob, continue_prob, edge_prob = option_action_probs(
+            stop_logits=out.stop_logits,
+            expand_logits=out.expand_logits,
+            edge_logits=out.edge_logits,
+            candidate_batch_ids=out.candidate_batch_ids,
+            can_expand=can_expand,
+            batch_size=num_graphs,
+        )
+
+        if depth >= expand_budget:
+            stopping = active.clone()
+            if bool(stopping.any()):
+                p_stop = stop_prob[stopping].float().clamp_min(1.0e-12)
+                log_path_prob[stopping] += p_stop.log()
+                terminal_stop_probs.extend(p_stop.detach().cpu().tolist())
+            active[stopping] = False
+            break
+
+        candidate_state = CandidateEdgesForState.from_state(batch=batch, state=state)
+        gains, valid = teacher.score_expands(
+            retrieval_batch=batch,
+            state=state,
+            candidates=candidate_state.candidates,
+            reward_model=reward_model,
+            current_reward=current,
+            budget_per_graph=remaining_budget,
+            num_graphs=num_graphs,
+        )
+
+        chosen_edges: list[int] = []
+        for graph_id in active.nonzero(as_tuple=False).view(-1).tolist():
+            graph_id = int(graph_id)
+            if not bool(can_expand[graph_id].item()):
+                p_stop = stop_prob[graph_id].float().clamp_min(1.0e-12)
+                log_path_prob[graph_id] += p_stop.log()
+                terminal_stop_probs.append(float(p_stop.item()))
+                active[graph_id] = False
+                continue
+
+            mask = candidate_state.candidates.batch_index.eq(graph_id) & valid
+            if not bool(mask.any()):
+                p_stop = stop_prob[graph_id].float().clamp_min(1.0e-12)
+                log_path_prob[graph_id] += p_stop.log()
+                terminal_stop_probs.append(float(p_stop.item()))
+                active[graph_id] = False
+                continue
+
+            pos = mask.nonzero(as_tuple=False).view(-1)
+            best = pos[gains.index_select(0, pos).argmax()]
+            best_gain = float(gains[best].item())
+            if float(current.utility[graph_id].item()) > 0.0 and best_gain <= 0.02:
+                p_stop = stop_prob[graph_id].float().clamp_min(1.0e-12)
+                log_path_prob[graph_id] += p_stop.log()
+                terminal_stop_probs.append(float(p_stop.item()))
+                active[graph_id] = False
+                continue
+
+            edge_id = int(candidate_state.candidates.edge_ids[best].item())
+            edge_pos = (
+                (
+                    out.candidate_batch_ids.eq(graph_id)
+                    & out.candidate_edge_ids.eq(edge_id)
+                )
+                .nonzero(as_tuple=False)
+                .view(-1)
+            )
+            if edge_pos.numel() == 0:
+                p_stop = stop_prob[graph_id].float().clamp_min(1.0e-12)
+                log_path_prob[graph_id] += p_stop.log()
+                terminal_stop_probs.append(float(p_stop.item()))
+                active[graph_id] = False
+                continue
+
+            edge_pos = edge_pos[0]
+            p_continue = continue_prob[graph_id].float().clamp_min(1.0e-12)
+            p_edge = edge_prob[edge_pos].float().clamp_min(1.0e-12)
+            log_path_prob[graph_id] += p_continue.log() + p_edge.log()
+            selected_edge_count[graph_id] += 1.0
+            chosen_edges.append(edge_id)
+
+            graph_pos = (
+                out.candidate_batch_ids.eq(graph_id).nonzero(as_tuple=False).view(-1)
+            )
+            graph_logits = out.edge_logits.index_select(0, graph_pos)
+            local_pos = graph_pos.eq(edge_pos).nonzero(as_tuple=False).view(-1)
+            rank = 0.0
+            if local_pos.numel() > 0:
+                chosen_logit = graph_logits[int(local_pos[0].item())]
+                rank = 1.0 + float((graph_logits > chosen_logit).sum().item())
+
+            edge_prob_value = float(p_edge.item())
+            continue_prob_value = float(p_continue.item())
+            chosen_edge_probs.append(edge_prob_value)
+            chosen_continue_probs.append(continue_prob_value)
+            chosen_edge_ranks.append(rank)
+            agg.add(f"oracle_path/chosen_edge_prob_depth_{depth}", edge_prob_value)
+            agg.add(f"oracle_path/continue_prob_depth_{depth}", continue_prob_value)
+            agg.add(f"oracle_path/chosen_edge_rank_depth_{depth}", rank)
+
+        if chosen_edges:
+            state.apply_expansion(
+                chosen_edges=torch.tensor(
+                    chosen_edges, dtype=torch.long, device=device
+                ),
+                edge_index=batch.edge_index,
+            )
+
+    final_reward = reward_model.evaluate_terminal_state(
+        retrieval_batch=batch,
+        active_nodes=state.active_nodes,
+        active_edges=state.active_edges,
+        state=state,
+    )
+    path_prob = log_path_prob.exp().clamp(0.0, 1.0)
+    expected_hit = 1.0 - (1.0 - path_prob).clamp(0.0, 1.0) ** int(num_rollouts)
+    nonzero = final_reward.answer_f1.gt(0.0)
+
+    metrics = {
+        "oracle_path/nonzero_f1_rate": _safe_float(nonzero.float().mean()),
+        "oracle_path/answer_f1_mean": _safe_float(
+            final_reward.answer_f1.float().mean()
+        ),
+        "oracle_path/exact_path_prob_mean": _safe_float(path_prob.mean()),
+        "oracle_path/exact_path_prob_when_nonzero_mean": (
+            _safe_float(path_prob[nonzero].mean()) if bool(nonzero.any()) else 0.0
+        ),
+        f"oracle_path/expected_hit_rate_{int(num_rollouts)}_mean": _safe_float(
+            expected_hit.mean()
+        ),
+        f"oracle_path/expected_hit_rate_{int(num_rollouts)}_when_nonzero_mean": (
+            _safe_float(expected_hit[nonzero].mean()) if bool(nonzero.any()) else 0.0
+        ),
+        "oracle_path/selected_edge_count_mean": _safe_float(selected_edge_count.mean()),
+        "oracle_path/chosen_edge_prob_mean": _mean(chosen_edge_probs),
+        "oracle_path/continue_prob_mean": _mean(chosen_continue_probs),
+        "oracle_path/chosen_edge_rank_mean": _mean(chosen_edge_ranks),
+        "oracle_path/terminal_stop_prob_mean": _mean(terminal_stop_probs),
+    }
+    metrics.update(agg.mean())
+    return metrics
 
 
 @torch.no_grad()
@@ -1091,7 +1348,13 @@ def stop_improvement_oracle_metrics(
             active_edges=state.active_edges,
             state=state,
         )
-        out = policy(batch, state, rollout_context=context, return_edge_breakdown=True)
+        out = policy(
+            batch,
+            state,
+            rollout_context=context,
+            return_edge_breakdown=True,
+            stop_log_reward=current.log_reward,
+        )
         remaining_budget = state.remaining_budget_per_graph(
             edge_batch=batch.edge_batch,
             num_graphs=int(batch.num_graphs),
@@ -1253,7 +1516,11 @@ def _prior_beam_rewards(
             next_beams: list[tuple[float, State]] = []
             for score, state in beams:
                 out = policy(
-                    batch, state, rollout_context=context, return_edge_breakdown=True
+                    batch,
+                    state,
+                    rollout_context=context,
+                    return_edge_breakdown=True,
+                    edge_logit_mode="semantic",
                 )
                 prior = out.edge_score_breakdown.semantic_logits
                 mask = out.candidate_batch_ids.eq(graph_id)
@@ -1287,14 +1554,14 @@ def _prior_beam_rewards(
                 break
             next_beams.sort(key=lambda item: item[0], reverse=True)
             beams = next_beams[: int(beam_size)]
-        best_nodes[batch.ptr[graph_id] : batch.ptr[graph_id + 1]] = (
-            graph_best_state.active_nodes[batch.ptr[graph_id] : batch.ptr[graph_id + 1]]
-        )
-        best_edges[batch.edge_ptr[graph_id] : batch.edge_ptr[graph_id + 1]] = (
-            graph_best_state.active_edges[
-                batch.edge_ptr[graph_id] : batch.edge_ptr[graph_id + 1]
-            ]
-        )
+        best_nodes[
+            batch.ptr[graph_id] : batch.ptr[graph_id + 1]
+        ] = graph_best_state.active_nodes[batch.ptr[graph_id] : batch.ptr[graph_id + 1]]
+        best_edges[
+            batch.edge_ptr[graph_id] : batch.edge_ptr[graph_id + 1]
+        ] = graph_best_state.active_edges[
+            batch.edge_ptr[graph_id] : batch.edge_ptr[graph_id + 1]
+        ]
 
     final_state = State(
         root_edges=base.root_edges,
@@ -1318,16 +1585,28 @@ def edge_and_gate_metrics(
     reward_model: RewardModel,
     expand_budget: int,
 ) -> dict[str, float]:
-    del reward_model
     state = State.create_initial(batch, expand_budget=expand_budget)
     context = policy.prepare_rollout_context(batch)
     agg = MeanAgg()
     for depth in range(min(expand_budget + 1, 3)):
-        out = policy(batch, state, rollout_context=context, return_edge_breakdown=True)
+        current = reward_model.evaluate_terminal_state(
+            retrieval_batch=batch,
+            active_nodes=state.active_nodes,
+            active_edges=state.active_edges,
+            state=state,
+        )
+        out = policy(
+            batch,
+            state,
+            rollout_context=context,
+            return_edge_breakdown=True,
+            stop_log_reward=current.log_reward,
+        )
         breakdown = out.edge_score_breakdown
         prior = breakdown.semantic_logits
-        residual = breakdown.residual_logits
-        scale = breakdown.residual_scale.detach().to(prior.device, prior.dtype)
+        residual = getattr(breakdown, "residual_logits", torch.zeros_like(prior))
+        scale = getattr(breakdown, "residual_scale", prior.new_tensor(0.0))
+        scale = scale.detach().to(prior.device, prior.dtype)
         scaled_residual = scale * residual
         final = breakdown.final_logits
         if prior.numel() > 0:
@@ -1347,7 +1626,12 @@ def edge_and_gate_metrics(
             )
         agg.add("edge/logit_scale", policy.edge_scorer.logit_scale.detach())
         agg.add("edge/entity_weight", policy.edge_scorer.entity_weight.detach())
-        agg.add("edge/residual_scale", policy.edge_scorer.residual_scale.detach())
+        scorer_residual_scale = getattr(
+            policy.edge_scorer,
+            "residual_scale",
+            prior.new_tensor(0.0),
+        )
+        agg.add("edge/residual_scale", scorer_residual_scale.detach())
 
         valid = valid_progress_mask(
             batch=batch,
@@ -1396,8 +1680,12 @@ def _prefix_rank_values(
     valid: torch.Tensor,
     num_graphs: int,
 ) -> dict[str, float]:
-    prior_by_graph = _best_valid_rank_by_graph(prior, candidate_batch, valid, num_graphs)
-    final_by_graph = _best_valid_rank_by_graph(final, candidate_batch, valid, num_graphs)
+    prior_by_graph = _best_valid_rank_by_graph(
+        prior, candidate_batch, valid, num_graphs
+    )
+    final_by_graph = _best_valid_rank_by_graph(
+        final, candidate_batch, valid, num_graphs
+    )
     shared_graphs = sorted(set(prior_by_graph).intersection(final_by_graph))
     prior_ranks = [prior_by_graph[graph_id] for graph_id in shared_graphs]
     final_ranks = [final_by_graph[graph_id] for graph_id in shared_graphs]
@@ -1546,8 +1834,15 @@ def _format_table(metrics: dict[str, float], keys: list[str]) -> str:
     lines = ["| metric | value |", "|---|---:|"]
     for key in keys:
         value = metrics.get(key, 0.0)
-        lines.append(f"| `{key}` | {value:.4f} |")
+        lines.append(f"| `{key}` | {_format_metric_value(value)} |")
     return "\n".join(lines)
+
+
+def _format_metric_value(value: float) -> str:
+    value = float(value)
+    if value != 0.0 and abs(value) < 1.0e-3:
+        return f"{value:.3e}"
+    return f"{value:.4f}"
 
 
 def _yes_no(value: bool) -> str:
@@ -1616,15 +1911,23 @@ def write_report(
             metrics,
             [
                 "prior/root_valid_edge_exists_rate",
+                "prior/root_candidate_count_mean",
                 "prior/root_best_valid_rank_mean",
                 "prior/root_best_valid_rank_median",
+                "prior/root_best_valid_prob_mean",
+                "prior/root_valid_edge_prob_mass_mean",
+                "prior/root_valid_edge_8sample_hit_rate",
                 "prior/root_valid_edge_top1_rate",
                 "prior/root_valid_edge_top3_rate",
                 "prior/root_valid_edge_top5_rate",
                 "prior/root_valid_edge_top10_rate",
                 "prior/root_valid_edge_mrr",
                 "prior/depth1_valid_edge_exists_rate",
+                "prior/depth1_candidate_count_mean",
                 "prior/depth1_best_valid_rank_mean",
+                "prior/depth1_best_valid_prob_mean",
+                "prior/depth1_valid_edge_prob_mass_mean",
+                "prior/depth1_valid_edge_8sample_hit_rate",
                 "prior/depth1_valid_edge_top10_rate",
             ],
         ),
@@ -1638,6 +1941,8 @@ def write_report(
                 "oracle/root_best_child_minus_stop_log_reward",
                 "oracle/root_best_child_support",
                 "oracle/root_answer_edge_rank_by_policy",
+                "oracle/root_best_child_edge_prob",
+                "oracle/root_best_child_8sample_hit_rate",
                 "oracle/root_policy_top1_child_support",
                 "oracle/root_policy_top5_child_support",
                 "oracle/root_candidate_count",
@@ -1672,6 +1977,30 @@ def write_report(
                 "stop_oracle/stop_now_better_ratio_depth_1",
                 "stop_oracle/stop_now_better_ratio_depth_2",
                 "stop_oracle/stop_now_better_ratio_depth_3",
+            ],
+        ),
+        "",
+        "## Oracle Path Probability",
+        _format_table(
+            metrics,
+            [
+                "oracle_path/nonzero_f1_rate",
+                "oracle_path/answer_f1_mean",
+                "oracle_path/exact_path_prob_mean",
+                "oracle_path/exact_path_prob_when_nonzero_mean",
+                "oracle_path/expected_hit_rate_8_mean",
+                "oracle_path/expected_hit_rate_8_when_nonzero_mean",
+                "oracle_path/selected_edge_count_mean",
+                "oracle_path/chosen_edge_rank_mean",
+                "oracle_path/chosen_edge_prob_mean",
+                "oracle_path/continue_prob_mean",
+                "oracle_path/terminal_stop_prob_mean",
+                "oracle_path/chosen_edge_prob_depth_0",
+                "oracle_path/chosen_edge_prob_depth_1",
+                "oracle_path/chosen_edge_prob_depth_2",
+                "oracle_path/continue_prob_depth_0",
+                "oracle_path/continue_prob_depth_1",
+                "oracle_path/continue_prob_depth_2",
             ],
         ),
         "",
@@ -1871,6 +2200,15 @@ def main(cfg: DictConfig) -> None:
                 batch=batch,
                 reward_model=model.reward_model,
                 expand_budget=expand_budget,
+            )
+        )
+        aggs.extend(
+            oracle_path_probability_metrics(
+                policy=model.policy,
+                batch=batch,
+                reward_model=model.reward_model,
+                expand_budget=expand_budget,
+                num_rollouts=eval_rollouts,
             )
         )
         aggs.extend(

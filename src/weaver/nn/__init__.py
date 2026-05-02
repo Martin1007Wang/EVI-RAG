@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .action_features import ActionFeatureBuilder, ActionFeatureOutput
 from .candidate_context import (
     CandidateContext,
     CandidateSemanticScores,
@@ -17,16 +16,11 @@ from .feature_encoder import (
     RoleProjection,
 )
 from .flow_head import FlowHead
-from .state_readout import FrontierReadout, StateContext, StateReadout
+from .state_readout import FrontierReadout, StateContext, StateOnlyContext, StateReadout
 from .stop_gate import StopExpandGate
-from .transition_features import TransitionFeatureBuilder, TransitionFeatureOutput
 
 __all__ = [
     "StopExpandGate",
-    "ActionFeatureBuilder",
-    "ActionFeatureOutput",
-    "TransitionFeatureBuilder",
-    "TransitionFeatureOutput",
     "CandidateContext",
     "CandidateSemanticScores",
     "DirectionalDDE",
@@ -40,6 +34,7 @@ __all__ = [
     "FlowHead",
     "FrontierReadout",
     "StateContext",
+    "StateOnlyContext",
     "StateReadout",
     "build_candidate_context",
     "candidate_semantic_scores",

@@ -14,10 +14,12 @@ class PolicyRuntimeConfig:
     feature_encoder_cfg: dict[str, Any]
     state_readout_dropout: float
     state_readout_cfg: dict[str, Any]
-    transition_features_cfg: dict[str, Any]
     stop_scorer_cfg: dict[str, Any]
     edge_scorer_cfg: dict[str, Any]
     flow_head_cfg: dict[str, Any]
+    action_parameterization: str
+    doob_stop_mode: str
+    doob_successor_value_mode: str
 
 
 @dataclass(frozen=True)
@@ -27,8 +29,6 @@ class RolloutRuntimeConfig:
     eval_num_rollout: int
     train_chunk_size: int
     eval_chunk_size: int
-    use_static_batch_rollouts: bool
-    use_fused_static_batch_rollouts: bool
     stop_advantage_cfg: StopAdvantageConfig
 
 
@@ -70,39 +70,46 @@ def build_policy_runtime_config(
 
     hidden_dim = int(cfg.pop("hidden_dim", 1024))
     state_readout_dropout = float(cfg.pop("state_readout_dropout", 0.0))
+    action_parameterization = str(
+        cfg.pop("action_parameterization", "doob_value_prior")
+    )
 
     feature_encoder_cfg = dict(cfg.pop("feature_encoder", {}))
     state_readout_cfg = dict(cfg.pop("state_readout", {}))
     transition_features_cfg = dict(cfg.pop("transition_features", {}))
     legacy_action_features_cfg = dict(cfg.pop("action_features", {}))
-    if legacy_action_features_cfg and transition_features_cfg:
+    if transition_features_cfg:
         raise ValueError(
-            "Use only policy_cfg.transition_features; action_features is a legacy key."
+            "policy_cfg.transition_features was removed with the residual edge "
+            f"scorer. Got: {sorted(transition_features_cfg)}."
         )
     if legacy_action_features_cfg:
-        transition_features_cfg = legacy_action_features_cfg
+        raise ValueError(
+            "policy_cfg.action_features was removed with the residual edge scorer. "
+            f"Got: {sorted(legacy_action_features_cfg)}."
+        )
     stop_scorer_cfg = dict(cfg.pop("stop_scorer", {}))
     edge_scorer_cfg = dict(cfg.pop("edge_scorer", {}))
     flow_head_cfg = dict(cfg.pop("flow_head", {}))
+    doob_cfg = normalize_doob_config(cfg.pop("doob", {}))
 
     state_readout_cfg = normalize_state_readout_config(state_readout_cfg)
-    transition_features_cfg = normalize_transition_features_config(
-        transition_features_cfg
-    )
     stop_scorer_cfg = normalize_stop_scorer_config(stop_scorer_cfg)
 
-    share_edge_encoder = bool(
-        edge_scorer_cfg.pop("share_edge_encoder_with_readout", True)
-    )
-    if not share_edge_encoder:
+    if "share_edge_encoder_with_readout" in edge_scorer_cfg:
         raise ValueError(
-            "policy_cfg.edge_scorer.share_edge_encoder_with_readout=false is no "
-            "longer supported; Policy always shares edge_encoder between readout "
-            "and edge_scorer."
+            "policy_cfg.edge_scorer.share_edge_encoder_with_readout was removed "
+            "with the residual edge scorer."
         )
 
     if cfg:
         raise ValueError(f"Unused policy_cfg keys: {sorted(cfg)}.")
+
+    if action_parameterization not in {"doob_value_prior", "semantic_gate"}:
+        raise ValueError(
+            "policy_cfg.action_parameterization must be 'doob_value_prior' or "
+            f"'semantic_gate', got {action_parameterization!r}."
+        )
 
     feature_encoder_cfg = build_feature_encoder_config(
         cfg=feature_encoder_cfg,
@@ -117,10 +124,12 @@ def build_policy_runtime_config(
         feature_encoder_cfg=feature_encoder_cfg,
         state_readout_dropout=state_readout_dropout,
         state_readout_cfg=state_readout_cfg,
-        transition_features_cfg=transition_features_cfg,
         stop_scorer_cfg=stop_scorer_cfg,
         edge_scorer_cfg=edge_scorer_cfg,
         flow_head_cfg=flow_head_cfg,
+        action_parameterization=action_parameterization,
+        doob_stop_mode=doob_cfg["stop_mode"],
+        doob_successor_value_mode=doob_cfg["successor_value_mode"],
     )
 
 
@@ -135,14 +144,15 @@ def build_rollout_runtime_config(
 
     train_chunk_size = cfg.pop("train_chunk_size", train_num_rollout)
     eval_chunk_size = cfg.pop("eval_chunk_size", eval_num_rollout)
-    use_static_batch_rollouts = bool(cfg.pop("use_static_batch_rollouts", False))
-    use_fused_static_batch_rollouts = bool(
-        cfg.pop("use_fused_static_batch_rollouts", False)
-    )
     stop_advantage_cfg = StopAdvantageConfig.from_dict(cfg.pop("stop_adv", None))
 
     if cfg:
         raise ValueError(f"Unused rollout_cfg keys: {sorted(cfg)}.")
+    if stop_advantage_cfg.enabled:
+        raise ValueError(
+            "rollout_cfg.stop_adv.enabled=true is not supported by fused-only "
+            "rollouts yet."
+        )
 
     validate_rollout_counts(
         expand_budget=expand_budget,
@@ -164,8 +174,6 @@ def build_rollout_runtime_config(
             fallback=eval_num_rollout,
             name="eval_chunk_size",
         ),
-        use_static_batch_rollouts=use_static_batch_rollouts,
-        use_fused_static_batch_rollouts=use_fused_static_batch_rollouts,
         stop_advantage_cfg=stop_advantage_cfg,
     )
 
@@ -339,18 +347,41 @@ def normalize_state_readout_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
-def normalize_transition_features_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(cfg)
-    if cfg:
-        raise ValueError(
-            "policy_cfg.transition_features does not accept handcrafted feature "
-            f"switches; residual transition features are fixed to 3 dims. Got: {sorted(cfg)}."
-        )
-    return cfg
-
-
 def normalize_stop_scorer_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(cfg)
+
+
+def normalize_doob_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(cfg or {})
+
+    top_k = cfg.pop("top_k", None)
+    if top_k is not None:
+        raise ValueError(
+            "policy_cfg.doob.top_k was removed because Doob policy now uses "
+            "full frontier support. Remove this key instead of truncating the prior."
+        )
+
+    stop_mode = str(cfg.pop("stop_mode", "reward"))
+    if stop_mode not in {"reward", "learned"}:
+        raise ValueError(
+            "policy_cfg.doob.stop_mode must be 'reward' or 'learned', "
+            f"got {stop_mode!r}."
+        )
+
+    successor_value_mode = str(cfg.pop("successor_value_mode", "flow"))
+    if successor_value_mode != "flow":
+        raise ValueError(
+            "policy_cfg.doob.successor_value_mode must be 'flow', "
+            f"got {successor_value_mode!r}."
+        )
+
+    if cfg:
+        raise ValueError(f"Unused policy_cfg.doob keys: {sorted(cfg)}.")
+
+    return {
+        "stop_mode": stop_mode,
+        "successor_value_mode": successor_value_mode,
+    }
 
 
 def _pop_expected(

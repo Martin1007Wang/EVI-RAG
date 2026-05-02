@@ -52,8 +52,6 @@ class RolloutRunConfig:
     collect_policy_diagnostics: bool
     validate_synchronous_depth: bool
     reward_mode: RewardMode
-    use_static_batch_rollouts: bool
-    use_fused_static_batch_rollouts: bool
     edge_logit_mode: str = "final"
 
 
@@ -84,15 +82,11 @@ class RolloutRunner:
         eval_num_rollout: int,
         train_chunk_size: int,
         eval_chunk_size: int,
-        use_static_batch_rollouts: bool = False,
-        use_fused_static_batch_rollouts: bool = False,
     ) -> None:
         self.train_num_rollout = positive_int(train_num_rollout, "train_num_rollout")
         self.eval_num_rollout = positive_int(eval_num_rollout, "eval_num_rollout")
         self.train_chunk_size = positive_int(train_chunk_size, "train_chunk_size")
         self.eval_chunk_size = positive_int(eval_chunk_size, "eval_chunk_size")
-        self.use_static_batch_rollouts = bool(use_static_batch_rollouts)
-        self.use_fused_static_batch_rollouts = bool(use_fused_static_batch_rollouts)
 
         self.engine = RolloutEngine(expand_budget=int(expand_budget))
 
@@ -139,8 +133,6 @@ class RolloutRunner:
                 auxiliary=auxiliary,
                 collect_stop_counterfactual=collect_stop_counterfactual,
             ).reward_mode,
-            use_static_batch_rollouts=self.use_static_batch_rollouts,
-            use_fused_static_batch_rollouts=self.use_fused_static_batch_rollouts,
             edge_logit_mode="final",
         )
 
@@ -242,8 +234,6 @@ class RolloutRunner:
                 reward_mode=reward_mode,
                 collect_stop_counterfactual=collect_stop_counterfactual,
             ).reward_mode,
-            use_static_batch_rollouts=self.use_static_batch_rollouts,
-            use_fused_static_batch_rollouts=self.use_fused_static_batch_rollouts,
             edge_logit_mode="final",
         )
 
@@ -286,8 +276,6 @@ class RolloutRunner:
             validate_synchronous_depth=config.validate_synchronous_depth,
             edge_logit_mode=config.edge_logit_mode,
             reward_mode=config.reward_mode,
-            use_static_batch_rollouts=config.use_static_batch_rollouts,
-            use_fused_static_batch_rollouts=config.use_fused_static_batch_rollouts,
         )
 
 

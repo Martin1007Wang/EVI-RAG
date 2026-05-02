@@ -30,9 +30,11 @@ If repo behavior and this file disagree, follow the source files and update this
 - There is no dedicated package build command or PEP 517 build backend configured.
 - For most work, treat install + tests + Hydra entrypoints as the relevant execution surface.
 - Discover Make targets with `make help`; cleanup commands are `make clean` and `make clean-logs`.
-- Run repo-wide formatting/lint with `make format` (`pre-commit run -a`).
+- `make format` may run legacy formatting/lint hooks, but agents should not
+  run Black just to normalize code style.
 - Run hooks on changed files with `pre-commit run --files path/to/file.py`.
-- Run a single hook with `pre-commit run black --files path/to/file.py`, `pre-commit run isort --files ...`, or `pre-commit run flake8 --files ...`.
+- Run targeted checks with `pre-commit run --files ...` or direct tools when
+  useful; avoid Black-only formatting passes unless the user explicitly asks.
 - Fast tests: `make test` or `pytest -k "not slow"`.
 - Full tests: `make test-full` or `pytest -v`.
 - Coverage: `pytest --cov src`.
@@ -68,10 +70,13 @@ If repo behavior and this file disagree, follow the source files and update this
 
 ## Formatting and import rules
 
-- Formatting is enforced by Black with a 99 character line length.
-- Import sorting is enforced by isort with `--profile black`.
-- Keep imports grouped as standard library, third-party, then local `src` imports.
-- Preserve blank lines between import groups and let isort settle exact ordering.
+- Do not use Black as the default code formatter in this repo. Keep edits
+  readable, minimal, and Pylance-compatible; passing Pylance/static analysis is
+  sufficient for formatting purposes unless the user requests stricter style.
+- Keep imports clear and grouped as standard library, third-party, then local
+  `src` imports; avoid mechanical import rewrites when they do not improve the
+  change.
+- Preserve blank lines between import groups.
 - `flake8` ignores `E402`, and that is intentional for entrypoints.
 - In entry scripts, call `rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)` before importing `src.*` modules.
 - Do not "fix" entrypoint import order by moving local imports above `rootutils.setup_root(...)`.

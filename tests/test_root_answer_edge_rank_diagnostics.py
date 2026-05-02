@@ -73,7 +73,9 @@ if "torch_scatter" not in sys.modules:
     sys.modules["torch_scatter"] = torch_scatter_stub
 
 from src.training.diagnostics import TrainingDiagnosticsCollector
-from src.training.rollout_diagnostics import compute_root_answer_edge_ranking_diagnostics
+from src.training.rollout_diagnostics import (
+    compute_root_answer_edge_ranking_diagnostics,
+)
 from src.weaver.nn.edge_scorer import EdgeScoreBreakdown
 from src.weaver.policy import PolicyOutput
 
@@ -116,7 +118,7 @@ class _Policy:
             state_log_flow=torch.zeros(2),
             stop_logits=torch.zeros(2),
             expand_logits=torch.zeros(2),
-            edge_logits=torch.tensor([4.0, 3.0, 8.0], dtype=torch.float32),
+            edge_logits=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
             candidate_batch_ids=torch.tensor([0, 0, 1], dtype=torch.long),
             candidate_edge_ids=torch.tensor([0, 1, 2], dtype=torch.long),
             edge_score_breakdown=EdgeScoreBreakdown(
@@ -125,9 +127,7 @@ class _Policy:
                 semantic_score=torch.tensor([0.3, 0.7, 0.5], dtype=torch.float32),
                 new_text_mask=torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
                 semantic_logits=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
-                residual_logits=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
-                final_logits=torch.tensor([4.0, 3.0, 8.0], dtype=torch.float32),
-                residual_scale=torch.tensor(0.0, dtype=torch.float32),
+                final_logits=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
             ),
         )
 
@@ -147,32 +147,30 @@ def test_root_answer_edge_rank_excludes_missing_graphs() -> None:
     assert metrics["root/prior_answer_edge_top1_rate"] == pytest.approx(1.0)
     assert metrics["root/prior_answer_edge_top5_rate"] == pytest.approx(1.0)
     assert metrics["root/prior_answer_edge_mrr"] == pytest.approx(1.0)
-    assert metrics["root/policy_answer_edge_best_rank_mean"] == pytest.approx(2.0)
-    assert metrics["root/policy_answer_edge_best_rank_median"] == pytest.approx(2.0)
-    assert metrics["root/policy_answer_edge_top1_rate"] == pytest.approx(0.0)
+    assert metrics["root/policy_answer_edge_best_rank_mean"] == pytest.approx(1.0)
+    assert metrics["root/policy_answer_edge_best_rank_median"] == pytest.approx(1.0)
+    assert metrics["root/policy_answer_edge_top1_rate"] == pytest.approx(1.0)
     assert metrics["root/policy_answer_edge_top5_rate"] == pytest.approx(1.0)
-    assert metrics["root/policy_answer_edge_mrr"] == pytest.approx(0.5)
-    assert metrics["root/answer_edge_rank_delta_mean"] == pytest.approx(1.0)
-    assert metrics["root/final_worse_than_prior_rate"] == pytest.approx(1.0)
+    assert metrics["root/policy_answer_edge_mrr"] == pytest.approx(1.0)
+    assert metrics["root/answer_edge_rank_delta_mean"] == pytest.approx(0.0)
+    assert metrics["root/final_worse_than_prior_rate"] == pytest.approx(0.0)
     assert metrics["edge/base_logit_std"] == pytest.approx(
         float(torch.tensor([1.0, 2.0, 3.0]).std(unbiased=False).item())
     )
-    assert metrics["edge/residual_logit_std"] == pytest.approx(0.0)
-    assert metrics["edge/residual_to_base_std_ratio"] == pytest.approx(0.0)
-    assert metrics["edge/prior_rank_vs_final_rank_kendall"] == pytest.approx(-1.0)
+    assert metrics["edge/prior_rank_vs_final_rank_kendall"] == pytest.approx(1.0)
     assert metrics["edge/answer_edge_prior_rank"] == pytest.approx(1.0)
-    assert metrics["edge/answer_edge_final_rank"] == pytest.approx(2.0)
+    assert metrics["edge/answer_edge_final_rank"] == pytest.approx(1.0)
 
     assert metrics["root/answer_edge_q_rel_mean"] == pytest.approx(0.9)
     assert metrics["root/answer_edge_q_new_mean"] == pytest.approx(0.8)
     assert metrics["root/answer_edge_q_candidate_mean"] == pytest.approx(0.7)
     assert metrics["root/answer_edge_new_text_rate"] == pytest.approx(1.0)
-    assert metrics["root/answer_edge_logit_mean"] == pytest.approx(3.0)
+    assert metrics["root/answer_edge_logit_mean"] == pytest.approx(2.0)
     assert metrics["root/nonanswer_edge_q_rel_mean"] == pytest.approx(0.2)
     assert metrics["root/nonanswer_edge_q_new_mean"] == pytest.approx(0.3)
     assert metrics["root/nonanswer_edge_q_candidate_mean"] == pytest.approx(0.4)
     assert metrics["root/nonanswer_edge_new_text_rate"] == pytest.approx(0.5)
-    assert metrics["root/nonanswer_edge_logit_mean"] == pytest.approx(6.0)
+    assert metrics["root/nonanswer_edge_logit_mean"] == pytest.approx(2.0)
 
 
 def test_training_policy_diagnostics_emit_root_edge_prior_metrics() -> None:
@@ -193,6 +191,5 @@ def test_training_policy_diagnostics_emit_root_edge_prior_metrics() -> None:
 
     assert metrics["train/loss/total"] == pytest.approx(1.0)
     assert metrics["train/edge/base_logit_std"] > 0.0
-    assert metrics["train/edge/residual_logit_std"] == pytest.approx(0.0)
     assert metrics["train/edge/answer_edge_prior_rank"] == pytest.approx(1.0)
-    assert metrics["train/edge/answer_edge_final_rank"] == pytest.approx(2.0)
+    assert metrics["train/edge/answer_edge_final_rank"] == pytest.approx(1.0)

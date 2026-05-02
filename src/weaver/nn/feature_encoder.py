@@ -147,8 +147,7 @@ class FeatureBank:
     """
     Static graph/query features independent of rollout state.
 
-    Model-space features are consumed by state readout, flow, Stop gate,
-    and residual edge scoring.
+    Model-space features are consumed by state readout, flow, and Stop gate.
 
     Semantic-space features are consumed by semantic edge priors.
     """
@@ -389,9 +388,13 @@ class FeatureEncoder(nn.Module):
             device=entity_embedding_map.device,
             dtype=torch.long,
         ).view(num_nodes)
-        return entity_embedding_map.index_select(0, node_entity_catalog_ids).lt(0).to(
-            device=device,
-            dtype=torch.bool,
+        return (
+            entity_embedding_map.index_select(0, node_entity_catalog_ids)
+            .lt(0)
+            .to(
+                device=device,
+                dtype=torch.bool,
+            )
         )
 
     @staticmethod

@@ -73,6 +73,7 @@ if "torch_scatter" not in sys.modules:
     torch_scatter_stub.scatter_logsumexp = _scatter_logsumexp
     sys.modules["torch_scatter"] = torch_scatter_stub
 
+from src.weaver.config import build_rollout_runtime_config
 from src.weaver.loss import LossOutput
 from src.weaver.rollout.engine import RewardMode
 from src.weaver.rollout.runner import (
@@ -177,6 +178,19 @@ def test_concat_rollout_batches_concatenates_policy_traces() -> None:
     assert merged.traces.stop_adv_loss.shape == (3, 2)
 
 
+def test_rollout_config_rejects_removed_rollout_mode_flags() -> None:
+    with pytest.raises(ValueError, match="Unused rollout_cfg keys"):
+        build_rollout_runtime_config({"use_static_batch_rollouts": True})
+
+    with pytest.raises(ValueError, match="Unused rollout_cfg keys"):
+        build_rollout_runtime_config({"use_fused_static_batch_rollouts": True})
+
+
+def test_rollout_config_rejects_stop_advantage_until_fused_support_exists() -> None:
+    with pytest.raises(ValueError, match="fused-only rollouts"):
+        build_rollout_runtime_config({"stop_adv": {"enabled": True}})
+
+
 def test_runner_passes_step_auxiliary_only_for_training(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -276,7 +290,7 @@ def test_runner_derives_reward_mode_from_declared_requirements(
     ]
 
 
-def test_runner_passes_static_batch_rollout_flag(
+def test_runner_uses_fused_only_rollout_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = RolloutRunner(
@@ -285,12 +299,18 @@ def test_runner_passes_static_batch_rollout_flag(
         eval_num_rollout=2,
         train_chunk_size=1,
         eval_chunk_size=1,
-        use_static_batch_rollouts=True,
     )
-    seen_flags: list[bool] = []
+    seen_mode_kwargs: list[set[str]] = []
 
     def _run_vectorized(**kwargs: object) -> list[RolloutBatch]:
-        seen_flags.append(bool(kwargs["use_static_batch_rollouts"]))
+        seen_mode_kwargs.append(
+            {
+                key
+                for key in kwargs
+                if key
+                in {"use_static_batch_rollouts", "use_fused_static_batch_rollouts"}
+            }
+        )
         return [_rollout() for _ in range(int(kwargs["num_rollouts"]))]
 
     monkeypatch.setattr(runner.engine, "run_vectorized", _run_vectorized)
@@ -302,33 +322,4 @@ def test_runner_passes_static_batch_rollout_flag(
         temperature=1.0,
     )
 
-    assert seen_flags == [True, True]
-
-
-def test_runner_passes_fused_static_batch_rollout_flag(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = RolloutRunner(
-        expand_budget=1,
-        train_num_rollout=1,
-        eval_num_rollout=2,
-        train_chunk_size=1,
-        eval_chunk_size=1,
-        use_fused_static_batch_rollouts=True,
-    )
-    seen_flags: list[bool] = []
-
-    def _run_vectorized(**kwargs: object) -> list[RolloutBatch]:
-        seen_flags.append(bool(kwargs["use_fused_static_batch_rollouts"]))
-        return [_rollout() for _ in range(int(kwargs["num_rollouts"]))]
-
-    monkeypatch.setattr(runner.engine, "run_vectorized", _run_vectorized)
-
-    runner.generate_eval_rollouts(
-        policy=object(),
-        reward_model=object(),
-        batch=object(),
-        temperature=1.0,
-    )
-
-    assert seen_flags == [True, True]
+    assert seen_mode_kwargs == [set(), set()]

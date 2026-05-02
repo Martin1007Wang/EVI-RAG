@@ -4,6 +4,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -80,15 +81,15 @@ if "torch_scatter" not in sys.modules:
     sys.modules["torch_scatter"] = torch_scatter_stub
 
 from src.data.collate import RetrievalCollator
-from src.data.schema import RetrievalData, repeat_retrieval_batch
+from src.data.schema import RetrievalData
 from src.weaver.policy import Policy, PolicyOutput
 from src.weaver.reward import RewardModel
 from src.weaver.rollout.engine import RewardMode, RolloutEngine
+from src.weaver.rollout.sampling import option_action_log_probs, option_action_probs
 from src.weaver.rollout.stop_advantage import (
     StopAdvantageAuxiliary,
     StopAdvantageConfig,
 )
-from src.weaver.rollout.sampling import option_action_log_probs, option_action_probs
 from src.weaver.state import RolloutState, State
 
 
@@ -184,59 +185,6 @@ def test_option_action_log_probs_backward_with_forced_stop_graph() -> None:
     assert expand_logits.grad is not None
     assert edge_logits.grad is not None
     assert torch.allclose(type_logp[1], torch.tensor([0.0, -float("inf")]))
-
-
-def test_repeat_retrieval_batch_offsets_graph_structure_and_node_ids() -> None:
-    batch = _batch()
-    repeated = repeat_retrieval_batch(batch, 3)
-
-    assert repeated.num_graphs == 6
-    assert repeated.num_nodes_total == 12
-
-    assert torch.equal(
-        repeated.edge_index,
-        torch.tensor(
-            [[0, 2, 4, 6, 8, 10], [1, 3, 5, 7, 9, 11]],
-            dtype=torch.long,
-        ),
-    )
-    assert torch.equal(
-        repeated.ptr,
-        torch.tensor([0, 2, 4, 6, 8, 10, 12], dtype=torch.long),
-    )
-    assert torch.equal(repeated.node_ptr, repeated.ptr)
-    assert torch.equal(
-        repeated.edge_ptr,
-        torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.long),
-    )
-    assert torch.equal(
-        repeated.batch,
-        torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], dtype=torch.long),
-    )
-    assert torch.equal(repeated.edge_batch, torch.arange(6, dtype=torch.long))
-    assert torch.equal(
-        repeated.anchor_node_ids,
-        torch.tensor([0, 2, 4, 6, 8, 10], dtype=torch.long),
-    )
-    assert torch.equal(
-        repeated.reachable_target_node_ids,
-        torch.tensor([1, 3, 5, 7, 9, 11], dtype=torch.long),
-    )
-    assert torch.equal(
-        repeated.question_emb,
-        torch.tensor(
-            [[1.0, 0.0], [2.0, 0.0], [1.0, 0.0], [2.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
-            dtype=torch.float32,
-        ),
-    )
-    assert torch.equal(
-        repeated.target_node_distances_flat,
-        batch.target_node_distances_flat.repeat(3),
-    )
-    assert torch.equal(
-        repeated.node_target_distance,
-        batch.node_target_distance.repeat(3),
-    )
 
 
 class _FakeOnlinePolicy:
@@ -419,53 +367,7 @@ def test_run_online_vectorized_splits_rollouts_back_to_original_batch() -> None:
         assert rollout.stats.terminal_answer_f1.shape == (2,)
 
 
-def test_static_batch_rollouts_reuse_context_and_match_physical_repeat() -> None:
-    batch = _batch()
-    static_policy = _CountingFakeOnlinePolicy()
-
-    static_rollouts = RolloutEngine(expand_budget=1).run_vectorized(
-        policy=static_policy,
-        retrieval_batch=batch,
-        reward_model=RewardModel(edge_cost=0.0),
-        num_rollouts=3,
-        temperature=1.0,
-        use_static_batch_rollouts=True,
-    )
-    physical_rollouts = RolloutEngine(expand_budget=1).run_vectorized(
-        policy=_FakeOnlinePolicy(),
-        retrieval_batch=batch,
-        reward_model=RewardModel(edge_cost=0.0),
-        num_rollouts=3,
-        temperature=1.0,
-    )
-
-    assert static_policy.prepare_calls == 1
-    assert static_policy.prepare_num_graphs == [2]
-    assert len(static_rollouts) == len(physical_rollouts) == 3
-    for static, physical in zip(static_rollouts, physical_rollouts):
-        assert torch.equal(
-            static.stats.trajectory_length,
-            physical.stats.trajectory_length,
-        )
-        assert torch.allclose(
-            static.stats.terminal_log_reward,
-            physical.stats.terminal_log_reward,
-        )
-        assert torch.equal(
-            static.traces.action_type,
-            physical.traces.action_type,
-        )
-        assert torch.equal(
-            static.traces.selected_edge_ids,
-            physical.traces.selected_edge_ids,
-        )
-        assert torch.equal(
-            static.traces.stop_mask,
-            physical.traces.stop_mask,
-        )
-
-
-def test_fused_static_batch_rollouts_reuse_context_and_match_physical_repeat() -> None:
+def test_fused_static_batch_rollouts_reuse_context_and_split_logical_rollouts() -> None:
     batch = _batch()
     fused_policy = _CountingFakeOnlinePolicy()
 
@@ -475,40 +377,33 @@ def test_fused_static_batch_rollouts_reuse_context_and_match_physical_repeat() -
         reward_model=RewardModel(edge_cost=0.0),
         num_rollouts=3,
         temperature=1.0,
-        use_fused_static_batch_rollouts=True,
-    )
-    physical_rollouts = RolloutEngine(expand_budget=1).run_vectorized(
-        policy=_FakeOnlinePolicy(),
-        retrieval_batch=batch,
-        reward_model=RewardModel(edge_cost=0.0),
-        num_rollouts=3,
-        temperature=1.0,
     )
 
     assert fused_policy.prepare_calls == 1
     assert fused_policy.prepare_num_graphs == [2]
-    assert len(fused_rollouts) == len(physical_rollouts) == 3
-    for fused, physical in zip(fused_rollouts, physical_rollouts):
+    assert len(fused_rollouts) == 3
+    for fused in fused_rollouts:
         assert torch.equal(
             fused.stats.trajectory_length,
-            physical.stats.trajectory_length,
+            torch.tensor([2, 2], dtype=torch.long),
         )
         assert torch.allclose(
             fused.stats.terminal_log_reward,
-            physical.stats.terminal_log_reward,
+            torch.log1p(torch.full((2,), 1.0e-4, dtype=torch.float32)),
+            atol=1.0e-7,
         )
         assert torch.equal(
             fused.traces.action_type,
-            physical.traces.action_type,
+            torch.tensor([[0, 1], [0, 1]], dtype=torch.long),
         )
         assert torch.equal(
-            fused.traces.selected_edge_ids,
-            physical.traces.selected_edge_ids,
+            fused.traces.selected_edge_ids[:, 0],
+            torch.tensor([0, 1], dtype=torch.long),
         )
-        assert torch.equal(
-            fused.traces.stop_mask,
-            physical.traces.stop_mask,
+        assert int(fused.traces.selected_edge_ids.max().item()) < batch.edge_index.size(
+            1
         )
+        assert bool(fused.traces.stop_mask[:, 1].all())
 
 
 def test_policy_forward_uses_rollout_ids_and_static_query_ids_for_fused_state() -> None:
@@ -535,7 +430,12 @@ def test_policy_forward_uses_rollout_ids_and_static_query_ids_for_fused_state() 
     )
     context = policy.prepare_rollout_context(batch)
 
-    output = policy(batch, state, rollout_context=context)
+    output = policy(
+        batch,
+        state,
+        rollout_context=context,
+        stop_log_reward=torch.zeros(4, dtype=torch.float32),
+    )
 
     assert context.query_h.shape == (2, 2)
     assert output.state_log_flow.shape == (4,)
@@ -600,7 +500,7 @@ def test_rollout_engine_eager_reward_writes_stop_tb_traces_without_diagnostics()
     assert bool(rollout.traces.policy_action_valid_mask[:, 0].all())
 
 
-def test_stop_advantage_auxiliary_writes_option_boundary_targets() -> None:
+def test_stop_advantage_auxiliary_is_rejected_by_fused_only_rollouts() -> None:
     batch = _three_node_batch()
     engine = RolloutEngine(expand_budget=1)
     auxiliary = StopAdvantageAuxiliary(
@@ -614,21 +514,12 @@ def test_stop_advantage_auxiliary_writes_option_boundary_targets() -> None:
         )
     )
 
-    rollouts = engine.run_vectorized(
-        policy=_FakeOnlinePolicy(),
-        retrieval_batch=batch,
-        reward_model=RewardModel(edge_cost=0.0),
-        num_rollouts=1,
-        temperature=1.0,
-        auxiliary=auxiliary,
-    )
-
-    traces = rollouts[0].traces
-    assert traces.stop_adv_valid_mask is not None
-    assert bool(traces.stop_adv_valid_mask[0, 0])
-    assert not bool(traces.stop_adv_valid_mask[0, 1])
-    assert traces.stop_adv_target is not None
-    assert traces.stop_adv_target[0, 0].item() < 0.01
-    assert traces.stop_adv_loss is not None
-    assert torch.isfinite(traces.stop_adv_loss[0, 0])
-    assert traces.stop_adv_loss[0, 0].item() >= 0.0
+    with pytest.raises(ValueError, match="fused-only rollouts"):
+        engine.run_vectorized(
+            policy=_FakeOnlinePolicy(),
+            retrieval_batch=batch,
+            reward_model=RewardModel(edge_cost=0.0),
+            num_rollouts=1,
+            temperature=1.0,
+            auxiliary=auxiliary,
+        )

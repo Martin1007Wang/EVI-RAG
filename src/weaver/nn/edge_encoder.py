@@ -14,8 +14,8 @@ class EdgeEncoder(nn.Module):
 
         phi_E(e) = W_E [h_u, h_r, h_v]
 
-    The same encoder is shared by state readout and candidate-edge residual
-    scoring, so each graph edge has one neural representation.
+    StateReadout uses the same encoder for active-edge evidence and frontier
+    summaries, so each graph edge has one neural representation.
     """
 
     def __init__(self, *, hidden_dim: int) -> None:

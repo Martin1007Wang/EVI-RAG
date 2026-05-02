@@ -118,10 +118,12 @@ class WeaverModule(LightningModule):
             hidden_dim=policy_runtime.hidden_dim,
             state_readout_dropout=policy_runtime.state_readout_dropout,
             state_readout_cfg=policy_runtime.state_readout_cfg,
-            transition_features_cfg=policy_runtime.transition_features_cfg,
             stop_scorer_cfg=policy_runtime.stop_scorer_cfg,
             edge_scorer_cfg=policy_runtime.edge_scorer_cfg,
             flow_head_cfg=policy_runtime.flow_head_cfg,
+            action_parameterization=policy_runtime.action_parameterization,
+            doob_stop_mode=policy_runtime.doob_stop_mode,
+            doob_successor_value_mode=policy_runtime.doob_successor_value_mode,
         )
 
         self.reward_model = RewardModel(**dict(reward_cfg or {}))
@@ -144,10 +146,6 @@ class WeaverModule(LightningModule):
             eval_num_rollout=rollout_runtime.eval_num_rollout,
             train_chunk_size=rollout_runtime.train_chunk_size,
             eval_chunk_size=rollout_runtime.eval_chunk_size,
-            use_static_batch_rollouts=rollout_runtime.use_static_batch_rollouts,
-            use_fused_static_batch_rollouts=(
-                rollout_runtime.use_fused_static_batch_rollouts
-            ),
         )
 
         self.expand_budget = rollout_runtime.expand_budget
@@ -189,9 +187,6 @@ class WeaverModule(LightningModule):
         optimizer = self.optimizer()
         accumulation_batches = self.accumulation_batches()
 
-        residual_schedule_metrics = self.policy.edge_scorer.update_residual_schedule(
-            step=int(self.global_step)
-        )
         temperature = self.temperature_schedule.current(self.global_step)
 
         result = self.rollout_runner.run_training_rollouts_and_backward(
@@ -222,7 +217,6 @@ class WeaverModule(LightningModule):
             optimizer=optimizer,
             temperature=temperature,
             grad_norm=grad_norm,
-            residual_schedule_metrics=residual_schedule_metrics,
         )
 
         return {"loss": result.loss_output.loss.detach()}
@@ -291,7 +285,7 @@ class WeaverModule(LightningModule):
             temperature=rollout_temperature,
             collect_stop_counterfactual=False,
             collect_policy_diagnostics=False,
-            reward_mode=RewardMode.LAZY_TERMINAL,
+            reward_mode=RewardMode.EAGER_STOP_NOW,
         )
 
         return compute_union_subgraph_masks(
@@ -372,7 +366,6 @@ class WeaverModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         temperature: float,
         grad_norm: float | None,
-        residual_schedule_metrics: dict[str, float] | None = None,
     ) -> None:
         metrics = self.train_metrics.collect(
             loss_output=result.loss_output,
@@ -391,8 +384,6 @@ class WeaverModule(LightningModule):
         )
         if grad_norm is not None:
             metrics["train/optim/grad_norm"] = float(grad_norm)
-        for key, value in (residual_schedule_metrics or {}).items():
-            metrics[f"train/optim/{key}"] = float(value)
 
         self.log_dict(
             metrics,

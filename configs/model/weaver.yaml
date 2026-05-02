@@ -3,6 +3,11 @@
 _target_: src.weaver.module.WeaverModule
 
 policy_cfg:
+  action_parameterization: doob_value_prior
+  doob:
+    stop_mode: reward
+    successor_value_mode: flow
+
   hidden_dim: 1024
   state_readout_dropout: 0.0
 
@@ -24,31 +29,12 @@ policy_cfg:
     use_path_memory: true
     use_frontier_summary: true
 
-  transition_features: {}
-
-  stop_scorer:
-    use_progress: true
-    use_frontier_summary: true
-    stop_bias_init: 0.0
-    expand_bias_init: 0.0
-    progress_penalty_init: 0.0
-    dropout: 0.0
-    trainable_bias: true
-
   edge_scorer:
-    type: semantic_prior_residual
-    action_dropout: 0.0
+    type: semantic_prior
     entity_weight_init: 0.1
     logit_scale_init: 5.0
-    residual_scale_init: 1.0
-    residual_warmup_start_step: 500
-    residual_warmup_steps: 1500
-    residual_max_multiplier: 1.0
-    freeze_residual_until_step: 0
-    zero_init_residual_output: true
     trainable_entity_weight: false
     trainable_logit_scale: false
-    trainable_residual: true
 
   flow_head:
     num_layers: 1
@@ -61,8 +47,6 @@ rollout_cfg:
   eval_num_rollout: 8
   train_chunk_size: 8
   eval_chunk_size: 8
-  use_static_batch_rollouts: false
-  use_fused_static_batch_rollouts: false
 
   stop_adv:
     enabled: false

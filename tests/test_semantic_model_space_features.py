@@ -78,11 +78,10 @@ from src.weaver.nn.dde import DirectionalDDE
 from src.weaver.nn.edge_scorer import EdgeScoreBreakdown, EdgeScorer
 from src.weaver.nn.feature_encoder import FeatureBank, FeatureEncoder
 from src.weaver.nn.flow_head import FlowHead
-from src.weaver.nn.state_readout import StateContext, StateReadout
+from src.weaver.nn.state_readout import StateContext, StateOnlyContext, StateReadout
 from src.weaver.nn.stop_gate import StopExpandGate
-from src.weaver.nn.transition_features import TransitionFeatureBuilder
-from src.weaver.policy import Policy
-from src.weaver.state import State
+from src.weaver.policy import Policy, _candidate_successor_state
+from src.weaver.state import RolloutState, State
 from src.weaver.state_ops import frontier_edges
 
 
@@ -293,7 +292,7 @@ def test_feature_encoder_caches_static_branching_features() -> None:
     )
 
 
-def test_policy_shares_edge_encoder_between_readout_and_residual() -> None:
+def test_policy_keeps_edge_encoder_in_state_readout_only() -> None:
     policy = Policy(
         hidden_dim=2,
         feature_encoder_cfg={
@@ -303,28 +302,17 @@ def test_policy_shares_edge_encoder_between_readout_and_residual() -> None:
             "embedding_dim": 2,
             "hidden_dim": 2,
         },
-        edge_scorer_cfg={
-            "share_edge_encoder_with_readout": True,
-        },
     )
 
     assert policy.state_readout.edge_encoder is policy.edge_encoder
-    assert policy.edge_scorer.edge_encoder is policy.edge_encoder
-    assert policy.edge_scorer.residual_features == (
-        "state",
-        "edge",
-        "transition_type",
-        "semantic_prior",
-    )
-    assert policy.edge_scorer.residual_head[0].in_features == (
-        4 + policy.transition_feature_builder.feature_dim + 1
-    )
-    assert not hasattr(policy.edge_scorer, "action_head")
-    assert not hasattr(policy.edge_scorer, "candidate_encoder")
+    assert not hasattr(policy.edge_scorer, "edge_encoder")
+    assert not hasattr(policy.edge_scorer, "residual_head")
+    assert not hasattr(policy.edge_scorer, "residual_scale")
+    assert not hasattr(policy, "transition_feature_builder")
 
 
 def test_policy_config_rejects_legacy_action_feature_switches() -> None:
-    with pytest.raises(ValueError, match="transition_features"):
+    with pytest.raises(ValueError, match="transition_features was removed"):
         build_policy_runtime_config(
             policy_cfg={
                 "hidden_dim": 2,
@@ -334,6 +322,24 @@ def test_policy_config_rejects_legacy_action_feature_switches() -> None:
                     "dde": {"enabled": False},
                 },
                 "transition_features": {"use_semantic_weak_features": True},
+            },
+            entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+            relation_embeddings=torch.eye(2, dtype=torch.float32),
+        )
+
+
+def test_policy_config_rejects_doob_top_k_truncation() -> None:
+    with pytest.raises(ValueError, match="top_k was removed"):
+        build_policy_runtime_config(
+            policy_cfg={
+                "hidden_dim": 2,
+                "feature_encoder": {
+                    "embedding_dim": 2,
+                    "hidden_dim": 2,
+                    "dde": {"enabled": False},
+                },
+                "doob": {"top_k": 2},
             },
             entity_text_embeddings=torch.eye(2, dtype=torch.float32),
             entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
@@ -353,10 +359,9 @@ def test_expand_edge_prior_uses_semantic_space_not_model_space() -> None:
     )
     scorer = EdgeScorer(
         hidden_dim=2,
-        type="semantic_prior_residual",
+        type="semantic_prior",
         entity_weight_init=2.0,
         logit_scale_init=3.0,
-        residual_scale_init=1.0,
     )
 
     output = scorer(
@@ -382,101 +387,33 @@ def test_expand_edge_prior_uses_semantic_space_not_model_space() -> None:
     assert torch.allclose(output.final_logits, output.semantic_logits)
 
 
-def test_expand_edge_can_disable_residual_online_logits() -> None:
-    fb = FeatureBank(
-        node_h=torch.ones((2, 2), dtype=torch.float32),
-        rel_h=torch.ones((1, 2), dtype=torch.float32),
-        query_h=torch.ones((1, 2), dtype=torch.float32),
-        node_sem_h=torch.tensor([[0.0, 1.0], [0.25, 0.0]], dtype=torch.float32),
-        rel_sem_h=torch.tensor([[0.5, 0.0]], dtype=torch.float32),
-        query_sem_h=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        node_is_non_text=torch.tensor([False, False], dtype=torch.bool),
-    )
+def test_edge_scorer_can_freeze_prior_parameters() -> None:
     scorer = EdgeScorer(
         hidden_dim=2,
-        type="semantic_prior_residual",
+        type="semantic_prior",
         entity_weight_init=2.0,
         logit_scale_init=3.0,
-        residual_scale_init=1.0,
-        use_residual=False,
-    )
-    with torch.no_grad():
-        scorer.residual_head[-1].bias.fill_(7.0)
-
-    output = scorer(
-        fb=fb,
-        context=StateContext(
-            state_h=torch.ones((1, 2), dtype=torch.float32),
-            query_h=fb.query_h,
-            node_h=fb.node_h,
-            rel_h=fb.rel_h,
-            progress=torch.zeros(1, dtype=torch.float32),
-        ),
-        edge_index=torch.tensor([[0], [1]], dtype=torch.long),
-        edge_batch_index=torch.tensor([0], dtype=torch.long),
-        active_nodes=torch.tensor([True, False], dtype=torch.bool),
-        candidate_edge_ids=torch.tensor([0], dtype=torch.long),
-        return_breakdown=True,
-    )
-
-    assert isinstance(output, EdgeScoreBreakdown)
-    assert torch.allclose(output.semantic_logits, torch.tensor([3.0]))
-    assert torch.allclose(output.residual_logits, torch.zeros(1))
-    assert torch.allclose(output.final_logits, output.semantic_logits)
-
-
-def test_edge_scorer_can_freeze_prior_and_residual_parameters() -> None:
-    scorer = EdgeScorer(
-        hidden_dim=2,
-        type="semantic_prior_residual",
-        entity_weight_init=2.0,
-        logit_scale_init=3.0,
-        residual_scale_init=0.0,
         trainable_entity_weight=False,
         trainable_logit_scale=False,
-        trainable_residual=False,
     )
 
     assert not scorer.entity_weight.requires_grad
     assert not scorer.logit_scale.requires_grad
-    assert not scorer.residual_scale.requires_grad
-    assert not any(
-        parameter.requires_grad for parameter in scorer.residual_head.parameters()
-    )
+    assert not hasattr(scorer, "residual_scale")
+    assert not hasattr(scorer, "residual_head")
 
 
 def test_edge_scorer_rejects_legacy_action_role() -> None:
-    with pytest.raises(ValueError, match="semantic_prior_residual"):
+    with pytest.raises(ValueError, match="semantic_prior"):
         EdgeScorer(hidden_dim=2, type="action_role")
 
 
-def test_edge_scorer_requires_zero_initialized_residual_head() -> None:
-    with pytest.raises(ValueError, match="zero_init_residual_output=false"):
-        EdgeScorer(hidden_dim=2, zero_init_residual_output=False)
+def test_edge_scorer_rejects_residual_config_keys() -> None:
+    with pytest.raises(ValueError, match="residual config keys"):
+        EdgeScorer(hidden_dim=2, residual_scale_init=1.0)
 
 
-def test_edge_scorer_residual_warmup_starts_from_zero() -> None:
-    scorer = EdgeScorer(
-        hidden_dim=2,
-        residual_scale_init=1.0,
-        residual_warmup_start_step=500,
-        residual_warmup_steps=1500,
-        residual_max_multiplier=1.0,
-    )
-
-    assert torch.allclose(scorer.effective_residual_scale(), torch.tensor(0.0))
-    assert scorer.update_residual_schedule(step=500)[
-        "residual_effective_scale"
-    ] == pytest.approx(0.0)
-    assert scorer.update_residual_schedule(step=1250)[
-        "residual_effective_scale"
-    ] == pytest.approx(0.5)
-    assert scorer.update_residual_schedule(step=2000)[
-        "residual_effective_scale"
-    ] == pytest.approx(1.0)
-
-
-def test_edge_scorer_detaches_semantic_prior_inside_residual() -> None:
+def test_edge_scorer_final_logits_are_semantic_logits() -> None:
     fb = FeatureBank(
         node_h=torch.ones((2, 2), dtype=torch.float32),
         rel_h=torch.ones((1, 2), dtype=torch.float32),
@@ -488,18 +425,10 @@ def test_edge_scorer_detaches_semantic_prior_inside_residual() -> None:
     )
     scorer = EdgeScorer(
         hidden_dim=2,
-        type="semantic_prior_residual",
+        type="semantic_prior",
         entity_weight_init=0.0,
         logit_scale_init=3.0,
-        residual_scale_init=1.0,
-        residual_warmup_steps=0,
     )
-    scorer.residual_head = torch.nn.Sequential(
-        torch.nn.Linear(5, 1, bias=False),
-    )
-    with torch.no_grad():
-        scorer.residual_head[0].weight.zero_()
-        scorer.residual_head[0].weight[0, -1] = 1.0
 
     output = scorer(
         fb=fb,
@@ -519,8 +448,7 @@ def test_edge_scorer_detaches_semantic_prior_inside_residual() -> None:
 
     assert isinstance(output, EdgeScoreBreakdown)
     assert torch.allclose(output.semantic_logits, torch.tensor([1.5]))
-    assert torch.allclose(output.residual_logits, torch.tensor([1.5]))
-    assert torch.allclose(output.final_logits, torch.tensor([3.0]))
+    assert torch.allclose(output.final_logits, output.semantic_logits)
 
     output.final_logits.sum().backward()
     assert scorer.logit_scale.grad is not None
@@ -575,77 +503,7 @@ def test_stop_gate_default_uses_state_only() -> None:
     assert torch.allclose(expand_a, torch.zeros(1))
 
 
-def test_transition_feature_builder_frontier_features_do_not_use_labels() -> None:
-    batch = _NoLeakBatch(
-        num_graphs=1,
-        edge_index=torch.tensor([[0, 2], [1, 0]], dtype=torch.long),
-        edge_batch=torch.tensor([0, 0], dtype=torch.long),
-        edge_relation_catalog_ids=torch.tensor([0, 0], dtype=torch.long),
-    )
-    fb = FeatureBank(
-        node_h=torch.zeros((3, 2), dtype=torch.float32),
-        rel_h=torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32),
-        query_h=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        node_sem_h=torch.tensor(
-            [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
-            dtype=torch.float32,
-        ),
-        rel_sem_h=torch.tensor([[0.25, 0.0], [0.25, 0.0]], dtype=torch.float32),
-        query_sem_h=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        node_dde=torch.tensor(
-            [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
-            dtype=torch.float32,
-        ),
-        node_is_non_text=torch.tensor([False, False, False], dtype=torch.bool),
-    )
-    context = StateContext(
-        state_h=torch.zeros((1, 2), dtype=torch.float32),
-        query_h=fb.query_h,
-        node_h=fb.node_h,
-        rel_h=fb.rel_h,
-        progress=torch.tensor([0.25], dtype=torch.float32),
-        relation_path_h=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-    )
-    state = State(
-        active_nodes=torch.tensor([True, False, False], dtype=torch.bool),
-        active_edges=torch.tensor([False, False], dtype=torch.bool),
-        root_edges=torch.tensor([False, True], dtype=torch.bool),
-        expand_budget=4,
-    )
-
-    builder = TransitionFeatureBuilder(hidden_dim=2, dde_dim=2)
-    features = builder(
-        fb=fb,
-        context=context,
-        batch=batch,
-        state=state,
-        candidate_edge_ids=torch.tensor([0, 1], dtype=torch.long),
-    )
-    name_to_idx = {name: idx for idx, name in enumerate(features.names)}
-
-    assert features.names == (
-        "src_active_dst_new",
-        "dst_active_src_new",
-        "both_active",
-    )
-    assert torch.equal(
-        features.values[:, name_to_idx["src_active_dst_new"]],
-        torch.tensor([1.0, 0.0]),
-    )
-    assert torch.equal(
-        features.values[:, name_to_idx["dst_active_src_new"]],
-        torch.tensor([0.0, 1.0]),
-    )
-    assert torch.equal(features.values[:, name_to_idx["both_active"]], torch.zeros(2))
-    assert "neither_active" not in name_to_idx
-    assert "frontier_log_size" not in name_to_idx
-    assert "relation_history_score" not in name_to_idx
-    assert "query_relation" not in name_to_idx
-    assert torch.allclose(features.query_relation_score, torch.tensor([0.25, 0.25]))
-    assert torch.allclose(features.query_new_node_score, torch.tensor([0.0, 0.5]))
-
-
-def test_semantic_prior_residual_scorer_preserves_prior_at_initialization() -> None:
+def test_semantic_prior_scorer_uses_prior_as_final_logit() -> None:
     fb = FeatureBank(
         node_h=torch.ones((2, 2), dtype=torch.float32),
         rel_h=torch.ones((1, 2), dtype=torch.float32),
@@ -663,29 +521,8 @@ def test_semantic_prior_residual_scorer_preserves_prior_at_initialization() -> N
         rel_h=fb.rel_h,
         progress=torch.zeros(1, dtype=torch.float32),
     )
-    transition_features = TransitionFeatureBuilder(
-        hidden_dim=2,
-        dde_dim=0,
-    )(
-        fb=fb,
-        context=context,
-        batch=types.SimpleNamespace(
-            num_graphs=1,
-            edge_index=torch.tensor([[0], [1]], dtype=torch.long),
-            edge_batch=torch.tensor([0], dtype=torch.long),
-            edge_relation_catalog_ids=torch.tensor([0], dtype=torch.long),
-        ),
-        state=State(
-            active_nodes=torch.tensor([True, False], dtype=torch.bool),
-            active_edges=torch.tensor([False], dtype=torch.bool),
-            root_edges=torch.tensor([False], dtype=torch.bool),
-            expand_budget=1,
-        ),
-        candidate_edge_ids=torch.tensor([0], dtype=torch.long),
-    )
     scorer = EdgeScorer(
         hidden_dim=2,
-        transition_feature_dim=transition_features.values.size(-1),
         entity_weight_init=2.0,
         logit_scale_init=3.0,
     )
@@ -697,27 +534,170 @@ def test_semantic_prior_residual_scorer_preserves_prior_at_initialization() -> N
         edge_batch_index=torch.tensor([0], dtype=torch.long),
         active_nodes=torch.tensor([True, False], dtype=torch.bool),
         candidate_edge_ids=torch.tensor([0], dtype=torch.long),
-        transition_features=transition_features,
         return_breakdown=True,
     )
 
     assert isinstance(output, EdgeScoreBreakdown)
     assert output.final_logits.shape == (1,)
-    assert output.residual_logits.shape == (1,)
-    assert torch.allclose(output.residual_logits, torch.zeros(1))
     assert torch.allclose(output.final_logits, output.semantic_logits)
     assert torch.allclose(output.query_relation_score, torch.tensor([0.5]))
     assert torch.allclose(output.query_new_node_score, torch.tensor([0.25]))
     assert torch.allclose(output.semantic_logits, torch.tensor([3.0]))
-    assert torch.allclose(output.residual_scale, torch.tensor(1.0))
 
 
-def test_edge_scorer_reuses_cached_frontier_edge_h() -> None:
-    class _FailingEdgeEncoder(torch.nn.Module):
-        def forward(self, **kwargs):  # pragma: no cover - should not be called.
-            del kwargs
-            raise AssertionError("edge encoder should be reused from StateContext")
+def test_doob_policy_uses_full_frontier_prior_without_frontier_size_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = types.SimpleNamespace(
+        num_graphs=2,
+        num_nodes_total=6,
+        batch=torch.tensor([0, 0, 0, 0, 1, 1], dtype=torch.long),
+        edge_index=torch.tensor(
+            [
+                [0, 0, 0, 4],
+                [1, 2, 3, 5],
+            ],
+            dtype=torch.long,
+        ),
+        edge_batch=torch.tensor([0, 0, 0, 1], dtype=torch.long),
+        anchor_node_ids=torch.tensor([0, 4], dtype=torch.long),
+        node_entity_catalog_ids=torch.arange(6, dtype=torch.long),
+        edge_relation_catalog_ids=torch.arange(4, dtype=torch.long),
+        question_emb=torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+        non_text_node_mask=torch.zeros(6, dtype=torch.bool),
+    )
+    policy = Policy(
+        hidden_dim=2,
+        action_parameterization="doob_value_prior",
+        doob_stop_mode="reward",
+        feature_encoder_cfg={
+            "hidden_dim": 2,
+            "entity_text_embeddings": torch.zeros((6, 2), dtype=torch.float32),
+            "entity_embedding_map": torch.arange(6, dtype=torch.long),
+            "relation_embeddings": torch.tensor(
+                [
+                    [3.0, 0.0],
+                    [2.0, 0.0],
+                    [1.0, 0.0],
+                    [5.0, 0.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "embedding_dim": 2,
+            "dde": {"enabled": False},
+        },
+        state_readout_cfg={
+            "use_path_memory": False,
+            "use_frontier_summary": False,
+        },
+        edge_scorer_cfg={
+            "entity_weight_init": 0.0,
+            "logit_scale_init": 1.0,
+        },
+        flow_head_cfg={"zero_init": True},
+    )
+    state = State.create_initial(batch, expand_budget=2)
+    context = policy.prepare_rollout_context(batch)
+    frontier_call_count = 0
+    original_forward_frontier = policy.state_readout.forward_frontier
 
+    def counted_forward_frontier(**kwargs):
+        nonlocal frontier_call_count
+        frontier_call_count += 1
+        return original_forward_frontier(**kwargs)
+
+    monkeypatch.setattr(
+        policy.state_readout,
+        "forward_frontier",
+        counted_forward_frontier,
+    )
+
+    out = policy(
+        batch,
+        state,
+        rollout_context=context,
+        return_edge_breakdown=True,
+        stop_log_reward=torch.zeros(2, dtype=torch.float32),
+    )
+
+    expected_edge_logits = torch.cat(
+        [
+            torch.log_softmax(torch.tensor([3.0, 2.0, 1.0]), dim=0),
+            torch.tensor([0.0]),
+        ]
+    )
+
+    assert torch.equal(out.candidate_edge_ids, torch.tensor([0, 1, 2, 3]))
+    assert torch.equal(out.candidate_batch_ids, torch.tensor([0, 0, 0, 1]))
+    assert frontier_call_count == 1
+    assert torch.allclose(out.edge_logits, expected_edge_logits)
+    assert torch.allclose(out.expand_logits, torch.zeros(2), atol=1e-6)
+    assert torch.allclose(out.stop_logits, torch.zeros(2))
+    assert isinstance(out.edge_score_breakdown, EdgeScoreBreakdown)
+    assert torch.allclose(
+        out.edge_score_breakdown.semantic_logits,
+        torch.tensor([3.0, 2.0, 1.0, 5.0]),
+    )
+    assert torch.allclose(out.edge_score_breakdown.final_logits, out.edge_logits)
+
+
+def test_doob_successor_value_does_not_materialize_dense_successor_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = types.SimpleNamespace(
+        num_graphs=1,
+        num_nodes_total=3,
+        batch=torch.tensor([0, 0, 0], dtype=torch.long),
+        edge_index=torch.tensor([[0, 0], [1, 2]], dtype=torch.long),
+        edge_batch=torch.tensor([0, 0], dtype=torch.long),
+        anchor_node_ids=torch.tensor([0], dtype=torch.long),
+        node_entity_catalog_ids=torch.arange(3, dtype=torch.long),
+        edge_relation_catalog_ids=torch.arange(2, dtype=torch.long),
+        question_emb=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        non_text_node_mask=torch.zeros(3, dtype=torch.bool),
+    )
+    policy = Policy(
+        hidden_dim=2,
+        action_parameterization="doob_value_prior",
+        doob_stop_mode="reward",
+        feature_encoder_cfg={
+            "hidden_dim": 2,
+            "entity_text_embeddings": torch.zeros((3, 2), dtype=torch.float32),
+            "entity_embedding_map": torch.arange(3, dtype=torch.long),
+            "relation_embeddings": torch.ones((2, 2), dtype=torch.float32),
+            "embedding_dim": 2,
+            "dde": {"enabled": False},
+        },
+        state_readout_cfg={
+            "use_path_memory": True,
+            "use_frontier_summary": False,
+        },
+        edge_scorer_cfg={
+            "entity_weight_init": 0.0,
+            "logit_scale_init": 1.0,
+        },
+        flow_head_cfg={"zero_init": True},
+    )
+
+    def fail_materialized_successor(**kwargs):  # pragma: no cover
+        del kwargs
+        raise AssertionError("Doob successor value must use delta state readout")
+
+    monkeypatch.setattr(
+        "src.weaver.policy._candidate_successor_state",
+        fail_materialized_successor,
+    )
+
+    out = policy(
+        batch,
+        State.create_initial(batch, expand_budget=2),
+        stop_log_reward=torch.zeros(1, dtype=torch.float32),
+    )
+
+    assert out.edge_logits.shape == (2,)
+
+
+def test_edge_scorer_does_not_depend_on_model_space_frontier_cache() -> None:
     fb = FeatureBank(
         node_h=torch.ones((2, 2), dtype=torch.float32),
         rel_h=torch.ones((1, 2), dtype=torch.float32),
@@ -736,11 +716,7 @@ def test_edge_scorer_reuses_cached_frontier_edge_h() -> None:
         frontier_edge_ids=torch.tensor([0], dtype=torch.long),
         frontier_edge_h=torch.tensor([[0.5, -0.5]], dtype=torch.float32),
     )
-    scorer = EdgeScorer(
-        hidden_dim=2,
-        edge_encoder=_FailingEdgeEncoder(),  # type: ignore[arg-type]
-        transition_feature_dim=0,
-    )
+    scorer = EdgeScorer(hidden_dim=2)
 
     output = scorer(
         fb=fb,
@@ -801,7 +777,145 @@ def test_state_readout_frontier_matches_legacy_frontier_edges() -> None:
     assert context.frontier_edge_h.shape == (old_edge_ids.numel(), 2)
 
 
-def test_stop_gate_expand_logit_is_frontier_logsumexp() -> None:
+def test_state_readout_forward_state_skips_frontier_readout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = types.SimpleNamespace(
+        num_graphs=1,
+        batch=torch.tensor([0, 0, 0], dtype=torch.long),
+        edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        edge_batch=torch.tensor([0, 0], dtype=torch.long),
+    )
+    fb = FeatureBank(
+        node_h=torch.ones((3, 2), dtype=torch.float32),
+        rel_h=torch.ones((2, 2), dtype=torch.float32),
+        query_h=torch.ones((1, 2), dtype=torch.float32),
+        node_sem_h=torch.ones((3, 2), dtype=torch.float32),
+        rel_sem_h=torch.ones((2, 2), dtype=torch.float32),
+        query_sem_h=torch.ones((1, 2), dtype=torch.float32),
+    )
+    state = State(
+        active_nodes=torch.tensor([True, False, False], dtype=torch.bool),
+        active_edges=torch.tensor([False, False], dtype=torch.bool),
+        root_edges=torch.zeros(2, dtype=torch.bool),
+        expand_budget=2,
+    )
+    readout = StateReadout(hidden_dim=2)
+
+    def fail_frontier_readout(**kwargs):  # pragma: no cover - should not be called.
+        del kwargs
+        raise AssertionError("forward_state must not materialize frontier readout")
+
+    monkeypatch.setattr(readout, "_frontier_readout", fail_frontier_readout)
+
+    context = readout.forward_state(fb=fb, batch=batch, state=state)
+
+    assert isinstance(context, StateOnlyContext)
+    assert context.state_h.shape == (1, 2)
+    assert not hasattr(context, "frontier_edge_ids")
+
+
+def test_successor_delta_state_readout_matches_materialized_successors() -> None:
+    batch = types.SimpleNamespace(
+        num_graphs=2,
+        num_nodes_total=6,
+        batch=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+        edge_index=torch.tensor(
+            [
+                [0, 1, 0, 3, 4, 3],
+                [1, 2, 2, 4, 5, 5],
+            ],
+            dtype=torch.long,
+        ),
+        edge_batch=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+    )
+    fb = FeatureBank(
+        node_h=torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 2.0],
+                [1.0, 1.0],
+                [0.5, 1.5],
+                [2.0, 0.5],
+                [1.5, 1.0],
+            ],
+            dtype=torch.float32,
+        ),
+        rel_h=torch.tensor(
+            [
+                [0.2, 1.0],
+                [1.0, 0.3],
+                [0.4, 0.7],
+                [0.5, 0.8],
+                [0.9, 0.1],
+                [0.6, 0.4],
+            ],
+            dtype=torch.float32,
+        ),
+        query_h=torch.tensor([[1.0, 0.5], [0.3, 1.0]], dtype=torch.float32),
+        node_sem_h=torch.ones((6, 2), dtype=torch.float32),
+        rel_sem_h=torch.ones((6, 2), dtype=torch.float32),
+        query_sem_h=torch.ones((2, 2), dtype=torch.float32),
+    )
+    parent = RolloutState(
+        active_nodes=torch.tensor(
+            [
+                [True, True, False, False, False, False],
+                [False, False, False, True, True, False],
+            ],
+            dtype=torch.bool,
+        ),
+        active_edges=torch.tensor(
+            [
+                [True, False, False, False, False, False],
+                [False, False, False, True, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        root_edges=torch.tensor(
+            [
+                [True, False, False, False, False, False],
+                [False, False, False, True, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        anchor_nodes=torch.tensor(
+            [
+                [True, False, False, False, False, False],
+                [False, False, False, True, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        rollout_to_graph=torch.tensor([0, 1], dtype=torch.long),
+        expand_budget=3,
+    )
+    candidate_edge_ids = torch.tensor([1, 2, 4, 5], dtype=torch.long)
+    candidate_batch_ids = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    readout = StateReadout(hidden_dim=2, use_path_memory=True)
+    materialized = _candidate_successor_state(
+        batch=batch,
+        state=parent,
+        candidate_edge_ids=candidate_edge_ids,
+        candidate_batch_ids=candidate_batch_ids,
+    )
+
+    exact = readout.forward_state(fb=fb, batch=batch, state=materialized)
+    delta = readout.forward_successor_state_delta(
+        fb=fb,
+        batch=batch,
+        state=parent,
+        candidate_edge_ids=candidate_edge_ids,
+        candidate_batch_ids=candidate_batch_ids,
+    )
+
+    assert torch.allclose(delta.state_h, exact.state_h, atol=1e-6)
+    assert torch.allclose(delta.progress, exact.progress)
+    assert delta.relation_path_h is not None
+    assert exact.relation_path_h is not None
+    assert torch.allclose(delta.relation_path_h, exact.relation_path_h, atol=1e-6)
+
+
+def test_stop_gate_expand_logit_ignores_raw_frontier_logsumexp() -> None:
     gate = StopExpandGate(
         hidden_dim=2,
         use_progress=True,
@@ -810,38 +924,66 @@ def test_stop_gate_expand_logit_is_frontier_logsumexp() -> None:
         trainable_progress_penalty=False,
     )
 
-    stop, expand = gate(
-        state_h=torch.zeros((2, 2), dtype=torch.float32),
+    kwargs = {
+        "state_h": torch.zeros((2, 2), dtype=torch.float32),
+        "progress_ratio": torch.tensor([0.5, 1.0], dtype=torch.float32),
+        "frontier_summary": torch.zeros((2, 3), dtype=torch.float32),
+        "has_candidate_edge": torch.tensor([True, True]),
+    }
+
+    stop_a, expand_a = gate(
+        **kwargs,
         edge_logits=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
         edge_batch_index=torch.tensor([0, 0, 1], dtype=torch.long),
-        progress_ratio=torch.tensor([0.5, 1.0], dtype=torch.float32),
-        frontier_summary=torch.zeros((2, 3), dtype=torch.float32),
+    )
+    stop_b, expand_b = gate(
+        **kwargs,
+        edge_logits=torch.tensor([100.0, 200.0, 300.0], dtype=torch.float32),
+        edge_batch_index=torch.tensor([0, 0, 1], dtype=torch.long),
+    )
+
+    assert torch.allclose(stop_a, stop_b)
+    assert torch.allclose(expand_a, expand_b)
+    assert torch.allclose(stop_a, torch.zeros(2))
+    assert torch.allclose(
+        expand_a,
+        torch.tensor([-0.25, -0.5]),
+    )
+
+
+def test_stop_gate_can_use_frontier_summary_without_logsumexp_bias() -> None:
+    gate = StopExpandGate(
+        hidden_dim=2,
+        use_progress=False,
+        use_frontier_summary=True,
+    )
+    gate.scalar_norm = torch.nn.Identity()
+    with torch.no_grad():
+        first = gate.net[0]
+        last = gate.net[-1]
+        first.weight.zero_()
+        first.bias.zero_()
+        last.weight.zero_()
+        last.bias.zero_()
+        first.weight[0, 3] = 1.0
+        last.weight[1, 0] = 1.0
+
+    _, low_quality_expand = gate(
+        state_h=torch.zeros((1, 2), dtype=torch.float32),
+        frontier_summary=torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
+        has_candidate_edge=torch.tensor([True]),
+    )
+    _, high_quality_expand = gate(
+        state_h=torch.zeros((2, 2), dtype=torch.float32),
+        frontier_summary=torch.tensor(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 10.0],
+            ],
+            dtype=torch.float32,
+        ),
         has_candidate_edge=torch.tensor([True, True]),
     )
 
-    assert torch.allclose(stop, torch.zeros(2))
-    assert torch.allclose(
-        expand,
-        torch.tensor(
-            [
-                torch.logsumexp(torch.tensor([1.0, 2.0]), dim=0) - 0.25,
-                3.0 - 0.5,
-            ]
-        ),
-    )
-
-
-class _NoLeakBatch(types.SimpleNamespace):
-    @property
-    def target_node_ids(self):  # pragma: no cover - only fails on policy leakage.
-        raise AssertionError("target_node_ids must not be read by policy features")
-
-    @property
-    def node_target_distance(self):  # pragma: no cover
-        raise AssertionError("node_target_distance must not be read by policy features")
-
-    @property
-    def target_shortest_path_edge_mask_flat(self):  # pragma: no cover
-        raise AssertionError(
-            "target_shortest_path_edge_mask_flat must not be read by policy features"
-        )
+    assert torch.allclose(high_quality_expand[0], high_quality_expand[1])
+    assert high_quality_expand[0] > low_quality_expand[0]

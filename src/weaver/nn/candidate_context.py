@@ -13,7 +13,7 @@ from .feature_encoder import FeatureBank
 @dataclass(frozen=True, slots=True)
 class CandidateContext:
     """
-    State-local candidate edge coordinates shared by action features and scoring.
+    State-local candidate edge coordinates shared by policy scoring.
 
     graph_id is the dynamic state row used for policy grouping. In the physical
     path it is also the original graph id. In fused static rollouts,
