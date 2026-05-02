@@ -5,18 +5,15 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch_scatter import scatter_logsumexp, scatter_max
+from torch_scatter import scatter_logsumexp
 
 from src.data.schema import RetrievalBatch
-from src.graph.segments import scatter_log_softmax
-
 from .nn.candidate_context import build_candidate_context
 from .nn.edge_encoder import EdgeEncoder
 from .nn.edge_scorer import EdgeScoreBreakdown, EdgeScorer
 from .nn.feature_encoder import FeatureBank, FeatureEncoder
 from .nn.flow_head import FlowHead
 from .nn.state_readout import StateReadout
-from .nn.stop_gate import StopExpandGate
 from .state import RolloutState, State
 
 
@@ -33,6 +30,9 @@ class PolicyOutput:
     the canonical state invariant:
 
         V_s = anchors union endpoints(E_s)
+
+    For fused rollout states, candidate_batch_ids are dynamic rollout row ids,
+    not physical RetrievalBatch graph ids.
     """
 
     state_log_flow: torch.Tensor
@@ -65,13 +65,14 @@ class Policy(nn.Module):
     State flow:
         log F(s | q) = FlowHead(h_s)
 
-    Doob/value-reweighted action policy:
-        P(Stop | s) ∝ R_stop(s)
-        P(Expand e | s) ∝ P0(e | s) * Z_theta(s + e)
+    Standard backward-flow target policy:
+        logit(Stop | s) = log R_stop(s)
+        logit(Expand e | s) = log F_theta(s + e)
 
-    P0 is the semantic prior normalized over the full frontier. The
-    Continue option is the logsumexp of these successor-valued edge logits, not
-    the raw frontier-size-biased semantic logsumexp.
+    The executor adds the candidate-level log P_B(s | s + e) term before
+    sampling and before writing log P_F into rollout traces. The semantic edge
+    scorer is kept only for diagnostics/proposals and does not enter target
+    logits.
 
     Root edges are part of E_s and are read by StateReadout. They are not
     excluded from evidence. Expansion budget accounting is handled by State.
@@ -91,9 +92,7 @@ class Policy(nn.Module):
         stop_scorer_cfg: dict[str, Any] | None = None,
         edge_scorer_cfg: dict[str, Any] | None = None,
         flow_head_cfg: dict[str, Any] | None = None,
-        action_parameterization: str = "doob_value_prior",
-        doob_stop_mode: str = "reward",
-        doob_successor_value_mode: str = "flow",
+        action_parameterization: str = "gfn_backward_flow",
     ) -> None:
         super().__init__()
 
@@ -102,24 +101,10 @@ class Policy(nn.Module):
             raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
 
         self.action_parameterization = str(action_parameterization)
-        if self.action_parameterization not in {"doob_value_prior", "semantic_gate"}:
+        if self.action_parameterization != "gfn_backward_flow":
             raise ValueError(
-                "action_parameterization must be 'doob_value_prior' or "
-                f"'semantic_gate', got {action_parameterization!r}."
-            )
-
-        self.doob_stop_mode = str(doob_stop_mode)
-        if self.doob_stop_mode not in {"reward", "learned"}:
-            raise ValueError(
-                "doob_stop_mode must be 'reward' or 'learned', "
-                f"got {doob_stop_mode!r}."
-            )
-
-        self.doob_successor_value_mode = str(doob_successor_value_mode)
-        if self.doob_successor_value_mode != "flow":
-            raise ValueError(
-                "Only doob_successor_value_mode='flow' is supported, "
-                f"got {doob_successor_value_mode!r}."
+                "action_parameterization must be 'gfn_backward_flow', "
+                f"got {action_parameterization!r}."
             )
 
         self.feature_encoder = FeatureEncoder(**feature_encoder_cfg)
@@ -140,10 +125,11 @@ class Policy(nn.Module):
             **(flow_head_cfg or {}),
         )
 
-        self.stop_gate = StopExpandGate(
-            hidden_dim=self.hidden_dim,
-            **(stop_scorer_cfg or {}),
-        )
+        if stop_scorer_cfg:
+            raise ValueError(
+                "policy_cfg.stop_scorer is not used by "
+                "action_parameterization='gfn_backward_flow'."
+            )
 
         edge_scorer_kwargs = dict(edge_scorer_cfg or {})
         if "share_edge_encoder_with_readout" in edge_scorer_kwargs:
@@ -158,10 +144,7 @@ class Policy(nn.Module):
 
     @property
     def requires_stop_log_reward(self) -> bool:
-        return (
-            self.action_parameterization == "doob_value_prior"
-            and self.doob_stop_mode == "reward"
-        )
+        return True
 
     def prepare_rollout_context(self, batch: RetrievalBatch) -> FeatureBank:
         return self.feature_encoder(batch)
@@ -217,92 +200,43 @@ class Policy(nn.Module):
             device=device,
             dtype=torch.long,
         )
-        candidate_context = build_candidate_context(
-            batch=batch,
-            state=state,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-            device=device,
-        )
-
-        edge_score = self.edge_scorer(
-            fb=fb,
-            context=context,
-            edge_index=batch.edge_index,
-            edge_batch_index=batch.edge_batch,
-            active_nodes=state.active_nodes,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_context=candidate_context,
-            return_breakdown=(
-                return_edge_breakdown
-                or edge_logit_mode == "semantic"
-                or self.action_parameterization == "doob_value_prior"
-            ),
-        )
-
-        if (
-            return_edge_breakdown
-            or edge_logit_mode == "semantic"
-            or self.action_parameterization == "doob_value_prior"
-        ):
-            if not isinstance(edge_score, EdgeScoreBreakdown):
-                raise TypeError(
-                    "Expected EdgeScoreBreakdown when edge breakdown is requested."
-                )
-
-            prior_logits = edge_score.semantic_logits
-            semantic_breakdown = edge_score
-        else:
-            if not isinstance(edge_score, torch.Tensor):
-                raise TypeError(
-                    "Expected tensor edge logits when edge breakdown is not requested."
-                )
-
-            prior_logits = edge_score
-            semantic_breakdown = None
-
-        full_candidate_batch_ids = candidate_batch_ids
-
-        if (
-            self.action_parameterization == "doob_value_prior"
-            and edge_logit_mode == "final"
-        ):
-            (
-                edge_logits,
-                candidate_edge_ids,
-                candidate_batch_ids,
-                edge_breakdown,
-                expand_logits,
-            ) = self._doob_edge_logits(
+        edge_breakdown = (
+            self._semantic_edge_breakdown(
                 fb=fb,
                 batch=batch,
                 state=state,
-                prior_logits=prior_logits,
+                context=context,
                 candidate_edge_ids=candidate_edge_ids,
                 candidate_batch_ids=candidate_batch_ids,
-                num_policy_graphs=num_policy_graphs,
-                semantic_breakdown=semantic_breakdown,
-                return_edge_breakdown=return_edge_breakdown,
             )
-            stop_logits = self._doob_stop_logits(
-                stop_log_reward=stop_log_reward,
-                context=context,
-                prior_logits=prior_logits,
-                candidate_batch_ids=full_candidate_batch_ids,
-                num_policy_graphs=num_policy_graphs,
-                device=device,
-            )
+            if return_edge_breakdown or edge_logit_mode == "semantic"
+            else None
+        )
+
+        if edge_logit_mode == "semantic":
+            if edge_breakdown is None:
+                raise RuntimeError("Semantic edge logits require edge breakdown.")
+            edge_logits = edge_breakdown.semantic_logits
         else:
-            edge_logits = prior_logits
-            edge_breakdown = semantic_breakdown if return_edge_breakdown else None
-            stop_logits, expand_logits = self._learned_gate_logits(
-                state_h=context.state_h,
-                edge_logits=edge_logits,
+            edge_logits = self._successor_flow_logits(
+                fb=fb,
+                batch=batch,
+                state=state,
+                candidate_edge_ids=candidate_edge_ids,
                 candidate_batch_ids=candidate_batch_ids,
-                num_policy_graphs=num_policy_graphs,
-                progress=context.progress,
-                device=device,
             )
+
+        stop_logits = _validate_stop_log_reward(
+            stop_log_reward,
+            num_graphs=int(num_policy_graphs),
+            device=device,
+            dtype=edge_logits.dtype if edge_logits.numel() else state_log_flow.dtype,
+        )
+        expand_logits = _segment_logsumexp_or_neg_inf(
+            values=edge_logits,
+            batch_ids=candidate_batch_ids,
+            num_graphs=num_policy_graphs,
+        )
 
         return PolicyOutput(
             state_log_flow=state_log_flow,
@@ -314,62 +248,52 @@ class Policy(nn.Module):
             edge_score_breakdown=edge_breakdown,
         )
 
-    def _doob_edge_logits(
+    def _semantic_edge_breakdown(
         self,
         *,
         fb: FeatureBank,
         batch: RetrievalBatch,
         state: State | RolloutState,
-        prior_logits: torch.Tensor,
+        context: Any,
         candidate_edge_ids: torch.Tensor,
         candidate_batch_ids: torch.Tensor,
-        num_policy_graphs: int,
-        semantic_breakdown: EdgeScoreBreakdown | None,
-        return_edge_breakdown: bool,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        EdgeScoreBreakdown | None,
-        torch.Tensor,
-    ]:
-        """
-        Doob-style action parameterization:
-
-            logit(expand e | s) = log P0(e | s) + log Z_theta(s + e)
-
-        P0 is the semantic prior normalized over the full legal frontier for
-        the state. This keeps full support: every legal frontier edge gets a
-        successor-value correction opportunity, including low-prior edges.
-        """
+    ) -> EdgeScoreBreakdown:
         device = fb.node_h.device
-        num_policy_graphs = int(num_policy_graphs)
-
-        if candidate_edge_ids.numel() == 0:
-            edge_logits = prior_logits.new_empty((0,))
-            expand_logits = prior_logits.new_full((num_policy_graphs,), -torch.inf)
-            edge_breakdown = (
-                _edge_breakdown_with_final_logits(
-                    semantic_breakdown,
-                    final_logits=edge_logits,
-                )
-                if return_edge_breakdown
-                else None
-            )
-            return (
-                edge_logits,
-                candidate_edge_ids,
-                candidate_batch_ids,
-                edge_breakdown,
-                expand_logits,
-            )
-
-        log_p0 = scatter_log_softmax(
-            prior_logits,
-            candidate_batch_ids,
-            num_segments=num_policy_graphs,
+        candidate_context = build_candidate_context(
+            batch=batch,
+            state=state,
+            candidate_edge_ids=candidate_edge_ids,
+            candidate_batch_ids=candidate_batch_ids,
+            device=device,
         )
+        edge_score = self.edge_scorer(
+            fb=fb,
+            context=context,
+            edge_index=batch.edge_index,
+            edge_batch_index=batch.edge_batch,
+            active_nodes=state.active_nodes,
+            candidate_edge_ids=candidate_edge_ids,
+            candidate_context=candidate_context,
+            return_breakdown=True,
+        )
+        if not isinstance(edge_score, EdgeScoreBreakdown):
+            raise TypeError(
+                "Expected EdgeScoreBreakdown when edge breakdown is requested."
+            )
+        return edge_score
 
+    def _successor_flow_logits(
+        self,
+        *,
+        fb: FeatureBank,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        candidate_edge_ids: torch.Tensor,
+        candidate_batch_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        device = fb.node_h.device
+        if candidate_edge_ids.numel() == 0:
+            return fb.node_h.new_empty((0,))
         successor_context = self.state_readout.forward_successor_state_delta(
             fb=fb,
             batch=batch,
@@ -377,105 +301,9 @@ class Policy(nn.Module):
             candidate_edge_ids=candidate_edge_ids,
             candidate_batch_ids=candidate_batch_ids,
         )
-        successor_log_value = self.flow_head(
+        return self.flow_head(
             state_h=successor_context.state_h,
-        ).to(device=device, dtype=log_p0.dtype)
-
-        edge_logits = log_p0 + successor_log_value
-        expand_logits = _segment_logsumexp_or_neg_inf(
-            values=edge_logits,
-            batch_ids=candidate_batch_ids,
-            num_graphs=num_policy_graphs,
-        )
-        edge_breakdown = (
-            _edge_breakdown_with_final_logits(
-                semantic_breakdown,
-                final_logits=edge_logits,
-            )
-            if return_edge_breakdown
-            else None
-        )
-
-        return (
-            edge_logits,
-            candidate_edge_ids,
-            candidate_batch_ids,
-            edge_breakdown,
-            expand_logits,
-        )
-
-    def _doob_stop_logits(
-        self,
-        *,
-        stop_log_reward: torch.Tensor | None,
-        context: Any,
-        prior_logits: torch.Tensor,
-        candidate_batch_ids: torch.Tensor,
-        num_policy_graphs: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if self.doob_stop_mode == "reward":
-            if stop_log_reward is None:
-                raise ValueError(
-                    "Policy action_parameterization='doob_value_prior' with "
-                    "doob_stop_mode='reward' requires stop_log_reward. "
-                    "Run rollouts with reward_mode='eager_stop_now'."
-                )
-            return _validate_stop_log_reward(
-                stop_log_reward,
-                num_graphs=int(num_policy_graphs),
-                device=device,
-                dtype=prior_logits.dtype,
-            )
-
-        stop_logits, _ = self._learned_gate_logits(
-            state_h=context.state_h,
-            edge_logits=prior_logits,
-            candidate_batch_ids=candidate_batch_ids,
-            num_policy_graphs=num_policy_graphs,
-            progress=context.progress,
-            device=device,
-        )
-        return stop_logits
-
-    def _learned_gate_logits(
-        self,
-        *,
-        state_h: torch.Tensor,
-        edge_logits: torch.Tensor,
-        candidate_batch_ids: torch.Tensor,
-        num_policy_graphs: int,
-        progress: torch.Tensor,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if candidate_batch_ids.numel() == 0:
-            has_candidate_edge = torch.zeros(
-                int(num_policy_graphs),
-                dtype=torch.bool,
-                device=device,
-            )
-        else:
-            has_candidate_edge = torch.bincount(
-                candidate_batch_ids,
-                minlength=int(num_policy_graphs),
-            ).gt(0)
-
-        frontier_summary = frontier_logit_summary(
-            edge_logits=edge_logits,
-            edge_batch=candidate_batch_ids,
-            num_graphs=int(num_policy_graphs),
-            device=device,
-        )
-
-        return self.stop_gate(
-            state_h=state_h,
-            edge_logits=edge_logits,
-            edge_batch_index=candidate_batch_ids,
-            num_graphs=int(num_policy_graphs),
-            progress_ratio=progress,
-            frontier_summary=frontier_summary.as_tensor(),
-            has_candidate_edge=has_candidate_edge,
-        )
+        ).to(device=device, dtype=fb.node_h.dtype)
 
     def _validate_feature_bank(
         self,
@@ -555,12 +383,17 @@ def _segment_logsumexp_or_neg_inf(
 
 
 def _validate_stop_log_reward(
-    value: torch.Tensor,
+    value: torch.Tensor | None,
     *,
     num_graphs: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    if value is None:
+        raise ValueError(
+            "Policy action_parameterization='gfn_backward_flow' requires "
+            "stop_log_reward for every visited state."
+        )
     value = value.to(device=device, dtype=dtype).view(-1)
     if value.shape != (int(num_graphs),):
         raise ValueError(
@@ -568,27 +401,6 @@ def _validate_stop_log_reward(
             f"got {tuple(value.shape)}."
         )
     return value
-
-
-def _edge_breakdown_with_final_logits(
-    breakdown: EdgeScoreBreakdown | None,
-    *,
-    final_logits: torch.Tensor,
-) -> EdgeScoreBreakdown:
-    if breakdown is None:
-        raise TypeError("Doob edge breakdown requires semantic EdgeScoreBreakdown.")
-
-    return EdgeScoreBreakdown(
-        query_relation_score=breakdown.query_relation_score,
-        query_new_node_score=breakdown.query_new_node_score,
-        semantic_score=breakdown.semantic_score,
-        new_text_mask=breakdown.new_text_mask,
-        semantic_logits=breakdown.semantic_logits,
-        final_logits=final_logits.to(
-            device=breakdown.semantic_logits.device,
-            dtype=breakdown.semantic_logits.dtype,
-        ),
-    )
 
 
 def _candidate_successor_state(
@@ -699,78 +511,7 @@ def _rollout_candidate_successor_state(
     return next_state
 
 
-@dataclass(frozen=True)
-class FrontierLogitSummary:
-    edge_logmeanexp: torch.Tensor
-    edge_max: torch.Tensor
-    edge_sharpness: torch.Tensor
-    edge_log_size: torch.Tensor
-
-    def as_tensor(self) -> torch.Tensor:
-        return torch.stack(
-            [self.edge_max, self.edge_logmeanexp, self.edge_log_size],
-            dim=-1,
-        )
-
-
-def frontier_logit_summary(
-    *,
-    edge_logits: torch.Tensor,
-    edge_batch: torch.Tensor,
-    num_graphs: int,
-    device: torch.device,
-) -> FrontierLogitSummary:
-    edge_logits = edge_logits.to(device=device)
-    edge_batch = edge_batch.to(device=device, dtype=torch.long)
-    num_graphs = int(num_graphs)
-
-    if edge_logits.numel() == 0:
-        zeros = edge_logits.new_zeros(num_graphs)
-        return FrontierLogitSummary(
-            edge_logmeanexp=zeros,
-            edge_max=zeros,
-            edge_sharpness=zeros,
-            edge_log_size=zeros,
-        )
-
-    counts = torch.bincount(edge_batch, minlength=num_graphs).to(
-        device=device,
-        dtype=edge_logits.dtype,
-    )
-    has_edge = counts.gt(0)
-
-    logsumexp = scatter_logsumexp(
-        edge_logits,
-        edge_batch,
-        dim=0,
-        dim_size=num_graphs,
-    )
-    logmeanexp = logsumexp - counts.clamp_min(1.0).log()
-
-    edge_max = scatter_max(
-        edge_logits,
-        edge_batch,
-        dim=0,
-        dim_size=num_graphs,
-    )[0]
-
-    zeros = edge_logits.new_zeros(num_graphs)
-    edge_logmeanexp = torch.where(has_edge, logmeanexp, zeros)
-    edge_max = torch.where(has_edge, edge_max, zeros)
-    edge_sharpness = torch.where(has_edge, edge_max - edge_logmeanexp, zeros)
-    edge_log_size = torch.where(has_edge, counts.clamp_min(1.0).log(), zeros)
-
-    return FrontierLogitSummary(
-        edge_logmeanexp=edge_logmeanexp,
-        edge_max=edge_max,
-        edge_sharpness=edge_sharpness,
-        edge_log_size=edge_log_size,
-    )
-
-
 __all__ = [
-    "FrontierLogitSummary",
     "Policy",
     "PolicyOutput",
-    "frontier_logit_summary",
 ]

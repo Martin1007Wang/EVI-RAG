@@ -40,9 +40,7 @@ class RolloutRewardRequirements:
 
     @property
     def reward_mode(self) -> RewardMode:
-        if self.stop_now:
-            return RewardMode.EAGER_STOP_NOW
-        return RewardMode.LAZY_TERMINAL
+        return RewardMode.EAGER_STOP_NOW
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,22 +481,18 @@ def resolve_rollout_reward_requirements(
     auxiliary: StepAuxiliary | None = None,
     collect_stop_counterfactual: bool = False,
 ) -> RolloutRewardRequirements:
-    if reward_mode is not None:
-        return RolloutRewardRequirements.from_stop_now_required(
-            _coerce_reward_mode(reward_mode) == RewardMode.EAGER_STOP_NOW
+    del loss_fn, auxiliary, collect_stop_counterfactual
+
+    if (
+        reward_mode is not None
+        and _coerce_reward_mode(reward_mode) != RewardMode.EAGER_STOP_NOW
+    ):
+        raise ValueError(
+            "Standard GFlowNet action logits require reward_mode='eager_stop_now' "
+            "because Stop is a target-policy action at every visited state."
         )
 
-    stop_now_required = bool(collect_stop_counterfactual)
-    if loss_fn is not None:
-        stop_now_required = stop_now_required or bool(
-            getattr(loss_fn, "requires_stop_now_reward", False)
-        )
-    if auxiliary is not None:
-        stop_now_required = stop_now_required or bool(
-            getattr(auxiliary, "requires_stop_now_reward", True)
-        )
-
-    return RolloutRewardRequirements.from_stop_now_required(stop_now_required)
+    return RolloutRewardRequirements.from_stop_now_required(True)
 
 
 def _coerce_reward_mode(reward_mode: RewardMode | str) -> RewardMode:

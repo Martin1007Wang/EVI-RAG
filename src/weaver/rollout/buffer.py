@@ -36,8 +36,8 @@ class RolloutBuffer:
             stop_adv_continue_log_reward[b, t]
 
         It never stores stop_adv_loss. StopAdv BCE is computed in loss.py from
-        stop_log_pf and stop_adv_target so gradients flow through the Stop/Expand
-        option gate.
+        stop_log_pf and stop_adv_target so gradients flow through the flat
+        target action distribution.
     """
 
     B: int
@@ -349,7 +349,7 @@ class RolloutBuffer:
 
         This method intentionally does not accept a loss tensor. StopAdv BCE is
         computed in loss.py from stop_log_pf and stop_adv_target, preserving
-        gradients through the Stop/Expand option gate.
+        gradients through the flat target action distribution.
         """
         self._check_t(t)
 

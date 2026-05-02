@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 import torch
 
-from src.graph.segments import scatter_log_softmax
-
 CONTINUE_ACTION = 0
 STOP_ACTION = 1
 
@@ -16,7 +14,7 @@ EXPAND_OPTION_INDEX = 1
 @dataclass(frozen=True, slots=True)
 class ActionSample:
     """
-    One sampled action per physical graph.
+    One sampled action per rollout row.
 
     action_type:
         [B], 0 for Continue/Expand(edge), 1 for Stop.
@@ -31,8 +29,7 @@ class ActionSample:
             log P_target(Stop | s)
 
         For Expand(edge):
-            log P_target(Expand | s)
-            + log P_target(edge | s, Expand)
+            log P_target(Expand(edge) | s)
 
         For environment-forced Stop, e.g. inactive graph, no frontier, or
         exhausted budget, this is zero. Forced Stop should not train the Stop
@@ -47,7 +44,6 @@ class ActionSample:
 def sample_policy_actions(
     *,
     stop_logits: torch.Tensor,
-    expand_logits: torch.Tensor,
     edge_logits: torch.Tensor,
     candidate_edge_ids: torch.Tensor,
     candidate_batch_ids: torch.Tensor,
@@ -59,15 +55,14 @@ def sample_policy_actions(
     """
     Sample one behavior action per graph.
 
-    Behavior distribution uses temperature:
+    Behavior distribution uses temperature over the flat action space:
 
-        P_behavior(o | s) ∝ exp(z_o / T)
-        P_behavior(e | s, Expand) ∝ exp(z_e / T)
+        A(s) = {Stop} union {Expand(e): e in C(s)}
 
     Returned log-probabilities are always from the untempered target policy:
 
         log P_target(Stop | s)
-        log P_target(Expand | s) + log P_target(e | s, Expand)
+        log P_target(Expand(e) | s)
     """
     batch_size = int(batch_size)
     if batch_size <= 0:
@@ -78,9 +73,6 @@ def sample_policy_actions(
     device = stop_logits.device
 
     stop_logits = stop_logits.to(device=device, dtype=torch.float32).view(batch_size)
-    expand_logits = expand_logits.to(device=device, dtype=torch.float32).view(
-        batch_size
-    )
     edge_logits = edge_logits.to(device=device, dtype=torch.float32).view(-1)
     candidate_edge_ids = candidate_edge_ids.to(device=device, dtype=torch.long).view(-1)
     candidate_batch_ids = candidate_batch_ids.to(
@@ -92,7 +84,6 @@ def sample_policy_actions(
 
     _validate_inputs(
         stop_logits=stop_logits,
-        expand_logits=expand_logits,
         edge_logits=edge_logits,
         candidate_edge_ids=candidate_edge_ids,
         candidate_batch_ids=candidate_batch_ids,
@@ -102,18 +93,16 @@ def sample_policy_actions(
         device=device,
     )
 
-    target_type_logp, target_edge_logp = option_action_log_probs(
+    target_stop_logp, target_edge_logp = action_log_probs(
         stop_logits=stop_logits,
-        expand_logits=expand_logits,
         edge_logits=edge_logits,
         candidate_batch_ids=candidate_batch_ids,
         can_expand=can_expand,
         batch_size=batch_size,
     )
 
-    behavior_type_logp, behavior_edge_logp = option_action_log_probs(
+    behavior_stop_logp, behavior_edge_logp = action_log_probs(
         stop_logits=stop_logits / float(temperature),
-        expand_logits=expand_logits / float(temperature),
         edge_logits=edge_logits / float(temperature),
         candidate_batch_ids=candidate_batch_ids,
         can_expand=can_expand,
@@ -146,33 +135,166 @@ def sample_policy_actions(
             target_log_prob=target_log_prob,
         )
 
-    sampled_options = torch.distributions.Categorical(
-        logits=behavior_type_logp.index_select(0, learnable_graphs),
-    ).sample()
-
-    target_log_prob[learnable_graphs] = (
-        target_type_logp.index_select(0, learnable_graphs)
-        .gather(dim=1, index=sampled_options.view(-1, 1))
-        .squeeze(1)
+    _sample_flat_actions(
+        active_graphs=learnable_graphs,
+        behavior_stop_logp=behavior_stop_logp,
+        behavior_edge_logp=behavior_edge_logp,
+        target_stop_logp=target_stop_logp,
+        target_edge_logp=target_edge_logp,
+        candidate_edge_ids=candidate_edge_ids,
+        candidate_batch_ids=candidate_batch_ids,
+        action_type=action_type,
+        chosen_edges=chosen_edges,
+        target_log_prob=target_log_prob,
     )
-
-    expand_graphs = learnable_graphs[sampled_options.eq(EXPAND_OPTION_INDEX)]
-    if expand_graphs.numel() > 0:
-        _sample_expand_edges(
-            expand_graphs=expand_graphs,
-            behavior_edge_logp=behavior_edge_logp,
-            target_edge_logp=target_edge_logp,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-            action_type=action_type,
-            chosen_edges=chosen_edges,
-            target_log_prob=target_log_prob,
-        )
 
     return ActionSample(
         action_type=action_type,
         chosen_edges=chosen_edges,
         target_log_prob=target_log_prob,
+    )
+
+
+def action_log_probs(
+    *,
+    stop_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    candidate_batch_ids: torch.Tensor,
+    can_expand: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Return flat action log-probs over {Stop} union {Expand(edge)}.
+
+    stop_logp:
+        [B], log P(Stop | s).
+
+    edge_logp:
+        [C], log P(Expand(edge) | s), normalized jointly with Stop inside each
+        candidate graph.
+
+    For graphs where can_expand=False:
+        P(Stop)=1 and candidate edge log-probs belonging to those graphs are
+        -inf.
+    """
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+
+    device = stop_logits.device
+
+    stop_logits = stop_logits.to(device=device, dtype=torch.float32).view(batch_size)
+    edge_logits = edge_logits.to(device=device, dtype=torch.float32).view(-1)
+    candidate_batch_ids = candidate_batch_ids.to(
+        device=device,
+        dtype=torch.long,
+    ).view(-1)
+    can_expand = can_expand.to(device=device, dtype=torch.bool).view(batch_size)
+
+    _validate_option_inputs(
+        stop_logits=stop_logits,
+        edge_logits=edge_logits,
+        candidate_batch_ids=candidate_batch_ids,
+        can_expand=can_expand,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    if edge_logits.numel() == 0:
+        stop_logp = torch.zeros_like(stop_logits)
+        return stop_logp, stop_logits.new_empty((0,), dtype=torch.float32)
+
+    log_z = _flat_action_log_normalizer(
+        stop_logits=stop_logits,
+        edge_logits=edge_logits,
+        candidate_batch_ids=candidate_batch_ids,
+        can_expand=can_expand,
+        batch_size=batch_size,
+    )
+    stop_logp = torch.where(
+        can_expand,
+        stop_logits - log_z,
+        torch.zeros_like(stop_logits),
+    )
+    edge_logp = edge_logits - log_z.index_select(0, candidate_batch_ids)
+
+    edge_allowed = can_expand.index_select(0, candidate_batch_ids)
+    edge_logp = torch.where(
+        edge_allowed,
+        edge_logp,
+        edge_logp.new_full(edge_logp.shape, -torch.inf),
+    )
+
+    return stop_logp, edge_logp
+
+
+def action_probs(
+    *,
+    stop_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    candidate_batch_ids: torch.Tensor,
+    can_expand: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Return:
+        stop_prob:       [B]
+        expand_prob_sum: [B], sum_e P(Expand(e) | s)
+        edge_prob:       [C], action-level P(Expand(edge) | s)
+    """
+    stop_logp, edge_logp = action_log_probs(
+        stop_logits=stop_logits,
+        edge_logits=edge_logits,
+        candidate_batch_ids=candidate_batch_ids,
+        can_expand=can_expand,
+        batch_size=int(batch_size),
+    )
+
+    stop_prob = stop_logp.exp()
+    edge_prob = torch.where(
+        torch.isfinite(edge_logp),
+        edge_logp.exp(),
+        edge_logp.new_zeros(edge_logp.shape),
+    )
+    expand_prob = torch.zeros(
+        int(batch_size),
+        dtype=edge_prob.dtype,
+        device=edge_prob.device,
+    )
+    if edge_prob.numel() > 0:
+        expand_prob = torch.bincount(
+            candidate_batch_ids.to(device=edge_prob.device, dtype=torch.long),
+            weights=edge_prob,
+            minlength=int(batch_size),
+        ).to(dtype=edge_prob.dtype)
+
+    return stop_prob, expand_prob, edge_prob
+
+
+def option_action_probs(
+    *,
+    stop_logits: torch.Tensor,
+    expand_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    candidate_batch_ids: torch.Tensor,
+    can_expand: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Backward-compatible wrapper for the removed Stop/Expand conditional policy.
+
+    Return:
+        stop_prob:   [B]
+        expand_prob: [B], sum_e P(Expand(e) | s)
+        edge_prob:   [C], action-level P(Expand(edge) | s)
+    """
+    del expand_logits
+    return action_probs(
+        stop_logits=stop_logits,
+        edge_logits=edge_logits,
+        candidate_batch_ids=candidate_batch_ids,
+        can_expand=can_expand,
+        batch_size=int(batch_size),
     )
 
 
@@ -186,123 +308,43 @@ def option_action_log_probs(
     batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Return option log-probs and conditional edge log-probs.
-
-    type_logp:
-        [B, 2], columns are [Stop, Expand].
-
-    edge_logp:
-        [C], conditional log P(edge | s, Expand), normalized within each
-        candidate graph.
-
-    For graphs where can_expand=False:
-        P(Stop)=1, P(Expand)=0.
-        Candidate edge log-probs belonging to those graphs, if any, are -inf.
+    Backward-compatible wrapper returning [Stop, Expand-sum] log-probs plus
+    action-level edge log-probs.
     """
-    batch_size = int(batch_size)
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}.")
-
-    device = stop_logits.device
-
-    stop_logits = stop_logits.to(device=device, dtype=torch.float32).view(batch_size)
-    expand_logits = expand_logits.to(device=device, dtype=torch.float32).view(
-        batch_size
-    )
-    edge_logits = edge_logits.to(device=device, dtype=torch.float32).view(-1)
-    candidate_batch_ids = candidate_batch_ids.to(
-        device=device,
-        dtype=torch.long,
-    ).view(-1)
-    can_expand = can_expand.to(device=device, dtype=torch.bool).view(batch_size)
-
-    _validate_option_inputs(
+    del expand_logits
+    stop_logp, edge_logp = action_log_probs(
         stop_logits=stop_logits,
-        expand_logits=expand_logits,
-        edge_logits=edge_logits,
-        candidate_batch_ids=candidate_batch_ids,
-        can_expand=can_expand,
-        batch_size=batch_size,
-        device=device,
-    )
-
-    type_logits = torch.stack([stop_logits, expand_logits], dim=-1)
-
-    forced_stop_logits = torch.stack(
-        [
-            torch.zeros_like(stop_logits),
-            torch.full_like(expand_logits, -torch.inf),
-        ],
-        dim=-1,
-    )
-    type_logits = torch.where(
-        can_expand.unsqueeze(-1),
-        type_logits,
-        forced_stop_logits,
-    )
-
-    type_logp = torch.log_softmax(type_logits, dim=-1)
-
-    if edge_logits.numel() == 0:
-        return type_logp, stop_logits.new_empty((0,), dtype=torch.float32)
-
-    edge_logp = scatter_log_softmax(
-        edge_logits,
-        candidate_batch_ids,
-        num_segments=batch_size,
-    )
-
-    edge_allowed = can_expand.index_select(0, candidate_batch_ids)
-    edge_logp = torch.where(
-        edge_allowed,
-        edge_logp,
-        edge_logp.new_full(edge_logp.shape, -torch.inf),
-    )
-
-    return type_logp, edge_logp
-
-
-def option_action_probs(
-    *,
-    stop_logits: torch.Tensor,
-    expand_logits: torch.Tensor,
-    edge_logits: torch.Tensor,
-    candidate_batch_ids: torch.Tensor,
-    can_expand: torch.Tensor,
-    batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Return:
-        stop_prob:   [B]
-        expand_prob: [B]
-        edge_prob:   [C], conditional P(edge | s, Expand)
-    """
-    type_logp, edge_logp = option_action_log_probs(
-        stop_logits=stop_logits,
-        expand_logits=expand_logits,
         edge_logits=edge_logits,
         candidate_batch_ids=candidate_batch_ids,
         can_expand=can_expand,
         batch_size=int(batch_size),
     )
-
-    edge_prob = torch.where(
-        torch.isfinite(edge_logp),
-        edge_logp.exp(),
-        edge_logp.new_zeros(edge_logp.shape),
+    expand_prob = torch.zeros_like(stop_logp)
+    if edge_logp.numel() > 0:
+        edge_prob = torch.where(
+            torch.isfinite(edge_logp),
+            edge_logp.exp(),
+            edge_logp.new_zeros(edge_logp.shape),
+        )
+        expand_prob = torch.bincount(
+            candidate_batch_ids.to(device=edge_logp.device, dtype=torch.long),
+            weights=edge_prob,
+            minlength=int(batch_size),
+        ).to(dtype=stop_logp.dtype)
+    expand_logp = torch.where(
+        expand_prob.gt(0.0),
+        expand_prob.clamp_min(torch.finfo(stop_logp.dtype).tiny).log(),
+        stop_logp.new_full(stop_logp.shape, -torch.inf),
     )
-
-    return (
-        type_logp[:, STOP_OPTION_INDEX].exp(),
-        type_logp[:, EXPAND_OPTION_INDEX].exp(),
-        edge_prob,
-    )
+    return torch.stack([stop_logp, expand_logp], dim=-1), edge_logp
 
 
-def _sample_expand_edges(
+def _sample_flat_actions(
     *,
-    expand_graphs: torch.Tensor,
+    active_graphs: torch.Tensor,
+    behavior_stop_logp: torch.Tensor,
     behavior_edge_logp: torch.Tensor,
+    target_stop_logp: torch.Tensor,
     target_edge_logp: torch.Tensor,
     candidate_edge_ids: torch.Tensor,
     candidate_batch_ids: torch.Tensor,
@@ -311,12 +353,9 @@ def _sample_expand_edges(
     target_log_prob: torch.Tensor,
 ) -> None:
     """
-    Sample one edge for each graph whose sampled option is Expand.
-
-    This loop is over expanding graphs, not over candidate edges. expand_budget
-    is small, and this keeps the code explicit.
+    Sample Stop or one Expand(edge) action per active rollout row.
     """
-    for graph_id_tensor in expand_graphs:
+    for graph_id_tensor in active_graphs:
         graph_id = int(graph_id_tensor.item())
         candidate_pos = (
             candidate_batch_ids.eq(graph_id).nonzero(as_tuple=False).view(-1)
@@ -324,27 +363,57 @@ def _sample_expand_edges(
 
         if candidate_pos.numel() == 0:
             raise RuntimeError(
-                "Sampled Expand for graph with no candidate edges: "
-                f"physical graph id={graph_id}."
+                "Sampled Expand for rollout row with no candidate edges: "
+                f"rollout row id={graph_id}."
             )
 
-        local_choice = torch.distributions.Categorical(
-            logits=behavior_edge_logp.index_select(0, candidate_pos),
-        ).sample()
+        logits = torch.cat(
+            [
+                behavior_stop_logp[graph_id].view(1),
+                behavior_edge_logp.index_select(0, candidate_pos),
+            ],
+            dim=0,
+        )
+        local_choice = torch.distributions.Categorical(logits=logits).sample()
+        local_idx = int(local_choice.item())
+        if local_idx == 0:
+            target_log_prob[graph_id] = target_stop_logp[graph_id]
+            continue
 
-        chosen_pos = candidate_pos[int(local_choice.item())]
+        chosen_pos = candidate_pos[local_idx - 1]
 
         action_type[graph_id] = CONTINUE_ACTION
         chosen_edges[graph_id] = candidate_edge_ids[chosen_pos]
-        target_log_prob[graph_id] = (
-            target_log_prob[graph_id] + target_edge_logp[chosen_pos]
-        )
+        target_log_prob[graph_id] = target_edge_logp[chosen_pos]
+
+
+def _flat_action_log_normalizer(
+    *,
+    stop_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    candidate_batch_ids: torch.Tensor,
+    can_expand: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    log_z = stop_logits.clone()
+    if edge_logits.numel() == 0:
+        return log_z
+    edge_log_z = torch.full_like(stop_logits, -torch.inf)
+    for graph_id in range(int(batch_size)):
+        mask = candidate_batch_ids.eq(graph_id)
+        if bool(mask.any()):
+            edge_log_z[graph_id] = torch.logsumexp(edge_logits[mask], dim=0)
+    edge_log_z = torch.where(
+        can_expand,
+        edge_log_z,
+        edge_log_z.new_full(edge_log_z.shape, -torch.inf),
+    )
+    return torch.logaddexp(stop_logits, edge_log_z)
 
 
 def _validate_inputs(
     *,
     stop_logits: torch.Tensor,
-    expand_logits: torch.Tensor,
     edge_logits: torch.Tensor,
     candidate_edge_ids: torch.Tensor,
     candidate_batch_ids: torch.Tensor,
@@ -357,7 +426,6 @@ def _validate_inputs(
 
     for name, tensor in {
         "stop_logits": stop_logits,
-        "expand_logits": expand_logits,
         "active": active,
         "can_expand": can_expand,
     }.items():
@@ -381,7 +449,6 @@ def _validate_inputs(
 def _validate_option_inputs(
     *,
     stop_logits: torch.Tensor,
-    expand_logits: torch.Tensor,
     edge_logits: torch.Tensor,
     candidate_batch_ids: torch.Tensor,
     can_expand: torch.Tensor,
@@ -392,7 +459,6 @@ def _validate_option_inputs(
 
     for name, tensor in {
         "stop_logits": stop_logits,
-        "expand_logits": expand_logits,
         "can_expand": can_expand,
     }.items():
         if tensor.shape != expected_shape:
@@ -504,6 +570,8 @@ __all__ = [
     "STOP_OPTION_INDEX",
     "EXPAND_OPTION_INDEX",
     "ActionSample",
+    "action_log_probs",
+    "action_probs",
     "option_action_log_probs",
     "option_action_probs",
     "sample_policy_actions",

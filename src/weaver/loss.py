@@ -73,7 +73,7 @@ class SubTrajectoryBalanceLoss(nn.Module):
               - (1 - y_stop) log P_F(Expand | s)
 
     StopAdv is not an edge imitation loss. It only supervises the Stop/Expand
-    option boundary.
+    marginal boundary derived from the flat action distribution.
     """
 
     metric_keys = (
@@ -635,7 +635,7 @@ def stop_advantage_loss(
     eps: float = 1.0e-6,
 ) -> torch.Tensor:
     """
-    BCE over the Stop/Expand option using log P(Stop | s).
+    BCE over the Stop-vs-Expand marginal using log P(Stop | s).
 
     target:
         Soft stop target in [0, 1].

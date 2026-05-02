@@ -354,69 +354,74 @@ z_0(e\mid s,q)
 
 默认配置中 `entity_weight_init=0.1`、`logit_scale_init=5.0`，并且这两个量默认冻结。
 
-## 9. Doob/value-reweighted 前向策略
+当前标准 GFlowNet target policy 不使用 \(\log P_0\)。`EdgeScorer` 只保留为语义先验诊断，后续若启用 proposal/behavior mixture，也不能把 proposal log-prob 写入 SubTB 所需的 target \(\log P_F\)。
 
-当前默认 `action_parameterization` 是 `doob_value_prior`。
+## 9. Backward-flow GFlowNet 前向策略
+
+当前默认 `action_parameterization` 是 `gfn_backward_flow`，反向策略为 `uniform_removable`。
 
 对每个候选边，策略先构造 successor state \(s+e\)，再估计其 flow：
 
 ```math
-V_\theta(s+e)=\log F_\theta(s+e\mid q).
+\log F_\theta(s+e\mid q)
 ```
 
-候选扩展边的最终 logit 为：
+每条候选边还需要先计算 child state 下的反向概率：
 
 ```math
-\ell(e\mid s,q)
+\log P_B(s\mid s+e)
 =
-\log P_0(e\mid s,q)
+-\log|\mathcal R(s+e)|.
+```
+
+候选扩展动作的 target logit 为：
+
+```math
+z_e(s,q)
+=
+\log F_\theta(s+e\mid q)
 +
-\log F_\theta(s+e\mid q).
+\log P_B(s\mid s+e).
 ```
 
-Expand option 的 logit 是所有 successor-valued edge logits 的 logsumexp：
-
-```math
-z_{\operatorname{Expand}}(s)
-=
-\log\sum_{e\in\mathcal C(s)}
-\exp \ell(e\mid s,q).
-```
-
-默认 `doob.stop_mode=reward`，因此 Stop option 的 logit 是当前状态立即停止的奖励：
+Stop 动作的 target logit 是当前状态立即停止的奖励：
 
 ```math
 z_{\operatorname{Stop}}(s)=\log R(s).
 ```
 
-option 概率为：
+动作空间不是两阶段 Stop/Expand gate，而是单层动作集合：
 
 ```math
-P_F(o\mid s,q)
+\mathcal A(s)
 =
-\operatorname{softmax}
-\left(
-z_{\operatorname{Stop}}(s),
-z_{\operatorname{Expand}}(s)
-\right)_o.
+\{\operatorname{Stop}\}
+\cup
+\{\operatorname{Expand}(e):e\in\mathcal C(s)\}.
 ```
 
-条件边概率为：
+因此 target policy 直接在所有动作上归一化：
 
 ```math
-P_F(e\mid s,q,\operatorname{Expand})
+P_F(a\mid s,q)
 =
-\frac{\exp\ell(e\mid s,q)}
-{\sum_{e'\in\mathcal C(s)}\exp\ell(e'\mid s,q)}.
+\frac{\exp z_a(s,q)}
+{\exp z_{\operatorname{Stop}}(s)+
+\sum_{e'\in\mathcal C(s)}\exp z_{e'}(s,q)}.
 ```
 
-因此完整扩展动作概率为：
+特别地：
 
 ```math
 P_F(\operatorname{Expand}(e)\mid s,q)
 =
-P_F(\operatorname{Expand}\mid s,q)
-P_F(e\mid s,q,\operatorname{Expand}).
+\frac{
+\exp(\log F_\theta(s+e\mid q)+\log P_B(s\mid s+e))
+}{
+\exp(\log R(s))+
+\sum_{e'\in\mathcal C(s)}
+\exp(\log F_\theta(s+e'\mid q)+\log P_B(s\mid s+e'))
+}.
 ```
 
 采样时 temperature 只影响 behavior distribution：
@@ -480,6 +485,13 @@ r_{\min}=-30.
 ## 11. 反向策略
 
 GFlowNet loss 需要前向概率和反向概率。当前反向策略不是神经网络，而是 uniform removable-edge policy。
+
+实现中有两个反向概率计算位置：
+
+- target policy 构造 edge logits 前，对所有候选 \((s,e)\) 批量计算 \(\log P_B(s\mid s+e)\)；
+- 采样出某条 Expand transition 后，再把同一 uniform backward policy 下的 selected \(\log P_B\) 写入 rollout trace，供 SubTB 使用。
+
+这两者必须语义一致。若某候选扩展后“刚加的边”不在 child 的 removable set 中，代码会直接报错，因为那意味着 forward action 有非零 target 概率但 backward transition 不存在。
 
 对扩展后的 child state \(s'=s+e\)，定义可逆移除集合：
 
@@ -626,7 +638,7 @@ y_{\operatorname{stop}}(s)
 \right),
 ```
 
-并用 BCE 监督 Stop/Expand option boundary。但默认配置 `stop_adv_coef=0.0`，因此它不是当前默认训练目标的一部分。
+并用 BCE 监督 Stop 与“所有 Expand 动作之和”的边界。但默认配置 `stop_adv_coef=0.0`，因此它不是当前默认训练目标的一部分。
 
 ## 15. 训练流程
 
@@ -637,7 +649,9 @@ y_{\operatorname{stop}}(s)
 3. 对每个样本采样 \(K\) 条 rollout。
 4. 每个 step：
    - 计算当前 stop-now reward；
-   - 用 policy 计算 Stop/Expand logits 和候选边 logits；
+   - 用 policy 计算 state flow、Stop logit 和候选 successor flow；
+   - 对每条候选 expansion 计算 candidate-level \(\log P_B(s\mid s+e)\)；
+   - 用 \(z_{\operatorname{Stop}}=\log R(s)\) 与 \(z_e=\log F_\theta(s+e)+\log P_B(s\mid s+e)\) 做单层 action softmax；
    - 按 temperature behavior policy 采样动作；
    - Expand 时更新 active edges/nodes；
    - Stop 时写入 terminal reward。
@@ -719,7 +733,7 @@ V_{\text{union}}=\bigcup_{k=1}^{K}V_{\text{term}}^{(k)}.
 P_\theta(x\mid q,G)\propto R(x,q),
 ```
 
-其中 \(x\) 是从 anchor 出发生长出的有限步证据子图。语义先验提供局部扩边偏好，state flow 提供全局子图价值校正，终止奖励定义“答案是否被 anchor-supported evidence 覆盖且子图是否紧凑”。
+其中 \(x\) 是从 anchor 出发生长出的有限步证据子图。当前 target policy 由 state flow、uniform removable backward policy 和 stop-now reward 共同定义；语义先验只用于 diagnostics，除非后续显式启用为 behavior proposal。终止奖励定义“答案是否被 anchor-supported evidence 覆盖且子图是否紧凑”。
 
 可以压缩成四句话：
 

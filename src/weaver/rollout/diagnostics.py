@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from src.graph.segments import scatter_log_softmax
 from src.weaver.policy import PolicyOutput
 from src.weaver.rollout.buffer import RolloutBuffer
 from src.weaver.rollout.executor import StepContext
-from src.weaver.rollout.sampling import (
-    EXPAND_OPTION_INDEX,
-    STOP_OPTION_INDEX,
-    option_action_log_probs,
-)
+from src.weaver.rollout.sampling import action_log_probs
 
 
 def write_policy_diagnostics(
@@ -23,42 +18,45 @@ def write_policy_diagnostics(
     """
     Write target-policy diagnostics.
 
-    target_continue_prob is option-level Expand probability.
-    target_stop_prob is option-level Stop probability.
+    target_continue_prob is the summed action probability of all Expand(e).
+    target_stop_prob is the action probability of Stop.
 
-    Edge entropy is conditional entropy:
-        H[P(edge | s, Expand)]
+    Edge entropy is action-level entropy over Expand(e) actions.
     """
     device = step_out.stop_logits.device
     active = step_context.active_mask.to(device=device, dtype=torch.bool)
     can_expand = step_context.can_expand.to(device=device, dtype=torch.bool)
 
-    type_logp, edge_logp = option_action_log_probs(
+    stop_logp, edge_logp = action_log_probs(
         stop_logits=step_out.stop_logits,
-        expand_logits=step_out.expand_logits,
         edge_logits=step_out.edge_logits,
         candidate_batch_ids=step_out.candidate_batch_ids,
         can_expand=can_expand,
         batch_size=int(num_graphs),
     )
-    del edge_logp
 
     target_stop_prob = torch.where(
-        torch.isfinite(type_logp[:, STOP_OPTION_INDEX]),
-        type_logp[:, STOP_OPTION_INDEX].exp(),
-        type_logp.new_zeros(num_graphs),
+        torch.isfinite(stop_logp),
+        stop_logp.exp(),
+        stop_logp.new_zeros(num_graphs),
     )
-
-    target_continue_prob = torch.where(
-        torch.isfinite(type_logp[:, EXPAND_OPTION_INDEX]),
-        type_logp[:, EXPAND_OPTION_INDEX].exp(),
-        type_logp.new_zeros(num_graphs),
+    edge_prob = torch.where(
+        torch.isfinite(edge_logp),
+        edge_logp.exp(),
+        edge_logp.new_zeros(edge_logp.shape),
     )
+    target_continue_prob = step_out.stop_logits.new_zeros(num_graphs)
+    if edge_prob.numel() > 0:
+        target_continue_prob = torch.bincount(
+            step_out.candidate_batch_ids.to(device=device, dtype=torch.long),
+            weights=edge_prob,
+            minlength=int(num_graphs),
+        ).to(dtype=torch.float32)
 
-    stop_log_pf = type_logp[:, STOP_OPTION_INDEX]
+    stop_log_pf = stop_logp
 
     edge_entropy, edge_entropy_valid = edge_entropy_by_graph(
-        edge_logits=step_out.edge_logits,
+        edge_log_probs=edge_logp,
         candidate_batch_ids=step_out.candidate_batch_ids,
         step_context=step_context,
         num_graphs=int(num_graphs),
@@ -84,14 +82,14 @@ def write_policy_diagnostics(
 
 def edge_entropy_by_graph(
     *,
-    edge_logits: torch.Tensor,
+    edge_log_probs: torch.Tensor,
     candidate_batch_ids: torch.Tensor,
     step_context: StepContext,
     num_graphs: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Conditional edge entropy H[P(edge | s, Expand)] per graph.
+    Action-level Expand-edge entropy -sum_e P(Expand(e)|s) log P(Expand(e)|s).
     """
     num_graphs = int(num_graphs)
 
@@ -101,20 +99,21 @@ def edge_entropy_by_graph(
     valid = valid & step_context.has_candidate.to(device=device, dtype=torch.bool)
     valid = valid & ~step_context.budget_exhausted.to(device=device, dtype=torch.bool)
 
-    if edge_logits.numel() == 0 or not bool(valid.any()):
+    if edge_log_probs.numel() == 0 or not bool(valid.any()):
         return entropy, valid
 
     edge_batch = candidate_batch_ids.to(device=device, dtype=torch.long)
-    logits = edge_logits.to(device=device, dtype=torch.float32)
-
-    log_probs = scatter_log_softmax(
-        logits,
-        edge_batch,
-        num_graphs,
+    log_probs = edge_log_probs.to(device=device, dtype=torch.float32)
+    probs = torch.where(
+        torch.isfinite(log_probs),
+        log_probs.exp(),
+        log_probs.new_zeros(log_probs.shape),
     )
-
-    probs = log_probs.exp()
-    contribution = -(probs * log_probs)
+    contribution = torch.where(
+        torch.isfinite(log_probs),
+        -(probs * log_probs),
+        torch.zeros_like(log_probs),
+    )
 
     entropy = torch.bincount(
         edge_batch,

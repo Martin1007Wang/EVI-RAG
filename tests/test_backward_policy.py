@@ -92,7 +92,8 @@ if "torch_scatter" not in sys.modules:
     sys.modules["torch_scatter"] = torch_scatter_stub
 
 from src.graph.ops import compute_uniform_nonroot_backward_removals, rebuild_active_nodes
-from src.weaver.state import State
+from src.weaver.rollout.backward import compute_candidate_uniform_backward_log_probs
+from src.weaver.state import RolloutState, State
 
 
 def test_backward_removals_exclude_edges_that_break_reachability() -> None:
@@ -207,3 +208,63 @@ def test_backward_removal_inverts_one_step_forward_expansion() -> None:
 
         assert torch.equal(restored_edges, parent.active_edges)
         assert torch.equal(restored_nodes, parent.active_nodes)
+
+
+def test_candidate_backward_log_probs_use_rollout_rows() -> None:
+    edge_index = torch.tensor(
+        [
+            [0, 1, 1, 4, 4],
+            [1, 2, 3, 5, 6],
+        ],
+        dtype=torch.long,
+    )
+    edge_batch = torch.tensor([0, 0, 0, 1, 1], dtype=torch.long)
+    anchor_nodes = torch.tensor(
+        [
+            [True, True, False, False, False, False, False],
+            [True, True, False, False, False, False, False],
+            [False, False, False, False, True, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    parent = RolloutState(
+        active_nodes=torch.tensor(
+            [
+                [True, True, True, False, False, False, False],
+                [True, True, True, False, False, False, False],
+                [False, False, False, False, True, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        active_edges=torch.tensor(
+            [
+                [True, True, False, False, False],
+                [True, True, False, False, False],
+                [False, False, False, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        root_edges=torch.tensor(
+            [
+                [True, False, False, False, False],
+                [True, False, False, False, False],
+                [False, False, False, False, False],
+            ],
+            dtype=torch.bool,
+        ),
+        anchor_nodes=anchor_nodes,
+        rollout_to_graph=torch.tensor([0, 0, 1], dtype=torch.long),
+        expand_budget=3,
+    )
+
+    log_pb = compute_candidate_uniform_backward_log_probs(
+        state=parent,
+        edge_index=edge_index,
+        edge_batch=edge_batch,
+        candidate_edge_ids=torch.tensor([2, 4], dtype=torch.long),
+        candidate_batch_ids=torch.tensor([1, 2], dtype=torch.long),
+        num_graphs=2,
+    )
+
+    expected = torch.tensor([-torch.log(torch.tensor(2.0)), 0.0], dtype=torch.float32)
+    assert torch.allclose(log_pb, expected)

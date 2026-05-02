@@ -135,8 +135,6 @@ class RolloutEngine:
             collect_stop_counterfactual=bool(collect_stop_counterfactual),
             auxiliary=auxiliary,
         )
-        if bool(getattr(policy, "requires_stop_log_reward", False)):
-            resolved_reward_mode = RewardMode.EAGER_STOP_NOW
 
         config = RolloutEngineConfig(
             temperature=float(temperature),
@@ -152,22 +150,16 @@ class RolloutEngine:
                 "edge_logit_mode must be 'final' or 'semantic', "
                 f"got {config.edge_logit_mode!r}."
             )
-        if (
-            config.reward_mode == RewardMode.LAZY_TERMINAL
-            and config.collect_stop_counterfactual
-        ):
+        if config.edge_logit_mode != "final":
             raise ValueError(
-                "reward_mode='lazy_terminal' cannot collect stop counterfactuals; "
-                "use reward_mode='eager_stop_now'."
+                "Standard GFlowNet target policy requires edge_logit_mode='final'. "
+                "Semantic logits are diagnostics/proposals only."
             )
-        if (
-            config.reward_mode == RewardMode.LAZY_TERMINAL
-            and auxiliary is not None
-            and bool(getattr(auxiliary, "requires_stop_now_reward", True))
-        ):
+        if config.reward_mode != RewardMode.EAGER_STOP_NOW:
             raise ValueError(
-                "reward_mode='lazy_terminal' is incompatible with a rollout "
-                "auxiliary that requires stop_now_reward."
+                "Standard GFlowNet target policy requires "
+                "reward_mode='eager_stop_now' because Stop is a target action "
+                "at every visited state."
             )
 
         if auxiliary is not None:
@@ -308,10 +300,15 @@ class RolloutEngine:
                     "stop_now_reward is required when stop counterfactuals are collected."
                 )
 
+            diagnostic_step_out = executor.with_candidate_backward_logits(
+                step_out=step_out,
+                state=policy_state,
+            )
+
             if need_policy_step_traces:
                 write_policy_diagnostics(
                     buffer=buffer,
-                    step_out=step_out,
+                    step_out=diagnostic_step_out,
                     step_context=step_context,
                     num_graphs=dynamic_graphs,
                 )
@@ -435,10 +432,9 @@ class RolloutEngine:
         collect_stop_counterfactual: bool,
         auxiliary: StepAuxiliary | None,
     ) -> RewardMode:
+        del collect_stop_counterfactual, auxiliary
         if reward_mode is None:
-            if bool(collect_stop_counterfactual) or auxiliary is not None:
-                return RewardMode.EAGER_STOP_NOW
-            return RewardMode.LAZY_TERMINAL
+            return RewardMode.EAGER_STOP_NOW
 
         if isinstance(reward_mode, RewardMode):
             return reward_mode

@@ -45,8 +45,8 @@ def compute_policy_behavior_diagnostics(
     ).float()
 
     metrics = {
-        "policy/target_stop_prob_mean": _masked_mean(stop_prob, valid),
-        "policy/target_continue_prob_mean": _masked_mean(continue_prob, valid),
+        "policy/stop_prob_mean": _masked_mean(stop_prob, valid),
+        "policy/expand_prob_sum_mean": _masked_mean(continue_prob, valid),
         "policy/edge_action_entropy_mean": _safe_ratio(
             float(entropy.sum().item()),
             float(entropy_valid.sum().item()),
@@ -61,18 +61,18 @@ def compute_policy_behavior_diagnostics(
         horizon = int(valid.size(1))
         for depth in range(min(max_depth, horizon)):
             depth_valid = valid[:, depth]
-            metrics[f"policy/target_stop_prob_depth_{depth}"] = _masked_mean(
+            metrics[f"policy/stop_prob_depth_{depth}"] = _masked_mean(
                 stop_prob[:, depth],
                 depth_valid,
             )
-            metrics[f"policy/target_continue_prob_depth_{depth}"] = _masked_mean(
+            metrics[f"policy/expand_prob_sum_depth_{depth}"] = _masked_mean(
                 continue_prob[:, depth],
                 depth_valid,
             )
     else:
         for depth in range(max_depth):
-            metrics[f"policy/target_stop_prob_depth_{depth}"] = 0.0
-            metrics[f"policy/target_continue_prob_depth_{depth}"] = 0.0
+            metrics[f"policy/stop_prob_depth_{depth}"] = 0.0
+            metrics[f"policy/expand_prob_sum_depth_{depth}"] = 0.0
 
     return metrics
 
@@ -120,7 +120,7 @@ def compute_root_answer_edge_ranking_diagnostics(
 
     edge_ids = step_out.candidate_edge_ids.view(-1)
     edge_batch = step_out.candidate_batch_ids.view(-1)
-    final_logits = step_out.edge_logits.view(-1)
+    target_logits = step_out.edge_logits.view(-1)
     breakdown = step_out.edge_score_breakdown
 
     if edge_ids.numel() == 0:
@@ -145,20 +145,20 @@ def compute_root_answer_edge_ranking_diagnostics(
 
     answer_edge = target.index_select(0, src) | target.index_select(0, dst)
     answer_edge_counts = scatter_sum(
-        answer_edge.to(dtype=final_logits.dtype),
+        answer_edge.to(dtype=target_logits.dtype),
         edge_batch,
         dim=0,
         dim_size=num_graphs,
     )
     candidate_counts = scatter_sum(
-        torch.ones_like(final_logits),
+        torch.ones_like(target_logits),
         edge_batch,
         dim=0,
         dim_size=num_graphs,
     )
     prior_logits = breakdown.semantic_logits.view(-1).to(
-        device=final_logits.device,
-        dtype=final_logits.dtype,
+        device=target_logits.device,
+        dtype=target_logits.dtype,
     )
     prior_ranks, has_answer = _best_answer_edge_ranks(
         logits=prior_logits,
@@ -166,90 +166,100 @@ def compute_root_answer_edge_ranking_diagnostics(
         edge_batch=edge_batch,
         num_graphs=num_graphs,
     )
-    final_ranks, _ = _best_answer_edge_ranks(
-        logits=final_logits,
+    target_ranks, _ = _best_answer_edge_ranks(
+        logits=target_logits,
         answer_edge=answer_edge,
         edge_batch=edge_batch,
         num_graphs=num_graphs,
     )
-    rank_delta = final_ranks - prior_ranks
-    base_logit_std = _tensor_std(prior_logits)
+    rank_delta = target_ranks - prior_ranks
+    prior_logit_std = _tensor_std(prior_logits)
 
     metrics = {
-        "edge/base_logit_std": base_logit_std,
-        "edge/prior_rank_vs_final_rank_kendall": _tensor_mean(
+        "prior/root_logit_std": prior_logit_std,
+        "prior/target_policy_rank_kendall": _tensor_mean(
             _kendall_tau_by_graph(
                 prior_logits=prior_logits,
-                final_logits=final_logits,
+                target_logits=target_logits,
                 edge_batch=edge_batch,
                 num_graphs=num_graphs,
             )
         ),
-        "edge/answer_edge_prior_rank": _tensor_mean(prior_ranks),
-        "edge/answer_edge_final_rank": _tensor_mean(final_ranks),
+        "prior/answer_edge_rank": _tensor_mean(prior_ranks),
+        "target_policy/answer_edge_rank": _tensor_mean(target_ranks),
         "root/frontier_answer_edge_rate": _tensor_mean(
             has_answer.to(dtype=torch.float32)
         ),
         "root/frontier_answer_edge_count_mean": _tensor_mean(answer_edge_counts),
         "root/frontier_candidate_count_mean": _tensor_mean(candidate_counts),
-        "root/prior_answer_edge_best_rank_mean": _tensor_mean(prior_ranks),
-        "root/prior_answer_edge_best_rank_median": _tensor_median(prior_ranks),
-        "root/prior_answer_edge_top1_rate": _tensor_mean(
+        "prior/root_answer_edge_best_rank_mean": _tensor_mean(prior_ranks),
+        "prior/root_answer_edge_best_rank_median": _tensor_median(prior_ranks),
+        "prior/root_answer_edge_top1_rate": _tensor_mean(
             prior_ranks.le(1.0).to(dtype=torch.float32)
         ),
-        "root/prior_answer_edge_top5_rate": _tensor_mean(
+        "prior/root_answer_edge_top5_rate": _tensor_mean(
             prior_ranks.le(5.0).to(dtype=torch.float32)
         ),
-        "root/prior_answer_edge_mrr": _tensor_mean(1.0 / prior_ranks.clamp_min(1.0)),
-        "root/policy_answer_edge_best_rank_mean": _tensor_mean(final_ranks),
-        "root/policy_answer_edge_best_rank_median": _tensor_median(final_ranks),
-        "root/policy_answer_edge_top1_rate": _tensor_mean(
-            final_ranks.le(1.0).to(dtype=torch.float32)
+        "prior/root_answer_edge_mrr": _tensor_mean(1.0 / prior_ranks.clamp_min(1.0)),
+        "target_policy/root_answer_edge_best_rank_mean": _tensor_mean(target_ranks),
+        "target_policy/root_answer_edge_best_rank_median": _tensor_median(target_ranks),
+        "target_policy/root_answer_edge_top1_rate": _tensor_mean(
+            target_ranks.le(1.0).to(dtype=torch.float32)
         ),
-        "root/policy_answer_edge_top5_rate": _tensor_mean(
-            final_ranks.le(5.0).to(dtype=torch.float32)
+        "target_policy/root_answer_edge_top5_rate": _tensor_mean(
+            target_ranks.le(5.0).to(dtype=torch.float32)
         ),
-        "root/policy_answer_edge_mrr": _tensor_mean(1.0 / final_ranks.clamp_min(1.0)),
-        "root/answer_edge_rank_delta_mean": _tensor_mean(rank_delta),
-        "root/final_worse_than_prior_rate": _tensor_mean(
+        "target_policy/root_answer_edge_mrr": _tensor_mean(
+            1.0 / target_ranks.clamp_min(1.0)
+        ),
+        "target_policy/root_answer_edge_rank_delta_mean": _tensor_mean(rank_delta),
+        "target_policy/root_worse_than_prior_rate": _tensor_mean(
             rank_delta.gt(0.0).to(dtype=torch.float32)
         ),
-        "root/answer_edge_q_rel_mean": _masked_mean_1d(
+        "prior/root_answer_edge_q_rel_mean": _masked_mean_1d(
             breakdown.query_relation_score, answer_edge
         ),
-        "root/answer_edge_q_new_mean": _masked_mean_1d(
+        "prior/root_answer_edge_q_new_mean": _masked_mean_1d(
             breakdown.query_new_node_score, answer_edge
         ),
-        "root/answer_edge_q_candidate_mean": _masked_mean_1d(
+        "prior/root_answer_edge_q_candidate_mean": _masked_mean_1d(
             breakdown.semantic_score,
             answer_edge,
         ),
-        "root/answer_edge_new_text_rate": _masked_mean_1d(
+        "prior/root_answer_edge_new_text_rate": _masked_mean_1d(
             breakdown.new_text_mask,
             answer_edge,
         ),
-        "root/answer_edge_logit_mean": _masked_mean_1d(
-            breakdown.final_logits,
+        "prior/root_answer_edge_logit_mean": _masked_mean_1d(
+            breakdown.semantic_logits,
             answer_edge,
         ),
-        "root/nonanswer_edge_q_rel_mean": _masked_mean_1d(
+        "target_policy/root_answer_edge_logit_mean": _masked_mean_1d(
+            target_logits,
+            answer_edge,
+        ),
+        "prior/root_nonanswer_edge_q_rel_mean": _masked_mean_1d(
             breakdown.query_relation_score,
             ~answer_edge,
         ),
-        "root/nonanswer_edge_q_new_mean": _masked_mean_1d(
+        "prior/root_nonanswer_edge_q_new_mean": _masked_mean_1d(
             breakdown.query_new_node_score,
             ~answer_edge,
         ),
-        "root/nonanswer_edge_q_candidate_mean": _masked_mean_1d(
+        "prior/root_nonanswer_edge_q_candidate_mean": _masked_mean_1d(
             breakdown.semantic_score,
             ~answer_edge,
         ),
-        "root/nonanswer_edge_new_text_rate": _masked_mean_1d(
+        "prior/root_nonanswer_edge_new_text_rate": _masked_mean_1d(
             breakdown.new_text_mask,
             ~answer_edge,
         ),
-        "root/nonanswer_edge_logit_mean": _masked_mean_1d(
-            breakdown.final_logits,
+        "prior/root_nonanswer_edge_logit_mean": _masked_mean_1d(
+            breakdown.semantic_logits,
+            ~answer_edge,
+        ),
+        "target_policy/root_nonanswer_edge_logit_mean": _masked_mean_1d(
+            target_logits,
             ~answer_edge,
         ),
     }
@@ -260,33 +270,33 @@ def compute_root_answer_edge_ranking_diagnostics(
 def _kendall_tau_by_graph(
     *,
     prior_logits: torch.Tensor,
-    final_logits: torch.Tensor,
+    target_logits: torch.Tensor,
     edge_batch: torch.Tensor,
     num_graphs: int,
 ) -> torch.Tensor:
     prior_logits = prior_logits.view(-1)
-    final_logits = final_logits.to(
+    target_logits = target_logits.to(
         device=prior_logits.device, dtype=prior_logits.dtype
     ).view(-1)
     edge_batch = edge_batch.to(device=prior_logits.device, dtype=torch.long).view(-1)
 
     if (
         prior_logits.numel() == 0
-        or final_logits.numel() != prior_logits.numel()
+        or target_logits.numel() != prior_logits.numel()
         or edge_batch.numel() != prior_logits.numel()
     ):
         return prior_logits.new_zeros((0,))
 
     values: list[torch.Tensor] = []
     prior_cpu = prior_logits.detach().float().cpu()
-    final_cpu = final_logits.detach().float().cpu()
+    target_cpu = target_logits.detach().float().cpu()
     edge_batch_cpu = edge_batch.detach().cpu()
     for graph_id in range(int(num_graphs)):
         mask = edge_batch_cpu.eq(graph_id)
         if int(mask.sum().item()) < 2:
             continue
 
-        tau = _kendall_tau_1d(prior_cpu[mask], final_cpu[mask])
+        tau = _kendall_tau_1d(prior_cpu[mask], target_cpu[mask])
         if tau is None:
             continue
 
@@ -1179,35 +1189,37 @@ def _masked_mean_1d(values: torch.Tensor, mask: torch.Tensor) -> float:
 
 def _root_answer_edge_rank_default_metrics() -> dict[str, float]:
     return {
-        "edge/base_logit_std": 0.0,
-        "edge/prior_rank_vs_final_rank_kendall": 0.0,
-        "edge/answer_edge_prior_rank": 0.0,
-        "edge/answer_edge_final_rank": 0.0,
+        "prior/root_logit_std": 0.0,
+        "prior/target_policy_rank_kendall": 0.0,
+        "prior/answer_edge_rank": 0.0,
+        "target_policy/answer_edge_rank": 0.0,
         "root/frontier_answer_edge_rate": 0.0,
         "root/frontier_answer_edge_count_mean": 0.0,
         "root/frontier_candidate_count_mean": 0.0,
-        "root/prior_answer_edge_best_rank_mean": 0.0,
-        "root/prior_answer_edge_best_rank_median": 0.0,
-        "root/prior_answer_edge_top1_rate": 0.0,
-        "root/prior_answer_edge_top5_rate": 0.0,
-        "root/prior_answer_edge_mrr": 0.0,
-        "root/policy_answer_edge_best_rank_mean": 0.0,
-        "root/policy_answer_edge_best_rank_median": 0.0,
-        "root/policy_answer_edge_top1_rate": 0.0,
-        "root/policy_answer_edge_top5_rate": 0.0,
-        "root/policy_answer_edge_mrr": 0.0,
-        "root/answer_edge_rank_delta_mean": 0.0,
-        "root/final_worse_than_prior_rate": 0.0,
-        "root/answer_edge_q_rel_mean": 0.0,
-        "root/answer_edge_q_new_mean": 0.0,
-        "root/answer_edge_q_candidate_mean": 0.0,
-        "root/answer_edge_new_text_rate": 0.0,
-        "root/answer_edge_logit_mean": 0.0,
-        "root/nonanswer_edge_q_rel_mean": 0.0,
-        "root/nonanswer_edge_q_new_mean": 0.0,
-        "root/nonanswer_edge_q_candidate_mean": 0.0,
-        "root/nonanswer_edge_new_text_rate": 0.0,
-        "root/nonanswer_edge_logit_mean": 0.0,
+        "prior/root_answer_edge_best_rank_mean": 0.0,
+        "prior/root_answer_edge_best_rank_median": 0.0,
+        "prior/root_answer_edge_top1_rate": 0.0,
+        "prior/root_answer_edge_top5_rate": 0.0,
+        "prior/root_answer_edge_mrr": 0.0,
+        "target_policy/root_answer_edge_best_rank_mean": 0.0,
+        "target_policy/root_answer_edge_best_rank_median": 0.0,
+        "target_policy/root_answer_edge_top1_rate": 0.0,
+        "target_policy/root_answer_edge_top5_rate": 0.0,
+        "target_policy/root_answer_edge_mrr": 0.0,
+        "target_policy/root_answer_edge_rank_delta_mean": 0.0,
+        "target_policy/root_worse_than_prior_rate": 0.0,
+        "prior/root_answer_edge_q_rel_mean": 0.0,
+        "prior/root_answer_edge_q_new_mean": 0.0,
+        "prior/root_answer_edge_q_candidate_mean": 0.0,
+        "prior/root_answer_edge_new_text_rate": 0.0,
+        "prior/root_answer_edge_logit_mean": 0.0,
+        "target_policy/root_answer_edge_logit_mean": 0.0,
+        "prior/root_nonanswer_edge_q_rel_mean": 0.0,
+        "prior/root_nonanswer_edge_q_new_mean": 0.0,
+        "prior/root_nonanswer_edge_q_candidate_mean": 0.0,
+        "prior/root_nonanswer_edge_new_text_rate": 0.0,
+        "prior/root_nonanswer_edge_logit_mean": 0.0,
+        "target_policy/root_nonanswer_edge_logit_mean": 0.0,
     }
 
 

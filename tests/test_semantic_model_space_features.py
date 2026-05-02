@@ -329,8 +329,8 @@ def test_policy_config_rejects_legacy_action_feature_switches() -> None:
         )
 
 
-def test_policy_config_rejects_doob_top_k_truncation() -> None:
-    with pytest.raises(ValueError, match="top_k was removed"):
+def test_policy_config_rejects_removed_doob_config() -> None:
+    with pytest.raises(ValueError, match="policy_cfg.doob was removed"):
         build_policy_runtime_config(
             policy_cfg={
                 "hidden_dim": 2,
@@ -340,6 +340,42 @@ def test_policy_config_rejects_doob_top_k_truncation() -> None:
                     "dde": {"enabled": False},
                 },
                 "doob": {"top_k": 2},
+            },
+            entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+            relation_embeddings=torch.eye(2, dtype=torch.float32),
+        )
+
+
+def test_policy_config_rejects_semantic_prior_in_target() -> None:
+    with pytest.raises(ValueError, match="Semantic prior is not allowed"):
+        build_policy_runtime_config(
+            policy_cfg={
+                "hidden_dim": 2,
+                "feature_encoder": {
+                    "embedding_dim": 2,
+                    "hidden_dim": 2,
+                    "dde": {"enabled": False},
+                },
+                "use_semantic_prior_in_target": True,
+            },
+            entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+            relation_embeddings=torch.eye(2, dtype=torch.float32),
+        )
+
+
+def test_policy_config_rejects_semantic_prior_proposal_for_now() -> None:
+    with pytest.raises(ValueError, match="proposal.type=none"):
+        build_policy_runtime_config(
+            policy_cfg={
+                "hidden_dim": 2,
+                "feature_encoder": {
+                    "embedding_dim": 2,
+                    "hidden_dim": 2,
+                    "dde": {"enabled": False},
+                },
+                "proposal": {"type": "mixture", "prior_weight_start": 0.5},
             },
             entity_text_embeddings=torch.eye(2, dtype=torch.float32),
             entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
@@ -545,7 +581,7 @@ def test_semantic_prior_scorer_uses_prior_as_final_logit() -> None:
     assert torch.allclose(output.semantic_logits, torch.tensor([3.0]))
 
 
-def test_doob_policy_uses_full_frontier_prior_without_frontier_size_bias(
+def test_gfn_target_policy_uses_successor_flow_not_semantic_prior(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = types.SimpleNamespace(
@@ -568,8 +604,7 @@ def test_doob_policy_uses_full_frontier_prior_without_frontier_size_bias(
     )
     policy = Policy(
         hidden_dim=2,
-        action_parameterization="doob_value_prior",
-        doob_stop_mode="reward",
+        action_parameterization="gfn_backward_flow",
         feature_encoder_cfg={
             "hidden_dim": 2,
             "entity_text_embeddings": torch.zeros((6, 2), dtype=torch.float32),
@@ -620,28 +655,32 @@ def test_doob_policy_uses_full_frontier_prior_without_frontier_size_bias(
         stop_log_reward=torch.zeros(2, dtype=torch.float32),
     )
 
-    expected_edge_logits = torch.cat(
-        [
-            torch.log_softmax(torch.tensor([3.0, 2.0, 1.0]), dim=0),
-            torch.tensor([0.0]),
-        ]
-    )
-
     assert torch.equal(out.candidate_edge_ids, torch.tensor([0, 1, 2, 3]))
     assert torch.equal(out.candidate_batch_ids, torch.tensor([0, 0, 0, 1]))
     assert frontier_call_count == 1
-    assert torch.allclose(out.edge_logits, expected_edge_logits)
-    assert torch.allclose(out.expand_logits, torch.zeros(2), atol=1e-6)
+    assert torch.allclose(out.edge_logits, torch.zeros(4))
+    assert torch.allclose(
+        out.expand_logits,
+        torch.tensor([torch.log(torch.tensor(3.0)), 0.0]),
+        atol=1e-6,
+    )
     assert torch.allclose(out.stop_logits, torch.zeros(2))
     assert isinstance(out.edge_score_breakdown, EdgeScoreBreakdown)
     assert torch.allclose(
         out.edge_score_breakdown.semantic_logits,
         torch.tensor([3.0, 2.0, 1.0, 5.0]),
     )
-    assert torch.allclose(out.edge_score_breakdown.final_logits, out.edge_logits)
+    assert torch.allclose(
+        out.edge_score_breakdown.final_logits,
+        out.edge_score_breakdown.semantic_logits,
+    )
+    assert not torch.allclose(
+        out.edge_score_breakdown.semantic_logits,
+        out.edge_logits,
+    )
 
 
-def test_doob_successor_value_does_not_materialize_dense_successor_state(
+def test_gfn_successor_flow_does_not_materialize_dense_successor_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = types.SimpleNamespace(
@@ -658,8 +697,7 @@ def test_doob_successor_value_does_not_materialize_dense_successor_state(
     )
     policy = Policy(
         hidden_dim=2,
-        action_parameterization="doob_value_prior",
-        doob_stop_mode="reward",
+        action_parameterization="gfn_backward_flow",
         feature_encoder_cfg={
             "hidden_dim": 2,
             "entity_text_embeddings": torch.zeros((3, 2), dtype=torch.float32),
@@ -681,7 +719,7 @@ def test_doob_successor_value_does_not_materialize_dense_successor_state(
 
     def fail_materialized_successor(**kwargs):  # pragma: no cover
         del kwargs
-        raise AssertionError("Doob successor value must use delta state readout")
+        raise AssertionError("Successor flow must use delta state readout")
 
     monkeypatch.setattr(
         "src.weaver.policy._candidate_successor_state",

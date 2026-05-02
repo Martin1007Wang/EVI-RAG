@@ -3,10 +3,11 @@
 _target_: src.weaver.module.WeaverModule
 
 policy_cfg:
-  action_parameterization: doob_value_prior
-  doob:
-    stop_mode: reward
-    successor_value_mode: flow
+  action_parameterization: gfn_backward_flow
+  backward_policy: uniform_removable
+  use_semantic_prior_in_target: false
+  proposal:
+    type: none
 
   hidden_dim: 1024
   state_readout_dropout: 0.0

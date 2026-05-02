@@ -18,8 +18,7 @@ class PolicyRuntimeConfig:
     edge_scorer_cfg: dict[str, Any]
     flow_head_cfg: dict[str, Any]
     action_parameterization: str
-    doob_stop_mode: str
-    doob_successor_value_mode: str
+    backward_policy: str
 
 
 @dataclass(frozen=True)
@@ -71,7 +70,7 @@ def build_policy_runtime_config(
     hidden_dim = int(cfg.pop("hidden_dim", 1024))
     state_readout_dropout = float(cfg.pop("state_readout_dropout", 0.0))
     action_parameterization = str(
-        cfg.pop("action_parameterization", "doob_value_prior")
+        cfg.pop("action_parameterization", "gfn_backward_flow")
     )
 
     feature_encoder_cfg = dict(cfg.pop("feature_encoder", {}))
@@ -91,7 +90,31 @@ def build_policy_runtime_config(
     stop_scorer_cfg = dict(cfg.pop("stop_scorer", {}))
     edge_scorer_cfg = dict(cfg.pop("edge_scorer", {}))
     flow_head_cfg = dict(cfg.pop("flow_head", {}))
-    doob_cfg = normalize_doob_config(cfg.pop("doob", {}))
+    legacy_doob_cfg = dict(cfg.pop("doob", {}))
+    if legacy_doob_cfg:
+        raise ValueError(
+            "policy_cfg.doob was removed. Use "
+            "action_parameterization='gfn_backward_flow' and "
+            "backward_policy='uniform_removable'."
+        )
+    backward_policy = str(cfg.pop("backward_policy", "uniform_removable"))
+    if backward_policy != "uniform_removable":
+        raise ValueError(
+            "policy_cfg.backward_policy must be 'uniform_removable', "
+            f"got {backward_policy!r}."
+        )
+    use_semantic_prior_in_target = bool(cfg.pop("use_semantic_prior_in_target", False))
+    if use_semantic_prior_in_target:
+        raise ValueError(
+            "Semantic prior is not allowed in the standard GFlowNet target policy."
+        )
+    proposal_cfg = dict(cfg.pop("proposal", {"type": "none"}))
+    proposal_type = str(proposal_cfg.pop("type", "none"))
+    if proposal_type != "none" or proposal_cfg:
+        raise ValueError(
+            "Semantic-prior proposal mixtures are not enabled in this experiment; "
+            "set policy_cfg.proposal.type=none."
+        )
 
     state_readout_cfg = normalize_state_readout_config(state_readout_cfg)
     stop_scorer_cfg = normalize_stop_scorer_config(stop_scorer_cfg)
@@ -105,10 +128,10 @@ def build_policy_runtime_config(
     if cfg:
         raise ValueError(f"Unused policy_cfg keys: {sorted(cfg)}.")
 
-    if action_parameterization not in {"doob_value_prior", "semantic_gate"}:
+    if action_parameterization != "gfn_backward_flow":
         raise ValueError(
-            "policy_cfg.action_parameterization must be 'doob_value_prior' or "
-            f"'semantic_gate', got {action_parameterization!r}."
+            "policy_cfg.action_parameterization must be 'gfn_backward_flow', "
+            f"got {action_parameterization!r}."
         )
 
     feature_encoder_cfg = build_feature_encoder_config(
@@ -128,8 +151,7 @@ def build_policy_runtime_config(
         edge_scorer_cfg=edge_scorer_cfg,
         flow_head_cfg=flow_head_cfg,
         action_parameterization=action_parameterization,
-        doob_stop_mode=doob_cfg["stop_mode"],
-        doob_successor_value_mode=doob_cfg["successor_value_mode"],
+        backward_policy=backward_policy,
     )
 
 
@@ -349,39 +371,6 @@ def normalize_state_readout_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_stop_scorer_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(cfg)
-
-
-def normalize_doob_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(cfg or {})
-
-    top_k = cfg.pop("top_k", None)
-    if top_k is not None:
-        raise ValueError(
-            "policy_cfg.doob.top_k was removed because Doob policy now uses "
-            "full frontier support. Remove this key instead of truncating the prior."
-        )
-
-    stop_mode = str(cfg.pop("stop_mode", "reward"))
-    if stop_mode not in {"reward", "learned"}:
-        raise ValueError(
-            "policy_cfg.doob.stop_mode must be 'reward' or 'learned', "
-            f"got {stop_mode!r}."
-        )
-
-    successor_value_mode = str(cfg.pop("successor_value_mode", "flow"))
-    if successor_value_mode != "flow":
-        raise ValueError(
-            "policy_cfg.doob.successor_value_mode must be 'flow', "
-            f"got {successor_value_mode!r}."
-        )
-
-    if cfg:
-        raise ValueError(f"Unused policy_cfg.doob keys: {sorted(cfg)}.")
-
-    return {
-        "stop_mode": stop_mode,
-        "successor_value_mode": successor_value_mode,
-    }
 
 
 def _pop_expected(

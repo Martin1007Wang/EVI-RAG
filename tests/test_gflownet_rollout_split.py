@@ -283,11 +283,30 @@ def test_runner_derives_reward_mode_from_declared_requirements(
     assert seen_modes == [
         RewardMode.EAGER_STOP_NOW,
         RewardMode.EAGER_STOP_NOW,
-        RewardMode.LAZY_TERMINAL,
-        RewardMode.LAZY_TERMINAL,
+        RewardMode.EAGER_STOP_NOW,
+        RewardMode.EAGER_STOP_NOW,
         RewardMode.EAGER_STOP_NOW,
         RewardMode.EAGER_STOP_NOW,
     ]
+
+
+def test_runner_rejects_lazy_reward_mode_for_gfn_target_policy() -> None:
+    runner = RolloutRunner(
+        expand_budget=1,
+        train_num_rollout=1,
+        eval_num_rollout=1,
+        train_chunk_size=1,
+        eval_chunk_size=1,
+    )
+
+    with pytest.raises(ValueError, match="eager_stop_now"):
+        runner.generate_eval_rollouts(
+            policy=object(),
+            reward_model=object(),
+            batch=object(),
+            temperature=1.0,
+            reward_mode=RewardMode.LAZY_TERMINAL,
+        )
 
 
 def test_runner_uses_fused_only_rollout_api(

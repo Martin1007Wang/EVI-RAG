@@ -122,8 +122,6 @@ class WeaverModule(LightningModule):
             edge_scorer_cfg=policy_runtime.edge_scorer_cfg,
             flow_head_cfg=policy_runtime.flow_head_cfg,
             action_parameterization=policy_runtime.action_parameterization,
-            doob_stop_mode=policy_runtime.doob_stop_mode,
-            doob_successor_value_mode=policy_runtime.doob_successor_value_mode,
         )
 
         self.reward_model = RewardModel(**dict(reward_cfg or {}))

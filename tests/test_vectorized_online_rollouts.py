@@ -85,7 +85,7 @@ from src.data.schema import RetrievalData
 from src.weaver.policy import Policy, PolicyOutput
 from src.weaver.reward import RewardModel
 from src.weaver.rollout.engine import RewardMode, RolloutEngine
-from src.weaver.rollout.sampling import option_action_log_probs, option_action_probs
+from src.weaver.rollout.sampling import action_log_probs, action_probs
 from src.weaver.rollout.stop_advantage import (
     StopAdvantageAuxiliary,
     StopAdvantageConfig,
@@ -135,33 +135,31 @@ def _three_node_batch():
     )
 
 
-def test_option_action_probs_separate_expand_mass_from_edge_count() -> None:
+def test_action_probs_normalize_stop_and_edges_jointly() -> None:
     edge_logits = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
     candidate_batch_ids = torch.tensor([0, 0, 1], dtype=torch.long)
 
-    stop_prob, continue_prob, edge_prob = option_action_probs(
+    stop_prob, continue_prob, edge_prob = action_probs(
         stop_logits=torch.tensor([0.0, 0.0], dtype=torch.float32),
-        expand_logits=torch.tensor([0.0, 0.0], dtype=torch.float32),
         edge_logits=edge_logits,
         candidate_batch_ids=candidate_batch_ids,
         can_expand=torch.tensor([True, False]),
         batch_size=2,
     )
 
-    expected_edge_graph0 = torch.softmax(torch.tensor([1.0, 2.0]), dim=0)
+    local = torch.softmax(torch.tensor([0.0, 1.0, 2.0]), dim=0)
 
-    assert torch.allclose(stop_prob[0], torch.tensor(0.5))
-    assert torch.allclose(continue_prob[0], torch.tensor(0.5))
-    assert torch.allclose(edge_prob[:2], expected_edge_graph0)
+    assert torch.allclose(stop_prob[0], local[0])
+    assert torch.allclose(continue_prob[0], local[1:].sum())
+    assert torch.allclose(edge_prob[:2], local[1:])
 
     assert torch.allclose(stop_prob[1], torch.tensor(1.0))
     assert torch.allclose(continue_prob[1], torch.tensor(0.0))
     assert torch.allclose(edge_prob[2], torch.tensor(0.0))
 
 
-def test_option_action_log_probs_backward_with_forced_stop_graph() -> None:
+def test_action_log_probs_backward_with_forced_stop_graph() -> None:
     stop_logits = torch.tensor([0.2, -0.3], dtype=torch.float32, requires_grad=True)
-    expand_logits = torch.tensor([0.7, 0.4], dtype=torch.float32, requires_grad=True)
     edge_logits = torch.tensor(
         [1.0, 2.0, 3.0],
         dtype=torch.float32,
@@ -169,22 +167,21 @@ def test_option_action_log_probs_backward_with_forced_stop_graph() -> None:
     )
     candidate_batch_ids = torch.tensor([0, 0, 1], dtype=torch.long)
 
-    type_logp, edge_logp = option_action_log_probs(
+    stop_logp, edge_logp = action_log_probs(
         stop_logits=stop_logits,
-        expand_logits=expand_logits,
         edge_logits=edge_logits,
         candidate_batch_ids=candidate_batch_ids,
         can_expand=torch.tensor([True, False]),
         batch_size=2,
     )
 
-    loss = type_logp[0, 0] + type_logp[0, 1] + edge_logp[:2].sum()
+    loss = stop_logp[0] + edge_logp[:2].sum()
     loss.backward()
 
     assert stop_logits.grad is not None
-    assert expand_logits.grad is not None
     assert edge_logits.grad is not None
-    assert torch.allclose(type_logp[1], torch.tensor([0.0, -float("inf")]))
+    assert torch.allclose(stop_logp[1], torch.tensor(0.0))
+    assert torch.isneginf(edge_logp[2])
 
 
 class _FakeOnlinePolicy:
@@ -450,28 +447,24 @@ def test_policy_forward_uses_rollout_ids_and_static_query_ids_for_fused_state() 
     assert output.edge_logits.shape == (4,)
 
 
-def test_rollout_engine_lazy_reward_only_evaluates_terminal_stops() -> None:
+def test_rollout_engine_rejects_lazy_reward_for_gfn_target_policy() -> None:
     batch = _batch()
     engine = RolloutEngine(expand_budget=1)
     reward_model = _CountingRewardModel(edge_cost=0.0)
 
-    rollout = engine.run_vectorized(
-        policy=_FakeOnlinePolicy(),
-        retrieval_batch=batch,
-        reward_model=reward_model,
-        num_rollouts=1,
-        temperature=1.0,
-        collect_stop_counterfactual=False,
-        collect_policy_diagnostics=True,
-        reward_mode=RewardMode.LAZY_TERMINAL,
-    )[0]
+    with pytest.raises(ValueError, match="eager_stop_now"):
+        engine.run_vectorized(
+            policy=_FakeOnlinePolicy(),
+            retrieval_batch=batch,
+            reward_model=reward_model,
+            num_rollouts=1,
+            temperature=1.0,
+            collect_stop_counterfactual=False,
+            collect_policy_diagnostics=True,
+            reward_mode=RewardMode.LAZY_TERMINAL,
+        )
 
-    assert reward_model.evaluate_calls == 1
-    assert not bool(rollout.traces.stop_now_valid_mask.any())
-    assert torch.equal(
-        rollout.stats.trajectory_length,
-        torch.tensor([2, 2], dtype=torch.long),
-    )
+    assert reward_model.evaluate_calls == 0
 
 
 def test_rollout_engine_eager_reward_writes_stop_tb_traces_without_diagnostics() -> (
