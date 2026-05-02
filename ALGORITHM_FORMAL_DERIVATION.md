@@ -341,7 +341,7 @@ g_\theta([h_q,n_s,e_s,r_s])
 z_0(e\mid s,q)=\tau\operatorname{sem}(e,s,q).
 ```
 
-在同一状态的 frontier 内归一化：
+若只看语义 base measure，可在 frontier 内归一化得到诊断分布：
 
 ```math
 \log P_0(e\mid s,q)
@@ -354,43 +354,41 @@ z_0(e\mid s,q)
 
 默认配置中 `entity_weight_init=0.1`、`logit_scale_init=5.0`，并且这两个量默认冻结。
 
-当前标准 GFlowNet target policy 不使用 \(\log P_0\)。`EdgeScorer` 只保留为语义先验诊断，后续若启用 proposal/behavior mixture，也不能把 proposal log-prob 写入 SubTB 所需的 target \(\log P_F\)。
+当前实现不会把 \(\log P_0\) 当作 Doob reference policy，也不会把语义 prior 降级为纯 diagnostics。它把 \(z_0\) 作为 forward policy 的 base logit，再由 learned residual 做 density correction。
 
-## 9. Backward-flow GFlowNet 前向策略
+## 9. Semantic Base-Measure GFlowNet 前向策略
 
-当前默认 `action_parameterization` 是 `gfn_backward_flow`，反向策略为 `uniform_removable`。
+当前默认 `action_parameterization` 是 `semantic_base_gfn`，反向策略为 `uniform_removable`。
 
-对每个候选边，策略先构造 successor state \(s+e\)，再估计其 flow：
-
-```math
-\log F_\theta(s+e\mid q)
-```
-
-每条候选边还需要先计算 child state 下的反向概率：
+State flow head 只估计状态流：
 
 ```math
-\log P_B(s\mid s+e)
-=
--\log|\mathcal R(s+e)|.
+\log F_\theta(s\mid q)=f_\theta(h_s).
 ```
 
-候选扩展动作的 target logit 为：
+它不负责 edge ranking。候选扩展动作由 semantic base measure 加 learned residual 打分：
 
 ```math
 z_e(s,q)
 =
-\log F_\theta(s+e\mid q)
-+
-\log P_B(s\mid s+e).
+z_0(e\mid s,q)+r_\theta(s,e,q).
 ```
 
-Stop 动作的 target logit 是当前状态立即停止的奖励：
+其中 residual head 的输入包括当前状态 readout \(h_s\)、frontier edge representation \(\phi(e)\)、transition-type features，以及 detached semantic logit \(z_0(e)\)。默认 residual 最后一层零初始化，因此训练初始时：
 
 ```math
-z_{\operatorname{Stop}}(s)=\log R(s).
+z_e(s,q)=z_0(e\mid s,q).
 ```
 
-动作空间不是两阶段 Stop/Expand gate，而是单层动作集合：
+Stop 动作不再使用 gold reward logit。它由 learned stop head 给出：
+
+```math
+z_{\operatorname{Stop}}(s,q)
+=
+g_\theta(h_s,\xi(s),\psi(\mathcal C(s))).
+```
+
+其中 \(\xi(s)\) 包括已扩展边数和 remaining budget；\(\psi(\mathcal C(s))\) 包括 frontier edge logits 的 max、logmeanexp 和 log size。动作空间是单层集合：
 
 ```math
 \mathcal A(s)
@@ -416,11 +414,11 @@ P_F(a\mid s,q)
 P_F(\operatorname{Expand}(e)\mid s,q)
 =
 \frac{
-\exp(\log F_\theta(s+e\mid q)+\log P_B(s\mid s+e))
+\exp(z_0(e\mid s,q)+r_\theta(s,e,q))
 }{
-\exp(\log R(s))+
+\exp(z_{\operatorname{Stop}}(s,q))+
 \sum_{e'\in\mathcal C(s)}
-\exp(\log F_\theta(s+e'\mid q)+\log P_B(s\mid s+e'))
+\exp(z_0(e'\mid s,q)+r_\theta(s,e',q))
 }.
 ```
 
@@ -434,7 +432,7 @@ P_{\text{beh}}(a\mid s)\propto \exp(z_a/T).
 
 ## 10. 终止奖励
 
-终端奖励由两部分构成：anchor-supported answer coverage 和边复杂度惩罚。
+终端奖励由两部分构成：minimal sufficient evidence score 和边复杂度惩罚。
 
 给定终端子图 \(s=(V_s,E_s)\)，先把 active edges 当作无向边，从 active anchors 出发求连通可达集合：
 
@@ -444,13 +442,30 @@ P_{\text{beh}}(a\mid s)\propto \exp(z_a/T).
 \operatorname{Reach}_{\text{undir}}(A,E_s).
 ```
 
-奖励答案集合默认为 \(Y^+\)。支持答案召回率为：
+奖励答案集合默认为 \(Y^+\)。支持答案召回率和精确率为：
+
+```math
+\operatorname{Rec}_{\text{supp}}(s,q)
+=
+\frac{|Y^+\cap \operatorname{Supp}(s)|}
+{|Y^+|}.
+```
+
+```math
+\operatorname{Prec}_{\text{supp}}(s,q)
+=
+\frac{|Y^+\cap \operatorname{Supp}(s)|}
+{\max(1,|\operatorname{Supp}(s)\setminus A|)}.
+```
+
+默认 utility 是 \(F_\beta\)：
 
 ```math
 U(s,q)
 =
-\frac{|Y^+\cap \operatorname{Supp}(s)|}
-{|Y^+|}.
+F_\beta(\operatorname{Prec}_{\text{supp}},\operatorname{Rec}_{\text{supp}})
+=
+\frac{(1+\beta^2)PR}{\beta^2P+R}.
 ```
 
 若某图没有 reward target，则实现中该图的 \(U\) 保持为 0。
@@ -476,22 +491,18 @@ r_{\min}
 
 ```math
 \epsilon=10^{-4},\qquad
+\beta=2,\qquad
 \lambda_E=0.10,\qquad
 r_{\min}=-30.
 ```
 
-注意：代码还计算 answer precision、answer recall、answer F1、answer degree excess 等指标，但这些是诊断项，不进入终止奖励。
+注意：代码仍保留 unsupported answer precision/recall/F1、answer degree excess 等诊断项。
 
 ## 11. 反向策略
 
 GFlowNet loss 需要前向概率和反向概率。当前反向策略不是神经网络，而是 uniform removable-edge policy。
 
-实现中有两个反向概率计算位置：
-
-- target policy 构造 edge logits 前，对所有候选 \((s,e)\) 批量计算 \(\log P_B(s\mid s+e)\)；
-- 采样出某条 Expand transition 后，再把同一 uniform backward policy 下的 selected \(\log P_B\) 写入 rollout trace，供 SubTB 使用。
-
-这两者必须语义一致。若某候选扩展后“刚加的边”不在 child 的 removable set 中，代码会直接报错，因为那意味着 forward action 有非零 target 概率但 backward transition 不存在。
+反向策略不进入 forward target logits。采样出某条 Expand transition 后，executor 把 uniform backward policy 下的 selected \(\log P_B\) 写入 rollout trace，供 SubTB 使用。若刚加的边不在 child 的 removable set 中，代码会直接报错，因为这意味着 forward action 有非零概率但 backward transition 不存在。
 
 对扩展后的 child state \(s'=s+e\)，定义可逆移除集合：
 
@@ -601,7 +612,7 @@ w_{i,j}\propto \lambda_{\text{SubTB}}^{j-i}.
 
 ## 14. StopTB counterfactual
 
-因为当前策略每步都能计算“现在停下”的 reward，训练额外加入 StopTB：
+Stop policy 是 learned head。训练时若启用 StopTB，则 rollout 需要额外计算每个 visited state 的 stop-now reward，用于监督 stop flow equation：
 
 ```math
 \mathcal L_{\text{StopTB}}
@@ -625,7 +636,9 @@ w_{i,j}\propto \lambda_{\text{SubTB}}^{j-i}.
 =
 \mathcal L_{\text{SubTB}}
 +
-\mathcal L_{\text{StopTB}}.
+\lambda_{\text{StopTB}}\mathcal L_{\text{StopTB}}
++
+\lambda_{\text{local}}\mathcal L_{\text{local}}.
 ```
 
 代码中还支持 StopAdv：
@@ -640,6 +653,32 @@ y_{\operatorname{stop}}(s)
 
 并用 BCE 监督 Stop 与“所有 Expand 动作之和”的边界。但默认配置 `stop_adv_coef=0.0`，因此它不是当前默认训练目标的一部分。
 
+代码还支持 reward-consistent local improvement auxiliary。对每个状态，把一跳 child reward improvement 构成 teacher：
+
+```math
+Q_R(e\mid s)
+=
+\operatorname{softmax}_{e\in\mathcal C(s)}
+\left(
+\frac{\log R(s+e)-\log R(s)}{\tau_R}
+\right),
+```
+
+并加入：
+
+```math
+\mathcal L_{\text{local}}
+=
+\operatorname{KL}
+\left(
+Q_R(\cdot\mid s)
+\parallel
+P_F^\theta(\cdot\mid s,\operatorname{Expand})
+\right).
+```
+
+默认 `local_improvement_coef=0.0` 且 `rollout_cfg.local_improvement.enabled=false`，所以它是可选 warmup/credit-assignment 项，不替代 SubTB。
+
 ## 15. 训练流程
 
 一次训练 step 的抽象流程如下：
@@ -648,15 +687,15 @@ y_{\operatorname{stop}}(s)
 2. `FeatureEncoder` 为静态图、问题、关系构造 `FeatureBank`。
 3. 对每个样本采样 \(K\) 条 rollout。
 4. 每个 step：
-   - 计算当前 stop-now reward；
-   - 用 policy 计算 state flow、Stop logit 和候选 successor flow；
-   - 对每条候选 expansion 计算 candidate-level \(\log P_B(s\mid s+e)\)；
-   - 用 \(z_{\operatorname{Stop}}=\log R(s)\) 与 \(z_e=\log F_\theta(s+e)+\log P_B(s\mid s+e)\) 做单层 action softmax；
+   - 若 StopTB/diagnostics/auxiliary 需要，则计算当前 stop-now reward；
+   - 用 policy 计算 state flow、learned Stop logit、semantic base logits 和 residual edge logits；
+   - 用 \(z_{\operatorname{Stop}}=g_\theta(\cdot)\) 与 \(z_e=z_0(e)+r_\theta(s,e)\) 做单层 action softmax；
    - 按 temperature behavior policy 采样动作；
    - Expand 时更新 active edges/nodes；
+   - 对 selected Expand transition 计算 uniform removable backward \(\log P_B\)，写入 trace；
    - Stop 时写入 terminal reward。
 5. 将 rollout traces 拼成 `RolloutBatch`。
-6. 计算 SubTB + StopTB loss。
+6. 计算 SubTB + StopTB + optional local-improvement loss。
 7. Lightning manual optimization 执行反传和 optimizer step。
 
 默认配置中：
@@ -733,11 +772,11 @@ V_{\text{union}}=\bigcup_{k=1}^{K}V_{\text{term}}^{(k)}.
 P_\theta(x\mid q,G)\propto R(x,q),
 ```
 
-其中 \(x\) 是从 anchor 出发生长出的有限步证据子图。当前 target policy 由 state flow、uniform removable backward policy 和 stop-now reward 共同定义；语义先验只用于 diagnostics，除非后续显式启用为 behavior proposal。终止奖励定义“答案是否被 anchor-supported evidence 覆盖且子图是否紧凑”。
+其中 \(x\) 是从 anchor 出发生长出的有限步证据子图。当前 target policy 是 semantic base-measure forward policy：PLM semantic edge logit 提供 base measure，learned residual 校准边选择，learned stop head 决定终止；uniform removable backward policy 只进入 SubTB 的流量守恒项。终止奖励定义“证据子图是否 anchor-supported、精确/召回是否充分、是否紧凑”。
 
 可以压缩成四句话：
 
 1. 数据准备把每个问题物化为局部有向图、anchor、reachable targets 和路径诊断标签。
 2. 模型从 anchor-induced 初始子图开始，每步在 Stop 与 Expand frontier edge 之间采样。
-3. 终端子图若能从 anchor 连通支持更多答案且使用更少 learned edges，就有更高 reward。
-4. SubTB/StopTB 训练让前向采样分布逼近 reward-proportional 的证据子图分布。
+3. 终端子图若能从 anchor 连通支持更多答案、减少无关 supported 节点并使用更少 learned edges，就有更高 reward。
+4. SubTB/StopTB 训练让 semantic base policy 被全局 reward/flow 校准为 reward-proportional 的证据子图分布。

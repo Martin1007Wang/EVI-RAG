@@ -79,7 +79,7 @@ from src.weaver.nn.edge_scorer import EdgeScoreBreakdown, EdgeScorer
 from src.weaver.nn.feature_encoder import FeatureBank, FeatureEncoder
 from src.weaver.nn.flow_head import FlowHead
 from src.weaver.nn.state_readout import StateContext, StateOnlyContext, StateReadout
-from src.weaver.nn.stop_gate import StopExpandGate
+from src.weaver.nn.stop_head import LearnedStopHead
 from src.weaver.policy import Policy, _candidate_successor_state
 from src.weaver.state import RolloutState, State
 from src.weaver.state_ops import frontier_edges
@@ -308,7 +308,8 @@ def test_policy_keeps_edge_encoder_in_state_readout_only() -> None:
     assert not hasattr(policy.edge_scorer, "edge_encoder")
     assert not hasattr(policy.edge_scorer, "residual_head")
     assert not hasattr(policy.edge_scorer, "residual_scale")
-    assert not hasattr(policy, "transition_feature_builder")
+    assert hasattr(policy, "transition_feature_builder")
+    assert hasattr(policy, "edge_residual_head")
 
 
 def test_policy_config_rejects_legacy_action_feature_switches() -> None:
@@ -347,8 +348,8 @@ def test_policy_config_rejects_removed_doob_config() -> None:
         )
 
 
-def test_policy_config_rejects_semantic_prior_in_target() -> None:
-    with pytest.raises(ValueError, match="Semantic prior is not allowed"):
+def test_policy_config_requires_semantic_prior_in_target() -> None:
+    with pytest.raises(ValueError, match="Semantic base-measure"):
         build_policy_runtime_config(
             policy_cfg={
                 "hidden_dim": 2,
@@ -357,7 +358,7 @@ def test_policy_config_rejects_semantic_prior_in_target() -> None:
                     "hidden_dim": 2,
                     "dde": {"enabled": False},
                 },
-                "use_semantic_prior_in_target": True,
+                "use_semantic_prior_in_target": False,
             },
             entity_text_embeddings=torch.eye(2, dtype=torch.float32),
             entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
@@ -504,11 +505,15 @@ def test_flow_head_uses_state_only() -> None:
     assert torch.allclose(flow_a, flow_b)
 
 
-def test_stop_gate_default_uses_state_only() -> None:
-    gate = StopExpandGate(hidden_dim=2, use_frontier_summary=False, use_progress=False)
+def test_stop_head_default_uses_state_only() -> None:
+    head = LearnedStopHead(
+        hidden_dim=2,
+        use_frontier_summary=False,
+        use_progress=False,
+    )
     with torch.no_grad():
-        first = gate.net[0]
-        last = gate.net[-1]
+        first = head.net[0]
+        last = head.net[-1]
         first.weight.zero_()
         first.bias.zero_()
         last.weight.zero_()
@@ -522,21 +527,19 @@ def test_stop_gate_default_uses_state_only() -> None:
         "has_candidate_edge": torch.tensor([True]),
     }
 
-    stop_a, expand_a = gate(
+    stop_a = head(
         **kwargs,
         edge_logmeanexp=torch.tensor([100.0], dtype=torch.float32),
         edge_max=torch.tensor([120.0], dtype=torch.float32),
     )
-    stop_b, expand_b = gate(
+    stop_b = head(
         **kwargs,
         edge_logmeanexp=torch.tensor([-100.0], dtype=torch.float32),
         edge_max=torch.tensor([-80.0], dtype=torch.float32),
     )
 
     assert torch.allclose(stop_a, stop_b)
-    assert torch.allclose(expand_a, expand_b)
     assert torch.allclose(stop_a, torch.nn.functional.gelu(torch.tensor([0.5])))
-    assert torch.allclose(expand_a, torch.zeros(1))
 
 
 def test_semantic_prior_scorer_uses_prior_as_final_logit() -> None:
@@ -581,7 +584,7 @@ def test_semantic_prior_scorer_uses_prior_as_final_logit() -> None:
     assert torch.allclose(output.semantic_logits, torch.tensor([3.0]))
 
 
-def test_gfn_target_policy_uses_successor_flow_not_semantic_prior(
+def test_semantic_base_policy_uses_prior_plus_zero_init_residual(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = types.SimpleNamespace(
@@ -604,7 +607,7 @@ def test_gfn_target_policy_uses_successor_flow_not_semantic_prior(
     )
     policy = Policy(
         hidden_dim=2,
-        action_parameterization="gfn_backward_flow",
+        action_parameterization="semantic_base_gfn",
         feature_encoder_cfg={
             "hidden_dim": 2,
             "entity_text_embeddings": torch.zeros((6, 2), dtype=torch.float32),
@@ -652,35 +655,34 @@ def test_gfn_target_policy_uses_successor_flow_not_semantic_prior(
         state,
         rollout_context=context,
         return_edge_breakdown=True,
-        stop_log_reward=torch.zeros(2, dtype=torch.float32),
     )
 
     assert torch.equal(out.candidate_edge_ids, torch.tensor([0, 1, 2, 3]))
     assert torch.equal(out.candidate_batch_ids, torch.tensor([0, 0, 0, 1]))
     assert frontier_call_count == 1
-    assert torch.allclose(out.edge_logits, torch.zeros(4))
+    expected_logits = torch.tensor([3.0, 2.0, 1.0, 5.0])
+    assert torch.allclose(out.edge_logits, expected_logits)
     assert torch.allclose(
         out.expand_logits,
-        torch.tensor([torch.log(torch.tensor(3.0)), 0.0]),
+        torch.stack([torch.logsumexp(expected_logits[:3], dim=0), expected_logits[3]]),
         atol=1e-6,
     )
     assert torch.allclose(out.stop_logits, torch.zeros(2))
     assert isinstance(out.edge_score_breakdown, EdgeScoreBreakdown)
     assert torch.allclose(
         out.edge_score_breakdown.semantic_logits,
-        torch.tensor([3.0, 2.0, 1.0, 5.0]),
+        expected_logits,
     )
+    assert out.edge_score_breakdown.residual_logits is not None
+    assert torch.allclose(out.edge_score_breakdown.residual_logits, torch.zeros(4))
     assert torch.allclose(
         out.edge_score_breakdown.final_logits,
         out.edge_score_breakdown.semantic_logits,
     )
-    assert not torch.allclose(
-        out.edge_score_breakdown.semantic_logits,
-        out.edge_logits,
-    )
+    assert torch.allclose(out.edge_score_breakdown.semantic_logits, out.edge_logits)
 
 
-def test_gfn_successor_flow_does_not_materialize_dense_successor_state(
+def test_semantic_base_policy_does_not_score_edges_with_successor_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = types.SimpleNamespace(
@@ -697,7 +699,7 @@ def test_gfn_successor_flow_does_not_materialize_dense_successor_state(
     )
     policy = Policy(
         hidden_dim=2,
-        action_parameterization="gfn_backward_flow",
+        action_parameterization="semantic_base_gfn",
         feature_encoder_cfg={
             "hidden_dim": 2,
             "entity_text_embeddings": torch.zeros((3, 2), dtype=torch.float32),
@@ -729,7 +731,6 @@ def test_gfn_successor_flow_does_not_materialize_dense_successor_state(
     out = policy(
         batch,
         State.create_initial(batch, expand_budget=2),
-        stop_log_reward=torch.zeros(1, dtype=torch.float32),
     )
 
     assert out.edge_logits.shape == (2,)
@@ -953,13 +954,11 @@ def test_successor_delta_state_readout_matches_materialized_successors() -> None
     assert torch.allclose(delta.relation_path_h, exact.relation_path_h, atol=1e-6)
 
 
-def test_stop_gate_expand_logit_ignores_raw_frontier_logsumexp() -> None:
-    gate = StopExpandGate(
+def test_stop_head_ignores_raw_frontier_logsumexp() -> None:
+    head = LearnedStopHead(
         hidden_dim=2,
         use_progress=True,
         use_frontier_summary=True,
-        progress_penalty_init=0.5,
-        trainable_progress_penalty=False,
     )
 
     kwargs = {
@@ -969,49 +968,44 @@ def test_stop_gate_expand_logit_ignores_raw_frontier_logsumexp() -> None:
         "has_candidate_edge": torch.tensor([True, True]),
     }
 
-    stop_a, expand_a = gate(
+    stop_a = head(
         **kwargs,
         edge_logits=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
         edge_batch_index=torch.tensor([0, 0, 1], dtype=torch.long),
     )
-    stop_b, expand_b = gate(
+    stop_b = head(
         **kwargs,
         edge_logits=torch.tensor([100.0, 200.0, 300.0], dtype=torch.float32),
         edge_batch_index=torch.tensor([0, 0, 1], dtype=torch.long),
     )
 
     assert torch.allclose(stop_a, stop_b)
-    assert torch.allclose(expand_a, expand_b)
     assert torch.allclose(stop_a, torch.zeros(2))
-    assert torch.allclose(
-        expand_a,
-        torch.tensor([-0.25, -0.5]),
-    )
 
 
-def test_stop_gate_can_use_frontier_summary_without_logsumexp_bias() -> None:
-    gate = StopExpandGate(
+def test_stop_head_can_use_frontier_summary_without_logsumexp_bias() -> None:
+    head = LearnedStopHead(
         hidden_dim=2,
         use_progress=False,
         use_frontier_summary=True,
     )
-    gate.scalar_norm = torch.nn.Identity()
+    head.scalar_norm = torch.nn.Identity()
     with torch.no_grad():
-        first = gate.net[0]
-        last = gate.net[-1]
+        first = head.net[0]
+        last = head.net[-1]
         first.weight.zero_()
         first.bias.zero_()
         last.weight.zero_()
         last.bias.zero_()
         first.weight[0, 3] = 1.0
-        last.weight[1, 0] = 1.0
+        last.weight[0, 0] = 1.0
 
-    _, low_quality_expand = gate(
+    low_quality_stop = head(
         state_h=torch.zeros((1, 2), dtype=torch.float32),
         frontier_summary=torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
         has_candidate_edge=torch.tensor([True]),
     )
-    _, high_quality_expand = gate(
+    high_quality_stop = head(
         state_h=torch.zeros((2, 2), dtype=torch.float32),
         frontier_summary=torch.tensor(
             [
@@ -1023,5 +1017,5 @@ def test_stop_gate_can_use_frontier_summary_without_logsumexp_bias() -> None:
         has_candidate_edge=torch.tensor([True, True]),
     )
 
-    assert torch.allclose(high_quality_expand[0], high_quality_expand[1])
-    assert high_quality_expand[0] > low_quality_expand[0]
+    assert torch.allclose(high_quality_stop[0], high_quality_stop[1])
+    assert high_quality_stop[0] > low_quality_stop[0]

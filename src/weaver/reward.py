@@ -24,8 +24,11 @@ class AnswerStats:
 @dataclass(frozen=True, slots=True)
 class SupportStats:
     supported_answer_recall: torch.Tensor
+    supported_answer_precision: torch.Tensor
+    supported_answer_f_beta: torch.Tensor
     supported_answer_count: torch.Tensor
     reward_answer_count: torch.Tensor
+    supported_retrieved_count: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +45,11 @@ class TerminalRewardOutput:
     base_log_reward: torch.Tensor
 
     supported_answer_recall: torch.Tensor
+    supported_answer_precision: torch.Tensor
+    supported_answer_f_beta: torch.Tensor
     supported_answer_count: torch.Tensor
     reward_answer_count: torch.Tensor
+    supported_retrieved_count: torch.Tensor
 
     expanded_edge_count: torch.Tensor
     complexity_penalty: torch.Tensor
@@ -60,13 +66,11 @@ class TerminalRewardOutput:
 
 class RewardModel(nn.Module):
     """
-    Anchor-supported answer evidence reward.
+    Minimal sufficient evidence reward.
 
     Terminal subgraph x is scored by:
 
-        U(x, q)
-            = fraction of reward answer nodes that are present and connected
-              to at least one active anchor inside x.
+        U(x, q) = F_beta over anchor-supported retrieved nodes.
 
         B(x)
             = |E_x \\ E_0|, the number of learned expanded non-root edges.
@@ -78,7 +82,7 @@ class RewardModel(nn.Module):
 
     The reward is a terminal verifier. It does not expose target distances,
     shortest-path labels, teacher paths, or rollout-time decisions to the policy.
-    Answer degree and F1-style statistics are diagnostics only.
+    Answer degree statistics remain diagnostics only.
 
     Recommended first setting:
         edge_cost = 0.08 ~ 0.12
@@ -90,6 +94,8 @@ class RewardModel(nn.Module):
         utility_epsilon: float = 1.0e-4,
         log_reward_clip_min: float = -30.0,
         edge_cost: float = 0.10,
+        score_mode: str = "f_beta",
+        beta: float = 2.0,
         debug_checks: bool = False,
     ) -> None:
         super().__init__()
@@ -97,6 +103,8 @@ class RewardModel(nn.Module):
         self.utility_epsilon = float(utility_epsilon)
         self.log_reward_clip_min = float(log_reward_clip_min)
         self.edge_cost = float(edge_cost)
+        self.score_mode = str(score_mode)
+        self.beta = float(beta)
         self.debug_checks = bool(debug_checks)
 
         if self.utility_epsilon <= 0.0:
@@ -109,6 +117,13 @@ class RewardModel(nn.Module):
             )
         if self.edge_cost < 0.0:
             raise ValueError(f"edge_cost must be >= 0, got {self.edge_cost}.")
+        if self.score_mode not in {"f_beta", "supported_recall"}:
+            raise ValueError(
+                "score_mode must be 'f_beta' or 'supported_recall', "
+                f"got {score_mode!r}."
+            )
+        if self.beta <= 0.0:
+            raise ValueError(f"beta must be > 0, got {self.beta}.")
 
     @torch.no_grad()
     def forward(
@@ -293,6 +308,7 @@ class RewardModel(nn.Module):
             edge_batch=edge_batch,
             num_graphs=num_graphs,
             dtype=dtype,
+            beta=self.beta,
         )
 
         compactness = compactness_stats(
@@ -306,7 +322,11 @@ class RewardModel(nn.Module):
             dtype=dtype,
         )
 
-        utility = support.supported_answer_recall
+        utility = (
+            support.supported_answer_f_beta
+            if self.score_mode == "f_beta"
+            else support.supported_answer_recall
+        )
         base_log_reward = (utility + self.utility_epsilon).log()
 
         complexity_penalty = self.edge_cost * compactness.expanded_edge_count
@@ -320,8 +340,11 @@ class RewardModel(nn.Module):
             utility=utility,
             base_log_reward=base_log_reward,
             supported_answer_recall=support.supported_answer_recall,
+            supported_answer_precision=support.supported_answer_precision,
+            supported_answer_f_beta=support.supported_answer_f_beta,
             supported_answer_count=support.supported_answer_count,
             reward_answer_count=support.reward_answer_count,
+            supported_retrieved_count=support.supported_retrieved_count,
             expanded_edge_count=compactness.expanded_edge_count,
             complexity_penalty=complexity_penalty,
             answer_f1=answer.f1,
@@ -420,13 +443,18 @@ def anchor_answer_support(
     edge_batch: torch.Tensor,
     num_graphs: int,
     dtype: torch.dtype,
+    beta: float = 2.0,
 ) -> SupportStats:
     """
-    Anchor-supported answer coverage.
+    Anchor-supported answer precision/recall.
 
         supported_answer_recall[g]
             = # target nodes connected to an active anchor inside selected subgraph
               / # target nodes
+
+        supported_answer_precision[g]
+            = # supported target nodes
+              / # active non-anchor nodes connected to an active anchor
 
     Connectivity is undirected. That is intentional: this is evidence support,
     not directed logical entailment.
@@ -435,7 +463,10 @@ def anchor_answer_support(
     num_graphs = int(num_graphs)
 
     supported_answer_recall = torch.zeros(num_graphs, dtype=dtype, device=device)
+    supported_answer_precision = torch.zeros(num_graphs, dtype=dtype, device=device)
+    supported_answer_f_beta = torch.zeros(num_graphs, dtype=dtype, device=device)
     supported_answer_count = torch.zeros(num_graphs, dtype=dtype, device=device)
+    supported_retrieved_count = torch.zeros(num_graphs, dtype=dtype, device=device)
     reward_answer_count = count_by_graph(
         target_mask,
         node_batch,
@@ -470,16 +501,47 @@ def anchor_answer_support(
             continue
 
         hits = sum(int(node_id) in reached for node_id in graph_targets.tolist())
+        supported_non_anchor = [
+            node_id
+            for node_id in reached
+            if bool(graph_nodes[node_id])
+            and not bool(anchor_mask[node_id])
+        ]
+        retrieved = max(1, len(supported_non_anchor))
+        recall_denom = max(1, int(graph_targets.numel()))
+        precision = float(hits) / float(retrieved)
+        recall = float(hits) / float(recall_denom)
+
         supported_answer_count[graph_id] = float(hits)
-        supported_answer_recall[graph_id] = float(hits) / float(
-            max(1, int(graph_targets.numel()))
+        supported_retrieved_count[graph_id] = float(len(supported_non_anchor))
+        supported_answer_precision[graph_id] = precision
+        supported_answer_recall[graph_id] = recall
+        supported_answer_f_beta[graph_id] = _f_beta(
+            precision=precision,
+            recall=recall,
+            beta=float(beta),
         )
 
     return SupportStats(
         supported_answer_recall=supported_answer_recall,
+        supported_answer_precision=supported_answer_precision,
+        supported_answer_f_beta=supported_answer_f_beta,
         supported_answer_count=supported_answer_count,
         reward_answer_count=reward_answer_count,
+        supported_retrieved_count=supported_retrieved_count,
     )
+
+
+def _f_beta(
+    *,
+    precision: float,
+    recall: float,
+    beta: float,
+) -> float:
+    if precision <= 0.0 or recall <= 0.0:
+        return 0.0
+    beta_sq = float(beta) ** 2
+    return (1.0 + beta_sq) * precision * recall / (beta_sq * precision + recall)
 
 
 def compactness_stats(

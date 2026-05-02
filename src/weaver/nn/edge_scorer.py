@@ -19,6 +19,7 @@ class EdgeScoreBreakdown:
     new_text_mask: torch.Tensor
     semantic_logits: torch.Tensor
     final_logits: torch.Tensor
+    residual_logits: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +33,7 @@ class _EdgeBaseMeasure:
 
 class EdgeScorer(nn.Module):
     """
-    Semantic-prior scorer for candidate Expand edges.
+    Semantic base-measure scorer for candidate Expand edges.
 
     For candidate edge e=(u,r,v):
 
@@ -40,11 +41,10 @@ class EdgeScorer(nn.Module):
             = <q_sem, r_sem>
               + alpha * 1[new endpoint is text] * <q_sem, new_sem>
 
-        logit(e | s) = tau * semantic(e)
+        z0(e | s, q) = tau * semantic(e)
 
-    This scorer intentionally has no state-conditioned residual branch. It
-    keeps the same high-level forward contract as the policy scorer while making
-    semantic logits and final logits identical.
+    This module intentionally has no state-conditioned residual branch. Policy
+    adds the learned density correction r_theta(s,e,q) on top of z0.
     """
 
     def __init__(
@@ -114,6 +114,7 @@ class EdgeScorer(nn.Module):
                 semantic_score=empty,
                 new_text_mask=empty_bool,
                 semantic_logits=empty,
+                residual_logits=empty,
                 final_logits=empty,
             )
 
@@ -154,6 +155,7 @@ class EdgeScorer(nn.Module):
             semantic_score=base.semantic_score,
             new_text_mask=base.new_text_mask,
             semantic_logits=base.semantic_logits,
+            residual_logits=torch.zeros_like(final_logits),
             final_logits=final_logits,
         )
 

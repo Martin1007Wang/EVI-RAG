@@ -6,15 +6,13 @@ from torch import nn
 from src.utils.nn_utils import zero_last_linear
 
 
-class StopExpandGate(nn.Module):
+class LearnedStopHead(nn.Module):
     """
-    Option-level Stop/Continue gate.
+    Learned Stop action logit head.
 
-    Stop and Continue are scored by a learned two-logit head over state,
-    progress, and frontier summary features. Raw frontier edge logits are not
-    summed into the Continue option; edge logits are only used later by the
-    conditional edge policy P(edge | state, Continue). Rollout logic still
-    forces Stop when no Continue action is legal.
+    Stop is a regular action in the flat target policy. Its logit is learned
+    from state, progress, frontier semantic-base summary, and scalar state
+    stats; it never receives stop-now reward as an input.
     """
 
     def __init__(
@@ -22,15 +20,20 @@ class StopExpandGate(nn.Module):
         *,
         hidden_dim: int,
         stop_bias_init: float = 0.0,
-        expand_bias_init: float = 0.0,
         dropout: float = 0.0,
         trainable_bias: bool = True,
         use_progress: bool = False,
         use_frontier_summary: bool = False,
-        progress_penalty_init: float = 0.0,
-        trainable_progress_penalty: bool = True,
+        state_stat_dim: int = 0,
+        **removed_kwargs: object,
     ) -> None:
         super().__init__()
+
+        if removed_kwargs:
+            raise ValueError(
+                "LearnedStopHead no longer accepts Stop/Expand gate keys: "
+                f"{sorted(removed_kwargs)}."
+            )
 
         self.hidden_dim = int(hidden_dim)
         if self.hidden_dim <= 0:
@@ -38,20 +41,23 @@ class StopExpandGate(nn.Module):
 
         self.use_progress = bool(use_progress)
         self.use_frontier_summary = bool(use_frontier_summary)
+        self.state_stat_dim = int(state_stat_dim)
+        if self.state_stat_dim < 0:
+            raise ValueError(
+                f"state_stat_dim must be >= 0, got {state_stat_dim}."
+            )
 
         self._stop_bias_init = float(stop_bias_init)
-        self._expand_bias_init = float(expand_bias_init)
-        self._progress_penalty_init = float(progress_penalty_init)
 
         self.stop_bias = nn.Parameter(torch.tensor(self._stop_bias_init))
-        self.expand_bias = nn.Parameter(torch.tensor(self._expand_bias_init))
-        self.progress_penalty = nn.Parameter(torch.tensor(self._progress_penalty_init))
 
         self.stop_bias.requires_grad_(bool(trainable_bias))
-        self.expand_bias.requires_grad_(bool(trainable_bias))
-        self.progress_penalty.requires_grad_(bool(trainable_progress_penalty))
 
-        scalar_dim = int(self.use_progress) + 3 * int(self.use_frontier_summary)
+        scalar_dim = (
+            int(self.use_progress)
+            + 3 * int(self.use_frontier_summary)
+            + self.state_stat_dim
+        )
         input_dim = self.hidden_dim + scalar_dim
 
         self.scalar_norm = nn.LayerNorm(scalar_dim) if scalar_dim > 0 else None
@@ -60,7 +66,7 @@ class StopExpandGate(nn.Module):
             nn.Linear(input_dim, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(float(dropout)),
-            nn.Linear(self.hidden_dim, 2),
+            nn.Linear(self.hidden_dim, 1),
         )
 
         self.reset_parameters()
@@ -69,8 +75,6 @@ class StopExpandGate(nn.Module):
         zero_last_linear(self.net)
         with torch.no_grad():
             self.stop_bias.fill_(self._stop_bias_init)
-            self.expand_bias.fill_(self._expand_bias_init)
-            self.progress_penalty.fill_(self._progress_penalty_init)
 
     def forward(
         self,
@@ -84,8 +88,9 @@ class StopExpandGate(nn.Module):
         edge_logmeanexp: torch.Tensor | None = None,
         edge_max: torch.Tensor | None = None,
         edge_log_size: torch.Tensor | None = None,
+        state_stats: torch.Tensor | None = None,
         has_candidate_edge: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         del edge_logits, edge_batch_index
 
         if state_h.ndim != 2:
@@ -144,25 +149,27 @@ class StopExpandGate(nn.Module):
 
             scalars.extend([max_value, logmeanexp, log_size])
 
-        option_input = state_h
+        stop_input = state_h
+        if self.state_stat_dim > 0:
+            stats = _matrix_or_zeros(
+                state_stats,
+                batch_size=batch_size,
+                width=self.state_stat_dim,
+                device=device,
+                dtype=dtype,
+            )
+            scalars.extend([stats[:, idx] for idx in range(self.state_stat_dim)])
+
         if scalars:
             scalar_h = torch.stack(scalars, dim=-1)
             if self.scalar_norm is not None:
                 scalar_h = self.scalar_norm(scalar_h)
-            option_input = torch.cat([state_h, scalar_h], dim=-1)
+            stop_input = torch.cat([state_h, scalar_h], dim=-1)
 
-        option_logits = self.net(option_input)
-        stop_logit = option_logits[:, 0] + self.stop_bias.to(
+        return self.net(stop_input).squeeze(-1) + self.stop_bias.to(
             device=device,
             dtype=dtype,
         )
-        expand_logit = (
-            option_logits[:, 1]
-            + self.expand_bias.to(device=device, dtype=dtype)
-            - self.progress_penalty.to(device=device, dtype=dtype) * progress
-        )
-
-        return stop_logit, expand_logit
 
 
 def _resolve_frontier_summary(
@@ -214,4 +221,24 @@ def _vector_or_zeros(
     return value.to(device=device, dtype=dtype).view(batch_size)
 
 
-__all__ = ["StopExpandGate"]
+def _matrix_or_zeros(
+    value: torch.Tensor | None,
+    *,
+    batch_size: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if value is None:
+        return torch.zeros(batch_size, width, device=device, dtype=dtype)
+
+    value = value.to(device=device, dtype=dtype)
+    if value.shape != (batch_size, width):
+        raise ValueError(
+            f"state_stats must have shape [{batch_size}, {width}], "
+            f"got {tuple(value.shape)}."
+        )
+    return value
+
+
+__all__ = ["LearnedStopHead"]

@@ -17,10 +17,11 @@ from .feature_encoder import (
 )
 from .flow_head import FlowHead
 from .state_readout import FrontierReadout, StateContext, StateOnlyContext, StateReadout
-from .stop_gate import StopExpandGate
+from .stop_head import LearnedStopHead
+from .transition_features import TransitionFeatureBuilder, TransitionFeatureOutput
 
 __all__ = [
-    "StopExpandGate",
+    "LearnedStopHead",
     "CandidateContext",
     "CandidateSemanticScores",
     "DirectionalDDE",
@@ -36,6 +37,8 @@ __all__ = [
     "StateContext",
     "StateOnlyContext",
     "StateReadout",
+    "TransitionFeatureBuilder",
+    "TransitionFeatureOutput",
     "build_candidate_context",
     "candidate_semantic_scores",
 ]

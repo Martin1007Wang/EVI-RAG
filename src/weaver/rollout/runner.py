@@ -40,7 +40,7 @@ class RolloutRewardRequirements:
 
     @property
     def reward_mode(self) -> RewardMode:
-        return RewardMode.EAGER_STOP_NOW
+        return RewardMode.EAGER_STOP_NOW if self.stop_now else RewardMode.LAZY_TERMINAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +448,14 @@ def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
             rollouts,
             lambda rollout: rollout.traces.stop_adv_continue_log_reward,
         ),
+        local_improvement_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.local_improvement_loss,
+        ),
+        local_improvement_valid_mask=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.local_improvement_valid_mask,
+        ),
     )
 
 
@@ -481,18 +489,28 @@ def resolve_rollout_reward_requirements(
     auxiliary: StepAuxiliary | None = None,
     collect_stop_counterfactual: bool = False,
 ) -> RolloutRewardRequirements:
-    del loss_fn, auxiliary, collect_stop_counterfactual
-
-    if (
-        reward_mode is not None
-        and _coerce_reward_mode(reward_mode) != RewardMode.EAGER_STOP_NOW
-    ):
-        raise ValueError(
-            "Standard GFlowNet action logits require reward_mode='eager_stop_now' "
-            "because Stop is a target-policy action at every visited state."
+    requires_stop_now = bool(collect_stop_counterfactual)
+    if loss_fn is not None:
+        requires_stop_now = requires_stop_now or bool(
+            getattr(loss_fn, "requires_stop_now_reward", False)
+        )
+    if auxiliary is not None:
+        requires_stop_now = requires_stop_now or bool(
+            getattr(auxiliary, "requires_stop_now_reward", False)
         )
 
-    return RolloutRewardRequirements.from_stop_now_required(True)
+    if reward_mode is not None:
+        mode = _coerce_reward_mode(reward_mode)
+        if requires_stop_now and mode != RewardMode.EAGER_STOP_NOW:
+            raise ValueError(
+                "reward_mode='eager_stop_now' is required when StopTB, "
+                "stop counterfactuals, or rollout auxiliaries need stop-now rewards."
+            )
+        return RolloutRewardRequirements.from_stop_now_required(
+            mode == RewardMode.EAGER_STOP_NOW
+        )
+
+    return RolloutRewardRequirements.from_stop_now_required(requires_stop_now)
 
 
 def _coerce_reward_mode(reward_mode: RewardMode | str) -> RewardMode:

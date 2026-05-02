@@ -87,6 +87,9 @@ class RolloutBuffer:
     stop_adv_valid_mask: torch.Tensor = field(init=False)
     stop_adv_continue_log_reward: torch.Tensor = field(init=False)
 
+    local_improvement_loss: torch.Tensor = field(init=False)
+    local_improvement_valid_mask: torch.Tensor = field(init=False)
+
     def __post_init__(self) -> None:
         self.B = int(self.B)
         self.T = int(self.T)
@@ -151,6 +154,9 @@ class RolloutBuffer:
         self.stop_adv_target = self._zeros_float(bt)
         self.stop_adv_valid_mask = self._zeros_bool(bt)
         self.stop_adv_continue_log_reward = self._zeros_float(bt)
+
+        self.local_improvement_loss = self._zeros_float(bt)
+        self.local_improvement_valid_mask = self._zeros_bool(bt)
 
     @property
     def active(self) -> torch.Tensor:
@@ -372,6 +378,28 @@ class RolloutBuffer:
         self.stop_adv_continue_log_reward[write_mask, t] = continue_log_reward[
             write_mask
         ]
+
+    def write_local_improvement(
+        self,
+        *,
+        t: int,
+        active: torch.Tensor,
+        loss: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> None:
+        self._check_t(t)
+
+        active = self._as_bool(active, shape=(self.B,), name="active")
+        loss = self._as_float(loss, shape=(self.B,), name="local_improvement.loss")
+        valid_mask = self._as_bool(
+            valid_mask,
+            shape=(self.B,),
+            name="local_improvement.valid_mask",
+        )
+
+        write_mask = active & valid_mask
+        self.local_improvement_loss[write_mask, t] = loss[write_mask]
+        self.local_improvement_valid_mask[write_mask, t] = True
 
     def finalize_unfinished(
         self,

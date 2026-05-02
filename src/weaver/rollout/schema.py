@@ -93,6 +93,9 @@ class RolloutTraces:
     stop_adv_valid_mask: torch.Tensor | None = None
     stop_adv_continue_log_reward: torch.Tensor | None = None
 
+    local_improvement_loss: torch.Tensor | None = None
+    local_improvement_valid_mask: torch.Tensor | None = None
+
     def __post_init__(self) -> None:
         if self.stop_adv_loss is None:
             object.__setattr__(self, "stop_adv_loss", self._compute_stop_adv_loss())
@@ -199,6 +202,8 @@ class RolloutBatch:
                 stop_adv_target=buffer.stop_adv_target,
                 stop_adv_valid_mask=buffer.stop_adv_valid_mask,
                 stop_adv_continue_log_reward=buffer.stop_adv_continue_log_reward,
+                local_improvement_loss=buffer.local_improvement_loss,
+                local_improvement_valid_mask=buffer.local_improvement_valid_mask,
             ),
         )
 

@@ -3,9 +3,9 @@
 _target_: src.weaver.module.WeaverModule
 
 policy_cfg:
-  action_parameterization: gfn_backward_flow
+  action_parameterization: semantic_base_gfn
   backward_policy: uniform_removable
-  use_semantic_prior_in_target: false
+  use_semantic_prior_in_target: true
   proposal:
     type: none
 
@@ -37,6 +37,18 @@ policy_cfg:
     trainable_entity_weight: false
     trainable_logit_scale: false
 
+  edge_residual:
+    dropout: 0.0
+    trainable: true
+    zero_init: true
+    include_semantic_logit: true
+
+  stop_scorer:
+    use_progress: true
+    use_frontier_summary: true
+    state_stat_dim: 2
+    dropout: 0.0
+
   flow_head:
     num_layers: 1
     dropout: 0.0
@@ -58,6 +70,10 @@ rollout_cfg:
     continue_pool_temperature: 0.5
     label_temperature: 0.5
 
+  local_improvement:
+    enabled: false
+    temperature: 0.5
+
 eval_cfg: ${eval_metric}
 
 schedule_cfg:
@@ -70,6 +86,8 @@ schedule_cfg:
     temperature_warmup_steps: 1
 
 reward_cfg:
+  score_mode: f_beta
+  beta: 2.0
   utility_epsilon: 1.0e-4
   log_reward_clip_min: -30.0
   edge_cost: 0.10
@@ -81,6 +99,7 @@ loss_cfg:
   subtb_coef: 1.0
   stop_tb_coef: 1.0
   stop_adv_coef: 0.0
+  local_improvement_coef: 0.0
   debug: false
 
 diagnostic_cfg:

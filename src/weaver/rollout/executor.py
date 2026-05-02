@@ -13,7 +13,6 @@ from src.weaver.policy import PolicyOutput
 from src.weaver.reward import RewardModel, TerminalRewardOutput
 from src.weaver.state import RolloutState
 
-from .backward import compute_candidate_uniform_backward_log_probs
 from .sampling import CONTINUE_ACTION, STOP_ACTION, sample_policy_actions
 from .schema import StepResult
 
@@ -177,16 +176,11 @@ class FusedStepExecutor:
         if bool((can_expand & ~active).any()):
             raise ValueError("can_expand cannot be true for inactive rollout rows.")
 
-        target_step_out = self.with_candidate_backward_logits(
-            step_out=step_out,
-            state=state,
-        )
-
         action = sample_policy_actions(
-            stop_logits=target_step_out.stop_logits,
-            edge_logits=target_step_out.edge_logits,
-            candidate_edge_ids=target_step_out.candidate_edge_ids,
-            candidate_batch_ids=target_step_out.candidate_batch_ids,
+            stop_logits=step_out.stop_logits,
+            edge_logits=step_out.edge_logits,
+            candidate_edge_ids=step_out.candidate_edge_ids,
+            candidate_batch_ids=step_out.candidate_batch_ids,
             active=active,
             can_expand=can_expand,
             temperature=float(temperature),
@@ -366,29 +360,6 @@ class FusedStepExecutor:
         return torch.stack(values, dim=0).to(
             device=self.graph.edge_index.device,
             dtype=torch.float32,
-        )
-
-    def with_candidate_backward_logits(
-        self,
-        *,
-        step_out: PolicyOutput,
-        state: RolloutState,
-    ) -> PolicyOutput:
-        candidate_log_pb = compute_candidate_uniform_backward_log_probs(
-            state=state,
-            edge_index=self.graph.edge_index,
-            edge_batch=self.graph.edge_batch,
-            candidate_edge_ids=step_out.candidate_edge_ids,
-            candidate_batch_ids=step_out.candidate_batch_ids,
-            num_graphs=self.graph.num_graphs,
-        )
-        edge_logits = step_out.edge_logits.to(
-            device=self.graph.edge_index.device,
-            dtype=torch.float32,
-        ) + candidate_log_pb.to(device=self.graph.edge_index.device, dtype=torch.float32)
-        return replace_policy_edge_logits(
-            step_out,
-            edge_logits=edge_logits,
         )
 
     def _stop(
@@ -640,43 +611,6 @@ def validate_policy_output(
     )
 
 
-def replace_policy_edge_logits(
-    step_out: PolicyOutput,
-    *,
-    edge_logits: torch.Tensor,
-) -> PolicyOutput:
-    return PolicyOutput(
-        state_log_flow=step_out.state_log_flow,
-        stop_logits=step_out.stop_logits,
-        expand_logits=edge_segment_logsumexp(
-            values=edge_logits,
-            batch_ids=step_out.candidate_batch_ids,
-            num_graphs=int(step_out.stop_logits.numel()),
-        ),
-        edge_logits=edge_logits,
-        candidate_edge_ids=step_out.candidate_edge_ids,
-        candidate_batch_ids=step_out.candidate_batch_ids,
-        edge_score_breakdown=step_out.edge_score_breakdown,
-    )
-
-
-def edge_segment_logsumexp(
-    *,
-    values: torch.Tensor,
-    batch_ids: torch.Tensor,
-    num_graphs: int,
-) -> torch.Tensor:
-    num_graphs = int(num_graphs)
-    values = values.view(-1)
-    batch_ids = batch_ids.to(device=values.device, dtype=torch.long).view(-1)
-    output = values.new_full((num_graphs,), -torch.inf)
-    for graph_id in range(num_graphs):
-        mask = batch_ids.eq(graph_id)
-        if bool(mask.any()):
-            output[graph_id] = torch.logsumexp(values[mask], dim=0)
-    return output
-
-
 def validate_candidate_tensors(
     *,
     edge_logits: torch.Tensor,
@@ -801,6 +735,9 @@ def validate_terminal_reward(
         "reward.complexity_penalty": reward.complexity_penalty,
         "reward.base_log_reward": reward.base_log_reward,
         "reward.utility": reward.utility,
+        "reward.supported_answer_precision": reward.supported_answer_precision,
+        "reward.supported_answer_f_beta": reward.supported_answer_f_beta,
+        "reward.supported_retrieved_count": reward.supported_retrieved_count,
         "reward.expanded_edge_count": reward.expanded_edge_count,
         "reward.answer_degree_excess": reward.answer_degree_excess,
     }.items():
@@ -884,10 +821,7 @@ __all__ = [
     "StepGraphContext",
     "TerminalStepTensors",
     "budget_exhausted_mask",
-    "compute_candidate_uniform_backward_log_probs",
-    "edge_segment_logsumexp",
     "has_candidate",
-    "replace_policy_edge_logits",
     "validate_candidate_tensors",
     "validate_fused_frontier_candidates",
     "validate_policy_output",

@@ -85,6 +85,10 @@ from src.data.schema import RetrievalData
 from src.weaver.policy import Policy, PolicyOutput
 from src.weaver.reward import RewardModel
 from src.weaver.rollout.engine import RewardMode, RolloutEngine
+from src.weaver.rollout.local_improvement import (
+    LocalImprovementAuxiliary,
+    LocalImprovementConfig,
+)
 from src.weaver.rollout.sampling import action_log_probs, action_probs
 from src.weaver.rollout.stop_advantage import (
     StopAdvantageAuxiliary,
@@ -447,24 +451,25 @@ def test_policy_forward_uses_rollout_ids_and_static_query_ids_for_fused_state() 
     assert output.edge_logits.shape == (4,)
 
 
-def test_rollout_engine_rejects_lazy_reward_for_gfn_target_policy() -> None:
+def test_rollout_engine_allows_lazy_reward_for_learned_stop_policy() -> None:
     batch = _batch()
     engine = RolloutEngine(expand_budget=1)
     reward_model = _CountingRewardModel(edge_cost=0.0)
 
-    with pytest.raises(ValueError, match="eager_stop_now"):
-        engine.run_vectorized(
-            policy=_FakeOnlinePolicy(),
-            retrieval_batch=batch,
-            reward_model=reward_model,
-            num_rollouts=1,
-            temperature=1.0,
-            collect_stop_counterfactual=False,
-            collect_policy_diagnostics=True,
-            reward_mode=RewardMode.LAZY_TERMINAL,
-        )
+    rollout = engine.run_vectorized(
+        policy=_FakeOnlinePolicy(),
+        retrieval_batch=batch,
+        reward_model=reward_model,
+        num_rollouts=1,
+        temperature=1.0,
+        collect_stop_counterfactual=False,
+        collect_policy_diagnostics=True,
+        reward_mode=RewardMode.LAZY_TERMINAL,
+    )[0]
 
-    assert reward_model.evaluate_calls == 0
+    assert reward_model.evaluate_calls == 1
+    assert bool(rollout.traces.policy_action_valid_mask[:, 0].all())
+    assert not bool(rollout.traces.stop_now_valid_mask.any())
 
 
 def test_rollout_engine_eager_reward_writes_stop_tb_traces_without_diagnostics() -> (
@@ -491,6 +496,31 @@ def test_rollout_engine_eager_reward_writes_stop_tb_traces_without_diagnostics()
     assert bool(rollout.traces.stop_tb_valid_mask[:, 0].all())
     assert not bool(rollout.traces.stop_tb_valid_mask[:, 1].any())
     assert bool(rollout.traces.policy_action_valid_mask[:, 0].all())
+
+
+def test_rollout_engine_writes_local_improvement_auxiliary_traces() -> None:
+    batch = _three_node_batch()
+    engine = RolloutEngine(expand_budget=1)
+    reward_model = _CountingRewardModel(edge_cost=0.0)
+
+    rollout = engine.run_vectorized(
+        policy=_FakeOnlinePolicy(),
+        retrieval_batch=batch,
+        reward_model=reward_model,
+        num_rollouts=1,
+        temperature=1.0,
+        auxiliary=LocalImprovementAuxiliary(
+            LocalImprovementConfig(enabled=True, temperature=0.5)
+        ),
+        collect_stop_counterfactual=False,
+        collect_policy_diagnostics=True,
+    )[0]
+
+    assert reward_model.evaluate_calls >= 2
+    assert rollout.traces.local_improvement_loss is not None
+    assert rollout.traces.local_improvement_valid_mask is not None
+    assert bool(rollout.traces.local_improvement_valid_mask[:, 0].any())
+    assert torch.isfinite(rollout.traces.local_improvement_loss).all()
 
 
 def test_stop_advantage_auxiliary_is_rejected_by_fused_only_rollouts() -> None:

@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from src.weaver.rollout.local_improvement import LocalImprovementConfig
 from src.weaver.rollout.stop_advantage import StopAdvantageConfig
 
 
@@ -16,6 +17,7 @@ class PolicyRuntimeConfig:
     state_readout_cfg: dict[str, Any]
     stop_scorer_cfg: dict[str, Any]
     edge_scorer_cfg: dict[str, Any]
+    edge_residual_cfg: dict[str, Any]
     flow_head_cfg: dict[str, Any]
     action_parameterization: str
     backward_policy: str
@@ -29,6 +31,7 @@ class RolloutRuntimeConfig:
     train_chunk_size: int
     eval_chunk_size: int
     stop_advantage_cfg: StopAdvantageConfig
+    local_improvement_cfg: LocalImprovementConfig
 
 
 @dataclass(frozen=True)
@@ -70,7 +73,7 @@ def build_policy_runtime_config(
     hidden_dim = int(cfg.pop("hidden_dim", 1024))
     state_readout_dropout = float(cfg.pop("state_readout_dropout", 0.0))
     action_parameterization = str(
-        cfg.pop("action_parameterization", "gfn_backward_flow")
+        cfg.pop("action_parameterization", "semantic_base_gfn")
     )
 
     feature_encoder_cfg = dict(cfg.pop("feature_encoder", {}))
@@ -89,12 +92,13 @@ def build_policy_runtime_config(
         )
     stop_scorer_cfg = dict(cfg.pop("stop_scorer", {}))
     edge_scorer_cfg = dict(cfg.pop("edge_scorer", {}))
+    edge_residual_cfg = dict(cfg.pop("edge_residual", {}))
     flow_head_cfg = dict(cfg.pop("flow_head", {}))
     legacy_doob_cfg = dict(cfg.pop("doob", {}))
     if legacy_doob_cfg:
         raise ValueError(
             "policy_cfg.doob was removed. Use "
-            "action_parameterization='gfn_backward_flow' and "
+            "action_parameterization='semantic_base_gfn' and "
             "backward_policy='uniform_removable'."
         )
     backward_policy = str(cfg.pop("backward_policy", "uniform_removable"))
@@ -103,10 +107,11 @@ def build_policy_runtime_config(
             "policy_cfg.backward_policy must be 'uniform_removable', "
             f"got {backward_policy!r}."
         )
-    use_semantic_prior_in_target = bool(cfg.pop("use_semantic_prior_in_target", False))
-    if use_semantic_prior_in_target:
+    use_semantic_prior_in_target = bool(cfg.pop("use_semantic_prior_in_target", True))
+    if not use_semantic_prior_in_target:
         raise ValueError(
-            "Semantic prior is not allowed in the standard GFlowNet target policy."
+            "Semantic base-measure GFlowNet requires "
+            "use_semantic_prior_in_target=true."
         )
     proposal_cfg = dict(cfg.pop("proposal", {"type": "none"}))
     proposal_type = str(proposal_cfg.pop("type", "none"))
@@ -128,9 +133,9 @@ def build_policy_runtime_config(
     if cfg:
         raise ValueError(f"Unused policy_cfg keys: {sorted(cfg)}.")
 
-    if action_parameterization != "gfn_backward_flow":
+    if action_parameterization != "semantic_base_gfn":
         raise ValueError(
-            "policy_cfg.action_parameterization must be 'gfn_backward_flow', "
+            "policy_cfg.action_parameterization must be 'semantic_base_gfn', "
             f"got {action_parameterization!r}."
         )
 
@@ -149,6 +154,7 @@ def build_policy_runtime_config(
         state_readout_cfg=state_readout_cfg,
         stop_scorer_cfg=stop_scorer_cfg,
         edge_scorer_cfg=edge_scorer_cfg,
+        edge_residual_cfg=edge_residual_cfg,
         flow_head_cfg=flow_head_cfg,
         action_parameterization=action_parameterization,
         backward_policy=backward_policy,
@@ -167,6 +173,9 @@ def build_rollout_runtime_config(
     train_chunk_size = cfg.pop("train_chunk_size", train_num_rollout)
     eval_chunk_size = cfg.pop("eval_chunk_size", eval_num_rollout)
     stop_advantage_cfg = StopAdvantageConfig.from_dict(cfg.pop("stop_adv", None))
+    local_improvement_cfg = LocalImprovementConfig.from_dict(
+        cfg.pop("local_improvement", None)
+    )
 
     if cfg:
         raise ValueError(f"Unused rollout_cfg keys: {sorted(cfg)}.")
@@ -197,6 +206,7 @@ def build_rollout_runtime_config(
             name="eval_chunk_size",
         ),
         stop_advantage_cfg=stop_advantage_cfg,
+        local_improvement_cfg=local_improvement_cfg,
     )
 
 

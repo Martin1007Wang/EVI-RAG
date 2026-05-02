@@ -120,6 +120,8 @@ def _rollout(batch_size: int = 1, horizon: int = 1) -> RolloutBatch:
             stop_adv_target=zeros_bt.clone(),
             stop_adv_valid_mask=bool_bt.clone(),
             stop_adv_continue_log_reward=zeros_bt.clone(),
+            local_improvement_loss=zeros_bt.clone(),
+            local_improvement_valid_mask=bool_bt.clone(),
         ),
     )
 
@@ -189,6 +191,15 @@ def test_rollout_config_rejects_removed_rollout_mode_flags() -> None:
 def test_rollout_config_rejects_stop_advantage_until_fused_support_exists() -> None:
     with pytest.raises(ValueError, match="fused-only rollouts"):
         build_rollout_runtime_config({"stop_adv": {"enabled": True}})
+
+
+def test_rollout_config_allows_local_improvement_auxiliary() -> None:
+    cfg = build_rollout_runtime_config(
+        {"local_improvement": {"enabled": True, "temperature": 0.7}}
+    )
+
+    assert cfg.local_improvement_cfg.enabled
+    assert cfg.local_improvement_cfg.temperature == pytest.approx(0.7)
 
 
 def test_runner_passes_step_auxiliary_only_for_training(
@@ -283,14 +294,14 @@ def test_runner_derives_reward_mode_from_declared_requirements(
     assert seen_modes == [
         RewardMode.EAGER_STOP_NOW,
         RewardMode.EAGER_STOP_NOW,
-        RewardMode.EAGER_STOP_NOW,
-        RewardMode.EAGER_STOP_NOW,
+        RewardMode.LAZY_TERMINAL,
+        RewardMode.LAZY_TERMINAL,
         RewardMode.EAGER_STOP_NOW,
         RewardMode.EAGER_STOP_NOW,
     ]
 
 
-def test_runner_rejects_lazy_reward_mode_for_gfn_target_policy() -> None:
+def test_runner_rejects_lazy_reward_mode_when_stop_now_is_required() -> None:
     runner = RolloutRunner(
         expand_budget=1,
         train_num_rollout=1,
@@ -300,11 +311,13 @@ def test_runner_rejects_lazy_reward_mode_for_gfn_target_policy() -> None:
     )
 
     with pytest.raises(ValueError, match="eager_stop_now"):
-        runner.generate_eval_rollouts(
+        runner.generate_rollouts(
             policy=object(),
             reward_model=object(),
             batch=object(),
+            num_rollouts=1,
             temperature=1.0,
+            collect_stop_counterfactual=True,
             reward_mode=RewardMode.LAZY_TERMINAL,
         )
 

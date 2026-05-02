@@ -131,6 +131,14 @@ def _slice_traces(
             traces.stop_adv_continue_log_reward,
             graph_slice,
         ),
+        local_improvement_loss=_slice_optional(
+            traces.local_improvement_loss,
+            graph_slice,
+        ),
+        local_improvement_valid_mask=_slice_optional(
+            traces.local_improvement_valid_mask,
+            graph_slice,
+        ),
     )
 
 

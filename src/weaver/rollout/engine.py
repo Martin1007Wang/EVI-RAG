@@ -150,19 +150,15 @@ class RolloutEngine:
                 "edge_logit_mode must be 'final' or 'semantic', "
                 f"got {config.edge_logit_mode!r}."
             )
-        if config.edge_logit_mode != "final":
+        if config.edge_logit_mode == "semantic":
             raise ValueError(
-                "Standard GFlowNet target policy requires edge_logit_mode='final'. "
-                "Semantic logits are diagnostics/proposals only."
-            )
-        if config.reward_mode != RewardMode.EAGER_STOP_NOW:
-            raise ValueError(
-                "Standard GFlowNet target policy requires "
-                "reward_mode='eager_stop_now' because Stop is a target action "
-                "at every visited state."
+                "Semantic logits are available for diagnostics/proposals but must "
+                "not replace the semantic-base target policy logits."
             )
 
-        if auxiliary is not None:
+        if auxiliary is not None and not bool(
+            getattr(auxiliary, "supports_fused_rollouts", False)
+        ):
             raise ValueError(
                 "Step auxiliaries are not supported by fused-only rollouts yet."
             )
@@ -197,7 +193,9 @@ class RolloutEngine:
     ) -> RolloutBatch:
         if config.temperature <= 0.0:
             raise ValueError(f"temperature must be positive, got {config.temperature}.")
-        if auxiliary is not None:
+        if auxiliary is not None and not bool(
+            getattr(auxiliary, "supports_fused_rollouts", False)
+        ):
             raise ValueError("Fused static-batch rollouts do not support auxiliaries.")
 
         device = retrieval_batch.edge_index.device
@@ -268,9 +266,6 @@ class RolloutEngine:
                 rollout_context=rollout_context,
                 return_edge_breakdown=False,
                 edge_logit_mode=config.edge_logit_mode,
-                stop_log_reward=(
-                    stop_now_reward.log_reward if stop_now_reward is not None else None
-                ),
             )
 
             step_context = self._build_step_context(
@@ -300,15 +295,26 @@ class RolloutEngine:
                     "stop_now_reward is required when stop counterfactuals are collected."
                 )
 
-            diagnostic_step_out = executor.with_candidate_backward_logits(
-                step_out=step_out,
-                state=policy_state,
-            )
+            if auxiliary is not None:
+                if stop_now_reward is None:
+                    raise RuntimeError(
+                        "stop_now_reward is required when a rollout auxiliary is active."
+                    )
+                auxiliary.write_step(
+                    buffer=buffer,
+                    t=t,
+                    retrieval_batch=retrieval_batch,
+                    reward_model=reward_model,
+                    state=policy_state,
+                    step_out=step_out,
+                    step_context=step_context,
+                    stop_now_reward=stop_now_reward,
+                )
 
             if need_policy_step_traces:
                 write_policy_diagnostics(
                     buffer=buffer,
-                    step_out=diagnostic_step_out,
+                    step_out=step_out,
                     step_context=step_context,
                     num_graphs=dynamic_graphs,
                 )
@@ -432,9 +438,12 @@ class RolloutEngine:
         collect_stop_counterfactual: bool,
         auxiliary: StepAuxiliary | None,
     ) -> RewardMode:
-        del collect_stop_counterfactual, auxiliary
         if reward_mode is None:
-            return RewardMode.EAGER_STOP_NOW
+            if collect_stop_counterfactual or (
+                auxiliary is not None and auxiliary.requires_stop_now_reward
+            ):
+                return RewardMode.EAGER_STOP_NOW
+            return RewardMode.LAZY_TERMINAL
 
         if isinstance(reward_mode, RewardMode):
             return reward_mode

@@ -45,7 +45,7 @@ def filter_compatible_state_dict(
         return state_dict
 
     filtered: dict[str, Any] = {}
-    reset_stop_gate = False
+    reset_stop_head = False
 
     for key, value in state_dict.items():
         current_value = current_state.get(key)
@@ -54,21 +54,21 @@ def filter_compatible_state_dict(
             and isinstance(current_value, torch.Tensor)
             and value.shape != current_value.shape
         ):
-            if key.startswith("policy.stop_gate.net.0."):
-                reset_stop_gate = True
+            if key.startswith(("policy.stop_head.net.0.", "policy.stop_gate.net.0.")):
+                reset_stop_head = True
             continue
         filtered[key] = value
 
-    if reset_stop_gate:
-        stop_gate_prefixes = (
-            "policy.stop_gate.net.",
-            "policy.stop_gate.stop_bias",
-            "policy.stop_gate.expand_bias",
+    if reset_stop_head:
+        stop_head_prefixes = (
+            "policy.stop_head.net.",
+            "policy.stop_head.stop_bias",
+            "policy.stop_gate.",
         )
         filtered = {
             key: value
             for key, value in filtered.items()
-            if not key.startswith(stop_gate_prefixes)
+            if not key.startswith(stop_head_prefixes)
         }
 
     return filtered

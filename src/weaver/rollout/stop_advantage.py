@@ -325,10 +325,6 @@ def evaluate_one_step_child_rewards(
     """
     Fast one-step stop reward evaluator for s + e.
 
-    This matches the simplified reward:
-
-        log R(s) = log(eps + support(s)) - edge_cost * expanded_edge_count(s)
-
     The function evaluates only selected candidate edges, not the full frontier.
     """
     device = state.active_nodes.device
@@ -420,8 +416,27 @@ def evaluate_one_step_child_rewards(
         # Adding an edge should not reduce undirected anchor-supported coverage.
         child_support[local_idx] = max(float(current_support[local_idx]), support)
 
+    if getattr(reward_model, "score_mode", "supported_recall") == "f_beta":
+        # Approximate one-step precision by preserving the current supported
+        # precision unless the child reaches a new answer. This helper remains
+        # an auxiliary oracle, not the terminal reward source of truth.
+        current_precision = stop_now_reward.supported_answer_precision.index_select(
+            0,
+            graph_ids,
+        ).to(device=device, dtype=torch.float32)
+        beta = float(getattr(reward_model, "beta", 2.0))
+        beta_sq = beta * beta
+        denom = beta_sq * current_precision + child_support
+        child_utility = torch.where(
+            (current_precision > 0.0) & (child_support > 0.0) & denom.gt(0.0),
+            (1.0 + beta_sq) * current_precision * child_support / denom,
+            torch.zeros_like(child_support),
+        )
+    else:
+        child_utility = child_support
+
     log_reward = (
-        (child_support + float(reward_model.utility_epsilon)).log()
+        (child_utility + float(reward_model.utility_epsilon)).log()
         - float(reward_model.edge_cost) * expanded_count
     ).clamp_min(float(reward_model.log_reward_clip_min))
 

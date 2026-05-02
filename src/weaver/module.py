@@ -26,6 +26,7 @@ from src.weaver.loss import SubTrajectoryBalanceLoss
 from src.weaver.policy import Policy
 from src.weaver.reward import RewardModel
 from src.weaver.rollout import RewardMode, RolloutRunner
+from src.weaver.rollout.local_improvement import LocalImprovementAuxiliary
 from src.weaver.rollout.stop_advantage import StopAdvantageAuxiliary
 from src.weaver.rollout.terminal_subgraph import compute_union_subgraph_masks
 
@@ -120,6 +121,7 @@ class WeaverModule(LightningModule):
             state_readout_cfg=policy_runtime.state_readout_cfg,
             stop_scorer_cfg=policy_runtime.stop_scorer_cfg,
             edge_scorer_cfg=policy_runtime.edge_scorer_cfg,
+            edge_residual_cfg=policy_runtime.edge_residual_cfg,
             flow_head_cfg=policy_runtime.flow_head_cfg,
             action_parameterization=policy_runtime.action_parameterization,
         )
@@ -153,6 +155,17 @@ class WeaverModule(LightningModule):
             if rollout_runtime.stop_advantage_cfg.enabled
             else None
         )
+        self.local_improvement_auxiliary = (
+            LocalImprovementAuxiliary(rollout_runtime.local_improvement_cfg)
+            if rollout_runtime.local_improvement_cfg.enabled
+            else None
+        )
+        if (
+            self.stop_adv_auxiliary is not None
+            and self.local_improvement_auxiliary is not None
+        ):
+            raise ValueError("Only one rollout auxiliary can be enabled at a time.")
+        self.rollout_auxiliary = self.stop_adv_auxiliary or self.local_improvement_auxiliary
 
         self.train_metrics = TrainingDiagnosticsCollector(
             debug=self.debug_metrics,
@@ -195,7 +208,7 @@ class WeaverModule(LightningModule):
             batch=batch,
             rollout_temperature=temperature,
             accumulation_batches=accumulation_batches,
-            auxiliary=self.stop_adv_auxiliary,
+            auxiliary=self.rollout_auxiliary,
             collect_stop_counterfactual=self.train_stop_counterfactual,
             collect_policy_diagnostics=self.train_policy_diagnostics,
             validate_synchronous_depth=self.train_validate_rollout_depth,

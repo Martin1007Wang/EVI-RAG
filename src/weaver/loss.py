@@ -81,9 +81,11 @@ class SubTrajectoryBalanceLoss(nn.Module):
         "loss/subtb",
         "loss/stop_tb",
         "loss/stop_adv",
+        "loss/local_improvement",
         "loss/subtb_coef",
         "loss/stop_tb_coef",
         "loss/stop_adv_coef",
+        "loss/local_improvement_coef",
         "subtb/residual_abs_mean",
         "subtb/residual_square_mean",
         "subtb/residual_mean",
@@ -125,6 +127,7 @@ class SubTrajectoryBalanceLoss(nn.Module):
         subtb_coef: float = 1.0,
         stop_tb_coef: float = 1.0,
         stop_adv_coef: float = 0.0,
+        local_improvement_coef: float = 0.0,
         log_reward_clip_min: float = -30.0,
         debug: bool = False,
     ) -> None:
@@ -142,12 +145,17 @@ class SubTrajectoryBalanceLoss(nn.Module):
             raise ValueError(f"stop_tb_coef must be >= 0, got {stop_tb_coef}.")
         if float(stop_adv_coef) < 0.0:
             raise ValueError(f"stop_adv_coef must be >= 0, got {stop_adv_coef}.")
+        if float(local_improvement_coef) < 0.0:
+            raise ValueError(
+                f"local_improvement_coef must be >= 0, got {local_improvement_coef}."
+            )
 
         self.max_trajectory_len = int(max_trajectory_len)
         self.subtb_lambda = float(subtb_lambda)
         self.subtb_coef = float(subtb_coef)
         self.stop_tb_coef = float(stop_tb_coef)
         self.stop_adv_coef = float(stop_adv_coef)
+        self.local_improvement_coef = float(local_improvement_coef)
         self.log_reward_clip_min = float(log_reward_clip_min)
         self.debug = bool(debug)
 
@@ -275,11 +283,18 @@ class SubTrajectoryBalanceLoss(nn.Module):
             target=stop_adv_target,
             valid_mask=stop_adv_valid_mask,
         )
+        local_improvement_loss = local_improvement_aux_loss(
+            loss=getattr(traces, "local_improvement_loss", None),
+            valid_mask=getattr(traces, "local_improvement_valid_mask", None),
+            device=device,
+            dtype=dtype,
+        )
 
         loss = (
             self.subtb_coef * subtb_loss
             + self.stop_tb_coef * stop_tb_loss
             + self.stop_adv_coef * stop_adv_loss
+            + self.local_improvement_coef * local_improvement_loss
         )
 
         terminal_stop_residual = residuals[
@@ -299,6 +314,7 @@ class SubTrajectoryBalanceLoss(nn.Module):
             subtb_loss=subtb_loss,
             stop_tb_loss=stop_tb_loss,
             stop_adv_loss=stop_adv_loss,
+            local_improvement_loss=local_improvement_loss,
             raw_log_rewards=raw_log_rewards,
             log_rewards=log_rewards,
             state_log_flows=state_log_flows,
@@ -352,6 +368,7 @@ class SubTrajectoryBalanceLoss(nn.Module):
         subtb_loss: torch.Tensor,
         stop_tb_loss: torch.Tensor,
         stop_adv_loss: torch.Tensor,
+        local_improvement_loss: torch.Tensor,
         raw_log_rewards: torch.Tensor,
         log_rewards: torch.Tensor,
         state_log_flows: torch.Tensor,
@@ -438,12 +455,16 @@ class SubTrajectoryBalanceLoss(nn.Module):
                 "loss/subtb": subtb_loss.detach(),
                 "loss/stop_tb": stop_tb_loss.detach(),
                 "loss/stop_adv": stop_adv_loss.detach(),
+                "loss/local_improvement": local_improvement_loss.detach(),
                 "loss/subtb_coef": state_log_flows.new_tensor(self.subtb_coef).detach(),
                 "loss/stop_tb_coef": state_log_flows.new_tensor(
                     self.stop_tb_coef
                 ).detach(),
                 "loss/stop_adv_coef": state_log_flows.new_tensor(
                     self.stop_adv_coef
+                ).detach(),
+                "loss/local_improvement_coef": state_log_flows.new_tensor(
+                    self.local_improvement_coef
                 ).detach(),
                 "subtb/residual_abs_mean": _mean_or_zero(valid_residuals.abs(), zero),
                 "subtb/residual_square_mean": _mean_or_zero(
@@ -678,6 +699,35 @@ def stop_advantage_loss(
 
     loss = -(target * logp_stop + (1.0 - target) * logp_expand)
     return loss.mean()
+
+
+def local_improvement_aux_loss(
+    *,
+    loss: torch.Tensor | None,
+    valid_mask: torch.Tensor | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if loss is None:
+        return torch.zeros((), device=device, dtype=dtype)
+    if valid_mask is None:
+        raise ValueError(
+            "local_improvement_valid_mask is required when "
+            "local_improvement_loss exists."
+        )
+
+    loss = loss.to(device=device, dtype=dtype)
+    valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+    if loss.shape != valid_mask.shape:
+        raise ValueError(
+            "local_improvement_loss and local_improvement_valid_mask must have "
+            f"matching shape: {tuple(loss.shape)} != {tuple(valid_mask.shape)}."
+        )
+
+    values = loss[valid_mask]
+    if values.numel() == 0:
+        return torch.zeros((), device=device, dtype=dtype)
+    return values.mean()
 
 
 def _optional_tensor(
