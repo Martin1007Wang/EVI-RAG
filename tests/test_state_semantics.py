@@ -7,10 +7,6 @@ from pathlib import Path
 import pytest
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
-
 if "torch_scatter" not in sys.modules:
     torch_scatter_stub = types.ModuleType("torch_scatter")
 
@@ -73,7 +69,11 @@ if "torch_scatter" not in sys.modules:
     torch_scatter_stub.scatter_logsumexp = _scatter_logsumexp
     sys.modules["torch_scatter"] = torch_scatter_stub
 
-from src.weaver.state import State
+from src.data.collate import RetrievalCollator
+from src.data.schema import RetrievalData
+from src.weaver.nn.feature_encoder import FeatureBank
+from src.weaver.nn.frontier_builder import build_frontier
+from src.weaver.state import RolloutState, State
 
 
 def _build_state(*, active_edges: torch.Tensor, expand_budget: int = 3) -> State:
@@ -84,6 +84,9 @@ def _build_state(*, active_edges: torch.Tensor, expand_budget: int = 3) -> State
         ),
         active_edges=active_edges,
         expand_budget=expand_budget,
+        boundary_nodes=torch.tensor(
+            [False, True, False, True, False, False], dtype=torch.bool
+        ),
     )
 
 
@@ -164,3 +167,46 @@ def test_create_initial_rejects_out_of_range_anchor_ids_by_default() -> None:
 
     with pytest.raises(ValueError, match="anchor_node_ids"):
         State.create_initial(batch, expand_budget=1)
+
+
+def test_rollout_frontier_is_directed_boundary_after_expansion() -> None:
+    data = RetrievalData(
+        num_nodes=4,
+        edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]], dtype=torch.long),
+        question_emb=torch.tensor([1.0, 0.0], dtype=torch.float32),
+        anchor_node_ids=torch.tensor([0], dtype=torch.long),
+        target_node_ids=torch.tensor([2], dtype=torch.long),
+        reachable_target_node_ids=torch.tensor([2], dtype=torch.long),
+    )
+    batch = RetrievalCollator()([data])
+    state = RolloutState.create_initial(
+        batch,
+        expand_budget=2,
+        rollout_to_graph=torch.tensor([0], dtype=torch.long),
+    )
+    state.apply_expansion(
+        rollout_ids=torch.tensor([0], dtype=torch.long),
+        chosen_edges=torch.tensor([0], dtype=torch.long),
+        edge_index=batch.edge_index,
+    )
+    hidden_dim = 4
+    fb = FeatureBank(
+        query_h=torch.zeros((1, hidden_dim), dtype=torch.float32),
+        node_h=torch.zeros((4, hidden_dim), dtype=torch.float32),
+        rel_h=torch.zeros((3, hidden_dim), dtype=torch.float32),
+        edge_h=torch.zeros((3, hidden_dim), dtype=torch.float32),
+        query_sem_h=torch.zeros((1, hidden_dim), dtype=torch.float32),
+        node_sem_h=torch.zeros((4, hidden_dim), dtype=torch.float32),
+        rel_sem_h=torch.zeros((3, hidden_dim), dtype=torch.float32),
+        node_incident_edge_ids=torch.tensor([0, 1, 0, 2, 1, 2], dtype=torch.long),
+        node_incident_ptr=torch.tensor([0, 2, 4, 5, 6], dtype=torch.long),
+    )
+
+    frontier = build_frontier(
+        fb=fb,
+        batch=batch,
+        state=state,
+        frontier_mode="boundary",
+    )
+
+    assert set(frontier.edge_ids.tolist()) == {2}

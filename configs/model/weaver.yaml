@@ -2,19 +2,14 @@
 
 _target_: src.weaver.module.WeaverModule
 
-policy_cfg:
-  action_parameterization: semantic_base_gfn
-  backward_policy: uniform_removable
-  use_semantic_prior_in_target: true
-  proposal:
-    type: none
+hidden_dim: 1024
 
-  hidden_dim: 1024
-  state_readout_dropout: 0.0
-
+policy:
+  mode: bdb
+  flow_budget_conditioning: additive
+  edge_scorer: pointer
+  evidence_state_encoder_dropout: 0.0
   feature_encoder:
-    embedding_dim: 1024
-    hidden_dim: 1024
     dde:
       enabled: true
       num_forward_rounds: 2
@@ -23,99 +18,57 @@ policy_cfg:
     role_projection: linear_layernorm
     role_projection_init: identity
     non_text_init_std: 0.02
-
-  state_readout:
+  evidence_state_encoder:
     num_layers: 1
     dropout: 0.0
-    use_path_memory: true
-    use_frontier_summary: true
-
-  edge_scorer:
-    type: semantic_prior
-    entity_weight_init: 0.1
-    logit_scale_init: 5.0
-    trainable_entity_weight: false
-    trainable_logit_scale: false
-
-  edge_residual:
-    dropout: 0.0
-    trainable: true
-    zero_init: true
-    include_semantic_logit: true
-
-  stop_scorer:
-    use_progress: true
-    use_frontier_summary: true
-    state_stat_dim: 2
-    dropout: 0.0
-
   flow_head:
     num_layers: 1
     dropout: 0.0
     zero_init: true
+    bias_init: 0.0
 
-rollout_cfg:
-  expand_budget: 3
+rollout:
+  expand_budget: 2
   train_num_rollout: 8
   eval_num_rollout: 8
+
+sampling:
+  train_temperature: 1.0
+  eval_temperature: 1.0
+
+reward:
+  reward_floor: 1.0e-6
+  edge_cost: 0.1
+  beta: 2.0
+  debug_checks: false
+
+loss:
+  type: bdb
+  child_flow_target: detach_current
+  backward_kernel: uniform_boundary
+  edge_mode: full
+  child_chunk_size: 2048
+  state_sources:
+    rollout: true
+    oracle_prefix: false
+    counterfactual: false
+
+eval: ${eval_metric}
+
+runtime:
   train_chunk_size: 8
   eval_chunk_size: 8
 
-  stop_adv:
-    enabled: false
-    topk_by_semantic: 8
-    topk_by_final: 8
-    random_k: 8
-    continue_pool: max
-    continue_pool_temperature: 0.5
-    label_temperature: 0.5
-
-  local_improvement:
-    enabled: false
-    temperature: 0.5
-
-eval_cfg: ${eval_metric}
-
-schedule_cfg:
-  temperature: 1.0
-  eval_temperature: 1.0
-
-  temperature_cfg:
-    temperature_start: 1.0
-    temperature_end: 1.0
-    temperature_warmup_steps: 1
-
-reward_cfg:
-  score_mode: f_beta
-  beta: 2.0
-  utility_epsilon: 1.0e-4
-  log_reward_clip_min: -30.0
-  edge_cost: 0.10
-  debug_checks: false
-
-loss_cfg:
-  max_trajectory_len: null
-  subtb_lambda: 0.9
-  subtb_coef: 1.0
-  stop_tb_coef: 1.0
-  stop_adv_coef: 0.0
-  local_improvement_coef: 0.0
-  debug: false
-
-diagnostic_cfg:
+diagnostics:
   train_rollout_diagnostics: false
   train_rollout_diagnostics_interval: 0
-  train_stop_counterfactual: false
-  train_policy_diagnostics: true
+  train_policy_diagnostics: false
   train_validate_rollout_depth: false
-
-  eval_stop_counterfactual: false
   eval_validate_rollout_depth: false
-
   grad_norm_interval: 0
 
-optimizer_cfg: ${optimizer}
-scheduler_cfg: ${scheduler}
+optimizer_cfg: null
+scheduler_cfg: null
 
 gradient_clip_val: null
 gradient_clip_algorithm: null

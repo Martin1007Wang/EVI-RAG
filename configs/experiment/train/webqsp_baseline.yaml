@@ -8,7 +8,26 @@ defaults:
   - override /scheduler: none
   - _self_
 
-task_name: train_webqsp_baseline
+task_name: train_webqsp_bdb
 
 logger:
-  tags: [weaver, baseline, webqsp]
+  tags: [weaver, bdb, webqsp]
+
+model:
+  policy:
+    mode: bdb
+    flow_budget_conditioning: additive
+    edge_scorer: pointer
+    continuation_logit_bias_init: -5.912023
+    continuation_mass_reduction: logsumexp
+    stop_head:
+      num_layers: 1
+      dropout: 0.0
+      zero_init: true
+      bias_init: 0.0
+  rollout:
+    expand_budget: 3
+  reward:
+    reward_floor: 1.0e-2
+  loss:
+    type: bdb

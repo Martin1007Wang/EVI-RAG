@@ -1,22 +1,40 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import math
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
-from torch_scatter import scatter_logsumexp, scatter_max
+from torch_scatter import scatter_max
 
 from src.data.schema import RetrievalBatch
-from src.utils.nn_utils import zero_last_linear
-from .nn.candidate_context import build_candidate_context
-from .nn.edge_encoder import EdgeEncoder
-from .nn.edge_scorer import EdgeScoreBreakdown, EdgeScorer
+from src.graph.ops import (
+    uniform_backward_parent_counts_for_selected_nonroot_edge_trace_tensors,
+    uniform_log_pb_for_selected_nonroot_edge_trace_tensors,
+)
+from src.graph.segments import segment_logsumexp
+from src.weaver.reward.context import build_reward_batch_context
+from src.weaver.reward.model import (
+    _evidence_support_stats_for_edge_traces,
+    _set_reward_terms,
+    _shortest_path_utility_for_edge_traces,
+)
+from src.weaver.reward.utility import sparse_rollout_active_node_trace
+
+from .nn.evidence_tokens import build_evidence_tokens
+from .nn.edge_residual_scorer import EdgeResidualScorer
 from .nn.feature_encoder import FeatureBank, FeatureEncoder
 from .nn.flow_head import FlowHead
-from .nn.state_readout import StateReadout
-from .nn.stop_head import LearnedStopHead
-from .nn.transition_features import TransitionFeatureBuilder, TransitionFeatureOutput
+from .nn.frontier_builder import build_frontier
+from .nn.evidence_state_encoder import EvidenceStateEncoder
+from .nn.frontier_context import FrontierContext, frontier_semantic_scores
+from .nn.frontier_pointer import FrontierPointerDiagnostics, FrontierPointerPolicy
+from .nn.stop_head import StopHead
+from .nn.successor_policy import SuccessorEdgeAdvantageScorer, SuccessorValueHead
+from .nn.transition_features import TransitionFeatureBuilder
 from .state import RolloutState, State
 
 
@@ -25,61 +43,113 @@ class PolicyOutput:
     """
     Policy evaluation at one subgraph state.
 
-    The policy is purely neural. It does not know rewards, StopAdv targets,
-    teachers, or oracle child states.
-
-    candidate_edge_ids / candidate_batch_ids are the frontier returned by
-    StateReadout for the same state snapshot. They must be interpreted under
-    the canonical state invariant:
-
-        V_s = anchors union endpoints(E_s)
-
-    For fused rollout states, candidate_batch_ids are dynamic rollout row ids,
-    not physical RetrievalBatch graph ids.
+    frontier_edge_ids / frontier_batch_ids are the global frontier returned by
+    FrontierBuilder for the same state snapshot. For fused rollout states,
+    frontier_batch_ids are dynamic rollout row ids.
     """
 
+    stop_logits: torch.Tensor
+    edge_logits: torch.Tensor
     state_log_flow: torch.Tensor
 
-    stop_logits: torch.Tensor
-    # Diagnostic aggregate logsumexp_e z_e. The target action distribution is
-    # still the flat softmax over Stop and every Expand(e), not a two-stage gate.
-    expand_logits: torch.Tensor
+    log_p_stop: torch.Tensor
+    log_p_continue: torch.Tensor
+    edge_cond_logprob: torch.Tensor
+    edge_expand_logprob: torch.Tensor
 
-    edge_logits: torch.Tensor
-    candidate_edge_ids: torch.Tensor
-    candidate_batch_ids: torch.Tensor
+    frontier_edge_ids: torch.Tensor
+    frontier_batch_ids: torch.Tensor
 
-    edge_score_breakdown: EdgeScoreBreakdown | None = None
+    edge_policy_diagnostics: FrontierPointerDiagnostics | None = None
+    log_c_continue: torch.Tensor | None = None
+    log_z_action: torch.Tensor | None = None
+    # REMOVED: TE-BFM trace fields kept only for old serialized buffers — see methodology.md §3.9
+    te_bfm_loss: torch.Tensor | None = None
+    te_bfm_valid_mask: torch.Tensor | None = None
+    te_bfm_residual_abs: torch.Tensor | None = None
+    te_bfm_target_log_value: torch.Tensor | None = None
+    te_bfm_log_reward: torch.Tensor | None = None
+    te_bfm_stop_prob: torch.Tensor | None = None
+    te_bfm_frontier_edge_count: torch.Tensor | None = None
+    te_bfm_counterfactual_child_loss: torch.Tensor | None = None
+    te_bfm_frontier_cap_used: torch.Tensor | None = None
+    te_bfm_frontier_cap_dropped_edge_count: torch.Tensor | None = None
+    bdb_stop_loss: torch.Tensor | None = None
+    bdb_edge_loss: torch.Tensor | None = None
+    bdb_base_loss: torch.Tensor | None = None
+    bdb_stop_valid_mask: torch.Tensor | None = None
+    bdb_edge_valid_mask: torch.Tensor | None = None
+    bdb_base_valid_mask: torch.Tensor | None = None
+    bdb_delta_stop: torch.Tensor | None = None
+    bdb_delta_edge: torch.Tensor | None = None
+    bdb_delta_base: torch.Tensor | None = None
+    bdb_frontier_size: torch.Tensor | None = None
+    bdb_parent_count: torch.Tensor | None = None
+    bdb_log_reward: torch.Tensor | None = None
+    bdb_log_flow: torch.Tensor | None = None
+    terminal_quotient_backup_used_rate: torch.Tensor | None = None
+    terminal_quotient_parent_count: torch.Tensor | None = None
+    terminal_quotient_edge_count: torch.Tensor | None = None
+    terminal_quotient_group_count_mean: torch.Tensor | None = None
+    terminal_quotient_floor_edge_count_mean: torch.Tensor | None = None
+    terminal_quotient_positive_edge_count_mean: torch.Tensor | None = None
+    terminal_quotient_speedup_estimate: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class PolicyContext:
+    fb: FeatureBank
+
+
+@dataclass(frozen=True)
+class _TerminalQuotientBackup:
+    continuation: torch.Tensor
+    edge_terms: torch.Tensor
+    row_ids: torch.Tensor
+    parent_count: int
+    edge_count: int
+    group_count_mean: float
+    floor_edge_count_mean: float
+    positive_edge_count_mean: float
+    speedup_estimate: float
+
+
+@dataclass(frozen=True)
+class _FrontierCapStats:
+    used_rate: float
+    dropped_edge_count_mean: float
+
+
+@dataclass(frozen=True)
+class _TerminalEdgeTerms:
+    log_reward: torch.Tensor
+    log_pb: torch.Tensor
+    supported: torch.Tensor
+
+    @property
+    def edge_terms(self) -> torch.Tensor:
+        return self.log_reward + self.log_pb
 
 
 class Policy(nn.Module):
     """
-    Forward policy and state-flow estimator for subgraph-state GFlowNet.
+    Forward policy for evidence subgraph construction.
 
     State:
-        s = (V_s, E_s)
-        V_s = anchors union endpoints(E_s)
+        s = (V_s, E_s), V_s = anchors union endpoints(E_s)
 
-    Readout:
-        h_s = StateReadout(q, V_s, E_s)
+    Action:
+        Stop or Add(e), where e belongs to the global frontier C(s).
 
-    State flow:
-        log F(s | q) = FlowHead(h_s)
+    Expand policy:
+        configurable frontier edge continuation logits over all legal frontier
+        edges. The default successor_value scorer evaluates each successor state
+        with policy-only value and edge-advantage heads.
 
-    Semantic base-measure target policy:
-        z_e(s, q) = z0(e | s, q) + r_theta(s, e, q)
-        z_stop(s, q) = learned_stop_theta(h_s, progress, frontier(z0 + r))
-
-    z0 is the PLM semantic base measure from EdgeScorer. r_theta is a
-    state-conditioned density correction. Uniform removable P_B is used only in
-    SubTB accounting after an edge is selected; it is not part of forward logits.
-
-    Root edges are part of E_s and are read by StateReadout. They are not
-    excluded from evidence. Expansion budget accounting is handled by State.
-
-    Policy consumes the state snapshot as provided by RolloutEngine. It does not
-    rebuild V_s from E_s; Executor validates that mutable state masks satisfy the
-    canonical node closure before transitions are applied.
+    Stop policy:
+        learned Stop head normalized against frontier continuation mass.
+        FrontierPointerPolicy is diagnostic-only unless the pointer scorer is
+        explicitly selected for ablation.
     """
 
     def __init__(
@@ -87,300 +157,1378 @@ class Policy(nn.Module):
         *,
         feature_encoder_cfg: dict[str, Any],
         hidden_dim: int = 1024,
-        state_readout_dropout: float = 0.0,
-        state_readout_cfg: dict[str, Any] | None = None,
-        transition_features_cfg: dict[str, Any] | None = None,
-        action_features_cfg: dict[str, Any] | None = None,
-        stop_scorer_cfg: dict[str, Any] | None = None,
-        edge_scorer_cfg: dict[str, Any] | None = None,
-        edge_residual_cfg: dict[str, Any] | None = None,
+        mode: str = "bdb",
+        max_budget: int = 8,
+        flow_budget_conditioning: str = "none",
+        te_bfm_lookahead_depth: int = 2,
+        te_bfm_child_chunk_size: int = 4096,
+        te_bfm_terminal_chunk_size: int = 4096,
+        te_bfm_max_backup_edges_per_state: int | None = None,
+        te_bfm_include_counterfactual_internal_states: bool = False,
+        te_bfm_max_expanded_states: int = 1000000,
+        bdb_child_chunk_size: int = 2048,
+        edge_scorer: str = "successor_value",
+        continuation_logit_bias_init: float = -5.912023,
+        continuation_mass_reduction: str = "logsumexp",
+        evidence_state_encoder_dropout: float = 0.0,
+        evidence_state_encoder_cfg: dict[str, Any] | None = None,
         flow_head_cfg: dict[str, Any] | None = None,
-        action_parameterization: str = "semantic_base_gfn",
+        frontier_pointer_cfg: dict[str, Any] | None = None,
+        stop_head_cfg: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
-
         self.hidden_dim = int(hidden_dim)
         if self.hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
-
-        self.action_parameterization = str(action_parameterization)
-        if self.action_parameterization != "semantic_base_gfn":
+        self.mode = str(mode).lower()
+        if self.mode not in {"bdb"}:
+            raise ValueError(f"Unsupported policy mode {mode!r}.")
+        self.max_budget = int(max_budget)
+        if self.max_budget < 0:
+            raise ValueError(f"max_budget must be non-negative, got {max_budget}.")
+        self.flow_budget_conditioning = str(flow_budget_conditioning).lower()
+        if self.flow_budget_conditioning not in {"none", "additive"}:
             raise ValueError(
-                "action_parameterization must be 'semantic_base_gfn', "
-                f"got {action_parameterization!r}."
+                "flow_budget_conditioning must be 'none' or 'additive', "
+                f"got {flow_budget_conditioning!r}."
+            )
+        self.te_bfm_lookahead_depth = int(te_bfm_lookahead_depth)
+        self.te_bfm_child_chunk_size = int(te_bfm_child_chunk_size)
+        self.te_bfm_terminal_chunk_size = int(te_bfm_terminal_chunk_size)
+        self.te_bfm_max_backup_edges_per_state = (
+            None
+            if te_bfm_max_backup_edges_per_state is None
+            else int(te_bfm_max_backup_edges_per_state)
+        )
+        self.te_bfm_include_counterfactual_internal_states = bool(
+            te_bfm_include_counterfactual_internal_states
+        )
+        self.te_bfm_max_expanded_states = int(te_bfm_max_expanded_states)
+        self.bdb_child_chunk_size = int(bdb_child_chunk_size)
+        # REMOVED: TE-BFM backup hyperparameter validation — see methodology.md §3.9
+        if self.bdb_child_chunk_size < 1:
+            raise ValueError("bdb_child_chunk_size must be >= 1.")
+        self._last_te_bfm_terminal_quotient_diagnostics: dict[str, float] = {
+            "terminal_quotient_backup_used_rate": 0.0,
+            "terminal_quotient_parent_count": 0.0,
+            "terminal_quotient_edge_count": 0.0,
+            "terminal_quotient_group_count_mean": 0.0,
+            "terminal_quotient_floor_edge_count_mean": 0.0,
+            "terminal_quotient_positive_edge_count_mean": 0.0,
+            "terminal_quotient_speedup_estimate": 0.0,
+            "frontier_cap_used_rate": 0.0,
+            "frontier_cap_dropped_edge_count_mean": 0.0,
+        }
+        self.edge_scorer = str(edge_scorer)
+        allowed_edge_scorers = {"pointer"}
+        if self.edge_scorer not in allowed_edge_scorers:
+            raise ValueError(
+                "edge_scorer must be one of "
+                f"{sorted(allowed_edge_scorers)}, got {self.edge_scorer!r}."
+            )
+        self.continuation_logit_bias = nn.Parameter(
+            torch.tensor(float(continuation_logit_bias_init), dtype=torch.float32)
+        )
+        self.continuation_mass_reduction = str(continuation_mass_reduction)
+        allowed_mass_reductions = {"logsumexp", "logmeanexp"}
+        if self.continuation_mass_reduction not in allowed_mass_reductions:
+            raise ValueError(
+                "continuation_mass_reduction must be one of "
+                f"{sorted(allowed_mass_reductions)}, "
+                f"got {self.continuation_mass_reduction!r}."
             )
 
         self.feature_encoder = FeatureEncoder(**feature_encoder_cfg)
 
-        self.edge_encoder = EdgeEncoder(hidden_dim=self.hidden_dim)
-
-        state_readout_kwargs = dict(state_readout_cfg or {})
-        state_readout_kwargs.setdefault("dropout", float(state_readout_dropout))
-
-        self.state_readout = StateReadout(
+        state_encoder_kwargs = dict(evidence_state_encoder_cfg or {})
+        state_encoder_kwargs.setdefault(
+            "dropout",
+            float(evidence_state_encoder_dropout),
+        )
+        self.state_encoder = EvidenceStateEncoder(
             hidden_dim=self.hidden_dim,
-            edge_encoder=self.edge_encoder,
-            **state_readout_kwargs,
+            **state_encoder_kwargs,
         )
 
         self.flow_head = FlowHead(
             hidden_dim=self.hidden_dim,
             **(flow_head_cfg or {}),
         )
-
-        if transition_features_cfg is not None and action_features_cfg is not None:
-            raise ValueError(
-                "Use only transition_features_cfg; action_features_cfg is a legacy alias."
-            )
-        transition_cfg = (
-            transition_features_cfg
-            if transition_features_cfg is not None
-            else action_features_cfg
+        self.budget_embedding = (
+            nn.Embedding(self.max_budget + 1, self.hidden_dim)
+            if self.flow_budget_conditioning == "additive"
+            else None
         )
-        if transition_cfg:
-            raise ValueError(
-                "transition_features_cfg no longer accepts handcrafted feature "
-                f"switches; residual transition features are fixed. Got: {sorted(transition_cfg)}."
-            )
-
+        self.stop_head = StopHead(
+            hidden_dim=self.hidden_dim,
+            **(stop_head_cfg or {}),
+        )
         self.transition_feature_builder = TransitionFeatureBuilder(
             hidden_dim=self.hidden_dim,
-            dde_dim=int(getattr(self.feature_encoder, "dde_dim", 0)),
         )
-
-        stop_head_kwargs = dict(stop_scorer_cfg or {})
-        stop_head_kwargs.setdefault("use_progress", True)
-        stop_head_kwargs.setdefault("use_frontier_summary", True)
-        stop_head_kwargs.setdefault("state_stat_dim", 2)
-        self.stop_head = LearnedStopHead(
+        self.edge_residual_scorer = EdgeResidualScorer(
             hidden_dim=self.hidden_dim,
-            **stop_head_kwargs,
+            feature_dim=self.transition_feature_builder.feature_dim,
         )
-
-        edge_scorer_kwargs = dict(edge_scorer_cfg or {})
-        if "share_edge_encoder_with_readout" in edge_scorer_kwargs:
-            raise ValueError(
-                "edge_scorer.share_edge_encoder_with_readout was removed with the "
-                "residual edge scorer."
-            )
-        self.edge_scorer = EdgeScorer(
+        self.successor_value_head = SuccessorValueHead(hidden_dim=self.hidden_dim)
+        self.successor_edge_advantage_scorer = SuccessorEdgeAdvantageScorer(
             hidden_dim=self.hidden_dim,
-            **edge_scorer_kwargs,
+            feature_dim=self.transition_feature_builder.feature_dim,
         )
-        self.edge_residual_head = EdgeResidualHead(
+        self.frontier_pointer = FrontierPointerPolicy(
             hidden_dim=self.hidden_dim,
-            transition_feature_dim=self.transition_feature_builder.feature_dim,
-            **(edge_residual_cfg or {}),
+            **(frontier_pointer_cfg or {}),
         )
 
-    @property
-    def requires_stop_log_reward(self) -> bool:
-        return False
-
-    def prepare_rollout_context(self, batch: RetrievalBatch) -> FeatureBank:
-        return self.feature_encoder(batch)
+    def prepare_rollout_context(self, batch: RetrievalBatch) -> PolicyContext:
+        fb = self.feature_encoder(batch)
+        return PolicyContext(fb=fb)
 
     def forward(
         self,
         batch: RetrievalBatch,
         state: State | RolloutState,
-        rollout_context: FeatureBank | None = None,
+        rollout_context: PolicyContext | FeatureBank | None = None,
         *,
-        return_edge_breakdown: bool = False,
-        edge_logit_mode: str = "final",
-        stop_log_reward: torch.Tensor | None = None,
+        reward_model: Any | None = None,
+        remaining_budget: torch.Tensor | None = None,
+        return_edge_diagnostics: bool = False,
+        compute_bdb_trace: bool = False,
     ) -> PolicyOutput:
-        del stop_log_reward
-
-        if edge_logit_mode not in {"final", "semantic"}:
-            raise ValueError(
-                "edge_logit_mode must be 'final' or 'semantic', "
-                f"got {edge_logit_mode!r}."
-            )
-
-        fb = (
-            rollout_context
-            if rollout_context is not None
-            else self.feature_encoder(batch)
-        )
-
+        policy_context = self._coerce_policy_context(batch, rollout_context)
+        fb = policy_context.fb
         device = fb.node_h.device
-        num_graphs = int(batch.num_graphs)
 
         self._validate_feature_bank(
             fb=fb,
             batch=batch,
+            num_graphs=int(batch.num_graphs),
+        )
+
+        context = self.state_encoder(fb=fb, batch=batch, state=state)
+        num_policy_graphs = int(context.state_h.size(0))
+        if remaining_budget is None:
+            remaining_budget = state.remaining_budget_per_graph(
+                edge_batch=batch.edge_batch,
+                num_graphs=num_policy_graphs,
+            )
+        remaining_budget = remaining_budget.to(device=device, dtype=torch.long).view(-1)
+        if remaining_budget.shape != (num_policy_graphs,):
+            raise ValueError(
+                "remaining_budget must have shape "
+                f"[{num_policy_graphs}], got {tuple(remaining_budget.shape)}."
+            )
+        frontier_context = build_frontier(
+            fb=fb,
+            batch=batch,
+            state=state,
+            frontier_mode=self._frontier_mode(),
+        )
+        frontier_edge_ids = frontier_context.edge_ids.to(
+            device=device,
+            dtype=torch.long,
+        )
+        frontier_batch_ids = frontier_context.graph_id.to(
+            device=device,
+            dtype=torch.long,
+        )
+        full_frontier_counts = torch.bincount(
+            frontier_batch_ids,
+            minlength=num_policy_graphs,
+        ).to(device=device, dtype=torch.float32)
+        if frontier_edge_ids.numel() > 0:
+            frontier_has_budget = remaining_budget.gt(0).index_select(
+                0,
+                frontier_batch_ids,
+            )
+            frontier_edge_ids = frontier_edge_ids[frontier_has_budget]
+            frontier_batch_ids = frontier_batch_ids[frontier_has_budget]
+            frontier_context = _filter_frontier_context(
+                frontier_context,
+                frontier_has_budget,
+                device=device,
+            )
+        # REMOVED: TE-BFM top-K backup frontier cap — see methodology.md §3.10
+        edge_diagnostics = None
+        if return_edge_diagnostics:
+            evidence_tokens, evidence_mask = build_evidence_tokens(
+                fb=fb,
+                batch=batch,
+                state=state,
+                query_h=context.query_h,
+            )
+            edge_output = self.frontier_pointer(
+                fb=fb,
+                context=context,
+                frontier_edge_ids=frontier_edge_ids,
+                frontier_batch_ids=frontier_batch_ids,
+                frontier_context=frontier_context,
+                evidence_tokens=evidence_tokens,
+                evidence_mask=evidence_mask,
+                return_diagnostics=True,
+            )
+            if not isinstance(edge_output, FrontierPointerDiagnostics):
+                raise RuntimeError(
+                    "FrontierPointerPolicy must return diagnostics when "
+                    "return_edge_diagnostics=True."
+                )
+            edge_diagnostics = edge_output
+
+        state_log_flow = self.evaluate_state_log_flow(
+            batch=batch,
+            state=state,
+            remaining_budget=remaining_budget,
+            rollout_context=policy_context,
+            context=context,
+        )
+        # REMOVED: reward/backup-derived inference logits — see methodology.md §3.6
+        stop_action_logits = self.stop_head(state_h=context.state_h)
+        (
+            continuation_logits,
+            log_c_continue,
+            log_z_action,
+            stop_logits,
+        ) = self._learned_action_terms(
+            batch=batch,
+            state=state,
+            rollout_context=policy_context,
+            frontier_batch_ids=frontier_batch_ids,
+            frontier_edge_ids=frontier_edge_ids,
+            context=context,
+            frontier_context=frontier_context,
+            stop_action_logits=stop_action_logits,
+            num_graphs=num_policy_graphs,
+            dtype=state_log_flow.dtype,
+            device=state_log_flow.device,
+        )
+        (
+            log_p_stop,
+            log_p_continue,
+            edge_cond_logprob,
+            edge_expand_logprob,
+        ) = hazard_policy_log_probs(
+            stop_logits=stop_logits,
+            edge_logits=continuation_logits,
+            frontier_batch_ids=frontier_batch_ids,
+            num_graphs=num_policy_graphs,
+        )
+        bdb_trace: dict[str, torch.Tensor] = {}
+        if self.mode == "bdb" and compute_bdb_trace:
+            if reward_model is None:
+                raise ValueError("reward_model is required when compute_bdb_trace=True.")
+            bdb_trace = self._bdb_trace(
+                batch=batch,
+                state=state,
+                rollout_context=policy_context,
+                frontier_edge_ids=frontier_edge_ids,
+                frontier_batch_ids=frontier_batch_ids,
+                remaining_budget=remaining_budget,
+                state_log_flow=state_log_flow,
+                log_p_stop=log_p_stop,
+                edge_expand_logprob=edge_expand_logprob,
+                full_frontier_counts=full_frontier_counts.to(
+                    device=state_log_flow.device,
+                    dtype=state_log_flow.dtype,
+                ),
+                reward_model=reward_model,
+                dtype=state_log_flow.dtype,
+                device=state_log_flow.device,
+            )
+
+        return PolicyOutput(
+            stop_logits=stop_logits,
+            edge_logits=continuation_logits,
+            state_log_flow=state_log_flow,
+            log_p_stop=log_p_stop,
+            log_p_continue=log_p_continue,
+            edge_cond_logprob=edge_cond_logprob,
+            edge_expand_logprob=edge_expand_logprob,
+            frontier_edge_ids=frontier_edge_ids,
+            frontier_batch_ids=frontier_batch_ids,
+            edge_policy_diagnostics=edge_diagnostics,
+            log_c_continue=log_c_continue,
+            log_z_action=log_z_action,
+            **bdb_trace,
+        )
+
+    def _bdb_trace(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        remaining_budget: torch.Tensor,
+        state_log_flow: torch.Tensor,
+        log_p_stop: torch.Tensor,
+        edge_expand_logprob: torch.Tensor,
+        full_frontier_counts: torch.Tensor,
+        reward_model: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        num_graphs = int(state_log_flow.numel())
+        with torch.no_grad():
+            reward = reward_model.evaluate_terminal_state(
+                retrieval_batch=batch,
+                state=state,
+                diagnostics="basic",
+            )
+        log_reward = (
+            reward.log_reward.to(device=device, dtype=dtype).view(num_graphs).detach()
+        )
+        remaining = remaining_budget.to(device=device, dtype=torch.long).view(
+            num_graphs
+        )
+        frontier_counts = full_frontier_counts.to(device=device, dtype=dtype).view(
+            num_graphs
+        )
+        base_valid = remaining.eq(0) | frontier_counts.eq(0)
+        non_base = ~base_valid
+
+        delta_base = state_log_flow - log_reward
+        base_loss = torch.where(
+            base_valid,
+            delta_base.square(),
+            state_log_flow.new_zeros((num_graphs,)),
+        )
+        delta_stop = (
+            state_log_flow + log_p_stop.to(device=device, dtype=dtype) - log_reward
+        )
+        stop_loss = torch.where(
+            non_base,
+            delta_stop.square(),
+            state_log_flow.new_zeros((num_graphs,)),
+        )
+
+        edge_loss_sum = state_log_flow.new_zeros((num_graphs,))
+        edge_delta_sum = state_log_flow.new_zeros((num_graphs,))
+        parent_count_sum = state_log_flow.new_zeros((num_graphs,))
+        edge_counts = state_log_flow.new_zeros((num_graphs,))
+        if frontier_edge_ids.numel() > 0:
+            row_ids = frontier_batch_ids.to(device=device, dtype=torch.long).view(-1)
+            edge_ids = frontier_edge_ids.to(device=device, dtype=torch.long).view(-1)
+            active_edge = non_base.index_select(0, row_ids)
+            if bool(active_edge.any()):
+                active_pos = active_edge.nonzero(as_tuple=False).flatten()
+                for chunk_pos in active_pos.split(self.bdb_child_chunk_size):
+                    chunk_edges = edge_ids.index_select(0, chunk_pos)
+                    chunk_rows = row_ids.index_select(0, chunk_pos)
+                    child_state = _successor_state_for_frontier(
+                        batch=batch,
+                        state=state,
+                        frontier_edge_ids=chunk_edges,
+                        frontier_batch_ids=chunk_rows,
+                    )
+                    child_budget = remaining.index_select(0, chunk_rows) - 1
+                    with torch.no_grad():
+                        child_reward = reward_model.evaluate_terminal_state(
+                            retrieval_batch=batch,
+                            state=child_state,
+                            diagnostics="basic",
+                        )
+                    child_log_reward = child_reward.log_reward.to(
+                        device=device,
+                        dtype=dtype,
+                    ).view(-1).detach()
+                    child_frontier = build_frontier(
+                        fb=rollout_context.fb,
+                        batch=batch,
+                        state=child_state,
+                        frontier_mode="boundary",
+                    )
+                    child_frontier_counts = torch.bincount(
+                        child_frontier.graph_id.to(device=device, dtype=torch.long),
+                        minlength=int(chunk_edges.numel()),
+                    ).to(device=device, dtype=dtype)
+                    child_flow = self.evaluate_state_log_flow(
+                        batch=batch,
+                        state=child_state,
+                        remaining_budget=child_budget,
+                        rollout_context=rollout_context,
+                    ).to(device=device, dtype=dtype)
+                    hard_terminal = child_budget.eq(0) | child_frontier_counts.eq(0)
+                    child_target = torch.where(
+                        hard_terminal,
+                        child_log_reward,
+                        child_flow.detach(),
+                    )
+                    parent_counts = _uniform_parent_counts_for_successor_edges(
+                        batch=batch,
+                        successor=child_state,
+                        frontier_edge_ids=chunk_edges,
+                    ).to(device=device, dtype=dtype)
+                    log_pb = -parent_counts.clamp_min(1.0).log()
+                    delta_edge = (
+                        state_log_flow.index_select(0, chunk_rows)
+                        + edge_expand_logprob.index_select(0, chunk_pos).to(
+                            device=device,
+                            dtype=dtype,
+                        )
+                        - child_target.detach()
+                        - log_pb
+                    )
+                    contribution = delta_edge.square()
+                    edge_loss_sum.scatter_add_(0, chunk_rows, contribution)
+                    edge_delta_sum.scatter_add_(0, chunk_rows, delta_edge.detach())
+                    parent_count_sum.scatter_add_(0, chunk_rows, parent_counts.detach())
+                    edge_counts.scatter_add_(
+                        0,
+                        chunk_rows,
+                        torch.ones_like(contribution),
+                    )
+
+        edge_valid = non_base & edge_counts.gt(0)
+        edge_loss = torch.where(
+            edge_valid,
+            edge_loss_sum / edge_counts.clamp_min(1.0),
+            state_log_flow.new_zeros((num_graphs,)),
+        )
+        delta_edge = torch.where(
+            edge_valid,
+            edge_delta_sum / edge_counts.clamp_min(1.0),
+            state_log_flow.new_zeros((num_graphs,)),
+        )
+        parent_count = torch.where(
+            edge_valid,
+            parent_count_sum / edge_counts.clamp_min(1.0),
+            state_log_flow.new_zeros((num_graphs,)),
+        )
+
+        return {
+            "bdb_stop_loss": stop_loss,
+            "bdb_edge_loss": edge_loss,
+            "bdb_base_loss": base_loss,
+            "bdb_stop_valid_mask": non_base,
+            "bdb_edge_valid_mask": edge_valid,
+            "bdb_base_valid_mask": base_valid,
+            "bdb_delta_stop": delta_stop.detach(),
+            "bdb_delta_edge": delta_edge.detach(),
+            "bdb_delta_base": delta_base.detach(),
+            "bdb_frontier_size": frontier_counts.detach(),
+            "bdb_parent_count": parent_count.detach(),
+            "bdb_log_reward": log_reward.detach(),
+            "bdb_log_flow": state_log_flow.detach(),
+        }
+
+    def evaluate_state_log_flow(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        remaining_budget: torch.Tensor,
+        rollout_context: PolicyContext | FeatureBank | None = None,
+        context: Any | None = None,
+    ) -> torch.Tensor:
+        policy_context = self._coerce_policy_context(batch, rollout_context)
+        if context is None:
+            context = self.state_encoder(fb=policy_context.fb, batch=batch, state=state)
+        state_h = context.state_h
+        if self.budget_embedding is not None:
+            budget = remaining_budget.to(
+                device=state_h.device,
+                dtype=torch.long,
+            ).view(-1)
+            budget = budget.clamp(0, self.max_budget)
+            if budget.shape != (int(state_h.size(0)),):
+                raise ValueError(
+                    "remaining_budget must match state rows for flow evaluation: "
+                    f"{tuple(budget.shape)} != {(int(state_h.size(0)),)}."
+                )
+            state_h = state_h + self.budget_embedding(budget).to(
+                dtype=state_h.dtype,
+            )
+        return self.flow_head(state_h=state_h)
+
+    def _te_bfm_policy_output(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        context: Any,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        remaining_budget: torch.Tensor,
+        state_log_flow: torch.Tensor,
+        reward_model: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> PolicyOutput:
+        # REMOVED: reward/backup-derived action logits — see methodology.md §3.6
+        raise RuntimeError("TE-BFM policy output was removed; BDB uses learned logits.")
+
+    def _removed_te_bfm_policy_output(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        context: Any,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        remaining_budget: torch.Tensor,
+        state_log_flow: torch.Tensor,
+        reward_model: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> PolicyOutput:
+        num_graphs = int(state_log_flow.numel())
+        reward = reward_model.evaluate_terminal_state(
+            retrieval_batch=batch,
+            state=state,
+            diagnostics="basic",
+        )
+        log_reward = reward.log_reward.to(device=device, dtype=dtype).view(num_graphs)
+        cap_used_rate = self._last_te_bfm_terminal_quotient_diagnostics.get(
+            "frontier_cap_used_rate",
+            0.0,
+        )
+        cap_dropped_mean = self._last_te_bfm_terminal_quotient_diagnostics.get(
+            "frontier_cap_dropped_edge_count_mean",
+            0.0,
+        )
+        self._last_te_bfm_terminal_quotient_diagnostics = {
+            "terminal_quotient_backup_used_rate": 0.0,
+            "terminal_quotient_parent_count": 0.0,
+            "terminal_quotient_edge_count": 0.0,
+            "terminal_quotient_group_count_mean": 0.0,
+            "terminal_quotient_floor_edge_count_mean": 0.0,
+            "terminal_quotient_positive_edge_count_mean": 0.0,
+            "terminal_quotient_speedup_estimate": 0.0,
+            "frontier_cap_used_rate": cap_used_rate,
+            "frontier_cap_dropped_edge_count_mean": cap_dropped_mean,
+        }
+        edge_logits = self._te_bfm_edge_logits(
+            batch=batch,
+            state=state,
+            rollout_context=rollout_context,
+            frontier_edge_ids=frontier_edge_ids,
+            frontier_batch_ids=frontier_batch_ids,
+            remaining_budget=remaining_budget,
+            reward_model=reward_model,
+            dtype=dtype,
+            device=device,
+        )
+        log_c = segment_logsumexp_or_neg_inf(
+            values=edge_logits,
+            segment_ids=frontier_batch_ids,
+            num_graphs=num_graphs,
+            device=device,
+            dtype=dtype,
+        )
+        expandable = remaining_budget.gt(0)
+        stop_logits = log_reward - log_c
+        stop_logits = torch.where(
+            expandable & torch.isfinite(log_c),
+            stop_logits,
+            torch.full_like(stop_logits, torch.inf),
+        )
+        log_z = torch.logaddexp(log_reward, log_c)
+        target = torch.where(expandable, log_z, log_reward)
+        residual = state_log_flow - target.detach()
+        valid = remaining_budget.gt(0)
+        parent_loss = torch.where(
+            valid,
+            residual.square(),
+            residual.new_zeros(residual.shape),
+        )
+        if self.te_bfm_include_counterfactual_internal_states:
+            internal_loss = self._te_bfm_counterfactual_child_loss(
+                batch=batch,
+                state=state,
+                rollout_context=rollout_context,
+                frontier_edge_ids=frontier_edge_ids,
+                frontier_batch_ids=frontier_batch_ids,
+                remaining_budget=remaining_budget,
+                reward_model=reward_model,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            internal_loss = torch.zeros_like(parent_loss)
+        loss = parent_loss + internal_loss
+
+        (
+            log_p_stop,
+            log_p_continue,
+            edge_cond_logprob,
+            edge_expand_logprob,
+        ) = hazard_policy_log_probs(
+            stop_logits=stop_logits,
+            edge_logits=edge_logits,
+            frontier_batch_ids=frontier_batch_ids,
             num_graphs=num_graphs,
         )
+        frontier_counts = torch.bincount(
+            frontier_batch_ids.to(device=device, dtype=torch.long),
+            minlength=num_graphs,
+        ).to(device=device, dtype=dtype)
 
-        context = self.state_readout(
-            fb=fb,
-            batch=batch,
-            state=state,
+        return PolicyOutput(
+            stop_logits=stop_logits,
+            edge_logits=edge_logits,
+            state_log_flow=state_log_flow,
+            log_p_stop=log_p_stop,
+            log_p_continue=log_p_continue,
+            edge_cond_logprob=edge_cond_logprob,
+            edge_expand_logprob=edge_expand_logprob,
+            frontier_edge_ids=frontier_edge_ids,
+            frontier_batch_ids=frontier_batch_ids,
+            edge_policy_diagnostics=None,
+            log_c_continue=log_c,
+            log_z_action=target,
+            te_bfm_loss=loss,
+            te_bfm_valid_mask=valid,
+            te_bfm_residual_abs=residual.abs(),
+            te_bfm_target_log_value=target.detach(),
+            te_bfm_log_reward=log_reward.detach(),
+            te_bfm_stop_prob=log_p_stop.exp().detach(),
+            te_bfm_frontier_edge_count=frontier_counts.detach(),
+            te_bfm_counterfactual_child_loss=internal_loss.detach(),
+            te_bfm_frontier_cap_used=torch.full(
+                (num_graphs,),
+                float(
+                    self._last_te_bfm_terminal_quotient_diagnostics[
+                        "frontier_cap_used_rate"
+                    ]
+                ),
+                dtype=dtype,
+                device=device,
+            ),
+            te_bfm_frontier_cap_dropped_edge_count=torch.full(
+                (num_graphs,),
+                float(
+                    self._last_te_bfm_terminal_quotient_diagnostics[
+                        "frontier_cap_dropped_edge_count_mean"
+                    ]
+                ),
+                dtype=dtype,
+                device=device,
+            ),
+            terminal_quotient_backup_used_rate=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_backup_used_rate"
+                ]
+            ),
+            terminal_quotient_parent_count=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_parent_count"
+                ]
+            ),
+            terminal_quotient_edge_count=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_edge_count"
+                ]
+            ),
+            terminal_quotient_group_count_mean=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_group_count_mean"
+                ]
+            ),
+            terminal_quotient_floor_edge_count_mean=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_floor_edge_count_mean"
+                ]
+            ),
+            terminal_quotient_positive_edge_count_mean=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_positive_edge_count_mean"
+                ]
+            ),
+            terminal_quotient_speedup_estimate=edge_logits.new_tensor(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "terminal_quotient_speedup_estimate"
+                ]
+            ),
         )
-        num_policy_graphs = int(context.state_h.size(0))
 
-        state_log_flow = self.flow_head(state_h=context.state_h)
-
-        if context.frontier_edge_ids is None or context.frontier_edge_batch is None:
-            raise RuntimeError("StateReadout did not return frontier candidates.")
-
-        candidate_edge_ids = context.frontier_edge_ids.to(
+    def _te_bfm_counterfactual_child_loss(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        remaining_budget: torch.Tensor,
+        reward_model: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if frontier_edge_ids.numel() == 0 or self.te_bfm_lookahead_depth <= 1:
+            return torch.zeros(
+                remaining_budget.shape,
+                dtype=dtype,
+                device=device,
+            )
+        if int(frontier_edge_ids.numel()) > self.te_bfm_max_expanded_states:
+            raise RuntimeError(
+                "TE-BFM counterfactual child fit exceeded max_expanded_states: "
+                f"{int(frontier_edge_ids.numel())} > "
+                f"{self.te_bfm_max_expanded_states}."
+            )
+        parent_budget = remaining_budget.to(device=device, dtype=torch.long)
+        edge_budget = parent_budget.index_select(
+            0,
+            frontier_batch_ids.to(device=device, dtype=torch.long),
+        )
+        child_budget = edge_budget - 1
+        train_child = child_budget.gt(0)
+        if not bool(train_child.any()):
+            return torch.zeros(
+                remaining_budget.shape,
+                dtype=dtype,
+                device=device,
+            )
+        edge_ids = frontier_edge_ids[train_child]
+        row_ids = frontier_batch_ids[train_child]
+        child_budget = child_budget[train_child]
+        sums = torch.zeros(
+            int(remaining_budget.numel()),
+            dtype=dtype,
             device=device,
+        )
+        counts = torch.zeros_like(sums)
+        positions = torch.arange(int(edge_ids.numel()), dtype=torch.long, device=device)
+        for chunk_pos in positions.split(self.te_bfm_child_chunk_size):
+            chunk_edges = edge_ids.index_select(0, chunk_pos)
+            chunk_rows = row_ids.index_select(0, chunk_pos)
+            chunk_budget = child_budget.index_select(0, chunk_pos)
+            child_state = _successor_state_for_frontier(
+                batch=batch,
+                state=state,
+                frontier_edge_ids=chunk_edges,
+                frontier_batch_ids=chunk_rows,
+            )
+            target = self._te_bfm_value(
+                batch=batch,
+                state=child_state,
+                remaining_budget=chunk_budget,
+                lookahead_depth=self.te_bfm_lookahead_depth - 1,
+                reward_model=reward_model,
+                rollout_context=rollout_context,
+                detach_bootstrap=True,
+            ).to(device=device, dtype=dtype)
+            pred = self.evaluate_state_log_flow(
+                batch=batch,
+                state=child_state,
+                remaining_budget=chunk_budget,
+                rollout_context=rollout_context,
+            ).to(device=device, dtype=dtype)
+            child_loss = (pred - target.detach()).square()
+            scatter_rows = chunk_rows.to(device=device, dtype=torch.long)
+            sums.scatter_add_(0, scatter_rows, child_loss)
+            counts.scatter_add_(
+                0,
+                scatter_rows,
+                torch.ones_like(child_loss),
+            )
+        return torch.where(counts.gt(0), sums / counts.clamp_min(1.0), sums)
+
+    def _te_bfm_edge_logits(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        remaining_budget: torch.Tensor,
+        reward_model: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if frontier_edge_ids.numel() == 0:
+            return torch.empty((0,), dtype=dtype, device=device)
+        parent_budget = remaining_budget.to(device=device, dtype=torch.long)
+        edge_budget = parent_budget.index_select(
+            0,
+            frontier_batch_ids.to(device=device, dtype=torch.long),
+        )
+        active_edge = edge_budget.gt(0)
+        if not bool(active_edge.any()):
+            return torch.empty((0,), dtype=dtype, device=device)
+        out = torch.full(
+            frontier_edge_ids.shape,
+            -torch.inf,
+            dtype=dtype,
+            device=device,
+        )
+        active_positions = active_edge.nonzero(as_tuple=False).flatten()
+        terminal_positions = (
+            active_positions[edge_budget.index_select(0, active_positions).eq(1)]
+            if isinstance(state, RolloutState)
+            else active_positions.new_empty((0,))
+        )
+        if terminal_positions.numel() > 0:
+            terminal = self._te_bfm_terminal_backup_quotient(
+                batch=batch,
+                state=state,
+                frontier_edge_ids=frontier_edge_ids.index_select(0, terminal_positions),
+                frontier_batch_ids=frontier_batch_ids.index_select(
+                    0,
+                    terminal_positions,
+                ),
+                reward_model=reward_model,
+                dtype=dtype,
+                device=device,
+            )
+            out[terminal_positions] = terminal.edge_terms.to(device=device, dtype=dtype)
+
+        recursive_positions = (
+            active_positions[edge_budget.index_select(0, active_positions).gt(1)]
+            if isinstance(state, RolloutState)
+            else active_positions
+        )
+        if int(recursive_positions.numel()) > self.te_bfm_max_expanded_states:
+            raise RuntimeError(
+                "TE-BFM frontier expansion exceeded max_expanded_states: "
+                f"{int(recursive_positions.numel())} > "
+                f"{self.te_bfm_max_expanded_states}."
+            )
+        if recursive_positions.numel() > 0:
+            for chunk_pos in recursive_positions.split(self.te_bfm_child_chunk_size):
+                edge_ids = frontier_edge_ids.index_select(0, chunk_pos)
+                row_ids = frontier_batch_ids.index_select(0, chunk_pos)
+                child_state = _successor_state_for_frontier(
+                    batch=batch,
+                    state=state,
+                    frontier_edge_ids=edge_ids,
+                    frontier_batch_ids=row_ids,
+                )
+                child_budget = edge_budget.index_select(0, chunk_pos) - 1
+                child_value = self._te_bfm_value(
+                    batch=batch,
+                    state=child_state,
+                    remaining_budget=child_budget,
+                    lookahead_depth=self.te_bfm_lookahead_depth - 1,
+                    reward_model=reward_model,
+                    rollout_context=rollout_context,
+                    detach_bootstrap=True,
+                ).to(device=device, dtype=dtype)
+                log_pb = _uniform_log_pb_for_successor_edges(
+                    batch=batch,
+                    successor=child_state,
+                    frontier_edge_ids=edge_ids,
+                ).to(device=device, dtype=dtype)
+                out[chunk_pos] = child_value + log_pb
+        return out
+
+    def _te_bfm_terminal_backup_quotient(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: RolloutState,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        reward_model: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _TerminalQuotientBackup:
+        row_ids = frontier_batch_ids.to(device=device, dtype=torch.long).view(-1)
+        edge_term_chunks: list[torch.Tensor] = []
+        log_reward_chunks: list[torch.Tensor] = []
+        log_pb_chunks: list[torch.Tensor] = []
+        supported_chunks: list[torch.Tensor] = []
+        edge_ids = frontier_edge_ids.to(device=device, dtype=torch.long).view(-1)
+        for chunk_pos in torch.arange(
+            int(edge_ids.numel()),
             dtype=torch.long,
-        )
-        candidate_batch_ids = context.frontier_edge_batch.to(
             device=device,
-            dtype=torch.long,
+        ).split(self.te_bfm_terminal_chunk_size):
+            terminal_terms = _te_bfm_terminal_edge_terms(
+                batch=batch,
+                state=state,
+                frontier_edge_ids=edge_ids.index_select(0, chunk_pos),
+                frontier_batch_ids=row_ids.index_select(0, chunk_pos),
+                reward_model=reward_model,
+                dtype=dtype,
+                device=device,
+            )
+            edge_term_chunks.append(terminal_terms.edge_terms)
+            log_reward_chunks.append(terminal_terms.log_reward)
+            log_pb_chunks.append(terminal_terms.log_pb)
+            supported_chunks.append(terminal_terms.supported)
+        edge_terms = (
+            torch.cat(edge_term_chunks, dim=0)
+            if edge_term_chunks
+            else torch.empty((0,), dtype=dtype, device=device)
         )
-        candidate_context = build_candidate_context(
+        supported = (
+            torch.cat(supported_chunks, dim=0)
+            if supported_chunks
+            else torch.empty((0,), dtype=dtype, device=device)
+        )
+        log_rewards = (
+            torch.cat(log_reward_chunks, dim=0)
+            if log_reward_chunks
+            else torch.empty((0,), dtype=dtype, device=device)
+        )
+        log_pbs = (
+            torch.cat(log_pb_chunks, dim=0)
+            if log_pb_chunks
+            else torch.empty((0,), dtype=dtype, device=device)
+        )
+        group_masses, group_rows = _terminal_quotient_group_masses(
+            row_ids=row_ids,
+            log_rewards=log_rewards,
+            log_pbs=log_pbs,
+            dtype=dtype,
+            device=device,
+        )
+        continuation = segment_logsumexp_or_neg_inf(
+            values=group_masses,
+            segment_ids=group_rows,
+            num_graphs=state.num_rollouts,
+            device=device,
+            dtype=dtype,
+        )
+        counts = torch.bincount(row_ids, minlength=state.num_rollouts).to(
+            device=device,
+            dtype=dtype,
+        )
+        positive = supported.gt(0)
+        positive_counts = torch.zeros_like(counts)
+        floor_counts = torch.zeros_like(counts)
+        positive_counts.scatter_add_(
+            0,
+            row_ids,
+            positive.to(device=device, dtype=dtype),
+        )
+        floor_counts.scatter_add_(
+            0,
+            row_ids,
+            (~positive).to(device=device, dtype=dtype),
+        )
+        active = counts.gt(0)
+        parent_count = int(active.sum().item())
+        edge_count = int(row_ids.numel())
+        group_counts = torch.bincount(group_rows, minlength=state.num_rollouts).to(
+            device=device,
+            dtype=dtype,
+        )
+        group_count_mean = (
+            float(group_counts[active].mean().item()) if bool(active.any()) else 0.0
+        )
+        floor_mean = (
+            float(floor_counts[active].mean().item()) if bool(active.any()) else 0.0
+        )
+        positive_mean = (
+            float(positive_counts[active].mean().item()) if bool(active.any()) else 0.0
+        )
+        group_count_total = int(group_rows.numel())
+        speedup = float(edge_count) / float(max(group_count_total, 1))
+        cap_used_rate = self._last_te_bfm_terminal_quotient_diagnostics.get(
+            "frontier_cap_used_rate",
+            0.0,
+        )
+        cap_dropped_mean = self._last_te_bfm_terminal_quotient_diagnostics.get(
+            "frontier_cap_dropped_edge_count_mean",
+            0.0,
+        )
+        self._last_te_bfm_terminal_quotient_diagnostics = {
+            "terminal_quotient_backup_used_rate": 1.0 if edge_count > 0 else 0.0,
+            "terminal_quotient_parent_count": float(parent_count),
+            "terminal_quotient_edge_count": float(edge_count),
+            "terminal_quotient_group_count_mean": group_count_mean,
+            "terminal_quotient_floor_edge_count_mean": floor_mean,
+            "terminal_quotient_positive_edge_count_mean": positive_mean,
+            "terminal_quotient_speedup_estimate": speedup,
+            "frontier_cap_used_rate": cap_used_rate,
+            "frontier_cap_dropped_edge_count_mean": cap_dropped_mean,
+        }
+        return _TerminalQuotientBackup(
+            continuation=continuation,
+            edge_terms=edge_terms,
+            row_ids=row_ids,
+            parent_count=parent_count,
+            edge_count=edge_count,
+            group_count_mean=group_count_mean,
+            floor_edge_count_mean=floor_mean,
+            positive_edge_count_mean=positive_mean,
+            speedup_estimate=speedup,
+        )
+
+    def _te_bfm_value(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: RolloutState,
+        remaining_budget: torch.Tensor,
+        lookahead_depth: int,
+        reward_model: Any,
+        rollout_context: PolicyContext,
+        detach_bootstrap: bool,
+    ) -> torch.Tensor:
+        device = remaining_budget.device
+        budget = remaining_budget.to(device=device, dtype=torch.long).view(-1)
+        if budget.shape != (state.num_rollouts,):
+            raise ValueError(
+                "remaining_budget must match TE-BFM state rows: "
+                f"{tuple(budget.shape)} != {(state.num_rollouts,)}."
+            )
+        reward = reward_model.evaluate_terminal_state(
+            retrieval_batch=batch,
+            state=state,
+            diagnostics="basic",
+        )
+        log_reward = reward.log_reward.to(device=device, dtype=torch.float32).view(-1)
+        if int(lookahead_depth) <= 0:
+            flow = self.evaluate_state_log_flow(
+                batch=batch,
+                state=state,
+                remaining_budget=budget,
+                rollout_context=rollout_context,
+            ).to(device=device, dtype=torch.float32)
+            if detach_bootstrap:
+                flow = flow.detach()
+            return torch.where(budget.eq(0), log_reward, flow)
+        if bool(budget.eq(0).all()):
+            return log_reward
+
+        frontier = build_frontier(
+            fb=rollout_context.fb,
             batch=batch,
             state=state,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
+            frontier_mode="boundary",
+        )
+        if self.te_bfm_max_backup_edges_per_state is not None:
+            frontier, cap_stats = _cap_frontier_context_by_semantic_topk(
+                fb=rollout_context.fb,
+                frontier=frontier,
+                max_edges_per_state=self.te_bfm_max_backup_edges_per_state,
+                device=device,
+            )
+            self._last_te_bfm_terminal_quotient_diagnostics[
+                "frontier_cap_used_rate"
+            ] = max(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "frontier_cap_used_rate"
+                ],
+                cap_stats.used_rate,
+            )
+            self._last_te_bfm_terminal_quotient_diagnostics[
+                "frontier_cap_dropped_edge_count_mean"
+            ] = max(
+                self._last_te_bfm_terminal_quotient_diagnostics[
+                    "frontier_cap_dropped_edge_count_mean"
+                ],
+                cap_stats.dropped_edge_count_mean,
+            )
+        edge_ids = frontier.edge_ids.to(device=device, dtype=torch.long)
+        row_ids = frontier.graph_id.to(device=device, dtype=torch.long)
+        if edge_ids.numel() > 0:
+            has_budget = budget.gt(0).index_select(0, row_ids)
+            edge_ids = edge_ids[has_budget]
+            row_ids = row_ids[has_budget]
+        if edge_ids.numel() == 0:
+            return log_reward
+
+        child_terms: list[torch.Tensor] = []
+        child_rows: list[torch.Tensor] = []
+        terminal_edge = budget.index_select(0, row_ids).eq(1)
+        if bool(terminal_edge.any()):
+            terminal = self._te_bfm_terminal_backup_quotient(
+                batch=batch,
+                state=state,
+                frontier_edge_ids=edge_ids[terminal_edge],
+                frontier_batch_ids=row_ids[terminal_edge],
+                reward_model=reward_model,
+                dtype=log_reward.dtype,
+                device=device,
+            )
+            child_terms.append(terminal.edge_terms)
+            child_rows.append(terminal.row_ids)
+
+        recursive_edge = ~terminal_edge
+        recursive_edge_ids = edge_ids[recursive_edge]
+        recursive_row_ids = row_ids[recursive_edge]
+        if int(recursive_edge_ids.numel()) > self.te_bfm_max_expanded_states:
+            diagnostics = _te_bfm_recursive_expansion_diagnostics(
+                batch=batch,
+                state=state,
+                row_ids=recursive_row_ids,
+                expanded_state_count=int(recursive_edge_ids.numel()),
+                max_expanded_states=self.te_bfm_max_expanded_states,
+                remaining_budget=budget,
+                lookahead_depth=int(lookahead_depth),
+            )
+            raise RuntimeError(
+                "TE-BFM recursive expansion exceeded max_expanded_states: "
+                f"{int(recursive_edge_ids.numel())} > {self.te_bfm_max_expanded_states}. "
+                "This usually indicates a high-fanout exact lookahead outlier. "
+                "diagnostics="
+                f"{json.dumps(diagnostics, sort_keys=True)}"
+            )
+
+        if recursive_edge_ids.numel() > 0:
+            positions = torch.arange(
+                int(recursive_edge_ids.numel()),
+                dtype=torch.long,
+                device=device,
+            )
+            for chunk_pos in positions.split(self.te_bfm_child_chunk_size):
+                chunk_edges = recursive_edge_ids.index_select(0, chunk_pos)
+                chunk_rows = recursive_row_ids.index_select(0, chunk_pos)
+                child_state = _successor_state_for_frontier(
+                    batch=batch,
+                    state=state,
+                    frontier_edge_ids=chunk_edges,
+                    frontier_batch_ids=chunk_rows,
+                )
+                child_budget = budget.index_select(0, chunk_rows) - 1
+                child_value = self._te_bfm_value(
+                    batch=batch,
+                    state=child_state,
+                    remaining_budget=child_budget,
+                    lookahead_depth=int(lookahead_depth) - 1,
+                    reward_model=reward_model,
+                    rollout_context=rollout_context,
+                    detach_bootstrap=detach_bootstrap,
+                )
+                log_pb = _uniform_log_pb_for_successor_edges(
+                    batch=batch,
+                    successor=child_state,
+                    frontier_edge_ids=chunk_edges,
+                ).to(device=device, dtype=child_value.dtype)
+                child_terms.append(child_value + log_pb)
+                child_rows.append(chunk_rows)
+        if not child_terms:
+            return log_reward
+        terms = torch.cat(child_terms, dim=0)
+        term_rows = torch.cat(child_rows, dim=0)
+        continuation = segment_logsumexp_or_neg_inf(
+            values=terms,
+            segment_ids=term_rows,
+            num_graphs=state.num_rollouts,
             device=device,
+            dtype=terms.dtype,
         )
-        base_breakdown = self._semantic_edge_breakdown(
-            fb=fb,
-            batch=batch,
-            state=state,
-            context=context,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-            candidate_context=candidate_context,
+        target = torch.logaddexp(log_reward, continuation)
+        return torch.where(budget.gt(0), target, log_reward)
+
+    def _learned_action_terms(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        frontier_batch_ids: torch.Tensor,
+        frontier_edge_ids: torch.Tensor,
+        context: Any,
+        frontier_context: FrontierContext,
+        stop_action_logits: torch.Tensor,
+        num_graphs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.edge_scorer == "pointer":
+            continuation_logits = self._pointer_edge_logits(
+                batch=batch,
+                state=state,
+                fb=rollout_context.fb,
+                context=context,
+                frontier_edge_ids=frontier_edge_ids,
+                frontier_batch_ids=frontier_batch_ids,
+                frontier_context=frontier_context,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            raise RuntimeError(f"Unknown edge_scorer {self.edge_scorer!r}.")
+        # REMOVED: reward/backup/semantic-derived action logits — see methodology.md §3.6
+        if continuation_logits.numel() > 0:
+            continuation_logits = continuation_logits + self.continuation_logit_bias.to(
+                device=continuation_logits.device,
+                dtype=continuation_logits.dtype,
+            )
+            continuation_logits = _reduce_frontier_size_bias(
+                continuation_logits=continuation_logits,
+                frontier_batch_ids=frontier_batch_ids,
+                num_graphs=int(num_graphs),
+                mode=self.continuation_mass_reduction,
+            )
+        stop_action_logits = stop_action_logits.to(
+            device=continuation_logits.device,
+            dtype=continuation_logits.dtype,
+        ).view(int(num_graphs))
+        log_c = segment_logsumexp_or_neg_inf(
+            values=continuation_logits,
+            segment_ids=frontier_batch_ids,
+            num_graphs=int(num_graphs),
+            device=continuation_logits.device,
+            dtype=continuation_logits.dtype,
         )
+        log_z = torch.logaddexp(stop_action_logits, log_c)
+        return continuation_logits, log_c, log_z, stop_action_logits
+
+    def _semantic_residual_edge_logits(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        fb: FeatureBank,
+        context: Any,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        frontier_context: FrontierContext,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if frontier_edge_ids.numel() == 0:
+            return torch.empty((0,), dtype=dtype, device=device)
+
+        edge_ids = frontier_edge_ids.to(device=device, dtype=torch.long).view(-1)
+        row_ids = frontier_batch_ids.to(device=device, dtype=torch.long).view(-1)
+        semantic = frontier_semantic_scores(fb=fb, frontier=frontier_context)
+        semantic_score = (
+            semantic.query_relation_score + semantic.query_new_node_score
+        ).to(device=device, dtype=dtype)
         transition_features = self.transition_feature_builder(
             fb=fb,
             context=context,
             batch=batch,
             state=state,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-            candidate_context=candidate_context,
+            frontier_edge_ids=edge_ids,
+            frontier_batch_ids=row_ids,
+            frontier_context=frontier_context,
+        ).values.to(device=device, dtype=dtype)
+        residual = self.edge_residual_scorer(
+            state_h=context.state_h.to(device=device, dtype=dtype),
+            edge_h=fb.edge_h.index_select(0, edge_ids).to(device=device, dtype=dtype),
+            query_h=context.query_h.to(device=device, dtype=dtype),
+            row_ids=row_ids,
+            edge_feat=transition_features,
         )
+        return semantic_score + residual.to(device=device, dtype=dtype)
 
-        residual_logits = self.edge_residual_head(
-            context=context,
-            candidate_edge_h=context.frontier_edge_h,
-            candidate_batch_ids=candidate_batch_ids,
-            semantic_logits=base_breakdown.semantic_logits,
-            transition_features=transition_features,
-        )
-        final_edge_logits = base_breakdown.semantic_logits + residual_logits
-        edge_logits = (
-            base_breakdown.semantic_logits
-            if edge_logit_mode == "semantic"
-            else final_edge_logits
-        )
-        edge_breakdown = (
-            EdgeScoreBreakdown(
-                query_relation_score=base_breakdown.query_relation_score,
-                query_new_node_score=base_breakdown.query_new_node_score,
-                semantic_score=base_breakdown.semantic_score,
-                new_text_mask=base_breakdown.new_text_mask,
-                semantic_logits=base_breakdown.semantic_logits,
-                residual_logits=residual_logits,
-                final_logits=final_edge_logits,
-            )
-            if return_edge_breakdown or edge_logit_mode == "semantic"
-            else None
-        )
-
-        expand_logits = _segment_logsumexp_or_neg_inf(
-            values=edge_logits,
-            batch_ids=candidate_batch_ids,
-            num_graphs=num_policy_graphs,
-        )
-        has_candidate_edge = _has_candidate_edge(
-            candidate_batch_ids=candidate_batch_ids,
-            num_graphs=num_policy_graphs,
-            device=device,
-        )
-        frontier_summary = frontier_logit_summary(
-            edge_logits=edge_logits,
-            edge_batch=candidate_batch_ids,
-            num_graphs=num_policy_graphs,
-            device=device,
-        )
-        state_stats = self._state_stats(
-            state=state,
-            batch=batch,
-            num_graphs=num_policy_graphs,
-            device=device,
-            dtype=state_log_flow.dtype,
-        )
-        stop_logits = self.stop_head(
-            state_h=context.state_h,
-            num_graphs=num_policy_graphs,
-            progress_ratio=context.progress,
-            frontier_summary=frontier_summary.as_tensor(),
-            state_stats=state_stats,
-            has_candidate_edge=has_candidate_edge,
-        )
-
-        return PolicyOutput(
-            state_log_flow=state_log_flow,
-            stop_logits=stop_logits,
-            expand_logits=expand_logits,
-            edge_logits=edge_logits,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-            edge_score_breakdown=edge_breakdown,
-        )
-
-    def _semantic_edge_breakdown(
+    def _pointer_edge_logits(
         self,
         *,
-        fb: FeatureBank,
         batch: RetrievalBatch,
         state: State | RolloutState,
+        fb: FeatureBank,
         context: Any,
-        candidate_edge_ids: torch.Tensor,
-        candidate_batch_ids: torch.Tensor,
-        candidate_context: Any | None = None,
-    ) -> EdgeScoreBreakdown:
-        device = fb.node_h.device
-        candidate_context = candidate_context or build_candidate_context(
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        frontier_context: FrontierContext,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if frontier_edge_ids.numel() == 0:
+            return torch.empty((0,), dtype=dtype, device=device)
+        evidence_tokens, evidence_mask = build_evidence_tokens(
+            fb=fb,
             batch=batch,
             state=state,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-            device=device,
+            query_h=context.query_h,
         )
-        edge_score = self.edge_scorer(
+        output = self.frontier_pointer(
             fb=fb,
             context=context,
-            edge_index=batch.edge_index,
-            edge_batch_index=batch.edge_batch,
-            active_nodes=state.active_nodes,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_context=candidate_context,
-            return_breakdown=True,
+            frontier_edge_ids=frontier_edge_ids,
+            frontier_batch_ids=frontier_batch_ids,
+            frontier_context=frontier_context,
+            evidence_tokens=evidence_tokens,
+            evidence_mask=evidence_mask,
+            return_diagnostics=False,
         )
-        if not isinstance(edge_score, EdgeScoreBreakdown):
-            raise TypeError(
-                "Expected EdgeScoreBreakdown when edge breakdown is requested."
-            )
-        return edge_score
+        if not isinstance(output, torch.Tensor):
+            raise RuntimeError("FrontierPointerPolicy must return logits tensor.")
+        return output.to(device=device, dtype=dtype)
 
-    def _state_stats(
+    def _successor_edge_log_mass(
         self,
         *,
-        state: State | RolloutState,
         batch: RetrievalBatch,
-        num_graphs: int,
-        device: torch.device,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        context: Any | None = None,
+        frontier_context: FrontierContext | None = None,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
         dtype: torch.dtype,
+        device: torch.device,
     ) -> torch.Tensor:
-        expanded = state.expanded_edge_count_per_graph(
-            edge_batch=batch.edge_batch,
-            num_graphs=int(num_graphs),
-        ).to(device=device, dtype=dtype)
-        remaining = state.remaining_budget_per_graph(
-            edge_batch=batch.edge_batch,
-            num_graphs=int(num_graphs),
-        ).to(device=device, dtype=dtype)
-        return torch.stack([expanded, remaining], dim=-1)
+        return self._successor_value_edge_log_mass(
+            batch=batch,
+            state=state,
+            rollout_context=rollout_context,
+            context=context,
+            frontier_context=frontier_context,
+            frontier_edge_ids=frontier_edge_ids,
+            frontier_batch_ids=frontier_batch_ids,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _successor_value_edge_log_mass(
+        self,
+        *,
+        batch: RetrievalBatch,
+        state: State | RolloutState,
+        rollout_context: PolicyContext,
+        context: Any | None,
+        frontier_context: FrontierContext | None,
+        frontier_edge_ids: torch.Tensor,
+        frontier_batch_ids: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if frontier_edge_ids.numel() == 0:
+            return torch.empty((0,), dtype=dtype, device=device)
+        edge_ids = frontier_edge_ids.to(device=device, dtype=torch.long).view(-1)
+        row_ids = frontier_batch_ids.to(device=device, dtype=torch.long).view(-1)
+        if context is None:
+            context = self.state_encoder(
+                fb=rollout_context.fb,
+                batch=batch,
+                state=state,
+            )
+        successor = _successor_state_for_frontier(
+            batch=batch,
+            state=state,
+            frontier_edge_ids=frontier_edge_ids,
+            frontier_batch_ids=frontier_batch_ids,
+        )
+        successor_context = self.state_encoder(
+            fb=rollout_context.fb,
+            batch=batch,
+            state=successor,
+        )
+        successor_h = successor_context.state_h.to(device=device, dtype=dtype)
+        successor_value = self.successor_value_head(successor_h=successor_h)
+        transition_features = self.transition_feature_builder(
+            fb=rollout_context.fb,
+            context=context,
+            batch=batch,
+            state=state,
+            frontier_edge_ids=edge_ids,
+            frontier_batch_ids=row_ids,
+            frontier_context=frontier_context,
+        ).values.to(device=device, dtype=dtype)
+        edge_advantage = self.successor_edge_advantage_scorer(
+            state_h=context.state_h.to(device=device, dtype=dtype),
+            edge_h=rollout_context.fb.edge_h.index_select(0, edge_ids).to(
+                device=device,
+                dtype=dtype,
+            ),
+            successor_h=successor_h,
+            query_h=context.query_h.to(device=device, dtype=dtype),
+            row_ids=row_ids,
+            edge_feat=transition_features,
+        )
+        log_pb = _uniform_log_pb_for_successor_edges(
+            batch=batch,
+            successor=successor,
+            frontier_edge_ids=frontier_edge_ids,
+        )
+        return successor_value + edge_advantage + log_pb.to(
+            device=successor_value.device,
+            dtype=successor_value.dtype,
+        )
 
     def _validate_feature_bank(
         self,
@@ -414,6 +1562,21 @@ class Policy(nn.Module):
                     f"got {tensor.size(-1)}."
                 )
 
+        if fb.edge_h.ndim != 2:
+            raise ValueError(
+                f"edge_h must have shape [num_edges, H], got {tuple(fb.edge_h.shape)}."
+            )
+        if fb.edge_h.size(0) != int(batch.edge_index.size(1)):
+            raise ValueError(
+                "edge_h first dimension mismatch: expected "
+                f"{int(batch.edge_index.size(1))}, got {fb.edge_h.size(0)}."
+            )
+        if fb.edge_h.size(-1) != self.hidden_dim:
+            raise ValueError(
+                "edge_h hidden dimension mismatch: expected "
+                f"{self.hidden_dim}, got {fb.edge_h.size(-1)}."
+            )
+
         if fb.node_dde is not None:
             if fb.node_dde.ndim != 2:
                 raise ValueError(
@@ -437,26 +1600,742 @@ class Policy(nn.Module):
                     f"{int(batch.num_nodes_total)}, got {fb.node_is_non_text.numel()}."
                 )
 
+    def _coerce_policy_context(
+        self,
+        batch: RetrievalBatch,
+        rollout_context: PolicyContext | FeatureBank | None,
+    ) -> PolicyContext:
+        if rollout_context is None:
+            return self.prepare_rollout_context(batch)
+        if isinstance(rollout_context, PolicyContext):
+            return rollout_context
+        if isinstance(rollout_context, FeatureBank):
+            return PolicyContext(fb=rollout_context)
+        raise TypeError(
+            "rollout_context must be a PolicyContext, FeatureBank, or None, "
+            f"got {type(rollout_context).__name__}."
+        )
 
-def _segment_logsumexp_or_neg_inf(
+    def _frontier_mode(self) -> str:
+        return "boundary"
+
+
+def hazard_policy_log_probs(
+    *,
+    stop_logits: torch.Tensor,
+    edge_logits: torch.Tensor,
+    frontier_batch_ids: torch.Tensor,
+    num_graphs: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Return log-probs from a single softmax over [Stop, frontier edges].
+    """
+    num_graphs = int(num_graphs)
+    stop_logits = stop_logits.view(num_graphs)
+    edge_logits = edge_logits.view(-1)
+    frontier_batch_ids = frontier_batch_ids.to(
+        device=stop_logits.device,
+        dtype=torch.long,
+    ).view(-1)
+
+    if edge_logits.numel() != frontier_batch_ids.numel():
+        raise ValueError(
+            "edge_logits and frontier_batch_ids must have matching length: "
+            f"{edge_logits.numel()} != {frontier_batch_ids.numel()}."
+        )
+
+    if edge_logits.numel() == 0:
+        log_p_stop = torch.zeros_like(stop_logits)
+        log_p_continue = torch.full_like(stop_logits, -torch.inf)
+        empty = edge_logits.new_empty((0,))
+        return log_p_stop, log_p_continue, empty, empty
+
+    edge_log_z = segment_logsumexp(
+        values=edge_logits,
+        segment_ids=frontier_batch_ids,
+        num_segments=num_graphs,
+    )
+    action_log_z = torch.logaddexp(stop_logits, edge_log_z)
+    log_p_stop = stop_logits - action_log_z
+    log_p_continue = edge_log_z - action_log_z
+    edge_cond_logprob = edge_logits - edge_log_z.index_select(
+        0,
+        frontier_batch_ids,
+    )
+    edge_expand_logprob = edge_logits - action_log_z.index_select(0, frontier_batch_ids)
+    prob_sum = log_p_stop.exp()
+    prob_sum = prob_sum.scatter_add(
+        0,
+        frontier_batch_ids,
+        edge_expand_logprob.exp(),
+    )
+    if not bool(torch.allclose(prob_sum, torch.ones_like(prob_sum), atol=1.0e-5, rtol=1.0e-5)):
+        raise RuntimeError("Action probabilities must sum to 1 for every state.")
+
+    return log_p_stop, log_p_continue, edge_cond_logprob, edge_expand_logprob
+
+
+def segment_logsumexp_or_neg_inf(
     *,
     values: torch.Tensor,
-    batch_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
     num_graphs: int,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    values = values.view(-1)
-    batch_ids = batch_ids.to(device=values.device, dtype=torch.long).view(-1)
-    num_graphs = int(num_graphs)
     if values.numel() == 0:
-        return values.new_full((num_graphs,), -torch.inf)
-
-    counts = torch.bincount(batch_ids, minlength=num_graphs).to(device=values.device)
-    raw = scatter_logsumexp(values, batch_ids, dim=0, dim_size=num_graphs)
-    return torch.where(
-        counts.gt(0),
-        raw,
-        values.new_full((num_graphs,), -torch.inf),
+        return torch.full(
+            (int(num_graphs),),
+            -torch.inf,
+            dtype=dtype,
+            device=device,
+        )
+    return segment_logsumexp(
+        values=values.to(device=device, dtype=dtype),
+        segment_ids=segment_ids.to(device=device, dtype=torch.long),
+        num_segments=int(num_graphs),
     )
+
+
+def _reduce_frontier_size_bias(
+    *,
+    continuation_logits: torch.Tensor,
+    frontier_batch_ids: torch.Tensor,
+    num_graphs: int,
+    mode: str,
+) -> torch.Tensor:
+    if mode == "logsumexp":
+        return continuation_logits
+    if mode != "logmeanexp":
+        raise RuntimeError(f"Unknown continuation mass reduction {mode!r}.")
+    counts = torch.bincount(
+        frontier_batch_ids.to(device=continuation_logits.device, dtype=torch.long),
+        minlength=int(num_graphs),
+    ).to(device=continuation_logits.device, dtype=continuation_logits.dtype)
+    edge_counts = counts.index_select(0, frontier_batch_ids).clamp_min(1.0)
+    return continuation_logits - edge_counts.log()
+
+
+def _successor_state_for_frontier(
+    *,
+    batch: RetrievalBatch,
+    state: State | RolloutState,
+    frontier_edge_ids: torch.Tensor,
+    frontier_batch_ids: torch.Tensor,
+) -> RolloutState:
+    edge_ids = frontier_edge_ids.to(
+        device=batch.edge_index.device,
+        dtype=torch.long,
+    ).view(-1)
+    row_ids = frontier_batch_ids.to(
+        device=batch.edge_index.device,
+        dtype=torch.long,
+    ).view(-1)
+    if edge_ids.shape != row_ids.shape:
+        raise ValueError(
+            "frontier_edge_ids and frontier_batch_ids must have matching shape: "
+            f"{tuple(edge_ids.shape)} != {tuple(row_ids.shape)}."
+        )
+    if edge_ids.numel() == 0:
+        raise ValueError("Cannot build successor state for an empty frontier.")
+
+    if isinstance(state, RolloutState):
+        parent = state.select_rollouts(row_ids)
+        rollout_to_graph = parent.rollout_to_graph
+        expand_budget = int(state.expand_budget)
+    else:
+        node_batch = batch.batch.to(device=edge_ids.device, dtype=torch.long)
+        edge_batch = batch.edge_batch.to(device=edge_ids.device, dtype=torch.long)
+        rollout_to_graph = edge_batch.index_select(0, edge_ids)
+        node_belongs = node_batch.view(1, -1).eq(rollout_to_graph.view(-1, 1))
+        edge_belongs = edge_batch.view(1, -1).eq(rollout_to_graph.view(-1, 1))
+        parent = RolloutState(
+            rollout_to_graph=rollout_to_graph,
+            expand_budget=int(state.expand_budget),
+            edge_index=batch.edge_index.to(device=edge_ids.device, dtype=torch.long),
+            num_nodes=int(batch.num_nodes_total),
+            num_edges=int(batch.edge_index.size(1)),
+            active_nodes=state.active_nodes.to(device=edge_ids.device, dtype=torch.bool)
+            .unsqueeze(0)
+            .expand(int(edge_ids.numel()), -1)
+            & node_belongs,
+            active_edges=state.active_edges.to(device=edge_ids.device, dtype=torch.bool)
+            .unsqueeze(0)
+            .expand(int(edge_ids.numel()), -1)
+            & edge_belongs,
+            root_edges=state.root_edges.to(device=edge_ids.device, dtype=torch.bool)
+            .unsqueeze(0)
+            .expand(int(edge_ids.numel()), -1)
+            & edge_belongs,
+            boundary_nodes=(
+                state.boundary_nodes.to(device=edge_ids.device, dtype=torch.bool)
+                .unsqueeze(0)
+                .expand(int(edge_ids.numel()), -1)
+                & node_belongs
+                if state.boundary_nodes is not None
+                else None
+            ),
+        )
+        expand_budget = int(state.expand_budget)
+
+    successor = parent.snapshot()
+    successor.expand_budget = expand_budget
+    _ensure_expanded_trace_capacity(successor, capacity=expand_budget)
+    successor.apply_expansion(
+        rollout_ids=torch.arange(
+            int(edge_ids.numel()),
+            dtype=torch.long,
+            device=edge_ids.device,
+        ),
+        chosen_edges=edge_ids,
+        edge_index=batch.edge_index,
+        validate=True,
+    )
+    return successor
+
+
+def _te_bfm_terminal_edge_terms(
+    *,
+    batch: RetrievalBatch,
+    state: RolloutState,
+    frontier_edge_ids: torch.Tensor,
+    frontier_batch_ids: torch.Tensor,
+    reward_model: Any,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> _TerminalEdgeTerms:
+    edge_ids = frontier_edge_ids.to(device=state.device, dtype=torch.long).view(-1)
+    row_ids = frontier_batch_ids.to(device=state.device, dtype=torch.long).view(-1)
+    if edge_ids.shape != row_ids.shape:
+        raise ValueError(
+            "frontier_edge_ids and frontier_batch_ids must have matching shape: "
+            f"{tuple(edge_ids.shape)} != {tuple(row_ids.shape)}."
+        )
+    if edge_ids.numel() == 0:
+        empty = torch.empty((0,), dtype=dtype, device=device)
+        return _TerminalEdgeTerms(
+            log_reward=empty,
+            log_pb=empty,
+            supported=empty,
+        )
+
+    context = build_reward_batch_context(
+        retrieval_batch=batch,
+        device=state.device,
+        dtype=torch.float32,
+        debug_checks=bool(getattr(reward_model, "debug_checks", False)),
+    )
+    child_expanded_trace, child_expanded_lengths = (
+        state.expanded_edge_trace_for_rollouts_tensor(
+            row_ids,
+            selected_edge_ids=edge_ids,
+        )
+    )
+    anchor_node_trace, anchor_node_lengths = state.anchor_node_trace_for_rollouts_tensor(
+        row_ids,
+    )
+    active_node_trace, active_node_valid = sparse_rollout_active_node_trace(
+        anchor_node_trace=anchor_node_trace,
+        anchor_node_lengths=anchor_node_lengths,
+        expanded_edge_trace=child_expanded_trace,
+        expanded_edge_lengths=child_expanded_lengths,
+        edge_index=context.edge_index,
+    )
+    root_trace, root_lengths = state.root_edge_trace_for_rollouts_tensor(row_ids)
+    active_edge_trace = _concat_trace_rows(
+        left_trace=root_trace,
+        left_lengths=root_lengths,
+        right_trace=child_expanded_trace,
+        right_lengths=child_expanded_lengths,
+    )
+    active_edge_lengths = root_lengths + child_expanded_lengths
+    row_to_graph = state.rollout_to_graph.to(
+        device=state.device,
+        dtype=torch.long,
+    ).index_select(0, row_ids)
+    support = _evidence_support_stats_for_edge_traces(
+        retrieval_batch=batch,
+        active_node_trace=active_node_trace,
+        active_node_valid=active_node_valid,
+        active_edge_trace=active_edge_trace,
+        active_edge_lengths=active_edge_lengths,
+        row_to_graph=row_to_graph,
+        context=context,
+        beta=float(getattr(reward_model, "beta")),
+    )
+    path_utility = _shortest_path_utility_for_edge_traces(
+        retrieval_batch=batch,
+        active_edge_trace=active_edge_trace,
+        active_edge_lengths=active_edge_lengths,
+        row_to_graph=row_to_graph,
+        context=context,
+    )
+    reward_terms = _set_reward_terms(
+        answer_utility=support.supported_answer_f_beta,
+        path_utility=path_utility,
+        expanded_edge_count=child_expanded_lengths.to(
+            device=context.edge_index.device,
+            dtype=context.dtype,
+        ),
+        reward_floor=float(getattr(reward_model, "reward_floor")),
+        edge_cost=float(getattr(reward_model, "edge_cost")),
+    )
+    local_rows = torch.arange(
+        int(edge_ids.numel()),
+        dtype=torch.long,
+        device=state.device,
+    )
+    log_pb = uniform_log_pb_for_selected_nonroot_edge_trace_tensors(
+        active_nonroot_edge_trace=child_expanded_trace,
+        active_nonroot_edge_lengths=child_expanded_lengths,
+        anchor_node_trace=anchor_node_trace,
+        anchor_node_lengths=anchor_node_lengths,
+        edge_index=batch.edge_index,
+        edge_batch=batch.edge_batch,
+        row_ids=local_rows,
+        selected_edge_ids=edge_ids,
+        row_to_graph=row_to_graph,
+        validate=False,
+        append_selected_if_missing=True,
+    )
+    return _TerminalEdgeTerms(
+        log_reward=reward_terms.log_reward.to(device=device, dtype=dtype),
+        log_pb=log_pb.to(device=device, dtype=dtype),
+        supported=support.supported_answer_f_beta.to(device=device, dtype=dtype),
+    )
+
+
+def _terminal_quotient_group_masses(
+    *,
+    row_ids: torch.Tensor,
+    log_rewards: torch.Tensor,
+    log_pbs: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    row_ids = row_ids.to(device=device, dtype=torch.long).view(-1)
+    log_rewards = log_rewards.to(device=device, dtype=dtype).view(-1)
+    log_pbs = log_pbs.to(device=device, dtype=dtype).view(-1)
+    if row_ids.numel() == 0:
+        empty_mass = torch.empty((0,), dtype=dtype, device=device)
+        empty_rows = torch.empty((0,), dtype=torch.long, device=device)
+        return empty_mass, empty_rows
+    if log_rewards.shape != row_ids.shape or log_pbs.shape != row_ids.shape:
+        raise ValueError(
+            "row_ids, log_rewards, and log_pbs must have matching shape for "
+            "terminal quotient grouping."
+        )
+
+    groups: dict[tuple[int, float, float], int] = {}
+    rewards_cpu = log_rewards.detach().cpu().tolist()
+    pbs_cpu = log_pbs.detach().cpu().tolist()
+    rows_cpu = row_ids.detach().cpu().tolist()
+    for row_id, log_reward, log_pb in zip(rows_cpu, rewards_cpu, pbs_cpu):
+        key = (int(row_id), float(log_reward), float(log_pb))
+        groups[key] = groups.get(key, 0) + 1
+
+    group_rows: list[int] = []
+    group_masses: list[float] = []
+    for (row_id, log_reward, log_pb), count in groups.items():
+        group_rows.append(row_id)
+        group_masses.append(math.log(float(count)) + log_reward + log_pb)
+
+    return (
+        torch.tensor(group_masses, dtype=dtype, device=device),
+        torch.tensor(group_rows, dtype=torch.long, device=device),
+    )
+
+
+def _concat_trace_rows(
+    *,
+    left_trace: torch.Tensor,
+    left_lengths: torch.Tensor,
+    right_trace: torch.Tensor,
+    right_lengths: torch.Tensor,
+) -> torch.Tensor:
+    width = int(left_trace.size(1) + right_trace.size(1))
+    out = torch.full(
+        (int(left_trace.size(0)), width),
+        -1,
+        dtype=torch.long,
+        device=left_trace.device,
+    )
+    if left_trace.size(1) > 0:
+        out[:, : left_trace.size(1)] = left_trace
+    if right_trace.size(1) > 0:
+        right_cols = torch.arange(
+            right_trace.size(1),
+            dtype=torch.long,
+            device=left_trace.device,
+        ).view(1, -1)
+        target_cols = left_lengths.to(device=left_trace.device, dtype=torch.long).view(
+            -1,
+            1,
+        ) + right_cols
+        out.scatter_(1, target_cols, right_trace.to(device=left_trace.device))
+    return out
+
+
+def _te_bfm_recursive_expansion_diagnostics(
+    *,
+    batch: RetrievalBatch,
+    state: RolloutState,
+    row_ids: torch.Tensor,
+    expanded_state_count: int,
+    max_expanded_states: int,
+    remaining_budget: torch.Tensor,
+    lookahead_depth: int,
+) -> dict[str, Any]:
+    row_ids_cpu = row_ids.detach().cpu().to(dtype=torch.long).view(-1)
+    counts_by_row = torch.bincount(row_ids_cpu, minlength=state.num_rollouts)
+    active_rows = counts_by_row.nonzero(as_tuple=False).flatten()
+    if active_rows.numel() == 0:
+        child_counts = torch.empty(0, dtype=torch.long)
+    else:
+        child_counts = counts_by_row.index_select(0, active_rows)
+
+    rollout_to_graph = state.rollout_to_graph.detach().cpu().to(dtype=torch.long)
+    active_graphs = (
+        rollout_to_graph.index_select(0, active_rows)
+        if active_rows.numel() > 0
+        else torch.empty(0, dtype=torch.long)
+    )
+    graph_contrib: dict[int, int] = {}
+    for graph_id, count in zip(active_graphs.tolist(), child_counts.tolist()):
+        graph_contrib[int(graph_id)] = graph_contrib.get(int(graph_id), 0) + int(count)
+
+    top_graph_ids = sorted(
+        graph_contrib,
+        key=lambda graph_id: graph_contrib[graph_id],
+        reverse=True,
+    )[:5]
+
+    budget_cpu = remaining_budget.detach().cpu().to(dtype=torch.long).view(-1)
+    graph_records = [
+        _te_bfm_graph_diagnostics(
+            batch=batch,
+            state=state,
+            graph_id=graph_id,
+            active_rows=active_rows,
+            active_graphs=active_graphs,
+            counts_by_row=counts_by_row,
+            remaining_budget=budget_cpu,
+            frontier_count=graph_contrib[graph_id],
+        )
+        for graph_id in top_graph_ids
+    ]
+
+    return {
+        "expanded_state_count": int(expanded_state_count),
+        "max_expanded_states": int(max_expanded_states),
+        "lookahead_depth": int(lookahead_depth),
+        "remaining_budget_min": _safe_int(budget_cpu.min()) if budget_cpu.numel() else None,
+        "remaining_budget_max": _safe_int(budget_cpu.max()) if budget_cpu.numel() else None,
+        "current_state_frontier_count": int(expanded_state_count),
+        "frontier_count": int(expanded_state_count),
+        "child_frontier_count_sum": int(expanded_state_count),
+        "child_frontier_count_mean": _safe_mean(child_counts),
+        "child_frontier_count_max": _safe_int(child_counts.max())
+        if child_counts.numel()
+        else 0,
+        "num_rollout_rows": int(state.num_rollouts),
+        "num_frontier_rows": int(active_rows.numel()),
+        "top_graphs": graph_records,
+    }
+
+
+def _te_bfm_graph_diagnostics(
+    *,
+    batch: RetrievalBatch,
+    state: RolloutState,
+    graph_id: int,
+    active_rows: torch.Tensor,
+    active_graphs: torch.Tensor,
+    counts_by_row: torch.Tensor,
+    remaining_budget: torch.Tensor,
+    frontier_count: int,
+) -> dict[str, Any]:
+    graph_id = int(graph_id)
+    ptr = getattr(batch, "ptr", None)
+    edge_ptr = getattr(batch, "edge_ptr", None)
+    node_lo = _ptr_value(ptr, graph_id, default=0)
+    node_hi = _ptr_value(ptr, graph_id + 1, default=int(getattr(batch, "num_nodes_total", 0)))
+    edge_lo = _ptr_value(edge_ptr, graph_id, default=0)
+    edge_hi = _ptr_value(
+        edge_ptr,
+        graph_id + 1,
+        default=int(getattr(batch, "num_edges_total", 0)),
+    )
+
+    row_mask = active_graphs.eq(graph_id) if active_graphs.numel() else torch.empty(0, dtype=torch.bool)
+    rows = active_rows[row_mask] if row_mask.numel() else torch.empty(0, dtype=torch.long)
+    row_counts = counts_by_row.index_select(0, rows) if rows.numel() else torch.empty(0, dtype=torch.long)
+    row_budgets = remaining_budget.index_select(0, rows) if rows.numel() else torch.empty(0, dtype=torch.long)
+
+    sample_id = _batch_graph_field(batch, graph_id, "sample_id", "question_id")
+    split = _batch_graph_field(batch, graph_id, "split")
+    if split is None and sample_id is not None:
+        parts = str(sample_id).split("/")
+        if len(parts) >= 3:
+            split = parts[1]
+
+    return {
+        "split": split,
+        "sample_id": sample_id,
+        "question_id": _batch_graph_field(batch, graph_id, "question_id") or sample_id,
+        "batch_index": _batch_graph_field(batch, graph_id, "batch_index"),
+        "graph_index": graph_id,
+        "graph_index_in_batch": graph_id,
+        "num_nodes": max(0, node_hi - node_lo),
+        "num_edges": max(0, edge_hi - edge_lo),
+        "num_anchors": _node_id_count_for_graph(batch, "anchor_node_ids", graph_id),
+        "num_targets": _node_id_count_for_graph(batch, "target_node_ids", graph_id),
+        "remaining_budget_b_min": _safe_int(row_budgets.min()) if row_budgets.numel() else None,
+        "remaining_budget_b_max": _safe_int(row_budgets.max()) if row_budgets.numel() else None,
+        "frontier_count": int(frontier_count),
+        "child_frontier_count_sum": int(frontier_count),
+        "child_frontier_count_mean": _safe_mean(row_counts),
+        "child_frontier_count_max": _safe_int(row_counts.max()) if row_counts.numel() else 0,
+        "rollout_row_count": int(rows.numel()),
+    }
+
+
+def _batch_graph_field(
+    batch: RetrievalBatch,
+    graph_id: int,
+    *names: str,
+) -> Any | None:
+    for name in names:
+        if not hasattr(batch, name):
+            continue
+        value = getattr(batch, name)
+        item = _graph_field_item(value, int(graph_id))
+        if item is not None:
+            return item
+    return None
+
+
+def _graph_field_item(value: Any, graph_id: int) -> Any | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return value[graph_id] if 0 <= graph_id < len(value) else None
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return _tensor_scalar(value)
+        if 0 <= graph_id < int(value.size(0)):
+            return _tensor_scalar(value[graph_id])
+        return None
+    if isinstance(value, str):
+        return value if graph_id == 0 else None
+    return value if graph_id == 0 else None
+
+
+def _tensor_scalar(value: torch.Tensor) -> Any:
+    if value.numel() != 1:
+        return value.detach().cpu().tolist()
+    item = value.detach().cpu().item()
+    return item.decode("utf-8") if isinstance(item, bytes) else item
+
+
+def _node_id_count_for_graph(
+    batch: RetrievalBatch,
+    field_name: str,
+    graph_id: int,
+) -> int:
+    if not hasattr(batch, field_name) or not hasattr(batch, "batch"):
+        return 0
+    ids = getattr(batch, field_name)
+    if not isinstance(ids, torch.Tensor) or ids.numel() == 0:
+        return 0
+    node_batch = batch.batch.detach().cpu().to(dtype=torch.long)
+    ids_cpu = ids.detach().cpu().to(dtype=torch.long).view(-1)
+    valid = ids_cpu.ge(0) & ids_cpu.lt(int(node_batch.numel()))
+    if not bool(valid.any()):
+        return 0
+    graph_ids = node_batch.index_select(0, ids_cpu[valid])
+    return int(graph_ids.eq(int(graph_id)).sum().item())
+
+
+def _ptr_value(ptr: Any, index: int, *, default: int) -> int:
+    if not isinstance(ptr, torch.Tensor):
+        return int(default)
+    ptr_cpu = ptr.detach().cpu().to(dtype=torch.long).view(-1)
+    if index < 0 or index >= int(ptr_cpu.numel()):
+        return int(default)
+    return int(ptr_cpu[index].item())
+
+
+def _safe_int(value: torch.Tensor) -> int:
+    return int(value.item())
+
+
+def _safe_mean(values: torch.Tensor) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return float(values.to(dtype=torch.float32).mean().item())
+
+
+def _ensure_expanded_trace_capacity(
+    state: RolloutState,
+    *,
+    capacity: int,
+) -> None:
+    if state.expanded_edge_trace is None:
+        return
+    capacity = int(capacity)
+    current_width = int(state.expanded_edge_trace.size(1))
+    if current_width >= capacity:
+        return
+    padded = torch.full(
+        (int(state.expanded_edge_trace.size(0)), capacity),
+        -1,
+        dtype=state.expanded_edge_trace.dtype,
+        device=state.expanded_edge_trace.device,
+    )
+    if current_width > 0:
+        padded[:, :current_width] = state.expanded_edge_trace
+    state.expanded_edge_trace = padded
+
+
+def _uniform_log_pb_for_successor_edges(
+    *,
+    batch: RetrievalBatch,
+    successor: RolloutState,
+    frontier_edge_ids: torch.Tensor,
+) -> torch.Tensor:
+    edge_ids = frontier_edge_ids.to(
+        device=batch.edge_index.device,
+        dtype=torch.long,
+    ).view(-1)
+    row_ids = torch.arange(
+        int(edge_ids.numel()),
+        dtype=torch.long,
+        device=edge_ids.device,
+    )
+    expanded_edge_trace, expanded_edge_lengths = (
+        successor.expanded_edge_trace_for_rollouts_tensor(row_ids)
+    )
+    anchor_node_trace, anchor_node_lengths = (
+        successor.anchor_node_trace_for_rollouts_tensor(row_ids)
+    )
+    return uniform_log_pb_for_selected_nonroot_edge_trace_tensors(
+        active_nonroot_edge_trace=expanded_edge_trace,
+        active_nonroot_edge_lengths=expanded_edge_lengths,
+        anchor_node_trace=anchor_node_trace,
+        anchor_node_lengths=anchor_node_lengths,
+        edge_index=batch.edge_index,
+        edge_batch=batch.edge_batch,
+        row_ids=row_ids,
+        selected_edge_ids=edge_ids,
+        row_to_graph=successor.rollout_to_graph,
+        validate=False,
+        append_selected_if_missing=True,
+    )
+
+
+def _uniform_parent_counts_for_successor_edges(
+    *,
+    batch: RetrievalBatch,
+    successor: RolloutState,
+    frontier_edge_ids: torch.Tensor,
+) -> torch.Tensor:
+    edge_ids = frontier_edge_ids.to(
+        device=batch.edge_index.device,
+        dtype=torch.long,
+    ).view(-1)
+    row_ids = torch.arange(
+        int(edge_ids.numel()),
+        dtype=torch.long,
+        device=edge_ids.device,
+    )
+    expanded_edge_trace, expanded_edge_lengths = (
+        successor.expanded_edge_trace_for_rollouts_tensor(row_ids)
+    )
+    anchor_node_trace, anchor_node_lengths = (
+        successor.anchor_node_trace_for_rollouts_tensor(row_ids)
+    )
+    return uniform_backward_parent_counts_for_selected_nonroot_edge_trace_tensors(
+        active_nonroot_edge_trace=expanded_edge_trace,
+        active_nonroot_edge_lengths=expanded_edge_lengths,
+        anchor_node_trace=anchor_node_trace,
+        anchor_node_lengths=anchor_node_lengths,
+        edge_index=batch.edge_index,
+        edge_batch=batch.edge_batch,
+        row_ids=row_ids,
+        selected_edge_ids=edge_ids,
+        row_to_graph=successor.rollout_to_graph,
+        validate=False,
+        append_selected_if_missing=True,
+    )
+
+
+def _filter_frontier_context(
+    frontier: Any,
+    mask: torch.Tensor,
+    *,
+    device: torch.device,
+) -> Any:
+    mask = mask.to(device=device, dtype=torch.bool).view(-1)
+    return type(frontier)(
+        **{
+            field: value[mask] if isinstance(value, torch.Tensor) else value
+            for field, value in (
+                (item.name, getattr(frontier, item.name)) for item in fields(frontier)
+            )
+        }
+    )
+
+
+def _cap_frontier_context_by_semantic_topk(
+    *,
+    fb: FeatureBank,
+    frontier: FrontierContext,
+    max_edges_per_state: int,
+    device: torch.device,
+) -> tuple[FrontierContext, _FrontierCapStats]:
+    max_edges = int(max_edges_per_state)
+    if max_edges < 1:
+        raise ValueError(
+            f"max_edges_per_state must be >= 1, got {max_edges_per_state}."
+        )
+    if frontier.edge_ids.numel() <= max_edges:
+        return frontier, _FrontierCapStats(
+            used_rate=0.0,
+            dropped_edge_count_mean=0.0,
+        )
+
+    row_ids = frontier.graph_id.to(device=device, dtype=torch.long).view(-1)
+    if row_ids.numel() == 0:
+        return frontier, _FrontierCapStats(
+            used_rate=0.0,
+            dropped_edge_count_mean=0.0,
+        )
+    semantic = frontier_semantic_scores(fb=fb, frontier=frontier)
+    scores = (
+        semantic.query_relation_score + semantic.query_new_node_score
+    ).to(device=device, dtype=torch.float32)
+    keep = torch.zeros(row_ids.shape, dtype=torch.bool, device=device)
+    dropped_counts: list[float] = []
+    for row_id in torch.unique(row_ids, sorted=True):
+        row_mask = row_ids.eq(row_id)
+        positions = row_mask.nonzero(as_tuple=False).flatten()
+        if int(positions.numel()) <= max_edges:
+            keep[positions] = True
+            dropped_counts.append(0.0)
+            continue
+        row_scores = scores.index_select(0, positions)
+        _, local_topk = torch.topk(row_scores, k=max_edges, largest=True, sorted=False)
+        keep[positions.index_select(0, local_topk)] = True
+        dropped_counts.append(float(int(positions.numel()) - max_edges))
+    dropped = [count for count in dropped_counts if count > 0.0]
+    stats = _FrontierCapStats(
+        used_rate=1.0 if dropped else 0.0,
+        dropped_edge_count_mean=(
+            float(sum(dropped) / max(len(dropped), 1)) if dropped else 0.0
+        ),
+    )
+    return _filter_frontier_context(frontier, keep, device=device), stats
 
 
 @dataclass(frozen=True)
@@ -499,11 +2378,10 @@ def frontier_logit_summary(
     )
     has_edge = counts.gt(0)
 
-    logsumexp = scatter_logsumexp(
-        edge_logits,
-        edge_batch,
-        dim=0,
-        dim_size=num_graphs,
+    logsumexp = segment_logsumexp(
+        values=edge_logits,
+        segment_ids=edge_batch,
+        num_segments=num_graphs,
     )
     logmeanexp = logsumexp - counts.clamp_min(1.0).log()
 
@@ -528,231 +2406,12 @@ def frontier_logit_summary(
     )
 
 
-class EdgeResidualHead(nn.Module):
-    """
-    Learned density correction r_theta(s,e,q) added to semantic base logits.
-    """
-
-    def __init__(
-        self,
-        *,
-        hidden_dim: int,
-        transition_feature_dim: int,
-        dropout: float = 0.0,
-        trainable: bool = True,
-        zero_init: bool = True,
-        include_semantic_logit: bool = True,
-    ) -> None:
-        super().__init__()
-
-        self.hidden_dim = int(hidden_dim)
-        if self.hidden_dim <= 0:
-            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
-        self.transition_feature_dim = int(transition_feature_dim)
-        if self.transition_feature_dim < 0:
-            raise ValueError(
-                f"transition_feature_dim must be >= 0, got {transition_feature_dim}."
-            )
-        self.include_semantic_logit = bool(include_semantic_logit)
-
-        input_dim = self.hidden_dim * 2 + self.transition_feature_dim
-        if self.include_semantic_logit:
-            input_dim += 1
-
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(self.hidden_dim, 1),
-        )
-        if zero_init:
-            zero_last_linear(self.net)
-        for parameter in self.parameters():
-            parameter.requires_grad_(bool(trainable))
-
-    def forward(
-        self,
-        *,
-        context: Any,
-        candidate_edge_h: torch.Tensor | None,
-        candidate_batch_ids: torch.Tensor,
-        semantic_logits: torch.Tensor,
-        transition_features: TransitionFeatureOutput,
-    ) -> torch.Tensor:
-        semantic_logits = semantic_logits.view(-1)
-        num_candidates = int(semantic_logits.numel())
-        if num_candidates == 0:
-            return semantic_logits.new_empty((0,))
-
-        if candidate_edge_h is None:
-            raise RuntimeError("StateReadout did not return frontier edge features.")
-        edge_h = candidate_edge_h.to(
-            device=semantic_logits.device,
-            dtype=context.state_h.dtype,
-        )
-        if edge_h.shape != (num_candidates, self.hidden_dim):
-            raise ValueError(
-                "candidate_edge_h must have shape "
-                f"[{num_candidates}, {self.hidden_dim}], got {tuple(edge_h.shape)}."
-            )
-
-        batch_ids = candidate_batch_ids.to(
-            device=context.state_h.device,
-            dtype=torch.long,
-        ).view(-1)
-        if batch_ids.shape != (num_candidates,):
-            raise ValueError(
-                "candidate_batch_ids must have shape "
-                f"[{num_candidates}], got {tuple(batch_ids.shape)}."
-            )
-        state_h = context.state_h.index_select(0, batch_ids)
-
-        transition_values = transition_features.values.to(
-            device=context.state_h.device,
-            dtype=context.state_h.dtype,
-        )
-        expected = (num_candidates, self.transition_feature_dim)
-        if transition_values.shape != expected:
-            raise ValueError(
-                f"transition_features.values must have shape {expected}, "
-                f"got {tuple(transition_values.shape)}."
-            )
-
-        pieces = [state_h, edge_h, transition_values]
-        if self.include_semantic_logit:
-            pieces.append(
-                semantic_logits.detach()
-                .to(device=context.state_h.device, dtype=context.state_h.dtype)
-                .unsqueeze(-1)
-            )
-
-        return self.net(torch.cat(pieces, dim=-1)).squeeze(-1)
-
-
-def _has_candidate_edge(
-    *,
-    candidate_batch_ids: torch.Tensor,
-    num_graphs: int,
-    device: torch.device,
-) -> torch.Tensor:
-    candidate_batch_ids = candidate_batch_ids.to(device=device, dtype=torch.long)
-    if candidate_batch_ids.numel() == 0:
-        return torch.zeros(int(num_graphs), dtype=torch.bool, device=device)
-    return torch.bincount(candidate_batch_ids, minlength=int(num_graphs)).gt(0)
-
-
-def _candidate_successor_state(
-    *,
-    batch: RetrievalBatch,
-    state: State | RolloutState,
-    candidate_edge_ids: torch.Tensor,
-    candidate_batch_ids: torch.Tensor,
-) -> RolloutState:
-    if isinstance(state, RolloutState) or state.active_nodes.ndim == 2:
-        if not isinstance(state, RolloutState):
-            raise TypeError("2D active masks require RolloutState.")
-        return _rollout_candidate_successor_state(
-            batch=batch,
-            state=state,
-            candidate_edge_ids=candidate_edge_ids,
-            candidate_batch_ids=candidate_batch_ids,
-        )
-
-    return _single_batch_candidate_successor_state(
-        batch=batch,
-        state=state,
-        candidate_edge_ids=candidate_edge_ids,
-        candidate_batch_ids=candidate_batch_ids,
-    )
-
-
-def _single_batch_candidate_successor_state(
-    *,
-    batch: RetrievalBatch,
-    state: State,
-    candidate_edge_ids: torch.Tensor,
-    candidate_batch_ids: torch.Tensor,
-) -> RolloutState:
-    device = state.active_nodes.device
-    edge_ids = candidate_edge_ids.to(device=device, dtype=torch.long).view(-1)
-    graph_ids = candidate_batch_ids.to(device=device, dtype=torch.long).view(-1)
-    if edge_ids.shape != graph_ids.shape:
-        raise ValueError(
-            "candidate_edge_ids and candidate_batch_ids must have matching shape: "
-            f"{tuple(edge_ids.shape)} != {tuple(graph_ids.shape)}."
-        )
-
-    num_candidates = int(edge_ids.numel())
-    node_batch = batch.batch.to(device=device, dtype=torch.long)
-    edge_batch = batch.edge_batch.to(device=device, dtype=torch.long)
-
-    node_belongs = node_batch.view(1, -1).eq(graph_ids.view(-1, 1))
-    edge_belongs = edge_batch.view(1, -1).eq(graph_ids.view(-1, 1))
-
-    active_nodes = state.active_nodes.view(1, -1).expand_as(node_belongs) & node_belongs
-    active_edges = state.active_edges.view(1, -1).expand_as(edge_belongs) & edge_belongs
-    root_edges = state.root_edges.view(1, -1).expand_as(edge_belongs) & edge_belongs
-
-    anchor_mask = torch.zeros_like(state.active_nodes, dtype=torch.bool, device=device)
-    anchors = batch.anchor_node_ids.to(device=device, dtype=torch.long).view(-1)
-    valid_anchors = anchors.ge(0) & anchors.lt(anchor_mask.numel())
-    if bool(valid_anchors.any()):
-        anchor_mask[anchors[valid_anchors]] = True
-    anchor_nodes = anchor_mask.view(1, -1).expand_as(node_belongs) & node_belongs
-
-    next_state = RolloutState(
-        active_nodes=active_nodes.clone(),
-        active_edges=active_edges.clone(),
-        root_edges=root_edges.clone(),
-        anchor_nodes=anchor_nodes.clone(),
-        rollout_to_graph=graph_ids,
-        expand_budget=int(state.expand_budget),
-    )
-    next_state.apply_expansion(
-        rollout_ids=torch.arange(num_candidates, dtype=torch.long, device=device),
-        chosen_edges=edge_ids,
-        edge_index=batch.edge_index,
-    )
-    return next_state
-
-
-def _rollout_candidate_successor_state(
-    *,
-    batch: RetrievalBatch,
-    state: RolloutState,
-    candidate_edge_ids: torch.Tensor,
-    candidate_batch_ids: torch.Tensor,
-) -> RolloutState:
-    device = state.active_nodes.device
-    edge_ids = candidate_edge_ids.to(device=device, dtype=torch.long).view(-1)
-    rollout_ids = candidate_batch_ids.to(device=device, dtype=torch.long).view(-1)
-    if edge_ids.shape != rollout_ids.shape:
-        raise ValueError(
-            "candidate_edge_ids and candidate_batch_ids must have matching shape: "
-            f"{tuple(edge_ids.shape)} != {tuple(rollout_ids.shape)}."
-        )
-
-    num_candidates = int(edge_ids.numel())
-    next_state = RolloutState(
-        active_nodes=state.active_nodes.index_select(0, rollout_ids).clone(),
-        active_edges=state.active_edges.index_select(0, rollout_ids).clone(),
-        root_edges=state.root_edges.index_select(0, rollout_ids).clone(),
-        anchor_nodes=state.anchor_nodes.index_select(0, rollout_ids).clone(),
-        rollout_to_graph=state.rollout_to_graph.index_select(0, rollout_ids),
-        expand_budget=int(state.expand_budget),
-    )
-    next_state.apply_expansion(
-        rollout_ids=torch.arange(num_candidates, dtype=torch.long, device=device),
-        chosen_edges=edge_ids,
-        edge_index=batch.edge_index,
-    )
-    return next_state
-
-
 __all__ = [
-    "EdgeResidualHead",
     "FrontierLogitSummary",
     "Policy",
+    "PolicyContext",
     "PolicyOutput",
     "frontier_logit_summary",
+    "hazard_policy_log_probs",
+    "segment_logsumexp_or_neg_inf",
 ]
