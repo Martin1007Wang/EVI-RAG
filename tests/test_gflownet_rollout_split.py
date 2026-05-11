@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import sys
 import types
+import dataclasses
 from pathlib import Path
 
 import pytest
 import torch
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
 
 if "torch_scatter" not in sys.modules:
     torch_scatter_stub = types.ModuleType("torch_scatter")
@@ -73,13 +70,21 @@ if "torch_scatter" not in sys.modules:
     torch_scatter_stub.scatter_logsumexp = _scatter_logsumexp
     sys.modules["torch_scatter"] = torch_scatter_stub
 
-from src.weaver.config import build_rollout_runtime_config
-from src.weaver.loss import LossOutput
-from src.weaver.rollout.engine import RewardMode
+from src.weaver.config import (
+    build_eval_runtime_config,
+    build_loss_config,
+    build_policy_runtime_config,
+    build_reward_config,
+    build_rollout_runtime_config,
+    validate_algorithm_coupling,
+)
+from src.weaver.loss import BudgetedDAGDetailedBalanceLoss, LossOutput
+from src.weaver.module import WeaverModule, build_loss
 from src.weaver.rollout.runner import (
     RolloutRunner,
-    backward_rollouts,
+    TrainingRolloutChunk,
     concat_rollout_batches,
+    detach_rollout_for_metrics,
     rollout_chunk_sizes,
 )
 from src.weaver.rollout.schema import RolloutBatch, RolloutStats, RolloutTraces
@@ -91,7 +96,6 @@ def _rollout(batch_size: int = 1, horizon: int = 1) -> RolloutBatch:
     bool_bt = torch.zeros((batch_size, horizon), dtype=torch.bool)
     return RolloutBatch(
         stats=RolloutStats(
-            root_log_z=zeros_b.clone(),
             trajectory_length=torch.ones(batch_size, dtype=torch.long),
             terminal_log_reward=zeros_b.clone(),
             terminal_answer_f1=zeros_b.clone(),
@@ -99,9 +103,20 @@ def _rollout(batch_size: int = 1, horizon: int = 1) -> RolloutBatch:
             edge_action_count=zeros_b.clone(),
         ),
         traces=RolloutTraces(
-            state_log_flows=zeros_bt.clone(),
             log_pf=zeros_bt.clone(),
             log_pb=zeros_bt.clone(),
+            state_log_flow=zeros_bt.clone(),
+            db_parent_log_reward=zeros_bt.clone(),
+            db_child_log_reward=zeros_bt.clone(),
+            db_parent_shortest_path_potential=zeros_bt.clone(),
+            db_child_shortest_path_potential=zeros_bt.clone(),
+            db_parent_process_log_bonus=zeros_bt.clone(),
+            db_child_process_log_bonus=zeros_bt.clone(),
+            db_log_p_stop_parent=zeros_bt.clone(),
+            db_log_p_stop_child=zeros_bt.clone(),
+            db_log_pf_expand=zeros_bt.clone(),
+            db_log_pb=zeros_bt.clone(),
+            db_valid_mask=bool_bt.clone(),
             action_type=torch.zeros((batch_size, horizon), dtype=torch.long),
             continue_mask=bool_bt.clone(),
             stop_mask=bool_bt.clone(),
@@ -109,25 +124,109 @@ def _rollout(batch_size: int = 1, horizon: int = 1) -> RolloutBatch:
             stop_now_log_reward=zeros_bt.clone(),
             stop_now_answer_f1=zeros_bt.clone(),
             stop_now_valid_mask=bool_bt.clone(),
-            stop_log_pf=zeros_bt.clone(),
-            stop_tb_valid_mask=bool_bt.clone(),
             target_stop_prob=zeros_bt.clone(),
             target_continue_prob=zeros_bt.clone(),
             policy_action_valid_mask=bool_bt.clone(),
             edge_action_entropy=zeros_bt.clone(),
             edge_action_entropy_valid_mask=bool_bt.clone(),
-            stop_adv_loss=zeros_bt.clone(),
-            stop_adv_target=zeros_bt.clone(),
-            stop_adv_valid_mask=bool_bt.clone(),
-            stop_adv_continue_log_reward=zeros_bt.clone(),
-            local_improvement_loss=zeros_bt.clone(),
-            local_improvement_valid_mask=bool_bt.clone(),
         ),
     )
 
 
+def _rollout_with_autograd_traces(
+    batch_size: int = 1,
+    horizon: int = 1,
+) -> RolloutBatch:
+    def grad_tensor(*shape: int) -> torch.Tensor:
+        return torch.ones(shape, dtype=torch.float32, requires_grad=True) * 2.0
+
+    bool_bt = torch.zeros((batch_size, horizon), dtype=torch.bool)
+    return RolloutBatch(
+        stats=RolloutStats(
+            trajectory_length=torch.ones(batch_size, dtype=torch.long),
+            terminal_log_reward=grad_tensor(batch_size),
+            terminal_answer_f1=grad_tensor(batch_size),
+            edge_action_entropy=grad_tensor(batch_size),
+            edge_action_count=grad_tensor(batch_size),
+            terminal_complexity_penalty=grad_tensor(batch_size),
+            terminal_base_log_reward=grad_tensor(batch_size),
+            terminal_utility=grad_tensor(batch_size),
+            terminal_shortest_path_potential=grad_tensor(batch_size),
+            terminal_expanded_edge_count=grad_tensor(batch_size),
+            terminal_answer_degree_excess=grad_tensor(batch_size),
+        ),
+        traces=RolloutTraces(
+            log_pf=grad_tensor(batch_size, horizon),
+            log_pb=grad_tensor(batch_size, horizon),
+            state_log_flow=grad_tensor(batch_size, horizon),
+            db_parent_log_reward=grad_tensor(batch_size, horizon),
+            db_child_log_reward=grad_tensor(batch_size, horizon),
+            db_parent_shortest_path_potential=grad_tensor(batch_size, horizon),
+            db_child_shortest_path_potential=grad_tensor(batch_size, horizon),
+            db_parent_process_log_bonus=grad_tensor(batch_size, horizon),
+            db_child_process_log_bonus=grad_tensor(batch_size, horizon),
+            db_log_p_stop_parent=grad_tensor(batch_size, horizon),
+            db_log_p_stop_child=grad_tensor(batch_size, horizon),
+            db_log_pf_expand=grad_tensor(batch_size, horizon),
+            db_log_pb=grad_tensor(batch_size, horizon),
+            db_valid_mask=bool_bt.clone(),
+            action_type=torch.zeros((batch_size, horizon), dtype=torch.long),
+            continue_mask=bool_bt.clone(),
+            stop_mask=bool_bt.clone(),
+            selected_edge_ids=torch.full((batch_size, horizon), -1, dtype=torch.long),
+            stop_now_log_reward=grad_tensor(batch_size, horizon),
+            stop_now_answer_f1=grad_tensor(batch_size, horizon),
+            stop_now_valid_mask=bool_bt.clone(),
+            target_stop_prob=grad_tensor(batch_size, horizon),
+            target_continue_prob=grad_tensor(batch_size, horizon),
+            policy_action_valid_mask=bool_bt.clone(),
+            edge_action_entropy=grad_tensor(batch_size, horizon),
+            edge_action_entropy_valid_mask=bool_bt.clone(),
+            budget_exhausted_mask=bool_bt.clone(),
+        ),
+    )
+
+
+def _rollout_has_autograd_tensor(rollout: RolloutBatch) -> bool:
+    for value in (rollout.stats, rollout.traces):
+        for field in dataclasses.fields(value):
+            tensor = getattr(value, field.name)
+            if isinstance(tensor, torch.Tensor) and (
+                tensor.requires_grad or tensor.grad_fn is not None
+            ):
+                return True
+    return False
+
+
+def _tiny_module() -> WeaverModule:
+    return WeaverModule(
+        hidden_dim=2,
+        entity_text_embeddings=torch.eye(3, 2, dtype=torch.float32),
+        entity_embedding_map=torch.tensor([0, 1, 2], dtype=torch.long),
+        relation_embeddings=torch.eye(3, 2, dtype=torch.float32),
+        rollout={
+            "expand_budget": 1,
+            "train_num_rollout": 1,
+            "eval_num_rollout": 1,
+        },
+        runtime={
+            "train_chunk_size": 1,
+            "eval_chunk_size": 1,
+        },
+        eval={
+            "budgets": [1],
+        },
+        optimizer_cfg={"type": "adamw", "lr": 1.0e-3},
+        scheduler_cfg={"type": "none"},
+    )
+
+
 class _ConstantLoss(torch.nn.Module):
-    def __init__(self, value: float, requires_stop_now_reward: bool = False) -> None:
+    def __init__(
+        self,
+        value: float,
+        requires_stop_now_reward: bool = False,
+    ) -> None:
         super().__init__()
         self.value = float(value)
         self.requires_stop_now_reward = bool(requires_stop_now_reward)
@@ -145,20 +244,126 @@ def test_rollout_chunk_sizes_cover_total_without_changing_order() -> None:
     assert list(rollout_chunk_sizes(total=0, chunk_size=8)) == []
 
 
-def test_backward_rollouts_normalizes_by_full_training_step() -> None:
+def test_module_normalizes_chunk_losses_by_full_training_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _tiny_module()
     loss_fn = _ConstantLoss(2.0)
     backward_values: list[float] = []
 
-    output = backward_rollouts(
-        rollouts=[_rollout(), _rollout()],
-        loss_fn=loss_fn,
-        backward_fn=lambda loss: backward_values.append(float(loss.detach().item())),
-        normalize_by=8,
+    module.loss_fn = loss_fn
+    module.rollout_runner.train_num_rollout = 4
+
+    def _iter_training_rollout_chunks(**kwargs: object):
+        del kwargs
+        yield TrainingRolloutChunk(rollouts=(_rollout(), _rollout()), num_rollouts=2)
+        yield TrainingRolloutChunk(rollouts=(_rollout(), _rollout()), num_rollouts=2)
+
+    monkeypatch.setattr(
+        module.rollout_runner,
+        "iter_training_rollout_chunks",
+        _iter_training_rollout_chunks,
+    )
+    monkeypatch.setattr(
+        module,
+        "manual_backward",
+        lambda loss: backward_values.append(float(loss.detach().item())),
     )
 
-    assert output.metrics["loss/total"].item() == pytest.approx(2.0)
-    assert backward_values == [pytest.approx(0.5)]
-    assert loss_fn.seen_batch_sizes == [2]
+    result = module.run_training_rollouts_and_backward(
+        batch=object(),
+        rollout_temperature=1.0,
+        accumulation_batches=2,
+    )
+
+    assert result.loss_output.metrics["loss/total"].item() == pytest.approx(2.0)
+    assert backward_values == [pytest.approx(0.5), pytest.approx(0.5)]
+    assert loss_fn.seen_batch_sizes == [2, 2]
+
+
+def test_detach_rollout_for_metrics_drops_autograd_from_all_tensors() -> None:
+    rollout = _rollout_with_autograd_traces(batch_size=2, horizon=2)
+    detached = detach_rollout_for_metrics(rollout)
+
+    assert _rollout_has_autograd_tensor(rollout)
+    assert not _rollout_has_autograd_tensor(detached)
+
+
+def test_training_chunks_keep_loss_rollouts_with_autograd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RolloutRunner(
+        expand_budget=1,
+        train_num_rollout=2,
+        eval_num_rollout=1,
+        train_chunk_size=1,
+        eval_chunk_size=1,
+    )
+    def _run_vectorized(**kwargs: object) -> list[RolloutBatch]:
+        return [
+            _rollout_with_autograd_traces()
+            for _ in range(int(kwargs["num_rollouts"]))
+        ]
+
+    monkeypatch.setattr(runner.engine, "run_vectorized", _run_vectorized)
+
+    chunks = list(runner.iter_training_rollout_chunks(
+        policy=object(),
+        reward_model=object(),
+        batch=object(),
+        rollout_temperature=1.0,
+        collect_policy_diagnostics=False,
+    ))
+
+    assert len(chunks) == 2
+    assert all(
+        _rollout_has_autograd_tensor(rollout)
+        for chunk in chunks
+        for rollout in chunk.rollouts
+    )
+
+
+def test_module_training_result_keeps_only_detached_metric_rollouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _tiny_module()
+    loss_fn = _ConstantLoss(1.0)
+    loss_seen_autograd: list[bool] = []
+
+    module.loss_fn = loss_fn
+
+    def _iter_training_rollout_chunks(**kwargs: object):
+        del kwargs
+        yield TrainingRolloutChunk(
+            rollouts=(_rollout_with_autograd_traces(),),
+            num_rollouts=1,
+        )
+        yield TrainingRolloutChunk(
+            rollouts=(_rollout_with_autograd_traces(),),
+            num_rollouts=1,
+        )
+
+    def _loss(rollout: RolloutBatch) -> LossOutput:
+        loss_seen_autograd.append(_rollout_has_autograd_tensor(rollout))
+        return _ConstantLoss.forward(loss_fn, rollout)
+
+    monkeypatch.setattr(
+        module.rollout_runner,
+        "iter_training_rollout_chunks",
+        _iter_training_rollout_chunks,
+    )
+    monkeypatch.setattr(loss_fn, "forward", _loss)
+    monkeypatch.setattr(module, "manual_backward", lambda loss: None)
+
+    result = module.run_training_rollouts_and_backward(
+        batch=object(),
+        rollout_temperature=1.0,
+        accumulation_batches=1,
+    )
+
+    assert loss_seen_autograd == [True, True]
+    assert len(result.rollouts) == 2
+    assert not any(_rollout_has_autograd_tensor(rollout) for rollout in result.rollouts)
 
 
 def test_concat_rollout_batches_concatenates_policy_traces() -> None:
@@ -176,76 +381,299 @@ def test_concat_rollout_batches_concatenates_policy_traces() -> None:
         torch.tensor([0.5, 0.7]),
     )
     assert bool(merged.traces.policy_action_valid_mask[1:, 0].all())
-    assert merged.traces.stop_adv_loss is not None
-    assert merged.traces.stop_adv_loss.shape == (3, 2)
+
+
+def test_concat_rollout_batches_preserves_missing_optional_auxiliary_traces() -> None:
+    first = _rollout(batch_size=1, horizon=2)
+    second = _rollout(batch_size=2, horizon=2)
+    first = dataclasses.replace(
+        first,
+        traces=dataclasses.replace(
+            first.traces,
+            stop_now_log_reward=None,
+            stop_now_answer_f1=None,
+            stop_now_valid_mask=None,
+        ),
+    )
+    second = dataclasses.replace(
+        second,
+        traces=dataclasses.replace(
+            second.traces,
+            stop_now_log_reward=None,
+            stop_now_answer_f1=None,
+            stop_now_valid_mask=None,
+        ),
+    )
+
+    merged = concat_rollout_batches([first, second])
+
+    assert merged.traces.stop_now_log_reward is None
+    assert merged.traces.stop_now_answer_f1 is None
+    assert merged.traces.stop_now_valid_mask is None
 
 
 def test_rollout_config_rejects_removed_rollout_mode_flags() -> None:
-    with pytest.raises(ValueError, match="Unused rollout_cfg keys"):
-        build_rollout_runtime_config({"use_static_batch_rollouts": True})
+    with pytest.raises(ValueError, match="Unused rollout keys"):
+        build_rollout_runtime_config(
+            rollout={"use_static_batch_rollouts": True},
+            runtime=None,
+        )
 
-    with pytest.raises(ValueError, match="Unused rollout_cfg keys"):
-        build_rollout_runtime_config({"use_fused_static_batch_rollouts": True})
+    with pytest.raises(ValueError, match="Unused rollout keys"):
+        build_rollout_runtime_config(
+            rollout={"use_fused_static_batch_rollouts": True},
+            runtime=None,
+        )
 
 
-def test_rollout_config_rejects_stop_advantage_until_fused_support_exists() -> None:
-    with pytest.raises(ValueError, match="fused-only rollouts"):
-        build_rollout_runtime_config({"stop_adv": {"enabled": True}})
+def test_rollout_config_rejects_removed_auxiliary_configs() -> None:
+    with pytest.raises(ValueError, match="Unused rollout keys"):
+        build_rollout_runtime_config(
+            rollout={"stop_adv": {"enabled": True}},
+            runtime=None,
+        )
+
+    with pytest.raises(ValueError, match="Unused rollout keys"):
+        build_rollout_runtime_config(
+            rollout={"local_improvement": {"enabled": True}},
+            runtime=None,
+        )
 
 
-def test_rollout_config_allows_local_improvement_auxiliary() -> None:
-    cfg = build_rollout_runtime_config(
-        {"local_improvement": {"enabled": True, "temperature": 0.7}}
+def test_loss_config_rejects_removed_dag_db_selector() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Only loss.type='bdb'",
+    ):
+        build_loss_config(
+            {"type": "dag_db"},
+            max_trajectory_len=1,
+        )
+
+
+def test_build_loss_supports_bdb_only() -> None:
+    loss = build_loss({"type": "bdb"})
+
+    assert isinstance(loss, BudgetedDAGDetailedBalanceLoss)
+
+
+def test_loss_config_parses_bdb_defaults() -> None:
+    cfg = build_loss_config(
+        {},
+        max_trajectory_len=1,
     )
 
-    assert cfg.local_improvement_cfg.enabled
-    assert cfg.local_improvement_cfg.temperature == pytest.approx(0.7)
+    assert cfg["type"] == "bdb"
+    assert cfg["child_chunk_size"] == 2048
+    assert cfg["child_flow_target"] == "detach_current"
 
 
-def test_runner_passes_step_auxiliary_only_for_training(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = RolloutRunner(
-        expand_budget=1,
-        train_num_rollout=3,
-        eval_num_rollout=2,
-        train_chunk_size=2,
-        eval_chunk_size=1,
+def test_loss_config_rejects_removed_auxiliary_loss_keys() -> None:
+    with pytest.raises(ValueError, match="Unused loss keys"):
+        build_loss_config({"stop_oracle_weight": 0.0}, max_trajectory_len=1)
+
+    with pytest.raises(ValueError, match="Unused loss keys"):
+        build_loss_config({"counterfactual_edge_weight": 0.0}, max_trajectory_len=1)
+
+    with pytest.raises(ValueError, match="Unused loss keys"):
+        build_loss_config({"center_log_reward_by_question": True}, max_trajectory_len=1)
+
+    with pytest.raises(ValueError, match="Removed loss keys"):
+        build_loss_config(
+            {"stop_boundary": {"enabled": False, "unused": True}},
+            max_trajectory_len=1,
+        )
+
+
+def test_reward_config_parses_set_reward_defaults() -> None:
+    cfg = build_reward_config({})
+
+    assert cfg["reward_floor"] == pytest.approx(1.0e-6)
+    assert cfg["edge_cost"] == pytest.approx(0.1)
+    assert cfg["beta"] == pytest.approx(2.0)
+    assert cfg["debug_checks"] is False
+
+
+def test_reward_config_parses_set_reward_overrides() -> None:
+    cfg = build_reward_config(
+        {
+            "reward_floor": 1.0e-3,
+            "edge_cost": 0.2,
+            "beta": 1.0,
+            "debug_checks": True,
+        }
     )
-    loss_fn = _ConstantLoss(1.0)
-    backward_values: list[float] = []
-    seen_auxiliary: list[object | None] = []
 
-    def _run_vectorized(**kwargs: object) -> list[RolloutBatch]:
-        seen_auxiliary.append(kwargs["auxiliary"])
-        return [_rollout() for _ in range(int(kwargs["num_rollouts"]))]
+    assert cfg["reward_floor"] == pytest.approx(1.0e-3)
+    assert cfg["edge_cost"] == pytest.approx(0.2)
+    assert cfg["beta"] == pytest.approx(1.0)
+    assert cfg["debug_checks"] is True
 
-    monkeypatch.setattr(runner.engine, "run_vectorized", _run_vectorized)
 
-    auxiliary = object()
-    runner.run_training_rollouts_and_backward(
-        policy=object(),
-        reward_model=object(),
-        loss_fn=loss_fn,
-        backward_fn=lambda loss: backward_values.append(float(loss.detach().item())),
-        batch=object(),
-        rollout_temperature=1.0,
-        accumulation_batches=1,
-        auxiliary=auxiliary,
+def test_reward_config_rejects_unknown_process_key() -> None:
+    with pytest.raises(ValueError, match="Unused reward keys"):
+        build_reward_config({"process": {"relation_weight": 1.0}})
+
+
+def test_reward_config_rejects_removed_reward_keys() -> None:
+    for key in (
+        "utility_epsilon",
+        "edge_cost_base",
+        "edge_cost_answer",
+        "score_mode",
+        "length_discount",
+        "path_weight",
+        "prefix_answer_bonus",
+        "wrong_branch_penalty",
+        "path_prefix_weight",
+    ):
+        with pytest.raises(ValueError):
+            build_reward_config({key: 1.0})
+
+
+def test_reward_config_rejects_invalid_set_reward_scale() -> None:
+    with pytest.raises(ValueError, match="reward_floor"):
+        build_reward_config({"reward_floor": 0.0})
+
+    with pytest.raises(ValueError, match="edge_cost"):
+        build_reward_config({"edge_cost": -0.1})
+
+    with pytest.raises(ValueError, match="beta"):
+        build_reward_config({"beta": 0.0})
+
+
+def test_bdb_algorithm_coupling_rejects_mismatched_loss() -> None:
+    policy = build_policy_runtime_config(
+        hidden_dim=2,
+        entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+        entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+        relation_embeddings=torch.eye(2, dtype=torch.float32),
     )
-    runner.generate_eval_rollouts(
-        policy=object(),
-        reward_model=object(),
-        batch=object(),
-        temperature=1.0,
+    rollout = build_rollout_runtime_config(
+        rollout={"expand_budget": 1, "train_num_rollout": 1, "eval_num_rollout": 1},
+        runtime=None,
+    )
+    reward = build_reward_config({})
+
+    with pytest.raises(ValueError, match="requires loss.type='bdb'"):
+        validate_algorithm_coupling(
+            policy=policy,
+            loss={"type": "subtb"},
+            rollout=rollout,
+            reward=reward,
+        )
+
+    with pytest.raises(ValueError, match="policy.mode"):
+        build_policy_runtime_config(
+            hidden_dim=2,
+            entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+            relation_embeddings=torch.eye(2, dtype=torch.float32),
+            policy={"mode": "subtb", "flow_budget_conditioning": "none"},
+        )
+
+
+def test_bdb_algorithm_coupling_accepts_reward_floor() -> None:
+    policy = build_policy_runtime_config(
+        hidden_dim=2,
+        entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+        entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+        relation_embeddings=torch.eye(2, dtype=torch.float32),
+    )
+    rollout = build_rollout_runtime_config(
+        rollout={"expand_budget": 1, "train_num_rollout": 1, "eval_num_rollout": 1},
+        runtime=None,
     )
 
-    assert seen_auxiliary == [auxiliary, auxiliary, None, None]
-    assert backward_values == [pytest.approx(2.0 / 3.0), pytest.approx(1.0 / 3.0)]
-    assert loss_fn.seen_batch_sizes == [2, 1]
+    validate_algorithm_coupling(
+        policy=policy,
+        loss={"type": "bdb"},
+        rollout=rollout,
+        reward={"reward_floor": 1.0e-2},
+    )
 
 
-def test_runner_derives_reward_mode_from_declared_requirements(
+def test_policy_runtime_config_does_not_carry_reward_edge_cost() -> None:
+    runtime = build_policy_runtime_config(
+        hidden_dim=2,
+        entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+        entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+        relation_embeddings=torch.eye(2, dtype=torch.float32),
+    )
+
+    assert runtime.hidden_dim == 2
+    assert runtime.mode == "bdb"
+    assert runtime.flow_budget_conditioning == "additive"
+    assert not hasattr(runtime, "edge_cost")
+
+
+def test_policy_runtime_config_rejects_removed_path_memory_key() -> None:
+    with pytest.raises(ValueError, match="Removed evidence_state_encoder keys"):
+        build_policy_runtime_config(
+            hidden_dim=2,
+            entity_text_embeddings=torch.eye(2, dtype=torch.float32),
+            entity_embedding_map=torch.tensor([0, 1], dtype=torch.long),
+            relation_embeddings=torch.eye(2, dtype=torch.float32),
+            policy={"evidence_state_encoder": {"use_path_memory": False}},
+        )
+
+
+def test_weaver_module_has_no_target_policy_parameters() -> None:
+    from src.training.optimization import AdamWConfig, build_param_groups
+
+    module = _tiny_module()
+
+    assert not hasattr(module, "target_policy")
+    param_groups = build_param_groups(module, cfg=AdamWConfig())
+    names = [
+        name
+        for group in param_groups
+        for name in group.get("param_names", ())
+    ]
+    assert names
+    assert not any(name.startswith("target_policy.") for name in names)
+
+
+def test_weaver_module_checkpoint_load_drops_legacy_target_policy_state() -> None:
+    module = _tiny_module()
+    state_dict = module.state_dict()
+    checkpoint = {
+        "state_dict": {
+            **state_dict,
+            "target_policy.fake_weight": torch.ones(1),
+        },
+    }
+
+    module.on_load_checkpoint(checkpoint)
+
+    assert "target_policy.fake_weight" not in checkpoint["state_dict"]
+
+
+def test_weaver_module_checkpoint_save_drops_legacy_target_sync_counter() -> None:
+    module = _tiny_module()
+    checkpoint: dict[str, object] = {"target_policy_optimizer_steps": 1}
+
+    module.on_save_checkpoint(checkpoint)
+
+    assert "target_policy_optimizer_steps" not in checkpoint
+
+
+def test_eval_runtime_config_defaults_to_skipping_loss() -> None:
+    runtime = build_eval_runtime_config(eval_cfg={"budgets": [1]}, eval_num_rollout=1)
+
+    assert runtime.compute_loss is False
+
+
+def test_eval_runtime_config_can_enable_loss() -> None:
+    runtime = build_eval_runtime_config(
+        eval_cfg={"budgets": [1], "compute_loss": True},
+        eval_num_rollout=1,
+    )
+
+    assert runtime.compute_loss is True
+
+
+def test_runner_stores_stop_now_trace_when_loss_requires_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = RolloutRunner(
@@ -255,31 +683,27 @@ def test_runner_derives_reward_mode_from_declared_requirements(
         train_chunk_size=1,
         eval_chunk_size=1,
     )
-    seen_modes: list[RewardMode] = []
+    seen_store_stop_now: list[bool] = []
 
     def _run_vectorized(**kwargs: object) -> list[RolloutBatch]:
-        seen_modes.append(kwargs["reward_mode"])
+        seen_store_stop_now.append(bool(kwargs["store_stop_now_reward"]))
         return [_rollout() for _ in range(int(kwargs["num_rollouts"]))]
 
     monkeypatch.setattr(runner.engine, "run_vectorized", _run_vectorized)
 
-    runner.run_training_rollouts_and_backward(
+    list(runner.iter_training_rollout_chunks(
         policy=object(),
         reward_model=object(),
         loss_fn=_ConstantLoss(1.0, requires_stop_now_reward=True),
-        backward_fn=lambda loss: None,
         batch=object(),
         rollout_temperature=1.0,
-        accumulation_batches=1,
-        collect_stop_counterfactual=False,
         collect_policy_diagnostics=False,
-    )
+    ))
     runner.generate_eval_rollouts(
         policy=object(),
         reward_model=object(),
         batch=object(),
         temperature=1.0,
-        collect_stop_counterfactual=False,
         collect_policy_diagnostics=True,
     )
     runner.generate_eval_rollouts(
@@ -287,39 +711,11 @@ def test_runner_derives_reward_mode_from_declared_requirements(
         reward_model=object(),
         batch=object(),
         temperature=1.0,
-        collect_stop_counterfactual=True,
         collect_policy_diagnostics=False,
+        loss_fn=_ConstantLoss(1.0, requires_stop_now_reward=True),
     )
 
-    assert seen_modes == [
-        RewardMode.EAGER_STOP_NOW,
-        RewardMode.EAGER_STOP_NOW,
-        RewardMode.LAZY_TERMINAL,
-        RewardMode.LAZY_TERMINAL,
-        RewardMode.EAGER_STOP_NOW,
-        RewardMode.EAGER_STOP_NOW,
-    ]
-
-
-def test_runner_rejects_lazy_reward_mode_when_stop_now_is_required() -> None:
-    runner = RolloutRunner(
-        expand_budget=1,
-        train_num_rollout=1,
-        eval_num_rollout=1,
-        train_chunk_size=1,
-        eval_chunk_size=1,
-    )
-
-    with pytest.raises(ValueError, match="eager_stop_now"):
-        runner.generate_rollouts(
-            policy=object(),
-            reward_model=object(),
-            batch=object(),
-            num_rollouts=1,
-            temperature=1.0,
-            collect_stop_counterfactual=True,
-            reward_mode=RewardMode.LAZY_TERMINAL,
-        )
+    assert seen_store_stop_now == [True, True, False, False, True, True]
 
 
 def test_runner_uses_fused_only_rollout_api(

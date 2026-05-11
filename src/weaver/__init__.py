@@ -6,20 +6,21 @@ from typing import Any
 __all__ = [
     "LossOutput",
     "Policy",
+    "PolicyContext",
     "PolicyOutput",
     "RewardModel",
     "State",
-    "SubTrajectoryBalanceLoss",
     "WeaverModule",
 ]
 
 _EXPORTS = {
     "LossOutput": ("src.weaver.loss", "LossOutput"),
     "Policy": ("src.weaver.policy", "Policy"),
+    "PolicyContext": ("src.weaver.policy", "PolicyContext"),
     "PolicyOutput": ("src.weaver.policy", "PolicyOutput"),
     "RewardModel": ("src.weaver.reward", "RewardModel"),
     "State": ("src.weaver.state", "State"),
-    "SubTrajectoryBalanceLoss": ("src.weaver.loss", "SubTrajectoryBalanceLoss"),
+    # REMOVED: SubTB export — see methodology.md §3.9
     "WeaverModule": ("src.weaver.module", "WeaverModule"),
 }
 

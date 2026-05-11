@@ -167,7 +167,7 @@ class Policy(nn.Module):
         te_bfm_include_counterfactual_internal_states: bool = False,
         te_bfm_max_expanded_states: int = 1000000,
         bdb_child_chunk_size: int = 2048,
-        edge_scorer: str = "successor_value",
+        edge_scorer: str = "pointer",
         continuation_logit_bias_init: float = -5.912023,
         continuation_mass_reduction: str = "logsumexp",
         evidence_state_encoder_dropout: float = 0.0,
