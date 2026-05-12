@@ -24,6 +24,7 @@ from src.weaver.config import (
     validate_algorithm_coupling,
 )
 from src.weaver.loss import (
+    BudgetedFlowDistillLoss,
     BudgetedDAGDetailedBalanceLoss,
     LossOutput,
 )
@@ -63,6 +64,7 @@ class WeaverModule(LightningModule):
         rollout: dict[str, Any] | None = None,
         sampling: dict[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
+        planner: dict[str, Any] | None = None,
         reward: dict[str, Any] | None = None,
         loss: dict[str, Any] | None = None,
         eval: dict[str, Any] | None = None,
@@ -70,10 +72,12 @@ class WeaverModule(LightningModule):
         diagnostics: dict[str, Any] | None = None,
         optimizer_cfg: dict[str, Any] | None = None,
         scheduler_cfg: dict[str, Any] | None = None,
+        manual_accumulate_grad_batches: int = 1,
         gradient_clip_val: float | None = None,
         gradient_clip_algorithm: str = "norm",
     ) -> None:
         super().__init__()
+        self.planner_cfg = dict(planner or {})
 
         self.save_hyperparameters(
             ignore=[
@@ -84,6 +88,7 @@ class WeaverModule(LightningModule):
         )
 
         reward_kwargs = build_reward_config(reward)
+        planner_cfg = dict(planner or {})
         rollout_runtime = build_rollout_runtime_config(
             rollout=rollout,
             runtime=runtime,
@@ -115,6 +120,10 @@ class WeaverModule(LightningModule):
 
         self.optimizer_cfg = dict(optimizer_cfg or {})
         self.scheduler_cfg = dict(scheduler_cfg or {})
+        self.manual_accumulate_grad_batches = self._positive_int(
+            manual_accumulate_grad_batches,
+            "manual_accumulate_grad_batches",
+        )
 
         self.gradient_clip_val = (
             None if gradient_clip_val is None else float(gradient_clip_val)
@@ -128,6 +137,15 @@ class WeaverModule(LightningModule):
             max_budget=rollout_runtime.expand_budget,
             flow_budget_conditioning=policy_runtime.flow_budget_conditioning,
             bdb_child_chunk_size=int(loss_kwargs.get("child_chunk_size", 2048)),
+            policy_type=policy_runtime.policy_type,
+            planner_enabled=bool(planner_cfg.get("enabled", True)),
+            planner_exact_budget=int(planner_cfg.get("exact_budget", 2)),
+            planner_top_m_for_budget3=int(
+                planner_cfg.get("top_m_for_budget3", 64)
+            ),
+            planner_include_oracle_prefix_states=bool(
+                planner_cfg.get("include_oracle_prefix_states", True)
+            ),
             edge_scorer=policy_runtime.edge_scorer,
             continuation_logit_bias_init=(
                 policy_runtime.continuation_logit_bias_init
@@ -139,6 +157,12 @@ class WeaverModule(LightningModule):
             evidence_state_encoder_cfg=policy_runtime.evidence_state_encoder_cfg,
             flow_head_cfg=policy_runtime.flow_head_cfg,
             frontier_pointer_cfg=policy_runtime.frontier_pointer_cfg,
+            relation_residual_edge_scorer_cfg=(
+                policy_runtime.relation_residual_edge_scorer_cfg
+            ),
+            budgeted_successor_policy_cfg=(
+                policy_runtime.budgeted_successor_policy_cfg
+            ),
             stop_head_cfg=policy_runtime.stop_head_cfg,
         )
 
@@ -193,6 +217,7 @@ class WeaverModule(LightningModule):
         accumulation_batches = self.accumulation_batches()
 
         temperature = self.temperature_schedule.current(self.global_step)
+        self.policy.set_residual_warmup_step(int(self.global_step))
         result = self.run_training_rollouts_and_backward(
             batch=batch,
             rollout_temperature=temperature,
@@ -215,6 +240,12 @@ class WeaverModule(LightningModule):
             temperature=temperature,
             grad_norm=grad_norm,
             global_step=int(self.global_step),
+        )
+        metrics.update(
+            {
+                f"train/{name}": value
+                for name, value in self.policy.edge_prior_diagnostics_summary().items()
+            }
         )
         self.log_dict(
             metrics,
@@ -259,8 +290,9 @@ class WeaverModule(LightningModule):
             self.manual_backward(loss_output.loss * scale)
 
             loss_outputs.append(loss_output)
+            metrics_device = self._train_metric_rollout_device()
             metric_rollouts.extend(
-                detach_rollout_for_metrics(rollout)
+                detach_rollout_for_metrics(rollout, device=metrics_device)
                 for rollout in chunk.rollouts
             )
 
@@ -516,21 +548,7 @@ class WeaverModule(LightningModule):
             scheduler.step()
 
     def accumulation_batches(self) -> int:
-        accumulation_batches = getattr(self.trainer, "accumulate_grad_batches", 1)
-
-        if not isinstance(accumulation_batches, int):
-            raise TypeError(
-                "Manual optimization expects trainer.accumulate_grad_batches "
-                f"to be an int, got {type(accumulation_batches)!r}."
-            )
-
-        if accumulation_batches < 1:
-            raise ValueError(
-                "trainer.accumulate_grad_batches must be >= 1, "
-                f"got {accumulation_batches}."
-            )
-
-        return accumulation_batches
+        return self.manual_accumulate_grad_batches
 
     def optimizer_step_due(
         self,
@@ -548,15 +566,30 @@ class WeaverModule(LightningModule):
             and (int(batch_idx) + 1) == num_batches
         )
 
+    def _train_metric_rollout_device(self) -> torch.device | str | None:
+        train_diagnostics = self.metric_suite.train_diagnostics
+        rollout_diagnostics_enabled = (
+            bool(train_diagnostics.rollout_diagnostics)
+            and int(train_diagnostics.rollout_diagnostics_interval) > 0
+        )
+        if rollout_diagnostics_enabled:
+            return None
+        return "cpu"
+
 
 def build_loss(
     loss_config: dict[str, Any],
-) -> BudgetedDAGDetailedBalanceLoss:
+) -> BudgetedDAGDetailedBalanceLoss | BudgetedFlowDistillLoss:
     cfg = dict(loss_config)
     loss_type = str(cfg.pop("type", "bdb")).lower()
     if loss_type == "bdb":
         return BudgetedDAGDetailedBalanceLoss(**cfg)
-    raise ValueError(f"loss.type must be 'bdb', got {loss_type!r}.")
+    if loss_type == "budgeted_flow_distill":
+        return BudgetedFlowDistillLoss(**cfg)
+    raise ValueError(
+        "loss.type must be 'bdb' or 'budgeted_flow_distill', "
+        f"got {loss_type!r}."
+    )
 
 
 __all__ = ["WeaverModule", "build_loss"]

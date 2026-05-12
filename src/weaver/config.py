@@ -9,9 +9,10 @@ import torch
 @dataclass(frozen=True)
 class PolicyDefaults:
     mode: str = "bdb"
+    policy_type: str = "budgeted_successor"
     flow_budget_conditioning: str = "additive"
     evidence_state_encoder_dropout: float = 0.0
-    edge_scorer: str = "pointer"
+    edge_scorer: str = "budgeted_successor"
     continuation_logit_bias_init: float = -5.912023
     continuation_mass_reduction: str = "logsumexp"
     feature_dde_cfg: dict[str, Any] = field(
@@ -32,6 +33,8 @@ class PolicyDefaults:
         }
     )
     frontier_pointer_cfg: dict[str, Any] = field(default_factory=dict)
+    relation_residual_edge_scorer_cfg: dict[str, Any] = field(default_factory=dict)
+    budgeted_successor_policy_cfg: dict[str, Any] = field(default_factory=dict)
     stop_head_cfg: dict[str, Any] = field(default_factory=dict)
     flow_head_cfg: dict[str, Any] = field(
         default_factory=lambda: {
@@ -45,15 +48,16 @@ class PolicyDefaults:
 
 @dataclass(frozen=True)
 class RewardDefaults:
-    reward_floor: float = 1.0e-6
-    edge_cost: float = 0.1
-    beta: float = 2.0
+    answer_credit: float = 2.0
+    edge_cost: float = 0.05
+    fail_penalty: float = 2.0
+    expand_budget: int | None = None
     debug_checks: bool = False
 
 
 @dataclass(frozen=True)
 class LossDefaults:
-    type: str = "bdb"
+    type: str = "budgeted_flow_distill"
     child_flow_target: str = "detach_current"
     backward_kernel: str = "uniform_boundary"
     edge_mode: str = "full"
@@ -64,6 +68,7 @@ class LossDefaults:
 class PolicyRuntimeConfig:
     hidden_dim: int
     mode: str
+    policy_type: str
     flow_budget_conditioning: str
     edge_scorer: str
     continuation_logit_bias_init: float
@@ -73,6 +78,8 @@ class PolicyRuntimeConfig:
     evidence_state_encoder_cfg: dict[str, Any]
     flow_head_cfg: dict[str, Any]
     frontier_pointer_cfg: dict[str, Any]
+    relation_residual_edge_scorer_cfg: dict[str, Any]
+    budgeted_successor_policy_cfg: dict[str, Any]
     stop_head_cfg: dict[str, Any]
 
 
@@ -135,6 +142,12 @@ def build_policy_runtime_config(
     allowed_modes = {"bdb"}
     if mode not in allowed_modes:
         raise ValueError(f"policy.mode must be one of {sorted(allowed_modes)}, got {mode!r}.")
+    policy_type = str(cfg.pop("policy_type", defaults.policy_type)).lower()
+    if policy_type not in {"budgeted_successor", "legacy"}:
+        raise ValueError(
+            "policy.policy_type must be 'budgeted_successor' or 'legacy', "
+            f"got {policy_type!r}."
+        )
     flow_budget_conditioning = str(
         cfg.pop("flow_budget_conditioning", defaults.flow_budget_conditioning)
     ).lower()
@@ -158,7 +171,7 @@ def build_policy_runtime_config(
             defaults.continuation_mass_reduction,
         )
     )
-    allowed_edge_scorers = {"pointer"}
+    allowed_edge_scorers = {"relation_residual", "pointer", "budgeted_successor"}
     if edge_scorer not in allowed_edge_scorers:
         raise ValueError(
             "policy.edge_scorer must be one of "
@@ -192,6 +205,18 @@ def build_policy_runtime_config(
     frontier_pointer_cfg = dict(
         cfg.pop("frontier_pointer", defaults.frontier_pointer_cfg)
     )
+    relation_residual_edge_scorer_cfg = dict(
+        cfg.pop(
+            "relation_residual_edge_scorer",
+            defaults.relation_residual_edge_scorer_cfg,
+        )
+    )
+    budgeted_successor_policy_cfg = dict(
+        cfg.pop(
+            "budgeted_successor_policy",
+            defaults.budgeted_successor_policy_cfg,
+        )
+    )
     stop_head_cfg = dict(cfg.pop("stop_head", defaults.stop_head_cfg))
     flow_head_cfg = dict(cfg.pop("flow_head", defaults.flow_head_cfg))
     if cfg:
@@ -215,6 +240,7 @@ def build_policy_runtime_config(
     return PolicyRuntimeConfig(
         hidden_dim=hidden_dim,
         mode=mode,
+        policy_type=policy_type,
         flow_budget_conditioning=flow_budget_conditioning,
         edge_scorer=edge_scorer,
         continuation_logit_bias_init=continuation_logit_bias_init,
@@ -224,6 +250,8 @@ def build_policy_runtime_config(
         evidence_state_encoder_cfg=evidence_state_encoder_cfg,
         flow_head_cfg=flow_head_cfg,
         frontier_pointer_cfg=frontier_pointer_cfg,
+        relation_residual_edge_scorer_cfg=relation_residual_edge_scorer_cfg,
+        budgeted_successor_policy_cfg=budgeted_successor_policy_cfg,
         stop_head_cfg=stop_head_cfg,
     )
 
@@ -339,8 +367,19 @@ def build_reward_config(
 ) -> dict[str, Any]:
     defaults = defaults or RewardDefaults()
     cfg = dict(reward or {})
+    reward_type = str(cfg.pop("type", "lexicographic_directed")).lower()
+    if reward_type not in {"lexicographic_directed", "directed_terminal"}:
+        raise ValueError(
+            "reward.type must be 'lexicographic_directed' or 'directed_terminal', "
+            f"got {reward_type!r}."
+        )
 
     removed_reward_keys = {
+        "reward_floor",
+        "beta",
+        "utility_epsilon",
+        "edge_cost_base",
+        "edge_cost_answer",
         "score_mode",
         "length_discount",
         "path_weight",
@@ -351,27 +390,38 @@ def build_reward_config(
     if removed_reward_keys:
         raise ValueError(
             "Removed reward keys: "
-            f"{sorted(removed_reward_keys)}. Reward is terminal F-beta plus edge cost."
+            f"{sorted(removed_reward_keys)}. Reward is directed terminal support plus edge cost."
         )
-    reward_floor = float(cfg.pop("reward_floor", defaults.reward_floor))
+    answer_credit = float(cfg.pop("eta", cfg.pop("answer_credit", defaults.answer_credit)))
     edge_cost = float(cfg.pop("edge_cost", defaults.edge_cost))
-    beta = float(cfg.pop("beta", defaults.beta))
-    if reward_floor <= 0.0:
+    fail_penalty = float(cfg.pop("fail_penalty", defaults.fail_penalty))
+    expand_budget_value = cfg.pop("expand_budget", defaults.expand_budget)
+    expand_budget = None if expand_budget_value is None else int(expand_budget_value)
+    if answer_credit <= 0.0:
         raise ValueError(
-            f"reward.reward_floor must be > 0, got {reward_floor}."
+            f"reward.answer_credit must be > 0, got {answer_credit}."
         )
     if edge_cost < 0.0:
         raise ValueError(f"reward.edge_cost must be >= 0, got {edge_cost}.")
-    if beta <= 0.0:
-        raise ValueError(f"reward.beta must be > 0, got {beta}.")
+    if fail_penalty < 0.0:
+        raise ValueError(f"reward.fail_penalty must be >= 0, got {fail_penalty}.")
+    if expand_budget is not None:
+        if expand_budget < 0:
+            raise ValueError(f"reward.expand_budget must be >= 0, got {expand_budget}.")
+        if answer_credit <= edge_cost * float(expand_budget):
+            raise ValueError(
+                "reward.answer_credit must be greater than "
+                "reward.edge_cost * reward.expand_budget."
+            )
     debug_checks = bool(cfg.pop("debug_checks", defaults.debug_checks))
     if cfg:
         raise ValueError(f"Unused reward keys: {sorted(cfg)}.")
 
     return {
-        "reward_floor": reward_floor,
+        "answer_credit": answer_credit,
         "edge_cost": edge_cost,
-        "beta": beta,
+        "fail_penalty": fail_penalty,
+        "expand_budget": expand_budget,
         "debug_checks": debug_checks,
     }
 
@@ -387,11 +437,23 @@ def build_loss_config(
     cfg = dict(loss or {})
 
     loss_type = str(cfg.pop("type", defaults.type)).lower()
-    if loss_type not in {"bdb"}:
+    if loss_type not in {"bdb", "budgeted_flow_distill"}:
         raise ValueError(
-            "Only loss.type='bdb' is supported, "
+            "loss.type must be 'bdb' or 'budgeted_flow_distill', "
             f"got {loss_type!r}."
         )
+    if loss_type == "budgeted_flow_distill":
+        policy_kl_weight = float(cfg.pop("policy_kl_weight", 1.0))
+        terminal_weight = float(cfg.pop("terminal_weight", 1.0))
+        value_weight = float(cfg.pop("value_weight", 0.5))
+        if cfg:
+            raise ValueError(f"Unused loss keys: {sorted(cfg)}.")
+        return {
+            "type": loss_type,
+            "policy_kl_weight": policy_kl_weight,
+            "terminal_weight": terminal_weight,
+            "value_weight": value_weight,
+        }
     child_flow_target = str(
         cfg.pop("child_flow_target", defaults.child_flow_target)
     )
@@ -487,16 +549,26 @@ def validate_algorithm_coupling(
     rollout: RolloutRuntimeConfig,
     reward: dict[str, Any],
 ) -> None:
-    loss_type = str(loss.get("type", "bdb")).lower()
-    if policy.mode == "bdb" and loss_type != "bdb":
-        raise ValueError("policy.mode='bdb' requires loss.type='bdb'.")
-    if loss_type == "bdb" and policy.mode != "bdb":
-        raise ValueError("loss.type='bdb' requires policy.mode='bdb'.")
+    loss_type = str(loss.get("type", "budgeted_flow_distill")).lower()
+    if policy.mode == "bdb" and loss_type not in {"bdb", "budgeted_flow_distill"}:
+        raise ValueError("policy.mode='bdb' requires a Weaver flow loss.")
+    if loss_type == "budgeted_flow_distill" and policy.policy_type != "budgeted_successor":
+        raise ValueError(
+            "loss.type='budgeted_flow_distill' requires "
+            "policy.policy_type='budgeted_successor'."
+        )
     if policy.flow_budget_conditioning == "none":
         raise ValueError("policy.flow_budget_conditioning cannot be 'none' for BDB.")
     if rollout.expand_budget < 1:
         raise ValueError("rollout.expand_budget must be >= 1 for BDB.")
-    del reward
+    defaults = RewardDefaults()
+    answer_credit = float(reward.get("answer_credit", defaults.answer_credit))
+    edge_cost = float(reward.get("edge_cost", defaults.edge_cost))
+    if answer_credit <= edge_cost * float(rollout.expand_budget):
+        raise ValueError(
+            "reward.answer_credit must be greater than "
+            "reward.edge_cost * rollout.expand_budget."
+        )
     # REMOVED: TE-BFM coupling checks and backup caps — see methodology.md §3.9
 
 
