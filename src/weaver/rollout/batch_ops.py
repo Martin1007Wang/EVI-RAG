@@ -211,26 +211,6 @@ def _slice_traces(
         bdb_parent_count=_slice_optional(traces.bdb_parent_count, graph_slice),
         bdb_log_reward=_slice_optional(traces.bdb_log_reward, graph_slice),
         bdb_log_flow=_slice_optional(traces.bdb_log_flow, graph_slice),
-        budgeted_policy_kl=_slice_optional(traces.budgeted_policy_kl, graph_slice),
-        budgeted_terminal_loss=_slice_optional(
-            traces.budgeted_terminal_loss,
-            graph_slice,
-        ),
-        budgeted_value_loss=_slice_optional(traces.budgeted_value_loss, graph_slice),
-        budgeted_valid_mask=_slice_optional(traces.budgeted_valid_mask, graph_slice),
-        oracle_v_star=_slice_optional(traces.oracle_v_star, graph_slice),
-        oracle_terminal_j=_slice_optional(traces.oracle_terminal_j, graph_slice),
-        oracle_stop_prob=_slice_optional(traces.oracle_stop_prob, graph_slice),
-        oracle_edge_entropy=_slice_optional(traces.oracle_edge_entropy, graph_slice),
-        model_stop_prob=_slice_optional(traces.model_stop_prob, graph_slice),
-        budgeted_oracle_good_edge_policy_mass=_slice_optional(
-            traces.budgeted_oracle_good_edge_policy_mass,
-            graph_slice,
-        ),
-        sampled_oracle_good_edge_rate=_slice_optional(
-            traces.sampled_oracle_good_edge_rate,
-            graph_slice,
-        ),
     )
 
 

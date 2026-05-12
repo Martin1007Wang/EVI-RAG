@@ -74,7 +74,6 @@ class RolloutEngine:
         store_stop_now_reward: bool | None = None,
         store_te_bfm: bool | None = None,
         store_bdb: bool | None = None,
-        store_budgeted_flow: bool | None = None,
     ) -> list[RolloutBatch]:
         """
         Run K independent rollouts.
@@ -94,9 +93,6 @@ class RolloutEngine:
         )
         store_te_bfm_trace = bool(store_te_bfm) if store_te_bfm is not None else False
         store_bdb_trace = bool(store_bdb) if store_bdb is not None else False
-        store_budgeted_flow_trace = (
-            bool(store_budgeted_flow) if store_budgeted_flow is not None else False
-        )
 
         config = RolloutEngineConfig(
             temperature=float(temperature),
@@ -106,7 +102,6 @@ class RolloutEngine:
                 store_stop_now_reward=store_stop_now,
                 store_te_bfm=store_te_bfm_trace,
                 store_bdb=store_bdb_trace,
-                store_budgeted_flow=store_budgeted_flow_trace,
             ),
         )
 
@@ -219,7 +214,6 @@ class RolloutEngine:
                 remaining_budget=active_remaining_budget,
                 return_edge_diagnostics=False,
                 compute_bdb_trace=config.trace_spec.store_bdb,
-                compute_budgeted_flow_trace=config.trace_spec.store_budgeted_flow,
             )
             step_out = _scatter_policy_output(
                 active_step_out,
@@ -410,77 +404,6 @@ class RolloutEngine:
                     log_flow=_scatter_required_trace(
                         active_step_out.bdb_log_flow,
                         "bdb_log_flow",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                )
-            if config.trace_spec.store_budgeted_flow:
-                buffer.write_budgeted_flow(
-                    t=t,
-                    active=active,
-                    policy_kl=_scatter_required_trace(
-                        active_step_out.budgeted_policy_kl,
-                        "budgeted_policy_kl",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    terminal_loss=_scatter_required_trace(
-                        active_step_out.budgeted_terminal_loss,
-                        "budgeted_terminal_loss",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    value_loss=_scatter_required_trace(
-                        active_step_out.budgeted_value_loss,
-                        "budgeted_value_loss",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    valid_mask=_scatter_required_trace(
-                        active_step_out.budgeted_valid_mask,
-                        "budgeted_valid_mask",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ).to(dtype=torch.bool),
-                    oracle_v_star=_scatter_required_trace(
-                        active_step_out.oracle_v_star,
-                        "oracle_v_star",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    oracle_terminal_j=_scatter_required_trace(
-                        active_step_out.oracle_terminal_j,
-                        "oracle_terminal_j",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    oracle_stop_prob=_scatter_required_trace(
-                        active_step_out.oracle_stop_prob,
-                        "oracle_stop_prob",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    oracle_edge_entropy=_scatter_required_trace(
-                        active_step_out.oracle_edge_entropy,
-                        "oracle_edge_entropy",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    model_stop_prob=_scatter_required_trace(
-                        active_step_out.model_stop_prob,
-                        "model_stop_prob",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    oracle_good_edge_policy_mass=_scatter_required_trace(
-                        active_step_out.budgeted_oracle_good_edge_policy_mass,
-                        "budgeted_oracle_good_edge_policy_mass",
-                        active_rollout_ids,
-                        dynamic_graphs,
-                    ),
-                    sampled_oracle_good_edge_rate=_scatter_required_trace(
-                        active_step_out.sampled_oracle_good_edge_rate,
-                        "sampled_oracle_good_edge_rate",
                         active_rollout_ids,
                         dynamic_graphs,
                     ),
@@ -849,71 +772,6 @@ def _scatter_policy_output(
         ),
         bdb_log_flow=_scatter_optional_active_rows(
             values=step_out.bdb_log_flow,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        budgeted_policy_kl=_scatter_optional_active_rows(
-            values=step_out.budgeted_policy_kl,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        budgeted_terminal_loss=_scatter_optional_active_rows(
-            values=step_out.budgeted_terminal_loss,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        budgeted_value_loss=_scatter_optional_active_rows(
-            values=step_out.budgeted_value_loss,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        budgeted_valid_mask=_scatter_optional_bool_rows(
-            values=step_out.budgeted_valid_mask,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-        ),
-        oracle_v_star=_scatter_optional_active_rows(
-            values=step_out.oracle_v_star,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        oracle_terminal_j=_scatter_optional_active_rows(
-            values=step_out.oracle_terminal_j,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        oracle_stop_prob=_scatter_optional_active_rows(
-            values=step_out.oracle_stop_prob,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        oracle_edge_entropy=_scatter_optional_active_rows(
-            values=step_out.oracle_edge_entropy,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        model_stop_prob=_scatter_optional_active_rows(
-            values=step_out.model_stop_prob,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        budgeted_oracle_good_edge_policy_mass=_scatter_optional_active_rows(
-            values=step_out.budgeted_oracle_good_edge_policy_mass,
-            active_rollout_ids=active_rollout_ids,
-            num_graphs=num_graphs,
-            fill_value=0.0,
-        ),
-        sampled_oracle_good_edge_rate=_scatter_optional_active_rows(
-            values=step_out.sampled_oracle_good_edge_rate,
             active_rollout_ids=active_rollout_ids,
             num_graphs=num_graphs,
             fill_value=0.0,

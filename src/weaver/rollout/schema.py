@@ -53,7 +53,6 @@ class RolloutTraceSpec:
     store_stop_now_reward: bool = False
     store_te_bfm: bool = False
     store_bdb: bool = False
-    store_budgeted_flow: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,17 +126,6 @@ class RolloutTraces:
     bdb_parent_count: torch.Tensor | None = None
     bdb_log_reward: torch.Tensor | None = None
     bdb_log_flow: torch.Tensor | None = None
-    budgeted_policy_kl: torch.Tensor | None = None
-    budgeted_terminal_loss: torch.Tensor | None = None
-    budgeted_value_loss: torch.Tensor | None = None
-    budgeted_valid_mask: torch.Tensor | None = None
-    oracle_v_star: torch.Tensor | None = None
-    oracle_terminal_j: torch.Tensor | None = None
-    oracle_stop_prob: torch.Tensor | None = None
-    oracle_edge_entropy: torch.Tensor | None = None
-    model_stop_prob: torch.Tensor | None = None
-    budgeted_oracle_good_edge_policy_mass: torch.Tensor | None = None
-    sampled_oracle_good_edge_rate: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         _require_all_or_none(
@@ -180,22 +168,6 @@ class RolloutTraces:
                 self.bdb_log_flow,
             ),
             name="BDB rollout traces",
-        )
-        _require_all_or_none(
-            (
-                self.budgeted_policy_kl,
-                self.budgeted_terminal_loss,
-                self.budgeted_value_loss,
-                self.budgeted_valid_mask,
-                self.oracle_v_star,
-                self.oracle_terminal_j,
-                self.oracle_stop_prob,
-                self.oracle_edge_entropy,
-                self.model_stop_prob,
-                self.budgeted_oracle_good_edge_policy_mass,
-                self.sampled_oracle_good_edge_rate,
-            ),
-            name="budgeted-flow rollout traces",
         )
 
 
@@ -317,19 +289,6 @@ class RolloutBatch:
                 bdb_parent_count=buffer.bdb_parent_count,
                 bdb_log_reward=buffer.bdb_log_reward,
                 bdb_log_flow=buffer.bdb_log_flow,
-                budgeted_policy_kl=buffer.budgeted_policy_kl,
-                budgeted_terminal_loss=buffer.budgeted_terminal_loss,
-                budgeted_value_loss=buffer.budgeted_value_loss,
-                budgeted_valid_mask=buffer.budgeted_valid_mask,
-                oracle_v_star=buffer.oracle_v_star,
-                oracle_terminal_j=buffer.oracle_terminal_j,
-                oracle_stop_prob=buffer.oracle_stop_prob,
-                oracle_edge_entropy=buffer.oracle_edge_entropy,
-                model_stop_prob=buffer.model_stop_prob,
-                budgeted_oracle_good_edge_policy_mass=(
-                    buffer.budgeted_oracle_good_edge_policy_mass
-                ),
-                sampled_oracle_good_edge_rate=buffer.sampled_oracle_good_edge_rate,
             ),
         )
 

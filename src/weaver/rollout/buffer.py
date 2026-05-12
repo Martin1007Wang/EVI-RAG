@@ -106,17 +106,6 @@ class RolloutBuffer:
     bdb_parent_count: torch.Tensor | None = field(init=False)
     bdb_log_reward: torch.Tensor | None = field(init=False)
     bdb_log_flow: torch.Tensor | None = field(init=False)
-    budgeted_policy_kl: torch.Tensor | None = field(init=False)
-    budgeted_terminal_loss: torch.Tensor | None = field(init=False)
-    budgeted_value_loss: torch.Tensor | None = field(init=False)
-    budgeted_valid_mask: torch.Tensor | None = field(init=False)
-    oracle_v_star: torch.Tensor | None = field(init=False)
-    oracle_terminal_j: torch.Tensor | None = field(init=False)
-    oracle_stop_prob: torch.Tensor | None = field(init=False)
-    oracle_edge_entropy: torch.Tensor | None = field(init=False)
-    model_stop_prob: torch.Tensor | None = field(init=False)
-    budgeted_oracle_good_edge_policy_mass: torch.Tensor | None = field(init=False)
-    sampled_oracle_good_edge_rate: torch.Tensor | None = field(init=False)
 
     def __post_init__(self) -> None:
         self.B = int(self.B)
@@ -247,31 +236,6 @@ class RolloutBuffer:
             self.bdb_parent_count = None
             self.bdb_log_reward = None
             self.bdb_log_flow = None
-
-        if self.trace_spec.store_budgeted_flow:
-            self.budgeted_policy_kl = self._zeros_float(bt)
-            self.budgeted_terminal_loss = self._zeros_float(bt)
-            self.budgeted_value_loss = self._zeros_float(bt)
-            self.budgeted_valid_mask = self._zeros_bool(bt)
-            self.oracle_v_star = self._zeros_float(bt)
-            self.oracle_terminal_j = self._zeros_float(bt)
-            self.oracle_stop_prob = self._zeros_float(bt)
-            self.oracle_edge_entropy = self._zeros_float(bt)
-            self.model_stop_prob = self._zeros_float(bt)
-            self.budgeted_oracle_good_edge_policy_mass = self._zeros_float(bt)
-            self.sampled_oracle_good_edge_rate = self._zeros_float(bt)
-        else:
-            self.budgeted_policy_kl = None
-            self.budgeted_terminal_loss = None
-            self.budgeted_value_loss = None
-            self.budgeted_valid_mask = None
-            self.oracle_v_star = None
-            self.oracle_terminal_j = None
-            self.oracle_stop_prob = None
-            self.oracle_edge_entropy = None
-            self.model_stop_prob = None
-            self.budgeted_oracle_good_edge_policy_mass = None
-            self.sampled_oracle_good_edge_rate = None
 
     @property
     def active(self) -> torch.Tensor:
@@ -712,80 +676,6 @@ class RolloutBuffer:
         self.bdb_log_flow[active, t] = self._as_float(
             log_flow, shape=(self.B,), name="bdb_log_flow"
         )[active]
-
-    def write_budgeted_flow(
-        self,
-        *,
-        t: int,
-        active: torch.Tensor,
-        policy_kl: torch.Tensor,
-        terminal_loss: torch.Tensor,
-        value_loss: torch.Tensor,
-        valid_mask: torch.Tensor,
-        oracle_v_star: torch.Tensor,
-        oracle_terminal_j: torch.Tensor,
-        oracle_stop_prob: torch.Tensor,
-        oracle_edge_entropy: torch.Tensor,
-        model_stop_prob: torch.Tensor,
-        oracle_good_edge_policy_mass: torch.Tensor,
-        sampled_oracle_good_edge_rate: torch.Tensor,
-    ) -> None:
-        self._check_t(t)
-        if self.budgeted_policy_kl is None:
-            raise RuntimeError("Budgeted-flow trace storage is disabled.")
-
-        active = self._as_bool(active, shape=(self.B,), name="active")
-        valid = self._as_bool(valid_mask, shape=(self.B,), name="budgeted_valid_mask")
-        mask = active & valid
-        if not bool(mask.any()):
-            return
-
-        assert self.budgeted_terminal_loss is not None
-        assert self.budgeted_value_loss is not None
-        assert self.budgeted_valid_mask is not None
-        assert self.oracle_v_star is not None
-        assert self.oracle_terminal_j is not None
-        assert self.oracle_stop_prob is not None
-        assert self.oracle_edge_entropy is not None
-        assert self.model_stop_prob is not None
-        assert self.budgeted_oracle_good_edge_policy_mass is not None
-        assert self.sampled_oracle_good_edge_rate is not None
-
-        self.budgeted_policy_kl[mask, t] = self._as_float(
-            policy_kl, shape=(self.B,), name="budgeted_policy_kl"
-        )[mask]
-        self.budgeted_terminal_loss[mask, t] = self._as_float(
-            terminal_loss, shape=(self.B,), name="budgeted_terminal_loss"
-        )[mask]
-        self.budgeted_value_loss[mask, t] = self._as_float(
-            value_loss, shape=(self.B,), name="budgeted_value_loss"
-        )[mask]
-        self.budgeted_valid_mask[mask, t] = True
-        self.oracle_v_star[mask, t] = self._as_float(
-            oracle_v_star, shape=(self.B,), name="oracle_v_star"
-        )[mask]
-        self.oracle_terminal_j[mask, t] = self._as_float(
-            oracle_terminal_j, shape=(self.B,), name="oracle_terminal_j"
-        )[mask]
-        self.oracle_stop_prob[mask, t] = self._as_float(
-            oracle_stop_prob, shape=(self.B,), name="oracle_stop_prob"
-        )[mask]
-        self.oracle_edge_entropy[mask, t] = self._as_float(
-            oracle_edge_entropy, shape=(self.B,), name="oracle_edge_entropy"
-        )[mask]
-        self.model_stop_prob[mask, t] = self._as_float(
-            model_stop_prob, shape=(self.B,), name="model_stop_prob"
-        )[mask]
-        self.budgeted_oracle_good_edge_policy_mass[mask, t] = self._as_float(
-            oracle_good_edge_policy_mass,
-            shape=(self.B,),
-            name="budgeted_oracle_good_edge_policy_mass",
-        )[mask]
-        self.sampled_oracle_good_edge_rate[mask, t] = self._as_float(
-            sampled_oracle_good_edge_rate,
-            shape=(self.B,),
-            name="sampled_oracle_good_edge_rate",
-        )[mask]
 
     def finalize_unfinished(
         self,

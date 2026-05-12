@@ -24,7 +24,6 @@ from src.weaver.config import (
     validate_algorithm_coupling,
 )
 from src.weaver.loss import (
-    BudgetedFlowDistillLoss,
     BudgetedDAGDetailedBalanceLoss,
     LossOutput,
 )
@@ -64,7 +63,6 @@ class WeaverModule(LightningModule):
         rollout: dict[str, Any] | None = None,
         sampling: dict[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
-        planner: dict[str, Any] | None = None,
         reward: dict[str, Any] | None = None,
         loss: dict[str, Any] | None = None,
         eval: dict[str, Any] | None = None,
@@ -77,7 +75,6 @@ class WeaverModule(LightningModule):
         gradient_clip_algorithm: str = "norm",
     ) -> None:
         super().__init__()
-        self.planner_cfg = dict(planner or {})
 
         self.save_hyperparameters(
             ignore=[
@@ -88,7 +85,6 @@ class WeaverModule(LightningModule):
         )
 
         reward_kwargs = build_reward_config(reward)
-        planner_cfg = dict(planner or {})
         rollout_runtime = build_rollout_runtime_config(
             rollout=rollout,
             runtime=runtime,
@@ -137,15 +133,6 @@ class WeaverModule(LightningModule):
             max_budget=rollout_runtime.expand_budget,
             flow_budget_conditioning=policy_runtime.flow_budget_conditioning,
             bdb_child_chunk_size=int(loss_kwargs.get("child_chunk_size", 2048)),
-            policy_type=policy_runtime.policy_type,
-            planner_enabled=bool(planner_cfg.get("enabled", True)),
-            planner_exact_budget=int(planner_cfg.get("exact_budget", 2)),
-            planner_top_m_for_budget3=int(
-                planner_cfg.get("top_m_for_budget3", 64)
-            ),
-            planner_include_oracle_prefix_states=bool(
-                planner_cfg.get("include_oracle_prefix_states", True)
-            ),
             edge_scorer=policy_runtime.edge_scorer,
             continuation_logit_bias_init=(
                 policy_runtime.continuation_logit_bias_init
@@ -159,9 +146,6 @@ class WeaverModule(LightningModule):
             frontier_pointer_cfg=policy_runtime.frontier_pointer_cfg,
             relation_residual_edge_scorer_cfg=(
                 policy_runtime.relation_residual_edge_scorer_cfg
-            ),
-            budgeted_successor_policy_cfg=(
-                policy_runtime.budgeted_successor_policy_cfg
             ),
             stop_head_cfg=policy_runtime.stop_head_cfg,
         )
@@ -579,17 +563,12 @@ class WeaverModule(LightningModule):
 
 def build_loss(
     loss_config: dict[str, Any],
-) -> BudgetedDAGDetailedBalanceLoss | BudgetedFlowDistillLoss:
+) -> BudgetedDAGDetailedBalanceLoss:
     cfg = dict(loss_config)
     loss_type = str(cfg.pop("type", "bdb")).lower()
     if loss_type == "bdb":
         return BudgetedDAGDetailedBalanceLoss(**cfg)
-    if loss_type == "budgeted_flow_distill":
-        return BudgetedFlowDistillLoss(**cfg)
-    raise ValueError(
-        "loss.type must be 'bdb' or 'budgeted_flow_distill', "
-        f"got {loss_type!r}."
-    )
+    raise ValueError(f"loss.type must be 'bdb', got {loss_type!r}.")
 
 
 __all__ = ["WeaverModule", "build_loss"]

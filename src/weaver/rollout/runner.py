@@ -34,7 +34,6 @@ class RolloutRunConfig:
     store_stop_now_reward: bool
     store_te_bfm: bool
     store_bdb: bool
-    store_budgeted_flow: bool
 
 
 class RolloutRunner:
@@ -86,7 +85,6 @@ class RolloutRunner:
         )
         store_te_bfm = requires_te_bfm_trace(loss_fn=loss_fn)
         store_bdb = requires_bdb_trace(loss_fn=loss_fn)
-        store_budgeted_flow = requires_budgeted_flow_trace(loss_fn=loss_fn)
 
         config = RolloutRunConfig(
             temperature=float(rollout_temperature),
@@ -95,7 +93,6 @@ class RolloutRunner:
             store_stop_now_reward=store_stop_now_reward,
             store_te_bfm=store_te_bfm,
             store_bdb=store_bdb,
-            store_budgeted_flow=store_budgeted_flow,
         )
 
         for current_size in rollout_chunk_sizes(
@@ -175,7 +172,6 @@ class RolloutRunner:
         )
         store_te_bfm = requires_te_bfm_trace(loss_fn=loss_fn)
         store_bdb = requires_bdb_trace(loss_fn=loss_fn)
-        store_budgeted_flow = requires_budgeted_flow_trace(loss_fn=loss_fn)
 
         config = RolloutRunConfig(
             temperature=float(temperature),
@@ -184,7 +180,6 @@ class RolloutRunner:
             store_stop_now_reward=store_stop_now_reward,
             store_te_bfm=store_te_bfm,
             store_bdb=store_bdb,
-            store_budgeted_flow=store_budgeted_flow,
         )
 
         rollouts: list[RolloutBatch] = []
@@ -223,7 +218,6 @@ class RolloutRunner:
             store_stop_now_reward=config.store_stop_now_reward,
             store_te_bfm=config.store_te_bfm,
             store_bdb=config.store_bdb,
-            store_budgeted_flow=config.store_budgeted_flow,
         )
 
 
@@ -541,50 +535,6 @@ def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
             rollouts,
             lambda rollout: rollout.traces.bdb_log_flow,
         ),
-        budgeted_policy_kl=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.budgeted_policy_kl,
-        ),
-        budgeted_terminal_loss=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.budgeted_terminal_loss,
-        ),
-        budgeted_value_loss=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.budgeted_value_loss,
-        ),
-        budgeted_valid_mask=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.budgeted_valid_mask,
-        ),
-        oracle_v_star=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.oracle_v_star,
-        ),
-        oracle_terminal_j=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.oracle_terminal_j,
-        ),
-        oracle_stop_prob=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.oracle_stop_prob,
-        ),
-        oracle_edge_entropy=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.oracle_edge_entropy,
-        ),
-        model_stop_prob=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.model_stop_prob,
-        ),
-        budgeted_oracle_good_edge_policy_mass=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.budgeted_oracle_good_edge_policy_mass,
-        ),
-        sampled_oracle_good_edge_rate=_cat_optional(
-            rollouts,
-            lambda rollout: rollout.traces.sampled_oracle_good_edge_rate,
-        ),
     )
 
 
@@ -632,13 +582,6 @@ def requires_bdb_trace(
     return bool(getattr(loss_fn, "requires_bdb_trace", False))
 
 
-def requires_budgeted_flow_trace(
-    *,
-    loss_fn: object | None = None,
-) -> bool:
-    return bool(getattr(loss_fn, "requires_budgeted_flow_trace", False))
-
-
 def rollout_chunk_sizes(
     *,
     total: int,
@@ -679,6 +622,5 @@ __all__ = [
     "requires_stop_now_trace",
     "requires_te_bfm_trace",
     "requires_bdb_trace",
-    "requires_budgeted_flow_trace",
     "rollout_chunk_sizes",
 ]

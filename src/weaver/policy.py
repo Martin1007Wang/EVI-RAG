@@ -24,7 +24,6 @@ from src.weaver.reward.model import (
 from src.weaver.reward.utility import sparse_rollout_active_node_trace
 
 from .nn.evidence_tokens import build_evidence_tokens
-from .nn.budgeted_successor_policy import BudgetedSuccessorPolicy
 from .nn.edge_residual_scorer import EdgeResidualScorer
 from .nn.feature_encoder import FeatureBank, FeatureEncoder
 from .nn.flow_head import FlowHead
@@ -39,8 +38,6 @@ from .nn.relation_residual_edge_scorer import (
 from .nn.successor_policy import SuccessorEdgeAdvantageScorer, SuccessorValueHead
 from .nn.terminal_head import TerminalHead
 from .nn.transition_features import TransitionFeatureBuilder
-from .loss.budgeted_flow_distill import budgeted_flow_state_loss
-from .planner.lexicographic_oracle import BudgetedLexicographicOracle
 from .state import RolloutState, State
 
 
@@ -66,7 +63,7 @@ class PolicyOutput:
     frontier_edge_ids: torch.Tensor
     frontier_batch_ids: torch.Tensor
 
-    edge_policy_diagnostics: FrontierPointerDiagnostics | RelationResidualEdgeDiagnostics | Any | None = None
+    edge_policy_diagnostics: FrontierPointerDiagnostics | RelationResidualEdgeDiagnostics | None = None
     log_c_continue: torch.Tensor | None = None
     log_z_action: torch.Tensor | None = None
     terminal_energy: torch.Tensor | None = None
@@ -96,17 +93,6 @@ class PolicyOutput:
     bdb_parent_count: torch.Tensor | None = None
     bdb_log_reward: torch.Tensor | None = None
     bdb_log_flow: torch.Tensor | None = None
-    budgeted_policy_kl: torch.Tensor | None = None
-    budgeted_terminal_loss: torch.Tensor | None = None
-    budgeted_value_loss: torch.Tensor | None = None
-    budgeted_valid_mask: torch.Tensor | None = None
-    oracle_v_star: torch.Tensor | None = None
-    oracle_terminal_j: torch.Tensor | None = None
-    oracle_stop_prob: torch.Tensor | None = None
-    oracle_edge_entropy: torch.Tensor | None = None
-    model_stop_prob: torch.Tensor | None = None
-    budgeted_oracle_good_edge_policy_mass: torch.Tensor | None = None
-    sampled_oracle_good_edge_rate: torch.Tensor | None = None
     terminal_quotient_backup_used_rate: torch.Tensor | None = None
     terminal_quotient_parent_count: torch.Tensor | None = None
     terminal_quotient_edge_count: torch.Tensor | None = None
@@ -187,11 +173,6 @@ class Policy(nn.Module):
         te_bfm_include_counterfactual_internal_states: bool = False,
         te_bfm_max_expanded_states: int = 1000000,
         bdb_child_chunk_size: int = 2048,
-        policy_type: str = "budgeted_successor",
-        planner_enabled: bool = True,
-        planner_exact_budget: int = 2,
-        planner_top_m_for_budget3: int = 64,
-        planner_include_oracle_prefix_states: bool = True,
         edge_scorer: str = "relation_residual",
         continuation_logit_bias_init: float = -5.912023,
         continuation_mass_reduction: str = "logsumexp",
@@ -200,7 +181,6 @@ class Policy(nn.Module):
         flow_head_cfg: dict[str, Any] | None = None,
         frontier_pointer_cfg: dict[str, Any] | None = None,
         relation_residual_edge_scorer_cfg: dict[str, Any] | None = None,
-        budgeted_successor_policy_cfg: dict[str, Any] | None = None,
         stop_head_cfg: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -232,12 +212,6 @@ class Policy(nn.Module):
         )
         self.te_bfm_max_expanded_states = int(te_bfm_max_expanded_states)
         self.bdb_child_chunk_size = int(bdb_child_chunk_size)
-        self.planner_enabled = bool(planner_enabled)
-        self.planner_exact_budget = int(planner_exact_budget)
-        self.planner_top_m_for_budget3 = int(planner_top_m_for_budget3)
-        self.planner_include_oracle_prefix_states = bool(
-            planner_include_oracle_prefix_states
-        )
         # REMOVED: TE-BFM backup hyperparameter validation — see methodology.md §3.9
         if self.bdb_child_chunk_size < 1:
             raise ValueError("bdb_child_chunk_size must be >= 1.")
@@ -252,14 +226,8 @@ class Policy(nn.Module):
             "frontier_cap_used_rate": 0.0,
             "frontier_cap_dropped_edge_count_mean": 0.0,
         }
-        self.policy_type = str(policy_type).lower()
-        if self.policy_type not in {"budgeted_successor", "legacy"}:
-            raise ValueError(
-                "policy_type must be 'budgeted_successor' or 'legacy', "
-                f"got {policy_type!r}."
-            )
         self.edge_scorer = str(edge_scorer)
-        allowed_edge_scorers = {"relation_residual", "pointer", "budgeted_successor"}
+        allowed_edge_scorers = {"relation_residual", "pointer"}
         if self.edge_scorer not in allowed_edge_scorers:
             raise ValueError(
                 "edge_scorer must be one of "
@@ -321,11 +289,6 @@ class Policy(nn.Module):
             hidden_dim=self.hidden_dim,
             **(relation_residual_edge_scorer_cfg or {}),
         )
-        self.budgeted_successor_policy = BudgetedSuccessorPolicy(
-            hidden_dim=self.hidden_dim,
-            max_budget=self.max_budget,
-            **(budgeted_successor_policy_cfg or {}),
-        )
 
     def set_residual_warmup_step(self, step: int) -> None:
         self.relation_residual_edge_scorer.set_warmup_step(int(step))
@@ -347,7 +310,6 @@ class Policy(nn.Module):
         remaining_budget: torch.Tensor | None = None,
         return_edge_diagnostics: bool = False,
         compute_bdb_trace: bool = False,
-        compute_budgeted_flow_trace: bool = False,
     ) -> PolicyOutput:
         policy_context = self._coerce_policy_context(batch, rollout_context)
         fb = policy_context.fb
@@ -485,33 +447,6 @@ class Policy(nn.Module):
                 dtype=state_log_flow.dtype,
                 device=state_log_flow.device,
             )
-        if compute_budgeted_flow_trace:
-            if not self.planner_enabled:
-                raise ValueError(
-                    "Budgeted-flow distillation requires planner.enabled=true."
-                )
-            if reward_model is None:
-                raise ValueError(
-                    "reward_model is required when compute_budgeted_flow_trace=True."
-                )
-            bdb_trace.update(
-                self._budgeted_flow_distill_trace(
-                    batch=batch,
-                    state=state,
-                    rollout_context=policy_context,
-                    frontier_context=frontier_context,
-                    frontier_edge_ids=frontier_edge_ids,
-                    frontier_batch_ids=frontier_batch_ids,
-                    remaining_budget=remaining_budget,
-                    terminal_energy=terminal_energy,
-                    value_energy=value_energy,
-                    edge_expand_logprob=edge_expand_logprob,
-                    reward_model=reward_model,
-                    dtype=state_log_flow.dtype,
-                    device=state_log_flow.device,
-                )
-            )
-
         return PolicyOutput(
             stop_logits=terminal_energy,
             edge_logits=expand_logits,
@@ -530,188 +465,6 @@ class Policy(nn.Module):
             value_energy=value_energy,
             **bdb_trace,
         )
-
-    def _budgeted_flow_distill_trace(
-        self,
-        *,
-        batch: RetrievalBatch,
-        state: State | RolloutState,
-        rollout_context: PolicyContext,
-        frontier_context: FrontierContext,
-        frontier_edge_ids: torch.Tensor,
-        frontier_batch_ids: torch.Tensor,
-        remaining_budget: torch.Tensor,
-        terminal_energy: torch.Tensor,
-        value_energy: torch.Tensor,
-        edge_expand_logprob: torch.Tensor,
-        reward_model: Any,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        oracle = BudgetedLexicographicOracle(
-            reward_model=reward_model,
-            exact_budget=self.planner_exact_budget,
-            top_m_for_budget3=self.planner_top_m_for_budget3,
-            frontier_mode=self._frontier_mode(),
-        )
-        target = oracle.evaluate(
-            batch=batch,
-            fb=rollout_context.fb,
-            state=state,
-            remaining_budget=remaining_budget,
-            frontier=frontier_context,
-        )
-        losses = budgeted_flow_state_loss(
-            model_terminal=terminal_energy.to(device=device, dtype=dtype),
-            model_value=value_energy.to(device=device, dtype=dtype),
-            model_edge_logprobs=edge_expand_logprob.to(device=device, dtype=dtype),
-            oracle_terminal=target.terminal_J.to(device=device, dtype=dtype),
-            oracle_value=target.V_star.to(device=device, dtype=dtype),
-            oracle_stop_prob=target.stop_prob.to(device=device, dtype=dtype),
-            oracle_edge_probs=target.edge_probs.to(device=device, dtype=dtype),
-            frontier_batch_ids=frontier_batch_ids.to(device=device, dtype=torch.long),
-            valid_mask=target.valid_mask.to(device=device, dtype=torch.bool),
-        )
-        if self.planner_include_oracle_prefix_states:
-            prefix_losses = self._oracle_prefix_distill_losses(
-                batch=batch,
-                state=state,
-                rollout_context=rollout_context,
-                remaining_budget=remaining_budget,
-                oracle=oracle,
-                target=target,
-                parent_rows=int(terminal_energy.numel()),
-                dtype=dtype,
-                device=device,
-                reward_model=reward_model,
-            )
-            if prefix_losses is not None:
-                losses = {
-                    name: 0.5 * losses[name] + 0.5 * prefix_losses[name]
-                    for name in losses
-                }
-        good_edge = target.edge_probs.to(device=device, dtype=dtype)
-        if good_edge.numel() > 0:
-            max_by_row = scatter_max(
-                good_edge,
-                frontier_batch_ids.to(device=device, dtype=torch.long),
-                dim=0,
-                dim_size=int(terminal_energy.numel()),
-            )[0]
-            edge_good = good_edge >= max_by_row.index_select(
-                0,
-                frontier_batch_ids.to(device=device, dtype=torch.long),
-            ).clamp_min(0.0)
-            model_edge_prob = edge_expand_logprob.exp().to(device=device, dtype=dtype)
-            mass = terminal_energy.new_zeros((int(terminal_energy.numel()),))
-            mass.scatter_add_(
-                0,
-                frontier_batch_ids.to(device=device, dtype=torch.long),
-                torch.where(edge_good, model_edge_prob, torch.zeros_like(model_edge_prob)),
-            )
-        else:
-            mass = terminal_energy.new_zeros((int(terminal_energy.numel()),))
-        return {
-            "budgeted_policy_kl": losses["policy_kl"] + (
-                terminal_energy.sum() + edge_expand_logprob.sum() + value_energy.sum()
-            ) * 0.0,
-            "budgeted_terminal_loss": losses["terminal_loss"],
-            "budgeted_value_loss": losses["value_loss"],
-            "budgeted_valid_mask": target.valid_mask.to(device=device),
-            "oracle_v_star": target.V_star.to(device=device, dtype=dtype).detach(),
-            "oracle_terminal_j": target.terminal_J.to(device=device, dtype=dtype).detach(),
-            "oracle_stop_prob": target.stop_prob.to(device=device, dtype=dtype).detach(),
-            "oracle_edge_entropy": target.diagnostics[
-                "oracle/oracle_edge_entropy"
-            ].expand_as(terminal_energy).to(device=device, dtype=dtype).detach(),
-            "model_stop_prob": (terminal_energy - value_energy).exp().detach(),
-            "budgeted_oracle_good_edge_policy_mass": mass.detach(),
-            "sampled_oracle_good_edge_rate": mass.gt(0).to(dtype=dtype).detach(),
-        }
-
-    def _oracle_prefix_distill_losses(
-        self,
-        *,
-        batch: RetrievalBatch,
-        state: State | RolloutState,
-        rollout_context: PolicyContext,
-        remaining_budget: torch.Tensor,
-        oracle: BudgetedLexicographicOracle,
-        target: Any,
-        parent_rows: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        reward_model: Any,
-    ) -> dict[str, torch.Tensor] | None:
-        if target.edge_probs.numel() == 0:
-            return None
-        row_ids = target.frontier_batch_ids.to(device=device, dtype=torch.long).view(-1)
-        edge_ids = target.frontier_edge_ids.to(device=device, dtype=torch.long).view(-1)
-        budget = remaining_budget.to(device=device, dtype=torch.long).view(parent_rows)
-        selected_edges: list[int] = []
-        selected_rows: list[int] = []
-        for row in range(parent_rows):
-            if int(budget[row].item()) <= 1:
-                continue
-            pos = row_ids.eq(row).nonzero(as_tuple=False).flatten()
-            if pos.numel() == 0:
-                continue
-            best = pos.index_select(
-                0,
-                target.edge_probs.to(device=device).index_select(0, pos).argmax().view(1),
-            )[0]
-            selected_rows.append(row)
-            selected_edges.append(int(edge_ids[int(best)].item()))
-        if not selected_edges:
-            return None
-        child_edge_ids = torch.tensor(selected_edges, dtype=torch.long, device=device)
-        parent_row_ids = torch.tensor(selected_rows, dtype=torch.long, device=device)
-        child_state = _successor_state_for_frontier(
-            batch=batch,
-            state=state,
-            frontier_edge_ids=child_edge_ids,
-            frontier_batch_ids=parent_row_ids,
-        )
-        child_budget = budget.index_select(0, parent_row_ids) - 1
-        child_out = self.forward(
-            batch=batch,
-            state=child_state,
-            rollout_context=rollout_context,
-            reward_model=reward_model,
-            remaining_budget=child_budget,
-            return_edge_diagnostics=False,
-            compute_bdb_trace=False,
-            compute_budgeted_flow_trace=False,
-        )
-        child_target = oracle.evaluate(
-            batch=batch,
-            fb=rollout_context.fb,
-            state=child_state,
-            remaining_budget=child_budget,
-        )
-        child_losses = budgeted_flow_state_loss(
-            model_terminal=child_out.terminal_energy.to(device=device, dtype=dtype),
-            model_value=child_out.value_energy.to(device=device, dtype=dtype),
-            model_edge_logprobs=child_out.edge_expand_logprob.to(device=device, dtype=dtype),
-            oracle_terminal=child_target.terminal_J.to(device=device, dtype=dtype),
-            oracle_value=child_target.V_star.to(device=device, dtype=dtype),
-            oracle_stop_prob=child_target.stop_prob.to(device=device, dtype=dtype),
-            oracle_edge_probs=child_target.edge_probs.to(device=device, dtype=dtype),
-            frontier_batch_ids=child_out.frontier_batch_ids.to(device=device, dtype=torch.long),
-            valid_mask=child_target.valid_mask.to(device=device, dtype=torch.bool),
-        )
-        out = {
-            name: torch.zeros((parent_rows,), dtype=dtype, device=device)
-            for name in child_losses
-        }
-        counts = torch.zeros((parent_rows,), dtype=dtype, device=device)
-        for name, values in child_losses.items():
-            out[name].scatter_add_(0, parent_row_ids, values.to(device=device, dtype=dtype))
-        counts.scatter_add_(0, parent_row_ids, torch.ones_like(parent_row_ids, dtype=dtype))
-        return {
-            name: torch.where(counts.gt(0), values / counts.clamp_min(1.0), values)
-            for name, values in out.items()
-        }
 
     def _bdb_trace(
         self,
@@ -1566,34 +1319,6 @@ class Policy(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.policy_type == "budgeted_successor":
-            terminal_energy, expand_logits, value_energy = (
-                self._budgeted_successor_action_terms(
-                    batch=batch,
-                    state=state,
-                    rollout_context=rollout_context,
-                    frontier_batch_ids=frontier_batch_ids,
-                    frontier_edge_ids=frontier_edge_ids,
-                    context=context,
-                    frontier_context=frontier_context,
-                    depth=depth,
-                    remaining_budget=remaining_budget,
-                    num_graphs=num_graphs,
-                    dtype=dtype,
-                    device=device,
-                )
-            )
-            log_c = segment_logsumexp_or_neg_inf(
-                values=expand_logits,
-                segment_ids=frontier_batch_ids,
-                num_graphs=int(num_graphs),
-                device=device,
-                dtype=dtype,
-            )
-            can_continue = remaining_budget.to(device=device, dtype=torch.long).gt(0)
-            log_c = torch.where(can_continue, log_c, torch.full_like(log_c, -torch.inf))
-            return expand_logits, log_c, value_energy, terminal_energy
-
         if self.edge_scorer == "relation_residual":
             edge_logits = self._relation_residual_edge_logits(
                 batch=batch,
@@ -1664,88 +1389,6 @@ class Policy(nn.Module):
         log_z = torch.logaddexp(terminal_energy, log_c)
         log_z = torch.where(can_continue, log_z, terminal_energy)
         return expand_logits, log_c, log_z, terminal_energy
-
-    def _budgeted_successor_action_terms(
-        self,
-        *,
-        batch: RetrievalBatch,
-        state: State | RolloutState,
-        rollout_context: PolicyContext,
-        frontier_batch_ids: torch.Tensor,
-        frontier_edge_ids: torch.Tensor,
-        context: Any,
-        frontier_context: FrontierContext,
-        depth: torch.Tensor,
-        remaining_budget: torch.Tensor,
-        num_graphs: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        child_h = self._frontier_child_state_h(
-            batch=batch,
-            state=state,
-            rollout_context=rollout_context,
-            frontier_edge_ids=frontier_edge_ids,
-            frontier_batch_ids=frontier_batch_ids,
-            dtype=dtype,
-            device=device,
-        )
-        frontier_size = torch.bincount(
-            frontier_batch_ids.to(device=device, dtype=torch.long),
-            minlength=int(num_graphs),
-        ).to(device=device, dtype=dtype)
-        terminal, edge_logits, value = self.budgeted_successor_policy(
-            fb=rollout_context.fb,
-            batch=batch,
-            context=context,
-            child_state_h=child_h,
-            frontier=frontier_context,
-            frontier_batch_ids=frontier_batch_ids,
-            depth=depth,
-            remaining_budget=remaining_budget,
-            frontier_size=frontier_size,
-            num_graphs=int(num_graphs),
-        )
-        return (
-            terminal.to(device=device, dtype=dtype),
-            edge_logits.to(device=device, dtype=dtype),
-            value.to(device=device, dtype=dtype),
-        )
-
-    def _frontier_child_state_h(
-        self,
-        *,
-        batch: RetrievalBatch,
-        state: State | RolloutState,
-        rollout_context: PolicyContext,
-        frontier_edge_ids: torch.Tensor,
-        frontier_batch_ids: torch.Tensor,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if frontier_edge_ids.numel() == 0:
-            return torch.empty((0, self.hidden_dim), dtype=dtype, device=device)
-        row_ids = frontier_batch_ids.to(device=device, dtype=torch.long).view(-1)
-        edge_ids = frontier_edge_ids.to(device=device, dtype=torch.long).view(-1)
-        chunks: list[torch.Tensor] = []
-        for chunk_pos in torch.arange(
-            int(edge_ids.numel()),
-            dtype=torch.long,
-            device=device,
-        ).split(self.bdb_child_chunk_size):
-            child_state = _successor_state_for_frontier(
-                batch=batch,
-                state=state,
-                frontier_edge_ids=edge_ids.index_select(0, chunk_pos),
-                frontier_batch_ids=row_ids.index_select(0, chunk_pos),
-            )
-            child_context = self.state_encoder(
-                fb=rollout_context.fb,
-                batch=batch,
-                state=child_state,
-            )
-            chunks.append(child_context.state_h.to(device=device, dtype=dtype))
-        return torch.cat(chunks, dim=0) if chunks else torch.empty((0, self.hidden_dim), dtype=dtype, device=device)
 
     def _exact1_child_terminal_values(
         self,
@@ -1847,32 +1490,6 @@ class Policy(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> FrontierPointerDiagnostics | RelationResidualEdgeDiagnostics | None:
-        if self.policy_type == "budgeted_successor":
-            child_h = self._frontier_child_state_h(
-                batch=batch,
-                state=state,
-                rollout_context=PolicyContext(fb=fb),
-                frontier_edge_ids=frontier_edge_ids,
-                frontier_batch_ids=frontier_batch_ids,
-                dtype=dtype,
-                device=device,
-            )
-            frontier_size = torch.bincount(
-                frontier_batch_ids.to(device=device, dtype=torch.long),
-                minlength=int(num_graphs),
-            ).to(device=device, dtype=dtype)
-            return self.budgeted_successor_policy.diagnostics(
-                fb=fb,
-                batch=batch,
-                context=context,
-                child_state_h=child_h,
-                frontier=frontier_context,
-                frontier_batch_ids=frontier_batch_ids,
-                depth=depth,
-                remaining_budget=remaining_budget,
-                frontier_size=frontier_size,
-                num_graphs=int(num_graphs),
-            )
         if self.edge_scorer == "relation_residual":
             frontier_size = torch.bincount(
                 frontier_batch_ids.to(device=device, dtype=torch.long),
