@@ -3,12 +3,22 @@
 _target_: src.weaver.module.WeaverModule
 
 hidden_dim: 1024
+manual_accumulate_grad_batches: 2
 
 policy:
   mode: bdb
+  policy_type: budgeted_successor
   flow_budget_conditioning: additive
-  edge_scorer: pointer
+  edge_scorer: budgeted_successor
   evidence_state_encoder_dropout: 0.0
+  relation_residual_edge_scorer:
+    alpha_rel_init: 1.0
+    alpha_dst_init: 0.0
+    alpha_trainable: true
+    residual_scale_init: 0.05
+    residual_scale_trainable: true
+    residual_warmup_steps: 0
+    topk_overlap_k: 5
   feature_encoder:
     dde:
       enabled: true
@@ -26,6 +36,19 @@ policy:
     dropout: 0.0
     zero_init: true
     bias_init: 0.0
+  budgeted_successor_policy:
+    num_layers: 2
+    dropout: 0.0
+    zero_init: true
+    terminal_bias_init: 0.0
+    edge_bias_init: 0.0
+
+planner:
+  enabled: true
+  exact_budget: 2
+  top_m_for_budget3: 64
+  include_oracle_prefix_states: true
+  include_model_rollout_states: true
 
 rollout:
   expand_budget: 2
@@ -37,27 +60,24 @@ sampling:
   eval_temperature: 1.0
 
 reward:
-  reward_floor: 1.0e-6
-  edge_cost: 0.1
-  beta: 2.0
+  type: lexicographic_directed
+  eta: 2.0
+  edge_cost: 0.05
+  fail_penalty: 2.0
+  expand_budget: ${model.rollout.expand_budget}
   debug_checks: false
 
 loss:
-  type: bdb
-  child_flow_target: detach_current
-  backward_kernel: uniform_boundary
-  edge_mode: full
-  child_chunk_size: 2048
-  state_sources:
-    rollout: true
-    oracle_prefix: false
-    counterfactual: false
+  type: budgeted_flow_distill
+  policy_kl_weight: 1.0
+  terminal_weight: 1.0
+  value_weight: 0.5
 
 eval: ${eval_metric}
 
 runtime:
-  train_chunk_size: 8
-  eval_chunk_size: 8
+  train_chunk_size: 2
+  eval_chunk_size: 4
 
 diagnostics:
   train_rollout_diagnostics: false
@@ -70,5 +90,5 @@ diagnostics:
 optimizer_cfg: null
 scheduler_cfg: null
 
-gradient_clip_val: null
-gradient_clip_algorithm: null
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm

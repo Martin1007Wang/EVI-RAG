@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.weaver.loss import LossOutput, SubTrajectoryBalanceLoss
+from src.weaver.loss import LossOutput
 from src.weaver.policy import Policy
 from src.weaver.reward import RewardModel
 
-from .engine import RewardMode, RolloutEngine, StepAuxiliary
+from .engine import RolloutEngine
 from .schema import RolloutBatch, RolloutStats, RolloutTraces
-
-BackwardFn = Callable[[torch.Tensor], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,34 +21,20 @@ class TrainingRolloutResult:
 
 
 @dataclass(frozen=True, slots=True)
-class RolloutRewardRequirements:
-    stop_now: bool
-    terminal_only: bool
-
-    def __post_init__(self) -> None:
-        if bool(self.stop_now) == bool(self.terminal_only):
-            raise ValueError(
-                "Exactly one rollout reward requirement must be selected: "
-                "stop_now or terminal_only."
-            )
-
-    @classmethod
-    def from_stop_now_required(cls, required: bool) -> "RolloutRewardRequirements":
-        return cls(stop_now=bool(required), terminal_only=not bool(required))
-
-    @property
-    def reward_mode(self) -> RewardMode:
-        return RewardMode.EAGER_STOP_NOW if self.stop_now else RewardMode.LAZY_TERMINAL
+class TrainingRolloutChunk:
+    rollouts: tuple[RolloutBatch, ...]
+    num_rollouts: int
 
 
 @dataclass(frozen=True, slots=True)
 class RolloutRunConfig:
     temperature: float
-    collect_stop_counterfactual: bool
     collect_policy_diagnostics: bool
     validate_synchronous_depth: bool
-    reward_mode: RewardMode
-    edge_logit_mode: str = "final"
+    store_stop_now_reward: bool
+    store_te_bfm: bool
+    store_bdb: bool
+    store_budgeted_flow: bool
 
 
 class RolloutRunner:
@@ -60,16 +44,8 @@ class RolloutRunner:
     Responsibilities:
         1. split rollout requests into memory-safe chunks;
         2. call RolloutEngine to generate policy rollouts;
-        3. compute loss per chunk and backpropagate with stable normalization;
+        3. yield rollout chunks for module-owned loss and backward;
         4. concatenate rollout chunks for logging / evaluation.
-
-    Non-responsibilities:
-        - no action sampling;
-        - no environment transition;
-        - no reward definition;
-        - no policy computation;
-        - no SubTB / StopTB / StopAdv internals;
-        - no coverage teacher / proposal intervention.
     """
 
     def __init__(
@@ -88,54 +64,39 @@ class RolloutRunner:
 
         self.engine = RolloutEngine(expand_budget=int(expand_budget))
 
-    def run_training_rollouts_and_backward(
+    def iter_training_rollout_chunks(
         self,
         *,
         policy: Policy,
         reward_model: RewardModel,
-        loss_fn: SubTrajectoryBalanceLoss,
-        backward_fn: BackwardFn,
         batch: RetrievalBatch,
         rollout_temperature: float,
-        accumulation_batches: int,
-        auxiliary: StepAuxiliary | None = None,
-        collect_stop_counterfactual: bool = True,
         collect_policy_diagnostics: bool = False,
         validate_synchronous_depth: bool = False,
-        reward_mode: RewardMode | str | None = None,
-    ) -> TrainingRolloutResult:
+        loss_fn: torch.nn.Module | None = None,
+    ) -> Iterator[TrainingRolloutChunk]:
         """
-        Run one training-step worth of rollouts and backpropagate chunk losses.
+        Yield one training-step worth of memory-safe rollout chunks.
 
-        Loss normalization uses:
-
-            train_num_rollout * accumulation_batches
-
-        It must not depend on chunk size. Otherwise changing chunk_size silently
-        changes the effective learning rate.
+        The Lightning module owns loss computation and backward so optimizer
+        semantics stay visible at the training entry point.
         """
-        accumulation_batches = positive_int(
-            accumulation_batches,
-            "accumulation_batches",
+        store_stop_now_reward = requires_stop_now_trace(
+            loss_fn=loss_fn,
         )
-        normalize_by = self.train_num_rollout * accumulation_batches
+        store_te_bfm = requires_te_bfm_trace(loss_fn=loss_fn)
+        store_bdb = requires_bdb_trace(loss_fn=loss_fn)
+        store_budgeted_flow = requires_budgeted_flow_trace(loss_fn=loss_fn)
 
         config = RolloutRunConfig(
             temperature=float(rollout_temperature),
-            collect_stop_counterfactual=bool(collect_stop_counterfactual),
             collect_policy_diagnostics=bool(collect_policy_diagnostics),
             validate_synchronous_depth=bool(validate_synchronous_depth),
-            reward_mode=resolve_rollout_reward_requirements(
-                reward_mode=reward_mode,
-                loss_fn=loss_fn,
-                auxiliary=auxiliary,
-                collect_stop_counterfactual=collect_stop_counterfactual,
-            ).reward_mode,
-            edge_logit_mode="final",
+            store_stop_now_reward=store_stop_now_reward,
+            store_te_bfm=store_te_bfm,
+            store_bdb=store_bdb,
+            store_budgeted_flow=store_budgeted_flow,
         )
-
-        rollouts: list[RolloutBatch] = []
-        loss_outputs: list[LossOutput] = []
 
         for current_size in rollout_chunk_sizes(
             total=self.train_num_rollout,
@@ -147,23 +108,12 @@ class RolloutRunner:
                 batch=batch,
                 num_rollouts=current_size,
                 config=config,
-                auxiliary=auxiliary,
             )
 
-            loss_output = backward_rollouts(
-                rollouts=current_rollouts,
-                loss_fn=loss_fn,
-                backward_fn=backward_fn,
-                normalize_by=normalize_by,
+            yield TrainingRolloutChunk(
+                rollouts=tuple(current_rollouts),
+                num_rollouts=current_size,
             )
-
-            rollouts.extend(current_rollouts)
-            loss_outputs.append(loss_output)
-
-        return TrainingRolloutResult(
-            loss_output=LossOutput.aggregate(loss_outputs),
-            rollouts=tuple(rollouts),
-        )
 
     @torch.no_grad()
     def generate_eval_rollouts(
@@ -174,10 +124,9 @@ class RolloutRunner:
         batch: RetrievalBatch,
         temperature: float,
         num_rollouts: int | None = None,
-        collect_stop_counterfactual: bool = True,
         collect_policy_diagnostics: bool = True,
         validate_synchronous_depth: bool = False,
-        reward_mode: RewardMode | str | None = None,
+        loss_fn: torch.nn.Module | None = None,
     ) -> list[RolloutBatch]:
         total = (
             self.eval_num_rollout
@@ -192,10 +141,9 @@ class RolloutRunner:
             num_rollouts=total,
             temperature=float(temperature),
             chunk_size=self.eval_chunk_size,
-            collect_stop_counterfactual=collect_stop_counterfactual,
             collect_policy_diagnostics=collect_policy_diagnostics,
             validate_synchronous_depth=validate_synchronous_depth,
-            reward_mode=reward_mode,
+            loss_fn=loss_fn,
         )
 
     @torch.no_grad()
@@ -208,10 +156,9 @@ class RolloutRunner:
         num_rollouts: int,
         temperature: float,
         chunk_size: int | None = None,
-        collect_stop_counterfactual: bool = True,
         collect_policy_diagnostics: bool = True,
         validate_synchronous_depth: bool = False,
-        reward_mode: RewardMode | str | None = None,
+        loss_fn: torch.nn.Module | None = None,
     ) -> list[RolloutBatch]:
         total = non_negative_int(num_rollouts, "num_rollouts")
         if total == 0:
@@ -223,16 +170,21 @@ class RolloutRunner:
             else positive_int(chunk_size, "chunk_size")
         )
 
+        store_stop_now_reward = requires_stop_now_trace(
+            loss_fn=loss_fn,
+        )
+        store_te_bfm = requires_te_bfm_trace(loss_fn=loss_fn)
+        store_bdb = requires_bdb_trace(loss_fn=loss_fn)
+        store_budgeted_flow = requires_budgeted_flow_trace(loss_fn=loss_fn)
+
         config = RolloutRunConfig(
             temperature=float(temperature),
-            collect_stop_counterfactual=bool(collect_stop_counterfactual),
             collect_policy_diagnostics=bool(collect_policy_diagnostics),
             validate_synchronous_depth=bool(validate_synchronous_depth),
-            reward_mode=resolve_rollout_reward_requirements(
-                reward_mode=reward_mode,
-                collect_stop_counterfactual=collect_stop_counterfactual,
-            ).reward_mode,
-            edge_logit_mode="final",
+            store_stop_now_reward=store_stop_now_reward,
+            store_te_bfm=store_te_bfm,
+            store_bdb=store_bdb,
+            store_budgeted_flow=store_budgeted_flow,
         )
 
         rollouts: list[RolloutBatch] = []
@@ -244,7 +196,6 @@ class RolloutRunner:
                     batch=batch,
                     num_rollouts=current_size,
                     config=config,
-                    auxiliary=None,
                 )
             )
 
@@ -258,7 +209,6 @@ class RolloutRunner:
         batch: RetrievalBatch,
         num_rollouts: int,
         config: RolloutRunConfig,
-        auxiliary: StepAuxiliary | None,
     ) -> list[RolloutBatch]:
         num_rollouts = positive_int(num_rollouts, "num_rollouts")
 
@@ -268,40 +218,56 @@ class RolloutRunner:
             reward_model=reward_model,
             num_rollouts=num_rollouts,
             temperature=float(config.temperature),
-            auxiliary=auxiliary,
-            collect_stop_counterfactual=config.collect_stop_counterfactual,
             collect_policy_diagnostics=config.collect_policy_diagnostics,
             validate_synchronous_depth=config.validate_synchronous_depth,
-            edge_logit_mode=config.edge_logit_mode,
-            reward_mode=config.reward_mode,
+            store_stop_now_reward=config.store_stop_now_reward,
+            store_te_bfm=config.store_te_bfm,
+            store_bdb=config.store_bdb,
+            store_budgeted_flow=config.store_budgeted_flow,
         )
 
 
-def backward_rollouts(
+def detach_rollout_for_metrics(
+    rollout: RolloutBatch,
     *,
-    rollouts: Sequence[RolloutBatch],
-    loss_fn: SubTrajectoryBalanceLoss,
-    backward_fn: BackwardFn,
-    normalize_by: int,
-) -> LossOutput:
+    device: torch.device | str | None = None,
+) -> RolloutBatch:
     """
-    Backpropagate one rollout execution chunk.
-
-    normalize_by is the full training-step rollout count times gradient
-    accumulation batches. It is not the current chunk size.
+    Return a rollout snapshot that is safe to retain after chunk backward.
     """
-    if not rollouts:
-        raise ValueError("Cannot backpropagate over an empty rollout sequence.")
+    return RolloutBatch(
+        stats=_detach_rollout_dataclass(rollout.stats, device=device),
+        traces=_detach_rollout_dataclass(rollout.traces, device=device),
+    )
 
-    normalize_by = positive_int(normalize_by, "normalize_by")
 
-    rollout = concat_rollout_batches(rollouts)
-    output = loss_fn(rollout)
+def _detach_rollout_dataclass(
+    value: RolloutStats | RolloutTraces,
+    *,
+    device: torch.device | str | None,
+) -> RolloutStats | RolloutTraces:
+    detached = {
+        field.name: _detach_rollout_tensor(
+            getattr(value, field.name),
+            device=device,
+        )
+        for field in fields(value)
+    }
+    return type(value)(**detached)
 
-    scale = float(len(rollouts)) / float(normalize_by)
-    backward_fn(output.loss * scale)
 
-    return output
+def _detach_rollout_tensor(
+    tensor: torch.Tensor | None,
+    *,
+    device: torch.device | str | None,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+
+    detached = tensor.detach()
+    if device is None:
+        return detached
+    return detached.to(device=device)
 
 
 def concat_rollout_batches(rollouts: Sequence[RolloutBatch]) -> RolloutBatch:
@@ -318,7 +284,6 @@ def concat_rollout_batches(rollouts: Sequence[RolloutBatch]) -> RolloutBatch:
 
 def concat_rollout_stats(rollouts: Sequence[RolloutBatch]) -> RolloutStats:
     return RolloutStats(
-        root_log_z=_cat(rollouts, lambda rollout: rollout.stats.root_log_z),
         trajectory_length=_cat(
             rollouts,
             lambda rollout: rollout.stats.trajectory_length,
@@ -339,6 +304,10 @@ def concat_rollout_stats(rollouts: Sequence[RolloutBatch]) -> RolloutStats:
             rollouts,
             lambda rollout: rollout.stats.edge_action_count,
         ),
+        source_graph_id=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.stats.source_graph_id,
+        ),
         terminal_complexity_penalty=_cat_optional(
             rollouts,
             lambda rollout: rollout.stats.terminal_complexity_penalty,
@@ -350,6 +319,10 @@ def concat_rollout_stats(rollouts: Sequence[RolloutBatch]) -> RolloutStats:
         terminal_utility=_cat_optional(
             rollouts,
             lambda rollout: rollout.stats.terminal_utility,
+        ),
+        terminal_shortest_path_potential=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.stats.terminal_shortest_path_potential,
         ),
         terminal_expanded_edge_count=_cat_optional(
             rollouts,
@@ -364,10 +337,6 @@ def concat_rollout_stats(rollouts: Sequence[RolloutBatch]) -> RolloutStats:
 
 def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
     return RolloutTraces(
-        state_log_flows=_cat(
-            rollouts,
-            lambda rollout: rollout.traces.state_log_flows,
-        ),
         log_pf=_cat(
             rollouts,
             lambda rollout: rollout.traces.log_pf,
@@ -375,6 +344,54 @@ def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
         log_pb=_cat(
             rollouts,
             lambda rollout: rollout.traces.log_pb,
+        ),
+        state_log_flow=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.state_log_flow,
+        ),
+        db_parent_log_reward=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_parent_log_reward,
+        ),
+        db_child_log_reward=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_child_log_reward,
+        ),
+        db_parent_shortest_path_potential=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_parent_shortest_path_potential,
+        ),
+        db_child_shortest_path_potential=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_child_shortest_path_potential,
+        ),
+        db_parent_process_log_bonus=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_parent_process_log_bonus,
+        ),
+        db_child_process_log_bonus=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_child_process_log_bonus,
+        ),
+        db_log_p_stop_parent=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_log_p_stop_parent,
+        ),
+        db_log_p_stop_child=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_log_p_stop_child,
+        ),
+        db_log_pf_expand=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_log_pf_expand,
+        ),
+        db_log_pb=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_log_pb,
+        ),
+        db_valid_mask=_cat(
+            rollouts,
+            lambda rollout: rollout.traces.db_valid_mask,
         ),
         action_type=_cat(
             rollouts,
@@ -392,25 +409,17 @@ def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
             rollouts,
             lambda rollout: rollout.traces.selected_edge_ids,
         ),
-        stop_now_log_reward=_cat(
+        stop_now_log_reward=_cat_optional(
             rollouts,
             lambda rollout: rollout.traces.stop_now_log_reward,
         ),
-        stop_now_answer_f1=_cat(
+        stop_now_answer_f1=_cat_optional(
             rollouts,
             lambda rollout: rollout.traces.stop_now_answer_f1,
         ),
-        stop_now_valid_mask=_cat(
+        stop_now_valid_mask=_cat_optional(
             rollouts,
             lambda rollout: rollout.traces.stop_now_valid_mask,
-        ),
-        stop_log_pf=_cat(
-            rollouts,
-            lambda rollout: rollout.traces.stop_log_pf,
-        ),
-        stop_tb_valid_mask=_cat(
-            rollouts,
-            lambda rollout: rollout.traces.stop_tb_valid_mask,
         ),
         target_stop_prob=_cat(
             rollouts,
@@ -432,29 +441,149 @@ def concat_rollout_traces(rollouts: Sequence[RolloutBatch]) -> RolloutTraces:
             rollouts,
             lambda rollout: rollout.traces.edge_action_entropy_valid_mask,
         ),
+        log_p_stop=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.log_p_stop,
+        ),
         budget_exhausted_mask=_cat_optional(
             rollouts,
             lambda rollout: rollout.traces.budget_exhausted_mask,
         ),
-        stop_adv_target=_cat_optional(
+        te_bfm_loss=_cat_optional(
             rollouts,
-            lambda rollout: rollout.traces.stop_adv_target,
+            lambda rollout: rollout.traces.te_bfm_loss,
         ),
-        stop_adv_valid_mask=_cat_optional(
+        te_bfm_valid_mask=_cat_optional(
             rollouts,
-            lambda rollout: rollout.traces.stop_adv_valid_mask,
+            lambda rollout: rollout.traces.te_bfm_valid_mask,
         ),
-        stop_adv_continue_log_reward=_cat_optional(
+        te_bfm_residual_abs=_cat_optional(
             rollouts,
-            lambda rollout: rollout.traces.stop_adv_continue_log_reward,
+            lambda rollout: rollout.traces.te_bfm_residual_abs,
         ),
-        local_improvement_loss=_cat_optional(
+        te_bfm_target_log_value=_cat_optional(
             rollouts,
-            lambda rollout: rollout.traces.local_improvement_loss,
+            lambda rollout: rollout.traces.te_bfm_target_log_value,
         ),
-        local_improvement_valid_mask=_cat_optional(
+        te_bfm_log_reward=_cat_optional(
             rollouts,
-            lambda rollout: rollout.traces.local_improvement_valid_mask,
+            lambda rollout: rollout.traces.te_bfm_log_reward,
+        ),
+        te_bfm_stop_prob=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.te_bfm_stop_prob,
+        ),
+        te_bfm_frontier_edge_count=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.te_bfm_frontier_edge_count,
+        ),
+        te_bfm_counterfactual_child_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.te_bfm_counterfactual_child_loss,
+        ),
+        te_bfm_frontier_cap_used=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.te_bfm_frontier_cap_used,
+        ),
+        te_bfm_frontier_cap_dropped_edge_count=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.te_bfm_frontier_cap_dropped_edge_count,
+        ),
+        bdb_stop_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_stop_loss,
+        ),
+        bdb_edge_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_edge_loss,
+        ),
+        bdb_base_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_base_loss,
+        ),
+        bdb_stop_valid_mask=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_stop_valid_mask,
+        ),
+        bdb_edge_valid_mask=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_edge_valid_mask,
+        ),
+        bdb_base_valid_mask=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_base_valid_mask,
+        ),
+        bdb_delta_stop=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_delta_stop,
+        ),
+        bdb_delta_edge=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_delta_edge,
+        ),
+        bdb_delta_base=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_delta_base,
+        ),
+        bdb_frontier_size=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_frontier_size,
+        ),
+        bdb_parent_count=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_parent_count,
+        ),
+        bdb_log_reward=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_log_reward,
+        ),
+        bdb_log_flow=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.bdb_log_flow,
+        ),
+        budgeted_policy_kl=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.budgeted_policy_kl,
+        ),
+        budgeted_terminal_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.budgeted_terminal_loss,
+        ),
+        budgeted_value_loss=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.budgeted_value_loss,
+        ),
+        budgeted_valid_mask=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.budgeted_valid_mask,
+        ),
+        oracle_v_star=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.oracle_v_star,
+        ),
+        oracle_terminal_j=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.oracle_terminal_j,
+        ),
+        oracle_stop_prob=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.oracle_stop_prob,
+        ),
+        oracle_edge_entropy=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.oracle_edge_entropy,
+        ),
+        model_stop_prob=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.model_stop_prob,
+        ),
+        budgeted_oracle_good_edge_policy_mass=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.budgeted_oracle_good_edge_policy_mass,
+        ),
+        sampled_oracle_good_edge_rate=_cat_optional(
+            rollouts,
+            lambda rollout: rollout.traces.sampled_oracle_good_edge_rate,
         ),
     )
 
@@ -482,48 +611,32 @@ def _cat_optional(
     return torch.cat([value for value in values if value is not None], dim=0)
 
 
-def resolve_rollout_reward_requirements(
+def requires_stop_now_trace(
     *,
-    reward_mode: RewardMode | str | None = None,
     loss_fn: object | None = None,
-    auxiliary: StepAuxiliary | None = None,
-    collect_stop_counterfactual: bool = False,
-) -> RolloutRewardRequirements:
-    requires_stop_now = bool(collect_stop_counterfactual)
-    if loss_fn is not None:
-        requires_stop_now = requires_stop_now or bool(
-            getattr(loss_fn, "requires_stop_now_reward", False)
-        )
-    if auxiliary is not None:
-        requires_stop_now = requires_stop_now or bool(
-            getattr(auxiliary, "requires_stop_now_reward", False)
-        )
-
-    if reward_mode is not None:
-        mode = _coerce_reward_mode(reward_mode)
-        if requires_stop_now and mode != RewardMode.EAGER_STOP_NOW:
-            raise ValueError(
-                "reward_mode='eager_stop_now' is required when StopTB, "
-                "stop counterfactuals, or rollout auxiliaries need stop-now rewards."
-            )
-        return RolloutRewardRequirements.from_stop_now_required(
-            mode == RewardMode.EAGER_STOP_NOW
-        )
-
-    return RolloutRewardRequirements.from_stop_now_required(requires_stop_now)
+) -> bool:
+    return bool(getattr(loss_fn, "requires_stop_now_reward", False))
 
 
-def _coerce_reward_mode(reward_mode: RewardMode | str) -> RewardMode:
-    if isinstance(reward_mode, RewardMode):
-        return reward_mode
+def requires_te_bfm_trace(
+    *,
+    loss_fn: object | None = None,
+) -> bool:
+    return bool(getattr(loss_fn, "requires_te_bfm_trace", False))
 
-    try:
-        return RewardMode(str(reward_mode))
-    except ValueError as exc:
-        raise ValueError(
-            "reward_mode must be 'eager_stop_now' or 'lazy_terminal', "
-            f"got {reward_mode!r}."
-        ) from exc
+
+def requires_bdb_trace(
+    *,
+    loss_fn: object | None = None,
+) -> bool:
+    return bool(getattr(loss_fn, "requires_bdb_trace", False))
+
+
+def requires_budgeted_flow_trace(
+    *,
+    loss_fn: object | None = None,
+) -> bool:
+    return bool(getattr(loss_fn, "requires_budgeted_flow_trace", False))
 
 
 def rollout_chunk_sizes(
@@ -555,15 +668,17 @@ def non_negative_int(value: int, name: str) -> int:
 
 
 __all__ = [
-    "BackwardFn",
-    "RolloutRewardRequirements",
     "RolloutRunConfig",
     "RolloutRunner",
+    "TrainingRolloutChunk",
     "TrainingRolloutResult",
-    "backward_rollouts",
     "concat_rollout_batches",
     "concat_rollout_stats",
     "concat_rollout_traces",
-    "resolve_rollout_reward_requirements",
+    "detach_rollout_for_metrics",
+    "requires_stop_now_trace",
+    "requires_te_bfm_trace",
+    "requires_bdb_trace",
+    "requires_budgeted_flow_trace",
     "rollout_chunk_sizes",
 ]

@@ -57,10 +57,10 @@ from src.weaver.module import build_loss
 
 
 def test_subtb_objective_is_removed_from_active_factory() -> None:
-    with pytest.raises(ValueError, match="loss.type must be 'bdb'"):
+    with pytest.raises(ValueError, match="budgeted_flow_distill"):
         build_loss({"type": "subtb"})
 
 
 def test_te_bfm_objective_is_removed_from_active_factory() -> None:
-    with pytest.raises(ValueError, match="loss.type must be 'bdb'"):
+    with pytest.raises(ValueError, match="budgeted_flow_distill"):
         build_loss({"type": "te_bfm"})

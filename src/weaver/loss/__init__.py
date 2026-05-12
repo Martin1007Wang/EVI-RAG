@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .schema import LossOutput
+from .budgeted_flow_distill import BudgetedFlowDistillLoss
 from .bdb import BudgetedDAGDetailedBalanceLoss
 from .subtb import SubTrajectoryBalanceLoss
 from .te_bfm import TruncatedExactBFMLoss
@@ -9,6 +10,7 @@ from .te_bfm import TruncatedExactBFMLoss
 
 __all__ = [
     "BudgetedDAGDetailedBalanceLoss",
+    "BudgetedFlowDistillLoss",
     "LossOutput",
     "SubTrajectoryBalanceLoss",
     "TruncatedExactBFMLoss",
