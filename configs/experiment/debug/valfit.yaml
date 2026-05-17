@@ -4,13 +4,24 @@ defaults:
   - override /dataset: webqsp
   - override /model: weaver
   - override /trainer: gpu
-  - override /callbacks: eval
+  - override /callbacks: train
   - override /logger: wandb
   - _self_
 
 task_name: debug_valfit
 
-dataset:
+# Validation rollout probe:
+# train/validation/test all point at the validation split so
+# val/main/* should improve if optimization is healthy.
+trainer:
+  max_epochs: -1
+  max_steps: 10000
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+
+datamodule:
+  batch_size: 32
+  eval_batch_size: 32
   splits:
     train: validation
     validation: validation

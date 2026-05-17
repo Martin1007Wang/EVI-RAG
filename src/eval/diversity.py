@@ -1,4 +1,3 @@
-# src/eval/diversity.py
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -6,17 +5,21 @@ from collections.abc import Sequence
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.weaver.rollout.schema import RolloutBatch
-from src.weaver.rollout.terminal_subgraph import (
-    batch_num_graphs,
-    default_eval_device,
-    eval_target_node_mask,
-    stack_terminal_subgraph_masks,
-)
+from src.eval.targets import eval_target_node_mask
+from src.weaver.rollout.result import RolloutResult
+from src.weaver.rollout.subgraph import SubgraphReconstructor
+
+
+def default_eval_device() -> torch.device:
+    return torch.device("cpu")
+
+
+def batch_num_graphs(batch: RetrievalBatch) -> int:
+    return int(batch.num_graphs)
 
 
 def compute_exploration_diversity(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     device: torch.device | None = None,
@@ -42,11 +45,7 @@ def compute_exploration_diversity(
             "terminal_f1_std": terminal_f1_std(rollouts),
         }
 
-    node_masks, edge_masks = stack_terminal_subgraph_masks(
-        rollouts,
-        batch,
-        device=device,
-    )
+    node_masks, edge_masks = SubgraphReconstructor(batch, device=device).stack(rollouts)
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
     edge_batch = batch.edge_batch.to(device=device, dtype=torch.long)
@@ -75,7 +74,7 @@ def compute_exploration_diversity(
 
 
 def compute_exploration_diversity_at_ks(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     ks: Sequence[int],
@@ -156,15 +155,12 @@ def mean_pairwise_jaccard_distance_by_graph(
     return float(torch.cat(values).mean().item())
 
 
-def terminal_f1_std(rollouts: Sequence[RolloutBatch]) -> float:
+def terminal_f1_std(rollouts: Sequence[RolloutResult]) -> float:
     if not rollouts:
         return 0.0
 
     values = torch.cat(
-        [
-            rollout.stats.terminal_answer_f1.detach().to(dtype=torch.float32)
-            for rollout in rollouts
-        ],
+        [rollout.terminal_stop_log_prob.detach().to(dtype=torch.float32) for rollout in rollouts],
         dim=0,
     )
 
@@ -174,16 +170,16 @@ def terminal_f1_std(rollouts: Sequence[RolloutBatch]) -> float:
     return float(values.std(unbiased=False).item())
 
 
-def unique_terminal_subgraph_rate(rollouts: Sequence[RolloutBatch]) -> float:
+def unique_terminal_subgraph_rate(rollouts: Sequence[RolloutResult]) -> float:
     return unique_selected_edge_set_rate(rollouts)
 
 
-def unique_selected_edge_set_rate(rollouts: Sequence[RolloutBatch]) -> float:
+def unique_selected_edge_set_rate(rollouts: Sequence[RolloutResult]) -> float:
     if not rollouts:
         return 0.0
 
     num_rollouts = len(rollouts)
-    num_graphs = int(rollouts[0].stats.trajectory_length.numel())
+    num_graphs = int(rollouts[0].traj_len.numel())
     rates: list[float] = []
     for graph_id in range(num_graphs):
         unique_sets = {
@@ -196,11 +192,11 @@ def unique_selected_edge_set_rate(rollouts: Sequence[RolloutBatch]) -> float:
 
 
 def _selected_edge_set_for_graph(
-    *, rollout: RolloutBatch, graph_id: int
+    *, rollout: RolloutResult, graph_id: int
 ) -> tuple[int, ...]:
-    selected_edge_ids = rollout.traces.selected_edge_ids[graph_id]
-    continue_mask = rollout.traces.continue_mask[graph_id]
-    trajectory_length = int(rollout.stats.trajectory_length[graph_id].item())
+    selected_edge_ids = rollout.selected_edge_ids[graph_id]
+    continue_mask = rollout.expand_mask[graph_id]
+    trajectory_length = int(rollout.traj_len[graph_id].item())
     if trajectory_length <= 0:
         return ()
 

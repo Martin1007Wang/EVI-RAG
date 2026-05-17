@@ -1,7 +1,6 @@
 # @package scheduler
 
-type: cosine_with_warmup
+type: cosine
 interval: step
-num_warmup_steps: 30
-min_lr_ratio: 0.1
+warmup_ratio: 0.2
 eta_min: 0.0

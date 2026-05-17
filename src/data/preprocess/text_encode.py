@@ -4,9 +4,8 @@ import hashlib
 import json
 import logging
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence, cast
 
 import torch
 import torch.nn.functional as F
@@ -15,24 +14,52 @@ from transformers import AutoModel, AutoTokenizer
 
 log = logging.getLogger(__name__)
 
-TEXT_ENCODE_CACHE_SCHEMA_VERSION = 1
+_pooling = "cls"
+_normalization = "l2"
+_output_dtype = "float32"
 
 
 class TextEncoder:
     def __init__(
         self,
         model_name: str,
+        revision: str,
         device: str = "auto",
         progress_bar: bool = True,
+        tokenizer_name: str | None = None,
+        tokenizer_revision: str | None = None,
+        max_length: int | None = None,
     ) -> None:
+        model_name = str(model_name).strip()
+        revision = str(revision).strip()
+        resolved_tokenizer_name = str(tokenizer_name or model_name).strip()
+        resolved_tokenizer_revision = str(tokenizer_revision or revision).strip()
+        if not model_name:
+            raise ValueError("TextEncoder requires a non-empty model_name.")
+        if not revision:
+            raise ValueError("TextEncoder requires a non-empty revision.")
+        if not resolved_tokenizer_name:
+            raise ValueError("TextEncoder requires a non-empty tokenizer_name.")
+        if not resolved_tokenizer_revision:
+            raise ValueError("TextEncoder requires a non-empty tokenizer_revision.")
+        if max_length is not None and int(max_length) <= 0:
+            raise ValueError(f"max_length must be positive or None, got {max_length}.")
         if device in {"", "auto"}:
             resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             resolved_device = device
+        self.model_name = model_name
+        self.revision = revision
+        self.tokenizer_name = resolved_tokenizer_name
+        self.tokenizer_revision = resolved_tokenizer_revision
+        self.max_length = None if max_length is None else int(max_length)
         self.device = torch.device(resolved_device)
         self.progress_bar = progress_bar
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_name,
+            revision=self.tokenizer_revision,
+        )
+        self.model = AutoModel.from_pretrained(self.model_name, revision=self.revision)
         self.model.to(self.device).eval()
         self.hidden_size = int(self.model.config.hidden_size)
 
@@ -42,6 +69,7 @@ class TextEncoder:
             texts,
             padding=True,
             truncation=True,
+            max_length=self.max_length,
             return_tensors="pt",
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -57,81 +85,78 @@ class TextEncoder:
         desc: str = "Encode",
         query_prefix: str = "",
     ) -> torch.Tensor:
+        batch_size = _resolve_batch_size(batch_size)
         if not texts:
             return torch.empty((0, self.hidden_size), dtype=torch.float32)
-        prefixed = [f"{query_prefix}{t}" for t in texts] if query_prefix else list(texts)
         outputs = []
-        iterator = range(0, len(prefixed), batch_size)
+        iterator = range(0, len(texts), batch_size)
         for start in tqdm(iterator, desc=desc, disable=not self.progress_bar):
-            batch = prefixed[start : start + batch_size]
+            raw_batch = texts[start : start + batch_size]
+            batch = (
+                [f"{query_prefix}{t}" for t in raw_batch]
+                if query_prefix
+                else list(raw_batch)
+            )
             outputs.append(self._forward_batch(batch))
         return torch.cat(outputs, dim=0)
 
 
-@dataclass(frozen=True)
-class EncodedFeatures:
-    entity_text_embeddings: torch.Tensor  # [num_text_entities, dim]
-    relation_embeddings: torch.Tensor  # [num_relations, dim]
-    question_embeddings: torch.Tensor  # [num_samples, dim]
-
-
-def encode_text_features(
+def encode_text_table(
     *,
-    entity_text_labels: list[str],
-    relation_text_labels: list[str],
-    question_texts: list[str],
+    texts: list[str],
     encoder_name: str,
+    encoder_revision: str,
     device: str = "auto",
     batch_size: int | None = None,
     progress_bar: bool = True,
     cache_dir: str | Path | None = None,
-) -> EncodedFeatures:
-    resolved_batch_size = batch_size or (256 if torch.cuda.is_available() else 16)
-    encoder: TextEncoder | None = None
+    cache_kind: str,
+    desc: str,
+    query_prefix: str = "",
+    encoder: TextEncoder | None = None,
+    tokenizer_name: str | None = None,
+    tokenizer_revision: str | None = None,
+    max_length: int | None = None,
+) -> torch.Tensor:
+    resolved_batch_size = _resolve_batch_size(batch_size)
+    resolved_cache_dir = Path(cache_dir) if cache_dir not in (None, "") else None
+    provenance = text_encoder_provenance(
+        encoder_name=encoder_name,
+        encoder_revision=encoder_revision,
+        tokenizer_name=tokenizer_name,
+        tokenizer_revision=tokenizer_revision,
+        max_length=max_length,
+    )
+    owned_encoder: TextEncoder | None = encoder
+    resolved_encoder_name = cast(str, provenance["encoder_name"])
+    resolved_encoder_revision = cast(str, provenance["encoder_revision"])
+    resolved_tokenizer_name = cast(str, provenance["tokenizer_name"])
+    resolved_tokenizer_revision = cast(str, provenance["tokenizer_revision"])
+    resolved_max_length = cast(int | None, provenance["max_length"])
 
     def get_encoder() -> TextEncoder:
-        nonlocal encoder
-        if encoder is None:
-            encoder = TextEncoder(
-                model_name=encoder_name,
+        nonlocal owned_encoder
+        if owned_encoder is None:
+            owned_encoder = TextEncoder(
+                model_name=resolved_encoder_name,
+                revision=resolved_encoder_revision,
                 device=device,
                 progress_bar=progress_bar,
+                tokenizer_name=resolved_tokenizer_name,
+                tokenizer_revision=resolved_tokenizer_revision,
+                max_length=resolved_max_length,
             )
-        return encoder
+        return owned_encoder
 
-    resolved_cache_dir = Path(cache_dir) if cache_dir not in (None, "") else None
-    entity_embs = _encode_text_table(
-        texts=entity_text_labels,
+    return _encode_text_table(
+        texts=texts,
         encoder_factory=get_encoder,
         batch_size=resolved_batch_size,
-        desc="Entities",
-        encoder_name=encoder_name,
+        desc=desc,
+        provenance=provenance,
         cache_dir=resolved_cache_dir,
-        cache_kind="entities",
-    )
-    relation_embs = _encode_text_table(
-        texts=relation_text_labels,
-        encoder_factory=get_encoder,
-        batch_size=resolved_batch_size,
-        desc="Relations",
-        encoder_name=encoder_name,
-        cache_dir=resolved_cache_dir,
-        cache_kind="relations",
-    )
-    question_embs = _encode_text_table(
-        texts=question_texts,
-        encoder_factory=get_encoder,
-        batch_size=resolved_batch_size,
-        desc="Questions",
-        query_prefix="Represent this sentence: ",
-        encoder_name=encoder_name,
-        cache_dir=resolved_cache_dir,
-        cache_kind="questions",
-    )
-    return EncodedFeatures(
-        entity_text_embeddings=entity_embs,
-        relation_embeddings=relation_embs,
-        question_embeddings=question_embs,
+        cache_kind=cache_kind,
+        query_prefix=query_prefix,
     )
 
 
@@ -141,7 +166,7 @@ def _encode_text_table(
     encoder_factory: Callable[[], TextEncoder],
     batch_size: int,
     desc: str,
-    encoder_name: str,
+    provenance: Mapping[str, object],
     cache_dir: Path | None,
     cache_kind: str,
     query_prefix: str = "",
@@ -149,7 +174,7 @@ def _encode_text_table(
     cache_path = _text_cache_path(
         cache_dir=cache_dir,
         kind=cache_kind,
-        encoder_name=encoder_name,
+        provenance=provenance,
         texts=texts,
         query_prefix=query_prefix,
     )
@@ -168,24 +193,70 @@ def _encode_text_table(
     )
     embeddings = embeddings.to(dtype=torch.float32, device="cpu").contiguous()
     if cache_path is not None:
-        _write_cached_embeddings(cache_path, embeddings=embeddings)
+        _write_cached_embeddings(cache_path, embeddings=embeddings, provenance=provenance)
     return embeddings
+
+
+def text_encoder_provenance(
+    *,
+    encoder_name: str,
+    encoder_revision: str,
+    tokenizer_name: str | None = None,
+    tokenizer_revision: str | None = None,
+    max_length: int | None = None,
+) -> dict[str, object]:
+    resolved_encoder_name = str(encoder_name).strip()
+    resolved_encoder_revision = str(encoder_revision).strip()
+    resolved_tokenizer_name = str(tokenizer_name or resolved_encoder_name).strip()
+    resolved_tokenizer_revision = str(
+        tokenizer_revision or resolved_encoder_revision
+    ).strip()
+    if not resolved_encoder_name:
+        raise ValueError("encoder_name must be non-empty.")
+    if not resolved_encoder_revision:
+        raise ValueError("encoder_revision must be non-empty.")
+    if not resolved_tokenizer_name:
+        raise ValueError("tokenizer_name must be non-empty.")
+    if not resolved_tokenizer_revision:
+        raise ValueError("tokenizer_revision must be non-empty.")
+    if max_length is not None and int(max_length) <= 0:
+        raise ValueError(f"max_length must be positive or None, got {max_length}.")
+    return {
+        "encoder_name": resolved_encoder_name,
+        "encoder_revision": resolved_encoder_revision,
+        "tokenizer_name": resolved_tokenizer_name,
+        "tokenizer_revision": resolved_tokenizer_revision,
+        "max_length": None if max_length is None else int(max_length),
+        "truncation": True,
+        "pooling": _pooling,
+        "normalize": _normalization,
+        "output_dtype": _output_dtype,
+    }
+
+
+def _resolve_batch_size(batch_size: int | None) -> int:
+    value = 256 if batch_size is None and torch.cuda.is_available() else batch_size
+    if value is None:
+        value = 16
+    resolved = int(value)
+    if resolved <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+    return resolved
 
 
 def _text_cache_path(
     *,
     cache_dir: Path | None,
     kind: str,
-    encoder_name: str,
+    provenance: Mapping[str, object],
     texts: list[str],
     query_prefix: str,
 ) -> Path | None:
     if cache_dir is None:
         return None
     payload = {
-        "schema_version": TEXT_ENCODE_CACHE_SCHEMA_VERSION,
         "kind": kind,
-        "encoder_name": encoder_name,
+        "provenance": dict(provenance),
         "query_prefix": query_prefix,
         "texts": texts,
     }
@@ -203,14 +274,12 @@ def _load_cached_embeddings(
     if not path.is_file():
         return None
     try:
-        payload = torch.load(path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as exc:
         log.warning("Ignoring unreadable text encode cache %s: %s", path, exc)
         return None
     if not isinstance(payload, dict):
         log.warning("Ignoring malformed text encode cache %s: expected dict.", path)
-        return None
-    if payload.get("schema_version") != TEXT_ENCODE_CACHE_SCHEMA_VERSION:
         return None
     embeddings = payload.get("embeddings")
     if not isinstance(embeddings, torch.Tensor):
@@ -233,13 +302,18 @@ def _load_cached_embeddings(
     return embeddings.to(dtype=torch.float32, device="cpu").contiguous()
 
 
-def _write_cached_embeddings(path: Path, *, embeddings: torch.Tensor) -> None:
+def _write_cached_embeddings(
+    path: Path,
+    *,
+    embeddings: torch.Tensor,
+    provenance: Mapping[str, object],
+) -> None:
     tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "schema_version": TEXT_ENCODE_CACHE_SCHEMA_VERSION,
+                "provenance": dict(provenance),
                 "embeddings": embeddings.to(
                     dtype=torch.float32,
                     device="cpu",

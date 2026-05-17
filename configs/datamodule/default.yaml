@@ -2,18 +2,21 @@
 
 _target_: src.data.datamodule.RetrievalDataModule
 
-dataset_cfg: ${dataset}
+batch_size: 1
+num_workers: 1
 
-batch_size: 8
-num_workers: 8
-
-eval_batch_size: 8
-eval_num_workers: 8
+eval_batch_size: 1
+eval_num_workers: 1
 
 pin_memory: true
 train_shuffle: true
 drop_last: false
 eval_drop_last: false
+
+splits:
+  train: train
+  validation: validation
+  test: test
 
 lmdb_readahead: true
 max_readers: 256

@@ -29,10 +29,34 @@ def load_checkpoint_weights(
         missing, unexpected = load_fn(str(checkpoint_path), strict=strict)
         return list(missing), list(unexpected)
 
-    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    checkpoint = load_checkpoint_payload(str(checkpoint_path))
     state_dict = checkpoint.get("state_dict", checkpoint)
     result = model.load_state_dict(state_dict, strict=strict)
     return list(result.missing_keys), list(result.unexpected_keys)
+
+
+def load_checkpoint_payload(checkpoint_path: str) -> dict[str, Any]:
+    try:
+        checkpoint = torch.load(
+            str(checkpoint_path),
+            map_location="cpu",
+            weights_only=True,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if "Weights only load failed" not in message:
+            raise
+        checkpoint = torch.load(
+            str(checkpoint_path),
+            map_location="cpu",
+            weights_only=False,
+        )
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "Checkpoint payload must be a dict-like object, "
+            f"got {type(checkpoint)!r} from {checkpoint_path!r}."
+        )
+    return checkpoint
 
 
 def filter_compatible_state_dict(
@@ -45,8 +69,6 @@ def filter_compatible_state_dict(
         return state_dict
 
     filtered: dict[str, Any] = {}
-    reset_stop_head = False
-
     for key, value in state_dict.items():
         current_value = current_state.get(key)
         if (
@@ -54,22 +76,8 @@ def filter_compatible_state_dict(
             and isinstance(current_value, torch.Tensor)
             and value.shape != current_value.shape
         ):
-            if key.startswith(("policy.stop_head.net.0.", "policy.stop_gate.net.0.")):
-                reset_stop_head = True
             continue
         filtered[key] = value
-
-    if reset_stop_head:
-        stop_head_prefixes = (
-            "policy.stop_head.net.",
-            "policy.stop_head.stop_bias",
-            "policy.stop_gate.",
-        )
-        filtered = {
-            key: value
-            for key, value in filtered.items()
-            if not key.startswith(stop_head_prefixes)
-        }
 
     return filtered
 

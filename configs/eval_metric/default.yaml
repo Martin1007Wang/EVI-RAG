@@ -1,6 +1,0 @@
-# @package eval_metric
-
-budgets: [1, 2, 4, 8]
-debug_metrics: false
-use_reachable_targets: true
-exclude_anchors_from_retrieved: true

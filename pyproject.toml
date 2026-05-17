@@ -5,6 +5,9 @@ addopts = [
   "--strict-markers",
   "--doctest-modules",
 ]
+pythonpath = [
+  ".",
+]
 filterwarnings = [
   "ignore::DeprecationWarning",
   "ignore::UserWarning",

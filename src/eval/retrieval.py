@@ -3,22 +3,26 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-from torch_scatter import scatter_sum
 
 from src.data.schema import RetrievalBatch
 from src.eval.compactness import compute_compactness_expectations
-from src.weaver.rollout.schema import RolloutBatch
-from src.weaver.rollout.terminal_subgraph import (
-    anchor_node_mask,
-    batch_num_graphs,
-    default_eval_device,
-    eval_target_node_mask,
-    stack_terminal_subgraph_masks,
-)
+from src.eval.targets import eval_target_node_mask
+from src.graph.masks import anchor_node_mask
+from src.utils.scatter import scatter_sum
+from src.weaver.rollout.result import RolloutResult
+from src.weaver.rollout.subgraph import SubgraphReconstructor
+
+
+def default_eval_device() -> torch.device:
+    return torch.device("cpu")
+
+
+def batch_num_graphs(batch: RetrievalBatch) -> int:
+    return int(batch.num_graphs)
 
 
 def compute_node_retrieval_matrix(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     device: torch.device | None = None,
@@ -55,11 +59,7 @@ def compute_node_retrieval_matrix(
         use_reachable_targets=use_reachable_targets,
     )
 
-    terminal_nodes, _ = stack_terminal_subgraph_masks(
-        rollouts,
-        batch,
-        device=device,
-    )
+    terminal_nodes, _ = SubgraphReconstructor(batch, device=device).stack(rollouts)
 
     if terminal_nodes.shape[0] != num_rollouts:
         raise ValueError(
@@ -118,7 +118,7 @@ def compute_node_retrieval_matrix(
 
 
 def compute_expected_node_retrieval_quality(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     device: torch.device | None = None,
@@ -166,7 +166,7 @@ def compute_expected_node_retrieval_quality(
 
 
 def compute_best_of_k_node_retrieval_quality(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     ks: Sequence[int],
@@ -229,7 +229,7 @@ def compute_best_of_k_node_retrieval_quality(
 
 
 def compute_sample_retrieval_metrics(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     include_compactness: bool = True,

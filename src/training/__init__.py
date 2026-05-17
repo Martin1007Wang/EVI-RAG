@@ -1,19 +1,41 @@
 from __future__ import annotations
 
 from .checkpoint import load_pretrained_if_requested
-from .diagnostics import TrainingDiagnosticsCollector
-from .factory import build_datamodule, build_model, build_trainer, require_cfg
-from .resources import setup_datamodule, validate_model_resources
+from .config import (
+    EvalRuntimeConfig,
+    LossRuntimeConfig,
+    ModelResources,
+    OptimizationRuntimeConfig,
+    OptimizerRuntimeConfig,
+    RewardRuntimeConfig,
+    RolloutRuntimeConfig,
+    SamplingRuntimeConfig,
+    SchedulerRuntimeConfig,
+    TrainingDataConfig,
+    TrainingRuntimeConfig,
+    build_training_data_config,
+    validate_model_resources,
+)
+from .factory import build_datamodule, build_model, build_trainer
 from .schedule import TemperatureSchedule
 
 __all__ = [
+    "build_training_data_config",
     "build_datamodule",
     "build_model",
     "build_trainer",
+    "EvalRuntimeConfig",
     "load_pretrained_if_requested",
-    "require_cfg",
-    "setup_datamodule",
+    "LossRuntimeConfig",
+    "ModelResources",
+    "OptimizationRuntimeConfig",
+    "OptimizerRuntimeConfig",
+    "RewardRuntimeConfig",
+    "RolloutRuntimeConfig",
+    "SamplingRuntimeConfig",
+    "SchedulerRuntimeConfig",
     "TemperatureSchedule",
-    "TrainingDiagnosticsCollector",
+    "TrainingDataConfig",
+    "TrainingRuntimeConfig",
     "validate_model_resources",
 ]

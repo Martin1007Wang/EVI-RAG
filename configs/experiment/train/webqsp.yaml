@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - override /dataset: webqsp
+  - override /model: weaver
+  - override /trainer: gpu
+  - override /callbacks: train
+  - override /logger: wandb
+  - _self_
+
+task_name: train_webqsp
+
+logger:
+  tags: [weaver, edge_flow_matching, webqsp]
+
+trainer:
+  max_steps: 20000
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+
+callbacks:
+  early_stopping:
+    patience: 20

@@ -5,16 +5,16 @@ _target_: lightning.pytorch.trainer.Trainer
 default_root_dir: ${paths.output_dir}
 accelerator: gpu
 devices: 1
-precision: 32-true
+precision: bf16-mixed
 
 min_epochs: 0
-max_epochs: 100000
+max_epochs: -1
 max_steps: 100000
 
 accumulate_grad_batches: 1
 benchmark: false
 
-val_check_interval: 1.0
+val_check_interval: null
 check_val_every_n_epoch: 1
 use_distributed_sampler: false
 num_sanity_val_steps: 0
@@ -23,8 +23,9 @@ limit_train_batches: null
 limit_val_batches: null
 limit_test_batches: null
 
-log_every_n_steps: 10
+log_every_n_steps: 50
 deterministic: false
 enable_checkpointing: true
+enable_model_summary: false
 enable_progress_bar: true
 detect_anomaly: false

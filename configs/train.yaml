@@ -6,9 +6,6 @@ defaults:
   - dataset: webqsp
   - datamodule: default
   - model: weaver
-  - eval_metric: default
-  - optimizer: adamw
-  - scheduler: cosine_warmup
   - trainer: gpu
   - callbacks: train
   - logger: wandb
@@ -20,10 +17,6 @@ task_name: train
 seed: 42
 print_config: false
 test_after_fit: false
-
-model:
-  optimizer_cfg: ${optimizer}
-  scheduler_cfg: ${scheduler}
 
 fit_ckpt_path: ${ckpt.fit}
 pretrained_ckpt_path: ${ckpt.pretrained}

@@ -1,26 +1,28 @@
-# src/eval/compactness.py
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 import torch
-from torch_scatter import scatter_sum
 
 from src.data.schema import RetrievalBatch
+from src.eval.targets import eval_target_node_mask
+from src.graph.masks import anchor_node_mask
 from src.graph.ops import prune_to_protected_core
-from src.weaver.rollout.schema import RolloutBatch
-from src.weaver.rollout.terminal_subgraph import (
-    anchor_node_mask,
-    batch_num_graphs,
-    default_eval_device,
-    eval_target_node_mask,
-    root_edge_mask,
-    stack_terminal_subgraph_masks,
-)
+from src.utils.scatter import scatter_sum
+from src.weaver.rollout.result import RolloutResult
+from src.weaver.rollout.subgraph import SubgraphReconstructor
+
+
+def default_eval_device() -> torch.device:
+    return torch.device("cpu")
+
+
+def batch_num_graphs(batch: RetrievalBatch) -> int:
+    return int(batch.num_graphs)
 
 
 def compute_compactness_expectations(
-    rollouts: Sequence[RolloutBatch],
+    rollouts: Sequence[RolloutResult],
     batch: RetrievalBatch,
     *,
     include_dangling: bool = False,
@@ -32,17 +34,13 @@ def compute_compactness_expectations(
     Metrics:
     - expected_nodes: mean active nodes per graph.
     - expected_edges: mean active edges per graph.
-    - expected_nonroot_edges: mean active non-root edges per graph.
-    - dangling_edge_ratio: optional ratio of non-root edges pruned away from the
+    - selected_edge_count: mean selected edges per graph.
+    - dangling_edge_ratio: optional ratio of selected edges pruned away from the
       protected anchor/target core.
     """
     device = device or default_eval_device()
 
-    node_masks, edge_masks = stack_terminal_subgraph_masks(
-        rollouts,
-        batch,
-        device=device,
-    )
+    node_masks, edge_masks = SubgraphReconstructor(batch, device=device).stack(rollouts)
 
     metrics = compactness_from_masks(
         node_masks=node_masks,
@@ -75,14 +73,11 @@ def compactness_from_masks(
         return {
             "expected_nodes": 0.0,
             "expected_edges": 0.0,
-            "expected_nonroot_edges": 0.0,
+            "selected_edge_count": 0.0,
         }
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
     edge_batch = batch.edge_batch.to(device=device, dtype=torch.long)
-
-    anchors = anchor_node_mask(batch, device=device)
-    roots = root_edge_mask(batch, anchor_mask=anchors, device=device)
 
     node_counts = per_graph_counts(
         node_masks,
@@ -94,16 +89,11 @@ def compactness_from_masks(
         edge_batch,
         num_graphs=num_graphs,
     )
-    nonroot_counts = per_graph_counts(
-        edge_masks & ~roots.unsqueeze(0),
-        edge_batch,
-        num_graphs=num_graphs,
-    )
 
     return {
         "expected_nodes": float(node_counts.mean().item()),
         "expected_edges": float(edge_counts.mean().item()),
-        "expected_nonroot_edges": float(nonroot_counts.mean().item()),
+        "selected_edge_count": float(edge_counts.mean().item()),
     }
 
 
@@ -115,13 +105,13 @@ def dangling_edge_ratio_from_masks(
     device: torch.device,
 ) -> float:
     """
-    Mean dangling-edge ratio over rollout/graph pairs with at least one non-root edge.
+    Mean dangling-edge ratio over rollout/graph pairs with at least one selected edge.
 
     protected nodes:
         anchors plus active target nodes.
 
     dangling edges:
-        non-root active edges removed by prune_to_protected_core.
+        selected active edges removed by prune_to_protected_core.
     """
     if node_masks.numel() == 0:
         return 0.0
@@ -132,7 +122,6 @@ def dangling_edge_ratio_from_masks(
 
     anchors = anchor_node_mask(batch, device=device)
     targets = eval_target_node_mask(batch, device=device, use_reachable_targets=True)
-    roots = root_edge_mask(batch, anchor_mask=anchors, device=device)
 
     ratios: list[torch.Tensor] = []
 
@@ -146,11 +135,11 @@ def dangling_edge_ratio_from_masks(
             protected_nodes=protected_nodes,
         )
 
-        nonroot_edges = edges & ~roots
-        dangling_edges = nonroot_edges & ~core_edges
+        selected_edges = edges
+        dangling_edges = selected_edges & ~core_edges
 
-        nonroot_count = per_graph_counts(
-            nonroot_edges.unsqueeze(0),
+        selected_count = per_graph_counts(
+            selected_edges.unsqueeze(0),
             edge_batch,
             num_graphs=num_graphs,
         ).squeeze(0)
@@ -160,9 +149,9 @@ def dangling_edge_ratio_from_masks(
             num_graphs=num_graphs,
         ).squeeze(0)
 
-        valid = nonroot_count.gt(0.0)
+        valid = selected_count.gt(0.0)
         if bool(valid.any()):
-            ratios.append(dangling_count[valid] / nonroot_count[valid])
+            ratios.append(dangling_count[valid] / selected_count[valid])
 
     if not ratios:
         return 0.0

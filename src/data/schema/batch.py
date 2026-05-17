@@ -37,6 +37,16 @@ class RetrievalData(Data):
 
 
 class RetrievalBatch(Batch):
+    """
+    PyG batch contract for retrieval samples.
+
+    Core graph fields: edge_index, batch, ptr, num_nodes.
+    Feature fields: node_entity_catalog_ids, edge_relation_catalog_ids, question_emb.
+    Anchor/target fields: anchor_node_ids, target_node_ids, reachable_target_node_ids.
+    Node-target prior fields are required materialized supervision tensors.
+    State initialization must not depend on them.
+    """
+
     ptr: torch.Tensor
     batch: torch.Tensor
     edge_index: torch.Tensor
@@ -55,19 +65,12 @@ class RetrievalBatch(Batch):
     anchor_node_backward_distances_flat: torch.Tensor
 
     node_target_distance: torch.Tensor
-    target_node_distances_flat: torch.Tensor
-    target_shortest_path_count_flat: torch.Tensor
-    target_shortest_path_edge_mask_flat: torch.Tensor
+    node_target_distances_flat: torch.Tensor
+    node_target_shortest_path_count_flat: torch.Tensor
+    node_target_shortest_path_edge_mask_flat: torch.Tensor
+    node_target_shortest_path_edge_count_flat: torch.Tensor
 
-    node_tokens: torch.Tensor
-    non_text_node_mask: torch.Tensor
-    relation_tokens: torch.Tensor
-    is_non_text_entity: torch.Tensor
-    heuristic_log_v: torch.Tensor
-
-    node_ptr: torch.Tensor
     edge_batch: torch.Tensor
-    edge_ptr: torch.Tensor
 
     def __cat_dim__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         return super().__cat_dim__(key, value, *args, **kwargs)  # type: ignore[attr-defined]

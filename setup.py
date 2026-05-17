@@ -24,9 +24,8 @@ setup(
     url="https://github.com/user/project",
     python_requires=">=3.8",
     install_requires=_load_requirements(),
-    packages=find_packages(exclude=("tests", "tests.*")),
+    packages=find_packages(include=("src", "src.*")),
     py_modules=["text_encode_utils"],
-    # use this to customize global commands available in the terminal after installing the package
     entry_points={
         "console_scripts": [
             "train_command = src.train:main",

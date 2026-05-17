@@ -1,5 +1,10 @@
 # @package callbacks
 
 progress_bar:
-  _target_: lightning.pytorch.callbacks.TQDMProgressBar
+  _target_: lightning.pytorch.callbacks.RichProgressBar
   refresh_rate: 10
+
+local_metrics_writer:
+  _target_: src.callbacks.local_metrics_writer.LocalMetricsWriter
+  output_dir: ${paths.artifact_dir}/metrics
+  enabled: true

@@ -9,7 +9,7 @@ log_dir: ${paths.run_dir}/logs
 ckpt_dir: ${paths.run_dir}/checkpoints
 artifact_dir: ${paths.run_dir}/artifacts
 
-hf_home: ${oc.env:HF_HOME,${paths.root_dir}/.cache/huggingface}
+hf_home: ${oc.env:HF_HOME,/mnt/data/huggingface}
 hf_datasets_cache: ${oc.env:HF_DATASETS_CACHE,${paths.hf_home}/datasets}
 cache_dir: ${paths.hf_home}
 work_dir: ${hydra:runtime.cwd}

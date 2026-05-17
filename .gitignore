@@ -145,6 +145,7 @@ dmypy.json
 
 # Data & Models
 *.h5
+*.ckpt
 *.tar
 *.tar.gz
 
@@ -158,6 +159,26 @@ configs/local/default.yaml
 .aim
 outputs/
 *.out
+
+# Local experiment artifacts
+*_report.md
+*_metrics.json
+diagnostics_*.md
+quick_*.md
+oracle_*.md
+stop_*.md
+adaptive_*_report.md
+depth_*_oracle*.md
+marginal_*_oracle*.md
+webqsp_*_eval*.md
+current_*_latest.ckpt
+current_*_snapshot.ckpt
+latest_*_snapshot.ckpt
+latest_*_state_dict_only.ckpt
+
+# Documentation is intentionally consolidated under docs/.
+!docs/
+!docs/**/*.md
 
 # Others
 SubgraphRAG/

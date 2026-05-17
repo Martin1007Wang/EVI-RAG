@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - override /dataset: cwq
+  - override /preprocess: default
+  - _self_
+
+task_name: preprocess_cwq
+
+preprocess:
+  encoder:
+    question_prefix: "Represent this sentence for searching relevant passages: "

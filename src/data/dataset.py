@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -8,8 +8,11 @@ import lmdb
 import torch
 from torch_geometric.data import Dataset
 
+from src.data.split_index import SplitIndexReader
+from src.data.tensor_table import read_table
 from src.utils.lmdb_utils import deserialize_sample
 
+from .artifacts import ResolvedMaterialization
 from .schema.batch import RetrievalData
 from .schema.fields import SampleFields
 
@@ -57,16 +60,15 @@ class RetrievalDataset(Dataset):
     Dataset over materialized LMDB samples.
 
     Responsibilities:
-    - read split index from metadata_dir/{split}.index.pt
-    - open the single LMDB file for the split
+    - read split index from the active materialization
+    - open the single LMDB path for the split
     - deserialize the sample payload
     - convert the storage record into RetrievalData
 
     Non-responsibilities:
-    - no manifest reading
     - no LMDB key scanning
     - no runtime sample filtering
-    - no legacy field fallback
+    - no storage field fallback
     - no path recomputation
     - no anchor/target mask materialization
     - no entity/relation embedding loading
@@ -75,16 +77,14 @@ class RetrievalDataset(Dataset):
     def __init__(
         self,
         *,
-        lmdb_dir: str | Path,
-        metadata_dir: str | Path,
+        materialization: ResolvedMaterialization,
         split: str,
         lmdb_readahead: bool = False,
         max_readers: int = 256,
     ) -> None:
         super().__init__()
 
-        self.lmdb_dir = Path(lmdb_dir)
-        self.metadata_dir = Path(metadata_dir)
+        self.materialization = materialization
         self.split = str(split).strip()
 
         if not self.split:
@@ -95,43 +95,46 @@ class RetrievalDataset(Dataset):
         if self.max_readers <= 0:
             raise ValueError("max_readers must be positive")
 
-        if not self.metadata_dir.exists():
-            raise FileNotFoundError(
-                f"Metadata directory does not exist: {self.metadata_dir}"
+        paths = self.materialization.require_split(self.split)
+        self.index_path = paths.index
+        self.lmdb_path = paths.lmdb
+        self.num_samples = int(paths.num_samples)
+        self._question_embeddings = read_table(paths.question_embeddings)
+        if int(self._question_embeddings.size(0)) != self.num_samples:
+            raise ValueError(
+                f"question embedding rows mismatch for split {self.split}: "
+                f"got {int(self._question_embeddings.size(0))}, expected {self.num_samples}"
             )
+        self._index: SplitIndexReader | None = None
 
-        if not self.lmdb_dir.exists():
-            raise FileNotFoundError(f"LMDB directory does not exist: {self.lmdb_dir}")
-
-        self.sample_ids = _load_split_index(
-            metadata_dir=self.metadata_dir,
-            split=self.split,
-        )
-
-        self.lmdb_path = _lmdb_path(
-            lmdb_dir=self.lmdb_dir,
-            split=self.split,
-        )
         if not self.lmdb_path.exists():
             raise FileNotFoundError(f"LMDB path does not exist: {self.lmdb_path}")
 
         self._store: LMDBSampleStore | None = None
 
     def len(self) -> int:
-        return len(self.sample_ids)
+        return self.num_samples
 
     def get(self, idx: int) -> RetrievalData:
-        sample_id = self.sample_ids[idx]
+        sample_id = self._get_index().get(idx)
+        question_emb = self._question_embeddings[idx]
         raw = self._get_store().load_sample(sample_id)
-        return _build_retrieval_data(raw=raw, sample_id=sample_id)
+        return _build_retrieval_data(
+            raw=raw,
+            sample_id=sample_id,
+            question_emb=question_emb,
+        )
 
     def close(self) -> None:
         store = getattr(self, "_store", None)
-        if store is None:
-            return
+        if store is not None:
+            store.close()
+            self._store = None
 
-        store.close()
-        self._store = None
+        index = getattr(self, "_index", None)
+        if index is not None:
+            index.close()
+            self._index = None
 
     def _get_store(self) -> LMDBSampleStore:
         if self._store is None:
@@ -143,6 +146,16 @@ class RetrievalDataset(Dataset):
 
         return self._store
 
+    def _get_index(self) -> SplitIndexReader:
+        if self._index is None:
+            self._index = SplitIndexReader(
+                self.index_path,
+                readahead=self.lmdb_readahead,
+                max_readers=self.max_readers,
+            )
+
+        return self._index
+
     def __del__(self) -> None:
         self.close()
 
@@ -151,7 +164,9 @@ def _build_retrieval_data(
     *,
     raw: Mapping[str, Any],
     sample_id: str,
+    question_emb: torch.Tensor | None,
 ) -> RetrievalData:
+    raw = dict(raw)
     num_nodes = _scalar_int(raw[SampleFields.NUM_NODES], SampleFields.NUM_NODES)
     num_edges = _scalar_int(raw[SampleFields.NUM_EDGES], SampleFields.NUM_EDGES)
 
@@ -167,10 +182,9 @@ def _build_retrieval_data(
         dtype=torch.long,
     )
 
-    question_emb = _tensor(
-        raw[SampleFields.QUESTION_EMB],
-        dtype=torch.float32,
-    )
+    if question_emb is None:
+        raise KeyError(f"{sample_id}: missing external question embedding")
+    question_emb = _tensor(question_emb, dtype=torch.float32)
 
     anchor_node_ids = _tensor(
         raw[SampleFields.ANCHOR_NODE_IDS],
@@ -202,38 +216,22 @@ def _build_retrieval_data(
         dtype=torch.long,
     )
 
-    target_node_distances_flat = _tensor(
-        raw[SampleFields.TARGET_NODE_DISTANCE_FLAT],
+    node_target_distances_flat = _tensor(
+        raw[SampleFields.NODE_TARGET_DISTANCES_FLAT],
         dtype=torch.long,
     )
 
-    target_shortest_path_count_flat = _tensor(
-        raw[SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT],
+    node_target_shortest_path_count_flat = _tensor(
+        raw[SampleFields.NODE_TARGET_SHORTEST_PATH_COUNT_FLAT],
         dtype=torch.float32,
     )
-
-    target_shortest_path_edge_mask_flat = _tensor(
-        raw[SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT],
-        dtype=torch.bool,
-    )
-
-    _validate_runtime_shapes(
+    node_target_shortest_path_edge_count_flat = _restore_edge_count_flat(
+        raw=raw,
         sample_id=sample_id,
-        num_nodes=num_nodes,
         num_edges=num_edges,
-        edge_index=edge_index,
-        node_entity_catalog_ids=node_entity_catalog_ids,
-        edge_relation_catalog_ids=edge_relation_catalog_ids,
-        anchor_node_ids=anchor_node_ids,
-        target_node_ids=target_node_ids,
-        reachable_target_node_ids=reachable_target_node_ids,
-        anchor_node_forward_distances_flat=anchor_node_forward_distances_flat,
-        anchor_node_backward_distances_flat=anchor_node_backward_distances_flat,
-        node_target_distance=node_target_distance,
-        target_node_distances_flat=target_node_distances_flat,
-        target_shortest_path_count_flat=target_shortest_path_count_flat,
-        target_shortest_path_edge_mask_flat=target_shortest_path_edge_mask_flat,
+        num_reachable_targets=int(reachable_target_node_ids.numel()),
     )
+    node_target_shortest_path_edge_mask_flat = node_target_shortest_path_edge_count_flat.gt(0)
 
     return RetrievalData(
         sample_id=sample_id,
@@ -249,141 +247,11 @@ def _build_retrieval_data(
         anchor_node_forward_distances_flat=anchor_node_forward_distances_flat,
         anchor_node_backward_distances_flat=anchor_node_backward_distances_flat,
         node_target_distance=node_target_distance,
-        target_node_distances_flat=target_node_distances_flat,
-        target_shortest_path_count_flat=target_shortest_path_count_flat,
-        target_shortest_path_edge_mask_flat=target_shortest_path_edge_mask_flat,
+        node_target_distances_flat=node_target_distances_flat,
+        node_target_shortest_path_count_flat=node_target_shortest_path_count_flat,
+        node_target_shortest_path_edge_mask_flat=node_target_shortest_path_edge_mask_flat,
+        node_target_shortest_path_edge_count_flat=node_target_shortest_path_edge_count_flat,
     )
-
-
-def _validate_runtime_shapes(
-    *,
-    sample_id: str,
-    num_nodes: int,
-    num_edges: int,
-    edge_index: torch.Tensor,
-    node_entity_catalog_ids: torch.Tensor,
-    edge_relation_catalog_ids: torch.Tensor,
-    anchor_node_ids: torch.Tensor,
-    target_node_ids: torch.Tensor,
-    reachable_target_node_ids: torch.Tensor,
-    anchor_node_forward_distances_flat: torch.Tensor,
-    anchor_node_backward_distances_flat: torch.Tensor,
-    node_target_distance: torch.Tensor,
-    target_node_distances_flat: torch.Tensor,
-    target_shortest_path_count_flat: torch.Tensor,
-    target_shortest_path_edge_mask_flat: torch.Tensor,
-) -> None:
-    _require_shape(
-        sample_id=sample_id,
-        name=SampleFields.EDGE_INDEX,
-        actual=tuple(edge_index.shape),
-        expected=(2, num_edges),
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.NODE_ENTITY_CATALOG_IDS,
-        tensor=node_entity_catalog_ids,
-        expected=num_nodes,
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.EDGE_RELATION_CATALOG_IDS,
-        tensor=edge_relation_catalog_ids,
-        expected=num_edges,
-    )
-
-    _require_node_ids(
-        sample_id=sample_id,
-        name=SampleFields.ANCHOR_NODE_IDS,
-        tensor=anchor_node_ids,
-        num_nodes=num_nodes,
-    )
-
-    _require_node_ids(
-        sample_id=sample_id,
-        name=SampleFields.TARGET_NODE_IDS,
-        tensor=target_node_ids,
-        num_nodes=num_nodes,
-    )
-
-    _require_node_ids(
-        sample_id=sample_id,
-        name=SampleFields.REACHABLE_TARGET_NODE_IDS,
-        tensor=reachable_target_node_ids,
-        num_nodes=num_nodes,
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.ANCHOR_NODE_FORWARD_DISTANCE_FLAT,
-        tensor=anchor_node_forward_distances_flat,
-        expected=num_nodes,
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT,
-        tensor=anchor_node_backward_distances_flat,
-        expected=num_nodes,
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.NODE_TARGET_DISTANCE,
-        tensor=node_target_distance,
-        expected=num_nodes,
-    )
-
-    num_reachable_targets = int(reachable_target_node_ids.numel())
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.TARGET_NODE_DISTANCE_FLAT,
-        tensor=target_node_distances_flat,
-        expected=num_reachable_targets * num_nodes,
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.TARGET_SHORTEST_PATH_COUNT_FLAT,
-        tensor=target_shortest_path_count_flat,
-        expected=num_reachable_targets * num_nodes,
-    )
-
-    _require_numel(
-        sample_id=sample_id,
-        name=SampleFields.TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
-        tensor=target_shortest_path_edge_mask_flat,
-        expected=num_reachable_targets * num_edges,
-    )
-
-
-def _load_split_index(
-    *,
-    metadata_dir: Path,
-    split: str,
-) -> list[str]:
-    path = metadata_dir / f"{split}.index.pt"
-
-    if not path.exists():
-        raise FileNotFoundError(f"Split index file not found: {path}")
-
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-
-    if isinstance(payload, Mapping):
-        sample_ids = payload.get("sample_ids")
-    else:
-        sample_ids = payload
-
-    if isinstance(sample_ids, str) or not isinstance(sample_ids, Sequence):
-        raise TypeError(
-            f"{path} must contain a sequence of sample ids "
-            "or a mapping with key 'sample_ids'"
-        )
-
-    return [str(sample_id) for sample_id in sample_ids]
 
 
 def _tensor(value: object, *, dtype: torch.dtype) -> torch.Tensor:
@@ -393,6 +261,46 @@ def _tensor(value: object, *, dtype: torch.dtype) -> torch.Tensor:
         return value.to(dtype=dtype).contiguous()
 
     return torch.as_tensor(value, dtype=dtype).contiguous()
+
+
+def _restore_edge_count_flat(
+    *,
+    raw: Mapping[str, Any],
+    sample_id: str,
+    num_edges: int,
+    num_reachable_targets: int,
+) -> torch.Tensor:
+    expected = num_reachable_targets * num_edges
+    indices = _tensor(
+        raw[SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES],
+        dtype=torch.long,
+    )
+    values = _tensor(
+        raw[SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES],
+        dtype=torch.float32,
+    )
+    if int(indices.numel()) != int(values.numel()):
+        raise ValueError(
+            f"{sample_id}: sparse shortest-path edge count length mismatch, "
+            f"indices={int(indices.numel())}, values={int(values.numel())}"
+        )
+    if indices.numel() > 0:
+        min_idx = int(indices.min().item())
+        max_idx = int(indices.max().item())
+        if min_idx < 0 or max_idx >= expected:
+            raise ValueError(
+                f"{sample_id}: sparse shortest-path edge count indices outside "
+                f"[0, {expected})"
+            )
+        if bool(values.le(0).any()):
+            raise ValueError(
+                f"{sample_id}: sparse shortest-path edge count values must be positive"
+            )
+
+    out = torch.zeros((expected,), dtype=torch.float32)
+    if indices.numel() > 0:
+        out.scatter_(0, indices, values)
+    return out.contiguous()
 
 
 def _scalar_int(value: object, name: str) -> int:
@@ -409,62 +317,3 @@ def _scalar_int(value: object, name: str) -> int:
     raise TypeError(
         f"{name} must be an int or scalar tensor, got {type(value).__name__}"
     )
-
-
-def _require_shape(
-    *,
-    sample_id: str,
-    name: str,
-    actual: tuple[int, ...],
-    expected: tuple[int, ...],
-) -> None:
-    if actual != expected:
-        raise ValueError(
-            f"{sample_id}: {name} shape mismatch, got {actual}, expected {expected}"
-        )
-
-
-def _require_numel(
-    *,
-    sample_id: str,
-    name: str,
-    tensor: torch.Tensor,
-    expected: int,
-) -> None:
-    actual = int(tensor.numel())
-    if actual != expected:
-        raise ValueError(
-            f"{sample_id}: {name} length mismatch, got {actual}, expected {expected}"
-        )
-
-
-def _require_node_ids(
-    *,
-    sample_id: str,
-    name: str,
-    tensor: torch.Tensor,
-    num_nodes: int,
-) -> None:
-    if tensor.ndim != 1:
-        raise ValueError(
-            f"{sample_id}: {name} must be 1D, got shape {tuple(tensor.shape)}"
-        )
-
-    if tensor.numel() == 0:
-        return
-
-    min_id = int(tensor.min().item())
-    max_id = int(tensor.max().item())
-
-    if min_id < 0 or max_id >= num_nodes:
-        raise ValueError(
-            f"{sample_id}: {name} contains node ids outside [0, {num_nodes})"
-        )
-
-
-def _lmdb_path(
-    *,
-    lmdb_dir: Path,
-    split: str,
-) -> Path:
-    return lmdb_dir / f"{split}.lmdb"

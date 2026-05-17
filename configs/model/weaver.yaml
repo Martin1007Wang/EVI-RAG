@@ -3,82 +3,91 @@
 _target_: src.weaver.module.WeaverModule
 
 hidden_dim: 1024
-manual_accumulate_grad_batches: 2
+
+feature_encoder:
+  _target_: src.weaver.nn.feature_encoder.FeatureEncoder
+  entity_text_embeddings: null
+  entity_embedding_map: null
+  relation_embeddings: null
+  hidden_dim: ${..hidden_dim}
+  non_text_init_std: 0.02
+  learn_edge_role_weights: false
 
 policy:
-  mode: bdb
-  flow_budget_conditioning: additive
-  edge_scorer: relation_residual
-  evidence_state_encoder_dropout: 0.0
-  relation_residual_edge_scorer:
-    alpha_rel_init: 1.0
-    alpha_dst_init: 0.0
-    alpha_trainable: true
-    residual_scale_init: 0.05
-    residual_scale_trainable: true
-    residual_warmup_steps: 0
-    topk_overlap_k: 5
-  feature_encoder:
-    dde:
-      enabled: true
-      num_forward_rounds: 2
-      num_backward_rounds: 2
-      include_anchor_indicator: true
-    role_projection: linear_layernorm
-    role_projection_init: identity
-    non_text_init_std: 0.02
-  evidence_state_encoder:
-    num_layers: 1
-    dropout: 0.0
-  flow_head:
-    num_layers: 1
-    dropout: 0.0
-    zero_init: true
-    bias_init: 0.0
+  _target_: src.weaver.policy.Policy
+  state_encoder:
+    _target_: src.weaver.nn.state_encoder.StateEncoder
+    hidden_dim: ${...hidden_dim}
+    max_budget: ${...runner.rollout_cfg.expand_budget}
+  frontier_encoder:
+    _target_: src.weaver.nn.frontier_encoder.FrontierEncoder
+    hidden_dim: ${...hidden_dim}
+  edge_scorer:
+    _target_: src.weaver.nn.edge_flow_scorer.EdgeActionScorer
+    hidden_dim: ${...hidden_dim}
+    init_adapter_scale: 0.1
+    adapter_final_init_scale: 0.0
+    semantic_prior_scale: 10.0
+    use_edge_logit_shift: false
 
-rollout:
-  expand_budget: 2
-  train_num_rollout: 8
-  eval_num_rollout: 8
+reward_model:
+  _target_: src.weaver.reward.EvidenceLogReward
+  alpha: 4.0
+  lambda_: 0.02
+  eta: 6.0
 
-sampling:
-  train_temperature: 1.0
-  eval_temperature: 1.0
+runner:
+  _target_: src.weaver.rollout.runner.RolloutRunner
+  engine:
+    _target_: src.weaver.rollout.engine.RolloutEngine
+    expand_budget: ${..rollout_cfg.expand_budget}
+  rollout_cfg:
+    _target_: src.training.config.RolloutRuntimeConfig
+    expand_budget: 3
+    train_num_rollout: 8
+    eval_num_rollout: 8
+    train_chunk_size: ${.train_num_rollout}
+    eval_chunk_size: ${.eval_num_rollout}
+  replay_source:
+    _target_: src.weaver.rollout.replay.ShortestPathReplaySource
+    expand_budget: ${..rollout_cfg.expand_budget}
+  replay_schedule:
+    enabled: true
+    schedule:
+      - until_progress: 0.2
+        policy_rollout: 0.2
+        replay_expand: 0.8
+      - until_progress: 0.7
+        policy_rollout: 0.5
+        replay_expand: 0.5
+      - until_progress: 1.0
+        policy_rollout: 0.9
+        replay_expand: 0.1
 
-reward:
-  answer_credit: 2.0
-  edge_cost: 0.05
-  fail_penalty: 2.0
-  expand_budget: ${model.rollout.expand_budget}
-  debug_checks: false
+optimization:
+  _target_: src.training.config.OptimizationRuntimeConfig
+  optimizer:
+    _target_: src.training.config.OptimizerRuntimeConfig
+    type: adamw
+    lr: 1.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+    no_decay_on_bias_and_norm: true
+  scheduler:
+    _target_: src.training.config.SchedulerRuntimeConfig
+    type: cosine
+    interval: step
+    warmup_ratio: 0.2
+    eta_min: 0.0
 
-loss:
-  type: bdb
-  child_flow_target: detach_current
-  backward_kernel: uniform_boundary
-  edge_mode: full
-  child_chunk_size: 512
-  state_sources:
-    rollout: true
-    oracle_prefix: false
-    counterfactual: false
+evaluation:
+  _target_: src.training.config.EvalRuntimeConfig
+  best_of_k_values: [1, 2, 4, 8]
+  utility_k: 8
+  utility_lambda: ${..reward_model.lambda_}
+  exclude_anchors_from_retrieved: true
+  use_reachable_targets: true
 
-eval: ${eval_metric}
-
-runtime:
-  train_chunk_size: 2
-  eval_chunk_size: 4
-
-diagnostics:
-  train_rollout_diagnostics: false
-  train_rollout_diagnostics_interval: 0
-  train_policy_diagnostics: false
-  train_validate_rollout_depth: false
-  eval_validate_rollout_depth: false
-  grad_norm_interval: 0
-
-optimizer_cfg: null
-scheduler_cfg: null
-
-gradient_clip_val: 1.0
-gradient_clip_algorithm: norm
+train_temperature: 1.0
+eval_temperature: ${.train_temperature}
+gradient_clip_val: null

@@ -11,3 +11,9 @@ task_name: eval_webqsp
 
 logger:
   tags: [weaver, eval, webqsp]
+
+model:
+  runner:
+    rollout_cfg:
+      eval_num_rollout: 64
+      eval_chunk_size: 64

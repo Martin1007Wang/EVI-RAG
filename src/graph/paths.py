@@ -16,9 +16,10 @@ class PathLabels:
     anchor_node_forward_distances_flat: torch.Tensor
     anchor_node_backward_distances_flat: torch.Tensor
     node_target_distance: torch.Tensor
-    target_node_distances_flat: torch.Tensor
-    target_shortest_path_count_flat: torch.Tensor
-    target_shortest_path_edge_mask_flat: torch.Tensor
+    node_target_distances_flat: torch.Tensor
+    node_target_shortest_path_count_flat: torch.Tensor
+    node_target_shortest_path_edge_mask_flat: torch.Tensor
+    node_target_shortest_path_edge_count_flat: torch.Tensor
 
 
 def compute_path_labels(
@@ -44,22 +45,24 @@ def compute_path_labels(
         anchor_node_forward_distances_flat=anchor.anchor_node_forward_distances_flat.contiguous(),
         anchor_node_backward_distances_flat=anchor.anchor_node_backward_distances_flat.contiguous(),
         node_target_distance=_nearest_target_distance(
-            target_node_distances_flat=target.target_node_distances_flat,
+            node_target_distances_flat=target.node_target_distances_flat,
             num_targets=int(target.target_node_ids.numel()),
             num_nodes=num_nodes,
         ),
-        target_node_distances_flat=target.target_node_distances_flat.contiguous(),
-        target_shortest_path_count_flat=target.target_shortest_path_count_flat.contiguous(),
-        target_shortest_path_edge_mask_flat=target.target_shortest_path_edge_mask_flat.contiguous(),
+        node_target_distances_flat=target.node_target_distances_flat.contiguous(),
+        node_target_shortest_path_count_flat=target.node_target_shortest_path_count_flat.contiguous(),
+        node_target_shortest_path_edge_mask_flat=target.node_target_shortest_path_edge_mask_flat.contiguous(),
+        node_target_shortest_path_edge_count_flat=target.node_target_shortest_path_edge_count_flat.contiguous(),
     )
 
 
 @dataclass(frozen=True)
 class TargetPathLabels:
     target_node_ids: torch.Tensor
-    target_node_distances_flat: torch.Tensor
-    target_shortest_path_count_flat: torch.Tensor
-    target_shortest_path_edge_mask_flat: torch.Tensor
+    node_target_distances_flat: torch.Tensor
+    node_target_shortest_path_count_flat: torch.Tensor
+    node_target_shortest_path_edge_mask_flat: torch.Tensor
+    node_target_shortest_path_edge_count_flat: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -77,19 +80,28 @@ def compute_target_path_labels(
 ) -> TargetPathLabels:
     """
     Compute target-conditioned shortest-path supervision.
+
+    Source graphs are treated as directed. Preprocessing does not add inverse
+    edges; source graphs must already contain every traversable directed edge.
+
     Semantics:
     - target_node_ids:
         Reachable answer target local node ids.
-    - target_node_distances_flat:
+    - node_target_distances_flat:
         Flattened [num_targets, num_nodes].
         Entry [t, v] is d(v -> target_t).
-    - target_shortest_path_count_flat:
+    - node_target_shortest_path_count_flat:
         Flattened [num_targets, num_nodes].
         Entry [t, v] is the number of shortest suffixes from v to target_t.
-    - target_shortest_path_edge_mask_flat:
+    - node_target_shortest_path_edge_mask_flat:
         Flattened [num_targets, num_edges].
         Entry [t, e] is true iff edge e lies on at least one shortest path
-        from some anchor to target_t.
+        from some anchor to target_t. This is triple-id level: parallel triples
+        with the same endpoints are separate edge ids and are marked separately.
+    - node_target_shortest_path_edge_count_flat:
+        Flattened [num_targets, num_edges].
+        Entry [t, e] counts shortest anchor-to-target_t paths passing through
+        edge e. It is zero outside the shortest-path edge mask.
     """
     if num_nodes <= 0:
         return _empty_target_labels()
@@ -120,18 +132,21 @@ def compute_target_path_labels(
         target_node_ids=reachable_targets,
         target_distances=target_distances,
     )
-    target_edge_mask = _shortest_path_edge_mask(
+    target_edge_mask, target_edge_counts = _shortest_path_edge_stats(
         src=src,
         dst=dst,
+        adjacency=adjacency,
         anchor_distances=anchor_distances,
         target_node_ids=reachable_targets,
         target_distances=target_distances,
+        target_suffix_counts=target_counts,
     )
     return TargetPathLabels(
         target_node_ids=torch.tensor(reachable_targets, dtype=torch.long),
-        target_node_distances_flat=target_distances.reshape(-1).contiguous(),
-        target_shortest_path_count_flat=target_counts.reshape(-1).contiguous(),
-        target_shortest_path_edge_mask_flat=target_edge_mask.reshape(-1).contiguous(),
+        node_target_distances_flat=target_distances.reshape(-1).contiguous(),
+        node_target_shortest_path_count_flat=target_counts.reshape(-1).contiguous(),
+        node_target_shortest_path_edge_mask_flat=target_edge_mask.reshape(-1).contiguous(),
+        node_target_shortest_path_edge_count_flat=target_edge_counts.reshape(-1).contiguous(),
     )
 
 
@@ -229,24 +244,36 @@ def _shortest_suffix_counts(
     return counts
 
 
-def _shortest_path_edge_mask(
+def _shortest_path_edge_stats(
     *,
     src: Sequence[int],
     dst: Sequence[int],
+    adjacency: list[list[int]],
     anchor_distances: Sequence[Sequence[int]],
     target_node_ids: Sequence[int],
     target_distances: torch.Tensor,
-) -> torch.Tensor:
+    target_suffix_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Mark edges lying on at least one anchor-to-target shortest path.
+    Mark and count edges lying on anchor-to-target shortest paths.
     """
     mask = torch.zeros((len(target_node_ids), len(src)), dtype=torch.bool)
+    counts = torch.zeros((len(target_node_ids), len(src)), dtype=torch.float32)
     if not target_node_ids or not src or not anchor_distances:
-        return mask
+        return mask, counts
     if target_distances.ndim != 2 or target_distances.size(0) != len(target_node_ids):
         raise ValueError(
             "target_distances must have shape "
             f"[num_targets, num_nodes], got {tuple(target_distances.shape)}."
+        )
+    if (
+        target_suffix_counts.ndim != 2
+        or target_suffix_counts.size(0) != len(target_node_ids)
+        or target_suffix_counts.size(1) != target_distances.size(1)
+    ):
+        raise ValueError(
+            "target_suffix_counts must have shape "
+            f"{tuple(target_distances.shape)}, got {tuple(target_suffix_counts.shape)}."
         )
 
     num_nodes = int(target_distances.size(1))
@@ -259,7 +286,7 @@ def _shortest_path_edge_mask(
         & dst_tensor.lt(num_nodes)
     )
     if not bool(valid_edges.any()):
-        return mask
+        return mask, counts
 
     edge_ids = torch.nonzero(valid_edges, as_tuple=False).view(-1)
     valid_src = src_tensor[edge_ids]
@@ -271,6 +298,10 @@ def _shortest_path_edge_mask(
             f"[num_anchors, num_nodes], got {tuple(anchor_matrix.shape)}."
         )
 
+    prefix_counts = _anchor_shortest_prefix_count_matrix(
+        adjacency=adjacency,
+        anchor_distances=anchor_distances,
+    )
     max_elements_per_chunk = 4_000_000
     for target_idx, target in enumerate(target_node_ids):
         target_id = int(target)
@@ -284,6 +315,7 @@ def _shortest_path_edge_mask(
 
         active_edge_ids = edge_ids[edge_can_reach_target]
         active_src = valid_src[edge_can_reach_target]
+        active_dst = valid_dst[edge_can_reach_target]
         active_edge_to_target = edge_to_target[edge_can_reach_target]
 
         anchor_to_target = anchor_matrix[:, target_id]
@@ -293,20 +325,74 @@ def _shortest_path_edge_mask(
 
         active_anchor_distances = anchor_matrix[anchor_can_reach_target]
         active_anchor_to_target = anchor_to_target[anchor_can_reach_target]
+        active_prefix_counts = prefix_counts[anchor_can_reach_target]
         num_active_anchors = int(active_anchor_distances.size(0))
         chunk_size = max(1, max_elements_per_chunk // max(1, num_active_anchors))
 
         for start in range(0, int(active_src.numel()), chunk_size):
             end = min(start + chunk_size, int(active_src.numel()))
             src_chunk = active_src[start:end]
+            dst_chunk = active_dst[start:end]
             suffix_chunk = active_edge_to_target[start:end]
             anchor_to_src = active_anchor_distances[:, src_chunk]
             on_path = anchor_to_src.ne(unreachable_distance) & (
                 anchor_to_src + 1 + suffix_chunk.unsqueeze(0)
                 == active_anchor_to_target.unsqueeze(1)
             )
-            mask[target_idx, active_edge_ids[start:end]] = on_path.any(dim=0)
-    return mask
+            edge_chunk = active_edge_ids[start:end]
+            mask[target_idx, edge_chunk] = on_path.any(dim=0)
+            prefix = active_prefix_counts[:, src_chunk].to(dtype=torch.float32)
+            suffix = target_suffix_counts[target_idx, dst_chunk].view(1, -1)
+            counts[target_idx, edge_chunk] = (prefix * suffix * on_path).sum(dim=0)
+    counts = counts.masked_fill(~mask, 0.0)
+    return mask, counts
+
+
+def _anchor_shortest_prefix_count_matrix(
+    *,
+    adjacency: list[list[int]],
+    anchor_distances: Sequence[Sequence[int]],
+) -> torch.Tensor:
+    rows = [
+        _shortest_prefix_counts(
+            adjacency=adjacency,
+            anchor_to_node_dist=distances,
+        )
+        for distances in anchor_distances
+    ]
+    if not rows:
+        return torch.empty((0, len(adjacency)), dtype=torch.float32)
+    return torch.stack(rows, dim=0)
+
+
+def _shortest_prefix_counts(
+    *,
+    adjacency: list[list[int]],
+    anchor_to_node_dist: Sequence[int],
+) -> torch.Tensor:
+    num_nodes = len(adjacency)
+    counts = torch.zeros(num_nodes, dtype=torch.float32)
+    buckets: list[list[int]] = []
+    for node_id, dist in enumerate(anchor_to_node_dist):
+        if dist < 0:
+            continue
+        while len(buckets) <= dist:
+            buckets.append([])
+        buckets[dist].append(node_id)
+    if not buckets:
+        return counts
+
+    for node_id in buckets[0]:
+        counts[node_id] = 1.0
+    for dist in range(0, len(buckets) - 1):
+        for u in buckets[dist]:
+            prefix_count = float(counts[u])
+            if prefix_count <= 0.0:
+                continue
+            for v in adjacency[u]:
+                if anchor_to_node_dist[v] == dist + 1:
+                    counts[v] += prefix_count
+    return counts
 
 
 def _multi_source_min_dist(
@@ -335,7 +421,7 @@ def _multi_source_min_dist(
 
 def _nearest_target_distance(
     *,
-    target_node_distances_flat: torch.Tensor,
+    node_target_distances_flat: torch.Tensor,
     num_targets: int,
     num_nodes: int,
 ) -> torch.Tensor:
@@ -351,7 +437,7 @@ def _nearest_target_distance(
             dtype=torch.long,
         )
 
-    distances = target_node_distances_flat.view(num_targets, num_nodes)
+    distances = node_target_distances_flat.view(num_targets, num_nodes)
     distances = distances.masked_fill(
         distances.eq(unreachable_distance),
         node_target_unreachable_distance,
@@ -379,6 +465,12 @@ def _build_adjacency(
     src: Sequence[int],
     dst: Sequence[int],
 ) -> tuple[list[list[int]], list[list[int]]]:
+    """
+    Build directed adjacency with one entry per edge id.
+
+    Parallel triples with the same (src, dst) are intentionally represented as
+    repeated adjacency entries so path counts stay aligned with triple actions.
+    """
     adjacency = [[] for _ in range(num_nodes)]
     reverse_adjacency = [[] for _ in range(num_nodes)]
     for u, v in zip(src, dst):
@@ -424,9 +516,10 @@ def _valid_unique_nodes(
 def _empty_target_labels() -> TargetPathLabels:
     return TargetPathLabels(
         target_node_ids=torch.empty((0,), dtype=torch.long),
-        target_node_distances_flat=torch.empty((0,), dtype=torch.long),
-        target_shortest_path_count_flat=torch.empty((0,), dtype=torch.float32),
-        target_shortest_path_edge_mask_flat=torch.empty((0,), dtype=torch.bool),
+        node_target_distances_flat=torch.empty((0,), dtype=torch.long),
+        node_target_shortest_path_count_flat=torch.empty((0,), dtype=torch.float32),
+        node_target_shortest_path_edge_mask_flat=torch.empty((0,), dtype=torch.bool),
+        node_target_shortest_path_edge_count_flat=torch.empty((0,), dtype=torch.float32),
     )
 
 

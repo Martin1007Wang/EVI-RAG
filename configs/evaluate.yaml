@@ -6,7 +6,6 @@ defaults:
   - dataset: webqsp
   - datamodule: default
   - model: weaver
-  - eval_metric: default
   - trainer: gpu
   - callbacks: eval
   - logger: wandb

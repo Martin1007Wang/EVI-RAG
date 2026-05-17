@@ -1,53 +1,63 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-import sys
 
-from dotenv import load_dotenv
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(_PROJECT_ROOT / ".env")
+import hydra
+from lightning.pytorch import seed_everything
+from omegaconf import DictConfig, OmegaConf
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
 
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-try:
-    import rootutils
-except ModuleNotFoundError:
-    rootutils = None
-else:
-    rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-import hydra  # noqa: E402
-from lightning import seed_everything  # noqa: E402
-from omegaconf import DictConfig, OmegaConf  # noqa: E402
-
-from src.training.checkpoint import load_pretrained_if_requested  # noqa: E402
-from src.training.factory import build_datamodule, build_model, build_trainer  # noqa: E402
-from src.training.resources import setup_datamodule  # noqa: E402
+from src.runtime import load_project_env
+from src.training.checkpoint import load_pretrained_if_requested
+from src.training.factory import (
+    build_datamodule,
+    build_model,
+    build_trainer,
+    setup_datamodule,
+)
 
 
-def fit_ckpt_path(cfg: DictConfig) -> str | None:
-    value = cfg.get("fit_ckpt_path", None)
-    if value in (None, ""):
-        return None
-    return str(value)
+PROJECT_ROOT: Path = load_project_env(__file__)
+console = Console()
 
 
-def maybe_print_config(cfg: DictConfig) -> None:
-    if bool(cfg.get("print_config", False)):
-        print(OmegaConf.to_yaml(cfg, resolve=True))
+def print_config(cfg: DictConfig) -> None:
+    yaml = OmegaConf.to_yaml(
+        cfg,
+        resolve=True,
+        sort_keys=False,
+    )
+
+    console.print(
+        Panel(
+            Syntax(
+                yaml,
+                "yaml",
+                theme="ansi_dark",
+                line_numbers=False,
+                word_wrap=False,
+            ),
+            title=f"Config: {cfg.task_name}",
+            border_style="cyan",
+        )
+    )
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="train")
+@hydra.main(
+    version_base=None,
+    config_path=str(PROJECT_ROOT / "configs"),
+    config_name="train",
+)
 def main(cfg: DictConfig) -> None:
-    print(f"Starting training run: {cfg.get('task_name', 'train')}")
+    console.print(f"[bold]Starting training run:[/bold] {cfg.task_name}")
+    print_config(cfg)
 
-    maybe_print_config(cfg)
-
-    seed = cfg.get("seed", None)
-    if seed is not None:
-        seed_everything(int(seed), workers=True)
+    seed_everything(int(cfg.seed), workers=True)
 
     datamodule = build_datamodule(cfg)
     resources = setup_datamodule(datamodule)
@@ -60,10 +70,10 @@ def main(cfg: DictConfig) -> None:
     trainer.fit(
         model=model,
         datamodule=datamodule,
-        ckpt_path=fit_ckpt_path(cfg),
+        ckpt_path=cfg.fit_ckpt_path,
     )
 
-    if bool(cfg.get("test_after_fit", False)):
+    if cfg.test_after_fit:
         trainer.test(
             model=model,
             datamodule=datamodule,

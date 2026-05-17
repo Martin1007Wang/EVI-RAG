@@ -6,6 +6,7 @@ defaults:
   - dataset: webqsp
   - preprocess: default
   - _self_
+  - experiment: null
 
 task_name: preprocess
 seed: 42

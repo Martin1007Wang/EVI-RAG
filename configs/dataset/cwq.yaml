@@ -5,6 +5,10 @@ dataset_family: kgqa
 dataset_scope: cwq
 dataset_source: hf
 hf_dataset: rmanluo/RoG-cwq
+hf_revision: b0f6275586286312c4e99ef4b0adc65463c91f8e
+
+entity_typing:
+  non_text_prefixes: ["m.", "g."]
 
 splits:
   train: train
@@ -16,14 +20,8 @@ artifact_dir: ${dataset.root_dir}/artifacts
 
 paths:
   raw_dir: ${dataset.root_dir}/raw
-  lmdb_dir: ${dataset.root_dir}/lmdb
   metadata_dir: ${dataset.root_dir}/metadata
   embeddings_dir: ${dataset.root_dir}/embeddings
-  entity_text_embeddings: ${dataset.paths.embeddings_dir}/entity_text_embeddings.pt
-  relation_embeddings: ${dataset.paths.embeddings_dir}/relation_embeddings.pt
-  entity_metadata_path: ${dataset.paths.metadata_dir}/entity_metadata.pt
-  entity_catalog_path: ${dataset.paths.metadata_dir}/entity_catalog.pt
-  relation_catalog_path: ${dataset.paths.metadata_dir}/relation_catalog.pt
 
 column_map:
   question_id_field: id

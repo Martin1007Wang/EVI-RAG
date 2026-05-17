@@ -1,36 +1,83 @@
 from __future__ import annotations
 
 import zlib
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
 import lmdb
 import torch
 
-from src.data.schema import StorageSchema
-
-
 # =========================
 # serialization
 # =========================
 
 
+SampleValue = torch.Tensor | int
+
+
 def serialize_sample(sample: Dict[str, torch.Tensor]) -> bytes:
     from safetensors.torch import save
 
+    return save(_normalize_sample_for_safetensors(sample))
+
+
+def _normalize_sample_for_safetensors(
+    sample: Dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    normalized: dict[str, torch.Tensor] = {}
     for k, v in sample.items():
         if not (torch.is_tensor(v) or isinstance(v, int)):
             raise TypeError(f"{k} must be tensor or int, got {type(v)}")
+        tensor = torch.as_tensor(v) if isinstance(v, int) else v
+        normalized[k] = tensor.detach()
 
-    return save(sample)
+    for key, tensor in normalized.items():
+        if not tensor.is_contiguous():
+            normalized[key] = tensor.contiguous()
+
+    for key in _overlapping_storage_keys(normalized):
+        normalized[key] = normalized[key].clone().contiguous()
+
+    return normalized
+
+
+def _overlapping_storage_keys(sample: Dict[str, torch.Tensor]) -> set[str]:
+    storage_groups: dict[tuple[torch.device, int, int], list[tuple[int, int, str]]] = defaultdict(list)
+    for key, tensor in sample.items():
+        if tensor.device.type == "meta" or tensor.untyped_storage().nbytes() == 0:
+            continue
+        storage = tensor.untyped_storage()
+        storage_groups[(tensor.device, storage.data_ptr(), storage.nbytes())].append((_tensor_start_ptr(tensor), _tensor_end_ptr(tensor), key))
+
+    overlapping: set[str] = set()
+    for spans in storage_groups.values():
+        if len(spans) < 2:
+            continue
+        spans.sort()
+        _, last_end, last_key = spans[0]
+        for start, end, key in spans[1:]:
+            if start < last_end:
+                overlapping.add(last_key)
+                overlapping.add(key)
+            if end > last_end:
+                last_end = end
+                last_key = key
+    return overlapping
+
+
+def _tensor_start_ptr(tensor: torch.Tensor) -> int:
+    return tensor.data_ptr()
+
+
+def _tensor_end_ptr(tensor: torch.Tensor) -> int:
+    return tensor.data_ptr() + tensor.nelement() * tensor.element_size()
 
 
 def deserialize_sample(payload: bytes) -> Dict[str, torch.Tensor]:
     from safetensors.torch import load
 
-    data = load(payload)
-    StorageSchema.validate(data)
-    return data
+    return load(payload)
 
 
 # =========================

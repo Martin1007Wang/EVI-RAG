@@ -1,38 +1,25 @@
 from __future__ import annotations
 
-from pathlib import Path
-import sys
 from typing import Any
 
-from dotenv import load_dotenv
+import hydra
+from lightning import seed_everything
+from omegaconf import DictConfig, OmegaConf
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(_PROJECT_ROOT / ".env")
+from src.runtime import load_project_env
+from src.training.checkpoint import load_checkpoint_weights
+from src.training.factory import build_datamodule, build_model, build_trainer, setup_datamodule
 
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-try:
-    import rootutils
-except ModuleNotFoundError:
-    rootutils = None
-else:
-    rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-import hydra  # noqa: E402
-from lightning import seed_everything  # noqa: E402
-from omegaconf import DictConfig, OmegaConf  # noqa: E402
-
-from src.training.checkpoint import load_checkpoint_weights  # noqa: E402
-from src.training.factory import build_datamodule, build_model, build_trainer  # noqa: E402
-from src.training.resources import setup_datamodule  # noqa: E402
+PROJECT_ROOT = load_project_env(__file__)
 
 
 def required_ckpt_path(cfg: DictConfig) -> str:
     value = cfg.get("ckpt_path", None)
     if value in (None, ""):
         raise ValueError(
-            "ckpt_path must be provided for evaluation. " "Example: python src/evaluate.py experiment=eval/webqsp ckpt_path=/path/to/model.ckpt"
+            "ckpt_path must be provided for evaluation. "
+            "Example: evaluate_command experiment=eval/webqsp "
+            "ckpt_path=/path/to/model.ckpt"
         )
     return str(value)
 
@@ -57,7 +44,11 @@ def scalarize_metrics(metrics: dict[str, Any]) -> dict[str, float]:
     return scalars
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="evaluate")
+@hydra.main(
+    version_base=None,
+    config_path=str(PROJECT_ROOT / "configs"),
+    config_name="evaluate",
+)
 def main(cfg: DictConfig) -> None:
     print(f"Starting evaluation run: {cfg.get('task_name', 'evaluate')}")
 
