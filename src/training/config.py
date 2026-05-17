@@ -178,30 +178,15 @@ class LossRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class EvalRuntimeConfig:
-    best_of_k_values: tuple[int, ...]
-    utility_k: int
-    utility_lambda: float
+    best_of_k: int
     exclude_anchors_from_retrieved: bool
     use_reachable_targets: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
-            "best_of_k_values",
-            best_of_k_values_value(
-                self.best_of_k_values,
-                "best_of_k_values",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "utility_k",
-            positive_int(self.utility_k, "utility_k"),
-        )
-        object.__setattr__(
-            self,
-            "utility_lambda",
-            non_negative_float(self.utility_lambda, "utility_lambda"),
+            "best_of_k",
+            positive_int(self.best_of_k, "best_of_k"),
         )
         object.__setattr__(
             self,
@@ -753,23 +738,6 @@ def betas_value(value: Any, name: str) -> tuple[float, float]:
     return beta1, beta2
 
 
-def best_of_k_values_value(value: Any, name: str) -> tuple[int, ...]:
-    if isinstance(value, (str, bytes)):
-        raise TypeError(f"{name} must be a sequence of integers.")
-
-    if not isinstance(value, (list, tuple, ListConfig)):
-        raise TypeError(
-            f"{name} must be a sequence of integers, got {type(value).__name__}."
-        )
-
-    values = tuple(sorted({positive_int(k, f"{name}[]") for k in value}))
-
-    if not values:
-        raise ValueError(f"{name} must be non-empty.")
-
-    return values
-
-
 __all__ = [
     "EvalRuntimeConfig",
     "LossRuntimeConfig",
@@ -782,7 +750,6 @@ __all__ = [
     "SchedulerRuntimeConfig",
     "TrainingDataConfig",
     "TrainingRuntimeConfig",
-    "best_of_k_values_value",
     "betas_value",
     "boolean",
     "build_training_data_config",

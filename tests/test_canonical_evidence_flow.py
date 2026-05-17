@@ -9,7 +9,7 @@ from src.data.collate import RetrievalCollator
 from src.data.dataset import _build_retrieval_data
 from src.training.config import EvalRuntimeConfig, OptimizationRuntimeConfig, OptimizerRuntimeConfig
 from src.data.schema.fields import SampleFields
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.loss import ProbabilityDBLoss
 from src.weaver.module import WeaverModule
 from src.weaver.nn.edge_flow_scorer import EdgeActionScorer
@@ -19,19 +19,22 @@ from src.weaver.nn.state_encoder import StateEncoder
 from src.weaver.policy import Policy, PolicyOutput
 from src.weaver.reward import EvidenceLogReward
 from src.weaver.rollout.engine import RolloutContext, RolloutEngine
-from src.weaver.rollout.replay import ReplayBatch
 from src.weaver.rollout.result import RolloutResult
-from src.weaver.rollout.runner import RolloutChunk
 from src.weaver.rollout.sampling import SampledAction
 from src.weaver.rollout.trace import RolloutTrace
-from src.weaver.state import Frontier, FrontierBuilder, State, assert_anchor_connected_state
+from src.weaver.state import (
+    Frontier,
+    FrontierBuilder,
+    State,
+    assert_anchor_connected_state,
+)
 from src.weaver.transitions import TransitionBatch
 
 
 def test_policy_outputs_normalized_probabilities() -> None:
     batch = _batch()
     features = _features()
-    context = FlowContext.from_batch(batch)
+    context = GraphContext.from_batch(batch)
     state = State.initial(batch, budget=2)
     policy = _policy()
 
@@ -56,7 +59,7 @@ def test_policy_outputs_normalized_probabilities() -> None:
 def test_policy_frontier_scoring_chunk_size_preserves_outputs() -> None:
     batch = _batch()
     features = _features()
-    context = FlowContext.from_batch(batch)
+    context = GraphContext.from_batch(batch)
     state = State.initial(batch, budget=2)
     policy = _policy()
 
@@ -85,13 +88,13 @@ def test_rollout_context_rejects_attached_features() -> None:
     batch = _batch()
     features = _features()
     features.edge_h.requires_grad_()
-    flow_context = FlowContext.from_batch(batch)
+    graph_context = GraphContext.from_batch(batch)
 
     with pytest.raises(ValueError, match="features must be detached"):
         RolloutContext(
-            flow_context=flow_context,
+            graph_context=graph_context,
             features=features,
-            frontier_builder=FrontierBuilder.from_flow_context(flow_context),
+            frontier_builder=FrontierBuilder.from_graph_context(graph_context),
         )
 
 
@@ -105,7 +108,6 @@ def test_terminal_write_uses_policy_stop_log_prob() -> None:
         frontier=Frontier(
             row_ids=torch.empty(0, dtype=torch.long),
             edge_ids=torch.empty(0, dtype=torch.long),
-            edge_direction=torch.empty(0, dtype=torch.long),
         ),
         stop_logit=torch.zeros(3),
         stop_log_prob=torch.tensor([1.5, 2.5, 3.5]),
@@ -145,7 +147,7 @@ def test_probability_db_loss_matches_manual_residual() -> None:
         log_backward_prob=torch.tensor([-0.7, -0.2]),
         parent_stop_log_prob=torch.tensor([-0.4, -0.6]),
         parent_continue_log_prob=torch.tensor([-0.2, -0.3]),
-        parent_edge_log_prob=torch.tensor([-0.1, -0.1]),
+        parent_edge_log_prob=torch.tensor([-0.1, -0.1], requires_grad=True),
         child_stop_log_prob=torch.tensor([-0.1, -0.5]),
     )
     residual = torch.tensor(
@@ -184,7 +186,7 @@ def test_reward_uses_answer_support_and_edge_penalty() -> None:
 def test_weaver_module_direct_db_path_requires_transition_actions_in_frontier() -> None:
     batch = _batch()
     features = _features()
-    flow_context = FlowContext.from_batch(batch)
+    graph_context = GraphContext.from_batch(batch)
     frontier_builder = FrontierBuilder.from_batch(batch)
     reward = EvidenceLogReward()
     reward_context = reward.prepare_context(batch, expand_budget=2)
@@ -208,7 +210,7 @@ def test_weaver_module_direct_db_path_requires_transition_actions_in_frontier() 
         transitions=transitions,
         features=features,
         rollout_context=RolloutContext(
-            flow_context=flow_context,
+            graph_context=graph_context,
             features=features.detach_to(device=features.edge_h.device) if hasattr(features, "detach_to") else _detached_rollout_context_features(features),
             frontier_builder=frontier_builder,
         ),
@@ -216,19 +218,68 @@ def test_weaver_module_direct_db_path_requires_transition_actions_in_frontier() 
     )
     assert output.loss.requires_grad
     assert output.num_states == 1
+    assert {
+        "db/residual_abs_mean",
+        "reward/hit_rate_after_action",
+        "reward/hit_rate_delta",
+        "policy/stop_prob_before_action",
+        "policy/selected_edge_prob",
+    } == set(output.metrics)
+    assert "objective/total" not in output.metrics
+    assert "db/residual_sq_mean" not in output.metrics
+    assert "reward/parent_hit_rate" not in output.metrics
+    assert "reward/child_hit_rate" not in output.metrics
+    assert "policy/parent_stop_log_prob_mean" not in output.metrics
 
 
 def test_invalid_disconnected_selected_edges_are_rejected() -> None:
     batch = _batch()
     state = State.initial(batch, budget=2)
     state.edge_mask[0, 1] = True
-    state.rebuild_node_mask_(edge_index=FrontierBuilder.from_batch(batch).edge_index)
+    graph_context = GraphContext.from_batch(batch)
+    state.rebuild_node_mask_(graph_context=graph_context)
 
     with pytest.raises(AssertionError, match="recursive frontier expansion"):
         assert_anchor_connected_state(
             state=state,
-            edge_index=FrontierBuilder.from_batch(batch).edge_index,
+            graph_context=graph_context,
         )
+
+
+def test_internal_completion_selected_edges_are_rejected() -> None:
+    batch = _batch()
+    state = State.initial(batch, budget=3)
+    state.edge_mask[0, torch.tensor([0, 1, 2], dtype=torch.long)] = True
+    graph_context = GraphContext.from_batch(batch)
+    state.rebuild_node_mask_(graph_context=graph_context)
+
+    with pytest.raises(AssertionError, match="recursive frontier expansion"):
+        assert_anchor_connected_state(
+            state=state,
+            graph_context=graph_context,
+        )
+
+
+def test_boundary_reachability_rejects_cycle_without_internal_chord() -> None:
+    graph_context = GraphContext(
+        edge_index=torch.tensor([[0, 0, 1, 2], [1, 2, 3, 3]], dtype=torch.long),
+        node_to_graph=torch.zeros(4, dtype=torch.long),
+        edge_to_graph=torch.zeros(4, dtype=torch.long),
+        anchor_mask=torch.tensor([True, False, False, False], dtype=torch.bool),
+        num_nodes=4,
+        num_edges=4,
+        num_graphs=1,
+        device=torch.device("cpu"),
+    )
+    state = State(
+        node_mask=torch.ones((1, 4), dtype=torch.bool),
+        edge_mask=torch.ones((1, 4), dtype=torch.bool),
+        max_budget_by_row=torch.tensor([4], dtype=torch.long),
+        row_to_graph=torch.tensor([0], dtype=torch.long),
+    )
+
+    with pytest.raises(AssertionError, match="recursive frontier expansion"):
+        assert_anchor_connected_state(state=state, graph_context=graph_context)
 
 
 def _policy() -> Policy:
@@ -261,9 +312,7 @@ def _module(
             scheduler=None,
         ),
         evaluation=EvalRuntimeConfig(
-            best_of_k_values=(1, 2),
-            utility_k=2,
-            utility_lambda=0.02,
+            best_of_k=2,
             exclude_anchors_from_retrieved=True,
             use_reachable_targets=True,
         ),

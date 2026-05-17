@@ -33,6 +33,10 @@ class RolloutChunk:
         return self.transitions is not None and self.transitions.num_transitions > 0
 
     @property
+    def has_states(self) -> bool:
+        return self.has_replay
+
+    @property
     def num_policy_rollouts(self) -> int:
         return len(self.rollouts)
 

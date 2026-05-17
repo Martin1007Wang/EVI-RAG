@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from src.weaver.context import GraphContext
 from src.weaver.rollout.engine import RolloutContext
 from src.weaver.state import State, assert_anchor_connected_state, derive_node_mask
 
@@ -152,7 +153,7 @@ class UniformSubgraphBackwardKernel(BackwardKernel):
             try:
                 assert_anchor_connected_state(
                     state=candidate_parent,
-                    edge_index=edge_index_from_context(context),
+                    graph_context=graph_context_from_context(context),
                 )
             except AssertionError:
                 continue
@@ -188,7 +189,7 @@ class UniformSubgraphBackwardKernel(BackwardKernel):
 
         node_mask = derive_node_mask(
             state=raw_parent,
-            edge_index=edge_index_from_context(context),
+            graph_context=graph_context_from_context(context),
         )
 
         return State(
@@ -214,10 +215,10 @@ def frontier_contains(
     )
 
 
-def edge_index_from_context(
+def graph_context_from_context(
     context: RolloutContext,
-) -> object:
-    return context.frontier_builder.edge_index
+) -> GraphContext:
+    return context.graph_context
 
 
 def same_state(

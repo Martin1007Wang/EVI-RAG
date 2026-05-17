@@ -7,7 +7,6 @@ from src.data.collate import RetrievalCollator
 from src.data.dataset import _build_retrieval_data
 from src.data.schema.fields import SampleFields
 from src.eval.rollout import evaluate_rollout_samples
-from src.eval.groups import flatten_metric_groups
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.rollout.subgraph import SubgraphReconstructor
 
@@ -103,7 +102,7 @@ def _rollout_result(
     )
 
 
-def test_evaluate_rollout_samples_emits_recall_first_metric_groups() -> None:
+def test_evaluate_rollout_samples_emits_minimal_validation_dashboard() -> None:
     batch = _batch()
     rollouts = (
         _rollout_result(
@@ -120,36 +119,23 @@ def test_evaluate_rollout_samples_emits_recall_first_metric_groups() -> None:
         ),
     )
 
-    grouped = evaluate_rollout_samples(
+    metrics = evaluate_rollout_samples(
         rollout_samples=rollouts,
         batch=batch,
-        best_of_k_values=(1, 2, 4, 8),
-        utility_k=8,
-        utility_lambda=0.02,
+        best_of_k=8,
         exclude_anchors_from_retrieved=True,
         use_reachable_targets=True,
     )
-    metrics = flatten_metric_groups(grouped)
 
-    assert metrics["main/utility_at_8"] == metrics["best_of_k/target_recall_at_2"] - (
-        0.02 * metrics["evidence/selected_edge_count_mean"]
+    assert metrics["sampling_recall_gain"] == (
+        metrics["best_of_k_reachable_recall"] - metrics["one_sample_reachable_recall"]
     )
-    assert "best_of_k/target_f1_at_1" in metrics
-    assert "best_of_k/target_f1_at_2" in metrics
-    assert "best_of_k/target_f1_at_8" not in metrics
-    assert "best_of_k/target_recall_at_2" in metrics
-    assert "sample/target_f1_mean" in metrics
-    assert "sample/nonzero_f1_rate" in metrics
-    assert "sample/full_recall_rate" in metrics
-    assert "behavior/model_stop_rate" in metrics
-    assert "behavior/forced_stop_rate" in metrics
-    assert "behavior/answer_hit_then_continue_rate" in metrics
-    assert "behavior/extra_expansions_after_first_hit_mean" in metrics
-    assert "evidence/selected_edge_count_mean" in metrics
-    assert "behavior/mean_terminal_stop_log_prob" not in metrics
+    assert metrics["best_of_k_reachable_recall"] >= metrics["one_sample_reachable_recall"]
+    assert "mean_selected_edges" in metrics
+    assert "budget_forced_stop_rate" in metrics
 
 
-def test_main_utility_uses_requested_k_even_when_missing() -> None:
+def test_best_of_k_reachable_recall_uses_available_rollouts_when_k_is_larger() -> None:
     batch = _batch()
     rollouts = (
         _rollout_result(
@@ -160,20 +146,16 @@ def test_main_utility_uses_requested_k_even_when_missing() -> None:
         ),
     )
 
-    grouped = evaluate_rollout_samples(
+    metrics = evaluate_rollout_samples(
         rollout_samples=rollouts,
         batch=batch,
-        best_of_k_values=(1, 2, 4, 8),
-        utility_k=8,
-        utility_lambda=0.02,
+        best_of_k=8,
         exclude_anchors_from_retrieved=True,
         use_reachable_targets=True,
     )
-    metrics = flatten_metric_groups(grouped)
 
-    assert metrics["main/utility_at_8"] == 0.0 - (
-        0.02 * metrics["evidence/selected_edge_count_mean"]
-    )
+    assert metrics["best_of_k_reachable_recall"] == 0.0
+    assert metrics["sampling_recall_gain"] == 0.0
 
 
 def test_subgraph_reconstructor_matches_legacy_delegate() -> None:

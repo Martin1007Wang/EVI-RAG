@@ -67,10 +67,7 @@ class ProbabilityDBLoss(nn.Module):
         per_unit_loss = residual.square()
         loss = per_unit_loss.mean() if per_unit_loss.numel() > 0 else residual.sum() * 0.0
         metrics = {
-            "objective/total": loss.detach(),
-            "db/residual_mean": _safe_mean(residual).detach(),
             "db/residual_abs_mean": _safe_mean(residual.abs()).detach(),
-            "db/residual_sq_mean": _safe_mean(per_unit_loss).detach(),
         }
         return LossOutput(
             loss=loss,

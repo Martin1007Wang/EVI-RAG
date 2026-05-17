@@ -3,15 +3,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import torch
 from src.data.schema import RetrievalBatch
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 
 
 @dataclass(frozen=True, slots=True)
 class Frontier:
     """
-    Expandable action list induced by State.
+    Expandable edge actions induced by State.
 
-    row_ids[i] expands edge_ids[i].
+    row_ids[i] expands the directed KG edge edge_ids[i].
 
     row_ids:
         rollout-state rows, local to this State.
@@ -22,176 +22,14 @@ class Frontier:
 
     row_ids: torch.Tensor  # [F], long
     edge_ids: torch.Tensor  # [F], long
-    edge_direction: torch.Tensor  # [F], long: 0=forward, 1=backward, 2=internal
 
     @property
     def num_actions(self) -> int:
         return int(self.edge_ids.numel())
 
     @property
-    def num_edges(self) -> int:
-        return self.num_actions
-
-    @property
     def is_empty(self) -> bool:
         return self.num_actions == 0
-
-
-@dataclass(frozen=True, slots=True)
-class GraphTopology:
-    """
-    Public static graph topology view shared by rollout utilities.
-
-    This is the minimal topology contract required by derive_node_mask() and
-    debug assertions. It intentionally excludes incident-edge indexing.
-    """
-
-    edge_index: torch.Tensor  # [2, E], long
-    edge_to_graph: torch.Tensor  # [E], long
-    node_to_graph: torch.Tensor  # [N], long
-    anchor_mask: torch.Tensor  # [N], bool
-
-    @classmethod
-    def from_flow_context(
-        cls,
-        flow_context: FlowContext,
-    ) -> GraphTopology:
-        return cls(
-            edge_index=flow_context.edge_index,
-            edge_to_graph=_edge_to_graph(
-                edge_index=flow_context.edge_index,
-                node_to_graph=flow_context.node_to_graph,
-            ),
-            node_to_graph=flow_context.node_to_graph,
-            anchor_mask=flow_context.anchor_mask,
-        )
-
-    @classmethod
-    def from_tensors(
-        cls,
-        *,
-        edge_index: torch.Tensor,
-        node_to_graph: torch.Tensor,
-        anchor_mask: torch.Tensor,
-        edge_to_graph: torch.Tensor | None = None,
-    ) -> GraphTopology:
-        edge_index = edge_index.to(dtype=torch.long)
-        node_to_graph = node_to_graph.to(device=edge_index.device, dtype=torch.long)
-        anchor_mask = anchor_mask.to(device=edge_index.device, dtype=torch.bool)
-
-        if edge_to_graph is None:
-            edge_to_graph = _edge_to_graph(
-                edge_index=edge_index,
-                node_to_graph=node_to_graph,
-            )
-        else:
-            edge_to_graph = edge_to_graph.to(
-                device=edge_index.device,
-                dtype=torch.long,
-            )
-
-        return cls(
-            edge_index=edge_index,
-            edge_to_graph=edge_to_graph,
-            node_to_graph=node_to_graph,
-            anchor_mask=anchor_mask,
-        )
-
-    @property
-    def device(self) -> torch.device:
-        return self.edge_index.device
-
-    @property
-    def num_nodes(self) -> int:
-        return int(self.node_to_graph.numel())
-
-    @property
-    def num_edges(self) -> int:
-        return int(self.edge_index.size(1))
-
-
-@dataclass(frozen=True, slots=True)
-class IncidentEdgeIndex(GraphTopology):
-    """
-    Node-to-incident-edge index over a batched graph.
-
-    Selected triples remain directed. Incidence is used only for frontier
-    eligibility from the active anchor-connected evidence component.
-    """
-
-    incident_ptr: torch.Tensor  # [N + 1], long
-    edge_ids_by_node: torch.Tensor  # [2E], long
-
-    @classmethod
-    def from_batch(
-        cls,
-        batch: RetrievalBatch,
-        *,
-        device: torch.device | None = None,
-    ) -> IncidentEdgeIndex:
-        return cls.from_flow_context(
-            FlowContext.from_batch(batch, device=device),
-        )
-
-    @classmethod
-    def from_flow_context(
-        cls,
-        flow_context: FlowContext,
-    ) -> IncidentEdgeIndex:
-        return cls.from_graph_topology(
-            GraphTopology.from_flow_context(flow_context),
-        )
-
-    @classmethod
-    def from_graph_topology(
-        cls,
-        topology: GraphTopology,
-    ) -> IncidentEdgeIndex:
-        edge_index = topology.edge_index
-        num_nodes = topology.num_nodes
-        num_edges = topology.num_edges
-        src = edge_index[0]
-        dst = edge_index[1]
-
-        endpoint_nodes = torch.cat([src, dst], dim=0)
-        endpoint_edges = torch.arange(
-            num_edges,
-            dtype=torch.long,
-            device=topology.device,
-        ).repeat(2)
-
-        order = torch.argsort(endpoint_nodes)
-        sorted_nodes = endpoint_nodes.index_select(0, order)
-        sorted_edges = endpoint_edges.index_select(0, order)
-
-        incident_count = torch.bincount(
-            sorted_nodes,
-            minlength=num_nodes,
-        )
-
-        incident_ptr = torch.empty(
-            num_nodes + 1,
-            dtype=torch.long,
-            device=topology.device,
-        )
-        incident_ptr[0] = 0
-        incident_ptr[1:] = torch.cumsum(incident_count, dim=0)
-
-        return cls(
-            incident_ptr=incident_ptr,
-            edge_ids_by_node=sorted_edges,
-            edge_index=topology.edge_index,
-            edge_to_graph=topology.edge_to_graph,
-            node_to_graph=topology.node_to_graph,
-            anchor_mask=topology.anchor_mask,
-        )
-
-    @property
-    def num_nodes(self) -> int:
-        return int(self.incident_ptr.numel()) - 1
-
-
-_IncidentView = GraphTopology
 
 
 class FrontierBuilder:
@@ -205,15 +43,16 @@ class FrontierBuilder:
             e not in S_z
             |S_z| < B
             graph(e) == graph(z)
-            u in V_z or v in V_z
+            exactly one of u, v is in V_z
 
     V_z is read from State.node_mask. In rollout, node_mask is a cache
     maintained by State.apply_edges_(). For backward-kernel/debug code that
     deletes edges, rebuild node_mask from edge_mask before using this builder.
     """
 
-    def __init__(self, edge_index: IncidentEdgeIndex) -> None:
-        self.edge_index = edge_index
+    def __init__(self, graph_context: GraphContext) -> None:
+        self.graph_context = graph_context
+        self.incident_ptr, self.edge_ids_by_node = _build_incident_edges(graph_context)
 
     @classmethod
     def from_batch(
@@ -222,20 +61,16 @@ class FrontierBuilder:
         *,
         device: torch.device | None = None,
     ) -> FrontierBuilder:
-        return cls(IncidentEdgeIndex.from_batch(batch, device=device))
+        return cls(GraphContext.from_batch(batch, device=device))
 
     @classmethod
-    def from_flow_context(
+    def from_graph_context(
         cls,
-        flow_context: FlowContext,
+        graph_context: GraphContext,
     ) -> FrontierBuilder:
-        return cls(IncidentEdgeIndex.from_flow_context(flow_context))
+        return cls(graph_context)
 
     def build(self, state: State) -> Frontier:
-        assert_node_cache_consistent(
-            state=state,
-            edge_index=self.edge_index,
-        )
         rows, nodes = _mask_to_pairs(state.node_mask)
 
         if rows.numel() == 0:
@@ -248,7 +83,7 @@ class FrontierBuilder:
         if rows.numel() == 0:
             return _empty_frontier(state.device)
 
-        ptr = self.edge_index.incident_ptr
+        ptr = self.incident_ptr
         starts = ptr.index_select(0, nodes)
         ends = ptr.index_select(0, nodes + 1)
         degrees = ends - starts
@@ -263,12 +98,12 @@ class FrontierBuilder:
 
         frontier_rows = torch.repeat_interleave(rows, degrees)
         edge_positions = torch.repeat_interleave(starts, degrees) + _segment_arange(degrees)
-        edge_ids = self.edge_index.edge_ids_by_node.index_select(
+        edge_ids = self.edge_ids_by_node.index_select(
             0,
             edge_positions,
         )
 
-        same_graph = self.edge_index.edge_to_graph.index_select(
+        same_graph = self.graph_context.edge_to_graph.index_select(
             0,
             edge_ids,
         ).eq(state.row_to_graph.index_select(0, frontier_rows))
@@ -291,17 +126,20 @@ class FrontierBuilder:
 
         row_ids = keys // state.num_edges
         edge_ids = keys % state.num_edges
-        edge_direction = _edge_direction(
-            state=state,
-            edge_index=self.edge_index.edge_index,
-            row_ids=row_ids,
-            edge_ids=edge_ids,
-        )
+        src = self.graph_context.edge_index[0].index_select(0, edge_ids)
+        dst = self.graph_context.edge_index[1].index_select(0, edge_ids)
+        src_active = state.node_mask[row_ids, src]
+        dst_active = state.node_mask[row_ids, dst]
+        expands_new_node = src_active ^ dst_active
+        row_ids = row_ids[expands_new_node]
+        edge_ids = edge_ids[expands_new_node]
+
+        if edge_ids.numel() == 0:
+            return _empty_frontier(state.device)
 
         return Frontier(
             row_ids=row_ids,
             edge_ids=edge_ids,
-            edge_direction=edge_direction,
         )
 
     def contains(
@@ -315,7 +153,7 @@ class FrontierBuilder:
             state=state,
             row=row,
             edge_id=edge_id,
-            edge_index=self.edge_index,
+            graph_context=self.graph_context,
         )
 
 
@@ -398,22 +236,22 @@ class State:
         )
 
     @classmethod
-    def initial_from_flow_context(
+    def initial_from_graph_context(
         cls,
-        flow_context: FlowContext,
+        graph_context: GraphContext,
         *,
         budget: int,
         rollouts_per_graph: int = 1,
     ) -> State:
-        device = flow_context.device
-        num_rows = int(flow_context.num_graphs) * int(rollouts_per_graph)
+        device = graph_context.device
+        num_rows = int(graph_context.num_graphs) * int(rollouts_per_graph)
         node_mask = torch.zeros(
-            (num_rows, int(flow_context.num_nodes)),
+            (num_rows, int(graph_context.num_nodes)),
             dtype=torch.bool,
             device=device,
         )
         edge_mask = torch.zeros(
-            (num_rows, int(flow_context.num_edges)),
+            (num_rows, int(graph_context.num_edges)),
             dtype=torch.bool,
             device=device,
         )
@@ -424,16 +262,16 @@ class State:
             device=device,
         )
         row_to_graph = torch.arange(
-            int(flow_context.num_graphs),
+            int(graph_context.num_graphs),
             dtype=torch.long,
             device=device,
         ).repeat_interleave(int(rollouts_per_graph))
 
-        anchors = flow_context.anchor_mask.nonzero(as_tuple=False).view(-1)
+        anchors = graph_context.anchor_mask.nonzero(as_tuple=False).view(-1)
         if anchors.numel() > 0:
             rows, cols = _anchor_rows_and_cols(
                 anchors=anchors,
-                node_to_graph=flow_context.node_to_graph,
+                node_to_graph=graph_context.node_to_graph,
                 rollouts_per_graph=rollouts_per_graph,
                 num_rows=num_rows,
             )
@@ -582,7 +420,7 @@ class State:
     def rebuild_node_mask_(
         self,
         *,
-        edge_index: IncidentEdgeIndex,
+        graph_context: GraphContext,
     ) -> None:
         """
         Rebuild node_mask from edge_mask truth.
@@ -592,18 +430,18 @@ class State:
         """
         self.node_mask = derive_node_mask(
             state=self,
-            edge_index=edge_index,
+            graph_context=graph_context,
         )
 
     def with_rebuilt_node_mask(
         self,
         *,
-        edge_index: IncidentEdgeIndex,
+        graph_context: GraphContext,
     ) -> State:
         return State(
             node_mask=derive_node_mask(
                 state=self,
-                edge_index=edge_index,
+                graph_context=graph_context,
             ),
             edge_mask=self.edge_mask,
             max_budget_by_row=self.max_budget_by_row,
@@ -639,9 +477,7 @@ def derive_remaining_budget(state: State) -> torch.Tensor:
 def derive_node_mask(
     *,
     state: State,
-    edge_index: IncidentEdgeIndex | GraphTopology | torch.Tensor,
-    node_to_graph: torch.Tensor | None = None,
-    anchor_mask: torch.Tensor | None = None,
+    graph_context: GraphContext,
 ) -> torch.Tensor:
     """
     Rebuild active nodes from edge_mask truth.
@@ -654,17 +490,12 @@ def derive_node_mask(
 
         X_n(S) = A_n union Vtx_n(S)
     """
-    incident = _as_graph_topology(
-        edge_index=edge_index,
-        node_to_graph=node_to_graph,
-        anchor_mask=anchor_mask,
-    )
     out = torch.zeros_like(state.node_mask)
 
     for row in range(state.num_rollouts):
         graph_id = state.row_to_graph[row]
-        graph_nodes = incident.node_to_graph.eq(graph_id)
-        anchors = (incident.anchor_mask & graph_nodes).nonzero(as_tuple=True)[0]
+        graph_nodes = graph_context.node_to_graph.eq(graph_id)
+        anchors = (graph_context.anchor_mask & graph_nodes).nonzero(as_tuple=True)[0]
 
         if anchors.numel() > 0:
             out[row, anchors] = True
@@ -673,8 +504,8 @@ def derive_node_mask(
         if selected_edges.numel() == 0:
             continue
 
-        src = incident.edge_index[0].index_select(0, selected_edges)
-        dst = incident.edge_index[1].index_select(0, selected_edges)
+        src = graph_context.edge_index[0].index_select(0, selected_edges)
+        dst = graph_context.edge_index[1].index_select(0, selected_edges)
         out[row, src] = True
         out[row, dst] = True
 
@@ -684,10 +515,7 @@ def derive_node_mask(
 def assert_anchor_connected_state(
     *,
     state: State,
-    edge_index: IncidentEdgeIndex | GraphTopology | torch.Tensor,
-    edge_to_graph: torch.Tensor | None = None,
-    node_to_graph: torch.Tensor | None = None,
-    anchor_mask: torch.Tensor | None = None,
+    graph_context: GraphContext,
 ) -> None:
     """
     Debug-only assertion.
@@ -695,18 +523,11 @@ def assert_anchor_connected_state(
     Verify that every selected edge can be generated by the recursive frontier
     expansion rule starting from anchors.
     """
-    incident = _as_graph_topology(
-        edge_index=edge_index,
-        edge_to_graph=edge_to_graph,
-        node_to_graph=node_to_graph,
-        anchor_mask=anchor_mask,
-    )
-
     for row in range(state.num_rollouts):
         selected_edges = state.edge_mask[row].nonzero(as_tuple=True)[0]
         graph_id = state.row_to_graph[row]
 
-        selected_graph = incident.edge_to_graph.index_select(
+        selected_graph = graph_context.edge_to_graph.index_select(
             0,
             selected_edges,
         )
@@ -715,26 +536,9 @@ def assert_anchor_connected_state(
         if not _is_recursively_frontier_reachable(
             selected_edges=selected_edges,
             graph_id=int(graph_id.item()),
-            incident=incident,
+            graph_context=graph_context,
         ):
             raise AssertionError("Every selected edge must be reachable by recursive frontier expansion from anchors.")
-
-
-def assert_node_cache_consistent(
-    *,
-    state: State,
-    edge_index: IncidentEdgeIndex,
-) -> None:
-    """
-    Debug-only assertion.
-    """
-    derived = derive_node_mask(
-        state=state,
-        edge_index=edge_index,
-    )
-
-    if not bool(torch.equal(state.node_mask, derived)):
-        raise AssertionError("node_mask cache differs from edge_mask-derived active nodes.")
 
 
 def is_frontier_edge(
@@ -742,7 +546,7 @@ def is_frontier_edge(
     state: State,
     row: int,
     edge_id: int,
-    edge_index: IncidentEdgeIndex,
+    graph_context: GraphContext,
 ) -> bool:
     """
     Scalar frontier predicate using the same incident rule as FrontierBuilder.
@@ -755,36 +559,13 @@ def is_frontier_edge(
     if int(state.remaining_budget[row].item()) <= 0:
         return False
 
-    if int(edge_index.edge_to_graph[edge_id].item()) != int(state.row_to_graph[row].item()):
+    if int(graph_context.edge_to_graph[edge_id].item()) != int(state.row_to_graph[row].item()):
         return False
 
-    src = int(edge_index.edge_index[0, edge_id].item())
-    dst = int(edge_index.edge_index[1, edge_id].item())
+    src = int(graph_context.edge_index[0, edge_id].item())
+    dst = int(graph_context.edge_index[1, edge_id].item())
 
-    return bool(state.node_mask[row, src] or state.node_mask[row, dst])
-
-
-def _as_graph_topology(
-    *,
-    edge_index: IncidentEdgeIndex | GraphTopology | torch.Tensor,
-    edge_to_graph: torch.Tensor | None = None,
-    node_to_graph: torch.Tensor | None = None,
-    anchor_mask: torch.Tensor | None = None,
-) -> IncidentEdgeIndex | GraphTopology:
-    if isinstance(edge_index, GraphTopology):
-        return edge_index
-
-    if node_to_graph is None or anchor_mask is None:
-        raise TypeError(
-            "node_to_graph and anchor_mask are required when edge_index is a tensor."
-        )
-
-    return GraphTopology.from_tensors(
-        edge_index=edge_index,
-        node_to_graph=node_to_graph,
-        anchor_mask=anchor_mask,
-        edge_to_graph=edge_to_graph,
-    )
+    return bool(state.node_mask[row, src] ^ state.node_mask[row, dst])
 
 
 def _anchor_component_nodes(
@@ -829,27 +610,72 @@ def _is_recursively_frontier_reachable(
     *,
     selected_edges: torch.Tensor,
     graph_id: int,
-    incident: IncidentEdgeIndex | GraphTopology,
+    graph_context: GraphContext,
 ) -> bool:
     if selected_edges.numel() == 0:
         return True
 
-    graph_nodes = incident.node_to_graph.eq(int(graph_id))
-    active = (incident.anchor_mask & graph_nodes).clone()
-    remaining = selected_edges.clone()
+    graph_nodes = graph_context.node_to_graph.eq(int(graph_id))
+    anchor_nodes = set(
+        (graph_context.anchor_mask & graph_nodes)
+        .nonzero(as_tuple=False)
+        .view(-1)
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    if not anchor_nodes:
+        return False
 
-    while remaining.numel() > 0:
-        src = incident.edge_index[0].index_select(0, remaining)
-        dst = incident.edge_index[1].index_select(0, remaining)
-        expandable = active.index_select(0, src) | active.index_select(0, dst)
-        if not bool(expandable.any()):
+    src_nodes = (
+        graph_context.edge_index[0]
+        .index_select(0, selected_edges)
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    dst_nodes = (
+        graph_context.edge_index[1]
+        .index_select(0, selected_edges)
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+    parent: dict[int, int] = {}
+
+    def find(node: int) -> int:
+        node = int(node)
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> bool:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
             return False
-        chosen = remaining.index_select(0, expandable.nonzero(as_tuple=False).view(-1))
-        chosen_src = incident.edge_index[0].index_select(0, chosen)
-        chosen_dst = incident.edge_index[1].index_select(0, chosen)
-        active[chosen_src] = True
-        active[chosen_dst] = True
-        remaining = remaining.index_select(0, (~expandable).nonzero(as_tuple=False).view(-1))
+        parent[right_root] = left_root
+        return True
+
+    component_nodes: set[int] = set()
+    for src_node, dst_node in zip(src_nodes, dst_nodes):
+        component_nodes.add(int(src_node))
+        component_nodes.add(int(dst_node))
+        if not union(int(src_node), int(dst_node)):
+            return False
+
+    anchors_by_component: dict[int, int] = {}
+    for node in component_nodes:
+        if node in anchor_nodes:
+            root = find(node)
+            anchors_by_component[root] = anchors_by_component.get(root, 0) + 1
+
+    for node in component_nodes:
+        if anchors_by_component.get(find(node), 0) != 1:
+            return False
 
     return True
 
@@ -859,12 +685,38 @@ def _mask_to_pairs(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return rows, cols
 
 
-def _edge_to_graph(
-    *,
-    edge_index: torch.Tensor,
-    node_to_graph: torch.Tensor,
-) -> torch.Tensor:
-    return node_to_graph.index_select(0, edge_index[0])
+def _build_incident_edges(
+    graph_context: GraphContext,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_index = graph_context.edge_index
+    src = edge_index[0]
+    dst = edge_index[1]
+
+    endpoint_nodes = torch.cat([src, dst], dim=0)
+    endpoint_edges = torch.arange(
+        int(graph_context.num_edges),
+        dtype=torch.long,
+        device=graph_context.device,
+    ).repeat(2)
+
+    order = torch.argsort(endpoint_nodes)
+    sorted_nodes = endpoint_nodes.index_select(0, order)
+    sorted_edges = endpoint_edges.index_select(0, order)
+
+    incident_count = torch.bincount(
+        sorted_nodes,
+        minlength=int(graph_context.num_nodes),
+    )
+
+    incident_ptr = torch.empty(
+        int(graph_context.num_nodes) + 1,
+        dtype=torch.long,
+        device=graph_context.device,
+    )
+    incident_ptr[0] = 0
+    incident_ptr[1:] = torch.cumsum(incident_count, dim=0)
+
+    return incident_ptr, sorted_edges
 
 
 def _anchor_rows_and_cols(
@@ -931,40 +783,14 @@ def _empty_frontier(device: torch.device) -> Frontier:
     return Frontier(
         row_ids=empty,
         edge_ids=empty,
-        edge_direction=empty,
     )
-
-
-def _edge_direction(
-    *,
-    state: State,
-    edge_index: torch.Tensor,
-    row_ids: torch.Tensor,
-    edge_ids: torch.Tensor,
-) -> torch.Tensor:
-    if edge_ids.numel() == 0:
-        return edge_ids.new_empty(0)
-
-    src = edge_index[0].index_select(0, edge_ids)
-    dst = edge_index[1].index_select(0, edge_ids)
-    src_active = state.node_mask[row_ids, src]
-    dst_active = state.node_mask[row_ids, dst]
-
-    forward = torch.zeros_like(edge_ids)
-    backward = torch.ones_like(edge_ids)
-    internal = torch.full_like(edge_ids, 2)
-    return torch.where(src_active & dst_active, internal, torch.where(src_active, forward, backward))
 
 
 __all__ = [
     "Frontier",
-    "GraphTopology",
-    "IncidentEdgeIndex",
     "FrontierBuilder",
     "State",
-    "_IncidentView",
     "assert_anchor_connected_state",
-    "assert_node_cache_consistent",
     "build_row_to_graph",
     "derive_node_mask",
     "derive_remaining_budget",

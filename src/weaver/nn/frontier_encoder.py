@@ -6,7 +6,7 @@ import warnings
 import torch
 from torch import nn
 
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.state import Frontier, State
 
 from .feature_encoder import FeatureBank
@@ -29,9 +29,8 @@ class FrontierEncoding:
     All tensors with first dimension F are aligned to the same legal frontier
     action list. No consumer should pass row_ids separately.
 
-    edge_direction is carried as discrete structural metadata. FeatureBank does
-    not precompute direction-specific edge features; the scorer is responsible
-    for consuming this field if direction should affect action scores.
+    Frontier actions select original directed KG edges. Incidence only decides
+    eligibility; the edge id is never rewritten into an inverse relation.
     """
 
     row_ids: torch.Tensor  # [F], long
@@ -44,7 +43,6 @@ class FrontierEncoding:
     rel_sem_h: torch.Tensor  # [F, D]
     dst_sem_h: torch.Tensor  # [F, D]
     query_sem_h: torch.Tensor  # [F, D], graph-level query broadcast to actions
-    edge_direction: torch.Tensor  # [F], long: 0=forward, 1=backward, 2=internal
 
     @property
     def num_actions(self) -> int:
@@ -95,7 +93,7 @@ class FrontierEncoder(nn.Module):
     def forward(
         self,
         *,
-        context: FlowContext,
+        context: GraphContext,
         features: FeatureBank,
         state: State,
         frontier: Frontier,
@@ -129,10 +127,6 @@ class FrontierEncoder(nn.Module):
             rel_sem_h=features.rel_sem_h.index_select(0, edge_ids),
             dst_sem_h=features.node_sem_h.index_select(0, dst_ids),
             query_sem_h=features.query_sem_h.index_select(0, graph_ids),
-            edge_direction=frontier.edge_direction.to(
-                device=edge_ids.device,
-                dtype=torch.long,
-            ),
         )
 
 

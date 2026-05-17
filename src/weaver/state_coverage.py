@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from src.weaver.rollout.engine import RolloutContext
-from src.weaver.rollout.replay import ReplayBatch, dedupe_states
+from src.weaver.rollout.replay import ReplayBatch
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.state import State
 
@@ -18,6 +18,9 @@ class StateCoverageBatch:
     @property
     def num_states(self) -> int:
         return int(self.state.num_rollouts)
+
+
+StateBatch = StateCoverageBatch
 
 
 class StateCoverageBuilder:
@@ -42,7 +45,7 @@ class StateCoverageBuilder:
             )
         ]
         if replay is not None and replay.num_transitions > 0:
-            states.append(replay.state)
+            states.append(replay.transitions.parent_state)
         present = [x for x in states if x is not None and x.num_rollouts > 0]
         if not present:
             return None
@@ -58,8 +61,8 @@ def policy_visited_states(
     visited: list[State] = []
     for rollout in rollouts:
         graph_ids = rollout.source_graph_id.to(device=device, dtype=torch.long).view(-1)
-        current = State.initial_from_flow_context(
-            context.flow_context,
+        current = State.initial_from_graph_context(
+            context.graph_context,
             budget=int(rollout.expand_budget),
             rollouts_per_graph=1,
         ).select_rows(graph_ids)
@@ -72,7 +75,7 @@ def policy_visited_states(
                 continue
             edge_ids = rollout.selected_edge_ids[:, step].to(device=device, dtype=torch.long).index_select(0, expand_rows)
             current.apply_edges_(
-                edge_index=context.flow_context.edge_index,
+                edge_index=context.graph_context.edge_index,
                 rows=expand_rows,
                 edge_ids=edge_ids,
             )
@@ -81,7 +84,26 @@ def policy_visited_states(
     return dedupe_states(State.concat(visited))
 
 
+def dedupe_states(state: State) -> State:
+    seen: set[tuple[int, int, tuple[int, ...]]] = set()
+    keep: list[int] = []
+    edge_masks = state.edge_mask.detach().cpu()
+    graphs = state.row_to_graph.detach().cpu()
+    budgets = state.max_budget_by_row.detach().cpu()
+    for row in range(state.num_rollouts):
+        edges = tuple(edge_masks[row].nonzero(as_tuple=False).view(-1).tolist())
+        key = (int(graphs[row]), int(budgets[row]), edges)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(row)
+    if not keep:
+        return state.select_rows(torch.empty(0, dtype=torch.long, device=state.device))
+    return state.select_rows(torch.tensor(keep, dtype=torch.long, device=state.device))
+
+
 __all__ = [
+    "StateBatch",
     "StateCoverageBatch",
     "StateCoverageBuilder",
     "policy_visited_states",

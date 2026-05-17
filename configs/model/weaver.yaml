@@ -82,9 +82,7 @@ optimization:
 
 evaluation:
   _target_: src.training.config.EvalRuntimeConfig
-  best_of_k_values: [1, 2, 4, 8]
-  utility_k: 8
-  utility_lambda: ${..reward_model.lambda_}
+  best_of_k: 8
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
 

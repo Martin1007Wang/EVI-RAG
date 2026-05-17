@@ -159,9 +159,7 @@ def test_validation_step_logs_rollout_metrics_instead_of_objective_loss(monkeypa
             scheduler=None,
         ),
         evaluation=EvalRuntimeConfig(
-            best_of_k_values=(1, 2, 4, 8),
-            utility_k=8,
-            utility_lambda=0.02,
+            best_of_k=8,
             exclude_anchors_from_retrieved=True,
             use_reachable_targets=True,
         ),
@@ -177,7 +175,7 @@ def test_validation_step_logs_rollout_metrics_instead_of_objective_loss(monkeypa
 
     module.validation_step(batch, batch_idx=0)
 
-    assert "val/main/utility_at_8" in logged
-    assert "val/best_of_k/target_recall_at_2" in logged
-    assert "val/sample/target_f1_mean" in logged
+    assert "val/best_of_k_reachable_recall" in logged
+    assert "val/one_sample_reachable_recall" in logged
+    assert "val/mean_selected_edges" in logged
     assert "val/objective_epoch_loss" not in logged

@@ -6,16 +6,13 @@ import torch
 from src.data.collate import RetrievalCollator
 from src.data.dataset import _build_retrieval_data
 from src.data.schema.fields import SampleFields
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.nn.feature_encoder import FeatureBank
 from src.weaver.nn.frontier_encoder import FrontierEncoder
 from src.weaver.state import (
     Frontier,
     FrontierBuilder,
-    GraphTopology,
-    IncidentEdgeIndex,
     State,
-    _IncidentView,
     derive_node_mask,
 )
 
@@ -26,12 +23,11 @@ def test_frontier_encoder_empty_frontier_returns_empty_feature_rows() -> None:
     frontier = Frontier(
         row_ids=torch.empty(0, dtype=torch.long),
         edge_ids=torch.empty(0, dtype=torch.long),
-        edge_direction=torch.empty(0, dtype=torch.long),
     )
     batch = _batch()
 
     encoding = FrontierEncoder(hidden_dim=3)(
-        context=FlowContext.from_batch(batch),
+        context=GraphContext.from_batch(batch),
         features=features,
         state=state,
         frontier=frontier,
@@ -52,7 +48,7 @@ def test_frontier_encoder_rejects_edge_hidden_dim_mismatch() -> None:
 
     with pytest.raises(ValueError, match="features.edge_h hidden dimension"):
         FrontierEncoder(hidden_dim=3)(
-            context=FlowContext.from_batch(_batch()),
+            context=GraphContext.from_batch(_batch()),
             features=features,
             state=_state(),
             frontier=_empty_frontier(),
@@ -64,7 +60,7 @@ def test_frontier_encoder_rejects_query_hidden_dim_mismatch() -> None:
 
     with pytest.raises(ValueError, match="features.query_h hidden dimension"):
         FrontierEncoder(hidden_dim=3)(
-            context=FlowContext.from_batch(_batch()),
+            context=GraphContext.from_batch(_batch()),
             features=features,
             state=_state(),
             frontier=_empty_frontier(),
@@ -77,12 +73,11 @@ def test_frontier_encoder_materializes_semantic_tensors_from_batch_static_featur
     frontier = Frontier(
         row_ids=torch.tensor([1, 0], dtype=torch.long),
         edge_ids=torch.tensor([1, 0], dtype=torch.long),
-        edge_direction=torch.tensor([1, 0], dtype=torch.long),
     )
     batch = _batch()
 
     encoding = FrontierEncoder(hidden_dim=3)(
-        context=FlowContext.from_batch(batch),
+        context=GraphContext.from_batch(batch),
         features=features,
         state=state,
         frontier=frontier,
@@ -106,12 +101,11 @@ def test_frontier_encoder_uses_compact_state_rows_for_query_lookup() -> None:
     frontier = Frontier(
         row_ids=torch.tensor([0, 1], dtype=torch.long),
         edge_ids=torch.tensor([0, 1], dtype=torch.long),
-        edge_direction=torch.tensor([2, 1], dtype=torch.long),
     )
     batch = _batch()
 
     encoding = FrontierEncoder(hidden_dim=3)(
-        context=FlowContext.from_batch(batch),
+        context=GraphContext.from_batch(batch),
         features=features,
         state=compact_state,
         frontier=frontier,
@@ -121,21 +115,13 @@ def test_frontier_encoder_uses_compact_state_rows_for_query_lookup() -> None:
     assert torch.equal(encoding.query_sem_h, features.query_sem_h[[0, 1]])
 
 
-def test_frontier_builder_marks_edge_direction_cases() -> None:
+def test_frontier_builder_keeps_original_directed_edge_ids() -> None:
     batch = _direction_batch()
     builder = FrontierBuilder.from_batch(batch)
     state = State.initial(batch, budget=2)
 
     root_frontier = builder.build(state)
-    root_by_edge = {
-        int(edge_id): int(direction)
-        for edge_id, direction in zip(
-            root_frontier.edge_ids.tolist(),
-            root_frontier.edge_direction.tolist(),
-        )
-    }
-    assert root_by_edge[0] == 0
-    assert root_by_edge[2] == 1
+    assert set(root_frontier.edge_ids.tolist()) == {0, 2}
 
     state.apply_edges_(
         edge_index=batch.edge_index,
@@ -143,79 +129,59 @@ def test_frontier_builder_marks_edge_direction_cases() -> None:
         edge_ids=torch.tensor([0], dtype=torch.long),
     )
     frontier = builder.build(state)
-    by_edge = {
-        int(edge_id): int(direction)
-        for edge_id, direction in zip(
-            frontier.edge_ids.tolist(),
-            frontier.edge_direction.tolist(),
-        )
-    }
-    assert by_edge[1] == 1
-    assert by_edge[2] == 2
+    edge_ids = set(frontier.edge_ids.tolist())
+    assert 1 in edge_ids
+    assert 2 not in edge_ids
+    assert not builder.contains(state=state, row=0, edge_id=2)
 
 
-def test_frontier_builder_from_flow_context_matches_batch_path() -> None:
+def test_frontier_builder_from_graph_context_matches_batch_path() -> None:
     batch = _direction_batch()
-    flow_context = FlowContext.from_batch(batch)
+    graph_context = GraphContext.from_batch(batch)
     from_batch = FrontierBuilder.from_batch(batch)
-    from_context = FrontierBuilder.from_flow_context(flow_context)
-    state = State.initial_from_flow_context(flow_context, budget=2)
+    from_context = FrontierBuilder.from_graph_context(graph_context)
+    state = State.initial_from_graph_context(graph_context, budget=2)
 
     frontier_from_batch = from_batch.build(state)
     frontier_from_context = from_context.build(state)
 
     assert torch.equal(frontier_from_batch.row_ids, frontier_from_context.row_ids)
     assert torch.equal(frontier_from_batch.edge_ids, frontier_from_context.edge_ids)
-    assert torch.equal(
-        frontier_from_batch.edge_direction,
-        frontier_from_context.edge_direction,
-    )
 
 
-def test_derive_node_mask_matches_graph_topology_and_tensor_paths() -> None:
+def test_derive_node_mask_uses_graph_context() -> None:
     batch = _direction_batch()
-    flow_context = FlowContext.from_batch(batch)
-    state = State.initial_from_flow_context(flow_context, budget=3)
+    graph_context = GraphContext.from_batch(batch)
+    state = State.initial_from_graph_context(graph_context, budget=3)
     state.apply_edges_(
-        edge_index=flow_context.edge_index,
+        edge_index=graph_context.edge_index,
         rows=torch.tensor([0, 0], dtype=torch.long),
         edge_ids=torch.tensor([0, 1], dtype=torch.long),
     )
 
-    topology = GraphTopology.from_flow_context(flow_context)
-    derived_from_topology = derive_node_mask(
+    derived = derive_node_mask(
         state=state,
-        edge_index=topology,
-    )
-    derived_from_tensor = derive_node_mask(
-        state=state,
-        edge_index=flow_context.edge_index,
-        node_to_graph=flow_context.node_to_graph,
-        anchor_mask=flow_context.anchor_mask,
+        graph_context=graph_context,
     )
 
-    assert torch.equal(derived_from_topology, derived_from_tensor)
+    assert torch.equal(derived, state.node_mask)
 
 
-def test_incident_edge_index_from_flow_context_shares_topology_tensors() -> None:
-    flow_context = FlowContext.from_batch(_direction_batch())
-    incident = IncidentEdgeIndex.from_flow_context(flow_context)
+def test_frontier_builder_from_graph_context_shares_context() -> None:
+    graph_context = GraphContext.from_batch(_direction_batch())
+    builder = FrontierBuilder.from_graph_context(graph_context)
 
-    assert incident.edge_index is flow_context.edge_index
-    assert incident.node_to_graph is flow_context.node_to_graph
-    assert incident.anchor_mask is flow_context.anchor_mask
-    assert _IncidentView is GraphTopology
+    assert builder.graph_context is graph_context
 
 
 def test_frontier_encoding_num_edges_warns_and_matches_num_actions() -> None:
     encoding = FrontierEncoder(hidden_dim=3)(
-        context=FlowContext.from_batch(_batch()),
+        context=GraphContext.from_batch(_batch()),
         features=_features(hidden_dim=3),
         state=_state(),
         frontier=Frontier(
             row_ids=torch.tensor([0, 1], dtype=torch.long),
             edge_ids=torch.tensor([0, 1], dtype=torch.long),
-            edge_direction=torch.tensor([0, 1], dtype=torch.long),
         ),
     )
 
@@ -278,7 +244,6 @@ def _empty_frontier() -> Frontier:
     return Frontier(
         row_ids=torch.empty(0, dtype=torch.long),
         edge_ids=torch.empty(0, dtype=torch.long),
-        edge_direction=torch.empty(0, dtype=torch.long),
     )
 
 

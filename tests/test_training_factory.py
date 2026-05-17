@@ -44,6 +44,7 @@ def test_build_model_instantiates_probability_db_graph() -> None:
     assert model.policy.edge_scorer.edge_logit_shift is None
     assert not model.feature_encoder.edge_encoder.role_logits.requires_grad
     assert hasattr(model.policy, "stop_head")
+    assert not hasattr(model.policy, "value_head")
     assert not hasattr(model.policy, "terminal_utility_estimator")
 
 
@@ -64,8 +65,8 @@ def test_instantiate_list_accepts_hydra_mapping_groups() -> None:
     early_stopping = next(callback for callback in callbacks if isinstance(callback, EarlyStopping))
     checkpoint = next(callback for callback in callbacks if isinstance(callback, ModelCheckpoint))
     assert early_stopping.patience == 20
-    assert early_stopping.monitor == "val/main/utility_at_8"
-    assert checkpoint.monitor == "val/main/utility_at_8"
+    assert early_stopping.monitor == "val/best_of_k_reachable_recall"
+    assert checkpoint.monitor == "val/best_of_k_reachable_recall"
 
 
 def test_trainer_logger_accepts_single_hydra_target_mapping() -> None:

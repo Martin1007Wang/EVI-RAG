@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from src.utils.nn_utils import init_xavier
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.state import State
 
 from .feature_encoder import FeatureBank
@@ -38,7 +38,7 @@ class TerminalUtilityEstimator(nn.Module):
     def forward(
         self,
         *,
-        context: FlowContext,
+        context: GraphContext,
         features: FeatureBank,
         state: State,
         state_encoding: StateEncoding,

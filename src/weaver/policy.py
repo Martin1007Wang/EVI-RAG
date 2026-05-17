@@ -8,7 +8,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from src.graph.segments import segment_log_softmax
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 
 from .nn.edge_flow_scorer import EdgeActionScorer
 from .nn.feature_encoder import FeatureBank
@@ -70,7 +70,7 @@ class Policy(nn.Module):
     def forward(
         self,
         *,
-        context: FlowContext,
+        context: GraphContext,
         state: State,
         features: FeatureBank,
         frontier_builder: FrontierBuilder,
@@ -124,7 +124,7 @@ class Policy(nn.Module):
         self,
         *,
         state_encoding: StateEncoding,
-        context: FlowContext,
+        context: GraphContext,
         features: FeatureBank,
         state: State,
         frontier: Frontier,
@@ -146,7 +146,6 @@ class Policy(nn.Module):
         query_h = frontier_encoding.query_h.to(device=device)
         rel_sem_h = frontier_encoding.rel_sem_h.to(device=device)
         query_sem_h = frontier_encoding.query_sem_h.to(device=device)
-        edge_direction = frontier_encoding.edge_direction.to(device=device, dtype=torch.long).view(-1)
 
         def score_chunk(
             row_chunk: torch.Tensor,
@@ -154,7 +153,6 @@ class Policy(nn.Module):
             query_chunk: torch.Tensor,
             rel_sem_chunk: torch.Tensor,
             query_sem_chunk: torch.Tensor,
-            direction_chunk: torch.Tensor,
         ) -> torch.Tensor:
             return self.edge_scorer.score_tensors(
                 state_h=state_encoding.state_h,
@@ -163,7 +161,6 @@ class Policy(nn.Module):
                 query_h=query_chunk,
                 rel_sem_h=rel_sem_chunk,
                 query_sem_h=query_sem_chunk,
-                edge_direction=direction_chunk,
             )
 
         use_checkpoint = torch.is_grad_enabled()
@@ -176,7 +173,6 @@ class Policy(nn.Module):
             query_chunk = query_h[start:stop]
             rel_sem_chunk = rel_sem_h[start:stop]
             query_sem_chunk = query_sem_h[start:stop]
-            direction_chunk = edge_direction[start:stop]
             if use_checkpoint:
                 part = checkpoint(
                     score_chunk,
@@ -185,7 +181,6 @@ class Policy(nn.Module):
                     query_chunk,
                     rel_sem_chunk,
                     query_sem_chunk,
-                    direction_chunk,
                     use_reentrant=False,
                 )
             else:
@@ -195,7 +190,6 @@ class Policy(nn.Module):
                     query_chunk,
                     rel_sem_chunk,
                     query_sem_chunk,
-                    direction_chunk,
                 )
             parts.append(part.view(-1))
         return torch.cat(parts, dim=0).view(num_frontier)

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from src.utils.nn_utils import init_xavier
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.state import State, derive_remaining_budget
 
 from .feature_encoder import FeatureBank
@@ -65,7 +65,7 @@ class StateEncoder(nn.Module):
         self,
         *,
         features: FeatureBank,
-        context: FlowContext,
+        context: GraphContext,
         state: State,
     ) -> StateEncoding:
         del context

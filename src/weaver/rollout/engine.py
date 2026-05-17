@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.nn.feature_encoder import FeatureBank
 from src.weaver.policy import Policy, PolicyOutput
 from src.weaver.state import FrontierBuilder, State
@@ -17,7 +17,7 @@ from .trace import RolloutTrace
 
 @dataclass(frozen=True, slots=True)
 class RolloutContext:
-    flow_context: FlowContext
+    graph_context: GraphContext
     features: FeatureBank
     frontier_builder: FrontierBuilder
 
@@ -30,7 +30,7 @@ class RolloutContext:
 
     @property
     def device(self) -> torch.device:
-        return self.flow_context.device
+        return self.graph_context.device
 
 
 class RolloutEngine:
@@ -49,10 +49,10 @@ class RolloutEngine:
     ) -> RolloutContext:
         features = _detach_feature_bank(features)
         device = features.edge_h.device
-        flow_context = FlowContext.from_batch(batch, device=device)
-        frontier_builder = FrontierBuilder.from_flow_context(flow_context)
+        graph_context = GraphContext.from_batch(batch, device=device)
+        frontier_builder = FrontierBuilder.from_graph_context(graph_context)
         return RolloutContext(
-            flow_context=flow_context,
+            graph_context=graph_context,
             features=features,
             frontier_builder=frontier_builder,
         )
@@ -84,11 +84,11 @@ class RolloutEngine:
         rollouts_per_graph: int,
         temperature: float,
     ) -> RolloutResult:
-        flow_context = context.flow_context
+        graph_context = context.graph_context
         device = context.device
 
-        state = State.initial_from_flow_context(
-            flow_context,
+        state = State.initial_from_graph_context(
+            graph_context,
             budget=self.expand_budget,
             rollouts_per_graph=rollouts_per_graph,
         )
@@ -108,7 +108,7 @@ class RolloutEngine:
 
             active_state = state.select_rows(active_rows)
             policy_out = policy(
-                context=flow_context,
+                context=graph_context,
                 state=active_state,
                 features=context.features,
                 frontier_builder=context.frontier_builder,
@@ -132,7 +132,7 @@ class RolloutEngine:
                 state=state,
                 active_rows=active_rows,
                 action=action,
-                flow_context=flow_context,
+                graph_context=graph_context,
                 trace=trace,
             )
 
@@ -170,7 +170,7 @@ class RolloutEngine:
         state: State,
         active_rows: torch.Tensor,
         action: SampledAction,
-        flow_context: FlowContext,
+        graph_context: GraphContext,
         trace: RolloutTrace,
     ) -> None:
         if action.expand_rows.numel() == 0:
@@ -182,7 +182,7 @@ class RolloutEngine:
             edge_ids=action.expand_edge_ids,
         )
         state.apply_edges_(
-            edge_index=flow_context.edge_index,
+            edge_index=graph_context.edge_index,
             rows=rows,
             edge_ids=action.expand_edge_ids,
         )

@@ -63,7 +63,7 @@ class EdgeActionScorer(nn.Module):
             )
 
         self.residual_head = nn.Sequential(
-            nn.Linear(self.hidden_dim * 3 + 3, adapter_hidden_dim),
+            nn.Linear(self.hidden_dim * 3, adapter_hidden_dim),
             nn.SiLU(),
             nn.Linear(adapter_hidden_dim, 1),
         )
@@ -89,7 +89,6 @@ class EdgeActionScorer(nn.Module):
             query_h=frontier.query_h,
             rel_sem_h=frontier.rel_sem_h,
             query_sem_h=frontier.query_sem_h,
-            edge_direction=frontier.edge_direction,
         )
 
     def semantic_prior(self, frontier: FrontierEncoding) -> torch.Tensor:
@@ -104,7 +103,6 @@ class EdgeActionScorer(nn.Module):
         query_h: torch.Tensor,
         rel_sem_h: torch.Tensor,
         query_sem_h: torch.Tensor,
-        edge_direction: torch.Tensor,
     ) -> torch.Tensor:
         if edge_h.numel() == 0:
             return edge_h.new_empty((0,))
@@ -112,7 +110,6 @@ class EdgeActionScorer(nn.Module):
         device = edge_h.device
         dtype = edge_h.dtype
         row_ids = row_ids.to(device=device, dtype=torch.long).view(-1)
-        edge_direction = edge_direction.to(device=device, dtype=torch.long).view(-1)
         num_frontier = row_ids.numel()
 
         if edge_h.shape[0] != num_frontier:
@@ -127,8 +124,6 @@ class EdgeActionScorer(nn.Module):
             )
         if rel_sem_h.shape[0] != num_frontier or query_sem_h.shape[0] != num_frontier:
             raise ValueError("semantic tensors must have one row per frontier action.")
-        if edge_direction.numel() != num_frontier:
-            raise ValueError("edge_direction must have one value per frontier action.")
         if edge_h.shape[-1] != self.hidden_dim:
             raise ValueError(f"edge_h last dim must be {self.hidden_dim}, got {edge_h.shape[-1]}.")
         if query_h.shape[-1] != self.hidden_dim:
@@ -152,7 +147,6 @@ class EdgeActionScorer(nn.Module):
             state_h=state_edge_h,
             query_h=query_h,
             edge_h=edge_h,
-            edge_direction=edge_direction,
         )
         edge_log_energy = semantic + residual
 
@@ -170,19 +164,13 @@ class EdgeActionScorer(nn.Module):
         state_h: torch.Tensor,
         query_h: torch.Tensor,
         edge_h: torch.Tensor,
-        edge_direction: torch.Tensor,
     ) -> torch.Tensor:
-        direction = torch.nn.functional.one_hot(
-            edge_direction.clamp(min=0, max=2),
-            num_classes=3,
-        ).to(device=edge_h.device, dtype=edge_h.dtype)
         residual = self.residual_head(
             torch.cat(
                 [
                     query_h,
                     state_h,
                     edge_h,
-                    direction,
                 ],
                 dim=-1,
             )

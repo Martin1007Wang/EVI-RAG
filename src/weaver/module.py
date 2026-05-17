@@ -49,9 +49,7 @@ class WeaverModule(LightningModule):
         self.optimization = optimization
         self.evaluation = evaluation
         self.metric_suite = WeaverMetricSuite(
-            best_of_k_values=evaluation.best_of_k_values,
-            utility_k=evaluation.utility_k,
-            utility_lambda=evaluation.utility_lambda,
+            best_of_k=evaluation.best_of_k,
             exclude_anchors_from_retrieved=evaluation.exclude_anchors_from_retrieved,
             use_reachable_targets=evaluation.use_reachable_targets,
         )
@@ -172,7 +170,7 @@ class WeaverModule(LightningModule):
 
         mean_loss = weighted_loss_sum / float(total_weight)
         self.log(
-            "train/objective_epoch_loss",
+            "train/loss",
             mean_loss,
             on_step=False,
             on_epoch=True,
@@ -181,17 +179,8 @@ class WeaverModule(LightningModule):
             sync_dist=True,
         )
         self.log(
-            "train/chunks",
-            float(num_chunks),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=batch_size,
-            sync_dist=True,
-        )
-        self.log(
-            "train/transitions",
-            float(total_weight),
+            "train/signal/transitions_per_graph",
+            torch.tensor(float(total_weight) / float(batch_size), device=self.device),
             on_step=False,
             on_epoch=True,
             prog_bar=False,
@@ -440,7 +429,7 @@ class WeaverModule(LightningModule):
             zero = torch.zeros((), device=features.edge_h.device)
             return LossOutput(
                 loss=zero,
-                metrics={"transitions/num_transitions": zero.clone()},
+                metrics={},
                 num_states=0,
                 per_unit_loss=None,
             )
@@ -460,13 +449,13 @@ class WeaverModule(LightningModule):
         reward_context: RewardContext,
     ) -> LossOutput:
         parent_out = self.policy(
-            context=rollout_context.flow_context,
+            context=rollout_context.graph_context,
             state=transitions.parent_state,
             features=features,
             frontier_builder=rollout_context.frontier_builder,
         )
         child_out = self.policy(
-            context=rollout_context.flow_context,
+            context=rollout_context.graph_context,
             state=transitions.child_state,
             features=features,
             frontier_builder=rollout_context.frontier_builder,
@@ -499,21 +488,14 @@ class WeaverModule(LightningModule):
             child_stop_log_prob=child_out.stop_log_prob,
         )
         metrics = dict(output.metrics)
+        before_hit_rate = (~parent_reward.fail_penalty).float().mean().detach()
+        after_hit_rate = (~child_reward.fail_penalty).float().mean().detach()
         metrics.update(
             {
-                "transitions/num_transitions": torch.tensor(
-                    float(transitions.num_transitions),
-                    device=output.loss.device,
-                ),
-                "reward/parent_mean": parent_reward.log_reward.float().mean().detach(),
-                "reward/child_mean": child_reward.log_reward.float().mean().detach(),
-                "reward/parent_hit_rate": (~parent_reward.fail_penalty).float().mean().detach(),
-                "reward/child_hit_rate": (~child_reward.fail_penalty).float().mean().detach(),
-                "policy/parent_stop_log_prob_mean": parent_out.stop_log_prob.float().mean().detach(),
-                "policy/parent_continue_log_prob_mean": parent_out.continue_log_prob.float().mean().detach(),
-                "policy/child_stop_log_prob_mean": child_out.stop_log_prob.float().mean().detach(),
-                "policy/parent_edge_log_prob_mean": parent_edge_log_prob.float().mean().detach(),
-                "transition/log_backward_prob_mean": transitions.log_backward_prob.float().mean().detach(),
+                "reward/hit_rate_after_action": after_hit_rate,
+                "reward/hit_rate_delta": after_hit_rate - before_hit_rate,
+                "policy/stop_prob_before_action": parent_out.stop_log_prob.exp().float().mean().detach(),
+                "policy/selected_edge_prob": parent_edge_log_prob.exp().float().mean().detach(),
             }
         )
         return LossOutput(

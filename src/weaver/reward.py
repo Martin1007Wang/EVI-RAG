@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from src.data.schema import RetrievalBatch
-from src.weaver.context import RewardContext
+from src.weaver.context import GraphContext, RewardContext
 from src.weaver.state import State, derive_node_mask
 
 
@@ -109,9 +109,19 @@ class EvidenceLogReward(nn.Module):
             target_count = context.target_count_by_graph.index_select(0, row_to_graph)
             node_mask = derive_node_mask(
                 state=state,
-                edge_index=context.edge_index,
-                node_to_graph=context.node_to_graph,
-                anchor_mask=context.anchor_mask,
+                graph_context=GraphContext(
+                    edge_index=context.edge_index,
+                    node_to_graph=context.node_to_graph,
+                    edge_to_graph=context.node_to_graph.index_select(
+                        0,
+                        context.edge_index[0],
+                    ),
+                    anchor_mask=context.anchor_mask,
+                    num_nodes=int(context.node_to_graph.numel()),
+                    num_edges=int(context.edge_index.size(1)),
+                    num_graphs=int(context.target_count_by_graph.numel()),
+                    device=context.edge_index.device,
+                ),
             )
             active_targets = node_mask & context.target_mask.view(1, -1)
             hit_count = active_targets.sum(dim=1).to(dtype=torch.float32)

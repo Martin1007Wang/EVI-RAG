@@ -7,7 +7,7 @@ import torch
 
 from src.data.schema import RetrievalBatch
 from src.weaver.backward import UniformSubgraphBackwardKernel
-from src.weaver.context import FlowContext
+from src.weaver.context import GraphContext
 from src.weaver.rollout.engine import RolloutContext
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.state import FrontierBuilder, State
@@ -61,11 +61,11 @@ class ShortestPathReplaySource:
         if num_transitions <= 0:
             return None
         device = batch.edge_index.device if device is None else device
-        flow_context = FlowContext.from_batch(batch, device=device)
+        graph_context = GraphContext.from_batch(batch, device=device)
         rollout_context = RolloutContext(
-            flow_context=flow_context,
+            graph_context=graph_context,
             features=_empty_feature_bank(device=device),
-            frontier_builder=FrontierBuilder.from_flow_context(flow_context),
+            frontier_builder=FrontierBuilder.from_graph_context(graph_context),
         )
         batches = [
             transitions_from_rollouts(
@@ -105,7 +105,7 @@ def transitions_from_rollouts(
     device: torch.device,
 ) -> TransitionBatch | None:
     all_batches: list[TransitionBatch] = []
-    flow_context = FlowContext.from_batch(batch, device=device)
+    graph_context = GraphContext.from_batch(batch, device=device)
     for rollout in rollouts:
         graph_ids = rollout.source_graph_id.to(device=device, dtype=torch.long).view(-1)
         current = State.initial_from_graph_ids(
@@ -122,7 +122,7 @@ def transitions_from_rollouts(
             edge_ids = rollout.selected_edge_ids[:, step].to(device=device, dtype=torch.long).index_select(0, expand_rows)
             child = parent.clone()
             child.apply_edges_(
-                edge_index=flow_context.edge_index,
+                edge_index=graph_context.edge_index,
                 rows=torch.arange(parent.num_rollouts, device=device, dtype=torch.long),
                 edge_ids=edge_ids,
             )
@@ -141,7 +141,7 @@ def transitions_from_rollouts(
                 )
             )
             current.apply_edges_(
-                edge_index=flow_context.edge_index,
+                edge_index=graph_context.edge_index,
                 rows=expand_rows,
                 edge_ids=edge_ids,
             )
@@ -158,14 +158,14 @@ def oracle_prefix_transitions(
     backward_kernel: UniformSubgraphBackwardKernel,
     device: torch.device,
 ) -> TransitionBatch | None:
-    flow_context = FlowContext.from_batch(batch, device=device)
+    graph_context = GraphContext.from_batch(batch, device=device)
     batches: list[TransitionBatch] = []
     targets = batch.reachable_target_node_ids.to(device=device, dtype=torch.long).view(-1)
-    for graph_id in range(flow_context.num_graphs):
-        graph_targets = targets[flow_context.node_to_graph.index_select(0, targets).eq(graph_id)]
+    for graph_id in range(graph_context.num_graphs):
+        graph_targets = targets[graph_context.node_to_graph.index_select(0, targets).eq(graph_id)]
         for target in graph_targets.tolist():
             path = _incident_shortest_edge_path(
-                flow_context=flow_context,
+                graph_context=graph_context,
                 graph_id=graph_id,
                 target=int(target),
                 budget=int(budget),
@@ -183,7 +183,7 @@ def oracle_prefix_transitions(
                 child = current.clone()
                 edge_tensor = torch.tensor([edge_id], dtype=torch.long, device=device)
                 child.apply_edges_(
-                    edge_index=flow_context.edge_index,
+                    edge_index=graph_context.edge_index,
                     rows=torch.zeros(1, dtype=torch.long, device=device),
                     edge_ids=edge_tensor,
                 )
@@ -227,12 +227,12 @@ def dedupe_transitions(batch: TransitionBatch) -> TransitionBatch:
 
 def _incident_shortest_edge_path(
     *,
-    flow_context: FlowContext,
+    graph_context: GraphContext,
     graph_id: int,
     target: int,
     budget: int,
 ) -> list[int]:
-    anchors = (flow_context.anchor_mask & flow_context.node_to_graph.eq(graph_id)).nonzero(as_tuple=False).view(-1)
+    anchors = (graph_context.anchor_mask & graph_context.node_to_graph.eq(graph_id)).nonzero(as_tuple=False).view(-1)
     if anchors.numel() == 0:
         return []
     if bool(torch.any(anchors.eq(int(target)))):
@@ -242,9 +242,9 @@ def _incident_shortest_edge_path(
     parent_node: dict[int, int] = {}
     parent_edge: dict[int, int] = {}
     seen = set(frontier)
-    src_all = flow_context.edge_index[0]
-    dst_all = flow_context.edge_index[1]
-    edge_graph = flow_context.node_to_graph.index_select(0, src_all)
+    src_all = graph_context.edge_index[0]
+    dst_all = graph_context.edge_index[1]
+    edge_graph = graph_context.edge_to_graph
 
     for _ in range(int(budget)):
         next_frontier: list[int] = []
