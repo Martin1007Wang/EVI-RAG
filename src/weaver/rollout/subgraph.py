@@ -94,19 +94,19 @@ class SubgraphReconstructor:
                 f"{batch_size} != {num_graphs}."
             )
 
-        trajectory_length = result.traj_len.to(
+        stop_step = result.stop_step.to(
             device=self.device,
             dtype=torch.long,
         ).view(-1)
 
-        if trajectory_length.shape != (num_graphs,):
+        if stop_step.shape != (num_graphs,):
             raise ValueError(
-                f"trajectory_length must have shape [{num_graphs}], "
-                f"got {tuple(trajectory_length.shape)}."
+                f"stop_step must have shape [{num_graphs}], "
+                f"got {tuple(stop_step.shape)}."
             )
 
         step_ids = torch.arange(horizon, device=self.device).unsqueeze(0)
-        valid_steps = step_ids < trajectory_length.unsqueeze(1)
+        valid_steps = step_ids <= stop_step.unsqueeze(1)
         valid_expands = valid_steps & continue_mask & selected_edge_ids.ge(0)
 
         if not bool(valid_expands.any()):

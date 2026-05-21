@@ -43,7 +43,7 @@ def compute_node_retrieval_matrix(
         recall    = hit target nodes / gold target nodes
         f1        = harmonic mean of precision and recall
 
-    retrieved nodes are terminal active nodes reconstructed from rollout traces.
+    retrieved nodes are terminal active nodes reconstructed from rollout trajectories.
     target nodes are controlled by use_reachable_targets.
     """
 

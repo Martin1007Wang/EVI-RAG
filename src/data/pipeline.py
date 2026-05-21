@@ -41,8 +41,8 @@ _LEGACY_ROOT_PREPROCESS_KEYS = frozenset(
 _STALE_MATERIALIZED_PATH_KEYS = frozenset(
     {
         "lmdb_dir",
-        "entity_text_embeddings",
-        "relation_embeddings",
+        "entity_text_semantic_table",
+        "relation_semantic_table",
         "entity_metadata_path",
         "entity_catalog_path",
         "relation_catalog_path",
@@ -122,10 +122,7 @@ def _resolve_optional_path(value: Any, *, name: str) -> Path | None:
 def _resolve_required_string(value: Any, *, name: str) -> str:
     resolved = str(value or "").strip()
     if not resolved:
-        raise ValueError(
-            f"{name} must be non-empty. Default null revisions must be "
-            "overridden by CLI or experiment config before preprocessing."
-        )
+        raise ValueError(f"{name} must be non-empty. Default null revisions must be " "overridden by CLI or experiment config before preprocessing.")
     return resolved
 
 
@@ -175,23 +172,15 @@ def _resolve_source_splits(dataset_cfg: Mapping[str, Any]) -> dict[str, str]:
     if not isinstance(splits_cfg, Mapping):
         raise TypeError("dataset.splits must be a mapping if provided")
 
-    split_items = (
-        splits_cfg.items()
-        if splits_cfg
-        else ((split, split) for split in LOGICAL_SPLITS)
-    )
+    split_items = splits_cfg.items() if splits_cfg else ((split, split) for split in LOGICAL_SPLITS)
     source_splits: dict[str, str] = {}
     for logical_split, configured_source_split in split_items:
         logical = str(logical_split).strip()
         if not logical:
-            raise ValueError(
-                "dataset.splits keys must be non-empty logical split names"
-            )
+            raise ValueError("dataset.splits keys must be non-empty logical split names")
         source_split = str(configured_source_split).strip()
         if not source_split:
-            raise ValueError(
-                f"dataset.splits.{logical} must be a non-empty source split name"
-            )
+            raise ValueError(f"dataset.splits.{logical} must be a non-empty source split name")
         source_splits[logical] = source_split
     if not source_splits:
         raise ValueError("dataset.splits must contain at least one split")
@@ -265,14 +254,10 @@ def _resolve_source_options(
 ) -> dict[str, Any]:
     if dataset_source != "stark":
         return {}
-    stark_options = dict(
-        _as_mapping(dataset_cfg.get("stark", {}), name="dataset.stark")
-    )
+    stark_options = dict(_as_mapping(dataset_cfg.get("stark", {}), name="dataset.stark"))
     if stark_options.get("root") in (None, ""):
         if paths.raw_dir is None:
-            raise ValueError(
-                "dataset_source=stark requires dataset.paths.raw_dir or dataset.stark.root."
-            )
+            raise ValueError("dataset_source=stark requires dataset.paths.raw_dir or dataset.stark.root.")
         stark_options["root"] = str(paths.raw_dir)
     return {"stark": stark_options}
 
@@ -337,9 +322,7 @@ def build_preprocess_config(raw_cfg: DictConfig) -> PreprocessConfig:
         ),
         entity_text_policy=_resolve_entity_text_policy(dataset_cfg),
         source_splits=source_splits,
-        column_map={
-            str(k): str(v) for k, v in dataset_cfg.get("column_map", {}).items()
-        },
+        column_map={str(k): str(v) for k, v in dataset_cfg.get("column_map", {}).items()},
         source_options=_resolve_source_options(
             dataset_source=dataset_source,
             dataset_cfg=dataset_cfg,
@@ -349,9 +332,7 @@ def build_preprocess_config(raw_cfg: DictConfig) -> PreprocessConfig:
         split_filters=split_filters,
         dedup_edges=bool(preprocess_cfg.get("dedup_edges", True)),
         remove_self_loops=bool(preprocess_cfg.get("remove_self_loops", True)),
-        validate_graph_alignment=bool(
-            preprocess_cfg.get("validate_graph_alignment", False)
-        ),
+        validate_graph_alignment=bool(preprocess_cfg.get("validate_graph_alignment", False)),
         overwrite_lmdb=bool(preprocess_cfg.get("overwrite_lmdb", False)),
         map_size_gb=float(preprocess_cfg.get("map_size_gb", 128)),
         progress_bar=bool(preprocess_cfg.get("progress_bar", True)),
@@ -367,9 +348,7 @@ def build_preprocess_config(raw_cfg: DictConfig) -> PreprocessConfig:
                 name="preprocess.encoder.revision",
             ),
             tokenizer_name=_resolve_optional_string(encoder_cfg.get("tokenizer_name")),
-            tokenizer_revision=_resolve_optional_string(
-                encoder_cfg.get("tokenizer_revision")
-            ),
+            tokenizer_revision=_resolve_optional_string(encoder_cfg.get("tokenizer_revision")),
             max_length=_resolve_optional_positive_int(
                 encoder_cfg.get("max_length"),
                 name="preprocess.encoder.max_length",
@@ -392,15 +371,10 @@ def build_preprocess_config(raw_cfg: DictConfig) -> PreprocessConfig:
 
 def _reject_legacy_root_preprocess_keys(raw_cfg: Mapping[str, Any]) -> None:
     if "preprocess" in raw_cfg and raw_cfg.get("preprocess") is not None:
-        legacy_keys = sorted(
-            key for key in _LEGACY_ROOT_PREPROCESS_KEYS if key in raw_cfg
-        )
+        legacy_keys = sorted(key for key in _LEGACY_ROOT_PREPROCESS_KEYS if key in raw_cfg)
         if legacy_keys:
             formatted = ", ".join(legacy_keys)
-            raise KeyError(
-                "Preprocess options must live under cfg.preprocess; "
-                f"found legacy root key(s): {formatted}"
-            )
+            raise KeyError("Preprocess options must live under cfg.preprocess; " f"found legacy root key(s): {formatted}")
 
 
 def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
@@ -464,7 +438,7 @@ def run_preprocess(config: PreprocessConfig) -> PreprocessResult:
     )
 
     log.info("Stage 2/4: encode global text tables")
-    entity_text_embeddings = encode_text_table(
+    entity_text_semantic_table = encode_text_table(
         texts=entity_catalog.entity_text_labels,
         encoder_name=config.encoder.model_name,
         encoder_revision=config.encoder.revision,
@@ -480,7 +454,7 @@ def run_preprocess(config: PreprocessConfig) -> PreprocessResult:
         tokenizer_revision=config.encoder.tokenizer_revision,
         max_length=config.encoder.max_length,
     )
-    relation_embeddings = encode_text_table(
+    relation_semantic_table = encode_text_table(
         texts=relation_catalog.relation_text_labels,
         encoder_name=config.encoder.model_name,
         encoder_revision=config.encoder.revision,
@@ -496,16 +470,12 @@ def run_preprocess(config: PreprocessConfig) -> PreprocessResult:
         tokenizer_revision=config.encoder.tokenizer_revision,
         max_length=config.encoder.max_length,
     )
-    hidden_dim = int(entity_text_embeddings.size(1))
+    hidden_dim = int(entity_text_semantic_table.size(1))
     if hidden_dim <= 0:
         raise ValueError("encoder produced empty entity embedding dimension")
     log.info("Stage 2 complete")
 
-    split_plans = {
-        split: SplitPlan(num_samples=count)
-        for split, count in scan.split_counts.items()
-        if count > 0
-    }
+    split_plans = {split: SplitPlan(num_samples=count) for split, count in scan.split_counts.items() if count > 0}
     materialization_plan = MaterializationPlan(
         split_plans=split_plans,
         question_embedding_dim=hidden_dim,
@@ -516,8 +486,8 @@ def run_preprocess(config: PreprocessConfig) -> PreprocessResult:
         plan=materialization_plan,
         entity_catalog=entity_catalog,
         relation_catalog=relation_catalog,
-        entity_text_embeddings=entity_text_embeddings,
-        relation_embeddings=relation_embeddings,
+        entity_text_semantic_table=entity_text_semantic_table,
+        relation_semantic_table=relation_semantic_table,
         metadata_dir=config.paths.metadata_dir,
         overwrite=config.overwrite_lmdb,
         map_size_gb=config.map_size_gb,
@@ -572,13 +542,8 @@ def run_preprocess(config: PreprocessConfig) -> PreprocessResult:
         )
     log.info("Stage 3 complete")
     log.info("Stage 4/4: verify stream counts")
-    if materializer.split_counts != {
-        split: plan.num_samples for split, plan in split_plans.items()
-    }:
-        raise RuntimeError(
-            "materialized split counts mismatch: "
-            f"got {materializer.split_counts}, expected={split_plans}"
-        )
+    if materializer.split_counts != {split: plan.num_samples for split, plan in split_plans.items()}:
+        raise RuntimeError("materialized split counts mismatch: " f"got {materializer.split_counts}, expected={split_plans}")
     log.info("Preprocess finished for dataset=%s", config.dataset_name)
     return PreprocessResult(
         dataset_name=config.dataset_name,
@@ -764,9 +729,7 @@ def _question_chunk_key(chunk: list[Any]) -> str:
         }
         for sample in chunk
     ]
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _build_preprocess_provenance(
@@ -811,9 +774,7 @@ def _build_preprocess_provenance(
             "split_filters": {
                 str(split): {
                     "require_answer_in_graph": bool(filter_cfg.require_answer_in_graph),
-                    "require_reachable_answer": bool(
-                        filter_cfg.require_reachable_answer
-                    ),
+                    "require_reachable_answer": bool(filter_cfg.require_reachable_answer),
                 }
                 for split, filter_cfg in split_filters.items()
             },

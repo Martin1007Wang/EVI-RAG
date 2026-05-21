@@ -7,6 +7,8 @@ from src.data.dataset import _build_retrieval_data
 from src.data.preprocess.materialize import storage_record_from_sample
 from src.data.preprocess.samples import PreparedSample
 from src.data.schema.fields import SampleFields
+from src.weaver.context import GraphContext
+from src.weaver.rollout.replay import build_replay_target_views
 from src.weaver.state import State
 
 
@@ -125,6 +127,14 @@ def test_collate_stacks_questions_offsets_node_ids_and_attaches_edge_batch() -> 
         batch.reachable_target_node_ids,
         torch.tensor([2, 5], dtype=torch.long),
     )
+    assert torch.equal(
+        batch.reachable_target_node_ids_batch,
+        torch.tensor([0, 1], dtype=torch.long),
+    )
+    assert torch.equal(
+        batch.reachable_target_node_ids_ptr,
+        torch.tensor([0, 1, 2], dtype=torch.long),
+    )
 
 
 def test_state_initial_uses_core_graph_and_anchor_fields_only() -> None:
@@ -135,12 +145,15 @@ def test_state_initial_uses_core_graph_and_anchor_fields_only() -> None:
     del data.node_target_shortest_path_edge_count_flat
 
     batch = RetrievalCollator()([data])
-    state = State.initial(batch, budget=2)
+    state = State.initial(
+        graph=GraphContext.from_batch(batch),
+        graph_ids=torch.tensor([0], dtype=torch.long),
+    )
 
-    assert tuple(state.node_mask.shape) == (1, 3)
-    assert tuple(state.edge_mask.shape) == (1, 2)
-    assert torch.equal(state.node_mask, torch.tensor([[True, False, False]]))
-    assert torch.equal(state.edge_mask, torch.tensor([[False, False]]))
+    assert tuple(state.active_node_mask.shape) == (1, 3)
+    assert tuple(state.selected_edge_mask.shape) == (1, 2)
+    assert torch.equal(state.active_node_mask, torch.tensor([[True, False, False]]))
+    assert torch.equal(state.selected_edge_mask, torch.tensor([[False, False]]))
 
 
 def test_state_initial_maps_multiple_same_graph_anchors_to_all_rollout_rows() -> None:
@@ -148,7 +161,10 @@ def test_state_initial_maps_multiple_same_graph_anchors_to_all_rollout_rows() ->
     data.anchor_node_ids = torch.tensor([0, 1], dtype=torch.long)
     batch = RetrievalCollator()([data])
 
-    state = State.initial(batch, budget=2, rollouts_per_graph=3)
+    state = State.initial(
+        graph=GraphContext.from_batch(batch),
+        graph_ids=torch.zeros(3, dtype=torch.long),
+    )
 
     expected = torch.tensor(
         [
@@ -158,4 +174,57 @@ def test_state_initial_maps_multiple_same_graph_anchors_to_all_rollout_rows() ->
         ],
         dtype=torch.bool,
     )
-    assert torch.equal(state.node_mask, expected)
+    assert torch.equal(state.active_node_mask, expected)
+
+
+def test_replay_target_views_derive_edge_ranges_from_edge_batch() -> None:
+    batch = RetrievalCollator()([_data("sample-0", torch.tensor([0.0, 1.0], dtype=torch.float32))])
+    assert not hasattr(batch, "edge_ptr")
+
+    context = GraphContext.from_batch(batch)
+    targets = batch.reachable_target_node_ids.to(dtype=torch.long)
+    target_graph = context.node_to_graph.index_select(0, targets)
+
+    views = build_replay_target_views(
+        batch=batch,
+        context=context,
+        targets=targets,
+        target_graph=target_graph,
+    )
+
+    assert len(views) == 1
+    assert views[0].graph_id == 0
+    assert views[0].edge_start == 0
+    assert torch.equal(views[0].node_distances, torch.tensor([2, 1, 0], dtype=torch.long))
+    assert torch.equal(views[0].edge_counts, torch.tensor([1.0, 1.0], dtype=torch.float32))
+
+
+def test_replay_target_views_support_multi_graph_batches() -> None:
+    batch = RetrievalCollator()(
+        [
+            _data("sample-0", torch.tensor([0.0, 1.0], dtype=torch.float32)),
+            _data("sample-1", torch.tensor([2.0, 3.0], dtype=torch.float32)),
+        ]
+    )
+    context = GraphContext.from_batch(batch)
+    targets = batch.reachable_target_node_ids.to(dtype=torch.long)
+    target_graph = context.node_to_graph.index_select(0, targets)
+
+    views = build_replay_target_views(
+        batch=batch,
+        context=context,
+        targets=targets,
+        target_graph=target_graph,
+    )
+
+    assert len(views) == 2
+    assert [view.graph_id for view in views] == [0, 1]
+    assert [view.node_start for view in views] == [0, 3]
+    assert all(
+        torch.equal(view.node_distances, torch.tensor([2, 1, 0], dtype=torch.long))
+        for view in views
+    )
+    assert all(
+        torch.equal(view.edge_counts, torch.tensor([1.0, 1.0], dtype=torch.float32))
+        for view in views
+    )

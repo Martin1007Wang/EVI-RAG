@@ -8,6 +8,10 @@ import torch
 from .schema.batch import RetrievalBatch
 from .schema.fields import SampleFields
 
+_DEFAULT_FOLLOW_BATCH = (
+    SampleFields.REACHABLE_TARGET_NODE_IDS,
+)
+
 
 class RetrievalCollator:
     """
@@ -31,7 +35,7 @@ class RetrievalCollator:
         follow_batch: Sequence[str] = (),
         exclude_keys: Sequence[str] = (),
     ) -> None:
-        self.follow_batch = list(follow_batch)
+        self.follow_batch = _merge_follow_batch(follow_batch)
         self.exclude_keys = _exclude_question_embedding(exclude_keys)
 
     def __call__(self, samples: list[Any]) -> RetrievalBatch:
@@ -54,6 +58,14 @@ def _exclude_question_embedding(exclude_keys: Sequence[str]) -> list[str]:
     keys = list(exclude_keys)
     if SampleFields.QUESTION_EMB not in keys:
         keys.append(SampleFields.QUESTION_EMB)
+    return keys
+
+
+def _merge_follow_batch(follow_batch: Sequence[str]) -> list[str]:
+    keys = list(follow_batch)
+    for key in _DEFAULT_FOLLOW_BATCH:
+        if key not in keys:
+            keys.append(key)
     return keys
 
 

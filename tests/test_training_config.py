@@ -6,7 +6,10 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
-from src.data.artifacts import parse_materialization_manifest
+from src.data.artifacts import (
+    canonicalize_materialization_manifest_payload,
+    parse_materialization_manifest,
+)
 from src.data.split_index import SplitIndexWriter
 from src.data.tensor_table import write_table
 from src.training.config import build_training_data_config
@@ -32,16 +35,16 @@ def test_build_training_data_config_resolves_materialization_paths(tmp_path: Pat
     (lmdb_dir / "validation.lmdb").mkdir(parents=True)
     (lmdb_dir / "test.lmdb").mkdir(parents=True)
 
-    entity_text_embeddings = torch.nn.functional.normalize(
+    entity_text_semantic_table = torch.nn.functional.normalize(
         torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32),
         dim=1,
     )
-    relation_embeddings = torch.nn.functional.normalize(
+    relation_semantic_table = torch.nn.functional.normalize(
         torch.tensor([[1.0, 1.0]], dtype=torch.float32),
         dim=1,
     )
-    write_table(embeddings_dir / "entity_text_embeddings.f32", entity_text_embeddings)
-    write_table(embeddings_dir / "relation_embeddings.f32", relation_embeddings)
+    write_table(embeddings_dir / "entity_text_semantic_table.f32", entity_text_semantic_table)
+    write_table(embeddings_dir / "relation_semantic_table.f32", relation_semantic_table)
     write_table(
         embeddings_dir / "train.questions.f32",
         torch.tensor([[1.0, 0.0]], dtype=torch.float32),
@@ -57,7 +60,7 @@ def test_build_training_data_config_resolves_materialization_paths(tmp_path: Pat
 
     torch.save(
         {
-            "entity_embedding_map": torch.tensor([0, 1], dtype=torch.long),
+            "text_row_by_entity_id": torch.tensor([0, 1], dtype=torch.long),
             "entity_text_row_ids": torch.tensor([0, 1], dtype=torch.long),
         },
         materialization_metadata_dir / "entity_metadata.pt",
@@ -74,60 +77,61 @@ def test_build_training_data_config_resolves_materialization_paths(tmp_path: Pat
 
     manifest = {
         "generation_id": generation_id,
+        "materialization_dir": ".materializations/gen123",
         "catalogs": {
-            "entity_catalog": ".materializations/gen123/metadata/entity_catalog.pt",
-            "entity_metadata": ".materializations/gen123/metadata/entity_metadata.pt",
-            "relation_catalog": ".materializations/gen123/metadata/relation_catalog.pt",
+            "entity_catalog": "metadata/entity_catalog.pt",
+            "entity_metadata": "metadata/entity_metadata.pt",
+            "relation_catalog": "metadata/relation_catalog.pt",
         },
         "embeddings": {
-            "entity_embedding_map": ".materializations/gen123/embeddings/entity_embedding_map.pt",
-            "entity_text_embeddings": {
-                "path": ".materializations/gen123/embeddings/entity_text_embeddings.f32",
+            "text_row_by_entity_id": "embeddings/text_row_by_entity_id.pt",
+            "entity_text_semantic_table": {
+                "path": "embeddings/entity_text_semantic_table.f32",
                 "shape": [2, 2],
                 "dtype": "float32",
             },
-            "non_text_entity_mask": ".materializations/gen123/embeddings/non_text_entity_mask.pt",
-            "relation_embeddings": {
-                "path": ".materializations/gen123/embeddings/relation_embeddings.f32",
+            "non_text_entity_mask": "embeddings/non_text_entity_mask.pt",
+            "relation_semantic_table": {
+                "path": "embeddings/relation_semantic_table.f32",
                 "shape": [1, 2],
                 "dtype": "float32",
             },
-            "relation_text_labels": ".materializations/gen123/embeddings/relation_text_labels.pt",
+            "relation_text_labels": "embeddings/relation_text_labels.pt",
         },
         "splits": {
             "train": {
-                "lmdb_path": ".materializations/gen123/lmdb/train.lmdb",
-                "index_path": ".materializations/gen123/metadata/train.index.lmdb",
+                "lmdb_path": "lmdb/train.lmdb",
+                "index_path": "metadata/train.index.lmdb",
                 "num_samples": 1,
                 "question_embeddings": {
-                    "path": ".materializations/gen123/embeddings/train.questions.f32",
+                    "path": "embeddings/train.questions.f32",
                     "shape": [1, 2],
                     "dtype": "float32",
                 },
             },
             "validation": {
-                "lmdb_path": ".materializations/gen123/lmdb/validation.lmdb",
-                "index_path": ".materializations/gen123/metadata/validation.index.lmdb",
+                "lmdb_path": "lmdb/validation.lmdb",
+                "index_path": "metadata/validation.index.lmdb",
                 "num_samples": 1,
                 "question_embeddings": {
-                    "path": ".materializations/gen123/embeddings/validation.questions.f32",
+                    "path": "embeddings/validation.questions.f32",
                     "shape": [1, 2],
                     "dtype": "float32",
                 },
             },
             "test": {
-                "lmdb_path": ".materializations/gen123/lmdb/test.lmdb",
-                "index_path": ".materializations/gen123/metadata/test.index.lmdb",
+                "lmdb_path": "lmdb/test.lmdb",
+                "index_path": "metadata/test.index.lmdb",
                 "num_samples": 1,
                 "question_embeddings": {
-                    "path": ".materializations/gen123/embeddings/test.questions.f32",
+                    "path": "embeddings/test.questions.f32",
                     "shape": [1, 2],
                     "dtype": "float32",
                 },
             },
         },
     }
-    torch.save(torch.tensor([0, 1], dtype=torch.long), embeddings_dir / "entity_embedding_map.pt")
+    torch.save(torch.tensor([0, 1], dtype=torch.long), embeddings_dir / "text_row_by_entity_id.pt")
     torch.save(torch.tensor([False, False], dtype=torch.bool), embeddings_dir / "non_text_entity_mask.pt")
     torch.save(["r"], embeddings_dir / "relation_text_labels.pt")
 
@@ -186,15 +190,15 @@ def test_parse_materialization_manifest_normalizes_legacy_relative_paths(tmp_pat
             "relation_catalog": ".materializations/abc/metadata/relation_catalog.pt",
         },
         "embeddings": {
-            "entity_embedding_map": ".materializations/abc/embeddings/entity_embedding_map.pt",
-            "entity_text_embeddings": {
-                "path": ".materializations/abc/embeddings/entity_text_embeddings.f32",
+            "text_row_by_entity_id": ".materializations/abc/embeddings/text_row_by_entity_id.pt",
+            "entity_text_semantic_table": {
+                "path": ".materializations/abc/embeddings/entity_text_semantic_table.f32",
                 "shape": [2, 2],
                 "dtype": "float32",
             },
             "non_text_entity_mask": ".materializations/abc/embeddings/non_text_entity_mask.pt",
-            "relation_embeddings": {
-                "path": ".materializations/abc/embeddings/relation_embeddings.f32",
+            "relation_semantic_table": {
+                "path": ".materializations/abc/embeddings/relation_semantic_table.f32",
                 "shape": [1, 2],
                 "dtype": "float32",
             },
@@ -219,8 +223,107 @@ def test_parse_materialization_manifest_normalizes_legacy_relative_paths(tmp_pat
 
     assert manifest.materialization_dir == metadata_dir / ".materializations" / "abc"
     assert manifest.catalogs.entity_metadata == Path("metadata/entity_metadata.pt")
-    assert manifest.embeddings.entity_text_embeddings.path == Path(
-        "embeddings/entity_text_embeddings.f32"
-    )
+    assert manifest.embeddings.entity_text_semantic_table.path == Path("embeddings/entity_text_semantic_table.f32")
     assert resolved.entity_metadata == metadata_dir / ".materializations" / "abc" / "metadata" / "entity_metadata.pt"
     assert resolved.require_split("train").lmdb == metadata_dir / ".materializations" / "abc" / "lmdb" / "train.lmdb"
+
+
+def test_parse_materialization_manifest_accepts_legacy_embedding_keys(tmp_path: Path) -> None:
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir()
+    manifest_path = metadata_dir / "materialization_manifest.json"
+    payload = {
+        "generation_id": "legacy123",
+        "catalogs": {
+            "entity_catalog": ".materializations/legacy123/metadata/entity_catalog.pt",
+            "entity_metadata": ".materializations/legacy123/metadata/entity_metadata.pt",
+            "relation_catalog": ".materializations/legacy123/metadata/relation_catalog.pt",
+        },
+        "embeddings": {
+            "entity_embedding_map": ".materializations/legacy123/embeddings/entity_embedding_map.pt",
+            "entity_text_embeddings": {
+                "path": ".materializations/legacy123/embeddings/entity_text_embeddings.f32",
+                "shape": [2, 2],
+                "dtype": "float32",
+            },
+            "non_text_entity_mask": ".materializations/legacy123/embeddings/non_text_entity_mask.pt",
+            "relation_embeddings": {
+                "path": ".materializations/legacy123/embeddings/relation_embeddings.f32",
+                "shape": [1, 2],
+                "dtype": "float32",
+            },
+            "relation_text_labels": ".materializations/legacy123/embeddings/relation_text_labels.pt",
+        },
+        "splits": {
+            "train": {
+                "lmdb_path": ".materializations/legacy123/lmdb/train.lmdb",
+                "index_path": ".materializations/legacy123/metadata/train.index.lmdb",
+                "num_samples": 1,
+                "question_embeddings": {
+                    "path": ".materializations/legacy123/embeddings/train.questions.f32",
+                    "shape": [1, 2],
+                    "dtype": "float32",
+                },
+            }
+        },
+    }
+
+    manifest = parse_materialization_manifest(payload, manifest_path=manifest_path)
+    resolved = manifest.resolve()
+
+    assert manifest.embeddings.text_row_by_entity_id == Path("embeddings/entity_embedding_map.pt")
+    assert manifest.embeddings.entity_text_semantic_table.path == Path("embeddings/entity_text_embeddings.f32")
+    assert manifest.embeddings.relation_semantic_table.path == Path("embeddings/relation_embeddings.f32")
+    assert resolved.text_row_by_entity_id == metadata_dir / ".materializations" / "legacy123" / "embeddings" / "entity_embedding_map.pt"
+
+
+def test_canonicalize_materialization_manifest_payload_renames_legacy_keys(tmp_path: Path) -> None:
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir()
+    manifest_path = metadata_dir / "materialization_manifest.json"
+    payload = {
+        "generation_id": "legacy123",
+        "catalogs": {
+            "entity_catalog": ".materializations/legacy123/metadata/entity_catalog.pt",
+            "entity_metadata": ".materializations/legacy123/metadata/entity_metadata.pt",
+            "relation_catalog": ".materializations/legacy123/metadata/relation_catalog.pt",
+        },
+        "embeddings": {
+            "entity_embedding_map": ".materializations/legacy123/embeddings/entity_embedding_map.pt",
+            "entity_text_embeddings": {
+                "path": ".materializations/legacy123/embeddings/entity_text_embeddings.f32",
+                "shape": [2, 2],
+                "dtype": "float32",
+            },
+            "non_text_entity_mask": ".materializations/legacy123/embeddings/non_text_entity_mask.pt",
+            "relation_embeddings": {
+                "path": ".materializations/legacy123/embeddings/relation_embeddings.f32",
+                "shape": [1, 2],
+                "dtype": "float32",
+            },
+            "relation_text_labels": ".materializations/legacy123/embeddings/relation_text_labels.pt",
+        },
+        "splits": {
+            "train": {
+                "lmdb_path": ".materializations/legacy123/lmdb/train.lmdb",
+                "index_path": ".materializations/legacy123/metadata/train.index.lmdb",
+                "num_samples": 1,
+                "question_embeddings": {
+                    "path": ".materializations/legacy123/embeddings/train.questions.f32",
+                    "shape": [1, 2],
+                    "dtype": "float32",
+                },
+            }
+        },
+    }
+
+    canonical = canonicalize_materialization_manifest_payload(
+        payload,
+        manifest_path=manifest_path,
+    )
+
+    assert canonical["materialization_dir"] == ".materializations/legacy123"
+    assert canonical["embeddings"]["text_row_by_entity_id"] == "embeddings/text_row_by_entity_id.pt"
+    assert canonical["embeddings"]["entity_text_semantic_table"]["path"] == "embeddings/entity_text_semantic_table.f32"
+    assert canonical["embeddings"]["relation_semantic_table"]["path"] == "embeddings/relation_semantic_table.f32"
+    assert canonical["splits"]["train"]["lmdb_path"] == "lmdb/train.lmdb"

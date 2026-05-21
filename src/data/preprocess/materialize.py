@@ -63,8 +63,8 @@ class StreamingMaterializer:
         plan: MaterializationPlan,
         entity_catalog: EntityCatalog,
         relation_catalog: RelationCatalog,
-        entity_text_embeddings: torch.Tensor,
-        relation_embeddings: torch.Tensor,
+        entity_text_semantic_table: torch.Tensor,
+        relation_semantic_table: torch.Tensor,
         metadata_dir: Path,
         overwrite: bool = True,
         map_size_gb: float = 128,
@@ -75,16 +75,16 @@ class StreamingMaterializer:
             plan=plan,
             entity_catalog=entity_catalog,
             relation_catalog=relation_catalog,
-            entity_text_embeddings=entity_text_embeddings,
-            relation_embeddings=relation_embeddings,
+            entity_text_semantic_table=entity_text_semantic_table,
+            relation_semantic_table=relation_semantic_table,
             commit_frequency=commit_frequency,
         )
 
         self.plan = plan
         self.entity_catalog = entity_catalog
         self.relation_catalog = relation_catalog
-        self.entity_text_embeddings = entity_text_embeddings
-        self.relation_embeddings = relation_embeddings
+        self.entity_text_semantic_table = entity_text_semantic_table
+        self.relation_semantic_table = relation_semantic_table
 
         self.metadata_dir = Path(metadata_dir)
         self.entity_metadata_name = ENTITY_METADATA_NAME
@@ -250,20 +250,18 @@ class StreamingMaterializer:
         )
 
         self._entity_text_table = write_table(
-            self.tmp_embeddings_dir / "entity_text_embeddings.f32",
-            self.entity_text_embeddings,
+            self.tmp_embeddings_dir / "entity_text_semantic_table.f32",
+            self.entity_text_semantic_table,
         )
         self._relation_table = write_table(
-            self.tmp_embeddings_dir / "relation_embeddings.f32",
-            self.relation_embeddings,
+            self.tmp_embeddings_dir / "relation_semantic_table.f32",
+            self.relation_semantic_table,
         )
 
-        entity_embedding_map = entity_text_row_ids(
-            self.entity_catalog.entity_text_embedding_ids
-        )
+        text_row_by_entity_id = entity_text_row_ids(self.entity_catalog.entity_text_embedding_ids)
         torch.save(
-            entity_embedding_map,
-            self.tmp_embeddings_dir / "entity_embedding_map.pt",
+            text_row_by_entity_id,
+            self.tmp_embeddings_dir / "text_row_by_entity_id.pt",
         )
         torch.save(
             self.entity_catalog.non_text_entity_mask.bool().contiguous(),
@@ -363,8 +361,8 @@ def _validate_inputs(
     plan: MaterializationPlan,
     entity_catalog: EntityCatalog,
     relation_catalog: RelationCatalog,
-    entity_text_embeddings: torch.Tensor,
-    relation_embeddings: torch.Tensor,
+    entity_text_semantic_table: torch.Tensor,
+    relation_semantic_table: torch.Tensor,
     commit_frequency: int,
 ) -> None:
     if not plan.split_plans:
@@ -378,24 +376,28 @@ def _validate_inputs(
         raise ValueError("materialization plan must contain at least one sample")
     if plan.question_embedding_dim <= 0:
         raise ValueError("question_embedding_dim must be positive")
-    if entity_text_embeddings.ndim != 2:
-        raise ValueError("entity_text_embeddings must be 2D")
-    if int(entity_text_embeddings.size(0)) != entity_catalog.num_text_entities:
+    if entity_text_semantic_table.ndim != 2:
+        raise ValueError("entity_text_semantic_table must be 2D")
+    if int(entity_text_semantic_table.size(0)) != entity_catalog.num_text_entities:
         raise ValueError(
-            "entity_text_embeddings size mismatch: " f"got {int(entity_text_embeddings.size(0))}, " f"expected {entity_catalog.num_text_entities}"
+            "entity_text_semantic_table size mismatch: " f"got {int(entity_text_semantic_table.size(0))}, " f"expected {entity_catalog.num_text_entities}"
         )
-    if relation_embeddings.ndim != 2:
-        raise ValueError("relation_embeddings must be 2D")
-    if int(relation_embeddings.size(0)) != len(relation_catalog.relation_labels):
+    if relation_semantic_table.ndim != 2:
+        raise ValueError("relation_semantic_table must be 2D")
+    if int(relation_semantic_table.size(0)) != len(relation_catalog.relation_labels):
         raise ValueError(
-            "relation_embeddings size mismatch: " f"got {int(relation_embeddings.size(0))}, " f"expected {len(relation_catalog.relation_labels)}"
+            "relation_semantic_table size mismatch: "
+            f"got {int(relation_semantic_table.size(0))}, "
+            f"expected {len(relation_catalog.relation_labels)}"
         )
-    if int(entity_text_embeddings.size(1)) != plan.question_embedding_dim:
+    if int(entity_text_semantic_table.size(1)) != plan.question_embedding_dim:
         raise ValueError(
-            "entity_text_embeddings dim mismatch: " f"got {int(entity_text_embeddings.size(1))}, " f"expected {plan.question_embedding_dim}"
+            "entity_text_semantic_table dim mismatch: " f"got {int(entity_text_semantic_table.size(1))}, " f"expected {plan.question_embedding_dim}"
         )
-    if int(relation_embeddings.size(1)) != plan.question_embedding_dim:
-        raise ValueError("relation_embeddings dim mismatch: " f"got {int(relation_embeddings.size(1))}, " f"expected {plan.question_embedding_dim}")
+    if int(relation_semantic_table.size(1)) != plan.question_embedding_dim:
+        raise ValueError(
+            "relation_semantic_table dim mismatch: " f"got {int(relation_semantic_table.size(1))}, " f"expected {plan.question_embedding_dim}"
+        )
     if commit_frequency <= 0:
         raise ValueError("commit_frequency must be positive")
 
@@ -433,11 +435,11 @@ def _save_catalog_artifacts(
     entity_catalog.save(entity_catalog_path)
     relation_catalog.save(relation_catalog_path)
 
-    entity_embedding_map = entity_text_row_ids(entity_catalog.entity_text_embedding_ids)
+    text_row_by_entity_id = entity_text_row_ids(entity_catalog.entity_text_embedding_ids)
     torch.save(
         {
-            "entity_text_row_ids": entity_embedding_map,
-            "entity_embedding_map": entity_embedding_map,
+            "entity_text_row_ids": text_row_by_entity_id,
+            "text_row_by_entity_id": text_row_by_entity_id,
             "non_text_entity_mask": (entity_catalog.non_text_entity_mask.bool().contiguous()),
         },
         entity_metadata_path,
@@ -454,7 +456,7 @@ def entity_text_row_ids(entity_text_embedding_ids: torch.Tensor) -> torch.Tensor
 
     Returned convention:
     - -1 means no text embedding.
-    - nonnegative values are 0-based rows in entity_text_embeddings.
+    - nonnegative values are 0-based rows in entity_text_semantic_table.
     """
     if entity_text_embedding_ids.ndim != 1:
         raise ValueError("entity_text_embedding_ids must be 1D, " f"got shape={tuple(entity_text_embedding_ids.shape)}.")
@@ -494,58 +496,62 @@ def _build_manifest(
     for split, split_plan in sorted(plan.split_plans.items()):
         question_table = question_tables[split]
         splits[split] = {
-            "lmdb_path": _relative_to_metadata(
+            "lmdb_path": _relative_to_root(
                 generation_dir / "lmdb" / f"{split}.lmdb",
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
-            "index_path": _relative_to_metadata(
+            "index_path": _relative_to_root(
                 generation_dir / "metadata" / f"{split}.index.lmdb",
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
             "num_samples": int(split_plan.num_samples),
             "question_embeddings": _tensor_manifest_entry(
                 question_table,
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
         }
 
     manifest: dict[str, Any] = {
         "generation_id": generation_id,
+        "materialization_dir": _relative_to_metadata(
+            generation_dir,
+            metadata_dir=metadata_dir,
+        ),
         "splits": splits,
         "catalogs": {
-            "entity_metadata": _relative_to_metadata(
+            "entity_metadata": _relative_to_root(
                 entity_metadata_path,
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
-            "entity_catalog": _relative_to_metadata(
+            "entity_catalog": _relative_to_root(
                 entity_catalog_path,
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
-            "relation_catalog": _relative_to_metadata(
+            "relation_catalog": _relative_to_root(
                 relation_catalog_path,
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
         },
         "embeddings": {
-            "entity_text_embeddings": _tensor_manifest_entry(
+            "entity_text_semantic_table": _tensor_manifest_entry(
                 entity_text_table,
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
-            "entity_embedding_map": _relative_to_metadata(
-                generation_dir / "embeddings" / "entity_embedding_map.pt",
-                metadata_dir=metadata_dir,
+            "text_row_by_entity_id": _relative_to_root(
+                generation_dir / "embeddings" / "text_row_by_entity_id.pt",
+                root_dir=generation_dir,
             ),
-            "non_text_entity_mask": _relative_to_metadata(
+            "non_text_entity_mask": _relative_to_root(
                 generation_dir / "embeddings" / "non_text_entity_mask.pt",
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
-            "relation_embeddings": _tensor_manifest_entry(
+            "relation_semantic_table": _tensor_manifest_entry(
                 relation_table,
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
-            "relation_text_labels": _relative_to_metadata(
+            "relation_text_labels": _relative_to_root(
                 generation_dir / "embeddings" / "relation_text_labels.pt",
-                metadata_dir=metadata_dir,
+                root_dir=generation_dir,
             ),
         },
     }
@@ -557,12 +563,16 @@ def _build_manifest(
 def _tensor_manifest_entry(
     table: TensorTable,
     *,
-    metadata_dir: Path,
+    root_dir: Path,
 ) -> dict[str, Any]:
     return manifest_entry(
-        path=_relative_to_metadata(table.path, metadata_dir=metadata_dir),
+        path=_relative_to_root(table.path, root_dir=root_dir),
         shape=table.shape,
     )
+
+
+def _relative_to_root(path: Path, *, root_dir: Path) -> str:
+    return path.relative_to(root_dir).as_posix()
 
 
 def _relative_to_metadata(path: Path, *, metadata_dir: Path) -> str:
@@ -607,22 +617,23 @@ def _verify_manifest_artifacts(
     manifest: Mapping[str, Any],
     metadata_dir: Path,
 ) -> None:
+    materialization_root = _manifest_root(metadata_dir=metadata_dir, manifest=manifest)
     paths: list[Path] = []
 
     for split_entry in manifest["splits"].values():
-        paths.append(_manifest_path(metadata_dir, split_entry["lmdb_path"]))
-        paths.append(_manifest_path(metadata_dir, split_entry["index_path"]))
+        paths.append(_manifest_path(materialization_root, split_entry["lmdb_path"]))
+        paths.append(_manifest_path(materialization_root, split_entry["index_path"]))
         question_entry = split_entry["question_embeddings"]
-        paths.append(_manifest_path(metadata_dir, question_entry["path"]))
+        paths.append(_manifest_path(materialization_root, question_entry["path"]))
 
     for entry in manifest["catalogs"].values():
-        paths.append(_manifest_path(metadata_dir, entry))
+        paths.append(_manifest_path(materialization_root, entry))
 
     for entry in manifest["embeddings"].values():
         if isinstance(entry, Mapping):
-            paths.append(_manifest_path(metadata_dir, entry["path"]))
+            paths.append(_manifest_path(materialization_root, entry["path"]))
         else:
-            paths.append(_manifest_path(metadata_dir, entry))
+            paths.append(_manifest_path(materialization_root, entry))
 
     missing = [path for path in paths if not path.exists()]
     if missing:
@@ -633,6 +644,13 @@ def _verify_manifest_artifacts(
 def _manifest_path(metadata_dir: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else metadata_dir / path
+
+
+def _manifest_root(*, metadata_dir: Path, manifest: Mapping[str, Any]) -> Path:
+    raw_dir = manifest.get("materialization_dir")
+    if not isinstance(raw_dir, str) or not raw_dir.strip():
+        raise ValueError("materialization manifest requires non-empty 'materialization_dir' before publish")
+    return _manifest_path(metadata_dir, raw_dir)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -664,9 +682,7 @@ def storage_record_from_sample(sample: PreparedSample) -> dict[str, torch.Tensor
         SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT: (sample.anchor_node_backward_distances_flat.long().contiguous()),
         SampleFields.NODE_TARGET_DISTANCE: sample.node_target_distance.long().contiguous(),
         SampleFields.NODE_TARGET_DISTANCES_FLAT: (sample.node_target_distances_flat.long().contiguous()),
-        SampleFields.NODE_TARGET_SHORTEST_PATH_COUNT_FLAT: (
-            sample.node_target_shortest_path_count_flat.float().contiguous()
-        ),
+        SampleFields.NODE_TARGET_SHORTEST_PATH_COUNT_FLAT: (sample.node_target_shortest_path_count_flat.float().contiguous()),
         SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES: (edge_count_indices.long().contiguous()),
         SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES: (edge_count_values.float().contiguous()),
     }
@@ -677,6 +693,7 @@ def _sparse_nonzero_counts(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     indices = dense.nonzero(as_tuple=False).view(-1).to(dtype=torch.long)
     values = dense.index_select(0, indices).to(dtype=torch.float32).contiguous()
     return indices.contiguous(), values
+
 
 def _index_map_size(plan: MaterializationPlan) -> int:
     total = sum(split.num_samples for split in plan.split_plans.values())

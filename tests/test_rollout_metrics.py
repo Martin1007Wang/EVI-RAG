@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 import torch
 
 from src.data.collate import RetrievalCollator
@@ -53,51 +52,45 @@ def _rollout_result(
     max_steps: int,
     stop_steps: dict[int, int] | None = None,
     forced_stop_steps: dict[int, int] | None = None,
+    policy_log_probs: dict[int, dict[int, float]] | None = None,
 ) -> RolloutResult:
     num_rows = len(source_graph_id)
     stop_steps = stop_steps or {}
     forced_stop_steps = forced_stop_steps or {}
+    policy_log_probs = policy_log_probs or {}
 
-    expand_mask = torch.zeros((num_rows, max_steps), dtype=torch.bool)
-    stop_mask = torch.zeros((num_rows, max_steps), dtype=torch.bool)
-    forced_stop_mask = torch.zeros((num_rows, max_steps), dtype=torch.bool)
-    valid_mask = torch.zeros((num_rows, max_steps), dtype=torch.bool)
     selected_edge_ids = torch.full((num_rows, max_steps), -1, dtype=torch.long)
-    traj_len = torch.zeros(num_rows, dtype=torch.long)
-    terminal_step = torch.full((num_rows,), -1, dtype=torch.long)
+    policy_action_log_prob = torch.zeros((num_rows, max_steps), dtype=torch.float32)
+    stop_step = torch.zeros(num_rows, dtype=torch.long)
+    forced_stop = torch.zeros(num_rows, dtype=torch.bool)
 
     for row in range(num_rows):
         last_step = -1
         for step, edge_id in expand_steps.get(row, {}).items():
-            expand_mask[row, step] = True
-            valid_mask[row, step] = True
             selected_edge_ids[row, step] = int(edge_id)
+            policy_action_log_prob[row, step] = float(policy_log_probs.get(row, {}).get(step, 0.0))
             last_step = max(last_step, int(step))
         if row in stop_steps:
             step = int(stop_steps[row])
-            stop_mask[row, step] = True
-            valid_mask[row, step] = True
+            policy_action_log_prob[row, step] = float(policy_log_probs.get(row, {}).get(step, 0.0))
             last_step = max(last_step, step)
-        if row in forced_stop_steps:
+            stop_step[row] = step
+        elif row in forced_stop_steps:
             step = int(forced_stop_steps[row])
-            stop_mask[row, step] = True
-            forced_stop_mask[row, step] = True
-            valid_mask[row, step] = True
+            policy_action_log_prob[row, step] = float(policy_log_probs.get(row, {}).get(step, 0.0))
             last_step = max(last_step, step)
-        traj_len[row] = last_step + 1 if last_step >= 0 else 0
-        terminal_step[row] = last_step
+            stop_step[row] = step
+            forced_stop[row] = True
+        else:
+            stop_step[row] = max(last_step, 0)
 
     return RolloutResult(
         source_graph_id=torch.tensor(source_graph_id, dtype=torch.long),
-        traj_len=traj_len,
-        terminal_step=terminal_step,
-        terminal_stop_log_prob=torch.zeros(num_rows, dtype=torch.float32),
-        valid_mask=valid_mask,
-        expand_mask=expand_mask,
-        stop_mask=stop_mask,
-        forced_stop_mask=forced_stop_mask,
-        action_type=torch.zeros((num_rows, max_steps), dtype=torch.long),
         selected_edge_ids=selected_edge_ids,
+        policy_action_log_prob=policy_action_log_prob,
+        behavior_action_log_prob=policy_action_log_prob.clone(),
+        stop_step=stop_step,
+        forced_stop=forced_stop,
         expand_budget=max_steps - 1,
     )
 
@@ -127,15 +120,20 @@ def test_evaluate_rollout_samples_emits_minimal_validation_dashboard() -> None:
         use_reachable_targets=True,
     )
 
-    assert metrics["sampling_recall_gain"] == (
-        metrics["best_of_k_reachable_recall"] - metrics["one_sample_reachable_recall"]
+    assert metrics["best_of_k_target_recall@1"] == metrics["oracle_best@1/target_recall"]
+    assert metrics["best_of_k_target_recall@2"] == metrics["oracle_best@2/target_recall"]
+    assert metrics["best_of_k_target_recall@2"] >= metrics["sample@1/target_recall"]
+    assert metrics["best@2/target_recall"] == metrics["oracle_best@2/target_recall"]
+    assert "best@2/effective_reward" in metrics
+    assert torch.isclose(
+        torch.tensor(metrics["reward/mean_log_reward_of_stopped"]),
+        torch.tensor(-0.1),
     )
-    assert metrics["best_of_k_reachable_recall"] >= metrics["one_sample_reachable_recall"]
-    assert "mean_selected_edges" in metrics
-    assert "budget_forced_stop_rate" in metrics
+    assert "mean_edges" in metrics
+    assert "expected_target_recall" in metrics
 
 
-def test_best_of_k_reachable_recall_uses_available_rollouts_when_k_is_larger() -> None:
+def test_best_of_k_target_recall_uses_available_rollouts_when_k_is_larger() -> None:
     batch = _batch()
     rollouts = (
         _rollout_result(
@@ -154,11 +152,45 @@ def test_best_of_k_reachable_recall_uses_available_rollouts_when_k_is_larger() -
         use_reachable_targets=True,
     )
 
-    assert metrics["best_of_k_reachable_recall"] == 0.0
-    assert metrics["sampling_recall_gain"] == 0.0
+    assert metrics["best_of_k_target_recall@1"] == 0.0
 
 
-def test_subgraph_reconstructor_matches_legacy_delegate() -> None:
+def test_oracle_model_and_union_best_of_k_have_distinct_semantics() -> None:
+    batch = _batch()
+    rollouts = (
+        _rollout_result(
+            source_graph_id=[0],
+            expand_steps={0: {0: 0}},
+            stop_steps={0: 1},
+            max_steps=3,
+            policy_log_probs={0: {0: 0.0, 1: 0.0}},
+        ),
+        _rollout_result(
+            source_graph_id=[0],
+            expand_steps={0: {0: 0, 1: 1}},
+            stop_steps={0: 2},
+            max_steps=3,
+            policy_log_probs={0: {0: -5.0, 1: -5.0, 2: -5.0}},
+        ),
+    )
+
+    metrics = evaluate_rollout_samples(
+        rollout_samples=rollouts,
+        batch=batch,
+        best_of_k=2,
+        exclude_anchors_from_retrieved=True,
+        use_reachable_targets=True,
+    )
+
+    assert metrics["sample@1/target_recall"] == 0.0
+    assert metrics["oracle_best@2/target_recall"] == 1.0
+    assert metrics["best@2/target_recall"] == 0.0
+    assert metrics["best@2/score_gap_to_oracle"] == 1.0
+    assert metrics["union@2/target_recall"] == 1.0
+    assert "model_best@2/target_recall" not in metrics
+
+
+def test_subgraph_reconstructor_matches_expected_masks() -> None:
     batch = _batch()
     rollout = _rollout_result(
         source_graph_id=[0],
@@ -169,17 +201,8 @@ def test_subgraph_reconstructor_matches_legacy_delegate() -> None:
     reconstructor = SubgraphReconstructor(batch, device=torch.device("cpu"))
 
     direct_nodes, direct_edges = reconstructor.reconstruct(rollout)
-    with pytest.warns(
-        DeprecationWarning,
-        match="terminal_subgraph_mask is deprecated",
-    ):
-        legacy_nodes, legacy_edges = rollout.terminal_subgraph_mask(
-            batch,
-            device=torch.device("cpu"),
-        )
-
-    assert torch.equal(direct_nodes, legacy_nodes)
-    assert torch.equal(direct_edges, legacy_edges)
+    assert direct_nodes.tolist() == [True, True, False, True]
+    assert direct_edges.tolist() == [True, True, False, False]
 
 
 def test_subgraph_reconstructor_stack_and_union() -> None:

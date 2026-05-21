@@ -12,40 +12,45 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 
 from src.training.factory import build_datamodule, build_model, instantiate_list, trainer_logger
-from src.weaver.module import WeaverModule
+from src.weaver.module import WeaverModule, stop_branch_gradient_metrics
 from src.weaver.nn.feature_encoder import FeatureEncoder
-from src.weaver.reward import EvidenceLogReward
+from src.weaver.policy import ForwardPolicy
+from src.weaver.rollout.replay import ReplayBuilder
+from src.weaver.utility import TrueTerminalReward
 
 
 def test_build_model_instantiates_probability_db_graph() -> None:
     cfg = OmegaConf.create({"model": OmegaConf.load("configs/model/weaver.yaml")})
     resources = SimpleNamespace(
-        entity_text_embeddings=torch.eye(4, 2, dtype=torch.float32),
-        entity_embedding_map=torch.arange(4, dtype=torch.long),
-        relation_embeddings=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        entity_text_semantic_table=torch.eye(4, 2, dtype=torch.float32),
+        text_row_by_entity_id=torch.arange(4, dtype=torch.long),
+        relation_semantic_table=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
     )
 
     model = build_model(cfg, resources)
 
     assert isinstance(model, WeaverModule)
-    assert isinstance(model.feature_encoder, FeatureEncoder)
-    assert isinstance(model.reward_model, EvidenceLogReward)
-    assert model.policy.max_budget == 3
-    assert model.policy.state_encoder.max_budget == 3
+    assert isinstance(model.policy_feature_encoder, FeatureEncoder)
+    assert isinstance(model.policy, ForwardPolicy)
+    assert isinstance(model.reward_model, TrueTerminalReward)
     assert torch.equal(
-        model.feature_encoder.entity_embedding.entity_embedding_map,
-        resources.entity_embedding_map,
+        model.policy_feature_encoder.text_row_by_entity_id,
+        resources.text_row_by_entity_id,
     )
-    assert model.runner.replay_schedule.enabled
-    assert model.runner.sample_budget(10).policy_rollout == 2
-    assert model.runner.sample_budget(10).replay_expand == 8
-    assert model.policy.edge_scorer.adapter_final_init_scale == 0.0
-    assert model.policy.edge_scorer.semantic_prior_scale == 10.0
-    assert model.policy.edge_scorer.edge_logit_shift is None
-    assert not model.feature_encoder.edge_encoder.role_logits.requires_grad
+    assert model.runner.replay_source is not None
+    assert isinstance(model.runner.replay_builder, ReplayBuilder)
+    assert model.runner.replay_schedule is not None
+    budget = model.runner.sample_budget(10)
+    assert budget.policy_rollout == 5
+    assert budget.replay_expand == 5
+    assert model.runner.eval_num_rollouts == 16
+    assert model.metric_suite.k_windows == (1, 2, 4, 8, 16)
+    assert model.train_temperature == 1.0
+    assert model.eval_temperature == 1.0
     assert hasattr(model.policy, "stop_head")
-    assert not hasattr(model.policy, "value_head")
-    assert not hasattr(model.policy, "terminal_utility_estimator")
+    assert hasattr(model.policy, "edge_head")
+    assert hasattr(model.policy, "action_logits")
+    assert hasattr(model.policy, "state_encoder")
 
 
 def compose_train_config(*overrides: str):
@@ -65,14 +70,42 @@ def test_instantiate_list_accepts_hydra_mapping_groups() -> None:
     early_stopping = next(callback for callback in callbacks if isinstance(callback, EarlyStopping))
     checkpoint = next(callback for callback in callbacks if isinstance(callback, ModelCheckpoint))
     assert early_stopping.patience == 20
-    assert early_stopping.monitor == "val/best_of_k_reachable_recall"
-    assert checkpoint.monitor == "val/best_of_k_reachable_recall"
+    assert early_stopping.monitor == "val/best@8/target_recall"
+    assert checkpoint.monitor == "val/best@8/target_recall"
 
 
 def test_trainer_logger_accepts_single_hydra_target_mapping() -> None:
     cfg = compose_train_config("experiment=train/webqsp", "trainer=cpu")
     logger = trainer_logger(cfg.logger)
     assert isinstance(logger, WandbLogger)
+
+
+def test_manual_optimization_keeps_gradient_clipping_out_of_trainer() -> None:
+    cfg = compose_train_config("experiment=train/webqsp", "trainer=cpu")
+
+    assert cfg.trainer.gradient_clip_val is None
+    assert cfg.model.gradient_clip_val == 1.0
+    assert cfg.model.gradient_clip_algorithm == "norm"
+
+
+def test_stop_branch_gradient_metrics_reports_conflict_cosine() -> None:
+    stop_head = torch.nn.Linear(2, 1, bias=False)
+    x = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    terminal_loss = stop_head(x).sum()
+    expansion_loss = -stop_head(x).sum()
+
+    metrics = stop_branch_gradient_metrics(
+        stop_head=stop_head,
+        terminal_loss=terminal_loss,
+        expansion_loss=expansion_loss,
+    )
+
+    assert metrics["grad/stop_head/from_terminal_loss"].gt(0)
+    assert metrics["grad/stop_head/from_expansion_loss"].gt(0)
+    assert torch.allclose(
+        metrics["grad/stop_head/terminal_expansion_cosine"],
+        torch.tensor(-1.0),
+    )
 
 
 @dataclass(frozen=True)

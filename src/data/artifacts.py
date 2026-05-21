@@ -8,8 +8,23 @@ from typing import Any
 
 from .tensor_table import TensorTable
 
-
 MANIFEST_NAME = "materialization_manifest.json"
+_LEGACY_EMBEDDING_KEY_ALIASES = {
+    "text_row_by_entity_id": ("text_row_by_entity_id", "entity_embedding_map"),
+    "entity_text_semantic_table": (
+        "entity_text_semantic_table",
+        "entity_text_embeddings",
+    ),
+    "relation_semantic_table": (
+        "relation_semantic_table",
+        "relation_embeddings",
+    ),
+}
+_LEGACY_ARTIFACT_FILENAMES = {
+    "entity_embedding_map.pt": "text_row_by_entity_id.pt",
+    "entity_text_embeddings.f32": "entity_text_semantic_table.f32",
+    "relation_embeddings.f32": "relation_semantic_table.f32",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +57,10 @@ class CatalogPaths:
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingPaths:
-    entity_embedding_map: Path
-    entity_text_embeddings: TensorTableSpec
+    text_row_by_entity_id: Path
+    entity_text_semantic_table: TensorTableSpec
     non_text_entity_mask: Path
-    relation_embeddings: TensorTableSpec
+    relation_semantic_table: TensorTableSpec
     relation_text_labels: Path
 
 
@@ -73,10 +88,10 @@ class ResolvedMaterialization:
     entity_catalog: Path
     entity_metadata: Path
     relation_catalog: Path
-    entity_embedding_map: Path
-    entity_text_embeddings: TensorTable
+    text_row_by_entity_id: Path
+    entity_text_semantic_table: TensorTable
     non_text_entity_mask: Path
-    relation_embeddings: TensorTable
+    relation_semantic_table: TensorTable
     relation_text_labels: Path
     splits: dict[str, SplitArtifacts]
 
@@ -85,8 +100,7 @@ class ResolvedMaterialization:
         if entry is None:
             available = ", ".join(sorted(self.splits)) or "<none>"
             raise FileNotFoundError(
-                f"Split {split!r} is not present in materialization manifest "
-                f"{self.manifest_path}. Available splits: {available}."
+                f"Split {split!r} is not present in materialization manifest " f"{self.manifest_path}. Available splits: {available}."
             )
         return entry
 
@@ -113,24 +127,21 @@ class MaterializationManifest:
             entity_catalog=_resolve_artifact_path(root=root, value=self.catalogs.entity_catalog),
             entity_metadata=_resolve_artifact_path(root=root, value=self.catalogs.entity_metadata),
             relation_catalog=_resolve_artifact_path(root=root, value=self.catalogs.relation_catalog),
-            entity_embedding_map=_resolve_artifact_path(
+            text_row_by_entity_id=_resolve_artifact_path(
                 root=root,
-                value=self.embeddings.entity_embedding_map,
+                value=self.embeddings.text_row_by_entity_id,
             ),
-            entity_text_embeddings=self.embeddings.entity_text_embeddings.resolve(root),
+            entity_text_semantic_table=self.embeddings.entity_text_semantic_table.resolve(root),
             non_text_entity_mask=_resolve_artifact_path(
                 root=root,
                 value=self.embeddings.non_text_entity_mask,
             ),
-            relation_embeddings=self.embeddings.relation_embeddings.resolve(root),
+            relation_semantic_table=self.embeddings.relation_semantic_table.resolve(root),
             relation_text_labels=_resolve_artifact_path(
                 root=root,
                 value=self.embeddings.relation_text_labels,
             ),
-            splits={
-                name: split.resolve(root)
-                for name, split in self.splits.items()
-            },
+            splits={name: split.resolve(root) for name, split in self.splits.items()},
         )
 
 
@@ -242,12 +253,20 @@ def parse_materialization_manifest(
             ),
         ),
         embeddings=EmbeddingPaths(
-            entity_embedding_map=_manifest_relative_path(
-                value=string(embeddings_payload, "entity_embedding_map", path),
+            text_row_by_entity_id=_manifest_relative_path(
+                value=string_alias(
+                    embeddings_payload,
+                    _LEGACY_EMBEDDING_KEY_ALIASES["text_row_by_entity_id"],
+                    path,
+                ),
                 legacy_prefix=legacy_prefix,
             ),
-            entity_text_embeddings=_tensor_table_spec(
-                entry=mapping(embeddings_payload, "entity_text_embeddings", path),
+            entity_text_semantic_table=_tensor_table_spec(
+                entry=mapping_alias(
+                    embeddings_payload,
+                    _LEGACY_EMBEDDING_KEY_ALIASES["entity_text_semantic_table"],
+                    path,
+                ),
                 path=path,
                 legacy_prefix=legacy_prefix,
             ),
@@ -255,8 +274,12 @@ def parse_materialization_manifest(
                 value=string(embeddings_payload, "non_text_entity_mask", path),
                 legacy_prefix=legacy_prefix,
             ),
-            relation_embeddings=_tensor_table_spec(
-                entry=mapping(embeddings_payload, "relation_embeddings", path),
+            relation_semantic_table=_tensor_table_spec(
+                entry=mapping_alias(
+                    embeddings_payload,
+                    _LEGACY_EMBEDDING_KEY_ALIASES["relation_semantic_table"],
+                    path,
+                ),
                 path=path,
                 legacy_prefix=legacy_prefix,
             ),
@@ -268,6 +291,75 @@ def parse_materialization_manifest(
         splits=splits,
         provenance=provenance,
     )
+
+
+def canonicalize_materialization_manifest_payload(
+    payload: Mapping[str, Any],
+    *,
+    manifest_path: str | Path,
+) -> dict[str, Any]:
+    manifest = parse_materialization_manifest(payload, manifest_path=manifest_path)
+    root = manifest.materialization_dir
+    canonical: dict[str, Any] = {
+        "generation_id": manifest.generation_id,
+        "materialization_dir": _path_for_manifest(
+            root=manifest.manifest_path.parent,
+            value=root,
+        ),
+        "catalogs": {
+            "entity_catalog": _path_for_manifest(
+                root=root,
+                value=manifest.catalogs.entity_catalog,
+            ),
+            "entity_metadata": _path_for_manifest(
+                root=root,
+                value=manifest.catalogs.entity_metadata,
+            ),
+            "relation_catalog": _path_for_manifest(
+                root=root,
+                value=manifest.catalogs.relation_catalog,
+            ),
+        },
+        "embeddings": {
+            "text_row_by_entity_id": _path_for_manifest(
+                root=root,
+                value=_canonical_artifact_path(manifest.embeddings.text_row_by_entity_id),
+            ),
+            "entity_text_semantic_table": _tensor_table_entry_for_manifest(
+                root=root,
+                spec=manifest.embeddings.entity_text_semantic_table,
+            ),
+            "non_text_entity_mask": _path_for_manifest(
+                root=root,
+                value=manifest.embeddings.non_text_entity_mask,
+            ),
+            "relation_semantic_table": _tensor_table_entry_for_manifest(
+                root=root,
+                spec=manifest.embeddings.relation_semantic_table,
+            ),
+            "relation_text_labels": _path_for_manifest(
+                root=root,
+                value=manifest.embeddings.relation_text_labels,
+            ),
+        },
+        "splits": {},
+    }
+    if manifest.provenance is not None:
+        canonical["provenance"] = dict(manifest.provenance)
+
+    splits: dict[str, Any] = {}
+    for split_name, split in manifest.splits.items():
+        splits[split_name] = {
+            "lmdb_path": _path_for_manifest(root=root, value=split.lmdb),
+            "index_path": _path_for_manifest(root=root, value=split.index),
+            "num_samples": split.num_samples,
+            "question_embeddings": _tensor_table_entry_for_manifest(
+                root=root,
+                spec=split.question_embeddings,
+            ),
+        }
+    canonical["splits"] = splits
+    return canonical
 
 
 def split_artifacts(
@@ -293,21 +385,27 @@ def artifact_path(
         metadata_dir=metadata_dir,
         manifest=manifest,
     )
+    if section == "embeddings":
+        key = canonical_embedding_key(key)
     value: Path | TensorTable
     if section == "catalogs":
         value = {
             "entity_catalog": resolved.entity_catalog,
             "entity_metadata": resolved.entity_metadata,
             "relation_catalog": resolved.relation_catalog,
-        }.get(key)  # type: ignore[assignment]
+        }.get(
+            key
+        )  # type: ignore[assignment]
     elif section == "embeddings":
         value = {
-            "entity_embedding_map": resolved.entity_embedding_map,
-            "entity_text_embeddings": resolved.entity_text_embeddings,
+            "text_row_by_entity_id": resolved.text_row_by_entity_id,
+            "entity_text_semantic_table": resolved.entity_text_semantic_table,
             "non_text_entity_mask": resolved.non_text_entity_mask,
-            "relation_embeddings": resolved.relation_embeddings,
+            "relation_semantic_table": resolved.relation_semantic_table,
             "relation_text_labels": resolved.relation_text_labels,
-        }.get(key)  # type: ignore[assignment]
+        }.get(
+            key
+        )  # type: ignore[assignment]
     else:
         raise KeyError(f"Unknown artifact manifest section {section!r}.")
 
@@ -331,9 +429,10 @@ def tensor_table(
     )
     if section != "embeddings":
         raise KeyError(f"Tensor tables are only available under 'embeddings', got {section!r}.")
+    key = canonical_embedding_key(key)
     table = {
-        "entity_text_embeddings": resolved.entity_text_embeddings,
-        "relation_embeddings": resolved.relation_embeddings,
+        "entity_text_semantic_table": resolved.entity_text_semantic_table,
+        "relation_semantic_table": resolved.relation_semantic_table,
     }.get(key)
     if table is None:
         raise KeyError(f"Unknown tensor table key embeddings.{key}.")
@@ -365,10 +464,20 @@ def string(
 ) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(
-            f"Artifact manifest field {key!r} must be a non-empty string: {path}"
-        )
+        raise ValueError(f"Artifact manifest field {key!r} must be a non-empty string: {path}")
     return value
+
+
+def string_alias(
+    payload: Mapping[str, Any],
+    keys: tuple[str, ...],
+    path: Path,
+) -> str:
+    for key in keys:
+        if key in payload:
+            return string(payload, key, path)
+    formatted = " or ".join(repr(key) for key in keys)
+    raise ValueError(f"Artifact manifest requires one of {formatted}: {path}")
 
 
 def integer(
@@ -380,6 +489,18 @@ def integer(
     if not isinstance(value, int):
         raise TypeError(f"Artifact manifest field {key!r} must be an integer: {path}")
     return int(value)
+
+
+def mapping_alias(
+    payload: Mapping[str, Any],
+    keys: tuple[str, ...],
+    path: Path,
+) -> Mapping[str, Any]:
+    for key in keys:
+        if key in payload:
+            return mapping(payload, key, path)
+    formatted = " or ".join(repr(key) for key in keys)
+    raise TypeError(f"Artifact manifest requires one of {formatted}: {path}")
 
 
 def _resolved_materialization(
@@ -411,9 +532,7 @@ def _materialization_dir(
         legacy_prefix = Path(".materializations") / generation_id
         return manifest_dir / legacy_prefix, legacy_prefix
     if not isinstance(raw_dir, str) or not raw_dir.strip():
-        raise ValueError(
-            f"Artifact manifest field 'materialization_dir' must be a non-empty string: {path}"
-        )
+        raise ValueError(f"Artifact manifest field 'materialization_dir' must be a non-empty string: {path}")
     return resolve_path(metadata_dir=manifest_dir, value=raw_dir), None
 
 
@@ -442,11 +561,7 @@ def _tensor_table_spec(
         raise ValueError(f"unsupported tensor table dtype: {dtype!r}")
 
     raw_shape = entry.get("shape")
-    if (
-        not isinstance(raw_shape, (list, tuple))
-        or len(raw_shape) != 2
-        or not all(isinstance(value, int) for value in raw_shape)
-    ):
+    if not isinstance(raw_shape, (list, tuple)) or len(raw_shape) != 2 or not all(isinstance(value, int) for value in raw_shape):
         raise ValueError("tensor table manifest entry requires shape [rows, dim]")
 
     rows, dim = int(raw_shape[0]), int(raw_shape[1])
@@ -468,6 +583,46 @@ def _resolve_artifact_path(*, root: Path, value: Path) -> Path:
     return root / value
 
 
+def canonical_embedding_key(key: str) -> str:
+    return {
+        "entity_embedding_map": "text_row_by_entity_id",
+        "entity_text_embeddings": "entity_text_semantic_table",
+        "relation_embeddings": "relation_semantic_table",
+    }.get(key, key)
+
+
+def _tensor_table_entry_for_manifest(
+    *,
+    root: Path,
+    spec: TensorTableSpec,
+) -> dict[str, Any]:
+    return {
+        "path": _path_for_manifest(
+            root=root,
+            value=_canonical_artifact_path(spec.path),
+        ),
+        "dtype": spec.dtype,
+        "shape": [spec.shape[0], spec.shape[1]],
+    }
+
+
+def _path_for_manifest(*, root: Path, value: Path) -> str:
+    normalized = _canonical_artifact_path(value)
+    if not normalized.is_absolute():
+        return normalized.as_posix()
+    try:
+        return normalized.relative_to(root).as_posix()
+    except ValueError:
+        return str(normalized)
+
+
+def _canonical_artifact_path(value: Path) -> Path:
+    renamed = _LEGACY_ARTIFACT_FILENAMES.get(value.name)
+    if renamed is None:
+        return value
+    return value.with_name(renamed)
+
+
 __all__ = [
     "CatalogPaths",
     "EmbeddingPaths",
@@ -478,15 +633,19 @@ __all__ = [
     "SplitPaths",
     "TensorTableSpec",
     "artifact_path",
+    "canonicalize_materialization_manifest_payload",
+    "canonical_embedding_key",
     "integer",
     "load_manifest",
     "load_materialization_manifest",
     "load_materialization_manifest_from_path",
     "manifest_path",
+    "mapping_alias",
     "mapping",
     "parse_materialization_manifest",
     "resolve_path",
     "split_artifacts",
     "string",
+    "string_alias",
     "tensor_table",
 ]

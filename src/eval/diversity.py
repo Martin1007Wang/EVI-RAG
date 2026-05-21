@@ -160,7 +160,13 @@ def terminal_f1_std(rollouts: Sequence[RolloutResult]) -> float:
         return 0.0
 
     values = torch.cat(
-        [rollout.terminal_stop_log_prob.detach().to(dtype=torch.float32) for rollout in rollouts],
+        [
+            rollout.policy_action_log_prob[
+                torch.arange(rollout.num_rollouts, device=rollout.device),
+                rollout.stop_step,
+            ].detach().to(dtype=torch.float32)
+            for rollout in rollouts
+        ],
         dim=0,
     )
 
@@ -179,7 +185,7 @@ def unique_selected_edge_set_rate(rollouts: Sequence[RolloutResult]) -> float:
         return 0.0
 
     num_rollouts = len(rollouts)
-    num_graphs = int(rollouts[0].traj_len.numel())
+    num_graphs = int(rollouts[0].num_rollouts)
     rates: list[float] = []
     for graph_id in range(num_graphs):
         unique_sets = {
@@ -196,7 +202,7 @@ def _selected_edge_set_for_graph(
 ) -> tuple[int, ...]:
     selected_edge_ids = rollout.selected_edge_ids[graph_id]
     continue_mask = rollout.expand_mask[graph_id]
-    trajectory_length = int(rollout.traj_len[graph_id].item())
+    trajectory_length = int(rollout.stop_step[graph_id].item()) + 1
     if trajectory_length <= 0:
         return ()
 

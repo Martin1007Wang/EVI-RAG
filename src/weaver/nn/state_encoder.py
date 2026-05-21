@@ -7,202 +7,251 @@ from torch import nn
 
 from src.utils.nn_utils import init_xavier
 from src.weaver.context import GraphContext
-from src.weaver.state import State, derive_remaining_budget
+from src.weaver.state import State
 
-from .feature_encoder import FeatureBank
+from .edge_encoder import EdgeEncoder
+from .feature_encoder import (
+    EncodedFeatures,
+    select_edge_relation_model,
+    select_node_model,
+    select_query_model,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class StateEncoding:
-    """
-    Per-rollout state representation.
-
-    state_h:
-        evidence-state vector h_z, shape [R, H].
-
-    query_h:
-        original query vector h_q aligned to rollout rows, shape [R, H].
-    """
-
-    state_h: torch.Tensor
     query_h: torch.Tensor
+    row_state_h: torch.Tensor
+    node_state_h: torch.Tensor
+    edge_state_h: torch.Tensor
+
+
+class SegmentTokenPool(nn.Module):
+    """
+    Project tokens and mean-pool them by rollout row.
+
+    Contract:
+    - tokens already live in model space.
+    - row_ids already indexes rollout rows.
+    - num_rows is the number of rollout states.
+    - No dtype/device/view/detach/normalization repair is performed.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        output_dim: int,
+    ) -> None:
+        super().__init__()
+
+        self.output_dim = output_dim
+
+        self.token_proj = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.SiLU(),
+            nn.Linear(output_dim, output_dim),
+        )
+
+        self.reset_parameters()
+
+    def forward(
+        self,
+        *,
+        tokens: torch.Tensor,
+        row_ids: torch.Tensor,
+        num_rows: int,
+    ) -> torch.Tensor:
+        token_h = self.token_proj(tokens)
+
+        out = token_h.new_zeros((num_rows, self.output_dim))
+        out.scatter_add_(
+            0,
+            row_ids[:, None].expand(-1, self.output_dim),
+            token_h,
+        )
+        counts = token_h.new_zeros((num_rows, 1))
+        counts.scatter_add_(
+            0,
+            row_ids[:, None],
+            token_h.new_ones((token_h.size(0), 1)),
+        )
+        return out / counts.clamp_min(1.0)
+
+    def reset_parameters(self) -> None:
+        for module in self.token_proj:
+            if isinstance(module, nn.Linear):
+                init_xavier(module)
 
 
 class StateEncoder(nn.Module):
     """
-    Permutation-invariant encoder for z = (V_z, E_z, b_z).
+    Encode rollout states from model-space features.
 
-    It encodes the current evidence state only.
-    It does not score frontier edges.
-    It does not compute stop flow.
-    It does not perform query-edge matching.
+    State representation:
+
+        query_h      = query model feature
+        node_state_h = mean-pooled active node model tokens
+        edge_state_h = mean-pooled selected edge model tokens
+        row_state_h  = learned fusion of query/node/edge state
+
+    Contract:
+    - FeatureEncoder owns semantic/model-space construction.
+    - StateEncoder consumes only model-space features.
+    - EdgeEncoder returns role-preserving edge tokens, e.g. concat(src, rel, dst).
+    - StateEncoder compresses edge tokens only for state representation.
+    - No dtype/device/view/detach/normalization repair is performed.
     """
 
     def __init__(
         self,
         *,
         hidden_dim: int,
-        max_budget: int = 8,
+        edge_encoder: EdgeEncoder | None = None,
     ) -> None:
         super().__init__()
 
-        self.hidden_dim = int(hidden_dim)
-        if self.hidden_dim <= 0:
-            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+        self.hidden_dim = hidden_dim
+        self.edge_encoder = edge_encoder or EdgeEncoder(hidden_dim=hidden_dim)
 
-        self.max_budget = int(max_budget)
-        if self.max_budget < 0:
-            raise ValueError(f"max_budget must be non-negative, got {max_budget}.")
+        self.node_pool = SegmentTokenPool(
+            input_dim=hidden_dim,
+            output_dim=hidden_dim,
+        )
 
-        self.node_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.edge_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.budget_proj = nn.Linear(3, self.hidden_dim, bias=True)
-        self.out_norm = nn.LayerNorm(self.hidden_dim)
+        self.edge_pool = SegmentTokenPool(
+            input_dim=self.edge_encoder.output_dim,
+            output_dim=hidden_dim,
+        )
 
-        self._reset_parameters()
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.reset_parameters()
 
     def forward(
         self,
         *,
-        features: FeatureBank,
-        context: GraphContext,
+        features: EncodedFeatures,
         state: State,
+        context: GraphContext,
     ) -> StateEncoding:
-        del context
+        num_rows = state.num_rows
 
-        device = features.node_h.device
-        dtype = features.node_h.dtype
+        query_h = select_query_model(
+            features,
+            state.graph_ids,
+        )
 
-        num_rows = int(state.num_rollouts)
-
-        node_summary = self._node_summary(
+        node_state_h = self.encode_active_nodes(
             features=features,
             state=state,
+            context=context,
             num_rows=num_rows,
-            device=device,
-            dtype=dtype,
+            like=query_h,
         )
 
-        edge_summary = self._edge_summary(
+        edge_state_h = self.encode_selected_edges(
             features=features,
             state=state,
+            context=context,
             num_rows=num_rows,
-            device=device,
-            dtype=dtype,
+            like=query_h,
         )
 
-        budget_feat = self._budget_features(
-            state=state,
-            device=device,
-            dtype=dtype,
-        )
-
-        state_h = self.out_norm(self.node_proj(node_summary) + self.edge_proj(edge_summary) + self.budget_proj(budget_feat))
-
-        query_h = features.query_h.index_select(
-            0,
-            state.row_to_graph.to(device=device, dtype=torch.long),
+        row_state_h = self.fuse(
+            torch.cat(
+                [
+                    query_h,
+                    node_state_h,
+                    edge_state_h,
+                ],
+                dim=-1,
+            )
         )
 
         return StateEncoding(
-            state_h=state_h,
-            query_h=query_h.to(device=device, dtype=dtype),
+            query_h=query_h,
+            row_state_h=row_state_h,
+            node_state_h=node_state_h,
+            edge_state_h=edge_state_h,
         )
 
-    def _node_summary(
+    def encode_edge_tokens(
         self,
         *,
-        features: FeatureBank,
-        state: State,
-        num_rows: int,
-        device: torch.device,
-        dtype: torch.dtype,
+        features: EncodedFeatures,
+        src_node_ids: torch.Tensor,
+        edge_ids: torch.Tensor,
+        dst_node_ids: torch.Tensor,
     ) -> torch.Tensor:
-        rows, node_ids = state.active_node_trace_rows()
-        rows = rows.to(device=device, dtype=torch.long)
-        node_ids = node_ids.to(device=device, dtype=torch.long)
+        return self.edge_encoder(
+            src_h=select_node_model(features, src_node_ids),
+            rel_h=select_edge_relation_model(features, edge_ids),
+            dst_h=select_node_model(features, dst_node_ids),
+        )
+
+    def encode_active_nodes(
+        self,
+        *,
+        features: EncodedFeatures,
+        state: State,
+        context: GraphContext,
+        num_rows: int,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        row_ids, node_ids = state.active_node_mask.nonzero(as_tuple=True)
 
         if node_ids.numel() == 0:
-            return torch.zeros((num_rows, self.hidden_dim), device=device, dtype=dtype)
+            return like.new_zeros((num_rows, self.hidden_dim))
 
-        node_h = features.node_h.to(device=device, dtype=dtype).index_select(0, node_ids)
-        return _segment_mean(
-            values=node_h,
-            row_ids=rows,
+        return self.node_pool(
+            tokens=select_node_model(features, node_ids),
+            row_ids=row_ids,
             num_rows=num_rows,
         )
 
-    def _edge_summary(
+    def encode_selected_edges(
         self,
         *,
-        features: FeatureBank,
+        features: EncodedFeatures,
         state: State,
+        context: GraphContext,
         num_rows: int,
-        device: torch.device,
-        dtype: torch.dtype,
+        like: torch.Tensor,
     ) -> torch.Tensor:
-        rows, edge_ids = state.active_edge_trace_rows()
-        rows = rows.to(device=device, dtype=torch.long)
-        edge_ids = edge_ids.to(device=device, dtype=torch.long)
+        row_ids, edge_ids = state.selected_edge_mask.nonzero(as_tuple=True)
 
         if edge_ids.numel() == 0:
-            return torch.zeros((num_rows, self.hidden_dim), device=device, dtype=dtype)
+            return like.new_zeros((num_rows, self.hidden_dim))
 
-        edge_h = features.edge_h.to(device=device, dtype=dtype).index_select(0, edge_ids)
-        return _segment_mean(
-            values=edge_h,
-            row_ids=rows,
+        src_node_ids = context.edge_index[0].index_select(0, edge_ids)
+        dst_node_ids = context.edge_index[1].index_select(0, edge_ids)
+
+        edge_h = self.encode_edge_tokens(
+            features=features,
+            src_node_ids=src_node_ids,
+            edge_ids=edge_ids,
+            dst_node_ids=dst_node_ids,
+        )
+
+        return self.edge_pool(
+            tokens=edge_h,
+            row_ids=row_ids,
             num_rows=num_rows,
         )
 
-    def _budget_features(
-        self,
-        *,
-        state: State,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        remaining = derive_remaining_budget(state).to(device=device, dtype=dtype).view(-1)
-        max_budget = max(float(self.max_budget), 1.0)
-
-        depth = (max_budget - remaining).clamp_min(0.0)
-        remaining_ratio = remaining / max_budget
-        depth_ratio = depth / max_budget
-        exhausted = remaining.le(0.0).to(dtype=dtype)
-
-        return torch.stack(
-            [remaining_ratio, depth_ratio, exhausted],
-            dim=-1,
-        )
-
-    def _reset_parameters(self) -> None:
-        init_xavier(self.node_proj)
-        init_xavier(self.edge_proj)
-        init_xavier(self.budget_proj)
+    def reset_parameters(self) -> None:
+        for module in self.fuse:
+            if isinstance(module, nn.Linear):
+                init_xavier(module)
 
 
-def _segment_mean(
-    *,
-    values: torch.Tensor,
-    row_ids: torch.Tensor,
-    num_rows: int,
-) -> torch.Tensor:
-    out = values.new_zeros((int(num_rows), int(values.size(-1))))
-    count = values.new_zeros((int(num_rows), 1))
-
-    out.scatter_add_(
-        0,
-        row_ids.view(-1, 1).expand(-1, values.size(-1)),
-        values,
-    )
-
-    count.scatter_add_(
-        0,
-        row_ids.view(-1, 1),
-        values.new_ones((values.size(0), 1)),
-    )
-
-    return out / count.clamp_min(1.0)
-
-
-__all__ = ["StateEncoding", "StateEncoder"]
+__all__ = [
+    "SegmentTokenPool",
+    "StateEncoder",
+    "StateEncoding",
+]

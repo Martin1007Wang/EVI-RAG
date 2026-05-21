@@ -2,67 +2,59 @@
 
 _target_: src.weaver.module.WeaverModule
 
-hidden_dim: 1024
-
-feature_encoder:
+policy_feature_encoder:
   _target_: src.weaver.nn.feature_encoder.FeatureEncoder
-  entity_text_embeddings: null
-  entity_embedding_map: null
-  relation_embeddings: null
-  hidden_dim: ${..hidden_dim}
-  non_text_init_std: 0.02
-  learn_edge_role_weights: false
+  entity_text_semantic_table: null
+  text_row_by_entity_id: null
+  relation_semantic_table: null
+  model_dim: 1024
+  non_text_node_init_std: 0.02
 
 policy:
-  _target_: src.weaver.policy.Policy
+  _target_: src.weaver.policy.ForwardPolicy
   state_encoder:
     _target_: src.weaver.nn.state_encoder.StateEncoder
-    hidden_dim: ${...hidden_dim}
-    max_budget: ${...runner.rollout_cfg.expand_budget}
-  frontier_encoder:
-    _target_: src.weaver.nn.frontier_encoder.FrontierEncoder
-    hidden_dim: ${...hidden_dim}
-  edge_scorer:
-    _target_: src.weaver.nn.edge_flow_scorer.EdgeActionScorer
-    hidden_dim: ${...hidden_dim}
-    init_adapter_scale: 0.1
-    adapter_final_init_scale: 0.0
-    semantic_prior_scale: 10.0
-    use_edge_logit_shift: false
+    hidden_dim: 1024
+    edge_encoder:
+      _target_: src.weaver.nn.edge_encoder.EdgeEncoder
+      hidden_dim: 1024
 
 reward_model:
-  _target_: src.weaver.reward.EvidenceLogReward
-  alpha: 4.0
-  lambda_: 0.02
-  eta: 6.0
+  _target_: src.weaver.utility.TrueTerminalReward
+  epsilon: 1.0e-6
+  answer_weight: 1.0
+  edge_cost: 0.05
+  fail_cost: 1.0
+  log_reward_scale: 5.0
+
+policy_objective:
+  _target_: src.weaver.objectives.SubTBLoss
+  alpha_replay: 1.0
+  subtb_lambda: 0.9
+  max_len: null
+  residual_loss: huber
+  huber_delta: 2.0
 
 runner:
   _target_: src.weaver.rollout.runner.RolloutRunner
   engine:
     _target_: src.weaver.rollout.engine.RolloutEngine
-    expand_budget: ${..rollout_cfg.expand_budget}
-  rollout_cfg:
-    _target_: src.training.config.RolloutRuntimeConfig
     expand_budget: 3
-    train_num_rollout: 8
-    eval_num_rollout: 8
-    train_chunk_size: ${.train_num_rollout}
-    eval_chunk_size: ${.eval_num_rollout}
+  train_num_rollouts: 8
+  eval_num_rollouts: 16
   replay_source:
-    _target_: src.weaver.rollout.replay.ShortestPathReplaySource
-    expand_budget: ${..rollout_cfg.expand_budget}
+    _target_: src.weaver.rollout.replay.ReplaySource
+    expand_budget: ${model.runner.engine.expand_budget}
+  replay_builder:
+    _target_: src.weaver.rollout.replay.ReplayBuilder
+    expand_budget: ${model.runner.engine.expand_budget}
   replay_schedule:
-    enabled: true
-    schedule:
-      - until_progress: 0.2
-        policy_rollout: 0.2
-        replay_expand: 0.8
-      - until_progress: 0.7
-        policy_rollout: 0.5
-        replay_expand: 0.5
-      - until_progress: 1.0
-        policy_rollout: 0.9
-        replay_expand: 0.1
+    _target_: src.weaver.rollout.runner.ReplaySchedule
+    rows:
+      - _target_: src.weaver.rollout.runner.ReplayScheduleRow
+        until_progress: 0.0
+        policy_rollout: 1.0
+        replay_expand: 1.0
 
 optimization:
   _target_: src.training.config.OptimizationRuntimeConfig
@@ -70,7 +62,7 @@ optimization:
     _target_: src.training.config.OptimizerRuntimeConfig
     type: adamw
     lr: 1.0e-4
-    weight_decay: 0.05
+    weight_decay: 0.01
     betas: [0.9, 0.999]
     no_decay_on_bias_and_norm: true
   scheduler:
@@ -82,10 +74,12 @@ optimization:
 
 evaluation:
   _target_: src.training.config.EvalRuntimeConfig
-  best_of_k: 8
+  k_windows: [1, 2, 4, 8, 16]
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
 
 train_temperature: 1.0
-eval_temperature: ${.train_temperature}
-gradient_clip_val: null
+eval_temperature: ${model.train_temperature}
+
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm

@@ -14,6 +14,6 @@ logger:
 
 model:
   runner:
-    rollout_cfg:
-      eval_num_rollout: 64
-      eval_chunk_size: 64
+    eval_num_rollouts: 32
+  evaluation:
+    k_windows: [1, 2, 4, 8, 16, 32]

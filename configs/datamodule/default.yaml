@@ -2,11 +2,11 @@
 
 _target_: src.data.datamodule.RetrievalDataModule
 
-batch_size: 1
-num_workers: 1
+batch_size: 32
+num_workers: 16
 
-eval_batch_size: 1
-eval_num_workers: 1
+eval_batch_size: 32
+eval_num_workers: 16
 
 pin_memory: true
 train_shuffle: true

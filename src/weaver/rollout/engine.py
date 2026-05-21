@@ -1,207 +1,199 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
-from src.data.schema import RetrievalBatch
 from src.weaver.context import GraphContext
-from src.weaver.nn.feature_encoder import FeatureBank
-from src.weaver.policy import Policy, PolicyOutput
-from src.weaver.state import FrontierBuilder, State
+from src.weaver.nn.feature_encoder import EncodedFeatures
+from src.weaver.policy import ForwardPolicy
+from src.weaver.state import Frontier, State
 
+from .action import StepAction, sample_step
 from .result import RolloutResult
-from .sampling import SampledAction, sample_action
-from .trace import RolloutTrace
-
-
-@dataclass(frozen=True, slots=True)
-class RolloutContext:
-    graph_context: GraphContext
-    features: FeatureBank
-    frontier_builder: FrontierBuilder
-
-    def __post_init__(self) -> None:
-        if self.features.edge_h.requires_grad:
-            raise ValueError(
-                "RolloutContext.features must be detached. "
-                "Call _detach_feature_bank() before constructing RolloutContext."
-            )
-
-    @property
-    def device(self) -> torch.device:
-        return self.graph_context.device
+from .tape import RolloutTape
 
 
 class RolloutEngine:
     """
-    Label-free vectorized finite-horizon rollout engine.
+    Vectorized finite-horizon rollout engine.
     """
 
     def __init__(self, expand_budget: int) -> None:
         self.expand_budget = int(expand_budget)
 
-    def prepare_context(
-        self,
-        *,
-        batch: RetrievalBatch,
-        features: FeatureBank,
-    ) -> RolloutContext:
-        features = _detach_feature_bank(features)
-        device = features.edge_h.device
-        graph_context = GraphContext.from_batch(batch, device=device)
-        frontier_builder = FrontierBuilder.from_graph_context(graph_context)
-        return RolloutContext(
-            graph_context=graph_context,
-            features=features,
-            frontier_builder=frontier_builder,
-        )
-
     def sample_rollouts(
         self,
         *,
-        policy: Policy,
-        context: RolloutContext,
+        policy: ForwardPolicy,
+        context: GraphContext,
+        features: EncodedFeatures,
         num_rollouts: int,
         temperature: float = 1.0,
     ) -> list[RolloutResult]:
         with torch.no_grad():
-            fused = self._sample_fused_rollouts(
+            fused = self.sample_fused_rollouts(
                 policy=policy,
                 context=context,
+                features=features,
                 rollouts_per_graph=int(num_rollouts),
                 temperature=float(temperature),
             )
-        return fused.split_by_rollout_id(
+
+        return split_fused_rollouts(
+            fused=fused,
             rollouts_per_graph=int(num_rollouts),
+            num_graphs=int(context.num_graphs),
         )
 
-    def _sample_fused_rollouts(
+    def sample_fused_rollouts(
         self,
         *,
-        policy: Policy,
-        context: RolloutContext,
+        policy: ForwardPolicy,
+        context: GraphContext,
+        features: EncodedFeatures,
         rollouts_per_graph: int,
-        temperature: float,
+        temperature: float = 1.0,
     ) -> RolloutResult:
-        graph_context = context.graph_context
-        device = context.device
-
-        state = State.initial_from_graph_context(
-            graph_context,
-            budget=self.expand_budget,
-            rollouts_per_graph=rollouts_per_graph,
+        graph_ids = torch.arange(
+            int(context.num_graphs),
+            dtype=torch.long,
+            device=context.device,
+        ).repeat_interleave(int(rollouts_per_graph))
+        state = State.initial(
+            graph=context,
+            graph_ids=graph_ids,
         )
-        source_graph_id = state.row_to_graph.to(device=device, dtype=torch.long)
-        num_rows = int(source_graph_id.numel())
-        trace = RolloutTrace(
-            R=num_rows,
+        tape = RolloutTape(
+            R=state.num_rows,
             T=self.expand_budget + 1,
-            device=device,
+            device=context.device,
         )
-        alive = torch.ones(num_rows, dtype=torch.bool, device=device)
 
         for t in range(self.expand_budget + 1):
-            active_rows = alive.nonzero(as_tuple=False).flatten()
+            active_rows = (~tape.is_stopped).nonzero(as_tuple=False).flatten()
             if active_rows.numel() == 0:
                 break
 
             active_state = state.select_rows(active_rows)
+            frontier = active_state.frontier(
+                context,
+                expand_budget=self.expand_budget,
+            )
             policy_out = policy(
-                context=graph_context,
+                features=features,
                 state=active_state,
-                features=context.features,
-                frontier_builder=context.frontier_builder,
+                context=context,
+                frontier=frontier,
             )
-            action = sample_action(
-                policy_out=policy_out,
-                temperature=temperature,
+            forced_local = forced_stop_rows(
+                state=active_state,
+                frontier=frontier,
+                expand_budget=self.expand_budget,
             )
+            sample_rows = rows_without_forced(
+                num_rows=active_state.num_rows,
+                forced_rows=forced_local,
+                device=context.device,
+            )
+            actions: list[StepAction] = []
+            if sample_rows.numel() > 0:
+                actions.append(
+                    sample_step(
+                        policy_out=policy_out,
+                        rows=sample_rows,
+                        temperature=float(temperature),
+                    )
+                )
+            if forced_local.numel() > 0:
+                actions.append(
+                    StepAction.forced_stop(
+                        rows=forced_local,
+                        dtype=policy_out.stop_logit.dtype,
+                        device=context.device,
+                    )
+                )
+            sampled = StepAction.concat(actions)
+            action = StepAction(
+                row_ids=active_rows.index_select(0, sampled.row_ids),
+                edge_ids=sampled.edge_ids,
+                policy_log_prob=sampled.policy_log_prob,
+                behavior_log_prob=sampled.behavior_log_prob,
+                forced=sampled.forced,
+            )
+            tape.write(t, action)
 
-            trace.write_state(t=t, rows=active_rows)
-            self._write_terminal_rows(
-                t=t,
-                active_rows=active_rows,
-                policy_out=policy_out,
-                action=action,
-                trace=trace,
-                alive=alive,
-            )
-            self._expand_rows(
-                t=t,
-                state=state,
-                active_rows=active_rows,
-                action=action,
-                graph_context=graph_context,
-                trace=trace,
-            )
+            if bool(action.expand_mask.any()):
+                state = state.expand(
+                    graph=context,
+                    rows=action.expand_rows,
+                    edge_ids=action.expand_edge_ids,
+                    expand_budget=self.expand_budget,
+                )
 
-        return RolloutResult.from_trace(
-            trace=trace,
-            source_graph_id=source_graph_id,
+        stop_step = tape.stop_step.clone()
+        unstopped = stop_step.lt(0)
+        if bool(unstopped.any()):
+            stop_step[unstopped] = self.expand_budget
+
+        return RolloutResult(
+            source_graph_id=graph_ids,
+            selected_edge_ids=tape.selected_edge_ids,
+            policy_action_log_prob=tape.policy_action_log_prob,
+            behavior_action_log_prob=tape.behavior_action_log_prob,
+            stop_step=stop_step,
+            forced_stop=tape.forced_stop,
             expand_budget=self.expand_budget,
         )
 
-    @staticmethod
-    def _write_terminal_rows(
-        *,
-        t: int,
-        active_rows: torch.Tensor,
-        policy_out: PolicyOutput,
-        action: SampledAction,
-        trace: RolloutTrace,
-        alive: torch.Tensor,
-    ) -> None:
-        if action.stop_rows.numel() == 0:
-            return
-        terminal_rows = active_rows.index_select(0, action.stop_rows)
-        trace.write_terminal(
-            t=t,
-            rows=terminal_rows,
-            stop_log_prob=policy_out.stop_log_prob.index_select(0, action.stop_rows),
-            forced=action.forced_stop,
-        )
-        alive[terminal_rows] = False
 
-    @staticmethod
-    def _expand_rows(
-        *,
-        t: int,
-        state: State,
-        active_rows: torch.Tensor,
-        action: SampledAction,
-        graph_context: GraphContext,
-        trace: RolloutTrace,
-    ) -> None:
-        if action.expand_rows.numel() == 0:
-            return
-        rows = active_rows.index_select(0, action.expand_rows)
-        trace.write_expand(
-            t=t,
-            rows=rows,
-            edge_ids=action.expand_edge_ids,
-        )
-        state.apply_edges_(
-            edge_index=graph_context.edge_index,
-            rows=rows,
-            edge_ids=action.expand_edge_ids,
-        )
-
-
-def _detach_feature_bank(features: FeatureBank) -> FeatureBank:
-    return FeatureBank(
-        node_h=features.node_h.detach(),
-        edge_h=features.edge_h.detach(),
-        query_h=features.query_h.detach(),
-        node_is_non_text=features.node_is_non_text.detach(),
-        node_sem_h=features.node_sem_h.detach(),
-        rel_sem_h=features.rel_sem_h.detach(),
-        query_sem_h=features.query_sem_h.detach(),
-        rel_h=features.rel_h.detach(),
+def forced_stop_rows(
+    *,
+    state: State,
+    frontier: Frontier,
+    expand_budget: int,
+) -> torch.Tensor:
+    num_rows = state.num_rows
+    has_frontier = torch.zeros(
+        num_rows,
+        dtype=torch.bool,
+        device=state.device,
     )
+    if frontier.row_ids.numel() > 0:
+        has_frontier.index_fill_(0, frontier.row_ids, True)
+    exhausted = state.depth.ge(int(expand_budget))
+    return (~has_frontier | exhausted).nonzero(as_tuple=False).flatten()
+
+
+def rows_without_forced(
+    *,
+    num_rows: int,
+    forced_rows: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    rows = torch.arange(int(num_rows), dtype=torch.long, device=device)
+    if forced_rows.numel() == 0:
+        return rows
+    keep = torch.ones(int(num_rows), dtype=torch.bool, device=device)
+    keep[forced_rows.to(device=device, dtype=torch.long)] = False
+    return rows[keep]
+
+
+def split_fused_rollouts(
+    *,
+    fused: RolloutResult,
+    rollouts_per_graph: int,
+    num_graphs: int,
+) -> list[RolloutResult]:
+    out: list[RolloutResult] = []
+    for rollout_id in range(int(rollouts_per_graph)):
+        rows = torch.arange(
+            int(num_graphs),
+            dtype=torch.long,
+            device=fused.device,
+        ) * int(rollouts_per_graph) + int(rollout_id)
+        out.append(fused.select_rows(rows))
+    return out
 
 
 __all__ = [
     "RolloutEngine",
-    "RolloutContext",
 ]

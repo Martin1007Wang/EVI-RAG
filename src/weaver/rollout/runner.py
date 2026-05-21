@@ -1,50 +1,65 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from omegaconf import DictConfig
-
 from src.data.schema import RetrievalBatch
-from src.training.config import RolloutRuntimeConfig
-from src.weaver.policy import Policy
-from src.weaver.rollout.engine import RolloutContext, RolloutEngine
+from src.weaver.context import GraphContext
+from src.weaver.nn.feature_encoder import EncodedFeatures
+from src.weaver.policy import ForwardPolicy
+from src.weaver.rollout.engine import RolloutEngine
 from src.weaver.rollout.replay import (
     ReplayBatch,
+    ReplayBuilder,
     ReplaySampleBudget,
-    ShortestPathReplaySource,
-    transitions_from_rollouts,
+    ReplaySource,
+    training_from_rollouts,
 )
 from src.weaver.rollout.result import RolloutResult
-from src.weaver.transitions import TransitionBatch
+from src.weaver.transition import (
+    SRC_POLICY,
+    SRC_REPLAY,
+    TrainingBatch,
+)
 
 
 @dataclass(frozen=True, slots=True)
-class RolloutChunk:
+class RolloutBatch:
     rollouts: tuple[RolloutResult, ...]
-    transitions: TransitionBatch | None = None
+    training: TrainingBatch | None = None
+    replay: ReplayBatch | None = None
 
     @property
-    def has_rollouts(self) -> bool:
-        return len(self.rollouts) > 0
-
-    @property
-    def has_replay(self) -> bool:
-        return self.transitions is not None and self.transitions.num_transitions > 0
-
-    @property
-    def has_states(self) -> bool:
-        return self.has_replay
-
-    @property
-    def num_policy_rollouts(self) -> int:
+    def num_rollouts(self) -> int:
         return len(self.rollouts)
 
     @property
-    def num_replay_transitions(self) -> int:
-        if self.transitions is None:
+    def num_transitions(self) -> int:
+        if self.training is None:
             return 0
-        return int(self.transitions.num_transitions)
+        return int(self.training.num_items)
+
+    @property
+    def has_transitions(self) -> bool:
+        return self.num_transitions > 0
+
+    @property
+    def num_replay_trajectories(self) -> int:
+        if self.replay is None:
+            return 0
+        return int(self.replay.num_trajectories)
+
+    @property
+    def num_replay_transitions(self) -> int:
+        if self.training is None:
+            return 0
+        return int(self.training.num_expansions)
+
+    @property
+    def num_replay_terminal_transitions(self) -> int:
+        if self.training is None:
+            return 0
+        return int(self.training.num_terminals)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +71,6 @@ class ReplayScheduleRow:
 
 @dataclass(frozen=True, slots=True)
 class ReplaySchedule:
-    enabled: bool
     rows: tuple[ReplayScheduleRow, ...]
 
     def weights_at(self, progress: float) -> ReplayScheduleRow:
@@ -67,139 +81,152 @@ class ReplaySchedule:
 
 
 class RolloutRunner:
-    """
-    Thin execution wrapper around RolloutEngine.
-
-    Owns:
-        - train/eval rollout counts;
-        - chunking;
-        - optional replay sampling from policy-visited states.
-    """
-
     def __init__(
         self,
         *,
         engine: RolloutEngine,
-        rollout_cfg: RolloutRuntimeConfig,
-        replay_source: ShortestPathReplaySource | None = None,
-        replay_schedule: DictConfig | None = None,
+        train_num_rollouts: int,
+        eval_num_rollouts: int,
+        replay_source: ReplaySource | None = None,
+        replay_builder: ReplayBuilder | None = None,
+        replay_schedule: ReplaySchedule | None = None,
         progress_fn: Callable[[], float] | None = None,
     ) -> None:
         self.engine = engine
+        self.train_num_rollouts = int(train_num_rollouts)
+        self.eval_num_rollouts = int(eval_num_rollouts)
         self.replay_source = replay_source
-
-        self.train_num_rollout = int(rollout_cfg.train_num_rollout)
-        self.eval_num_rollout = int(rollout_cfg.eval_num_rollout)
-        self.train_chunk_size = int(rollout_cfg.train_chunk_size)
-        self.eval_chunk_size = int(rollout_cfg.eval_chunk_size)
-
-        self.replay_schedule = parse_replay_schedule(replay_schedule)
+        self.replay_builder = replay_builder
+        self.replay_schedule = replay_schedule
         self.progress_fn = progress_fn or zero_progress
 
-    def train_chunks(
+    def train_rollouts(
         self,
         *,
-        policy: Policy,
+        policy: ForwardPolicy,
         batch: RetrievalBatch,
-        context: RolloutContext,
+        context: GraphContext,
+        features: EncodedFeatures,
         temperature: float,
-    ) -> Iterator[RolloutChunk]:
-        for num_samples in chunk_sizes(
-            total=self.train_num_rollout,
-            chunk_size=self.train_chunk_size,
-        ):
-            yield self.train_chunk(
-                policy=policy,
-                batch=batch,
-                context=context,
-                num_samples=num_samples,
-                temperature=temperature,
-            )
-
-    def train_chunk(
-        self,
-        *,
-        policy: Policy,
-        batch: RetrievalBatch,
-        context: RolloutContext,
-        num_samples: int,
-        temperature: float,
-    ) -> RolloutChunk:
-        budget = self.sample_budget(num_samples)
-
-        rollouts: tuple[RolloutResult, ...] = ()
-        if budget.policy_rollout > 0:
-            rollouts = tuple(
-                self.engine.sample_rollouts(
-                    policy=policy,
-                    context=context,
-                    num_rollouts=budget.policy_rollout,
-                    temperature=temperature,
-                )
-            )
-
-        replay: ReplayBatch | None = None
-        if budget.replay_expand > 0:
-            if self.replay_source is None:
-                raise RuntimeError("replay_source is required when replay_expand > 0.")
-            replay = self.replay_source.sample_from_rollouts(
-                batch=batch,
-                rollouts=rollouts,
-                num_transitions=budget.replay_expand,
-                device=context.device,
-            )
-
-        transition_parts: list[TransitionBatch] = []
-        policy_transitions = transitions_from_rollouts(
+    ) -> RolloutBatch:
+        budget = self.sample_budget(self.train_num_rollouts)
+        rollouts = self.policy_rollouts(
+            policy=policy,
+            context=context,
+            features=features,
+            num_rollouts=budget.policy_rollout,
+            temperature=temperature,
+        )
+        replay = self.replay_trajectories(
             batch=batch,
             rollouts=rollouts,
-            budget=self.engine.expand_budget,
-            rollout_context=context,
-            backward_kernel=self.replay_source.backward_kernel if self.replay_source is not None else ShortestPathReplaySource(expand_budget=self.engine.expand_budget).backward_kernel,
-            device=context.device,
+            context=context,
+            num_trajectories=budget.replay_expand,
         )
-        if policy_transitions is not None and policy_transitions.num_transitions > 0:
-            transition_parts.append(policy_transitions)
-        if replay is not None and replay.num_transitions > 0:
-            transition_parts.append(replay.transitions)
-
-        return RolloutChunk(
+        training = self.training_batch(
             rollouts=rollouts,
-            transitions=None if not transition_parts else TransitionBatch.concat(transition_parts),
+            replay=replay,
+            context=context,
+        )
+        return RolloutBatch(
+            rollouts=rollouts,
+            training=training,
+            replay=replay,
         )
 
     def eval_rollouts(
         self,
         *,
-        policy: Policy,
-        batch: RetrievalBatch,
-        context: RolloutContext,
+        policy: ForwardPolicy,
+        context: GraphContext,
+        features: EncodedFeatures,
         temperature: float,
         num_rollouts: int | None = None,
-        chunk_size: int | None = None,
     ) -> tuple[RolloutResult, ...]:
-        total = self.eval_num_rollout if num_rollouts is None else int(num_rollouts)
-        size = self.eval_chunk_size if chunk_size is None else int(chunk_size)
+        total = self.eval_num_rollouts if num_rollouts is None else int(num_rollouts)
+        return self.policy_rollouts(
+            policy=policy,
+            context=context,
+            features=features,
+            num_rollouts=total,
+            temperature=temperature,
+        )
 
-        rollouts: list[RolloutResult] = []
-        for current_size in chunk_sizes(
-            total=total,
-            chunk_size=size,
-        ):
-            rollouts.extend(
-                self.engine.sample_rollouts(
-                    policy=policy,
-                    context=context,
-                    num_rollouts=current_size,
-                    temperature=temperature,
-                )
+    def policy_rollouts(
+        self,
+        *,
+        policy: ForwardPolicy,
+        context: GraphContext,
+        features: EncodedFeatures,
+        num_rollouts: int,
+        temperature: float,
+    ) -> tuple[RolloutResult, ...]:
+        num_rollouts = int(num_rollouts)
+        if num_rollouts <= 0:
+            return ()
+        return tuple(
+            self.engine.sample_rollouts(
+                policy=policy,
+                context=context,
+                features=features,
+                num_rollouts=num_rollouts,
+                temperature=temperature,
             )
+        )
 
-        return tuple(rollouts)
+    def replay_trajectories(
+        self,
+        *,
+        batch: RetrievalBatch,
+        rollouts: tuple[RolloutResult, ...],
+        context: GraphContext,
+        num_trajectories: int,
+    ) -> ReplayBatch | None:
+        if int(num_trajectories) <= 0:
+            return None
+        if self.replay_source is None:
+            raise RuntimeError("replay_source is required when replay_expand > 0.")
+        return self.replay_source.sample_from_rollouts(
+            batch=batch,
+            context=context,
+            rollouts=rollouts,
+            num_trajectories=int(num_trajectories),
+        )
+
+    def training_batch(
+        self,
+        *,
+        rollouts: tuple[RolloutResult, ...],
+        replay: ReplayBatch | None,
+        context: GraphContext,
+    ) -> TrainingBatch | None:
+        parts: list[TrainingBatch] = []
+
+        policy_training = training_from_rollouts(
+            rollouts=rollouts,
+            budget=self.engine.expand_budget,
+            context=context,
+        )
+        if policy_training is not None and policy_training.num_items > 0:
+            parts.append(policy_training.with_source_id(SRC_POLICY))
+
+        if replay is not None and replay.num_trajectories > 0:
+            if self.replay_builder is None:
+                raise RuntimeError("replay_builder is required when replay is enabled.")
+            replay_training = self.replay_builder.build(
+                graph=context,
+                trajectories=replay,
+            )
+            if replay_training.num_items > 0:
+                parts.append(replay_training.with_source_id(SRC_REPLAY))
+
+        if not parts:
+            return None
+        return TrainingBatch.concat_reindex_trajectories(parts)
 
     def sample_budget(self, total: int) -> ReplaySampleBudget:
         total = int(total)
-        if not self.replay_schedule.enabled:
+        if self.replay_schedule is None:
             return ReplaySampleBudget(
                 policy_rollout=total,
                 replay_expand=0,
@@ -215,38 +242,6 @@ class RolloutRunner:
         )
 
 
-def parse_replay_schedule(
-    cfg: DictConfig | None,
-) -> ReplaySchedule:
-    if cfg is None or not bool(cfg.enabled):
-        return ReplaySchedule(
-            enabled=False,
-            rows=(
-                ReplayScheduleRow(
-                    until_progress=1.0,
-                    policy_rollout=1.0,
-                    replay_expand=0.0,
-                ),
-            ),
-        )
-
-    rows = tuple(
-        ReplayScheduleRow(
-            until_progress=float(row.until_progress),
-            policy_rollout=float(row.policy_rollout),
-            replay_expand=float(row.replay_expand),
-        )
-        for row in cfg.schedule
-    )
-    if len(rows) == 0:
-        raise ValueError("replay_schedule.schedule must not be empty.")
-
-    return ReplaySchedule(
-        enabled=True,
-        rows=rows,
-    )
-
-
 def allocate_replay_budget(
     *,
     total: int,
@@ -260,48 +255,26 @@ def allocate_replay_budget(
             replay_expand=0,
         )
 
-    weight_sum = float(policy_weight) + float(replay_weight)
+    policy_weight = float(policy_weight)
+    replay_weight = float(replay_weight)
+    weight_sum = policy_weight + replay_weight
     if weight_sum <= 0.0:
-        raise ValueError("policy_rollout and replay_expand weights cannot both be zero.")
+        raise ValueError("policy_weight and replay_weight cannot both be zero.")
 
-    policy_raw = total * float(policy_weight) / weight_sum
-    replay_raw = total * float(replay_weight) / weight_sum
-
+    policy_raw = total * policy_weight / weight_sum
+    replay_raw = total * replay_weight / weight_sum
     policy_count = int(policy_raw)
     replay_count = int(replay_raw)
     remainder = total - policy_count - replay_count
     if remainder > 0:
-        policy_fraction = policy_raw - policy_count
-        replay_fraction = replay_raw - replay_count
-        if policy_fraction >= replay_fraction:
+        if policy_raw - policy_count >= replay_raw - replay_count:
             policy_count += remainder
         else:
             replay_count += remainder
-
     return ReplaySampleBudget(
         policy_rollout=policy_count,
         replay_expand=replay_count,
     )
-
-
-def chunk_sizes(
-    *,
-    total: int,
-    chunk_size: int,
-) -> Iterator[int]:
-    remaining = int(total)
-    size = int(chunk_size)
-
-    if remaining <= 0:
-        return
-
-    if size <= 0:
-        raise ValueError(f"chunk_size must be positive, got {size}.")
-
-    while remaining > 0:
-        current = min(size, remaining)
-        remaining -= current
-        yield current
 
 
 def zero_progress() -> float:
@@ -309,12 +282,9 @@ def zero_progress() -> float:
 
 
 __all__ = [
-    "ReplaySampleBudget",
     "ReplaySchedule",
     "ReplayScheduleRow",
-    "RolloutChunk",
+    "RolloutBatch",
     "RolloutRunner",
     "allocate_replay_budget",
-    "chunk_sizes",
-    "parse_replay_schedule",
 ]

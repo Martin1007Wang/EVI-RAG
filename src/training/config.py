@@ -11,13 +11,12 @@ from omegaconf import DictConfig, ListConfig
 from src.data.artifacts import ResolvedMaterialization, load_materialization_manifest
 from src.data.tensor_table import read_table, validate_file
 
-
 _EMBEDDING_NORM_ATOL = 1.0e-3
 _STALE_MATERIALIZED_PATH_KEYS = frozenset(
     {
         "lmdb_dir",
-        "entity_text_embeddings",
-        "relation_embeddings",
+        "entity_text_semantic_table",
+        "relation_semantic_table",
         "entity_metadata_path",
         "entity_catalog_path",
         "relation_catalog_path",
@@ -27,9 +26,9 @@ _STALE_MATERIALIZED_PATH_KEYS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class ModelResources:
-    entity_text_embeddings: torch.Tensor
-    entity_embedding_map: torch.Tensor
-    relation_embeddings: torch.Tensor
+    entity_text_semantic_table: torch.Tensor
+    text_row_by_entity_id: torch.Tensor
+    relation_semantic_table: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,16 +79,10 @@ class RolloutRuntimeConfig:
         )
 
         if train_chunk_size > train_num_rollout:
-            raise ValueError(
-                "train_chunk_size cannot exceed train_num_rollout: "
-                f"{train_chunk_size} > {train_num_rollout}."
-            )
+            raise ValueError("train_chunk_size cannot exceed train_num_rollout: " f"{train_chunk_size} > {train_num_rollout}.")
 
         if eval_chunk_size > eval_num_rollout:
-            raise ValueError(
-                "eval_chunk_size cannot exceed eval_num_rollout: "
-                f"{eval_chunk_size} > {eval_num_rollout}."
-            )
+            raise ValueError("eval_chunk_size cannot exceed eval_num_rollout: " f"{eval_chunk_size} > {eval_num_rollout}.")
 
         object.__setattr__(self, "expand_budget", expand_budget)
         object.__setattr__(self, "train_num_rollout", train_num_rollout)
@@ -178,15 +171,29 @@ class LossRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class EvalRuntimeConfig:
-    best_of_k: int
     exclude_anchors_from_retrieved: bool
     use_reachable_targets: bool
+    k_windows: tuple[int, ...] | list[int] | None = None
+    best_of_k: int | None = None
 
     def __post_init__(self) -> None:
+        if self.k_windows is None:
+            if self.best_of_k is None:
+                k_windows = (1, 2, 4, 8, 16)
+            else:
+                best_of_k = positive_int(self.best_of_k, "best_of_k")
+                values = [1]
+                while values[-1] < best_of_k:
+                    values.append(values[-1] * 2)
+                k_windows = tuple(x for x in values if x <= best_of_k)
+        else:
+            k_windows = tuple(positive_int(k, "k_windows") for k in self.k_windows)
+            if not k_windows:
+                raise ValueError("k_windows must not be empty.")
         object.__setattr__(
             self,
-            "best_of_k",
-            positive_int(self.best_of_k, "best_of_k"),
+            "k_windows",
+            k_windows,
         )
         object.__setattr__(
             self,
@@ -310,18 +317,12 @@ class OptimizationRuntimeConfig:
 
     def __post_init__(self) -> None:
         if not isinstance(self.optimizer, OptimizerRuntimeConfig):
-            raise TypeError(
-                "optimization.optimizer must be OptimizerRuntimeConfig, "
-                f"got {type(self.optimizer).__name__}."
-            )
+            raise TypeError("optimization.optimizer must be OptimizerRuntimeConfig, " f"got {type(self.optimizer).__name__}.")
         if self.scheduler is not None and not isinstance(
             self.scheduler,
             SchedulerRuntimeConfig,
         ):
-            raise TypeError(
-                "optimization.scheduler must be SchedulerRuntimeConfig or None, "
-                f"got {type(self.scheduler).__name__}."
-            )
+            raise TypeError("optimization.scheduler must be SchedulerRuntimeConfig or None, " f"got {type(self.scheduler).__name__}.")
 
 
 def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
@@ -331,10 +332,7 @@ def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
     metadata_dir = _dataset_path(dataset_cfg, "metadata_dir")
     manifest = load_materialization_manifest(metadata_dir)
     if manifest is None:
-        raise FileNotFoundError(
-            "Materialization manifest not found. Re-run preprocessing to rebuild "
-            f"materialized data under {metadata_dir}."
-        )
+        raise FileNotFoundError("Materialization manifest not found. Re-run preprocessing to rebuild " f"materialized data under {metadata_dir}.")
     materialization = manifest.resolve()
 
     train_split = _split_name(datamodule_cfg.get("splits"), "train", default="train")
@@ -351,34 +349,28 @@ def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
         _require_dir(paths.index, f"{split} split index")
         validate_file(paths.question_embeddings)
         if paths.question_embeddings.rows != int(paths.num_samples):
-            raise ValueError(
-                f"{split} question embedding rows mismatch: "
-                f"{paths.question_embeddings.rows} != {int(paths.num_samples)}."
-            )
+            raise ValueError(f"{split} question embedding rows mismatch: " f"{paths.question_embeddings.rows} != {int(paths.num_samples)}.")
 
-    validate_file(materialization.entity_text_embeddings)
-    validate_file(materialization.relation_embeddings)
+    validate_file(materialization.entity_text_semantic_table)
+    validate_file(materialization.relation_semantic_table)
+    _require_file(materialization.text_row_by_entity_id, "text_row_by_entity_id")
     _require_file(materialization.entity_metadata, "entity_metadata")
 
-    entity_text_embeddings = read_table(
-        materialization.entity_text_embeddings,
+    entity_text_semantic_table = read_table(
+        materialization.entity_text_semantic_table,
     ).to(dtype=torch.float32)
-    relation_embeddings = read_table(
-        materialization.relation_embeddings,
+    relation_semantic_table = read_table(
+        materialization.relation_semantic_table,
     ).to(dtype=torch.float32)
-    entity_metadata = _load_artifact(
-        path=materialization.entity_metadata,
-        name="entity_metadata",
-    )
-    entity_embedding_map = _extract_entity_embedding_map(
-        artifact=entity_metadata,
-        name="entity_metadata",
+    text_row_by_entity_id = _load_tensor_artifact(
+        path=materialization.text_row_by_entity_id,
+        name="text_row_by_entity_id",
     ).to(dtype=torch.long)
 
     model_resources = validate_model_resources(
-        entity_text_embeddings=entity_text_embeddings,
-        entity_embedding_map=entity_embedding_map,
-        relation_embeddings=relation_embeddings,
+        entity_text_semantic_table=entity_text_semantic_table,
+        text_row_by_entity_id=text_row_by_entity_id,
+        relation_semantic_table=relation_semantic_table,
     )
 
     batch_size = positive_int(
@@ -439,67 +431,51 @@ def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
 
 def validate_model_resources(
     *,
-    entity_text_embeddings: torch.Tensor,
-    entity_embedding_map: torch.Tensor,
-    relation_embeddings: torch.Tensor,
+    entity_text_semantic_table: torch.Tensor,
+    text_row_by_entity_id: torch.Tensor,
+    relation_semantic_table: torch.Tensor,
 ) -> ModelResources:
-    if entity_text_embeddings.ndim != 2:
-        raise ValueError(
-            "entity_text_embeddings must be 2D, "
-            f"got shape={tuple(entity_text_embeddings.shape)}."
-        )
+    if entity_text_semantic_table.ndim != 2:
+        raise ValueError("entity_text_semantic_table must be 2D, " f"got shape={tuple(entity_text_semantic_table.shape)}.")
 
-    if entity_embedding_map.ndim != 1:
-        raise ValueError(
-            "entity_embedding_map must be 1D, "
-            f"got shape={tuple(entity_embedding_map.shape)}."
-        )
+    if text_row_by_entity_id.ndim != 1:
+        raise ValueError("text_row_by_entity_id must be 1D, " f"got shape={tuple(text_row_by_entity_id.shape)}.")
 
-    if relation_embeddings.ndim != 2:
-        raise ValueError(
-            "relation_embeddings must be 2D, "
-            f"got shape={tuple(relation_embeddings.shape)}."
-        )
+    if relation_semantic_table.ndim != 2:
+        raise ValueError("relation_semantic_table must be 2D, " f"got shape={tuple(relation_semantic_table.shape)}.")
 
-    entity_dim = int(entity_text_embeddings.size(1))
-    relation_dim = int(relation_embeddings.size(1))
+    entity_dim = int(entity_text_semantic_table.size(1))
+    relation_dim = int(relation_semantic_table.size(1))
     if entity_dim != relation_dim:
-        raise ValueError(
-            "Embedding dimension mismatch: "
-            f"entity_text_embeddings dim={entity_dim}, "
-            f"relation_embeddings dim={relation_dim}."
-        )
+        raise ValueError("Embedding dimension mismatch: " f"entity_text_semantic_table dim={entity_dim}, " f"relation_semantic_table dim={relation_dim}.")
 
     _validate_l2_normalized_rows(
-        entity_text_embeddings,
-        name="entity_text_embeddings",
+        entity_text_semantic_table,
+        name="entity_text_semantic_table",
     )
     _validate_l2_normalized_rows(
-        relation_embeddings,
-        name="relation_embeddings",
+        relation_semantic_table,
+        name="relation_semantic_table",
     )
 
-    if entity_embedding_map.numel() > 0:
-        min_id = int(entity_embedding_map.min().item())
-        max_id = int(entity_embedding_map.max().item())
+    if text_row_by_entity_id.numel() > 0:
+        min_id = int(text_row_by_entity_id.min().item())
+        max_id = int(text_row_by_entity_id.max().item())
 
         if min_id < -1:
-            raise ValueError(
-                "entity_embedding_map must contain -1 or nonnegative text ids, "
-                f"got min={min_id}."
-            )
+            raise ValueError("text_row_by_entity_id must contain -1 or nonnegative text ids, " f"got min={min_id}.")
 
-        if max_id >= int(entity_text_embeddings.size(0)):
+        if max_id >= int(entity_text_semantic_table.size(0)):
             raise ValueError(
-                "entity_embedding_map contains text ids outside "
-                "entity_text_embeddings: "
-                f"max={max_id}, table_size={int(entity_text_embeddings.size(0))}."
+                "text_row_by_entity_id contains text ids outside "
+                "entity_text_semantic_table: "
+                f"max={max_id}, table_size={int(entity_text_semantic_table.size(0))}."
             )
 
     return ModelResources(
-        entity_text_embeddings=entity_text_embeddings.contiguous(),
-        entity_embedding_map=entity_embedding_map.contiguous(),
-        relation_embeddings=relation_embeddings.contiguous(),
+        entity_text_semantic_table=entity_text_semantic_table.contiguous(),
+        text_row_by_entity_id=text_row_by_entity_id.contiguous(),
+        relation_semantic_table=relation_semantic_table.contiguous(),
     )
 
 
@@ -574,34 +550,15 @@ def _load_artifact(
         raise RuntimeError(f"Failed to load {name} artifact from {path}") from exc
 
 
-def _extract_entity_embedding_map(*, artifact: Any, name: str) -> torch.Tensor:
-    if isinstance(artifact, Mapping):
-        entity_embedding_map = artifact.get("entity_embedding_map")
-        if isinstance(entity_embedding_map, torch.Tensor):
-            return entity_embedding_map
-
-        entity_text_row_ids = artifact.get("entity_text_row_ids")
-        if isinstance(entity_text_row_ids, torch.Tensor):
-            return entity_text_row_ids
-
-        raise KeyError(
-            f"{name} mapping does not contain tensor key 'entity_embedding_map' or "
-            "'entity_text_row_ids'. Available keys: "
-            f"{sorted(artifact.keys())}."
-        )
-
-    entity_embedding_map = getattr(artifact, "entity_embedding_map", None)
-    if isinstance(entity_embedding_map, torch.Tensor):
-        return entity_embedding_map
-
-    entity_text_row_ids = getattr(artifact, "entity_text_row_ids", None)
-    if isinstance(entity_text_row_ids, torch.Tensor):
-        return entity_text_row_ids
-
-    raise TypeError(
-        f"{name} must expose tensor field 'entity_embedding_map' or "
-        f"'entity_text_row_ids'; got {type(artifact)!r}."
-    )
+def _load_tensor_artifact(
+    *,
+    path: Path,
+    name: str,
+) -> torch.Tensor:
+    artifact = _load_artifact(path=path, name=name)
+    if not isinstance(artifact, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor artifact, got {type(artifact).__name__}: {path}")
+    return artifact
 
 
 def _validate_l2_normalized_rows(
@@ -702,10 +659,7 @@ def config_value(
     if isinstance(section, Mapping):
         return section.get(key, default)
 
-    raise TypeError(
-        f"Config section for {key!r} must be DictConfig, mapping, or None; "
-        f"got {type(section).__name__}."
-    )
+    raise TypeError(f"Config section for {key!r} must be DictConfig, mapping, or None; " f"got {type(section).__name__}.")
 
 
 def one_of(value: Any, name: str, allowed: set[str]) -> str:
@@ -721,9 +675,7 @@ def betas_value(value: Any, name: str) -> tuple[float, float]:
         raise TypeError(f"{name} must be a sequence of two floats.")
 
     if not isinstance(value, (list, tuple, ListConfig)):
-        raise TypeError(
-            f"{name} must be a sequence of two floats, got {type(value).__name__}."
-        )
+        raise TypeError(f"{name} must be a sequence of two floats, got {type(value).__name__}.")
 
     if len(value) != 2:
         raise ValueError(f"{name} must contain exactly two values, got {len(value)}.")

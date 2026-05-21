@@ -12,6 +12,8 @@ max_epochs: -1
 max_steps: 100000
 
 accumulate_grad_batches: 1
+gradient_clip_val: null
+gradient_clip_algorithm: norm
 benchmark: false
 val_check_interval: null
 check_val_every_n_epoch: 1

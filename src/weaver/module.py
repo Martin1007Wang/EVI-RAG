@@ -1,201 +1,320 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 from lightning import LightningModule
-from lightning.pytorch.utilities.types import OptimizerLRScheduler
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from lightning.pytorch.utilities.types import OptimizerLRScheduler, OptimizerLRSchedulerConfig
 
 from src.data.schema import RetrievalBatch
 from src.training.config import EvalRuntimeConfig, OptimizationRuntimeConfig
 from src.training.metrics import WeaverMetricSuite
-from src.weaver.loss import LossOutput, ProbabilityDBLoss
-from src.weaver.context import RewardContext
-from src.weaver.nn.feature_encoder import FeatureBank, FeatureEncoder
-from src.weaver.policy import Policy
-from src.weaver.reward import EvidenceLogReward
-from src.weaver.rollout.engine import RolloutContext
+from src.training.optimization import (
+    build_lightning_scheduler_config,
+    build_optimizer,
+    build_scheduler,
+    resolve_scheduler_horizon,
+)
+from src.weaver.context import GraphContext, TargetContext
+from src.weaver.nn.feature_encoder import EncodedFeatures, FeatureEncoder
+from src.weaver.objectives import SubTBLoss, build_subtb_input, single_step_branch_losses
+from src.weaver.policy import ForwardPolicy, PolicyOutput, UniformValidPredecessorBackwardPolicy
 from src.weaver.rollout.result import RolloutResult
-from src.weaver.rollout.runner import RolloutChunk, RolloutRunner
-from src.weaver.transitions import TransitionBatch
+from src.weaver.rollout.runner import RolloutBatch, RolloutRunner
+from src.weaver.state import State
+from src.weaver.transition import TrainingBatch
+from src.weaver.utility import TrueTerminalReward
 
 Scalar = torch.Tensor | float | int
+
+
+@dataclass(frozen=True, slots=True)
+class StepOutput:
+    loss: torch.Tensor
+    metrics: Mapping[str, Scalar]
+    expansion_branch_loss: torch.Tensor
+    terminal_branch_loss: torch.Tensor
 
 
 class WeaverModule(LightningModule):
     def __init__(
         self,
         *,
-        feature_encoder: FeatureEncoder,
-        policy: Policy,
-        reward_model: EvidenceLogReward,
+        policy_feature_encoder: FeatureEncoder,
+        policy: ForwardPolicy,
+        reward_model: TrueTerminalReward,
+        policy_objective: SubTBLoss,
         runner: RolloutRunner,
         optimization: OptimizationRuntimeConfig,
         evaluation: EvalRuntimeConfig,
         train_temperature: float = 1.0,
         eval_temperature: float = 1.0,
         gradient_clip_val: float | None = None,
+        gradient_clip_algorithm: str = "norm",
     ) -> None:
         super().__init__()
 
-        self.feature_encoder = feature_encoder
+        self.automatic_optimization = False
+
+        self.policy_feature_encoder = policy_feature_encoder
         self.policy = policy
         self.reward_model = reward_model
-        self.db_loss = ProbabilityDBLoss()
+        self.policy_objective = policy_objective
+        self.backward_policy = UniformValidPredecessorBackwardPolicy()
 
         self.runner = runner
         self.optimization = optimization
         self.evaluation = evaluation
+
+        self.train_temperature = float(train_temperature)
+        self.eval_temperature = float(eval_temperature)
+        self.gradient_clip_val = gradient_clip_val
+        self.gradient_clip_algorithm = gradient_clip_algorithm
+
         self.metric_suite = WeaverMetricSuite(
-            best_of_k=evaluation.best_of_k,
+            k_windows=evaluation.k_windows,
             exclude_anchors_from_retrieved=evaluation.exclude_anchors_from_retrieved,
             use_reachable_targets=evaluation.use_reachable_targets,
         )
 
-        self.train_temperature = float(train_temperature)
-        self.eval_temperature = float(eval_temperature)
-        self.gradient_clip_val = None if gradient_clip_val is None else float(gradient_clip_val)
+        self.runner.progress_fn = self.training_progress
 
-        if self.train_temperature <= 0.0:
-            raise ValueError(f"train_temperature must be positive, got {self.train_temperature}.")
-        if self.eval_temperature <= 0.0:
-            raise ValueError(f"eval_temperature must be positive, got {self.eval_temperature}.")
-        if self.gradient_clip_val is not None and self.gradient_clip_val < 0.0:
-            raise ValueError(f"gradient_clip_val must be non-negative, got {self.gradient_clip_val}.")
-
-        self.runner.progress_fn = self._training_progress
-        self.automatic_optimization = False
         self.save_hyperparameters(
             {
                 "train_temperature": self.train_temperature,
                 "eval_temperature": self.eval_temperature,
                 "gradient_clip_val": self.gradient_clip_val,
+                "gradient_clip_algorithm": self.gradient_clip_algorithm,
             }
         )
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
-        optimizer = self._build_optimizer()
-        scheduler = self._build_scheduler(optimizer)
+        optimizer = build_optimizer(
+            modules=(
+                self.policy_feature_encoder,
+                self.policy,
+            ),
+            cfg=self.optimization.optimizer,
+        )
+
+        scheduler = build_scheduler(
+            optimizer=optimizer,
+            cfg=self.optimization.scheduler,
+            trainer=self.trainer,
+            base_lr=self.optimization.optimizer.lr,
+        )
+
         if scheduler is None:
             return optimizer
-        return {
+
+        config: OptimizerLRSchedulerConfig = {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": self.optimization.scheduler.interval,
-            },
+            "lr_scheduler": build_lightning_scheduler_config(
+                scheduler=scheduler,
+                interval=self.optimization.scheduler.interval,
+            ),
         }
+        return config
 
     def training_step(
         self,
         batch: RetrievalBatch,
         batch_idx: int,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         del batch_idx
-        optimizer = self._single_optimizer()
-        optimizer.zero_grad(set_to_none=True)
 
-        batch_size = _batch_size(batch)
-        total_weight = 0
-        num_chunks = 0
-        weighted_loss_sum = torch.zeros((), device=self.device)
-        metric_sums: dict[str, torch.Tensor] = {}
-
-        with torch.no_grad():
-            rollout_features = self.feature_encoder(batch)
-            rollout_context = self.runner.engine.prepare_context(
-                batch=batch,
-                features=rollout_features,
-            )
-            reward_context = self.reward_model.prepare_context(
-                batch,
-                expand_budget=self.runner.engine.expand_budget,
-            )
-
-        chunks = self.runner.train_chunks(
-            policy=self.policy,
+        output = self.compute_step(
             batch=batch,
-            context=rollout_context,
-            temperature=self.train_temperature,
         )
 
-        for chunk in chunks:
-            if not _chunk_has_signal(chunk):
-                continue
-            output = self._forward_chunk(
-                chunk=chunk,
-                features=self.feature_encoder(batch),
-                rollout_context=rollout_context,
-                reward_context=reward_context,
-            )
-            weight = int(output.num_states)
-            if weight <= 0:
-                continue
-
-            loss = _require_scalar_loss(output.loss)
-            weighted_loss = loss * float(weight)
-            self.manual_backward(weighted_loss)
-
-            weighted_loss_sum = weighted_loss_sum + weighted_loss.detach()
-            total_weight += weight
-            num_chunks += 1
-            _accumulate_metrics(
-                metric_sums=metric_sums,
-                metrics=output.metrics,
-                weight=weight,
-                device=self.device,
-            )
-
-        if total_weight <= 0 or num_chunks <= 0:
-            raise RuntimeError(
-                "No usable training signal was produced. "
-                "Check rollout sampling, replay schedule, and objective construction."
-            )
-
-        _normalize_gradients(
-            parameters=self.parameters(),
-            denominator=total_weight,
+        optimizer = self.optimizer()
+        optimizer.zero_grad(set_to_none=True)
+        branch_grad_metrics = stop_branch_gradient_metrics(
+            stop_head=self.policy.stop_head,
+            terminal_loss=output.terminal_branch_loss,
+            expansion_loss=output.expansion_branch_loss,
         )
-        if self.gradient_clip_val is not None and self.gradient_clip_val > 0.0:
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=self.gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-
+        self.manual_backward(output.loss)
+        grad_metrics = gradient_norm_metrics(self.policy)
+        self.clip_gradients_if_needed(optimizer)
         optimizer.step()
-        self._step_scheduler(interval="step")
+        self.step_scheduler_if_needed(interval="step")
 
-        mean_loss = weighted_loss_sum / float(total_weight)
-        self.log(
-            "train/loss",
-            mean_loss,
-            on_step=False,
-            on_epoch=True,
+        batch_n = graph_batch_size(batch)
+        metrics = {
+            **output.metrics,
+            **branch_grad_metrics,
+            **grad_metrics,
+        }
+        self.log_scalar(
+            "train/policy/loss",
+            output.loss,
+            batch_size=batch_n,
             prog_bar=True,
-            batch_size=batch_size,
-            sync_dist=True,
         )
-        self.log(
-            "train/signal/transitions_per_graph",
-            torch.tensor(float(total_weight) / float(batch_size), device=self.device),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=batch_size,
-            sync_dist=True,
+        self.log_scalars(
+            prefix="train/policy",
+            values=metrics,
+            batch_size=batch_n,
         )
-        self._log_averaged_scalars(
-            prefix="train",
-            metric_sums=metric_sums,
-            total_weight=total_weight,
-            batch_size=batch_size,
-            on_step=False,
-            on_epoch=True,
+        return output.loss.detach()
+
+    def compute_step(
+        self,
+        *,
+        batch: RetrievalBatch,
+    ) -> StepOutput:
+        graph = GraphContext.from_batch(batch)
+        target = TargetContext.from_batch(
+            batch=batch,
+            graph_context=graph,
         )
-        return {"loss": mean_loss}
+
+        policy_features = self.policy_feature_encoder(batch)
+
+        rollout = self.sample_train_rollout(
+            batch=batch,
+            graph=graph,
+            features=policy_features,
+        )
+        training = rollout.training
+        if training is None or training.num_items <= 0:
+            raise RuntimeError("No transition samples were produced.")
+
+        return self.policy_step_output(
+            graph=graph,
+            target=target,
+            policy_features=policy_features,
+            training=training,
+        )
+
+    def policy_step_output(
+        self,
+        *,
+        graph: GraphContext,
+        target: TargetContext,
+        policy_features: EncodedFeatures,
+        training: TrainingBatch,
+    ) -> StepOutput:
+        expansions = training.expansions
+        terminals = training.terminals
+        if terminals.num_items <= 0:
+            zero = policy_features.query_model.new_zeros(())
+            return StepOutput(
+                loss=zero,
+                metrics={"loss/subtb": zero.detach()},
+                expansion_branch_loss=zero,
+                terminal_branch_loss=zero,
+            )
+
+        expand_budget = int(self.runner.engine.expand_budget)
+        if expansions.num_items > 0:
+            parent_frontier = expansions.parent.frontier(
+                graph,
+                expand_budget=expand_budget,
+            )
+            child_frontier = expansions.child.frontier(
+                graph,
+                expand_budget=expand_budget,
+            )
+
+            parent_out = self.policy(
+                features=policy_features,
+                state=expansions.parent,
+                context=graph,
+                frontier=parent_frontier,
+            )
+            child_out = self.policy(
+                features=policy_features,
+                state=expansions.child,
+                context=graph,
+                frontier=child_frontier,
+            )
+            backward_log_prob = backward_action_log_prob(
+                backward_policy=self.backward_policy,
+                child_state=expansions.child,
+                context=graph,
+                action_edge_ids=expansions.edge_ids,
+            )
+        else:
+            parent_out = empty_policy_output(
+                device=policy_features.query_model.device,
+                dtype=policy_features.query_model.dtype,
+                num_edges=graph.num_edges,
+            )
+            child_out = parent_out
+            backward_log_prob = torch.empty(
+                0,
+                dtype=torch.float32,
+                device=policy_features.query_model.device,
+            )
+        terminal_frontier = terminals.state.frontier(
+            graph,
+            expand_budget=expand_budget,
+        )
+        terminal_out = self.policy(
+            features=policy_features,
+            state=terminals.state,
+            context=graph,
+            frontier=terminal_frontier,
+        )
+
+        reward_out = call_reward_model(
+            reward_model=self.reward_model,
+            state=terminals.state,
+            graph_context=graph,
+            target_context=target,
+        )
+
+        subtb_input = build_subtb_input(
+            parent_out=parent_out,
+            child_out=child_out,
+            terminal_out=terminal_out,
+            reward_out=reward_out,
+            backward_log_prob=backward_log_prob,
+            expansions=expansions,
+            terminals=terminals,
+        )
+
+        output = self.policy_objective(subtb_input)
+        expansion_branch_loss, terminal_branch_loss = single_step_branch_losses(
+            subtb_input,
+            loss_type=self.policy_objective.residual_loss,
+            huber_delta=self.policy_objective.huber_delta,
+        )
+        policy_metrics = policy_diagnostic_metrics(
+            expansion_out=parent_out,
+            expansion_depth=expansions.parent.depth,
+            terminal_out=terminal_out,
+            terminal_depth=terminals.state.depth,
+        )
+
+        return StepOutput(
+            loss=output.loss,
+            metrics={
+                **output.metrics,
+                **policy_metrics,
+            },
+            expansion_branch_loss=expansion_branch_loss,
+            terminal_branch_loss=terminal_branch_loss,
+        )
+
+    def sample_train_rollout(
+        self,
+        *,
+        batch: RetrievalBatch,
+        graph: GraphContext,
+        features: EncodedFeatures,
+    ) -> RolloutBatch:
+        with torch.no_grad():
+            return self.runner.train_rollouts(
+                policy=self.policy,
+                batch=batch,
+                context=graph,
+                features=features,
+                temperature=self.train_temperature,
+            )
 
     def validation_step(
         self,
@@ -203,7 +322,7 @@ class WeaverModule(LightningModule):
         batch_idx: int,
     ) -> None:
         del batch_idx
-        self._rollout_eval_step(split="val", batch=batch)
+        self.eval_step(split="val", batch=batch)
 
     def test_step(
         self,
@@ -211,7 +330,7 @@ class WeaverModule(LightningModule):
         batch_idx: int,
     ) -> None:
         del batch_idx
-        self._rollout_eval_step(split="test", batch=batch)
+        self.eval_step(split="test", batch=batch)
 
     def predict_step(
         self,
@@ -221,426 +340,372 @@ class WeaverModule(LightningModule):
     ) -> tuple[RolloutResult, ...]:
         del batch_idx, dataloader_idx
         with torch.no_grad():
-            features = self.feature_encoder(batch)
-            rollout_context = self.runner.engine.prepare_context(
-                batch=batch,
-                features=features,
-            )
+            graph = GraphContext.from_batch(batch)
+            features = self.policy_feature_encoder(batch)
             return self.runner.eval_rollouts(
                 policy=self.policy,
-                batch=batch,
-                context=rollout_context,
+                context=graph,
+                features=features,
                 temperature=self.eval_temperature,
             )
 
-    def on_train_epoch_end(self) -> None:
-        self._step_scheduler(interval="epoch")
-
-    def _rollout_eval_step(
+    def eval_step(
         self,
         *,
         split: str,
         batch: RetrievalBatch,
     ) -> None:
-        batch_size = _batch_size(batch)
-
         with torch.no_grad():
-            features = self.feature_encoder(batch)
-            rollout_context = self.runner.engine.prepare_context(
+            graph = GraphContext.from_batch(batch)
+            target = TargetContext.from_batch(
                 batch=batch,
-                features=features,
+                graph_context=graph,
             )
+            features = self.policy_feature_encoder(batch)
             rollouts = self.runner.eval_rollouts(
                 policy=self.policy,
-                batch=batch,
-                context=rollout_context,
+                context=graph,
+                features=features,
                 temperature=self.eval_temperature,
             )
-            output_metrics = self.metric_suite.eval_metrics(
+            metrics = self.metric_suite.eval_metrics(
                 rollout_samples=rollouts,
                 batch=batch,
                 stage="",
+                context=graph,
+                features=features,
+                reward_model=self.reward_model,
+                target_context=target,
             )
 
-        self.log(
+        batch_n = graph_batch_size(batch)
+        self.log_scalar(
             f"{split}/num_rollouts",
             float(len(rollouts)),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=batch_size,
-            sync_dist=True,
+            batch_size=batch_n,
         )
-        self._log_scalars(
+        self.log_scalars(
             prefix=split,
-            values=output_metrics,
-            batch_size=batch_size,
-            on_step=False,
-            on_epoch=True,
+            values=metrics,
+            batch_size=batch_n,
         )
 
-    def _single_optimizer(self) -> torch.optim.Optimizer:
-        optimizer = self.optimizers(use_pl_optimizer=False)
-        if isinstance(optimizer, list):
+    def optimizer(self) -> torch.optim.Optimizer:
+        optimizer = self.optimizers()
+        if isinstance(optimizer, (list, tuple)):
             if len(optimizer) != 1:
-                raise RuntimeError(f"WeaverModule expects exactly one optimizer, got {len(optimizer)}.")
-            optimizer = optimizer[0]
+                raise RuntimeError("WeaverModule expects exactly one optimizer.")
+            return optimizer[0]
         return optimizer
 
-    def _build_optimizer(self) -> torch.optim.Optimizer:
-        optimizer_cfg = self.optimization.optimizer
-        if optimizer_cfg.type != "adamw":
-            raise ValueError(f"Unsupported optimizer type {optimizer_cfg.type!r}.")
-        if optimizer_cfg.no_decay_on_bias_and_norm:
-            parameters = _parameter_groups_without_decay(
-                self,
-                weight_decay=optimizer_cfg.weight_decay,
-            )
-        else:
-            parameters = self.parameters()
-        return AdamW(
-            parameters,
-            lr=optimizer_cfg.lr,
-            betas=optimizer_cfg.betas,
-            weight_decay=optimizer_cfg.weight_decay,
-        )
-
-    def _build_scheduler(
+    def clip_gradients_if_needed(
         self,
         optimizer: torch.optim.Optimizer,
-    ) -> torch.optim.lr_scheduler.LRScheduler | None:
-        scheduler_cfg = self.optimization.scheduler
-        if scheduler_cfg is None:
-            return None
-        if scheduler_cfg.type != "cosine":
-            raise ValueError(f"Unsupported scheduler type {scheduler_cfg.type!r}.")
-
-        horizon = _resolve_scheduler_horizon(
-            trainer=self.trainer,
-            interval=scheduler_cfg.interval,
-        )
-        if horizon <= 0:
-            raise RuntimeError(
-                "Could not resolve a positive scheduler horizon. "
-                "Set Trainer.max_steps or Trainer.max_epochs correctly."
-            )
-
-        warmup_steps = int(float(horizon) * scheduler_cfg.warmup_ratio)
-        cosine_steps = max(1, horizon - warmup_steps)
-        cosine = CosineAnnealingLR(
+    ) -> None:
+        if self.gradient_clip_val is None or self.gradient_clip_val <= 0:
+            return
+        self.clip_gradients(
             optimizer,
-            T_max=cosine_steps,
-            eta_min=scheduler_cfg.eta_min,
-        )
-        if warmup_steps <= 0:
-            return cosine
-        warmup = LinearLR(
-            optimizer,
-            start_factor=1.0e-8,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        return SequentialLR(
-            optimizer,
-            schedulers=[warmup, cosine],
-            milestones=[warmup_steps],
+            gradient_clip_val=float(self.gradient_clip_val),
+            gradient_clip_algorithm=self.gradient_clip_algorithm,
         )
 
-    def _step_scheduler(
+    def step_scheduler_if_needed(
         self,
         *,
         interval: str,
     ) -> None:
-        scheduler_cfg = self.optimization.scheduler
-        if scheduler_cfg is None or scheduler_cfg.interval != interval:
+        cfg = self.optimization.scheduler
+        if cfg is None or cfg.interval != interval:
             return
         scheduler = self.lr_schedulers()
-        if scheduler is None:
-            return
-        if isinstance(scheduler, list):
-            if len(scheduler) != 1:
-                raise RuntimeError(f"WeaverModule expects exactly one scheduler, got {len(scheduler)}.")
-            scheduler = scheduler[0]
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
-    def _training_progress(self) -> float:
+    def on_train_epoch_end(self) -> None:
+        self.step_scheduler_if_needed(interval="epoch")
+
+    def training_progress(self) -> float:
         try:
             trainer = self.trainer
         except RuntimeError:
             return 0.0
-        horizon = _resolve_scheduler_horizon(trainer=trainer, interval="step")
+
+        horizon = resolve_scheduler_horizon(
+            trainer=trainer,
+            explicit_t_max=None,
+            interval="step",
+        )
         if horizon <= 0:
             return 0.0
-        step = int(getattr(trainer, "global_step", 0))
+        step = int(trainer.global_step)
         return min(1.0, max(0.0, float(step) / float(horizon)))
 
-    def _log_scalars(
+    def log_scalar(
+        self,
+        name: str,
+        value: Scalar,
+        *,
+        batch_size: int,
+        prog_bar: bool = False,
+    ) -> None:
+        log_value = value.detach() if isinstance(value, torch.Tensor) else float(value)
+        self.log(
+            name,
+            log_value,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=prog_bar,
+            batch_size=batch_size,
+            sync_dist=True,
+        )
+
+    def log_scalars(
         self,
         *,
         prefix: str,
         values: Mapping[str, Scalar],
         batch_size: int,
-        on_step: bool,
-        on_epoch: bool,
     ) -> None:
         for name, value in values.items():
-            scalar = _to_scalar_tensor(name=name, value=value, device=self.device)
-            self.log(
+            self.log_scalar(
                 f"{prefix}/{name}",
-                scalar,
-                on_step=on_step,
-                on_epoch=on_epoch,
-                prog_bar=False,
+                value,
                 batch_size=batch_size,
-                sync_dist=True,
             )
 
-    def _log_averaged_scalars(
-        self,
-        *,
-        prefix: str,
-        metric_sums: Mapping[str, torch.Tensor],
-        total_weight: int,
-        batch_size: int,
-        on_step: bool,
-        on_epoch: bool,
-    ) -> None:
-        if total_weight <= 0:
-            return
-        values = {name: value / float(total_weight) for name, value in metric_sums.items()}
-        self._log_scalars(
-            prefix=prefix,
-            values=values,
-            batch_size=batch_size,
-            on_step=on_step,
-            on_epoch=on_epoch,
-        )
 
-    def _forward_chunk(
-        self,
-        *,
-        chunk: RolloutChunk,
-        features: FeatureBank,
-        rollout_context: RolloutContext,
-        reward_context: RewardContext,
-    ) -> LossOutput:
-        transitions = chunk.transitions
-        if transitions is None or transitions.num_transitions <= 0:
-            zero = torch.zeros((), device=features.edge_h.device)
-            return LossOutput(
-                loss=zero,
-                metrics={},
-                num_states=0,
-                per_unit_loss=None,
-            )
-        return self._forward_transitions(
-            transitions=transitions,
-            features=features,
-            rollout_context=rollout_context,
-            reward_context=reward_context,
-        )
-
-    def _forward_transitions(
-        self,
-        *,
-        transitions: TransitionBatch,
-        features: FeatureBank,
-        rollout_context: RolloutContext,
-        reward_context: RewardContext,
-    ) -> LossOutput:
-        parent_out = self.policy(
-            context=rollout_context.graph_context,
-            state=transitions.parent_state,
-            features=features,
-            frontier_builder=rollout_context.frontier_builder,
-        )
-        child_out = self.policy(
-            context=rollout_context.graph_context,
-            state=transitions.child_state,
-            features=features,
-            frontier_builder=rollout_context.frontier_builder,
-        )
-
-        selected_positions = _match_transition_actions(
-            row_ids=parent_out.frontier.row_ids,
-            edge_ids=parent_out.frontier.edge_ids,
-            action_edge_ids=transitions.action_edge_ids,
-            device=parent_out.stop_log_prob.device,
-        )
-        parent_edge_log_prob = parent_out.edge_log_prob.index_select(0, selected_positions)
-
-        parent_reward = self.reward_model(
-            state=transitions.parent_state,
-            context=reward_context,
-        )
-        child_reward = self.reward_model(
-            state=transitions.child_state,
-            context=reward_context,
-        )
-
-        output = self.db_loss(
-            parent_log_reward=parent_reward.log_reward,
-            child_log_reward=child_reward.log_reward,
-            log_backward_prob=transitions.log_backward_prob,
-            parent_stop_log_prob=parent_out.stop_log_prob,
-            parent_continue_log_prob=parent_out.continue_log_prob,
-            parent_edge_log_prob=parent_edge_log_prob,
-            child_stop_log_prob=child_out.stop_log_prob,
-        )
-        metrics = dict(output.metrics)
-        before_hit_rate = (~parent_reward.fail_penalty).float().mean().detach()
-        after_hit_rate = (~child_reward.fail_penalty).float().mean().detach()
-        metrics.update(
-            {
-                "reward/hit_rate_after_action": after_hit_rate,
-                "reward/hit_rate_delta": after_hit_rate - before_hit_rate,
-                "policy/stop_prob_before_action": parent_out.stop_log_prob.exp().float().mean().detach(),
-                "policy/selected_edge_prob": parent_edge_log_prob.exp().float().mean().detach(),
-            }
-        )
-        return LossOutput(
-            loss=output.loss,
-            metrics=metrics,
-            num_states=output.num_states,
-            per_unit_loss=output.per_unit_loss,
-        )
-
-
-def _chunk_has_signal(chunk: RolloutChunk) -> bool:
-    return bool(chunk.has_rollouts or chunk.has_replay)
-
-
-def _require_scalar_loss(loss: torch.Tensor) -> torch.Tensor:
-    if not isinstance(loss, torch.Tensor):
-        raise TypeError(f"objective.loss must be a Tensor, got {type(loss).__name__}.")
-    if loss.ndim != 0:
-        raise ValueError(f"objective.loss must be scalar, got shape {tuple(loss.shape)}.")
-    if not torch.isfinite(loss.detach()):
-        raise FloatingPointError(f"objective.loss is not finite: {float(loss.detach())}.")
-    if not loss.requires_grad:
-        raise RuntimeError(
-            "objective.loss does not require grad. "
-            "The objective must recompute policy scores from sampled states."
-        )
-    return loss
-
-
-def _accumulate_metrics(
+def backward_action_log_prob(
     *,
-    metric_sums: dict[str, torch.Tensor],
-    metrics: Mapping[str, Scalar],
-    weight: int,
-    device: torch.device,
-) -> None:
-    for name, value in metrics.items():
-        scalar = _to_scalar_tensor(name=name, value=value, device=device)
-        if name not in metric_sums:
-            metric_sums[name] = torch.zeros((), device=device)
-        metric_sums[name] = metric_sums[name] + scalar.detach() * float(weight)
-
-
-def _to_scalar_tensor(
-    *,
-    name: str,
-    value: Scalar,
-    device: torch.device,
+    backward_policy: UniformValidPredecessorBackwardPolicy,
+    child_state: State,
+    context: GraphContext,
+    action_edge_ids: torch.Tensor,
 ) -> torch.Tensor:
-    if isinstance(value, torch.Tensor):
-        tensor = value.detach()
-        if tensor.ndim != 0:
-            raise ValueError(f"Logged value {name!r} must be scalar, got shape {tuple(tensor.shape)}.")
-        return tensor.to(device=device)
-    if isinstance(value, (float, int)):
-        return torch.tensor(float(value), device=device)
-    raise TypeError(
-        f"Logged value {name!r} must be Tensor, float, or int, "
-        f"got {type(value).__name__}."
+    action_edge_ids = action_edge_ids.to(device=child_state.device, dtype=torch.long).view(-1)
+    out = torch.zeros(
+        action_edge_ids.numel(),
+        dtype=torch.float32,
+        device=child_state.device,
+    )
+    expand = action_edge_ids.ge(0)
+    if bool(expand.any()):
+        out[expand] = backward_policy.log_prob(
+            child_state=child_state.select_rows(expand.nonzero(as_tuple=False).flatten()),
+            context=context,
+            action_edge_ids=action_edge_ids[expand],
+        )
+    return out
+
+
+def empty_policy_output(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_edges: int,
+) -> PolicyOutput:
+    return PolicyOutput(
+        stop_logit=torch.empty(0, dtype=dtype, device=device),
+        edge_logit=torch.empty(0, dtype=dtype, device=device),
+        state_log_flow=torch.empty(0, dtype=dtype, device=device),
+        edge_row_ids=torch.empty(0, dtype=torch.long, device=device),
+        edge_ids=torch.empty(0, dtype=torch.long, device=device),
+        num_rows=0,
+        num_edges=int(num_edges),
     )
 
 
-def _normalize_gradients(
+def call_reward_model(
     *,
-    parameters: Iterator[torch.nn.Parameter],
-    denominator: int,
-) -> None:
-    if denominator <= 0:
-        raise ValueError(f"denominator must be positive, got {denominator}.")
-    scale = float(denominator)
-    for param in parameters:
-        if param.grad is not None:
-            param.grad.div_(scale)
+    reward_model: TrueTerminalReward,
+    state: State,
+    graph_context: GraphContext,
+    target_context: TargetContext,
+):
+    return reward_model(
+        state=state,
+        graph_context=graph_context,
+        target_context=target_context,
+    )
 
 
-def _batch_size(batch: RetrievalBatch) -> int:
-    return int(batch.num_graphs_total)
+def policy_diagnostic_metrics(
+    *,
+    expansion_out: PolicyOutput,
+    expansion_depth: torch.Tensor,
+    terminal_out: PolicyOutput,
+    terminal_depth: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    stop_logit = torch.cat(
+        [
+            expansion_out.stop_logit.float(),
+            terminal_out.stop_logit.float(),
+        ],
+        dim=0,
+    )
+    depth = torch.cat(
+        [
+            expansion_depth.to(device=stop_logit.device, dtype=torch.long).view(-1),
+            terminal_depth.to(device=stop_logit.device, dtype=torch.long).view(-1),
+        ],
+        dim=0,
+    )
+    stop_prob = torch.cat(
+        [
+            expansion_out.stop_prob().float(),
+            terminal_out.stop_prob().float(),
+        ],
+        dim=0,
+    )
+
+    frontier_size = torch.cat(
+        [
+            expansion_out.frontier_size(),
+            terminal_out.frontier_size(),
+        ],
+        dim=0,
+    )
+    edge_cond_entropy = torch.cat(
+        [
+            expansion_out.edge_cond_entropy(),
+            terminal_out.edge_cond_entropy(),
+        ],
+        dim=0,
+    )
+    continue_prob = torch.cat(
+        [
+            expansion_out.continue_prob().float(),
+            terminal_out.continue_prob().float(),
+        ],
+        dim=0,
+    )
+    has_frontier = frontier_size.gt(0)
+
+    metrics: dict[str, torch.Tensor] = {
+        "policy/continue_prob_mean": masked_mean_or_zero(continue_prob, has_frontier).detach(),
+        "policy/edge_cond_entropy_mean": masked_mean_or_zero(edge_cond_entropy, has_frontier).detach(),
+        "policy/frontier_size_mean": mean_or_zero(frontier_size).detach(),
+        "policy/frontier_size_p90": quantile_or_zero(frontier_size, 0.90).detach(),
+        "policy/frontier_size_p99": quantile_or_zero(frontier_size, 0.99).detach(),
+    }
+    for bucket in range(4):
+        mask = depth.eq(bucket)
+        metrics[f"policy/stop_logit/depth{bucket}_mean"] = masked_mean_or_zero(
+            stop_logit,
+            mask,
+        ).detach()
+        metrics[f"policy/stop_prob/depth{bucket}_mean"] = masked_mean_or_zero(
+            stop_prob,
+            mask,
+        ).detach()
+    return metrics
 
 
-def _parameter_groups_without_decay(
+def stop_branch_gradient_metrics(
+    *,
+    stop_head: torch.nn.Module,
+    terminal_loss: torch.Tensor,
+    expansion_loss: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    params = [param for param in stop_head.parameters() if param.requires_grad]
+    terminal_grad = gradient_vector(
+        loss=terminal_loss,
+        params=params,
+        retain_graph=True,
+    )
+    expansion_grad = gradient_vector(
+        loss=expansion_loss,
+        params=params,
+        retain_graph=True,
+    )
+    terminal_norm = terminal_grad.norm()
+    expansion_norm = expansion_grad.norm()
+    denom = terminal_norm * expansion_norm
+    cosine = torch.where(
+        denom.gt(0),
+        torch.dot(terminal_grad, expansion_grad) / denom.clamp_min(torch.finfo(terminal_grad.dtype).tiny),
+        terminal_grad.new_zeros(()),
+    )
+    return {
+        "grad/stop_head/from_terminal_loss": terminal_norm.detach(),
+        "grad/stop_head/from_expansion_loss": expansion_norm.detach(),
+        "grad/stop_head/terminal_expansion_cosine": cosine.detach(),
+    }
+
+
+def gradient_vector(
+    *,
+    loss: torch.Tensor,
+    params: list[torch.nn.Parameter],
+    retain_graph: bool,
+) -> torch.Tensor:
+    if not params:
+        return loss.new_zeros((0,))
+    if not loss.requires_grad:
+        return torch.cat([param.detach().new_zeros(param.numel()) for param in params])
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )
+    values = [
+        torch.zeros_like(param).reshape(-1) if grad is None else grad.detach().reshape(-1)
+        for param, grad in zip(params, grads, strict=True)
+    ]
+    return torch.cat(values) if values else loss.new_zeros((0,))
+
+
+def gradient_norm_metrics(policy: ForwardPolicy) -> dict[str, torch.Tensor]:
+    reference = next(policy.parameters())
+    return {
+        "grad/stop_head_norm": module_grad_norm(policy.stop_head, reference).detach(),
+        "grad/edge_head_norm": module_grad_norm(policy.edge_head, reference).detach(),
+        "grad/state_encoder_norm": module_grad_norm(policy.state_encoder, reference).detach(),
+    }
+
+
+def module_grad_norm(
     module: torch.nn.Module,
-    *,
-    weight_decay: float,
-) -> list[dict[str, object]]:
-    decay_params: list[torch.nn.Parameter] = []
-    no_decay_params: list[torch.nn.Parameter] = []
-    for name, param in module.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.endswith(".bias") or param.ndim <= 1:
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-    groups: list[dict[str, object]] = []
-    if decay_params:
-        groups.append({"params": decay_params, "weight_decay": weight_decay})
-    if no_decay_params:
-        groups.append({"params": no_decay_params, "weight_decay": 0.0})
-    return groups
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    total = reference.new_zeros(())
+    for param in module.parameters():
+        if param.grad is not None:
+            total = total + param.grad.detach().float().square().sum()
+    return total.sqrt()
 
 
-def _resolve_scheduler_horizon(
-    *,
-    trainer: object,
-    interval: str,
+def masked_mean_or_zero(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    if values.numel() == 0 or not bool(mask.any()):
+        return values.new_zeros(())
+    return values.float()[mask].mean()
+
+
+def mean_or_zero(values: torch.Tensor) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.new_zeros(())
+    return values.float().mean()
+
+
+def quantile_or_zero(
+    values: torch.Tensor,
+    q: float,
+) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.new_zeros(())
+    return torch.quantile(values.float(), float(q))
+
+
+def graph_batch_size(
+    batch: RetrievalBatch,
 ) -> int:
-    if interval == "step":
-        max_steps = getattr(trainer, "max_steps", None)
-        if isinstance(max_steps, int) and max_steps > 0:
-            return max_steps
-        estimated = getattr(trainer, "estimated_stepping_batches", None)
-        if isinstance(estimated, int) and estimated > 0:
-            return estimated
-        return 0
-    if interval == "epoch":
-        max_epochs = getattr(trainer, "max_epochs", None)
-        if isinstance(max_epochs, int) and max_epochs > 0:
-            return max_epochs
-        return 0
-    raise ValueError(f"Unsupported scheduler interval {interval!r}.")
+    return int(batch.num_graphs_total)
 
 
 __all__ = [
     "WeaverModule",
 ]
-
-
-def _match_transition_actions(
-    *,
-    row_ids: torch.Tensor,
-    edge_ids: torch.Tensor,
-    action_edge_ids: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    row_ids = row_ids.to(device=device, dtype=torch.long).view(-1)
-    edge_ids = edge_ids.to(device=device, dtype=torch.long).view(-1)
-    target_rows = torch.arange(
-        action_edge_ids.numel(),
-        device=device,
-        dtype=torch.long,
-    )
-    target_edges = action_edge_ids.to(device=device, dtype=torch.long).view(-1)
-    if row_ids.numel() == 0:
-        raise RuntimeError("Parent policy frontier is empty for transition batch.")
-    selected = row_ids.eq(target_rows.unsqueeze(1)) & edge_ids.eq(target_edges.unsqueeze(1))
-    if not bool(selected.any(dim=1).all()):
-        raise RuntimeError("Transition action missing from parent frontier.")
-    return selected.float().argmax(dim=1).to(dtype=torch.long)

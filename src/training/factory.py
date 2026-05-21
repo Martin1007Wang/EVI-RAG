@@ -21,9 +21,7 @@ def setup_datamodule(
     datamodule.setup(stage)
 
     if not hasattr(datamodule, "model_resources"):
-        raise AttributeError(
-            f"Datamodule must expose `model_resources` after setup({stage!r})."
-        )
+        raise AttributeError(f"Datamodule must expose `model_resources` after setup({stage!r}).")
     resources = getattr(datamodule, "model_resources", None)
     return resources
 
@@ -35,9 +33,7 @@ def build_datamodule(cfg: DictConfig) -> LightningDataModule:
         throw_on_missing=True,
     )
     if not isinstance(datamodule_cfg, dict):
-        raise TypeError(
-            f"cfg.datamodule must resolve to dict, got {type(datamodule_cfg).__name__}."
-        )
+        raise TypeError(f"cfg.datamodule must resolve to dict, got {type(datamodule_cfg).__name__}.")
 
     target = datamodule_cfg.get("_target_")
     if not isinstance(target, str) or not target.strip():
@@ -63,9 +59,7 @@ def build_model(
         throw_on_missing=True,
     )
     if not isinstance(model_cfg, dict):
-        raise TypeError(
-            f"cfg.model must resolve to dict, got {type(model_cfg).__name__}."
-        )
+        raise TypeError(f"cfg.model must resolve to dict, got {type(model_cfg).__name__}.")
 
     model_cfg = deepcopy(model_cfg)
     _inject_model_resources(model_cfg, resources)
@@ -98,15 +92,9 @@ def instantiate_list(
         if "_target_" in config:
             return [hydra.utils.instantiate(config)]
 
-        return [
-            hydra.utils.instantiate(item)
-            for item in config.values()
-            if item is not None
-        ]
+        return [hydra.utils.instantiate(item) for item in config.values() if item is not None]
 
-    raise TypeError(
-        f"{name} must be a ListConfig, DictConfig, or null, got {type(config).__name__}."
-    )
+    raise TypeError(f"{name} must be a ListConfig, DictConfig, or null, got {type(config).__name__}.")
 
 
 def trainer_logger(config: ListConfig | DictConfig | None) -> bool | Any | list[Any]:
@@ -123,19 +111,19 @@ def trainer_logger(config: ListConfig | DictConfig | None) -> bool | Any | list[
 
 def model_resource_kwargs(resources: Any) -> dict[str, torch.Tensor]:
     return {
-        "entity_text_embeddings": require_attr(
+        "entity_text_semantic_table": require_attr(
             resources,
-            "entity_text_embeddings",
+            "entity_text_semantic_table",
             torch.Tensor,
         ),
-        "entity_embedding_map": require_attr(
+        "text_row_by_entity_id": require_attr(
             resources,
-            "entity_embedding_map",
+            "text_row_by_entity_id",
             torch.Tensor,
         ),
-        "relation_embeddings": require_attr(
+        "relation_semantic_table": require_attr(
             resources,
-            "relation_embeddings",
+            "relation_semantic_table",
             torch.Tensor,
         ),
     }
@@ -147,13 +135,13 @@ def _inject_model_resources(
 ) -> None:
     model_cfg.pop("hidden_dim", None)
 
-    feature_encoder_cfg = _require_mapping(
-        model_cfg.get("feature_encoder"),
-        "cfg.model.feature_encoder",
-    )
-
     resource_kwargs = model_resource_kwargs(resources)
-    feature_encoder_cfg.update(resource_kwargs)
+    for key in ("policy_feature_encoder",):
+        feature_encoder_cfg = _require_mapping(
+            model_cfg.get(key),
+            f"cfg.model.{key}",
+        )
+        feature_encoder_cfg.update(resource_kwargs)
 
 
 def _require_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -173,10 +161,7 @@ def require_attr(
     value = getattr(obj, name)
 
     if not isinstance(value, expected_type):
-        raise TypeError(
-            f"resources.{name} must be {expected_type.__name__}, "
-            f"got {type(value).__name__}."
-        )
+        raise TypeError(f"resources.{name} must be {expected_type.__name__}, " f"got {type(value).__name__}.")
 
     return cast(T, value)
 
@@ -187,10 +172,7 @@ def require_type(
     name: str,
 ) -> T:
     if not isinstance(value, expected_type):
-        raise TypeError(
-            f"{name} must instantiate {expected_type.__name__}, "
-            f"got {type(value).__name__}."
-        )
+        raise TypeError(f"{name} must instantiate {expected_type.__name__}, " f"got {type(value).__name__}.")
 
     return cast(T, value)
 
