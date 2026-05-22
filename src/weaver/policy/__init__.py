@@ -7,15 +7,15 @@ from .backward import (
 )
 from .forward import ForwardPolicy
 from .output import (
-    STOP_EDGE_ID,
-    PolicyOutput,
+    TERMINAL_EDGE_ID,
+    ForwardPolicyOutput,
 )
 
 __all__ = [
     "BackwardPolicy",
     "ForwardPolicy",
-    "PolicyOutput",
-    "STOP_EDGE_ID",
+    "ForwardPolicyOutput",
+    "TERMINAL_EDGE_ID",
     "UniformValidPredecessorBackwardPolicy",
     "valid_predecessor_count",
 ]

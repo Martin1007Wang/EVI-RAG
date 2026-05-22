@@ -28,8 +28,8 @@ class ReachableRecallScores:
 
 @dataclass(frozen=True, slots=True)
 class TerminalPolicyScores:
-    flow: torch.Tensor
-    stop_flow: torch.Tensor
+    state_flow: torch.Tensor
+    terminal_flow: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,11 +41,11 @@ class RolloutEvalTensors:
     hit: torch.Tensor
     edge_count: torch.Tensor
     trajectory_len: torch.Tensor
-    policy_stop: torch.Tensor
-    forced_stop: torch.Tensor
+    policy_terminal: torch.Tensor
+    forced_terminal: torch.Tensor
     traj_prob_score: torch.Tensor
-    flow_score: torch.Tensor
-    stop_flow_score: torch.Tensor
+    state_flow_score: torch.Tensor
+    terminal_flow_score: torch.Tensor
     log_reward: torch.Tensor
     valid_graph_mask: torch.Tensor
 
@@ -98,7 +98,7 @@ def evaluate_rollout_samples(
     )
     metrics.update(selector_metrics(tensors, ks=ks))
     metrics.update(calibration_metrics(tensors))
-    metrics.update(stop_metrics(rollout_samples, tensors, batch=batch))
+    metrics.update(terminal_metrics(rollout_samples, tensors, batch=batch))
     return metrics
 
 
@@ -133,8 +133,8 @@ def rollout_eval_tensors(
         batch.edge_batch.to(device=device, dtype=torch.long),
         num_graphs=int(batch.num_graphs),
     )
-    trajectory_len = _stack_stop_step(rollout_samples).float() + 1.0
-    policy_stop, forced_stop = stop_matrices(rollout_samples)
+    trajectory_len = _stack_terminal_step(rollout_samples).float() + 1.0
+    policy_terminal, forced_terminal = terminal_matrices(rollout_samples)
     traj_prob_score = _stack_trajectory_log_prob(rollout_samples)
 
     terminal_state = state_from_sample_edge_masks(edge_masks, context=context)
@@ -166,11 +166,11 @@ def rollout_eval_tensors(
         hit=answer_count.gt(0.0),
         edge_count=edge_count,
         trajectory_len=trajectory_len,
-        policy_stop=policy_stop,
-        forced_stop=forced_stop,
+        policy_terminal=policy_terminal,
+        forced_terminal=forced_terminal,
         traj_prob_score=traj_prob_score,
-        flow_score=terminal_scores.flow,
-        stop_flow_score=terminal_scores.stop_flow,
+        state_flow_score=terminal_scores.state_flow,
+        terminal_flow_score=terminal_scores.terminal_flow,
         log_reward=log_reward,
         valid_graph_mask=valid_graph_mask,
     )
@@ -286,8 +286,8 @@ def candidate_best_metrics(
 def selector_metrics(tensors: RolloutEvalTensors, *, ks: Sequence[int]) -> dict[str, float]:
     selectors: tuple[tuple[str, SelectorFn], ...] = (
         ("traj_prob", _traj_prob_indices),
-        ("flow", _flow_indices),
-        ("stop_flow", _stop_flow_indices),
+        ("state_flow", _state_flow_indices),
+        ("terminal_flow", _terminal_flow_indices),
     )
     metrics: dict[str, float] = {}
     for k in ks:
@@ -339,34 +339,34 @@ def union_metrics(
 def calibration_metrics(tensors: RolloutEvalTensors) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for name, score in (
-        ("stop_flow", tensors.stop_flow_score),
-        ("flow", tensors.flow_score),
+        ("terminal_flow", tensors.terminal_flow_score),
+        ("state_flow", tensors.state_flow_score),
         ("traj_prob", tensors.traj_prob_score),
     ):
         mean, valid_rate = per_graph_spearman(score, tensors.log_reward, tensors.valid_graph_mask)
         metrics[f"calibration/{name}_reward_spearman"] = mean
         metrics[f"calibration/{name}_reward_spearman_valid_rate"] = valid_rate
 
-    auc, valid_rate = per_graph_auc(tensors.stop_flow_score, tensors.hit, tensors.valid_graph_mask)
-    metrics["calibration/stop_flow_hit_auc"] = auc
-    metrics["calibration/stop_flow_hit_auc_valid_rate"] = valid_rate
+    auc, valid_rate = per_graph_auc(tensors.terminal_flow_score, tensors.hit, tensors.valid_graph_mask)
+    metrics["calibration/terminal_flow_hit_auc"] = auc
+    metrics["calibration/terminal_flow_hit_auc_valid_rate"] = valid_rate
     return metrics
 
 
-def stop_metrics(
+def terminal_metrics(
     rollouts: Sequence[RolloutResult],
     tensors: RolloutEvalTensors,
     *,
     batch: RetrievalBatch,
 ) -> dict[str, float]:
-    stats = hit_stop_stats(rollouts, batch=batch)
+    stats = hit_terminal_stats(rollouts, batch=batch)
     hit = stats["hit"]
     continued = stats["continued"]
     valid = tensors.valid_graph_mask
     return {
-        "stop/policy_stop_rate": mean_over_valid_graphs(tensors.policy_stop, valid),
-        "stop/forced_stop_rate": mean_over_valid_graphs(tensors.forced_stop, valid),
-        "stop/hit_then_continue_rate": _mean_hit_values(continued.float(), hit, valid),
+        "terminal/policy_terminal_rate": mean_over_valid_graphs(tensors.policy_terminal, valid),
+        "terminal/forced_terminal_rate": mean_over_valid_graphs(tensors.forced_terminal, valid),
+        "terminal/hit_then_continue_rate": _mean_hit_values(continued.float(), hit, valid),
     }
 
 
@@ -390,16 +390,16 @@ def one_sample_reachable_recall(scores: ReachableRecallScores) -> float:
     return mean_over_valid_graphs(scores.recall[:1], scores.valid_graph_mask)
 
 
-def budget_forced_stop_rate(
+def budget_forced_terminal_rate(
     *,
     rollout_samples: Sequence[RolloutResult],
     valid_graph_mask: torch.Tensor,
 ) -> float:
-    _, forced = stop_matrices(rollout_samples)
+    _, forced = terminal_matrices(rollout_samples)
     return mean_over_valid_graphs(forced, valid_graph_mask)
 
 
-def stop_matrices(rollouts: Sequence[RolloutResult]) -> tuple[torch.Tensor, torch.Tensor]:
+def terminal_matrices(rollouts: Sequence[RolloutResult]) -> tuple[torch.Tensor, torch.Tensor]:
     if not rollouts:
         return torch.zeros((0, 0)), torch.zeros((0, 0))
     policy: list[torch.Tensor] = []
@@ -469,12 +469,12 @@ def terminal_policy_scores(
             context=context,
             frontier=frontier,
         )
-    flow = out.log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-    stop_flow = (out.log_flow + out.stop_log_prob).detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-    return TerminalPolicyScores(flow=flow, stop_flow=stop_flow)
+    state_flow = out.state_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
+    terminal_flow = out.terminal_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
+    return TerminalPolicyScores(state_flow=state_flow, terminal_flow=terminal_flow)
 
 
-def hit_stop_stats(
+def hit_terminal_stats(
     rollouts: Sequence[RolloutResult],
     *,
     batch: RetrievalBatch,
@@ -635,12 +635,12 @@ def _traj_prob_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
     return _score_indices(tensors.traj_prob_score, k)
 
 
-def _flow_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    return _score_indices(tensors.flow_score, k)
+def _state_flow_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
+    return _score_indices(tensors.state_flow_score, k)
 
 
-def _stop_flow_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    return _score_indices(tensors.stop_flow_score, k)
+def _terminal_flow_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
+    return _score_indices(tensors.terminal_flow_score, k)
 
 
 def _selected_values(values: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -668,12 +668,12 @@ def _stack_trajectory_log_prob(rollouts: Sequence[RolloutResult]) -> torch.Tenso
     )
 
 
-def _stack_stop_step(rollouts: Sequence[RolloutResult]) -> torch.Tensor:
+def _stack_terminal_step(rollouts: Sequence[RolloutResult]) -> torch.Tensor:
     if not rollouts:
         return torch.zeros((0, 0), dtype=torch.long)
     return torch.stack(
         [
-            rollout.stop_step.detach().to(device=torch.device("cpu"), dtype=torch.long)
+            rollout.terminal_step.detach().to(device=torch.device("cpu"), dtype=torch.long)
             for rollout in rollouts
         ],
         dim=0,
@@ -713,7 +713,7 @@ def _all_equal(values: Sequence[float]) -> bool:
 
 __all__ = [
     "ReachableRecallScores",
-    "budget_forced_stop_rate",
+    "budget_forced_terminal_rate",
     "evaluate_rollout_samples",
     "one_sample_reachable_recall",
     "reachable_recall_scores",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .context import GraphContext, TargetContext
 from .objectives import ObjectiveOutput, SubTBLoss
-from .policy import ForwardPolicy, PolicyOutput
+from .policy import ForwardPolicy, ForwardPolicyOutput
 from .state import Frontier, State
 from .utility import (
     RewardOutput,
@@ -13,7 +13,7 @@ __all__ = [
     "GraphContext",
     "Frontier",
     "ForwardPolicy",
-    "PolicyOutput",
+    "ForwardPolicyOutput",
     "ObjectiveOutput",
     "RewardOutput",
     "SubTBLoss",

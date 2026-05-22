@@ -19,10 +19,10 @@ from src.training.optimization import (
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.nn.feature_encoder import EncodedFeatures, FeatureEncoder
 from src.weaver.objectives import SubTBLoss, build_subtb_input, single_step_branch_losses
-from src.weaver.policy import ForwardPolicy, PolicyOutput, UniformValidPredecessorBackwardPolicy
+from src.weaver.policy import ForwardPolicy, ForwardPolicyOutput, UniformValidPredecessorBackwardPolicy
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.rollout.runner import RolloutBatch, RolloutRunner
-from src.weaver.state import Frontier, State
+from src.weaver.state import State
 from src.weaver.transition import TrainingBatch
 from src.weaver.utility import TrueTerminalReward
 
@@ -124,8 +124,10 @@ class WeaverModule(LightningModule):
 
         optimizer = self.optimizer()
         optimizer.zero_grad(set_to_none=True)
-        branch_grad_metrics = stop_branch_gradient_metrics(
-            stop_head=self.policy.stop_head,
+        branch_grad_metrics = terminal_flow_branch_gradient_metrics(
+            terminal_flow_head=self.policy.terminal_flow_head,
+            continuation_flow_head=self.policy.continuation_flow_head,
+            edge_policy_head=self.policy.edge_policy_head,
             terminal_loss=output.terminal_branch_loss,
             expansion_loss=output.expansion_branch_loss,
         )
@@ -247,7 +249,6 @@ class WeaverModule(LightningModule):
         else:
             parent_out = empty_policy_output(
                 device=policy_features.query_model.device,
-                dtype=policy_features.query_model.dtype,
                 num_edges=graph.num_edges,
             )
             child_out = parent_out
@@ -511,17 +512,20 @@ def backward_action_log_prob(
 def empty_policy_output(
     *,
     device: torch.device,
-    dtype: torch.dtype,
     num_edges: int,
-) -> PolicyOutput:
-    return PolicyOutput(
-        stop_logit=torch.empty(0, dtype=dtype, device=device),
-        log_flow=torch.empty(0, dtype=dtype, device=device),
-        edge_logit=torch.empty(0, dtype=dtype, device=device),
-        frontier=Frontier(
-            row_ids=torch.empty(0, dtype=torch.long, device=device),
-            edge_ids=torch.empty(0, dtype=torch.long, device=device),
-        ),
+) -> ForwardPolicyOutput:
+    empty_float = torch.empty(0, dtype=torch.float32, device=device)
+    empty_long = torch.empty(0, dtype=torch.long, device=device)
+    return ForwardPolicyOutput(
+        frontier_row_ids=empty_long,
+        frontier_edge_ids=empty_long,
+        terminal_log_flow=empty_float,
+        continuation_log_flow=empty_float,
+        edge_log_flow=empty_float,
+        edge_log_policy=empty_float,
+        state_log_flow=empty_float,
+        terminal_log_prob=empty_float,
+        edge_log_prob=empty_float,
         num_rows=0,
         num_edges=int(num_edges),
     )
@@ -543,29 +547,29 @@ def call_reward_model(
 
 def policy_diagnostic_metrics(
     *,
-    expansion_out: PolicyOutput,
+    expansion_out: ForwardPolicyOutput,
     expansion_depth: torch.Tensor,
-    terminal_out: PolicyOutput,
+    terminal_out: ForwardPolicyOutput,
     terminal_depth: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    stop_logit = torch.cat(
+    terminal_ratio = torch.cat(
         [
-            expansion_out.stop_logit.float(),
-            terminal_out.stop_logit.float(),
+            expansion_out.terminal_vs_continuation_log_ratio.float(),
+            terminal_out.terminal_vs_continuation_log_ratio.float(),
         ],
         dim=0,
     )
     depth = torch.cat(
         [
-            expansion_depth.to(device=stop_logit.device, dtype=torch.long).view(-1),
-            terminal_depth.to(device=stop_logit.device, dtype=torch.long).view(-1),
+            expansion_depth.to(device=terminal_ratio.device, dtype=torch.long).view(-1),
+            terminal_depth.to(device=terminal_ratio.device, dtype=torch.long).view(-1),
         ],
         dim=0,
     )
-    stop_prob = torch.cat(
+    terminal_prob = torch.cat(
         [
-            expansion_out.stop_prob().float(),
-            terminal_out.stop_prob().float(),
+            expansion_out.terminal_prob().float(),
+            terminal_out.terminal_prob().float(),
         ],
         dim=0,
     )
@@ -577,57 +581,62 @@ def policy_diagnostic_metrics(
         ],
         dim=0,
     )
-    edge_cond_entropy = torch.cat(
+    edge_action_entropy = torch.cat(
         [
-            expansion_out.edge_cond_entropy(),
-            terminal_out.edge_cond_entropy(),
+            expansion_out.edge_action_entropy(),
+            terminal_out.edge_action_entropy(),
         ],
         dim=0,
     )
-    continue_prob = torch.cat(
+    continuation_prob = torch.cat(
         [
-            expansion_out.continue_prob().float(),
-            terminal_out.continue_prob().float(),
+            expansion_out.edge_prob_mass().float(),
+            terminal_out.edge_prob_mass().float(),
         ],
         dim=0,
     )
     has_frontier = frontier_size.gt(0)
 
     metrics: dict[str, torch.Tensor] = {
-        "policy_continue_prob_mean": masked_mean_or_zero(continue_prob, has_frontier).detach(),
-        "policy_edge_cond_entropy_mean": masked_mean_or_zero(edge_cond_entropy, has_frontier).detach(),
+        "policy_continuation_prob_mean": masked_mean_or_zero(continuation_prob, has_frontier).detach(),
+        "policy_edge_action_entropy_mean": masked_mean_or_zero(edge_action_entropy, has_frontier).detach(),
         "policy_frontier_size_mean": mean_or_zero(frontier_size).detach(),
         "policy_frontier_size_p90": quantile_or_zero(frontier_size, 0.90).detach(),
         "policy_frontier_size_p99": quantile_or_zero(frontier_size, 0.99).detach(),
     }
     for bucket in range(4):
         mask = depth.eq(bucket)
-        metrics[f"policy_stop_logit_depth{bucket}_mean"] = masked_mean_or_zero(
-            stop_logit,
+        metrics[f"policy_terminal_vs_continuation_log_ratio_depth{bucket}_mean"] = masked_mean_or_zero(
+            terminal_ratio,
             mask,
         ).detach()
-        metrics[f"policy_stop_prob_depth{bucket}_mean"] = masked_mean_or_zero(
-            stop_prob,
+        metrics[f"policy_terminal_prob_depth{bucket}_mean"] = masked_mean_or_zero(
+            terminal_prob,
             mask,
         ).detach()
     return metrics
 
 
-def stop_branch_gradient_metrics(
+def terminal_flow_branch_gradient_metrics(
     *,
-    stop_head: torch.nn.Module,
+    terminal_flow_head: torch.nn.Module,
+    continuation_flow_head: torch.nn.Module,
+    edge_policy_head: torch.nn.Module,
     terminal_loss: torch.Tensor,
     expansion_loss: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    params = [param for param in stop_head.parameters() if param.requires_grad]
+    terminal_params = [param for param in terminal_flow_head.parameters() if param.requires_grad]
+    continuation_params = [param for param in continuation_flow_head.parameters() if param.requires_grad]
+    edge_policy_params = [param for param in edge_policy_head.parameters() if param.requires_grad]
+
     terminal_grad = gradient_vector(
         loss=terminal_loss,
-        params=params,
+        params=terminal_params,
         retain_graph=True,
     )
     expansion_grad = gradient_vector(
         loss=expansion_loss,
-        params=params,
+        params=terminal_params,
         retain_graph=True,
     )
     terminal_norm = terminal_grad.norm()
@@ -638,10 +647,22 @@ def stop_branch_gradient_metrics(
         torch.dot(terminal_grad, expansion_grad) / denom.clamp_min(torch.finfo(terminal_grad.dtype).tiny),
         terminal_grad.new_zeros(()),
     )
+    continuation_expansion_grad = gradient_vector(
+        loss=expansion_loss,
+        params=continuation_params,
+        retain_graph=True,
+    )
+    edge_policy_expansion_grad = gradient_vector(
+        loss=expansion_loss,
+        params=edge_policy_params,
+        retain_graph=True,
+    )
     return {
-        "grad_stop_head_from_terminal_loss": terminal_norm.detach(),
-        "grad_stop_head_from_expansion_loss": expansion_norm.detach(),
-        "grad_stop_head_terminal_expansion_cosine": cosine.detach(),
+        "grad_terminal_flow_head_from_terminal_loss": terminal_norm.detach(),
+        "grad_terminal_flow_head_from_expansion_loss": expansion_norm.detach(),
+        "grad_terminal_flow_head_terminal_expansion_cosine": cosine.detach(),
+        "grad_continuation_flow_head_from_expansion_loss": continuation_expansion_grad.norm().detach(),
+        "grad_edge_policy_head_from_expansion_loss": edge_policy_expansion_grad.norm().detach(),
     }
 
 
@@ -671,9 +692,9 @@ def gradient_vector(
 def gradient_norm_metrics(policy: ForwardPolicy) -> dict[str, torch.Tensor]:
     reference = next(policy.parameters())
     return {
-        "grad_stop_head_norm": module_grad_norm(policy.stop_head, reference).detach(),
-        "grad_flow_head_norm": module_grad_norm(policy.flow_head, reference).detach(),
-        "grad_edge_head_norm": module_grad_norm(policy.edge_head, reference).detach(),
+        "grad_terminal_flow_head_norm": module_grad_norm(policy.terminal_flow_head, reference).detach(),
+        "grad_continuation_flow_head_norm": module_grad_norm(policy.continuation_flow_head, reference).detach(),
+        "grad_edge_policy_head_norm": module_grad_norm(policy.edge_policy_head, reference).detach(),
         "grad_state_encoder_norm": module_grad_norm(policy.state_encoder, reference).detach(),
     }
 

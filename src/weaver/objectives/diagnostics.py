@@ -4,7 +4,7 @@ import torch
 
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.policy import (
-    PolicyOutput,
+    ForwardPolicyOutput,
 )
 from src.weaver.state import Frontier, State
 from src.weaver.transition import SRC_POLICY
@@ -13,40 +13,20 @@ from src.weaver.utility import RewardOutput, TrueTerminalReward
 
 TerminalRewardModel = TrueTerminalReward
 
-def stop_expand_margin(policy_out: PolicyOutput) -> torch.Tensor:
-    num_rows = int(policy_out.num_rows)
-    margin = torch.full_like(policy_out.stop_logit.float(), torch.inf)
-    if policy_out.edge_logit.numel() == 0:
-        return margin
-    edge_log_flow = torch.full(
-        (num_rows,),
-        -torch.inf,
-        dtype=torch.float32,
-        device=policy_out.stop_logit.device,
-    )
-    edge_row_ids = policy_out.edge_row_ids.to(device=policy_out.stop_logit.device, dtype=torch.long)
-    edge_log_flow = edge_log_flow.scatter_reduce(
-        0,
-        edge_row_ids,
-        policy_out.edge_logit.float(),
-        reduce="amax",
-        include_self=True,
-    )
-    has_edge = torch.isfinite(edge_log_flow)
-    margin[has_edge] = policy_out.stop_logit.float()[has_edge] - edge_log_flow[has_edge]
-    return margin
+def terminal_expand_margin(policy_out: ForwardPolicyOutput) -> torch.Tensor:
+    return policy_out.terminal_vs_continuation_log_ratio.float()
 
 
-def policy_stop_expand_margin_mean(policy_out: PolicyOutput) -> torch.Tensor:
-    margin = stop_expand_margin(policy_out)
+def policy_terminal_expand_margin_mean(policy_out: ForwardPolicyOutput) -> torch.Tensor:
+    margin = terminal_expand_margin(policy_out)
     return masked_mean_or_zero(margin, torch.isfinite(margin))
 
 
-def policy_stop_expand_margin_by_mask(
-    policy_out: PolicyOutput,
+def policy_terminal_expand_margin_by_mask(
+    policy_out: ForwardPolicyOutput,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    margin = stop_expand_margin(policy_out)
+    margin = terminal_expand_margin(policy_out)
     mask = mask.to(device=margin.device, dtype=torch.bool).view(-1) & torch.isfinite(margin)
     return masked_mean_or_zero(margin, mask)
 
@@ -109,41 +89,41 @@ def supported_target_count(
     ).sum(dim=1)
 
 
-def stop_probability_by_depth(
+def terminal_probability_by_depth(
     *,
-    stop_log_prob: torch.Tensor,
+    terminal_log_prob: torch.Tensor,
     step_ids: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     metrics: dict[str, torch.Tensor] = {}
     if step_ids.numel() == 0:
         return metrics
 
-    step_ids = step_ids.to(device=stop_log_prob.device, dtype=torch.long).view(-1)
-    stop_probability = stop_log_prob.float().exp()
+    step_ids = step_ids.to(device=terminal_log_prob.device, dtype=torch.long).view(-1)
+    terminal_probability = terminal_log_prob.float().exp()
     for depth in torch.unique(step_ids, sorted=True).tolist():
         mask = step_ids.eq(int(depth))
-        metrics[f"policy_stop_prob_depth{int(depth)}"] = masked_mean_or_zero(
-            stop_probability,
+        metrics[f"policy_terminal_prob_depth{int(depth)}"] = masked_mean_or_zero(
+            terminal_probability,
             mask,
         ).detach()
     return metrics
 
 
-def stop_expand_margin_by_depth(
+def terminal_expand_margin_by_depth(
     *,
-    policy_out: PolicyOutput,
+    policy_out: ForwardPolicyOutput,
     step_ids: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     metrics: dict[str, torch.Tensor] = {}
     if step_ids.numel() == 0:
         return metrics
 
-    margin = stop_expand_margin(policy_out)
+    margin = terminal_expand_margin(policy_out)
     step_ids = step_ids.to(device=margin.device, dtype=torch.long).view(-1)
     finite = torch.isfinite(margin)
     for depth in torch.unique(step_ids, sorted=True).tolist():
         mask = step_ids.eq(int(depth)) & finite
-        metrics[f"policy_stop_expand_margin_depth{int(depth)}"] = masked_mean_or_zero(
+        metrics[f"policy_terminal_expand_margin_depth{int(depth)}"] = masked_mean_or_zero(
             margin,
             mask,
         ).detach()
@@ -159,15 +139,15 @@ def rollout_metrics(
     num_rows: int,
 ) -> dict[str, torch.Tensor]:
     policy = source_ids.eq(SRC_POLICY)
-    stop = policy & action_edge_ids.lt(0)
-    structural = stop & ~rows_with_frontier(frontier=frontier, num_rows=num_rows)
-    forced = torch.zeros_like(stop)
+    terminal = policy & action_edge_ids.lt(0)
+    structural = terminal & ~rows_with_frontier(frontier=frontier, num_rows=num_rows)
+    forced = torch.zeros_like(terminal)
 
     return {
-        "rollout_stop_rate": masked_fraction(stop, policy).detach(),
-        "rollout_structural_stop_rate": masked_fraction(structural, stop).detach(),
-        "rollout_forced_stop_rate": masked_fraction(forced, stop).detach(),
-        "rollout_mean_stop_depth": masked_mean_or_zero(step_ids.float(), stop).detach(),
+        "rollout_terminal_rate": masked_fraction(terminal, policy).detach(),
+        "rollout_structural_terminal_rate": masked_fraction(structural, terminal).detach(),
+        "rollout_forced_terminal_rate": masked_fraction(forced, terminal).detach(),
+        "rollout_mean_terminal_depth": masked_mean_or_zero(step_ids.float(), terminal).detach(),
     }
 
 
@@ -208,14 +188,14 @@ def rows_with_frontier(
 
 def summarize_policy_diagnostics(
     *,
-    policy_out: PolicyOutput,
+    policy_out: ForwardPolicyOutput,
 ) -> dict[str, torch.Tensor]:
     return {
-        "policy_stop_log_prob_mean": policy_out.stop_log_prob.float().mean().detach(),
+        "policy_terminal_log_prob_mean": policy_out.terminal_log_prob.float().mean().detach(),
         "policy_action_log_prob_mean": policy_out.action_log_prob().float().mean().detach(),
-        "policy_stop_prob_mean": policy_out.stop_prob().mean().detach(),
+        "policy_terminal_prob_mean": policy_out.terminal_prob().mean().detach(),
         "policy_edge_prob_mass_mean": policy_out.edge_prob_mass().mean().detach(),
-        "policy_stop_expand_margin_mean": policy_stop_expand_margin_mean(policy_out).detach(),
+        "policy_terminal_expand_margin_mean": policy_terminal_expand_margin_mean(policy_out).detach(),
     }
 
 
@@ -241,14 +221,14 @@ def masked_fraction(
 __all__ = [
     "TerminalRewardModel",
     "call_reward_model",
-    "policy_stop_expand_margin_by_mask",
-    "policy_stop_expand_margin_mean",
+    "policy_terminal_expand_margin_by_mask",
+    "policy_terminal_expand_margin_mean",
     "reward_delta_after_hit",
     "rollout_metrics",
     "source_rollout_metrics",
-    "stop_expand_margin",
-    "stop_expand_margin_by_depth",
-    "stop_probability_by_depth",
+    "terminal_expand_margin",
+    "terminal_expand_margin_by_depth",
+    "terminal_probability_by_depth",
     "summarize_policy_diagnostics",
     "supported_target_count",
 ]

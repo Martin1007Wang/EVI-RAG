@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .action import StepAction, STOP_EDGE_ID
+from .action import StepAction, TERMINAL_EDGE_ID
 
 NO_STEP = -1
 
@@ -19,8 +19,8 @@ class RolloutTape:
     selected_edge_ids: torch.Tensor = field(init=False)
     policy_action_log_prob: torch.Tensor = field(init=False)
     behavior_action_log_prob: torch.Tensor = field(init=False)
-    stop_step: torch.Tensor = field(init=False)
-    forced_stop: torch.Tensor = field(init=False)
+    terminal_step: torch.Tensor = field(init=False)
+    forced_terminal: torch.Tensor = field(init=False)
     is_stopped: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
@@ -28,7 +28,7 @@ class RolloutTape:
         self.T = int(self.T)
         self.selected_edge_ids = torch.full(
             (self.R, self.T),
-            STOP_EDGE_ID,
+            TERMINAL_EDGE_ID,
             dtype=torch.long,
             device=self.device,
         )
@@ -42,13 +42,13 @@ class RolloutTape:
             dtype=self.dtype,
             device=self.device,
         )
-        self.stop_step = torch.full(
+        self.terminal_step = torch.full(
             (self.R,),
             NO_STEP,
             dtype=torch.long,
             device=self.device,
         )
-        self.forced_stop = torch.zeros(
+        self.forced_terminal = torch.zeros(
             self.R,
             dtype=torch.bool,
             device=self.device,
@@ -82,17 +82,17 @@ class RolloutTape:
             dtype=self.dtype,
         )
 
-        stop_mask = action.stop_mask
-        stop_rows = rows[stop_mask]
-        if stop_rows.numel() == 0:
+        terminal_mask = action.terminal_mask
+        terminal_rows = rows[terminal_mask]
+        if terminal_rows.numel() == 0:
             return
 
-        self.stop_step[stop_rows] = step
-        self.forced_stop[stop_rows] = action.forced[stop_mask].to(
+        self.terminal_step[terminal_rows] = step
+        self.forced_terminal[terminal_rows] = action.forced[terminal_mask].to(
             device=self.device,
             dtype=torch.bool,
         )
-        self.is_stopped[stop_rows] = True
+        self.is_stopped[terminal_rows] = True
 
 
 __all__ = [

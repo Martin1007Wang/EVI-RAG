@@ -4,7 +4,7 @@ model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.ckpt_dir}
   filename: "epoch_{epoch:03d}-step_{step:07d}"
-  monitor: val/selector_stop_flow@8/f1
+  monitor: val/selector_terminal_flow@8/f1
   mode: max
   save_top_k: 3
   save_last: true
@@ -15,7 +15,7 @@ learning_rate_monitor:
 
 early_stopping:
   _target_: lightning.pytorch.callbacks.EarlyStopping
-  monitor: val/selector_stop_flow@8/f1
+  monitor: val/selector_terminal_flow@8/f1
   mode: max
   patience: 50
   min_delta: 1.0e-4

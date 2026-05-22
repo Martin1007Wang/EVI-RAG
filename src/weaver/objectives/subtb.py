@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from src.weaver.policy import PolicyOutput
+from src.weaver.policy import ForwardPolicyOutput
 from src.weaver.transition import (
     ExpansionBatch,
     SRC_POLICY,
@@ -28,12 +28,10 @@ class SubTBEventBatch:
     trajectory_ids: torch.Tensor
     step_ids: torch.Tensor
     source_ids: torch.Tensor
-    parent_log_flow: torch.Tensor
-    child_log_flow: torch.Tensor
+    parent_state_log_flow: torch.Tensor
+    child_state_log_flow: torch.Tensor
     action_log_prob: torch.Tensor
-    continue_log_prob: torch.Tensor
-    edge_cond_log_prob: torch.Tensor
-    stop_log_prob: torch.Tensor
+    action_log_flow: torch.Tensor
     backward_log_prob: torch.Tensor
     terminal_log_reward: torch.Tensor
     terminal: torch.Tensor
@@ -43,12 +41,10 @@ class SubTBEventBatch:
         fields = {
             "step_ids": self.step_ids,
             "source_ids": self.source_ids,
-            "parent_log_flow": self.parent_log_flow,
-            "child_log_flow": self.child_log_flow,
+            "parent_state_log_flow": self.parent_state_log_flow,
+            "child_state_log_flow": self.child_state_log_flow,
             "action_log_prob": self.action_log_prob,
-            "continue_log_prob": self.continue_log_prob,
-            "edge_cond_log_prob": self.edge_cond_log_prob,
-            "stop_log_prob": self.stop_log_prob,
+            "action_log_flow": self.action_log_flow,
             "backward_log_prob": self.backward_log_prob,
             "terminal_log_reward": self.terminal_log_reward,
             "terminal": self.terminal,
@@ -67,9 +63,10 @@ class SubTBEvent:
     trajectory_id: int
     step_id: int
     source_id: torch.Tensor
-    parent_log_flow: torch.Tensor
-    child_log_flow: torch.Tensor
+    parent_state_log_flow: torch.Tensor
+    child_state_log_flow: torch.Tensor
     action_log_prob: torch.Tensor
+    action_log_flow: torch.Tensor
     backward_log_prob: torch.Tensor
     terminal_log_reward: torch.Tensor
     terminal: bool
@@ -160,9 +157,9 @@ class SubTBLoss(nn.Module):
 
 def build_subtb_input(
     *,
-    parent_out: PolicyOutput,
-    child_out: PolicyOutput,
-    terminal_out: PolicyOutput,
+    parent_out: ForwardPolicyOutput,
+    child_out: ForwardPolicyOutput,
+    terminal_out: ForwardPolicyOutput,
     reward_out: RewardOutput,
     backward_log_prob: torch.Tensor,
     expansions: ExpansionBatch,
@@ -173,34 +170,28 @@ def build_subtb_input(
         dtype=torch.long,
         device=expansions.device,
     )
-    expansion_parent_log_flow = parent_out.log_flow.float()
-    expansion_child_log_flow = child_out.log_flow.float()
-    expansion_continue_log_prob = parent_out.gather_continue_log_prob(
-        row_ids=expansion_rows,
-    ).float()
-    expansion_edge_cond_log_prob = parent_out.gather_edge_cond_log_prob(
-        row_ids=expansion_rows,
-        edge_ids=expansions.edge_ids,
-    ).float()
+    expansion_parent_state_log_flow = parent_out.state_log_flow.float()
+    expansion_child_state_log_flow = child_out.state_log_flow.float()
     expansion_action_log_prob = parent_out.gather_log_prob(
         row_ids=expansion_rows,
         edge_ids=expansions.edge_ids,
     ).float()
-    expansion_stop_log_prob = expansion_parent_log_flow.new_zeros(expansions.num_items)
-    expansion_terminal_log_reward = expansion_parent_log_flow.new_zeros(expansions.num_items)
+    expansion_action_log_flow = parent_out.gather_action_log_flow(
+        row_ids=expansion_rows,
+        edge_ids=expansions.edge_ids,
+    ).float()
+    expansion_terminal_log_reward = expansion_parent_state_log_flow.new_zeros(expansions.num_items)
     expansion_terminal = torch.zeros(
         expansions.num_items,
         dtype=torch.bool,
         device=expansions.device,
     )
 
-    terminal_parent_log_flow = terminal_out.log_flow.float()
-    terminal_child_log_flow = terminal_parent_log_flow.new_zeros(terminals.num_items)
-    terminal_action_log_prob = terminal_out.stop_log_prob.float()
-    terminal_continue_log_prob = terminal_parent_log_flow.new_zeros(terminals.num_items)
-    terminal_edge_cond_log_prob = terminal_parent_log_flow.new_zeros(terminals.num_items)
-    terminal_stop_log_prob = terminal_action_log_prob
-    terminal_backward_log_prob = terminal_parent_log_flow.new_zeros(terminals.num_items)
+    terminal_parent_state_log_flow = terminal_out.state_log_flow.float()
+    terminal_child_state_log_flow = terminal_parent_state_log_flow.new_zeros(terminals.num_items)
+    terminal_action_log_prob = terminal_out.terminal_log_prob.float()
+    terminal_action_log_flow = terminal_out.terminal_log_flow.float()
+    terminal_backward_log_prob = terminal_parent_state_log_flow.new_zeros(terminals.num_items)
     terminal_terminal = torch.ones(
         terminals.num_items,
         dtype=torch.bool,
@@ -230,17 +221,17 @@ def build_subtb_input(
                 ],
                 dim=0,
             ),
-            parent_log_flow=torch.cat(
+            parent_state_log_flow=torch.cat(
                 [
-                    expansion_parent_log_flow,
-                    terminal_parent_log_flow,
+                    expansion_parent_state_log_flow,
+                    terminal_parent_state_log_flow,
                 ],
                 dim=0,
             ),
-            child_log_flow=torch.cat(
+            child_state_log_flow=torch.cat(
                 [
-                    expansion_child_log_flow,
-                    terminal_child_log_flow,
+                    expansion_child_state_log_flow,
+                    terminal_child_state_log_flow,
                 ],
                 dim=0,
             ),
@@ -251,24 +242,10 @@ def build_subtb_input(
                 ],
                 dim=0,
             ),
-            continue_log_prob=torch.cat(
+            action_log_flow=torch.cat(
                 [
-                    expansion_continue_log_prob,
-                    terminal_continue_log_prob,
-                ],
-                dim=0,
-            ),
-            edge_cond_log_prob=torch.cat(
-                [
-                    expansion_edge_cond_log_prob,
-                    terminal_edge_cond_log_prob,
-                ],
-                dim=0,
-            ),
-            stop_log_prob=torch.cat(
-                [
-                    expansion_stop_log_prob,
-                    terminal_stop_log_prob,
+                    expansion_action_log_flow,
+                    terminal_action_log_flow,
                 ],
                 dim=0,
             ),
@@ -304,61 +281,57 @@ def single_step_branch_losses(
     huber_delta: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     exp_residual = expansion_event_residual(x.events)
-    stop_residual = stop_event_residual(x.events)
+    terminal_residual = terminal_event_residual(x.events)
     exp_mask = ~x.events.terminal
-    stop_mask = x.events.terminal
+    terminal_mask = x.events.terminal
     exp_units = residual_loss_units(
         exp_residual,
         loss_type=loss_type,
         huber_delta=huber_delta,
     )
-    stop_units = residual_loss_units(
-        stop_residual,
+    terminal_units = residual_loss_units(
+        terminal_residual,
         loss_type=loss_type,
         huber_delta=huber_delta,
     )
     return (
         masked_mean_or_zero(exp_units, exp_mask),
-        masked_mean_or_zero(stop_units, stop_mask),
+        masked_mean_or_zero(terminal_units, terminal_mask),
     )
 
 
 def expansion_event_residual(events: SubTBEventBatch) -> torch.Tensor:
     return (
-        events.parent_log_flow
-        + events.continue_log_prob
-        + events.edge_cond_log_prob
-        - events.child_log_flow
+        events.action_log_flow
+        - events.child_state_log_flow
         - events.backward_log_prob
     )
 
 
-def stop_event_residual(events: SubTBEventBatch) -> torch.Tensor:
-    # terminal transition does not accumulate backward_log_prob.
-    # Equivalently, we fix P_B(STOP) = 1.
-    return events.parent_log_flow + events.stop_log_prob - events.terminal_log_reward
+def terminal_event_residual(events: SubTBEventBatch) -> torch.Tensor:
+    return events.action_log_flow - events.terminal_log_reward
 
 
 def branch_decomposition_metrics(x: SubTBInput) -> dict[str, torch.Tensor]:
     events = x.events
     exp = ~events.terminal
-    stop = events.terminal
+    terminal = events.terminal
     exp_residual = expansion_event_residual(events)
-    stop_residual = stop_event_residual(events)
+    terminal_residual = terminal_event_residual(events)
 
     return {
-        "subtb_exp_parent_log_flow_mean": masked_mean_or_zero(events.parent_log_flow, exp).detach(),
-        "subtb_exp_child_log_flow_mean": masked_mean_or_zero(events.child_log_flow, exp).detach(),
-        "subtb_exp_continue_log_prob_mean": masked_mean_or_zero(events.continue_log_prob, exp).detach(),
-        "subtb_exp_edge_cond_log_prob_mean": masked_mean_or_zero(events.edge_cond_log_prob, exp).detach(),
+        "subtb_exp_parent_state_log_flow_mean": masked_mean_or_zero(events.parent_state_log_flow, exp).detach(),
+        "subtb_exp_child_state_log_flow_mean": masked_mean_or_zero(events.child_state_log_flow, exp).detach(),
+        "subtb_exp_action_log_flow_mean": masked_mean_or_zero(events.action_log_flow, exp).detach(),
+        "subtb_exp_action_log_prob_mean": masked_mean_or_zero(events.action_log_prob, exp).detach(),
         "subtb_exp_backward_log_prob_mean": masked_mean_or_zero(events.backward_log_prob, exp).detach(),
-        "subtb_exp_residual_mean": masked_mean_or_zero(exp_residual, exp).detach(),
-        "subtb_exp_residual_abs_mean": masked_mean_or_zero(exp_residual.abs(), exp).detach(),
-        "subtb_stop_parent_log_flow_mean": masked_mean_or_zero(events.parent_log_flow, stop).detach(),
-        "subtb_stop_stop_log_prob_mean": masked_mean_or_zero(events.stop_log_prob, stop).detach(),
-        "subtb_stop_log_reward_mean": masked_mean_or_zero(events.terminal_log_reward, stop).detach(),
-        "subtb_stop_residual_mean": masked_mean_or_zero(stop_residual, stop).detach(),
-        "subtb_stop_residual_abs_mean": masked_mean_or_zero(stop_residual.abs(), stop).detach(),
+        "subtb_exp_db_residual_mean": masked_mean_or_zero(exp_residual, exp).detach(),
+        "subtb_exp_db_residual_abs_mean": masked_mean_or_zero(exp_residual.abs(), exp).detach(),
+        "subtb_terminal_parent_state_log_flow_mean": masked_mean_or_zero(events.parent_state_log_flow, terminal).detach(),
+        "subtb_terminal_action_log_flow_mean": masked_mean_or_zero(events.action_log_flow, terminal).detach(),
+        "subtb_terminal_log_reward_mean": masked_mean_or_zero(events.terminal_log_reward, terminal).detach(),
+        "subtb_terminal_db_residual_mean": masked_mean_or_zero(terminal_residual, terminal).detach(),
+        "subtb_terminal_db_residual_abs_mean": masked_mean_or_zero(terminal_residual.abs(), terminal).detach(),
     }
 
 
@@ -389,7 +362,7 @@ def subtrajectory_terms(
 ) -> SubTBTerms:
     events = assemble_events(x)
     if not events:
-        return empty_terms(x.events.parent_log_flow, x.events.source_ids)
+        return empty_terms(x.events.parent_state_log_flow, x.events.source_ids)
 
     residuals: list[torch.Tensor] = []
     weights: list[torch.Tensor] = []
@@ -407,8 +380,8 @@ def subtrajectory_terms(
 
         for start_pos in range(n):
             start = event_list[start_pos]
-            running_forward = x.events.parent_log_flow.new_zeros(())
-            running_backward = x.events.parent_log_flow.new_zeros(())
+            running_forward = x.events.parent_state_log_flow.new_zeros(())
+            running_backward = x.events.parent_state_log_flow.new_zeros(())
             previous_step: int | None = None
             end_limit = n if max_len is None else min(n, start_pos + int(max_len))
 
@@ -425,20 +398,20 @@ def subtrajectory_terms(
                     running_backward = running_backward + event.backward_log_prob
 
                 length = end_pos - start_pos + 1
-                weight = x.events.parent_log_flow.new_tensor(float(subtb_lambda) ** float(length - 1))
+                weight = x.events.parent_state_log_flow.new_tensor(float(subtb_lambda) ** float(length - 1))
 
                 if is_terminal:
                     residual = (
-                        start.parent_log_flow
+                        start.parent_state_log_flow
                         + running_forward
                         - event.terminal_log_reward
                         - running_backward
                     )
                 else:
                     residual = (
-                        start.parent_log_flow
+                        start.parent_state_log_flow
                         + running_forward
-                        - event.child_log_flow
+                        - event.child_state_log_flow
                         - running_backward
                     )
 
@@ -452,14 +425,14 @@ def subtrajectory_terms(
                     break
 
     if not residuals:
-        return empty_terms(x.events.parent_log_flow, x.events.source_ids)
+        return empty_terms(x.events.parent_state_log_flow, x.events.source_ids)
 
     return SubTBTerms(
         residual=torch.stack(residuals),
         weight=torch.stack(weights),
         source_ids=torch.stack(sources),
-        terminal=torch.tensor(terminal_flags, dtype=torch.bool, device=x.events.parent_log_flow.device),
-        length=torch.tensor(lengths, dtype=torch.long, device=x.events.parent_log_flow.device),
+        terminal=torch.tensor(terminal_flags, dtype=torch.bool, device=x.events.parent_state_log_flow.device),
+        length=torch.tensor(lengths, dtype=torch.long, device=x.events.parent_state_log_flow.device),
     )
 
 
@@ -472,9 +445,10 @@ def assemble_events(x: SubTBInput) -> list[SubTBEvent]:
                 trajectory_id=int(batch.trajectory_ids[idx].item()),
                 step_id=int(batch.step_ids[idx].item()),
                 source_id=batch.source_ids[idx],
-                parent_log_flow=batch.parent_log_flow[idx],
-                child_log_flow=batch.child_log_flow[idx],
+                parent_state_log_flow=batch.parent_state_log_flow[idx],
+                child_state_log_flow=batch.child_state_log_flow[idx],
                 action_log_prob=batch.action_log_prob[idx],
+                action_log_flow=batch.action_log_flow[idx],
                 backward_log_prob=batch.backward_log_prob[idx],
                 terminal_log_reward=batch.terminal_log_reward[idx],
                 terminal=bool(batch.terminal[idx].item()),

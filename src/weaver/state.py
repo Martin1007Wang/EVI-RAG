@@ -13,10 +13,10 @@ class Frontier:
     """
     Candidate physical KG edges for expansion.
 
-    STOP is not included here.
+    The terminal action is not included here.
     The full policy action space is:
 
-        A(z) = {STOP} ∪ Frontier(z)
+        A(z) = {TERMINAL} ∪ Frontier(z)
     """
 
     row_ids: torch.Tensor
@@ -229,7 +229,7 @@ class State:
 
         This method does not fabricate inverse edges.
 
-        STOP is not included.
+        The terminal action is not included.
         """
         if expand_budget is not None and not bool(self.depth.lt(int(expand_budget)).any()):
             return empty_frontier(graph.device)
@@ -300,7 +300,7 @@ class State:
         """
         Return the child state after selecting one physical edge per row.
 
-        STOP actions must not enter this method.
+        Terminal actions must not enter this method.
         """
 
         if rows.numel() != edge_ids.numel():
@@ -366,7 +366,7 @@ class State:
         if bool(rows.lt(0).any()) or bool(rows.ge(self.num_rows).any()):
             raise ValueError("Expansion rows must be valid state row ids.")
         if bool(edge_ids.lt(0).any()) or bool(edge_ids.ge(self.num_edges).any()):
-            raise ValueError("Expansion edge ids must be valid non-STOP edge ids.")
+            raise ValueError("Expansion edge ids must be valid non-terminal edge ids.")
         if int(torch.unique(rows).numel()) != int(rows.numel()):
             raise ValueError("At most one expansion action is allowed per row.")
 

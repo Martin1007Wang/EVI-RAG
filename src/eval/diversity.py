@@ -163,7 +163,7 @@ def terminal_f1_std(rollouts: Sequence[RolloutResult]) -> float:
         [
             rollout.policy_action_log_prob[
                 torch.arange(rollout.num_rollouts, device=rollout.device),
-                rollout.stop_step,
+                rollout.terminal_step,
             ].detach().to(dtype=torch.float32)
             for rollout in rollouts
         ],
@@ -202,7 +202,7 @@ def _selected_edge_set_for_graph(
 ) -> tuple[int, ...]:
     selected_edge_ids = rollout.selected_edge_ids[graph_id]
     continue_mask = rollout.expand_mask[graph_id]
-    trajectory_length = int(rollout.stop_step[graph_id].item()) + 1
+    trajectory_length = int(rollout.terminal_step[graph_id].item()) + 1
     if trajectory_length <= 0:
         return ()
 

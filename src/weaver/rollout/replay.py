@@ -222,33 +222,33 @@ def training_from_rollouts(
                     expand_budget=int(budget),
                 )
 
-            stop_rows = rollout.stop_mask[:, step].to(
+            terminal_rows = rollout.terminal_mask[:, step].to(
                 device=context.device,
                 dtype=torch.bool,
             ).nonzero(as_tuple=False).flatten()
-            if stop_rows.numel() > 0:
+            if terminal_rows.numel() > 0:
                 term_parts.append(
                     TerminalBatch(
-                        state=current.select_rows(stop_rows),
+                        state=current.select_rows(terminal_rows),
                         meta=SampleMeta(
-                            trajectory_ids=rollout_trajectory_ids.index_select(0, stop_rows),
+                            trajectory_ids=rollout_trajectory_ids.index_select(0, terminal_rows),
                             step_ids=torch.full(
-                                (stop_rows.numel(),),
+                                (terminal_rows.numel(),),
                                 step,
                                 dtype=torch.long,
                                 device=context.device,
                             ),
                             source_ids=torch.full(
-                                (stop_rows.numel(),),
+                                (terminal_rows.numel(),),
                                 SRC_UNKNOWN,
                                 dtype=torch.long,
                                 device=context.device,
                             ),
                         ),
-                        forced_stop=rollout.forced_stop.to(
+                        forced_terminal=rollout.forced_terminal.to(
                             device=context.device,
                             dtype=torch.bool,
-                        ).index_select(0, stop_rows),
+                        ).index_select(0, terminal_rows),
                     )
                 )
 
@@ -431,7 +431,7 @@ def training_from_trajectories(
                 step_ids=torch.tensor([len(trajectory.edge_ids)], dtype=torch.long, device=graph.device),
                 source_ids=torch.full((1,), SRC_UNKNOWN, dtype=torch.long, device=graph.device),
             ),
-            forced_stop=torch.zeros(1, dtype=torch.bool, device=graph.device),
+            forced_terminal=torch.zeros(1, dtype=torch.bool, device=graph.device),
         )
         batches.append(
             TrainingBatch(

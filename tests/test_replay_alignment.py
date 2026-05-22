@@ -44,15 +44,15 @@ def replay_batch():
     )
 
 
-def rollout(edge_rows: list[list[int]], stop_step: int = 3) -> RolloutResult:
+def rollout(edge_rows: list[list[int]], terminal_step: int = 3) -> RolloutResult:
     selected = torch.tensor(edge_rows, dtype=torch.long)
     return RolloutResult(
         source_graph_id=torch.arange(selected.size(0), dtype=torch.long),
         selected_edge_ids=selected,
         policy_action_log_prob=torch.zeros_like(selected, dtype=torch.float32),
         behavior_action_log_prob=torch.zeros_like(selected, dtype=torch.float32),
-        stop_step=torch.full((selected.size(0),), int(stop_step), dtype=torch.long),
-        forced_stop=torch.zeros(selected.size(0), dtype=torch.bool),
+        terminal_step=torch.full((selected.size(0),), int(terminal_step), dtype=torch.long),
+        forced_terminal=torch.zeros(selected.size(0), dtype=torch.bool),
         expand_budget=3,
     )
 
@@ -86,7 +86,7 @@ def test_reward_sufficient_rollout_skips_replay_but_low_quality_hit_does_not() -
             [0, 2, -1, -1],
             [4, 6, -1, -1],
         ],
-        stop_step=2,
+        terminal_step=2,
     )
     skipped, skipped_stats = replay_trajectories_with_stats(
         batch=batch,
@@ -105,7 +105,7 @@ def test_reward_sufficient_rollout_skips_replay_but_low_quality_hit_does_not() -
             [0, 2, 3, -1],
             [4, 6, 7, -1],
         ],
-        stop_step=3,
+        terminal_step=3,
     )
     replayed, replayed_stats = replay_trajectories_with_stats(
         batch=batch,

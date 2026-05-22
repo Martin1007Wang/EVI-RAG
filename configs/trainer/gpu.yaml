@@ -5,7 +5,7 @@ _target_: lightning.pytorch.trainer.Trainer
 default_root_dir: ${paths.output_dir}
 accelerator: gpu
 devices: 1
-precision: bf16-mixed
+precision: 32-true
 
 min_epochs: 0
 max_epochs: -1

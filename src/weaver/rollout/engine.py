@@ -81,7 +81,7 @@ class RolloutEngine:
                 context=context,
                 frontier=frontier,
             )
-            forced_local = forced_stop_rows(
+            forced_local = forced_terminal_rows(
                 state=active_state,
                 frontier=frontier,
                 expand_budget=self.expand_budget,
@@ -101,9 +101,9 @@ class RolloutEngine:
                 )
             if forced_local.numel() > 0:
                 actions.append(
-                    StepAction.forced_stop(
+                    StepAction.forced_terminal(
                         rows=forced_local,
-                        dtype=policy_out.stop_logit.dtype,
+                        dtype=policy_out.terminal_log_flow.dtype,
                         device=context.device,
                     )
                 )
@@ -125,23 +125,23 @@ class RolloutEngine:
                     expand_budget=self.expand_budget,
                 )
 
-        stop_step = tape.stop_step.clone()
-        unstopped = stop_step.lt(0)
+        terminal_step = tape.terminal_step.clone()
+        unstopped = terminal_step.lt(0)
         if bool(unstopped.any()):
-            stop_step[unstopped] = self.expand_budget
+            terminal_step[unstopped] = self.expand_budget
 
         return RolloutResult(
             source_graph_id=graph_ids,
             selected_edge_ids=tape.selected_edge_ids,
             policy_action_log_prob=tape.policy_action_log_prob,
             behavior_action_log_prob=tape.behavior_action_log_prob,
-            stop_step=stop_step,
-            forced_stop=tape.forced_stop,
+            terminal_step=terminal_step,
+            forced_terminal=tape.forced_terminal,
             expand_budget=self.expand_budget,
         )
 
 
-def forced_stop_rows(
+def forced_terminal_rows(
     *,
     state: State,
     frontier: Frontier,
@@ -192,4 +192,5 @@ def split_fused_rollouts(
 
 __all__ = [
     "RolloutEngine",
+    "forced_terminal_rows",
 ]

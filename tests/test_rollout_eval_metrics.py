@@ -60,22 +60,22 @@ class FakePolicy:
         score -= state.selected_edge_mask[:, 2].float() * 5.0
         score -= state.selected_edge_mask[:, 4].float() * 5.0
         return SimpleNamespace(
-            log_flow=score,
-            stop_log_prob=torch.zeros_like(score),
+            state_log_flow=score,
+            terminal_log_flow=score,
         )
 
 
 def rollout(edge_rows: list[list[int]], logprob_rows: list[list[float]]) -> RolloutResult:
     selected = torch.tensor(edge_rows, dtype=torch.long)
     logprob = torch.tensor(logprob_rows, dtype=torch.float32)
-    stop_step = torch.tensor([len(row) - 1 for row in edge_rows], dtype=torch.long)
+    terminal_step = torch.tensor([len(row) - 1 for row in edge_rows], dtype=torch.long)
     return RolloutResult(
         source_graph_id=torch.arange(len(edge_rows), dtype=torch.long),
         selected_edge_ids=selected,
         policy_action_log_prob=logprob,
         behavior_action_log_prob=logprob,
-        stop_step=stop_step,
-        forced_stop=torch.zeros(len(edge_rows), dtype=torch.bool),
+        terminal_step=terminal_step,
+        forced_terminal=torch.zeros(len(edge_rows), dtype=torch.bool),
         expand_budget=2,
     )
 
@@ -126,12 +126,12 @@ def test_rollout_metric_contract_and_selector_semantics() -> None:
     assert not any(key.startswith("expected/") for key in metrics)
 
     assert metrics["selector_traj_prob@2/recall"] == 0.0
-    assert metrics["selector_stop_flow@2/recall"] == 0.75
-    assert metrics["selector_stop_flow@2/f1"] > 0.0
+    assert metrics["selector_terminal_flow@2/recall"] == 0.75
+    assert metrics["selector_terminal_flow@2/f1"] > 0.0
     assert metrics["candidate_union@3/recall"] > metrics["candidate_oracle_best@3/recall"]
     assert metrics["candidate_union@3/edges"] == 2.5
     assert "candidate_union@3/precision" not in metrics
-    assert "selector_stop_flow@2/edges" not in metrics
+    assert "selector_terminal_flow@2/edges" not in metrics
     assert not any(key.startswith("diversity@") for key in metrics)
 
 
@@ -159,7 +159,7 @@ def test_same_terminal_graph_counts_once_but_trajectory_scores_can_differ() -> N
         policy=FakePolicy(),
     )
 
-    assert metrics["selector_traj_prob@2/recall"] == metrics["selector_stop_flow@2/recall"]
+    assert metrics["selector_traj_prob@2/recall"] == metrics["selector_terminal_flow@2/recall"]
     assert not any(key.startswith("diversity@") for key in metrics)
 
 

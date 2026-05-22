@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 import torch
 
-from src.weaver.policy import PolicyOutput
+from src.weaver.policy import ForwardPolicyOutput
 
-STOP_EDGE_ID = -1
+TERMINAL_EDGE_ID = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,21 +28,21 @@ class StepAction:
             raise ValueError("behavior_log_prob must match row_ids length.")
         if int(self.forced.numel()) != count:
             raise ValueError("forced must match row_ids length.")
-        invalid_negative = self.edge_ids.lt(STOP_EDGE_ID)
+        invalid_negative = self.edge_ids.lt(TERMINAL_EDGE_ID)
         if bool(invalid_negative.any()):
-            raise ValueError("Only STOP_EDGE_ID may be negative.")
+            raise ValueError("Only TERMINAL_EDGE_ID may be negative.")
 
     @property
-    def stop_mask(self) -> torch.Tensor:
-        return self.edge_ids.eq(STOP_EDGE_ID)
+    def terminal_mask(self) -> torch.Tensor:
+        return self.edge_ids.eq(TERMINAL_EDGE_ID)
 
     @property
     def expand_mask(self) -> torch.Tensor:
         return self.edge_ids.ge(0)
 
     @property
-    def stop_rows(self) -> torch.Tensor:
-        return self.row_ids[self.stop_mask]
+    def terminal_rows(self) -> torch.Tensor:
+        return self.row_ids[self.terminal_mask]
 
     @property
     def expand_rows(self) -> torch.Tensor:
@@ -57,7 +57,7 @@ class StepAction:
         return self.policy_log_prob[self.expand_mask]
 
     @classmethod
-    def forced_stop(
+    def forced_terminal(
         cls,
         *,
         rows: torch.Tensor,
@@ -72,7 +72,7 @@ class StepAction:
             row_ids=rows,
             edge_ids=torch.full(
                 (rows.numel(),),
-                STOP_EDGE_ID,
+                TERMINAL_EDGE_ID,
                 dtype=torch.long,
                 device=rows.device,
             ),
@@ -123,19 +123,19 @@ class StepAction:
 
 def sample_step(
     *,
-    policy_out: PolicyOutput,
+    policy_out: ForwardPolicyOutput,
     rows: torch.Tensor,
 ) -> StepAction:
     rows = rows.to(
-        device=policy_out.stop_logit.device,
+        device=policy_out.terminal_log_flow.device,
         dtype=torch.long,
     ).view(-1)
     if rows.numel() == 0:
         return StepAction(
             row_ids=rows,
             edge_ids=rows.new_empty((0,)),
-            policy_log_prob=policy_out.stop_logit.new_empty((0,)).float(),
-            behavior_log_prob=policy_out.stop_logit.new_empty((0,)).float(),
+            policy_log_prob=policy_out.terminal_log_flow.new_empty((0,)).float(),
+            behavior_log_prob=policy_out.terminal_log_flow.new_empty((0,)).float(),
             forced=torch.zeros(0, dtype=torch.bool, device=rows.device),
         )
 
@@ -156,7 +156,7 @@ def sample_step(
 
 
 __all__ = [
-    "STOP_EDGE_ID",
+    "TERMINAL_EDGE_ID",
     "StepAction",
     "sample_step",
 ]
