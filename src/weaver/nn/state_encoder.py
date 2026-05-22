@@ -12,8 +12,7 @@ from src.weaver.state import State
 from .edge_encoder import EdgeEncoder
 from .feature_encoder import (
     EncodedFeatures,
-    select_edge_relation_model,
-    select_node_model,
+    select_edge_token_model,
     select_query_model,
 )
 
@@ -171,11 +170,8 @@ class StateEncoder(nn.Module):
         edge_ids: torch.Tensor,
         dst_node_ids: torch.Tensor,
     ) -> torch.Tensor:
-        return self.edge_encoder(
-            src_h=select_node_model(features, src_node_ids),
-            rel_h=select_edge_relation_model(features, edge_ids),
-            dst_h=select_node_model(features, dst_node_ids),
-        )
+        del src_node_ids, dst_node_ids
+        return select_edge_token_model(features, edge_ids)
 
     def encode_selected_edges(
         self,
@@ -186,20 +182,12 @@ class StateEncoder(nn.Module):
         num_rows: int,
         like: torch.Tensor,
     ) -> torch.Tensor:
-        row_ids, edge_ids = state.selected_edge_mask.nonzero(as_tuple=True)
+        row_ids, edge_ids = state.selected_edges()
 
         if edge_ids.numel() == 0:
             return like.new_zeros((num_rows, self.hidden_dim))
 
-        src_node_ids = context.edge_index[0].index_select(0, edge_ids)
-        dst_node_ids = context.edge_index[1].index_select(0, edge_ids)
-
-        edge_h = self.encode_edge_tokens(
-            features=features,
-            src_node_ids=src_node_ids,
-            edge_ids=edge_ids,
-            dst_node_ids=dst_node_ids,
-        )
+        edge_h = select_edge_token_model(features, edge_ids)
 
         return self.edge_pool(
             tokens=edge_h,

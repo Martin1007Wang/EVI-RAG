@@ -10,35 +10,39 @@ TERMINAL_EDGE_ID = -1
 @dataclass(frozen=True, slots=True)
 class ForwardPolicyOutput:
     """
-    Forward policy output for a flat terminal-or-edge action-flow distribution.
+    Forward policy output for a flat stop-or-edge action-flow distribution.
     """
 
     frontier_row_ids: torch.Tensor
     frontier_edge_ids: torch.Tensor
-    terminal_log_flow: torch.Tensor
-    continuation_log_flow: torch.Tensor
+    stop_log_flow: torch.Tensor
+    continue_log_flow: torch.Tensor
+    continue_log_gain: torch.Tensor
     edge_log_flow: torch.Tensor
-    edge_log_policy: torch.Tensor
+    edge_log_reference: torch.Tensor
+    edge_log_advantage: torch.Tensor
     state_log_flow: torch.Tensor
-    terminal_log_prob: torch.Tensor
+    stop_log_prob: torch.Tensor
     edge_log_prob: torch.Tensor
     num_rows: int
     num_edges: int
 
     def __post_init__(self) -> None:
-        device = self.terminal_log_flow.device
+        device = self.stop_log_flow.device
         float_fields = {
-            "terminal_log_flow": self.terminal_log_flow,
-            "continuation_log_flow": self.continuation_log_flow,
+            "stop_log_flow": self.stop_log_flow,
+            "continue_log_flow": self.continue_log_flow,
+            "continue_log_gain": self.continue_log_gain,
             "edge_log_flow": self.edge_log_flow,
-            "edge_log_policy": self.edge_log_policy,
+            "edge_log_reference": self.edge_log_reference,
+            "edge_log_advantage": self.edge_log_advantage,
             "state_log_flow": self.state_log_flow,
-            "terminal_log_prob": self.terminal_log_prob,
+            "stop_log_prob": self.stop_log_prob,
             "edge_log_prob": self.edge_log_prob,
         }
         for name, value in float_fields.items():
             if value.device != device:
-                raise ValueError(f"{name} must be on the same device as terminal_log_flow.")
+                raise ValueError(f"{name} must be on the same device as stop_log_flow.")
             if value.dtype != torch.float32:
                 raise TypeError(f"{name} must use torch.float32.")
 
@@ -48,7 +52,7 @@ class ForwardPolicyOutput:
         }
         for name, value in index_fields.items():
             if value.device != device:
-                raise ValueError(f"{name} must be on the same device as terminal_log_flow.")
+                raise ValueError(f"{name} must be on the same device as stop_log_flow.")
             if value.dtype != torch.long:
                 raise TypeError(f"{name} must use torch.long.")
 
@@ -61,30 +65,30 @@ class ForwardPolicyOutput:
         return self.frontier_edge_ids
 
     @property
-    def terminal_vs_continuation_log_ratio(self) -> torch.Tensor:
-        return self.terminal_log_flow.float() - self.continuation_log_flow
+    def stop_vs_continue_log_ratio(self) -> torch.Tensor:
+        return self.stop_log_flow.float() - self.continue_log_flow
 
     def has_edge(self) -> torch.Tensor:
         return _rows_with_edges(
             edge_row_ids=self.frontier_row_ids,
             num_rows=int(self.num_rows),
-            device=self.terminal_log_flow.device,
+            device=self.stop_log_flow.device,
         )
 
-    def terminal_prob(self) -> torch.Tensor:
-        return self.terminal_log_prob.exp()
+    def stop_prob(self) -> torch.Tensor:
+        return self.stop_log_prob.exp()
 
     def action_log_prob(self) -> torch.Tensor:
         return torch.cat(
             [
-                self.terminal_log_prob,
+                self.stop_log_prob,
                 self.edge_log_prob,
             ],
             dim=0,
         )
 
     def edge_prob_mass(self) -> torch.Tensor:
-        mass = self.terminal_log_flow.new_zeros((int(self.num_rows),)).float()
+        mass = self.stop_log_flow.new_zeros((int(self.num_rows),)).float()
         if self.edge_log_prob.numel() == 0:
             return mass
         probs = self.edge_log_prob.exp()
@@ -102,7 +106,7 @@ class ForwardPolicyOutput:
         edge_ids: torch.Tensor,
     ) -> torch.Tensor:
         return _gather_by_action_keys(
-            terminal_values=self.terminal_log_prob,
+            stop_values=self.stop_log_prob,
             edge_values=self.edge_log_prob,
             out=self,
             row_ids=row_ids,
@@ -116,7 +120,7 @@ class ForwardPolicyOutput:
         edge_ids: torch.Tensor,
     ) -> torch.Tensor:
         return _gather_by_action_keys(
-            terminal_values=self.terminal_log_flow,
+            stop_values=self.stop_log_flow,
             edge_values=self.edge_log_flow,
             out=self,
             row_ids=row_ids,
@@ -127,11 +131,11 @@ class ForwardPolicyOutput:
         return _frontier_size(
             edge_row_ids=self.frontier_row_ids,
             num_rows=int(self.num_rows),
-            device=self.terminal_log_flow.device,
+            device=self.stop_log_flow.device,
         )
 
     def edge_action_entropy(self) -> torch.Tensor:
-        entropy = self.terminal_log_flow.new_zeros((int(self.num_rows),)).float()
+        entropy = self.stop_log_flow.new_zeros((int(self.num_rows),)).float()
         if self.edge_log_prob.numel() == 0:
             return entropy
         edge_row_ids = self.frontier_row_ids.to(device=self.edge_log_prob.device, dtype=torch.long)
@@ -145,7 +149,7 @@ class ForwardPolicyOutput:
         *,
         rows: torch.Tensor,
     ) -> torch.Tensor:
-        rows = rows.to(device=self.terminal_log_flow.device, dtype=torch.long).view(-1)
+        rows = rows.to(device=self.stop_log_flow.device, dtype=torch.long).view(-1)
         picked_edge_ids = torch.full(
             (rows.numel(),),
             TERMINAL_EDGE_ID,
@@ -157,7 +161,7 @@ class ForwardPolicyOutput:
 
         for out_pos, row in enumerate(rows.tolist()):
             edge_positions = self.frontier_row_ids.eq(int(row)).nonzero(as_tuple=False).flatten()
-            values = [self.terminal_log_prob[int(row)].float()]
+            values = [self.stop_log_prob[int(row)].float()]
             edge_ids = [TERMINAL_EDGE_ID]
             if edge_positions.numel() > 0:
                 values.append(self.edge_log_prob.index_select(0, edge_positions).float())
@@ -197,23 +201,23 @@ def _rows_with_edges(
 
 def _gather_by_action_keys(
     *,
-    terminal_values: torch.Tensor,
+    stop_values: torch.Tensor,
     edge_values: torch.Tensor,
     out: ForwardPolicyOutput,
     row_ids: torch.Tensor,
     edge_ids: torch.Tensor,
 ) -> torch.Tensor:
-    row_ids = row_ids.to(device=terminal_values.device, dtype=torch.long).view(-1)
-    edge_ids = edge_ids.to(device=terminal_values.device, dtype=torch.long).view(-1)
+    row_ids = row_ids.to(device=stop_values.device, dtype=torch.long).view(-1)
+    edge_ids = edge_ids.to(device=stop_values.device, dtype=torch.long).view(-1)
     if int(row_ids.numel()) != int(edge_ids.numel()):
         raise ValueError("row_ids and edge_ids must have the same length.")
     if bool(row_ids.lt(0).any()) or bool(row_ids.ge(int(out.num_rows)).any()):
         raise IndexError("row_ids must be in [0, ForwardPolicyOutput.num_rows).")
 
-    out_values = terminal_values.new_empty((row_ids.numel(),))
-    terminal_mask = edge_ids.eq(TERMINAL_EDGE_ID)
-    if bool(terminal_mask.any()):
-        out_values[terminal_mask] = terminal_values.index_select(0, row_ids[terminal_mask])
+    out_values = stop_values.new_empty((row_ids.numel(),))
+    stop_mask = edge_ids.eq(TERMINAL_EDGE_ID)
+    if bool(stop_mask.any()):
+        out_values[stop_mask] = stop_values.index_select(0, row_ids[stop_mask])
 
     edge_mask = edge_ids.ge(0)
     if bool(edge_mask.any()):

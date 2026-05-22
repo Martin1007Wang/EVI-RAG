@@ -58,32 +58,21 @@ class ReplaySampleBudget:
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayTargetView:
-    target_node_id: int
+class ReplayGraphLabelView:
     graph_id: int
-    node_start: int
-    edge_start: int
-    anchor_target_distance: int
-    node_distances: torch.Tensor
-    edge_counts: torch.Tensor
+    target_node_ids: torch.Tensor
+    admissible_edge_ids: torch.Tensor
+    admissible_edge_mask: torch.Tensor
 
-    def node_distance(self, node_id: int) -> int:
-        local_node_id = int(node_id) - int(self.node_start)
-        return int(self.node_distances[local_node_id].item())
 
-    def node_distances_for(self, node_ids: torch.Tensor) -> torch.Tensor:
-        local_node_ids = node_ids.to(
-            device=self.node_distances.device,
-            dtype=torch.long,
-        ) - int(self.node_start)
-        return self.node_distances.index_select(0, local_node_ids)
-
-    def edge_counts_for(self, edge_ids: torch.Tensor) -> torch.Tensor:
-        local_edge_ids = edge_ids.to(
-            device=self.edge_counts.device,
-            dtype=torch.long,
-        ) - int(self.edge_start)
-        return self.edge_counts.index_select(0, local_edge_ids)
+@dataclass(frozen=True, slots=True)
+class ReplayStateNode:
+    key: tuple[int, ...]
+    state: State
+    reward: float
+    predecessor_keys: tuple[tuple[int, ...], ...]
+    predecessor_edge_ids: tuple[int, ...]
+    trajectory_count: int
 
 
 class ReplaySource:
@@ -227,6 +216,13 @@ def training_from_rollouts(
                 dtype=torch.bool,
             ).nonzero(as_tuple=False).flatten()
             if terminal_rows.numel() > 0:
+                terminal_rows = terminal_rows[
+                    ~rollout.budget_truncated.index_select(
+                        0,
+                        terminal_rows.to(device=rollout.device, dtype=torch.long),
+                    ).to(device=context.device, dtype=torch.bool)
+                ]
+            if terminal_rows.numel() > 0:
                 term_parts.append(
                     TerminalBatch(
                         state=current.select_rows(terminal_rows),
@@ -245,9 +241,9 @@ def training_from_rollouts(
                                 device=context.device,
                             ),
                         ),
-                        forced_terminal=rollout.forced_terminal.to(
+                        stop_reason=rollout.stop_reason.to(
                             device=context.device,
-                            dtype=torch.bool,
+                            dtype=torch.long,
                         ).index_select(0, terminal_rows),
                     )
                 )
@@ -312,16 +308,18 @@ def replay_trajectories_with_stats(
         return [], ReplayStats()
 
     target_graph = context.node_to_graph.index_select(0, targets)
-    base_eligible_graphs = replay_graph_ids(
+    eligible_graphs = replay_graph_ids(
         targets=targets,
         target_graph=target_graph,
         context=context,
     )
-    if not base_eligible_graphs:
+    if not eligible_graphs:
         return [], ReplayStats()
 
-    trajectories: list[ReplayTrajectory] = []
-    target_views = build_replay_target_views(
+    if reward_model is None or target_context is None:
+        raise ValueError("Reward-first replay requires reward_model and target_context.")
+
+    graph_views = build_replay_graph_label_views(
         batch=batch,
         context=context,
         targets=targets,
@@ -333,55 +331,56 @@ def replay_trajectories_with_stats(
         target_context=target_context,
         reward_model=reward_model,
     )
-    skipped_by_reward = 0
 
-    for graph_id in range(int(context.num_graphs)):
-        if graph_id not in base_eligible_graphs:
+    trajectories: list[ReplayTrajectory] = []
+    skipped_by_reward = 0
+    covered_graphs: set[int] = set()
+
+    for view in graph_views:
+        graph_id = int(view.graph_id)
+        if graph_id not in eligible_graphs:
             continue
-        graph_target_positions = target_graph.eq(int(graph_id)).nonzero(as_tuple=False).view(-1)
-        if graph_target_positions.numel() == 0:
+
+        replay_states = enumerate_replay_state_dag(
+            context=context,
+            graph_view=view,
+            budget=int(budget),
+        )
+        if not replay_states:
             continue
-        graph_candidates: list[ReplayTrajectory] = []
-        for target_pos in graph_target_positions.tolist():
-            edge_paths = precomputed_shortest_edge_paths(
-                batch=batch,
-                context=context,
-                target_view=target_views[int(target_pos)],
-                budget=int(budget),
-                max_paths=max_per_graph,
-            )
-            graph_candidates.extend(
-                ReplayTrajectory(
-                    graph_id=int(graph_id),
-                    edge_ids=tuple(int(edge_id) for edge_id in edge_path[: int(budget)]),
-                )
-                for edge_path in edge_paths
-            )
-        graph_candidates = dedupe_replay_trajectories(graph_candidates)
-        graph_candidates.sort(key=replay_trajectory_sort_key)
-        if max_per_graph is not None:
-            graph_candidates = graph_candidates[:max_per_graph]
-        if not graph_candidates:
+
+        terminal_nodes = score_replay_states(
+            replay_states=replay_states,
+            context=context,
+            target_context=target_context,
+            reward_model=reward_model,
+        )
+        if not terminal_nodes:
             continue
-        if reward_model is not None and target_context is not None:
-            best_oracle = best_replay_reward(
-                trajectories=graph_candidates,
-                context=context,
-                target_context=target_context,
-                reward_model=reward_model,
-                budget=int(budget),
-            )
-            best_policy = rollout_reward.get(int(graph_id))
-            if best_policy is not None and best_policy >= best_oracle:
-                skipped_by_reward += 1
-                continue
-        trajectories.extend(graph_candidates)
+
+        best_oracle = max(node.reward for node in terminal_nodes)
+        best_policy = rollout_reward.get(graph_id)
+        if best_policy is not None and best_policy >= best_oracle:
+            skipped_by_reward += 1
+            continue
+
+        sampled = sample_oracle_trajectories(
+            graph_id=graph_id,
+            replay_states=replay_states,
+            terminal_nodes=terminal_nodes,
+            max_trajectories=max_per_graph,
+        )
+        if not sampled:
+            continue
+
+        trajectories.extend(sampled)
+        covered_graphs.add(graph_id)
 
     stats = ReplayStats(
-        eligible_graphs=len(base_eligible_graphs),
+        eligible_graphs=len(eligible_graphs),
         skipped_by_reward=skipped_by_reward,
         generated_trajectories=len(trajectories),
-        covered_graphs=len({trajectory.graph_id for trajectory in trajectories}),
+        covered_graphs=len(covered_graphs),
     )
     return trajectories, stats
 
@@ -394,8 +393,6 @@ def training_from_trajectories(
 ) -> TrainingBatch:
     batches: list[TrainingBatch] = []
     for trajectory_id, trajectory in enumerate(trajectories):
-        if trajectory.is_empty:
-            continue
         current = initial_state_for_graph_ids(
             context=graph,
             graph_ids=torch.tensor([int(trajectory.graph_id)], dtype=torch.long, device=graph.device),
@@ -431,11 +428,16 @@ def training_from_trajectories(
                 step_ids=torch.tensor([len(trajectory.edge_ids)], dtype=torch.long, device=graph.device),
                 source_ids=torch.full((1,), SRC_UNKNOWN, dtype=torch.long, device=graph.device),
             ),
-            forced_terminal=torch.zeros(1, dtype=torch.bool, device=graph.device),
+            stop_reason=torch.full(
+                (1,),
+                RolloutResult.POLICY_STOP,
+                dtype=torch.long,
+                device=graph.device,
+            ),
         )
         batches.append(
             TrainingBatch(
-                expansions=ExpansionBatch.concat(exp_parts),
+                expansions=ExpansionBatch.concat(exp_parts) if exp_parts else ExpansionBatch.empty_like(graph_like=current),
                 terminals=term,
             )
         )
@@ -451,6 +453,7 @@ def training_from_trajectories(
         )
     return TrainingBatch.concat_reindex_trajectories(batches)
 
+
 def replay_graph_ids(
     *,
     targets: torch.Tensor,
@@ -458,8 +461,7 @@ def replay_graph_ids(
     context: GraphContext,
 ) -> set[int]:
     del targets, context
-    graphs_with_targets = {int(x) for x in target_graph.tolist()}
-    return graphs_with_targets
+    return {int(x) for x in target_graph.tolist()}
 
 
 def rollout_hit_graph_ids(
@@ -602,24 +604,6 @@ def best_replay_reward(
     return float(reward.max().item())
 
 
-def dedupe_replay_trajectories(
-    trajectories: Sequence[ReplayTrajectory],
-) -> list[ReplayTrajectory]:
-    seen: set[tuple[int, tuple[int, ...]]] = set()
-    out: list[ReplayTrajectory] = []
-    for trajectory in trajectories:
-        key = (int(trajectory.graph_id), tuple(int(edge_id) for edge_id in trajectory.edge_ids))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(trajectory)
-    return out
-
-
-def replay_trajectory_sort_key(trajectory: ReplayTrajectory) -> tuple[int, tuple[int, ...]]:
-    return len(trajectory.edge_ids), tuple(trajectory.edge_ids)
-
-
 def initial_state_for_graph_ids(
     *,
     context: GraphContext,
@@ -634,13 +618,48 @@ def initial_state_for_graph_ids(
     )
 
 
-def build_replay_target_views(
+def build_replay_graph_label_views(
     *,
     batch: RetrievalBatch,
     context: GraphContext,
     targets: torch.Tensor,
     target_graph: torch.Tensor,
-) -> tuple[ReplayTargetView, ...]:
+) -> tuple[ReplayGraphLabelView, ...]:
+    device = context.device
+    target_mask_blocks = unflatten_target_edge_mask(
+        batch=batch,
+        context=context,
+        targets=targets,
+        target_graph=target_graph,
+    )
+    views: list[ReplayGraphLabelView] = []
+    for graph_id in range(int(context.num_graphs)):
+        graph_targets = target_graph.eq(graph_id).nonzero(as_tuple=False).flatten()
+        if graph_targets.numel() == 0:
+            continue
+        edge_mask = target_mask_blocks.index_select(0, graph_targets)
+        admissible_edge_mask = edge_mask.any(dim=0)
+        admissible_edge_ids = admissible_edge_mask.nonzero(as_tuple=False).flatten()
+        if admissible_edge_ids.numel() == 0:
+            continue
+        views.append(
+            ReplayGraphLabelView(
+                graph_id=graph_id,
+                target_node_ids=targets.index_select(0, graph_targets),
+                admissible_edge_ids=admissible_edge_ids,
+                admissible_edge_mask=admissible_edge_mask,
+            )
+        )
+    return tuple(views)
+
+
+def unflatten_target_edge_mask(
+    *,
+    batch: RetrievalBatch,
+    context: GraphContext,
+    targets: torch.Tensor,
+    target_graph: torch.Tensor,
+) -> torch.Tensor:
     if targets.ndim != 1:
         raise ValueError(f"targets must have shape [T], got {tuple(targets.shape)}.")
     if target_graph.shape != targets.shape:
@@ -649,115 +668,245 @@ def build_replay_target_views(
             f"{tuple(target_graph.shape)} != {tuple(targets.shape)}."
         )
 
-    device = context.device
-    node_ptr = batch.ptr.to(device=device, dtype=torch.long)
     edge_ptr = _edge_ptr_from_edge_batch(
         edge_batch=batch.edge_batch,
         num_graphs=int(context.num_graphs),
-        device=device,
-    )
-
-    node_target_distances = batch.node_target_distances_flat.to(
-        device=device,
-        dtype=torch.long,
-    )
-    node_target_edge_counts = batch.node_target_shortest_path_edge_count_flat.to(
-        device=device,
-        dtype=torch.float32,
-    )
-    anchor_forward = batch.anchor_node_forward_distances_flat.to(
-        device=device,
-        dtype=torch.long,
+        device=context.device,
     )
     target_batch = _target_batch_from_reachable_targets(
         batch=batch,
         targets=targets,
         target_graph=target_graph,
-        device=device,
+        device=context.device,
     )
-    target_graph_ptr = _graph_ptr_from_item_batch(
+    target_offsets = _item_offsets_within_graph(
         item_batch=target_batch,
         num_graphs=int(context.num_graphs),
-        device=device,
-    )
-    target_item_offsets = _item_offsets_within_graph(
-        item_batch=target_batch,
-        num_graphs=int(context.num_graphs),
-        device=device,
-    )
-    node_target_graph_ptr = _graph_ptr_from_flat_supervision(
-        item_batch=target_batch,
-        graph_sizes=node_ptr[1:] - node_ptr[:-1],
-        device=device,
+        device=context.device,
     )
     edge_target_graph_ptr = _graph_ptr_from_flat_supervision(
         item_batch=target_batch,
         graph_sizes=edge_ptr[1:] - edge_ptr[:-1],
-        device=device,
+        device=context.device,
     )
 
-    views: list[ReplayTargetView] = []
-    for target_pos, (target_id, graph_id) in enumerate(
-        zip(targets.tolist(), target_graph.tolist(), strict=True)
-    ):
-        node_start = int(node_ptr[graph_id].item())
-        node_end = int(node_ptr[graph_id + 1].item())
+    flat = batch.node_target_shortest_path_edge_mask_flat.to(
+        device=context.device,
+        dtype=torch.bool,
+    )
+    out = torch.zeros(
+        (int(targets.numel()), int(context.num_edges)),
+        dtype=torch.bool,
+        device=context.device,
+    )
+
+    for target_pos, graph_id in enumerate(target_graph.tolist()):
         edge_start = int(edge_ptr[graph_id].item())
         edge_end = int(edge_ptr[graph_id + 1].item())
-        local_target_pos = int(target_item_offsets[target_pos].item())
-        graph_target_count = int(
-            target_graph_ptr[graph_id + 1].item() - target_graph_ptr[graph_id].item()
-        )
-        graph_num_nodes = node_end - node_start
         graph_num_edges = edge_end - edge_start
+        local_target_pos = int(target_offsets[target_pos].item())
+        graph_edge_flat_start = int(edge_target_graph_ptr[graph_id].item())
+        slice_start = graph_edge_flat_start + local_target_pos * graph_num_edges
+        slice_end = slice_start + graph_num_edges
+        out[target_pos, edge_start:edge_end] = flat[slice_start:slice_end]
 
-        node_graph_start = int(node_target_graph_ptr[graph_id].item())
-        node_graph_end = int(node_target_graph_ptr[graph_id + 1].item())
-        edge_graph_start = int(edge_target_graph_ptr[graph_id].item())
-        edge_graph_end = int(edge_target_graph_ptr[graph_id + 1].item())
+    return out
 
-        if node_graph_end - node_graph_start != graph_target_count * graph_num_nodes:
-            raise ValueError(
-                "node_target_distances_flat graph block has inconsistent size: "
-                f"graph={graph_id}, targets={graph_target_count}, nodes={graph_num_nodes}."
-            )
-        if edge_graph_end - edge_graph_start != graph_target_count * graph_num_edges:
-            raise ValueError(
-                "node_target_shortest_path_edge_count_flat graph block has inconsistent size: "
-                f"graph={graph_id}, targets={graph_target_count}, edges={graph_num_edges}."
-            )
 
-        node_slice_start = node_graph_start + local_target_pos * graph_num_nodes
-        node_slice_end = node_slice_start + graph_num_nodes
-        edge_slice_start = edge_graph_start + local_target_pos * graph_num_edges
-        edge_slice_end = edge_slice_start + graph_num_edges
+def enumerate_replay_state_dag(
+    *,
+    context: GraphContext,
+    graph_view: ReplayGraphLabelView,
+    budget: int,
+) -> dict[tuple[int, ...], ReplayStateNode]:
+    graph_id = int(graph_view.graph_id)
+    initial = initial_state_for_graph_ids(
+        context=context,
+        graph_ids=torch.tensor([graph_id], dtype=torch.long, device=context.device),
+    )
+    initial_key = state_key(initial)
+    states: dict[tuple[int, ...], State] = {initial_key: initial}
+    predecessors: dict[tuple[int, ...], dict[tuple[int, ...], int]] = {initial_key: {}}
+    current_layer: list[tuple[int, ...]] = [initial_key]
 
-        node_distances = node_target_distances[node_slice_start:node_slice_end]
-        edge_counts = node_target_edge_counts[edge_slice_start:edge_slice_end]
-        if int(node_distances.numel()) != node_end - node_start:
-            raise ValueError(
-                "node_target_distances_flat is inconsistent with graph node slices: "
-                f"target={target_id}, graph={graph_id}."
+    for _ in range(int(budget)):
+        next_layer: list[tuple[int, ...]] = []
+        for key in current_layer:
+            parent = states[key]
+            frontier = parent.frontier(
+                context,
+                expand_budget=int(budget),
             )
-        if int(edge_counts.numel()) != edge_end - edge_start:
-            raise ValueError(
-                "node_target_shortest_path_edge_count_flat is inconsistent with graph edge slices: "
-                f"target={target_id}, graph={graph_id}."
-            )
+            if frontier.edge_ids.numel() == 0:
+                continue
+            local_rows = frontier.row_ids.eq(0)
+            edge_ids = frontier.edge_ids[local_rows]
+            if edge_ids.numel() == 0:
+                continue
+            admissible = graph_view.admissible_edge_mask.index_select(0, edge_ids)
+            edge_ids = edge_ids[admissible]
+            if edge_ids.numel() == 0:
+                continue
+            for edge_id in edge_ids.tolist():
+                child = parent.expand(
+                    graph=context,
+                    rows=torch.zeros(1, dtype=torch.long, device=context.device),
+                    edge_ids=torch.tensor([int(edge_id)], dtype=torch.long, device=context.device),
+                    expand_budget=int(budget),
+                )
+                child_key = state_key(child)
+                pred_map = predecessors.setdefault(child_key, {})
+                pred_map[key] = int(edge_id)
+                if child_key in states:
+                    continue
+                states[child_key] = child
+                next_layer.append(child_key)
+        current_layer = next_layer
 
-        views.append(
-            ReplayTargetView(
-                target_node_id=int(target_id),
-                graph_id=int(graph_id),
-                node_start=node_start,
-                edge_start=edge_start,
-                anchor_target_distance=int(anchor_forward[int(target_id)].item()),
-                node_distances=node_distances,
-                edge_counts=edge_counts,
-            )
+    trajectory_count = count_state_trajectories(
+        predecessor_map=predecessors,
+        root_key=initial_key,
+        state_depths={key: len(key) for key in states},
+    )
+
+    nodes: dict[tuple[int, ...], ReplayStateNode] = {}
+    for key, state in states.items():
+        pred_items = sorted(predecessors.get(key, {}).items())
+        predecessor_keys = tuple(parent_key for parent_key, _ in pred_items)
+        predecessor_edge_ids = tuple(edge_id for _, edge_id in pred_items)
+        nodes[key] = ReplayStateNode(
+            key=key,
+            state=state,
+            reward=float("-inf"),
+            predecessor_keys=predecessor_keys,
+            predecessor_edge_ids=predecessor_edge_ids,
+            trajectory_count=int(trajectory_count.get(key, 0)),
         )
+    return nodes
 
-    return tuple(views)
+
+def count_state_trajectories(
+    *,
+    predecessor_map: dict[tuple[int, ...], dict[tuple[int, ...], int]],
+    root_key: tuple[int, ...],
+    state_depths: dict[tuple[int, ...], int],
+) -> dict[tuple[int, ...], int]:
+    counts: dict[tuple[int, ...], int] = {root_key: 1}
+    ordered_keys = sorted(state_depths, key=state_depths.__getitem__)
+    for key in ordered_keys:
+        if key == root_key:
+            continue
+        preds = predecessor_map.get(key, {})
+        counts[key] = sum(counts[parent_key] for parent_key in preds)
+    return counts
+
+
+def score_replay_states(
+    *,
+    replay_states: dict[tuple[int, ...], ReplayStateNode],
+    context: GraphContext,
+    target_context: TargetContext,
+    reward_model: TrueTerminalReward,
+) -> list[ReplayStateNode]:
+    ordered_keys = sorted(replay_states.keys(), key=lambda key: (len(key), key))
+    states = State.concat([replay_states[key].state for key in ordered_keys])
+    reward = reward_model(
+        state=states,
+        graph_context=context,
+        target_context=target_context,
+    ).log_reward
+    best = float(reward.max().item()) if reward.numel() > 0 else float("-inf")
+    terminal_nodes: list[ReplayStateNode] = []
+    for idx, key in enumerate(ordered_keys):
+        node = replay_states[key]
+        scored = ReplayStateNode(
+            key=node.key,
+            state=node.state,
+            reward=float(reward[idx].item()),
+            predecessor_keys=node.predecessor_keys,
+            predecessor_edge_ids=node.predecessor_edge_ids,
+            trajectory_count=node.trajectory_count,
+        )
+        replay_states[key] = scored
+        if scored.reward == best:
+            terminal_nodes.append(scored)
+    return terminal_nodes
+
+
+def sample_oracle_trajectories(
+    *,
+    graph_id: int,
+    replay_states: dict[tuple[int, ...], ReplayStateNode],
+    terminal_nodes: Sequence[ReplayStateNode],
+    max_trajectories: int | None,
+) -> list[ReplayTrajectory]:
+    if not terminal_nodes:
+        return []
+
+    limit = None if max_trajectories is None else int(max_trajectories)
+    sequences: list[tuple[int, ...]] = []
+    seen: set[tuple[int, ...]] = set()
+    ordered_terminal_keys = sorted(
+        (node.key for node in terminal_nodes),
+        key=lambda key: (
+            -replay_states[key].trajectory_count,
+            len(key),
+            key,
+        ),
+    )
+    for key in ordered_terminal_keys:
+        for sequence in enumerate_action_sequences(
+            nodes_by_key=replay_states,
+            terminal_key=key,
+        ):
+            if sequence in seen:
+                continue
+            seen.add(sequence)
+            sequences.append(sequence)
+    sequences.sort(key=lambda seq: (len(seq), seq))
+    if limit is not None:
+        sequences = sequences[:limit]
+    return [
+        ReplayTrajectory(
+            graph_id=int(graph_id),
+            edge_ids=sequence,
+        )
+        for sequence in sequences
+    ]
+
+
+def state_key(state: State) -> tuple[int, ...]:
+    if state.num_rows != 1:
+        raise ValueError(f"Replay state_key expects exactly one row, got {state.num_rows}.")
+    return tuple(int(edge_id) for edge_id in state.edge_mask[0].nonzero(as_tuple=True)[0].tolist())
+
+
+def enumerate_action_sequences(
+    *,
+    nodes_by_key: dict[tuple[int, ...], ReplayStateNode],
+    terminal_key: tuple[int, ...],
+) -> tuple[tuple[int, ...], ...]:
+    memo: dict[tuple[int, ...], tuple[tuple[int, ...], ...]] = {}
+
+    def visit(key: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+        node = nodes_by_key[key]
+        if not node.predecessor_keys:
+            memo[key] = ((),)
+            return memo[key]
+
+        out: list[tuple[int, ...]] = []
+        for parent_key, edge_id in zip(node.predecessor_keys, node.predecessor_edge_ids, strict=True):
+            parent_sequences = visit(parent_key)
+            for parent_sequence in parent_sequences:
+                out.append((*parent_sequence, int(edge_id)))
+        deduped = tuple(sorted(set(out), key=lambda seq: (len(seq), seq)))
+        memo[key] = deduped
+        return deduped
+
+    return visit(terminal_key)
 
 
 def _edge_ptr_from_edge_batch(
@@ -778,24 +927,6 @@ def _edge_ptr_from_edge_batch(
     return edge_ptr
 
 
-def _target_ptr_from_target_graph(
-    *,
-    target_graph: torch.Tensor,
-    num_graphs: int,
-    device: torch.device,
-) -> torch.Tensor:
-    target_graph = target_graph.to(device=device, dtype=torch.long).view(-1)
-    target_counts = torch.bincount(target_graph, minlength=int(num_graphs))
-    target_ptr = torch.empty(
-        int(num_graphs) + 1,
-        dtype=torch.long,
-        device=device,
-    )
-    target_ptr[0] = 0
-    target_ptr[1:] = torch.cumsum(target_counts, dim=0)
-    return target_ptr
-
-
 def _target_batch_from_reachable_targets(
     *,
     batch: RetrievalBatch,
@@ -814,24 +945,6 @@ def _target_batch_from_reachable_targets(
             f"{tuple(target_batch.shape)} != {tuple(targets.shape)}."
         )
     return target_batch
-
-
-def _graph_ptr_from_item_batch(
-    *,
-    item_batch: torch.Tensor,
-    num_graphs: int,
-    device: torch.device,
-) -> torch.Tensor:
-    item_batch = item_batch.to(device=device, dtype=torch.long).view(-1)
-    counts = torch.bincount(item_batch, minlength=int(num_graphs))
-    ptr = torch.empty(
-        int(num_graphs) + 1,
-        dtype=torch.long,
-        device=device,
-    )
-    ptr[0] = 0
-    ptr[1:] = torch.cumsum(counts, dim=0)
-    return ptr
 
 
 def _item_offsets_within_graph(
@@ -859,8 +972,7 @@ def _graph_ptr_from_flat_supervision(
     item_batch = item_batch.to(device=device, dtype=torch.long).view(-1)
     graph_sizes = graph_sizes.to(device=device, dtype=torch.long).view(-1)
     if graph_sizes.numel() == 0:
-        ptr = torch.zeros(1, dtype=torch.long, device=device)
-        return ptr
+        return torch.zeros(1, dtype=torch.long, device=device)
 
     counts = torch.bincount(item_batch, minlength=int(graph_sizes.numel()))
     flat_sizes = counts * graph_sizes
@@ -874,192 +986,24 @@ def _graph_ptr_from_flat_supervision(
     return ptr
 
 
-def precomputed_shortest_edge_path(
-    *,
-    batch: RetrievalBatch,
-    context: GraphContext,
-    target_view: ReplayTargetView,
-    budget: int,
-) -> list[int]:
-    graph_id = int(target_view.graph_id)
-    target_node_id = int(target_view.target_node_id)
-
-    anchors = context.anchor_mask.nonzero(as_tuple=True)[0]
-    anchor_graph = context.node_to_graph.index_select(0, anchors)
-    graph_anchors = anchors[anchor_graph.eq(graph_id)]
-    if graph_anchors.numel() == 0:
-        return []
-
-    current = choose_best_anchor(
-        anchors=graph_anchors,
-        target_view=target_view,
-    )
-    path: list[int] = []
-
-    for _ in range(int(budget)):
-        if current == target_node_id:
-            break
-        current_dist = target_view.node_distance(current)
-        next_edge = choose_next_edge(
-            context=context,
-            target_view=target_view,
-            current_node_id=current,
-            current_distance=current_dist,
-        )
-        if next_edge is None:
-            return []
-        path.append(int(next_edge))
-        current = int(context.edge_index[1, next_edge].item())
-
-    return path if current == target_node_id else []
-
-
-def precomputed_shortest_edge_paths(
-    *,
-    batch: RetrievalBatch,
-    context: GraphContext,
-    target_view: ReplayTargetView,
-    budget: int,
-    max_paths: int | None,
-) -> list[list[int]]:
-    del batch
-    graph_id = int(target_view.graph_id)
-    target_node_id = int(target_view.target_node_id)
-    limit = max(1, int(max_paths) if max_paths is not None else int(budget))
-
-    anchors = context.anchor_mask.nonzero(as_tuple=True)[0]
-    anchor_graph = context.node_to_graph.index_select(0, anchors)
-    graph_anchors = anchors[anchor_graph.eq(graph_id)]
-    if graph_anchors.numel() == 0:
-        return []
-
-    anchor_distances = target_view.node_distances_for(graph_anchors)
-    anchor_order = torch.argsort(anchor_distances)
-    paths: list[list[int]] = []
-    beam: list[tuple[int, list[int]]] = []
-    for anchor in graph_anchors.index_select(0, anchor_order).tolist():
-        distance = target_view.node_distance(int(anchor))
-        if distance < 0 or distance > int(budget):
-            continue
-        beam.append((int(anchor), []))
-
-    for _ in range(int(budget) + 1):
-        next_beam: list[tuple[int, list[int]]] = []
-        for current, path in beam:
-            if current == target_node_id:
-                paths.append(path)
-                continue
-            if len(path) >= int(budget):
-                continue
-            current_dist = target_view.node_distance(current)
-            for edge_id in ranked_next_edges(
-                context=context,
-                target_view=target_view,
-                current_node_id=current,
-                current_distance=current_dist,
-            ):
-                dst_id = int(context.edge_index[1, edge_id].item())
-                next_beam.append((dst_id, [*path, int(edge_id)]))
-        if len(paths) >= limit:
-            break
-        if not next_beam:
-            break
-        next_beam.sort(key=lambda item: (len(item[1]), item[1]))
-        beam = next_beam[: max(limit * 4, limit)]
-
-    deduped: list[list[int]] = []
-    seen: set[tuple[int, ...]] = set()
-    for path in paths:
-        key = tuple(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(path)
-        if len(deduped) >= limit:
-            break
-    return deduped
-
-
-def choose_best_anchor(
-    *,
-    anchors: torch.Tensor,
-    target_view: ReplayTargetView,
-) -> int:
-    distances = target_view.node_distances_for(anchors)
-    best_pos = int(torch.argmin(distances).item())
-    return int(anchors[best_pos].item())
-
-
-def choose_next_edge(
-    *,
-    context: GraphContext,
-    target_view: ReplayTargetView,
-    current_node_id: int,
-    current_distance: int,
-) -> int | None:
-    out_start = int(context.adjacency.out_ptr[current_node_id].item())
-    out_end = int(context.adjacency.out_ptr[current_node_id + 1].item())
-    if out_end <= out_start:
-        return None
-
-    edge_ids = context.edge_ids_by_src[out_start:out_end]
-    dst_ids = context.edge_index[1].index_select(0, edge_ids)
-    dst_dist = target_view.node_distances_for(dst_ids)
-    edge_counts = target_view.edge_counts_for(edge_ids)
-
-    valid = dst_dist.eq(current_distance - 1) & edge_counts.gt(0)
-    if not bool(valid.any()):
-        return None
-
-    valid_edges = edge_ids[valid]
-    valid_counts = edge_counts[valid]
-    best_pos = int(torch.argmax(valid_counts).item())
-    return int(valid_edges[best_pos].item())
-
-
-def ranked_next_edges(
-    *,
-    context: GraphContext,
-    target_view: ReplayTargetView,
-    current_node_id: int,
-    current_distance: int,
-) -> list[int]:
-    out_start = int(context.adjacency.out_ptr[current_node_id].item())
-    out_end = int(context.adjacency.out_ptr[current_node_id + 1].item())
-    if out_end <= out_start:
-        return []
-
-    edge_ids = context.edge_ids_by_src[out_start:out_end]
-    dst_ids = context.edge_index[1].index_select(0, edge_ids)
-    dst_dist = target_view.node_distances_for(dst_ids)
-    edge_counts = target_view.edge_counts_for(edge_ids)
-
-    valid = dst_dist.eq(current_distance - 1) & edge_counts.gt(0)
-    if not bool(valid.any()):
-        return []
-
-    valid_edges = edge_ids[valid]
-    valid_counts = edge_counts[valid]
-    order = sorted(
-        range(int(valid_edges.numel())),
-        key=lambda idx: (-float(valid_counts[idx].item()), int(valid_edges[idx].item())),
-    )
-    return [int(valid_edges[idx].item()) for idx in order]
-
-
 __all__ = [
     "ReplayBatch",
     "ReplayBuilder",
-    "ReplayStats",
-    "ReplayTrajectory",
+    "ReplayGraphLabelView",
     "ReplaySampleBudget",
     "ReplaySource",
-    "ReplayTargetView",
-    "precomputed_shortest_edge_paths",
+    "ReplayStateNode",
+    "ReplayStats",
+    "ReplayTrajectory",
+    "best_replay_reward",
+    "best_rollout_reward_by_graph",
+    "build_replay_graph_label_views",
+    "enumerate_replay_state_dag",
+    "replay_graph_ids",
     "replay_trajectories",
     "replay_trajectories_with_stats",
-    "replay_graph_ids",
     "rollout_hit_graph_ids",
-    "training_from_trajectories",
+    "score_replay_states",
     "training_from_rollouts",
+    "training_from_trajectories",
 ]

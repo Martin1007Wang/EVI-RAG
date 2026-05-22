@@ -41,20 +41,39 @@ class State:
         S_r = selected evidence edge set
         X_r = active node set
 
-    selected_edge_mask is the canonical evidence-edge set S_r.
-
-    active_node_mask is a maintained cache:
-
-        X_r = anchors(graph_ids[r]) ∪ endpoints(S_r)
-
-    step is the number of expansion actions already applied.
-    Under valid transitions, step equals |S_r|.
+    The hot path stores selected edges sparsely as padded per-row ids.
+    Dense edge/node masks remain available as lazy compatibility views.
     """
 
     graph_ids: torch.Tensor  # [R]
-    selected_edge_mask: torch.Tensor  # [R, E]
-    active_node_mask: torch.Tensor  # [R, N]
+    selected_edge_ids: torch.Tensor  # [R, K] padded with -1
+    active_node_ids: torch.Tensor  # [R, K_nodes] padded with -1
     step: torch.Tensor  # [R]
+    num_graph_edges: int
+    num_graph_nodes: int
+    _selected_edge_mask_cache: torch.Tensor | None = None
+    _active_node_mask_cache: torch.Tensor | None = None
+    _frontier_cache: Frontier | None = None
+    _edge_state_h_cache: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.graph_ids.ndim != 1:
+            raise ValueError(f"graph_ids must have shape [R], got {tuple(self.graph_ids.shape)}.")
+        if self.selected_edge_ids.ndim != 2:
+            raise ValueError(
+                f"selected_edge_ids must have shape [R, K], got {tuple(self.selected_edge_ids.shape)}."
+            )
+        if self.active_node_ids.ndim != 2:
+            raise ValueError(
+                f"active_node_ids must have shape [R, K_nodes], got {tuple(self.active_node_ids.shape)}."
+            )
+        num_rows = int(self.graph_ids.numel())
+        if int(self.selected_edge_ids.size(0)) != num_rows:
+            raise ValueError("selected_edge_ids rows must match graph_ids length.")
+        if int(self.active_node_ids.size(0)) != num_rows:
+            raise ValueError("active_node_ids rows must match graph_ids length.")
+        if self.step.shape != (num_rows,):
+            raise ValueError(f"step must have shape [{num_rows}], got {tuple(self.step.shape)}.")
 
     @classmethod
     def initial(
@@ -62,14 +81,10 @@ class State:
         graph: GraphContext,
         graph_ids: torch.Tensor,
     ) -> State:
+        graph_ids = graph_ids.to(device=graph.device, dtype=torch.long).view(-1)
         num_rows = int(graph_ids.numel())
-
-        selected_edge_mask = torch.zeros(
-            (num_rows, int(graph.num_edges)),
-            dtype=torch.bool,
-            device=graph.device,
-        )
-        active_node_mask = anchor_mask_for_graph_rows(
+        empty_edges = torch.empty((num_rows, 0), dtype=torch.long, device=graph.device)
+        active_node_ids = active_nodes_for_graph_rows(
             graph=graph,
             graph_ids=graph_ids,
         )
@@ -78,12 +93,13 @@ class State:
             dtype=torch.long,
             device=graph.device,
         )
-
         return cls(
             graph_ids=graph_ids,
-            selected_edge_mask=selected_edge_mask,
-            active_node_mask=active_node_mask,
+            selected_edge_ids=empty_edges,
+            active_node_ids=active_node_ids,
             step=step,
+            num_graph_edges=int(graph.num_edges),
+            num_graph_nodes=int(graph.num_nodes),
         )
 
     @classmethod
@@ -106,31 +122,33 @@ class State:
                 f"{int(selected_edge_mask.size(1))} != {int(graph.num_edges)}."
             )
 
-        active_node_mask = anchor_mask_for_graph_rows(
-            graph=graph,
-            graph_ids=graph_ids,
-        )
         rows, edge_ids = selected_edge_mask.nonzero(as_tuple=True)
         if edge_ids.numel() > 0:
             edge_graph_ids = graph.edge_to_graph.index_select(0, edge_ids)
             row_graph_ids = graph_ids.index_select(0, rows)
             if not bool(edge_graph_ids.eq(row_graph_ids).all()):
                 raise ValueError("selected_edge_mask contains edges outside their row graph.")
-            src_node_ids = graph.edge_index[0].index_select(0, edge_ids)
-            dst_node_ids = graph.edge_index[1].index_select(0, edge_ids)
-            active_node_mask[rows, src_node_ids] = True
-            active_node_mask[rows, dst_node_ids] = True
 
+        selected_edge_ids = padded_ids_from_mask(selected_edge_mask, pad_value=-1)
+        active_node_ids = active_node_ids_from_selected_edges(
+            graph=graph,
+            graph_ids=graph_ids,
+            selected_edge_ids=selected_edge_ids,
+        )
+        step = selected_edge_mask.sum(dim=1).to(dtype=torch.long)
         return cls(
             graph_ids=graph_ids,
-            selected_edge_mask=selected_edge_mask,
-            active_node_mask=active_node_mask,
-            step=selected_edge_mask.sum(dim=1).to(dtype=torch.long),
+            selected_edge_ids=selected_edge_ids,
+            active_node_ids=active_node_ids,
+            step=step,
+            num_graph_edges=int(graph.num_edges),
+            num_graph_nodes=int(graph.num_nodes),
+            _selected_edge_mask_cache=selected_edge_mask.contiguous(),
         )
 
     @property
     def device(self) -> torch.device:
-        return self.selected_edge_mask.device
+        return self.graph_ids.device
 
     @property
     def num_rows(self) -> int:
@@ -138,11 +156,43 @@ class State:
 
     @property
     def num_edges(self) -> int:
-        return int(self.selected_edge_mask.size(1))
+        return int(self.num_graph_edges)
 
     @property
     def selected_edge_count(self) -> torch.Tensor:
         return self.step
+
+    @property
+    def selected_edge_mask(self) -> torch.Tensor:
+        cached = self._selected_edge_mask_cache
+        if cached is not None:
+            return cached
+        mask = torch.zeros(
+            (self.num_rows, int(self.num_graph_edges)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        row_ids, edge_ids = self.selected_edges()
+        if edge_ids.numel() > 0:
+            mask[row_ids, edge_ids] = True
+        object.__setattr__(self, "_selected_edge_mask_cache", mask)
+        return mask
+
+    @property
+    def active_node_mask(self) -> torch.Tensor:
+        cached = self._active_node_mask_cache
+        if cached is not None:
+            return cached
+        mask = torch.zeros(
+            (self.num_rows, int(self.num_graph_nodes)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        row_ids, node_ids = self.active_nodes()
+        if node_ids.numel() > 0:
+            mask[row_ids, node_ids] = True
+        object.__setattr__(self, "_active_node_mask_cache", mask)
+        return mask
 
     @property
     def edge_mask(self) -> torch.Tensor:
@@ -156,32 +206,65 @@ class State:
     def depth(self) -> torch.Tensor:
         return self.step
 
-    def selected_edges(self) -> tuple[torch.Tensor, ...]:
-        """
-        Return selected edges as:
+    def selected_edges(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return non_padded_ids(self.selected_edge_ids)
 
-            row_ids, edge_ids
-        """
-
-        return self.selected_edge_mask.nonzero(as_tuple=True)
+    def active_nodes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return non_padded_ids(self.active_node_ids)
 
     def select_rows(
         self,
         rows: torch.Tensor,
     ) -> State:
+        rows = rows.to(device=self.device, dtype=torch.long).view(-1)
+        selected_edge_mask = self._selected_edge_mask_cache
+        active_node_mask = self._active_node_mask_cache
+        frontier = self._frontier_cache
         return State(
             graph_ids=self.graph_ids.index_select(0, rows),
-            selected_edge_mask=self.selected_edge_mask.index_select(0, rows),
-            active_node_mask=self.active_node_mask.index_select(0, rows),
+            selected_edge_ids=self.selected_edge_ids.index_select(0, rows),
+            active_node_ids=self.active_node_ids.index_select(0, rows),
             step=self.step.index_select(0, rows),
+            num_graph_edges=self.num_graph_edges,
+            num_graph_nodes=self.num_graph_nodes,
+            _selected_edge_mask_cache=(
+                selected_edge_mask.index_select(0, rows)
+                if selected_edge_mask is not None
+                else None
+            ),
+            _active_node_mask_cache=(
+                active_node_mask.index_select(0, rows)
+                if active_node_mask is not None
+                else None
+            ),
+            _frontier_cache=select_frontier_rows(frontier, rows) if frontier is not None else None,
+            _edge_state_h_cache=None,
         )
 
     def clone(self) -> State:
         return State(
             graph_ids=self.graph_ids.clone(),
-            selected_edge_mask=self.selected_edge_mask.clone(),
-            active_node_mask=self.active_node_mask.clone(),
+            selected_edge_ids=self.selected_edge_ids.clone(),
+            active_node_ids=self.active_node_ids.clone(),
             step=self.step.clone(),
+            num_graph_edges=self.num_graph_edges,
+            num_graph_nodes=self.num_graph_nodes,
+            _selected_edge_mask_cache=(
+                self._selected_edge_mask_cache.clone()
+                if self._selected_edge_mask_cache is not None
+                else None
+            ),
+            _active_node_mask_cache=(
+                self._active_node_mask_cache.clone()
+                if self._active_node_mask_cache is not None
+                else None
+            ),
+            _frontier_cache=clone_frontier(self._frontier_cache),
+            _edge_state_h_cache=(
+                self._edge_state_h_cache.clone()
+                if self._edge_state_h_cache is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -192,23 +275,38 @@ class State:
         if not states:
             raise ValueError("Cannot concatenate an empty state sequence.")
 
+        num_edges = int(states[0].num_graph_edges)
+        num_nodes = int(states[0].num_graph_nodes)
+        edge_width = max(int(state.selected_edge_ids.size(1)) for state in states)
+        node_width = max(int(state.active_node_ids.size(1)) for state in states)
+        selected_edge_ids = torch.cat(
+            [pad_width(state.selected_edge_ids, edge_width, pad_value=-1) for state in states],
+            dim=0,
+        )
+        active_node_ids = torch.cat(
+            [pad_width(state.active_node_ids, node_width, pad_value=-1) for state in states],
+            dim=0,
+        )
+        selected_edge_mask = [state._selected_edge_mask_cache for state in states]
+        active_node_mask = [state._active_node_mask_cache for state in states]
         return cls(
-            graph_ids=torch.cat(
-                [state.graph_ids for state in states],
-                dim=0,
+            graph_ids=torch.cat([state.graph_ids for state in states], dim=0),
+            selected_edge_ids=selected_edge_ids,
+            active_node_ids=active_node_ids,
+            step=torch.cat([state.step for state in states], dim=0),
+            num_graph_edges=num_edges,
+            num_graph_nodes=num_nodes,
+            _selected_edge_mask_cache=(
+                torch.cat(selected_edge_mask, dim=0)
+                if all(mask is not None for mask in selected_edge_mask)
+                else None
             ),
-            selected_edge_mask=torch.cat(
-                [state.selected_edge_mask for state in states],
-                dim=0,
+            _active_node_mask_cache=(
+                torch.cat(active_node_mask, dim=0)
+                if all(mask is not None for mask in active_node_mask)
+                else None
             ),
-            active_node_mask=torch.cat(
-                [state.active_node_mask for state in states],
-                dim=0,
-            ),
-            step=torch.cat(
-                [state.step for state in states],
-                dim=0,
-            ),
+            _edge_state_h_cache=None,
         )
 
     def frontier(
@@ -226,15 +324,15 @@ class State:
             e ∉ S_i
             edge_to_graph[e] == graph_ids[i]
             depth(i) < expand_budget, when expand_budget is provided
-
-        This method does not fabricate inverse edges.
-
-        The terminal action is not included.
         """
         if expand_budget is not None and not bool(self.depth.lt(int(expand_budget)).any()):
             return empty_frontier(graph.device)
 
-        rows, active_nodes = self.active_node_mask.nonzero(as_tuple=True)
+        cached = self._frontier_cache
+        if cached is not None and expand_budget is None:
+            return cached
+
+        rows, active_nodes = self.active_nodes()
         if rows.numel() == 0:
             return empty_frontier(graph.device)
 
@@ -247,26 +345,26 @@ class State:
         if out_edges.numel() == 0:
             return empty_frontier(graph.device)
 
-        frontier_rows = out_rows
-        frontier_edge_ids = out_edges
-
         frontier_rows, frontier_edge_ids = filter_edges_in_same_graph(
             graph=graph,
             state=self,
-            rows=frontier_rows,
-            edge_ids=frontier_edge_ids,
+            rows=out_rows,
+            edge_ids=out_edges,
         )
         if frontier_edge_ids.numel() == 0:
             return empty_frontier(graph.device)
 
-        unselected = ~self.selected_edge_mask[
-            frontier_rows,
-            frontier_edge_ids,
-        ]
-        frontier_rows = frontier_rows[unselected]
-        frontier_edge_ids = frontier_edge_ids[unselected]
-        if frontier_edge_ids.numel() == 0:
-            return empty_frontier(graph.device)
+        selected_keys = selected_edge_keys(self)
+        if selected_keys.numel() > 0:
+            candidate_keys = frontier_rows * int(self.num_graph_edges) + frontier_edge_ids
+            keep = ~membership_mask(
+                query_ids=candidate_keys,
+                candidate_ids=selected_keys,
+            )
+            frontier_rows = frontier_rows[keep]
+            frontier_edge_ids = frontier_edge_ids[keep]
+            if frontier_edge_ids.numel() == 0:
+                return empty_frontier(graph.device)
 
         frontier_rows, frontier_edge_ids = unique_row_edge_pairs(
             rows=frontier_rows,
@@ -275,19 +373,19 @@ class State:
         )
 
         if expand_budget is not None:
-            before_horizon = self.depth.lt(int(expand_budget)).index_select(
-                0,
-                frontier_rows,
-            )
+            before_horizon = self.depth.lt(int(expand_budget)).index_select(0, frontier_rows)
             frontier_rows = frontier_rows[before_horizon]
             frontier_edge_ids = frontier_edge_ids[before_horizon]
             if frontier_edge_ids.numel() == 0:
                 return empty_frontier(graph.device)
 
-        return Frontier(
+        frontier = Frontier(
             row_ids=frontier_rows,
             edge_ids=frontier_edge_ids,
         )
+        if expand_budget is None:
+            object.__setattr__(self, "_frontier_cache", frontier)
+        return frontier
 
     def expand(
         self,
@@ -296,6 +394,7 @@ class State:
         edge_ids: torch.Tensor,
         *,
         expand_budget: int,
+        validate: bool = False,
     ) -> State:
         """
         Return the child state after selecting one physical edge per row.
@@ -303,49 +402,51 @@ class State:
         Terminal actions must not enter this method.
         """
 
-        if rows.numel() != edge_ids.numel():
-            raise ValueError("rows and edge_ids must have the same length.")
-
         rows = rows.to(device=self.device, dtype=torch.long).view(-1)
         edge_ids = edge_ids.to(device=self.device, dtype=torch.long).view(-1)
-
+        if rows.numel() != edge_ids.numel():
+            raise ValueError("rows and edge_ids must have the same length.")
         if rows.numel() == 0:
             return self
+        if validate:
+            self.validate_expansion_actions(
+                graph=graph,
+                rows=rows,
+                edge_ids=edge_ids,
+                expand_budget=expand_budget,
+            )
+        else:
+            validate_expansion_inputs(
+                state=self,
+                rows=rows,
+                edge_ids=edge_ids,
+            )
 
-        self.validate_expansion_actions(
-            graph=graph,
+        selected_edge_ids = append_unique_row_ids(
+            padded_ids=self.selected_edge_ids,
             rows=rows,
-            edge_ids=edge_ids,
-            expand_budget=expand_budget,
+            values=edge_ids,
         )
-
-        selected_edge_mask = self.selected_edge_mask.clone()
-        active_node_mask = self.active_node_mask.clone()
-        step = self.step.clone()
-
-        selected_edge_mask[rows, edge_ids] = True
-
         src_node_ids = graph.edge_index[0].index_select(0, edge_ids)
         dst_node_ids = graph.edge_index[1].index_select(0, edge_ids)
-
-        active_node_mask[rows, src_node_ids] = True
-        active_node_mask[rows, dst_node_ids] = True
-
+        active_node_ids = append_unique_row_pairs(
+            padded_ids=self.active_node_ids,
+            rows=torch.cat([rows, rows], dim=0),
+            values=torch.cat([src_node_ids, dst_node_ids], dim=0),
+        )
+        step = self.step.clone()
         step.index_add_(
             0,
             rows,
-            torch.ones(
-                rows.numel(),
-                dtype=torch.long,
-                device=self.device,
-            ),
+            torch.ones(rows.numel(), dtype=torch.long, device=self.device),
         )
-
         return State(
             graph_ids=self.graph_ids,
-            selected_edge_mask=selected_edge_mask,
-            active_node_mask=active_node_mask,
+            selected_edge_ids=selected_edge_ids,
+            active_node_ids=active_node_ids,
             step=step,
+            num_graph_edges=self.num_graph_edges,
+            num_graph_nodes=self.num_graph_nodes,
         )
 
     def validate_expansion_actions(
@@ -358,17 +459,11 @@ class State:
     ) -> None:
         rows = rows.to(device=self.device, dtype=torch.long).view(-1)
         edge_ids = edge_ids.to(device=self.device, dtype=torch.long).view(-1)
-
-        if rows.numel() != edge_ids.numel():
-            raise ValueError("rows and edge_ids must have the same length.")
-        if rows.numel() == 0:
-            return
-        if bool(rows.lt(0).any()) or bool(rows.ge(self.num_rows).any()):
-            raise ValueError("Expansion rows must be valid state row ids.")
-        if bool(edge_ids.lt(0).any()) or bool(edge_ids.ge(self.num_edges).any()):
-            raise ValueError("Expansion edge ids must be valid non-terminal edge ids.")
-        if int(torch.unique(rows).numel()) != int(rows.numel()):
-            raise ValueError("At most one expansion action is allowed per row.")
+        validate_expansion_inputs(
+            state=self,
+            rows=rows,
+            edge_ids=edge_ids,
+        )
 
         frontier = self.frontier(
             graph,
@@ -380,57 +475,203 @@ class State:
         key_width = int(self.num_edges)
         frontier_keys = frontier.row_ids * key_width + frontier.edge_ids
         target_keys = rows * key_width + edge_ids
-        order = torch.argsort(frontier_keys)
-        sorted_keys = frontier_keys.index_select(0, order)
-        positions = torch.searchsorted(sorted_keys, target_keys)
-        in_bounds = positions.lt(sorted_keys.numel())
-        if not bool(in_bounds.all()):
-            raise ValueError("Expansion action is not in the current frontier.")
-        matched = sorted_keys.index_select(0, positions)
-        if not torch.equal(matched, target_keys):
+        if not bool(membership_mask(query_ids=target_keys, candidate_ids=frontier_keys).all()):
             raise ValueError("Expansion action is not in the current frontier.")
 
 
-def anchor_mask_for_graph_rows(
+def validate_expansion_inputs(
+    *,
+    state: State,
+    rows: torch.Tensor,
+    edge_ids: torch.Tensor,
+) -> None:
+    if rows.numel() != edge_ids.numel():
+        raise ValueError("rows and edge_ids must have the same length.")
+    if rows.numel() == 0:
+        return
+    if bool(rows.lt(0).any()) or bool(rows.ge(state.num_rows).any()):
+        raise ValueError("Expansion rows must be valid state row ids.")
+    if bool(edge_ids.lt(0).any()) or bool(edge_ids.ge(state.num_edges).any()):
+        raise ValueError("Expansion edge ids must be valid non-terminal edge ids.")
+    if int(torch.unique(rows).numel()) != int(rows.numel()):
+        raise ValueError("At most one expansion action is allowed per row.")
+
+
+def active_nodes_for_graph_rows(
     *,
     graph: GraphContext,
     graph_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Build initial active-node masks for rollout rows.
-
-    Row i activates all anchors whose graph id equals graph_ids[i].
-    """
-
-    out = torch.zeros(
-        (int(graph_ids.numel()), int(graph.num_nodes)),
-        dtype=torch.bool,
-        device=graph.device,
-    )
-
     anchor_node_ids = graph.anchor_mask.nonzero(as_tuple=True)[0]
-    if anchor_node_ids.numel() == 0:
-        return out
+    if anchor_node_ids.numel() == 0 or graph_ids.numel() == 0:
+        return torch.empty((int(graph_ids.numel()), 0), dtype=torch.long, device=graph.device)
 
-    anchor_graph_ids = graph.node_to_graph.index_select(
-        0,
-        anchor_node_ids,
+    anchor_graph_ids = graph.node_to_graph.index_select(0, anchor_node_ids)
+    grouped: list[torch.Tensor] = []
+    max_width = 0
+    for graph_id in graph_ids.tolist():
+        nodes = anchor_node_ids[anchor_graph_ids.eq(int(graph_id))]
+        grouped.append(nodes)
+        max_width = max(max_width, int(nodes.numel()))
+    out = torch.full((int(graph_ids.numel()), max_width), -1, dtype=torch.long, device=graph.device)
+    for row, node_ids in enumerate(grouped):
+        if node_ids.numel() > 0:
+            out[row, : node_ids.numel()] = node_ids
+    return out
+
+
+def active_node_ids_from_selected_edges(
+    *,
+    graph: GraphContext,
+    graph_ids: torch.Tensor,
+    selected_edge_ids: torch.Tensor,
+) -> torch.Tensor:
+    active_node_ids = active_nodes_for_graph_rows(
+        graph=graph,
+        graph_ids=graph_ids,
+    )
+    rows, edge_ids = non_padded_ids(selected_edge_ids)
+    if edge_ids.numel() == 0:
+        return active_node_ids
+    src_node_ids = graph.edge_index[0].index_select(0, edge_ids)
+    dst_node_ids = graph.edge_index[1].index_select(0, edge_ids)
+    return append_unique_row_pairs(
+        padded_ids=active_node_ids,
+        rows=torch.cat([rows, rows], dim=0),
+        values=torch.cat([src_node_ids, dst_node_ids], dim=0),
     )
 
-    rows, anchor_positions = (
-        graph_ids[:, None]
-        .eq(
-            anchor_graph_ids[None, :],
+
+def selected_edge_keys(state: State) -> torch.Tensor:
+    rows, edge_ids = state.selected_edges()
+    if edge_ids.numel() == 0:
+        return empty_long(state.device)
+    return rows * int(state.num_graph_edges) + edge_ids
+
+
+def select_frontier_rows(frontier: Frontier, rows: torch.Tensor) -> Frontier:
+    rows = rows.to(device=frontier.row_ids.device, dtype=torch.long).view(-1)
+    if rows.numel() == 0 or frontier.edge_ids.numel() == 0:
+        return empty_frontier(frontier.row_ids.device)
+    source = frontier.row_ids
+    remapped = torch.full((int(source.numel()),), -1, dtype=torch.long, device=source.device)
+    for new_row, old_row in enumerate(rows.tolist()):
+        remapped[source.eq(int(old_row))] = int(new_row)
+    keep = remapped.ge(0)
+    if not bool(keep.any()):
+        return empty_frontier(source.device)
+    return Frontier(
+        row_ids=remapped[keep],
+        edge_ids=frontier.edge_ids[keep],
+    )
+
+
+def clone_frontier(frontier: Frontier | None) -> Frontier | None:
+    if frontier is None:
+        return None
+    return Frontier(
+        row_ids=frontier.row_ids.clone(),
+        edge_ids=frontier.edge_ids.clone(),
+    )
+
+
+def non_padded_ids(
+    padded_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if padded_ids.numel() == 0:
+        return empty_long(padded_ids.device), empty_long(padded_ids.device)
+    return padded_ids.ge(0).nonzero(as_tuple=True)[0], padded_ids[padded_ids.ge(0)]
+
+
+def pad_width(
+    tensor: torch.Tensor,
+    width: int,
+    *,
+    pad_value: int,
+) -> torch.Tensor:
+    width = int(width)
+    if int(tensor.size(1)) == width:
+        return tensor
+    out = torch.full(
+        (int(tensor.size(0)), width),
+        int(pad_value),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    if tensor.numel() > 0:
+        out[:, : int(tensor.size(1))] = tensor
+    return out
+
+
+def append_unique_row_ids(
+    *,
+    padded_ids: torch.Tensor,
+    rows: torch.Tensor,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    return append_unique_row_pairs(
+        padded_ids=padded_ids,
+        rows=rows,
+        values=values,
+    )
+
+
+def append_unique_row_pairs(
+    *,
+    padded_ids: torch.Tensor,
+    rows: torch.Tensor,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    rows = rows.to(device=padded_ids.device, dtype=torch.long).view(-1)
+    values = values.to(device=padded_ids.device, dtype=torch.long).view(-1)
+    if rows.numel() != values.numel():
+        raise ValueError("rows and values must have the same length.")
+    existing_counts = padded_ids.ge(0).sum(dim=1) if padded_ids.numel() > 0 else torch.zeros(
+        int(padded_ids.size(0)), dtype=torch.long, device=padded_ids.device
+    )
+    additions_per_row = torch.zeros_like(existing_counts)
+    memberships = []
+    for row, value in zip(rows.tolist(), values.tolist(), strict=True):
+        row_ids = padded_ids[row, : int(existing_counts[row].item())] if int(existing_counts[row].item()) > 0 else empty_long(
+            padded_ids.device
         )
-        .nonzero(as_tuple=True)
+        exists = bool(row_ids.eq(int(value)).any())
+        memberships.append(exists)
+        if not exists:
+            additions_per_row[row] += 1
+    if not bool(additions_per_row.any()):
+        return padded_ids
+
+    target_width = int((existing_counts + additions_per_row).max().item())
+    out = pad_width(padded_ids, target_width, pad_value=-1)
+    next_pos = existing_counts.clone()
+    for exists, row, value in zip(memberships, rows.tolist(), values.tolist(), strict=True):
+        if exists:
+            continue
+        out[row, int(next_pos[row].item())] = int(value)
+        next_pos[row] += 1
+    return out
+
+
+def padded_ids_from_mask(
+    mask: torch.Tensor,
+    *,
+    pad_value: int,
+) -> torch.Tensor:
+    row_counts = mask.sum(dim=1).to(dtype=torch.long)
+    width = int(row_counts.max().item()) if row_counts.numel() > 0 else 0
+    out = torch.full(
+        (int(mask.size(0)), width),
+        int(pad_value),
+        dtype=torch.long,
+        device=mask.device,
     )
-
-    if rows.numel() > 0:
-        out[
-            rows,
-            anchor_node_ids.index_select(0, anchor_positions),
-        ] = True
-
+    if width == 0:
+        return out
+    for row in range(int(mask.size(0))):
+        edge_ids = mask[row].nonzero(as_tuple=False).flatten()
+        if edge_ids.numel() > 0:
+            out[row, : edge_ids.numel()] = edge_ids
     return out
 
 
@@ -443,16 +684,6 @@ def incident_edges_from_nodes(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Enumerate edge ids grouped by active nodes.
-
-    Inputs:
-        rows:
-            Row id for each active node occurrence.
-
-        node_ids:
-            Active physical node ids.
-
-        ptr / edge_ids_by_node:
-            CSR node -> edge-id index.
     """
 
     starts = ptr.index_select(0, node_ids)
@@ -529,6 +760,24 @@ def unique_row_edge_pairs(
     return unique_rows, unique_edge_ids
 
 
+def membership_mask(
+    *,
+    query_ids: torch.Tensor,
+    candidate_ids: torch.Tensor,
+) -> torch.Tensor:
+    query_ids = query_ids.view(-1)
+    candidate_ids = candidate_ids.view(-1)
+    if query_ids.numel() == 0 or candidate_ids.numel() == 0:
+        return torch.zeros(query_ids.numel(), dtype=torch.bool, device=query_ids.device)
+    sorted_candidates = torch.sort(candidate_ids).values
+    positions = torch.searchsorted(sorted_candidates, query_ids)
+    in_bounds = positions.lt(sorted_candidates.numel())
+    matched = torch.zeros(query_ids.numel(), dtype=torch.bool, device=query_ids.device)
+    if bool(in_bounds.any()):
+        matched[in_bounds] = sorted_candidates.index_select(0, positions[in_bounds]).eq(query_ids[in_bounds])
+    return matched
+
+
 def empty_frontier(
     device: torch.device,
 ) -> Frontier:
@@ -583,6 +832,5 @@ def segment_arange(
 __all__ = [
     "Frontier",
     "State",
-    "anchor_mask_for_graph_rows",
     "empty_frontier",
 ]

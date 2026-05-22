@@ -52,7 +52,7 @@ def rollout(edge_rows: list[list[int]], terminal_step: int = 3) -> RolloutResult
         policy_action_log_prob=torch.zeros_like(selected, dtype=torch.float32),
         behavior_action_log_prob=torch.zeros_like(selected, dtype=torch.float32),
         terminal_step=torch.full((selected.size(0),), int(terminal_step), dtype=torch.long),
-        forced_terminal=torch.zeros(selected.size(0), dtype=torch.bool),
+        stop_reason=torch.full((selected.size(0),), RolloutResult.POLICY_STOP, dtype=torch.long),
         expand_budget=3,
     )
 
@@ -60,12 +60,16 @@ def rollout(edge_rows: list[list[int]], terminal_step: int = 3) -> RolloutResult
 def test_replay_budget_is_per_eligible_graph() -> None:
     batch = replay_batch()
     context = GraphContext.from_batch(batch)
+    target = TargetContext.from_batch(batch=batch, graph_context=context)
+    reward = TrueTerminalReward(edge_cost=0.05, fail_cost=1.0)
 
     trajectories, stats = replay_trajectories_with_stats(
         batch=batch,
         context=context,
         budget=3,
         max_trajectories_per_graph=2,
+        reward_model=reward,
+        target_context=target,
     )
 
     assert stats.eligible_graphs == 2
@@ -123,11 +127,15 @@ def test_reward_sufficient_rollout_skips_replay_but_low_quality_hit_does_not() -
 def test_replay_transitions_use_current_frontier_semantics() -> None:
     batch = replay_batch()
     context = GraphContext.from_batch(batch)
+    target = TargetContext.from_batch(batch=batch, graph_context=context)
+    reward = TrueTerminalReward(edge_cost=0.05, fail_cost=1.0)
     trajectories, _ = replay_trajectories_with_stats(
         batch=batch,
         context=context,
         budget=3,
         max_trajectories_per_graph=2,
+        reward_model=reward,
+        target_context=target,
     )
 
     training = training_from_trajectories(

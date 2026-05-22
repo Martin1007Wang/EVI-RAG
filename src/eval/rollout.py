@@ -41,8 +41,9 @@ class RolloutEvalTensors:
     hit: torch.Tensor
     edge_count: torch.Tensor
     trajectory_len: torch.Tensor
-    policy_terminal: torch.Tensor
-    forced_terminal: torch.Tensor
+    policy_stop: torch.Tensor
+    no_frontier_stop: torch.Tensor
+    budget_truncated: torch.Tensor
     traj_prob_score: torch.Tensor
     state_flow_score: torch.Tensor
     terminal_flow_score: torch.Tensor
@@ -134,7 +135,7 @@ def rollout_eval_tensors(
         num_graphs=int(batch.num_graphs),
     )
     trajectory_len = _stack_terminal_step(rollout_samples).float() + 1.0
-    policy_terminal, forced_terminal = terminal_matrices(rollout_samples)
+    policy_stop, no_frontier_stop, budget_truncated = terminal_matrices(rollout_samples)
     traj_prob_score = _stack_trajectory_log_prob(rollout_samples)
 
     terminal_state = state_from_sample_edge_masks(edge_masks, context=context)
@@ -166,8 +167,9 @@ def rollout_eval_tensors(
         hit=answer_count.gt(0.0),
         edge_count=edge_count,
         trajectory_len=trajectory_len,
-        policy_terminal=policy_terminal,
-        forced_terminal=forced_terminal,
+        policy_stop=policy_stop,
+        no_frontier_stop=no_frontier_stop,
+        budget_truncated=budget_truncated,
         traj_prob_score=traj_prob_score,
         state_flow_score=terminal_scores.state_flow,
         terminal_flow_score=terminal_scores.terminal_flow,
@@ -364,8 +366,14 @@ def terminal_metrics(
     continued = stats["continued"]
     valid = tensors.valid_graph_mask
     return {
-        "terminal/policy_terminal_rate": mean_over_valid_graphs(tensors.policy_terminal, valid),
-        "terminal/forced_terminal_rate": mean_over_valid_graphs(tensors.forced_terminal, valid),
+        "terminal/policy_stop_rate": mean_over_valid_graphs(tensors.policy_stop, valid),
+        "terminal/structural_stop_rate": mean_over_valid_graphs(tensors.no_frontier_stop, valid),
+        "terminal/budget_truncate_rate": mean_over_valid_graphs(tensors.budget_truncated, valid),
+        "terminal/policy_terminal_rate": mean_over_valid_graphs(tensors.policy_stop, valid),
+        "terminal/forced_terminal_rate": mean_over_valid_graphs(
+            tensors.no_frontier_stop + tensors.budget_truncated,
+            valid,
+        ),
         "terminal/hit_then_continue_rate": _mean_hit_values(continued.float(), hit, valid),
     }
 
@@ -395,21 +403,21 @@ def budget_forced_terminal_rate(
     rollout_samples: Sequence[RolloutResult],
     valid_graph_mask: torch.Tensor,
 ) -> float:
-    _, forced = terminal_matrices(rollout_samples)
-    return mean_over_valid_graphs(forced, valid_graph_mask)
+    _, _, truncated = terminal_matrices(rollout_samples)
+    return mean_over_valid_graphs(truncated, valid_graph_mask)
 
 
-def terminal_matrices(rollouts: Sequence[RolloutResult]) -> tuple[torch.Tensor, torch.Tensor]:
+def terminal_matrices(rollouts: Sequence[RolloutResult]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not rollouts:
-        return torch.zeros((0, 0)), torch.zeros((0, 0))
+        return torch.zeros((0, 0)), torch.zeros((0, 0)), torch.zeros((0, 0))
     policy: list[torch.Tensor] = []
-    forced: list[torch.Tensor] = []
+    structural: list[torch.Tensor] = []
+    truncated: list[torch.Tensor] = []
     for rollout in rollouts:
-        forced_row = rollout.forced_terminal_mask.any(dim=1)
-        terminal_row = rollout.terminal_mask.any(dim=1)
-        policy.append((terminal_row & ~forced_row).to(device=torch.device("cpu"), dtype=torch.float32))
-        forced.append(forced_row.to(device=torch.device("cpu"), dtype=torch.float32))
-    return torch.stack(policy, dim=0), torch.stack(forced, dim=0)
+        policy.append(rollout.policy_stop.to(device=torch.device("cpu"), dtype=torch.float32))
+        structural.append(rollout.no_frontier_stop.to(device=torch.device("cpu"), dtype=torch.float32))
+        truncated.append(rollout.budget_truncated.to(device=torch.device("cpu"), dtype=torch.float32))
+    return torch.stack(policy, dim=0), torch.stack(structural, dim=0), torch.stack(truncated, dim=0)
 
 
 def state_from_sample_edge_masks(edge_masks: torch.Tensor, *, context: GraphContext) -> State:
@@ -470,7 +478,7 @@ def terminal_policy_scores(
             frontier=frontier,
         )
     state_flow = out.state_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-    terminal_flow = out.terminal_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
+    terminal_flow = out.stop_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
     return TerminalPolicyScores(state_flow=state_flow, terminal_flow=terminal_flow)
 
 

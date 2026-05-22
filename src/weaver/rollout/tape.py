@@ -20,41 +20,44 @@ class RolloutTape:
     policy_action_log_prob: torch.Tensor = field(init=False)
     behavior_action_log_prob: torch.Tensor = field(init=False)
     terminal_step: torch.Tensor = field(init=False)
-    forced_terminal: torch.Tensor = field(init=False)
+    stop_reason: torch.Tensor = field(init=False)
     is_stopped: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
         self.R = int(self.R)
         self.T = int(self.T)
+        rollout_shape = (self.R, self.T)
+        row_shape = (self.R,)
         self.selected_edge_ids = torch.full(
-            (self.R, self.T),
+            rollout_shape,
             TERMINAL_EDGE_ID,
             dtype=torch.long,
             device=self.device,
         )
         self.policy_action_log_prob = torch.zeros(
-            (self.R, self.T),
+            rollout_shape,
             dtype=self.dtype,
             device=self.device,
         )
         self.behavior_action_log_prob = torch.zeros(
-            (self.R, self.T),
+            rollout_shape,
             dtype=self.dtype,
             device=self.device,
         )
         self.terminal_step = torch.full(
-            (self.R,),
+            row_shape,
             NO_STEP,
             dtype=torch.long,
             device=self.device,
         )
-        self.forced_terminal = torch.zeros(
-            self.R,
-            dtype=torch.bool,
+        self.stop_reason = torch.full(
+            row_shape,
+            NO_STEP,
+            dtype=torch.long,
             device=self.device,
         )
         self.is_stopped = torch.zeros(
-            self.R,
+            row_shape,
             dtype=torch.bool,
             device=self.device,
         )
@@ -88,9 +91,9 @@ class RolloutTape:
             return
 
         self.terminal_step[terminal_rows] = step
-        self.forced_terminal[terminal_rows] = action.forced[terminal_mask].to(
+        self.stop_reason[terminal_rows] = action.stop_reason[terminal_mask].to(
             device=self.device,
-            dtype=torch.bool,
+            dtype=torch.long,
         )
         self.is_stopped[terminal_rows] = True
 

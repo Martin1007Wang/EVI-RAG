@@ -17,6 +17,7 @@ class StepAction:
     policy_log_prob: torch.Tensor
     behavior_log_prob: torch.Tensor
     forced: torch.Tensor
+    stop_reason: torch.Tensor
 
     def __post_init__(self) -> None:
         count = int(self.row_ids.numel())
@@ -28,6 +29,8 @@ class StepAction:
             raise ValueError("behavior_log_prob must match row_ids length.")
         if int(self.forced.numel()) != count:
             raise ValueError("forced must match row_ids length.")
+        if int(self.stop_reason.numel()) != count:
+            raise ValueError("stop_reason must match row_ids length.")
         invalid_negative = self.edge_ids.lt(TERMINAL_EDGE_ID)
         if bool(invalid_negative.any()):
             raise ValueError("Only TERMINAL_EDGE_ID may be negative.")
@@ -62,12 +65,19 @@ class StepAction:
         *,
         rows: torch.Tensor,
         dtype: torch.dtype,
+        reason: torch.Tensor,
         device: torch.device | None = None,
     ) -> StepAction:
         rows = rows.to(
             device=device or rows.device,
             dtype=torch.long,
         ).view(-1)
+        reason = reason.to(
+            device=rows.device,
+            dtype=torch.long,
+        ).view(-1)
+        if int(reason.numel()) != int(rows.numel()):
+            raise ValueError("reason must match rows length.")
         return cls(
             row_ids=rows,
             edge_ids=torch.full(
@@ -91,6 +101,7 @@ class StepAction:
                 dtype=torch.bool,
                 device=rows.device,
             ),
+            stop_reason=reason,
         )
 
     @classmethod
@@ -104,6 +115,7 @@ class StepAction:
                 policy_log_prob=torch.empty(0, dtype=torch.float32, device=device),
                 behavior_log_prob=torch.empty(0, dtype=torch.float32, device=device),
                 forced=torch.empty(0, dtype=torch.bool, device=device),
+                stop_reason=torch.empty(0, dtype=torch.long, device=device),
             )
 
         row_ids = torch.cat([action.row_ids for action in non_empty], dim=0)
@@ -111,6 +123,7 @@ class StepAction:
         policy_log_prob = torch.cat([action.policy_log_prob for action in non_empty], dim=0)
         behavior_log_prob = torch.cat([action.behavior_log_prob for action in non_empty], dim=0)
         forced = torch.cat([action.forced for action in non_empty], dim=0)
+        stop_reason = torch.cat([action.stop_reason for action in non_empty], dim=0)
         order = torch.argsort(row_ids)
         return cls(
             row_ids=row_ids.index_select(0, order),
@@ -118,6 +131,7 @@ class StepAction:
             policy_log_prob=policy_log_prob.index_select(0, order),
             behavior_log_prob=behavior_log_prob.index_select(0, order),
             forced=forced.index_select(0, order),
+            stop_reason=stop_reason.index_select(0, order),
         )
 
 
@@ -127,16 +141,17 @@ def sample_step(
     rows: torch.Tensor,
 ) -> StepAction:
     rows = rows.to(
-        device=policy_out.terminal_log_flow.device,
+        device=policy_out.stop_log_flow.device,
         dtype=torch.long,
     ).view(-1)
     if rows.numel() == 0:
         return StepAction(
             row_ids=rows,
             edge_ids=rows.new_empty((0,)),
-            policy_log_prob=policy_out.terminal_log_flow.new_empty((0,)).float(),
-            behavior_log_prob=policy_out.terminal_log_flow.new_empty((0,)).float(),
+            policy_log_prob=policy_out.stop_log_flow.new_empty((0,)).float(),
+            behavior_log_prob=policy_out.stop_log_flow.new_empty((0,)).float(),
             forced=torch.zeros(0, dtype=torch.bool, device=rows.device),
+            stop_reason=torch.empty(0, dtype=torch.long, device=rows.device),
         )
 
     picked_edge_ids = policy_out.sample(
@@ -152,6 +167,7 @@ def sample_step(
         policy_log_prob=policy_log_prob,
         behavior_log_prob=policy_log_prob,
         forced=torch.zeros(rows.numel(), dtype=torch.bool, device=rows.device),
+        stop_reason=torch.zeros(rows.numel(), dtype=torch.long, device=rows.device),
     )
 
 

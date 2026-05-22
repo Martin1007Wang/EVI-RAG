@@ -38,6 +38,7 @@ def test_state_encoder_ignores_active_nodes_without_selected_edges() -> None:
         node_model=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         edge_relation_model=torch.tensor([[5.0, 6.0]]),
         query_model=torch.tensor([[7.0, 8.0]]),
+        edge_token_model=torch.tensor([[1.0, 2.0, 5.0, 6.0, 3.0, 4.0]]),
     )
     features_b = EncodedFeatures(
         node_text_semantic=features_a.node_text_semantic,
@@ -47,6 +48,7 @@ def test_state_encoder_ignores_active_nodes_without_selected_edges() -> None:
         node_model=torch.tensor([[101.0, 202.0], [303.0, 404.0]]),
         edge_relation_model=features_a.edge_relation_model,
         query_model=features_a.query_model,
+        edge_token_model=features_a.edge_token_model,
     )
 
     encoding_a = encoder(
@@ -97,6 +99,7 @@ def test_state_encoder_selected_edges_still_depend_on_endpoint_features() -> Non
         node_model=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         edge_relation_model=torch.tensor([[5.0, 6.0]]),
         query_model=torch.tensor([[7.0, 8.0]]),
+        edge_token_model=torch.tensor([[1.0, 2.0, 5.0, 6.0, 3.0, 4.0]]),
     )
     features_b = EncodedFeatures(
         node_text_semantic=features_a.node_text_semantic,
@@ -106,6 +109,7 @@ def test_state_encoder_selected_edges_still_depend_on_endpoint_features() -> Non
         node_model=torch.tensor([[10.0, 20.0], [30.0, 40.0]]),
         edge_relation_model=features_a.edge_relation_model,
         query_model=features_a.query_model,
+        edge_token_model=torch.tensor([[10.0, 20.0, 5.0, 6.0, 30.0, 40.0]]),
     )
 
     encoding_a = encoder(

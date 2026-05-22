@@ -288,10 +288,13 @@ ReplaySampleBudget(policy_rollout, replay_expand)
 `ReplaySource.sample_from_rollouts` 调 `replay_trajectories_with_stats`，为有 reachable target 的图生成 replay 轨迹。核心逻辑：
 
 1. 找出含 target 的 eligible graphs。
-2. 为每个 reachable target 构建 `ReplayTargetView`，其中包含节点到 target 的距离、edge shortest-path count 等预计算监督。
-3. 从该图 anchor 出发，用 `ranked_next_edges` 选择满足 `dst_dist = current_dist - 1` 且 `edge_counts > 0` 的出边，beam 式生成到 target 的短路径。
-4. 按 `(路径长度, edge ids)` 排序、去重，并限制每图数量。
-5. 如果传入 reward model 与 target context，则比较当前 policy rollouts 的 best reward 与 replay candidates 的 best oracle reward；若 policy 已经达到或超过 oracle，则该图 replay 会被跳过。
+2. 对每个 graph 构建 graph-level label view：
+   - `target_node_ids`
+   - `admissible_edge_mask = union_t shortest_path_edge_mask[t, :]`
+3. 在当前 `State.frontier/expand` 语义下，对 `E ⊆ admissible_edge_mask` 且 `|E| <= budget` 的可达 state 做 exact 枚举；每个 visited state 都视为 terminal candidate。
+4. 对所有 terminal candidate 直接调用当前 reward model 计算 `log_R(z)`，选出该图 reward 最大的 oracle terminal states。
+5. 从 oracle terminal states 的 predecessor DAG 精确回溯合法 action sequences，按数量限制采样 replay trajectories。
+6. 比较当前 policy rollout 的 best reward 与 oracle best reward；若 policy 已达到或超过 oracle，则该图 replay 被跳过。
 
 ### ReplayBuilder
 
@@ -300,6 +303,14 @@ ReplaySampleBudget(policy_rollout, replay_expand)
 - 每条 replay edge 形成一个 expansion event。
 - 轨迹末尾补一个 terminal event。
 - replay transition 后续用 `SRC_REPLAY` 标记。
+
+这意味着当前 replay 不是 shortest-path path-first teacher，而是：
+
+```text
+label-constrained
+reward-first
+exact terminal-state oracle
+```
 
 ## 9. TrainingBatch 与事件
 

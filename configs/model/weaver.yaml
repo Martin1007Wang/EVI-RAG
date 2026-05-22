@@ -12,6 +12,7 @@ policy_feature_encoder:
 
 policy:
   _target_: src.weaver.policy.ForwardPolicy
+  max_expand_budget: ${model.runner.engine.expand_budget}
   state_encoder:
     _target_: src.weaver.nn.state_encoder.StateEncoder
     hidden_dim: 1024

@@ -103,7 +103,13 @@ class RolloutEngine:
                 actions.append(
                     StepAction.forced_terminal(
                         rows=forced_local,
-                        dtype=policy_out.terminal_log_flow.dtype,
+                        dtype=policy_out.stop_log_flow.dtype,
+                        reason=forced_stop_reason(
+                            state=active_state,
+                            frontier=frontier,
+                            rows=forced_local,
+                            expand_budget=self.expand_budget,
+                        ),
                         device=context.device,
                     )
                 )
@@ -114,6 +120,7 @@ class RolloutEngine:
                 policy_log_prob=sampled.policy_log_prob,
                 behavior_log_prob=sampled.behavior_log_prob,
                 forced=sampled.forced,
+                stop_reason=sampled.stop_reason,
             )
             tape.write(t, action)
 
@@ -136,7 +143,7 @@ class RolloutEngine:
             policy_action_log_prob=tape.policy_action_log_prob,
             behavior_action_log_prob=tape.behavior_action_log_prob,
             terminal_step=terminal_step,
-            forced_terminal=tape.forced_terminal,
+            stop_reason=tape.stop_reason,
             expand_budget=self.expand_budget,
         )
 
@@ -157,6 +164,33 @@ def forced_terminal_rows(
         has_frontier.index_fill_(0, frontier.row_ids, True)
     exhausted = state.depth.ge(int(expand_budget))
     return (~has_frontier | exhausted).nonzero(as_tuple=False).flatten()
+
+
+def forced_stop_reason(
+    *,
+    state: State,
+    frontier: Frontier,
+    rows: torch.Tensor,
+    expand_budget: int,
+) -> torch.Tensor:
+    rows = rows.to(device=state.device, dtype=torch.long).view(-1)
+    if rows.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=state.device)
+    has_frontier = torch.zeros(state.num_rows, dtype=torch.bool, device=state.device)
+    if frontier.row_ids.numel() > 0:
+        has_frontier.index_fill_(0, frontier.row_ids, True)
+    no_frontier = ~has_frontier.index_select(0, rows)
+    exhausted = state.depth.ge(int(expand_budget)).index_select(0, rows)
+    out = torch.full(
+        (rows.numel(),),
+        int(RolloutResult.NO_FRONTIER_STOP),
+        dtype=torch.long,
+        device=state.device,
+    )
+    out[exhausted] = int(RolloutResult.BUDGET_TRUNCATED)
+    if bool((~(no_frontier | exhausted)).any()):
+        raise RuntimeError("forced_stop_reason requires rows that are actually forced to stop.")
+    return out
 
 
 def rows_without_forced(

@@ -154,7 +154,7 @@ class ExpansionBatch:
 class TerminalBatch:
     state: State
     meta: SampleMeta
-    forced_terminal: torch.Tensor
+    stop_reason: torch.Tensor
 
     @property
     def num_items(self) -> int:
@@ -172,7 +172,7 @@ class TerminalBatch:
         return TerminalBatch(
             state=self.state.select_rows(rows),
             meta=self.meta.select_rows(rows),
-            forced_terminal=self.forced_terminal.index_select(0, rows),
+            stop_reason=self.stop_reason.index_select(0, rows),
         )
 
     @classmethod
@@ -186,7 +186,7 @@ class TerminalBatch:
         return cls(
             state=empty_state,
             meta=SampleMeta.empty(graph_like.device),
-            forced_terminal=torch.empty(0, dtype=torch.bool, device=graph_like.device),
+            stop_reason=torch.empty(0, dtype=torch.long, device=graph_like.device),
         )
 
     @classmethod
@@ -201,7 +201,7 @@ class TerminalBatch:
         return cls(
             state=State.concat([batch.state for batch in batches]),
             meta=SampleMeta.concat([batch.meta for batch in batches]),
-            forced_terminal=torch.cat([batch.forced_terminal for batch in batches], dim=0),
+            stop_reason=torch.cat([batch.stop_reason for batch in batches], dim=0),
         )
 
 
@@ -244,7 +244,7 @@ class TrainingBatch:
             terminals=TerminalBatch(
                 state=self.terminals.state,
                 meta=self.terminals.meta.with_source_id(source_id),
-                forced_terminal=self.terminals.forced_terminal,
+                stop_reason=self.terminals.stop_reason,
             ),
         )
 
@@ -314,7 +314,7 @@ class TrainingBatch:
                         terminals.meta,
                         terminal_traj_ids + offset,
                     ),
-                    forced_terminal=terminals.forced_terminal,
+                    stop_reason=terminals.stop_reason,
                 ),
             )
         )

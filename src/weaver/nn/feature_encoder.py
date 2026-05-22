@@ -30,6 +30,7 @@ class EncodedFeatures:
     node_model: torch.Tensor  # [num_nodes_total, model_dim]
     edge_relation_model: torch.Tensor  # [num_edges_total, model_dim]
     query_model: torch.Tensor  # [num_graphs_total, model_dim]
+    edge_token_model: torch.Tensor  # [num_edges_total, 3 * model_dim]
 
 
 class FeatureEncoder(nn.Module):
@@ -109,18 +110,32 @@ class FeatureEncoder(nn.Module):
         edge_relation_semantic = self.encode_edge_relation_semantic(batch.edge_relation_catalog_ids)
 
         query_semantic = batch.question_emb
+        node_model = self.encode_node_model(
+            node_text_semantic=node_text_semantic,
+            node_has_text=node_has_text,
+        )
+        edge_relation_model = self.to_model_space(edge_relation_semantic)
+        query_model = self.to_model_space(query_semantic)
+        src_node_ids = batch.edge_index[0].to(dtype=torch.long)
+        dst_node_ids = batch.edge_index[1].to(dtype=torch.long)
+        edge_token_model = torch.cat(
+            [
+                node_model.index_select(0, src_node_ids),
+                edge_relation_model,
+                node_model.index_select(0, dst_node_ids),
+            ],
+            dim=-1,
+        )
 
         return EncodedFeatures(
             node_text_semantic=node_text_semantic,
             node_has_text=node_has_text,
             edge_relation_semantic=edge_relation_semantic,
             query_semantic=query_semantic,
-            node_model=self.encode_node_model(
-                node_text_semantic=node_text_semantic,
-                node_has_text=node_has_text,
-            ),
-            edge_relation_model=self.to_model_space(edge_relation_semantic),
-            query_model=self.to_model_space(query_semantic),
+            node_model=node_model,
+            edge_relation_model=edge_relation_model,
+            query_model=query_model,
+            edge_token_model=edge_token_model,
         )
 
     def encode_node_text_semantic(
@@ -222,6 +237,13 @@ def select_edge_relation_model(
     return features.edge_relation_model.index_select(0, edge_ids)
 
 
+def select_edge_token_model(
+    features: EncodedFeatures,
+    edge_ids: torch.Tensor,
+) -> torch.Tensor:
+    return features.edge_token_model.index_select(0, edge_ids)
+
+
 def select_query_model(
     features: EncodedFeatures,
     graph_ids: torch.Tensor,
@@ -233,6 +255,7 @@ __all__ = [
     "EncodedFeatures",
     "FeatureEncoder",
     "select_edge_relation_model",
+    "select_edge_token_model",
     "select_edge_relation_semantic",
     "select_node_has_text",
     "select_node_model",

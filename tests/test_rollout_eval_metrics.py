@@ -61,7 +61,7 @@ class FakePolicy:
         score -= state.selected_edge_mask[:, 4].float() * 5.0
         return SimpleNamespace(
             state_log_flow=score,
-            terminal_log_flow=score,
+            stop_log_flow=score,
         )
 
 
@@ -75,7 +75,7 @@ def rollout(edge_rows: list[list[int]], logprob_rows: list[list[float]]) -> Roll
         policy_action_log_prob=logprob,
         behavior_action_log_prob=logprob,
         terminal_step=terminal_step,
-        forced_terminal=torch.zeros(len(edge_rows), dtype=torch.bool),
+        stop_reason=torch.full((len(edge_rows),), RolloutResult.POLICY_STOP, dtype=torch.long),
         expand_budget=2,
     )
 

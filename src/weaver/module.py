@@ -125,9 +125,8 @@ class WeaverModule(LightningModule):
         optimizer = self.optimizer()
         optimizer.zero_grad(set_to_none=True)
         branch_grad_metrics = terminal_flow_branch_gradient_metrics(
-            terminal_flow_head=self.policy.terminal_flow_head,
-            continuation_flow_head=self.policy.continuation_flow_head,
-            edge_policy_head=self.policy.edge_policy_head,
+            stop_flow_head=self.policy.stop_flow_head,
+            edge_advantage_head=self.policy.edge_advantage_head,
             terminal_loss=output.terminal_branch_loss,
             expansion_loss=output.expansion_branch_loss,
         )
@@ -218,27 +217,15 @@ class WeaverModule(LightningModule):
 
         expand_budget = int(self.runner.engine.expand_budget)
         if expansions.num_items > 0:
-            parent_frontier = expansions.parent.frontier(
-                graph,
-                expand_budget=expand_budget,
-            )
-            child_frontier = expansions.child.frontier(
-                graph,
-                expand_budget=expand_budget,
-            )
-
-            parent_out = self.policy(
+            parent_frontier = expansions.parent.frontier(graph, expand_budget=expand_budget)
+            child_frontier = expansions.child.frontier(graph, expand_budget=expand_budget)
+            terminal_frontier = terminals.state.frontier(graph, expand_budget=expand_budget)
+            parent_out, child_out, terminal_out = batched_policy_outputs(
+                policy=self.policy,
                 features=policy_features,
-                state=expansions.parent,
                 context=graph,
-                frontier=parent_frontier,
-            )
-            # Child flow must come from an explicit child-state forward pass.
-            child_out = self.policy(
-                features=policy_features,
-                state=expansions.child,
-                context=graph,
-                frontier=child_frontier,
+                states=(expansions.parent, expansions.child, terminals.state),
+                frontiers=(parent_frontier, child_frontier, terminal_frontier),
             )
             backward_log_prob = backward_action_log_prob(
                 backward_policy=self.backward_policy,
@@ -257,16 +244,13 @@ class WeaverModule(LightningModule):
                 dtype=torch.float32,
                 device=policy_features.query_model.device,
             )
-        terminal_frontier = terminals.state.frontier(
-            graph,
-            expand_budget=expand_budget,
-        )
-        terminal_out = self.policy(
-            features=policy_features,
-            state=terminals.state,
-            context=graph,
-            frontier=terminal_frontier,
-        )
+            terminal_frontier = terminals.state.frontier(graph, expand_budget=expand_budget)
+            terminal_out = self.policy(
+                features=policy_features,
+                state=terminals.state,
+                context=graph,
+                frontier=terminal_frontier,
+            )
 
         reward_out = call_reward_model(
             reward_model=self.reward_model,
@@ -509,6 +493,88 @@ def backward_action_log_prob(
     return out
 
 
+def batched_policy_outputs(
+    *,
+    policy: ForwardPolicy,
+    features: EncodedFeatures,
+    context: GraphContext,
+    states: tuple[State, ...],
+    frontiers: tuple,
+) -> tuple[ForwardPolicyOutput, ...]:
+    if len(states) != len(frontiers):
+        raise ValueError("states and frontiers must have the same length.")
+    if not states:
+        return ()
+
+    counts = [state.num_rows for state in states]
+    offsets = [0]
+    for count in counts[:-1]:
+        offsets.append(offsets[-1] + int(count))
+
+    fused_state = State.concat(states)
+    fused_frontier = concat_frontiers(frontiers=frontiers, offsets=offsets, device=fused_state.device)
+    fused_out = policy(
+        features=features,
+        state=fused_state,
+        context=context,
+        frontier=fused_frontier,
+    )
+
+    outputs: list[ForwardPolicyOutput] = []
+    for offset, count in zip(offsets, counts, strict=True):
+        outputs.append(slice_policy_output(fused_out, start=int(offset), length=int(count)))
+    return tuple(outputs)
+
+
+def concat_frontiers(
+    *,
+    frontiers: tuple,
+    offsets: list[int],
+    device: torch.device,
+):
+    row_ids_parts: list[torch.Tensor] = []
+    edge_ids_parts: list[torch.Tensor] = []
+    for frontier, offset in zip(frontiers, offsets, strict=True):
+        if frontier.edge_ids.numel() == 0:
+            continue
+        row_ids_parts.append(frontier.row_ids.to(device=device, dtype=torch.long) + int(offset))
+        edge_ids_parts.append(frontier.edge_ids.to(device=device, dtype=torch.long))
+    if not row_ids_parts:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return type(frontiers[0])(row_ids=empty, edge_ids=empty)
+    return type(frontiers[0])(
+        row_ids=torch.cat(row_ids_parts, dim=0),
+        edge_ids=torch.cat(edge_ids_parts, dim=0),
+    )
+
+
+def slice_policy_output(
+    output: ForwardPolicyOutput,
+    *,
+    start: int,
+    length: int,
+) -> ForwardPolicyOutput:
+    end = int(start + length)
+    if length <= 0:
+        return empty_policy_output(device=output.stop_log_flow.device, num_edges=output.num_edges)
+    row_mask = output.frontier_row_ids.ge(int(start)) & output.frontier_row_ids.lt(end)
+    return ForwardPolicyOutput(
+        frontier_row_ids=output.frontier_row_ids[row_mask] - int(start),
+        frontier_edge_ids=output.frontier_edge_ids[row_mask],
+        stop_log_flow=output.stop_log_flow[start:end],
+        continue_log_flow=output.continue_log_flow[start:end],
+        continue_log_gain=output.continue_log_gain[start:end],
+        edge_log_flow=output.edge_log_flow[row_mask],
+        edge_log_reference=output.edge_log_reference[row_mask],
+        edge_log_advantage=output.edge_log_advantage[row_mask],
+        state_log_flow=output.state_log_flow[start:end],
+        stop_log_prob=output.stop_log_prob[start:end],
+        edge_log_prob=output.edge_log_prob[row_mask],
+        num_rows=int(length),
+        num_edges=output.num_edges,
+    )
+
+
 def empty_policy_output(
     *,
     device: torch.device,
@@ -519,12 +585,14 @@ def empty_policy_output(
     return ForwardPolicyOutput(
         frontier_row_ids=empty_long,
         frontier_edge_ids=empty_long,
-        terminal_log_flow=empty_float,
-        continuation_log_flow=empty_float,
+        stop_log_flow=empty_float,
+        continue_log_flow=empty_float,
+        continue_log_gain=empty_float,
         edge_log_flow=empty_float,
-        edge_log_policy=empty_float,
+        edge_log_reference=empty_float,
+        edge_log_advantage=empty_float,
         state_log_flow=empty_float,
-        terminal_log_prob=empty_float,
+        stop_log_prob=empty_float,
         edge_log_prob=empty_float,
         num_rows=0,
         num_edges=int(num_edges),
@@ -552,24 +620,24 @@ def policy_diagnostic_metrics(
     terminal_out: ForwardPolicyOutput,
     terminal_depth: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    terminal_ratio = torch.cat(
+    stop_ratio = torch.cat(
         [
-            expansion_out.terminal_vs_continuation_log_ratio.float(),
-            terminal_out.terminal_vs_continuation_log_ratio.float(),
+            expansion_out.stop_vs_continue_log_ratio.float(),
+            terminal_out.stop_vs_continue_log_ratio.float(),
         ],
         dim=0,
     )
     depth = torch.cat(
         [
-            expansion_depth.to(device=terminal_ratio.device, dtype=torch.long).view(-1),
-            terminal_depth.to(device=terminal_ratio.device, dtype=torch.long).view(-1),
+            expansion_depth.to(device=stop_ratio.device, dtype=torch.long).view(-1),
+            terminal_depth.to(device=stop_ratio.device, dtype=torch.long).view(-1),
         ],
         dim=0,
     )
-    terminal_prob = torch.cat(
+    stop_prob = torch.cat(
         [
-            expansion_out.terminal_prob().float(),
-            terminal_out.terminal_prob().float(),
+            expansion_out.stop_prob().float(),
+            terminal_out.stop_prob().float(),
         ],
         dim=0,
     )
@@ -606,12 +674,12 @@ def policy_diagnostic_metrics(
     }
     for bucket in range(4):
         mask = depth.eq(bucket)
-        metrics[f"policy_terminal_vs_continuation_log_ratio_depth{bucket}_mean"] = masked_mean_or_zero(
-            terminal_ratio,
+        metrics[f"policy_stop_vs_continue_log_ratio_depth{bucket}_mean"] = masked_mean_or_zero(
+            stop_ratio,
             mask,
         ).detach()
-        metrics[f"policy_terminal_prob_depth{bucket}_mean"] = masked_mean_or_zero(
-            terminal_prob,
+        metrics[f"policy_stop_prob_depth{bucket}_mean"] = masked_mean_or_zero(
+            stop_prob,
             mask,
         ).detach()
     return metrics
@@ -619,24 +687,22 @@ def policy_diagnostic_metrics(
 
 def terminal_flow_branch_gradient_metrics(
     *,
-    terminal_flow_head: torch.nn.Module,
-    continuation_flow_head: torch.nn.Module,
-    edge_policy_head: torch.nn.Module,
+    stop_flow_head: torch.nn.Module,
+    edge_advantage_head: torch.nn.Module,
     terminal_loss: torch.Tensor,
     expansion_loss: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    terminal_params = [param for param in terminal_flow_head.parameters() if param.requires_grad]
-    continuation_params = [param for param in continuation_flow_head.parameters() if param.requires_grad]
-    edge_policy_params = [param for param in edge_policy_head.parameters() if param.requires_grad]
+    stop_params = [param for param in stop_flow_head.parameters() if param.requires_grad]
+    edge_advantage_params = [param for param in edge_advantage_head.parameters() if param.requires_grad]
 
     terminal_grad = gradient_vector(
         loss=terminal_loss,
-        params=terminal_params,
+        params=stop_params,
         retain_graph=True,
     )
     expansion_grad = gradient_vector(
         loss=expansion_loss,
-        params=terminal_params,
+        params=stop_params,
         retain_graph=True,
     )
     terminal_norm = terminal_grad.norm()
@@ -647,22 +713,16 @@ def terminal_flow_branch_gradient_metrics(
         torch.dot(terminal_grad, expansion_grad) / denom.clamp_min(torch.finfo(terminal_grad.dtype).tiny),
         terminal_grad.new_zeros(()),
     )
-    continuation_expansion_grad = gradient_vector(
+    edge_advantage_expansion_grad = gradient_vector(
         loss=expansion_loss,
-        params=continuation_params,
-        retain_graph=True,
-    )
-    edge_policy_expansion_grad = gradient_vector(
-        loss=expansion_loss,
-        params=edge_policy_params,
+        params=edge_advantage_params,
         retain_graph=True,
     )
     return {
-        "grad_terminal_flow_head_from_terminal_loss": terminal_norm.detach(),
-        "grad_terminal_flow_head_from_expansion_loss": expansion_norm.detach(),
-        "grad_terminal_flow_head_terminal_expansion_cosine": cosine.detach(),
-        "grad_continuation_flow_head_from_expansion_loss": continuation_expansion_grad.norm().detach(),
-        "grad_edge_policy_head_from_expansion_loss": edge_policy_expansion_grad.norm().detach(),
+        "grad_stop_flow_head_from_terminal_loss": terminal_norm.detach(),
+        "grad_stop_flow_head_from_expansion_loss": expansion_norm.detach(),
+        "grad_stop_flow_head_terminal_expansion_cosine": cosine.detach(),
+        "grad_edge_advantage_head_from_expansion_loss": edge_advantage_expansion_grad.norm().detach(),
     }
 
 
@@ -692,9 +752,8 @@ def gradient_vector(
 def gradient_norm_metrics(policy: ForwardPolicy) -> dict[str, torch.Tensor]:
     reference = next(policy.parameters())
     return {
-        "grad_terminal_flow_head_norm": module_grad_norm(policy.terminal_flow_head, reference).detach(),
-        "grad_continuation_flow_head_norm": module_grad_norm(policy.continuation_flow_head, reference).detach(),
-        "grad_edge_policy_head_norm": module_grad_norm(policy.edge_policy_head, reference).detach(),
+        "grad_stop_flow_head_norm": module_grad_norm(policy.stop_flow_head, reference).detach(),
+        "grad_edge_advantage_head_norm": module_grad_norm(policy.edge_advantage_head, reference).detach(),
         "grad_state_encoder_norm": module_grad_norm(policy.state_encoder, reference).detach(),
     }
 
