@@ -16,4 +16,4 @@ model:
   runner:
     eval_num_rollouts: 32
   evaluation:
-    k_windows: [1, 2, 4, 8, 16, 32]
+    k_windows: [1, 2, 4, 8]

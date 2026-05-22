@@ -111,12 +111,16 @@ class TargetContext:
     """
     Target-label context for supervision, reward computation, and evaluation.
 
-    This object contains only reachable answer labels.
+    This object contains only reachable answer labels and shortest-path
+    supervision derived from them.
     Graph structure belongs to GraphContext.
     """
 
     target_mask: torch.Tensor  # [N]
+    reachable_target_node_ids: torch.Tensor  # [T]
+    reachable_target_node_ids_ptr: torch.Tensor  # [G + 1]
     target_count_by_graph: torch.Tensor  # [G]
+    node_target_shortest_path_edge_mask_flat: torch.Tensor  # [sum_g T_g * E_g]
 
     @classmethod
     def from_batch(
@@ -143,10 +147,29 @@ class TargetContext:
             target_graph_ids,
             minlength=int(graph_context.num_graphs),
         )
+        target_ptr = getattr(batch, "reachable_target_node_ids_ptr", None)
+        if target_ptr is None:
+            target_ptr = torch.empty(
+                int(graph_context.num_graphs) + 1,
+                dtype=torch.long,
+                device=graph_context.device,
+            )
+            target_ptr[0] = 0
+            target_ptr[1:] = torch.cumsum(target_count_by_graph, dim=0)
+        else:
+            target_ptr = target_ptr.to(device=graph_context.device, dtype=torch.long)
 
         return cls(
             target_mask=target_mask,
+            reachable_target_node_ids=target_node_ids,
+            reachable_target_node_ids_ptr=target_ptr,
             target_count_by_graph=target_count_by_graph,
+            node_target_shortest_path_edge_mask_flat=(
+                batch.node_target_shortest_path_edge_mask_flat.to(
+                    device=graph_context.device,
+                    dtype=torch.bool,
+                )
+            ),
         )
 
     @property

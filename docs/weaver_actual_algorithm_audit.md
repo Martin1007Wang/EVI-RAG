@@ -6,7 +6,7 @@
 
 当前仓库实现的是一个有限步 evidence subgraph 生成器：从 question anchors 初始化 active node set，每步在 active source nodes 的 outgoing physical edges 上采样扩展，或采样 STOP，最终得到一个 anchor-connected edge set/subgraph。它不是 DAG-GFlowNet；生成对象可以有环，frontier 只包含原始 physical outgoing edges。更准确地说，状态转移图是按 edge set inclusion 单调增长的 DAG，但生成对象不是 DAG。训练目标是 `SubTBLoss`，不是旧配置名里的 edge flow matching，也不是纯 DB/TB；`subtb_lambda=0.9` 时枚举采样轨迹内所有连续 subtrajectory，长度 1 项退化为 DB 风格，完整起止项包含 TB 风格项。STOP 被建模为 `edge_id=-1` 的 terminal action，不在 `Frontier` 中，但 policy 归一化时与 frontier edges 一起进入 `logsumexp`。frontier 是 active source outgoing frontier：`src in active` 的原始有向 KG 边，不制造 inverse edge。reward 是 label-dependent terminal reward：reachable answer recall 的 log，加 edge penalty 和 no-answer penalty；只用 `reachable_target_node_ids`，不是 full `target_node_ids`。训练信号不是直接监督 next edge，而是监督 policy 的 action logits/derived flows 在 policy rollouts + replay shortest paths 上满足 SubTB residual。
 
-当前最核心的理论或实现错位是：代码与配置标签接近 edge-flow/GFlowNet，但实际是 sampled SubTB over anchor-connected outgoing-expanded edge sets；STOP flow 由 learned stop head 直接对齐 reward，验证却用 `val/union@8/target_recall` 选模型，和训练 loss 的终端 reward/trajectory likelihood 不同。
+当前最核心的理论或实现错位是：代码与配置标签接近 edge-flow/GFlowNet，但实际是 sampled SubTB over anchor-connected outgoing-expanded edge sets；STOP flow 由 learned stop head 直接对齐 reward。验证现在默认用 `val/selector_stop_flow@8/f1` 选模型，并同时报告 candidate coverage、union、trajectory diagnostic、calibration 和 stop 行为。
 
 ## 1. Code structure map
 
@@ -74,7 +74,7 @@
 1. `validation_step/test_step` 调 `eval_step`，见 `src/weaver/module.py:288-348`。
 2. eval 只采样 `runner.eval_rollouts`，不构造 loss，不用 replay。
 3. metrics 用 `SubgraphReconstructor` 从 trajectory 重建 terminal node/edge masks，见 `src/weaver/rollout/subgraph.py:49-124`。
-4. validation 默认监控 `val/union@8/target_recall`，见 `configs/callbacks/train.yaml:7-18`，不是 loss。
+4. validation 默认监控 `val/selector_stop_flow@8/f1`，见 `configs/callbacks/train.yaml:7-18`，不是 loss。
 
 静态图对象：`RetrievalBatch.edge_index/batch/ptr/catalog ids`、`GraphContext`、`EncodedFeatures`。动态 state：`State.selected_edge_mask/active_node_mask/step`、`RolloutTape`、`RolloutResult`。监督信号：`reachable_target_node_ids` 用于 reward/eval，shortest-path distance/count tensors 用于 replay path construction。
 
@@ -240,7 +240,7 @@ behavior policy 和 trained policy 不完全一致：采样用 logits / temperat
 
 replay 生成完整 shortest-path trajectories，并转成 expansion/terminal transitions；不是直接 CE 监督 next edge。`precomputed_shortest_edge_path` 从 best anchor 沿 outgoing edge 走向 target，见 `src/weaver/rollout/replay.py:706-743`。replay 只对 policy rollouts 未命中的 graph 生成，见 `src/weaver/rollout/replay.py:384-401`。
 
-validation metric 和 training objective 不对齐：训练优化 `loss/subtb`；checkpoint/early stopping 监控 `val/union@8/target_recall`，见 `configs/callbacks/train.yaml:7-18`。`oracle_best@k` 用真实 recall/f1/edge_count 选最佳 sample，见 `src/eval/rollout.py:621-638`；`model_best@k` 用 trajectory log prob，见 `src/eval/rollout.py:641-644`；`union@k` 是前 k 个 rollout 的 node/edge union recall，见 `src/eval/rollout.py:274-312`。forced stop rate 来自 terminal action 是否 forced，见 `src/eval/rollout.py:433-443`。
+validation metric 现在拆成 candidate coverage、terminal selector、calibration 和 stop 行为；checkpoint/early stopping 监控 `val/selector_stop_flow@8/f1`，见 `configs/callbacks/train.yaml:7-18`。`candidate_oracle_best@k` 用真实 eval metric 选候选池上限；`candidate_reward_best@k` 用 label-dependent terminal reward 选 reward oracle；`selector_traj_prob@k` 只诊断 trajectory log probability；`selector_stop_flow@k` 用 `log_flow + log P(STOP)` 作为 terminal graph selector；`candidate_union@k` 是前 k 个 rollout 的 node/edge union object。forced stop rate 来自 terminal action 是否 forced。
 
 ## 9. Minimal pseudocode of the actual algorithm
 
@@ -389,7 +389,7 @@ for batch in train_loader:
 | Replay as oracle CE | Replay transitions 进入同一个 SubTB，无 CE | `src/weaver/rollout/runner.py:216-221`, `src/weaver/objectives/subtb.py:75-80` | Oracle path signal 是间接的 | minor | 如有需要添加 auxiliary CE |
 | Behavior policy equals learned policy | Sampling uses temperature，stored/eval logprob uses untempered policy | `src/weaver/rollout/sampler.py:74-81`, `src/weaver/rollout/sampler.py:40-44` | `temperature != 1` 时 off-policy | major | 存 behavior logprob 或设 `temperature=1` |
 | Budget-free stopping | Budget forced stop exists；默认 `expand_budget=3` | `src/weaver/rollout/engine.py:170-171`, `configs/model/weaver.yaml:42` | 模型可能学 expand-to-budget | major | 跟踪并惩罚 forced stop；调 budget |
-| Validation aligns with loss | Checkpoint monitors `union@8/target_recall` | `configs/callbacks/train.yaml:7` | best checkpoint 不一定最小化 SubTB/reward objective | major | 同时报并选择 reward/model_best/loss 指标 |
+| Validation aligns with loss | Checkpoint monitors `selector_stop_flow@8/f1` | `configs/callbacks/train.yaml:7` | best checkpoint 侧重 deploy-time terminal selection，不直接最小化 SubTB loss | minor | 同时报 coverage、selector、calibration 和 loss 指标 |
 
 ## 11. Load-bearing assumptions
 
@@ -401,7 +401,7 @@ for batch in train_loader:
 | Budget 3 足够覆盖 answer paths | shortest path length to reachable targets | WebQSP train/val | forced stop rate high, recall ceiling low | 用 `anchor_node_forward_distances_flat` / replay path length histogram |
 | Replay shortest paths 有代表性 | replay fraction and replay hit graphs | WebQSP train | model overfits shortest outgoing paths | ablate `replay_expand=0` vs default |
 | Edge penalty scale 合理 | `edge_cost/log_reward_scale` | WebQSP val | too small: expand-to-budget；too large: early STOP | sweep `edge_cost`，监控 forced stop/reward/recall |
-| Model score 能排序有用 rollouts | `model_best@k` gap to `oracle_best@k` | WebQSP val | high oracle recall but low model_best recall | 使用现有 `model_best@k/score_gap_to_oracle` metrics |
+| Terminal score 能排序有用 rollouts | `selector_stop_flow@k` gap to `candidate_oracle_best@k` | WebQSP val | high oracle recall but low stop_flow recall | 使用 `selector_stop_flow@k/oracle_gap` 和 calibration metrics |
 | Temperature off-policy effect 可忽略 | `train_temperature`, `eval_temperature` | WebQSP train/val | `tau < 1` 降低 diversity 或 bias replay coverage | 跑 `tau=1.0` vs `0.7` 同 seed |
 
 ## 12. What this implementation breaks
@@ -415,14 +415,14 @@ for batch in train_loader:
 - 当 temperature 不等于 1 时，rollout collection 是 off-policy。
 - Terminal reward 是 supervised label reward，推理时不可用。
 
-相比普通 KGQA retrieval，这个实现新增的可验证能力是：随机生成多个 compact-ish anchor-connected evidence subgraphs，并支持 diversity / best-of-k / union evaluation。如果实验不能证明 `model_best@k` 或 downstream LLM 指标超过 shortest-path/BFS baselines，那么这套实现主要是在 answer hit + edge penalty reward 外包了一层 GFN-style trajectory consistency，复杂化了 retrieval。
+相比普通 KGQA retrieval，这个实现新增的可验证能力是：随机生成多个 compact-ish anchor-connected evidence subgraphs，并支持 diversity、candidate coverage、terminal selector calibration 和 union evaluation。如果实验不能证明 `selector_stop_flow@k`、`candidate_union@k` 或 downstream LLM 指标超过 shortest-path/BFS baselines，那么这套实现主要是在 answer hit + edge penalty reward 外包了一层 GFN-style trajectory consistency，复杂化了 retrieval。
 
 ## 13. Final verdict
 
 当前代码实际算法的一句话定义：一个用 action-log-flow 参数化的 sampled SubTB 训练器，在 KG local graph 上从 anchors 生成 bounded anchor-connected outgoing edge subgraphs，terminal STOP flow 用 reachable-answer reward 监督。
 
-值得继续修，但前提是先承认它不是 DAG-GFlowNet，也不是 edge flow matching。第一优先级应改 STOP/frontier/validation 三件事：校正 STOP 与 frontier degree 的耦合，验证 outgoing-only frontier 的覆盖代价，并把 checkpoint metric 从 `union@8/target_recall` 拆成 `model_best`/reward/loss 同时报。
+值得继续修，但前提是先承认它不是 DAG-GFlowNet，也不是 edge flow matching。第一优先级应改 STOP/frontier/validation 三件事：校正 STOP 与 frontier degree 的耦合，验证 outgoing-only frontier 的覆盖代价，并持续同时监控 `selector_stop_flow@k`、`candidate_union@k`、calibration 和 loss。
 
 应删除或重命名旧语义模块名和配置 tag：`edge_flow_matching`、DAG-GFlowNet 表述、旧 `loss/objective/transitions` 叫法；`state_log_flow` 可保留但文档必须写明它是 derived `logsumexp(action logits)`。
 
-必须先跑的实验是：`tau=1` vs `0.7`、replay on/off、frontier incident vs outgoing、edge_cost sweep、budget sweep，以及 `oracle_best@k` 到 `model_best@k` 的 gap；这些不跑，无法判断 GFN 部分是否带来超过 shortest-path replay 的收益。
+必须先跑的实验是：`tau=1` vs `0.7`、replay on/off、frontier incident vs outgoing、edge_cost sweep、budget sweep，以及 `candidate_oracle_best@k` 到 `selector_stop_flow@k` 的 gap；这些不跑，无法判断 GFN 部分是否带来超过 shortest-path replay 的收益。

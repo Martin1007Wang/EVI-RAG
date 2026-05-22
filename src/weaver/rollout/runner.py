@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from src.data.schema import RetrievalBatch
-from src.weaver.context import GraphContext
+from src.weaver.context import GraphContext, TargetContext
 from src.weaver.nn.feature_encoder import EncodedFeatures
 from src.weaver.policy import ForwardPolicy
 from src.weaver.rollout.engine import RolloutEngine
@@ -21,6 +21,7 @@ from src.weaver.transition import (
     SRC_REPLAY,
     TrainingBatch,
 )
+from src.weaver.utility import TrueTerminalReward
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,13 +54,13 @@ class RolloutBatch:
     def num_replay_transitions(self) -> int:
         if self.training is None:
             return 0
-        return int(self.training.num_expansions)
+        return int(self.training.expansions.meta.source_ids.eq(SRC_REPLAY).sum().item())
 
     @property
     def num_replay_terminal_transitions(self) -> int:
         if self.training is None:
             return 0
-        return int(self.training.num_terminals)
+        return int(self.training.terminals.meta.source_ids.eq(SRC_REPLAY).sum().item())
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +108,8 @@ class RolloutRunner:
         batch: RetrievalBatch,
         context: GraphContext,
         features: EncodedFeatures,
-        temperature: float,
+        reward_model: TrueTerminalReward | None = None,
+        target_context: TargetContext | None = None,
     ) -> RolloutBatch:
         budget = self.sample_budget(self.train_num_rollouts)
         rollouts = self.policy_rollouts(
@@ -115,13 +117,14 @@ class RolloutRunner:
             context=context,
             features=features,
             num_rollouts=budget.policy_rollout,
-            temperature=temperature,
         )
         replay = self.replay_trajectories(
             batch=batch,
             rollouts=rollouts,
             context=context,
             num_trajectories=budget.replay_expand,
+            reward_model=reward_model,
+            target_context=target_context,
         )
         training = self.training_batch(
             rollouts=rollouts,
@@ -140,7 +143,6 @@ class RolloutRunner:
         policy: ForwardPolicy,
         context: GraphContext,
         features: EncodedFeatures,
-        temperature: float,
         num_rollouts: int | None = None,
     ) -> tuple[RolloutResult, ...]:
         total = self.eval_num_rollouts if num_rollouts is None else int(num_rollouts)
@@ -149,7 +151,6 @@ class RolloutRunner:
             context=context,
             features=features,
             num_rollouts=total,
-            temperature=temperature,
         )
 
     def policy_rollouts(
@@ -159,7 +160,6 @@ class RolloutRunner:
         context: GraphContext,
         features: EncodedFeatures,
         num_rollouts: int,
-        temperature: float,
     ) -> tuple[RolloutResult, ...]:
         num_rollouts = int(num_rollouts)
         if num_rollouts <= 0:
@@ -170,7 +170,6 @@ class RolloutRunner:
                 context=context,
                 features=features,
                 num_rollouts=num_rollouts,
-                temperature=temperature,
             )
         )
 
@@ -181,6 +180,8 @@ class RolloutRunner:
         rollouts: tuple[RolloutResult, ...],
         context: GraphContext,
         num_trajectories: int,
+        reward_model: TrueTerminalReward | None = None,
+        target_context: TargetContext | None = None,
     ) -> ReplayBatch | None:
         if int(num_trajectories) <= 0:
             return None
@@ -191,6 +192,8 @@ class RolloutRunner:
             context=context,
             rollouts=rollouts,
             num_trajectories=int(num_trajectories),
+            reward_model=reward_model,
+            target_context=target_context,
         )
 
     def training_batch(

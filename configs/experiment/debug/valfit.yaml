@@ -23,7 +23,3 @@ datamodule:
     train: validation
     validation: validation
     test: validation
-
-model:
-  runner:
-    replay_schedule: null

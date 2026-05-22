@@ -101,7 +101,7 @@ def main() -> None:
         print(
             "train "
             f"epoch={epoch + 1} "
-            f"loss={metrics['loss/main']:.4f} "
+            f"loss={metrics['loss']:.4f} "
             f"forced_stop={metrics['rollout/forced_stop_rate']:.4f} "
             f"hit_then_continue={metrics['rollout/hit_then_continue_rate']:.4f} "
             f"m_after_hit={metrics['policy/stop_expand_margin_after_hit']:.4f} "
@@ -162,7 +162,9 @@ def train_one_step(
     output.loss.backward()
     optimizer.step()
 
-    return {key: float(value.detach().cpu()) for key, value in output.metrics.items()}
+    metrics = {key: float(value.detach().cpu()) for key, value in output.metrics.items()}
+    metrics["loss"] = float(output.loss.detach().cpu())
+    return metrics
 
 
 def choose_sample(

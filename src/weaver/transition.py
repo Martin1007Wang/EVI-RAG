@@ -155,7 +155,6 @@ class TerminalBatch:
     state: State
     meta: SampleMeta
     forced_stop: torch.Tensor
-    hit_continue_steps: torch.Tensor
 
     @property
     def num_items(self) -> int:
@@ -174,7 +173,6 @@ class TerminalBatch:
             state=self.state.select_rows(rows),
             meta=self.meta.select_rows(rows),
             forced_stop=self.forced_stop.index_select(0, rows),
-            hit_continue_steps=self.hit_continue_steps.index_select(0, rows),
         )
 
     @classmethod
@@ -189,7 +187,6 @@ class TerminalBatch:
             state=empty_state,
             meta=SampleMeta.empty(graph_like.device),
             forced_stop=torch.empty(0, dtype=torch.bool, device=graph_like.device),
-            hit_continue_steps=torch.empty(0, dtype=torch.long, device=graph_like.device),
         )
 
     @classmethod
@@ -205,7 +202,6 @@ class TerminalBatch:
             state=State.concat([batch.state for batch in batches]),
             meta=SampleMeta.concat([batch.meta for batch in batches]),
             forced_stop=torch.cat([batch.forced_stop for batch in batches], dim=0),
-            hit_continue_steps=torch.cat([batch.hit_continue_steps for batch in batches], dim=0),
         )
 
 
@@ -248,6 +244,7 @@ class TrainingBatch:
             terminals=TerminalBatch(
                 state=self.terminals.state,
                 meta=self.terminals.meta.with_source_id(source_id),
+                forced_stop=self.terminals.forced_stop,
             ),
         )
 
@@ -311,15 +308,16 @@ class TrainingBatch:
                             expand_traj_ids + offset,
                         ),
                     ),
-                    terminals=TerminalBatch(
-                        state=terminals.state,
-                        meta=_with_trajectory_ids(
-                            terminals.meta,
-                            terminal_traj_ids + offset,
-                        ),
+                terminals=TerminalBatch(
+                    state=terminals.state,
+                    meta=_with_trajectory_ids(
+                        terminals.meta,
+                        terminal_traj_ids + offset,
                     ),
-                )
+                    forced_stop=terminals.forced_stop,
+                ),
             )
+        )
             offset += num_local_traj
 
         return cls.concat(out)

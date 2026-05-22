@@ -5,7 +5,6 @@ from collections.abc import Sequence
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.eval.compactness import compute_compactness_expectations
 from src.eval.targets import eval_target_node_mask
 from src.graph.masks import anchor_node_mask
 from src.utils.scatter import scatter_sum
@@ -117,160 +116,6 @@ def compute_node_retrieval_matrix(
     return precision, recall, f1, valid_graph_mask
 
 
-def compute_expected_node_retrieval_quality(
-    rollouts: Sequence[RolloutResult],
-    batch: RetrievalBatch,
-    *,
-    device: torch.device | None = None,
-    exclude_anchors_from_retrieved: bool = True,
-    use_reachable_targets: bool = True,
-) -> dict[str, float]:
-    """
-    Monte Carlo estimate of one sampled terminal subgraph's answer quality.
-    """
-
-    if not rollouts:
-        return {
-            "expected_target_precision": 0.0,
-            "expected_target_recall": 0.0,
-            "expected_target_f1": 0.0,
-            "nonzero_f1_rate": 0.0,
-        }
-
-    precision, recall, f1, valid_graph_mask = compute_node_retrieval_matrix(
-        rollouts,
-        batch,
-        device=device,
-        exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
-        use_reachable_targets=use_reachable_targets,
-    )
-
-    return {
-        "expected_target_precision": mean_over_valid_graphs(
-            precision,
-            valid_graph_mask,
-        ),
-        "expected_target_recall": mean_over_valid_graphs(
-            recall,
-            valid_graph_mask,
-        ),
-        "expected_target_f1": mean_over_valid_graphs(
-            f1,
-            valid_graph_mask,
-        ),
-        "nonzero_f1_rate": mean_over_valid_graphs(
-            f1.gt(0.0).to(dtype=torch.float32),
-            valid_graph_mask,
-        ),
-    }
-
-
-def compute_best_of_k_node_retrieval_quality(
-    rollouts: Sequence[RolloutResult],
-    batch: RetrievalBatch,
-    *,
-    ks: Sequence[int],
-    device: torch.device | None = None,
-    exclude_anchors_from_retrieved: bool = True,
-    use_reachable_targets: bool = True,
-) -> dict[str, float]:
-    """
-    Best-of-k answer discovery over rollout samples.
-
-    For each k, use the best metric value among the first k rollout samples.
-    """
-
-    effective_ks = normalize_ks(ks, max_k=len(rollouts))
-    metrics: dict[str, float] = {}
-
-    if not rollouts:
-        for k in effective_ks:
-            metrics[f"max_target_precision_at_{k}"] = 0.0
-            metrics[f"max_target_recall_at_{k}"] = 0.0
-            metrics[f"max_target_f1_at_{k}"] = 0.0
-            metrics[f"full_recall_rate_at_{k}"] = 0.0
-        return metrics
-
-    precision, recall, f1, valid_graph_mask = compute_node_retrieval_matrix(
-        rollouts,
-        batch,
-        device=device,
-        exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
-        use_reachable_targets=use_reachable_targets,
-    )
-
-    for k in effective_ks:
-        best_precision = precision[:k].max(dim=0).values
-        best_recall = recall[:k].max(dim=0).values
-        best_f1 = f1[:k].max(dim=0).values
-
-        metrics[f"max_target_precision_at_{k}"] = mean_over_valid_graphs(
-            best_precision,
-            valid_graph_mask,
-        )
-        metrics[f"max_target_recall_at_{k}"] = mean_over_valid_graphs(
-            best_recall,
-            valid_graph_mask,
-        )
-        metrics[f"max_target_f1_at_{k}"] = mean_over_valid_graphs(
-            best_f1,
-            valid_graph_mask,
-        )
-        metrics[f"nonzero_f1_rate_at_{k}"] = mean_over_valid_graphs(
-            best_f1.gt(0.0).to(dtype=torch.float32),
-            valid_graph_mask,
-        )
-        metrics[f"full_recall_rate_at_{k}"] = full_recall_rate(
-            best_recall,
-            valid_graph_mask,
-        )
-
-    return metrics
-
-
-def compute_sample_retrieval_metrics(
-    rollouts: Sequence[RolloutResult],
-    batch: RetrievalBatch,
-    *,
-    include_compactness: bool = True,
-    include_dangling: bool = False,
-    exclude_anchors_from_retrieved: bool = True,
-    use_reachable_targets: bool = True,
-) -> dict[str, float]:
-    """
-    Metrics for a single sampled rollout distribution.
-
-    This estimates:
-        If one terminal subgraph is sampled from the policy, what is its average
-        target retrieval quality and structural cost?
-    """
-
-    metrics = compute_expected_node_retrieval_quality(
-        rollouts,
-        batch,
-        exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
-        use_reachable_targets=use_reachable_targets,
-    )
-
-    if include_compactness:
-        metrics.update(
-            compute_compactness_expectations(
-                rollouts,
-                batch,
-                include_dangling=include_dangling,
-            )
-        )
-    elif include_dangling:
-        compactness = compute_compactness_expectations(
-            rollouts,
-            batch,
-            include_dangling=True,
-        )
-        metrics["dangling_edge_ratio"] = compactness["dangling_edge_ratio"]
-
-    return metrics
-
-
 def mean_over_valid_graphs(
     values: torch.Tensor,
     valid_graph_mask: torch.Tensor,
@@ -295,16 +140,6 @@ def mean_over_valid_graphs(
         return float(values[:, valid_graph_mask].mean().item())
 
     raise ValueError(f"values must be 1D or 2D, got {tuple(values.shape)}.")
-
-
-def full_recall_rate(
-    recall: torch.Tensor,
-    valid_graph_mask: torch.Tensor,
-) -> float:
-    if recall.numel() == 0 or not bool(valid_graph_mask.any()):
-        return 0.0
-
-    return float(recall[valid_graph_mask].eq(1.0).float().mean().item())
 
 
 def safe_divide(
@@ -342,29 +177,9 @@ def safe_f1(
     )
 
 
-def normalize_ks(
-    ks: Sequence[int],
-    *,
-    max_k: int,
-) -> tuple[int, ...]:
-    if max_k < 1:
-        return tuple(sorted({int(k) for k in ks if int(k) >= 1}))
-
-    normalized = tuple(sorted({int(k) for k in ks if 1 <= int(k) <= max_k}))
-    if not normalized:
-        raise ValueError(f"No valid k in {tuple(ks)} for max_k={max_k}.")
-
-    return normalized
-
-
 __all__ = [
-    "compute_best_of_k_node_retrieval_quality",
-    "compute_expected_node_retrieval_quality",
     "compute_node_retrieval_matrix",
-    "compute_sample_retrieval_metrics",
-    "full_recall_rate",
     "mean_over_valid_graphs",
-    "normalize_ks",
     "safe_divide",
     "safe_f1",
 ]

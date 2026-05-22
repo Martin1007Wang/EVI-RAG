@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from src.data.schema import RetrievalBatch
-from src.weaver.context import GraphContext
+from src.weaver.context import GraphContext, TargetContext
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.state import State
 from src.weaver.transition import (
@@ -16,6 +16,7 @@ from src.weaver.transition import (
     TerminalBatch,
     TrainingBatch,
 )
+from src.weaver.utility import TrueTerminalReward
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,10 +32,19 @@ class ReplayTrajectory:
 @dataclass(frozen=True, slots=True)
 class ReplayBatch:
     trajectories: tuple[ReplayTrajectory, ...]
+    stats: ReplayStats = field(default_factory=lambda: ReplayStats())
 
     @property
     def num_trajectories(self) -> int:
         return len(self.trajectories)
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayStats:
+    eligible_graphs: int = 0
+    skipped_by_reward: int = 0
+    generated_trajectories: int = 0
+    covered_graphs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,21 +102,25 @@ class ReplaySource:
         context: GraphContext,
         rollouts: Sequence[RolloutResult],
         num_trajectories: int,
+        reward_model: TrueTerminalReward | None = None,
+        target_context: TargetContext | None = None,
     ) -> ReplayBatch | None:
-        num_trajectories = int(num_trajectories)
-        if num_trajectories <= 0:
+        trajectories_per_graph = int(num_trajectories)
+        if trajectories_per_graph <= 0:
             return None
 
-        trajectories = replay_trajectories(
+        trajectories, stats = replay_trajectories_with_stats(
             batch=batch,
             context=context,
             rollouts=rollouts,
             budget=self.expand_budget,
-            max_trajectories=num_trajectories,
+            max_trajectories_per_graph=trajectories_per_graph,
+            reward_model=reward_model,
+            target_context=target_context,
         )
         if not trajectories:
-            return None
-        return ReplayBatch(trajectories=tuple(trajectories))
+            return ReplayBatch(trajectories=(), stats=stats)
+        return ReplayBatch(trajectories=tuple(trajectories), stats=stats)
 
 
 class ReplayBuilder:
@@ -213,11 +227,6 @@ def training_from_rollouts(
                 dtype=torch.bool,
             ).nonzero(as_tuple=False).flatten()
             if stop_rows.numel() > 0:
-                hit_continue_steps = rollout_hit_continue_steps(
-                    rollout=rollout,
-                    context=context,
-                    stop_rows=stop_rows,
-                )
                 term_parts.append(
                     TerminalBatch(
                         state=current.select_rows(stop_rows),
@@ -240,7 +249,6 @@ def training_from_rollouts(
                             device=context.device,
                             dtype=torch.bool,
                         ).index_select(0, stop_rows),
-                        hit_continue_steps=hit_continue_steps,
                     )
                 )
 
@@ -271,27 +279,46 @@ def replay_trajectories(
     max_trajectories: int | None = None,
     rollouts: Sequence[RolloutResult] = (),
 ) -> list[ReplayTrajectory]:
-    max_trajectories = None if max_trajectories is None else int(max_trajectories)
-    if max_trajectories is not None and max_trajectories <= 0:
-        return []
+    max_per_graph = None if max_trajectories is None else int(max_trajectories)
+    trajectories, _ = replay_trajectories_with_stats(
+        batch=batch,
+        context=context,
+        budget=budget,
+        max_trajectories_per_graph=max_per_graph,
+        rollouts=rollouts,
+    )
+    return trajectories
+
+
+def replay_trajectories_with_stats(
+    *,
+    batch: RetrievalBatch,
+    context: GraphContext,
+    budget: int,
+    max_trajectories_per_graph: int | None = None,
+    rollouts: Sequence[RolloutResult] = (),
+    reward_model: TrueTerminalReward | None = None,
+    target_context: TargetContext | None = None,
+) -> tuple[list[ReplayTrajectory], ReplayStats]:
+    max_per_graph = None if max_trajectories_per_graph is None else int(max_trajectories_per_graph)
+    if max_per_graph is not None and max_per_graph <= 0:
+        return [], ReplayStats()
 
     targets = batch.reachable_target_node_ids.to(
         device=context.device,
         dtype=torch.long,
     ).view(-1)
     if targets.numel() == 0:
-        return []
+        return [], ReplayStats()
 
     target_graph = context.node_to_graph.index_select(0, targets)
-    eligible_graphs = replay_graph_ids(
+    base_eligible_graphs = replay_graph_ids(
         targets=targets,
         target_graph=target_graph,
         context=context,
-        rollouts=rollouts,
-        budget=int(budget),
     )
-    if not eligible_graphs:
-        return []
+    if not base_eligible_graphs:
+        return [], ReplayStats()
 
     trajectories: list[ReplayTrajectory] = []
     target_views = build_replay_target_views(
@@ -300,33 +327,63 @@ def replay_trajectories(
         targets=targets,
         target_graph=target_graph,
     )
+    rollout_reward = best_rollout_reward_by_graph(
+        rollouts=rollouts,
+        context=context,
+        target_context=target_context,
+        reward_model=reward_model,
+    )
+    skipped_by_reward = 0
 
     for graph_id in range(int(context.num_graphs)):
-        if graph_id not in eligible_graphs:
+        if graph_id not in base_eligible_graphs:
             continue
         graph_target_positions = target_graph.eq(int(graph_id)).nonzero(as_tuple=False).view(-1)
         if graph_target_positions.numel() == 0:
             continue
+        graph_candidates: list[ReplayTrajectory] = []
         for target_pos in graph_target_positions.tolist():
-            edge_path = precomputed_shortest_edge_path(
+            edge_paths = precomputed_shortest_edge_paths(
                 batch=batch,
                 context=context,
                 target_view=target_views[int(target_pos)],
                 budget=int(budget),
+                max_paths=max_per_graph,
             )
-            if not edge_path:
-                continue
-            trajectories.append(
+            graph_candidates.extend(
                 ReplayTrajectory(
                     graph_id=int(graph_id),
                     edge_ids=tuple(int(edge_id) for edge_id in edge_path[: int(budget)]),
                 )
+                for edge_path in edge_paths
             )
+        graph_candidates = dedupe_replay_trajectories(graph_candidates)
+        graph_candidates.sort(key=replay_trajectory_sort_key)
+        if max_per_graph is not None:
+            graph_candidates = graph_candidates[:max_per_graph]
+        if not graph_candidates:
+            continue
+        if reward_model is not None and target_context is not None:
+            best_oracle = best_replay_reward(
+                trajectories=graph_candidates,
+                context=context,
+                target_context=target_context,
+                reward_model=reward_model,
+                budget=int(budget),
+            )
+            best_policy = rollout_reward.get(int(graph_id))
+            if best_policy is not None and best_policy >= best_oracle:
+                skipped_by_reward += 1
+                continue
+        trajectories.extend(graph_candidates)
 
-    if max_trajectories is not None and len(trajectories) > max_trajectories:
-        order = torch.randperm(len(trajectories), device=context.device)[:max_trajectories].cpu()
-        trajectories = [trajectories[int(i)] for i in order.tolist()]
-    return trajectories
+    stats = ReplayStats(
+        eligible_graphs=len(base_eligible_graphs),
+        skipped_by_reward=skipped_by_reward,
+        generated_trajectories=len(trajectories),
+        covered_graphs=len({trajectory.graph_id for trajectory in trajectories}),
+    )
+    return trajectories, stats
 
 
 def training_from_trajectories(
@@ -375,7 +432,6 @@ def training_from_trajectories(
                 source_ids=torch.full((1,), SRC_UNKNOWN, dtype=torch.long, device=graph.device),
             ),
             forced_stop=torch.zeros(1, dtype=torch.bool, device=graph.device),
-            hit_continue_steps=torch.zeros(1, dtype=torch.long, device=graph.device),
         )
         batches.append(
             TrainingBatch(
@@ -395,58 +451,15 @@ def training_from_trajectories(
         )
     return TrainingBatch.concat_reindex_trajectories(batches)
 
-
-def rollout_hit_continue_steps(
-    *,
-    rollout: RolloutResult,
-    context: GraphContext,
-    stop_rows: torch.Tensor,
-) -> torch.Tensor:
-    stop_rows = stop_rows.to(device=context.device, dtype=torch.long).view(-1)
-    if stop_rows.numel() == 0:
-        return torch.empty(0, dtype=torch.long, device=context.device)
-
-    selected = rollout.selected_edge_ids.to(device=context.device, dtype=torch.long)
-    expand = rollout.expand_mask.to(device=context.device, dtype=torch.bool)
-    edge_index = context.edge_index.to(device=context.device, dtype=torch.long)
-
-    active = anchor_mask_for_graph_rows(
-        graph=context,
-        graph_ids=rollout.source_graph_id.to(device=context.device, dtype=torch.long),
-    )
-    target_mask = context.anchor_mask.new_zeros(
-        int(context.num_nodes),
-        dtype=torch.bool,
-        device=context.device,
-    )
-    hit_continue_steps = torch.zeros(
-        int(rollout.source_graph_id.numel()),
-        dtype=torch.long,
-        device=context.device,
-    )
-    target_rows = stop_rows.new_empty((0,))
-    del target_rows
-    return hit_continue_steps.index_select(0, stop_rows)
-
-
 def replay_graph_ids(
     *,
     targets: torch.Tensor,
     target_graph: torch.Tensor,
     context: GraphContext,
-    rollouts: Sequence[RolloutResult],
-    budget: int,
 ) -> set[int]:
-    del budget
+    del targets, context
     graphs_with_targets = {int(x) for x in target_graph.tolist()}
-    if not rollouts:
-        return graphs_with_targets
-    hit_graphs = rollout_hit_graph_ids(
-        rollouts=rollouts,
-        targets=targets,
-        context=context,
-    )
-    return graphs_with_targets - hit_graphs
+    return graphs_with_targets
 
 
 def rollout_hit_graph_ids(
@@ -496,6 +509,115 @@ def rollout_hit_graph_ids(
         for graph_id in graph_ids[has_target].tolist():
             hit_graphs.add(int(graph_id))
     return hit_graphs
+
+
+@torch.no_grad()
+def best_rollout_reward_by_graph(
+    *,
+    rollouts: Sequence[RolloutResult],
+    context: GraphContext,
+    target_context: TargetContext | None,
+    reward_model: TrueTerminalReward | None,
+) -> dict[int, float]:
+    if not rollouts or reward_model is None or target_context is None:
+        return {}
+
+    out: dict[int, float] = {}
+    for rollout in rollouts:
+        state = terminal_state_from_rollout(
+            rollout=rollout,
+            context=context,
+        )
+        if state.num_rows == 0:
+            continue
+        reward = reward_model(
+            state=state,
+            graph_context=context,
+            target_context=target_context,
+        ).log_reward
+        for graph_id, value in zip(state.graph_ids.tolist(), reward.tolist(), strict=True):
+            current = out.get(int(graph_id))
+            value = float(value)
+            if current is None or value > current:
+                out[int(graph_id)] = value
+    return out
+
+
+def terminal_state_from_rollout(
+    *,
+    rollout: RolloutResult,
+    context: GraphContext,
+) -> State:
+    graph_ids = rollout.source_graph_id.to(
+        device=context.device,
+        dtype=torch.long,
+    ).view(-1)
+    state = initial_state_for_graph_ids(
+        context=context,
+        graph_ids=graph_ids,
+    )
+    for step in range(int(rollout.max_steps)):
+        expand_rows = rollout.expand_mask[:, step].to(
+            device=context.device,
+            dtype=torch.bool,
+        ).nonzero(as_tuple=False).flatten()
+        if expand_rows.numel() == 0:
+            continue
+        edge_ids = rollout.selected_edge_ids[:, step].to(
+            device=context.device,
+            dtype=torch.long,
+        ).index_select(0, expand_rows)
+        state = state.expand(
+            graph=context,
+            rows=expand_rows,
+            edge_ids=edge_ids,
+            expand_budget=int(rollout.expand_budget),
+        )
+    return state
+
+
+@torch.no_grad()
+def best_replay_reward(
+    *,
+    trajectories: Sequence[ReplayTrajectory],
+    context: GraphContext,
+    target_context: TargetContext,
+    reward_model: TrueTerminalReward,
+    budget: int,
+) -> float:
+    training = training_from_trajectories(
+        trajectories=trajectories,
+        graph=context,
+        budget=int(budget),
+    )
+    if training.terminals.num_items <= 0:
+        return float("-inf")
+    reward = reward_model(
+        state=training.terminals.state,
+        graph_context=context,
+        target_context=target_context,
+    ).log_reward
+    if reward.numel() == 0:
+        return float("-inf")
+    return float(reward.max().item())
+
+
+def dedupe_replay_trajectories(
+    trajectories: Sequence[ReplayTrajectory],
+) -> list[ReplayTrajectory]:
+    seen: set[tuple[int, tuple[int, ...]]] = set()
+    out: list[ReplayTrajectory] = []
+    for trajectory in trajectories:
+        key = (int(trajectory.graph_id), tuple(int(edge_id) for edge_id in trajectory.edge_ids))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(trajectory)
+    return out
+
+
+def replay_trajectory_sort_key(trajectory: ReplayTrajectory) -> tuple[int, tuple[int, ...]]:
+    return len(trajectory.edge_ids), tuple(trajectory.edge_ids)
 
 
 def initial_state_for_graph_ids(
@@ -792,6 +914,72 @@ def precomputed_shortest_edge_path(
     return path if current == target_node_id else []
 
 
+def precomputed_shortest_edge_paths(
+    *,
+    batch: RetrievalBatch,
+    context: GraphContext,
+    target_view: ReplayTargetView,
+    budget: int,
+    max_paths: int | None,
+) -> list[list[int]]:
+    del batch
+    graph_id = int(target_view.graph_id)
+    target_node_id = int(target_view.target_node_id)
+    limit = max(1, int(max_paths) if max_paths is not None else int(budget))
+
+    anchors = context.anchor_mask.nonzero(as_tuple=True)[0]
+    anchor_graph = context.node_to_graph.index_select(0, anchors)
+    graph_anchors = anchors[anchor_graph.eq(graph_id)]
+    if graph_anchors.numel() == 0:
+        return []
+
+    anchor_distances = target_view.node_distances_for(graph_anchors)
+    anchor_order = torch.argsort(anchor_distances)
+    paths: list[list[int]] = []
+    beam: list[tuple[int, list[int]]] = []
+    for anchor in graph_anchors.index_select(0, anchor_order).tolist():
+        distance = target_view.node_distance(int(anchor))
+        if distance < 0 or distance > int(budget):
+            continue
+        beam.append((int(anchor), []))
+
+    for _ in range(int(budget) + 1):
+        next_beam: list[tuple[int, list[int]]] = []
+        for current, path in beam:
+            if current == target_node_id:
+                paths.append(path)
+                continue
+            if len(path) >= int(budget):
+                continue
+            current_dist = target_view.node_distance(current)
+            for edge_id in ranked_next_edges(
+                context=context,
+                target_view=target_view,
+                current_node_id=current,
+                current_distance=current_dist,
+            ):
+                dst_id = int(context.edge_index[1, edge_id].item())
+                next_beam.append((dst_id, [*path, int(edge_id)]))
+        if len(paths) >= limit:
+            break
+        if not next_beam:
+            break
+        next_beam.sort(key=lambda item: (len(item[1]), item[1]))
+        beam = next_beam[: max(limit * 4, limit)]
+
+    deduped: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for path in paths:
+        key = tuple(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
 def choose_best_anchor(
     *,
     anchors: torch.Tensor,
@@ -829,14 +1017,47 @@ def choose_next_edge(
     return int(valid_edges[best_pos].item())
 
 
+def ranked_next_edges(
+    *,
+    context: GraphContext,
+    target_view: ReplayTargetView,
+    current_node_id: int,
+    current_distance: int,
+) -> list[int]:
+    out_start = int(context.adjacency.out_ptr[current_node_id].item())
+    out_end = int(context.adjacency.out_ptr[current_node_id + 1].item())
+    if out_end <= out_start:
+        return []
+
+    edge_ids = context.edge_ids_by_src[out_start:out_end]
+    dst_ids = context.edge_index[1].index_select(0, edge_ids)
+    dst_dist = target_view.node_distances_for(dst_ids)
+    edge_counts = target_view.edge_counts_for(edge_ids)
+
+    valid = dst_dist.eq(current_distance - 1) & edge_counts.gt(0)
+    if not bool(valid.any()):
+        return []
+
+    valid_edges = edge_ids[valid]
+    valid_counts = edge_counts[valid]
+    order = sorted(
+        range(int(valid_edges.numel())),
+        key=lambda idx: (-float(valid_counts[idx].item()), int(valid_edges[idx].item())),
+    )
+    return [int(valid_edges[idx].item()) for idx in order]
+
+
 __all__ = [
     "ReplayBatch",
     "ReplayBuilder",
+    "ReplayStats",
     "ReplayTrajectory",
     "ReplaySampleBudget",
     "ReplaySource",
     "ReplayTargetView",
+    "precomputed_shortest_edge_paths",
     "replay_trajectories",
+    "replay_trajectories_with_stats",
     "replay_graph_ids",
     "rollout_hit_graph_ids",
     "training_from_trajectories",

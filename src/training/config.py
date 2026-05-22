@@ -92,24 +92,6 @@ class RolloutRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class SamplingRuntimeConfig:
-    train_temperature: float
-    eval_temperature: float
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "train_temperature",
-            positive_float(self.train_temperature, "train_temperature"),
-        )
-        object.__setattr__(
-            self,
-            "eval_temperature",
-            positive_float(self.eval_temperature, "eval_temperature"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class RewardRuntimeConfig:
     tau: float
     full_support_bonus: float
@@ -173,23 +155,12 @@ class LossRuntimeConfig:
 class EvalRuntimeConfig:
     exclude_anchors_from_retrieved: bool
     use_reachable_targets: bool
-    k_windows: tuple[int, ...] | list[int] | None = None
-    best_of_k: int | None = None
+    k_windows: tuple[int, ...] | list[int] = (1, 2, 4, 8)
 
     def __post_init__(self) -> None:
-        if self.k_windows is None:
-            if self.best_of_k is None:
-                k_windows = (1, 2, 4, 8, 16)
-            else:
-                best_of_k = positive_int(self.best_of_k, "best_of_k")
-                values = [1]
-                while values[-1] < best_of_k:
-                    values.append(values[-1] * 2)
-                k_windows = tuple(x for x in values if x <= best_of_k)
-        else:
-            k_windows = tuple(positive_int(k, "k_windows") for k in self.k_windows)
-            if not k_windows:
-                raise ValueError("k_windows must not be empty.")
+        k_windows = tuple(positive_int(k, "k_windows") for k in self.k_windows)
+        if not k_windows:
+            raise ValueError("k_windows must not be empty.")
         object.__setattr__(
             self,
             "k_windows",
@@ -698,7 +669,6 @@ __all__ = [
     "OptimizerRuntimeConfig",
     "RewardRuntimeConfig",
     "RolloutRuntimeConfig",
-    "SamplingRuntimeConfig",
     "SchedulerRuntimeConfig",
     "TrainingDataConfig",
     "TrainingRuntimeConfig",

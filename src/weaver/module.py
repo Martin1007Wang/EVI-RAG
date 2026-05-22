@@ -22,7 +22,7 @@ from src.weaver.objectives import SubTBLoss, build_subtb_input, single_step_bran
 from src.weaver.policy import ForwardPolicy, PolicyOutput, UniformValidPredecessorBackwardPolicy
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.rollout.runner import RolloutBatch, RolloutRunner
-from src.weaver.state import State
+from src.weaver.state import Frontier, State
 from src.weaver.transition import TrainingBatch
 from src.weaver.utility import TrueTerminalReward
 
@@ -48,8 +48,6 @@ class WeaverModule(LightningModule):
         runner: RolloutRunner,
         optimization: OptimizationRuntimeConfig,
         evaluation: EvalRuntimeConfig,
-        train_temperature: float = 1.0,
-        eval_temperature: float = 1.0,
         gradient_clip_val: float | None = None,
         gradient_clip_algorithm: str = "norm",
     ) -> None:
@@ -67,8 +65,6 @@ class WeaverModule(LightningModule):
         self.optimization = optimization
         self.evaluation = evaluation
 
-        self.train_temperature = float(train_temperature)
-        self.eval_temperature = float(eval_temperature)
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
 
@@ -82,8 +78,6 @@ class WeaverModule(LightningModule):
 
         self.save_hyperparameters(
             {
-                "train_temperature": self.train_temperature,
-                "eval_temperature": self.eval_temperature,
                 "gradient_clip_val": self.gradient_clip_val,
                 "gradient_clip_algorithm": self.gradient_clip_algorithm,
             }
@@ -176,17 +170,29 @@ class WeaverModule(LightningModule):
         rollout = self.sample_train_rollout(
             batch=batch,
             graph=graph,
+            target=target,
             features=policy_features,
         )
+        rollout_entropy = rollout_action_entropy(rollout.rollouts)
         training = rollout.training
         if training is None or training.num_items <= 0:
             raise RuntimeError("No transition samples were produced.")
 
-        return self.policy_step_output(
+        output = self.policy_step_output(
             graph=graph,
             target=target,
             policy_features=policy_features,
             training=training,
+        )
+        return StepOutput(
+            loss=output.loss,
+            metrics={
+                **output.metrics,
+                "rollout_action_entropy": rollout_entropy.detach(),
+                **rollout_replay_metrics(rollout, policy_features.query_model),
+            },
+            expansion_branch_loss=output.expansion_branch_loss,
+            terminal_branch_loss=output.terminal_branch_loss,
         )
 
     def policy_step_output(
@@ -203,7 +209,7 @@ class WeaverModule(LightningModule):
             zero = policy_features.query_model.new_zeros(())
             return StepOutput(
                 loss=zero,
-                metrics={"loss/subtb": zero.detach()},
+                metrics={},
                 expansion_branch_loss=zero,
                 terminal_branch_loss=zero,
             )
@@ -225,6 +231,7 @@ class WeaverModule(LightningModule):
                 context=graph,
                 frontier=parent_frontier,
             )
+            # Child flow must come from an explicit child-state forward pass.
             child_out = self.policy(
                 features=policy_features,
                 state=expansions.child,
@@ -305,6 +312,7 @@ class WeaverModule(LightningModule):
         *,
         batch: RetrievalBatch,
         graph: GraphContext,
+        target: TargetContext,
         features: EncodedFeatures,
     ) -> RolloutBatch:
         with torch.no_grad():
@@ -313,7 +321,8 @@ class WeaverModule(LightningModule):
                 batch=batch,
                 context=graph,
                 features=features,
-                temperature=self.train_temperature,
+                reward_model=self.reward_model,
+                target_context=target,
             )
 
     def validation_step(
@@ -346,7 +355,6 @@ class WeaverModule(LightningModule):
                 policy=self.policy,
                 context=graph,
                 features=features,
-                temperature=self.eval_temperature,
             )
 
     def eval_step(
@@ -366,7 +374,6 @@ class WeaverModule(LightningModule):
                 policy=self.policy,
                 context=graph,
                 features=features,
-                temperature=self.eval_temperature,
             )
             metrics = self.metric_suite.eval_metrics(
                 rollout_samples=rollouts,
@@ -376,6 +383,7 @@ class WeaverModule(LightningModule):
                 features=features,
                 reward_model=self.reward_model,
                 target_context=target,
+                policy=self.policy,
             )
 
         batch_n = graph_batch_size(batch)
@@ -449,6 +457,8 @@ class WeaverModule(LightningModule):
         batch_size: int,
         prog_bar: bool = False,
     ) -> None:
+        if name.count("/") >= 3:
+            raise ValueError(f"Metric name must have at most three slash-separated levels: {name}")
         log_value = value.detach() if isinstance(value, torch.Tensor) else float(value)
         self.log(
             name,
@@ -506,10 +516,12 @@ def empty_policy_output(
 ) -> PolicyOutput:
     return PolicyOutput(
         stop_logit=torch.empty(0, dtype=dtype, device=device),
+        log_flow=torch.empty(0, dtype=dtype, device=device),
         edge_logit=torch.empty(0, dtype=dtype, device=device),
-        state_log_flow=torch.empty(0, dtype=dtype, device=device),
-        edge_row_ids=torch.empty(0, dtype=torch.long, device=device),
-        edge_ids=torch.empty(0, dtype=torch.long, device=device),
+        frontier=Frontier(
+            row_ids=torch.empty(0, dtype=torch.long, device=device),
+            edge_ids=torch.empty(0, dtype=torch.long, device=device),
+        ),
         num_rows=0,
         num_edges=int(num_edges),
     )
@@ -582,19 +594,19 @@ def policy_diagnostic_metrics(
     has_frontier = frontier_size.gt(0)
 
     metrics: dict[str, torch.Tensor] = {
-        "policy/continue_prob_mean": masked_mean_or_zero(continue_prob, has_frontier).detach(),
-        "policy/edge_cond_entropy_mean": masked_mean_or_zero(edge_cond_entropy, has_frontier).detach(),
-        "policy/frontier_size_mean": mean_or_zero(frontier_size).detach(),
-        "policy/frontier_size_p90": quantile_or_zero(frontier_size, 0.90).detach(),
-        "policy/frontier_size_p99": quantile_or_zero(frontier_size, 0.99).detach(),
+        "policy_continue_prob_mean": masked_mean_or_zero(continue_prob, has_frontier).detach(),
+        "policy_edge_cond_entropy_mean": masked_mean_or_zero(edge_cond_entropy, has_frontier).detach(),
+        "policy_frontier_size_mean": mean_or_zero(frontier_size).detach(),
+        "policy_frontier_size_p90": quantile_or_zero(frontier_size, 0.90).detach(),
+        "policy_frontier_size_p99": quantile_or_zero(frontier_size, 0.99).detach(),
     }
     for bucket in range(4):
         mask = depth.eq(bucket)
-        metrics[f"policy/stop_logit/depth{bucket}_mean"] = masked_mean_or_zero(
+        metrics[f"policy_stop_logit_depth{bucket}_mean"] = masked_mean_or_zero(
             stop_logit,
             mask,
         ).detach()
-        metrics[f"policy/stop_prob/depth{bucket}_mean"] = masked_mean_or_zero(
+        metrics[f"policy_stop_prob_depth{bucket}_mean"] = masked_mean_or_zero(
             stop_prob,
             mask,
         ).detach()
@@ -627,9 +639,9 @@ def stop_branch_gradient_metrics(
         terminal_grad.new_zeros(()),
     )
     return {
-        "grad/stop_head/from_terminal_loss": terminal_norm.detach(),
-        "grad/stop_head/from_expansion_loss": expansion_norm.detach(),
-        "grad/stop_head/terminal_expansion_cosine": cosine.detach(),
+        "grad_stop_head_from_terminal_loss": terminal_norm.detach(),
+        "grad_stop_head_from_expansion_loss": expansion_norm.detach(),
+        "grad_stop_head_terminal_expansion_cosine": cosine.detach(),
     }
 
 
@@ -659,9 +671,10 @@ def gradient_vector(
 def gradient_norm_metrics(policy: ForwardPolicy) -> dict[str, torch.Tensor]:
     reference = next(policy.parameters())
     return {
-        "grad/stop_head_norm": module_grad_norm(policy.stop_head, reference).detach(),
-        "grad/edge_head_norm": module_grad_norm(policy.edge_head, reference).detach(),
-        "grad/state_encoder_norm": module_grad_norm(policy.state_encoder, reference).detach(),
+        "grad_stop_head_norm": module_grad_norm(policy.stop_head, reference).detach(),
+        "grad_flow_head_norm": module_grad_norm(policy.flow_head, reference).detach(),
+        "grad_edge_head_norm": module_grad_norm(policy.edge_head, reference).detach(),
+        "grad_state_encoder_norm": module_grad_norm(policy.state_encoder, reference).detach(),
     }
 
 
@@ -704,6 +717,48 @@ def graph_batch_size(
     batch: RetrievalBatch,
 ) -> int:
     return int(batch.num_graphs_total)
+
+
+def rollout_action_entropy(
+    rollouts: tuple[RolloutResult, ...],
+) -> torch.Tensor:
+    if not rollouts:
+        return torch.zeros((), dtype=torch.float32)
+    values = torch.cat(
+        [
+            rollout.policy_action_log_prob[rollout.valid_mask].reshape(-1)
+            for rollout in rollouts
+        ],
+        dim=0,
+    )
+    if values.numel() == 0:
+        return torch.zeros((), dtype=torch.float32, device=rollouts[0].device)
+    return (-values.float()).mean()
+
+
+def rollout_replay_metrics(
+    rollout: RolloutBatch,
+    reference: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    replay = rollout.replay
+    if replay is None:
+        return {
+            "replay_eligible_graphs": reference.new_zeros(()).detach(),
+            "replay_skipped_by_reward": reference.new_zeros(()).detach(),
+            "replay_generated_trajectories": reference.new_zeros(()).detach(),
+            "replay_covered_graphs": reference.new_zeros(()).detach(),
+            "replay_expansion_transitions": reference.new_zeros(()).detach(),
+            "replay_terminal_transitions": reference.new_zeros(()).detach(),
+        }
+    stats = replay.stats
+    return {
+        "replay_eligible_graphs": reference.new_tensor(float(stats.eligible_graphs)).detach(),
+        "replay_skipped_by_reward": reference.new_tensor(float(stats.skipped_by_reward)).detach(),
+        "replay_generated_trajectories": reference.new_tensor(float(stats.generated_trajectories)).detach(),
+        "replay_covered_graphs": reference.new_tensor(float(stats.covered_graphs)).detach(),
+        "replay_expansion_transitions": reference.new_tensor(float(rollout.num_replay_transitions)).detach(),
+        "replay_terminal_transitions": reference.new_tensor(float(rollout.num_replay_terminal_transitions)).detach(),
+    }
 
 
 __all__ = [

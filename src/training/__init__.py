@@ -9,7 +9,6 @@ from .config import (
     OptimizerRuntimeConfig,
     RewardRuntimeConfig,
     RolloutRuntimeConfig,
-    SamplingRuntimeConfig,
     SchedulerRuntimeConfig,
     TrainingDataConfig,
     TrainingRuntimeConfig,
@@ -17,8 +16,6 @@ from .config import (
     validate_model_resources,
 )
 from .factory import build_datamodule, build_model, build_trainer
-from .schedule import TemperatureSchedule
-
 __all__ = [
     "build_training_data_config",
     "build_datamodule",
@@ -32,9 +29,7 @@ __all__ = [
     "OptimizerRuntimeConfig",
     "RewardRuntimeConfig",
     "RolloutRuntimeConfig",
-    "SamplingRuntimeConfig",
     "SchedulerRuntimeConfig",
-    "TemperatureSchedule",
     "TrainingDataConfig",
     "TrainingRuntimeConfig",
     "validate_model_resources",

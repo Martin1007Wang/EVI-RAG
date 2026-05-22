@@ -27,7 +27,6 @@ class RolloutEngine:
         context: GraphContext,
         features: EncodedFeatures,
         num_rollouts: int,
-        temperature: float = 1.0,
     ) -> list[RolloutResult]:
         with torch.no_grad():
             fused = self.sample_fused_rollouts(
@@ -35,7 +34,6 @@ class RolloutEngine:
                 context=context,
                 features=features,
                 rollouts_per_graph=int(num_rollouts),
-                temperature=float(temperature),
             )
 
         return split_fused_rollouts(
@@ -51,7 +49,6 @@ class RolloutEngine:
         context: GraphContext,
         features: EncodedFeatures,
         rollouts_per_graph: int,
-        temperature: float = 1.0,
     ) -> RolloutResult:
         graph_ids = torch.arange(
             int(context.num_graphs),
@@ -100,7 +97,6 @@ class RolloutEngine:
                     sample_step(
                         policy_out=policy_out,
                         rows=sample_rows,
-                        temperature=float(temperature),
                     )
                 )
             if forced_local.numel() > 0:

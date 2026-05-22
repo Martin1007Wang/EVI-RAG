@@ -13,11 +13,6 @@ from src.weaver.utility import RewardOutput, TrueTerminalReward
 
 TerminalRewardModel = TrueTerminalReward
 
-
-def state_minus_action_lse(policy_out: PolicyOutput) -> torch.Tensor:
-    return policy_out.log_flow() - policy_out.state_log_flow.float()
-
-
 def stop_expand_margin(policy_out: PolicyOutput) -> torch.Tensor:
     num_rows = int(policy_out.num_rows)
     margin = torch.full_like(policy_out.stop_logit.float(), torch.inf)
@@ -127,7 +122,7 @@ def stop_probability_by_depth(
     stop_probability = stop_log_prob.float().exp()
     for depth in torch.unique(step_ids, sorted=True).tolist():
         mask = step_ids.eq(int(depth))
-        metrics[f"policy/stop_prob_by_depth/{int(depth)}"] = masked_mean_or_zero(
+        metrics[f"policy_stop_prob_depth{int(depth)}"] = masked_mean_or_zero(
             stop_probability,
             mask,
         ).detach()
@@ -148,7 +143,7 @@ def stop_expand_margin_by_depth(
     finite = torch.isfinite(margin)
     for depth in torch.unique(step_ids, sorted=True).tolist():
         mask = step_ids.eq(int(depth)) & finite
-        metrics[f"policy/stop_expand_margin_by_depth/{int(depth)}"] = masked_mean_or_zero(
+        metrics[f"policy_stop_expand_margin_depth{int(depth)}"] = masked_mean_or_zero(
             margin,
             mask,
         ).detach()
@@ -169,10 +164,10 @@ def rollout_metrics(
     forced = torch.zeros_like(stop)
 
     return {
-        "rollout/stop_rate": masked_fraction(stop, policy).detach(),
-        "rollout/structural_stop_rate": masked_fraction(structural, stop).detach(),
-        "rollout/forced_stop_rate": masked_fraction(forced, stop).detach(),
-        "rollout/mean_stop_depth": masked_mean_or_zero(step_ids.float(), stop).detach(),
+        "rollout_stop_rate": masked_fraction(stop, policy).detach(),
+        "rollout_structural_stop_rate": masked_fraction(structural, stop).detach(),
+        "rollout_forced_stop_rate": masked_fraction(forced, stop).detach(),
+        "rollout_mean_stop_depth": masked_mean_or_zero(step_ids.float(), stop).detach(),
     }
 
 
@@ -193,7 +188,6 @@ def source_rollout_metrics(
     )
     return {
         **metrics,
-        "rollout/mean_depth": metrics["rollout/mean_stop_depth"],
     }
 
 
@@ -217,11 +211,11 @@ def summarize_policy_diagnostics(
     policy_out: PolicyOutput,
 ) -> dict[str, torch.Tensor]:
     return {
-        "policy/stop_log_prob_mean": policy_out.stop_log_prob().float().mean().detach(),
-        "policy/action_log_prob_mean": policy_out.action_log_prob().float().mean().detach(),
-        "policy/stop_prob_mean": policy_out.stop_prob().mean().detach(),
-        "policy/edge_prob_mass_mean": policy_out.edge_prob_mass().mean().detach(),
-        "policy/stop_expand_margin_mean": policy_stop_expand_margin_mean(policy_out).detach(),
+        "policy_stop_log_prob_mean": policy_out.stop_log_prob.float().mean().detach(),
+        "policy_action_log_prob_mean": policy_out.action_log_prob().float().mean().detach(),
+        "policy_stop_prob_mean": policy_out.stop_prob().mean().detach(),
+        "policy_edge_prob_mass_mean": policy_out.edge_prob_mass().mean().detach(),
+        "policy_stop_expand_margin_mean": policy_stop_expand_margin_mean(policy_out).detach(),
     }
 
 

@@ -122,20 +122,18 @@ class SubTBLoss(nn.Module):
         terminal = terms.terminal
         nonterminal = ~terminal
         metrics = {
-            "loss/main": loss.detach(),
-            "loss/subtb": loss.detach(),
-            "subtb/residual_mean": mean_or_zero(terms.residual).detach(),
-            "subtb/residual_abs_mean": mean_or_zero(terms.residual.abs()).detach(),
-            "subtb/terminal_residual_mean": masked_mean_or_zero(terms.residual, terminal).detach(),
-            "subtb/nonterminal_residual_mean": masked_mean_or_zero(terms.residual, nonterminal).detach(),
-            "subtb/num_segments": terms.residual.new_tensor(float(terms.residual.numel())).detach(),
-            "subtb/length_mean": mean_or_zero(terms.length.float()).detach(),
-            "subtb/terminal_fraction": masked_fraction(
+            "subtb_residual_mean": mean_or_zero(terms.residual).detach(),
+            "subtb_residual_abs_mean": mean_or_zero(terms.residual.abs()).detach(),
+            "subtb_terminal_residual_mean": masked_mean_or_zero(terms.residual, terminal).detach(),
+            "subtb_nonterminal_residual_mean": masked_mean_or_zero(terms.residual, nonterminal).detach(),
+            "subtb_num_segments": terms.residual.new_tensor(float(terms.residual.numel())).detach(),
+            "subtb_length_mean": mean_or_zero(terms.length.float()).detach(),
+            "subtb_terminal_fraction": masked_fraction(
                 terminal,
                 torch.ones_like(terminal, dtype=torch.bool),
             ).detach(),
-            "subtb/lambda": terms.residual.new_tensor(float(self.subtb_lambda)).detach(),
-            "source/policy_num_segments": terms.residual.new_tensor(
+            "subtb_lambda": terms.residual.new_tensor(float(self.subtb_lambda)).detach(),
+            "source_policy_num_segments": terms.residual.new_tensor(
                 float(
                     (
                         terms.source_ids.eq(SRC_POLICY)
@@ -143,7 +141,7 @@ class SubTBLoss(nn.Module):
                     ).sum().item()
                 )
             ).detach(),
-            "source/replay_num_segments": terms.residual.new_tensor(
+            "source_replay_num_segments": terms.residual.new_tensor(
                 float(terms.source_ids.eq(SRC_REPLAY).sum().item())
             ).detach(),
         }
@@ -175,8 +173,8 @@ def build_subtb_input(
         dtype=torch.long,
         device=expansions.device,
     )
-    expansion_parent_log_flow = parent_out.log_flow()
-    expansion_child_log_flow = child_out.log_flow()
+    expansion_parent_log_flow = parent_out.log_flow.float()
+    expansion_child_log_flow = child_out.log_flow.float()
     expansion_continue_log_prob = parent_out.gather_continue_log_prob(
         row_ids=expansion_rows,
     ).float()
@@ -196,9 +194,9 @@ def build_subtb_input(
         device=expansions.device,
     )
 
-    terminal_parent_log_flow = terminal_out.log_flow()
+    terminal_parent_log_flow = terminal_out.log_flow.float()
     terminal_child_log_flow = terminal_parent_log_flow.new_zeros(terminals.num_items)
-    terminal_action_log_prob = terminal_out.stop_log_prob().float()
+    terminal_action_log_prob = terminal_out.stop_log_prob.float()
     terminal_continue_log_prob = terminal_parent_log_flow.new_zeros(terminals.num_items)
     terminal_edge_cond_log_prob = terminal_parent_log_flow.new_zeros(terminals.num_items)
     terminal_stop_log_prob = terminal_action_log_prob
@@ -336,6 +334,8 @@ def expansion_event_residual(events: SubTBEventBatch) -> torch.Tensor:
 
 
 def stop_event_residual(events: SubTBEventBatch) -> torch.Tensor:
+    # terminal transition does not accumulate backward_log_prob.
+    # Equivalently, we fix P_B(STOP) = 1.
     return events.parent_log_flow + events.stop_log_prob - events.terminal_log_reward
 
 
@@ -347,18 +347,18 @@ def branch_decomposition_metrics(x: SubTBInput) -> dict[str, torch.Tensor]:
     stop_residual = stop_event_residual(events)
 
     return {
-        "subtb/exp/parent_log_flow_mean": masked_mean_or_zero(events.parent_log_flow, exp).detach(),
-        "subtb/exp/child_log_flow_mean": masked_mean_or_zero(events.child_log_flow, exp).detach(),
-        "subtb/exp/continue_log_prob_mean": masked_mean_or_zero(events.continue_log_prob, exp).detach(),
-        "subtb/exp/edge_cond_log_prob_mean": masked_mean_or_zero(events.edge_cond_log_prob, exp).detach(),
-        "subtb/exp/backward_log_prob_mean": masked_mean_or_zero(events.backward_log_prob, exp).detach(),
-        "subtb/exp/residual_mean": masked_mean_or_zero(exp_residual, exp).detach(),
-        "subtb/exp/residual_abs_mean": masked_mean_or_zero(exp_residual.abs(), exp).detach(),
-        "subtb/stop/parent_log_flow_mean": masked_mean_or_zero(events.parent_log_flow, stop).detach(),
-        "subtb/stop/stop_log_prob_mean": masked_mean_or_zero(events.stop_log_prob, stop).detach(),
-        "subtb/stop/log_reward_mean": masked_mean_or_zero(events.terminal_log_reward, stop).detach(),
-        "subtb/stop/residual_mean": masked_mean_or_zero(stop_residual, stop).detach(),
-        "subtb/stop/residual_abs_mean": masked_mean_or_zero(stop_residual.abs(), stop).detach(),
+        "subtb_exp_parent_log_flow_mean": masked_mean_or_zero(events.parent_log_flow, exp).detach(),
+        "subtb_exp_child_log_flow_mean": masked_mean_or_zero(events.child_log_flow, exp).detach(),
+        "subtb_exp_continue_log_prob_mean": masked_mean_or_zero(events.continue_log_prob, exp).detach(),
+        "subtb_exp_edge_cond_log_prob_mean": masked_mean_or_zero(events.edge_cond_log_prob, exp).detach(),
+        "subtb_exp_backward_log_prob_mean": masked_mean_or_zero(events.backward_log_prob, exp).detach(),
+        "subtb_exp_residual_mean": masked_mean_or_zero(exp_residual, exp).detach(),
+        "subtb_exp_residual_abs_mean": masked_mean_or_zero(exp_residual.abs(), exp).detach(),
+        "subtb_stop_parent_log_flow_mean": masked_mean_or_zero(events.parent_log_flow, stop).detach(),
+        "subtb_stop_stop_log_prob_mean": masked_mean_or_zero(events.stop_log_prob, stop).detach(),
+        "subtb_stop_log_reward_mean": masked_mean_or_zero(events.terminal_log_reward, stop).detach(),
+        "subtb_stop_residual_mean": masked_mean_or_zero(stop_residual, stop).detach(),
+        "subtb_stop_residual_abs_mean": masked_mean_or_zero(stop_residual.abs(), stop).detach(),
     }
 
 
@@ -372,12 +372,12 @@ def source_subtb_metrics(
     policy_loss = weighted_mean_or_zero(units, terms.weight, policy)
     replay_loss = weighted_mean_or_zero(units, terms.weight, replay)
     return {
-        "subtb/policy/residual_abs_mean": masked_mean_or_zero(terms.residual.abs(), policy).detach(),
-        "subtb/replay/residual_abs_mean": masked_mean_or_zero(terms.residual.abs(), replay).detach(),
-        "subtb/policy/terminal_fraction": masked_fraction(terms.terminal & policy, policy).detach(),
-        "subtb/replay/terminal_fraction": masked_fraction(terms.terminal & replay, replay).detach(),
-        "subtb/policy/loss": policy_loss.detach(),
-        "subtb/replay/loss": replay_loss.detach(),
+        "subtb_policy_residual_abs_mean": masked_mean_or_zero(terms.residual.abs(), policy).detach(),
+        "subtb_replay_residual_abs_mean": masked_mean_or_zero(terms.residual.abs(), replay).detach(),
+        "subtb_policy_terminal_fraction": masked_fraction(terms.terminal & policy, policy).detach(),
+        "subtb_replay_terminal_fraction": masked_fraction(terms.terminal & replay, replay).detach(),
+        "subtb_policy_loss": policy_loss.detach(),
+        "subtb_replay_loss": replay_loss.detach(),
     }
 
 

@@ -21,11 +21,9 @@ policy:
 
 reward_model:
   _target_: src.weaver.utility.TrueTerminalReward
-  epsilon: 1.0e-6
-  answer_weight: 1.0
   edge_cost: 0.05
   fail_cost: 1.0
-  log_reward_scale: 5.0
+  reward_temperature: 1.0
 
 policy_objective:
   _target_: src.weaver.objectives.SubTBLoss
@@ -74,12 +72,9 @@ optimization:
 
 evaluation:
   _target_: src.training.config.EvalRuntimeConfig
-  k_windows: [1, 2, 4, 8, 16]
+  k_windows: [1, 2, 4, 8]
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
-
-train_temperature: 1.0
-eval_temperature: ${model.train_temperature}
 
 gradient_clip_val: 1.0
 gradient_clip_algorithm: norm

@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from src.data.schema import RetrievalBatch
     from src.weaver.context import GraphContext, TargetContext
     from src.weaver.nn.feature_encoder import EncodedFeatures
+    from src.weaver.policy import ForwardPolicy
     from src.weaver.rollout.result import RolloutResult
     from src.weaver.utility import TrueTerminalReward
 
@@ -23,22 +24,10 @@ class WeaverMetricSuite:
     def __init__(
         self,
         *,
-        k_windows: Sequence[int] | None = None,
-        best_of_k: int | None = None,
+        k_windows: Sequence[int],
         exclude_anchors_from_retrieved: bool,
         use_reachable_targets: bool,
     ) -> None:
-        if k_windows is None:
-            if best_of_k is None:
-                k_windows = (1, 2, 4, 8, 16)
-            else:
-                k = int(best_of_k)
-                if k < 1:
-                    raise ValueError(f"best_of_k must be positive, got {k}.")
-                values = [1]
-                while values[-1] < k:
-                    values.append(values[-1] * 2)
-                k_windows = tuple(x for x in values if x <= k)
         self.k_windows = tuple(int(k) for k in k_windows)
         if not self.k_windows or any(k < 1 for k in self.k_windows):
             raise ValueError(f"k_windows must contain positive integers, got {self.k_windows}.")
@@ -55,6 +44,7 @@ class WeaverMetricSuite:
         features: EncodedFeatures | None = None,
         reward_model: TrueTerminalReward | None = None,
         target_context: TargetContext | None = None,
+        policy: ForwardPolicy | None = None,
     ) -> dict[str, float]:
         metrics = evaluate_rollout_samples(
             rollout_samples=rollout_samples,
@@ -66,6 +56,7 @@ class WeaverMetricSuite:
             features=features,
             reward_model=reward_model,
             target_context=target_context,
+            policy=policy,
         )
 
         if not stage:

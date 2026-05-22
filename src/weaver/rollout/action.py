@@ -125,11 +125,7 @@ def sample_step(
     *,
     policy_out: PolicyOutput,
     rows: torch.Tensor,
-    temperature: float = 1.0,
 ) -> StepAction:
-    if temperature <= 0.0:
-        raise ValueError(f"temperature must be positive, got {temperature}.")
-
     rows = rows.to(
         device=policy_out.stop_logit.device,
         dtype=torch.long,
@@ -145,23 +141,16 @@ def sample_step(
 
     picked_edge_ids = policy_out.sample(
         rows=rows,
-        temperature=float(temperature),
     )
     policy_log_prob = policy_out.gather_log_prob(
         row_ids=rows,
         edge_ids=picked_edge_ids,
-        temperature=1.0,
-    ).float()
-    behavior_log_prob = policy_out.gather_log_prob(
-        row_ids=rows,
-        edge_ids=picked_edge_ids,
-        temperature=float(temperature),
     ).float()
     return StepAction(
         row_ids=rows,
         edge_ids=picked_edge_ids,
         policy_log_prob=policy_log_prob,
-        behavior_log_prob=behavior_log_prob,
+        behavior_log_prob=policy_log_prob,
         forced=torch.zeros(rows.numel(), dtype=torch.bool, device=rows.device),
     )
 

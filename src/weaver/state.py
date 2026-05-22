@@ -86,6 +86,48 @@ class State:
             step=step,
         )
 
+    @classmethod
+    def from_selected_edges(
+        cls,
+        *,
+        graph: GraphContext,
+        graph_ids: torch.Tensor,
+        selected_edge_mask: torch.Tensor,
+    ) -> State:
+        graph_ids = graph_ids.to(device=graph.device, dtype=torch.long).view(-1)
+        selected_edge_mask = selected_edge_mask.to(device=graph.device, dtype=torch.bool)
+        if selected_edge_mask.ndim != 2:
+            raise ValueError(f"selected_edge_mask must have shape [R, E], got {tuple(selected_edge_mask.shape)}.")
+        if int(selected_edge_mask.size(0)) != int(graph_ids.numel()):
+            raise ValueError("selected_edge_mask rows must match graph_ids length.")
+        if int(selected_edge_mask.size(1)) != int(graph.num_edges):
+            raise ValueError(
+                "selected_edge_mask edge dimension must match graph.num_edges: "
+                f"{int(selected_edge_mask.size(1))} != {int(graph.num_edges)}."
+            )
+
+        active_node_mask = anchor_mask_for_graph_rows(
+            graph=graph,
+            graph_ids=graph_ids,
+        )
+        rows, edge_ids = selected_edge_mask.nonzero(as_tuple=True)
+        if edge_ids.numel() > 0:
+            edge_graph_ids = graph.edge_to_graph.index_select(0, edge_ids)
+            row_graph_ids = graph_ids.index_select(0, rows)
+            if not bool(edge_graph_ids.eq(row_graph_ids).all()):
+                raise ValueError("selected_edge_mask contains edges outside their row graph.")
+            src_node_ids = graph.edge_index[0].index_select(0, edge_ids)
+            dst_node_ids = graph.edge_index[1].index_select(0, edge_ids)
+            active_node_mask[rows, src_node_ids] = True
+            active_node_mask[rows, dst_node_ids] = True
+
+        return cls(
+            graph_ids=graph_ids,
+            selected_edge_mask=selected_edge_mask,
+            active_node_mask=active_node_mask,
+            step=selected_edge_mask.sum(dim=1).to(dtype=torch.long),
+        )
+
     @property
     def device(self) -> torch.device:
         return self.selected_edge_mask.device
