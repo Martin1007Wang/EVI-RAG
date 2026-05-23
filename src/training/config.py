@@ -156,6 +156,8 @@ class EvalRuntimeConfig:
     exclude_anchors_from_retrieved: bool
     use_reachable_targets: bool
     k_windows: tuple[int, ...] | list[int] = (1, 2, 4, 8)
+    enable_calibration_metrics: bool = False
+    enable_terminal_diagnostics: bool = False
 
     def __post_init__(self) -> None:
         k_windows = tuple(positive_int(k, "k_windows") for k in self.k_windows)
@@ -178,6 +180,16 @@ class EvalRuntimeConfig:
             self,
             "use_reachable_targets",
             boolean(self.use_reachable_targets, "use_reachable_targets"),
+        )
+        object.__setattr__(
+            self,
+            "enable_calibration_metrics",
+            boolean(self.enable_calibration_metrics, "enable_calibration_metrics"),
+        )
+        object.__setattr__(
+            self,
+            "enable_terminal_diagnostics",
+            boolean(self.enable_terminal_diagnostics, "enable_terminal_diagnostics"),
         )
 
 

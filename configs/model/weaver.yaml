@@ -17,12 +17,20 @@ policy:
     _target_: src.weaver.nn.state_encoder.StateEncoder
     hidden_dim: 1024
     edge_encoder:
-      _target_: src.weaver.nn.edge_encoder.EdgeEncoder
+      _target_: src.weaver.nn.state_encoder.QueryEdgeEncoder
       hidden_dim: 1024
+      num_heads: 8
+    state_encoder:
+      _target_: src.weaver.nn.state_encoder.QueryStateEncoder
+      hidden_dim: 1024
+    edge_num_heads: 8
 
 reward_model:
-  _target_: src.weaver.utility.TrueTerminalReward
+  _target_: src.weaver.utility.EvidenceUtilityReward
+  support_weight: 0.25
+  connect_weight: 0.5
   edge_cost: 0.05
+  unsupported_edge_cost: 0.05
   fail_cost: 1.0
   reward_temperature: 1.0
 
@@ -44,6 +52,9 @@ runner:
   replay_source:
     _target_: src.weaver.rollout.replay.ReplaySource
     expand_budget: ${model.runner.engine.expand_budget}
+    skip_warmup_progress: 0.05
+    skip_gap_ema_beta: 0.9
+    skip_gap_margin: 0.0
   replay_builder:
     _target_: src.weaver.rollout.replay.ReplayBuilder
     expand_budget: ${model.runner.engine.expand_budget}
@@ -76,6 +87,8 @@ evaluation:
   k_windows: [1, 2, 4, 8]
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
+  enable_calibration_metrics: false
+  enable_terminal_diagnostics: false
 
 gradient_clip_val: 1.0
 gradient_clip_algorithm: norm

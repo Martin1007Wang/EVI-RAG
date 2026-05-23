@@ -57,9 +57,10 @@
 
 `FeatureEncoder` 把节点文本、关系文本和问题 embedding 投到 Weaver model space：
 
-- 文本节点：由 upstream PLM semantic embedding 投影到 model space。
+- 文本节点：由 upstream PLM semantic embedding 先做 L2 normalize，再通过节点投影 `Wn`。
 - 非文本节点：使用可学习的 `non_text_node_model` token。
-- 关系和 query：同样通过 `project_to_model + LayerNorm`。
+- 关系：先做 L2 normalize，再通过关系投影 `Wr`。
+- query：先做 L2 normalize，再通过 query 投影 `Wq`。
 
 输出 `EncodedFeatures`：
 
@@ -132,9 +133,12 @@ step' = step + 1
 `ForwardPolicy` 输出的是 action flow 分布，而不是只输出 action logits。它对每个 state row 产生：
 
 - `terminal_log_flow`
+- `continue_log_flow`
+- 每条 frontier edge 的 `edge_logit`
+- 每条 frontier edge 的 `edge_log_prob`
 - 每条 frontier edge 的 `edge_log_flow`
 - `state_log_flow`
-- 归一化后的 `terminal_log_prob` 与 `edge_log_prob`
+- 归一化后的 `stop_log_prob`、`expand_log_prob` 与 `edge_action_log_prob`
 
 ### StateEncoder
 
@@ -142,58 +146,76 @@ step' = step + 1
 
 ```text
 query_h      = select_query_model(features, state.graph_ids)
-edge_state_h = mean_pool(EdgeEncoder(selected edges))
-row_state_h  = MLP([query_h, edge_state_h])
+q_edge_h     = query attends to [src, rel, dst] for each edge
+row_state_h  = query attends to selected q_edge_h tokens + anchor tokens
+edge_state_h = row_state_h
 ```
 
-其中 `EdgeEncoder` 对一条边 `e = (u, r, v)` 只做 role-preserving 拼接：
+其中 query-conditioned edge encoder 对一条边 `e = (u, r, v)` 构造 role token：
 
 ```text
-h_e = concat(h_u, h_r, h_v)
+[h_u + p_src, h_r + p_rel, h_v + p_dst]
 ```
 
-如果当前 state 没有已选边，则 `edge_state_h` 为 0。
+然后让 query 读取这 3 个 token，得到该边的 `q_edge_h`。state 没有已选边时，query 读取 anchor token；如果连 anchor 也没有，则退化到 learned empty token。
 
 ### Action Flow Head
 
-terminal flow：
+当前实现显式建模 terminal head、continue head 和条件 edge 分布。frontier 内边分布直接由 edge logits 做按-row `logsoftmax`。
+
+budget embedding：
 
 ```text
-u(z) = terminal_flow_head([query_h, row_state_h])
+remaining = clamp(state.remaining_budget, 0, max_expand_budget)
+budget_h  = Embedding(remaining)
 ```
 
-continuation flow：
+stop flow：
 
 ```text
-c(z) = continuation_flow_head([query_h, row_state_h])
+u(z) = stop_flow_head([query_h, row_state_h, budget_h])
 ```
 
-edge policy：
+对 row `z` 的第 `e` 条 frontier edge：
 
 ```text
-log π(e | z) = logsoftmax_e edge_policy_head([query_h, row_state_h, edge_h])
+ref(e | z) = -log |Frontier(z)|
+adv(e | z) = edge_advantage_head([query_h, row_state_h, budget_h, edge_h])
+m(e | z)   = ref(e | z) + adv(e | z)
+```
+
+continuation gain 是 frontier edge measure 的 logsumexp：
+
+```text
+g(z) = logsumexp_{e in Frontier(z)} m(e | z)
 ```
 
 edge action-flow：
 
 ```text
-log F(z, e) = c(z) + log π(e | z)
+log F(z, e) = u(z) + m(e | z)
 ```
 
-state flow 是 terminal 与 continuation 的二项 logaddexp：
+continuation flow：
 
 ```text
-log F(z) = logaddexp(u(z), c(z))
+log F_continue(z) = u(z) + g(z)
+```
+
+state flow 是 stop 与 continuation 的二项合并。实现写成 `u + softplus(g)`，等价于 `logaddexp(u, u + g)`：
+
+```text
+log F(z) = u(z) + softplus(g(z))
 ```
 
 action log-prob 由 action log-flow 减去 state log-flow：
 
 ```text
-log P_F(TERMINAL | z) = u(z) - log F(z)
-log P_F(e | z)        = c(z) - log F(z) + log π(e | z)
+log P_F(TERMINAL | z) = -softplus(g(z))
+log P_F(e | z)        = log F(z, e) - log F(z)
 ```
 
-当某个 row 没有 frontier 时，`c(z) = -inf`，terminal probability 为 1。
+当某个 row 没有 frontier 时，`g(z) = -inf`，terminal probability 为 1。
 
 ### Sampling
 
@@ -261,15 +283,19 @@ tape = RolloutTape(R, T = expand_budget + 1)
 - `policy_action_log_prob`
 - `behavior_action_log_prob`
 - `terminal_step`
-- `forced_terminal`
+- `stop_reason`
 - `expand_budget`
+- `terminal_state`
 
 派生 mask：
 
 - `valid_mask`: `step <= terminal_step`
 - `terminal_mask`: `step == terminal_step`
 - `expand_mask`: valid 且 edge id 非负
-- `forced_terminal_mask`: terminal 且 forced
+- `policy_stop_mask`: terminal 且 stop reason 为 policy stop
+- `no_frontier_stop_mask`: terminal 且 stop reason 为 no frontier stop
+- `budget_truncated_mask`: terminal 且 stop reason 为 budget truncated
+- `forced_terminal_mask`: terminal 且 stop reason 非 policy stop
 
 `policy_trajectory_log_prob` 是 valid step 上 policy action log-prob 的和。
 
@@ -324,9 +350,9 @@ exact terminal-state oracle
 - `TerminalBatch`
   - `state`
   - `meta`
-  - `forced_terminal`
+  - `stop_reason`
 
-`training_from_rollouts` 会按 rollout tape 重放 trajectory：
+当前 `RolloutEngine.sample_fused_rollouts` 在采样时同步构造 training transitions：
 
 - expansion step 生成 parent/child transition。
 - terminal step 生成 terminal state。
@@ -382,7 +408,7 @@ terminal event 的 backward log-prob 为 0。
 单步 diagnostic residual：
 
 ```text
-residual_expand = c(z) + log π(a | z) - log F(z') - log P_B(z | z')
+residual_expand = log F(z, a) - log F(z') - log P_B(z | z')
 ```
 
 ### 单步 terminal event
@@ -545,7 +571,654 @@ RolloutRunner.eval_rollouts(policy, context, features)
 
 但这些 evaluation selector 不改变训练 loss 本身。
 
-## 14. 关键实现约束与注意点
+## 14. 条件分支总表：用于裁剪和冗余识别
+
+本节只列当前主算法路径中的条件分支。目标是后续可以逐项判断：保留、删除、合并、参数化，或移到 debug/eval 逻辑中。
+
+### 14.1 Feature / Context 分支
+
+`FeatureEncoder.encode_node_text_semantic`：
+
+```text
+if node has text:
+    node_text_semantic = entity_text_semantic_table[text_row]
+else:
+    node_text_semantic = 0
+```
+
+`FeatureEncoder.encode_node_model`：
+
+```text
+if node_has_text:
+    node_model = Linear(L2Normalize(node_text_semantic))
+else:
+    node_model = learned non_text_node_model
+```
+
+裁剪判断：
+
+- 如果数据保证所有节点都有文本，`non_text_node_model` 分支可以删除。
+- 如果非文本节点很多，这个分支是必要建模能力，不是冗余。
+
+`TargetContext`：
+
+```text
+target / shortest-path tensors exist:
+    reward、replay、eval 可用
+else:
+    训练 reward-first replay 无法运行
+```
+
+裁剪判断：
+
+- target 不进入 frontier 和 rollout policy，不能为了简化把 target 接进 state/action 合法性，否则会改变算法定义。
+
+### 14.2 State / Frontier 分支
+
+`State.initial`：
+
+```text
+if graph has anchors:
+    active_node_ids = anchors(graph)
+else:
+    active_node_ids = empty
+```
+
+影响：
+
+- 没 anchor 的 row 初始 frontier 必为空，rollout 会 forced terminal。
+
+`State.frontier(graph, expand_budget)`：
+
+```text
+if expand_budget is not None and all depth >= expand_budget:
+    return empty_frontier
+
+if cached frontier exists and expand_budget is None:
+    return cached frontier
+
+if no active nodes:
+    return empty_frontier
+
+if no outgoing edges from active nodes:
+    return empty_frontier
+
+filter edges outside current graph
+if no same-graph edges:
+    return empty_frontier
+
+remove already selected edges
+if no remaining edges:
+    return empty_frontier
+
+deduplicate (row, edge)
+
+if expand_budget is not None:
+    remove rows with depth >= expand_budget
+    if no remaining edges:
+        return empty_frontier
+```
+
+裁剪判断：
+
+- `expand_budget is None` 缓存分支服务 exact predecessor / replay 等无 budget frontier 调用；若统一所有 frontier 都传 budget，需要重新确认 backward predecessor 语义。
+- `same graph` 过滤是 batch 图拼接后的安全条件，不能删。
+- `already selected` 过滤防止重复边，不能删，除非算法允许 multiset edge。
+- `deduplicate` 防止同一边由多个 active node 路径重复出现；在 directed outgoing edge by src 设计下通常重复较少，但仍是安全条件。
+
+`State.expand`：
+
+```text
+if rows and edge_ids length mismatch:
+    error
+if rows empty:
+    return self
+if validate:
+    validate action in current frontier
+else:
+    validate only row/edge shape, range, one action per row
+
+append selected edge
+append src/dst to active nodes
+step += 1
+```
+
+裁剪判断：
+
+- rollout hot path默认 `validate=False`，依赖 sample 来自 frontier；这减少开销。
+- 如果要更强安全性，可以打开 validate，但会增加 frontier 重算。
+
+### 14.3 ForwardPolicy 分支
+
+`ForwardPolicy.action_log_flows`：
+
+```text
+stop_log_flow = stop_flow_head(...)
+continue_log_gain = -inf
+continue_log_flow = -inf
+
+if frontier empty:
+    return stop-only output
+
+row_frontier_size = bincount(frontier rows)
+edge_log_reference = -log(row_frontier_size)
+edge_log_advantage = edge_advantage_head(...)
+edge_log_measure = edge_log_reference + edge_log_advantage
+continue_log_gain = segment_logsumexp(edge_log_measure by row)
+continue_log_flow = stop_log_flow + continue_log_gain
+edge_log_flow = stop_log_flow[row] + edge_log_measure
+```
+
+`ForwardPolicy.forward`：
+
+```text
+state_log_flow = stop_log_flow + softplus(continue_log_gain)
+stop_log_prob = -softplus(continue_log_gain)
+edge_log_prob = edge_log_flow - state_log_flow[row]
+```
+
+裁剪判断：
+
+- `edge_log_reference = -log |Frontier|` 是一个 uniform base measure。删掉后，大 frontier state 的 continuation mass 会天然更大，算法行为会变。
+- 当前没有独立 continuation head；continuation 完全由 stop flow 与 edge measure 决定。若想砍参数，这是已经较简的设计。
+- `budget_embedding` 是 policy 识别剩余步数的唯一显式条件。删除后模型只能从 selected edge count 的 state 表征间接推断 budget。
+
+`ForwardPolicyOutput.sample`：
+
+```text
+if sampled rows empty:
+    return empty
+
+if selected rows have no frontier edges:
+    return TERMINAL for all selected rows
+
+else:
+    concatenate stop logits and edge logits
+    sample by per-row Gumbel-max
+```
+
+裁剪判断：
+
+- rollout engine 已经提前把 no-frontier row 标记为 forced terminal，所以 `sample` 内部 no-edge terminal 是防御性分支。若只保留 engine 调用路径，可考虑删除或转 assert。
+
+### 14.4 RolloutEngine 分支
+
+`sample_rollouts`：
+
+```text
+with no_grad:
+    sample_fused_rollouts
+split fused rollouts by rollout_id
+```
+
+`sample_fused_rollouts` 每步：
+
+```text
+active_rows = rows not stopped
+if active_rows empty:
+    break
+
+frontier = active_state.frontier(..., expand_budget)
+policy_out = policy(active_state, frontier)
+
+forced_local = rows where no frontier OR depth >= expand_budget
+sample_rows = all rows except forced_local
+
+actions = []
+if sample_rows non-empty:
+    actions += policy sampled actions
+if forced_local non-empty:
+    actions += forced TERMINAL actions with stop_reason
+
+sampled = concat and sort actions by row
+write action to tape
+
+if any expansion action:
+    build ExpansionBatch parent/child
+    update global state by expand
+
+if any terminal action:
+    drop budget_truncated terminals from TerminalBatch
+    keep policy_stop and no_frontier_stop terminals
+```
+
+循环结束：
+
+```text
+terminal_step = tape.terminal_step
+if any row never stopped:
+    terminal_step = expand_budget
+
+if expansion_parts or terminal_parts:
+    build TrainingBatch
+else:
+    training = None
+```
+
+stop reason：
+
+```text
+POLICY_STOP = 0
+NO_FRONTIER_STOP = 1
+BUDGET_TRUNCATED = 2
+```
+
+裁剪判断：
+
+- `budget_truncated` terminal 当前不会进入 `TerminalBatch`，因此不会直接产生 terminal reward event；它主要保留在 rollout result/eval 里。这是一个可以重点审查的分支。
+- forced no-frontier terminal 会进入 training terminal batch，reward 会约束死胡同状态的 stop flow。
+- policy stop 与 no-frontier stop 在 `RolloutResult` 中可区分，但进入 SubTB terminal event 后都走同一个 terminal reward 公式。
+- `behavior_log_prob` 目前等于 `policy_log_prob`；没有 off-policy correction 使用。若不做重要性采样或行为策略分析，它可能是冗余字段。
+
+### 14.5 RolloutRunner / Replay Budget 分支
+
+`policy_rollouts`：
+
+```text
+if num_rollouts <= 0:
+    return empty rollouts, None training
+else:
+    call engine.sample_rollouts
+```
+
+`replay_trajectories`：
+
+```text
+if num_trajectories <= 0:
+    return None
+if replay_source is None:
+    error
+else:
+    sample_from_rollouts
+```
+
+`training_batch`：
+
+```text
+parts = []
+if policy_training exists and non-empty:
+    add policy_training as SRC_POLICY
+
+if replay exists and num_trajectories > 0:
+    if replay_builder is None:
+        error
+    replay_training = replay_builder.build(...)
+    if replay_training non-empty:
+        add as SRC_REPLAY
+
+if parts empty:
+    return None
+else:
+    concat_reindex_trajectories(parts)
+```
+
+`sample_budget`：
+
+```text
+if replay_schedule is None:
+    policy_rollout = total
+    replay_expand = 0
+else:
+    weights = schedule.weights_at(progress)
+    allocate_replay_budget(total, weights)
+```
+
+`allocate_replay_budget`：
+
+```text
+if total <= 0:
+    return 0, 0
+if policy_weight + replay_weight <= 0:
+    error
+
+floor proportional allocation
+assign remainder to larger fractional part
+```
+
+裁剪判断：
+
+- 如果确定不使用 replay，可以删除 replay schedule/source/builder 整条路径，loss 中 source-balanced replay 逻辑也可同步简化。
+- 如果 replay 永远启用，`replay_source is None` 与 `replay_builder is None` 可变成构造期校验。
+- `SRC_UNKNOWN` 主要作为 build 阶段临时 source，最终通常会被 runner 改成 `SRC_POLICY` 或 `SRC_REPLAY`。
+
+### 14.6 ReplaySource 分支
+
+`replay_trajectories_with_stats`：
+
+```text
+if max_trajectories_per_graph is not None and <= 0:
+    return empty
+
+targets = reachable_target_node_ids
+if no targets:
+    return empty
+
+eligible_graphs = graphs containing targets
+if no eligible graphs:
+    return empty
+
+if reward_model is None or target_context is None:
+    error
+
+build graph label views from shortest-path edge masks
+compute best policy rollout reward per graph
+
+for each graph view:
+    if graph not eligible:
+        continue
+
+    enumerate reachable replay state DAG under admissible edges
+    if no replay states:
+        continue
+
+    score every replay state by reward
+    if no terminal candidates:
+        continue
+
+    best_oracle = max reward among replay states
+    best_policy = best rollout reward for graph
+    if best_policy exists and best_policy >= best_oracle:
+        skipped_by_reward += 1
+        continue
+
+    sample oracle trajectories from best terminal states
+    if none sampled:
+        continue
+
+    add sampled trajectories
+```
+
+`build_replay_graph_label_views`：
+
+```text
+for each graph:
+    if graph has no targets:
+        continue
+    admissible_edge_mask = union shortest-path-edge masks over targets
+    if no admissible edges:
+        continue
+    create graph view
+```
+
+`enumerate_replay_state_dag`：
+
+```text
+start from initial state
+for depth in range(budget):
+    for current state:
+        frontier = parent.frontier(..., expand_budget=budget)
+        if frontier empty:
+            continue
+        keep local row 0 edges
+        if no local edges:
+            continue
+        filter to admissible edges
+        if no admissible edges:
+            continue
+        expand each admissible edge
+        dedupe by selected-edge-set key
+```
+
+`score_replay_states`：
+
+```text
+score all enumerated states by reward
+best = max reward
+terminal_nodes = all states with reward == best
+```
+
+`sample_oracle_trajectories`：
+
+```text
+if no terminal nodes:
+    return empty
+
+sort terminal states by trajectory_count desc, length asc, key asc
+enumerate all predecessor action sequences
+dedupe sequences
+sort by length asc, lexicographic
+if max_trajectories is set:
+    truncate
+```
+
+裁剪判断：
+
+- replay 依赖 shortest-path edge masks，但最终按 reward 选 terminal state；不是固定 shortest path teacher。
+- `best_policy >= best_oracle` 会跳过 replay，属于自适应节省分支；若想稳定 teacher signal，可以考虑删除该 skip。
+- exact DAG 枚举复杂度随 budget 和 admissible frontier 增长；这是最可能的训练开销来源之一。
+- 空 trajectory 是允许的：如果初始 anchor state 就是 best terminal，ReplayBuilder 会只产生 terminal event。
+
+### 14.7 BackwardPolicy 分支
+
+`UniformValidPredecessorBackwardPolicy.log_prob`：
+
+```text
+out = zeros
+expand = action_edge_ids >= 0
+if no expand:
+    return zeros
+
+counts = valid_predecessor_count(child_state)
+if any expanded row count <= 0:
+    error
+
+for each expanded row:
+    remove action edge from selected edges
+    check parent is exact forward predecessor
+    if invalid:
+        error
+
+out[expand] = -log(counts)
+```
+
+`valid_predecessor_count`：
+
+```text
+for each child row:
+    if selected edges empty:
+        count = 0
+        continue
+    for each selected edge:
+        remove it
+        if resulting parent can forward-reach child by that edge:
+            count += 1
+```
+
+裁剪判断：
+
+- 当前 backward policy 是非参数 uniform kernel；若砍掉多 predecessor 支持，就会把 GFlowNet 的 DAG credit assignment 改成 tree 假设。
+- Python loop 是潜在性能热点，但逻辑上保证 exact predecessor。
+
+### 14.8 Reward 分支
+
+`TrueTerminalReward.forward`：
+
+```text
+answer_count = |active_nodes intersect target_mask|
+failed = answer_count == 0
+
+answer_gain = answer_weight * log1p(answer_count)
+edge_penalty = edge_cost * selected_edge_count
+fail_penalty = fail_cost * failed
+
+raw_log_reward = answer_gain - edge_penalty - fail_penalty
+log_reward = raw_log_reward / reward_temperature
+```
+
+构造期参数校验：
+
+```text
+if answer_weight <= 0: error
+if edge_cost < 0: error
+if fail_cost < 0: error
+if reward_temperature <= 0: error
+```
+
+裁剪判断：
+
+- reward 是 `no_grad`，不训练 reward model。
+- `fail_cost` 与 `answer_weight` 都影响命中/未命中的 margin；如果只保留 `answer_count`，失败图可能只由 edge cost 区分。
+- `reward_temperature` 只缩放 reward 边界条件，不改变 terminal state 排序。
+
+### 14.9 SubTB Loss 分支
+
+`policy_step_output`：
+
+```text
+if terminals.num_items <= 0:
+    return zero loss
+
+if expansions.num_items > 0:
+    compute parent_frontier, child_frontier, terminal_frontier
+    run batched policy for parent/child/terminal states
+    compute backward_log_prob for expansion actions
+else:
+    parent_out = empty
+    child_out = empty
+    backward_log_prob = empty
+    run policy only for terminal states
+
+reward_out = reward(terminals.state)
+subtb_input = build_subtb_input(...)
+loss = SubTBLoss(...)
+```
+
+`build_subtb_input`：
+
+```text
+expansion event:
+    terminal_log_reward = 0
+    terminal = False
+
+terminal event:
+    child_state_log_flow = 0
+    backward_log_prob = 0
+    terminal_log_reward = reward.log_reward
+    terminal = True
+```
+
+`subtrajectory_terms`：
+
+```text
+events = assemble_events
+if no events:
+    return empty terms
+
+group by trajectory_id
+sort each group by step_id
+
+for every start position:
+    running_forward = 0
+    running_backward = 0
+    end_limit = n or start + max_len
+
+    for end position:
+        if step is not consecutive:
+            break
+
+        running_forward += action_log_prob
+        if not terminal:
+            running_backward += backward_log_prob
+
+        if terminal:
+            residual = start_flow + running_forward - terminal_reward - running_backward
+        else:
+            residual = start_flow + running_forward - child_flow - running_backward
+
+        if terminal:
+            break
+
+if no residuals:
+    return empty terms
+```
+
+`residual_loss_units`：
+
+```text
+if residual_loss == "mse":
+    unit = residual^2
+else:
+    unit = huber(residual, huber_delta)
+```
+
+注意：当前代码里非 `"mse"` 都走 Huber，没有显式校验 `residual_loss == "huber"`。
+
+`weighted_source_balanced_mean`：
+
+```text
+if no values:
+    return 0
+
+policy_mask = source in {SRC_POLICY, SRC_UNKNOWN}
+replay_mask = source == SRC_REPLAY
+
+if no policy samples:
+    return alpha_replay * replay_loss
+if no replay samples:
+    return policy_loss
+else:
+    return policy_loss + alpha_replay * replay_loss
+```
+
+裁剪判断：
+
+- 如果禁用 replay，可以把 source-balanced mean 简化成单一 weighted mean。
+- 如果只保留单步 DB loss，可以删除 `subtrajectory_terms` 中所有多长度枚举与 `subtb_lambda/max_len`。
+- `action_log_flow` 只用于单步 branch diagnostics 和 build input 字段；真正 SubTB residual 使用 `action_log_prob` 加首状态 flow。
+
+### 14.10 Training / Optimization 分支
+
+`compute_step`：
+
+```text
+rollout_batch = runner.train_rollouts(...)
+if not rollout_batch.has_transitions:
+    raise RuntimeError
+else:
+    policy_step_output(...)
+```
+
+`training_step`：
+
+```text
+optimizer.zero_grad()
+manual_backward(loss)
+if gradient_clip_val is set and > 0:
+    clip gradients
+optimizer.step()
+if scheduler interval == "step":
+    scheduler.step()
+log metrics
+```
+
+`validation/test/predict`：
+
+```text
+with no_grad:
+    eval_rollouts only
+    no replay
+    no loss update
+```
+
+裁剪判断：
+
+- manual optimization 是 Lightning 风格选择；若不需要 branch gradient diagnostics，可以切回自动优化，但要同步改 logging。
+- eval selector 使用 trajectory probability / flow / reward 等指标，不影响训练 loss；可单独裁剪评估复杂度。
+
+## 15. 当前可优先审查的冗余/复杂度候选
+
+这些不是结论，只是基于分支复盘得到的优先检查点：
+
+1. `behavior_action_log_prob`：当前等于 `policy_action_log_prob`，没有看到 off-policy correction 使用。
+2. `budget_truncated` terminal：不进入 `TerminalBatch` reward event，只留在 rollout/eval 统计里。
+3. `ForwardPolicyOutput.sample` 内 no-frontier fallback：engine 已提前 forced terminal，可能是防御性重复。
+4. `residual_loss` 字符串：除 `"mse"` 外全部走 Huber，缺少显式非法值报错。
+5. replay 的 exact DAG 枚举：算法上清晰，但可能是训练耗时最大来源。
+6. `SRC_UNKNOWN`：多数情况下只是中间态 source id，最终会被 runner 改写。
+7. `action_log_flow` 字段：SubTB 主 residual 不直接用它，主要服务单步 diagnostics。
+8. `expand(validate=False)` 与后续 backward exact predecessor 校验并存：一个为速度，一个为训练一致性；是否都需要取决于是否保留 replay/DB diagnostics。
+
+## 16. 关键实现约束与注意点
 
 - `TERMINAL` 是 action，不是 KG edge；其 id 固定为 `-1`。
 - frontier 只看当前 active nodes 的出边，不读答案标签。

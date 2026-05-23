@@ -27,12 +27,16 @@ class WeaverMetricSuite:
         k_windows: Sequence[int],
         exclude_anchors_from_retrieved: bool,
         use_reachable_targets: bool,
+        enable_calibration_metrics: bool,
+        enable_terminal_diagnostics: bool,
     ) -> None:
         self.k_windows = tuple(int(k) for k in k_windows)
         if not self.k_windows or any(k < 1 for k in self.k_windows):
             raise ValueError(f"k_windows must contain positive integers, got {self.k_windows}.")
         self.exclude_anchors_from_retrieved = bool(exclude_anchors_from_retrieved)
         self.use_reachable_targets = bool(use_reachable_targets)
+        self.enable_calibration_metrics = bool(enable_calibration_metrics)
+        self.enable_terminal_diagnostics = bool(enable_terminal_diagnostics)
 
     def eval_metrics(
         self,
@@ -52,6 +56,8 @@ class WeaverMetricSuite:
             k_windows=self.k_windows,
             exclude_anchors_from_retrieved=self.exclude_anchors_from_retrieved,
             use_reachable_targets=self.use_reachable_targets,
+            enable_calibration_metrics=self.enable_calibration_metrics,
+            enable_terminal_diagnostics=self.enable_terminal_diagnostics,
             context=context,
             features=features,
             reward_model=reward_model,

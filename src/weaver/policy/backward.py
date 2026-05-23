@@ -22,6 +22,7 @@ class BackwardPolicy(nn.Module):
         child_state: State,
         context: GraphContext,
         action_edge_ids: torch.Tensor,
+        expand_budget: int,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -54,6 +55,7 @@ class UniformValidPredecessorBackwardPolicy(BackwardPolicy):
         child_state: State,
         context: GraphContext,
         action_edge_ids: torch.Tensor,
+        expand_budget: int,
     ) -> torch.Tensor:
         out = action_edge_ids.new_zeros(action_edge_ids.numel()).float()
         expand = action_edge_ids.ge(0)
@@ -63,6 +65,7 @@ class UniformValidPredecessorBackwardPolicy(BackwardPolicy):
         counts = valid_predecessor_count(
             state=child_state,
             context=context,
+            expand_budget=int(expand_budget),
         ).float()
         if bool(counts[expand].le(0).any()):
             raise ValueError("Expansion child state has no exact forward predecessor.")
@@ -81,6 +84,7 @@ class UniformValidPredecessorBackwardPolicy(BackwardPolicy):
                 graph_id=int(child_state.row_to_graph[row].item()),
                 parent_edge_ids=parent_edges,
                 removed_edge_id=edge_id,
+                expand_budget=int(expand_budget),
             ):
                 raise ValueError(
                     f"Edge {edge_id} is not an exact forward predecessor for child row {row}."
@@ -94,6 +98,7 @@ def valid_predecessor_count(
     *,
     state: State,
     context: GraphContext,
+    expand_budget: int,
 ) -> torch.Tensor:
     counts = torch.zeros(
         state.num_rows,
@@ -121,6 +126,7 @@ def valid_predecessor_count(
                 graph_id=int(state.row_to_graph[row].item()),
                 parent_edge_ids=parent_edges,
                 removed_edge_id=edge_id,
+                expand_budget=int(expand_budget),
             ):
                 count += 1
 
@@ -135,6 +141,7 @@ def is_valid_predecessor_edge(
     graph_id: int,
     parent_edge_ids: torch.Tensor,
     removed_edge_id: int,
+    expand_budget: int,
 ) -> bool:
     if removed_edge_id < 0 or removed_edge_id >= int(context.num_edges):
         return False
@@ -152,13 +159,14 @@ def is_valid_predecessor_edge(
         context=context,
         graph_id=graph_id,
         edge_ids=parent_edge_ids,
+        expand_budget=int(expand_budget),
     )
     if parent_state is None:
         return False
 
     frontier = parent_state.frontier(
         context,
-        expand_budget=None,
+        expand_budget=int(expand_budget),
     )
     return bool(frontier.edge_ids.eq(int(removed_edge_id)).any())
 
@@ -168,11 +176,15 @@ def exact_forward_parent_state(
     context: GraphContext,
     graph_id: int,
     edge_ids: torch.Tensor,
+    expand_budget: int,
 ) -> State | None:
     edge_ids = edge_ids.to(
         device=context.device,
         dtype=torch.long,
     ).view(-1)
+    if int(edge_ids.numel()) > int(expand_budget):
+        return None
+
     if edge_ids.numel() == 0:
         return State.initial(
             graph=context,
@@ -181,6 +193,7 @@ def exact_forward_parent_state(
                 dtype=torch.long,
                 device=context.device,
             ),
+            expand_budget=int(expand_budget),
         )
 
     if int(torch.unique(edge_ids).numel()) != int(edge_ids.numel()):
@@ -190,7 +203,6 @@ def exact_forward_parent_state(
     if not bool(edge_graph.eq(int(graph_id)).all()):
         return None
 
-    budget = int(edge_ids.numel())
     state = State.initial(
         graph=context,
         graph_ids=torch.tensor(
@@ -198,6 +210,7 @@ def exact_forward_parent_state(
             dtype=torch.long,
             device=context.device,
         ),
+        expand_budget=int(expand_budget),
     )
     row = torch.zeros(1, dtype=torch.long, device=context.device)
     remaining = edge_ids
@@ -205,7 +218,7 @@ def exact_forward_parent_state(
     while remaining.numel() > 0:
         frontier = state.frontier(
             context,
-            expand_budget=budget,
+            expand_budget=int(expand_budget),
         )
         frontier_mask = _membership_mask(
             query_ids=frontier.edge_ids,
@@ -219,7 +232,7 @@ def exact_forward_parent_state(
             graph=context,
             rows=row,
             edge_ids=next_edge_id,
-            expand_budget=budget,
+            expand_budget=int(expand_budget),
         )
         remaining = remaining[remaining.ne(next_edge_id.view(()))]
 

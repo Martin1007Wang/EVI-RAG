@@ -24,7 +24,7 @@ from src.weaver.rollout.result import RolloutResult
 from src.weaver.rollout.runner import RolloutBatch, RolloutRunner
 from src.weaver.state import State
 from src.weaver.transition import TrainingBatch
-from src.weaver.utility import TrueTerminalReward
+from src.weaver.utility import RewardOutput, TrueTerminalReward
 
 Scalar = torch.Tensor | float | int
 
@@ -72,6 +72,8 @@ class WeaverModule(LightningModule):
             k_windows=evaluation.k_windows,
             exclude_anchors_from_retrieved=evaluation.exclude_anchors_from_retrieved,
             use_reachable_targets=evaluation.use_reachable_targets,
+            enable_calibration_metrics=evaluation.enable_calibration_metrics,
+            enable_terminal_diagnostics=evaluation.enable_terminal_diagnostics,
         )
 
         self.runner.progress_fn = self.training_progress
@@ -124,12 +126,6 @@ class WeaverModule(LightningModule):
 
         optimizer = self.optimizer()
         optimizer.zero_grad(set_to_none=True)
-        branch_grad_metrics = terminal_flow_branch_gradient_metrics(
-            stop_flow_head=self.policy.stop_flow_head,
-            edge_advantage_head=self.policy.edge_advantage_head,
-            terminal_loss=output.terminal_branch_loss,
-            expansion_loss=output.expansion_branch_loss,
-        )
         self.manual_backward(output.loss)
         grad_metrics = gradient_norm_metrics(self.policy)
         self.clip_gradients_if_needed(optimizer)
@@ -139,7 +135,6 @@ class WeaverModule(LightningModule):
         batch_n = graph_batch_size(batch)
         metrics = {
             **output.metrics,
-            **branch_grad_metrics,
             **grad_metrics,
         }
         self.log_scalar(
@@ -206,15 +201,6 @@ class WeaverModule(LightningModule):
     ) -> StepOutput:
         expansions = training.expansions
         terminals = training.terminals
-        if terminals.num_items <= 0:
-            zero = policy_features.query_model.new_zeros(())
-            return StepOutput(
-                loss=zero,
-                metrics={},
-                expansion_branch_loss=zero,
-                terminal_branch_loss=zero,
-            )
-
         expand_budget = int(self.runner.engine.expand_budget)
         if expansions.num_items > 0:
             parent_frontier = expansions.parent.frontier(graph, expand_budget=expand_budget)
@@ -232,6 +218,7 @@ class WeaverModule(LightningModule):
                 child_state=expansions.child,
                 context=graph,
                 action_edge_ids=expansions.edge_ids,
+                expand_budget=expand_budget,
             )
         else:
             parent_out = empty_policy_output(
@@ -252,12 +239,19 @@ class WeaverModule(LightningModule):
                 frontier=terminal_frontier,
             )
 
-        reward_out = call_reward_model(
-            reward_model=self.reward_model,
-            state=terminals.state,
-            graph_context=graph,
-            target_context=target,
-        )
+        if terminals.num_items > 0:
+            reward_out = call_reward_model(
+                reward_model=self.reward_model,
+                state=terminals.state,
+                graph_context=graph,
+                target_context=target,
+            )
+        else:
+            empty_reward = policy_features.query_model.new_empty((0,))
+            reward_out = RewardOutput(
+                log_reward=empty_reward,
+                raw_log_reward=empty_reward,
+            )
 
         subtb_input = build_subtb_input(
             parent_out=parent_out,
@@ -476,6 +470,7 @@ def backward_action_log_prob(
     child_state: State,
     context: GraphContext,
     action_edge_ids: torch.Tensor,
+    expand_budget: int,
 ) -> torch.Tensor:
     action_edge_ids = action_edge_ids.to(device=child_state.device, dtype=torch.long).view(-1)
     out = torch.zeros(
@@ -489,6 +484,7 @@ def backward_action_log_prob(
             child_state=child_state.select_rows(expand.nonzero(as_tuple=False).flatten()),
             context=context,
             action_edge_ids=action_edge_ids[expand],
+            expand_budget=int(expand_budget),
         )
     return out
 
@@ -556,20 +552,20 @@ def slice_policy_output(
 ) -> ForwardPolicyOutput:
     end = int(start + length)
     if length <= 0:
-        return empty_policy_output(device=output.stop_log_flow.device, num_edges=output.num_edges)
+        return empty_policy_output(device=output.terminal_log_flow.device, num_edges=output.num_edges)
     row_mask = output.frontier_row_ids.ge(int(start)) & output.frontier_row_ids.lt(end)
     return ForwardPolicyOutput(
         frontier_row_ids=output.frontier_row_ids[row_mask] - int(start),
         frontier_edge_ids=output.frontier_edge_ids[row_mask],
-        stop_log_flow=output.stop_log_flow[start:end],
+        terminal_log_flow=output.terminal_log_flow[start:end],
         continue_log_flow=output.continue_log_flow[start:end],
-        continue_log_gain=output.continue_log_gain[start:end],
-        edge_log_flow=output.edge_log_flow[row_mask],
-        edge_log_reference=output.edge_log_reference[row_mask],
-        edge_log_advantage=output.edge_log_advantage[row_mask],
         state_log_flow=output.state_log_flow[start:end],
-        stop_log_prob=output.stop_log_prob[start:end],
+        edge_logit=output.edge_logit[row_mask],
         edge_log_prob=output.edge_log_prob[row_mask],
+        edge_log_flow=output.edge_log_flow[row_mask],
+        stop_log_prob=output.stop_log_prob[start:end],
+        expand_log_prob=output.expand_log_prob[start:end],
+        edge_action_log_prob=output.edge_action_log_prob[row_mask],
         num_rows=int(length),
         num_edges=output.num_edges,
     )
@@ -585,15 +581,15 @@ def empty_policy_output(
     return ForwardPolicyOutput(
         frontier_row_ids=empty_long,
         frontier_edge_ids=empty_long,
-        stop_log_flow=empty_float,
+        terminal_log_flow=empty_float,
         continue_log_flow=empty_float,
-        continue_log_gain=empty_float,
-        edge_log_flow=empty_float,
-        edge_log_reference=empty_float,
-        edge_log_advantage=empty_float,
         state_log_flow=empty_float,
-        stop_log_prob=empty_float,
+        edge_logit=empty_float,
         edge_log_prob=empty_float,
+        edge_log_flow=empty_float,
+        stop_log_prob=empty_float,
+        expand_log_prob=empty_float,
+        edge_action_log_prob=empty_float,
         num_rows=0,
         num_edges=int(num_edges),
     )
@@ -663,9 +659,37 @@ def policy_diagnostic_metrics(
         ],
         dim=0,
     )
+    terminal_flow = torch.cat(
+        [
+            expansion_out.terminal_log_flow.float(),
+            terminal_out.terminal_log_flow.float(),
+        ],
+        dim=0,
+    )
+    continue_flow = torch.cat(
+        [
+            expansion_out.continue_log_flow.float(),
+            terminal_out.continue_log_flow.float(),
+        ],
+        dim=0,
+    )
+    state_flow = torch.cat(
+        [
+            expansion_out.state_log_flow.float(),
+            terminal_out.state_log_flow.float(),
+        ],
+        dim=0,
+    )
     has_frontier = frontier_size.gt(0)
 
     metrics: dict[str, torch.Tensor] = {
+        "flow_terminal_log_flow_mean": mean_or_zero(terminal_flow).detach(),
+        "flow_continue_log_flow_mean": masked_mean_or_zero(continue_flow, torch.isfinite(continue_flow)).detach(),
+        "flow_state_log_flow_mean": mean_or_zero(state_flow).detach(),
+        "flow_branch_margin_mean": masked_mean_or_zero(stop_ratio, torch.isfinite(stop_ratio)).detach(),
+        "prob_stop_mean": mean_or_zero(stop_prob).detach(),
+        "prob_expand_mean": masked_mean_or_zero(continuation_prob, has_frontier).detach(),
+        "edge_conditional_entropy_mean": masked_mean_or_zero(edge_action_entropy, has_frontier).detach(),
         "policy_continuation_prob_mean": masked_mean_or_zero(continuation_prob, has_frontier).detach(),
         "policy_edge_action_entropy_mean": masked_mean_or_zero(edge_action_entropy, has_frontier).detach(),
         "policy_frontier_size_mean": mean_or_zero(frontier_size).detach(),
@@ -685,75 +709,12 @@ def policy_diagnostic_metrics(
     return metrics
 
 
-def terminal_flow_branch_gradient_metrics(
-    *,
-    stop_flow_head: torch.nn.Module,
-    edge_advantage_head: torch.nn.Module,
-    terminal_loss: torch.Tensor,
-    expansion_loss: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    stop_params = [param for param in stop_flow_head.parameters() if param.requires_grad]
-    edge_advantage_params = [param for param in edge_advantage_head.parameters() if param.requires_grad]
-
-    terminal_grad = gradient_vector(
-        loss=terminal_loss,
-        params=stop_params,
-        retain_graph=True,
-    )
-    expansion_grad = gradient_vector(
-        loss=expansion_loss,
-        params=stop_params,
-        retain_graph=True,
-    )
-    terminal_norm = terminal_grad.norm()
-    expansion_norm = expansion_grad.norm()
-    denom = terminal_norm * expansion_norm
-    cosine = torch.where(
-        denom.gt(0),
-        torch.dot(terminal_grad, expansion_grad) / denom.clamp_min(torch.finfo(terminal_grad.dtype).tiny),
-        terminal_grad.new_zeros(()),
-    )
-    edge_advantage_expansion_grad = gradient_vector(
-        loss=expansion_loss,
-        params=edge_advantage_params,
-        retain_graph=True,
-    )
-    return {
-        "grad_stop_flow_head_from_terminal_loss": terminal_norm.detach(),
-        "grad_stop_flow_head_from_expansion_loss": expansion_norm.detach(),
-        "grad_stop_flow_head_terminal_expansion_cosine": cosine.detach(),
-        "grad_edge_advantage_head_from_expansion_loss": edge_advantage_expansion_grad.norm().detach(),
-    }
-
-
-def gradient_vector(
-    *,
-    loss: torch.Tensor,
-    params: list[torch.nn.Parameter],
-    retain_graph: bool,
-) -> torch.Tensor:
-    if not params:
-        return loss.new_zeros((0,))
-    if not loss.requires_grad:
-        return torch.cat([param.detach().new_zeros(param.numel()) for param in params])
-    grads = torch.autograd.grad(
-        loss,
-        params,
-        retain_graph=retain_graph,
-        allow_unused=True,
-    )
-    values = [
-        torch.zeros_like(param).reshape(-1) if grad is None else grad.detach().reshape(-1)
-        for param, grad in zip(params, grads, strict=True)
-    ]
-    return torch.cat(values) if values else loss.new_zeros((0,))
-
-
 def gradient_norm_metrics(policy: ForwardPolicy) -> dict[str, torch.Tensor]:
     reference = next(policy.parameters())
     return {
-        "grad_stop_flow_head_norm": module_grad_norm(policy.stop_flow_head, reference).detach(),
-        "grad_edge_advantage_head_norm": module_grad_norm(policy.edge_advantage_head, reference).detach(),
+        "grad_terminal_flow_head_norm": module_grad_norm(policy.terminal_flow_head, reference).detach(),
+        "grad_continue_flow_head_norm": module_grad_norm(policy.continue_flow_head, reference).detach(),
+        "grad_edge_score_head_norm": module_grad_norm(policy.edge_score_head, reference).detach(),
         "grad_state_encoder_norm": module_grad_norm(policy.state_encoder, reference).detach(),
     }
 
@@ -829,6 +790,9 @@ def rollout_replay_metrics(
             "replay_covered_graphs": reference.new_zeros(()).detach(),
             "replay_expansion_transitions": reference.new_zeros(()).detach(),
             "replay_terminal_transitions": reference.new_zeros(()).detach(),
+            "replay_oracle_reward": reference.new_zeros(()).detach(),
+            "replay_policy_best_reward": reference.new_zeros(()).detach(),
+            "replay_reward_gap": reference.new_zeros(()).detach(),
         }
     stats = replay.stats
     return {
@@ -838,6 +802,9 @@ def rollout_replay_metrics(
         "replay_covered_graphs": reference.new_tensor(float(stats.covered_graphs)).detach(),
         "replay_expansion_transitions": reference.new_tensor(float(rollout.num_replay_transitions)).detach(),
         "replay_terminal_transitions": reference.new_tensor(float(rollout.num_replay_terminal_transitions)).detach(),
+        "replay_oracle_reward": reference.new_tensor(float(stats.oracle_reward_mean)).detach(),
+        "replay_policy_best_reward": reference.new_tensor(float(stats.policy_best_reward_mean)).detach(),
+        "replay_reward_gap": reference.new_tensor(float(stats.reward_gap_mean)).detach(),
     }
 
 

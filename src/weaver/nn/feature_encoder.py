@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from src.data.schema import RetrievalBatch
@@ -79,12 +80,21 @@ class FeatureEncoder(nn.Module):
         self.semantic_dim = int(entity_text_semantic_table.size(-1))
         self.model_dim = int(model_dim)
 
-        self.project_to_model = nn.Linear(
+        self.project_query_to_model = nn.Linear(
             self.semantic_dim,
             self.model_dim,
             bias=False,
         )
-        self.model_norm = nn.LayerNorm(self.model_dim)
+        self.project_node_to_model = nn.Linear(
+            self.semantic_dim,
+            self.model_dim,
+            bias=False,
+        )
+        self.project_relation_to_model = nn.Linear(
+            self.semantic_dim,
+            self.model_dim,
+            bias=False,
+        )
 
         self.non_text_node_model = nn.Parameter(torch.empty(self.model_dim))
 
@@ -97,7 +107,9 @@ class FeatureEncoder(nn.Module):
         *,
         non_text_node_init_std: float,
     ) -> None:
-        init_xavier(self.project_to_model)
+        init_xavier(self.project_query_to_model)
+        init_xavier(self.project_node_to_model)
+        init_xavier(self.project_relation_to_model)
         nn.init.normal_(
             self.non_text_node_model,
             mean=0.0,
@@ -114,8 +126,8 @@ class FeatureEncoder(nn.Module):
             node_text_semantic=node_text_semantic,
             node_has_text=node_has_text,
         )
-        edge_relation_model = self.to_model_space(edge_relation_semantic)
-        query_model = self.to_model_space(query_semantic)
+        edge_relation_model = self.project_relation_semantic(edge_relation_semantic)
+        query_model = self.project_query_semantic(query_semantic)
         src_node_ids = batch.edge_index[0].to(dtype=torch.long)
         dst_node_ids = batch.edge_index[1].to(dtype=torch.long)
         edge_token_model = torch.cat(
@@ -175,7 +187,7 @@ class FeatureEncoder(nn.Module):
         node_text_semantic: torch.Tensor,
         node_has_text: torch.Tensor,
     ) -> torch.Tensor:
-        text_node_model = self.to_model_space(node_text_semantic)
+        text_node_model = self.project_node_semantic(node_text_semantic)
 
         non_text_node_model = self.non_text_node_model.unsqueeze(0).expand(
             node_text_semantic.size(0),
@@ -188,11 +200,41 @@ class FeatureEncoder(nn.Module):
             non_text_node_model,
         )
 
-    def to_model_space(
+    def project_query_semantic(
         self,
         semantic: torch.Tensor,
     ) -> torch.Tensor:
-        return self.model_norm(self.project_to_model(semantic))
+        return self.to_model_space(
+            semantic,
+            projector=self.project_query_to_model,
+        )
+
+    def project_node_semantic(
+        self,
+        semantic: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.to_model_space(
+            semantic,
+            projector=self.project_node_to_model,
+        )
+
+    def project_relation_semantic(
+        self,
+        semantic: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.to_model_space(
+            semantic,
+            projector=self.project_relation_to_model,
+        )
+
+    def to_model_space(
+        self,
+        semantic: torch.Tensor,
+        *,
+        projector: nn.Linear,
+    ) -> torch.Tensor:
+        normalized = F.normalize(semantic, p=2, dim=-1)
+        return projector(normalized)
 
 
 def select_node_text_semantic(

@@ -15,7 +15,6 @@ from src.weaver.context import GraphContext, TargetContext
 from src.weaver.nn.feature_encoder import EncodedFeatures
 from src.weaver.policy import ForwardPolicy
 from src.weaver.rollout.result import RolloutResult
-from src.weaver.rollout.subgraph import SubgraphReconstructor
 from src.weaver.state import State
 from src.weaver.utility import TrueTerminalReward
 
@@ -62,6 +61,8 @@ def evaluate_rollout_samples(
     exclude_anchors_from_retrieved: bool,
     use_reachable_targets: bool,
     k_windows: Sequence[int],
+    enable_calibration_metrics: bool,
+    enable_terminal_diagnostics: bool,
     context: GraphContext | None = None,
     features: EncodedFeatures | None = None,
     reward_model: TrueTerminalReward | None = None,
@@ -98,8 +99,10 @@ def evaluate_rollout_samples(
         )
     )
     metrics.update(selector_metrics(tensors, ks=ks))
-    metrics.update(calibration_metrics(tensors))
-    metrics.update(terminal_metrics(rollout_samples, tensors, batch=batch))
+    if enable_calibration_metrics:
+        metrics.update(calibration_metrics(tensors))
+    if enable_terminal_diagnostics:
+        metrics.update(terminal_metrics(rollout_samples, tensors, batch=batch))
     return metrics
 
 
@@ -116,7 +119,12 @@ def rollout_eval_tensors(
     policy: ForwardPolicy,
 ) -> RolloutEvalTensors:
     device = torch.device("cpu")
-    node_masks, edge_masks = SubgraphReconstructor(batch, device=device).stack(rollout_samples)
+    node_masks, edge_masks = stacked_terminal_masks(
+        rollout_samples,
+        num_nodes=int(context.num_nodes),
+        num_edges=int(context.num_edges),
+        device=device,
+    )
     _, recall, f1, valid_graph_mask = retrieval_from_masks(
         node_masks=node_masks,
         batch=batch,
@@ -138,7 +146,7 @@ def rollout_eval_tensors(
     policy_stop, no_frontier_stop, budget_truncated = terminal_matrices(rollout_samples)
     traj_prob_score = _stack_trajectory_log_prob(rollout_samples)
 
-    terminal_state = state_from_sample_edge_masks(edge_masks, context=context)
+    terminal_state = stacked_terminal_state(rollout_samples, context=context)
     log_reward = log_reward_from_state(
         state=terminal_state,
         num_samples=int(edge_masks.size(0)),
@@ -420,24 +428,53 @@ def terminal_matrices(rollouts: Sequence[RolloutResult]) -> tuple[torch.Tensor, 
     return torch.stack(policy, dim=0), torch.stack(structural, dim=0), torch.stack(truncated, dim=0)
 
 
-def state_from_sample_edge_masks(edge_masks: torch.Tensor, *, context: GraphContext) -> State:
-    num_samples = int(edge_masks.size(0))
-    num_graphs = int(context.num_graphs)
-    graph_ids = torch.arange(num_graphs, device=context.device, dtype=torch.long)
-    repeated_graph_ids = graph_ids.repeat(num_samples)
-    edge_graph = context.edge_to_graph.view(1, 1, -1)
-    expanded_graph = graph_ids.view(1, num_graphs, 1)
-    selected = (
-        edge_masks.to(device=context.device, dtype=torch.bool)
-        .view(num_samples, 1, int(context.num_edges))
-        .expand(num_samples, num_graphs, int(context.num_edges))
-        & edge_graph.eq(expanded_graph)
-    ).reshape(num_samples * num_graphs, int(context.num_edges))
-    return State.from_selected_edges(
-        graph=context,
-        graph_ids=repeated_graph_ids,
-        selected_edge_mask=selected,
+def stacked_terminal_state(
+    rollouts: Sequence[RolloutResult],
+    *,
+    context: GraphContext,
+) -> State:
+    states = [rollout.terminal_state for rollout in rollouts]
+    if not states:
+        return State.initial(
+            graph=context,
+            graph_ids=torch.empty(0, dtype=torch.long, device=context.device),
+            expand_budget=0,
+        )
+    if any(state is None for state in states):
+        raise ValueError("rollout terminal_state must be present for evaluation.")
+    return State.concat(states)
+
+
+def stacked_terminal_masks(
+    rollouts: Sequence[RolloutResult],
+    *,
+    num_nodes: int,
+    num_edges: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not rollouts:
+        return (
+            torch.zeros((0, int(num_nodes)), dtype=torch.bool, device=device),
+            torch.zeros((0, int(num_edges)), dtype=torch.bool, device=device),
+        )
+    states = [rollout.terminal_state for rollout in rollouts]
+    if any(state is None for state in states):
+        raise ValueError("rollout terminal_state must be present for evaluation.")
+    node_masks = torch.stack(
+        [
+            state.active_node_mask.any(dim=0).to(device=device, dtype=torch.bool)
+            for state in states
+        ],
+        dim=0,
     )
+    edge_masks = torch.stack(
+        [
+            state.selected_edge_mask.any(dim=0).to(device=device, dtype=torch.bool)
+            for state in states
+        ],
+        dim=0,
+    )
+    return node_masks, edge_masks
 
 
 def log_reward_from_state(
@@ -478,7 +515,7 @@ def terminal_policy_scores(
             frontier=frontier,
         )
     state_flow = out.state_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-    terminal_flow = out.stop_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
+    terminal_flow = out.terminal_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
     return TerminalPolicyScores(state_flow=state_flow, terminal_flow=terminal_flow)
 
 

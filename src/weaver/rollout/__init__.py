@@ -1,3 +1,13 @@
 from __future__ import annotations
 
-__all__: list[str] = []
+from .latent_prefix import (
+    LatentPrefixRollout,
+    LatentPrefixRolloutEngine,
+    PrefixBatch,
+)
+
+__all__ = [
+    "LatentPrefixRollout",
+    "LatentPrefixRolloutEngine",
+    "PrefixBatch",
+]

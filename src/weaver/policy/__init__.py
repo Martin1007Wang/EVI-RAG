@@ -6,6 +6,11 @@ from .backward import (
     valid_predecessor_count,
 )
 from .forward import ForwardPolicy
+from .latent_prefix import (
+    EdgeOnlyPolicyOutput,
+    EdgeOnlyProposalPolicy,
+    PrefixSelector,
+)
 from .output import (
     TERMINAL_EDGE_ID,
     ForwardPolicyOutput,
@@ -13,8 +18,11 @@ from .output import (
 
 __all__ = [
     "BackwardPolicy",
+    "EdgeOnlyPolicyOutput",
+    "EdgeOnlyProposalPolicy",
     "ForwardPolicy",
     "ForwardPolicyOutput",
+    "PrefixSelector",
     "TERMINAL_EDGE_ID",
     "UniformValidPredecessorBackwardPolicy",
     "valid_predecessor_count",

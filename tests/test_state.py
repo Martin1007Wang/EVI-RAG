@@ -26,6 +26,7 @@ def test_sparse_state_exposes_dense_masks_compatibly() -> None:
         graph=graph,
         graph_ids=torch.tensor([0], dtype=torch.long),
         selected_edge_mask=torch.tensor([[True, False, True]], dtype=torch.bool),
+        expand_budget=3,
     )
 
     assert torch.equal(state.edge_mask, torch.tensor([[True, False, True]], dtype=torch.bool))
@@ -41,6 +42,7 @@ def test_expand_defaults_to_no_frontier_revalidation() -> None:
     state = State.initial(
         graph=graph,
         graph_ids=torch.tensor([0], dtype=torch.long),
+        expand_budget=3,
     )
 
     frontier = state.frontier(graph, expand_budget=3)

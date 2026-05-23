@@ -10,39 +10,42 @@ TERMINAL_EDGE_ID = -1
 @dataclass(frozen=True, slots=True)
 class ForwardPolicyOutput:
     """
-    Forward policy output for a flat stop-or-edge action-flow distribution.
+    Forward policy output for a terminal/continue/conditional-edge flow factorization.
     """
 
     frontier_row_ids: torch.Tensor
     frontier_edge_ids: torch.Tensor
-    stop_log_flow: torch.Tensor
+    terminal_log_flow: torch.Tensor
     continue_log_flow: torch.Tensor
-    continue_log_gain: torch.Tensor
-    edge_log_flow: torch.Tensor
-    edge_log_reference: torch.Tensor
-    edge_log_advantage: torch.Tensor
     state_log_flow: torch.Tensor
-    stop_log_prob: torch.Tensor
+    edge_logit: torch.Tensor
     edge_log_prob: torch.Tensor
+    edge_log_flow: torch.Tensor
+    stop_log_prob: torch.Tensor
+    expand_log_prob: torch.Tensor
+    edge_action_log_prob: torch.Tensor
     num_rows: int
     num_edges: int
+    frontier_offsets: torch.Tensor | None = None
+    action_key_order: torch.Tensor | None = None
+    sorted_action_keys: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        device = self.stop_log_flow.device
+        device = self.terminal_log_flow.device
         float_fields = {
-            "stop_log_flow": self.stop_log_flow,
+            "terminal_log_flow": self.terminal_log_flow,
             "continue_log_flow": self.continue_log_flow,
-            "continue_log_gain": self.continue_log_gain,
-            "edge_log_flow": self.edge_log_flow,
-            "edge_log_reference": self.edge_log_reference,
-            "edge_log_advantage": self.edge_log_advantage,
             "state_log_flow": self.state_log_flow,
-            "stop_log_prob": self.stop_log_prob,
+            "edge_logit": self.edge_logit,
             "edge_log_prob": self.edge_log_prob,
+            "edge_log_flow": self.edge_log_flow,
+            "stop_log_prob": self.stop_log_prob,
+            "expand_log_prob": self.expand_log_prob,
+            "edge_action_log_prob": self.edge_action_log_prob,
         }
         for name, value in float_fields.items():
             if value.device != device:
-                raise ValueError(f"{name} must be on the same device as stop_log_flow.")
+                raise ValueError(f"{name} must be on the same device as terminal_log_flow.")
             if value.dtype != torch.float32:
                 raise TypeError(f"{name} must use torch.float32.")
 
@@ -52,9 +55,25 @@ class ForwardPolicyOutput:
         }
         for name, value in index_fields.items():
             if value.device != device:
-                raise ValueError(f"{name} must be on the same device as stop_log_flow.")
+                raise ValueError(f"{name} must be on the same device as terminal_log_flow.")
             if value.dtype != torch.long:
                 raise TypeError(f"{name} must use torch.long.")
+        offsets = self.frontier_offsets
+        if offsets is None:
+            offsets = _frontier_offsets(
+                edge_row_ids=self.frontier_row_ids,
+                num_rows=int(self.num_rows),
+                device=device,
+            )
+            object.__setattr__(self, "frontier_offsets", offsets)
+        action_key_order = self.action_key_order
+        sorted_action_keys = self.sorted_action_keys
+        if action_key_order is None or sorted_action_keys is None:
+            edge_keys = self.frontier_row_ids * int(self.num_edges) + self.frontier_edge_ids
+            action_key_order = torch.argsort(edge_keys)
+            sorted_action_keys = edge_keys.index_select(0, action_key_order)
+            object.__setattr__(self, "action_key_order", action_key_order)
+            object.__setattr__(self, "sorted_action_keys", sorted_action_keys)
 
     @property
     def edge_row_ids(self) -> torch.Tensor:
@@ -65,14 +84,18 @@ class ForwardPolicyOutput:
         return self.frontier_edge_ids
 
     @property
+    def stop_log_flow(self) -> torch.Tensor:
+        return self.terminal_log_flow
+
+    @property
     def stop_vs_continue_log_ratio(self) -> torch.Tensor:
-        return self.stop_log_flow.float() - self.continue_log_flow
+        return self.terminal_log_flow.float() - self.continue_log_flow
 
     def has_edge(self) -> torch.Tensor:
         return _rows_with_edges(
             edge_row_ids=self.frontier_row_ids,
             num_rows=int(self.num_rows),
-            device=self.stop_log_flow.device,
+            device=self.terminal_log_flow.device,
         )
 
     def stop_prob(self) -> torch.Tensor:
@@ -82,13 +105,16 @@ class ForwardPolicyOutput:
         return torch.cat(
             [
                 self.stop_log_prob,
-                self.edge_log_prob,
+                self.edge_action_log_prob,
             ],
             dim=0,
         )
 
     def edge_prob_mass(self) -> torch.Tensor:
-        mass = self.stop_log_flow.new_zeros((int(self.num_rows),)).float()
+        return self.expand_log_prob.exp()
+
+    def conditional_edge_prob_mass(self) -> torch.Tensor:
+        mass = self.terminal_log_flow.new_zeros((int(self.num_rows),)).float()
         if self.edge_log_prob.numel() == 0:
             return mass
         probs = self.edge_log_prob.exp()
@@ -107,7 +133,7 @@ class ForwardPolicyOutput:
     ) -> torch.Tensor:
         return _gather_by_action_keys(
             stop_values=self.stop_log_prob,
-            edge_values=self.edge_log_prob,
+            edge_values=self.edge_action_log_prob,
             out=self,
             row_ids=row_ids,
             edge_ids=edge_ids,
@@ -131,11 +157,11 @@ class ForwardPolicyOutput:
         return _frontier_size(
             edge_row_ids=self.frontier_row_ids,
             num_rows=int(self.num_rows),
-            device=self.stop_log_flow.device,
+            device=self.terminal_log_flow.device,
         )
 
     def edge_action_entropy(self) -> torch.Tensor:
-        entropy = self.stop_log_flow.new_zeros((int(self.num_rows),)).float()
+        entropy = self.terminal_log_flow.new_zeros((int(self.num_rows),)).float()
         if self.edge_log_prob.numel() == 0:
             return entropy
         edge_row_ids = self.frontier_row_ids.to(device=self.edge_log_prob.device, dtype=torch.long)
@@ -149,28 +175,43 @@ class ForwardPolicyOutput:
         *,
         rows: torch.Tensor,
     ) -> torch.Tensor:
-        rows = rows.to(device=self.stop_log_flow.device, dtype=torch.long).view(-1)
-        picked_edge_ids = torch.full(
-            (rows.numel(),),
-            TERMINAL_EDGE_ID,
-            dtype=torch.long,
-            device=rows.device,
-        )
+        rows = rows.to(device=self.terminal_log_flow.device, dtype=torch.long).view(-1)
         if rows.numel() == 0:
-            return picked_edge_ids
+            return torch.empty(0, dtype=torch.long, device=rows.device)
 
-        for out_pos, row in enumerate(rows.tolist()):
-            edge_positions = self.frontier_row_ids.eq(int(row)).nonzero(as_tuple=False).flatten()
-            values = [self.stop_log_prob[int(row)].float()]
-            edge_ids = [TERMINAL_EDGE_ID]
-            if edge_positions.numel() > 0:
-                values.append(self.edge_log_prob.index_select(0, edge_positions).float())
-                edge_ids.extend(self.frontier_edge_ids.index_select(0, edge_positions).tolist())
-            logits = torch.cat([value.view(-1) for value in values], dim=0)
-            gumbel = -torch.empty_like(logits).exponential_().log()
-            picked = int(torch.argmax(logits + gumbel).item())
-            picked_edge_ids[out_pos] = int(edge_ids[picked])
-        return picked_edge_ids
+        row_ids = self.frontier_row_ids
+        edge_ids = self.frontier_edge_ids
+        stop_pos = torch.arange(rows.numel(), device=rows.device, dtype=torch.long)
+        stop_logits = self.stop_log_prob.index_select(0, rows)
+        stop_segment = stop_pos
+
+        offsets = self.frontier_offsets.index_select(0, rows)
+        lengths = self.frontier_offsets.index_select(0, rows + 1) - offsets
+        total_edges = int(lengths.sum().item())
+        if total_edges == 0:
+            return torch.full((rows.numel(),), TERMINAL_EDGE_ID, dtype=torch.long, device=rows.device)
+
+        edge_positions = _segment_positions(lengths=lengths) + torch.repeat_interleave(offsets, lengths)
+        edge_logits = self.edge_action_log_prob.index_select(0, edge_positions)
+        edge_segment = torch.repeat_interleave(stop_pos, lengths)
+        edge_choice_ids = edge_ids.index_select(0, edge_positions)
+
+        logits = torch.cat([stop_logits, edge_logits], dim=0)
+        segment_ids = torch.cat([stop_segment, edge_segment], dim=0)
+        choice_ids = torch.cat(
+            [
+                torch.full((rows.numel(),), TERMINAL_EDGE_ID, dtype=torch.long, device=rows.device),
+                edge_choice_ids,
+            ],
+            dim=0,
+        )
+        gumbel = -torch.empty_like(logits).exponential_().log()
+        winner_pos = _segment_argmax(
+            values=logits + gumbel,
+            segment_ids=segment_ids,
+            num_segments=int(rows.numel()),
+        )
+        return choice_ids.index_select(0, winner_pos)
 
 
 def _frontier_size(
@@ -185,6 +226,22 @@ def _frontier_size(
         edge_row_ids.to(device=device, dtype=torch.long),
         minlength=int(num_rows),
     ).float()
+
+
+def _frontier_offsets(
+    *,
+    edge_row_ids: torch.Tensor,
+    num_rows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    counts = torch.bincount(
+        edge_row_ids.to(device=device, dtype=torch.long),
+        minlength=int(num_rows),
+    )
+    offsets = torch.empty(int(num_rows) + 1, dtype=torch.long, device=device)
+    offsets[0] = 0
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
 
 
 def _rows_with_edges(
@@ -226,10 +283,9 @@ def _gather_by_action_keys(
             raise KeyError("Requested edge action is not present in ForwardPolicyOutput.")
         if bool(edge_ids[edge_mask].ge(key_width).any()):
             raise IndexError("edge_ids must be TERMINAL_EDGE_ID or in [0, ForwardPolicyOutput.num_edges).")
-        edge_keys = out.frontier_row_ids * key_width + out.frontier_edge_ids
         target_keys = row_ids[edge_mask] * key_width + edge_ids[edge_mask]
-        order = torch.argsort(edge_keys)
-        sorted_keys = edge_keys.index_select(0, order)
+        sorted_keys = out.sorted_action_keys
+        order = out.action_key_order
         duplicate_keys = (
             sorted_keys[1:].eq(sorted_keys[:-1])
             if sorted_keys.numel() > 1
@@ -246,6 +302,38 @@ def _gather_by_action_keys(
         out_values[edge_mask] = edge_values.index_select(0, order.index_select(0, positions))
 
     return out_values
+
+
+def _segment_argmax(
+    *,
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+) -> torch.Tensor:
+    best = values.new_full((int(num_segments),), -torch.inf)
+    best.scatter_reduce_(0, segment_ids, values, reduce="amax", include_self=True)
+    matches = values.eq(best.index_select(0, segment_ids))
+    candidate_pos = torch.arange(values.numel(), device=values.device, dtype=torch.long)
+    fallback = torch.full_like(candidate_pos, values.numel())
+    winner = torch.full((int(num_segments),), values.numel(), dtype=torch.long, device=values.device)
+    winner.scatter_reduce_(
+        0,
+        segment_ids,
+        torch.where(matches, candidate_pos, fallback),
+        reduce="amin",
+        include_self=True,
+    )
+    if bool(winner.eq(values.numel()).any()):
+        raise RuntimeError("segment argmax failed to pick an action for at least one segment.")
+    return winner
+
+
+def _segment_positions(*, lengths: torch.Tensor) -> torch.Tensor:
+    total = int(lengths.sum().item())
+    if total == 0:
+        return torch.empty(0, dtype=torch.long, device=lengths.device)
+    starts = torch.cumsum(lengths, dim=0) - lengths
+    return torch.arange(total, dtype=torch.long, device=lengths.device) - torch.repeat_interleave(starts, lengths)
 
 
 __all__ = [

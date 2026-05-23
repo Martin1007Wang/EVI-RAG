@@ -13,7 +13,6 @@ from src.weaver.rollout.replay import (
     ReplayBuilder,
     ReplaySampleBudget,
     ReplaySource,
-    training_from_rollouts,
 )
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.transition import (
@@ -111,8 +110,12 @@ class RolloutRunner:
         reward_model: TrueTerminalReward | None = None,
         target_context: TargetContext | None = None,
     ) -> RolloutBatch:
-        budget = self.sample_budget(self.train_num_rollouts)
-        rollouts = self.policy_rollouts(
+        progress = float(self.progress_fn())
+        budget = self.sample_budget(
+            self.train_num_rollouts,
+            progress=progress,
+        )
+        rollouts, policy_training = self.policy_rollouts(
             policy=policy,
             context=context,
             features=features,
@@ -125,9 +128,11 @@ class RolloutRunner:
             num_trajectories=budget.replay_expand,
             reward_model=reward_model,
             target_context=target_context,
+            progress=progress,
         )
         training = self.training_batch(
             rollouts=rollouts,
+            policy_training=policy_training,
             replay=replay,
             context=context,
         )
@@ -146,12 +151,13 @@ class RolloutRunner:
         num_rollouts: int | None = None,
     ) -> tuple[RolloutResult, ...]:
         total = self.eval_num_rollouts if num_rollouts is None else int(num_rollouts)
-        return self.policy_rollouts(
+        rollouts, _ = self.policy_rollouts(
             policy=policy,
             context=context,
             features=features,
             num_rollouts=total,
         )
+        return rollouts
 
     def policy_rollouts(
         self,
@@ -160,18 +166,17 @@ class RolloutRunner:
         context: GraphContext,
         features: EncodedFeatures,
         num_rollouts: int,
-    ) -> tuple[RolloutResult, ...]:
+    ) -> tuple[tuple[RolloutResult, ...], TrainingBatch | None]:
         num_rollouts = int(num_rollouts)
         if num_rollouts <= 0:
-            return ()
-        return tuple(
-            self.engine.sample_rollouts(
-                policy=policy,
-                context=context,
-                features=features,
-                num_rollouts=num_rollouts,
-            )
+            return (), None
+        rollouts, training = self.engine.sample_rollouts(
+            policy=policy,
+            context=context,
+            features=features,
+            num_rollouts=num_rollouts,
         )
+        return tuple(rollouts), training
 
     def replay_trajectories(
         self,
@@ -182,6 +187,7 @@ class RolloutRunner:
         num_trajectories: int,
         reward_model: TrueTerminalReward | None = None,
         target_context: TargetContext | None = None,
+        progress: float = 0.0,
     ) -> ReplayBatch | None:
         if int(num_trajectories) <= 0:
             return None
@@ -194,22 +200,19 @@ class RolloutRunner:
             num_trajectories=int(num_trajectories),
             reward_model=reward_model,
             target_context=target_context,
+            progress=float(progress),
         )
 
     def training_batch(
         self,
         *,
         rollouts: tuple[RolloutResult, ...],
+        policy_training: TrainingBatch | None,
         replay: ReplayBatch | None,
         context: GraphContext,
     ) -> TrainingBatch | None:
         parts: list[TrainingBatch] = []
 
-        policy_training = training_from_rollouts(
-            rollouts=rollouts,
-            budget=self.engine.expand_budget,
-            context=context,
-        )
         if policy_training is not None and policy_training.num_items > 0:
             parts.append(policy_training.with_source_id(SRC_POLICY))
 
@@ -227,7 +230,12 @@ class RolloutRunner:
             return None
         return TrainingBatch.concat_reindex_trajectories(parts)
 
-    def sample_budget(self, total: int) -> ReplaySampleBudget:
+    def sample_budget(
+        self,
+        total: int,
+        *,
+        progress: float | None = None,
+    ) -> ReplaySampleBudget:
         total = int(total)
         if self.replay_schedule is None:
             return ReplaySampleBudget(
@@ -235,8 +243,10 @@ class RolloutRunner:
                 replay_expand=0,
             )
 
+        if progress is None:
+            progress = float(self.progress_fn())
         weights = self.replay_schedule.weights_at(
-            progress=float(self.progress_fn()),
+            progress=float(progress),
         )
         return allocate_replay_budget(
             total=total,

@@ -6,6 +6,7 @@ from src.weaver.context import GraphContext
 from src.weaver.nn.feature_encoder import EncodedFeatures
 from src.weaver.policy import ForwardPolicy
 from src.weaver.state import Frontier, State
+from src.weaver.transition import ExpansionBatch, SampleMeta, SRC_UNKNOWN, TerminalBatch, TrainingBatch
 
 from .action import StepAction, sample_step
 from .result import RolloutResult
@@ -27,19 +28,22 @@ class RolloutEngine:
         context: GraphContext,
         features: EncodedFeatures,
         num_rollouts: int,
-    ) -> list[RolloutResult]:
+    ) -> tuple[list[RolloutResult], TrainingBatch | None]:
         with torch.no_grad():
-            fused = self.sample_fused_rollouts(
+            fused, training = self.sample_fused_rollouts(
                 policy=policy,
                 context=context,
                 features=features,
                 rollouts_per_graph=int(num_rollouts),
             )
 
-        return split_fused_rollouts(
-            fused=fused,
-            rollouts_per_graph=int(num_rollouts),
-            num_graphs=int(context.num_graphs),
+        return (
+            split_fused_rollouts(
+                fused=fused,
+                rollouts_per_graph=int(num_rollouts),
+                num_graphs=int(context.num_graphs),
+            ),
+            training,
         )
 
     def sample_fused_rollouts(
@@ -49,7 +53,7 @@ class RolloutEngine:
         context: GraphContext,
         features: EncodedFeatures,
         rollouts_per_graph: int,
-    ) -> RolloutResult:
+    ) -> tuple[RolloutResult, TrainingBatch | None]:
         graph_ids = torch.arange(
             int(context.num_graphs),
             dtype=torch.long,
@@ -58,12 +62,20 @@ class RolloutEngine:
         state = State.initial(
             graph=context,
             graph_ids=graph_ids,
+            expand_budget=self.expand_budget,
         )
         tape = RolloutTape(
             R=state.num_rows,
             T=self.expand_budget + 1,
             device=context.device,
         )
+        trajectory_ids = torch.arange(
+            state.num_rows,
+            dtype=torch.long,
+            device=context.device,
+        )
+        expansion_parts: list[ExpansionBatch] = []
+        terminal_parts: list[TerminalBatch] = []
 
         for t in range(self.expand_budget + 1):
             active_rows = (~tape.is_stopped).nonzero(as_tuple=False).flatten()
@@ -125,26 +137,105 @@ class RolloutEngine:
             tape.write(t, action)
 
             if bool(action.expand_mask.any()):
-                state = state.expand(
+                expand_rows = action.expand_rows
+                expand_edge_ids = action.expand_edge_ids
+                parent = state.select_rows(expand_rows)
+                child = parent.expand(
                     graph=context,
-                    rows=action.expand_rows,
-                    edge_ids=action.expand_edge_ids,
+                    rows=torch.arange(
+                        parent.num_rows,
+                        dtype=torch.long,
+                        device=context.device,
+                    ),
+                    edge_ids=expand_edge_ids,
                     expand_budget=self.expand_budget,
                 )
+                expansion_parts.append(
+                    ExpansionBatch(
+                        parent=parent,
+                        child=child,
+                        edge_ids=expand_edge_ids,
+                        meta=SampleMeta(
+                            trajectory_ids=trajectory_ids.index_select(0, expand_rows),
+                            step_ids=torch.full(
+                                (expand_rows.numel(),),
+                                int(t),
+                                dtype=torch.long,
+                                device=context.device,
+                            ),
+                            source_ids=torch.full(
+                                (expand_rows.numel(),),
+                                SRC_UNKNOWN,
+                                dtype=torch.long,
+                                device=context.device,
+                            ),
+                        ),
+                    )
+                )
+                state = state.expand(
+                    graph=context,
+                    rows=expand_rows,
+                    edge_ids=expand_edge_ids,
+                    expand_budget=self.expand_budget,
+                )
+            if bool(action.terminal_mask.any()):
+                terminal_rows = action.terminal_rows
+                if terminal_rows.numel() > 0:
+                    terminal_parts.append(
+                        TerminalBatch(
+                            state=state.select_rows(terminal_rows),
+                            meta=SampleMeta(
+                                trajectory_ids=trajectory_ids.index_select(0, terminal_rows),
+                                step_ids=torch.full(
+                                    (terminal_rows.numel(),),
+                                    int(t),
+                                    dtype=torch.long,
+                                    device=context.device,
+                                ),
+                                source_ids=torch.full(
+                                    (terminal_rows.numel(),),
+                                    SRC_UNKNOWN,
+                                    dtype=torch.long,
+                                    device=context.device,
+                                ),
+                            ),
+                            stop_reason=action.stop_reason[action.terminal_mask],
+                        )
+                    )
 
         terminal_step = tape.terminal_step.clone()
         unstopped = terminal_step.lt(0)
         if bool(unstopped.any()):
             terminal_step[unstopped] = self.expand_budget
 
-        return RolloutResult(
-            source_graph_id=graph_ids,
-            selected_edge_ids=tape.selected_edge_ids,
-            policy_action_log_prob=tape.policy_action_log_prob,
-            behavior_action_log_prob=tape.behavior_action_log_prob,
-            terminal_step=terminal_step,
-            stop_reason=tape.stop_reason,
-            expand_budget=self.expand_budget,
+        empty_state = initial_empty_state(context=context)
+        training = None
+        if expansion_parts or terminal_parts:
+            training = TrainingBatch(
+                expansions=(
+                    ExpansionBatch.concat(expansion_parts)
+                    if expansion_parts
+                    else ExpansionBatch.empty_like(graph_like=empty_state)
+                ),
+                terminals=(
+                    TerminalBatch.concat(terminal_parts)
+                    if terminal_parts
+                    else TerminalBatch.empty_like(graph_like=empty_state)
+                ),
+            )
+
+        return (
+            RolloutResult(
+                source_graph_id=graph_ids,
+                selected_edge_ids=tape.selected_edge_ids,
+                policy_action_log_prob=tape.policy_action_log_prob,
+                behavior_action_log_prob=tape.behavior_action_log_prob,
+                terminal_step=terminal_step,
+                stop_reason=tape.stop_reason,
+                expand_budget=self.expand_budget,
+                terminal_state=state,
+            ),
+            training,
         )
 
 
@@ -162,7 +253,8 @@ def forced_terminal_rows(
     )
     if frontier.row_ids.numel() > 0:
         has_frontier.index_fill_(0, frontier.row_ids, True)
-    exhausted = state.depth.ge(int(expand_budget))
+    del expand_budget
+    exhausted = state.remaining_budget.le(0)
     return (~has_frontier | exhausted).nonzero(as_tuple=False).flatten()
 
 
@@ -180,7 +272,8 @@ def forced_stop_reason(
     if frontier.row_ids.numel() > 0:
         has_frontier.index_fill_(0, frontier.row_ids, True)
     no_frontier = ~has_frontier.index_select(0, rows)
-    exhausted = state.depth.ge(int(expand_budget)).index_select(0, rows)
+    del expand_budget
+    exhausted = state.remaining_budget.le(0).index_select(0, rows)
     out = torch.full(
         (rows.numel(),),
         int(RolloutResult.NO_FRONTIER_STOP),
@@ -222,6 +315,14 @@ def split_fused_rollouts(
         ) * int(rollouts_per_graph) + int(rollout_id)
         out.append(fused.select_rows(rows))
     return out
+
+
+def initial_empty_state(*, context: GraphContext) -> State:
+    return State.initial(
+        graph=context,
+        graph_ids=torch.empty(0, dtype=torch.long, device=context.device),
+        expand_budget=0,
+    )
 
 
 __all__ = [

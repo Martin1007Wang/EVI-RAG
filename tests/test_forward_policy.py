@@ -34,6 +34,7 @@ def test_action_log_flows_accepts_keyword_only_segment_logsumexp() -> None:
     state = State.initial(
         graph=graph,
         graph_ids=torch.tensor([0], dtype=torch.long),
+        expand_budget=3,
     )
     features = EncodedFeatures(
         node_text_semantic=torch.zeros((3, hidden_dim)),
@@ -54,12 +55,7 @@ def test_action_log_flows_accepts_keyword_only_segment_logsumexp() -> None:
             ]
         ),
         query_model=torch.tensor([[7.0, 8.0]]),
-        edge_token_model=torch.tensor(
-            [
-                [1.0, 2.0, 0.5, 1.5, 3.0, 4.0],
-                [1.0, 2.0, 2.5, 3.5, 5.0, 6.0],
-            ]
-        ),
+        edge_token_model=torch.empty((2, hidden_dim * 3)),
     )
     frontier = Frontier(
         row_ids=torch.tensor([0, 0], dtype=torch.long),
@@ -74,12 +70,12 @@ def test_action_log_flows_accepts_keyword_only_segment_logsumexp() -> None:
     budget_h = policy.encode_budget(state)
 
     (
-        stop_log_flow,
+        terminal_log_flow,
         continue_log_flow,
-        continue_log_gain,
+        state_log_flow,
+        edge_logit,
+        edge_log_prob,
         edge_log_flow,
-        edge_log_reference,
-        edge_log_advantage,
         frontier_row_ids,
         frontier_edge_ids,
     ) = policy.action_log_flows(
@@ -91,15 +87,54 @@ def test_action_log_flows_accepts_keyword_only_segment_logsumexp() -> None:
         frontier=frontier,
     )
 
-    assert stop_log_flow.shape == (1,)
+    assert terminal_log_flow.shape == (1,)
     assert continue_log_flow.shape == (1,)
-    assert continue_log_gain.shape == (1,)
+    assert state_log_flow.shape == (1,)
+    assert edge_logit.shape == (2,)
+    assert edge_log_prob.shape == (2,)
     assert edge_log_flow.shape == (2,)
-    assert edge_log_reference.shape == (2,)
-    assert edge_log_advantage.shape == (2,)
     assert torch.equal(frontier_row_ids, frontier.row_ids)
     assert torch.equal(frontier_edge_ids, frontier.edge_ids)
     assert torch.allclose(
-        continue_log_flow,
-        stop_log_flow + continue_log_gain,
+        state_log_flow,
+        torch.logaddexp(terminal_log_flow, continue_log_flow),
     )
+    assert torch.allclose(
+        edge_log_flow,
+        continue_log_flow.index_select(0, frontier.row_ids) + edge_log_prob,
+    )
+
+
+def test_forward_policy_stop_continue_depend_on_row_state_and_budget_only() -> None:
+    hidden_dim = 4
+    state_encoder = StateEncoder(hidden_dim=hidden_dim)
+    policy = ForwardPolicy(
+        state_encoder=state_encoder,
+        max_expand_budget=3,
+    )
+    row_state_h = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+    budget_h = torch.tensor([[0.5, 0.5, 0.5, 0.5]], dtype=torch.float32)
+
+    score_a = policy.score_terminal_flow(
+        query_h=torch.tensor([[9.0, 9.0, 9.0, 9.0]], dtype=torch.float32),
+        state_h=row_state_h,
+        budget_h=budget_h,
+    )
+    score_b = policy.score_terminal_flow(
+        query_h=torch.tensor([[1.0, 1.0, 1.0, 1.0]], dtype=torch.float32),
+        state_h=row_state_h,
+        budget_h=budget_h,
+    )
+    continue_a = policy.score_continue_flow(
+        query_h=torch.tensor([[9.0, 9.0, 9.0, 9.0]], dtype=torch.float32),
+        state_h=row_state_h,
+        budget_h=budget_h,
+    )
+    continue_b = policy.score_continue_flow(
+        query_h=torch.tensor([[1.0, 1.0, 1.0, 1.0]], dtype=torch.float32),
+        state_h=row_state_h,
+        budget_h=budget_h,
+    )
+
+    assert torch.allclose(score_a, score_b)
+    assert torch.allclose(continue_a, continue_b)

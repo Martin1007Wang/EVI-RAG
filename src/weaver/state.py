@@ -49,6 +49,7 @@ class State:
     selected_edge_ids: torch.Tensor  # [R, K] padded with -1
     active_node_ids: torch.Tensor  # [R, K_nodes] padded with -1
     step: torch.Tensor  # [R]
+    remaining_budget: torch.Tensor  # [R]
     num_graph_edges: int
     num_graph_nodes: int
     _selected_edge_mask_cache: torch.Tensor | None = None
@@ -74,12 +75,19 @@ class State:
             raise ValueError("active_node_ids rows must match graph_ids length.")
         if self.step.shape != (num_rows,):
             raise ValueError(f"step must have shape [{num_rows}], got {tuple(self.step.shape)}.")
+        if self.remaining_budget.shape != (num_rows,):
+            raise ValueError(
+                f"remaining_budget must have shape [{num_rows}], got {tuple(self.remaining_budget.shape)}."
+            )
+        if bool(self.remaining_budget.lt(0).any()):
+            raise ValueError("remaining_budget must be non-negative.")
 
     @classmethod
     def initial(
         cls,
         graph: GraphContext,
         graph_ids: torch.Tensor,
+        expand_budget: int = 0,
     ) -> State:
         graph_ids = graph_ids.to(device=graph.device, dtype=torch.long).view(-1)
         num_rows = int(graph_ids.numel())
@@ -93,11 +101,18 @@ class State:
             dtype=torch.long,
             device=graph.device,
         )
+        remaining_budget = torch.full(
+            (num_rows,),
+            int(expand_budget),
+            dtype=torch.long,
+            device=graph.device,
+        )
         return cls(
             graph_ids=graph_ids,
             selected_edge_ids=empty_edges,
             active_node_ids=active_node_ids,
             step=step,
+            remaining_budget=remaining_budget,
             num_graph_edges=int(graph.num_edges),
             num_graph_nodes=int(graph.num_nodes),
         )
@@ -109,6 +124,7 @@ class State:
         graph: GraphContext,
         graph_ids: torch.Tensor,
         selected_edge_mask: torch.Tensor,
+        expand_budget: int | None = None,
     ) -> State:
         graph_ids = graph_ids.to(device=graph.device, dtype=torch.long).view(-1)
         selected_edge_mask = selected_edge_mask.to(device=graph.device, dtype=torch.bool)
@@ -136,11 +152,16 @@ class State:
             selected_edge_ids=selected_edge_ids,
         )
         step = selected_edge_mask.sum(dim=1).to(dtype=torch.long)
+        if expand_budget is None:
+            remaining_budget = torch.zeros_like(step)
+        else:
+            remaining_budget = (torch.full_like(step, int(expand_budget)) - step).clamp_min(0)
         return cls(
             graph_ids=graph_ids,
             selected_edge_ids=selected_edge_ids,
             active_node_ids=active_node_ids,
             step=step,
+            remaining_budget=remaining_budget,
             num_graph_edges=int(graph.num_edges),
             num_graph_nodes=int(graph.num_nodes),
             _selected_edge_mask_cache=selected_edge_mask.contiguous(),
@@ -225,6 +246,7 @@ class State:
             selected_edge_ids=self.selected_edge_ids.index_select(0, rows),
             active_node_ids=self.active_node_ids.index_select(0, rows),
             step=self.step.index_select(0, rows),
+            remaining_budget=self.remaining_budget.index_select(0, rows),
             num_graph_edges=self.num_graph_edges,
             num_graph_nodes=self.num_graph_nodes,
             _selected_edge_mask_cache=(
@@ -247,6 +269,7 @@ class State:
             selected_edge_ids=self.selected_edge_ids.clone(),
             active_node_ids=self.active_node_ids.clone(),
             step=self.step.clone(),
+            remaining_budget=self.remaining_budget.clone(),
             num_graph_edges=self.num_graph_edges,
             num_graph_nodes=self.num_graph_nodes,
             _selected_edge_mask_cache=(
@@ -294,6 +317,7 @@ class State:
             selected_edge_ids=selected_edge_ids,
             active_node_ids=active_node_ids,
             step=torch.cat([state.step for state in states], dim=0),
+            remaining_budget=torch.cat([state.remaining_budget for state in states], dim=0),
             num_graph_edges=num_edges,
             num_graph_nodes=num_nodes,
             _selected_edge_mask_cache=(
@@ -323,13 +347,14 @@ class State:
             u ∈ X_i
             e ∉ S_i
             edge_to_graph[e] == graph_ids[i]
-            depth(i) < expand_budget, when expand_budget is provided
+            remaining_budget(i) > 0
         """
-        if expand_budget is not None and not bool(self.depth.lt(int(expand_budget)).any()):
+        cacheable = expand_budget is None
+        if not bool(self.remaining_budget.gt(0).any()):
             return empty_frontier(graph.device)
 
         cached = self._frontier_cache
-        if cached is not None and expand_budget is None:
+        if cached is not None and cacheable:
             return cached
 
         rows, active_nodes = self.active_nodes()
@@ -372,18 +397,17 @@ class State:
             num_edges=self.num_edges,
         )
 
-        if expand_budget is not None:
-            before_horizon = self.depth.lt(int(expand_budget)).index_select(0, frontier_rows)
-            frontier_rows = frontier_rows[before_horizon]
-            frontier_edge_ids = frontier_edge_ids[before_horizon]
-            if frontier_edge_ids.numel() == 0:
-                return empty_frontier(graph.device)
+        before_horizon = self.remaining_budget.gt(0).index_select(0, frontier_rows)
+        frontier_rows = frontier_rows[before_horizon]
+        frontier_edge_ids = frontier_edge_ids[before_horizon]
+        if frontier_edge_ids.numel() == 0:
+            return empty_frontier(graph.device)
 
         frontier = Frontier(
             row_ids=frontier_rows,
             edge_ids=frontier_edge_ids,
         )
-        if expand_budget is None:
+        if cacheable:
             object.__setattr__(self, "_frontier_cache", frontier)
         return frontier
 
@@ -440,11 +464,18 @@ class State:
             rows,
             torch.ones(rows.numel(), dtype=torch.long, device=self.device),
         )
+        remaining_budget = self.remaining_budget.clone()
+        remaining_budget.index_add_(
+            0,
+            rows,
+            -torch.ones(rows.numel(), dtype=torch.long, device=self.device),
+        )
         return State(
             graph_ids=self.graph_ids,
             selected_edge_ids=selected_edge_ids,
             active_node_ids=active_node_ids,
             step=step,
+            remaining_budget=remaining_budget,
             num_graph_edges=self.num_graph_edges,
             num_graph_nodes=self.num_graph_nodes,
         )
@@ -495,6 +526,8 @@ def validate_expansion_inputs(
         raise ValueError("Expansion edge ids must be valid non-terminal edge ids.")
     if int(torch.unique(rows).numel()) != int(rows.numel()):
         raise ValueError("At most one expansion action is allowed per row.")
+    if bool(state.remaining_budget.index_select(0, rows).le(0).any()):
+        raise ValueError("Expansion rows must have positive remaining budget.")
 
 
 def active_nodes_for_graph_rows(

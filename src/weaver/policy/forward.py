@@ -4,7 +4,7 @@ import torch
 from torch.nn import init
 from torch import nn
 
-from src.graph.segments import segment_logsumexp
+from src.graph.segments import segment_log_softmax
 from src.utils.nn_utils import init_xavier
 
 from ..context import GraphContext
@@ -35,13 +35,19 @@ class ForwardPolicy(nn.Module):
 
         self.budget_embedding = nn.Embedding(self.max_expand_budget + 1, hidden_dim)
 
-        self.stop_flow_head = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+        self.terminal_flow_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-        self.edge_advantage_head = nn.Sequential(
+        self.continue_flow_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self.edge_score_head = nn.Sequential(
             nn.Linear(hidden_dim * 3 + edge_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
@@ -52,6 +58,14 @@ class ForwardPolicy(nn.Module):
     @property
     def hidden_dim(self) -> int:
         return self.state_encoder.hidden_dim
+
+    @property
+    def stop_flow_head(self) -> nn.Module:
+        return self.terminal_flow_head
+
+    @property
+    def edge_advantage_head(self) -> nn.Module:
+        return self.edge_score_head
 
     def forward(
         self,
@@ -69,12 +83,12 @@ class ForwardPolicy(nn.Module):
         budget_h = self.encode_budget(state)
 
         (
-            stop_log_flow,
+            terminal_log_flow,
             continue_log_flow,
-            continue_log_gain,
+            state_log_flow,
+            edge_logit,
+            edge_log_prob,
             edge_log_flow,
-            edge_log_reference,
-            edge_log_advantage,
             frontier_row_ids,
             frontier_edge_ids,
         ) = self.action_log_flows(
@@ -85,9 +99,9 @@ class ForwardPolicy(nn.Module):
             budget_h=budget_h,
             frontier=frontier,
         )
-        state_log_flow = stop_log_flow + torch.nn.functional.softplus(continue_log_gain)
-        stop_log_prob = -torch.nn.functional.softplus(continue_log_gain)
-        edge_log_prob = edge_log_flow - state_log_flow.index_select(
+        stop_log_prob = terminal_log_flow - state_log_flow
+        expand_log_prob = continue_log_flow - state_log_flow
+        edge_action_log_prob = edge_log_flow - state_log_flow.index_select(
             0,
             frontier_row_ids.to(device=state_log_flow.device, dtype=torch.long),
         )
@@ -95,15 +109,15 @@ class ForwardPolicy(nn.Module):
         return ForwardPolicyOutput(
             frontier_row_ids=frontier_row_ids,
             frontier_edge_ids=frontier_edge_ids,
-            stop_log_flow=stop_log_flow,
+            terminal_log_flow=terminal_log_flow,
             continue_log_flow=continue_log_flow,
-            continue_log_gain=continue_log_gain,
-            edge_log_flow=edge_log_flow,
-            edge_log_reference=edge_log_reference,
-            edge_log_advantage=edge_log_advantage,
             state_log_flow=state_log_flow,
-            stop_log_prob=stop_log_prob,
+            edge_logit=edge_logit,
             edge_log_prob=edge_log_prob,
+            edge_log_flow=edge_log_flow,
+            stop_log_prob=stop_log_prob,
+            expand_log_prob=expand_log_prob,
+            edge_action_log_prob=edge_action_log_prob,
             num_rows=state.num_rows,
             num_edges=state.num_edges,
         )
@@ -127,21 +141,29 @@ class ForwardPolicy(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        stop_log_flow = self.score_stop_flow(
+        terminal_log_flow = self.score_terminal_flow(
             query_h=query_h,
             state_h=state_h,
             budget_h=budget_h,
         ).float()
-        continue_log_gain = stop_log_flow.new_full((query_h.size(0),), -torch.inf)
-        continue_log_flow = stop_log_flow.new_full((query_h.size(0),), -torch.inf)
+        continue_log_flow = self.score_continue_flow(
+            query_h=query_h,
+            state_h=state_h,
+            budget_h=budget_h,
+        ).float()
+        can_continue = torch.zeros(query_h.size(0), dtype=torch.bool, device=query_h.device)
+        if frontier.row_ids.numel() > 0:
+            can_continue.index_fill_(0, frontier.row_ids.to(device=query_h.device, dtype=torch.long), True)
+        continue_log_flow = continue_log_flow.masked_fill(~can_continue, -torch.inf)
+        state_log_flow = torch.logaddexp(terminal_log_flow, continue_log_flow)
 
         if frontier.edge_ids.numel() == 0:
             empty = torch.empty(0, dtype=torch.long, device=query_h.device)
-            empty_float = stop_log_flow.new_empty((0,))
+            empty_float = terminal_log_flow.new_empty((0,))
             return (
-                stop_log_flow,
+                terminal_log_flow,
                 continue_log_flow,
-                continue_log_gain,
+                state_log_flow,
                 empty_float,
                 empty_float,
                 empty_float,
@@ -150,43 +172,36 @@ class ForwardPolicy(nn.Module):
             )
 
         row_ids = frontier.row_ids.to(device=query_h.device, dtype=torch.long)
-        row_frontier_size = torch.bincount(
-            row_ids,
-            minlength=int(query_h.size(0)),
-        ).to(dtype=torch.float32, device=query_h.device)
-        edge_log_reference = -torch.log(
-            row_frontier_size.index_select(0, row_ids).clamp_min(1.0)
-        )
-
+        src_node_ids = context.edge_index[0].index_select(0, frontier.edge_ids)
+        dst_node_ids = context.edge_index[1].index_select(0, frontier.edge_ids)
         edge_h = self.state_encoder.encode_edge_tokens(
             features=features,
-            src_node_ids=torch.empty(0, dtype=torch.long, device=query_h.device),
+            src_node_ids=src_node_ids,
             edge_ids=frontier.edge_ids,
-            dst_node_ids=torch.empty(0, dtype=torch.long, device=query_h.device),
+            dst_node_ids=dst_node_ids,
+            query_h=query_h.index_select(0, row_ids),
         )
 
-        edge_log_advantage = self.score_edge_advantage(
+        edge_logit = self.score_edge(
             query_h=query_h.index_select(0, row_ids),
             state_h=state_h.index_select(0, row_ids),
             budget_h=budget_h.index_select(0, row_ids),
             edge_h=edge_h,
         ).float()
-        edge_log_measure = edge_log_reference + edge_log_advantage
-        continue_log_gain = segment_logsumexp(
-            values=edge_log_measure,
-            segment_ids=row_ids,
+        edge_log_prob = segment_log_softmax(
+            edge_logit,
+            row_ids,
             num_segments=int(query_h.size(0)),
-        )
-        continue_log_flow = stop_log_flow + continue_log_gain
-        edge_log_flow = stop_log_flow.index_select(0, row_ids) + edge_log_measure
+        ).float()
+        edge_log_flow = continue_log_flow.index_select(0, row_ids) + edge_log_prob
 
         return (
-            stop_log_flow,
+            terminal_log_flow,
             continue_log_flow,
-            continue_log_gain,
+            state_log_flow,
+            edge_logit,
+            edge_log_prob,
             edge_log_flow,
-            edge_log_reference,
-            edge_log_advantage,
             frontier.row_ids,
             frontier.edge_ids,
         )
@@ -196,22 +211,33 @@ class ForwardPolicy(nn.Module):
         state: State,
     ) -> torch.Tensor:
         remaining = torch.clamp(
-            self.max_expand_budget - state.depth.to(dtype=torch.long),
+            state.remaining_budget.to(dtype=torch.long),
             min=0,
             max=self.max_expand_budget,
         )
         return self.budget_embedding(remaining)
 
-    def score_stop_flow(
+    def score_terminal_flow(
         self,
         *,
         query_h: torch.Tensor,
         state_h: torch.Tensor,
         budget_h: torch.Tensor,
     ) -> torch.Tensor:
-        return self.stop_flow_head(torch.cat([query_h, state_h, budget_h], dim=-1)).squeeze(-1)
+        del query_h
+        return self.terminal_flow_head(torch.cat([state_h, budget_h], dim=-1)).squeeze(-1)
 
-    def score_edge_advantage(
+    def score_continue_flow(
+        self,
+        *,
+        query_h: torch.Tensor,
+        state_h: torch.Tensor,
+        budget_h: torch.Tensor,
+    ) -> torch.Tensor:
+        del query_h
+        return self.continue_flow_head(torch.cat([state_h, budget_h], dim=-1)).squeeze(-1)
+
+    def score_edge(
         self,
         *,
         query_h: torch.Tensor,
@@ -219,7 +245,7 @@ class ForwardPolicy(nn.Module):
         budget_h: torch.Tensor,
         edge_h: torch.Tensor,
     ) -> torch.Tensor:
-        return self.edge_advantage_head(
+        return self.edge_score_head(
             torch.cat(
                 [
                     query_h,
@@ -234,15 +260,20 @@ class ForwardPolicy(nn.Module):
     def reset_parameters(self) -> None:
         nn.init.normal_(self.budget_embedding.weight, mean=0.0, std=0.02)
 
-        for module in self.stop_flow_head:
+        for module in self.terminal_flow_head:
             if isinstance(module, nn.Linear):
                 init_xavier(module)
-        _zero_linear(self.stop_flow_head[-1])
+        _zero_linear(self.terminal_flow_head[-1])
 
-        for module in self.edge_advantage_head:
+        for module in self.continue_flow_head:
             if isinstance(module, nn.Linear):
                 init_xavier(module)
-        _zero_linear(self.edge_advantage_head[-1])
+        _zero_linear(self.continue_flow_head[-1])
+
+        for module in self.edge_score_head:
+            if isinstance(module, nn.Linear):
+                init_xavier(module)
+        _zero_linear(self.edge_score_head[-1])
 
 
 __all__ = [

@@ -190,7 +190,7 @@ def build_subtb_input(
     terminal_parent_state_log_flow = terminal_out.state_log_flow.float()
     terminal_child_state_log_flow = terminal_parent_state_log_flow.new_zeros(terminals.num_items)
     terminal_action_log_prob = terminal_out.stop_log_prob.float()
-    terminal_action_log_flow = terminal_out.stop_log_flow.float()
+    terminal_action_log_flow = terminal_out.terminal_log_flow.float()
     terminal_backward_log_prob = terminal_parent_state_log_flow.new_zeros(terminals.num_items)
     terminal_terminal = torch.ones(
         terminals.num_items,

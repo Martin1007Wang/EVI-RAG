@@ -10,6 +10,7 @@ from src.eval.rollout import per_graph_auc
 from src.eval.rollout import per_graph_spearman
 from src.weaver.context import GraphContext
 from src.weaver.rollout.result import RolloutResult
+from src.weaver.state import State
 
 
 class TinyBatch:
@@ -61,7 +62,7 @@ class FakePolicy:
         score -= state.selected_edge_mask[:, 4].float() * 5.0
         return SimpleNamespace(
             state_log_flow=score,
-            stop_log_flow=score,
+            terminal_log_flow=score,
         )
 
 
@@ -69,6 +70,19 @@ def rollout(edge_rows: list[list[int]], logprob_rows: list[list[float]]) -> Roll
     selected = torch.tensor(edge_rows, dtype=torch.long)
     logprob = torch.tensor(logprob_rows, dtype=torch.float32)
     terminal_step = torch.tensor([len(row) - 1 for row in edge_rows], dtype=torch.long)
+    batch = TinyBatch()
+    context = GraphContext.from_batch(batch)
+    edge_mask = torch.zeros((len(edge_rows), batch.num_edges_total), dtype=torch.bool)
+    for row_id, row in enumerate(edge_rows):
+        for edge_id in row:
+            if edge_id >= 0:
+                edge_mask[row_id, int(edge_id)] = True
+    terminal_state = State.from_selected_edges(
+        graph=context,
+        graph_ids=torch.arange(len(edge_rows), dtype=torch.long),
+        selected_edge_mask=edge_mask,
+        expand_budget=2,
+    )
     return RolloutResult(
         source_graph_id=torch.arange(len(edge_rows), dtype=torch.long),
         selected_edge_ids=selected,
@@ -77,6 +91,7 @@ def rollout(edge_rows: list[list[int]], logprob_rows: list[list[float]]) -> Roll
         terminal_step=terminal_step,
         stop_reason=torch.full((len(edge_rows),), RolloutResult.POLICY_STOP, dtype=torch.long),
         expand_budget=2,
+        terminal_state=terminal_state,
     )
 
 
@@ -112,6 +127,8 @@ def test_rollout_metric_contract_and_selector_semantics() -> None:
         exclude_anchors_from_retrieved=True,
         use_reachable_targets=True,
         k_windows=[1, 2, 3],
+        enable_calibration_metrics=True,
+        enable_terminal_diagnostics=True,
         context=context,
         features=SimpleNamespace(),
         reward_model=FakeReward(),
@@ -152,6 +169,8 @@ def test_same_terminal_graph_counts_once_but_trajectory_scores_can_differ() -> N
         exclude_anchors_from_retrieved=True,
         use_reachable_targets=True,
         k_windows=[2],
+        enable_calibration_metrics=False,
+        enable_terminal_diagnostics=False,
         context=context,
         features=SimpleNamespace(),
         reward_model=FakeReward(),

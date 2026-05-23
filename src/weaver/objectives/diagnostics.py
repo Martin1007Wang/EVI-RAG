@@ -8,7 +8,7 @@ from src.weaver.policy import (
 )
 from src.weaver.state import Frontier, State
 from src.weaver.transition import SRC_POLICY
-from src.weaver.utility import RewardOutput, TrueTerminalReward
+from src.weaver.utility import EvidenceUtilityReward, RewardOutput, TrueTerminalReward
 
 def stop_expand_margin(policy_out: ForwardPolicyOutput) -> torch.Tensor:
     return policy_out.stop_vs_continue_log_ratio.float()
@@ -60,9 +60,9 @@ def call_reward_model(
     target_context: TargetContext | None,
     features,
 ) -> RewardOutput:
-    if isinstance(reward_model, TrueTerminalReward):
+    if isinstance(reward_model, (EvidenceUtilityReward, TrueTerminalReward)):
         if target_context is None:
-            raise ValueError("TrueTerminalReward requires target_context.")
+            raise ValueError("Terminal reward requires target_context.")
         return reward_model(
             state=state,
             graph_context=graph_context,
@@ -70,7 +70,7 @@ def call_reward_model(
         )
 
     raise TypeError(
-        "reward_model must be TrueTerminalReward, "
+        "reward_model must be EvidenceUtilityReward or TrueTerminalReward, "
         f"got {type(reward_model).__name__}."
     )
 

@@ -5,6 +5,8 @@ from typing import ClassVar
 
 import torch
 
+from src.weaver.state import State
+
 
 @dataclass(frozen=True, slots=True)
 class RolloutResult:
@@ -15,6 +17,7 @@ class RolloutResult:
     terminal_step: torch.Tensor
     stop_reason: torch.Tensor
     expand_budget: int
+    terminal_state: State | None = None
 
     POLICY_STOP: ClassVar[int] = 0
     NO_FRONTIER_STOP: ClassVar[int] = 1
@@ -96,6 +99,11 @@ class RolloutResult:
             terminal_step=self.terminal_step.index_select(0, rows),
             stop_reason=self.stop_reason.index_select(0, rows),
             expand_budget=self.expand_budget,
+            terminal_state=(
+                self.terminal_state.select_rows(rows)
+                if self.terminal_state is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -109,6 +117,11 @@ class RolloutResult:
             terminal_step=torch.cat([rollout.terminal_step for rollout in rollouts], dim=0),
             stop_reason=torch.cat([rollout.stop_reason for rollout in rollouts], dim=0),
             expand_budget=first.expand_budget,
+            terminal_state=(
+                State.concat([rollout.terminal_state for rollout in rollouts])
+                if all(rollout.terminal_state is not None for rollout in rollouts)
+                else None
+            ),
         )
 
 

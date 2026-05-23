@@ -9,13 +9,7 @@ from src.data.schema import RetrievalBatch
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.rollout.result import RolloutResult
 from src.weaver.state import State
-from src.weaver.transition import (
-    ExpansionBatch,
-    SampleMeta,
-    SRC_UNKNOWN,
-    TerminalBatch,
-    TrainingBatch,
-)
+from src.weaver.transition import ExpansionBatch, SampleMeta, SRC_UNKNOWN, TerminalBatch, TrainingBatch
 from src.weaver.utility import TrueTerminalReward
 
 
@@ -45,6 +39,9 @@ class ReplayStats:
     skipped_by_reward: int = 0
     generated_trajectories: int = 0
     covered_graphs: int = 0
+    oracle_reward_mean: float = 0.0
+    policy_best_reward_mean: float = 0.0
+    reward_gap_mean: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,8 +77,15 @@ class ReplaySource:
         self,
         *,
         expand_budget: int,
+        skip_warmup_progress: float = 0.05,
+        skip_gap_ema_beta: float = 0.9,
+        skip_gap_margin: float = 0.0,
     ) -> None:
         self.expand_budget = int(expand_budget)
+        self.skip_warmup_progress = float(skip_warmup_progress)
+        self.skip_gap_ema_beta = float(skip_gap_ema_beta)
+        self.skip_gap_margin = float(skip_gap_margin)
+        self._reward_gap_ema: float | None = None
 
     @torch.no_grad()
     def sample_from_rollouts(
@@ -93,11 +97,17 @@ class ReplaySource:
         num_trajectories: int,
         reward_model: TrueTerminalReward | None = None,
         target_context: TargetContext | None = None,
+        progress: float = 0.0,
     ) -> ReplayBatch | None:
         trajectories_per_graph = int(num_trajectories)
         if trajectories_per_graph <= 0:
             return None
 
+        allow_reward_skip = (
+            float(progress) >= self.skip_warmup_progress
+            and self._reward_gap_ema is not None
+            and self._reward_gap_ema <= self.skip_gap_margin
+        )
         trajectories, stats = replay_trajectories_with_stats(
             batch=batch,
             context=context,
@@ -106,7 +116,15 @@ class ReplaySource:
             max_trajectories_per_graph=trajectories_per_graph,
             reward_model=reward_model,
             target_context=target_context,
+            allow_reward_skip=allow_reward_skip,
+            skip_gap_margin=self.skip_gap_margin,
         )
+        if stats.eligible_graphs > 0:
+            if self._reward_gap_ema is None:
+                self._reward_gap_ema = float(stats.reward_gap_mean)
+            else:
+                beta = self.skip_gap_ema_beta
+                self._reward_gap_ema = beta * self._reward_gap_ema + (1.0 - beta) * float(stats.reward_gap_mean)
         if not trajectories:
             return ReplayBatch(trajectories=(), stats=stats)
         return ReplayBatch(trajectories=tuple(trajectories), stats=stats)
@@ -131,140 +149,6 @@ class ReplayBuilder:
             graph=graph,
             budget=self.expand_budget,
         )
-
-
-def training_from_rollouts(
-    *,
-    rollouts: Sequence[RolloutResult],
-    budget: int,
-    context: GraphContext,
-) -> TrainingBatch | None:
-    batches: list[TrainingBatch] = []
-    trajectory_offset = 0
-
-    for rollout in rollouts:
-        graph_ids = rollout.source_graph_id.to(
-            device=context.device,
-            dtype=torch.long,
-        ).view(-1)
-        current = initial_state_for_graph_ids(
-            context=context,
-            graph_ids=graph_ids,
-        )
-        rollout_trajectory_ids = torch.arange(
-            graph_ids.numel(),
-            dtype=torch.long,
-            device=context.device,
-        ) + trajectory_offset
-        trajectory_offset += graph_ids.numel()
-
-        exp_parts: list[ExpansionBatch] = []
-        term_parts: list[TerminalBatch] = []
-
-        for step in range(int(rollout.max_steps)):
-            expand_rows = rollout.expand_mask[:, step].to(
-                device=context.device,
-                dtype=torch.bool,
-            ).nonzero(as_tuple=False).flatten()
-            if expand_rows.numel() > 0:
-                edge_ids = rollout.selected_edge_ids[:, step].to(
-                    device=context.device,
-                    dtype=torch.long,
-                ).index_select(0, expand_rows)
-                parent = current.select_rows(expand_rows)
-                child = parent.expand(
-                    graph=context,
-                    rows=torch.arange(
-                        parent.num_rows,
-                        dtype=torch.long,
-                        device=context.device,
-                    ),
-                    edge_ids=edge_ids,
-                    expand_budget=int(budget),
-                )
-                exp_parts.append(
-                    ExpansionBatch(
-                        parent=parent,
-                        child=child,
-                        edge_ids=edge_ids,
-                        meta=SampleMeta(
-                            trajectory_ids=rollout_trajectory_ids.index_select(0, expand_rows),
-                            step_ids=torch.full(
-                                (expand_rows.numel(),),
-                                step,
-                                dtype=torch.long,
-                                device=context.device,
-                            ),
-                            source_ids=torch.full(
-                                (expand_rows.numel(),),
-                                SRC_UNKNOWN,
-                                dtype=torch.long,
-                                device=context.device,
-                            ),
-                        ),
-                    )
-                )
-                current = current.expand(
-                    graph=context,
-                    rows=expand_rows,
-                    edge_ids=edge_ids,
-                    expand_budget=int(budget),
-                )
-
-            terminal_rows = rollout.terminal_mask[:, step].to(
-                device=context.device,
-                dtype=torch.bool,
-            ).nonzero(as_tuple=False).flatten()
-            if terminal_rows.numel() > 0:
-                terminal_rows = terminal_rows[
-                    ~rollout.budget_truncated.index_select(
-                        0,
-                        terminal_rows.to(device=rollout.device, dtype=torch.long),
-                    ).to(device=context.device, dtype=torch.bool)
-                ]
-            if terminal_rows.numel() > 0:
-                term_parts.append(
-                    TerminalBatch(
-                        state=current.select_rows(terminal_rows),
-                        meta=SampleMeta(
-                            trajectory_ids=rollout_trajectory_ids.index_select(0, terminal_rows),
-                            step_ids=torch.full(
-                                (terminal_rows.numel(),),
-                                step,
-                                dtype=torch.long,
-                                device=context.device,
-                            ),
-                            source_ids=torch.full(
-                                (terminal_rows.numel(),),
-                                SRC_UNKNOWN,
-                                dtype=torch.long,
-                                device=context.device,
-                            ),
-                        ),
-                        stop_reason=rollout.stop_reason.to(
-                            device=context.device,
-                            dtype=torch.long,
-                        ).index_select(0, terminal_rows),
-                    )
-                )
-
-        if not exp_parts and not term_parts:
-            continue
-
-        empty_state = initial_state_for_graph_ids(
-            context=context,
-            graph_ids=torch.empty(0, dtype=torch.long, device=context.device),
-        )
-        batches.append(
-            TrainingBatch(
-                expansions=ExpansionBatch.concat(exp_parts) if exp_parts else ExpansionBatch.empty_like(graph_like=empty_state),
-                terminals=TerminalBatch.concat(term_parts) if term_parts else TerminalBatch.empty_like(graph_like=empty_state),
-            )
-        )
-
-    if not batches:
-        return None
-    return TrainingBatch.concat_reindex_trajectories(batches)
 
 
 def replay_trajectories(
@@ -295,6 +179,8 @@ def replay_trajectories_with_stats(
     rollouts: Sequence[RolloutResult] = (),
     reward_model: TrueTerminalReward | None = None,
     target_context: TargetContext | None = None,
+    allow_reward_skip: bool = False,
+    skip_gap_margin: float = 0.0,
 ) -> tuple[list[ReplayTrajectory], ReplayStats]:
     max_per_graph = None if max_trajectories_per_graph is None else int(max_trajectories_per_graph)
     if max_per_graph is not None and max_per_graph <= 0:
@@ -335,6 +221,9 @@ def replay_trajectories_with_stats(
     trajectories: list[ReplayTrajectory] = []
     skipped_by_reward = 0
     covered_graphs: set[int] = set()
+    oracle_rewards: list[float] = []
+    policy_rewards: list[float] = []
+    reward_gaps: list[float] = []
 
     for view in graph_views:
         graph_id = int(view.graph_id)
@@ -360,7 +249,15 @@ def replay_trajectories_with_stats(
 
         best_oracle = max(node.reward for node in terminal_nodes)
         best_policy = rollout_reward.get(graph_id)
-        if best_policy is not None and best_policy >= best_oracle:
+        oracle_rewards.append(float(best_oracle))
+        if best_policy is not None:
+            policy_rewards.append(float(best_policy))
+            reward_gaps.append(max(0.0, float(best_oracle) - float(best_policy)))
+        if (
+            allow_reward_skip
+            and best_policy is not None
+            and best_policy >= best_oracle - float(skip_gap_margin)
+        ):
             skipped_by_reward += 1
             continue
 
@@ -381,6 +278,9 @@ def replay_trajectories_with_stats(
         skipped_by_reward=skipped_by_reward,
         generated_trajectories=len(trajectories),
         covered_graphs=len(covered_graphs),
+        oracle_reward_mean=float(sum(oracle_rewards) / len(oracle_rewards)) if oracle_rewards else 0.0,
+        policy_best_reward_mean=float(sum(policy_rewards) / len(policy_rewards)) if policy_rewards else 0.0,
+        reward_gap_mean=float(sum(reward_gaps) / len(reward_gaps)) if reward_gaps else 0.0,
     )
     return trajectories, stats
 
@@ -396,6 +296,7 @@ def training_from_trajectories(
         current = initial_state_for_graph_ids(
             context=graph,
             graph_ids=torch.tensor([int(trajectory.graph_id)], dtype=torch.long, device=graph.device),
+            expand_budget=int(budget),
         )
         exp_parts: list[ExpansionBatch] = []
         for step, edge_id in enumerate(trajectory.edge_ids):
@@ -446,6 +347,7 @@ def training_from_trajectories(
         empty_state = initial_state_for_graph_ids(
             context=graph,
             graph_ids=torch.empty(0, dtype=torch.long, device=graph.device),
+            expand_budget=int(budget),
         )
         return TrainingBatch(
             expansions=ExpansionBatch.empty_like(graph_like=empty_state),
@@ -489,6 +391,7 @@ def rollout_hit_graph_ids(
         state = initial_state_for_graph_ids(
             context=context,
             graph_ids=graph_ids,
+            expand_budget=int(rollout.expand_budget),
         )
         for step in range(int(rollout.max_steps)):
             expand_rows = rollout.expand_mask[:, step].to(
@@ -557,6 +460,7 @@ def terminal_state_from_rollout(
     state = initial_state_for_graph_ids(
         context=context,
         graph_ids=graph_ids,
+        expand_budget=int(rollout.expand_budget),
     )
     for step in range(int(rollout.max_steps)):
         expand_rows = rollout.expand_mask[:, step].to(
@@ -608,6 +512,7 @@ def initial_state_for_graph_ids(
     *,
     context: GraphContext,
     graph_ids: torch.Tensor,
+    expand_budget: int,
 ) -> State:
     return State.initial(
         graph=context,
@@ -615,6 +520,7 @@ def initial_state_for_graph_ids(
             device=context.device,
             dtype=torch.long,
         ).view(-1),
+        expand_budget=int(expand_budget),
     )
 
 
@@ -723,6 +629,7 @@ def enumerate_replay_state_dag(
     initial = initial_state_for_graph_ids(
         context=context,
         graph_ids=torch.tensor([graph_id], dtype=torch.long, device=context.device),
+        expand_budget=int(budget),
     )
     initial_key = state_key(initial)
     states: dict[tuple[int, ...], State] = {initial_key: initial}
@@ -1004,6 +911,5 @@ __all__ = [
     "replay_trajectories_with_stats",
     "rollout_hit_graph_ids",
     "score_replay_states",
-    "training_from_rollouts",
     "training_from_trajectories",
 ]

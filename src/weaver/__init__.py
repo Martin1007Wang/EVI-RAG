@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from .context import GraphContext, TargetContext
-from .objectives import ObjectiveOutput, SubTBLoss
-from .policy import ForwardPolicy, ForwardPolicyOutput
+from .objectives import LatentPrefixObjective, ObjectiveOutput, SubTBLoss
+from .policy import EdgeOnlyProposalPolicy, ForwardPolicy, ForwardPolicyOutput, PrefixSelector
 from .state import Frontier, State
 from .utility import (
+    EvidenceUtilityReward,
     RewardOutput,
     TrueTerminalReward,
 )
@@ -12,9 +13,13 @@ from .utility import (
 __all__ = [
     "GraphContext",
     "Frontier",
+    "EdgeOnlyProposalPolicy",
+    "EvidenceUtilityReward",
     "ForwardPolicy",
     "ForwardPolicyOutput",
+    "LatentPrefixObjective",
     "ObjectiveOutput",
+    "PrefixSelector",
     "RewardOutput",
     "SubTBLoss",
     "State",
