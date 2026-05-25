@@ -68,6 +68,8 @@ def build_scheduler(
 ) -> torch.optim.lr_scheduler.LRScheduler | None:
     if cfg is None:
         return None
+    if str(cfg.type) == "none":
+        return None
 
     horizon = resolve_scheduler_horizon(
         trainer=trainer,

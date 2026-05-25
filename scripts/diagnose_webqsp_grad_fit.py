@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.training.factory import build_datamodule, build_model
+from src.training.factory import build_model, prepare_training_components
 from src.training.optimization import build_optimizer
 from src.weaver.module import (
     graph_batch_size,
@@ -55,9 +55,7 @@ def main() -> None:
 
     set_seed(int(args.seed))
     cfg = compose_cfg(data_dir=str(args.data_dir))
-    dm = build_datamodule(cfg)
-    dm.prepare_data()
-    dm.setup("fit")
+    dm, resources = prepare_training_components(cfg, stage="fit")
     if dm.train_dataset is None:
         raise RuntimeError("train_dataset was not initialized.")
 
@@ -65,7 +63,7 @@ def main() -> None:
     sample_ids = [str(getattr(sample, "sample_id", "")) for sample in samples]
     batch = dm.collator(samples)
 
-    model = build_model(cfg, dm.model_resources)
+    model = build_model(cfg, resources)
     model.runner.replay_schedule = None
     model.train()
 
@@ -86,7 +84,7 @@ def main() -> None:
         "device": "cpu",
         "replay_schedule": None,
         "train_num_rollouts": int(model.runner.train_num_rollouts),
-        "expand_budget": int(model.runner.engine.expand_budget),
+        "budget": int(model.budget),
         "optimizer": {
             "type": type(optimizer).__name__,
             "lr": float(model.optimization.optimizer.lr),
@@ -118,11 +116,7 @@ def main() -> None:
 
             raw_grad_stats = gradient_stats(named_params)
             raw_total_grad_norm = total_grad_norm(named_params)
-            raw_grads = {
-                name: param.grad.detach().clone()
-                for name, param in named_params
-                if name in tracked_names and param.grad is not None
-            }
+            raw_grads = {name: param.grad.detach().clone() for name, param in named_params if name in tracked_names and param.grad is not None}
 
             clip_return = None
             if model.gradient_clip_val is not None and float(model.gradient_clip_val) > 0.0:
@@ -132,11 +126,7 @@ def main() -> None:
                     norm_type=2.0,
                 )
             clipped_total_grad_norm = total_grad_norm(named_params)
-            clipped_grads = {
-                name: param.grad.detach().clone()
-                for name, param in named_params
-                if name in tracked_names and param.grad is not None
-            }
+            clipped_grads = {name: param.grad.detach().clone() for name, param in named_params if name in tracked_names and param.grad is not None}
 
             expected_after = adamw_expected_after(before, clipped_grads, optimizer, param_to_name)
             optimizer.step()
@@ -463,7 +453,7 @@ def render_report(metadata: dict[str, Any], records: list[dict[str, Any]]) -> st
         f"- batch: {metadata['batch']}",
         f"- epochs/steps: {metadata['epochs']}",
         f"- replay: disabled by `model.runner.replay_schedule = None`; replay segments observed: {replay_segments}",
-        f"- train_num_rollouts: {metadata['train_num_rollouts']}, expand_budget: {metadata['expand_budget']}",
+        f"- train_num_rollouts: {metadata['train_num_rollouts']}, budget: {metadata['budget']}",
         f"- optimizer: {metadata['optimizer']}",
         f"- gradient_clip_val: {metadata['gradient_clip_val']}",
         "",
@@ -503,15 +493,9 @@ def render_report(metadata: dict[str, Any], records: list[dict[str, Any]]) -> st
         lines.append(f"- module_grad_stats: {record['grad_stats']['modules']}")
         top = list(record["grad_stats"]["top_params_by_norm"].items())[:5]
         lines.append(f"- top5_param_grad_norms: {top}")
-        tracked = {
-            name: summary
-            for name, summary in list(record["tracked_raw_grads"].items())[:6]
-        }
+        tracked = {name: summary for name, summary in list(record["tracked_raw_grads"].items())[:6]}
         lines.append(f"- tracked_raw_grad_summaries: {tracked}")
-        fit = {
-            name: summary
-            for name, summary in list(record["adamw_fit"]["per_param"].items())[:6]
-        }
+        fit = {name: summary for name, summary in list(record["adamw_fit"]["per_param"].items())[:6]}
         lines.append(f"- tracked_adamw_fit: {fit}")
 
     lines.extend(

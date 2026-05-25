@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data.artifacts import load_materialization_manifest_from_path
+from src.data.artifacts import load_materialization_artifact_from_path
 from src.data.dataset import RetrievalDataset
 from src.data.tensor_table import read_table
 
@@ -62,10 +62,9 @@ def run_dataset(
     rng: random.Random,
 ) -> DatasetResult:
     manifest_path = data_root / dataset / "metadata" / "materialization_manifest.json"
-    manifest = load_materialization_manifest_from_path(manifest_path)
-    if manifest is None:
+    materialization = load_materialization_artifact_from_path(manifest_path)
+    if materialization is None:
         raise FileNotFoundError(f"missing manifest: {manifest_path}")
-    materialization = manifest.resolve()
     relation_semantic_table = torch.nn.functional.normalize(
         read_table(materialization.relation_semantic_table).float(),
         p=2,

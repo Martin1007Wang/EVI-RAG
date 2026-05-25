@@ -8,11 +8,11 @@ import lmdb
 import torch
 from torch_geometric.data import Dataset
 
-from src.data.split_index import SplitIndexReader
+from src.data.keys import row_key
 from src.data.tensor_table import read_table
 from src.utils.lmdb_utils import deserialize_sample
 
-from .artifacts import ResolvedMaterialization
+from .artifacts import MaterializationArtifact
 from .schema.batch import RetrievalData
 from .schema.fields import SampleFields
 
@@ -40,14 +40,12 @@ class LMDBSampleStore:
             subdir=True,
         )
 
-    def load_sample(self, sample_id: str) -> dict[str, torch.Tensor]:
-        key = sample_id.encode("utf-8")
-
+    def load_sample(self, row_idx: int) -> dict[str, torch.Tensor]:
         with self.env.begin(write=False) as txn:
-            payload = txn.get(key)
+            payload = txn.get(row_key(row_idx))
 
         if payload is None:
-            raise KeyError(f"Sample not found in {self.path}: {sample_id}")
+            raise KeyError(f"Sample row not found in {self.path}: {row_idx}")
 
         return deserialize_sample(payload)
 
@@ -60,13 +58,12 @@ class RetrievalDataset(Dataset):
     Dataset over materialized LMDB samples.
 
     Responsibilities:
-    - read split index from the active materialization
     - open the single LMDB path for the split
     - deserialize the sample payload
     - convert the storage record into RetrievalData
 
     Non-responsibilities:
-    - no LMDB key scanning
+    - no secondary row-to-sample indirection
     - no runtime sample filtering
     - no storage field fallback
     - no path recomputation
@@ -77,7 +74,7 @@ class RetrievalDataset(Dataset):
     def __init__(
         self,
         *,
-        materialization: ResolvedMaterialization,
+        materialization: MaterializationArtifact,
         split: str,
         lmdb_readahead: bool = False,
         max_readers: int = 256,
@@ -96,7 +93,6 @@ class RetrievalDataset(Dataset):
             raise ValueError("max_readers must be positive")
 
         paths = self.materialization.require_split(self.split)
-        self.index_path = paths.index
         self.lmdb_path = paths.lmdb
         self.num_samples = int(paths.num_samples)
         self._question_embeddings = read_table(paths.question_embeddings)
@@ -105,7 +101,6 @@ class RetrievalDataset(Dataset):
                 f"question embedding rows mismatch for split {self.split}: "
                 f"got {int(self._question_embeddings.size(0))}, expected {self.num_samples}"
             )
-        self._index: SplitIndexReader | None = None
 
         if not self.lmdb_path.exists():
             raise FileNotFoundError(f"LMDB path does not exist: {self.lmdb_path}")
@@ -116,9 +111,9 @@ class RetrievalDataset(Dataset):
         return self.num_samples
 
     def get(self, idx: int) -> RetrievalData:
-        sample_id = self._get_index().get(idx)
         question_emb = self._question_embeddings[idx]
-        raw = self._get_store().load_sample(sample_id)
+        raw = self._get_store().load_sample(int(idx))
+        sample_id = _sample_id(raw, row_idx=int(idx))
         return _build_retrieval_data(
             raw=raw,
             sample_id=sample_id,
@@ -131,11 +126,6 @@ class RetrievalDataset(Dataset):
             store.close()
             self._store = None
 
-        index = getattr(self, "_index", None)
-        if index is not None:
-            index.close()
-            self._index = None
-
     def _get_store(self) -> LMDBSampleStore:
         if self._store is None:
             self._store = LMDBSampleStore(
@@ -145,16 +135,6 @@ class RetrievalDataset(Dataset):
             )
 
         return self._store
-
-    def _get_index(self) -> SplitIndexReader:
-        if self._index is None:
-            self._index = SplitIndexReader(
-                self.index_path,
-                readahead=self.lmdb_readahead,
-                max_readers=self.max_readers,
-            )
-
-        return self._index
 
     def __del__(self) -> None:
         self.close()
@@ -232,6 +212,16 @@ def _build_retrieval_data(
         num_reachable_targets=int(reachable_target_node_ids.numel()),
     )
     node_target_shortest_path_edge_mask_flat = node_target_shortest_path_edge_count_flat.gt(0)
+    replay_trajectory_edge_ids = _optional_tensor(
+        raw,
+        SampleFields.REPLAY_TRAJECTORY_EDGE_IDS,
+        dtype=torch.long,
+    )
+    replay_trajectory_lengths = _optional_tensor(
+        raw,
+        SampleFields.REPLAY_TRAJECTORY_LENGTHS,
+        dtype=torch.long,
+    )
 
     return RetrievalData(
         sample_id=sample_id,
@@ -251,7 +241,24 @@ def _build_retrieval_data(
         node_target_shortest_path_count_flat=node_target_shortest_path_count_flat,
         node_target_shortest_path_edge_mask_flat=node_target_shortest_path_edge_mask_flat,
         node_target_shortest_path_edge_count_flat=node_target_shortest_path_edge_count_flat,
+        replay_trajectory_edge_ids=replay_trajectory_edge_ids,
+        replay_trajectory_lengths=replay_trajectory_lengths,
     )
+
+
+def _sample_id(raw: Mapping[str, Any], *, row_idx: int) -> str:
+    value = raw.get(SampleFields.SAMPLE_ID)
+    if not isinstance(value, torch.Tensor):
+        raise KeyError(f"row {row_idx}: missing {SampleFields.SAMPLE_ID}")
+    if value.dtype != torch.uint8:
+        raise TypeError(
+            f"row {row_idx}: {SampleFields.SAMPLE_ID} must be uint8, got {value.dtype}"
+        )
+    if value.ndim != 1:
+        raise ValueError(
+            f"row {row_idx}: {SampleFields.SAMPLE_ID} must be 1D, got shape={tuple(value.shape)}"
+        )
+    return bytes(value.tolist()).decode("utf-8")
 
 
 def _tensor(value: object, *, dtype: torch.dtype) -> torch.Tensor:
@@ -261,6 +268,18 @@ def _tensor(value: object, *, dtype: torch.dtype) -> torch.Tensor:
         return value.to(dtype=dtype).contiguous()
 
     return torch.as_tensor(value, dtype=dtype).contiguous()
+
+
+def _optional_tensor(
+    raw: Mapping[str, Any],
+    key: str,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    value = raw.get(key)
+    if value is None:
+        return torch.empty((0,), dtype=dtype)
+    return _tensor(value, dtype=dtype)
 
 
 def _restore_edge_count_flat(

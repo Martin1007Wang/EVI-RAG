@@ -97,11 +97,11 @@ def resolve_lmdb_paths(root: Path, split: str) -> List[Path]:
     return shards
 
 
-def load_sample_ids_from_paths(paths: list[Path]) -> list[str]:
-    sample_ids: list[str] = []
+def load_row_ids_from_paths(paths: list[Path]) -> list[int]:
+    row_ids: list[int] = []
     for path in paths:
-        sample_ids.extend(get_all_keys_from_lmdb(path))
-    return sorted(sample_ids)
+        row_ids.extend(get_all_row_ids_from_lmdb(path))
+    return sorted(row_ids)
 
 
 # =========================
@@ -122,7 +122,7 @@ def assign_lmdb_shard(sample_key: str | bytes, num_shards: int) -> int:
 # =========================
 
 
-def get_all_keys_from_lmdb(path: Path) -> list[str]:
+def get_all_row_ids_from_lmdb(path: Path) -> list[int]:
     env = lmdb.open(
         str(path),
         readonly=True,
@@ -134,10 +134,10 @@ def get_all_keys_from_lmdb(path: Path) -> list[str]:
     try:
         with env.begin(write=False) as txn:
             cursor = txn.cursor()
-            out: list[str] = []
+            out: list[int] = []
             for item in cursor:
                 key = item[0] if isinstance(item, tuple) else item
-                out.append(bytes(key).decode("utf-8"))
+                out.append(int.from_bytes(bytes(key), byteorder="big", signed=False))
             return out
     finally:
         env.close()

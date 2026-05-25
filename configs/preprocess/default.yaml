@@ -12,8 +12,8 @@ preprocess_filter:
     require_answer_in_graph: true
     require_reachable_answer: true
   test:
-    require_answer_in_graph: false
-    require_reachable_answer: false
+    require_answer_in_graph: true
+    require_reachable_answer: true
 
 map_size_gb: 128
 overwrite_lmdb: true
@@ -21,19 +21,24 @@ progress_bar: true
 stream_chunk_size: 4096
 commit_frequency: 1000
 
+replay_candidates:
+  max_trajectories: 8
+  max_length: 3
+
 encoder:
   model_name: BAAI/bge-large-en-v1.5
   revision: d4aa6901d3a41ba39fb536a557fa166f842b0e09
   tokenizer_name: null
   tokenizer_revision: null
-  max_length: null
+  max_length: 512
   device: auto
-  batch_size: 512
+  batch_size: 1024
   cache_enabled: true
   cache_dir: null
+
   entity_prefix: ""
   relation_prefix: ""
-  question_prefix: "Represent this sentence for searching relevant passages: "
+  question_prefix: ""
 
 hf_env:
   cache_dir: ${paths.hf_datasets_cache}

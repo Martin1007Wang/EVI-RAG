@@ -4,12 +4,45 @@ from typing import Sequence
 
 import torch
 
+Edge = tuple[str, str, str]
+
 
 def check_edge_index(edge_index: torch.Tensor) -> None:
     if edge_index.ndim != 2 or edge_index.size(0) != 2:
         raise ValueError(
             f"edge_index must have shape [2, num_edges], got {tuple(edge_index.shape)}."
         )
+
+
+def check_bool_vector(x: torch.Tensor, *, name: str, size: int | None = None) -> None:
+    if x.dtype != torch.bool:
+        raise TypeError(f"{name} must be bool, got {x.dtype}.")
+    if x.ndim != 1:
+        raise ValueError(f"{name} must be 1D, got shape {tuple(x.shape)}.")
+    if size is not None and x.numel() != size:
+        raise ValueError(f"{name} must have shape [{size}], got {tuple(x.shape)}.")
+
+
+def build_local_graph(
+    graph_edges: Sequence[Edge],
+) -> tuple[dict[str, int], torch.Tensor]:
+    """
+    Build local node ids and directed edge_index.
+
+    Contract:
+    - one edge_index column per input triple;
+    - parallel triples are preserved;
+    - node ids follow first occurrence order in graph_edges.
+    """
+    node_index: dict[str, int] = {}
+    src: list[int] = []
+    dst: list[int] = []
+
+    for head, _, tail in graph_edges:
+        src.append(node_index.setdefault(head, len(node_index)))
+        dst.append(node_index.setdefault(tail, len(node_index)))
+
+    return node_index, torch.tensor((src, dst), dtype=torch.long)
 
 
 def rebuild_active_nodes(
@@ -19,36 +52,23 @@ def rebuild_active_nodes(
     anchor_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Reconstruct node state from anchors and active edges.
+    Reconstruct active nodes from anchors and selected edges:
 
-        V_s = A union endpoints(E_s)
+        V_s = A ∪ endpoints(E_s)
     """
     check_edge_index(edge_index)
 
-    if active_edges.dtype != torch.bool:
-        raise TypeError(f"active_edges must be bool, got {active_edges.dtype}.")
-    if anchor_mask.dtype != torch.bool:
-        raise TypeError(f"anchor_mask must be bool, got {anchor_mask.dtype}.")
-
+    num_nodes = int(anchor_mask.numel())
     num_edges = int(edge_index.size(1))
-    if active_edges.numel() != num_edges:
-        raise ValueError(
-            f"active_edges must have shape [{num_edges}], got {tuple(active_edges.shape)}."
-        )
 
-    device = edge_index.device
-    active_edges = active_edges.to(device=device, dtype=torch.bool)
-    active_nodes = anchor_mask.to(device=device, dtype=torch.bool).clone()
+    check_bool_vector(anchor_mask, name="anchor_mask")
+    check_bool_vector(active_edges, name="active_edges", size=num_edges)
 
-    if active_edges.numel() == 0 or not bool(active_edges.any()):
-        return active_nodes
+    edge_index = edge_index.to(device=anchor_mask.device, dtype=torch.long)
+    active_edges = active_edges.to(device=anchor_mask.device)
 
-    src = edge_index[0, active_edges]
-    dst = edge_index[1, active_edges]
-
-    active_nodes[src] = True
-    active_nodes[dst] = True
-
+    active_nodes = anchor_mask.clone()
+    active_nodes[edge_index[:, active_edges].reshape(-1)] = True
     return active_nodes
 
 
@@ -61,89 +81,54 @@ def prune_to_protected_core(
     max_iters: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Evaluation utility: iteratively prune non-protected leaves from an active
-    subgraph.
+    Iteratively remove non-protected leaves from the active undirected support.
+
+    This is an evaluation utility, not a training transition.
+    Direction is ignored only for degree pruning; edge identity is preserved.
     """
     check_edge_index(edge_index)
-
-    if active_nodes.dtype != torch.bool:
-        raise TypeError(f"active_nodes must be bool, got {active_nodes.dtype}.")
-    if active_edges.dtype != torch.bool:
-        raise TypeError(f"active_edges must be bool, got {active_edges.dtype}.")
-    if protected_nodes.dtype != torch.bool:
-        raise TypeError(f"protected_nodes must be bool, got {protected_nodes.dtype}.")
 
     num_nodes = int(active_nodes.numel())
     num_edges = int(edge_index.size(1))
 
-    if active_edges.numel() != num_edges:
-        raise ValueError(
-            f"active_edges must have shape [{num_edges}], got {tuple(active_edges.shape)}."
-        )
-    if protected_nodes.numel() != num_nodes:
-        raise ValueError(
-            f"protected_nodes must have shape [{num_nodes}], got {tuple(protected_nodes.shape)}."
-        )
+    check_bool_vector(active_nodes, name="active_nodes")
+    check_bool_vector(protected_nodes, name="protected_nodes", size=num_nodes)
+    check_bool_vector(active_edges, name="active_edges", size=num_edges)
 
     device = active_nodes.device
     edge_index = edge_index.to(device=device, dtype=torch.long)
-    active_edges = active_edges.to(device=device, dtype=torch.bool)
-    protected_nodes = protected_nodes.to(device=device, dtype=torch.bool)
-
-    if num_nodes == 0 or num_edges == 0 or not bool(active_edges.any()):
-        return active_nodes.clone(), torch.zeros_like(active_edges)
+    active_edges = active_edges.to(device=device)
+    protected_nodes = protected_nodes.to(device=device)
 
     src, dst = edge_index
     alive_nodes = active_nodes.clone()
     max_steps = num_nodes if max_iters is None else int(max_iters)
 
     for _ in range(max_steps):
-        alive_edges = (
-            active_edges
-            & alive_nodes.index_select(0, src)
-            & alive_nodes.index_select(0, dst)
-        )
+        alive_edges = active_edges & alive_nodes[src] & alive_nodes[dst]
 
         degree = torch.zeros(num_nodes, dtype=torch.long, device=device)
-        if bool(alive_edges.any()):
-            edge_src = src[alive_edges]
-            edge_dst = dst[alive_edges]
-            ones = torch.ones(edge_src.numel(), dtype=torch.long, device=device)
-            degree.index_add_(0, edge_src, ones)
-            degree.index_add_(0, edge_dst, ones)
+        edge_src = src[alive_edges]
+        edge_dst = dst[alive_edges]
+        ones = torch.ones(edge_src.numel(), dtype=torch.long, device=device)
+
+        degree.index_add_(0, edge_src, ones)
+        degree.index_add_(0, edge_dst, ones)
 
         prune_nodes = alive_nodes & ~protected_nodes & degree.le(1)
         if not bool(prune_nodes.any()):
             break
 
-        alive_nodes = alive_nodes & ~prune_nodes
+        alive_nodes &= ~prune_nodes
 
-    core_edges = (
-        active_edges
-        & alive_nodes.index_select(0, src)
-        & alive_nodes.index_select(0, dst)
-    )
-
+    core_edges = active_edges & alive_nodes[src] & alive_nodes[dst]
     return alive_nodes, core_edges
 
 
-def build_local_graph(
-    graph_edges: Sequence[tuple[str, str, str]],
-) -> tuple[dict[str, int], torch.Tensor]:
-    """Build edge_index with one column per input triple-id edge."""
-    node_index: dict[str, int] = {}
-    src: list[int] = []
-    dst: list[int] = []
-
-    for head, _, tail in graph_edges:
-        src.append(node_index.setdefault(head, len(node_index)))
-        dst.append(node_index.setdefault(tail, len(node_index)))
-
-    return node_index, torch.tensor([src, dst], dtype=torch.long)
-
-
 __all__ = [
+    "Edge",
     "build_local_graph",
+    "check_bool_vector",
     "check_edge_index",
     "prune_to_protected_core",
     "rebuild_active_nodes",

@@ -5,9 +5,11 @@ from collections.abc import Sequence
 import torch
 
 from src.data.schema import RetrievalBatch
+from src.eval.aggregation import grouped_sample_ids
 from src.eval.targets import eval_target_node_mask
-from src.weaver.rollout.result import RolloutResult
-from src.weaver.rollout.subgraph import SubgraphReconstructor
+from src.weaver.context import GraphContext
+from src.weaver.rollout.subgraph import stacked_subgraph_masks
+from src.weaver.rollout.trajectory import TrajectoryBatch
 
 
 def default_eval_device() -> torch.device:
@@ -19,7 +21,7 @@ def batch_num_graphs(batch: RetrievalBatch) -> int:
 
 
 def compute_exploration_diversity(
-    rollouts: Sequence[RolloutResult],
+    rollouts: TrajectoryBatch,
     batch: RetrievalBatch,
     *,
     device: torch.device | None = None,
@@ -35,7 +37,7 @@ def compute_exploration_diversity(
     """
     device = device or default_eval_device()
 
-    if len(rollouts) <= 1:
+    if _num_samples(rollouts, num_graphs=batch_num_graphs(batch)) <= 1:
         return {
             "pairwise_edge_jaccard_distance": 0.0,
             "node_jaccard_distance": 0.0,
@@ -45,7 +47,12 @@ def compute_exploration_diversity(
             "terminal_f1_std": terminal_f1_std(rollouts),
         }
 
-    node_masks, edge_masks = SubgraphReconstructor(batch, device=device).stack(rollouts)
+    node_masks, edge_masks = stacked_subgraph_masks(
+        rollouts,
+        GraphContext.from_batch(batch),
+        batch,
+        device=device,
+    )
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
     edge_batch = batch.edge_batch.to(device=device, dtype=torch.long)
@@ -74,19 +81,20 @@ def compute_exploration_diversity(
 
 
 def compute_exploration_diversity_at_ks(
-    rollouts: Sequence[RolloutResult],
+    rollouts: TrajectoryBatch,
     batch: RetrievalBatch,
     *,
     ks: Sequence[int],
     device: torch.device | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
-    effective_ks = tuple(sorted({int(k) for k in ks if 1 <= int(k) <= len(rollouts)}))
+    num_samples = _num_samples(rollouts, num_graphs=batch_num_graphs(batch))
+    effective_ks = tuple(sorted({int(k) for k in ks if 1 <= int(k) <= num_samples}))
     if not effective_ks:
         effective_ks = tuple(sorted({int(k) for k in ks if int(k) >= 1}))
 
     for k in effective_ks:
-        current = compute_exploration_diversity(rollouts[:k], batch, device=device)
+        current = compute_exploration_diversity(_take_first_k(rollouts, k, batch_num_graphs(batch)), batch, device=device)
         metrics[f"unique_terminal_subgraph_rate_at_{k}"] = current[
             "unique_terminal_subgraph_rate"
         ]
@@ -155,20 +163,11 @@ def mean_pairwise_jaccard_distance_by_graph(
     return float(torch.cat(values).mean().item())
 
 
-def terminal_f1_std(rollouts: Sequence[RolloutResult]) -> float:
-    if not rollouts:
+def terminal_f1_std(rollouts: TrajectoryBatch) -> float:
+    if rollouts.num_trajectories == 0:
         return 0.0
 
-    values = torch.cat(
-        [
-            rollout.policy_action_log_prob[
-                torch.arange(rollout.num_rollouts, device=rollout.device),
-                rollout.terminal_step,
-            ].detach().to(dtype=torch.float32)
-            for rollout in rollouts
-        ],
-        dim=0,
-    )
+    values = rollouts.stop_logp[rollouts.policy_stop].detach().to(dtype=torch.float32)
 
     if values.numel() <= 1:
         return 0.0
@@ -176,41 +175,46 @@ def terminal_f1_std(rollouts: Sequence[RolloutResult]) -> float:
     return float(values.std(unbiased=False).item())
 
 
-def unique_terminal_subgraph_rate(rollouts: Sequence[RolloutResult]) -> float:
+def unique_terminal_subgraph_rate(rollouts: TrajectoryBatch) -> float:
     return unique_selected_edge_set_rate(rollouts)
 
 
-def unique_selected_edge_set_rate(rollouts: Sequence[RolloutResult]) -> float:
-    if not rollouts:
+def unique_selected_edge_set_rate(rollouts: TrajectoryBatch) -> float:
+    if rollouts.num_trajectories == 0:
         return 0.0
 
-    num_rollouts = len(rollouts)
-    num_graphs = int(rollouts[0].num_rollouts)
+    num_rollouts = _num_samples(rollouts, num_graphs=int(rollouts.graph_ids.max().item()) + 1)
+    num_graphs = int(rollouts.graph_ids.max().item()) + 1
     rates: list[float] = []
     for graph_id in range(num_graphs):
         unique_sets = {
-            _selected_edge_set_for_graph(rollout=rollout, graph_id=graph_id)
-            for rollout in rollouts
+            _selected_edge_set_for_row(rollouts=rollouts, row=row)
+            for row in rollouts.graph_ids.eq(graph_id).nonzero(as_tuple=False).flatten().tolist()
         }
         rates.append(float(len(unique_sets)) / float(num_rollouts))
 
     return sum(rates) / float(len(rates)) if rates else 0.0
 
 
-def _selected_edge_set_for_graph(
-    *, rollout: RolloutResult, graph_id: int
-) -> tuple[int, ...]:
-    selected_edge_ids = rollout.selected_edge_ids[graph_id]
-    continue_mask = rollout.expand_mask[graph_id]
-    trajectory_length = int(rollout.terminal_step[graph_id].item()) + 1
-    if trajectory_length <= 0:
-        return ()
-
+def _selected_edge_set_for_row(*, rollouts: TrajectoryBatch, row: int) -> tuple[int, ...]:
+    selected_edge_ids = rollouts.edge_ids[int(row)]
     valid_steps = torch.arange(
         selected_edge_ids.numel(), device=selected_edge_ids.device
-    ).lt(trajectory_length)
-    edge_ids = selected_edge_ids[valid_steps & continue_mask & selected_edge_ids.ge(0)]
+    ).lt(rollouts.num_edges[int(row)])
+    edge_ids = selected_edge_ids[valid_steps & selected_edge_ids.ge(0)]
     return tuple(sorted(int(edge_id) for edge_id in edge_ids.tolist()))
+
+
+def _num_samples(rollouts: TrajectoryBatch, *, num_graphs: int) -> int:
+    if rollouts.num_trajectories == 0:
+        return 0
+    counts = torch.bincount(rollouts.graph_ids, minlength=int(num_graphs))
+    return int(counts.max().item()) if counts.numel() > 0 else 0
+
+
+def _take_first_k(rollouts: TrajectoryBatch, k: int, num_graphs: int) -> TrajectoryBatch:
+    keep = grouped_sample_ids(rollouts, num_graphs=int(num_graphs)).lt(int(k))
+    return rollouts.select_rows(keep.nonzero(as_tuple=False).flatten())
 
 
 __all__ = [

@@ -1,94 +1,86 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
 from src.data.schema import RetrievalBatch
+from src.eval.aggregation import grouped_sample_ids, trajectory_row_matrix
 from src.eval.compactness import per_graph_counts
 from src.eval.retrieval import mean_over_valid_graphs, safe_divide, safe_f1
 from src.eval.targets import eval_target_node_mask
 from src.graph.masks import anchor_node_mask
 from src.utils.scatter import scatter_sum
-from src.weaver.context import GraphContext, TargetContext
-from src.weaver.nn.feature_encoder import EncodedFeatures
-from src.weaver.policy import ForwardPolicy
-from src.weaver.rollout.result import RolloutResult
-from src.weaver.state import State
-from src.weaver.utility import TrueTerminalReward
+from src.weaver.context import GraphContext
+from src.weaver.rollout.trajectory import (
+    BUDGET,
+    NO_FRONTIER,
+    POLICY_STOP,
+    SRC_POLICY,
+    TrajectoryBatch,
+)
+from src.weaver.state import StateBatch
+
+Tensor = torch.Tensor
+
+MAX_LOGGED_K = 8
 
 
 @dataclass(frozen=True, slots=True)
 class ReachableRecallScores:
-    recall: torch.Tensor
-    valid_graph_mask: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class TerminalPolicyScores:
-    state_flow: torch.Tensor
-    terminal_flow: torch.Tensor
+    recall: Tensor
+    valid_graph_mask: Tensor
 
 
 @dataclass(frozen=True, slots=True)
 class RolloutEvalTensors:
-    node_masks: torch.Tensor
-    edge_masks: torch.Tensor
-    recall: torch.Tensor
-    f1: torch.Tensor
-    hit: torch.Tensor
-    edge_count: torch.Tensor
-    trajectory_len: torch.Tensor
-    policy_stop: torch.Tensor
-    no_frontier_stop: torch.Tensor
-    budget_truncated: torch.Tensor
-    traj_prob_score: torch.Tensor
-    state_flow_score: torch.Tensor
-    terminal_flow_score: torch.Tensor
-    log_reward: torch.Tensor
-    valid_graph_mask: torch.Tensor
+    node_masks: Tensor
+    edge_masks: Tensor
 
+    recall: Tensor
+    f1: Tensor
 
-SelectorFn = Callable[[RolloutEvalTensors, int], torch.Tensor]
-MAX_LOGGED_K = 8
+    edge_count: Tensor
+    trajectory_len: Tensor
+
+    policy_stop: Tensor
+    no_frontier_stop: Tensor
+    budget_boundary: Tensor
+    terminal_step: Tensor
+
+    valid_graph_mask: Tensor
+    budget: int
 
 
 def evaluate_rollout_samples(
     *,
-    rollout_samples: Sequence[RolloutResult],
+    trajectories: TrajectoryBatch,
     batch: RetrievalBatch,
+    context: GraphContext,
     exclude_anchors_from_retrieved: bool,
     use_reachable_targets: bool,
     k_windows: Sequence[int],
-    enable_calibration_metrics: bool,
     enable_terminal_diagnostics: bool,
-    context: GraphContext | None = None,
-    features: EncodedFeatures | None = None,
-    reward_model: TrueTerminalReward | None = None,
-    target_context: TargetContext | None = None,
-    policy: ForwardPolicy | None = None,
 ) -> dict[str, float]:
-    if context is None or features is None or reward_model is None or target_context is None or policy is None:
-        raise ValueError("rollout evaluation requires context, features, reward_model, target_context, and policy.")
+    ks = normalize_k_windows(
+        k_windows,
+        max_k=_num_samples(
+            trajectories,
+            num_graphs=int(batch.num_graphs),
+        ),
+    )
 
-    ks = normalize_k_windows(k_windows, max_k=len(rollout_samples))
     tensors = rollout_eval_tensors(
-        rollout_samples=rollout_samples,
+        trajectories=trajectories,
         batch=batch,
+        context=context,
         exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
         use_reachable_targets=use_reachable_targets,
-        context=context,
-        features=features,
-        reward_model=reward_model,
-        target_context=target_context,
-        policy=policy,
     )
 
     metrics: dict[str, float] = {}
     metrics.update(sample_metrics(tensors))
-    metrics.update(candidate_best_metrics(tensors, ks=ks, name="oracle_best", selector=_oracle_indices))
-    metrics.update(candidate_best_metrics(tensors, ks=ks, name="reward_best", selector=_reward_indices))
     metrics.update(
         union_metrics(
             tensors,
@@ -98,221 +90,313 @@ def evaluate_rollout_samples(
             use_reachable_targets=use_reachable_targets,
         )
     )
-    metrics.update(selector_metrics(tensors, ks=ks))
-    if enable_calibration_metrics:
-        metrics.update(calibration_metrics(tensors))
+
+    metrics["marginal/answer_support_prob"] = answer_support_probability(
+        tensors=tensors,
+        batch=batch,
+        exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
+        use_reachable_targets=use_reachable_targets,
+    )
+
     if enable_terminal_diagnostics:
-        metrics.update(terminal_metrics(rollout_samples, tensors, batch=batch))
+        metrics.update(
+            terminal_metrics(
+                trajectories=trajectories,
+                tensors=tensors,
+                batch=batch,
+            )
+        )
+
     return metrics
 
 
 def rollout_eval_tensors(
     *,
-    rollout_samples: Sequence[RolloutResult],
+    trajectories: TrajectoryBatch,
     batch: RetrievalBatch,
+    context: GraphContext,
     exclude_anchors_from_retrieved: bool,
     use_reachable_targets: bool,
-    context: GraphContext,
-    features: EncodedFeatures,
-    reward_model: TrueTerminalReward,
-    target_context: TargetContext,
-    policy: ForwardPolicy,
 ) -> RolloutEvalTensors:
     device = torch.device("cpu")
+    num_graphs = int(batch.num_graphs)
+
+    terminal_state = terminal_state_from_trajectories(trajectories)
+
     node_masks, edge_masks = stacked_terminal_masks(
-        rollout_samples,
+        state=terminal_state,
+        trajectories=trajectories,
+        context=context,
+        num_graphs=num_graphs,
         num_nodes=int(context.num_nodes),
         num_edges=int(context.num_edges),
         device=device,
     )
+
     _, recall, f1, valid_graph_mask = retrieval_from_masks(
         node_masks=node_masks,
         batch=batch,
         exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
         use_reachable_targets=use_reachable_targets,
     )
-    answer_count = answer_count_from_masks(
-        node_masks=node_masks,
-        batch=batch,
-        exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
-        use_reachable_targets=use_reachable_targets,
-    )
+
     edge_count = per_graph_counts(
         edge_masks,
         batch.edge_batch.to(device=device, dtype=torch.long),
-        num_graphs=int(batch.num_graphs),
+        num_graphs=num_graphs,
     )
-    trajectory_len = _stack_terminal_step(rollout_samples).float() + 1.0
-    policy_stop, no_frontier_stop, budget_truncated = terminal_matrices(rollout_samples)
-    traj_prob_score = _stack_trajectory_log_prob(rollout_samples)
 
-    terminal_state = stacked_terminal_state(rollout_samples, context=context)
-    log_reward = log_reward_from_state(
-        state=terminal_state,
-        num_samples=int(edge_masks.size(0)),
-        num_graphs=int(batch.num_graphs),
-        reward_model=reward_model,
-        context=context,
-        target_context=target_context,
-        device=device,
+    terminal_step = _stack_terminal_step(
+        trajectories=trajectories,
+        num_graphs=num_graphs,
     )
-    terminal_scores = terminal_policy_scores(
-        state=terminal_state,
-        num_samples=int(edge_masks.size(0)),
-        num_graphs=int(batch.num_graphs),
-        context=context,
-        features=features,
-        policy=policy,
-        expand_budget=_rollout_expand_budget(rollout_samples),
-        device=device,
+
+    policy_stop, no_frontier_stop, budget_boundary = terminal_matrices(
+        trajectories=trajectories,
+        num_graphs=num_graphs,
     )
+
+    trajectory_len = terminal_step.float() + policy_stop
 
     return RolloutEvalTensors(
         node_masks=node_masks,
         edge_masks=edge_masks,
         recall=recall,
         f1=f1,
-        hit=answer_count.gt(0.0),
         edge_count=edge_count,
         trajectory_len=trajectory_len,
         policy_stop=policy_stop,
         no_frontier_stop=no_frontier_stop,
-        budget_truncated=budget_truncated,
-        traj_prob_score=traj_prob_score,
-        state_flow_score=terminal_scores.state_flow,
-        terminal_flow_score=terminal_scores.terminal_flow,
-        log_reward=log_reward,
+        budget_boundary=budget_boundary,
+        terminal_step=terminal_step,
         valid_graph_mask=valid_graph_mask,
+        budget=int(trajectories.budget),
     )
+
+
+def terminal_state_from_trajectories(
+    trajectories: TrajectoryBatch,
+) -> StateBatch:
+    """
+    Zero-replay conversion from trajectory records to terminal StateBatch.
+
+    This does not expand edges step by step. It only wraps the canonical
+    terminal selected-edge representation.
+    """
+
+    return StateBatch(
+        graph_ids=trajectories.graph_ids,
+        edge_ids=trajectories.edge_ids,
+        edge_count=trajectories.edge_count,
+        budget=int(trajectories.budget),
+    )
+
+
+def stacked_terminal_masks(
+    *,
+    state: StateBatch,
+    trajectories: TrajectoryBatch,
+    context: GraphContext,
+    num_graphs: int,
+    num_nodes: int,
+    num_edges: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """
+    Build dense sample-level terminal node/edge masks.
+
+    Shape:
+    - node_masks: [K, num_nodes]
+    - edge_masks: [K, num_edges]
+
+    K is the maximum number of trajectories sampled per graph.
+    """
+
+    if state.num_states != int(trajectories.num_trajectories):
+        raise ValueError("StateBatch rows must match TrajectoryBatch rows: " f"{state.num_states} vs {int(trajectories.num_trajectories)}.")
+
+    num_samples = _num_samples(
+        trajectories,
+        num_graphs=int(num_graphs),
+    )
+
+    if num_samples == 0:
+        return (
+            torch.zeros((0, int(num_nodes)), dtype=torch.bool, device=device),
+            torch.zeros((0, int(num_edges)), dtype=torch.bool, device=device),
+        )
+
+    source_device = state.device
+
+    sample_ids = _sample_ids(
+        trajectories,
+        num_graphs=int(num_graphs),
+    ).to(device=source_device, dtype=torch.long)
+
+    node_masks = torch.zeros(
+        (num_samples, int(num_nodes)),
+        dtype=torch.bool,
+        device=source_device,
+    )
+    edge_masks = torch.zeros(
+        (num_samples, int(num_edges)),
+        dtype=torch.bool,
+        device=source_device,
+    )
+
+    node_state_ids, node_ids = state.covered_node_pairs(context)
+    if int(node_ids.numel()) > 0:
+        node_sample_ids = sample_ids.index_select(0, node_state_ids)
+        node_masks[node_sample_ids, node_ids] = True
+
+    edge_state_ids, edge_ids = selected_edge_pairs(state)
+    if int(edge_ids.numel()) > 0:
+        edge_sample_ids = sample_ids.index_select(0, edge_state_ids)
+        edge_masks[edge_sample_ids, edge_ids] = True
+
+    return (
+        node_masks.to(device=device),
+        edge_masks.to(device=device),
+    )
+
+
+def selected_edge_pairs(state: StateBatch) -> tuple[Tensor, Tensor]:
+    """
+    Return valid selected (state_id, edge_id) pairs from StateBatch.
+
+    Uses edge_count rather than edge_ids >= 0, so padding is ignored even if a
+    caller accidentally leaves non-negative garbage after edge_count.
+    """
+
+    num_states = int(state.num_states)
+    budget = int(state.budget)
+
+    if num_states == 0 or budget == 0:
+        empty = torch.empty(0, dtype=torch.long, device=state.device)
+        return empty, empty
+
+    steps = torch.arange(
+        budget,
+        dtype=torch.long,
+        device=state.device,
+    ).view(1, budget)
+
+    valid = steps.lt(state.edge_count.view(num_states, 1))
+    edge_ids = state.edge_ids[valid]
+
+    state_ids = torch.repeat_interleave(
+        torch.arange(
+            num_states,
+            dtype=torch.long,
+            device=state.device,
+        ),
+        state.edge_count.to(dtype=torch.long),
+    )
+
+    return state_ids, edge_ids
 
 
 def retrieval_from_masks(
     *,
-    node_masks: torch.Tensor,
+    node_masks: Tensor,
     batch: RetrievalBatch,
     exclude_anchors_from_retrieved: bool,
     use_reachable_targets: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     device = node_masks.device
     num_samples = int(node_masks.size(0))
     num_graphs = int(batch.num_graphs)
+
     if num_samples == 0:
         empty = torch.zeros((0, num_graphs), dtype=torch.float32, device=device)
-        return empty, empty, empty, torch.zeros(num_graphs, dtype=torch.bool, device=device)
+        return (
+            empty,
+            empty,
+            empty,
+            torch.zeros(num_graphs, dtype=torch.bool, device=device),
+        )
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
+
     target_nodes = eval_target_node_mask(
         batch,
         device=device,
         use_reachable_targets=use_reachable_targets,
     )
+
     retrieved_nodes = node_masks
     if exclude_anchors_from_retrieved:
-        retrieved_nodes = retrieved_nodes & ~anchor_node_mask(batch, device=device).unsqueeze(0)
+        retrieved_nodes = retrieved_nodes & ~anchor_node_mask(
+            batch,
+            device=device,
+        ).unsqueeze(0)
+
     hit_nodes = retrieved_nodes & target_nodes.unsqueeze(0)
+
     expanded_index = _sample_item_graph_index(
         item_batch=node_batch,
         num_samples=num_samples,
         num_graphs=num_graphs,
     )
+
     hits = scatter_sum(
         hit_nodes.float().reshape(-1),
         expanded_index,
         dim=0,
         dim_size=num_samples * num_graphs,
     ).view(num_samples, num_graphs)
+
     retrieved = scatter_sum(
         retrieved_nodes.float().reshape(-1),
         expanded_index,
         dim=0,
         dim_size=num_samples * num_graphs,
     ).view(num_samples, num_graphs)
+
     gold = scatter_sum(
         target_nodes.float(),
         node_batch,
         dim=0,
         dim_size=num_graphs,
     )
+
     valid = gold.gt(0.0)
+
     precision = safe_divide(hits, retrieved)
-    recall = safe_divide(hits, gold.unsqueeze(0).expand_as(hits))
-    recall = torch.where(valid.unsqueeze(0), recall, torch.zeros_like(recall))
-    return precision, recall, safe_f1(precision, recall), valid
 
-
-def answer_count_from_masks(
-    *,
-    node_masks: torch.Tensor,
-    batch: RetrievalBatch,
-    exclude_anchors_from_retrieved: bool,
-    use_reachable_targets: bool,
-) -> torch.Tensor:
-    device = node_masks.device
-    num_samples = int(node_masks.size(0))
-    num_graphs = int(batch.num_graphs)
-    if num_samples == 0:
-        return torch.zeros((0, num_graphs), dtype=torch.float32, device=device)
-    targets = eval_target_node_mask(batch, device=device, use_reachable_targets=use_reachable_targets)
-    nodes = node_masks
-    if exclude_anchors_from_retrieved:
-        nodes = nodes & ~anchor_node_mask(batch, device=device).unsqueeze(0)
-    index = _sample_item_graph_index(
-        item_batch=batch.batch.to(device=device, dtype=torch.long),
-        num_samples=num_samples,
-        num_graphs=num_graphs,
+    recall = safe_divide(
+        hits,
+        gold.unsqueeze(0).expand_as(hits),
     )
-    return scatter_sum(
-        (nodes & targets.unsqueeze(0)).float().reshape(-1),
-        index,
-        dim=0,
-        dim_size=num_samples * num_graphs,
-    ).view(num_samples, num_graphs)
+    recall = torch.where(
+        valid.unsqueeze(0),
+        recall,
+        torch.zeros_like(recall),
+    )
+
+    return precision, recall, safe_f1(precision, recall), valid
 
 
 def sample_metrics(tensors: RolloutEvalTensors) -> dict[str, float]:
     valid = tensors.valid_graph_mask
-    return {
-        "sample/mean_recall": mean_over_valid_graphs(tensors.recall, valid),
-        "sample/mean_edges": mean_over_valid_graphs(tensors.edge_count, valid),
-        "sample/mean_log_reward": mean_over_valid_graphs(tensors.log_reward, valid),
+
+    metrics = {
+        "single_rollout/mean_recall": mean_over_valid_graphs(tensors.recall, valid),
+        "single_rollout/mean_f1": mean_over_valid_graphs(tensors.f1, valid),
+        "rollout/edge_count_mean": mean_over_valid_graphs(tensors.edge_count, valid),
     }
 
+    for edge_count in range(int(tensors.budget) + 1):
+        metrics[f"rollout/edge_count_rate_{edge_count}"] = mean_over_valid_graphs(
+            tensors.edge_count.eq(edge_count).float(),
+            valid,
+        )
 
-def candidate_best_metrics(
-    tensors: RolloutEvalTensors,
-    *,
-    ks: Sequence[int],
-    name: str,
-    selector: SelectorFn,
-) -> dict[str, float]:
-    metrics: dict[str, float] = {}
-    for k in ks:
-        idx = selector(tensors, k)
-        prefix = f"candidate_{name}@{k}"
-        metrics[f"{prefix}/recall"] = _mean_selected(tensors.recall, idx, tensors.valid_graph_mask)
-    return metrics
-
-
-def selector_metrics(tensors: RolloutEvalTensors, *, ks: Sequence[int]) -> dict[str, float]:
-    selectors: tuple[tuple[str, SelectorFn], ...] = (
-        ("traj_prob", _traj_prob_indices),
-        ("state_flow", _state_flow_indices),
-        ("terminal_flow", _terminal_flow_indices),
+    metrics["rollout/edge_budget_full_rate"] = mean_over_valid_graphs(
+        tensors.edge_count.ge(int(tensors.budget)).float(),
+        valid,
     )
-    metrics: dict[str, float] = {}
-    for k in ks:
-        for name, selector in selectors:
-            idx = selector(tensors, k)
-            prefix = f"selector_{name}@{k}"
-            metrics[f"{prefix}/recall"] = _mean_selected(tensors.recall, idx, tensors.valid_graph_mask)
-            metrics[f"{prefix}/f1"] = _mean_selected(tensors.f1, idx, tensors.valid_graph_mask)
-            oracle_idx = _oracle_indices(tensors, k)
-            oracle_recall = _selected_values(tensors.recall, oracle_idx)
-            selected_recall = _selected_values(tensors.recall, idx)
-            metrics[f"{prefix}/oracle_gap"] = mean_over_valid_graphs(
-                oracle_recall - selected_recall,
-                tensors.valid_graph_mask,
-            )
+
     return metrics
 
 
@@ -325,70 +409,135 @@ def union_metrics(
     use_reachable_targets: bool,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
-    edge_batch = batch.edge_batch.to(device=tensors.edge_masks.device, dtype=torch.long)
+
+    edge_batch = batch.edge_batch.to(
+        device=tensors.edge_masks.device,
+        dtype=torch.long,
+    )
+
     for k in ks:
         node_masks = tensors.node_masks[:k].any(dim=0, keepdim=True)
         edge_masks = tensors.edge_masks[:k].any(dim=0, keepdim=True)
+
         _, recall, _, valid = retrieval_from_masks(
             node_masks=node_masks,
             batch=batch,
             exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
             use_reachable_targets=use_reachable_targets,
         )
-        edge_count = per_graph_counts(edge_masks, edge_batch, num_graphs=int(batch.num_graphs)).squeeze(0)
+
+        edge_count = per_graph_counts(
+            edge_masks,
+            edge_batch,
+            num_graphs=int(batch.num_graphs),
+        ).squeeze(0)
+
         denom = tensors.edge_count[:k].sum(dim=0)
         unique_ratio = safe_divide(edge_count, denom)
 
-        prefix = f"candidate_union@{k}"
-        metrics[f"{prefix}/recall"] = mean_over_valid_graphs(recall.squeeze(0), valid)
-        metrics[f"{prefix}/edges"] = mean_over_valid_graphs(edge_count, valid)
-        metrics[f"{prefix}/redundancy"] = mean_over_valid_graphs(1.0 - unique_ratio, valid)
+        prefix = f"rollout_union@{k}"
+        metrics[f"{prefix}/recall"] = mean_over_valid_graphs(
+            recall.squeeze(0),
+            valid,
+        )
+        metrics[f"{prefix}/edges"] = mean_over_valid_graphs(
+            edge_count,
+            valid,
+        )
+        metrics[f"{prefix}/redundancy"] = mean_over_valid_graphs(
+            1.0 - unique_ratio,
+            valid,
+        )
+
     return metrics
 
 
-def calibration_metrics(tensors: RolloutEvalTensors) -> dict[str, float]:
-    metrics: dict[str, float] = {}
-    for name, score in (
-        ("terminal_flow", tensors.terminal_flow_score),
-        ("state_flow", tensors.state_flow_score),
-        ("traj_prob", tensors.traj_prob_score),
-    ):
-        mean, valid_rate = per_graph_spearman(score, tensors.log_reward, tensors.valid_graph_mask)
-        metrics[f"calibration/{name}_reward_spearman"] = mean
-        metrics[f"calibration/{name}_reward_spearman_valid_rate"] = valid_rate
+def answer_support_probability(
+    *,
+    tensors: RolloutEvalTensors,
+    batch: RetrievalBatch,
+    exclude_anchors_from_retrieved: bool,
+    use_reachable_targets: bool,
+) -> float:
+    if tensors.node_masks.numel() == 0:
+        return 0.0
 
-    auc, valid_rate = per_graph_auc(tensors.terminal_flow_score, tensors.hit, tensors.valid_graph_mask)
-    metrics["calibration/terminal_flow_hit_auc"] = auc
-    metrics["calibration/terminal_flow_hit_auc_valid_rate"] = valid_rate
-    return metrics
+    device = tensors.node_masks.device
+
+    node_batch = batch.batch.to(device=device, dtype=torch.long)
+    targets = eval_target_node_mask(
+        batch,
+        device=device,
+        use_reachable_targets=use_reachable_targets,
+    )
+
+    if exclude_anchors_from_retrieved:
+        targets = targets & ~anchor_node_mask(batch, device=device)
+
+    support = tensors.node_masks.float().mean(dim=0)
+
+    values: list[Tensor] = []
+    for graph_id in range(int(batch.num_graphs)):
+        if not bool(tensors.valid_graph_mask[graph_id]):
+            continue
+
+        graph_targets = targets & node_batch.eq(graph_id)
+        if bool(graph_targets.any()):
+            values.append(support[graph_targets].mean())
+
+    if not values:
+        return 0.0
+
+    return float(torch.stack(values).mean().item())
 
 
 def terminal_metrics(
-    rollouts: Sequence[RolloutResult],
-    tensors: RolloutEvalTensors,
     *,
+    trajectories: TrajectoryBatch,
+    tensors: RolloutEvalTensors,
     batch: RetrievalBatch,
 ) -> dict[str, float]:
-    stats = hit_terminal_stats(rollouts, batch=batch)
+    stats = hit_terminal_stats(
+        trajectories,
+        batch=batch,
+    )
+
     hit = stats["hit"]
     continued = stats["continued"]
     valid = tensors.valid_graph_mask
+
     return {
-        "terminal/policy_stop_rate": mean_over_valid_graphs(tensors.policy_stop, valid),
-        "terminal/structural_stop_rate": mean_over_valid_graphs(tensors.no_frontier_stop, valid),
-        "terminal/budget_truncate_rate": mean_over_valid_graphs(tensors.budget_truncated, valid),
-        "terminal/policy_terminal_rate": mean_over_valid_graphs(tensors.policy_stop, valid),
-        "terminal/forced_terminal_rate": mean_over_valid_graphs(
-            tensors.no_frontier_stop + tensors.budget_truncated,
+        "terminal/policy_stop_rate": mean_over_valid_graphs(
+            tensors.policy_stop,
             valid,
         ),
-        "terminal/hit_then_continue_rate": _mean_hit_values(continued.float(), hit, valid),
+        "terminal/structural_stop_rate": mean_over_valid_graphs(
+            tensors.no_frontier_stop,
+            valid,
+        ),
+        "terminal/budget_boundary_rate": mean_over_valid_graphs(
+            tensors.budget_boundary,
+            valid,
+        ),
+        "terminal/policy_terminal_rate": mean_over_valid_graphs(
+            tensors.policy_stop,
+            valid,
+        ),
+        "terminal/forced_terminal_rate": mean_over_valid_graphs(
+            tensors.no_frontier_stop + tensors.budget_boundary,
+            valid,
+        ),
+        "terminal/hit_then_continue_rate": _mean_hit_values(
+            continued.float(),
+            hit,
+            valid,
+        ),
     }
 
 
 def reachable_recall_scores(
     *,
-    node_masks: torch.Tensor,
+    node_masks: Tensor,
     batch: RetrievalBatch,
     exclude_anchors_from_retrieved: bool,
     use_reachable_targets: bool,
@@ -399,361 +548,279 @@ def reachable_recall_scores(
         exclude_anchors_from_retrieved=exclude_anchors_from_retrieved,
         use_reachable_targets=use_reachable_targets,
     )
-    return ReachableRecallScores(recall=recall, valid_graph_mask=valid)
+
+    return ReachableRecallScores(
+        recall=recall,
+        valid_graph_mask=valid,
+    )
 
 
 def one_sample_reachable_recall(scores: ReachableRecallScores) -> float:
-    return mean_over_valid_graphs(scores.recall[:1], scores.valid_graph_mask)
+    return mean_over_valid_graphs(
+        scores.recall[:1],
+        scores.valid_graph_mask,
+    )
 
 
 def budget_forced_terminal_rate(
     *,
-    rollout_samples: Sequence[RolloutResult],
-    valid_graph_mask: torch.Tensor,
+    trajectories: TrajectoryBatch,
+    valid_graph_mask: Tensor,
 ) -> float:
-    _, _, truncated = terminal_matrices(rollout_samples)
-    return mean_over_valid_graphs(truncated, valid_graph_mask)
-
-
-def terminal_matrices(rollouts: Sequence[RolloutResult]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not rollouts:
-        return torch.zeros((0, 0)), torch.zeros((0, 0)), torch.zeros((0, 0))
-    policy: list[torch.Tensor] = []
-    structural: list[torch.Tensor] = []
-    truncated: list[torch.Tensor] = []
-    for rollout in rollouts:
-        policy.append(rollout.policy_stop.to(device=torch.device("cpu"), dtype=torch.float32))
-        structural.append(rollout.no_frontier_stop.to(device=torch.device("cpu"), dtype=torch.float32))
-        truncated.append(rollout.budget_truncated.to(device=torch.device("cpu"), dtype=torch.float32))
-    return torch.stack(policy, dim=0), torch.stack(structural, dim=0), torch.stack(truncated, dim=0)
-
-
-def stacked_terminal_state(
-    rollouts: Sequence[RolloutResult],
-    *,
-    context: GraphContext,
-) -> State:
-    states = [rollout.terminal_state for rollout in rollouts]
-    if not states:
-        return State.initial(
-            graph=context,
-            graph_ids=torch.empty(0, dtype=torch.long, device=context.device),
-            expand_budget=0,
-        )
-    if any(state is None for state in states):
-        raise ValueError("rollout terminal_state must be present for evaluation.")
-    return State.concat(states)
-
-
-def stacked_terminal_masks(
-    rollouts: Sequence[RolloutResult],
-    *,
-    num_nodes: int,
-    num_edges: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not rollouts:
-        return (
-            torch.zeros((0, int(num_nodes)), dtype=torch.bool, device=device),
-            torch.zeros((0, int(num_edges)), dtype=torch.bool, device=device),
-        )
-    states = [rollout.terminal_state for rollout in rollouts]
-    if any(state is None for state in states):
-        raise ValueError("rollout terminal_state must be present for evaluation.")
-    node_masks = torch.stack(
-        [
-            state.active_node_mask.any(dim=0).to(device=device, dtype=torch.bool)
-            for state in states
-        ],
-        dim=0,
+    _, _, boundary = terminal_matrices(
+        trajectories=trajectories,
+        num_graphs=int(valid_graph_mask.numel()),
     )
-    edge_masks = torch.stack(
-        [
-            state.selected_edge_mask.any(dim=0).to(device=device, dtype=torch.bool)
-            for state in states
-        ],
-        dim=0,
+
+    return mean_over_valid_graphs(
+        boundary,
+        valid_graph_mask,
     )
-    return node_masks, edge_masks
 
 
-def log_reward_from_state(
+def terminal_matrices(
     *,
-    state: State,
-    num_samples: int,
+    trajectories: TrajectoryBatch,
     num_graphs: int,
-    reward_model: TrueTerminalReward,
-    context: GraphContext,
-    target_context: TargetContext,
-    device: torch.device,
-) -> torch.Tensor:
-    reward_out = reward_model(
-        state=state,
-        graph_context=context,
-        target_context=target_context,
+    policy_only: bool = False,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Return [K, G] terminal-reason matrices.
+
+    Outputs:
+    - policy_stop: trajectory ended because policy sampled STOP;
+    - no_frontier_stop: trajectory ended because no legal expansion existed;
+    - budget_boundary: trajectory ended because expansion budget was exhausted.
+
+    If policy_only=True, policy_stop only counts trajectories whose source is
+    SRC_POLICY. Use this when trajectories may mix policy/replay/oracle rows.
+    """
+
+    if int(trajectories.num_trajectories) == 0:
+        shape = (0, int(num_graphs))
+        empty = torch.zeros(shape, dtype=torch.float32)
+        return empty, empty.clone(), empty.clone()
+
+    policy_stop = trajectories.stop_reason.eq(int(POLICY_STOP))
+    no_frontier_stop = trajectories.stop_reason.eq(int(NO_FRONTIER))
+    budget_boundary = trajectories.stop_reason.eq(int(BUDGET))
+
+    if policy_only:
+        policy_source = trajectories.source.eq(int(SRC_POLICY))
+        policy_stop = policy_stop & policy_source
+
+    return (
+        trajectory_row_matrix(
+            trajectories,
+            policy_stop.float(),
+            num_graphs=int(num_graphs),
+        ).to(device=torch.device("cpu"), dtype=torch.float32),
+        trajectory_row_matrix(
+            trajectories,
+            no_frontier_stop.float(),
+            num_graphs=int(num_graphs),
+        ).to(device=torch.device("cpu"), dtype=torch.float32),
+        trajectory_row_matrix(
+            trajectories,
+            budget_boundary.float(),
+            num_graphs=int(num_graphs),
+        ).to(device=torch.device("cpu"), dtype=torch.float32),
     )
-    return reward_out.log_reward.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-
-
-def terminal_policy_scores(
-    *,
-    state: State,
-    num_samples: int,
-    num_graphs: int,
-    context: GraphContext,
-    features: EncodedFeatures,
-    policy: ForwardPolicy,
-    expand_budget: int | None,
-    device: torch.device,
-) -> TerminalPolicyScores:
-    frontier = state.frontier(context, expand_budget=expand_budget)
-    with torch.no_grad():
-        out = policy(
-            features=features,
-            state=state,
-            context=context,
-            frontier=frontier,
-        )
-    state_flow = out.state_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-    terminal_flow = out.terminal_log_flow.detach().to(device=device, dtype=torch.float32).view(int(num_samples), int(num_graphs))
-    return TerminalPolicyScores(state_flow=state_flow, terminal_flow=terminal_flow)
 
 
 def hit_terminal_stats(
-    rollouts: Sequence[RolloutResult],
+    trajectories: TrajectoryBatch,
     *,
     batch: RetrievalBatch,
-) -> dict[str, torch.Tensor]:
-    k = len(rollouts)
-    b = int(batch.num_graphs)
-    hit = torch.zeros((k, b), dtype=torch.bool)
-    continued = torch.zeros((k, b), dtype=torch.bool)
-    targets = eval_target_node_mask(batch, device=torch.device("cpu"), use_reachable_targets=True)
-    anchors = anchor_node_mask(batch, device=torch.device("cpu"))
-    edge_index = batch.edge_index.to(device=torch.device("cpu"), dtype=torch.long)
+) -> dict[str, Tensor]:
+    num_graphs = int(batch.num_graphs)
+    num_samples = _num_samples(
+        trajectories,
+        num_graphs=num_graphs,
+    )
 
-    for rollout_id, rollout in enumerate(rollouts):
-        selected = rollout.selected_edge_ids.to(device=torch.device("cpu"), dtype=torch.long)
-        expand = rollout.expand_mask.to(device=torch.device("cpu"), dtype=torch.bool)
-        for graph_id in range(b):
-            active = anchors.clone()
-            graph_nodes = batch.batch.to(device=torch.device("cpu")).eq(graph_id)
-            active &= graph_nodes
-            seen_hit = bool((active & targets & graph_nodes).any())
-            expanded_after_hit = False
-            for step in range(int(selected.size(1))):
-                if bool(expand[graph_id, step]) and int(selected[graph_id, step]) >= 0:
-                    if seen_hit:
-                        expanded_after_hit = True
-                    edge_id = int(selected[graph_id, step].item())
-                    active[edge_index[0, edge_id]] = True
-                    active[edge_index[1, edge_id]] = True
-                seen_hit = seen_hit or bool((active & targets & graph_nodes).any())
-            hit[rollout_id, graph_id] = seen_hit
-            continued[rollout_id, graph_id] = expanded_after_hit
-    return {"hit": hit, "continued": continued}
+    hit = torch.zeros(
+        (num_samples, num_graphs),
+        dtype=torch.bool,
+    )
+    continued = torch.zeros(
+        (num_samples, num_graphs),
+        dtype=torch.bool,
+    )
 
+    if int(trajectories.num_trajectories) == 0:
+        return {
+            "hit": hit,
+            "continued": continued,
+        }
 
-def per_graph_spearman(scores: torch.Tensor, targets: torch.Tensor, valid_graph_mask: torch.Tensor) -> tuple[float, float]:
-    values: list[float] = []
-    valid_total = int(valid_graph_mask.sum().item())
-    for graph_id in range(int(valid_graph_mask.numel())):
-        if not bool(valid_graph_mask[graph_id]):
+    device = torch.device("cpu")
+
+    targets = eval_target_node_mask(
+        batch,
+        device=device,
+        use_reachable_targets=True,
+    )
+    anchors = anchor_node_mask(
+        batch,
+        device=device,
+    )
+    node_batch = batch.batch.to(
+        device=device,
+        dtype=torch.long,
+    )
+    edge_index = batch.edge_index.to(
+        device=device,
+        dtype=torch.long,
+    )
+
+    selected = trajectories.edge_ids.to(
+        device=device,
+        dtype=torch.long,
+    )
+    edge_count = trajectories.edge_count.to(
+        device=device,
+        dtype=torch.long,
+    )
+    sample_ids = _sample_ids(
+        trajectories,
+        num_graphs=num_graphs,
+    ).to(device=device, dtype=torch.long)
+    graph_ids = trajectories.graph_ids.to(
+        device=device,
+        dtype=torch.long,
+    )
+
+    for row in range(int(trajectories.num_trajectories)):
+        sample_id = int(sample_ids[row].item())
+        graph_id = int(graph_ids[row].item())
+
+        if graph_id >= num_graphs:
             continue
-        score = [float(x) for x in scores[:, graph_id].tolist()]
-        target = [float(x) for x in targets[:, graph_id].tolist()]
-        value = spearman(score, target)
-        if value is not None:
-            values.append(value)
-    if not values:
-        return 0.0, 0.0
-    return float(sum(values) / len(values)), float(len(values)) / float(max(valid_total, 1))
+
+        graph_nodes = node_batch.eq(graph_id)
+        active = anchors & graph_nodes
+
+        seen_hit = bool((active & targets & graph_nodes).any())
+        expanded_after_hit = False
+
+        for step in range(int(edge_count[row].item())):
+            edge_id = int(selected[row, step].item())
+
+            if edge_id < 0:
+                raise ValueError("Trajectory edge prefix contains negative edge id " f"at row={row}, step={step}.")
+
+            if seen_hit:
+                expanded_after_hit = True
+
+            active[edge_index[0, edge_id]] = True
+            active[edge_index[1, edge_id]] = True
+
+            seen_hit = seen_hit or bool((active & targets & graph_nodes).any())
+
+        hit[sample_id, graph_id] = seen_hit
+        continued[sample_id, graph_id] = expanded_after_hit
+
+    return {
+        "hit": hit,
+        "continued": continued,
+    }
 
 
-def per_graph_auc(scores: torch.Tensor, labels: torch.Tensor, valid_graph_mask: torch.Tensor) -> tuple[float, float]:
-    values: list[float] = []
-    valid_total = int(valid_graph_mask.sum().item())
-    for graph_id in range(int(valid_graph_mask.numel())):
-        if not bool(valid_graph_mask[graph_id]):
-            continue
-        value = auc_score(
-            [float(x) for x in scores[:, graph_id].tolist()],
-            [bool(x) for x in labels[:, graph_id].tolist()],
-        )
-        if value is not None:
-            values.append(value)
-    if not values:
-        return 0.5, 0.0
-    return float(sum(values) / len(values)), float(len(values)) / float(max(valid_total, 1))
-
-
-def spearman(scores: Sequence[float], targets: Sequence[float]) -> float | None:
-    if len(scores) < 2 or _all_equal(scores) or _all_equal(targets):
-        return None
-    score_rank = average_ranks(scores)
-    target_rank = average_ranks(targets)
-    return pearson(score_rank, target_rank)
-
-
-def auc_score(scores: Sequence[float], labels: Sequence[bool]) -> float | None:
-    positives = [score for score, label in zip(scores, labels, strict=True) if label]
-    negatives = [score for score, label in zip(scores, labels, strict=True) if not label]
-    if not positives or not negatives:
-        return None
-    total = 0.0
-    for pos in positives:
-        for neg in negatives:
-            if pos > neg:
-                total += 1.0
-            elif pos == neg:
-                total += 0.5
-    return total / float(len(positives) * len(negatives))
-
-
-def average_ranks(values: Sequence[float]) -> list[float]:
-    order = sorted(range(len(values)), key=lambda idx: values[idx])
-    ranks = [0.0] * len(values)
-    pos = 0
-    while pos < len(order):
-        end = pos + 1
-        while end < len(order) and values[order[end]] == values[order[pos]]:
-            end += 1
-        rank = (float(pos) + float(end - 1)) / 2.0
-        for idx in order[pos:end]:
-            ranks[idx] = rank
-        pos = end
-    return ranks
-
-
-def pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
-    x_mean = sum(xs) / float(len(xs))
-    y_mean = sum(ys) / float(len(ys))
-    x_centered = [x - x_mean for x in xs]
-    y_centered = [y - y_mean for y in ys]
-    x_norm = sum(x * x for x in x_centered) ** 0.5
-    y_norm = sum(y * y for y in y_centered) ** 0.5
-    denom = x_norm * y_norm
-    if denom <= 0.0:
-        return None
-    return sum(x * y for x, y in zip(x_centered, y_centered, strict=True)) / denom
-
-
-def normalize_k_windows(ks: Sequence[int], *, max_k: int) -> tuple[int, ...]:
-    max_logged_k = min(int(max_k), MAX_LOGGED_K) if max_k > 0 else MAX_LOGGED_K
+def normalize_k_windows(
+    ks: Sequence[int],
+    *,
+    max_k: int,
+) -> tuple[int, ...]:
     if max_k <= 0:
-        return tuple(sorted({int(k) for k in ks if 1 <= int(k) <= max_logged_k}))
+        return tuple()
+
+    max_logged_k = min(
+        int(max_k),
+        MAX_LOGGED_K,
+    )
+
     out = tuple(sorted({int(k) for k in ks if 1 <= int(k) <= max_logged_k}))
+
     return out or (1,)
 
 
-def _oracle_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    out = torch.zeros(int(tensors.valid_graph_mask.numel()), dtype=torch.long)
-    for graph_id in range(int(tensors.valid_graph_mask.numel())):
-        best = 0
-        best_key = (-1.0, -1.0, float("-inf"), float("-inf"), 0.0)
-        for row in range(min(int(k), int(tensors.recall.size(0)))):
-            key = (
-                float(tensors.recall[row, graph_id]),
-                float(tensors.f1[row, graph_id]),
-                -float(tensors.edge_count[row, graph_id]),
-                -float(tensors.trajectory_len[row, graph_id]),
-                -float(row),
-            )
-            if key > best_key:
-                best = row
-                best_key = key
-        out[graph_id] = best
-    return out
+def _stack_terminal_step(
+    *,
+    trajectories: TrajectoryBatch,
+    num_graphs: int,
+) -> Tensor:
+    if int(trajectories.num_trajectories) == 0:
+        return torch.zeros(
+            (0, int(num_graphs)),
+            dtype=torch.long,
+        )
 
-
-def _score_indices(score: torch.Tensor, k: int) -> torch.Tensor:
-    if score.numel() == 0:
-        return torch.zeros((int(score.size(1)) if score.ndim == 2 else 0,), dtype=torch.long)
-    return torch.argmax(score[:k], dim=0).to(dtype=torch.long)
-
-
-def _reward_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    return _score_indices(tensors.log_reward, k)
-
-
-def _traj_prob_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    return _score_indices(tensors.traj_prob_score, k)
-
-
-def _state_flow_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    return _score_indices(tensors.state_flow_score, k)
-
-
-def _terminal_flow_indices(tensors: RolloutEvalTensors, k: int) -> torch.Tensor:
-    return _score_indices(tensors.terminal_flow_score, k)
-
-
-def _selected_values(values: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    if values.numel() == 0:
-        return torch.zeros_like(idx, dtype=torch.float32)
-    return values.gather(0, idx.view(1, -1)).squeeze(0)
-
-
-def _mean_selected(values: torch.Tensor, idx: torch.Tensor, valid_graph_mask: torch.Tensor) -> float:
-    return mean_over_valid_graphs(_selected_values(values, idx), valid_graph_mask)
-
-
-def _stack_trajectory_log_prob(rollouts: Sequence[RolloutResult]) -> torch.Tensor:
-    if not rollouts:
-        return torch.zeros((0, 0), dtype=torch.float32)
-    return torch.stack(
-        [
-            rollout.policy_trajectory_log_prob.detach().to(
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-            )
-            for rollout in rollouts
-        ],
-        dim=0,
+    return trajectory_row_matrix(
+        trajectories,
+        trajectories.edge_count,
+        num_graphs=int(num_graphs),
+        fill_value=0.0,
+    ).to(
+        device=torch.device("cpu"),
+        dtype=torch.long,
     )
 
 
-def _stack_terminal_step(rollouts: Sequence[RolloutResult]) -> torch.Tensor:
-    if not rollouts:
-        return torch.zeros((0, 0), dtype=torch.long)
-    return torch.stack(
-        [
-            rollout.terminal_step.detach().to(device=torch.device("cpu"), dtype=torch.long)
-            for rollout in rollouts
-        ],
-        dim=0,
+def _sample_ids(
+    trajectories: TrajectoryBatch,
+    *,
+    num_graphs: int,
+) -> Tensor:
+    return grouped_sample_ids(
+        trajectories,
+        num_graphs=int(num_graphs),
     )
 
 
-def _rollout_expand_budget(rollouts: Sequence[RolloutResult]) -> int | None:
-    if not rollouts:
-        return None
-    return max(int(rollout.expand_budget) for rollout in rollouts)
+def _num_samples(
+    trajectories: TrajectoryBatch,
+    *,
+    num_graphs: int,
+) -> int:
+    if int(trajectories.num_trajectories) == 0:
+        return 0
+
+    counts = torch.bincount(
+        trajectories.graph_ids.to(dtype=torch.long),
+        minlength=int(num_graphs),
+    )
+
+    return int(counts.max().item()) if counts.numel() > 0 else 0
 
 
 def _sample_item_graph_index(
     *,
-    item_batch: torch.Tensor,
+    item_batch: Tensor,
     num_samples: int,
     num_graphs: int,
-) -> torch.Tensor:
-    offsets = torch.arange(int(num_samples), device=item_batch.device).unsqueeze(1) * int(num_graphs)
+) -> Tensor:
+    offsets = torch.arange(
+        int(num_samples),
+        device=item_batch.device,
+    ).unsqueeze(
+        1
+    ) * int(num_graphs)
+
     return (item_batch.unsqueeze(0) + offsets).reshape(-1)
 
 
 def _mean_hit_values(
-    values: torch.Tensor,
-    hit_mask: torch.Tensor,
-    valid_graph_mask: torch.Tensor,
+    values: Tensor,
+    hit_mask: Tensor,
+    valid_graph_mask: Tensor,
 ) -> float:
     valid = hit_mask & valid_graph_mask.unsqueeze(0)
+
     if not bool(valid.any()):
         return 0.0
+
     return float(values[valid].float().mean().item())
-
-
-def _all_equal(values: Sequence[float]) -> bool:
-    return all(value == values[0] for value in values)
 
 
 __all__ = [

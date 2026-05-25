@@ -22,7 +22,7 @@ def maybe_print_config(cfg: DictConfig) -> None:
     config_name="preprocess",
 )
 def main(cfg: DictConfig) -> None:
-    maybe_print_config(cfg)
+    # maybe_print_config(cfg)
 
     if "dataset" not in cfg or cfg.dataset is None:
         raise ValueError(

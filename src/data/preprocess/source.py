@@ -41,7 +41,6 @@ def iter_samples(
     hf_dataset: str | None = None,
     hf_revision: str | None = None,
     hf_cache_dir: Path | None = None,
-    source_options: Mapping[str, object] | None = None,
 ) -> Iterable[RawSample]:
     resolved_split_mapping = _resolve_split_mapping(
         split_mapping=split_mapping,
@@ -81,15 +80,6 @@ def iter_samples(
                 source_split=source_split,
                 stats=graph_parse_stats,
             )
-        return
-    if source == "stark":
-        from .stark import iter_stark_samples
-
-        yield from iter_stark_samples(
-            dataset=dataset,
-            split_mapping=resolved_split_mapping,
-            options=source_options,
-        )
         return
     raise ValueError(f"Unsupported dataset_source={dataset_source!r}.")
 

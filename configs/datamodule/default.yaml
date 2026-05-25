@@ -2,16 +2,15 @@
 
 _target_: src.data.datamodule.RetrievalDataModule
 
-batch_size: 16
-num_workers: 16
+batch_size: 1
+num_workers: 0
 
-eval_batch_size: 16
-eval_num_workers: 16
+eval_batch_size: 1
+eval_num_workers: 0
 
 pin_memory: true
 train_shuffle: true
 drop_last: false
-eval_drop_last: false
 
 splits:
   train: train
@@ -20,3 +19,7 @@ splits:
 
 lmdb_readahead: true
 max_readers: 256
+
+train_indices: null
+validation_indices: null
+test_indices: null

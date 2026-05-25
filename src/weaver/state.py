@@ -2,169 +2,167 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
 from src.weaver.context import GraphContext
 
+Tensor = torch.Tensor
+
 
 @dataclass(frozen=True, slots=True)
-class Frontier:
+class ExpansionBatch:
     """
-    Candidate physical KG edges for expansion.
+    Chosen EXPAND actions.
 
-    The terminal action is not included here.
-    The full policy action space is:
-
-        A(z) = {TERMINAL} ∪ Frontier(z)
+    Contract:
+    - state_ids[k] is the local parent-state id inside a StateBatch.
+    - edge_ids[k] is a physical KG edge id.
+    - STOP actions are not represented here.
+    - Multiple rows may reference the same parent state; this supports branching.
     """
 
-    row_ids: torch.Tensor
-    edge_ids: torch.Tensor
+    state_ids: Tensor  # [K]
+    edge_ids: Tensor  # [K]
 
     @property
-    def num_edges(self) -> int:
+    def device(self) -> torch.device:
+        return self.state_ids.device
+
+    @property
+    def num_actions(self) -> int:
         return int(self.edge_ids.numel())
 
-    @property
-    def is_empty(self) -> bool:
-        return self.edge_ids.numel() == 0
+    @classmethod
+    def empty(cls, *, device: torch.device) -> ExpansionBatch:
+        empty = _empty_long(device)
+        return cls(state_ids=empty, edge_ids=empty)
 
 
 @dataclass(frozen=True, slots=True)
-class State:
+class ActionSpace:
     """
-    Dynamic evidence-subgraph state.
+    Legal actions derived from StateBatch and GraphContext.
 
-    For each rollout row r:
+    STOP:
+    - STOP is legal for every state.
+    - STOP is represented implicitly by state id, not by a fake edge id.
 
-        S_r = selected evidence edge set
-        X_r = active node set
+    EXPAND:
+    - expand_state_ids[k] is the parent state id.
+    - expand_edge_ids[k] is the legal physical KG edge id.
+    - expand_ptr[s]:expand_ptr[s + 1] gives the contiguous expansion slice
+      for state s.
+    - expansion actions exclude already selected edges.
+    - expansion actions only exist for states with remaining budget.
 
-    The hot path stores selected edges sparsely as padded per-row ids.
-    Dense edge/node masks remain available as lazy compatibility views.
+    Invariant:
+    - expand_state_ids is grouped by state id.
+    - expand_ptr has shape [num_states + 1].
     """
 
-    graph_ids: torch.Tensor  # [R]
-    selected_edge_ids: torch.Tensor  # [R, K] padded with -1
-    active_node_ids: torch.Tensor  # [R, K_nodes] padded with -1
-    step: torch.Tensor  # [R]
-    remaining_budget: torch.Tensor  # [R]
-    num_graph_edges: int
-    num_graph_nodes: int
-    _selected_edge_mask_cache: torch.Tensor | None = None
-    _active_node_mask_cache: torch.Tensor | None = None
-    _frontier_cache: Frontier | None = None
-    _edge_state_h_cache: torch.Tensor | None = None
+    num_states: int
+    expand_state_ids: Tensor  # [F]
+    expand_edge_ids: Tensor  # [F]
+    expand_ptr: Tensor  # [S + 1]
 
-    def __post_init__(self) -> None:
-        if self.graph_ids.ndim != 1:
-            raise ValueError(f"graph_ids must have shape [R], got {tuple(self.graph_ids.shape)}.")
-        if self.selected_edge_ids.ndim != 2:
-            raise ValueError(
-                f"selected_edge_ids must have shape [R, K], got {tuple(self.selected_edge_ids.shape)}."
-            )
-        if self.active_node_ids.ndim != 2:
-            raise ValueError(
-                f"active_node_ids must have shape [R, K_nodes], got {tuple(self.active_node_ids.shape)}."
-            )
-        num_rows = int(self.graph_ids.numel())
-        if int(self.selected_edge_ids.size(0)) != num_rows:
-            raise ValueError("selected_edge_ids rows must match graph_ids length.")
-        if int(self.active_node_ids.size(0)) != num_rows:
-            raise ValueError("active_node_ids rows must match graph_ids length.")
-        if self.step.shape != (num_rows,):
-            raise ValueError(f"step must have shape [{num_rows}], got {tuple(self.step.shape)}.")
-        if self.remaining_budget.shape != (num_rows,):
-            raise ValueError(
-                f"remaining_budget must have shape [{num_rows}], got {tuple(self.remaining_budget.shape)}."
-            )
-        if bool(self.remaining_budget.lt(0).any()):
-            raise ValueError("remaining_budget must be non-negative.")
+    @property
+    def device(self) -> torch.device:
+        return self.expand_ptr.device
+
+    @property
+    def num_expansions(self) -> int:
+        return int(self.expand_edge_ids.numel())
+
+    @property
+    def stop_state_ids(self) -> Tensor:
+        return torch.arange(
+            int(self.num_states),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    @property
+    def expand_count(self) -> Tensor:
+        return self.expand_ptr[1:] - self.expand_ptr[:-1]
+
+    @classmethod
+    def empty(
+        cls,
+        *,
+        num_states: int,
+        device: torch.device,
+    ) -> ActionSpace:
+        return cls(
+            num_states=int(num_states),
+            expand_state_ids=_empty_long(device),
+            expand_edge_ids=_empty_long(device),
+            expand_ptr=torch.zeros(
+                int(num_states) + 1,
+                dtype=torch.long,
+                device=device,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StateBatch:
+    """
+    Batched evidence-subgraph prefix states.
+
+    Truth source:
+    - graph_ids[s] gives the graph id of prefix state s.
+    - edge_ids[s, :edge_count[s]] gives selected physical KG edges.
+    - edge_ids is the only set-valued truth source.
+
+    Derived views:
+    - covered_node_pairs(graph): anchors plus endpoints of selected edges.
+    - action_space(graph): STOP plus legal EXPAND actions.
+
+    STOP is an action, not an edge, and is never written into edge_ids.
+
+    Expansion semantics:
+    - Current implementation enumerates outgoing edges from covered nodes.
+    - If the intended theory is incident-edge expansion, GraphContext must expose
+      incoming CSR too; do not hide that semantic change here.
+    """
+
+    graph_ids: Tensor  # [S] 当前 state s 属于哪个原始的 KGQA 子图
+    edge_ids: Tensor  # [S, B], padded with -1 当前的 state s 在每个可扩展的 budget 的每一步选择了哪些边
+    edge_count: Tensor  # [S] 当前 state s 已经选择了多少条边
+    budget: int  # 所有 state 最大可选择的边的数量
 
     @classmethod
     def initial(
         cls,
-        graph: GraphContext,
-        graph_ids: torch.Tensor,
-        expand_budget: int = 0,
-    ) -> State:
-        graph_ids = graph_ids.to(device=graph.device, dtype=torch.long).view(-1)
-        num_rows = int(graph_ids.numel())
-        empty_edges = torch.empty((num_rows, 0), dtype=torch.long, device=graph.device)
-        active_node_ids = active_nodes_for_graph_rows(
-            graph=graph,
-            graph_ids=graph_ids,
-        )
-        step = torch.zeros(
-            num_rows,
-            dtype=torch.long,
-            device=graph.device,
-        )
-        remaining_budget = torch.full(
-            (num_rows,),
-            int(expand_budget),
-            dtype=torch.long,
-            device=graph.device,
-        )
-        return cls(
-            graph_ids=graph_ids,
-            selected_edge_ids=empty_edges,
-            active_node_ids=active_node_ids,
-            step=step,
-            remaining_budget=remaining_budget,
-            num_graph_edges=int(graph.num_edges),
-            num_graph_nodes=int(graph.num_nodes),
-        )
-
-    @classmethod
-    def from_selected_edges(
-        cls,
         *,
-        graph: GraphContext,
-        graph_ids: torch.Tensor,
-        selected_edge_mask: torch.Tensor,
-        expand_budget: int | None = None,
-    ) -> State:
-        graph_ids = graph_ids.to(device=graph.device, dtype=torch.long).view(-1)
-        selected_edge_mask = selected_edge_mask.to(device=graph.device, dtype=torch.bool)
-        if selected_edge_mask.ndim != 2:
-            raise ValueError(f"selected_edge_mask must have shape [R, E], got {tuple(selected_edge_mask.shape)}.")
-        if int(selected_edge_mask.size(0)) != int(graph_ids.numel()):
-            raise ValueError("selected_edge_mask rows must match graph_ids length.")
-        if int(selected_edge_mask.size(1)) != int(graph.num_edges):
-            raise ValueError(
-                "selected_edge_mask edge dimension must match graph.num_edges: "
-                f"{int(selected_edge_mask.size(1))} != {int(graph.num_edges)}."
-            )
+        graph_ids: Tensor,
+        budget: int,
+    ) -> StateBatch:
+        graph_ids = graph_ids.to(dtype=torch.long).view(-1)
+        budget = int(budget)
 
-        rows, edge_ids = selected_edge_mask.nonzero(as_tuple=True)
-        if edge_ids.numel() > 0:
-            edge_graph_ids = graph.edge_to_graph.index_select(0, edge_ids)
-            row_graph_ids = graph_ids.index_select(0, rows)
-            if not bool(edge_graph_ids.eq(row_graph_ids).all()):
-                raise ValueError("selected_edge_mask contains edges outside their row graph.")
+        if budget < 0:
+            raise ValueError("budget must be nonnegative.")
 
-        selected_edge_ids = padded_ids_from_mask(selected_edge_mask, pad_value=-1)
-        active_node_ids = active_node_ids_from_selected_edges(
-            graph=graph,
-            graph_ids=graph_ids,
-            selected_edge_ids=selected_edge_ids,
-        )
-        step = selected_edge_mask.sum(dim=1).to(dtype=torch.long)
-        if expand_budget is None:
-            remaining_budget = torch.zeros_like(step)
-        else:
-            remaining_budget = (torch.full_like(step, int(expand_budget)) - step).clamp_min(0)
+        num_states = int(graph_ids.numel())
+        device = graph_ids.device
+
         return cls(
             graph_ids=graph_ids,
-            selected_edge_ids=selected_edge_ids,
-            active_node_ids=active_node_ids,
-            step=step,
-            remaining_budget=remaining_budget,
-            num_graph_edges=int(graph.num_edges),
-            num_graph_nodes=int(graph.num_nodes),
-            _selected_edge_mask_cache=selected_edge_mask.contiguous(),
+            edge_ids=torch.full(
+                (num_states, budget),
+                -1,
+                dtype=torch.long,
+                device=device,
+            ),
+            edge_count=torch.zeros(
+                num_states,
+                dtype=torch.long,
+                device=device,
+            ),
+            budget=budget,
         )
 
     @property
@@ -172,658 +170,537 @@ class State:
         return self.graph_ids.device
 
     @property
-    def num_rows(self) -> int:
+    def num_states(self) -> int:
         return int(self.graph_ids.numel())
 
     @property
-    def num_edges(self) -> int:
-        return int(self.num_graph_edges)
+    def budget_left(self) -> Tensor:
+        return int(self.budget) - self.edge_count
 
-    @property
-    def selected_edge_count(self) -> torch.Tensor:
-        return self.step
+    def take(self, state_ids: Tensor) -> StateBatch:
+        """
+        Select prefix states by local state ids.
 
-    @property
-    def selected_edge_mask(self) -> torch.Tensor:
-        cached = self._selected_edge_mask_cache
-        if cached is not None:
-            return cached
-        mask = torch.zeros(
-            (self.num_rows, int(self.num_graph_edges)),
-            dtype=torch.bool,
+        Use this for branching, terminal extraction, candidate pruning, or
+        evaluation selection.
+        """
+
+        state_ids = state_ids.to(
+            device=self.device,
+            dtype=torch.long,
+        ).view(-1)
+
+        return StateBatch(
+            graph_ids=self.graph_ids.index_select(0, state_ids),
+            edge_ids=self.edge_ids.index_select(0, state_ids),
+            edge_count=self.edge_count.index_select(0, state_ids),
+            budget=int(self.budget),
+        )
+
+    def branch(self, expansion: ExpansionBatch) -> StateBatch:
+        """
+        Apply chosen expansion actions and return child states.
+
+        This is not an in-place row update.
+
+        If expansion has K actions, the returned StateBatch has K child states.
+        Multiple expansion actions may branch from the same parent state.
+        """
+
+        parent_state_ids = expansion.state_ids.to(
+            device=self.device,
+            dtype=torch.long,
+        ).view(-1)
+
+        new_edge_ids = expansion.edge_ids.to(
+            device=self.device,
+            dtype=torch.long,
+        ).view(-1)
+
+        if int(parent_state_ids.numel()) != int(new_edge_ids.numel()):
+            raise ValueError("expansion.state_ids and expansion.edge_ids must have the same length.")
+
+        next_graph_ids = self.graph_ids.index_select(0, parent_state_ids)
+        next_edge_ids = self.edge_ids.index_select(0, parent_state_ids).clone()
+        next_edge_count = self.edge_count.index_select(0, parent_state_ids).clone()
+
+        child_ids = torch.arange(
+            int(parent_state_ids.numel()),
+            dtype=torch.long,
             device=self.device,
         )
-        row_ids, edge_ids = self.selected_edges()
-        if edge_ids.numel() > 0:
-            mask[row_ids, edge_ids] = True
-        object.__setattr__(self, "_selected_edge_mask_cache", mask)
-        return mask
 
-    @property
-    def active_node_mask(self) -> torch.Tensor:
-        cached = self._active_node_mask_cache
-        if cached is not None:
-            return cached
-        mask = torch.zeros(
-            (self.num_rows, int(self.num_graph_nodes)),
-            dtype=torch.bool,
+        next_edge_ids[child_ids, next_edge_count] = new_edge_ids
+        next_edge_count = next_edge_count + 1
+
+        return StateBatch(
+            graph_ids=next_graph_ids,
+            edge_ids=next_edge_ids,
+            edge_count=next_edge_count,
+            budget=int(self.budget),
+        )
+
+    def advance(self, expansion: ExpansionBatch) -> StateBatch:
+        """
+        Advance selected state rows by one chosen expansion edge.
+
+        Contract:
+        - returned StateBatch has the same number of states as self.
+        - expansion.state_ids are local row ids inside this StateBatch.
+        - each row may appear at most once.
+        - each row must have remaining budget.
+        - expansion.edge_ids should come from this state's ActionSpace.
+        """
+
+        rows = expansion.state_ids.to(
             device=self.device,
-        )
-        row_ids, node_ids = self.active_nodes()
-        if node_ids.numel() > 0:
-            mask[row_ids, node_ids] = True
-        object.__setattr__(self, "_active_node_mask_cache", mask)
-        return mask
+            dtype=torch.long,
+        ).view(-1)
 
-    @property
-    def edge_mask(self) -> torch.Tensor:
-        return self.selected_edge_mask
+        new_edge_ids = expansion.edge_ids.to(
+            device=self.device,
+            dtype=torch.long,
+        ).view(-1)
 
-    @property
-    def row_to_graph(self) -> torch.Tensor:
-        return self.graph_ids
+        if int(rows.numel()) != int(new_edge_ids.numel()):
+            raise ValueError("expansion.state_ids and expansion.edge_ids must have the same length.")
 
-    @property
-    def depth(self) -> torch.Tensor:
-        return self.step
-
-    def selected_edges(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return non_padded_ids(self.selected_edge_ids)
-
-    def active_nodes(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return non_padded_ids(self.active_node_ids)
-
-    def select_rows(
-        self,
-        rows: torch.Tensor,
-    ) -> State:
-        rows = rows.to(device=self.device, dtype=torch.long).view(-1)
-        selected_edge_mask = self._selected_edge_mask_cache
-        active_node_mask = self._active_node_mask_cache
-        frontier = self._frontier_cache
-        return State(
-            graph_ids=self.graph_ids.index_select(0, rows),
-            selected_edge_ids=self.selected_edge_ids.index_select(0, rows),
-            active_node_ids=self.active_node_ids.index_select(0, rows),
-            step=self.step.index_select(0, rows),
-            remaining_budget=self.remaining_budget.index_select(0, rows),
-            num_graph_edges=self.num_graph_edges,
-            num_graph_nodes=self.num_graph_nodes,
-            _selected_edge_mask_cache=(
-                selected_edge_mask.index_select(0, rows)
-                if selected_edge_mask is not None
-                else None
-            ),
-            _active_node_mask_cache=(
-                active_node_mask.index_select(0, rows)
-                if active_node_mask is not None
-                else None
-            ),
-            _frontier_cache=select_frontier_rows(frontier, rows) if frontier is not None else None,
-            _edge_state_h_cache=None,
-        )
-
-    def clone(self) -> State:
-        return State(
-            graph_ids=self.graph_ids.clone(),
-            selected_edge_ids=self.selected_edge_ids.clone(),
-            active_node_ids=self.active_node_ids.clone(),
-            step=self.step.clone(),
-            remaining_budget=self.remaining_budget.clone(),
-            num_graph_edges=self.num_graph_edges,
-            num_graph_nodes=self.num_graph_nodes,
-            _selected_edge_mask_cache=(
-                self._selected_edge_mask_cache.clone()
-                if self._selected_edge_mask_cache is not None
-                else None
-            ),
-            _active_node_mask_cache=(
-                self._active_node_mask_cache.clone()
-                if self._active_node_mask_cache is not None
-                else None
-            ),
-            _frontier_cache=clone_frontier(self._frontier_cache),
-            _edge_state_h_cache=(
-                self._edge_state_h_cache.clone()
-                if self._edge_state_h_cache is not None
-                else None
-            ),
-        )
-
-    @classmethod
-    def concat(
-        cls,
-        states: Sequence[State],
-    ) -> State:
-        if not states:
-            raise ValueError("Cannot concatenate an empty state sequence.")
-
-        num_edges = int(states[0].num_graph_edges)
-        num_nodes = int(states[0].num_graph_nodes)
-        edge_width = max(int(state.selected_edge_ids.size(1)) for state in states)
-        node_width = max(int(state.active_node_ids.size(1)) for state in states)
-        selected_edge_ids = torch.cat(
-            [pad_width(state.selected_edge_ids, edge_width, pad_value=-1) for state in states],
-            dim=0,
-        )
-        active_node_ids = torch.cat(
-            [pad_width(state.active_node_ids, node_width, pad_value=-1) for state in states],
-            dim=0,
-        )
-        selected_edge_mask = [state._selected_edge_mask_cache for state in states]
-        active_node_mask = [state._active_node_mask_cache for state in states]
-        return cls(
-            graph_ids=torch.cat([state.graph_ids for state in states], dim=0),
-            selected_edge_ids=selected_edge_ids,
-            active_node_ids=active_node_ids,
-            step=torch.cat([state.step for state in states], dim=0),
-            remaining_budget=torch.cat([state.remaining_budget for state in states], dim=0),
-            num_graph_edges=num_edges,
-            num_graph_nodes=num_nodes,
-            _selected_edge_mask_cache=(
-                torch.cat(selected_edge_mask, dim=0)
-                if all(mask is not None for mask in selected_edge_mask)
-                else None
-            ),
-            _active_node_mask_cache=(
-                torch.cat(active_node_mask, dim=0)
-                if all(mask is not None for mask in active_node_mask)
-                else None
-            ),
-            _edge_state_h_cache=None,
-        )
-
-    def frontier(
-        self,
-        graph: GraphContext,
-        *,
-        expand_budget: int | None = None,
-    ) -> Frontier:
-        """
-        Return the physical directed outgoing frontier.
-
-        A KG edge e=(u,r,v) is legal for row i iff:
-
-            u ∈ X_i
-            e ∉ S_i
-            edge_to_graph[e] == graph_ids[i]
-            remaining_budget(i) > 0
-        """
-        cacheable = expand_budget is None
-        if not bool(self.remaining_budget.gt(0).any()):
-            return empty_frontier(graph.device)
-
-        cached = self._frontier_cache
-        if cached is not None and cacheable:
-            return cached
-
-        rows, active_nodes = self.active_nodes()
-        if rows.numel() == 0:
-            return empty_frontier(graph.device)
-
-        out_rows, out_edges = incident_edges_from_nodes(
-            rows=rows,
-            node_ids=active_nodes,
-            ptr=graph.adjacency.out_ptr,
-            edge_ids_by_node=graph.adjacency.edge_ids_by_src,
-        )
-        if out_edges.numel() == 0:
-            return empty_frontier(graph.device)
-
-        frontier_rows, frontier_edge_ids = filter_edges_in_same_graph(
-            graph=graph,
-            state=self,
-            rows=out_rows,
-            edge_ids=out_edges,
-        )
-        if frontier_edge_ids.numel() == 0:
-            return empty_frontier(graph.device)
-
-        selected_keys = selected_edge_keys(self)
-        if selected_keys.numel() > 0:
-            candidate_keys = frontier_rows * int(self.num_graph_edges) + frontier_edge_ids
-            keep = ~membership_mask(
-                query_ids=candidate_keys,
-                candidate_ids=selected_keys,
-            )
-            frontier_rows = frontier_rows[keep]
-            frontier_edge_ids = frontier_edge_ids[keep]
-            if frontier_edge_ids.numel() == 0:
-                return empty_frontier(graph.device)
-
-        frontier_rows, frontier_edge_ids = unique_row_edge_pairs(
-            rows=frontier_rows,
-            edge_ids=frontier_edge_ids,
-            num_edges=self.num_edges,
-        )
-
-        before_horizon = self.remaining_budget.gt(0).index_select(0, frontier_rows)
-        frontier_rows = frontier_rows[before_horizon]
-        frontier_edge_ids = frontier_edge_ids[before_horizon]
-        if frontier_edge_ids.numel() == 0:
-            return empty_frontier(graph.device)
-
-        frontier = Frontier(
-            row_ids=frontier_rows,
-            edge_ids=frontier_edge_ids,
-        )
-        if cacheable:
-            object.__setattr__(self, "_frontier_cache", frontier)
-        return frontier
-
-    def expand(
-        self,
-        graph: GraphContext,
-        rows: torch.Tensor,
-        edge_ids: torch.Tensor,
-        *,
-        expand_budget: int,
-        validate: bool = False,
-    ) -> State:
-        """
-        Return the child state after selecting one physical edge per row.
-
-        Terminal actions must not enter this method.
-        """
-
-        rows = rows.to(device=self.device, dtype=torch.long).view(-1)
-        edge_ids = edge_ids.to(device=self.device, dtype=torch.long).view(-1)
-        if rows.numel() != edge_ids.numel():
-            raise ValueError("rows and edge_ids must have the same length.")
-        if rows.numel() == 0:
+        if int(rows.numel()) == 0:
             return self
-        if validate:
-            self.validate_expansion_actions(
-                graph=graph,
-                rows=rows,
-                edge_ids=edge_ids,
-                expand_budget=expand_budget,
-            )
-        else:
-            validate_expansion_inputs(
-                state=self,
-                rows=rows,
-                edge_ids=edge_ids,
-            )
 
-        selected_edge_ids = append_unique_row_ids(
-            padded_ids=self.selected_edge_ids,
-            rows=rows,
-            values=edge_ids,
-        )
-        src_node_ids = graph.edge_index[0].index_select(0, edge_ids)
-        dst_node_ids = graph.edge_index[1].index_select(0, edge_ids)
-        active_node_ids = append_unique_row_pairs(
-            padded_ids=self.active_node_ids,
-            rows=torch.cat([rows, rows], dim=0),
-            values=torch.cat([src_node_ids, dst_node_ids], dim=0),
-        )
-        step = self.step.clone()
-        step.index_add_(
-            0,
-            rows,
-            torch.ones(rows.numel(), dtype=torch.long, device=self.device),
-        )
-        remaining_budget = self.remaining_budget.clone()
-        remaining_budget.index_add_(
-            0,
-            rows,
-            -torch.ones(rows.numel(), dtype=torch.long, device=self.device),
-        )
-        return State(
+        # Rollout advance is fixed-row update. Repeated rows would make the update ambiguous.
+        if int(torch.unique(rows).numel()) != int(rows.numel()):
+            raise ValueError("advance() requires each state row to appear at most once.")
+
+        if bool(self.budget_left.index_select(0, rows).le(0).any()):
+            raise ValueError("advance() received rows with no remaining budget.")
+
+        next_edge_ids = self.edge_ids.clone()
+        next_edge_count = self.edge_count.clone()
+
+        pos = next_edge_count.index_select(0, rows)
+        next_edge_ids[rows, pos] = new_edge_ids
+        next_edge_count[rows] = next_edge_count[rows] + 1
+
+        return StateBatch(
             graph_ids=self.graph_ids,
-            selected_edge_ids=selected_edge_ids,
-            active_node_ids=active_node_ids,
-            step=step,
-            remaining_budget=remaining_budget,
-            num_graph_edges=self.num_graph_edges,
-            num_graph_nodes=self.num_graph_nodes,
+            edge_ids=next_edge_ids,
+            edge_count=next_edge_count,
+            budget=int(self.budget),
         )
 
-    def validate_expansion_actions(
-        self,
-        *,
-        graph: GraphContext,
-        rows: torch.Tensor,
-        edge_ids: torch.Tensor,
-        expand_budget: int,
-    ) -> None:
-        rows = rows.to(device=self.device, dtype=torch.long).view(-1)
-        edge_ids = edge_ids.to(device=self.device, dtype=torch.long).view(-1)
-        validate_expansion_inputs(
+    def covered_node_pairs(self, graph: GraphContext) -> tuple[Tensor, Tensor]:
+        """
+        Return unique (state_id, node_id) pairs covered by each prefix state.
+
+        Covered nodes are:
+        - graph anchors;
+        - sources of selected edges;
+        - destinations of selected edges.
+
+        This is a derived view, not a stored state field.
+        """
+
+        return _covered_node_pairs(state=self, graph=graph)
+
+    def action_space(self, graph: GraphContext) -> ActionSpace:
+        """
+        Derive STOP plus legal EXPAND actions from this state batch.
+
+        Expansion frontier:
+
+            covered nodes
+            -> outgoing physical KG edges
+            -> same parent graph
+            -> parent has remaining budget
+            -> edge not already selected by that parent state
+        """
+
+        if self.num_states == 0:
+            return ActionSpace.empty(
+                num_states=0,
+                device=self.device,
+            )
+
+        covered_state_ids, covered_node_ids = _covered_node_pairs(
             state=self,
-            rows=rows,
-            edge_ids=edge_ids,
+            graph=graph,
         )
 
-        frontier = self.frontier(
-            graph,
-            expand_budget=int(expand_budget),
+        expand_state_ids, expand_edge_ids = _outgoing_edges_from_nodes(
+            state_ids=covered_state_ids,
+            node_ids=covered_node_ids,
+            ptr=graph.adjacency.out_ptr,
+            edge_ids_by_src=graph.adjacency.edge_ids_by_src,
         )
-        if frontier.edge_ids.numel() == 0:
-            raise ValueError("Expansion action is not in the current frontier.")
 
-        key_width = int(self.num_edges)
-        frontier_keys = frontier.row_ids * key_width + frontier.edge_ids
-        target_keys = rows * key_width + edge_ids
-        if not bool(membership_mask(query_ids=target_keys, candidate_ids=frontier_keys).all()):
-            raise ValueError("Expansion action is not in the current frontier.")
+        expand_state_ids, expand_edge_ids = _filter_legal_expansions(
+            state=self,
+            graph=graph,
+            state_ids=expand_state_ids,
+            edge_ids=expand_edge_ids,
+        )
+
+        expand_ptr = _grouped_state_ids_to_ptr(
+            state_ids=expand_state_ids,
+            num_states=self.num_states,
+            device=self.device,
+        )
+
+        return ActionSpace(
+            num_states=self.num_states,
+            expand_state_ids=expand_state_ids,
+            expand_edge_ids=expand_edge_ids,
+            expand_ptr=expand_ptr,
+        )
 
 
-def validate_expansion_inputs(
+def cat_state_batches(states: Sequence[StateBatch]) -> StateBatch:
+    """
+    Concatenate StateBatch objects.
+
+    This is a batch-boundary operation, not a StateBatch method.
+    """
+
+    if not states:
+        raise ValueError("Cannot concatenate an empty sequence of StateBatch objects.")
+
+    first = states[0]
+
+    for state in states[1:]:
+        if int(state.budget) != int(first.budget):
+            raise ValueError("Cannot concatenate StateBatch objects with different budgets.")
+        if state.device != first.device:
+            raise ValueError("Cannot concatenate StateBatch objects on different devices.")
+
+    return StateBatch(
+        graph_ids=torch.cat([state.graph_ids for state in states], dim=0),
+        edge_ids=torch.cat([state.edge_ids for state in states], dim=0),
+        edge_count=torch.cat([state.edge_count for state in states], dim=0),
+        budget=int(first.budget),
+    )
+
+
+def _covered_node_pairs(
     *,
-    state: State,
-    rows: torch.Tensor,
-    edge_ids: torch.Tensor,
-) -> None:
-    if rows.numel() != edge_ids.numel():
-        raise ValueError("rows and edge_ids must have the same length.")
-    if rows.numel() == 0:
-        return
-    if bool(rows.lt(0).any()) or bool(rows.ge(state.num_rows).any()):
-        raise ValueError("Expansion rows must be valid state row ids.")
-    if bool(edge_ids.lt(0).any()) or bool(edge_ids.ge(state.num_edges).any()):
-        raise ValueError("Expansion edge ids must be valid non-terminal edge ids.")
-    if int(torch.unique(rows).numel()) != int(rows.numel()):
-        raise ValueError("At most one expansion action is allowed per row.")
-    if bool(state.remaining_budget.index_select(0, rows).le(0).any()):
-        raise ValueError("Expansion rows must have positive remaining budget.")
-
-
-def active_nodes_for_graph_rows(
-    *,
+    state: StateBatch,
     graph: GraphContext,
-    graph_ids: torch.Tensor,
-) -> torch.Tensor:
-    anchor_node_ids = graph.anchor_mask.nonzero(as_tuple=True)[0]
-    if anchor_node_ids.numel() == 0 or graph_ids.numel() == 0:
-        return torch.empty((int(graph_ids.numel()), 0), dtype=torch.long, device=graph.device)
-
-    anchor_graph_ids = graph.node_to_graph.index_select(0, anchor_node_ids)
-    grouped: list[torch.Tensor] = []
-    max_width = 0
-    for graph_id in graph_ids.tolist():
-        nodes = anchor_node_ids[anchor_graph_ids.eq(int(graph_id))]
-        grouped.append(nodes)
-        max_width = max(max_width, int(nodes.numel()))
-    out = torch.full((int(graph_ids.numel()), max_width), -1, dtype=torch.long, device=graph.device)
-    for row, node_ids in enumerate(grouped):
-        if node_ids.numel() > 0:
-            out[row, : node_ids.numel()] = node_ids
-    return out
-
-
-def active_node_ids_from_selected_edges(
-    *,
-    graph: GraphContext,
-    graph_ids: torch.Tensor,
-    selected_edge_ids: torch.Tensor,
-) -> torch.Tensor:
-    active_node_ids = active_nodes_for_graph_rows(
+) -> tuple[Tensor, Tensor]:
+    anchor_state_ids, anchor_node_ids = _anchor_node_pairs(
+        state=state,
         graph=graph,
-        graph_ids=graph_ids,
-    )
-    rows, edge_ids = non_padded_ids(selected_edge_ids)
-    if edge_ids.numel() == 0:
-        return active_node_ids
-    src_node_ids = graph.edge_index[0].index_select(0, edge_ids)
-    dst_node_ids = graph.edge_index[1].index_select(0, edge_ids)
-    return append_unique_row_pairs(
-        padded_ids=active_node_ids,
-        rows=torch.cat([rows, rows], dim=0),
-        values=torch.cat([src_node_ids, dst_node_ids], dim=0),
     )
 
+    selected_state_ids, selected_edge_ids = _selected_edge_pairs(state)
 
-def selected_edge_keys(state: State) -> torch.Tensor:
-    rows, edge_ids = state.selected_edges()
-    if edge_ids.numel() == 0:
-        return empty_long(state.device)
-    return rows * int(state.num_graph_edges) + edge_ids
-
-
-def select_frontier_rows(frontier: Frontier, rows: torch.Tensor) -> Frontier:
-    rows = rows.to(device=frontier.row_ids.device, dtype=torch.long).view(-1)
-    if rows.numel() == 0 or frontier.edge_ids.numel() == 0:
-        return empty_frontier(frontier.row_ids.device)
-    source = frontier.row_ids
-    remapped = torch.full((int(source.numel()),), -1, dtype=torch.long, device=source.device)
-    for new_row, old_row in enumerate(rows.tolist()):
-        remapped[source.eq(int(old_row))] = int(new_row)
-    keep = remapped.ge(0)
-    if not bool(keep.any()):
-        return empty_frontier(source.device)
-    return Frontier(
-        row_ids=remapped[keep],
-        edge_ids=frontier.edge_ids[keep],
-    )
-
-
-def clone_frontier(frontier: Frontier | None) -> Frontier | None:
-    if frontier is None:
-        return None
-    return Frontier(
-        row_ids=frontier.row_ids.clone(),
-        edge_ids=frontier.edge_ids.clone(),
-    )
-
-
-def non_padded_ids(
-    padded_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if padded_ids.numel() == 0:
-        return empty_long(padded_ids.device), empty_long(padded_ids.device)
-    return padded_ids.ge(0).nonzero(as_tuple=True)[0], padded_ids[padded_ids.ge(0)]
-
-
-def pad_width(
-    tensor: torch.Tensor,
-    width: int,
-    *,
-    pad_value: int,
-) -> torch.Tensor:
-    width = int(width)
-    if int(tensor.size(1)) == width:
-        return tensor
-    out = torch.full(
-        (int(tensor.size(0)), width),
-        int(pad_value),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    if tensor.numel() > 0:
-        out[:, : int(tensor.size(1))] = tensor
-    return out
-
-
-def append_unique_row_ids(
-    *,
-    padded_ids: torch.Tensor,
-    rows: torch.Tensor,
-    values: torch.Tensor,
-) -> torch.Tensor:
-    return append_unique_row_pairs(
-        padded_ids=padded_ids,
-        rows=rows,
-        values=values,
-    )
-
-
-def append_unique_row_pairs(
-    *,
-    padded_ids: torch.Tensor,
-    rows: torch.Tensor,
-    values: torch.Tensor,
-) -> torch.Tensor:
-    rows = rows.to(device=padded_ids.device, dtype=torch.long).view(-1)
-    values = values.to(device=padded_ids.device, dtype=torch.long).view(-1)
-    if rows.numel() != values.numel():
-        raise ValueError("rows and values must have the same length.")
-    existing_counts = padded_ids.ge(0).sum(dim=1) if padded_ids.numel() > 0 else torch.zeros(
-        int(padded_ids.size(0)), dtype=torch.long, device=padded_ids.device
-    )
-    additions_per_row = torch.zeros_like(existing_counts)
-    memberships = []
-    for row, value in zip(rows.tolist(), values.tolist(), strict=True):
-        row_ids = padded_ids[row, : int(existing_counts[row].item())] if int(existing_counts[row].item()) > 0 else empty_long(
-            padded_ids.device
+    if int(selected_edge_ids.numel()) == 0:
+        return _unique_sorted_pairs(
+            left_ids=anchor_state_ids,
+            right_ids=anchor_node_ids,
+            right_size=int(graph.num_nodes),
         )
-        exists = bool(row_ids.eq(int(value)).any())
-        memberships.append(exists)
-        if not exists:
-            additions_per_row[row] += 1
-    if not bool(additions_per_row.any()):
-        return padded_ids
 
-    target_width = int((existing_counts + additions_per_row).max().item())
-    out = pad_width(padded_ids, target_width, pad_value=-1)
-    next_pos = existing_counts.clone()
-    for exists, row, value in zip(memberships, rows.tolist(), values.tolist(), strict=True):
-        if exists:
-            continue
-        out[row, int(next_pos[row].item())] = int(value)
-        next_pos[row] += 1
-    return out
+    selected_src_ids = graph.edge_src.index_select(0, selected_edge_ids)
+    selected_dst_ids = graph.edge_dst.index_select(0, selected_edge_ids)
 
-
-def padded_ids_from_mask(
-    mask: torch.Tensor,
-    *,
-    pad_value: int,
-) -> torch.Tensor:
-    row_counts = mask.sum(dim=1).to(dtype=torch.long)
-    width = int(row_counts.max().item()) if row_counts.numel() > 0 else 0
-    out = torch.full(
-        (int(mask.size(0)), width),
-        int(pad_value),
-        dtype=torch.long,
-        device=mask.device,
+    state_ids = torch.cat(
+        (
+            anchor_state_ids,
+            selected_state_ids,
+            selected_state_ids,
+        ),
+        dim=0,
     )
-    if width == 0:
-        return out
-    for row in range(int(mask.size(0))):
-        edge_ids = mask[row].nonzero(as_tuple=False).flatten()
-        if edge_ids.numel() > 0:
-            out[row, : edge_ids.numel()] = edge_ids
-    return out
+
+    node_ids = torch.cat(
+        (
+            anchor_node_ids,
+            selected_src_ids,
+            selected_dst_ids,
+        ),
+        dim=0,
+    )
+
+    return _unique_sorted_pairs(
+        left_ids=state_ids,
+        right_ids=node_ids,
+        right_size=int(graph.num_nodes),
+    )
 
 
-def incident_edges_from_nodes(
+def _anchor_node_pairs(
     *,
-    rows: torch.Tensor,
-    node_ids: torch.Tensor,
-    ptr: torch.Tensor,
-    edge_ids_by_node: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    state: StateBatch,
+    graph: GraphContext,
+) -> tuple[Tensor, Tensor]:
+    starts = graph.anchor_ptr.index_select(0, state.graph_ids)
+    ends = graph.anchor_ptr.index_select(0, state.graph_ids + 1)
+    counts = ends - starts
+    total = counts.sum()
+
+    state_ids = _repeat_interleave(
+        torch.arange(
+            state.num_states,
+            dtype=torch.long,
+            device=state.device,
+        ),
+        counts,
+        output_size=total,
+    )
+
+    positions = _repeat_interleave(
+        starts,
+        counts,
+        output_size=total,
+    ) + _segment_arange(counts)
+
+    node_ids = graph.anchor_node_ids.index_select(0, positions)
+
+    return state_ids, node_ids
+
+
+def _selected_edge_pairs(state: StateBatch) -> tuple[Tensor, Tensor]:
     """
-    Enumerate edge ids grouped by active nodes.
+    Return padded-free (state_id, selected_edge_id) pairs.
+
+    edge_ids >= 0 is the physical validity mask.
+    edge_count remains the semantic selected-edge count.
     """
+
+    num_states, budget = state.edge_ids.shape
+
+    flat_edge_ids = state.edge_ids.reshape(-1)
+    flat_state_ids = torch.repeat_interleave(
+        torch.arange(
+            int(num_states),
+            dtype=torch.long,
+            device=state.device,
+        ),
+        int(budget),
+    )
+
+    valid = flat_edge_ids.ge(0)
+
+    return flat_state_ids[valid], flat_edge_ids[valid]
+
+
+def _outgoing_edges_from_nodes(
+    *,
+    state_ids: Tensor,
+    node_ids: Tensor,
+    ptr: Tensor,
+    edge_ids_by_src: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """
+    Expand (state_id, node_id) pairs into outgoing (state_id, edge_id) pairs.
+
+    CSR contract:
+    - ptr[node]:ptr[node + 1] gives the slice inside edge_ids_by_src.
+    """
+
+    if int(node_ids.numel()) == 0:
+        device = state_ids.device
+        empty = _empty_long(device)
+        return empty, empty
 
     starts = ptr.index_select(0, node_ids)
     ends = ptr.index_select(0, node_ids + 1)
     degrees = ends - starts
+    total = degrees.sum()
 
-    keep = degrees.gt(0)
-    if not bool(keep.any()):
-        return empty_long(rows.device), empty_long(rows.device)
-
-    kept_rows = rows[keep]
-    kept_starts = starts[keep]
-    kept_degrees = degrees[keep]
-
-    expanded_rows = torch.repeat_interleave(
-        kept_rows,
-        kept_degrees,
-    )
-    positions = torch.repeat_interleave(
-        kept_starts,
-        kept_degrees,
-    ) + segment_arange(kept_degrees)
-
-    expanded_edge_ids = edge_ids_by_node.index_select(
-        0,
-        positions,
+    out_state_ids = _repeat_interleave(
+        state_ids,
+        degrees,
+        output_size=total,
     )
 
-    return expanded_rows, expanded_edge_ids
+    positions = _repeat_interleave(
+        starts,
+        degrees,
+        output_size=total,
+    ) + _segment_arange(degrees)
+
+    out_edge_ids = edge_ids_by_src.index_select(0, positions)
+
+    return out_state_ids, out_edge_ids
 
 
-def filter_edges_in_same_graph(
+def _filter_legal_expansions(
     *,
+    state: StateBatch,
     graph: GraphContext,
-    state: State,
-    rows: torch.Tensor,
-    edge_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    edge_graph_ids = graph.edge_to_graph.index_select(
-        0,
-        edge_ids,
-    )
-    row_graph_ids = state.graph_ids.index_select(
-        0,
-        rows,
-    )
+    state_ids: Tensor,
+    edge_ids: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """
+    Filter candidate expansion edges.
 
-    keep = edge_graph_ids.eq(row_graph_ids)
+    Conditions:
+    - edge belongs to the same graph as the parent state;
+    - parent state has remaining budget;
+    - edge is not already selected by that parent state.
 
-    return rows[keep], edge_ids[keep]
+    Selected-edge exclusion is O(F * B).
+    This is deliberate: B is the expansion budget and should stay small.
+    """
+
+    if int(edge_ids.numel()) == 0:
+        return state_ids, edge_ids
+
+    parent_graph_ids = state.graph_ids.index_select(0, state_ids)
+    edge_graph_ids = graph.edge_to_graph.index_select(0, edge_ids)
+
+    same_graph = edge_graph_ids.eq(parent_graph_ids)
+    has_budget = state.budget_left.gt(0).index_select(0, state_ids)
+
+    selected_by_parent = state.edge_ids.index_select(0, state_ids)
+    not_selected = selected_by_parent.ne(edge_ids[:, None]).all(dim=1)
+
+    keep = same_graph & has_budget & not_selected
+
+    return state_ids[keep], edge_ids[keep]
 
 
-def unique_row_edge_pairs(
+def _unique_sorted_pairs(
     *,
-    rows: torch.Tensor,
-    edge_ids: torch.Tensor,
-    num_edges: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pair_keys = rows * int(num_edges) + edge_ids
-    pair_keys = torch.unique(
-        pair_keys,
-        sorted=True,
+    left_ids: Tensor,
+    right_ids: Tensor,
+    right_size: int,
+) -> tuple[Tensor, Tensor]:
+    """
+    Unique pair compression.
+
+    Encodes each pair as:
+
+        key = left_id * right_size + right_id
+
+    This is appropriate for covered-node pairs:
+    O(S * (num_anchors + 2 * budget)).
+    Do not use this for large frontier deduplication unless measured.
+    """
+
+    if int(left_ids.numel()) == 0:
+        device = left_ids.device
+        empty = _empty_long(device)
+        return empty, empty
+
+    keys = left_ids.to(dtype=torch.long) * int(right_size) + right_ids.to(dtype=torch.long)
+    keys = torch.unique(keys, sorted=True)
+
+    return (
+        torch.div(keys, int(right_size), rounding_mode="floor"),
+        keys.remainder(int(right_size)),
     )
 
-    unique_rows = torch.div(
-        pair_keys,
-        int(num_edges),
-        rounding_mode="floor",
-    )
-    unique_edge_ids = pair_keys.remainder(
-        int(num_edges),
-    )
 
-    return unique_rows, unique_edge_ids
-
-
-def membership_mask(
+def _grouped_state_ids_to_ptr(
     *,
-    query_ids: torch.Tensor,
-    candidate_ids: torch.Tensor,
-) -> torch.Tensor:
-    query_ids = query_ids.view(-1)
-    candidate_ids = candidate_ids.view(-1)
-    if query_ids.numel() == 0 or candidate_ids.numel() == 0:
-        return torch.zeros(query_ids.numel(), dtype=torch.bool, device=query_ids.device)
-    sorted_candidates = torch.sort(candidate_ids).values
-    positions = torch.searchsorted(sorted_candidates, query_ids)
-    in_bounds = positions.lt(sorted_candidates.numel())
-    matched = torch.zeros(query_ids.numel(), dtype=torch.bool, device=query_ids.device)
-    if bool(in_bounds.any()):
-        matched[in_bounds] = sorted_candidates.index_select(0, positions[in_bounds]).eq(query_ids[in_bounds])
-    return matched
-
-
-def empty_frontier(
+    state_ids: Tensor,
+    num_states: int,
     device: torch.device,
-) -> Frontier:
-    empty = empty_long(device)
-    return Frontier(
-        row_ids=empty,
-        edge_ids=empty,
+) -> Tensor:
+    """
+    Convert grouped expansion state ids to CSR-style ptr.
+
+    state_ids is expected to be grouped by state id. The ptr remains valid when
+    some states have zero legal expansion actions.
+    """
+
+    counts = torch.bincount(
+        state_ids,
+        minlength=int(num_states),
+    ).to(dtype=torch.long)
+
+    ptr = torch.empty(
+        int(num_states) + 1,
+        dtype=torch.long,
+        device=device,
+    )
+
+    ptr[0] = 0
+    ptr[1:] = torch.cumsum(counts, dim=0)
+
+    return ptr
+
+
+def _segment_arange(lengths: Tensor) -> Tensor:
+    """
+    For lengths [l0, l1, ...], return:
+
+        [0, ..., l0 - 1, 0, ..., l1 - 1, ...]
+
+    Used to expand CSR segments without Python loops.
+    """
+
+    lengths = lengths.to(dtype=torch.long).view(-1)
+
+    if int(lengths.numel()) == 0:
+        return _empty_long(lengths.device)
+
+    total = lengths.sum()
+    starts = torch.cumsum(lengths, dim=0) - lengths
+
+    return torch.arange(
+        _torch_scalar_as_int(total),
+        dtype=torch.long,
+        device=lengths.device,
+    ) - _repeat_interleave(
+        starts,
+        lengths,
+        output_size=total,
     )
 
 
-def empty_long(
-    device: torch.device,
-) -> torch.Tensor:
+def _repeat_interleave(
+    values: Tensor,
+    repeats: Tensor,
+    *,
+    output_size: Tensor,
+) -> Tensor:
+    """
+    Type-checker-safe wrapper around torch.repeat_interleave.
+
+    Runtime PyTorch accepts a 0-d integral Tensor for output_size.
+    Pylance's overload usually requires int. The cast is intentionally local:
+    it avoids scattering `# type: ignore` or `.item()` across the code.
+
+    Do not replace this with int(output_size.item()) in hot CUDA paths unless
+    you accept the synchronization.
+    """
+
+    return torch.repeat_interleave(
+        values,
+        repeats.to(dtype=torch.long),
+        output_size=_torch_scalar_as_int(output_size),
+    )
+
+
+def _torch_scalar_as_int(value: Tensor) -> int:
+    """
+    Static typing adapter.
+
+    This is a no-op at runtime. It exists because PyTorch accepts 0-d scalar
+    tensors in places where its public typing stubs often only declare int.
+    """
+
+    return cast(int, value)
+
+
+def _check_1d_long(value: Tensor, name: str) -> None:
+    if value.ndim != 1:
+        raise ValueError(f"{name} must have shape [N], got {tuple(value.shape)}.")
+    if value.dtype != torch.long:
+        raise TypeError(f"{name} must have dtype torch.long.")
+
+
+def _check_2d_long(value: Tensor, name: str) -> None:
+    if value.ndim != 2:
+        raise ValueError(f"{name} must have shape [N, M], got {tuple(value.shape)}.")
+    if value.dtype != torch.long:
+        raise TypeError(f"{name} must have dtype torch.long.")
+
+
+def _empty_long(device: torch.device) -> Tensor:
     return torch.empty(
         0,
         dtype=torch.long,
@@ -831,39 +708,9 @@ def empty_long(
     )
 
 
-def segment_arange(
-    lengths: torch.Tensor,
-) -> torch.Tensor:
-    """
-    For lengths [a, b, c], return:
-
-        [0, ..., a-1, 0, ..., b-1, 0, ..., c-1]
-    """
-
-    total = int(lengths.sum().item())
-    if total == 0:
-        return empty_long(lengths.device)
-
-    starts = (
-        torch.cumsum(
-            lengths,
-            dim=0,
-        )
-        - lengths
-    )
-
-    return torch.arange(
-        total,
-        dtype=torch.long,
-        device=lengths.device,
-    ) - torch.repeat_interleave(
-        starts,
-        lengths,
-    )
-
-
 __all__ = [
-    "Frontier",
-    "State",
-    "empty_frontier",
+    "ActionSpace",
+    "ExpansionBatch",
+    "StateBatch",
+    "cat_state_batches",
 ]

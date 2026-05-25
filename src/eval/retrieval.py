@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import torch
 
 from src.data.schema import RetrievalBatch
 from src.eval.targets import eval_target_node_mask
 from src.graph.masks import anchor_node_mask
 from src.utils.scatter import scatter_sum
-from src.weaver.rollout.result import RolloutResult
-from src.weaver.rollout.subgraph import SubgraphReconstructor
+from src.weaver.context import GraphContext
+from src.weaver.rollout.subgraph import stacked_subgraph_masks
+from src.weaver.rollout.trajectory import TrajectoryBatch
 
 
 def default_eval_device() -> torch.device:
@@ -21,7 +20,7 @@ def batch_num_graphs(batch: RetrievalBatch) -> int:
 
 
 def compute_node_retrieval_matrix(
-    rollouts: Sequence[RolloutResult],
+    rollouts: TrajectoryBatch,
     batch: RetrievalBatch,
     *,
     device: torch.device | None = None,
@@ -48,8 +47,8 @@ def compute_node_retrieval_matrix(
 
     device = device or default_eval_device()
 
-    num_rollouts = len(rollouts)
     num_graphs = batch_num_graphs(batch)
+    num_rollouts = _num_samples(rollouts, num_graphs=num_graphs)
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
     target_nodes = eval_target_node_mask(
@@ -58,7 +57,12 @@ def compute_node_retrieval_matrix(
         use_reachable_targets=use_reachable_targets,
     )
 
-    terminal_nodes, _ = SubgraphReconstructor(batch, device=device).stack(rollouts)
+    terminal_nodes, _ = stacked_subgraph_masks(
+        rollouts,
+        GraphContext.from_batch(batch),
+        batch,
+        device=device,
+    )
 
     if terminal_nodes.shape[0] != num_rollouts:
         raise ValueError(
@@ -114,6 +118,13 @@ def compute_node_retrieval_matrix(
     f1 = safe_f1(precision, recall)
 
     return precision, recall, f1, valid_graph_mask
+
+
+def _num_samples(rollouts: TrajectoryBatch, *, num_graphs: int) -> int:
+    if rollouts.num_trajectories == 0:
+        return 0
+    counts = torch.bincount(rollouts.graph_ids, minlength=int(num_graphs))
+    return int(counts.max().item()) if counts.numel() > 0 else 0
 
 
 def mean_over_valid_graphs(

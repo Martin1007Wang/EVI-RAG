@@ -15,10 +15,9 @@ from rich.syntax import Syntax
 from src.runtime import load_project_env
 from src.training.checkpoint import load_pretrained_if_requested
 from src.training.factory import (
-    build_datamodule,
     build_model,
     build_trainer,
-    setup_datamodule,
+    prepare_training_components,
 )
 
 
@@ -59,8 +58,7 @@ def main(cfg: DictConfig) -> None:
 
     seed_everything(int(cfg.seed), workers=True)
 
-    datamodule = build_datamodule(cfg)
-    resources = setup_datamodule(datamodule)
+    datamodule, resources = prepare_training_components(cfg, stage="fit")
 
     model = build_model(cfg, resources)
     load_pretrained_if_requested(cfg, model)

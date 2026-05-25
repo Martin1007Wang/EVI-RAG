@@ -1,303 +1,263 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
+
+import torch
 
 from src.data.schema import RetrievalBatch
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.nn.feature_encoder import EncodedFeatures
+from src.weaver.nn.feature_encoder import FeatureBank
 from src.weaver.policy import ForwardPolicy
 from src.weaver.rollout.engine import RolloutEngine
-from src.weaver.rollout.replay import (
-    ReplayBatch,
-    ReplayBuilder,
-    ReplaySampleBudget,
-    ReplaySource,
-)
-from src.weaver.rollout.result import RolloutResult
-from src.weaver.transition import (
-    SRC_POLICY,
-    SRC_REPLAY,
-    TrainingBatch,
-)
-from src.weaver.utility import TrueTerminalReward
+from src.weaver.rollout.replay import ReplaySource
+from src.weaver.rollout.trajectory import SRC_POLICY, SRC_REPLAY, TrajectoryBatch
 
 
 @dataclass(frozen=True, slots=True)
 class RolloutBatch:
-    rollouts: tuple[RolloutResult, ...]
-    training: TrainingBatch | None = None
-    replay: ReplayBatch | None = None
+    """
+    Output of train rollout generation.
+
+    trajectories:
+    - policy and replay trajectories concatenated together.
+    """
+
+    trajectories: TrajectoryBatch
 
     @property
-    def num_rollouts(self) -> int:
-        return len(self.rollouts)
+    def num_trajectories(self) -> int:
+        return int(self.trajectories.num_trajectories)
 
     @property
-    def num_transitions(self) -> int:
-        if self.training is None:
+    def num_policy_trajectories(self) -> int:
+        if self.trajectories.num_trajectories == 0:
             return 0
-        return int(self.training.num_items)
-
-    @property
-    def has_transitions(self) -> bool:
-        return self.num_transitions > 0
+        return int(self.trajectories.source.eq(int(SRC_POLICY)).sum().item())
 
     @property
     def num_replay_trajectories(self) -> int:
-        if self.replay is None:
+        if self.trajectories.num_trajectories == 0:
             return 0
-        return int(self.replay.num_trajectories)
-
-    @property
-    def num_replay_transitions(self) -> int:
-        if self.training is None:
-            return 0
-        return int(self.training.expansions.meta.source_ids.eq(SRC_REPLAY).sum().item())
-
-    @property
-    def num_replay_terminal_transitions(self) -> int:
-        if self.training is None:
-            return 0
-        return int(self.training.terminals.meta.source_ids.eq(SRC_REPLAY).sum().item())
-
-
-@dataclass(frozen=True, slots=True)
-class ReplayScheduleRow:
-    until_progress: float
-    policy_rollout: float
-    replay_expand: float
-
-
-@dataclass(frozen=True, slots=True)
-class ReplaySchedule:
-    rows: tuple[ReplayScheduleRow, ...]
-
-    def weights_at(self, progress: float) -> ReplayScheduleRow:
-        for row in self.rows:
-            if progress <= row.until_progress:
-                return row
-        return self.rows[-1]
+        return int(self.trajectories.source.eq(int(SRC_REPLAY)).sum().item())
 
 
 class RolloutRunner:
+    """
+    Thin rollout orchestrator.
+
+    Responsibilities:
+    - sample policy trajectories;
+    - optionally attach precomputed replay trajectories;
+
+    Non-responsibilities:
+    - no replay reward gating;
+    - no replay stats;
+    - no dynamic replay schedule;
+    - no progress_fn;
+    - no loss construction;
+    - no metric aggregation;
+    - no State / StateOps manipulation.
+    """
+
     def __init__(
         self,
         *,
         engine: RolloutEngine,
-        train_num_rollouts: int,
-        eval_num_rollouts: int,
+        train_policy_rollouts: int,
+        train_replay_rollouts: int = 0,
+        eval_rollouts: int = 1,
         replay_source: ReplaySource | None = None,
-        replay_builder: ReplayBuilder | None = None,
-        replay_schedule: ReplaySchedule | None = None,
-        progress_fn: Callable[[], float] | None = None,
     ) -> None:
         self.engine = engine
-        self.train_num_rollouts = int(train_num_rollouts)
-        self.eval_num_rollouts = int(eval_num_rollouts)
         self.replay_source = replay_source
-        self.replay_builder = replay_builder
-        self.replay_schedule = replay_schedule
-        self.progress_fn = progress_fn or zero_progress
 
+        self.train_policy_rollouts = int(train_policy_rollouts)
+        self.train_replay_rollouts = int(train_replay_rollouts)
+        self.eval_rollouts_count = int(eval_rollouts)
+
+        if self.train_policy_rollouts < 0:
+            raise ValueError("train_policy_rollouts must be nonnegative.")
+        if self.train_replay_rollouts < 0:
+            raise ValueError("train_replay_rollouts must be nonnegative.")
+        if self.eval_rollouts_count < 0:
+            raise ValueError("eval_rollouts must be nonnegative.")
+        if self.train_replay_rollouts > 0 and replay_source is None:
+            raise ValueError("replay_source is required when train_replay_rollouts > 0.")
+
+        self._validate_budget_consistency()
+
+    @property
+    def budget(self) -> int:
+        return int(self.engine.budget)
+
+    def _validate_budget_consistency(self) -> None:
+        if self.replay_source is None:
+            return
+
+        replay_budget = int(self.replay_source.budget)
+        if replay_budget != self.budget:
+            raise ValueError("replay_source budget must match rollout engine budget, got " f"{replay_budget} and {self.budget}.")
+
+    @torch.no_grad()
     def train_rollouts(
         self,
         *,
         policy: ForwardPolicy,
         batch: RetrievalBatch,
         context: GraphContext,
-        features: EncodedFeatures,
-        reward_model: TrueTerminalReward | None = None,
-        target_context: TargetContext | None = None,
+        features: FeatureBank,
+        target_context: TargetContext,
     ) -> RolloutBatch:
-        progress = float(self.progress_fn())
-        budget = self.sample_budget(
-            self.train_num_rollouts,
-            progress=progress,
-        )
-        rollouts, policy_training = self.policy_rollouts(
+        if int(policy.budget) != self.budget:
+            raise ValueError("policy budget must match rollout engine budget, got " f"{int(policy.budget)} and {self.budget}.")
+
+        policy_trajectories = self.policy_rollouts(
             policy=policy,
             context=context,
             features=features,
-            num_rollouts=budget.policy_rollout,
-        )
-        replay = self.replay_trajectories(
-            batch=batch,
-            rollouts=rollouts,
-            context=context,
-            num_trajectories=budget.replay_expand,
-            reward_model=reward_model,
-            target_context=target_context,
-            progress=progress,
-        )
-        training = self.training_batch(
-            rollouts=rollouts,
-            policy_training=policy_training,
-            replay=replay,
-            context=context,
-        )
-        return RolloutBatch(
-            rollouts=rollouts,
-            training=training,
-            replay=replay,
+            num_rollouts=self.train_policy_rollouts,
         )
 
+        replay_trajectories = self.replay_rollouts(
+            batch=batch,
+            context=context,
+            target_context=target_context,
+        )
+
+        trajectories = concat_trajectory_batches(
+            [
+                policy_trajectories,
+                replay_trajectories,
+            ],
+            device=context.device,
+            budget=self.budget,
+        )
+
+        if trajectories.num_trajectories <= 0:
+            raise RuntimeError("RolloutRunner produced zero training trajectories.")
+
+        return RolloutBatch(
+            trajectories=trajectories,
+        )
+
+    @torch.no_grad()
     def eval_rollouts(
         self,
         *,
         policy: ForwardPolicy,
         context: GraphContext,
-        features: EncodedFeatures,
+        features: FeatureBank,
         num_rollouts: int | None = None,
-    ) -> tuple[RolloutResult, ...]:
-        total = self.eval_num_rollouts if num_rollouts is None else int(num_rollouts)
-        rollouts, _ = self.policy_rollouts(
+    ) -> TrajectoryBatch:
+        count = self.eval_rollouts_count if num_rollouts is None else int(num_rollouts)
+        if int(policy.budget) != self.budget:
+            raise ValueError("policy budget must match rollout engine budget, got " f"{int(policy.budget)} and {self.budget}.")
+
+        return self.policy_rollouts(
             policy=policy,
             context=context,
             features=features,
-            num_rollouts=total,
+            num_rollouts=count,
         )
-        return rollouts
 
+    @torch.no_grad()
     def policy_rollouts(
         self,
         *,
         policy: ForwardPolicy,
         context: GraphContext,
-        features: EncodedFeatures,
+        features: FeatureBank,
         num_rollouts: int,
-    ) -> tuple[tuple[RolloutResult, ...], TrainingBatch | None]:
+    ) -> TrajectoryBatch:
         num_rollouts = int(num_rollouts)
+
         if num_rollouts <= 0:
-            return (), None
-        rollouts, training = self.engine.sample_rollouts(
+            return TrajectoryBatch.empty(
+                device=context.device,
+                budget=self.budget,
+            )
+
+        graph_ids = repeated_graph_ids(
+            num_graphs=int(context.num_graphs),
+            repeats=num_rollouts,
+            device=context.device,
+        )
+
+        return self.engine.sample(
             policy=policy,
             context=context,
             features=features,
-            num_rollouts=num_rollouts,
+            graph_ids=graph_ids,
         )
-        return tuple(rollouts), training
 
-    def replay_trajectories(
+    @torch.no_grad()
+    def replay_rollouts(
         self,
         *,
         batch: RetrievalBatch,
-        rollouts: tuple[RolloutResult, ...],
         context: GraphContext,
-        num_trajectories: int,
-        reward_model: TrueTerminalReward | None = None,
-        target_context: TargetContext | None = None,
-        progress: float = 0.0,
-    ) -> ReplayBatch | None:
-        if int(num_trajectories) <= 0:
-            return None
+        target_context: TargetContext,
+    ) -> TrajectoryBatch:
+        if self.train_replay_rollouts <= 0:
+            return TrajectoryBatch.empty(
+                device=context.device,
+                budget=self.budget,
+            )
+
         if self.replay_source is None:
-            raise RuntimeError("replay_source is required when replay_expand > 0.")
-        return self.replay_source.sample_from_rollouts(
-            batch=batch,
-            context=context,
-            rollouts=rollouts,
-            num_trajectories=int(num_trajectories),
-            reward_model=reward_model,
-            target_context=target_context,
-            progress=float(progress),
-        )
+            raise RuntimeError("replay_source is required when train_replay_rollouts > 0.")
 
-    def training_batch(
-        self,
-        *,
-        rollouts: tuple[RolloutResult, ...],
-        policy_training: TrainingBatch | None,
-        replay: ReplayBatch | None,
-        context: GraphContext,
-    ) -> TrainingBatch | None:
-        parts: list[TrainingBatch] = []
-
-        if policy_training is not None and policy_training.num_items > 0:
-            parts.append(policy_training.with_source_id(SRC_POLICY))
-
-        if replay is not None and replay.num_trajectories > 0:
-            if self.replay_builder is None:
-                raise RuntimeError("replay_builder is required when replay is enabled.")
-            replay_training = self.replay_builder.build(
-                graph=context,
-                trajectories=replay,
-            )
-            if replay_training.num_items > 0:
-                parts.append(replay_training.with_source_id(SRC_REPLAY))
-
-        if not parts:
-            return None
-        return TrainingBatch.concat_reindex_trajectories(parts)
-
-    def sample_budget(
-        self,
-        total: int,
-        *,
-        progress: float | None = None,
-    ) -> ReplaySampleBudget:
-        total = int(total)
-        if self.replay_schedule is None:
-            return ReplaySampleBudget(
-                policy_rollout=total,
-                replay_expand=0,
-            )
-
-        if progress is None:
-            progress = float(self.progress_fn())
-        weights = self.replay_schedule.weights_at(
-            progress=float(progress),
-        )
-        return allocate_replay_budget(
-            total=total,
-            policy_weight=weights.policy_rollout,
-            replay_weight=weights.replay_expand,
-        )
+        return self.replay_source.sample(batch=batch, graph=context, target=target_context, trajectories_per_graph=self.train_replay_rollouts)
 
 
-def allocate_replay_budget(
+def repeated_graph_ids(
     *,
-    total: int,
-    policy_weight: float,
-    replay_weight: float,
-) -> ReplaySampleBudget:
-    total = int(total)
-    if total <= 0:
-        return ReplaySampleBudget(
-            policy_rollout=0,
-            replay_expand=0,
+    num_graphs: int,
+    repeats: int,
+    device: torch.device,
+) -> torch.Tensor:
+    num_graphs = int(num_graphs)
+    repeats = int(repeats)
+
+    if num_graphs < 0:
+        raise ValueError("num_graphs must be nonnegative.")
+    if repeats < 0:
+        raise ValueError("repeats must be nonnegative.")
+
+    if num_graphs == 0 or repeats == 0:
+        return torch.empty(
+            0,
+            dtype=torch.long,
+            device=device,
         )
 
-    policy_weight = float(policy_weight)
-    replay_weight = float(replay_weight)
-    weight_sum = policy_weight + replay_weight
-    if weight_sum <= 0.0:
-        raise ValueError("policy_weight and replay_weight cannot both be zero.")
-
-    policy_raw = total * policy_weight / weight_sum
-    replay_raw = total * replay_weight / weight_sum
-    policy_count = int(policy_raw)
-    replay_count = int(replay_raw)
-    remainder = total - policy_count - replay_count
-    if remainder > 0:
-        if policy_raw - policy_count >= replay_raw - replay_count:
-            policy_count += remainder
-        else:
-            replay_count += remainder
-    return ReplaySampleBudget(
-        policy_rollout=policy_count,
-        replay_expand=replay_count,
-    )
+    return torch.arange(
+        num_graphs,
+        dtype=torch.long,
+        device=device,
+    ).repeat_interleave(repeats)
 
 
-def zero_progress() -> float:
-    return 0.0
+def concat_trajectory_batches(
+    batches: list[TrajectoryBatch],
+    *,
+    device: torch.device,
+    budget: int,
+) -> TrajectoryBatch:
+    non_empty = [batch for batch in batches if batch.num_trajectories > 0]
+
+    if not non_empty:
+        return TrajectoryBatch.empty(
+            device=device,
+            budget=int(budget),
+        )
+
+    return TrajectoryBatch.concat(non_empty)
 
 
 __all__ = [
-    "ReplaySchedule",
-    "ReplayScheduleRow",
     "RolloutBatch",
     "RolloutRunner",
-    "allocate_replay_budget",
+    "concat_trajectory_batches",
+    "repeated_graph_ids",
 ]

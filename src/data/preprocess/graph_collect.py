@@ -1,14 +1,12 @@
 from __future__ import annotations
-import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 import torch
 from src.graph.ops import build_local_graph
-from src.graph.paths import compute_path_labels
+from src.graph.paths import compute_path_labels, compute_replay_path_candidates
 from .samples import PreparedSample, RawSample, SplitFilter
-from .vocab import EntityVocab, RelationVocab
+from .catalog import CatalogBuilder
 
-log = logging.getLogger(__name__)
 Edge = tuple[str, str, str]
 
 
@@ -31,61 +29,16 @@ class GraphCollectStats:
         }
 
 
-def collect_and_filter_graphs(
-    sample_iter: Iterable[RawSample],
-    *,
-    split_filters: dict[str, SplitFilter],
-    dedup_edges: bool = True,
-    remove_self_loops: bool = True,
-    validate_alignment: bool = True,
-) -> tuple[list[PreparedSample], EntityVocab, RelationVocab]:
-    entity_vocab = EntityVocab()
-    relation_vocab = RelationVocab()
-    prepared_samples: list[PreparedSample] = []
-    drops = {
-        "empty_graph": 0,
-        "no_anchor_in_graph": 0,
-        "no_answer_in_graph": 0,
-        "no_reachable_answer": 0,
-        "unknown_split": 0,
-    }
-    for sample in sample_iter:
-        stats = GraphCollectStats()
-        prepared = prepare_sample(
-            sample=sample,
-            split_filters=split_filters,
-            entity_vocab=entity_vocab,
-            relation_vocab=relation_vocab,
-            dedup_edges=dedup_edges,
-            remove_self_loops=remove_self_loops,
-            validate_alignment=validate_alignment,
-            update_vocab=True,
-            stats=stats,
-        )
-        for key, value in stats.drops().items():
-            drops[key] += value
-        if prepared is not None:
-            prepared_samples.append(prepared)
-    if not prepared_samples:
-        raise RuntimeError("No valid samples after graph collection.")
-    log.info(
-        "Collected %d samples (drop: %s)",
-        len(prepared_samples),
-        drops,
-    )
-    return prepared_samples, entity_vocab, relation_vocab
-
-
 def prepare_sample(
     *,
     sample: RawSample,
     split_filters: dict[str, SplitFilter],
-    entity_vocab: EntityVocab,
-    relation_vocab: RelationVocab,
+    catalog_builder: CatalogBuilder,
     dedup_edges: bool = True,
     remove_self_loops: bool = True,
     validate_alignment: bool = True,
-    update_vocab: bool = True,
+    replay_max_trajectories: int = 8,
+    replay_max_length: int = 3,
     stats: GraphCollectStats | None = None,
 ) -> PreparedSample | None:
     stats = stats or GraphCollectStats()
@@ -144,12 +97,20 @@ def prepare_sample(
     ):
         stats.no_reachable_answer += 1
         return None
+    replay_candidates = compute_replay_path_candidates(
+        edge_index=edge_index,
+        anchor_node_ids=anchor_node_ids,
+        reachable_target_node_ids=path_labels.reachable_target_node_ids,
+        node_target_distances_flat=path_labels.node_target_distances_flat,
+        node_target_shortest_path_edge_count_flat=path_labels.node_target_shortest_path_edge_count_flat,
+        num_nodes=num_nodes,
+        max_trajectories=int(replay_max_trajectories),
+        max_length=int(replay_max_length),
+    )
     node_entity_catalog_ids, edge_relation_catalog_ids = _build_graph_catalog_ids(
         graph_edges=graph_edges,
         node_index=node_index,
-        entity_vocab=entity_vocab,
-        relation_vocab=relation_vocab,
-        update_vocab=update_vocab,
+        catalog_builder=catalog_builder,
     )
     stats.kept += 1
     return PreparedSample(
@@ -174,6 +135,8 @@ def prepare_sample(
         node_target_shortest_path_count_flat=path_labels.node_target_shortest_path_count_flat,
         node_target_shortest_path_edge_mask_flat=path_labels.node_target_shortest_path_edge_mask_flat,
         node_target_shortest_path_edge_count_flat=path_labels.node_target_shortest_path_edge_count_flat,
+        replay_trajectory_edge_ids=replay_candidates.edge_ids,
+        replay_trajectory_lengths=replay_candidates.lengths,
     )
 
 
@@ -217,20 +180,13 @@ def _build_graph_catalog_ids(
     *,
     graph_edges: Sequence[Edge],
     node_index: dict[str, int],
-    entity_vocab: EntityVocab,
-    relation_vocab: RelationVocab,
-    update_vocab: bool = True,
+    catalog_builder: CatalogBuilder,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     node_entity_catalog_ids = torch.empty(len(node_index), dtype=torch.long)
     for entity, local_node_id in node_index.items():
-        node_entity_catalog_ids[local_node_id] = (
-            entity_vocab.add(entity) if update_vocab else entity_vocab.id(entity)
-        )
+        node_entity_catalog_ids[local_node_id] = catalog_builder.add_entity(entity)
     edge_relation_catalog_ids = torch.tensor(
-        [
-            relation_vocab.add(relation) if update_vocab else relation_vocab.id(relation)
-            for _, relation, _ in graph_edges
-        ],
+        [catalog_builder.add_relation(relation) for _, relation, _ in graph_edges],
         dtype=torch.long,
     )
     return (

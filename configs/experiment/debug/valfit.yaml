@@ -10,16 +10,23 @@ defaults:
 
 task_name: debug_valfit
 
-# Validation rollout probe:
-# train/validation/test all point at the validation split so
-# val/main/* should improve if optimization is healthy.
 trainer:
-  max_epochs: -1
-  max_steps: 10000
+  max_epochs: 10000
+  max_steps: -1
+  num_sanity_val_steps: 0
   check_val_every_n_epoch: 1
+  log_every_n_steps: 1
+  devices: 1
 
 datamodule:
   splits:
     train: validation
     validation: validation
     test: validation
+
+  batch_size: 16
+  eval_batch_size: 16
+
+  num_workers: 0
+  eval_num_workers: 0
+  train_shuffle: false

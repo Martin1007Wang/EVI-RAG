@@ -1,287 +1,185 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
 
-from ..context import GraphContext
-from ..state import State
+from src.weaver.state import StateBatch
 
-
-class BackwardPolicy(nn.Module):
-    """
-    Backward kernel P_B for ordered subtrajectory supervision.
-
-    It is not the rollout policy.
-    It is not the inference policy.
-    It should not read rewards.
-    """
-
-    def log_prob(
-        self,
-        *,
-        child_state: State,
-        context: GraphContext,
-        action_edge_ids: torch.Tensor,
-        expand_budget: int,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+Tensor = torch.Tensor
 
 
-class UniformValidPredecessorBackwardPolicy(BackwardPolicy):
-    """
-    Uniform backward policy over exact forward predecessors.
-
-    For child state:
-
-        z' = S'
-
-    A removable edge e in S' is a valid predecessor action iff:
-
-        S = S' \\ {e}
-
-    satisfies:
-
-        1. S is forward-reachable under the current frontier semantics.
-        2. e is in Frontier(S).
-
-    Then:
-
-        P_B(S | S') = 1 / |Pred(S')|
-    """
-
-    def log_prob(
-        self,
-        *,
-        child_state: State,
-        context: GraphContext,
-        action_edge_ids: torch.Tensor,
-        expand_budget: int,
-    ) -> torch.Tensor:
-        out = action_edge_ids.new_zeros(action_edge_ids.numel()).float()
-        expand = action_edge_ids.ge(0)
-        if not bool(expand.any()):
-            return out
-
-        counts = valid_predecessor_count(
-            state=child_state,
-            context=context,
-            expand_budget=int(expand_budget),
-        ).float()
-        if bool(counts[expand].le(0).any()):
-            raise ValueError("Expansion child state has no exact forward predecessor.")
-
-        expanded_rows = expand.nonzero(as_tuple=False).flatten()
-        expanded_edge_ids = action_edge_ids[expand]
-        for local_pos, row in enumerate(expanded_rows.tolist()):
-            selected = child_state.edge_mask[row].nonzero(as_tuple=True)[0]
-            edge_id = int(expanded_edge_ids[local_pos].item())
-            parent_edges = _parent_edge_ids_after_removal(
-                selected_edge_ids=selected,
-                removed_edge_id=edge_id,
-            )
-            if not is_valid_predecessor_edge(
-                context=context,
-                graph_id=int(child_state.row_to_graph[row].item()),
-                parent_edge_ids=parent_edges,
-                removed_edge_id=edge_id,
-                expand_budget=int(expand_budget),
-            ):
-                raise ValueError(
-                    f"Edge {edge_id} is not an exact forward predecessor for child row {row}."
-                )
-
-        out[expand] = -counts[expand].log()
-        return out
-
-
-def valid_predecessor_count(
+def deterministic_backward_log_prob(
     *,
-    state: State,
-    context: GraphContext,
-    expand_budget: int,
-) -> torch.Tensor:
-    counts = torch.zeros(
-        state.num_rows,
-        dtype=torch.long,
-        device=state.device,
-    )
+    parent_state: StateBatch,
+    child_state: StateBatch,
+    action_edge_ids: Tensor,
+    validate: bool = False,
+) -> Tensor:
+    """
+    Deterministic backward kernel for ordered-prefix states.
 
-    for row in range(state.num_rows):
-        selected = state.edge_mask[row].nonzero(as_tuple=True)[0]
-        if selected.numel() == 0:
-            continue
+    Forward expansion:
 
-        count = 0
-        for pos in range(int(selected.numel())):
-            edge_id = int(selected[pos].item())
-            parent_edges = torch.cat(
-                [
-                    selected[:pos],
-                    selected[pos + 1 :],
-                ],
-                dim=0,
-            )
-            if is_valid_predecessor_edge(
-                context=context,
-                graph_id=int(state.row_to_graph[row].item()),
-                parent_edge_ids=parent_edges,
-                removed_edge_id=edge_id,
-                expand_budget=int(expand_budget),
-            ):
-                count += 1
+        parent.edge_ids[row, :k]
+        -- action e -->
+        child.edge_ids[row, :k + 1]
 
-        counts[row] = count
+    Since StateBatch stores ordered prefixes, every expansion child has exactly
+    one predecessor: remove the last appended edge.
 
-    return counts
+    Therefore:
 
+        log P_B(parent | child) = 0
 
-def is_valid_predecessor_edge(
-    *,
-    context: GraphContext,
-    graph_id: int,
-    parent_edge_ids: torch.Tensor,
-    removed_edge_id: int,
-    expand_budget: int,
-) -> bool:
-    if removed_edge_id < 0 or removed_edge_id >= int(context.num_edges):
-        return False
+    This function:
+    - has no parameters;
+    - is not used for rollout inference;
+    - does not read rewards;
+    - does not enumerate removable edges;
+    - does not model unordered-subgraph predecessors.
+    """
 
-    removed_edge_tensor = torch.tensor(
-        [removed_edge_id],
-        dtype=torch.long,
-        device=context.device,
-    )
-    removed_edge_graph = context.edge_to_graph.index_select(0, removed_edge_tensor)
-    if not bool(removed_edge_graph.eq(int(graph_id)).all()):
-        return False
-
-    parent_state = exact_forward_parent_state(
-        context=context,
-        graph_id=graph_id,
-        edge_ids=parent_edge_ids,
-        expand_budget=int(expand_budget),
-    )
-    if parent_state is None:
-        return False
-
-    frontier = parent_state.frontier(
-        context,
-        expand_budget=int(expand_budget),
-    )
-    return bool(frontier.edge_ids.eq(int(removed_edge_id)).any())
-
-
-def exact_forward_parent_state(
-    *,
-    context: GraphContext,
-    graph_id: int,
-    edge_ids: torch.Tensor,
-    expand_budget: int,
-) -> State | None:
-    edge_ids = edge_ids.to(
-        device=context.device,
+    action_edge_ids = action_edge_ids.to(
+        device=child_state.device,
         dtype=torch.long,
     ).view(-1)
-    if int(edge_ids.numel()) > int(expand_budget):
-        return None
 
-    if edge_ids.numel() == 0:
-        return State.initial(
-            graph=context,
-            graph_ids=torch.tensor(
-                [graph_id],
-                dtype=torch.long,
-                device=context.device,
-            ),
-            expand_budget=int(expand_budget),
+    if validate:
+        validate_ordered_prefix_transitions(
+            parent_state=parent_state,
+            child_state=child_state,
+            action_edge_ids=action_edge_ids,
         )
 
-    if int(torch.unique(edge_ids).numel()) != int(edge_ids.numel()):
-        return None
-
-    edge_graph = context.edge_to_graph.index_select(0, edge_ids)
-    if not bool(edge_graph.eq(int(graph_id)).all()):
-        return None
-
-    state = State.initial(
-        graph=context,
-        graph_ids=torch.tensor(
-            [graph_id],
-            dtype=torch.long,
-            device=context.device,
-        ),
-        expand_budget=int(expand_budget),
+    return torch.zeros(
+        int(action_edge_ids.numel()),
+        dtype=torch.float32,
+        device=child_state.device,
     )
-    row = torch.zeros(1, dtype=torch.long, device=context.device)
-    remaining = edge_ids
-
-    while remaining.numel() > 0:
-        frontier = state.frontier(
-            context,
-            expand_budget=int(expand_budget),
-        )
-        frontier_mask = _membership_mask(
-            query_ids=frontier.edge_ids,
-            candidate_ids=remaining,
-        )
-        if not bool(frontier_mask.any()):
-            return None
-
-        next_edge_id = frontier.edge_ids[frontier_mask][:1]
-        state = state.expand(
-            graph=context,
-            rows=row,
-            edge_ids=next_edge_id,
-            expand_budget=int(expand_budget),
-        )
-        remaining = remaining[remaining.ne(next_edge_id.view(()))]
-
-    return state
 
 
-def _parent_edge_ids_after_removal(
+def validate_ordered_prefix_transitions(
     *,
-    selected_edge_ids: torch.Tensor,
-    removed_edge_id: int,
-) -> torch.Tensor:
-    keep = selected_edge_ids.ne(int(removed_edge_id))
-    if int(keep.sum().item()) == int(selected_edge_ids.numel()):
-        raise ValueError(f"Removed edge {removed_edge_id} is not selected in the child state.")
-    return selected_edge_ids[keep]
+    parent_state: StateBatch,
+    child_state: StateBatch,
+    action_edge_ids: Tensor,
+) -> None:
+    """
+    Debug-only validation.
 
+    Expansion rows must satisfy:
 
-def _membership_mask(
-    *,
-    query_ids: torch.Tensor,
-    candidate_ids: torch.Tensor,
-) -> torch.Tensor:
-    query_ids = query_ids.view(-1)
-    candidate_ids = candidate_ids.view(-1)
-    if query_ids.numel() == 0 or candidate_ids.numel() == 0:
-        return torch.zeros(
-            query_ids.numel(),
-            dtype=torch.bool,
-            device=query_ids.device,
+        child = parent + action_edge_id
+
+    Terminal diagnostic rows may use negative action ids and must not change
+    the prefix.
+    """
+
+    action_edge_ids = action_edge_ids.to(
+        device=child_state.device,
+        dtype=torch.long,
+    ).view(-1)
+
+    if int(parent_state.num_states) != int(child_state.num_states):
+        raise ValueError("parent_state and child_state must have the same num_states.")
+
+    if int(action_edge_ids.numel()) != int(child_state.num_states):
+        raise ValueError("action_edge_ids must match state rows.")
+
+    if int(parent_state.budget) != int(child_state.budget):
+        raise ValueError("parent_state and child_state must have the same budget.")
+
+    if not bool(parent_state.graph_ids.eq(child_state.graph_ids).all()):
+        raise ValueError("parent_state and child_state must have identical graph_ids.")
+
+    expand_rows = action_edge_ids.ge(0).nonzero(as_tuple=False).flatten()
+    terminal_rows = action_edge_ids.lt(0).nonzero(as_tuple=False).flatten()
+
+    if int(expand_rows.numel()) > 0:
+        _validate_expansion_rows(
+            parent_state=parent_state,
+            child_state=child_state,
+            rows=expand_rows,
+            action_edge_ids=action_edge_ids,
         )
 
-    sorted_candidates = torch.sort(candidate_ids).values
-    positions = torch.searchsorted(sorted_candidates, query_ids)
-    in_bounds = positions.lt(sorted_candidates.numel())
-    matched = torch.zeros(
-        query_ids.numel(),
-        dtype=torch.bool,
-        device=query_ids.device,
-    )
-    if bool(in_bounds.any()):
-        matched[in_bounds] = sorted_candidates.index_select(
-            0,
-            positions[in_bounds],
-        ).eq(query_ids[in_bounds])
-    return matched
+    if int(terminal_rows.numel()) > 0:
+        _validate_terminal_rows(
+            parent_state=parent_state,
+            child_state=child_state,
+            rows=terminal_rows,
+        )
+
+
+def _validate_expansion_rows(
+    *,
+    parent_state: StateBatch,
+    child_state: StateBatch,
+    rows: Tensor,
+    action_edge_ids: Tensor,
+) -> None:
+    parent_count = parent_state.edge_count.index_select(0, rows)
+    child_count = child_state.edge_count.index_select(0, rows)
+
+    if not bool(child_count.eq(parent_count + 1).all()):
+        raise ValueError("Expansion child edge_count must equal parent edge_count + 1.")
+
+    appended_edges = child_state.edge_ids[rows, parent_count]
+    selected_actions = action_edge_ids.index_select(0, rows)
+
+    if not bool(appended_edges.eq(selected_actions).all()):
+        raise ValueError("Expansion action_edge_ids must equal appended child edge.")
+
+    if not _prefix_equal(
+        left=parent_state.edge_ids.index_select(0, rows),
+        right=child_state.edge_ids.index_select(0, rows),
+        lengths=parent_count,
+    ):
+        raise ValueError("Expansion parent prefix must match child prefix.")
+
+
+def _validate_terminal_rows(
+    *,
+    parent_state: StateBatch,
+    child_state: StateBatch,
+    rows: Tensor,
+) -> None:
+    parent_count = parent_state.edge_count.index_select(0, rows)
+    child_count = child_state.edge_count.index_select(0, rows)
+
+    if not bool(parent_count.eq(child_count).all()):
+        raise ValueError("Terminal rows must not change edge_count.")
+
+    if not _prefix_equal(
+        left=parent_state.edge_ids.index_select(0, rows),
+        right=child_state.edge_ids.index_select(0, rows),
+        lengths=parent_count,
+    ):
+        raise ValueError("Terminal rows must not change selected edge prefix.")
+
+
+def _prefix_equal(
+    *,
+    left: Tensor,
+    right: Tensor,
+    lengths: Tensor,
+) -> bool:
+    if left.shape != right.shape:
+        return False
+
+    if int(left.numel()) == 0:
+        return True
+
+    steps = torch.arange(
+        int(left.size(1)),
+        dtype=torch.long,
+        device=left.device,
+    ).unsqueeze(0)
+
+    valid = steps.lt(lengths.view(-1, 1))
+    return bool(left[valid].eq(right[valid]).all())
 
 
 __all__ = [
-    "BackwardPolicy",
-    "UniformValidPredecessorBackwardPolicy",
-    "valid_predecessor_count",
+    "deterministic_backward_log_prob",
+    "validate_ordered_prefix_transitions",
 ]

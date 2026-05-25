@@ -33,6 +33,7 @@ class TensorTableWriter:
         self.path = Path(path)
         self.rows = int(rows)
         self.dim = int(dim)
+        self.cursor = 0
 
         _check_shape(self.rows, self.dim)
 
@@ -44,8 +45,7 @@ class TensorTableWriter:
     def table(self) -> TensorTable:
         return TensorTable(path=self.path, shape=(self.rows, self.dim))
 
-    def write(self, start: int, rows: torch.Tensor) -> None:
-        start = int(start)
+    def append(self, rows: torch.Tensor) -> int:
         data = rows.to(dtype=_dtype, device="cpu").contiguous()
 
         if data.ndim != 2:
@@ -53,18 +53,25 @@ class TensorTableWriter:
         if int(data.size(1)) != self.dim:
             raise ValueError(f"row dim mismatch: got {data.size(1)}, expected {self.dim}")
 
+        start = self.cursor
         end = start + int(data.size(0))
-        if start < 0 or end > self.rows:
+        if end > self.rows:
             raise ValueError(
-                f"row write out of bounds: start={start}, end={end}, table_rows={self.rows}"
+                f"table append out of bounds: start={start}, end={end}, rows={self.rows}"
             )
 
         self._handle.seek(start * self.dim * _item_size)
         self._handle.write(data.numpy().tobytes(order="C"))
+        self.cursor = end
+        return start
 
     def close(self) -> None:
         if self._handle.closed:
             return
+        if self.cursor != self.rows:
+            raise ValueError(
+                f"tensor table closed before full write: wrote={self.cursor}, expected={self.rows}"
+            )
         self._handle.flush()
         os.fsync(self._handle.fileno())
         self._handle.close()
@@ -82,7 +89,7 @@ def write_table(path: str | Path, tensor: torch.Tensor) -> TensorTable:
         raise ValueError(f"tensor table must be 2D, got {tuple(data.shape)}")
 
     with TensorTableWriter(path, rows=int(data.size(0)), dim=int(data.size(1))) as writer:
-        writer.write(0, data)
+        writer.append(data)
         return writer.table
 
 

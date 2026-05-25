@@ -1,207 +1,127 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
 import torch
 
 from src.data.schema import RetrievalBatch
 from src.graph.masks import anchor_node_mask
-
-if TYPE_CHECKING:
-    from .result import RolloutResult
-
-
-@dataclass(frozen=True, slots=True)
-class UnionSubgraphMasks:
-    """
-    Union of terminal subgraphs over rollout samples.
-
-    node_mask:
-        Boolean mask over all nodes in the current batched graph, shape [N].
-
-    edge_mask:
-        Boolean mask over all edges in the current batched graph, shape [E].
-    """
-
-    node_mask: torch.Tensor
-    edge_mask: torch.Tensor
+from src.weaver.context import GraphContext
+from src.weaver.rollout.trajectory import TrajectoryBatch
 
 
-class SubgraphReconstructor:
-    """
-    Reconstruct terminal node/edge masks from rollout trajectories.
-
-    RolloutResult owns trajectory tensors only; this helper owns the
-    RetrievalBatch topology required to interpret selected edge ids.
-    """
-
-    def __init__(
-        self,
-        batch: RetrievalBatch,
-        *,
-        device: torch.device,
-    ) -> None:
-        self.batch = batch
-        self.device = device
-
-    def reconstruct(self, result: RolloutResult) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Reconstruct the terminal subgraph represented by one rollout result.
-
-        Returned masks are over the full physical batched graph:
-            node_mask: [N]
-            edge_mask: [E]
-
-        This preserves the legacy evaluator contract: one RolloutResult must
-        contain exactly one rollout row per graph in the batch.
-        """
-        num_graphs = int(self.batch.num_graphs)
-        num_nodes = int(self.batch.num_nodes_total)
-        num_edges = int(self.batch.edge_index.size(1))
-
-        edge_index = self.batch.edge_index.to(device=self.device, dtype=torch.long)
-
-        node_mask = anchor_node_mask(self.batch, device=self.device)
-        edge_mask = torch.zeros(num_edges, dtype=torch.bool, device=self.device)
-
-        selected_edge_ids = result.selected_edge_ids.to(
-            device=self.device,
-            dtype=torch.long,
-        )
-        continue_mask = result.expand_mask.to(
-            device=self.device,
-            dtype=torch.bool,
+def union_subgraph_masks(
+    trajectories: TrajectoryBatch,
+    context: GraphContext,
+    batch: RetrievalBatch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if trajectories.num_trajectories == 0:
+        return (
+            anchor_node_mask(batch, device=context.device),
+            torch.zeros(int(context.num_edges), dtype=torch.bool, device=context.device),
         )
 
-        if selected_edge_ids.ndim != 2:
-            raise ValueError(
-                f"selected_edge_ids must have shape [B, T], "
-                f"got {tuple(selected_edge_ids.shape)}."
-            )
-
-        if continue_mask.shape != selected_edge_ids.shape:
-            raise ValueError(
-                "continue_mask must have the same shape as selected_edge_ids: "
-                f"{tuple(continue_mask.shape)} != {tuple(selected_edge_ids.shape)}."
-            )
-
-        batch_size, horizon = selected_edge_ids.shape
-        if batch_size != num_graphs:
-            raise ValueError(
-                "rollout batch size must match batch.num_graphs: "
-                f"{batch_size} != {num_graphs}."
-            )
-
-        terminal_step = result.terminal_step.to(
-            device=self.device,
-            dtype=torch.long,
-        ).view(-1)
-
-        if terminal_step.shape != (num_graphs,):
-            raise ValueError(
-                f"terminal_step must have shape [{num_graphs}], "
-                f"got {tuple(terminal_step.shape)}."
-            )
-
-        step_ids = torch.arange(horizon, device=self.device).unsqueeze(0)
-        valid_steps = step_ids <= terminal_step.unsqueeze(1)
-        valid_expands = valid_steps & continue_mask & selected_edge_ids.ge(0)
-
-        if not bool(valid_expands.any()):
-            return node_mask, edge_mask
-
-        edge_ids = selected_edge_ids[valid_expands].view(-1)
-        _check_id_range(edge_ids, upper=num_edges, name="selected_edge_ids")
-
+    edge_ids = trajectories.edge_ids[trajectories.valid_edge_mask()]
+    edge_mask = torch.zeros(int(context.num_edges), dtype=torch.bool, device=context.device)
+    node_mask = anchor_node_mask(batch, device=context.device)
+    if edge_ids.numel() > 0:
+        edge_ids = edge_ids.to(device=context.device, dtype=torch.long)
         edge_mask[edge_ids] = True
-
-        endpoints = edge_index[:, edge_ids].reshape(-1)
-        _check_id_range(endpoints, upper=num_nodes, name="selected edge endpoints")
-        node_mask[endpoints] = True
-
-        return node_mask, edge_mask
-
-    def stack(
-        self,
-        rollouts: Sequence[RolloutResult],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Stack terminal subgraph masks for rollout samples.
-
-        Returns:
-            node_masks: [R, N]
-            edge_masks: [R, E]
-        """
-        num_nodes = int(self.batch.num_nodes_total)
-        num_edges = int(self.batch.edge_index.size(1))
-
-        if not rollouts:
-            return (
-                torch.zeros((0, num_nodes), dtype=torch.bool, device=self.device),
-                torch.zeros((0, num_edges), dtype=torch.bool, device=self.device),
-            )
-
-        nodes: list[torch.Tensor] = []
-        edges: list[torch.Tensor] = []
-
-        for rollout in rollouts:
-            node_mask, edge_mask = self.reconstruct(rollout)
-            nodes.append(node_mask)
-            edges.append(edge_mask)
-
-        return torch.stack(nodes, dim=0), torch.stack(edges, dim=0)
-
-    def union(
-        self,
-        rollouts: Sequence[RolloutResult],
-    ) -> UnionSubgraphMasks:
-        """
-        Compute node / edge union over terminal subgraphs from rollout samples.
-        """
-        node_masks, edge_masks = self.stack(rollouts)
-
-        if node_masks.numel() == 0:
-            return UnionSubgraphMasks(
-                node_mask=torch.zeros(
-                    int(self.batch.num_nodes_total),
-                    dtype=torch.bool,
-                    device=self.device,
-                ),
-                edge_mask=torch.zeros(
-                    int(self.batch.edge_index.size(1)),
-                    dtype=torch.bool,
-                    device=self.device,
-                ),
-            )
-
-        return UnionSubgraphMasks(
-            node_mask=node_masks.any(dim=0),
-            edge_mask=edge_masks.any(dim=0),
-        )
+        node_mask[context.edge_src.index_select(0, edge_ids)] = True
+        node_mask[context.edge_dst.index_select(0, edge_ids)] = True
+    return node_mask, edge_mask
 
 
-def _check_id_range(
-    ids: torch.Tensor,
+def stacked_subgraph_masks(
+    trajectories: TrajectoryBatch,
+    context: GraphContext,
+    batch: RetrievalBatch | None = None,
     *,
-    upper: int,
-    name: str,
-) -> None:
-    if ids.numel() == 0:
-        return
-
-    min_id = int(ids.min())
-    max_id = int(ids.max())
-
-    if min_id < 0 or max_id >= int(upper):
-        raise ValueError(
-            f"{name} contains ids outside range [0, {upper}): "
-            f"min={min_id}, max={max_id}."
+    sample_ids: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del batch
+    out_device = device or context.device
+    num_nodes = int(context.num_nodes)
+    num_edges = int(context.num_edges)
+    if trajectories.num_trajectories == 0:
+        return (
+            torch.zeros((0, num_nodes), dtype=torch.bool, device=out_device),
+            torch.zeros((0, num_edges), dtype=torch.bool, device=out_device),
         )
+
+    if sample_ids is None:
+        sample_ids = _grouped_sample_ids(trajectories, num_graphs=int(context.num_graphs))
+    sample_ids = sample_ids.to(device=context.device, dtype=torch.long).view(-1)
+    if int(sample_ids.numel()) != trajectories.num_trajectories:
+        raise ValueError("sample_ids must match trajectory count.")
+
+    num_samples = int(sample_ids.max().item()) + 1 if sample_ids.numel() > 0 else 0
+    node_masks = torch.zeros((num_samples, num_nodes), dtype=torch.bool, device=context.device)
+    edge_masks = torch.zeros((num_samples, num_edges), dtype=torch.bool, device=context.device)
+
+    anchor_rows, anchor_nodes = _anchor_sample_node_pairs(
+        trajectories=trajectories,
+        context=context,
+        sample_ids=sample_ids,
+    )
+    if anchor_nodes.numel() > 0:
+        node_masks[anchor_rows, anchor_nodes] = True
+
+    valid = trajectories.valid_edge_mask()
+    if bool(valid.any()):
+        traj_rows = valid.nonzero(as_tuple=True)[0]
+        edge_ids = trajectories.edge_ids[valid].to(device=context.device, dtype=torch.long)
+        edge_sample_ids = sample_ids.index_select(0, traj_rows.to(device=context.device))
+        edge_masks[edge_sample_ids, edge_ids] = True
+        node_masks[edge_sample_ids, context.edge_src.index_select(0, edge_ids)] = True
+        node_masks[edge_sample_ids, context.edge_dst.index_select(0, edge_ids)] = True
+
+    return (
+        node_masks.to(device=out_device, dtype=torch.bool),
+        edge_masks.to(device=out_device, dtype=torch.bool),
+    )
+
+
+def _anchor_sample_node_pairs(
+    *,
+    trajectories: TrajectoryBatch,
+    context: GraphContext,
+    sample_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    graph_ids = trajectories.graph_ids.to(device=context.device, dtype=torch.long)
+    starts = context.anchor_ptr.index_select(0, graph_ids)
+    ends = context.anchor_ptr.index_select(0, graph_ids + 1)
+    lengths = ends - starts
+    if not bool(lengths.gt(0).any()):
+        empty = torch.empty(0, dtype=torch.long, device=context.device)
+        return empty, empty
+    rows = torch.repeat_interleave(sample_ids, lengths)
+    offsets = torch.cumsum(lengths, dim=0) - lengths
+    positions = torch.arange(
+        int(lengths.sum().item()),
+        dtype=torch.long,
+        device=context.device,
+    ) - torch.repeat_interleave(offsets, lengths) + torch.repeat_interleave(starts, lengths)
+    return rows, context.anchor_node_ids.index_select(0, positions)
+
+
+def _grouped_sample_ids(trajectories: TrajectoryBatch, *, num_graphs: int) -> torch.Tensor:
+    graph_ids = trajectories.graph_ids.to(dtype=torch.long)
+    counts = torch.bincount(graph_ids, minlength=int(num_graphs))
+    expected = torch.repeat_interleave(
+        torch.arange(int(num_graphs), dtype=torch.long, device=trajectories.device),
+        counts,
+    )
+    if expected.shape != graph_ids.shape or not bool(expected.eq(graph_ids).all()):
+        raise ValueError("trajectory graph_ids must be grouped by graph; pass explicit sample_ids for mixed trajectories.")
+    starts = torch.cumsum(counts, dim=0) - counts
+    return torch.arange(
+        trajectories.num_trajectories,
+        dtype=torch.long,
+        device=trajectories.device,
+    ) - starts.index_select(0, graph_ids)
 
 
 __all__ = [
-    "SubgraphReconstructor",
-    "UnionSubgraphMasks",
+    "stacked_subgraph_masks",
+    "union_subgraph_masks",
 ]

@@ -3,27 +3,30 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from src.utils.nn_utils import init_xavier
+
 
 class EdgeEncoder(nn.Module):
     """
-    Build a role-preserving KG edge token for e=(u,r,v).
+    Encode directed KG edges from model-space endpoint and relation tokens.
 
-        h_e = concat(h_u, h_r, h_v)
-
-    Contract:
-    - src_h, rel_h, dst_h are already produced by FeatureEncoder.
-    - FeatureEncoder owns all semantic/model-space projection decisions.
-    - EdgeEncoder does not normalize, project, detach, cast, reshape, or move tensors.
-    - The output is a structured model-space edge token with dimension 3H.
-    - Consumers decide how to compress or score it.
+    src_h, rel_h, dst_h: [E, H]
+    output: W_src src_h + W_rel rel_h + W_dst dst_h, shape [E, H]
     """
-
-    output_multiplier: int = 3
 
     def __init__(self, *, hidden_dim: int) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
-        self.output_dim = self.output_multiplier * self.hidden_dim
+
+        self.src_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.rel_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.dst_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+
+        self.reset_parameters()
+
+    @property
+    def output_dim(self) -> int:
+        return self.hidden_dim
 
     def forward(
         self,
@@ -32,7 +35,12 @@ class EdgeEncoder(nn.Module):
         rel_h: torch.Tensor,
         dst_h: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.cat([src_h, rel_h, dst_h], dim=-1)
+        return self.src_proj(src_h) + self.rel_proj(rel_h) + self.dst_proj(dst_h)
+
+    def reset_parameters(self) -> None:
+        init_xavier(self.src_proj)
+        init_xavier(self.rel_proj)
+        init_xavier(self.dst_proj)
 
 
 __all__ = ["EdgeEncoder"]

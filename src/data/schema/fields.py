@@ -1,8 +1,5 @@
-from __future__ import annotations
-from typing import FrozenSet
-
-
 class SampleFields:
+    SAMPLE_ID = "sample_id"  # scalar uint8 tensor containing utf-8 bytes
     EDGE_INDEX = "edge_index"  # LongTensor [2, num_edges]
     NODE_ENTITY_CATALOG_IDS = "node_entity_catalog_ids"  # LongTensor [num_nodes]
     EDGE_RELATION_CATALOG_IDS = "edge_relation_catalog_ids"  # LongTensor [num_edges]
@@ -27,39 +24,15 @@ class SampleFields:
     NODE_TARGET_SHORTEST_PATH_COUNT_FLAT = (
         "node_target_shortest_path_count_flat"  # FloatTensor [T * num_nodes]
     )
-    NODE_TARGET_SHORTEST_PATH_EDGE_MASK_FLAT = (
-        "node_target_shortest_path_edge_mask_flat"  # BoolTensor [T * num_edges]
-    )
-    NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_FLAT = (
-        "node_target_shortest_path_edge_count_flat"  # FloatTensor [T * num_edges]
-    )
     NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES = (
-        "node_target_shortest_path_edge_count_indices"  # LongTensor [nnz]
+        "node_target_shortest_path_edge_count_indices"  # LongTensor [nnz] into [T * num_edges]
     )
     NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES = (
         "node_target_shortest_path_edge_count_values"  # FloatTensor [nnz]
     )
-    NODE_ID_KEYS: FrozenSet[str] = frozenset(
-        {
-            ANCHOR_NODE_IDS,
-            TARGET_NODE_IDS,
-            REACHABLE_TARGET_NODE_IDS,
-        }
+    REPLAY_TRAJECTORY_EDGE_IDS = (
+        "replay_trajectory_edge_ids"  # LongTensor [sum replay trajectory lengths]
     )
-    NO_INCREMENT_KEYS: FrozenSet[str] = frozenset(
-        {
-            NODE_ENTITY_CATALOG_IDS,
-            EDGE_RELATION_CATALOG_IDS,
-            NUM_NODES,
-            NUM_EDGES,
-            ANCHOR_NODE_FORWARD_DISTANCE_FLAT,
-            ANCHOR_NODE_BACKWARD_DISTANCE_FLAT,
-            NODE_TARGET_DISTANCE,
-            NODE_TARGET_DISTANCES_FLAT,
-            NODE_TARGET_SHORTEST_PATH_COUNT_FLAT,
-            NODE_TARGET_SHORTEST_PATH_EDGE_MASK_FLAT,
-            NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_FLAT,
-            NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES,
-            NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES,
-        }
+    REPLAY_TRAJECTORY_LENGTHS = (
+        "replay_trajectory_lengths"  # LongTensor [num replay trajectories]
     )

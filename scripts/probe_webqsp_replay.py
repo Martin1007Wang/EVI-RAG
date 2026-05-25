@@ -9,11 +9,15 @@ import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from torch import nn
 
-from src.training.factory import build_datamodule
+from src.training.factory import prepare_training_components
 from src.training.checkpoint import load_checkpoint_weights
 from src.graph.segments import segment_log_softmax, segment_logsumexp
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.nn.feature_encoder import select_edge_relation_model, select_node_model, select_query_model
+from src.weaver.nn.feature_encoder import (
+    select_edge_relation_model,
+    select_node_model,
+    select_query_model,
+)
 from src.weaver.nn.state_encoder import SegmentTokenPool
 from src.weaver.rollout.replay import (
     build_replay_target_views,
@@ -21,7 +25,7 @@ from src.weaver.rollout.replay import (
     replay_trajectories_with_stats,
     training_from_trajectories,
 )
-from src.weaver.utility import TrueTerminalReward
+from src.weaver.utility import Reward
 
 
 def main() -> None:
@@ -37,15 +41,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = _compose_cfg(args.data_dir)
-    dm = build_datamodule(cfg)
-    dm.prepare_data()
-    dm.setup("fit")
+    dm, resources = prepare_training_components(cfg, stage="fit")
     model = None
     policy_features = None
     if args.ckpt:
         from src.training.factory import build_model
 
-        model = build_model(cfg, dm.model_resources)
+        model = build_model(cfg, resources)
         legacy_kind = _legacy_checkpoint_kind(args.ckpt)
         if legacy_kind == "node_state":
             model.policy = LegacyForwardPolicy(
@@ -89,7 +91,7 @@ def main() -> None:
         graph=graph,
         budget=int(args.budget),
     )
-    reward = TrueTerminalReward(edge_cost=0.05, fail_cost=1.0, reward_temperature=1.0)(
+    reward = Reward(edge_cost=0.05, fail_cost=1.0, reward_temperature=1.0)(
         state=training.terminals.state,
         graph_context=graph,
         target_context=target,
@@ -110,11 +112,7 @@ def main() -> None:
         f"generated_trajectories={stats.generated_trajectories} "
         f"skipped_by_reward={stats.skipped_by_reward}"
     )
-    print(
-        "training "
-        f"expansions={training.expansions.num_items} "
-        f"terminals={training.terminals.num_items}"
-    )
+    print("training " f"expansions={training.expansions.num_items} " f"terminals={training.terminals.num_items}")
 
     target_graph = graph.node_to_graph.index_select(0, batch.reachable_target_node_ids.long())
     target_views = build_replay_target_views(
@@ -128,7 +126,12 @@ def main() -> None:
         views_by_graph.setdefault(int(view.graph_id), []).append(view)
 
     for graph_id in range(int(graph.num_graphs)):
-        _print_graph_summary(batch=batch, graph=graph, graph_id=graph_id, views=views_by_graph.get(graph_id, []))
+        _print_graph_summary(
+            batch=batch,
+            graph=graph,
+            graph_id=graph_id,
+            views=views_by_graph.get(graph_id, []),
+        )
 
     for idx, trajectory in enumerate(trajectories[: int(args.max_trajectories_per_graph)]):
         terminal_row = training.terminals.meta.trajectory_ids.eq(idx).nonzero(as_tuple=False).flatten()
@@ -173,12 +176,8 @@ def _compose_cfg(data_dir: str):
 def _print_graph_summary(*, batch, graph: GraphContext, graph_id: int, views: list[Any]) -> None:
     nodes = graph.node_to_graph.eq(graph_id).nonzero(as_tuple=False).flatten()
     edges = graph.edge_to_graph.eq(graph_id).nonzero(as_tuple=False).flatten()
-    anchors = batch.anchor_node_ids[
-        graph.node_to_graph.index_select(0, batch.anchor_node_ids.long()).eq(graph_id)
-    ]
-    targets = batch.reachable_target_node_ids[
-        graph.node_to_graph.index_select(0, batch.reachable_target_node_ids.long()).eq(graph_id)
-    ]
+    anchors = batch.anchor_node_ids[graph.node_to_graph.index_select(0, batch.anchor_node_ids.long()).eq(graph_id)]
+    targets = batch.reachable_target_node_ids[graph.node_to_graph.index_select(0, batch.reachable_target_node_ids.long()).eq(graph_id)]
     dists = [view.anchor_target_distance for view in views]
     print(
         "graph "
@@ -203,7 +202,7 @@ def _print_trajectory_steps(
         graph_ids=torch.tensor([int(graph_id)], dtype=torch.long),
     )
     for step, edge_id in enumerate(edge_ids):
-        frontier = current.frontier(graph, expand_budget=int(budget))
+        frontier = current.frontier(graph, budget=int(budget))
         in_frontier = bool(frontier.edge_ids.eq(int(edge_id)).any())
         src = int(graph.edge_index[0, int(edge_id)].item())
         dst = int(graph.edge_index[1, int(edge_id)].item())
@@ -249,7 +248,7 @@ def _print_trajectory_steps(
             graph=graph,
             rows=torch.zeros(1, dtype=torch.long),
             edge_ids=torch.tensor([int(edge_id)], dtype=torch.long),
-            expand_budget=int(budget),
+            budget=int(budget),
         )
 
 
@@ -452,9 +451,17 @@ class LegacyForwardPolicy(nn.Module):
         self.state_encoder = state_encoder
         hidden_dim = state_encoder.hidden_dim
         edge_dim = state_encoder.edge_encoder.output_dim
-        self.stop_head = nn.Sequential(nn.Linear(hidden_dim * 2 + 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.stop_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self.flow_head = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-        self.edge_head = nn.Sequential(nn.Linear(hidden_dim * 2 + edge_dim + 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.edge_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + edge_dim + 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     @property
     def hidden_dim(self) -> int:
@@ -525,7 +532,11 @@ class LegacyEdgeStateForwardPolicy(nn.Module):
         edge_dim = state_encoder.edge_encoder.output_dim
         self.stop_head = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
         self.flow_head = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-        self.edge_head = nn.Sequential(nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.edge_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     @property
     def hidden_dim(self) -> int:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any, TypeVar, cast
 
 import hydra
@@ -8,25 +7,21 @@ import torch
 from lightning import LightningDataModule, LightningModule, Trainer
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-from .config import build_training_data_config
+from .config import (
+    ModelResources,
+    RetrievalDataConfig,
+    build_retrieval_data_config,
+    load_model_resources,
+    validate_retrieval_data_config,
+)
 
 T = TypeVar("T")
 
 
-def setup_datamodule(
-    datamodule: LightningDataModule,
-    stage: str = "fit",
-) -> Any:
-    datamodule.prepare_data()
-    datamodule.setup(stage)
-
-    if not hasattr(datamodule, "model_resources"):
-        raise AttributeError(f"Datamodule must expose `model_resources` after setup({stage!r}).")
-    resources = getattr(datamodule, "model_resources", None)
-    return resources
-
-
-def build_datamodule(cfg: DictConfig) -> LightningDataModule:
+def build_datamodule(
+    cfg: DictConfig,
+    data_config: RetrievalDataConfig,
+) -> LightningDataModule:
     datamodule_cfg = OmegaConf.to_container(
         cfg.datamodule,
         resolve=True,
@@ -42,30 +37,81 @@ def build_datamodule(cfg: DictConfig) -> LightningDataModule:
     datamodule_cfg = {
         "_target_": target,
         "_convert_": "object",
-        "data_config": build_training_data_config(cfg),
+        "data_config": data_config,
     }
 
     datamodule = hydra.utils.instantiate(datamodule_cfg)
     return require_type(datamodule, LightningDataModule, "cfg.datamodule")
 
 
+def prepare_training_components(
+    cfg: DictConfig,
+    *,
+    stage: str | tuple[str, ...],
+) -> tuple[LightningDataModule, ModelResources]:
+    data_config = build_retrieval_data_config(cfg)
+    stages = _normalized_stages(stage)
+    validate_retrieval_data_config(
+        data_config,
+        splits=_split_names_for_stages(data_config, stages),
+    )
+    datamodule = build_datamodule(cfg, data_config)
+    datamodule.prepare_data()
+    datamodule.setup(stages[0])
+    resources = load_model_resources(data_config.materialization)
+    return datamodule, resources
+
+
 def build_model(
     cfg: DictConfig,
     resources: Any,
 ) -> LightningModule:
-    model_cfg = OmegaConf.to_container(
-        cfg.model,
-        resolve=True,
-        throw_on_missing=True,
+    policy_feature_encoder = hydra.utils.instantiate(
+        cfg.model.policy_feature_encoder,
+        **model_resource_kwargs(resources),
     )
-    if not isinstance(model_cfg, dict):
-        raise TypeError(f"cfg.model must resolve to dict, got {type(model_cfg).__name__}.")
+    model = hydra.utils.instantiate(
+        cfg.model,
+        policy_feature_encoder=policy_feature_encoder,
+    )
+    module = require_type(model, LightningModule, "cfg.model")
+    debug_lookup = getattr(resources, "debug_lookup", None)
+    if debug_lookup is not None:
+        module.debug_lookup = debug_lookup
+    return module
 
-    model_cfg = deepcopy(model_cfg)
-    _inject_model_resources(model_cfg, resources)
 
-    model = hydra.utils.instantiate(model_cfg)
-    return require_type(model, LightningModule, "cfg.model")
+def _split_names_for_stages(
+    data_config: RetrievalDataConfig,
+    stages: tuple[str, ...],
+) -> tuple[str, ...]:
+    split_plan = data_config.splits
+    splits: list[str] = []
+
+    for stage in stages:
+        if stage == "fit":
+            splits.extend((split_plan.train, split_plan.validation))
+            continue
+        if stage == "validate":
+            splits.append(split_plan.validation)
+            continue
+        if stage == "test":
+            splits.append(split_plan.test)
+            continue
+        raise ValueError(f"Unsupported stage: {stage!r}.")
+
+    return tuple(dict.fromkeys(splits))
+
+
+def _normalized_stages(stage: str | tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(stage, str):
+        stages = (stage,)
+    else:
+        stages = tuple(stage)
+
+    if not stages:
+        raise ValueError("stage must contain at least one entry.")
+    return stages
 
 
 def build_trainer(cfg: DictConfig) -> Trainer:
@@ -109,7 +155,7 @@ def trainer_logger(config: ListConfig | DictConfig | None) -> bool | Any | list[
     return loggers
 
 
-def model_resource_kwargs(resources: Any) -> dict[str, torch.Tensor]:
+def model_resource_kwargs(resources: Any) -> dict[str, Any]:
     return {
         "entity_text_semantic_table": require_attr(
             resources,
@@ -127,27 +173,6 @@ def model_resource_kwargs(resources: Any) -> dict[str, torch.Tensor]:
             torch.Tensor,
         ),
     }
-
-
-def _inject_model_resources(
-    model_cfg: dict[str, Any],
-    resources: Any,
-) -> None:
-    model_cfg.pop("hidden_dim", None)
-
-    resource_kwargs = model_resource_kwargs(resources)
-    for key in ("policy_feature_encoder",):
-        feature_encoder_cfg = _require_mapping(
-            model_cfg.get(key),
-            f"cfg.model.{key}",
-        )
-        feature_encoder_cfg.update(resource_kwargs)
-
-
-def _require_mapping(value: Any, name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise TypeError(f"{name} must resolve to dict, got {type(value).__name__}.")
-    return value
 
 
 def require_attr(
@@ -183,8 +208,8 @@ __all__ = [
     "build_trainer",
     "instantiate_list",
     "model_resource_kwargs",
+    "prepare_training_components",
     "require_attr",
     "require_type",
-    "setup_datamodule",
     "trainer_logger",
 ]

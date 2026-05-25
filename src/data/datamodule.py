@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 
 from .collate import RetrievalCollator
 from .dataset import RetrievalDataset
-from src.training.config import ModelResources, TrainingDataConfig
+from src.training.config import RetrievalDataConfig
 
 
 class RetrievalDataModule(LightningDataModule):
@@ -14,7 +15,6 @@ class RetrievalDataModule(LightningDataModule):
 
     Responsibilities:
     - read materialized dataset paths from config;
-    - load model initialization resources;
     - instantiate RetrievalDataset for train/validation/test;
     - build DataLoader objects.
 
@@ -28,26 +28,11 @@ class RetrievalDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_config: TrainingDataConfig,
+        data_config: RetrievalDataConfig,
     ) -> None:
         super().__init__()
 
-        self.data_config = data_config
-        self.batch_size = data_config.batch_size
-        self.eval_batch_size = data_config.eval_batch_size
-        self.num_workers = data_config.num_workers
-        self.eval_num_workers = data_config.eval_num_workers
-        self.pin_memory = data_config.pin_memory
-        self.train_shuffle = data_config.train_shuffle
-        self.drop_last = data_config.drop_last
-        self.eval_drop_last = data_config.eval_drop_last
-        self.lmdb_readahead = data_config.lmdb_readahead
-        self.max_readers = data_config.max_readers
-        self.metadata_dir = data_config.metadata_dir
-        self.materialization = data_config.materialization
-        self.train_split = data_config.train_split
-        self.val_split = data_config.validation_split
-        self.test_split = data_config.test_split
+        self.cfg = data_config
 
         self.collator = RetrievalCollator()
 
@@ -56,53 +41,46 @@ class RetrievalDataModule(LightningDataModule):
         self.test_dataset: RetrievalDataset | None = None
         self._datasets_by_split: dict[str, RetrievalDataset] = {}
 
-        self._model_resources: ModelResources | None = None
-
-    @property
-    def model_resources(self) -> ModelResources:
-        """
-        Resources required by WeaverModule initialization.
-
-        Call prepare_data() and setup(...) before reading this property.
-        """
-        if self._model_resources is None:
-            raise RuntimeError(
-                "model_resources requested before setup(). "
-                "Call datamodule.prepare_data(); datamodule.setup('fit') first."
-            )
-        return self._model_resources
-
     def prepare_data(self) -> None:
         return None
 
     def setup(self, stage: str | None = None) -> None:
-        self._ensure_model_resources_loaded()
+        splits = self.cfg.splits
 
         if stage in (None, "fit"):
-            self.train_dataset = self._dataset_for_split(self.train_split)
-            self.val_dataset = self._dataset_for_split(self.val_split)
+            self.train_dataset = self._dataset_for_split(splits.train)
+            self.val_dataset = self._dataset_for_split(splits.validation)
 
         if stage in (None, "validate") and self.val_dataset is None:
-            self.val_dataset = self._dataset_for_split(self.val_split)
+            self.val_dataset = self._dataset_for_split(splits.validation)
 
         if stage in (None, "test"):
-            self.test_dataset = self._dataset_for_split(self.test_split)
+            self.test_dataset = self._dataset_for_split(splits.test)
 
     def train_dataloader(self) -> DataLoader:
         return self._build_loader(
-            dataset=self.train_dataset,
+            dataset=self._loader_dataset(
+                self.train_dataset,
+                indices=self.cfg.loader.train_indices,
+            ),
             training=True,
         )
 
     def val_dataloader(self) -> DataLoader:
         return self._build_loader(
-            dataset=self.val_dataset,
+            dataset=self._loader_dataset(
+                self.val_dataset,
+                indices=self.cfg.loader.validation_indices,
+            ),
             training=False,
         )
 
     def test_dataloader(self) -> DataLoader:
         return self._build_loader(
-            dataset=self.test_dataset,
+            dataset=self._loader_dataset(
+                self.test_dataset,
+                indices=self.cfg.loader.test_indices,
+            ),
             training=False,
         )
 
@@ -114,17 +92,13 @@ class RetrievalDataModule(LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
 
-    def _ensure_model_resources_loaded(self) -> None:
-        if self._model_resources is not None:
-            return
-        self._model_resources = self.data_config.model_resources
-
     def _build_dataset(self, split: str) -> RetrievalDataset:
+        loader = self.cfg.loader
         return RetrievalDataset(
-            materialization=self.materialization,
+            materialization=self.cfg.materialization,
             split=split,
-            lmdb_readahead=self.lmdb_readahead,
-            max_readers=self.max_readers,
+            lmdb_readahead=loader.lmdb_readahead,
+            max_readers=loader.max_readers,
         )
 
     def _dataset_for_split(self, split: str) -> RetrievalDataset:
@@ -137,28 +111,44 @@ class RetrievalDataModule(LightningDataModule):
     def _build_loader(
         self,
         *,
-        dataset: RetrievalDataset | None,
+        dataset: RetrievalDataset | Subset[RetrievalDataset] | None,
         training: bool,
     ) -> DataLoader:
         if dataset is None:
             raise RuntimeError("Dataset not initialized. Call setup() first.")
 
-        batch_size = self.batch_size if training else self.eval_batch_size
-        num_workers = self.num_workers if training else self.eval_num_workers
-        drop_last = self.drop_last if training else self.eval_drop_last
+        loader = self.cfg.loader
+        batch_size = loader.batch_size if training else loader.eval_batch_size
+        num_workers = loader.num_workers if training else loader.eval_num_workers
 
         return DataLoader(
             dataset=dataset,
             batch_size=batch_size,
-            shuffle=training and self.train_shuffle,
+            shuffle=training and loader.train_shuffle,
             num_workers=num_workers,
             collate_fn=self.collator,
-            pin_memory=self.pin_memory,
+            pin_memory=loader.pin_memory,
             persistent_workers=num_workers > 0,
-            drop_last=drop_last,
+            drop_last=loader.drop_last if training else False,
         )
 
+    def _loader_dataset(
+        self,
+        dataset: RetrievalDataset | None,
+        *,
+        indices: tuple[int, ...] | None,
+    ) -> RetrievalDataset | Subset[RetrievalDataset] | None:
+        if dataset is None or indices is None:
+            return dataset
+        max_index = len(dataset) - 1
+        for index in indices:
+            if index < 0 or index > max_index:
+                raise IndexError(
+                    f"Subset index out of range for split {dataset.split}: "
+                    f"{index} not in [0, {max_index}]."
+                )
+        return Subset(dataset, list(indices))
+
 __all__ = [
-    "ModelResources",
     "RetrievalDataModule",
 ]

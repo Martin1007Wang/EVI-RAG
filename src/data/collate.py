@@ -10,6 +10,7 @@ from .schema.fields import SampleFields
 
 _DEFAULT_FOLLOW_BATCH = (
     SampleFields.REACHABLE_TARGET_NODE_IDS,
+    SampleFields.REPLAY_TRAJECTORY_LENGTHS,
 )
 
 
@@ -48,6 +49,7 @@ class RetrievalCollator:
             exclude_keys=self.exclude_keys,
         )
 
+        batch.sample_id = [str(sample.sample_id) for sample in samples]
         batch.question_emb = stack_question_embeddings(samples)
         batch.edge_batch = edge_batch_from_node_batch(batch)
 

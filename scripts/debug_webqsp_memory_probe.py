@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from hydra import compose, initialize_config_dir
 
-from src.training.factory import build_datamodule, build_model
+from src.training.factory import build_model, prepare_training_components
 
 
 def _mem(label: str) -> None:
@@ -25,8 +25,7 @@ def _patch_successor_probe(model) -> None:
         edge_ids = kwargs["frontier_edge_ids"]
         row_ids = kwargs["frontier_row_ids"]
         print(
-            "encode_successor_actions "
-            f"actions={int(edge_ids.numel())} rows={int(row_ids.unique().numel())}",
+            "encode_successor_actions " f"actions={int(edge_ids.numel())} rows={int(row_ids.unique().numel())}",
             flush=True,
         )
         _mem("  before encode_successor_actions")
@@ -70,10 +69,8 @@ def main() -> None:
     with initialize_config_dir(version_base=None, config_dir=config_dir):
         cfg = compose(config_name="train", overrides=overrides)
 
-    dm = build_datamodule(cfg)
-    dm.prepare_data()
-    dm.setup("fit")
-    model = build_model(cfg, dm.model_resources).cuda().train()
+    dm, resources = prepare_training_components(cfg, stage="fit")
+    model = build_model(cfg, resources).cuda().train()
     _patch_successor_probe(model)
     _mem("after model.cuda")
 
@@ -91,7 +88,7 @@ def main() -> None:
         _mem("after prepare_context")
         reward_context = model.reward_model.prepare_context(
             batch,
-            expand_budget=model.runner.engine.expand_budget,
+            budget=model.budget,
         )
         _mem("after reward_context")
         chunk = model.runner.train_chunk(

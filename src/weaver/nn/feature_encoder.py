@@ -3,50 +3,35 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from src.data.schema import RetrievalBatch
-from src.utils.nn_utils import init_xavier
 
 
 @dataclass(frozen=True, slots=True)
-class EncodedFeatures:
-    """
-    Batch-local features produced by FeatureEncoder.
-
-    Contract:
-    - *_semantic tensors live in the upstream PLM L2 semantic space.
-    - *_model tensors live in the learned Weaver model space.
-    - Non-text nodes have zero node_text_semantic and node_has_text=False.
-    - Non-text nodes get a learnable model-space token in node_model.
-    """
-
-    node_text_semantic: torch.Tensor  # [num_nodes_total, semantic_dim]
-    node_has_text: torch.Tensor  # [num_nodes_total]
-
-    edge_relation_semantic: torch.Tensor  # [num_edges_total, semantic_dim]
-    query_semantic: torch.Tensor  # [num_graphs_total, semantic_dim]
-
-    node_model: torch.Tensor  # [num_nodes_total, model_dim]
-    edge_relation_model: torch.Tensor  # [num_edges_total, model_dim]
-    query_model: torch.Tensor  # [num_graphs_total, model_dim]
-    edge_token_model: torch.Tensor  # [num_edges_total, 3 * model_dim]
+class FeatureBank:
+    node_embedding: torch.Tensor  # [num_nodes_total, feature_dim]
+    relation_embedding: torch.Tensor  # [num_edges_total, feature_dim]
+    query_embedding: torch.Tensor  # [num_graphs_total, feature_dim]
+    node_text_mask: torch.Tensor  # [num_nodes_total]
 
 
 class FeatureEncoder(nn.Module):
     """
-    Build batch-local semantic and model-space features.
+    Projection-free batch-local feature reader.
 
     Input contract:
-    - entity_text_semantic_table is already float tensor in PLM L2 space.
-    - relation_semantic_table is already float tensor in PLM L2 space.
-    - batch.question_emb is already float tensor in the same PLM L2 space.
+    - entity_text_semantic_table is already a float tensor in BGE/PLM L2 space.
+    - relation_semantic_table is already a float tensor in the same BGE/PLM L2 space.
+    - batch.question_emb is already a float tensor in the same BGE/PLM L2 space.
     - text_row_by_entity_id is a long tensor.
     - text_row_by_entity_id[entity_id] < 0 means the entity has no text.
     - batch.node_entity_catalog_ids is a 1D long tensor.
     - batch.edge_relation_catalog_ids is a 1D long tensor.
-    - all tensors are already on the intended device.
+
+    No learned projection is applied. Downstream hidden_dim must equal feature_dim.
+    Nodes without text use one shared learned missing-node embedding for neural
+    state encoding, while node_text_mask keeps semantic-prior scoring explicit.
     """
 
     entity_text_semantic_table: torch.Tensor
@@ -59,11 +44,11 @@ class FeatureEncoder(nn.Module):
         entity_text_semantic_table: torch.Tensor,
         text_row_by_entity_id: torch.Tensor,
         relation_semantic_table: torch.Tensor,
-        model_dim: int = 1024,
         non_text_node_init_std: float = 0.02,
     ) -> None:
         super().__init__()
 
+        feature_dim = int(entity_text_semantic_table.size(-1))
         self.register_buffer(
             "entity_text_semantic_table",
             entity_text_semantic_table,
@@ -76,28 +61,8 @@ class FeatureEncoder(nn.Module):
             "relation_semantic_table",
             relation_semantic_table,
         )
-
-        self.semantic_dim = int(entity_text_semantic_table.size(-1))
-        self.model_dim = int(model_dim)
-
-        self.project_query_to_model = nn.Linear(
-            self.semantic_dim,
-            self.model_dim,
-            bias=False,
-        )
-        self.project_node_to_model = nn.Linear(
-            self.semantic_dim,
-            self.model_dim,
-            bias=False,
-        )
-        self.project_relation_to_model = nn.Linear(
-            self.semantic_dim,
-            self.model_dim,
-            bias=False,
-        )
-
-        self.non_text_node_model = nn.Parameter(torch.empty(self.model_dim))
-
+        self.feature_dim = feature_dim
+        self.missing_node_embedding = nn.Parameter(torch.empty(self.feature_dim))
         self.reset_parameters(
             non_text_node_init_std=non_text_node_init_std,
         )
@@ -107,201 +72,98 @@ class FeatureEncoder(nn.Module):
         *,
         non_text_node_init_std: float,
     ) -> None:
-        init_xavier(self.project_query_to_model)
-        init_xavier(self.project_node_to_model)
-        init_xavier(self.project_relation_to_model)
         nn.init.normal_(
-            self.non_text_node_model,
+            self.missing_node_embedding,
             mean=0.0,
             std=float(non_text_node_init_std),
         )
 
-    def forward(self, batch: RetrievalBatch) -> EncodedFeatures:
-        node_text_semantic, node_has_text = self.encode_node_text_semantic(batch.node_entity_catalog_ids)
-
-        edge_relation_semantic = self.encode_edge_relation_semantic(batch.edge_relation_catalog_ids)
-
-        query_semantic = batch.question_emb
-        node_model = self.encode_node_model(
-            node_text_semantic=node_text_semantic,
-            node_has_text=node_has_text,
+    def forward(self, batch: RetrievalBatch) -> FeatureBank:
+        node_embedding, node_text_mask = self.read_node_embeddings(
+            batch.node_entity_catalog_ids
         )
-        edge_relation_model = self.project_relation_semantic(edge_relation_semantic)
-        query_model = self.project_query_semantic(query_semantic)
-        src_node_ids = batch.edge_index[0].to(dtype=torch.long)
-        dst_node_ids = batch.edge_index[1].to(dtype=torch.long)
-        edge_token_model = torch.cat(
-            [
-                node_model.index_select(0, src_node_ids),
-                edge_relation_model,
-                node_model.index_select(0, dst_node_ids),
-            ],
-            dim=-1,
+        relation_embedding = self.read_relation_embeddings(
+            batch.edge_relation_catalog_ids
         )
+        query_embedding = batch.question_emb
+        if int(query_embedding.size(-1)) != self.feature_dim:
+            raise ValueError(
+                "batch.question_emb must have the same last dimension as the "
+                f"feature tables, got {int(query_embedding.size(-1))} and "
+                f"{self.feature_dim}."
+            )
 
-        return EncodedFeatures(
-            node_text_semantic=node_text_semantic,
-            node_has_text=node_has_text,
-            edge_relation_semantic=edge_relation_semantic,
-            query_semantic=query_semantic,
-            node_model=node_model,
-            edge_relation_model=edge_relation_model,
-            query_model=query_model,
-            edge_token_model=edge_token_model,
+        return FeatureBank(
+            node_embedding=node_embedding,
+            relation_embedding=relation_embedding,
+            query_embedding=query_embedding,
+            node_text_mask=node_text_mask,
         )
 
-    def encode_node_text_semantic(
+    def read_node_embeddings(
         self,
         entity_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_rows = self.text_row_by_entity_id.index_select(0, entity_ids)
-        node_has_text = text_rows.ge(0)
-
-        node_text_semantic = self.entity_text_semantic_table.new_zeros(
-            entity_ids.size(0),
-            self.semantic_dim,
+        node_text_mask = text_rows.ge(0)
+        node_embedding = (
+            self.missing_node_embedding.unsqueeze(0)
+            .expand(entity_ids.size(0), self.feature_dim)
+            .clone()
         )
 
-        text_node_ids = node_has_text.nonzero(as_tuple=True)[0]
+        text_node_ids = node_text_mask.nonzero(as_tuple=True)[0]
         if text_node_ids.numel() == 0:
-            return node_text_semantic, node_has_text
+            return node_embedding, node_text_mask
 
         valid_text_rows = text_rows.index_select(0, text_node_ids)
-        valid_text_semantic = self.entity_text_semantic_table.index_select(
+        valid_text_embedding = self.entity_text_semantic_table.index_select(
             0,
             valid_text_rows,
         )
+        node_embedding[text_node_ids] = valid_text_embedding
+        return node_embedding, node_text_mask
 
-        node_text_semantic[text_node_ids] = valid_text_semantic
-        return node_text_semantic, node_has_text
-
-    def encode_edge_relation_semantic(
+    def read_relation_embeddings(
         self,
         relation_ids: torch.Tensor,
     ) -> torch.Tensor:
         return self.relation_semantic_table.index_select(0, relation_ids)
 
-    def encode_node_model(
-        self,
-        *,
-        node_text_semantic: torch.Tensor,
-        node_has_text: torch.Tensor,
-    ) -> torch.Tensor:
-        text_node_model = self.project_node_semantic(node_text_semantic)
 
-        non_text_node_model = self.non_text_node_model.unsqueeze(0).expand(
-            node_text_semantic.size(0),
-            self.model_dim,
-        )
-
-        return torch.where(
-            node_has_text.unsqueeze(-1),
-            text_node_model,
-            non_text_node_model,
-        )
-
-    def project_query_semantic(
-        self,
-        semantic: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.to_model_space(
-            semantic,
-            projector=self.project_query_to_model,
-        )
-
-    def project_node_semantic(
-        self,
-        semantic: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.to_model_space(
-            semantic,
-            projector=self.project_node_to_model,
-        )
-
-    def project_relation_semantic(
-        self,
-        semantic: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.to_model_space(
-            semantic,
-            projector=self.project_relation_to_model,
-        )
-
-    def to_model_space(
-        self,
-        semantic: torch.Tensor,
-        *,
-        projector: nn.Linear,
-    ) -> torch.Tensor:
-        normalized = F.normalize(semantic, p=2, dim=-1)
-        return projector(normalized)
-
-
-def select_node_text_semantic(
-    features: EncodedFeatures,
+def select_node_embedding(
+    features: FeatureBank,
     node_ids: torch.Tensor,
 ) -> torch.Tensor:
-    return features.node_text_semantic.index_select(0, node_ids)
+    return features.node_embedding.index_select(0, node_ids)
 
 
-def select_node_has_text(
-    features: EncodedFeatures,
+def select_node_text_mask(
+    features: FeatureBank,
     node_ids: torch.Tensor,
 ) -> torch.Tensor:
-    return features.node_has_text.index_select(0, node_ids)
+    return features.node_text_mask.index_select(0, node_ids)
 
 
-def select_edge_relation_semantic(
-    features: EncodedFeatures,
+def select_relation_embedding(
+    features: FeatureBank,
     edge_ids: torch.Tensor,
 ) -> torch.Tensor:
-    return features.edge_relation_semantic.index_select(0, edge_ids)
+    return features.relation_embedding.index_select(0, edge_ids)
 
 
-def select_query_semantic(
-    features: EncodedFeatures,
+def select_query_embedding(
+    features: FeatureBank,
     graph_ids: torch.Tensor,
 ) -> torch.Tensor:
-    return features.query_semantic.index_select(0, graph_ids)
-
-
-def select_node_model(
-    features: EncodedFeatures,
-    node_ids: torch.Tensor,
-) -> torch.Tensor:
-    return features.node_model.index_select(0, node_ids)
-
-
-def select_edge_relation_model(
-    features: EncodedFeatures,
-    edge_ids: torch.Tensor,
-) -> torch.Tensor:
-    return features.edge_relation_model.index_select(0, edge_ids)
-
-
-def select_edge_token_model(
-    features: EncodedFeatures,
-    edge_ids: torch.Tensor,
-) -> torch.Tensor:
-    return features.edge_token_model.index_select(0, edge_ids)
-
-
-def select_query_model(
-    features: EncodedFeatures,
-    graph_ids: torch.Tensor,
-) -> torch.Tensor:
-    return features.query_model.index_select(0, graph_ids)
+    return features.query_embedding.index_select(0, graph_ids)
 
 
 __all__ = [
-    "EncodedFeatures",
+    "FeatureBank",
     "FeatureEncoder",
-    "select_edge_relation_model",
-    "select_edge_token_model",
-    "select_edge_relation_semantic",
-    "select_node_has_text",
-    "select_node_model",
-    "select_node_text_semantic",
-    "select_query_model",
-    "select_query_semantic",
+    "select_node_embedding",
+    "select_node_text_mask",
+    "select_query_embedding",
+    "select_relation_embedding",
 ]

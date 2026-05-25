@@ -2,42 +2,48 @@
 
 _target_: src.weaver.module.WeaverModule
 
+budget: 8
+
 policy_feature_encoder:
   _target_: src.weaver.nn.feature_encoder.FeatureEncoder
-  entity_text_semantic_table: null
-  text_row_by_entity_id: null
-  relation_semantic_table: null
-  model_dim: 1024
+  entity_text_semantic_table: null      # injected by builder
+  text_row_by_entity_id: null           # injected by builder
+  relation_semantic_table: null         # injected by builder
   non_text_node_init_std: 0.02
 
 policy:
   _target_: src.weaver.policy.ForwardPolicy
-  max_expand_budget: ${model.runner.engine.expand_budget}
+  budget: ${model.budget}
+  action_hidden_dim: null
+  semantic_relation_weight: 1.0
+  semantic_dst_weight: 0.5
+  frontier_size_correction: 0.0
   state_encoder:
     _target_: src.weaver.nn.state_encoder.StateEncoder
     hidden_dim: 1024
     edge_encoder:
-      _target_: src.weaver.nn.state_encoder.QueryEdgeEncoder
+      _target_: src.weaver.nn.edge_encoder.EdgeEncoder
       hidden_dim: 1024
-      num_heads: 8
-    state_encoder:
-      _target_: src.weaver.nn.state_encoder.QueryStateEncoder
+    token_pooler:
+      _target_: src.weaver.nn.state_encoder.QueryTokenPooler
       hidden_dim: 1024
-    edge_num_heads: 8
 
 reward_model:
-  _target_: src.weaver.utility.EvidenceUtilityReward
-  support_weight: 0.25
-  connect_weight: 0.5
-  edge_cost: 0.05
-  unsupported_edge_cost: 0.05
-  fail_cost: 1.0
+  _target_: src.weaver.reward.EvidenceSubgraphReward
+  answer_weight: 4.0
+  proximity_weight: 1.0
+  path_weight: 0.2
+  fail_cost: 8.0
+  fail_proximity_weight: 0.5
+  fail_path_weight: 0.1
+  edge_cost: 0.1
+  distance_temperature: 1.0
   reward_temperature: 1.0
 
-policy_objective:
-  _target_: src.weaver.objectives.SubTBLoss
-  alpha_replay: 1.0
-  subtb_lambda: 0.9
+loss_fn:
+  _target_: src.weaver.objectives.SubTBObjective
+  alpha_replay: 10.0
+  subtb_lambda: 0.8
   max_len: null
   residual_loss: huber
   huber_delta: 2.0
@@ -46,25 +52,13 @@ runner:
   _target_: src.weaver.rollout.runner.RolloutRunner
   engine:
     _target_: src.weaver.rollout.engine.RolloutEngine
-    expand_budget: 3
-  train_num_rollouts: 8
-  eval_num_rollouts: 16
+    budget: ${model.budget}
+  train_policy_rollouts: 8
+  train_replay_rollouts: 2
+  eval_rollouts: 8
   replay_source:
     _target_: src.weaver.rollout.replay.ReplaySource
-    expand_budget: ${model.runner.engine.expand_budget}
-    skip_warmup_progress: 0.05
-    skip_gap_ema_beta: 0.9
-    skip_gap_margin: 0.0
-  replay_builder:
-    _target_: src.weaver.rollout.replay.ReplayBuilder
-    expand_budget: ${model.runner.engine.expand_budget}
-  replay_schedule:
-    _target_: src.weaver.rollout.runner.ReplaySchedule
-    rows:
-      - _target_: src.weaver.rollout.runner.ReplayScheduleRow
-        until_progress: 0.0
-        policy_rollout: 1.0
-        replay_expand: 1.0
+    budget: ${model.budget}
 
 optimization:
   _target_: src.training.config.OptimizationRuntimeConfig
@@ -75,20 +69,11 @@ optimization:
     weight_decay: 0.01
     betas: [0.9, 0.999]
     no_decay_on_bias_and_norm: true
-  scheduler:
-    _target_: src.training.config.SchedulerRuntimeConfig
-    type: cosine
-    interval: step
-    warmup_ratio: 0.2
-    eta_min: 0.0
+  scheduler: null
 
 evaluation:
   _target_: src.training.config.EvalRuntimeConfig
   k_windows: [1, 2, 4, 8]
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
-  enable_calibration_metrics: false
   enable_terminal_diagnostics: false
-
-gradient_clip_val: 1.0
-gradient_clip_algorithm: norm

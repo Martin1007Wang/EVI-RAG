@@ -19,7 +19,7 @@
 
 默认配置见 `configs/model/weaver.yaml`：
 
-- `expand_budget: 3`
+- `budget: 3`
 - `train_num_rollouts: 8`
 - `eval_num_rollouts: 16`
 - `subtb_lambda: 0.9`
@@ -55,12 +55,12 @@
 
 ### FeatureEncoder
 
-`FeatureEncoder` 把节点文本、关系文本和问题 embedding 投到 Weaver model space：
+`FeatureEncoder` 把节点文本、关系文本和问题 embedding 投到 Weaver model space。输入契约是这些 semantic tensor 已经处于 upstream PLM L2 space，模型投影直接信任并消费这些向量：
 
-- 文本节点：由 upstream PLM semantic embedding 先做 L2 normalize，再通过节点投影 `Wn`。
+- 文本节点：upstream PLM L2 semantic embedding 通过节点投影 `Wn`。
 - 非文本节点：使用可学习的 `non_text_node_model` token。
-- 关系：先做 L2 normalize，再通过关系投影 `Wr`。
-- query：先做 L2 normalize，再通过 query 投影 `Wq`。
+- 关系：upstream PLM L2 semantic embedding 通过关系投影 `Wr`。
+- query：upstream PLM L2 semantic embedding 通过 query 投影 `Wq`。
 
 输出 `EncodedFeatures`：
 
@@ -105,13 +105,13 @@ A(z) = {TERMINAL} union Frontier(z)
 
 ### Frontier 合法性
 
-`State.frontier(graph, expand_budget)` 返回物理有向出边 frontier，不合成 inverse edge。对 row `i`，边 `e = (u, r, v)` 合法当且仅当：
+`State.frontier(graph, budget)` 返回物理有向出边 frontier，不合成 inverse edge。对 row `i`，边 `e = (u, r, v)` 合法当且仅当：
 
 ```text
 u in X_i
 e not in S_i
 edge_to_graph[e] == graph_ids[i]
-depth(i) < expand_budget    如果传入 expand_budget
+depth(i) < budget    如果传入 budget
 ```
 
 frontier 会对 `(row_id, edge_id)` 去重。`State.expand` 在加入边前会调用 `validate_expansion_actions`，确保每个 row 最多一个 expansion action，且 action 必须在当前 frontier 中。
@@ -146,18 +146,18 @@ step' = step + 1
 
 ```text
 query_h      = select_query_model(features, state.graph_ids)
-q_edge_h     = query attends to [src, rel, dst] for each edge
-row_state_h  = query attends to selected q_edge_h tokens + anchor tokens
+edge_h       = W_src h_src + W_rel h_rel + W_dst h_dst for each edge
+row_state_h  = query attends to selected edge_h tokens + anchor tokens
 edge_state_h = row_state_h
 ```
 
-其中 query-conditioned edge encoder 对一条边 `e = (u, r, v)` 构造 role token：
+其中线性三路 edge encoder 对一条边 `e = (u, r, v)` 做角色保持的线性投影：
 
 ```text
-[h_u + p_src, h_r + p_rel, h_v + p_dst]
+h_e = W_src h_u + W_rel h_r + W_dst h_v
 ```
 
-然后让 query 读取这 3 个 token，得到该边的 `q_edge_h`。state 没有已选边时，query 读取 anchor token；如果连 anchor 也没有，则退化到 learned empty token。
+然后 state encoder 让 query 读取 selected edge_h tokens + anchor tokens。state 没有已选边时，query 读取 anchor token；如果连 anchor 也没有，则退化到 learned empty token。
 
 ### Action Flow Head
 
@@ -166,46 +166,39 @@ edge_state_h = row_state_h
 budget embedding：
 
 ```text
-remaining = clamp(state.remaining_budget, 0, max_expand_budget)
+remaining = clamp(state.remaining_budget, 0, budget)
 budget_h  = Embedding(remaining)
 ```
 
 stop flow：
 
 ```text
-u(z) = stop_flow_head([query_h, row_state_h, budget_h])
+G(z, STOP) = stop_head([query_h, row_state_h, budget_h])
 ```
 
 对 row `z` 的第 `e` 条 frontier edge：
 
 ```text
-ref(e | z) = -log |Frontier(z)|
-adv(e | z) = edge_advantage_head([query_h, row_state_h, budget_h, edge_h])
-m(e | z)   = ref(e | z) + adv(e | z)
+prior_rel(q, e) = <query_sem, rel_sem>
+prior_dst(q, e) = 1[dst has text] * <query_sem, dst_text_sem>
+s0(q, e)        = alpha_r * prior_rel(q, e) + alpha_v * prior_dst(q, e)
+Delta(z, e)     = edge_residual_head([query_h, row_state_h, edge_h, budget_h])
+G(z, e)         = s0(q, e) + Delta(z, e)
 ```
 
-continuation gain 是 frontier edge measure 的 logsumexp：
+state flow 是 STOP 与所有 legal edge action 的统一 partition：
 
 ```text
-g(z) = logsumexp_{e in Frontier(z)} m(e | z)
+log F(z) = logsumexp(
+    G(z, STOP),
+    {G(z, e) : e in Frontier(z)}
+)
 ```
 
-edge action-flow：
+action probability：
 
 ```text
-log F(z, e) = u(z) + m(e | z)
-```
-
-continuation flow：
-
-```text
-log F_continue(z) = u(z) + g(z)
-```
-
-state flow 是 stop 与 continuation 的二项合并。实现写成 `u + softplus(g)`，等价于 `logaddexp(u, u + g)`：
-
-```text
-log F(z) = u(z) + softplus(g(z))
+log pi(a | z) = G(z, a) - log F(z)
 ```
 
 action log-prob 由 action log-flow 减去 state log-flow：
@@ -223,7 +216,7 @@ log P_F(e | z)        = log F(z, e) - log F(z)
 
 ## 6. Reward
 
-当前 reward 是 `TrueTerminalReward`，只在 terminal state 上计算。对 terminal 子图 `z = (V_z, E_z)`：
+当前 reward 是 `Reward`，只在 terminal state 上计算。对 terminal 子图 `z = (V_z, E_z)`：
 
 ```text
 answer_count(z) = |V_z intersect Y|
@@ -256,10 +249,10 @@ log_R(z) = raw_log_R(z) / reward_temperature
 ```text
 graph_ids = arange(num_graphs).repeat_interleave(rollouts_per_graph)
 state = State.initial(graph, graph_ids)
-tape = RolloutTape(R, T = expand_budget + 1)
+tape = RolloutTape(R, T = budget + 1)
 ```
 
-每个 step `t in [0, expand_budget]`：
+每个 step `t in [0, budget]`：
 
 1. 找出还未停止的 active rows。
 2. 对 active rows 取 `active_state`。
@@ -267,12 +260,12 @@ tape = RolloutTape(R, T = expand_budget + 1)
 4. 调 policy 得到 action distribution。
 5. 找 forced terminal rows：
    - 没有 frontier；或
-   - `depth >= expand_budget`。
+   - `depth >= budget`。
 6. 对非 forced rows 采样 terminal/edge action。
 7. 将 forced 与 sampled action 合并写入 `RolloutTape`。
 8. 对 expansion action 调 `state.expand` 更新全局 state。
 
-如果所有 row 都停止，提前 break。循环结束后，如果仍有 row 没记录 terminal step，则把 `terminal_step` 设为 `expand_budget`。
+如果所有 row 都停止，提前 break。循环结束后，如果仍有 row 没记录 terminal step，则把 `terminal_step` 设为 `budget`。
 
 ### RolloutResult
 
@@ -284,7 +277,7 @@ tape = RolloutTape(R, T = expand_budget + 1)
 - `behavior_action_log_prob`
 - `terminal_step`
 - `stop_reason`
-- `expand_budget`
+- `budget`
 - `terminal_state`
 
 派生 mask：
@@ -361,7 +354,7 @@ exact terminal-state oracle
 
 ## 10. Backward Policy
 
-训练 expansion event 时使用 `UniformValidPredecessorBackwardPolicy`。它不是 rollout policy，也不读 reward。
+训练 expansion event 时使用 `BackwardPolicy`。它不是 rollout policy，也不读 reward。
 
 对 child state `S'`，可删除边 `e` 是合法 predecessor 当且仅当：
 
@@ -542,13 +535,13 @@ if expansions exist:
     child_frontier = expansions.child.frontier(...)
     parent_out = policy(parent state)
     child_out = policy(child state)
-    backward_log_prob = UniformValidPredecessorBackwardPolicy(...)
+    backward_log_prob = BackwardPolicy(...)
 else:
     use empty policy output
 
 terminal_frontier = terminals.state.frontier(...)
 terminal_out = policy(terminal state)
-reward_out = TrueTerminalReward(terminal state)
+reward_out = Reward(terminal state)
 
 subtb_input = build_subtb_input(...)
 loss = SubTBLoss(subtb_input)
@@ -590,7 +583,7 @@ else:
 
 ```text
 if node_has_text:
-    node_model = Linear(L2Normalize(node_text_semantic))
+    node_model = Linear(node_text_semantic)
 else:
     node_model = learned non_text_node_model
 ```
@@ -628,13 +621,13 @@ else:
 
 - 没 anchor 的 row 初始 frontier 必为空，rollout 会 forced terminal。
 
-`State.frontier(graph, expand_budget)`：
+`State.frontier(graph, budget)`：
 
 ```text
-if expand_budget is not None and all depth >= expand_budget:
+if budget is not None and all depth >= budget:
     return empty_frontier
 
-if cached frontier exists and expand_budget is None:
+if cached frontier exists and budget is None:
     return cached frontier
 
 if no active nodes:
@@ -653,15 +646,15 @@ if no remaining edges:
 
 deduplicate (row, edge)
 
-if expand_budget is not None:
-    remove rows with depth >= expand_budget
+if budget is not None:
+    remove rows with depth >= budget
     if no remaining edges:
         return empty_frontier
 ```
 
 裁剪判断：
 
-- `expand_budget is None` 缓存分支服务 exact predecessor / replay 等无 budget frontier 调用；若统一所有 frontier 都传 budget，需要重新确认 backward predecessor 语义。
+- `budget is None` 缓存分支服务 exact predecessor / replay 等无 budget frontier 调用；若统一所有 frontier 都传 budget，需要重新确认 backward predecessor 语义。
 - `same graph` 过滤是 batch 图拼接后的安全条件，不能删。
 - `already selected` 过滤防止重复边，不能删，除非算法允许 multiset edge。
 - `deduplicate` 防止同一边由多个 active node 路径重复出现；在 directed outgoing edge by src 设计下通常重复较少，但仍是安全条件。
@@ -758,10 +751,10 @@ active_rows = rows not stopped
 if active_rows empty:
     break
 
-frontier = active_state.frontier(..., expand_budget)
+frontier = active_state.frontier(..., budget)
 policy_out = policy(active_state, frontier)
 
-forced_local = rows where no frontier OR depth >= expand_budget
+forced_local = rows where no frontier OR depth >= budget
 sample_rows = all rows except forced_local
 
 actions = []
@@ -787,7 +780,7 @@ if any terminal action:
 ```text
 terminal_step = tape.terminal_step
 if any row never stopped:
-    terminal_step = expand_budget
+    terminal_step = budget
 
 if expansion_parts or terminal_parts:
     build TrainingBatch
@@ -946,7 +939,7 @@ for each graph:
 start from initial state
 for depth in range(budget):
     for current state:
-        frontier = parent.frontier(..., expand_budget=budget)
+        frontier = parent.frontier(..., budget=budget)
         if frontier empty:
             continue
         keep local row 0 edges
@@ -990,7 +983,7 @@ if max_trajectories is set:
 
 ### 14.7 BackwardPolicy 分支
 
-`UniformValidPredecessorBackwardPolicy.log_prob`：
+`BackwardPolicy.log_prob`：
 
 ```text
 out = zeros
@@ -1031,7 +1024,7 @@ for each child row:
 
 ### 14.8 Reward 分支
 
-`TrueTerminalReward.forward`：
+`Reward.forward`：
 
 ```text
 answer_count = |active_nodes intersect target_mask|

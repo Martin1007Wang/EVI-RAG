@@ -8,7 +8,11 @@ from typing import Any
 import torch
 from omegaconf import DictConfig, ListConfig
 
-from src.data.artifacts import ResolvedMaterialization, load_materialization_manifest
+from src.data.artifacts import (
+    MaterializationArtifact,
+    load_materialization_artifact,
+)
+from src.data.preprocess.catalog import Catalog, DebugLookup, load_question_text_by_sample_id
 from src.data.tensor_table import read_table, validate_file
 
 _EMBEDDING_NORM_ATOL = 1.0e-3
@@ -17,9 +21,7 @@ _STALE_MATERIALIZED_PATH_KEYS = frozenset(
         "lmdb_dir",
         "entity_text_semantic_table",
         "relation_semantic_table",
-        "entity_metadata_path",
-        "entity_catalog_path",
-        "relation_catalog_path",
+        "catalog_path",
     }
 )
 
@@ -29,16 +31,29 @@ class ModelResources:
     entity_text_semantic_table: torch.Tensor
     text_row_by_entity_id: torch.Tensor
     relation_semantic_table: torch.Tensor
+    debug_lookup: DebugLookup | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class TrainingDataConfig:
-    metadata_dir: Path
-    materialization: ResolvedMaterialization
-    model_resources: ModelResources
-    train_split: str
-    validation_split: str
-    test_split: str
+class SplitPlan:
+    train: str
+    validation: str
+    test: str
+
+    def split_names(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.train,
+                    self.validation,
+                    self.test,
+                )
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LoaderConfig:
     batch_size: int
     eval_batch_size: int
     num_workers: int
@@ -46,21 +61,30 @@ class TrainingDataConfig:
     pin_memory: bool
     train_shuffle: bool
     drop_last: bool
-    eval_drop_last: bool
     lmdb_readahead: bool
     max_readers: int
+    train_indices: tuple[int, ...] | None = None
+    validation_indices: tuple[int, ...] | None = None
+    test_indices: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalDataConfig:
+    materialization: MaterializationArtifact
+    splits: SplitPlan
+    loader: LoaderConfig
 
 
 @dataclass(frozen=True, slots=True)
 class RolloutRuntimeConfig:
-    expand_budget: int
+    budget: int
     train_num_rollout: int
     eval_num_rollout: int
     train_chunk_size: int
     eval_chunk_size: int
 
     def __post_init__(self) -> None:
-        expand_budget = non_negative_int(self.expand_budget, "expand_budget")
+        budget = non_negative_int(self.budget, "budget")
         train_num_rollout = positive_int(
             self.train_num_rollout,
             "train_num_rollout",
@@ -84,7 +108,7 @@ class RolloutRuntimeConfig:
         if eval_chunk_size > eval_num_rollout:
             raise ValueError("eval_chunk_size cannot exceed eval_num_rollout: " f"{eval_chunk_size} > {eval_num_rollout}.")
 
-        object.__setattr__(self, "expand_budget", expand_budget)
+        object.__setattr__(self, "budget", budget)
         object.__setattr__(self, "train_num_rollout", train_num_rollout)
         object.__setattr__(self, "eval_num_rollout", eval_num_rollout)
         object.__setattr__(self, "train_chunk_size", train_chunk_size)
@@ -156,7 +180,6 @@ class EvalRuntimeConfig:
     exclude_anchors_from_retrieved: bool
     use_reachable_targets: bool
     k_windows: tuple[int, ...] | list[int] = (1, 2, 4, 8)
-    enable_calibration_metrics: bool = False
     enable_terminal_diagnostics: bool = False
 
     def __post_init__(self) -> None:
@@ -180,11 +203,6 @@ class EvalRuntimeConfig:
             self,
             "use_reachable_targets",
             boolean(self.use_reachable_targets, "use_reachable_targets"),
-        )
-        object.__setattr__(
-            self,
-            "enable_calibration_metrics",
-            boolean(self.enable_calibration_metrics, "enable_calibration_metrics"),
         )
         object.__setattr__(
             self,
@@ -308,15 +326,14 @@ class OptimizationRuntimeConfig:
             raise TypeError("optimization.scheduler must be SchedulerRuntimeConfig or None, " f"got {type(self.scheduler).__name__}.")
 
 
-def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
+def build_retrieval_data_config(cfg: DictConfig) -> RetrievalDataConfig:
     dataset_cfg = _mapping(cfg.get("dataset"), "dataset")
     datamodule_cfg = _mapping(cfg.get("datamodule"), "datamodule")
 
     metadata_dir = _dataset_path(dataset_cfg, "metadata_dir")
-    manifest = load_materialization_manifest(metadata_dir)
-    if manifest is None:
+    materialization = load_materialization_artifact(metadata_dir)
+    if materialization is None:
         raise FileNotFoundError("Materialization manifest not found. Re-run preprocessing to rebuild " f"materialized data under {metadata_dir}.")
-    materialization = manifest.resolve()
 
     train_split = _split_name(datamodule_cfg.get("splits"), "train", default="train")
     validation_split = _split_name(
@@ -325,36 +342,6 @@ def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
         default="validation",
     )
     test_split = _split_name(datamodule_cfg.get("splits"), "test", default="test")
-
-    for split in dict.fromkeys((train_split, validation_split, test_split)):
-        paths = materialization.require_split(split)
-        _require_dir(paths.lmdb, f"{split} LMDB")
-        _require_dir(paths.index, f"{split} split index")
-        validate_file(paths.question_embeddings)
-        if paths.question_embeddings.rows != int(paths.num_samples):
-            raise ValueError(f"{split} question embedding rows mismatch: " f"{paths.question_embeddings.rows} != {int(paths.num_samples)}.")
-
-    validate_file(materialization.entity_text_semantic_table)
-    validate_file(materialization.relation_semantic_table)
-    _require_file(materialization.text_row_by_entity_id, "text_row_by_entity_id")
-    _require_file(materialization.entity_metadata, "entity_metadata")
-
-    entity_text_semantic_table = read_table(
-        materialization.entity_text_semantic_table,
-    ).to(dtype=torch.float32)
-    relation_semantic_table = read_table(
-        materialization.relation_semantic_table,
-    ).to(dtype=torch.float32)
-    text_row_by_entity_id = _load_tensor_artifact(
-        path=materialization.text_row_by_entity_id,
-        name="text_row_by_entity_id",
-    ).to(dtype=torch.long)
-
-    model_resources = validate_model_resources(
-        entity_text_semantic_table=entity_text_semantic_table,
-        text_row_by_entity_id=text_row_by_entity_id,
-        relation_semantic_table=relation_semantic_table,
-    )
 
     batch_size = positive_int(
         datamodule_cfg.get("batch_size", 1),
@@ -377,13 +364,13 @@ def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
         "datamodule.max_readers",
     )
 
-    return TrainingDataConfig(
-        metadata_dir=metadata_dir,
-        materialization=materialization,
-        model_resources=model_resources,
-        train_split=train_split,
-        validation_split=validation_split,
-        test_split=test_split,
+    split_plan = SplitPlan(
+        train=train_split,
+        validation=validation_split,
+        test=test_split,
+    )
+
+    loader = LoaderConfig(
         batch_size=batch_size,
         eval_batch_size=eval_batch_size,
         num_workers=num_workers,
@@ -400,16 +387,92 @@ def build_training_data_config(cfg: DictConfig) -> TrainingDataConfig:
             datamodule_cfg.get("drop_last", False),
             "datamodule.drop_last",
         ),
-        eval_drop_last=boolean(
-            datamodule_cfg.get("eval_drop_last", False),
-            "datamodule.eval_drop_last",
-        ),
         lmdb_readahead=boolean(
             datamodule_cfg.get("lmdb_readahead", False),
             "datamodule.lmdb_readahead",
         ),
         max_readers=max_readers,
+        train_indices=_optional_index_tuple(
+            datamodule_cfg.get("train_indices"),
+            "datamodule.train_indices",
+        ),
+        validation_indices=_optional_index_tuple(
+            datamodule_cfg.get("validation_indices"),
+            "datamodule.validation_indices",
+        ),
+        test_indices=_optional_index_tuple(
+            datamodule_cfg.get("test_indices"),
+            "datamodule.test_indices",
+        ),
     )
+
+    return RetrievalDataConfig(
+        materialization=materialization,
+        splits=split_plan,
+        loader=loader,
+    )
+
+
+def validate_retrieval_data_config(
+    data_config: RetrievalDataConfig,
+    *,
+    validate_question_embeddings: bool = True,
+    splits: tuple[str, ...] | list[str] | None = None,
+) -> None:
+    split_names = data_config.splits.split_names() if splits is None else tuple(dict.fromkeys(splits))
+
+    for split in split_names:
+        paths = data_config.materialization.require_split(split)
+        _require_dir(paths.lmdb, f"{split} LMDB")
+
+        if not validate_question_embeddings:
+            continue
+
+        validate_file(paths.question_embeddings)
+        if paths.question_embeddings.rows != int(paths.num_samples):
+            raise ValueError(f"{split} question embedding rows mismatch: " f"{paths.question_embeddings.rows} != {int(paths.num_samples)}.")
+
+
+def load_model_resources(
+    materialization: MaterializationArtifact,
+) -> ModelResources:
+    # validate_file(materialization.entity_text_semantic_table)
+    # validate_file(materialization.relation_semantic_table)
+    # _require_file(materialization.catalog, "catalog")
+
+    entity_text_semantic_table = read_table(
+        materialization.entity_text_semantic_table,
+    )
+    relation_semantic_table = read_table(
+        materialization.relation_semantic_table,
+    )
+    catalog = Catalog.load(materialization.catalog)
+
+    return validate_model_resources(
+        entity_text_semantic_table=entity_text_semantic_table,
+        text_row_by_entity_id=catalog.entity_text_row_by_entity_id.long().contiguous(),
+        relation_semantic_table=relation_semantic_table,
+        debug_lookup=DebugLookup(
+            catalog=catalog,
+            question_text_by_sample_id=_load_question_text_by_sample_id(materialization),
+        ),
+    )
+
+
+def _optional_index_tuple(
+    value: Any,
+    name: str,
+) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be a sequence of integers, got {type(value).__name__}.")
+    if not isinstance(value, (list, tuple, ListConfig)):
+        raise TypeError(f"{name} must be a sequence of integers or null, got {type(value).__name__}.")
+    out = tuple(non_negative_int(item, name) for item in value)
+    if not out:
+        raise ValueError(f"{name} must not be empty when provided.")
+    return out
 
 
 def validate_model_resources(
@@ -417,6 +480,7 @@ def validate_model_resources(
     entity_text_semantic_table: torch.Tensor,
     text_row_by_entity_id: torch.Tensor,
     relation_semantic_table: torch.Tensor,
+    debug_lookup: DebugLookup | None = None,
 ) -> ModelResources:
     if entity_text_semantic_table.ndim != 2:
         raise ValueError("entity_text_semantic_table must be 2D, " f"got shape={tuple(entity_text_semantic_table.shape)}.")
@@ -430,7 +494,9 @@ def validate_model_resources(
     entity_dim = int(entity_text_semantic_table.size(1))
     relation_dim = int(relation_semantic_table.size(1))
     if entity_dim != relation_dim:
-        raise ValueError("Embedding dimension mismatch: " f"entity_text_semantic_table dim={entity_dim}, " f"relation_semantic_table dim={relation_dim}.")
+        raise ValueError(
+            "Embedding dimension mismatch: " f"entity_text_semantic_table dim={entity_dim}, " f"relation_semantic_table dim={relation_dim}."
+        )
 
     _validate_l2_normalized_rows(
         entity_text_semantic_table,
@@ -459,7 +525,17 @@ def validate_model_resources(
         entity_text_semantic_table=entity_text_semantic_table.contiguous(),
         text_row_by_entity_id=text_row_by_entity_id.contiguous(),
         relation_semantic_table=relation_semantic_table.contiguous(),
+        debug_lookup=debug_lookup,
     )
+
+
+def _load_question_text_by_sample_id(
+    materialization: MaterializationArtifact,
+) -> dict[str, str] | None:
+    lookup_path = materialization.question_texts
+    if lookup_path is not None and lookup_path.exists():
+        return load_question_text_by_sample_id(lookup_path)
+    return None
 
 
 def _dataset_path(dataset_cfg: Mapping[str, Any], key: str) -> Path:
@@ -476,7 +552,7 @@ def _reject_stale_materialized_path_keys(paths: Mapping[str, Any]) -> None:
     if stale_keys:
         formatted = ", ".join(f"dataset.paths.{key}" for key in stale_keys)
         raise KeyError(
-            "Training reads materialized artifacts only through "
+            "Retrieval data config reads materialized artifacts only through "
             "dataset.paths.metadata_dir/materialization_manifest.json; remove stale "
             f"path key(s): {formatted}."
         )
@@ -518,30 +594,6 @@ def _require_file(path: Path, name: str) -> None:
         raise FileNotFoundError(f"{name} file does not exist: {path}")
     if not path.is_file():
         raise FileNotFoundError(f"{name} path is not a file: {path}")
-
-
-def _load_artifact(
-    *,
-    path: Path,
-    name: str,
-) -> Any:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load {name} artifact from {path}") from exc
-
-
-def _load_tensor_artifact(
-    *,
-    path: Path,
-    name: str,
-) -> torch.Tensor:
-    artifact = _load_artifact(path=path, name=name)
-    if not isinstance(artifact, torch.Tensor):
-        raise TypeError(f"{name} must be a tensor artifact, got {type(artifact).__name__}: {path}")
-    return artifact
 
 
 def _validate_l2_normalized_rows(
@@ -675,26 +727,30 @@ def betas_value(value: Any, name: str) -> tuple[float, float]:
 
 __all__ = [
     "EvalRuntimeConfig",
+    "LoaderConfig",
     "LossRuntimeConfig",
     "ModelResources",
     "OptimizationRuntimeConfig",
     "OptimizerRuntimeConfig",
+    "RetrievalDataConfig",
     "RewardRuntimeConfig",
     "RolloutRuntimeConfig",
     "SchedulerRuntimeConfig",
-    "TrainingDataConfig",
+    "SplitPlan",
     "TrainingRuntimeConfig",
     "betas_value",
     "boolean",
-    "build_training_data_config",
+    "build_retrieval_data_config",
     "config_value",
     "float_value",
     "int_value",
+    "load_model_resources",
     "non_negative_float",
     "non_negative_int",
     "one_of",
     "positive_float",
     "positive_int",
     "ratio",
+    "validate_retrieval_data_config",
     "validate_model_resources",
 ]

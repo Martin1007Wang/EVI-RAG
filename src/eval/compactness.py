@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import torch
 
 from src.data.schema import RetrievalBatch
@@ -9,8 +7,9 @@ from src.eval.targets import eval_target_node_mask
 from src.graph.masks import anchor_node_mask
 from src.graph.ops import prune_to_protected_core
 from src.utils.scatter import scatter_sum
-from src.weaver.rollout.result import RolloutResult
-from src.weaver.rollout.subgraph import SubgraphReconstructor
+from src.weaver.context import GraphContext
+from src.weaver.rollout.subgraph import stacked_subgraph_masks
+from src.weaver.rollout.trajectory import TrajectoryBatch
 
 
 def default_eval_device() -> torch.device:
@@ -22,7 +21,7 @@ def batch_num_graphs(batch: RetrievalBatch) -> int:
 
 
 def compute_compactness_expectations(
-    rollouts: Sequence[RolloutResult],
+    rollouts: TrajectoryBatch,
     batch: RetrievalBatch,
     *,
     include_dangling: bool = False,
@@ -40,7 +39,12 @@ def compute_compactness_expectations(
     """
     device = device or default_eval_device()
 
-    node_masks, edge_masks = SubgraphReconstructor(batch, device=device).stack(rollouts)
+    node_masks, edge_masks = stacked_subgraph_masks(
+        rollouts,
+        GraphContext.from_batch(batch),
+        batch,
+        device=device,
+    )
 
     metrics = compactness_from_masks(
         node_masks=node_masks,

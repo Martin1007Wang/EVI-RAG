@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.runtime import load_project_env
 from src.training.checkpoint import load_checkpoint_weights
-from src.training.factory import build_datamodule, build_model, build_trainer, setup_datamodule
+from src.training.factory import build_model, build_trainer, prepare_training_components
 
 PROJECT_ROOT = load_project_env(__file__)
 
@@ -64,11 +64,12 @@ def main(cfg: DictConfig) -> None:
     if seed is not None:
         seed_everything(int(seed), workers=True)
 
-    datamodule = build_datamodule(cfg)
-    resources = setup_datamodule(
-        datamodule,
-        stage="validate" if run_validate else "test",
+    stages = tuple(
+        stage
+        for stage, enabled in (("validate", run_validate), ("test", run_test))
+        if enabled
     )
+    datamodule, resources = prepare_training_components(cfg, stage=stages)
 
     model = build_model(cfg, resources)
 
