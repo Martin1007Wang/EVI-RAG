@@ -20,7 +20,7 @@ from src.weaver.rollout.trajectory import (
     SRC_POLICY,
     TrajectoryBatch,
 )
-from src.weaver.state import StateBatch
+from src.weaver.state import StateBatch, canonicalize_state_batch
 
 Tensor = torch.Tensor
 
@@ -184,11 +184,13 @@ def terminal_state_from_trajectories(
     terminal selected-edge representation.
     """
 
-    return StateBatch(
-        graph_ids=trajectories.graph_ids,
-        edge_ids=trajectories.edge_ids,
-        edge_count=trajectories.edge_count,
-        budget=int(trajectories.budget),
+    return canonicalize_state_batch(
+        StateBatch(
+            graph_ids=trajectories.graph_ids,
+            edge_ids=trajectories.edge_ids,
+            edge_count=trajectories.edge_count,
+            budget=int(trajectories.budget),
+        )
     )
 
 

@@ -26,7 +26,7 @@ class ForwardPolicy(nn.Module):
     Unified action-flow policy over STOP plus legal expansion edges.
 
     Contract:
-    - StateBatch rows are ordered-prefix trajectory states.
+    - StateBatch rows are canonical selected-edge-set states.
     - ActionSpace contains only legal EXPAND actions.
     - STOP is not stored as a fake edge.
     - Policy does not enumerate, sort, filter, or repair ActionSpace.

@@ -7,7 +7,7 @@ from src.weaver.reward import EvidenceSubgraphReward, compute_zero_gain_edge_cou
 from src.weaver.state import StateBatch
 
 
-def test_zero_gain_edge_count_uses_trajectory_order() -> None:
+def test_zero_gain_edge_count_is_order_invariant() -> None:
     graph = _graph()
     target = _target()
     state = StateBatch(
@@ -23,7 +23,20 @@ def test_zero_gain_edge_count_uses_trajectory_order() -> None:
         target_mask=target.target_mask,
     )
 
+    reversed_state = StateBatch(
+        graph_ids=torch.tensor([0]),
+        edge_ids=torch.tensor([[1, 0]]),
+        edge_count=torch.tensor([2]),
+        budget=2,
+    )
+    reversed_zero_gain = compute_zero_gain_edge_count(
+        state=reversed_state,
+        graph=graph,
+        target_mask=target.target_mask,
+    )
+
     assert torch.allclose(zero_gain, torch.tensor([1.0]))
+    assert torch.allclose(reversed_zero_gain, torch.tensor([1.0]))
 
 
 def test_redundant_edge_cost_penalizes_zero_gain_edges() -> None:

@@ -302,20 +302,23 @@ def selected_edge_pairs(state: StateBatch) -> tuple[Tensor, Tensor]:
         )
         return empty, empty
 
-    flat_edge_ids = state.edge_ids.reshape(-1)
+    steps = torch.arange(
+        int(budget),
+        dtype=torch.long,
+        device=state.device,
+    ).view(1, int(budget))
+    valid = steps.lt(state.edge_count.view(int(num_states), 1))
 
-    flat_state_ids = torch.repeat_interleave(
+    state_ids = torch.repeat_interleave(
         torch.arange(
             int(num_states),
             dtype=torch.long,
             device=state.device,
         ),
-        int(budget),
+        state.edge_count.to(dtype=torch.long),
     )
 
-    valid = flat_edge_ids.ge(0)
-
-    return flat_state_ids[valid], flat_edge_ids[valid]
+    return state_ids, state.edge_ids[valid]
 
 
 __all__ = [

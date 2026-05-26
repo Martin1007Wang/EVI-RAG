@@ -62,7 +62,7 @@ class TerminalPrefixBatch:
 @dataclass(frozen=True, slots=True)
 class PrefixBatch:
     """
-    Loss-facing ordered-prefix view derived from trajectory records.
+    Loss-facing transition view derived from ordered trajectory records.
 
     This object is not a rollout record. It exists only to feed objective
     construction.
@@ -88,10 +88,10 @@ def build_prefix_batch(
     trajectories: TrajectoryBatch,
 ) -> PrefixBatch:
     """
-    Reconstruct ordered prefix states from completed trajectories.
+    Reconstruct canonical transition states from completed trajectories.
 
     Legality is owned by rollout/replay construction. This function only
-    replays recorded physical edge ids into StateBatch prefixes.
+    replays recorded physical edge ids into StateBatch states.
     """
 
     device = trajectories.device

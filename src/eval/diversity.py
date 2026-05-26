@@ -9,7 +9,7 @@ from src.eval.aggregation import grouped_sample_ids
 from src.eval.targets import eval_target_node_mask
 from src.weaver.context import GraphContext
 from src.weaver.rollout.subgraph import stacked_subgraph_masks
-from src.weaver.rollout.trajectory import TrajectoryBatch
+from src.weaver.rollout.trajectory import POLICY_STOP, TrajectoryBatch
 
 
 def default_eval_device() -> torch.device:
@@ -167,7 +167,8 @@ def terminal_f1_std(rollouts: TrajectoryBatch) -> float:
     if rollouts.num_trajectories == 0:
         return 0.0
 
-    values = rollouts.stop_logp[rollouts.policy_stop].detach().to(dtype=torch.float32)
+    policy_stop = rollouts.stop_reason.eq(int(POLICY_STOP))
+    values = rollouts.stop_logp[policy_stop].detach().to(dtype=torch.float32)
 
     if values.numel() <= 1:
         return 0.0
@@ -200,7 +201,7 @@ def _selected_edge_set_for_row(*, rollouts: TrajectoryBatch, row: int) -> tuple[
     selected_edge_ids = rollouts.edge_ids[int(row)]
     valid_steps = torch.arange(
         selected_edge_ids.numel(), device=selected_edge_ids.device
-    ).lt(rollouts.num_edges[int(row)])
+    ).lt(rollouts.edge_count[int(row)])
     edge_ids = selected_edge_ids[valid_steps & selected_edge_ids.ge(0)]
     return tuple(sorted(int(edge_id) for edge_id in edge_ids.tolist()))
 

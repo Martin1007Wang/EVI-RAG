@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.state import ExpansionBatch, StateBatch
+from src.weaver.state import StateBatch, legal_state_mask, remove_selected_edge
 
 Tensor = torch.Tensor
 
@@ -615,10 +615,10 @@ def compute_zero_gain_edge_count(
     target_mask: Tensor,
 ) -> Tensor:
     """
-    Count selected edges that do not increase covered target count at selection time.
+    Count order-invariant redundant selected edges.
 
-    StateBatch stores selected edges in trajectory order, so this is a prefix-time
-    redundancy proxy rather than a global minimal-subgraph computation.
+    A selected edge is redundant when removing it leaves a legal canonical state
+    and does not reduce covered target count.
     """
 
     zero_gain = torch.zeros(
@@ -630,37 +630,31 @@ def compute_zero_gain_edge_count(
     if state.num_states == 0 or int(state.budget) == 0:
         return zero_gain
 
-    current = StateBatch.initial(
-        graph_ids=state.graph_ids,
-        budget=int(state.budget),
-    )
-    current_answers = count_answers_in_state(
-        state=current,
+    full_answers = count_answers_in_state(
+        state=state,
         graph=graph,
         target_mask=target_mask,
     ).to(dtype=torch.float)
 
-    for step in range(int(state.budget)):
-        rows = state.edge_count.gt(step).nonzero(as_tuple=False).flatten()
-        if int(rows.numel()) == 0:
+    for row in range(state.num_states):
+        count = int(state.edge_count[row].item())
+        if count <= 0:
             continue
-
-        edge_ids = state.edge_ids.index_select(0, rows)[:, step]
-        current = current.advance(
-            ExpansionBatch(
-                state_ids=rows,
-                edge_ids=edge_ids,
+        for edge_id in state.edge_ids[row, :count].tolist():
+            parent = remove_selected_edge(
+                state=state,
+                row=row,
+                edge_id=int(edge_id),
             )
-        )
-        next_answers = count_answers_in_state(
-            state=current,
-            graph=graph,
-            target_mask=target_mask,
-        ).to(dtype=torch.float)
-
-        gain = next_answers.index_select(0, rows) - current_answers.index_select(0, rows)
-        zero_gain[rows] = zero_gain.index_select(0, rows) + gain.le(0.0).to(dtype=torch.float)
-        current_answers = next_answers
+            if not bool(legal_state_mask(state=parent, graph=graph)[0]):
+                continue
+            parent_answers = count_answers_in_state(
+                state=parent,
+                graph=graph,
+                target_mask=target_mask,
+            ).to(dtype=torch.float)
+            if bool(parent_answers[0].ge(full_answers[row])):
+                zero_gain[row] = zero_gain[row] + 1.0
 
     return zero_gain
 

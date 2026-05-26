@@ -5,7 +5,7 @@ import torch
 from src.weaver.context import DirectedAdjacencyIndex, GraphContext, TargetContext
 from src.weaver.objectives.prefix import ExpansionPrefixBatch, PrefixBatch, TerminalPrefixBatch
 from src.weaver.objectives.subtb import (
-    _deduplicate_ordered_states,
+    _deduplicate_canonical_states,
     build_subtb_input_from_prefix,
 )
 from src.weaver.policy.output import PolicyOutput
@@ -14,7 +14,7 @@ from src.weaver.rollout.trajectory import BUDGET, POLICY_STOP, SRC_POLICY
 from src.weaver.state import ActionSpace, ExpansionBatch, StateBatch
 
 
-def test_ordered_state_dedup_preserves_edge_order() -> None:
+def test_canonical_state_dedup_ignores_edge_order() -> None:
     state = StateBatch(
         graph_ids=torch.tensor([0, 0, 0]),
         edge_ids=torch.tensor(
@@ -29,11 +29,11 @@ def test_ordered_state_dedup_preserves_edge_order() -> None:
         budget=2,
     )
 
-    unique, inverse = _deduplicate_ordered_states(state)
+    unique, inverse = _deduplicate_canonical_states(state)
 
-    assert unique.num_states == 2
-    assert inverse.tolist() == [0, 0, 1]
-    assert unique.edge_ids.tolist() == [[0, 1], [1, 0]]
+    assert unique.num_states == 1
+    assert inverse.tolist() == [0, 0, 0]
+    assert unique.edge_ids.tolist() == [[0, 1]]
 
 
 def test_build_subtb_input_deduplicates_policy_and_terminal_reward() -> None:

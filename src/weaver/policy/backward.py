@@ -1,10 +1,72 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
-from src.weaver.state import StateBatch
+from src.weaver.context import GraphContext
+from src.weaver.state import (
+    StateBatch,
+    legal_state_mask,
+    remove_selected_edge,
+    state_rows_equal,
+)
 
 Tensor = torch.Tensor
+
+
+def canonical_backward_log_prob(
+    *,
+    parent_state: StateBatch,
+    child_state: StateBatch,
+    action_edge_ids: Tensor,
+    graph_context: GraphContext,
+    validate: bool = False,
+) -> Tensor:
+    """
+    Uniform backward kernel over valid canonical predecessor states.
+
+    For canonical edge-set states, a child can have multiple legal parents:
+    remove any selected edge whose removal leaves an anchor-reachable state and
+    whose edge is legal in that parent's forward frontier.
+    """
+
+    action_edge_ids = action_edge_ids.to(
+        device=child_state.device,
+        dtype=torch.long,
+    ).view(-1)
+
+    _check_batch_shapes(
+        parent_state=parent_state,
+        child_state=child_state,
+        action_edge_ids=action_edge_ids,
+    )
+
+    out = torch.empty(
+        int(action_edge_ids.numel()),
+        dtype=torch.float32,
+        device=child_state.device,
+    )
+
+    for row in range(int(action_edge_ids.numel())):
+        parents = valid_predecessor_count(
+            child_state=child_state,
+            graph_context=graph_context,
+            row=row,
+        )
+        if parents <= 0:
+            raise ValueError("child_state has no valid canonical predecessors.")
+        out[row] = -math.log(float(parents))
+
+    if validate:
+        validate_canonical_transitions(
+            parent_state=parent_state,
+            child_state=child_state,
+            action_edge_ids=action_edge_ids,
+            graph_context=graph_context,
+        )
+
+    return out
 
 
 def deterministic_backward_log_prob(
@@ -12,174 +74,145 @@ def deterministic_backward_log_prob(
     parent_state: StateBatch,
     child_state: StateBatch,
     action_edge_ids: Tensor,
+    graph_context: GraphContext,
     validate: bool = False,
 ) -> Tensor:
     """
-    Deterministic backward kernel for ordered-prefix states.
-
-    Forward expansion:
-
-        parent.edge_ids[row, :k]
-        -- action e -->
-        child.edge_ids[row, :k + 1]
-
-    Since StateBatch stores ordered prefixes, every expansion child has exactly
-    one predecessor: remove the last appended edge.
-
-    Therefore:
-
-        log P_B(parent | child) = 0
-
-    This function:
-    - has no parameters;
-    - is not used for rollout inference;
-    - does not read rewards;
-    - does not enumerate removable edges;
-    - does not model unordered-subgraph predecessors.
+    Backward-compatible name for the canonical uniform backward kernel.
     """
 
-    action_edge_ids = action_edge_ids.to(
-        device=child_state.device,
-        dtype=torch.long,
-    ).view(-1)
-
-    if validate:
-        validate_ordered_prefix_transitions(
-            parent_state=parent_state,
-            child_state=child_state,
-            action_edge_ids=action_edge_ids,
-        )
-
-    return torch.zeros(
-        int(action_edge_ids.numel()),
-        dtype=torch.float32,
-        device=child_state.device,
+    return canonical_backward_log_prob(
+        parent_state=parent_state,
+        child_state=child_state,
+        action_edge_ids=action_edge_ids,
+        graph_context=graph_context,
+        validate=validate,
     )
 
 
-def validate_ordered_prefix_transitions(
+def valid_predecessor_count(
+    *,
+    child_state: StateBatch,
+    graph_context: GraphContext,
+    row: int,
+) -> int:
+    count = int(child_state.edge_count[int(row)].item())
+    if count <= 0:
+        return 0
+
+    total = 0
+    selected = child_state.edge_ids[int(row), :count]
+    for edge_id in selected.tolist():
+        parent = remove_selected_edge(
+            state=child_state,
+            row=int(row),
+            edge_id=int(edge_id),
+        )
+        if not bool(legal_state_mask(state=parent, graph=graph_context)[0]):
+            continue
+        if _edge_is_forward_legal(
+            parent=parent,
+            edge_id=int(edge_id),
+            graph_context=graph_context,
+        ):
+            total += 1
+    return total
+
+
+def validate_canonical_transitions(
+    *,
+    parent_state: StateBatch,
+    child_state: StateBatch,
+    action_edge_ids: Tensor,
+    graph_context: GraphContext,
+) -> None:
+    _check_batch_shapes(
+        parent_state=parent_state,
+        child_state=child_state,
+        action_edge_ids=action_edge_ids,
+    )
+
+    if not bool(legal_state_mask(state=parent_state, graph=graph_context).all()):
+        raise ValueError("parent_state contains illegal canonical states.")
+    if not bool(legal_state_mask(state=child_state, graph=graph_context).all()):
+        raise ValueError("child_state contains illegal canonical states.")
+
+    for row, action_edge_id in enumerate(action_edge_ids.tolist()):
+        action_edge_id = int(action_edge_id)
+        if action_edge_id < 0:
+            _validate_terminal_row(
+                parent_state=parent_state,
+                child_state=child_state,
+                row=row,
+            )
+            continue
+
+        expected_parent = remove_selected_edge(
+            state=child_state,
+            row=row,
+            edge_id=action_edge_id,
+        )
+        if not state_rows_equal(
+            left=parent_state,
+            left_row=row,
+            right=expected_parent,
+            right_row=0,
+        ):
+            raise ValueError("Expansion parent must equal child minus action edge.")
+        if not _edge_is_forward_legal(
+            parent=expected_parent,
+            edge_id=action_edge_id,
+            graph_context=graph_context,
+        ):
+            raise ValueError("Expansion action is not legal in the canonical parent frontier.")
+
+
+def _check_batch_shapes(
     *,
     parent_state: StateBatch,
     child_state: StateBatch,
     action_edge_ids: Tensor,
 ) -> None:
-    """
-    Debug-only validation.
-
-    Expansion rows must satisfy:
-
-        child = parent + action_edge_id
-
-    Terminal diagnostic rows may use negative action ids and must not change
-    the prefix.
-    """
-
-    action_edge_ids = action_edge_ids.to(
-        device=child_state.device,
-        dtype=torch.long,
-    ).view(-1)
-
     if int(parent_state.num_states) != int(child_state.num_states):
         raise ValueError("parent_state and child_state must have the same num_states.")
-
     if int(action_edge_ids.numel()) != int(child_state.num_states):
         raise ValueError("action_edge_ids must match state rows.")
-
     if int(parent_state.budget) != int(child_state.budget):
         raise ValueError("parent_state and child_state must have the same budget.")
-
     if not bool(parent_state.graph_ids.eq(child_state.graph_ids).all()):
         raise ValueError("parent_state and child_state must have identical graph_ids.")
 
-    expand_rows = action_edge_ids.ge(0).nonzero(as_tuple=False).flatten()
-    terminal_rows = action_edge_ids.lt(0).nonzero(as_tuple=False).flatten()
 
-    if int(expand_rows.numel()) > 0:
-        _validate_expansion_rows(
-            parent_state=parent_state,
-            child_state=child_state,
-            rows=expand_rows,
-            action_edge_ids=action_edge_ids,
-        )
-
-    if int(terminal_rows.numel()) > 0:
-        _validate_terminal_rows(
-            parent_state=parent_state,
-            child_state=child_state,
-            rows=terminal_rows,
-        )
-
-
-def _validate_expansion_rows(
+def _validate_terminal_row(
     *,
     parent_state: StateBatch,
     child_state: StateBatch,
-    rows: Tensor,
-    action_edge_ids: Tensor,
+    row: int,
 ) -> None:
-    parent_count = parent_state.edge_count.index_select(0, rows)
-    child_count = child_state.edge_count.index_select(0, rows)
-
-    if not bool(child_count.eq(parent_count + 1).all()):
-        raise ValueError("Expansion child edge_count must equal parent edge_count + 1.")
-
-    appended_edges = child_state.edge_ids[rows, parent_count]
-    selected_actions = action_edge_ids.index_select(0, rows)
-
-    if not bool(appended_edges.eq(selected_actions).all()):
-        raise ValueError("Expansion action_edge_ids must equal appended child edge.")
-
-    if not _prefix_equal(
-        left=parent_state.edge_ids.index_select(0, rows),
-        right=child_state.edge_ids.index_select(0, rows),
-        lengths=parent_count,
+    if not state_rows_equal(
+        left=parent_state,
+        left_row=int(row),
+        right=child_state,
+        right_row=int(row),
     ):
-        raise ValueError("Expansion parent prefix must match child prefix.")
+        raise ValueError("Terminal rows must not change selected edge set.")
 
 
-def _validate_terminal_rows(
+def _edge_is_forward_legal(
     *,
-    parent_state: StateBatch,
-    child_state: StateBatch,
-    rows: Tensor,
-) -> None:
-    parent_count = parent_state.edge_count.index_select(0, rows)
-    child_count = child_state.edge_count.index_select(0, rows)
-
-    if not bool(parent_count.eq(child_count).all()):
-        raise ValueError("Terminal rows must not change edge_count.")
-
-    if not _prefix_equal(
-        left=parent_state.edge_ids.index_select(0, rows),
-        right=child_state.edge_ids.index_select(0, rows),
-        lengths=parent_count,
-    ):
-        raise ValueError("Terminal rows must not change selected edge prefix.")
-
-
-def _prefix_equal(
-    *,
-    left: Tensor,
-    right: Tensor,
-    lengths: Tensor,
+    parent: StateBatch,
+    edge_id: int,
+    graph_context: GraphContext,
 ) -> bool:
-    if left.shape != right.shape:
+    action_space = parent.action_space(graph_context)
+    if int(action_space.num_expansions) == 0:
         return False
-
-    if int(left.numel()) == 0:
-        return True
-
-    steps = torch.arange(
-        int(left.size(1)),
-        dtype=torch.long,
-        device=left.device,
-    ).unsqueeze(0)
-
-    valid = steps.lt(lengths.view(-1, 1))
-    return bool(left[valid].eq(right[valid]).all())
+    return bool(action_space.expand_edge_ids.eq(int(edge_id)).any())
 
 
 __all__ = [
+    "canonical_backward_log_prob",
     "deterministic_backward_log_prob",
-    "validate_ordered_prefix_transitions",
+    "valid_predecessor_count",
+    "validate_canonical_transitions",
 ]

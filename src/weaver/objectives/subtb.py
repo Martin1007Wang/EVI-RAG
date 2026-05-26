@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from src.weaver.policy import PolicyOutput
-from src.weaver.policy.backward import deterministic_backward_log_prob
+from src.weaver.policy.backward import canonical_backward_log_prob
 from src.weaver.rollout.trajectory import (
     BUDGET,
     NO_FRONTIER,
@@ -336,7 +336,7 @@ def prefix_terminal_objective(
             per_unit_loss=None,
         )
 
-    unique_state, inverse = _deduplicate_ordered_states(state)
+    unique_state, inverse = _deduplicate_canonical_states(state)
     action_space = unique_state.action_space(graph_context)
     policy_out = policy(
         features=features,
@@ -410,11 +410,11 @@ def _prefix_supervision_state(prefix: PrefixBatch) -> StateBatch:
     return cat_state_batches(states)
 
 
-def _deduplicate_ordered_states(state: StateBatch) -> tuple[StateBatch, Tensor]:
+def _deduplicate_canonical_states(state: StateBatch) -> tuple[StateBatch, Tensor]:
     if state.num_states == 0:
         return state, torch.empty(0, dtype=torch.long, device=state.device)
 
-    key = _ordered_state_key(state)
+    key = _canonical_state_key(state)
     unique_key, inverse = torch.unique(
         key,
         dim=0,
@@ -433,20 +433,16 @@ def _deduplicate_ordered_states(state: StateBatch) -> tuple[StateBatch, Tensor]:
     )
 
 
-def _ordered_state_key(state: StateBatch) -> Tensor:
+def _canonical_state_key(state: StateBatch) -> Tensor:
     edge_ids = state.edge_ids.to(device=state.device, dtype=torch.long)
     if int(state.budget) > 0:
-        steps = torch.arange(
-            int(state.budget),
-            dtype=torch.long,
-            device=state.device,
-        ).unsqueeze(0)
-        selected = steps.lt(state.edge_count.view(-1, 1))
-        edge_ids = torch.where(
-            selected,
-            edge_ids,
-            edge_ids.new_full(edge_ids.shape, -1),
-        )
+        canonical = edge_ids.new_full(edge_ids.shape, -1)
+        for row in range(state.num_states):
+            count = int(state.edge_count[row].item())
+            if count <= 0:
+                continue
+            canonical[row, :count] = torch.sort(edge_ids[row, :count]).values
+        edge_ids = canonical
 
     return torch.cat(
         (
@@ -456,6 +452,14 @@ def _ordered_state_key(state: StateBatch) -> Tensor:
         ),
         dim=1,
     )
+
+
+def _deduplicate_ordered_states(state: StateBatch) -> tuple[StateBatch, Tensor]:
+    """
+    Backward-compatible alias; state equality is now canonical edge-set equality.
+    """
+
+    return _deduplicate_canonical_states(state)
 
 
 def build_subtb_input_from_prefix(
@@ -478,7 +482,7 @@ def build_subtb_input_from_prefix(
             terminals.state,
         ]
     )
-    unique_states, inverse = _deduplicate_ordered_states(all_states)
+    unique_states, inverse = _deduplicate_canonical_states(all_states)
 
     if unique_states.num_states > 0:
         policy_out = policy(
@@ -497,10 +501,11 @@ def build_subtb_input_from_prefix(
     terminal_rows = inverse[2 * n_exp : 2 * n_exp + n_term]
 
     if expansions.num_items > 0:
-        backward_log_prob = deterministic_backward_log_prob(
+        backward_log_prob = canonical_backward_log_prob(
             parent_state=expansions.parent,
             child_state=expansions.child,
             action_edge_ids=expansions.edge_ids,
+            graph_context=graph_context,
             validate=bool(validate_backward),
         )
     else:
@@ -511,7 +516,7 @@ def build_subtb_input_from_prefix(
         )
 
     if terminals.num_items > 0:
-        unique_terminal_state, terminal_inverse = _deduplicate_ordered_states(terminals.state)
+        unique_terminal_state, terminal_inverse = _deduplicate_canonical_states(terminals.state)
         unique_terminal_reward = reward_model(
             state=unique_terminal_state,
             graph_context=graph_context,

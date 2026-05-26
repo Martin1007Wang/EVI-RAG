@@ -109,12 +109,13 @@ class ActionSpace:
 @dataclass(frozen=True, slots=True)
 class StateBatch:
     """
-    Batched evidence-subgraph prefix states.
+    Batched canonical evidence-subgraph states.
 
     Truth source:
-    - graph_ids[s] gives the graph id of prefix state s.
-    - edge_ids[s, :edge_count[s]] gives selected physical KG edges.
-    - edge_ids is the only set-valued truth source.
+    - graph_ids[s] gives the graph id of state s.
+    - edge_ids[s, :edge_count[s]] gives the selected physical KG edge set.
+    - selected edge ids are stored sorted so construction order is not state.
+    - edge_ids is the only selected-edge truth source.
 
     Derived views:
     - covered_node_pairs(graph): anchors plus endpoints of selected edges.
@@ -129,7 +130,7 @@ class StateBatch:
     """
 
     graph_ids: Tensor  # [S] 当前 state s 属于哪个原始的 KGQA 子图
-    edge_ids: Tensor  # [S, B], padded with -1 当前的 state s 在每个可扩展的 budget 的每一步选择了哪些边
+    edge_ids: Tensor  # [S, B], sorted selected physical edges padded with -1
     edge_count: Tensor  # [S] 当前 state s 已经选择了多少条边
     budget: int  # 所有 state 最大可选择的边的数量
 
@@ -230,8 +231,15 @@ class StateBatch:
             device=self.device,
         )
 
+        if bool(next_edge_ids.eq(new_edge_ids[:, None]).any(dim=1).any()):
+            raise ValueError("branch() received an already selected edge.")
+
         next_edge_ids[child_ids, next_edge_count] = new_edge_ids
         next_edge_count = next_edge_count + 1
+        next_edge_ids = _canonicalize_edge_ids(
+            edge_ids=next_edge_ids,
+            edge_count=next_edge_count,
+        )
 
         return StateBatch(
             graph_ids=next_graph_ids,
@@ -281,6 +289,10 @@ class StateBatch:
         pos = next_edge_count.index_select(0, rows)
         next_edge_ids[rows, pos] = new_edge_ids
         next_edge_count[rows] = next_edge_count[rows] + 1
+        next_edge_ids = _canonicalize_edge_ids(
+            edge_ids=next_edge_ids,
+            edge_count=next_edge_count,
+        )
 
         return StateBatch(
             graph_ids=self.graph_ids,
@@ -381,6 +393,113 @@ def cat_state_batches(states: Sequence[StateBatch]) -> StateBatch:
     )
 
 
+def canonicalize_state_batch(state: StateBatch) -> StateBatch:
+    """
+    Return a state batch with sorted selected edges and clean -1 padding.
+
+    This is useful at boundaries that wrap ordered trajectory records as states.
+    State construction itself remains a plain dataclass operation.
+    """
+
+    return StateBatch(
+        graph_ids=state.graph_ids,
+        edge_ids=_canonicalize_edge_ids(
+            edge_ids=state.edge_ids,
+            edge_count=state.edge_count,
+        ),
+        edge_count=state.edge_count,
+        budget=int(state.budget),
+    )
+
+
+def remove_selected_edge(
+    *,
+    state: StateBatch,
+    row: int,
+    edge_id: int,
+) -> StateBatch:
+    """
+    Return a one-row canonical state with ``edge_id`` removed from ``row``.
+    """
+
+    row = int(row)
+    edge_id = int(edge_id)
+    count = int(state.edge_count[row].item())
+    selected = state.edge_ids[row, :count]
+    keep = selected.ne(int(edge_id))
+    if int(keep.sum().item()) != count - 1:
+        raise ValueError("edge_id must appear exactly once in the selected edge set.")
+
+    edge_ids = torch.full(
+        (1, int(state.budget)),
+        -1,
+        dtype=torch.long,
+        device=state.device,
+    )
+    remaining = selected[keep]
+    if int(remaining.numel()) > 0:
+        edge_ids[0, : int(remaining.numel())] = torch.sort(remaining).values
+
+    return StateBatch(
+        graph_ids=state.graph_ids[row : row + 1],
+        edge_ids=edge_ids,
+        edge_count=torch.tensor(
+            [int(remaining.numel())],
+            dtype=torch.long,
+            device=state.device,
+        ),
+        budget=int(state.budget),
+    )
+
+
+def state_rows_equal(
+    *,
+    left: StateBatch,
+    left_row: int,
+    right: StateBatch,
+    right_row: int,
+) -> bool:
+    if int(left.budget) != int(right.budget):
+        return False
+    if int(left.graph_ids[int(left_row)].item()) != int(right.graph_ids[int(right_row)].item()):
+        return False
+    if int(left.edge_count[int(left_row)].item()) != int(right.edge_count[int(right_row)].item()):
+        return False
+    count = int(left.edge_count[int(left_row)].item())
+    if count == 0:
+        return True
+    left_edges = _selected_edges_for_row(left, int(left_row))
+    right_edges = _selected_edges_for_row(right, int(right_row))
+    return bool(left_edges.eq(right_edges).all())
+
+
+def legal_state_mask(
+    *,
+    state: StateBatch,
+    graph: GraphContext,
+) -> Tensor:
+    """
+    Return which canonical rows are anchor-reachable directed subgraphs.
+
+    A row is legal when every selected edge belongs to its graph, selected
+    edges are unique, and each selected edge's source can be reached from an
+    anchor through selected edges.
+    """
+
+    valid = torch.ones(
+        state.num_states,
+        dtype=torch.bool,
+        device=state.device,
+    )
+    for row in range(state.num_states):
+        valid[row] = _is_legal_state_row(
+            state=state,
+            graph=graph,
+            row=row,
+        )
+    return valid
+
+
 def _covered_node_pairs(
     *,
     state: StateBatch,
@@ -463,25 +582,32 @@ def _selected_edge_pairs(state: StateBatch) -> tuple[Tensor, Tensor]:
     """
     Return padded-free (state_id, selected_edge_id) pairs.
 
-    edge_ids >= 0 is the physical validity mask.
-    edge_count remains the semantic selected-edge count.
+    edge_count is the semantic selected-edge count.
     """
 
     num_states, budget = state.edge_ids.shape
 
-    flat_edge_ids = state.edge_ids.reshape(-1)
-    flat_state_ids = torch.repeat_interleave(
+    if int(num_states) == 0 or int(budget) == 0:
+        empty = _empty_long(state.device)
+        return empty, empty
+
+    steps = torch.arange(
+        int(budget),
+        dtype=torch.long,
+        device=state.device,
+    ).view(1, int(budget))
+    valid = steps.lt(state.edge_count.view(int(num_states), 1))
+
+    state_ids = torch.repeat_interleave(
         torch.arange(
             int(num_states),
             dtype=torch.long,
             device=state.device,
         ),
-        int(budget),
+        state.edge_count.to(dtype=torch.long),
     )
 
-    valid = flat_edge_ids.ge(0)
-
-    return flat_state_ids[valid], flat_edge_ids[valid]
+    return state_ids, state.edge_ids[valid]
 
 
 def _outgoing_edges_from_nodes(
@@ -559,6 +685,96 @@ def _filter_legal_expansions(
     keep = same_graph & has_budget & not_selected
 
     return state_ids[keep], edge_ids[keep]
+
+
+def _canonicalize_edge_ids(
+    *,
+    edge_ids: Tensor,
+    edge_count: Tensor,
+) -> Tensor:
+    edge_ids = edge_ids.to(dtype=torch.long)
+    edge_count = edge_count.to(dtype=torch.long).view(-1)
+
+    if edge_ids.ndim != 2:
+        raise ValueError(f"edge_ids must have shape [S, B], got {tuple(edge_ids.shape)}.")
+    if int(edge_ids.size(0)) != int(edge_count.numel()):
+        raise ValueError("edge_count must have one item per state row.")
+
+    out = edge_ids.new_full(edge_ids.shape, -1)
+    budget = int(edge_ids.size(1))
+    if budget == 0:
+        return out
+
+    for row in range(int(edge_ids.size(0))):
+        count = int(edge_count[row].item())
+        if count < 0 or count > budget:
+            raise ValueError("edge_count must be in [0, budget].")
+        if count == 0:
+            continue
+
+        selected = edge_ids[row, :count]
+        if bool(selected.lt(0).any()):
+            raise ValueError("selected edge ids must be nonnegative.")
+        unique = torch.unique(selected)
+        if int(unique.numel()) != count:
+            raise ValueError("canonical states cannot contain duplicate selected edges.")
+        out[row, :count] = torch.sort(selected).values
+
+    return out
+
+
+def _selected_edges_for_row(
+    state: StateBatch,
+    row: int,
+) -> Tensor:
+    row = int(row)
+    count = int(state.edge_count[row].item())
+    if count <= 0:
+        return _empty_long(state.device)
+    return torch.sort(state.edge_ids[row, :count].to(dtype=torch.long)).values
+
+
+def _is_legal_state_row(
+    *,
+    state: StateBatch,
+    graph: GraphContext,
+    row: int,
+) -> bool:
+    row = int(row)
+    graph_id = int(state.graph_ids[row].item())
+    selected = _selected_edges_for_row(state, row)
+
+    if int(selected.numel()) == 0:
+        return True
+
+    if int(torch.unique(selected).numel()) != int(selected.numel()):
+        return False
+
+    edge_graph = graph.edge_to_graph.index_select(0, selected)
+    if not bool(edge_graph.eq(graph_id).all()):
+        return False
+
+    anchor_start = int(graph.anchor_ptr[graph_id].item())
+    anchor_end = int(graph.anchor_ptr[graph_id + 1].item())
+    reachable: set[int] = {
+        int(node_id)
+        for node_id in graph.anchor_node_ids[anchor_start:anchor_end].detach().cpu().tolist()
+    }
+
+    remaining = set(int(edge_id) for edge_id in selected.detach().cpu().tolist())
+    src = graph.edge_src.detach().cpu()
+    dst = graph.edge_dst.detach().cpu()
+
+    changed = True
+    while changed and remaining:
+        changed = False
+        for edge_id in list(remaining):
+            if int(src[edge_id].item()) in reachable:
+                reachable.add(int(dst[edge_id].item()))
+                remaining.remove(edge_id)
+                changed = True
+
+    return not remaining
 
 
 def _unique_sorted_pairs(
@@ -712,5 +928,9 @@ __all__ = [
     "ActionSpace",
     "ExpansionBatch",
     "StateBatch",
+    "canonicalize_state_batch",
     "cat_state_batches",
+    "legal_state_mask",
+    "remove_selected_edge",
+    "state_rows_equal",
 ]

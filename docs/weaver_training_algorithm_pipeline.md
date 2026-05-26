@@ -51,7 +51,7 @@
 - `target_count_by_graph`。
 - shortest-path 监督相关扁平张量。
 
-它用于 reward、replay 和 evaluation，不进入 `State.frontier` 的合法动作判断。
+它用于 reward、replay 和 evaluation，不进入 `StateBatch.action_space` 的合法动作判断。
 
 ### FeatureEncoder
 
@@ -72,26 +72,27 @@
 
 ## 3. State
 
-`State` 是动态证据子图状态。对 rollout row `r`：
+`StateBatch` 是 canonical evidence graph state。rollout 仍记录 ordered construction trace，
+但训练/策略看到的状态是边集合等价类 `s=[tau]_pi`。对 row `r`：
 
-- `S_r`：已选择的证据边集合，对应 `selected_edge_mask[r, :]`。
-- `X_r`：当前 active node 集合，对应 `active_node_mask[r, :]`。
-- `step_r`：已执行的 expansion 次数，也就是 depth。
+- `S_r`：已选择的证据边集合，对应 `edge_ids[r, :edge_count[r]]`。
+- `edge_ids` 的有效区间按物理 edge id 排序，padding 为 `-1`。
+- `X_r`：由 anchors 与 `S_r` 中所有边端点派生得到。
+- `step_r = |S_r|`。
 
 代码中的不变量是：
 
 ```text
 X_r = anchors(graph_ids[r]) union endpoints(S_r)
-step_r = |S_r|    在合法 transition 下成立
+step_r = |S_r|
 ```
 
-初始状态由 `State.initial(graph, graph_ids)` 构造：
+初始状态由 `StateBatch.initial(graph_ids, budget)` 构造：
 
-- `selected_edge_mask` 全 False。
-- `active_node_mask` 只激活该图的 anchor 节点。
-- `step` 为 0。
+- `edge_ids` 全 `-1`。
+- `edge_count` 为 0。
 
-从已选边恢复状态时，`State.from_selected_edges` 会重新激活 anchor 与所有已选边端点，并检查边是否属于对应图。
+从 trajectory 记录恢复状态时，先 canonicalize，因此 `(e1,e2)` 与 `(e2,e1)` 是同一个状态。
 
 ## 4. Action
 
@@ -105,16 +106,16 @@ A(z) = {TERMINAL} union Frontier(z)
 
 ### Frontier 合法性
 
-`State.frontier(graph, budget)` 返回物理有向出边 frontier，不合成 inverse edge。对 row `i`，边 `e = (u, r, v)` 合法当且仅当：
+`StateBatch.action_space(graph)` 返回物理有向出边 frontier，不合成 inverse edge。对 row `i`，边 `e = (u, r, v)` 合法当且仅当：
 
 ```text
 u in X_i
 e not in S_i
 edge_to_graph[e] == graph_ids[i]
-depth(i) < budget    如果传入 budget
+edge_count(i) < budget
 ```
 
-frontier 会对 `(row_id, edge_id)` 去重。`State.expand` 在加入边前会调用 `validate_expansion_actions`，确保每个 row 最多一个 expansion action，且 action 必须在当前 frontier 中。
+frontier 会按 state row 分组。`advance`/`branch` 写入新边后会重新排序 selected edge set。
 
 ### Transition
 
@@ -126,7 +127,7 @@ X' = X union {src(e), dst(e)}
 step' = step + 1
 ```
 
-选择 `TERMINAL` 不调用 `State.expand`，而是停止当前 row。
+选择 `TERMINAL` 不改变 `StateBatch`，而是停止当前 row。
 
 ## 5. Policy
 
