@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.graph.segments import segment_logsumexp
 from src.eval.rollout import (
     evaluate_rollout_samples,
     rollout_eval_tensors,
@@ -31,7 +32,7 @@ from src.training.factory import build_model, prepare_training_components
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.rollout.replay import WeakReplaySource
 from src.weaver.rollout.trajectory import BUDGET, NO_FRONTIER, POLICY_STOP
-from src.weaver.state import StateBatch
+from src.weaver.state import ExpansionBatch, StateBatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,7 +335,7 @@ def load_run_config(*, run_dir: Path, data_dir: str):
 
 
 def sampled_parent_prefixes(trajectories) -> StateBatch:
-    from src.weaver.state import ExpansionBatch, cat_state_batches
+    from src.weaver.state import cat_state_batches
 
     device = trajectories.device
     budget = int(trajectories.budget)
@@ -430,6 +431,14 @@ def collect_stop_stats(
     action_space = state.action_space(graph)
     policy_out = model.policy(features=features, state=state, context=graph, action_space=action_space)
     reward = model.reward_model(state=state, graph_context=graph, target_context=target)
+    reward_dominance = prefix_reward_stop_dominance(
+        model=model,
+        graph=graph,
+        target=target,
+        state=state,
+        action_space=action_space,
+        reward=reward,
+    ).detach().cpu()
     stop_prob = policy_out.stop_log_prob.detach().cpu().exp()
     continue_prob = policy_out.continue_log_prob.detach().cpu().exp()
     margin = (policy_out.stop_log_flow - policy_out.continue_log_flow).detach().cpu()
@@ -449,6 +458,35 @@ def collect_stop_stats(
         add3(stats, label, d, "target_recall", float(recall[row].item()))
         add3(stats, label, d, "hit_rate", 1.0 if bool(hit[row].item()) else 0.0)
         add3(stats, label, d, "full_cover_rate", 1.0 if float(recall[row].item()) >= 1.0 - 1e-8 else 0.0)
+        if math.isfinite(float(reward_dominance[row].item())):
+            add3(stats, label, d, "reward_stop_dominance", float(reward_dominance[row].item()))
+
+
+def prefix_reward_stop_dominance(
+    *,
+    model,
+    graph: GraphContext,
+    target: TargetContext,
+    state: StateBatch,
+    action_space,
+    reward,
+) -> torch.Tensor:
+    if action_space.num_expansions <= 0:
+        return reward.log_reward.new_full((state.num_states,), float("-inf"))
+
+    child = state.branch(
+        ExpansionBatch(
+            state_ids=action_space.expand_state_ids,
+            edge_ids=action_space.expand_edge_ids,
+        )
+    )
+    child_reward = model.reward_model(state=child, graph_context=graph, target_context=target)
+    child_log_reward = segment_logsumexp(
+        values=child_reward.log_reward.float(),
+        segment_ids=action_space.expand_state_ids,
+        num_segments=int(state.num_states),
+    )
+    return reward.log_reward.float() - child_log_reward
 
 
 def score_components(*, model, features, graph: GraphContext, state: StateBatch, action_space) -> tuple[torch.Tensor, torch.Tensor]:

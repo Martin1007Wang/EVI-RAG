@@ -15,10 +15,17 @@ policy:
   _target_: src.weaver.policy.ForwardPolicy
   budget: ${model.budget}
   action_hidden_dim: null
+
+  # Semantic prior over candidate edges.
   semantic_relation_weight: 1.0
   semantic_dst_weight: 0.5
+
+  # Learned residual should help, but should not swamp the semantic prior early.
   edge_residual_weight: 0.25
+
+  # Keep this enabled unless diagnostics prove it over-penalizes large frontiers.
   frontier_size_correction: 1.0
+
   state_encoder:
     _target_: src.weaver.nn.state_encoder.StateEncoder
     hidden_dim: 1024
@@ -31,35 +38,72 @@ policy:
 
 reward_model:
   _target_: src.weaver.reward.EvidenceSubgraphReward
+
+  # Sufficiency terms.
   answer_weight: 4.0
   proximity_weight: 1.0
   path_weight: 0.2
+
+  # Failure terms.
   fail_cost: 8.0
   fail_proximity_weight: 0.5
   fail_path_weight: 0.1
-  edge_cost: 0.1
+
+  # Compactness terms.
+  # edge_cost is raised from 0.1 to 0.2 because the previous objective under-penalized
+  # budget-sized redundant subgraphs.
+  edge_cost: 0.2
+
+  # Penalizes zero-gain redundant expansions after evidence is already sufficient.
+  # Start moderate; 0.5+ may over-stop if marginal-gain labels are noisy.
+  redundant_edge_cost: 0.3
+
   distance_temperature: 1.0
   reward_temperature: 1.0
 
 loss_fn:
   _target_: src.weaver.objectives.SubTBObjective
-  alpha_replay: 0.0
+
+  # Weak replay is now a helper, not the dominant objective.
+  # Effective replay strength = alpha_replay * weak_replay_loss.weight.
+  alpha_replay: 0.5
+
+  # Keep SubTB as the main GFlowNet consistency objective.
   subtb_lambda: 0.8
   max_len: null
   residual_loss: huber
   huber_delta: 2.0
 
+  # Dense prefix terminal-flow calibration:
+  # train STOP log-flow on every prefix against oracle terminal reward.
+  prefix_calibration_weight: 0.2
+  prefix_calibration_huber_delta: 2.0
+
+  # Sufficient-state STOP dominance:
+  # force STOP flow to beat aggregate continuation flow once evidence is sufficient.
+  sufficient_stop_margin_weight: 0.1
+  sufficient_stop_margin: 0.5
+  sufficient_recall_threshold: 1.0
+
 weak_replay_loss:
   _target_: src.weaver.objectives.WeakReplayLoss
-  weight: 3.0
+
+  # Reduced from 3.0. Replay should help coverage but not dominate STOP learning.
+  weight: 1.0
+
+  # Critical: do not keep pushing expansion once the prefix is sufficient.
+  gate_sufficient: true
+  sufficient_recall_threshold: 1.0
 
 runner:
   _target_: src.weaver.rollout.runner.RolloutRunner
   engine:
     _target_: src.weaver.rollout.engine.RolloutEngine
     budget: ${model.budget}
+
   train_policy_rollouts: 8
   eval_rollouts: 8
+
   weak_replay_source:
     _target_: src.weaver.rollout.replay.WeakReplaySource
     budget: ${model.budget}
@@ -82,4 +126,6 @@ evaluation:
   k_windows: [1, 2, 4, 8]
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
-  enable_terminal_diagnostics: false
+
+  # Should be on by default now; otherwise you cannot debug STOP behavior.
+  enable_terminal_diagnostics: true

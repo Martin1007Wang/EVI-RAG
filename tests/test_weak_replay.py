@@ -9,8 +9,12 @@ from src.graph.paths import compute_path_labels
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.nn.feature_encoder import FeatureEncoder
 from src.weaver.nn.state_encoder import StateEncoder
+from src.weaver.objectives.weak_replay import WeakReplayLoss
 from src.weaver.policy import ForwardPolicy
+from src.weaver.policy.output import PolicyOutput
+from src.weaver.rollout.replay import WeakReplayBatch
 from src.weaver.rollout.replay import WeakReplaySource
+from src.weaver.state import ActionSpace
 from src.weaver.state import StateBatch
 
 
@@ -125,3 +129,59 @@ def test_edge_residual_weight_zero_preserves_semantic_ranking() -> None:
     )
 
     assert torch.allclose(output.edge_raw_score, semantic)
+
+
+def test_weak_replay_gate_skips_sufficient_prefix() -> None:
+    data = RetrievalData(
+        edge_index=_edge_tensor([(0, 1)]),
+        num_nodes=2,
+        node_entity_catalog_ids=torch.arange(2),
+        edge_relation_catalog_ids=torch.arange(1),
+        question_emb=torch.ones(4),
+        anchor_node_ids=torch.tensor([0]),
+        target_node_ids=torch.tensor([0]),
+        reachable_target_node_ids=torch.tensor([0]),
+        node_target_distance=torch.tensor([0, -1]),
+        weak_replay_edge_ids=torch.tensor([0]),
+        weak_replay_edge_weight=torch.tensor([1.0]),
+    )
+    data.sample_id = "toy"
+
+    batch = RetrievalCollator()([data])
+    graph = GraphContext.from_batch(batch)
+    target = TargetContext.from_batch(batch=batch, graph_context=graph)
+    state = StateBatch.initial(graph_ids=torch.tensor([0]), budget=1)
+
+    out = WeakReplayLoss(weight=1.0, gate_sufficient=True)(
+        policy=_ConstantPolicy(),
+        features=None,
+        graph_context=graph,
+        target_context=target,
+        weak_replay=WeakReplayBatch(state=state),
+    )
+
+    assert torch.allclose(out.loss, torch.tensor(0.0))
+    assert torch.allclose(out.metrics["weak_replay/active_state_count_before_gate"], torch.tensor(1.0))
+    assert torch.allclose(out.metrics["weak_replay/gated_state_count"], torch.tensor(1.0))
+    assert torch.allclose(out.metrics["weak_replay/sufficient_state_fraction"], torch.tensor(1.0))
+
+
+class _ConstantPolicy:
+    def __call__(self, *, features, state: StateBatch, context: GraphContext, action_space: ActionSpace) -> PolicyOutput:
+        del features, context
+        stop_log_flow = torch.zeros(state.num_states)
+        edge_log_flow = torch.zeros(action_space.num_expansions)
+        continue_log_flow = torch.zeros(state.num_states)
+        state_log_flow = torch.logaddexp(stop_log_flow, continue_log_flow)
+        return PolicyOutput(
+            action_space=action_space,
+            state_log_flow=state_log_flow,
+            stop_log_flow=stop_log_flow,
+            continue_log_flow=continue_log_flow,
+            stop_log_prob=stop_log_flow - state_log_flow,
+            continue_log_prob=continue_log_flow - state_log_flow,
+            edge_log_flow=edge_log_flow,
+            edge_log_prob=edge_log_flow - state_log_flow.index_select(0, action_space.expand_state_ids),
+            conditional_edge_log_prob=edge_log_flow,
+            edge_raw_score=edge_log_flow,
+        )

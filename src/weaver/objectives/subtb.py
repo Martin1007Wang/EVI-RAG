@@ -18,7 +18,7 @@ from src.weaver.rollout.trajectory import (
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.nn.feature_encoder import FeatureBank
 from src.weaver.policy import ForwardPolicy
-from src.weaver.state import ActionSpace
+from src.weaver.state import ActionSpace, StateBatch, cat_state_batches
 from src.weaver.objectives.prefix import (
     ExpansionPrefixBatch,
     PrefixBatch,
@@ -232,6 +232,11 @@ class SubTBObjective(nn.Module):
         residual_loss: str = "huber",
         huber_delta: float = 2.0,
         validate_backward: bool = False,
+        prefix_calibration_weight: float = 0.0,
+        prefix_calibration_huber_delta: float = 2.0,
+        sufficient_stop_margin_weight: float = 0.0,
+        sufficient_stop_margin: float = 0.0,
+        sufficient_recall_threshold: float = 1.0,
     ) -> None:
         super().__init__()
         self.loss = SubTBLoss(
@@ -242,6 +247,20 @@ class SubTBObjective(nn.Module):
             huber_delta=huber_delta,
         )
         self.validate_backward = bool(validate_backward)
+        self.prefix_calibration_weight = float(prefix_calibration_weight)
+        self.prefix_calibration_huber_delta = float(prefix_calibration_huber_delta)
+        self.sufficient_stop_margin_weight = float(sufficient_stop_margin_weight)
+        self.sufficient_stop_margin = float(sufficient_stop_margin)
+        self.sufficient_recall_threshold = float(sufficient_recall_threshold)
+
+        if self.prefix_calibration_weight < 0.0:
+            raise ValueError("prefix_calibration_weight must be nonnegative.")
+        if self.prefix_calibration_huber_delta <= 0.0:
+            raise ValueError("prefix_calibration_huber_delta must be positive.")
+        if self.sufficient_stop_margin_weight < 0.0:
+            raise ValueError("sufficient_stop_margin_weight must be nonnegative.")
+        if self.sufficient_recall_threshold < 0.0 or self.sufficient_recall_threshold > 1.0:
+            raise ValueError("sufficient_recall_threshold must be in [0, 1].")
 
     def forward(
         self,
@@ -263,7 +282,180 @@ class SubTBObjective(nn.Module):
             prefix=prefix,
             validate_backward=self.validate_backward,
         )
-        return self.loss(subtb_input)
+        out = self.loss(subtb_input)
+        aux = prefix_terminal_objective(
+            policy=policy,
+            reward_model=reward_model,
+            features=features,
+            graph_context=graph_context,
+            target_context=target_context,
+            prefix=prefix,
+            prefix_calibration_weight=self.prefix_calibration_weight,
+            prefix_calibration_huber_delta=self.prefix_calibration_huber_delta,
+            sufficient_stop_margin_weight=self.sufficient_stop_margin_weight,
+            sufficient_stop_margin=self.sufficient_stop_margin,
+            sufficient_recall_threshold=self.sufficient_recall_threshold,
+        )
+        if aux is None:
+            return out
+
+        metrics = dict(out.metrics)
+        metrics.update(aux.metrics)
+        return ObjectiveOutput(
+            loss=out.loss + aux.loss,
+            metrics=metrics,
+            num_states=out.num_states,
+            per_unit_loss=out.per_unit_loss,
+        )
+
+
+def prefix_terminal_objective(
+    *,
+    policy: ForwardPolicy,
+    reward_model: TerminalRecallReward,
+    features: FeatureBank,
+    graph_context: GraphContext,
+    target_context: TargetContext,
+    prefix: PrefixBatch,
+    prefix_calibration_weight: float,
+    prefix_calibration_huber_delta: float,
+    sufficient_stop_margin_weight: float,
+    sufficient_stop_margin: float,
+    sufficient_recall_threshold: float,
+) -> ObjectiveOutput | None:
+    if prefix_calibration_weight <= 0.0 and sufficient_stop_margin_weight <= 0.0:
+        return None
+
+    state = _prefix_supervision_state(prefix)
+    if state.num_states == 0:
+        zero = torch.zeros((), dtype=torch.float32, device=graph_context.device)
+        return ObjectiveOutput(
+            loss=zero,
+            metrics=prefix_terminal_metrics_empty(device=graph_context.device),
+            num_states=0,
+            per_unit_loss=None,
+        )
+
+    unique_state, inverse = _deduplicate_ordered_states(state)
+    action_space = unique_state.action_space(graph_context)
+    policy_out = policy(
+        features=features,
+        state=unique_state,
+        context=graph_context,
+        action_space=action_space,
+    )
+    unique_reward = reward_model(
+        state=unique_state,
+        graph_context=graph_context,
+        target_context=target_context,
+    )
+    reward = _select_reward_output(unique_reward, inverse)
+
+    valid = reward.valid_mask.to(device=state.device, dtype=torch.bool)
+    sufficient = valid & reward.target_recall.ge(float(sufficient_recall_threshold))
+
+    stop_log_flow = policy_out.stop_log_flow.index_select(0, inverse).float()
+    continue_log_flow = policy_out.continue_log_flow.index_select(0, inverse).float()
+    stop_log_prob = policy_out.stop_log_prob.index_select(0, inverse).float()
+
+    residual = stop_log_flow - reward.log_reward.detach().float()
+    calib_units = residual_loss_units(
+        residual,
+        loss_type="huber",
+        huber_delta=float(prefix_calibration_huber_delta),
+    )
+    calib_loss = masked_mean_or_zero(calib_units, valid)
+
+    has_frontier = torch.isfinite(continue_log_flow)
+    margin_value = (stop_log_flow - continue_log_flow).float()
+    margin_active = sufficient & has_frontier
+    margin_units = torch.relu(float(sufficient_stop_margin) + continue_log_flow - stop_log_flow)
+    margin_loss = masked_mean_or_zero(margin_units, margin_active)
+
+    loss = (
+        float(prefix_calibration_weight) * calib_loss
+        + float(sufficient_stop_margin_weight) * margin_loss
+    )
+
+    metrics = prefix_terminal_metrics(
+        reward=reward,
+        stop_log_prob=stop_log_prob,
+        residual=residual,
+        margin=margin_value,
+        valid=valid,
+        sufficient=sufficient,
+        margin_active=margin_active,
+        calib_loss=calib_loss,
+        margin_loss=margin_loss,
+    )
+
+    return ObjectiveOutput(
+        loss=loss,
+        metrics=metrics,
+        num_states=state.num_states,
+        per_unit_loss=None,
+    )
+
+
+def _prefix_supervision_state(prefix: PrefixBatch) -> StateBatch:
+    states: list[StateBatch] = []
+    if prefix.expansions.num_items > 0:
+        states.append(prefix.expansions.parent)
+    if prefix.terminals.num_items > 0:
+        states.append(prefix.terminals.state)
+    if not states:
+        return _empty_state(device=prefix.terminals.device, budget=int(prefix.terminals.state.budget))
+    if len(states) == 1:
+        return states[0]
+    return cat_state_batches(states)
+
+
+def _deduplicate_ordered_states(state: StateBatch) -> tuple[StateBatch, Tensor]:
+    if state.num_states == 0:
+        return state, torch.empty(0, dtype=torch.long, device=state.device)
+
+    key = _ordered_state_key(state)
+    unique_key, inverse = torch.unique(
+        key,
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+    )
+
+    return (
+        StateBatch(
+            graph_ids=unique_key[:, 0],
+            edge_count=unique_key[:, 1],
+            edge_ids=unique_key[:, 2:],
+            budget=int(state.budget),
+        ),
+        inverse.to(device=state.device, dtype=torch.long),
+    )
+
+
+def _ordered_state_key(state: StateBatch) -> Tensor:
+    edge_ids = state.edge_ids.to(device=state.device, dtype=torch.long)
+    if int(state.budget) > 0:
+        steps = torch.arange(
+            int(state.budget),
+            dtype=torch.long,
+            device=state.device,
+        ).unsqueeze(0)
+        selected = steps.lt(state.edge_count.view(-1, 1))
+        edge_ids = torch.where(
+            selected,
+            edge_ids,
+            edge_ids.new_full(edge_ids.shape, -1),
+        )
+
+    return torch.cat(
+        (
+            state.graph_ids.to(dtype=torch.long).view(-1, 1),
+            state.edge_count.to(dtype=torch.long).view(-1, 1),
+            edge_ids,
+        ),
+        dim=1,
+    )
 
 
 def build_subtb_input_from_prefix(
@@ -279,19 +471,32 @@ def build_subtb_input_from_prefix(
     expansions = prefix.expansions
     terminals = prefix.terminals
 
+    all_states = cat_state_batches(
+        [
+            expansions.parent,
+            expansions.child,
+            terminals.state,
+        ]
+    )
+    unique_states, inverse = _deduplicate_ordered_states(all_states)
+
+    if unique_states.num_states > 0:
+        policy_out = policy(
+            features=features,
+            state=unique_states,
+            context=graph_context,
+            action_space=unique_states.action_space(graph_context),
+        )
+    else:
+        policy_out = _empty_policy_output(device=all_states.device)
+
+    n_exp = expansions.num_items
+    n_term = terminals.num_items
+    parent_rows = inverse[:n_exp]
+    child_rows = inverse[n_exp : 2 * n_exp]
+    terminal_rows = inverse[2 * n_exp : 2 * n_exp + n_term]
+
     if expansions.num_items > 0:
-        parent_out = policy(
-            features=features,
-            state=expansions.parent,
-            context=graph_context,
-            action_space=expansions.parent.action_space(graph_context),
-        )
-        child_out = policy(
-            features=features,
-            state=expansions.child,
-            context=graph_context,
-            action_space=expansions.child.action_space(graph_context),
-        )
         backward_log_prob = deterministic_backward_log_prob(
             parent_state=expansions.parent,
             child_state=expansions.child,
@@ -299,8 +504,6 @@ def build_subtb_input_from_prefix(
             validate=bool(validate_backward),
         )
     else:
-        parent_out = _empty_policy_output(device=terminals.device)
-        child_out = _empty_policy_output(device=terminals.device)
         backward_log_prob = torch.empty(
             0,
             dtype=torch.float32,
@@ -308,33 +511,35 @@ def build_subtb_input_from_prefix(
         )
 
     if terminals.num_items > 0:
-        terminal_out = policy(
-            features=features,
-            state=terminals.state,
-            context=graph_context,
-            action_space=terminals.state.action_space(graph_context),
-        )
-        terminal_reward = reward_model(
-            state=terminals.state,
+        unique_terminal_state, terminal_inverse = _deduplicate_ordered_states(terminals.state)
+        unique_terminal_reward = reward_model(
+            state=unique_terminal_state,
             graph_context=graph_context,
             target_context=target_context,
         )
+        terminal_reward = _select_reward_output(unique_terminal_reward, terminal_inverse)
     else:
-        terminal_out = _empty_policy_output(device=expansions.device)
         terminal_reward = _empty_reward_output(device=expansions.device)
 
-    subtb_input = build_subtb_input(
-        parent_out=parent_out,
-        child_out=child_out,
-        terminal_out=terminal_out,
-        terminal_reward=terminal_reward,
+    exp_events = _build_expansion_events_from_policy_rows(
+        policy_out=policy_out,
+        parent_rows=parent_rows,
+        child_rows=child_rows,
         backward_log_prob=backward_log_prob,
         expansions=expansions,
+    )
+    stop_events = _build_terminal_events_from_policy_rows(
+        policy_out=policy_out,
+        terminal_rows=terminal_rows,
+        terminal_reward=terminal_reward,
         terminals=terminals,
     )
 
     return SubTBInput(
-        events=subtb_input.events,
+        events=_cat_event_batches(
+            [exp_events, stop_events],
+            device=_event_device(expansions, terminals),
+        ),
         metrics=terminal_metrics(
             terminal_reward=terminal_reward,
             terminals=terminals,
@@ -432,6 +637,58 @@ def _build_expansion_events(
     )
 
 
+def _build_expansion_events_from_policy_rows(
+    *,
+    policy_out: PolicyOutput,
+    parent_rows: Tensor,
+    child_rows: Tensor,
+    backward_log_prob: Tensor,
+    expansions: ExpansionPrefixBatch,
+) -> SubTBEventBatch:
+    device = expansions.device
+    n = expansions.num_items
+
+    if n == 0:
+        return _empty_events(device=device)
+
+    parent_rows = parent_rows.to(device=device, dtype=torch.long).view(-1)
+    child_rows = child_rows.to(device=device, dtype=torch.long).view(-1)
+
+    parent_state_log_flow = policy_out.state_log_flow.index_select(0, parent_rows).float()
+    child_state_log_flow = policy_out.state_log_flow.index_select(0, child_rows).float()
+
+    action_log_flow = policy_out.gather_action_log_flow(
+        row_ids=parent_rows,
+        edge_ids=expansions.edge_ids,
+    ).float()
+
+    return SubTBEventBatch(
+        trajectory_ids=expansions.traj_ids,
+        step_ids=expansions.step_ids,
+        source_ids=expansions.source,
+        parent_state_log_flow=parent_state_log_flow,
+        child_state_log_flow=child_state_log_flow,
+        action_log_flow=action_log_flow,
+        backward_log_prob=backward_log_prob.to(device=device).float().view(-1),
+        terminal_log_reward=torch.zeros(
+            n,
+            dtype=parent_state_log_flow.dtype,
+            device=device,
+        ),
+        terminal_reason=torch.full(
+            (n,),
+            int(TERMINAL_REASON_NONE),
+            dtype=torch.long,
+            device=device,
+        ),
+        is_terminal=torch.zeros(
+            n,
+            dtype=torch.bool,
+            device=device,
+        ),
+    )
+
+
 def _build_terminal_events(
     *,
     terminal_out: PolicyOutput,
@@ -470,6 +727,85 @@ def _build_terminal_events(
     stop_log_flow = terminal_out.stop_log_flow.index_select(
         0,
         rows,
+    ).float()
+    boundary_log_flow = parent_state_log_flow
+    action_log_flow = torch.where(
+        reason.eq(int(POLICY_STOP)),
+        stop_log_flow,
+        boundary_log_flow,
+    ).float()
+
+    return SubTBEventBatch(
+        trajectory_ids=terminals.traj_ids.index_select(0, rows),
+        step_ids=terminals.step_ids.index_select(0, rows),
+        source_ids=terminals.source.index_select(0, rows),
+        parent_state_log_flow=parent_state_log_flow,
+        child_state_log_flow=torch.zeros(
+            n,
+            dtype=parent_state_log_flow.dtype,
+            device=device,
+        ),
+        action_log_flow=action_log_flow,
+        backward_log_prob=torch.zeros(
+            n,
+            dtype=parent_state_log_flow.dtype,
+            device=device,
+        ),
+        terminal_log_reward=terminal_reward.log_reward.index_select(
+            0,
+            rows,
+        ).float(),
+        terminal_reason=reason,
+        is_terminal=torch.ones(
+            n,
+            dtype=torch.bool,
+            device=device,
+        ),
+    )
+
+
+def _build_terminal_events_from_policy_rows(
+    *,
+    policy_out: PolicyOutput,
+    terminal_rows: Tensor,
+    terminal_reward: RewardOutput,
+    terminals: TerminalPrefixBatch,
+) -> SubTBEventBatch:
+    device = terminals.device
+    n_all = terminals.num_items
+
+    if n_all == 0:
+        return _empty_events(device=device)
+
+    valid = terminal_reward.valid_mask.to(
+        device=device,
+        dtype=torch.bool,
+    ).view(-1)
+
+    if int(valid.numel()) != n_all:
+        raise ValueError("terminal_reward.valid_mask must have one item per terminal action.")
+
+    rows = valid.nonzero(as_tuple=False).flatten()
+    n = int(rows.numel())
+
+    if n == 0:
+        return _empty_events(device=device)
+
+    terminal_rows = terminal_rows.to(device=device, dtype=torch.long).view(-1)
+    policy_rows = terminal_rows.index_select(0, rows)
+
+    parent_state_log_flow = policy_out.state_log_flow.index_select(
+        0,
+        policy_rows,
+    ).float()
+
+    reason = terminals.reason.index_select(0, rows).to(
+        device=device,
+        dtype=torch.long,
+    )
+    stop_log_flow = policy_out.stop_log_flow.index_select(
+        0,
+        policy_rows,
     ).float()
     boundary_log_flow = parent_state_log_flow
     action_log_flow = torch.where(
@@ -808,6 +1144,85 @@ def terminal_metrics(
     }
 
 
+def prefix_terminal_metrics(
+    *,
+    reward: RewardOutput,
+    stop_log_prob: Tensor,
+    residual: Tensor,
+    margin: Tensor,
+    valid: Tensor,
+    sufficient: Tensor,
+    margin_active: Tensor,
+    calib_loss: Tensor,
+    margin_loss: Tensor,
+) -> dict[str, Tensor]:
+    zero_recall = valid & reward.target_recall.le(0.0)
+    partial_recall = valid & reward.target_recall.gt(0.0) & ~sufficient
+    stop_prob = stop_log_prob.float().exp()
+
+    valid_count = valid.to(dtype=torch.float).sum()
+    sufficient_count = sufficient.to(dtype=torch.float).sum()
+    margin_count = margin_active.to(dtype=torch.float).sum()
+
+    return {
+        "prefix_calib/loss": calib_loss.detach(),
+        "prefix_calib/residual_abs": masked_mean_or_zero(
+            residual.abs(),
+            valid,
+        ).detach(),
+        "prefix_calib/residual_abs_zero": masked_mean_or_zero(
+            residual.abs(),
+            zero_recall,
+        ).detach(),
+        "prefix_calib/residual_abs_partial": masked_mean_or_zero(
+            residual.abs(),
+            partial_recall,
+        ).detach(),
+        "prefix_calib/residual_abs_sufficient": masked_mean_or_zero(
+            residual.abs(),
+            sufficient,
+        ).detach(),
+        "sufficient/stop_margin_loss": margin_loss.detach(),
+        "sufficient/stop_margin_mean": masked_mean_or_zero(
+            margin,
+            margin_active,
+        ).detach(),
+        "full_cover/stop_margin_mean": masked_mean_or_zero(
+            margin,
+            margin_active,
+        ).detach(),
+        "sufficient/stop_prob_mean": masked_mean_or_zero(
+            stop_prob,
+            sufficient,
+        ).detach(),
+        "sufficient/active_fraction": _safe_divide(
+            sufficient_count,
+            valid_count,
+        ).detach(),
+        "sufficient/margin_active_fraction": _safe_divide(
+            margin_count,
+            valid_count,
+        ).detach(),
+    }
+
+
+def prefix_terminal_metrics_empty(*, device: torch.device) -> dict[str, Tensor]:
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    return {
+        "prefix_calib/loss": zero,
+        "prefix_calib/residual_abs": zero,
+        "prefix_calib/residual_abs_zero": zero,
+        "prefix_calib/residual_abs_partial": zero,
+        "prefix_calib/residual_abs_sufficient": zero,
+        "sufficient/stop_margin_loss": zero,
+        "sufficient/stop_margin_mean": zero,
+        "full_cover/stop_margin_mean": zero,
+        "sufficient/stop_prob_mean": zero,
+        "sufficient/active_fraction": zero,
+        "sufficient/margin_active_fraction": zero,
+    }
+
+
 def weighted_source_balanced_mean(
     *,
     values: Tensor,
@@ -993,6 +1408,17 @@ def _empty_policy_output(
     )
 
 
+def _empty_state(
+    *,
+    device: torch.device,
+    budget: int,
+) -> StateBatch:
+    return StateBatch.initial(
+        graph_ids=torch.empty(0, dtype=torch.long, device=device),
+        budget=int(budget),
+    )
+
+
 def _empty_reward_output(
     *,
     device: torch.device,
@@ -1012,6 +1438,25 @@ def _empty_reward_output(
         edge_count=float_,
         valid_mask=bool_,
         success_mask=bool_,
+        metrics={},
+    )
+
+
+def _select_reward_output(reward: RewardOutput, rows: Tensor) -> RewardOutput:
+    rows = rows.to(device=reward.log_reward.device, dtype=torch.long).view(-1)
+
+    return RewardOutput(
+        log_reward=reward.log_reward.index_select(0, rows),
+        raw_log_reward=reward.raw_log_reward.index_select(0, rows),
+        answer_count=reward.answer_count.index_select(0, rows),
+        target_count=reward.target_count.index_select(0, rows),
+        target_recall=reward.target_recall.index_select(0, rows),
+        target_proximity=reward.target_proximity.index_select(0, rows),
+        path_edge_count=reward.path_edge_count.index_select(0, rows),
+        path_edge_precision=reward.path_edge_precision.index_select(0, rows),
+        edge_count=reward.edge_count.index_select(0, rows),
+        valid_mask=reward.valid_mask.index_select(0, rows),
+        success_mask=reward.success_mask.index_select(0, rows),
         metrics={},
     )
 
@@ -1045,6 +1490,7 @@ __all__ = [
     "build_subtb_input",
     "expansion_db_residual",
     "masked_mean_or_zero",
+    "prefix_terminal_objective",
     "residual_loss_units",
     "single_step_metrics",
     "source_metrics",

@@ -384,6 +384,10 @@ def sample_metrics(tensors: RolloutEvalTensors) -> dict[str, float]:
         "single_rollout/mean_recall": mean_over_valid_graphs(tensors.recall, valid),
         "single_rollout/mean_f1": mean_over_valid_graphs(tensors.f1, valid),
         "rollout/edge_count_mean": mean_over_valid_graphs(tensors.edge_count, valid),
+        "rollout/recall_per_edge": mean_over_valid_graphs(
+            safe_divide(tensors.recall, tensors.edge_count.clamp_min(1.0)),
+            valid,
+        ),
     }
 
     for edge_count in range(int(tensors.budget) + 1):
@@ -529,6 +533,11 @@ def terminal_metrics(
         ),
         "terminal/hit_then_continue_rate": _mean_hit_values(
             continued.float(),
+            hit,
+            valid,
+        ),
+        "terminal/stop_after_hit_rate": _mean_hit_values(
+            tensors.policy_stop.float(),
             hit,
             valid,
         ),

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.state import StateBatch
+from src.weaver.state import ExpansionBatch, StateBatch
 
 Tensor = torch.Tensor
 
@@ -80,6 +80,7 @@ class EvidenceSubgraphReward(nn.Module):
         fail_proximity_weight: float = 0.5,
         fail_path_weight: float = 0.1,
         edge_cost: float = 0.1,
+        redundant_edge_cost: float = 0.0,
         success_bias: float = 0.0,
         distance_temperature: float = 1.0,
         reward_temperature: float = 1.0,
@@ -94,6 +95,7 @@ class EvidenceSubgraphReward(nn.Module):
         _check_non_negative("fail_proximity_weight", fail_proximity_weight)
         _check_non_negative("fail_path_weight", fail_path_weight)
         _check_non_negative("edge_cost", edge_cost)
+        _check_non_negative("redundant_edge_cost", redundant_edge_cost)
 
         if distance_temperature <= 0.0:
             raise ValueError(f"distance_temperature must be positive, got {distance_temperature}.")
@@ -109,6 +111,7 @@ class EvidenceSubgraphReward(nn.Module):
         self.fail_path_weight = float(fail_path_weight)
 
         self.edge_cost = float(edge_cost)
+        self.redundant_edge_cost = float(redundant_edge_cost)
         self.success_bias = float(success_bias)
 
         self.distance_temperature = float(distance_temperature)
@@ -191,6 +194,15 @@ class EvidenceSubgraphReward(nn.Module):
 
         edge_count = state.edge_count.to(dtype=torch.float)
         edge_penalty = self.edge_cost * edge_count
+        if self.redundant_edge_cost > 0.0:
+            zero_gain_edge_count = compute_zero_gain_edge_count(
+                state=state,
+                graph=graph_context,
+                target_mask=target_context.target_mask,
+            )
+        else:
+            zero_gain_edge_count = edge_count.new_zeros(edge_count.shape)
+        redundant_penalty = float(self.redundant_edge_cost) * zero_gain_edge_count
 
         success_log_reward = (
             self.success_bias
@@ -198,10 +210,15 @@ class EvidenceSubgraphReward(nn.Module):
             + self.proximity_weight * target_proximity
             + self.path_weight * path_edge_precision
             - edge_penalty
+            - redundant_penalty
         )
 
         failure_log_reward = (
-            -self.fail_cost + self.fail_proximity_weight * target_proximity + self.fail_path_weight * path_edge_precision - edge_penalty
+            -self.fail_cost
+            + self.fail_proximity_weight * target_proximity
+            + self.fail_path_weight * path_edge_precision
+            - edge_penalty
+            - redundant_penalty
         )
 
         raw_log_reward = torch.where(
@@ -271,6 +288,14 @@ class EvidenceSubgraphReward(nn.Module):
                 ),
                 "reward/edge_count_mean": _masked_mean(
                     edge_count,
+                    valid_mask,
+                ),
+                "reward/zero_gain_edge_count_mean": _masked_mean(
+                    zero_gain_edge_count,
+                    valid_mask,
+                ),
+                "reward/redundant_penalty_mean": _masked_mean(
+                    redundant_penalty,
                     valid_mask,
                 ),
                 "reward/hit_rate": _mean(
@@ -583,6 +608,63 @@ def compute_path_edge_fidelity(
     return path_edge_count, path_edge_precision
 
 
+def compute_zero_gain_edge_count(
+    *,
+    state: StateBatch,
+    graph: GraphContext,
+    target_mask: Tensor,
+) -> Tensor:
+    """
+    Count selected edges that do not increase covered target count at selection time.
+
+    StateBatch stores selected edges in trajectory order, so this is a prefix-time
+    redundancy proxy rather than a global minimal-subgraph computation.
+    """
+
+    zero_gain = torch.zeros(
+        state.num_states,
+        dtype=torch.float,
+        device=state.device,
+    )
+
+    if state.num_states == 0 or int(state.budget) == 0:
+        return zero_gain
+
+    current = StateBatch.initial(
+        graph_ids=state.graph_ids,
+        budget=int(state.budget),
+    )
+    current_answers = count_answers_in_state(
+        state=current,
+        graph=graph,
+        target_mask=target_mask,
+    ).to(dtype=torch.float)
+
+    for step in range(int(state.budget)):
+        rows = state.edge_count.gt(step).nonzero(as_tuple=False).flatten()
+        if int(rows.numel()) == 0:
+            continue
+
+        edge_ids = state.edge_ids.index_select(0, rows)[:, step]
+        current = current.advance(
+            ExpansionBatch(
+                state_ids=rows,
+                edge_ids=edge_ids,
+            )
+        )
+        next_answers = count_answers_in_state(
+            state=current,
+            graph=graph,
+            target_mask=target_mask,
+        ).to(dtype=torch.float)
+
+        gain = next_answers.index_select(0, rows) - current_answers.index_select(0, rows)
+        zero_gain[rows] = zero_gain.index_select(0, rows) + gain.le(0.0).to(dtype=torch.float)
+        current_answers = next_answers
+
+    return zero_gain
+
+
 def _check_base_target_context(
     *,
     state: StateBatch,
@@ -693,4 +775,5 @@ __all__ = [
     "count_answers_in_state",
     "compute_target_proximity",
     "compute_path_edge_fidelity",
+    "compute_zero_gain_edge_count",
 ]
