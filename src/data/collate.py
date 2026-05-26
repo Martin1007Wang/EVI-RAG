@@ -10,7 +10,7 @@ from .schema.fields import SampleFields
 
 _DEFAULT_FOLLOW_BATCH = (
     SampleFields.REACHABLE_TARGET_NODE_IDS,
-    SampleFields.REPLAY_TRAJECTORY_LENGTHS,
+    SampleFields.WEAK_REPLAY_EDGE_IDS,
 )
 
 

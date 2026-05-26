@@ -73,6 +73,7 @@ class WeaverModule(LightningModule):
         policy: ForwardPolicy,
         reward_model: TerminalRecallReward,
         loss_fn: torch.nn.Module,
+        weak_replay_loss: torch.nn.Module | None = None,
         runner: RolloutRunner,
         optimization: OptimizationRuntimeConfig,
         evaluation: EvalRuntimeConfig,
@@ -85,6 +86,7 @@ class WeaverModule(LightningModule):
         self.policy = policy
         self.reward_model = reward_model
         self.loss_fn = loss_fn
+        self.weak_replay_loss = weak_replay_loss
         self.runner = runner
         self.optimization = optimization
         self.evaluation = evaluation
@@ -128,6 +130,7 @@ class WeaverModule(LightningModule):
             self.policy_feature_encoder,
             self.policy,
             self.reward_model,
+            *(tuple() if self.weak_replay_loss is None else (self.weak_replay_loss,)),
         )
 
     def training_step(
@@ -175,12 +178,42 @@ class WeaverModule(LightningModule):
             trajectories=rollout.trajectories,
         )
 
-        loss = self._extract_loss(loss_out)
-        metrics = self._extract_metrics(loss_out)
+        weak_out = self._compute_weak_replay_loss(
+            ctx=ctx,
+            rollout=rollout,
+        )
+
+        loss = self._extract_loss(loss_out) + self._extract_loss(weak_out)
+        metrics = dict(self._extract_metrics(loss_out))
+        metrics.update(self._extract_metrics(weak_out))
+        metrics.update(rollout.metrics)
 
         return StepOutput(
             loss=loss,
             metrics=metrics,
+        )
+
+    def _compute_weak_replay_loss(
+        self,
+        *,
+        ctx: BatchContext,
+        rollout: RolloutBatch,
+    ) -> Any:
+        if self.weak_replay_loss is None:
+            zero = torch.zeros((), dtype=torch.float32, device=ctx.graph.device)
+            return StepOutput(
+                loss=zero,
+                metrics={
+                    "weak_replay/loss": zero,
+                    "weak_replay/active_state_count": zero,
+                },
+            )
+        return self.weak_replay_loss(
+            policy=self.policy,
+            features=ctx.features,
+            graph_context=ctx.graph,
+            target_context=ctx.target,
+            weak_replay=rollout.weak_replay,
         )
 
     def train_rollout(

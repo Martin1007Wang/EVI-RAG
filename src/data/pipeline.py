@@ -53,11 +53,6 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
         str(k): str(v) for k, v in _mapping(dataset_cfg.get("column_map", {}), "dataset.column_map").items()
     }
     encoder_cfg = _mapping(preprocess_cfg.get("encoder"), "preprocess.encoder")
-    replay_cfg = _mapping(
-        preprocess_cfg.get("replay_candidates", {}),
-        "preprocess.replay_candidates",
-    )
-
     sample_iter_factory = lambda: iter_samples(
         dataset=dataset_name,
         split_mapping=source_splits,
@@ -74,8 +69,6 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
         dedup_edges=bool(preprocess_cfg.get("dedup_edges", True)),
         remove_self_loops=bool(preprocess_cfg.get("remove_self_loops", True)),
         validate_graph_alignment=bool(preprocess_cfg.get("validate_graph_alignment", False)),
-        replay_max_trajectories=int(replay_cfg.get("max_trajectories", 8)),
-        replay_max_length=int(replay_cfg.get("max_length", 3)),
     )
     if scan.stats.kept <= 0:
         raise RuntimeError("No valid samples after graph collection.")
@@ -163,11 +156,7 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
                 "stream_chunk_size": chunk_size,
                 "map_size_gb": float(preprocess_cfg.get("map_size_gb", 128.0)),
                     "commit_frequency": int(preprocess_cfg.get("commit_frequency", 1000)),
-                    "replay_candidates": {
-                        "kind": "evidence_subgraph_v1",
-                        "max_trajectories": int(replay_cfg.get("max_trajectories", 8)),
-                        "max_length": int(replay_cfg.get("max_length", 3)),
-                    },
+                    "weak_replay_labels": {"kind": "shortest_path_edge_set_v1"},
                     "entity_typing": {"non_text_prefixes": list(entity_text_policy.non_text_prefixes)},
                 },
             "encoder": dict(encoder_provenance),
@@ -220,8 +209,6 @@ def _scan_samples(
     dedup_edges: bool,
     remove_self_loops: bool,
     validate_graph_alignment: bool,
-    replay_max_trajectories: int,
-    replay_max_length: int,
 ) -> _ScannedSamples:
     catalog = CatalogBuilder()
     prepared_samples: list[Any] = []
@@ -235,8 +222,6 @@ def _scan_samples(
             dedup_edges=dedup_edges,
             remove_self_loops=remove_self_loops,
             validate_alignment=validate_graph_alignment,
-            replay_max_trajectories=int(replay_max_trajectories),
-            replay_max_length=int(replay_max_length),
             stats=stats,
         )
         if prepared is None:

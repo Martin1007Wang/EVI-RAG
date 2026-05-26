@@ -17,7 +17,8 @@ policy:
   action_hidden_dim: null
   semantic_relation_weight: 1.0
   semantic_dst_weight: 0.5
-  frontier_size_correction: 0.0
+  edge_residual_weight: 0.25
+  frontier_size_correction: 1.0
   state_encoder:
     _target_: src.weaver.nn.state_encoder.StateEncoder
     hidden_dim: 1024
@@ -42,11 +43,15 @@ reward_model:
 
 loss_fn:
   _target_: src.weaver.objectives.SubTBObjective
-  alpha_replay: 10.0
+  alpha_replay: 0.0
   subtb_lambda: 0.8
   max_len: null
   residual_loss: huber
   huber_delta: 2.0
+
+weak_replay_loss:
+  _target_: src.weaver.objectives.WeakReplayLoss
+  weight: 3.0
 
 runner:
   _target_: src.weaver.rollout.runner.RolloutRunner
@@ -54,11 +59,12 @@ runner:
     _target_: src.weaver.rollout.engine.RolloutEngine
     budget: ${model.budget}
   train_policy_rollouts: 8
-  train_replay_rollouts: 2
   eval_rollouts: 8
-  replay_source:
-    _target_: src.weaver.rollout.replay.ReplaySource
+  weak_replay_source:
+    _target_: src.weaver.rollout.replay.WeakReplaySource
     budget: ${model.budget}
+    states_per_graph: 8
+    branch_per_state: 2
 
 optimization:
   _target_: src.training.config.OptimizationRuntimeConfig

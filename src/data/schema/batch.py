@@ -20,8 +20,8 @@ After collation:
 - anchor_node_ids / target_node_ids / reachable_target_node_ids contain
   batch-physical node ids.
 - node_entity_catalog_ids / edge_relation_catalog_ids remain global catalog ids.
-- replay_trajectory_edge_ids remain graph-local edge ids and must NOT be fed
-  directly into StateBatch. Convert them explicitly in replay code if needed.
+- weak_replay_edge_ids remain graph-local edge ids and must be converted with
+  their follow_batch graph ids before use.
 
 Do not add edge_batch as a required truth source. Infer edge_to_graph from:
 
@@ -55,31 +55,24 @@ _COUNT_KEYS = frozenset(
 
 _FLAT_SUPERVISION_KEYS = frozenset(
     {
-        SampleFields.ANCHOR_NODE_FORWARD_DISTANCE_FLAT,
-        SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT,
         SampleFields.NODE_TARGET_DISTANCE,
-        SampleFields.NODE_TARGET_DISTANCES_FLAT,
-        SampleFields.NODE_TARGET_SHORTEST_PATH_COUNT_FLAT,
-        SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES,
-        SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES,
     }
 )
 
-_LOCAL_REPLAY_KEYS = frozenset(
+_LOCAL_WEAK_REPLAY_KEYS = frozenset(
     {
-        SampleFields.REPLAY_TRAJECTORY_EDGE_IDS,
-        SampleFields.REPLAY_TRAJECTORY_LENGTHS,
+        SampleFields.WEAK_REPLAY_EDGE_IDS,
+        SampleFields.WEAK_REPLAY_EDGE_WEIGHT,
     }
 )
 
 _RUNTIME_ONLY_NO_INCREMENT_KEYS = frozenset(
     {
         "node_target_shortest_path_edge_mask_flat",
-        "node_target_shortest_path_edge_count_flat",
     }
 )
 
-_NO_INCREMENT_KEYS = _GLOBAL_ID_KEYS | _COUNT_KEYS | _FLAT_SUPERVISION_KEYS | _LOCAL_REPLAY_KEYS | _RUNTIME_ONLY_NO_INCREMENT_KEYS
+_NO_INCREMENT_KEYS = _GLOBAL_ID_KEYS | _COUNT_KEYS | _FLAT_SUPERVISION_KEYS | _LOCAL_WEAK_REPLAY_KEYS | _RUNTIME_ONLY_NO_INCREMENT_KEYS
 
 
 def _num_nodes(data: Any) -> int:
@@ -127,9 +120,8 @@ class RetrievalData(Data):
     - edge_index uses sample-local node ids.
     - anchor_node_ids / target_node_ids / reachable_target_node_ids use
       sample-local node ids.
-    - replay_trajectory_edge_ids uses sample-local edge ids and is intentionally
-      not incremented by PyG because it is usually padded and paired with
-      replay_trajectory_lengths.
+    - weak_replay_edge_ids uses sample-local edge ids and is intentionally not
+      incremented by PyG; use weak_replay_edge_ids_batch for graph ids.
 
     Global-id fields:
     - node_entity_catalog_ids
@@ -163,8 +155,8 @@ class RetrievalBatch(Batch):
     - target / reachable target fields
     - node-target shortest-path materialized tensors
 
-    Replay fields remain graph-local and must be converted explicitly by the
-    replay module before becoming StateBatch edge ids.
+    Weak replay edge labels remain graph-local and are converted explicitly by
+    TargetContext before loss code uses them.
     """
 
     ptr: torch.Tensor
@@ -180,17 +172,10 @@ class RetrievalBatch(Batch):
     target_node_ids: torch.Tensor
     reachable_target_node_ids: torch.Tensor
 
-    anchor_node_forward_distances_flat: torch.Tensor
-    anchor_node_backward_distances_flat: torch.Tensor
-
     node_target_distance: torch.Tensor
-    node_target_distances_flat: torch.Tensor
-    node_target_shortest_path_count_flat: torch.Tensor
-    node_target_shortest_path_edge_mask_flat: torch.Tensor
-    node_target_shortest_path_edge_count_flat: torch.Tensor
 
-    replay_trajectory_edge_ids: torch.Tensor
-    replay_trajectory_lengths: torch.Tensor
+    weak_replay_edge_ids: torch.Tensor
+    weak_replay_edge_weight: torch.Tensor
 
     def __cat_dim__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         return super().__cat_dim__(key, value, *args, **kwargs)  # type: ignore[attr-defined]

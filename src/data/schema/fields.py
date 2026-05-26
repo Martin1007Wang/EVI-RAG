@@ -11,28 +11,10 @@ class SampleFields:
     REACHABLE_TARGET_NODE_IDS = (
         "reachable_target_node_ids"  # LongTensor [num_reachable_targets]
     )
-    ANCHOR_NODE_FORWARD_DISTANCE_FLAT = (
-        "anchor_node_forward_distances_flat"  # LongTensor [num_nodes]
-    )
-    ANCHOR_NODE_BACKWARD_DISTANCE_FLAT = (
-        "anchor_node_backward_distances_flat"  # LongTensor [num_nodes]
-    )
     NODE_TARGET_DISTANCE = "node_target_distance"  # LongTensor [num_nodes]
-    NODE_TARGET_DISTANCES_FLAT = (
-        "node_target_distances_flat"  # LongTensor [T * num_nodes]
+    WEAK_REPLAY_EDGE_IDS = (
+        "weak_replay_edge_ids"  # LongTensor [num_weak_edges], graph-local edge ids
     )
-    NODE_TARGET_SHORTEST_PATH_COUNT_FLAT = (
-        "node_target_shortest_path_count_flat"  # FloatTensor [T * num_nodes]
-    )
-    NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES = (
-        "node_target_shortest_path_edge_count_indices"  # LongTensor [nnz] into [T * num_edges]
-    )
-    NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES = (
-        "node_target_shortest_path_edge_count_values"  # FloatTensor [nnz]
-    )
-    REPLAY_TRAJECTORY_EDGE_IDS = (
-        "replay_trajectory_edge_ids"  # LongTensor [sum replay trajectory lengths]
-    )
-    REPLAY_TRAJECTORY_LENGTHS = (
-        "replay_trajectory_lengths"  # LongTensor [num replay trajectories]
+    WEAK_REPLAY_EDGE_WEIGHT = (
+        "weak_replay_edge_weight"  # FloatTensor [num_weak_edges]
     )

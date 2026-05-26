@@ -9,8 +9,8 @@ from src.weaver.context import GraphContext, TargetContext
 from src.weaver.nn.feature_encoder import FeatureBank
 from src.weaver.policy import ForwardPolicy
 from src.weaver.rollout.engine import RolloutEngine
-from src.weaver.rollout.replay import ReplaySource
-from src.weaver.rollout.trajectory import SRC_POLICY, SRC_REPLAY, TrajectoryBatch
+from src.weaver.rollout.replay import WeakReplayBatch, WeakReplaySource
+from src.weaver.rollout.trajectory import SRC_POLICY, TrajectoryBatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,10 +19,12 @@ class RolloutBatch:
     Output of train rollout generation.
 
     trajectories:
-    - policy and replay trajectories concatenated together.
+    - policy trajectories only.
     """
 
     trajectories: TrajectoryBatch
+    weak_replay: WeakReplayBatch
+    metrics: dict[str, torch.Tensor]
 
     @property
     def num_trajectories(self) -> int:
@@ -35,10 +37,8 @@ class RolloutBatch:
         return int(self.trajectories.source.eq(int(SRC_POLICY)).sum().item())
 
     @property
-    def num_replay_trajectories(self) -> int:
-        if self.trajectories.num_trajectories == 0:
-            return 0
-        return int(self.trajectories.source.eq(int(SRC_REPLAY)).sum().item())
+    def num_weak_replay_states(self) -> int:
+        return int(self.weak_replay.num_states)
 
 
 class RolloutRunner:
@@ -47,11 +47,10 @@ class RolloutRunner:
 
     Responsibilities:
     - sample policy trajectories;
-    - optionally attach precomputed replay trajectories;
+    - optionally attach weak replay prefix states;
 
     Non-responsibilities:
     - no replay reward gating;
-    - no replay stats;
     - no dynamic replay schedule;
     - no progress_fn;
     - no loss construction;
@@ -64,25 +63,19 @@ class RolloutRunner:
         *,
         engine: RolloutEngine,
         train_policy_rollouts: int,
-        train_replay_rollouts: int = 0,
         eval_rollouts: int = 1,
-        replay_source: ReplaySource | None = None,
+        weak_replay_source: WeakReplaySource | None = None,
     ) -> None:
         self.engine = engine
-        self.replay_source = replay_source
+        self.weak_replay_source = weak_replay_source
 
         self.train_policy_rollouts = int(train_policy_rollouts)
-        self.train_replay_rollouts = int(train_replay_rollouts)
         self.eval_rollouts_count = int(eval_rollouts)
 
         if self.train_policy_rollouts < 0:
             raise ValueError("train_policy_rollouts must be nonnegative.")
-        if self.train_replay_rollouts < 0:
-            raise ValueError("train_replay_rollouts must be nonnegative.")
         if self.eval_rollouts_count < 0:
             raise ValueError("eval_rollouts must be nonnegative.")
-        if self.train_replay_rollouts > 0 and replay_source is None:
-            raise ValueError("replay_source is required when train_replay_rollouts > 0.")
 
         self._validate_budget_consistency()
 
@@ -91,12 +84,12 @@ class RolloutRunner:
         return int(self.engine.budget)
 
     def _validate_budget_consistency(self) -> None:
-        if self.replay_source is None:
+        if self.weak_replay_source is None:
             return
 
-        replay_budget = int(self.replay_source.budget)
+        replay_budget = int(self.weak_replay_source.budget)
         if replay_budget != self.budget:
-            raise ValueError("replay_source budget must match rollout engine budget, got " f"{replay_budget} and {self.budget}.")
+            raise ValueError("weak_replay_source budget must match rollout engine budget, got " f"{replay_budget} and {self.budget}.")
 
     @torch.no_grad()
     def train_rollouts(
@@ -118,26 +111,24 @@ class RolloutRunner:
             num_rollouts=self.train_policy_rollouts,
         )
 
-        replay_trajectories = self.replay_rollouts(
-            batch=batch,
+        weak_replay = self.weak_replay_states(
             context=context,
             target_context=target_context,
         )
 
-        trajectories = concat_trajectory_batches(
-            [
-                policy_trajectories,
-                replay_trajectories,
-            ],
-            device=context.device,
-            budget=self.budget,
-        )
-
-        if trajectories.num_trajectories <= 0:
+        if policy_trajectories.num_trajectories <= 0:
             raise RuntimeError("RolloutRunner produced zero training trajectories.")
 
         return RolloutBatch(
-            trajectories=trajectories,
+            trajectories=policy_trajectories,
+            weak_replay=weak_replay,
+            metrics={
+                "weak_replay/state_count": torch.as_tensor(
+                    float(weak_replay.num_states),
+                    dtype=torch.float32,
+                    device=context.device,
+                )
+            },
         )
 
     @torch.no_grad()
@@ -191,23 +182,18 @@ class RolloutRunner:
         )
 
     @torch.no_grad()
-    def replay_rollouts(
+    def weak_replay_states(
         self,
         *,
-        batch: RetrievalBatch,
         context: GraphContext,
         target_context: TargetContext,
-    ) -> TrajectoryBatch:
-        if self.train_replay_rollouts <= 0:
-            return TrajectoryBatch.empty(
+    ) -> WeakReplayBatch:
+        if self.weak_replay_source is None:
+            return WeakReplayBatch.empty(
                 device=context.device,
                 budget=self.budget,
             )
-
-        if self.replay_source is None:
-            raise RuntimeError("replay_source is required when train_replay_rollouts > 0.")
-
-        return self.replay_source.sample(batch=batch, graph=context, target=target_context, trajectories_per_graph=self.train_replay_rollouts)
+        return self.weak_replay_source.sample(graph=context, target=target_context)
 
 
 def repeated_graph_ids(

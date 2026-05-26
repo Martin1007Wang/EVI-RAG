@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import torch
 from src.graph.ops import build_local_graph
-from src.graph.paths import compute_path_labels, compute_replay_path_candidates
+from src.graph.paths import compute_path_labels
 from .samples import PreparedSample, RawSample, SplitFilter
 from .catalog import CatalogBuilder
 
@@ -37,8 +37,6 @@ def prepare_sample(
     dedup_edges: bool = True,
     remove_self_loops: bool = True,
     validate_alignment: bool = True,
-    replay_max_trajectories: int = 8,
-    replay_max_length: int = 3,
     stats: GraphCollectStats | None = None,
 ) -> PreparedSample | None:
     stats = stats or GraphCollectStats()
@@ -97,15 +95,9 @@ def prepare_sample(
     ):
         stats.no_reachable_answer += 1
         return None
-    replay_candidates = compute_replay_path_candidates(
-        edge_index=edge_index,
-        anchor_node_ids=anchor_node_ids,
-        reachable_target_node_ids=path_labels.reachable_target_node_ids,
-        node_target_distances_flat=path_labels.node_target_distances_flat,
-        node_target_shortest_path_edge_count_flat=path_labels.node_target_shortest_path_edge_count_flat,
-        num_nodes=num_nodes,
-        max_trajectories=int(replay_max_trajectories),
-        max_length=int(replay_max_length),
+    weak_replay_edge_ids, weak_replay_edge_weight = _weak_replay_edges(
+        edge_mask_flat=path_labels.node_target_shortest_path_edge_mask_flat,
+        num_edges=num_edges,
     )
     node_entity_catalog_ids, edge_relation_catalog_ids = _build_graph_catalog_ids(
         graph_edges=graph_edges,
@@ -128,16 +120,31 @@ def prepare_sample(
         reachable_target_node_ids=path_labels.reachable_target_node_ids,
         node_entity_catalog_ids=node_entity_catalog_ids,
         edge_relation_catalog_ids=edge_relation_catalog_ids,
-        anchor_node_forward_distances_flat=path_labels.anchor_node_forward_distances_flat,
-        anchor_node_backward_distances_flat=path_labels.anchor_node_backward_distances_flat,
         node_target_distance=path_labels.node_target_distance,
-        node_target_distances_flat=path_labels.node_target_distances_flat,
-        node_target_shortest_path_count_flat=path_labels.node_target_shortest_path_count_flat,
-        node_target_shortest_path_edge_mask_flat=path_labels.node_target_shortest_path_edge_mask_flat,
-        node_target_shortest_path_edge_count_flat=path_labels.node_target_shortest_path_edge_count_flat,
-        replay_trajectory_edge_ids=replay_candidates.edge_ids,
-        replay_trajectory_lengths=replay_candidates.lengths,
+        weak_replay_edge_ids=weak_replay_edge_ids,
+        weak_replay_edge_weight=weak_replay_edge_weight,
     )
+
+
+def _weak_replay_edges(
+    *,
+    edge_mask_flat: torch.Tensor,
+    num_edges: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if int(num_edges) <= 0 or int(edge_mask_flat.numel()) == 0:
+        return (
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+        )
+    mask = edge_mask_flat.to(dtype=torch.bool, device="cpu").view(-1, int(num_edges))
+    weight = mask.to(dtype=torch.float32).sum(dim=0)
+    edge_ids = weight.gt(0).nonzero(as_tuple=False).view(-1).long()
+    if int(edge_ids.numel()) == 0:
+        return (
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+        )
+    return edge_ids.contiguous(), weight.index_select(0, edge_ids).contiguous()
 
 
 def _clean_edges(

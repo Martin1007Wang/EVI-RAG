@@ -40,6 +40,7 @@ class ForwardPolicy(nn.Module):
         budget: int = 3,
         semantic_relation_weight: float = 1.0,
         semantic_dst_weight: float = 0.5,
+        edge_residual_weight: float = 1.0,
         frontier_size_correction: float = 1.0,
         action_hidden_dim: int | None = None,
     ) -> None:
@@ -57,7 +58,11 @@ class ForwardPolicy(nn.Module):
         self.action_hidden_dim = int(action_hidden_dim or hidden_dim)
         self.semantic_relation_weight = float(semantic_relation_weight)
         self.semantic_dst_weight = float(semantic_dst_weight)
+        self.edge_residual_weight = float(edge_residual_weight)
         self.frontier_size_correction = float(frontier_size_correction)
+
+        if self.edge_residual_weight < 0.0:
+            raise ValueError("edge_residual_weight must be nonnegative.")
 
         self.budget_embedding = nn.Embedding(
             self.budget + 1,
@@ -264,7 +269,7 @@ class ForwardPolicy(nn.Module):
             row_ids=row_ids,
         )
 
-        edge_raw_score = (semantic_prior + residual).float()
+        edge_raw_score = (semantic_prior + float(self.edge_residual_weight) * residual).float()
 
         edge_log_flow = self.size_normalized_edge_flow(
             edge_raw_score=edge_raw_score,

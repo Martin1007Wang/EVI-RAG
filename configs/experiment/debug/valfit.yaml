@@ -24,8 +24,8 @@ datamodule:
     validation: validation
     test: validation
 
-  batch_size: 16
-  eval_batch_size: 16
+  batch_size: 4
+  eval_batch_size: 4
 
   num_workers: 0
   eval_num_workers: 0

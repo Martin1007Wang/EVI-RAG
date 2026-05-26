@@ -47,26 +47,14 @@ class PreparedSample:
     node_entity_catalog_ids: torch.Tensor  # [num_nodes]
     edge_relation_catalog_ids: torch.Tensor  # [num_edges], aligned with edge_index columns
 
-    anchor_node_forward_distances_flat: torch.Tensor  # [num_nodes]
-    anchor_node_backward_distances_flat: torch.Tensor  # [num_nodes]
     node_target_distance: torch.Tensor  # [num_nodes]
-    node_target_distances_flat: torch.Tensor  # [T * num_nodes], T = num_reachable_targets
-
-    node_target_shortest_path_count_flat: torch.Tensor  # [T * num_nodes]
-    # Runtime-only dense edge labels at triple-id level: [target_idx, edge_id].
-    # Materialized artifacts persist sparse nonzero edge counts instead.
-    node_target_shortest_path_edge_mask_flat: torch.Tensor  # [T * num_edges]
-    node_target_shortest_path_edge_count_flat: torch.Tensor  # [T * num_edges]
-    replay_trajectory_edge_ids: torch.Tensor  # [sum replay trajectory lengths]
-    replay_trajectory_lengths: torch.Tensor  # [num replay trajectories]
+    weak_replay_edge_ids: torch.Tensor  # [num_weak_edges]
+    weak_replay_edge_weight: torch.Tensor  # [num_weak_edges]
 
     def storage_key(self) -> str:
         return f"{self.dataset}/{self.split}/{self.question_id}"
 
     def to_storage_record(self) -> StorageRecord:
-        edge_count_indices, edge_count_values = _sparse_nonzero_counts(
-            self.node_target_shortest_path_edge_count_flat
-        )
         sample_id = self.storage_key().encode("utf-8")
         return {
             SampleFields.SAMPLE_ID: torch.tensor(list(sample_id), dtype=torch.uint8),
@@ -78,24 +66,7 @@ class PreparedSample:
             SampleFields.ANCHOR_NODE_IDS: self.anchor_node_ids.long().contiguous(),
             SampleFields.TARGET_NODE_IDS: self.target_node_ids.long().contiguous(),
             SampleFields.REACHABLE_TARGET_NODE_IDS: self.reachable_target_node_ids.long().contiguous(),
-            SampleFields.ANCHOR_NODE_FORWARD_DISTANCE_FLAT: self.anchor_node_forward_distances_flat.long().contiguous(),
-            SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT: self.anchor_node_backward_distances_flat.long().contiguous(),
             SampleFields.NODE_TARGET_DISTANCE: self.node_target_distance.long().contiguous(),
-            SampleFields.NODE_TARGET_DISTANCES_FLAT: self.node_target_distances_flat.long().contiguous(),
-            SampleFields.NODE_TARGET_SHORTEST_PATH_COUNT_FLAT: self.node_target_shortest_path_count_flat.float().contiguous(),
-            SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES: edge_count_indices,
-            SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES: edge_count_values,
-            SampleFields.REPLAY_TRAJECTORY_EDGE_IDS: self.replay_trajectory_edge_ids.long().contiguous(),
-            SampleFields.REPLAY_TRAJECTORY_LENGTHS: self.replay_trajectory_lengths.long().contiguous(),
+            SampleFields.WEAK_REPLAY_EDGE_IDS: self.weak_replay_edge_ids.long().contiguous(),
+            SampleFields.WEAK_REPLAY_EDGE_WEIGHT: self.weak_replay_edge_weight.float().contiguous(),
         }
-
-
-def _sparse_nonzero_counts(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    dense = counts.to(dtype=torch.float32, device="cpu").contiguous().view(-1)
-    indices = dense.nonzero(as_tuple=False).view(-1).long().contiguous()
-    if indices.numel() == 0:
-        empty_indices = torch.empty((0,), dtype=torch.long)
-        empty_values = torch.empty((0,), dtype=torch.float32)
-        return empty_indices, empty_values
-    values = dense.index_select(0, indices).to(dtype=torch.float32).contiguous()
-    return indices.contiguous(), values

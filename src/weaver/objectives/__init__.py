@@ -21,6 +21,7 @@ from .subtb import (
     subtrajectory_terms,
     weighted_source_balanced_mean,
 )
+from .weak_replay import WeakReplayLoss
 
 __all__ = [
     "ObjectiveOutput",
@@ -39,4 +40,5 @@ __all__ = [
     "residual_loss_units",
     "subtrajectory_terms",
     "weighted_source_balanced_mean",
+    "WeakReplayLoss",
 ]

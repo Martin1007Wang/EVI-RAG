@@ -182,6 +182,7 @@ class TargetContext:
 
     node_target_distance: Tensor  # [N]
     shortest_path_edge_mask: Tensor  # [E]
+    shortest_path_edge_weight: Tensor  # [E]
 
     @classmethod
     def from_batch(
@@ -232,7 +233,7 @@ class TargetContext:
             dtype=torch.long,
         )
 
-        shortest_path_edge_mask = build_shortest_path_edge_mask(
+        shortest_path_edge_mask, shortest_path_edge_weight = build_shortest_path_edge_labels(
             batch=batch,
             graph_context=graph_context,
             target_count_by_graph=target_count_by_graph,
@@ -246,6 +247,7 @@ class TargetContext:
                 target_count_by_graph=target_count_by_graph,
                 node_target_distance=node_target_distance,
                 shortest_path_edge_mask=shortest_path_edge_mask,
+                shortest_path_edge_weight=shortest_path_edge_weight,
                 graph_context=graph_context,
             )
 
@@ -256,6 +258,7 @@ class TargetContext:
             target_count_by_graph=target_count_by_graph,
             node_target_distance=node_target_distance,
             shortest_path_edge_mask=shortest_path_edge_mask,
+            shortest_path_edge_weight=shortest_path_edge_weight,
         )
 
     @property
@@ -455,75 +458,65 @@ def build_ptr_from_counts(
     return ptr
 
 
-def build_shortest_path_edge_mask(
+def build_shortest_path_edge_labels(
     *,
     batch: RetrievalBatch,
     graph_context: GraphContext,
     target_count_by_graph: Tensor,
-) -> Tensor:
-    """
-    Build an edge-level shortest-path mask indexed by physical edge id.
-
-    Accepted input layouts:
-    1. [E]
-       Already edge-level.
-
-    2. concat_g [T_g * E_g]
-       Per-target edge mask flattened inside each graph.
-       This is reduced by any over target dimension to [E_g].
-    """
-
-    raw = batch.node_target_shortest_path_edge_mask_flat.to(
-        device=graph_context.device,
-        dtype=torch.bool,
-    ).view(-1)
-
-    num_edges = int(graph_context.num_edges)
-
-    if int(raw.numel()) == num_edges:
-        return raw
-
-    expected = int(
-        (target_count_by_graph.to(dtype=torch.long) * (graph_context.edge_ptr[1:] - graph_context.edge_ptr[:-1]).to(dtype=torch.long)).sum().item()
+) -> tuple[Tensor, Tensor]:
+    weak_edge_ids = getattr(batch, "weak_replay_edge_ids", None)
+    weak_edge_batch = getattr(batch, "weak_replay_edge_ids_batch", None)
+    weak_edge_weight = getattr(batch, "weak_replay_edge_weight", None)
+    del target_count_by_graph
+    if weak_edge_ids is None or weak_edge_batch is None or weak_edge_weight is None:
+        raise KeyError("weak replay edge labels are required in RetrievalBatch.")
+    return build_weak_replay_edge_labels(
+        local_edge_ids=weak_edge_ids,
+        edge_graph_ids=weak_edge_batch,
+        edge_weight=weak_edge_weight,
+        graph_context=graph_context,
     )
 
-    if int(raw.numel()) != expected:
+
+def build_weak_replay_edge_labels(
+    *,
+    local_edge_ids: Tensor,
+    edge_graph_ids: Tensor,
+    edge_weight: Tensor,
+    graph_context: GraphContext,
+) -> tuple[Tensor, Tensor]:
+    local_edge_ids = local_edge_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
+    edge_graph_ids = edge_graph_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
+    edge_weight = edge_weight.to(device=graph_context.device, dtype=torch.float32).view(-1)
+    if int(local_edge_ids.numel()) != int(edge_graph_ids.numel()):
+        raise ValueError("weak_replay_edge_ids and weak_replay_edge_ids_batch length mismatch.")
+    if int(local_edge_ids.numel()) != int(edge_weight.numel()):
+        raise ValueError("weak_replay_edge_ids and weak_replay_edge_weight length mismatch.")
+    mask = torch.zeros(int(graph_context.num_edges), dtype=torch.bool, device=graph_context.device)
+    weight = torch.zeros(int(graph_context.num_edges), dtype=torch.float32, device=graph_context.device)
+    if int(local_edge_ids.numel()) == 0:
+        return mask, weight
+    starts = graph_context.edge_ptr.index_select(0, edge_graph_ids)
+    ends = graph_context.edge_ptr.index_select(0, edge_graph_ids + 1)
+    edge_count = ends - starts
+    outside = local_edge_ids.lt(0) | local_edge_ids.ge(edge_count)
+    if bool(outside.any()):
+        first = int(outside.nonzero(as_tuple=False).flatten()[0].item())
         raise ValueError(
-            "node_target_shortest_path_edge_mask_flat has incompatible length: "
-            f"got {int(raw.numel())}, expected either num_edges={num_edges} "
-            f"or sum_g target_count_g * edge_count_g={expected}."
+            "weak_replay_edge_ids contains an id outside its graph edge range: "
+            f"graph_id={int(edge_graph_ids[first].item())}, "
+            f"local_edge_id={int(local_edge_ids[first].item())}."
         )
-
-    edge_mask = torch.zeros(
-        num_edges,
-        dtype=torch.bool,
-        device=graph_context.device,
+    physical_edge_ids = starts + local_edge_ids
+    mask[physical_edge_ids] = True
+    weight.scatter_reduce_(
+        dim=0,
+        index=physical_edge_ids,
+        src=edge_weight.clamp_min(0.0),
+        reduce="amax",
+        include_self=True,
     )
-
-    offset = 0
-    for graph_id in range(int(graph_context.num_graphs)):
-        edge_start = int(graph_context.edge_ptr[graph_id].item())
-        edge_end = int(graph_context.edge_ptr[graph_id + 1].item())
-        edge_count = edge_end - edge_start
-
-        target_count = int(target_count_by_graph[graph_id].item())
-        block_size = target_count * edge_count
-
-        if block_size == 0:
-            continue
-
-        block = raw[offset : offset + block_size].view(
-            target_count,
-            edge_count,
-        )
-
-        edge_mask[edge_start:edge_end] = block.any(dim=0)
-        offset += block_size
-
-    if offset != int(raw.numel()):
-        raise RuntimeError("Internal offset error while building shortest_path_edge_mask: " f"offset={offset}, raw_numel={int(raw.numel())}.")
-
-    return edge_mask
+    return mask, weight
 
 
 def _validate_target_context_tensors(
@@ -534,6 +527,7 @@ def _validate_target_context_tensors(
     target_count_by_graph: Tensor,
     node_target_distance: Tensor,
     shortest_path_edge_mask: Tensor,
+    shortest_path_edge_weight: Tensor,
     graph_context: GraphContext,
 ) -> None:
     if target_mask.ndim != 1:
@@ -586,6 +580,14 @@ def _validate_target_context_tensors(
     if int(shortest_path_edge_mask.numel()) != int(graph_context.num_edges):
         raise ValueError(
             "shortest_path_edge_mask length must equal num_edges: " f"{int(shortest_path_edge_mask.numel())} vs {int(graph_context.num_edges)}."
+        )
+
+    if shortest_path_edge_weight.ndim != 1:
+        raise ValueError("shortest_path_edge_weight must have shape [E], " f"got {tuple(shortest_path_edge_weight.shape)}.")
+
+    if int(shortest_path_edge_weight.numel()) != int(graph_context.num_edges):
+        raise ValueError(
+            "shortest_path_edge_weight length must equal num_edges: " f"{int(shortest_path_edge_weight.numel())} vs {int(graph_context.num_edges)}."
         )
 
 

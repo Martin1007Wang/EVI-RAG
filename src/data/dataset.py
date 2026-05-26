@@ -181,48 +181,15 @@ def _build_retrieval_data(
         dtype=torch.long,
     )
 
-    anchor_node_forward_distances_flat = _tensor(
-        raw[SampleFields.ANCHOR_NODE_FORWARD_DISTANCE_FLAT],
-        dtype=torch.long,
-    )
-
-    anchor_node_backward_distances_flat = _tensor(
-        raw[SampleFields.ANCHOR_NODE_BACKWARD_DISTANCE_FLAT],
-        dtype=torch.long,
-    )
-
     node_target_distance = _tensor(
         raw[SampleFields.NODE_TARGET_DISTANCE],
         dtype=torch.long,
     )
 
-    node_target_distances_flat = _tensor(
-        raw[SampleFields.NODE_TARGET_DISTANCES_FLAT],
-        dtype=torch.long,
-    )
-
-    node_target_shortest_path_count_flat = _tensor(
-        raw[SampleFields.NODE_TARGET_SHORTEST_PATH_COUNT_FLAT],
-        dtype=torch.float32,
-    )
-    node_target_shortest_path_edge_count_flat = _restore_edge_count_flat(
+    weak_replay_edge_ids, weak_replay_edge_weight = _weak_replay_fields(
         raw=raw,
         sample_id=sample_id,
-        num_edges=num_edges,
-        num_reachable_targets=int(reachable_target_node_ids.numel()),
     )
-    node_target_shortest_path_edge_mask_flat = node_target_shortest_path_edge_count_flat.gt(0)
-    replay_trajectory_edge_ids = _optional_tensor(
-        raw,
-        SampleFields.REPLAY_TRAJECTORY_EDGE_IDS,
-        dtype=torch.long,
-    )
-    replay_trajectory_lengths = _optional_tensor(
-        raw,
-        SampleFields.REPLAY_TRAJECTORY_LENGTHS,
-        dtype=torch.long,
-    )
-
     return RetrievalData(
         sample_id=sample_id,
         edge_index=edge_index,
@@ -234,15 +201,9 @@ def _build_retrieval_data(
         anchor_node_ids=anchor_node_ids,
         target_node_ids=target_node_ids,
         reachable_target_node_ids=reachable_target_node_ids,
-        anchor_node_forward_distances_flat=anchor_node_forward_distances_flat,
-        anchor_node_backward_distances_flat=anchor_node_backward_distances_flat,
         node_target_distance=node_target_distance,
-        node_target_distances_flat=node_target_distances_flat,
-        node_target_shortest_path_count_flat=node_target_shortest_path_count_flat,
-        node_target_shortest_path_edge_mask_flat=node_target_shortest_path_edge_mask_flat,
-        node_target_shortest_path_edge_count_flat=node_target_shortest_path_edge_count_flat,
-        replay_trajectory_edge_ids=replay_trajectory_edge_ids,
-        replay_trajectory_lengths=replay_trajectory_lengths,
+        weak_replay_edge_ids=weak_replay_edge_ids,
+        weak_replay_edge_weight=weak_replay_edge_weight,
     )
 
 
@@ -282,44 +243,26 @@ def _optional_tensor(
     return _tensor(value, dtype=dtype)
 
 
-def _restore_edge_count_flat(
+def _weak_replay_fields(
     *,
     raw: Mapping[str, Any],
     sample_id: str,
-    num_edges: int,
-    num_reachable_targets: int,
-) -> torch.Tensor:
-    expected = num_reachable_targets * num_edges
-    indices = _tensor(
-        raw[SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_INDICES],
-        dtype=torch.long,
-    )
-    values = _tensor(
-        raw[SampleFields.NODE_TARGET_SHORTEST_PATH_EDGE_COUNT_VALUES],
-        dtype=torch.float32,
-    )
-    if int(indices.numel()) != int(values.numel()):
+) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_ids = raw.get(SampleFields.WEAK_REPLAY_EDGE_IDS)
+    weight = raw.get(SampleFields.WEAK_REPLAY_EDGE_WEIGHT)
+    if edge_ids is None or weight is None:
+        raise KeyError(f"{sample_id}: missing weak replay edge labels")
+    edge_tensor = _tensor(edge_ids, dtype=torch.long).view(-1)
+    weight_tensor = _tensor(weight, dtype=torch.float32).view(-1)
+    if int(edge_tensor.numel()) != int(weight_tensor.numel()):
         raise ValueError(
-            f"{sample_id}: sparse shortest-path edge count length mismatch, "
-            f"indices={int(indices.numel())}, values={int(values.numel())}"
+            f"{sample_id}: weak replay edge fields length mismatch: "
+            f"edge_ids={int(edge_tensor.numel())}, weight={int(weight_tensor.numel())}"
         )
-    if indices.numel() > 0:
-        min_idx = int(indices.min().item())
-        max_idx = int(indices.max().item())
-        if min_idx < 0 or max_idx >= expected:
-            raise ValueError(
-                f"{sample_id}: sparse shortest-path edge count indices outside "
-                f"[0, {expected})"
-            )
-        if bool(values.le(0).any()):
-            raise ValueError(
-                f"{sample_id}: sparse shortest-path edge count values must be positive"
-            )
-
-    out = torch.zeros((expected,), dtype=torch.float32)
-    if indices.numel() > 0:
-        out.scatter_(0, indices, values)
-    return out.contiguous()
+    return (
+        edge_tensor.contiguous(),
+        weight_tensor.contiguous(),
+    )
 
 
 def _scalar_int(value: object, name: str) -> int:
