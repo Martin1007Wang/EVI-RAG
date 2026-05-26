@@ -19,6 +19,7 @@ from .subtb import (
     masked_mean_or_zero,
     residual_loss_units,
     subtrajectory_terms,
+    terminal_db_residual,
     weighted_source_balanced_mean,
 )
 from .weak_replay import WeakReplayLoss
@@ -39,6 +40,7 @@ __all__ = [
     "masked_mean_or_zero",
     "residual_loss_units",
     "subtrajectory_terms",
+    "terminal_db_residual",
     "weighted_source_balanced_mean",
     "WeakReplayLoss",
 ]

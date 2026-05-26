@@ -8,6 +8,9 @@ from torch import nn
 from src.weaver.policy import PolicyOutput
 from src.weaver.policy.backward import deterministic_backward_log_prob
 from src.weaver.rollout.trajectory import (
+    BUDGET,
+    NO_FRONTIER,
+    POLICY_STOP,
     SRC_POLICY,
     SRC_REPLAY,
     TrajectoryBatch,
@@ -28,6 +31,7 @@ from src.weaver.reward import TerminalRecallReward
 from .output import ObjectiveOutput
 
 Tensor = torch.Tensor
+TERMINAL_REASON_NONE = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,16 +50,18 @@ class SubTBEventBatch:
         expansion:
             z_t --e_t--> z_{t+1}
 
-        stop:
-            z_t --STOP--> terminal reward R(z_t)
+        terminal:
+            z_t --STOP--> terminal reward R(z_t), for policy STOP
+            z_t --BOUNDARY--> terminal reward R(z_t), for forced boundaries
 
     Stored quantities:
     - parent_state_log_flow = Φ(z_t)
     - child_state_log_flow  = Φ(z_{t+1}) for expansion, unused for STOP
-    - action_log_flow       = G(z_t, a_t)
+    - action_log_flow       = G(z_t, a_t) or Φ(z_t) for forced boundaries
     - action_log_prob       = G(z_t, a_t) - Φ(z_t), derived
-    - backward_log_prob     = log P_B(z_t | z_{t+1}) for expansion, 0 for STOP
-    - terminal_log_reward   = log R(z_t) for STOP, 0 for expansion
+    - backward_log_prob     = log P_B(z_t | z_{t+1}) for expansion, 0 for terminal
+    - terminal_log_reward   = log R(z_t) for terminal, 0 for expansion
+    - terminal_reason       = rollout stop reason for terminal, -1 for expansion
     """
 
     trajectory_ids: Tensor  # [N]
@@ -67,8 +73,9 @@ class SubTBEventBatch:
     action_log_flow: Tensor  # [N]
     backward_log_prob: Tensor  # [N]
     terminal_log_reward: Tensor  # [N]
+    terminal_reason: Tensor  # [N]
 
-    is_stop: Tensor  # [N], bool
+    is_terminal: Tensor  # [N], bool
 
     @property
     def device(self) -> torch.device:
@@ -82,13 +89,22 @@ class SubTBEventBatch:
     def action_log_prob(self) -> Tensor:
         return self.action_log_flow - self.parent_state_log_flow
 
+    @property
+    def is_stop(self) -> Tensor:
+        return self.is_terminal
+
 
 @dataclass(frozen=True, slots=True)
 class SubTBTerms:
     residual: Tensor
     weight: Tensor
     source_ids: Tensor
-    is_stop: Tensor
+    is_terminal: Tensor
+    terminal_reason: Tensor
+
+    @property
+    def is_stop(self) -> Tensor:
+        return self.is_terminal
 
 
 class SubTBLoss(nn.Module):
@@ -152,8 +168,8 @@ class SubTBLoss(nn.Module):
         )
 
         active = terms.weight.gt(0)
-        exp = (~terms.is_stop) & active
-        stop = terms.is_stop & active
+        exp = (~terms.is_terminal) & active
+        terminal = terms.is_terminal & active
 
         metrics = {
             "subtb/loss": loss.detach(),
@@ -175,12 +191,18 @@ class SubTBLoss(nn.Module):
             "subtb/stop_residual_abs": weighted_mean_or_zero(
                 terms.residual.abs(),
                 terms.weight,
-                stop,
+                terminal,
+            ).detach(),
+            "subtb/terminal_residual_abs": weighted_mean_or_zero(
+                terms.residual.abs(),
+                terms.weight,
+                terminal,
             ).detach(),
         }
 
         metrics.update(single_step_metrics(x.events))
         metrics.update(source_metrics(terms=terms, units=units))
+        metrics.update(subtrajectory_reason_metrics(terms=terms))
 
         if x.metrics:
             metrics.update(x.metrics)
@@ -333,8 +355,9 @@ def build_subtb_input(
     """
     Build SubTB events from transition states and policy outputs.
 
-    STOP uses terminal_out.stop_log_flow directly.
-    Do not represent STOP as a fake KG edge id.
+    Policy STOP uses terminal_out.stop_log_flow directly. Forced terminal
+    boundaries use terminal_out.state_log_flow so they do not act like sampled
+    STOP actions.
     """
 
     exp_events = _build_expansion_events(
@@ -395,7 +418,13 @@ def _build_expansion_events(
             dtype=parent_state_log_flow.dtype,
             device=device,
         ),
-        is_stop=torch.zeros(
+        terminal_reason=torch.full(
+            (n,),
+            int(TERMINAL_REASON_NONE),
+            dtype=torch.long,
+            device=device,
+        ),
+        is_terminal=torch.zeros(
             n,
             dtype=torch.bool,
             device=device,
@@ -434,9 +463,19 @@ def _build_terminal_events(
         rows,
     ).float()
 
-    action_log_flow = terminal_out.stop_log_flow.index_select(
+    reason = terminals.reason.index_select(0, rows).to(
+        device=device,
+        dtype=torch.long,
+    )
+    stop_log_flow = terminal_out.stop_log_flow.index_select(
         0,
         rows,
+    ).float()
+    boundary_log_flow = parent_state_log_flow
+    action_log_flow = torch.where(
+        reason.eq(int(POLICY_STOP)),
+        stop_log_flow,
+        boundary_log_flow,
     ).float()
 
     return SubTBEventBatch(
@@ -459,7 +498,8 @@ def _build_terminal_events(
             0,
             rows,
         ).float(),
-        is_stop=torch.ones(
+        terminal_reason=reason,
+        is_terminal=torch.ones(
             n,
             dtype=torch.bool,
             device=device,
@@ -492,8 +532,14 @@ def subtrajectory_terms(
     shape = (num_trajectories, num_steps)
 
     has_event = torch.zeros(shape, dtype=torch.bool, device=device)
-    is_stop = torch.zeros(shape, dtype=torch.bool, device=device)
+    is_terminal = torch.zeros(shape, dtype=torch.bool, device=device)
     source_ids = torch.full(shape, -1, dtype=torch.long, device=device)
+    terminal_reason = torch.full(
+        shape,
+        int(TERMINAL_REASON_NONE),
+        dtype=torch.long,
+        device=device,
+    )
 
     parent_flow = torch.zeros(shape, dtype=dtype, device=device)
     child_flow = torch.zeros(shape, dtype=dtype, device=device)
@@ -505,8 +551,9 @@ def subtrajectory_terms(
     step = events.step_ids
 
     has_event[traj, step] = True
-    is_stop[traj, step] = events.is_stop
+    is_terminal[traj, step] = events.is_terminal
     source_ids[traj, step] = events.source_ids
+    terminal_reason[traj, step] = events.terminal_reason
     parent_flow[traj, step] = events.parent_state_log_flow
     child_flow[traj, step] = events.child_state_log_flow
     action_log_prob[traj, step] = events.action_log_prob
@@ -520,7 +567,8 @@ def subtrajectory_terms(
     residuals: list[Tensor] = []
     weights: list[Tensor] = []
     sources: list[Tensor] = []
-    stop_flags: list[Tensor] = []
+    terminal_flags: list[Tensor] = []
+    terminal_reasons: list[Tensor] = []
 
     max_segment_len = num_steps if max_len is None else min(num_steps, int(max_len))
 
@@ -543,7 +591,7 @@ def subtrajectory_terms(
             continue
 
         tail = torch.where(
-            is_stop[:, end],
+            is_terminal[:, end],
             terminal_log_reward[:, end],
             child_flow[:, end],
         )
@@ -557,7 +605,8 @@ def subtrajectory_terms(
         residuals.append(residual[valid])
         weights.append(weight[valid])
         sources.append(source_ids[:, start][valid])
-        stop_flags.append(is_stop[:, end][valid])
+        terminal_flags.append(is_terminal[:, end][valid])
+        terminal_reasons.append(terminal_reason[:, end][valid])
 
     if not residuals:
         return _empty_terms(events)
@@ -566,16 +615,20 @@ def subtrajectory_terms(
         residual=torch.cat(residuals, dim=0),
         weight=torch.cat(weights, dim=0),
         source_ids=torch.cat(sources, dim=0),
-        is_stop=torch.cat(stop_flags, dim=0),
+        is_terminal=torch.cat(terminal_flags, dim=0),
+        terminal_reason=torch.cat(terminal_reasons, dim=0),
     )
 
 
 def single_step_metrics(events: SubTBEventBatch) -> dict[str, Tensor]:
-    exp = ~events.is_stop
-    stop = events.is_stop
+    exp = ~events.is_terminal
+    terminal = events.is_terminal
+    policy_stop = events.terminal_reason.eq(int(POLICY_STOP))
+    no_frontier = events.terminal_reason.eq(int(NO_FRONTIER))
+    budget = events.terminal_reason.eq(int(BUDGET))
 
     exp_residual = expansion_db_residual(events)
-    stop_residual = stop_db_residual(events)
+    terminal_residual = terminal_db_residual(events)
 
     return {
         "db/exp_residual_abs": masked_mean_or_zero(
@@ -583,12 +636,28 @@ def single_step_metrics(events: SubTBEventBatch) -> dict[str, Tensor]:
             exp,
         ).detach(),
         "db/stop_residual_abs": masked_mean_or_zero(
-            stop_residual.abs(),
-            stop,
+            terminal_residual.abs(),
+            terminal,
+        ).detach(),
+        "db/terminal_residual_abs": masked_mean_or_zero(
+            terminal_residual.abs(),
+            terminal,
+        ).detach(),
+        "db/policy_stop_residual_abs": masked_mean_or_zero(
+            terminal_residual.abs(),
+            policy_stop,
+        ).detach(),
+        "db/no_frontier_boundary_residual_abs": masked_mean_or_zero(
+            terminal_residual.abs(),
+            no_frontier,
+        ).detach(),
+        "db/budget_boundary_residual_abs": masked_mean_or_zero(
+            terminal_residual.abs(),
+            budget,
         ).detach(),
         "flow/terminal_log_reward": masked_mean_or_zero(
             events.terminal_log_reward,
-            stop,
+            terminal,
         ).detach(),
     }
 
@@ -603,14 +672,51 @@ def expansion_db_residual(events: SubTBEventBatch) -> Tensor:
     return events.action_log_flow - events.child_state_log_flow - events.backward_log_prob
 
 
-def stop_db_residual(events: SubTBEventBatch) -> Tensor:
+def terminal_db_residual(events: SubTBEventBatch) -> Tensor:
     """
-    One-step terminal residual for STOP:
+    One-step terminal residual:
 
-        G(z,STOP) - log R(z)
+        G(z,STOP) - log R(z), for policy STOP
+        Φ(z) - log R(z), for forced boundaries
     """
 
     return events.action_log_flow - events.terminal_log_reward
+
+
+def stop_db_residual(events: SubTBEventBatch) -> Tensor:
+    """
+    Backward-compatible alias for terminal_db_residual.
+    """
+
+    return terminal_db_residual(events)
+
+
+def subtrajectory_reason_metrics(
+    *,
+    terms: SubTBTerms,
+) -> dict[str, Tensor]:
+    active = terms.weight.gt(0)
+    policy_stop = terms.terminal_reason.eq(int(POLICY_STOP)) & active
+    no_frontier = terms.terminal_reason.eq(int(NO_FRONTIER)) & active
+    budget = terms.terminal_reason.eq(int(BUDGET)) & active
+
+    return {
+        "subtb/policy_stop_residual_abs": weighted_mean_or_zero(
+            terms.residual.abs(),
+            terms.weight,
+            policy_stop,
+        ).detach(),
+        "subtb/no_frontier_boundary_residual_abs": weighted_mean_or_zero(
+            terms.residual.abs(),
+            terms.weight,
+            no_frontier,
+        ).detach(),
+        "subtb/budget_boundary_residual_abs": weighted_mean_or_zero(
+            terms.residual.abs(),
+            terms.weight,
+            budget,
+        ).detach(),
+    }
 
 
 def source_metrics(
@@ -657,8 +763,15 @@ def terminal_metrics(
     )
 
     replay = terminals.source.eq(SRC_REPLAY) & valid
+    policy_stop = terminals.reason.eq(int(POLICY_STOP)) & valid
+    no_frontier = terminals.reason.eq(int(NO_FRONTIER)) & valid
+    budget = terminals.reason.eq(int(BUDGET)) & valid
 
     hit = terminal_reward.answer_count.gt(0).to(dtype=torch.float)
+    valid_count = valid.to(dtype=torch.float).sum()
+    policy_stop_count = policy_stop.to(dtype=torch.float).sum()
+    no_frontier_count = no_frontier.to(dtype=torch.float).sum()
+    budget_count = budget.to(dtype=torch.float).sum()
 
     return {
         "terminal/hit": masked_mean_or_zero(
@@ -676,6 +789,21 @@ def terminal_metrics(
         "terminal/replay_recall": masked_mean_or_zero(
             terminal_reward.target_recall,
             replay,
+        ).detach(),
+        "terminal/policy_stop_count": policy_stop_count.detach(),
+        "terminal/no_frontier_count": no_frontier_count.detach(),
+        "terminal/budget_count": budget_count.detach(),
+        "terminal/policy_stop_fraction": _safe_divide(
+            policy_stop_count,
+            valid_count,
+        ).detach(),
+        "terminal/no_frontier_fraction": _safe_divide(
+            no_frontier_count,
+            valid_count,
+        ).detach(),
+        "terminal/budget_fraction": _safe_divide(
+            budget_count,
+            valid_count,
         ).detach(),
     }
 
@@ -768,6 +896,12 @@ def masked_mean_or_zero(
     return values.float()[mask].mean()
 
 
+def _safe_divide(numerator: Tensor, denominator: Tensor) -> Tensor:
+    if not bool(denominator.gt(0)):
+        return numerator.new_zeros(())
+    return numerator.float() / denominator.float()
+
+
 def _exclusive_prefix_sum(x: Tensor) -> Tensor:
     zero = x.new_zeros((x.size(0), 1))
     return torch.cat(
@@ -810,7 +944,11 @@ def _cat_event_batches(
             [x.terminal_log_reward for x in non_empty],
             dim=0,
         ),
-        is_stop=torch.cat([x.is_stop for x in non_empty], dim=0),
+        terminal_reason=torch.cat(
+            [x.terminal_reason for x in non_empty],
+            dim=0,
+        ),
+        is_terminal=torch.cat([x.is_terminal for x in non_empty], dim=0),
     )
 
 
@@ -831,7 +969,8 @@ def _empty_events(
         action_log_flow=float_,
         backward_log_prob=float_,
         terminal_log_reward=float_,
-        is_stop=bool_,
+        terminal_reason=long,
+        is_terminal=bool_,
     )
 
 
@@ -882,7 +1021,8 @@ def _empty_terms(events: SubTBEventBatch) -> SubTBTerms:
         residual=events.parent_state_log_flow.new_empty((0,)),
         weight=events.parent_state_log_flow.new_empty((0,)),
         source_ids=events.source_ids.new_empty((0,)),
-        is_stop=torch.empty(0, dtype=torch.bool, device=events.device),
+        is_terminal=torch.empty(0, dtype=torch.bool, device=events.device),
+        terminal_reason=torch.empty(0, dtype=torch.long, device=events.device),
     )
 
 
@@ -910,6 +1050,8 @@ __all__ = [
     "source_metrics",
     "stop_db_residual",
     "subtrajectory_terms",
+    "subtrajectory_reason_metrics",
+    "terminal_db_residual",
     "terminal_metrics",
     "weighted_source_balanced_mean",
 ]
