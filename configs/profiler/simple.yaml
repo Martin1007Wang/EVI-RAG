@@ -1,0 +1,4 @@
+_target_: lightning.pytorch.profilers.SimpleProfiler
+dirpath: ${hydra:runtime.output_dir}/profiler_logs
+filename: simple_report
+extended: true

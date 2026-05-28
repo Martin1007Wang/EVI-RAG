@@ -17,7 +17,7 @@ from src.training.checkpoint import load_checkpoint_weights
 from src.training.factory import build_model, prepare_training_components
 from src.training.optimization import build_optimizer
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.objectives.subtb import (
+from src.weaver.objectives.edge_flow_matching import (
     build_subtb_input,
     expansion_event_residual,
     terminal_event_residual,

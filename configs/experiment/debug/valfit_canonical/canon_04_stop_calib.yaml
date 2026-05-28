@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: canon_04_stop_calib
+experiment_name: canon_04_stop_calib
+
+tags:
+  - canonical_state
+  - db
+  - stop_calibration
+
+notes: >
+  Adds weak prefix STOP-flow calibration.
+  Tests whether direct STOP log-flow calibration improves early stopping
+  without imposing STOP-over-continue dominance.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_canonical
+  tags: ${tags}
+
+model:
+  loss_fn:
+    prefix_calibration_weight: 0.05
+    prefix_calibration_huber_delta: 2.0

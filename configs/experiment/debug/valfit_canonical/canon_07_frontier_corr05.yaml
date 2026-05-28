@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: canon_07_frontier_corr05
+experiment_name: canon_07_frontier_corr05
+
+tags:
+  - canonical_state
+  - db
+  - frontier_correction
+  - correction_0_5
+
+notes: >
+  Tests moderate frontier-size correction under canonical multi-parent backward.
+  Used to determine whether large frontiers still over-attract continuation mass.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_canonical
+  tags: ${tags}
+
+model:
+  policy:
+    frontier_size_correction: 0.5

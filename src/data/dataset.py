@@ -78,6 +78,7 @@ class RetrievalDataset(Dataset):
         split: str,
         lmdb_readahead: bool = False,
         max_readers: int = 256,
+        require_witness_paths: bool = False,
     ) -> None:
         super().__init__()
 
@@ -89,8 +90,11 @@ class RetrievalDataset(Dataset):
 
         self.lmdb_readahead = bool(lmdb_readahead)
         self.max_readers = int(max_readers)
+        self.require_witness_paths = bool(require_witness_paths)
         if self.max_readers <= 0:
             raise ValueError("max_readers must be positive")
+        if self.require_witness_paths:
+            _require_witness_path_materialization(self.materialization)
 
         paths = self.materialization.require_split(self.split)
         self.lmdb_path = paths.lmdb
@@ -190,6 +194,10 @@ def _build_retrieval_data(
         raw=raw,
         sample_id=sample_id,
     )
+    witness_path_edge_ids, witness_path_edge_path_ids, witness_path_target_node_ids = _witness_path_fields(
+        raw=raw,
+        sample_id=sample_id,
+    )
     return RetrievalData(
         sample_id=sample_id,
         edge_index=edge_index,
@@ -204,6 +212,9 @@ def _build_retrieval_data(
         node_target_distance=node_target_distance,
         weak_replay_edge_ids=weak_replay_edge_ids,
         weak_replay_edge_weight=weak_replay_edge_weight,
+        witness_path_edge_ids=witness_path_edge_ids,
+        witness_path_edge_path_ids=witness_path_edge_path_ids,
+        witness_path_target_node_ids=witness_path_target_node_ids,
     )
 
 
@@ -263,6 +274,72 @@ def _weak_replay_fields(
         edge_tensor.contiguous(),
         weight_tensor.contiguous(),
     )
+
+
+def _witness_path_fields(
+    *,
+    raw: Mapping[str, Any],
+    sample_id: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    edge_ids = raw.get(SampleFields.WITNESS_PATH_EDGE_IDS)
+    path_ids = raw.get(SampleFields.WITNESS_PATH_EDGE_PATH_IDS)
+    target_node_ids = raw.get(SampleFields.WITNESS_PATH_TARGET_NODE_IDS)
+    if edge_ids is None or path_ids is None or target_node_ids is None:
+        raise KeyError(f"{sample_id}: missing witness path replay fields")
+
+    edge_tensor = _tensor(edge_ids, dtype=torch.long).view(-1)
+    path_tensor = _tensor(path_ids, dtype=torch.long).view(-1)
+    target_tensor = _tensor(target_node_ids, dtype=torch.long).view(-1)
+
+    if int(edge_tensor.numel()) != int(path_tensor.numel()):
+        raise ValueError(
+            f"{sample_id}: witness path edge fields length mismatch: "
+            f"edge_ids={int(edge_tensor.numel())}, path_ids={int(path_tensor.numel())}"
+        )
+    if int(path_tensor.numel()) > 0:
+        min_path = int(path_tensor.min().item())
+        max_path = int(path_tensor.max().item())
+        if min_path < 0 or max_path >= int(target_tensor.numel()):
+            raise ValueError(
+                f"{sample_id}: witness path ids outside target range: "
+                f"min={min_path}, max={max_path}, num_paths={int(target_tensor.numel())}"
+            )
+
+    return (
+        edge_tensor.contiguous(),
+        path_tensor.contiguous(),
+        target_tensor.contiguous(),
+    )
+
+
+def _require_witness_path_materialization(materialization: MaterializationArtifact) -> None:
+    provenance = materialization.provenance
+    if not isinstance(provenance, Mapping):
+        raise ValueError(
+            "Materialization is missing provenance for witness-path replay. "
+            "Re-run preprocessing to produce witness_path_v1 labels."
+        )
+
+    preprocess = provenance.get("preprocess")
+    if not isinstance(preprocess, Mapping):
+        raise ValueError(
+            "Materialization provenance is missing preprocess metadata for witness-path replay. "
+            "Re-run preprocessing to produce witness_path_v1 labels."
+        )
+
+    weak_replay = preprocess.get("weak_replay_labels")
+    if not isinstance(weak_replay, Mapping):
+        raise ValueError(
+            "Materialization provenance is missing weak_replay_labels metadata. "
+            "Re-run preprocessing to produce witness_path_v1 labels."
+        )
+
+    kind = weak_replay.get("kind")
+    if kind != "witness_path_v1":
+        raise ValueError(
+            "Materialization weak replay labels are incompatible with witness-path replay: "
+            f"found {kind!r}, expected 'witness_path_v1'. Re-run preprocessing."
+        )
 
 
 def _scalar_int(value: object, name: str) -> int:

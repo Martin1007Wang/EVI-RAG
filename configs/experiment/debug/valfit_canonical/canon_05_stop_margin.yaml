@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: canon_05_stop_margin
+experiment_name: canon_05_stop_margin
+
+tags:
+  - canonical_state
+  - db
+  - stop_margin
+  - sufficient_stop
+
+notes: >
+  Adds STOP-over-continue margin on sufficient states.
+  Tests whether sufficient evidence states stop instead of expanding to budget.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_canonical
+  tags: ${tags}
+
+model:
+  loss_fn:
+    prefix_calibration_weight: 0.05
+    prefix_calibration_huber_delta: 2.0
+
+    sufficient_stop_margin_weight: 0.05
+    sufficient_stop_margin: 0.2
+    sufficient_recall_threshold: 1.0

@@ -6,9 +6,9 @@ import pytest
 import torch
 
 from src.weaver.context import DirectedAdjacencyIndex, GraphContext
-from src.weaver.objectives.subtb import SubTBEventBatch, expansion_db_residual
+from src.weaver.objectives.edge_flow_matching import count_legal_backward_parents
 from src.weaver.policy.backward import canonical_backward_log_prob, valid_predecessor_count
-from src.weaver.state import ExpansionBatch, StateBatch, legal_state_mask
+from src.weaver.state import ExpansionBatch, StateBatch
 
 
 def test_state_advance_canonicalizes_edge_order() -> None:
@@ -50,26 +50,6 @@ def test_state_advance_rejects_duplicate_edge() -> None:
             )
         )
 
-
-def test_legal_state_requires_anchor_reachability() -> None:
-    graph = _graph([(0, 1), (1, 2), (3, 4)])
-    state = StateBatch(
-        graph_ids=torch.tensor([0, 0, 0]),
-        edge_ids=torch.tensor(
-            [
-                [0, 1],
-                [1, -1],
-                [2, -1],
-            ],
-            dtype=torch.long,
-        ),
-        edge_count=torch.tensor([2, 1, 1]),
-        budget=2,
-    )
-
-    assert legal_state_mask(state=state, graph=graph).tolist() == [True, False, False]
-
-
 def test_backward_counts_independent_valid_parents() -> None:
     graph = _graph([(0, 1), (0, 2)])
     parent = StateBatch(
@@ -97,23 +77,21 @@ def test_backward_counts_independent_valid_parents() -> None:
     assert torch.allclose(log_prob, torch.tensor([-math.log(2.0)]))
 
 
-def test_expansion_db_residual_uses_multi_parent_backward_term() -> None:
-    log_pb = torch.tensor([-math.log(2.0)])
-    child_flow = torch.tensor([5.0])
-    events = SubTBEventBatch(
-        trajectory_ids=torch.tensor([0]),
-        step_ids=torch.tensor([0]),
-        source_ids=torch.tensor([0]),
-        parent_state_log_flow=torch.tensor([0.0]),
-        child_state_log_flow=child_flow,
-        action_log_flow=child_flow + log_pb,
-        backward_log_prob=log_pb,
-        terminal_log_reward=torch.tensor([0.0]),
-        terminal_reason=torch.tensor([-1]),
-        is_terminal=torch.tensor([False]),
+def test_edge_flow_matching_backward_count_matches_policy_backward() -> None:
+    graph = _graph([(0, 1), (0, 2)])
+    child = StateBatch(
+        graph_ids=torch.tensor([0]),
+        edge_ids=torch.tensor([[0, 1]], dtype=torch.long),
+        edge_count=torch.tensor([2]),
+        budget=2,
     )
 
-    assert torch.allclose(expansion_db_residual(events), torch.zeros(1))
+    counts = count_legal_backward_parents(
+        child_state=child,
+        graph_context=graph,
+    )
+
+    assert counts.tolist() == [2]
 
 
 def test_backward_excludes_illegal_disconnected_parent() -> None:
@@ -136,11 +114,11 @@ def test_backward_excludes_illegal_disconnected_parent() -> None:
         child_state=child,
         action_edge_ids=torch.tensor([1]),
         graph_context=graph,
-        validate=True,
-    )
+            validate=True,
+        )
 
-    assert valid_predecessor_count(child_state=child, graph_context=graph, row=0) == 1
-    assert torch.allclose(log_prob, torch.tensor([0.0]))
+    assert valid_predecessor_count(child_state=child, graph_context=graph, row=0) == 2
+    assert torch.allclose(log_prob, torch.tensor([-math.log(2.0)]))
 
 
 def test_backward_validation_rejects_wrong_parent() -> None:

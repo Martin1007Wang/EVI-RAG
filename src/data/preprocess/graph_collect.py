@@ -123,6 +123,9 @@ def prepare_sample(
         node_target_distance=path_labels.node_target_distance,
         weak_replay_edge_ids=weak_replay_edge_ids,
         weak_replay_edge_weight=weak_replay_edge_weight,
+        witness_path_edge_ids=path_labels.witness_path_edge_ids,
+        witness_path_edge_path_ids=path_labels.witness_path_edge_path_ids,
+        witness_path_target_node_ids=path_labels.witness_path_target_node_ids,
     )
 
 

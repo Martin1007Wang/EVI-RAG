@@ -1,48 +1,39 @@
 from __future__ import annotations
 
+from .edge_flow_matching import (
+    EdgeFlowMatchingObjective,
+    MatchingTerms,
+    compute_log_backward,
+    count_legal_backward_parents,
+    nonterminal_edge_flow_matching,
+    terminal_edge_reward_matching,
+)
 from .output import ObjectiveOutput
-from .prefix import (
-    ExpansionPrefixBatch,
-    PrefixBatch,
-    TerminalPrefixBatch,
-    build_prefix_batch,
+from .transition_batch import (
+    EdgeFlowMatchingBatch,
+    NonterminalTransitionBatch,
+    TerminalTransitionBatch,
+    TransitionSource,
 )
-
-from .subtb import (
-    SubTBEventBatch,
-    SubTBInput,
-    SubTBObjective,
-    SubTBLoss,
-    SubTBTerms,
-    build_subtb_input_from_prefix,
-    build_subtb_input,
-    masked_mean_or_zero,
-    prefix_terminal_objective,
-    residual_loss_units,
-    subtrajectory_terms,
-    terminal_db_residual,
-    weighted_source_balanced_mean,
+from .transition_builder import (
+    build_edge_flow_matching_batch,
+    build_edge_flow_matching_batches_from_trajectories,
+    transition_source_counts,
 )
-from .weak_replay import WeakReplayLoss
 
 __all__ = [
+    "EdgeFlowMatchingObjective",
+    "EdgeFlowMatchingBatch",
+    "MatchingTerms",
+    "NonterminalTransitionBatch",
     "ObjectiveOutput",
-    "ExpansionPrefixBatch",
-    "PrefixBatch",
-    "SubTBInput",
-    "SubTBEventBatch",
-    "SubTBObjective",
-    "SubTBLoss",
-    "SubTBTerms",
-    "TerminalPrefixBatch",
-    "build_prefix_batch",
-    "build_subtb_input_from_prefix",
-    "build_subtb_input",
-    "masked_mean_or_zero",
-    "prefix_terminal_objective",
-    "residual_loss_units",
-    "subtrajectory_terms",
-    "terminal_db_residual",
-    "weighted_source_balanced_mean",
-    "WeakReplayLoss",
+    "TerminalTransitionBatch",
+    "TransitionSource",
+    "build_edge_flow_matching_batch",
+    "build_edge_flow_matching_batches_from_trajectories",
+    "compute_log_backward",
+    "count_legal_backward_parents",
+    "nonterminal_edge_flow_matching",
+    "terminal_edge_reward_matching",
+    "transition_source_counts",
 ]

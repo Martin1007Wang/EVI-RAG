@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -183,6 +183,10 @@ class TargetContext:
     node_target_distance: Tensor  # [N]
     shortest_path_edge_mask: Tensor  # [E]
     shortest_path_edge_weight: Tensor  # [E]
+    witness_path_edge_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    witness_path_edge_path_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    witness_path_target_node_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    witness_path_target_graph_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
 
     @classmethod
     def from_batch(
@@ -238,6 +242,15 @@ class TargetContext:
             graph_context=graph_context,
             target_count_by_graph=target_count_by_graph,
         )
+        witness_path_edge_ids, witness_path_edge_path_ids, witness_path_target_node_ids = build_witness_path_labels(
+            batch=batch,
+            graph_context=graph_context,
+        )
+        witness_path_target_graph_ids = (
+            graph_context.node_to_graph.index_select(0, witness_path_target_node_ids)
+            if int(witness_path_target_node_ids.numel()) > 0
+            else torch.empty(0, dtype=torch.long, device=graph_context.device)
+        )
 
         if validate:
             _validate_target_context_tensors(
@@ -248,6 +261,10 @@ class TargetContext:
                 node_target_distance=node_target_distance,
                 shortest_path_edge_mask=shortest_path_edge_mask,
                 shortest_path_edge_weight=shortest_path_edge_weight,
+                witness_path_edge_ids=witness_path_edge_ids,
+                witness_path_edge_path_ids=witness_path_edge_path_ids,
+                witness_path_target_node_ids=witness_path_target_node_ids,
+                witness_path_target_graph_ids=witness_path_target_graph_ids,
                 graph_context=graph_context,
             )
 
@@ -259,6 +276,10 @@ class TargetContext:
             node_target_distance=node_target_distance,
             shortest_path_edge_mask=shortest_path_edge_mask,
             shortest_path_edge_weight=shortest_path_edge_weight,
+            witness_path_edge_ids=witness_path_edge_ids,
+            witness_path_edge_path_ids=witness_path_edge_path_ids,
+            witness_path_target_node_ids=witness_path_target_node_ids,
+            witness_path_target_graph_ids=witness_path_target_graph_ids,
         )
 
     @property
@@ -517,6 +538,71 @@ def build_weak_replay_edge_labels(
         include_self=True,
     )
     return mask, weight
+
+
+def build_witness_path_labels(
+    *,
+    batch: RetrievalBatch,
+    graph_context: GraphContext,
+) -> tuple[Tensor, Tensor, Tensor]:
+    local_edge_ids = getattr(batch, "witness_path_edge_ids", None)
+    edge_graph_ids = getattr(batch, "witness_path_edge_ids_batch", None)
+    path_ids = getattr(batch, "witness_path_edge_path_ids", None)
+    target_node_ids = getattr(batch, "witness_path_target_node_ids", None)
+    if (
+        local_edge_ids is None
+        or edge_graph_ids is None
+        or path_ids is None
+        or target_node_ids is None
+    ):
+        raise KeyError("witness path replay fields are required in RetrievalBatch.")
+
+    local_edge_ids = local_edge_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
+    edge_graph_ids = edge_graph_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
+    path_ids = path_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
+    target_node_ids = target_node_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
+
+    if int(local_edge_ids.numel()) != int(edge_graph_ids.numel()):
+        raise ValueError("witness_path_edge_ids and witness_path_edge_ids_batch length mismatch.")
+    if int(local_edge_ids.numel()) != int(path_ids.numel()):
+        raise ValueError("witness_path_edge_ids and witness_path_edge_path_ids length mismatch.")
+
+    physical_edge_ids = _physical_edge_ids_from_local_ids(
+        local_edge_ids=local_edge_ids,
+        edge_graph_ids=edge_graph_ids,
+        graph_context=graph_context,
+        field_name="witness_path_edge_ids",
+    )
+
+    return (
+        physical_edge_ids.contiguous(),
+        path_ids.contiguous(),
+        target_node_ids.contiguous(),
+    )
+
+
+def _physical_edge_ids_from_local_ids(
+    *,
+    local_edge_ids: Tensor,
+    edge_graph_ids: Tensor,
+    graph_context: GraphContext,
+    field_name: str,
+) -> Tensor:
+    if int(local_edge_ids.numel()) == 0:
+        return torch.empty(0, dtype=torch.long, device=graph_context.device)
+
+    starts = graph_context.edge_ptr.index_select(0, edge_graph_ids)
+    ends = graph_context.edge_ptr.index_select(0, edge_graph_ids + 1)
+    edge_count = ends - starts
+    outside = local_edge_ids.lt(0) | local_edge_ids.ge(edge_count)
+    if bool(outside.any()):
+        first = int(outside.nonzero(as_tuple=False).flatten()[0].item())
+        raise ValueError(
+            f"{field_name} contains an id outside its graph edge range: "
+            f"graph_id={int(edge_graph_ids[first].item())}, "
+            f"local_edge_id={int(local_edge_ids[first].item())}."
+        )
+    return starts + local_edge_ids
 
 
 def _validate_target_context_tensors(

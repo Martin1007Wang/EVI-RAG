@@ -156,7 +156,10 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
                 "stream_chunk_size": chunk_size,
                 "map_size_gb": float(preprocess_cfg.get("map_size_gb", 128.0)),
                     "commit_frequency": int(preprocess_cfg.get("commit_frequency", 1000)),
-                    "weak_replay_labels": {"kind": "shortest_path_edge_set_v1"},
+                    "weak_replay_labels": {
+                        "kind": "witness_path_v1",
+                        "path_policy": "deterministic_single_shortest_per_target",
+                    },
                     "entity_typing": {"non_text_prefixes": list(entity_text_policy.non_text_prefixes)},
                 },
             "encoder": dict(encoder_provenance),

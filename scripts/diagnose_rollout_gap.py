@@ -30,7 +30,7 @@ from src.eval.rollout import (
 from src.training.checkpoint import load_checkpoint_weights
 from src.training.factory import build_model, prepare_training_components
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.rollout.replay import WeakReplaySource
+from src.weaver.rollout.replay import WeakTransitionSource, initial_replay_state_batch
 from src.weaver.rollout.trajectory import BUDGET, NO_FRONTIER, POLICY_STOP
 from src.weaver.state import ExpansionBatch, StateBatch
 
@@ -134,12 +134,13 @@ def main() -> None:
             batch = datamodule.collator(samples).to(device)
             graph = GraphContext.from_batch(batch)
             target = TargetContext.from_batch(batch=batch, graph_context=graph)
-            features = model.policy_feature_encoder(batch)
+            features = model.feature_encoder(batch)
 
             trajectories = model.runner.eval_rollouts(
                 policy=model.policy,
                 context=graph,
                 features=features,
+                budget=int(model.budget),
                 num_rollouts=int(args.num_rollouts),
             )
             metrics = evaluate_rollout_samples(
@@ -192,18 +193,26 @@ def main() -> None:
                 stats=stop_stats,
             )
 
-            weak = WeakReplaySource(
-                budget=int(model.budget),
-                states_per_graph=int(args.states_per_graph),
-                branch_per_state=int(args.branch_per_state),
-            ).sample(graph=graph, target=target)
-            if weak.num_states > 0:
+            weak = WeakTransitionSource(
+                max_depth=int(model.budget),
+                max_states_per_graph=int(args.states_per_graph),
+                max_positive_edges_per_state=int(args.branch_per_state),
+            ).collect(
+                graph_context=graph,
+                target_context=target,
+                initial_state=initial_replay_state_batch(
+                    graph_context=graph,
+                    target_context=target,
+                    budget=int(model.budget),
+                ),
+            )
+            if weak.nonterminal is not None and int(weak.nonterminal.parent_state.num_states) > 0:
                 collect_edge_score_stats(
                     model=model,
                     features=features,
                     graph=graph,
                     target=target,
-                    state=weak.state,
+                    state=weak.nonterminal.parent_state,
                     label="oracle_prefix",
                     stats=edge_stats,
                 )
@@ -212,7 +221,7 @@ def main() -> None:
                     features=features,
                     graph=graph,
                     target=target,
-                    state=weak.state,
+                    state=weak.nonterminal.parent_state,
                     label="oracle_prefix",
                     stats=stop_stats,
                 )
@@ -493,19 +502,23 @@ def score_components(*, model, features, graph: GraphContext, state: StateBatch,
     if action_space.num_expansions <= 0:
         empty = state.graph_ids.new_empty((0,), dtype=torch.float32)
         return empty, empty
-    query_h = model.policy.state_encoder.query_embeddings(features=features, state=state)
-    selected_h = model.policy.state_encoder.selected_edge_summary(features=features, state=state, context=graph, query_h=query_h)
-    covered_h = model.policy.state_encoder.covered_node_summary(features=features, state=state, context=graph, query_h=query_h)
-    budget_h = model.policy.encode_budget(state)
-    edge_h = model.policy.state_encoder.encode_edge_tokens(features=features, context=graph, edge_ids=action_space.expand_edge_ids)
-    semantic = model.policy.score_edge_semantic_prior(features=features, context=graph, query_h=query_h, action_space=action_space)
-    residual = model.policy.score_edge_residual(
-        query_h=query_h,
-        selected_h=selected_h,
-        covered_h=covered_h,
-        budget_h=budget_h,
-        edge_h=edge_h,
-        row_ids=action_space.expand_state_ids,
+    state_repr = model.policy.encode_state(
+        features=features,
+        state=state,
+        context=graph,
+    )
+    frontier = model.policy.encode_frontier(
+        features=features,
+        context=graph,
+        action_space=action_space,
+    )
+    semantic = model.policy.semantic_prior(
+        state_repr=state_repr,
+        frontier=frontier,
+    )
+    residual = model.policy.edge_residual_scorer(
+        state_repr=state_repr,
+        frontier=frontier,
     )
     return semantic.float(), residual.float()
 

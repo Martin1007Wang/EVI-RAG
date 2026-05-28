@@ -50,6 +50,9 @@ class PreparedSample:
     node_target_distance: torch.Tensor  # [num_nodes]
     weak_replay_edge_ids: torch.Tensor  # [num_weak_edges]
     weak_replay_edge_weight: torch.Tensor  # [num_weak_edges]
+    witness_path_edge_ids: torch.Tensor  # [num_witness_edges]
+    witness_path_edge_path_ids: torch.Tensor  # [num_witness_edges]
+    witness_path_target_node_ids: torch.Tensor  # [num_witness_paths]
 
     def storage_key(self) -> str:
         return f"{self.dataset}/{self.split}/{self.question_id}"
@@ -69,4 +72,7 @@ class PreparedSample:
             SampleFields.NODE_TARGET_DISTANCE: self.node_target_distance.long().contiguous(),
             SampleFields.WEAK_REPLAY_EDGE_IDS: self.weak_replay_edge_ids.long().contiguous(),
             SampleFields.WEAK_REPLAY_EDGE_WEIGHT: self.weak_replay_edge_weight.float().contiguous(),
+            SampleFields.WITNESS_PATH_EDGE_IDS: self.witness_path_edge_ids.long().contiguous(),
+            SampleFields.WITNESS_PATH_EDGE_PATH_IDS: self.witness_path_edge_path_ids.long().contiguous(),
+            SampleFields.WITNESS_PATH_TARGET_NODE_IDS: self.witness_path_target_node_ids.long().contiguous(),
         }

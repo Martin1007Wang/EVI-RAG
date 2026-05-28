@@ -1,0 +1,8 @@
+_target_: lightning.pytorch.profilers.PyTorchProfiler
+dirpath: ${hydra:runtime.output_dir}/profiler_logs
+filename: pytorch_trace
+record_shapes: true
+profile_memory: true
+with_stack: false      # 本地调试时改 true，CI/训练时保持 false
+with_flops: true
+emit_nvtx: false

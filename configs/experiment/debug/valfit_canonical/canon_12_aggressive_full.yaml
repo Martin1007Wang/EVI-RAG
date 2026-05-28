@@ -1,0 +1,63 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: canon_12_aggressive_full
+experiment_name: canon_12_aggressive_full
+
+tags:
+  - canonical_state
+  - aggressive
+  - full_subtb
+  - stop_aux
+  - strong_compactness
+  - frontier_correction
+
+notes: >
+  Aggressive later-stage configuration.
+  Combines full SubTB, STOP calibration, STOP margin, strong compactness,
+  stronger replay, and frontier correction.
+  Not suitable as the first canonical-DAG validation run.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_canonical
+  tags: ${tags}
+
+model:
+  policy:
+    frontier_size_correction: 1.0
+
+  reward_model:
+    answer_weight: 4.0
+    proximity_weight: 1.0
+    path_weight: 0.2
+
+    fail_cost: 8.0
+    fail_proximity_weight: 0.5
+    fail_path_weight: 0.1
+
+    edge_cost: 0.2
+    redundant_edge_cost: 0.3
+
+  loss_fn:
+    alpha_replay: 0.5
+
+    subtb_lambda: 0.8
+    max_len: null
+    residual_loss: huber
+    huber_delta: 2.0
+
+    prefix_calibration_weight: 0.2
+    prefix_calibration_huber_delta: 2.0
+
+    sufficient_stop_margin_weight: 0.1
+    sufficient_stop_margin: 0.5
+    sufficient_recall_threshold: 1.0
+
+  weak_replay_loss:
+    weight: 1.0
+    gate_sufficient: true
+    sufficient_recall_threshold: 1.0

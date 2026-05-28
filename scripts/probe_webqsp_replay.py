@@ -13,7 +13,7 @@ from src.training.factory import prepare_training_components
 from src.training.checkpoint import load_checkpoint_weights
 from src.graph.segments import segment_log_softmax, segment_logsumexp
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.nn.feature_encoder import (
+from src.weaver.feature import (
     select_edge_relation_model,
     select_node_model,
     select_query_model,

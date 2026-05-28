@@ -1,0 +1,24 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: canon_00_db_smoke
+experiment_name: canon_00_db_smoke
+
+tags:
+  - canonical_state
+  - db
+  - smoke
+  - light_replay
+
+notes: >
+  Canonical evidence state smoke test.
+  Uses DB objective with multi-parent backward correction.
+  No STOP auxiliary, no frontier correction, light weak replay.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_canonical
+  tags: ${tags}

@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 from src.training.checkpoint import load_checkpoint_weights
 from src.training.factory import build_model, prepare_training_components
 from src.weaver.context import GraphContext, TargetContext
-from src.weaver.rollout.replay import WeakReplaySource
+from src.weaver.rollout.replay import WeakTransitionSource, initial_replay_state_batch
 from src.weaver.state import StateBatch
 
 
@@ -41,10 +41,10 @@ def main() -> None:
     model.eval()
 
     stats: dict[str, list[float]] = defaultdict(list)
-    weak_source = WeakReplaySource(
-        budget=int(model.budget),
-        states_per_graph=int(args.states_per_graph),
-        branch_per_state=int(args.branch_per_state),
+    weak_source = WeakTransitionSource(
+        max_depth=int(model.budget),
+        max_states_per_graph=int(args.states_per_graph),
+        max_positive_edges_per_state=int(args.branch_per_state),
     )
 
     end = len(dataset) if args.max_samples <= 0 else min(len(dataset), int(args.max_samples))
@@ -54,7 +54,7 @@ def main() -> None:
             batch = datamodule.collator(samples)
             graph = GraphContext.from_batch(batch)
             target = TargetContext.from_batch(batch=batch, graph_context=graph)
-            features = model.policy_feature_encoder(batch)
+            features = model.feature_encoder(batch)
 
             initial = StateBatch.initial(
                 graph_ids=torch.arange(int(graph.num_graphs), dtype=torch.long, device=graph.device),
@@ -70,15 +70,23 @@ def main() -> None:
                 stats=stats,
             )
 
-            weak = weak_source.sample(graph=graph, target=target)
-            if weak.num_states > 0:
-                add(stats, "oracle_prefix/state_count_per_batch", weak.num_states)
+            weak = weak_source.collect(
+                graph_context=graph,
+                target_context=target,
+                initial_state=initial_replay_state_batch(
+                    graph_context=graph,
+                    target_context=target,
+                    budget=int(model.budget),
+                ),
+            )
+            if weak.nonterminal is not None and int(weak.nonterminal.parent_state.num_states) > 0:
+                add(stats, "oracle_prefix/state_count_per_batch", weak.nonterminal.parent_state.num_states)
                 collect_view(
                     model=model,
                     features=features,
                     graph=graph,
                     target=target,
-                    state=weak.state,
+                    state=weak.nonterminal.parent_state,
                     prefix="oracle_prefix",
                     stats=stats,
                 )
@@ -119,8 +127,8 @@ def load_run_config(*, run_dir: Path, data_dir: str):
             runner.weak_replay_source = runner.pop("replay_source")
         if "train_replay_rollouts" in runner:
             runner.pop("train_replay_rollouts")
-        if "weak_replay_loss" not in cfg.model:
-            cfg.model.weak_replay_loss = None
+        if "weak_replay_loss" in cfg.model:
+            cfg.model.pop("weak_replay_loss")
     return cfg
 
 
@@ -215,49 +223,29 @@ def score_components(
     state: StateBatch,
     action_space,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    query_h = model.policy.state_encoder.query_embeddings(features=features, state=state)
-    selected_h = model.policy.state_encoder.selected_edge_summary(
+    state_repr = model.policy.encode_state(
         features=features,
         state=state,
         context=graph,
-        query_h=query_h,
     )
-    covered_h = model.policy.state_encoder.covered_node_summary(
-        features=features,
-        state=state,
-        context=graph,
-        query_h=query_h,
-    )
-    budget_h = model.policy.encode_budget(state)
-    stop_flow = model.policy.score_stop_flow(
-        query_h=query_h,
-        selected_h=selected_h,
-        covered_h=covered_h,
-        budget_h=budget_h,
-    )
+    stop_flow = model.policy.stop_log_flow_predictor(state_repr)
 
     if action_space.num_expansions <= 0:
-        empty = query_h.new_empty((0,), dtype=torch.float32)
+        empty = state_repr.query_h.new_empty((0,), dtype=torch.float32)
         return stop_flow.float(), empty, empty
 
-    edge_h = model.policy.state_encoder.encode_edge_tokens(
+    frontier = model.policy.encode_frontier(
         features=features,
         context=graph,
-        edge_ids=action_space.expand_edge_ids,
-    )
-    semantic = model.policy.score_edge_semantic_prior(
-        features=features,
-        context=graph,
-        query_h=query_h,
         action_space=action_space,
     )
-    residual = model.policy.score_edge_residual(
-        query_h=query_h,
-        selected_h=selected_h,
-        covered_h=covered_h,
-        budget_h=budget_h,
-        edge_h=edge_h,
-        row_ids=action_space.expand_state_ids,
+    semantic = model.policy.semantic_prior(
+        state_repr=state_repr,
+        frontier=frontier,
+    )
+    residual = model.policy.edge_residual_scorer(
+        state_repr=state_repr,
+        frontier=frontier,
     )
     return stop_flow.float(), semantic.float(), residual.float()
 

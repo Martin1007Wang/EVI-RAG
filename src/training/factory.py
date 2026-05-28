@@ -14,6 +14,7 @@ from .config import (
     load_model_resources,
     validate_retrieval_data_config,
 )
+from src.weaver.feature import FeatureEncoder
 
 T = TypeVar("T")
 
@@ -66,18 +67,28 @@ def build_model(
     cfg: DictConfig,
     resources: Any,
 ) -> LightningModule:
-    policy_feature_encoder = hydra.utils.instantiate(
-        cfg.model.policy_feature_encoder,
-        **model_resource_kwargs(resources),
+    feature_encoder_obj = hydra.utils.instantiate(
+        cfg.model.feature_encoder,
+        entity_text_semantic_table=resources.entity_text_semantic_table,
+        text_row_by_entity_id=resources.text_row_by_entity_id,
+        relation_semantic_table=resources.relation_semantic_table,
     )
-    model = hydra.utils.instantiate(
+    feature_encoder = require_type(
+        feature_encoder_obj,
+        FeatureEncoder,
+        "cfg.model.feature_encoder",
+    )
+
+    model_obj = hydra.utils.instantiate(
         cfg.model,
-        policy_feature_encoder=policy_feature_encoder,
+        feature_encoder=feature_encoder,
     )
-    module = require_type(model, LightningModule, "cfg.model")
+    module = require_type(model_obj, LightningModule, "cfg.model")
+
     debug_lookup = getattr(resources, "debug_lookup", None)
     if debug_lookup is not None:
         module.debug_lookup = debug_lookup
+
     return module
 
 
@@ -115,10 +126,17 @@ def _normalized_stages(stage: str | tuple[str, ...]) -> tuple[str, ...]:
 
 
 def build_trainer(cfg: DictConfig) -> Trainer:
+    profiler = (
+        hydra.utils.instantiate(cfg.profiler)
+        if OmegaConf.is_missing(cfg, "profiler") is False and cfg.profiler is not None and "_target_" in cfg.profiler
+        else None
+    )
+
     trainer = hydra.utils.instantiate(
         cfg.trainer,
         callbacks=instantiate_list(cfg.callbacks, "cfg.callbacks"),
         logger=trainer_logger(cfg.logger),
+        profiler=profiler,
     )
 
     return require_type(trainer, Trainer, "cfg.trainer")

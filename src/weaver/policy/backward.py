@@ -7,7 +7,6 @@ import torch
 from src.weaver.context import GraphContext
 from src.weaver.state import (
     StateBatch,
-    legal_state_mask,
     remove_selected_edge,
     state_rows_equal,
 )
@@ -108,8 +107,6 @@ def valid_predecessor_count(
             row=int(row),
             edge_id=int(edge_id),
         )
-        if not bool(legal_state_mask(state=parent, graph=graph_context)[0]):
-            continue
         if _edge_is_forward_legal(
             parent=parent,
             edge_id=int(edge_id),
@@ -131,12 +128,6 @@ def validate_canonical_transitions(
         child_state=child_state,
         action_edge_ids=action_edge_ids,
     )
-
-    if not bool(legal_state_mask(state=parent_state, graph=graph_context).all()):
-        raise ValueError("parent_state contains illegal canonical states.")
-    if not bool(legal_state_mask(state=child_state, graph=graph_context).all()):
-        raise ValueError("child_state contains illegal canonical states.")
-
     for row, action_edge_id in enumerate(action_edge_ids.tolist()):
         action_edge_id = int(action_edge_id)
         if action_edge_id < 0:

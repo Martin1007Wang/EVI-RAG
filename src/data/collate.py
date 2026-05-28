@@ -11,6 +11,7 @@ from .schema.fields import SampleFields
 _DEFAULT_FOLLOW_BATCH = (
     SampleFields.REACHABLE_TARGET_NODE_IDS,
     SampleFields.WEAK_REPLAY_EDGE_IDS,
+    SampleFields.WITNESS_PATH_EDGE_IDS,
 )
 
 

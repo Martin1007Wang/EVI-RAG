@@ -20,7 +20,6 @@ from src.training.factory import (
     prepare_training_components,
 )
 
-
 PROJECT_ROOT: Path = load_project_env(__file__)
 console = Console()
 
@@ -55,22 +54,16 @@ def print_config(cfg: DictConfig) -> None:
 def main(cfg: DictConfig) -> None:
     console.print(f"[bold]Starting training run:[/bold] {cfg.task_name}")
     print_config(cfg)
-
     seed_everything(int(cfg.seed), workers=True)
-
     datamodule, resources = prepare_training_components(cfg, stage="fit")
-
     model = build_model(cfg, resources)
     load_pretrained_if_requested(cfg, model)
-
     trainer = build_trainer(cfg)
-
     trainer.fit(
         model=model,
         datamodule=datamodule,
         ckpt_path=cfg.fit_ckpt_path,
     )
-
     if cfg.test_after_fit:
         trainer.test(
             model=model,

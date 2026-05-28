@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 from torch.nn import init
 
-from src.graph.segments import segment_log_softmax, segment_logsumexp
+from src.graph.segments import segment_logsumexp
 from src.utils.nn_utils import init_xavier
 from src.weaver.context import GraphContext
-from src.weaver.nn.feature_encoder import (
+from src.weaver.feature import (
     FeatureBank,
     select_node_embedding,
     select_node_text_mask,
+    select_query_embedding,
     select_relation_embedding,
 )
 from src.weaver.nn.state_encoder import StateEncoder
@@ -21,67 +24,276 @@ from .output import PolicyOutput
 Tensor = torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class StateRepresentation:
+    query_h: Tensor
+    selected_h: Tensor
+    covered_h: Tensor
+
+    @property
+    def num_states(self) -> int:
+        return int(self.query_h.size(0))
+
+    @property
+    def hidden_dim(self) -> int:
+        return int(self.query_h.size(1))
+
+
+@dataclass(frozen=True, slots=True)
+class FrontierEncoding:
+    row_ids: Tensor
+    edge_ids: Tensor
+    dst_node_ids: Tensor
+
+    edge_h: Tensor
+    relation_h: Tensor
+    dst_h: Tensor
+    dst_text_mask: Tensor
+
+    @property
+    def num_actions(self) -> int:
+        return int(self.edge_ids.numel())
+
+
+class StopLogFlowPredictor(nn.Module):
+    """
+    Parametric reward predictor over current states.
+
+    Semantics:
+        stop_log_flow(z) = log R_hat_psi(z)
+
+    The true reward calculator remains parameter-free and outside this module.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        action_hidden_dim: int,
+        initial_log_reward: float = -4.0,
+    ) -> None:
+        super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
+        self.action_hidden_dim = int(action_hidden_dim)
+        self.initial_log_reward = float(initial_log_reward)
+
+        self.net = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.action_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.action_hidden_dim, 1),
+        )
+
+        self.reset_parameters()
+
+    def forward(self, state_repr: StateRepresentation) -> Tensor:
+        x = torch.cat(
+            (
+                state_repr.query_h,
+                state_repr.selected_h,
+                state_repr.covered_h,
+            ),
+            dim=-1,
+        )
+
+        return self.net(x).squeeze(-1).float()
+
+    def reset_parameters(self) -> None:
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                init_xavier(module)
+
+        last = self.net[-1]
+        if not isinstance(last, nn.Linear):
+            raise TypeError(f"Expected final nn.Linear, got {type(last).__name__}.")
+
+        init.zeros_(last.weight)
+        init.constant_(last.bias, self.initial_log_reward)
+
+
+class SemanticEdgePrior(nn.Module):
+    """
+    Fixed semantic prior in the original semantic embedding space.
+
+    No learned projection is used here.
+    """
+
+    def __init__(
+        self,
+        *,
+        relation_weight: float = 1.0,
+        dst_weight: float = 0.5,
+    ) -> None:
+        super().__init__()
+
+        self.relation_weight = float(relation_weight)
+        self.dst_weight = float(dst_weight)
+
+    def forward(
+        self,
+        *,
+        state_repr: StateRepresentation,
+        frontier: FrontierEncoding,
+    ) -> Tensor:
+        if int(frontier.num_actions) == 0:
+            return state_repr.query_h.new_empty((0,), dtype=torch.float32)
+
+        query_h = state_repr.query_h.index_select(0, frontier.row_ids).float()
+
+        relation_prior = (query_h * frontier.relation_h.float()).sum(dim=-1)
+
+        dst_text_mask = frontier.dst_text_mask.to(dtype=torch.float32)
+        dst_prior = dst_text_mask * (query_h * frontier.dst_h.float()).sum(dim=-1)
+
+        return (float(self.relation_weight) * relation_prior + float(self.dst_weight) * dst_prior).float()
+
+
+class LowRankEdgeResidualScorer(nn.Module):
+    """
+    State-conditioned residual scorer.
+
+    residual(z, e) =
+        < f_state([q, selected, covered])[z], f_edge(edge_h)[e] >
+        / sqrt(action_dim)
+        + edge_bias(edge_h)
+
+    This avoids a per-frontier-edge 4H concat MLP.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        action_dim: int,
+        use_edge_bias: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
+        self.action_dim = int(action_dim)
+        self.use_edge_bias = bool(use_edge_bias)
+
+        self.state_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.action_dim),
+            nn.SiLU(),
+            nn.Linear(self.action_dim, self.action_dim),
+        )
+
+        self.edge_proj = nn.Linear(
+            self.hidden_dim,
+            self.action_dim,
+            bias=False,
+        )
+
+        self.edge_bias = nn.Linear(self.hidden_dim, 1) if self.use_edge_bias else None
+
+        self.reset_parameters()
+
+    def forward(
+        self,
+        *,
+        state_repr: StateRepresentation,
+        frontier: FrontierEncoding,
+    ) -> Tensor:
+        if int(frontier.num_actions) == 0:
+            return state_repr.query_h.new_empty((0,), dtype=torch.float32)
+
+        if frontier.edge_h.ndim != 2 or int(frontier.edge_h.size(1)) != self.hidden_dim:
+            raise ValueError(f"frontier.edge_h must have shape [F, {self.hidden_dim}], " f"got {tuple(frontier.edge_h.shape)}.")
+
+        state_x = torch.cat(
+            (
+                state_repr.query_h,
+                state_repr.selected_h,
+                state_repr.covered_h,
+            ),
+            dim=-1,
+        )
+
+        state_h = self.state_proj(state_x)  # [S, D]
+        edge_h = self.edge_proj(frontier.edge_h)  # [F, D]
+        state_h_f = state_h.index_select(0, frontier.row_ids)
+
+        score = (state_h_f * edge_h).sum(dim=-1)
+        score = score / float(self.action_dim) ** 0.5
+
+        if self.edge_bias is not None:
+            score = score + self.edge_bias(frontier.edge_h).squeeze(-1)
+
+        return score.float()
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                init_xavier(module)
+
+        if self.edge_bias is not None:
+            init.zeros_(self.edge_bias.weight)
+            init.zeros_(self.edge_bias.bias)
+
+
 class ForwardPolicy(nn.Module):
     """
-    Unified action-flow policy over STOP plus legal expansion edges.
+    Forward flow model.
 
-    Contract:
-    - StateBatch rows are canonical selected-edge-set states.
-    - ActionSpace contains only legal EXPAND actions.
-    - STOP is not stored as a fake edge.
-    - Policy does not enumerate, sort, filter, or repair ActionSpace.
-    - Policy scores actions; StateBatch owns state semantics.
+    STOP flow:
+        stop_log_flow(z) = log R_hat_psi(z)
+
+    EXPAND flow:
+        edge_log_flow(z,e)
+          = semantic_prior(q,e)
+          + edge_residual_weight * residual_theta(z,e)
+          - frontier_size_correction * log |C(z)|
+
+    STATE flow:
+        state_log_flow(z)
+          = logaddexp(stop_log_flow(z), logsumexp_e edge_log_flow(z,e))
     """
 
     def __init__(
         self,
         *,
         state_encoder: StateEncoder,
-        budget: int = 3,
         semantic_relation_weight: float = 1.0,
         semantic_dst_weight: float = 0.5,
-        edge_residual_weight: float = 1.0,
+        edge_residual_weight: float = 0.25,
         frontier_size_correction: float = 1.0,
         action_hidden_dim: int | None = None,
+        residual_action_dim: int | None = None,
+        initial_stop_log_reward: float = -4.0,
     ) -> None:
         super().__init__()
 
         self.state_encoder = state_encoder
-        self.budget = int(budget)
-
-        if self.budget < 0:
-            raise ValueError("budget must be nonnegative.")
 
         hidden_dim = int(state_encoder.hidden_dim)
-        edge_dim = int(state_encoder.edge_output_dim)
-
         self.action_hidden_dim = int(action_hidden_dim or hidden_dim)
-        self.semantic_relation_weight = float(semantic_relation_weight)
-        self.semantic_dst_weight = float(semantic_dst_weight)
+        self.residual_action_dim = int(residual_action_dim or min(256, hidden_dim))
+
         self.edge_residual_weight = float(edge_residual_weight)
         self.frontier_size_correction = float(frontier_size_correction)
 
         if self.edge_residual_weight < 0.0:
             raise ValueError("edge_residual_weight must be nonnegative.")
+        if self.frontier_size_correction < 0.0:
+            raise ValueError("frontier_size_correction must be nonnegative.")
 
-        self.budget_embedding = nn.Embedding(
-            self.budget + 1,
-            hidden_dim,
+        self.stop_log_flow_predictor = StopLogFlowPredictor(
+            hidden_dim=hidden_dim,
+            action_hidden_dim=self.action_hidden_dim,
+            initial_log_reward=initial_stop_log_reward,
         )
 
-        self.stop_head = nn.Sequential(
-            nn.Linear(hidden_dim * 4, self.action_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.action_hidden_dim, 1),
+        self.semantic_prior = SemanticEdgePrior(
+            relation_weight=semantic_relation_weight,
+            dst_weight=semantic_dst_weight,
         )
 
-        self.edge_residual_head = nn.Sequential(
-            nn.Linear(hidden_dim * 4 + edge_dim, self.action_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.action_hidden_dim, 1),
+        self.edge_residual_scorer = LowRankEdgeResidualScorer(
+            hidden_dim=hidden_dim,
+            action_dim=self.residual_action_dim,
+            use_edge_bias=True,
         )
-
-        self.reset_parameters()
 
     @property
     def hidden_dim(self) -> int:
@@ -95,32 +307,49 @@ class ForwardPolicy(nn.Module):
         context: GraphContext,
         action_space: ActionSpace,
     ) -> PolicyOutput:
-        """
-        Score STOP and all legal EXPAND actions.
-
-        For each state z:
-
-            state_log_flow(z)
-              = logsumexp(
-                    stop_log_flow(z),
-                    {edge_log_flow(z, e): e in legal_expand(z)}
-                )
-
-        STOP and EXPAND edges compete in one action normalizer.
-        This is not a separate Bernoulli stop model.
-        """
-
         if int(action_space.num_states) != int(state.num_states):
-            raise ValueError("action_space.num_states must match state.num_states.")
-        if int(state.budget) != int(self.budget):
-            raise ValueError(
-                "state.budget must match policy budget, got "
-                f"{int(state.budget)} and {int(self.budget)}."
-            )
+            raise ValueError("action_space.num_states must match state.num_states: " f"{int(action_space.num_states)} != {int(state.num_states)}.")
 
-        query_h = self.state_encoder.query_embeddings(
+        state_repr = self.encode_state(
             features=features,
             state=state,
+            context=context,
+        )
+
+        stop_log_flow = self.stop_log_flow_predictor(state_repr)
+
+        edge_log_flow, edge_raw_score = self.score_edge_flows(
+            features=features,
+            context=context,
+            action_space=action_space,
+            state_repr=state_repr,
+        )
+
+        state_log_flow, continue_log_flow = combine_action_flows(
+            stop_log_flow=stop_log_flow,
+            edge_log_flow=edge_log_flow,
+            action_space=action_space,
+        )
+
+        return PolicyOutput(
+            action_space=action_space,
+            state_log_flow=state_log_flow,
+            stop_log_flow=stop_log_flow,
+            continue_log_flow=continue_log_flow,
+            edge_log_flow=edge_log_flow,
+            edge_raw_score=edge_raw_score,
+        )
+
+    def encode_state(
+        self,
+        *,
+        features: FeatureBank,
+        state: StateBatch,
+        context: GraphContext,
+    ) -> StateRepresentation:
+        query_h = select_query_embedding(
+            features,
+            state.graph_ids,
         )
 
         selected_h = self.state_encoder.selected_edge_summary(
@@ -137,96 +366,56 @@ class ForwardPolicy(nn.Module):
             query_h=query_h,
         )
 
-        budget_h = self.encode_budget(state)
-
-        stop_log_flow = self.score_stop_flow(
+        return StateRepresentation(
             query_h=query_h,
             selected_h=selected_h,
             covered_h=covered_h,
-            budget_h=budget_h,
         )
 
-        edge_log_flow, edge_raw_score, conditional_edge_log_prob = self.score_edge_flows(
-            features=features,
-            context=context,
-            action_space=action_space,
-            query_h=query_h,
-            selected_h=selected_h,
-            covered_h=covered_h,
-            budget_h=budget_h,
-        )
-
-        continue_log_flow = segment_logsumexp(
-            values=edge_log_flow,
-            segment_ids=action_space.expand_state_ids,
-            num_segments=int(state.num_states),
-        ).float()
-
-        state_log_flow = torch.logaddexp(
-            stop_log_flow,
-            continue_log_flow,
-        ).float()
-
-        stop_log_prob = (stop_log_flow - state_log_flow).float()
-
-        continue_log_prob = torch.where(
-            torch.isfinite(continue_log_flow),
-            continue_log_flow - state_log_flow,
-            state_log_flow.new_full(
-                (int(state.num_states),),
-                float("-inf"),
-            ),
-        ).float()
-
-        if int(action_space.num_expansions) == 0:
-            edge_log_prob = edge_log_flow
-        else:
-            edge_log_prob = (edge_log_flow - state_log_flow.index_select(0, action_space.expand_state_ids)).float()
-
-        return PolicyOutput(
-            action_space=action_space,
-            state_log_flow=state_log_flow,
-            stop_log_flow=stop_log_flow,
-            continue_log_flow=continue_log_flow,
-            stop_log_prob=stop_log_prob,
-            continue_log_prob=continue_log_prob,
-            edge_log_flow=edge_log_flow,
-            edge_log_prob=edge_log_prob,
-            conditional_edge_log_prob=conditional_edge_log_prob,
-            edge_raw_score=edge_raw_score,
-        )
-
-    def encode_budget(self, state: StateBatch) -> Tensor:
-        remaining = torch.clamp(
-            state.budget_left.to(dtype=torch.long),
-            min=0,
-            max=self.budget,
-        )
-
-        return self.budget_embedding(remaining)
-
-    def score_stop_flow(
+    def encode_frontier(
         self,
         *,
-        query_h: Tensor,
-        selected_h: Tensor,
-        covered_h: Tensor,
-        budget_h: Tensor,
-    ) -> Tensor:
-        return (
-            self.stop_head(
-                torch.cat(
-                    (
-                        query_h,
-                        selected_h,
-                        covered_h,
-                        budget_h,
-                    ),
-                    dim=-1,
-                )
-            )
-            .squeeze(-1)
-            .float()
+        features: FeatureBank,
+        context: GraphContext,
+        action_space: ActionSpace,
+    ) -> FrontierEncoding:
+        row_ids = action_space.expand_state_ids
+        edge_ids = action_space.expand_edge_ids
+
+        if int(edge_ids.numel()) == 0:
+            raise ValueError("encode_frontier requires at least one expansion action.")
+
+        dst_node_ids = context.edge_dst.index_select(0, edge_ids)
+
+        edge_h = self.state_encoder.encode_edge_tokens(
+            features=features,
+            context=context,
+            edge_ids=edge_ids,
+        )
+
+        relation_h = select_relation_embedding(
+            features,
+            edge_ids,
+        )
+
+        dst_h = select_node_embedding(
+            features,
+            dst_node_ids,
+        )
+
+        dst_text_mask = select_node_text_mask(
+            features,
+            dst_node_ids,
+        ).to(dtype=torch.float32)
+
+        return FrontierEncoding(
+            row_ids=row_ids,
+            edge_ids=edge_ids,
+            dst_node_ids=dst_node_ids,
+            edge_h=edge_h,
+            relation_h=relation_h,
+            dst_h=dst_h,
+            dst_text_mask=dst_text_mask,
         )
 
     def score_edge_flows(
@@ -235,159 +424,98 @@ class ForwardPolicy(nn.Module):
         features: FeatureBank,
         context: GraphContext,
         action_space: ActionSpace,
-        query_h: Tensor,
-        selected_h: Tensor,
-        covered_h: Tensor,
-        budget_h: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        state_repr: StateRepresentation,
+    ) -> tuple[Tensor, Tensor]:
         if int(action_space.num_expansions) == 0:
-            empty = query_h.new_empty((0,), dtype=torch.float32)
-            return empty, empty, empty
+            empty = state_repr.query_h.new_empty((0,), dtype=torch.float32)
+            return empty, empty
 
-        row_ids = action_space.expand_state_ids
-        edge_ids = action_space.expand_edge_ids
-
-        edge_h = self.state_encoder.encode_edge_tokens(
+        frontier = self.encode_frontier(
             features=features,
             context=context,
-            edge_ids=edge_ids,
-        )
-
-        semantic_prior = self.score_edge_semantic_prior(
-            features=features,
-            context=context,
-            query_h=query_h,
             action_space=action_space,
         )
 
-        residual = self.score_edge_residual(
-            query_h=query_h,
-            selected_h=selected_h,
-            covered_h=covered_h,
-            budget_h=budget_h,
-            edge_h=edge_h,
-            row_ids=row_ids,
+        semantic_prior = self.semantic_prior(
+            state_repr=state_repr,
+            frontier=frontier,
+        )
+
+        residual = self.edge_residual_scorer(
+            state_repr=state_repr,
+            frontier=frontier,
         )
 
         edge_raw_score = (semantic_prior + float(self.edge_residual_weight) * residual).float()
 
-        edge_log_flow = self.size_normalized_edge_flow(
+        edge_log_flow = apply_frontier_mass_correction(
             edge_raw_score=edge_raw_score,
             action_space=action_space,
             frontier_size_correction=self.frontier_size_correction,
         )
 
-        conditional_edge_log_prob = segment_log_softmax(
-            edge_log_flow,
-            row_ids,
-            num_segments=int(action_space.num_states),
-        ).float()
-
-        return edge_log_flow, edge_raw_score, conditional_edge_log_prob
-
-    def score_edge_residual(
-        self,
-        *,
-        query_h: Tensor,
-        selected_h: Tensor,
-        covered_h: Tensor,
-        budget_h: Tensor,
-        edge_h: Tensor,
-        row_ids: Tensor,
-    ) -> Tensor:
-        return (
-            self.edge_residual_head(
-                torch.cat(
-                    (
-                        query_h.index_select(0, row_ids),
-                        selected_h.index_select(0, row_ids),
-                        covered_h.index_select(0, row_ids),
-                        budget_h.index_select(0, row_ids),
-                        edge_h,
-                    ),
-                    dim=-1,
-                )
-            )
-            .squeeze(-1)
-            .float()
-        )
-
-    def score_edge_semantic_prior(
-        self,
-        *,
-        features: FeatureBank,
-        context: GraphContext,
-        query_h: Tensor,
-        action_space: ActionSpace,
-    ) -> Tensor:
-        edge_ids = action_space.expand_edge_ids
-        row_ids = action_space.expand_state_ids
-
-        dst_node_ids = context.edge_dst.index_select(0, edge_ids)
-
-        query_edge_h = query_h.index_select(0, row_ids)
-        relation_h = select_relation_embedding(features, edge_ids)
-        dst_h = select_node_embedding(features, dst_node_ids)
-
-        dst_text_mask = select_node_text_mask(
-            features,
-            dst_node_ids,
-        ).to(dtype=query_edge_h.dtype)
-
-        relation_prior = (query_edge_h * relation_h).sum(dim=-1)
-        dst_prior = dst_text_mask * (query_edge_h * dst_h).sum(dim=-1)
-
-        return (self.semantic_relation_weight * relation_prior + self.semantic_dst_weight * dst_prior).float()
-
-    @staticmethod
-    def size_normalized_edge_flow(
-        *,
-        edge_raw_score: Tensor,
-        action_space: ActionSpace,
-        frontier_size_correction: float = 1.0,
-    ) -> Tensor:
-        """
-        Convert per-edge raw scores into edge log-flow.
-
-        The correction subtracts beta * log |frontier(z)|. beta=1 makes the
-        continue flow a log-mean-exp over edge scores; beta=0 makes it a
-        log-sum-exp over edge scores.
-        """
-
-        row_ids = action_space.expand_state_ids
-
-        expand_count = action_space.expand_count.index_select(0, row_ids)
-        log_expand_count = expand_count.to(dtype=edge_raw_score.dtype).log()
-
-        return (edge_raw_score - float(frontier_size_correction) * log_expand_count).float()
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(
-            self.budget_embedding.weight,
-            mean=0.0,
-            std=0.02,
-        )
-
-        for module in self.stop_head:
-            if isinstance(module, nn.Linear):
-                init_xavier(module)
-
-        for module in self.edge_residual_head:
-            if isinstance(module, nn.Linear):
-                init_xavier(module)
-
-        _zero_linear(self.stop_head[-1])
-        _zero_linear(self.edge_residual_head[-1])
+        return edge_log_flow.float(), edge_raw_score.float()
 
 
-def _zero_linear(module: nn.Module) -> None:
-    if not isinstance(module, nn.Linear):
-        raise TypeError(f"Expected nn.Linear, got {type(module).__name__}.")
+def combine_action_flows(
+    *,
+    stop_log_flow: Tensor,
+    edge_log_flow: Tensor,
+    action_space: ActionSpace,
+) -> tuple[Tensor, Tensor]:
+    num_states = int(action_space.num_states)
 
-    init.zeros_(module.weight)
-    init.zeros_(module.bias)
+    if stop_log_flow.shape != (num_states,):
+        raise ValueError(f"stop_log_flow must have shape [{num_states}], " f"got {tuple(stop_log_flow.shape)}.")
+
+    continue_log_flow = segment_logsumexp(
+        values=edge_log_flow,
+        segment_ids=action_space.expand_state_ids,
+        num_segments=num_states,
+    ).float()
+
+    state_log_flow = torch.logaddexp(
+        stop_log_flow,
+        continue_log_flow,
+    ).float()
+
+    return state_log_flow, continue_log_flow
+
+
+def apply_frontier_mass_correction(
+    *,
+    edge_raw_score: Tensor,
+    action_space: ActionSpace,
+    frontier_size_correction: float = 1.0,
+) -> Tensor:
+    """
+    Apply per-state frontier-size correction.
+
+    For every e in C(z):
+        edge_log_flow(z,e)
+          = edge_raw_score(z,e) - alpha * log |C(z)|
+
+    This does not change P(e | continue, z). It only changes total CONTINUE
+    mass relative to STOP.
+    """
+    if int(action_space.num_expansions) == 0:
+        return edge_raw_score
+
+    row_ids = action_space.expand_state_ids
+    expand_count = action_space.expand_count.index_select(0, row_ids)
+
+    log_expand_count = expand_count.to(dtype=edge_raw_score.dtype).clamp_min(1).log()
+
+    return (edge_raw_score - float(frontier_size_correction) * log_expand_count).float()
 
 
 __all__ = [
     "ForwardPolicy",
+    "FrontierEncoding",
+    "LowRankEdgeResidualScorer",
+    "SemanticEdgePrior",
+    "StateRepresentation",
+    "StopLogFlowPredictor",
+    "apply_frontier_mass_correction",
+    "combine_action_flows",
 ]

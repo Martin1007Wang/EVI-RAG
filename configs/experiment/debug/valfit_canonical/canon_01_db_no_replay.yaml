@@ -1,0 +1,30 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: canon_01_db_no_replay
+experiment_name: canon_01_db_no_replay
+
+tags:
+  - canonical_state
+  - db
+  - no_replay
+  - policy_only
+
+notes: >
+  Removes replay signals to test whether policy rollouts alone provide enough
+  coverage for canonical DB learning.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_canonical
+  tags: ${tags}
+
+model:
+  loss_fn:
+    alpha_replay: 0.0
+
+  weak_replay_loss:
+    weight: 0.0

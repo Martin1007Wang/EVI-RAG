@@ -2,10 +2,10 @@
 
 _target_: src.data.datamodule.RetrievalDataModule
 
-batch_size: 1
+batch_size: 4
 num_workers: 0
 
-eval_batch_size: 1
+eval_batch_size: 4
 eval_num_workers: 0
 
 pin_memory: true

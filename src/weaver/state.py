@@ -473,33 +473,6 @@ def state_rows_equal(
     return bool(left_edges.eq(right_edges).all())
 
 
-def legal_state_mask(
-    *,
-    state: StateBatch,
-    graph: GraphContext,
-) -> Tensor:
-    """
-    Return which canonical rows are anchor-reachable directed subgraphs.
-
-    A row is legal when every selected edge belongs to its graph, selected
-    edges are unique, and each selected edge's source can be reached from an
-    anchor through selected edges.
-    """
-
-    valid = torch.ones(
-        state.num_states,
-        dtype=torch.bool,
-        device=state.device,
-    )
-    for row in range(state.num_states):
-        valid[row] = _is_legal_state_row(
-            state=state,
-            graph=graph,
-            row=row,
-        )
-    return valid
-
-
 def _covered_node_pairs(
     *,
     state: StateBatch,
@@ -756,10 +729,7 @@ def _is_legal_state_row(
 
     anchor_start = int(graph.anchor_ptr[graph_id].item())
     anchor_end = int(graph.anchor_ptr[graph_id + 1].item())
-    reachable: set[int] = {
-        int(node_id)
-        for node_id in graph.anchor_node_ids[anchor_start:anchor_end].detach().cpu().tolist()
-    }
+    reachable: set[int] = {int(node_id) for node_id in graph.anchor_node_ids[anchor_start:anchor_end].detach().cpu().tolist()}
 
     remaining = set(int(edge_id) for edge_id in selected.detach().cpu().tolist())
     src = graph.edge_src.detach().cpu()
@@ -930,7 +900,6 @@ __all__ = [
     "StateBatch",
     "canonicalize_state_batch",
     "cat_state_batches",
-    "legal_state_mask",
     "remove_selected_edge",
     "state_rows_equal",
 ]

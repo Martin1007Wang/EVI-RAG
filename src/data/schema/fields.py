@@ -18,3 +18,12 @@ class SampleFields:
     WEAK_REPLAY_EDGE_WEIGHT = (
         "weak_replay_edge_weight"  # FloatTensor [num_weak_edges]
     )
+    WITNESS_PATH_EDGE_IDS = (
+        "witness_path_edge_ids"  # LongTensor [num_witness_edges], graph-local edge ids
+    )
+    WITNESS_PATH_EDGE_PATH_IDS = (
+        "witness_path_edge_path_ids"  # LongTensor [num_witness_edges], graph-local path ids
+    )
+    WITNESS_PATH_TARGET_NODE_IDS = (
+        "witness_path_target_node_ids"  # LongTensor [num_witness_paths], sample-local node ids
+    )

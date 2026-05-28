@@ -15,6 +15,9 @@ class PathLabels:
     reachable_target_node_ids: torch.Tensor
     node_target_distance: torch.Tensor
     node_target_shortest_path_edge_mask_flat: torch.Tensor
+    witness_path_edge_ids: torch.Tensor
+    witness_path_edge_path_ids: torch.Tensor
+    witness_path_target_node_ids: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +25,8 @@ class TargetPathLabels:
     target_node_ids: torch.Tensor
     node_target_distances_flat: torch.Tensor
     node_target_shortest_path_edge_mask_flat: torch.Tensor
+    witness_path_edge_ids: torch.Tensor
+    witness_path_edge_path_ids: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +81,9 @@ def compute_path_labels(
             num_nodes=num_nodes,
         ),
         node_target_shortest_path_edge_mask_flat=target.node_target_shortest_path_edge_mask_flat,
+        witness_path_edge_ids=target.witness_path_edge_ids,
+        witness_path_edge_path_ids=target.witness_path_edge_path_ids,
+        witness_path_target_node_ids=target.target_node_ids,
     )
 
 
@@ -141,11 +149,19 @@ def _target_path_labels(
         targets=reachable_targets,
         target_distances=target_distances,
     )
+    witness_path_edge_ids, witness_path_edge_path_ids = _shortest_witness_paths(
+        graph=graph,
+        anchors=anchors,
+        targets=reachable_targets,
+        anchor_distances=anchor_distances,
+    )
 
     return TargetPathLabels(
         target_node_ids=torch.tensor(reachable_targets, dtype=torch.long),
         node_target_distances_flat=target_distances.reshape(-1).contiguous(),
         node_target_shortest_path_edge_mask_flat=edge_mask.reshape(-1).contiguous(),
+        witness_path_edge_ids=witness_path_edge_ids,
+        witness_path_edge_path_ids=witness_path_edge_path_ids,
     )
 
 
@@ -286,6 +302,111 @@ def _multi_source_min_dist(
     return torch.tensor(dist, dtype=torch.long)
 
 
+def _shortest_witness_paths(
+    *,
+    graph: _Graph,
+    anchors: Sequence[int],
+    targets: Sequence[int],
+    anchor_distances: Sequence[Sequence[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not anchors or not targets:
+        empty = torch.empty((0,), dtype=torch.long)
+        return empty, empty
+
+    path_edge_ids: list[int] = []
+    path_ids: list[int] = []
+
+    for path_id, target in enumerate(targets):
+        path = _deterministic_shortest_path(
+            graph=graph,
+            anchors=anchors,
+            target=int(target),
+            anchor_distances=anchor_distances,
+        )
+        for edge_id in path:
+            path_edge_ids.append(int(edge_id))
+            path_ids.append(int(path_id))
+
+    return (
+        torch.tensor(path_edge_ids, dtype=torch.long).contiguous()
+        if path_edge_ids
+        else torch.empty((0,), dtype=torch.long),
+        torch.tensor(path_ids, dtype=torch.long).contiguous()
+        if path_ids
+        else torch.empty((0,), dtype=torch.long),
+    )
+
+
+def _deterministic_shortest_path(
+    *,
+    graph: _Graph,
+    anchors: Sequence[int],
+    target: int,
+    anchor_distances: Sequence[Sequence[int]],
+) -> list[int]:
+    best_anchor_idx = None
+    best_distance = None
+    best_anchor_node = None
+
+    for anchor_idx, anchor in enumerate(anchors):
+        target_distance = int(anchor_distances[anchor_idx][target])
+        if target_distance == unreachable_distance:
+            continue
+        if (
+            best_distance is None
+            or target_distance < best_distance
+            or (
+                target_distance == best_distance
+                and int(anchor) < int(best_anchor_node)
+            )
+        ):
+            best_anchor_idx = int(anchor_idx)
+            best_distance = int(target_distance)
+            best_anchor_node = int(anchor)
+
+    if best_anchor_idx is None or best_distance is None or best_anchor_node is None:
+        raise ValueError(f"Target node {target} is not reachable from any anchor.")
+
+    if best_distance == 0:
+        return []
+
+    anchor_distance = anchor_distances[best_anchor_idx]
+    edge_ids_rev: list[int] = []
+    current = int(target)
+
+    while current != best_anchor_node:
+        current_distance = int(anchor_distance[current])
+        if current_distance <= 0:
+            raise ValueError(
+                "Failed to backtrack deterministic shortest path: "
+                f"target={target}, current={current}, anchor={best_anchor_node}."
+            )
+
+        best_predecessor = None
+        for edge_id, (src, dst) in enumerate(zip(graph.src, graph.dst, strict=True)):
+            if int(dst) != current:
+                continue
+            src_distance = int(anchor_distance[int(src)])
+            if src_distance == unreachable_distance or src_distance + 1 != current_distance:
+                continue
+            candidate = (int(src_distance), int(src), int(edge_id))
+            if best_predecessor is None or candidate < best_predecessor:
+                best_predecessor = candidate
+
+        if best_predecessor is None:
+            raise ValueError(
+                "Failed to materialize deterministic shortest path: "
+                f"target={target}, current={current}, anchor={best_anchor_node}."
+            )
+
+        _, src, edge_id = best_predecessor
+        edge_ids_rev.append(int(edge_id))
+        current = int(src)
+
+    edge_ids_rev.reverse()
+    return edge_ids_rev
+
+
 def _min_distances(
     distances: Sequence[Sequence[int]] | None,
     *,
@@ -359,6 +480,8 @@ def _empty_target_labels() -> TargetPathLabels:
         target_node_ids=torch.empty((0,), dtype=torch.long),
         node_target_distances_flat=torch.empty((0,), dtype=torch.long),
         node_target_shortest_path_edge_mask_flat=torch.empty((0,), dtype=torch.bool),
+        witness_path_edge_ids=torch.empty((0,), dtype=torch.long),
+        witness_path_edge_path_ids=torch.empty((0,), dtype=torch.long),
     )
 
 

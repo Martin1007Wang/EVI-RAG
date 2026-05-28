@@ -36,6 +36,7 @@ _NODE_INDEX_KEYS = frozenset(
         SampleFields.ANCHOR_NODE_IDS,
         SampleFields.TARGET_NODE_IDS,
         SampleFields.REACHABLE_TARGET_NODE_IDS,
+        SampleFields.WITNESS_PATH_TARGET_NODE_IDS,
     }
 )
 
@@ -63,6 +64,13 @@ _LOCAL_WEAK_REPLAY_KEYS = frozenset(
     {
         SampleFields.WEAK_REPLAY_EDGE_IDS,
         SampleFields.WEAK_REPLAY_EDGE_WEIGHT,
+        SampleFields.WITNESS_PATH_EDGE_IDS,
+    }
+)
+
+_LOCAL_PATH_ID_KEYS = frozenset(
+    {
+        SampleFields.WITNESS_PATH_EDGE_PATH_IDS,
     }
 )
 
@@ -96,6 +104,14 @@ def _num_edges(data: Any) -> int:
     raise ValueError("edge_index or num_edges is required to infer edge count.")
 
 
+def _num_witness_paths(data: Any) -> int:
+    if hasattr(data, SampleFields.WITNESS_PATH_TARGET_NODE_IDS):
+        value = getattr(data, SampleFields.WITNESS_PATH_TARGET_NODE_IDS)
+        if value is not None:
+            return int(torch.as_tensor(value).numel())
+    return 0
+
+
 def _retrieval_increment(data: Any, key: str) -> int | None:
     """
     Return a custom PyG batching increment for known retrieval fields.
@@ -105,6 +121,9 @@ def _retrieval_increment(data: Any, key: str) -> int | None:
 
     if key in _NODE_INDEX_KEYS:
         return _num_nodes(data)
+
+    if key in _LOCAL_PATH_ID_KEYS:
+        return _num_witness_paths(data)
 
     if key in _NO_INCREMENT_KEYS:
         return 0
@@ -122,6 +141,10 @@ class RetrievalData(Data):
       sample-local node ids.
     - weak_replay_edge_ids uses sample-local edge ids and is intentionally not
       incremented by PyG; use weak_replay_edge_ids_batch for graph ids.
+    - witness_path_edge_ids uses sample-local edge ids and is intentionally not
+      incremented by PyG; use witness_path_edge_ids_batch for graph ids.
+    - witness_path_edge_path_ids uses graph-local path ids and is incremented by
+      the number of witness paths in the sample.
 
     Global-id fields:
     - node_entity_catalog_ids
@@ -176,6 +199,9 @@ class RetrievalBatch(Batch):
 
     weak_replay_edge_ids: torch.Tensor
     weak_replay_edge_weight: torch.Tensor
+    witness_path_edge_ids: torch.Tensor
+    witness_path_edge_path_ids: torch.Tensor
+    witness_path_target_node_ids: torch.Tensor
 
     def __cat_dim__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         return super().__cat_dim__(key, value, *args, **kwargs)  # type: ignore[attr-defined]

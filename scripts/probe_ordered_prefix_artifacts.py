@@ -150,8 +150,8 @@ def load_run_config(*, run_dir: Path, data_dir: str, dataset: str | None):
             runner.weak_replay_source = runner.pop("replay_source")
         if "train_replay_rollouts" in runner:
             runner.pop("train_replay_rollouts")
-        if "weak_replay_loss" not in cfg.model:
-            cfg.model.weak_replay_loss = None
+        if "weak_replay_loss" in cfg.model:
+            cfg.model.pop("weak_replay_loss")
     return cfg
 
 
