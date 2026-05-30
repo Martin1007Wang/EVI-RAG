@@ -713,9 +713,9 @@ edge_log_prob = edge_log_flow - state_log_flow[row]
 
 裁剪判断：
 
-- `edge_log_reference = -log |Frontier|` 是一个 uniform base measure。删掉后，大 frontier state 的 continuation mass 会天然更大，算法行为会变。
-- 当前没有独立 continuation head；continuation 完全由 stop flow 与 edge measure 决定。若想砍参数，这是已经较简的设计。
-- `budget_embedding` 是 policy 识别剩余步数的唯一显式条件。删除后模型只能从 selected edge count 的 state 表征间接推断 budget。
+- 当前主线 edge policy 已切到统一表示：`typed edge token -> state attn pool -> state-action interaction -> flow head`。
+- STOP 和 EXPAND 共用同一 `state_h`，不再通过 `4-scalar state summary` 预测停止。
+- 主干不再读取 `edge_log_conductance`、`marginal_coverage_gain`、`degree_correction` 或 `frontier size` 这类 handcrafted scalar。
 
 `ForwardPolicyOutput.sample`：
 

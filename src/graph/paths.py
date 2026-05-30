@@ -14,19 +14,6 @@ node_target_unreachable_distance = 1_000_000_000
 class PathLabels:
     reachable_target_node_ids: torch.Tensor
     node_target_distance: torch.Tensor
-    node_target_shortest_path_edge_mask_flat: torch.Tensor
-    witness_path_edge_ids: torch.Tensor
-    witness_path_edge_path_ids: torch.Tensor
-    witness_path_target_node_ids: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class TargetPathLabels:
-    target_node_ids: torch.Tensor
-    node_target_distances_flat: torch.Tensor
-    node_target_shortest_path_edge_mask_flat: torch.Tensor
-    witness_path_edge_ids: torch.Tensor
-    witness_path_edge_path_ids: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,7 +51,7 @@ def compute_path_labels(
     if num_nodes > 0 and anchors and targets:
         anchor_distances = [_bfs(graph.adjacency, anchor) for anchor in anchors]
 
-    target = _target_path_labels(
+    reachable_targets, node_target_distances_flat = _target_path_labels(
         graph=graph,
         anchors=anchors,
         targets=targets,
@@ -72,34 +59,14 @@ def compute_path_labels(
         anchor_distances=anchor_distances,
     )
 
-    num_targets = int(target.target_node_ids.numel())
+    num_targets = int(reachable_targets.numel())
     return PathLabels(
-        reachable_target_node_ids=target.target_node_ids,
+        reachable_target_node_ids=reachable_targets,
         node_target_distance=_nearest_target_distance(
-            node_target_distances_flat=target.node_target_distances_flat,
+            node_target_distances_flat=node_target_distances_flat,
             num_targets=num_targets,
             num_nodes=num_nodes,
         ),
-        node_target_shortest_path_edge_mask_flat=target.node_target_shortest_path_edge_mask_flat,
-        witness_path_edge_ids=target.witness_path_edge_ids,
-        witness_path_edge_path_ids=target.witness_path_edge_path_ids,
-        witness_path_target_node_ids=target.target_node_ids,
-    )
-
-
-def compute_target_path_labels(
-    *,
-    edge_index: torch.Tensor,
-    anchor_node_ids: torch.Tensor,
-    target_node_ids: torch.Tensor,
-    num_nodes: int,
-) -> TargetPathLabels:
-    graph = _graph_from_edge_index(edge_index=edge_index, num_nodes=num_nodes)
-    return _target_path_labels(
-        graph=graph,
-        anchors=_valid_unique_nodes(anchor_node_ids, num_nodes=num_nodes),
-        targets=_valid_unique_nodes(target_node_ids, num_nodes=num_nodes),
-        num_nodes=num_nodes,
     )
 
 
@@ -124,7 +91,7 @@ def _target_path_labels(
     targets: Sequence[int],
     num_nodes: int,
     anchor_distances: Sequence[Sequence[int]] | None = None,
-) -> TargetPathLabels:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if num_nodes <= 0 or not anchors or not targets:
         return _empty_target_labels()
 
@@ -143,25 +110,9 @@ def _target_path_labels(
         [_bfs(graph.reverse_adjacency, target) for target in reachable_targets],
         dtype=torch.long,
     )
-    edge_mask = _shortest_path_edge_mask(
-        graph=graph,
-        anchor_distances=anchor_distances,
-        targets=reachable_targets,
-        target_distances=target_distances,
-    )
-    witness_path_edge_ids, witness_path_edge_path_ids = _shortest_witness_paths(
-        graph=graph,
-        anchors=anchors,
-        targets=reachable_targets,
-        anchor_distances=anchor_distances,
-    )
-
-    return TargetPathLabels(
-        target_node_ids=torch.tensor(reachable_targets, dtype=torch.long),
-        node_target_distances_flat=target_distances.reshape(-1).contiguous(),
-        node_target_shortest_path_edge_mask_flat=edge_mask.reshape(-1).contiguous(),
-        witness_path_edge_ids=witness_path_edge_ids,
-        witness_path_edge_path_ids=witness_path_edge_path_ids,
+    return (
+        torch.tensor(reachable_targets, dtype=torch.long),
+        target_distances.reshape(-1).contiguous(),
     )
 
 
@@ -228,58 +179,6 @@ def _graph_from_edge_index(*, edge_index: torch.Tensor, num_nodes: int) -> _Grap
     )
 
 
-def _shortest_path_edge_mask(
-    *,
-    graph: _Graph,
-    anchor_distances: Sequence[Sequence[int]],
-    targets: Sequence[int],
-    target_distances: torch.Tensor,
-) -> torch.Tensor:
-    num_targets = len(targets)
-    num_edges = graph.num_edges
-    mask = torch.zeros((num_targets, num_edges), dtype=torch.bool)
-    if num_targets == 0 or num_edges == 0 or not anchor_distances:
-        return mask
-
-    anchor_matrix = torch.tensor(anchor_distances, dtype=torch.long)
-
-    max_elements_per_chunk = 4_000_000
-    for target_idx, target in enumerate(targets):
-        edge_to_target = target_distances[target_idx, graph.dst_tensor]
-        candidate_edges = edge_to_target.ne(unreachable_distance)
-        if not bool(candidate_edges.any()):
-            continue
-
-        anchor_to_target = anchor_matrix[:, int(target)]
-        active_anchors = anchor_to_target.ne(unreachable_distance)
-        if not bool(active_anchors.any()):
-            continue
-
-        edge_ids = torch.nonzero(candidate_edges, as_tuple=False).view(-1)
-        active_anchor_dist = anchor_matrix[active_anchors]
-        active_anchor_to_target = anchor_to_target[active_anchors]
-        chunk_size = max(
-            1,
-            max_elements_per_chunk // max(1, int(active_anchor_dist.size(0))),
-        )
-
-        for start in range(0, int(edge_ids.numel()), chunk_size):
-            edge_chunk = edge_ids[start : start + chunk_size]
-            src = graph.src_tensor[edge_chunk]
-            dst = graph.dst_tensor[edge_chunk]
-            suffix_distance = target_distances[target_idx, dst]
-
-            anchor_to_src = active_anchor_dist[:, src]
-            on_path = anchor_to_src.ne(unreachable_distance) & (
-                anchor_to_src + 1 + suffix_distance.view(1, -1)
-                == active_anchor_to_target.view(-1, 1)
-            )
-
-            mask[target_idx, edge_chunk] = on_path.any(dim=0)
-
-    return mask
-
-
 def _multi_source_min_dist(
     adjacency: list[list[int]],
     starts: Sequence[int],
@@ -300,111 +199,6 @@ def _multi_source_min_dist(
                 dist[v] = next_dist
                 queue.append(v)
     return torch.tensor(dist, dtype=torch.long)
-
-
-def _shortest_witness_paths(
-    *,
-    graph: _Graph,
-    anchors: Sequence[int],
-    targets: Sequence[int],
-    anchor_distances: Sequence[Sequence[int]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not anchors or not targets:
-        empty = torch.empty((0,), dtype=torch.long)
-        return empty, empty
-
-    path_edge_ids: list[int] = []
-    path_ids: list[int] = []
-
-    for path_id, target in enumerate(targets):
-        path = _deterministic_shortest_path(
-            graph=graph,
-            anchors=anchors,
-            target=int(target),
-            anchor_distances=anchor_distances,
-        )
-        for edge_id in path:
-            path_edge_ids.append(int(edge_id))
-            path_ids.append(int(path_id))
-
-    return (
-        torch.tensor(path_edge_ids, dtype=torch.long).contiguous()
-        if path_edge_ids
-        else torch.empty((0,), dtype=torch.long),
-        torch.tensor(path_ids, dtype=torch.long).contiguous()
-        if path_ids
-        else torch.empty((0,), dtype=torch.long),
-    )
-
-
-def _deterministic_shortest_path(
-    *,
-    graph: _Graph,
-    anchors: Sequence[int],
-    target: int,
-    anchor_distances: Sequence[Sequence[int]],
-) -> list[int]:
-    best_anchor_idx = None
-    best_distance = None
-    best_anchor_node = None
-
-    for anchor_idx, anchor in enumerate(anchors):
-        target_distance = int(anchor_distances[anchor_idx][target])
-        if target_distance == unreachable_distance:
-            continue
-        if (
-            best_distance is None
-            or target_distance < best_distance
-            or (
-                target_distance == best_distance
-                and int(anchor) < int(best_anchor_node)
-            )
-        ):
-            best_anchor_idx = int(anchor_idx)
-            best_distance = int(target_distance)
-            best_anchor_node = int(anchor)
-
-    if best_anchor_idx is None or best_distance is None or best_anchor_node is None:
-        raise ValueError(f"Target node {target} is not reachable from any anchor.")
-
-    if best_distance == 0:
-        return []
-
-    anchor_distance = anchor_distances[best_anchor_idx]
-    edge_ids_rev: list[int] = []
-    current = int(target)
-
-    while current != best_anchor_node:
-        current_distance = int(anchor_distance[current])
-        if current_distance <= 0:
-            raise ValueError(
-                "Failed to backtrack deterministic shortest path: "
-                f"target={target}, current={current}, anchor={best_anchor_node}."
-            )
-
-        best_predecessor = None
-        for edge_id, (src, dst) in enumerate(zip(graph.src, graph.dst, strict=True)):
-            if int(dst) != current:
-                continue
-            src_distance = int(anchor_distance[int(src)])
-            if src_distance == unreachable_distance or src_distance + 1 != current_distance:
-                continue
-            candidate = (int(src_distance), int(src), int(edge_id))
-            if best_predecessor is None or candidate < best_predecessor:
-                best_predecessor = candidate
-
-        if best_predecessor is None:
-            raise ValueError(
-                "Failed to materialize deterministic shortest path: "
-                f"target={target}, current={current}, anchor={best_anchor_node}."
-            )
-
-        _, src, edge_id = best_predecessor
-        edge_ids_rev.append(int(edge_id))
-        current = int(src)
-
-    edge_ids_rev.reverse()
-    return edge_ids_rev
 
 
 def _min_distances(
@@ -475,13 +269,10 @@ def _valid_unique_nodes(node_ids: torch.Tensor, *, num_nodes: int) -> list[int]:
     return out
 
 
-def _empty_target_labels() -> TargetPathLabels:
-    return TargetPathLabels(
-        target_node_ids=torch.empty((0,), dtype=torch.long),
-        node_target_distances_flat=torch.empty((0,), dtype=torch.long),
-        node_target_shortest_path_edge_mask_flat=torch.empty((0,), dtype=torch.bool),
-        witness_path_edge_ids=torch.empty((0,), dtype=torch.long),
-        witness_path_edge_path_ids=torch.empty((0,), dtype=torch.long),
+def _empty_target_labels() -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty((0,), dtype=torch.long),
+        torch.empty((0,), dtype=torch.long),
     )
 
 
@@ -495,10 +286,8 @@ def _empty_anchor_labels() -> AnchorPathLabels:
 __all__ = [
     "AnchorPathLabels",
     "PathLabels",
-    "TargetPathLabels",
     "compute_anchor_path_labels",
     "compute_path_labels",
-    "compute_target_path_labels",
     "node_target_unreachable_distance",
     "unreachable_distance",
 ]

@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import torch
 from src.graph.ops import build_local_graph
+from src.graph.oracle_replay import build_replay_program
 from src.graph.paths import compute_path_labels
 from .samples import PreparedSample, RawSample, SplitFilter
 from .catalog import CatalogBuilder
@@ -95,9 +96,11 @@ def prepare_sample(
     ):
         stats.no_reachable_answer += 1
         return None
-    weak_replay_edge_ids, weak_replay_edge_weight = _weak_replay_edges(
-        edge_mask_flat=path_labels.node_target_shortest_path_edge_mask_flat,
-        num_edges=num_edges,
+    replay_program = build_replay_program(
+        edge_index=edge_index,
+        anchor_node_ids=anchor_node_ids,
+        reachable_target_node_ids=path_labels.reachable_target_node_ids,
+        num_nodes=num_nodes,
     )
     node_entity_catalog_ids, edge_relation_catalog_ids = _build_graph_catalog_ids(
         graph_edges=graph_edges,
@@ -121,33 +124,14 @@ def prepare_sample(
         node_entity_catalog_ids=node_entity_catalog_ids,
         edge_relation_catalog_ids=edge_relation_catalog_ids,
         node_target_distance=path_labels.node_target_distance,
-        weak_replay_edge_ids=weak_replay_edge_ids,
-        weak_replay_edge_weight=weak_replay_edge_weight,
-        witness_path_edge_ids=path_labels.witness_path_edge_ids,
-        witness_path_edge_path_ids=path_labels.witness_path_edge_path_ids,
-        witness_path_target_node_ids=path_labels.witness_path_target_node_ids,
+        replay_candidate_edge_ids=replay_program.candidate_edge_ids,
+        replay_candidate_ptr=replay_program.candidate_ptr,
+        replay_candidate_target_positions=replay_program.candidate_target_positions,
+        replay_candidate_target_ptr=replay_program.candidate_target_ptr,
+        replay_edge_to_candidate_ids=replay_program.edge_to_candidate_ids,
+        replay_edge_to_candidate_ptr=replay_program.edge_to_candidate_ptr,
+        replay_path_truncated=torch.as_tensor(int(replay_program.path_truncated), dtype=torch.long),
     )
-
-
-def _weak_replay_edges(
-    *,
-    edge_mask_flat: torch.Tensor,
-    num_edges: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if int(num_edges) <= 0 or int(edge_mask_flat.numel()) == 0:
-        return (
-            torch.empty((0,), dtype=torch.long),
-            torch.empty((0,), dtype=torch.float32),
-        )
-    mask = edge_mask_flat.to(dtype=torch.bool, device="cpu").view(-1, int(num_edges))
-    weight = mask.to(dtype=torch.float32).sum(dim=0)
-    edge_ids = weight.gt(0).nonzero(as_tuple=False).view(-1).long()
-    if int(edge_ids.numel()) == 0:
-        return (
-            torch.empty((0,), dtype=torch.long),
-            torch.empty((0,), dtype=torch.float32),
-        )
-    return edge_ids.contiguous(), weight.index_select(0, edge_ids).contiguous()
 
 
 def _clean_edges(

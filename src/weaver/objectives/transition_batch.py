@@ -5,6 +5,7 @@ from enum import IntEnum
 
 import torch
 
+from src.weaver.context import GraphContext
 from src.weaver.state import ExpansionBatch, StateBatch
 
 Tensor = torch.Tensor
@@ -36,6 +37,7 @@ class NonterminalTransitionBatch:
     parent_state_ids: Tensor  # [K]
     edge_ids: Tensor  # [K]
     child_state: StateBatch | None = None
+    graph_context: GraphContext | None = None
     log_backward: Tensor | None = None
     source: Tensor | None = None  # [K]
 
@@ -50,12 +52,15 @@ class NonterminalTransitionBatch:
     def materialize_child_state(self) -> StateBatch:
         if self.child_state is not None:
             return self.child_state
+        if self.graph_context is None:
+            raise ValueError("graph_context is required to materialize child_state when child_state is absent.")
 
         return self.parent_state.branch(
             ExpansionBatch(
                 state_ids=self.parent_state_ids,
                 edge_ids=self.edge_ids,
-            )
+            ),
+            graph_context=self.graph_context,
         )
 
 

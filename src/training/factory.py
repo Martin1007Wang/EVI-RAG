@@ -15,6 +15,7 @@ from .config import (
     validate_retrieval_data_config,
 )
 from src.weaver.feature import FeatureEncoder
+from src.weaver.policy import ForwardPolicy
 
 T = TypeVar("T")
 
@@ -79,9 +80,12 @@ def build_model(
         "cfg.model.feature_encoder",
     )
 
+    policy = _build_policy(cfg.model.policy)
+
     model_obj = hydra.utils.instantiate(
         cfg.model,
         feature_encoder=feature_encoder,
+        policy=policy,
     )
     module = require_type(model_obj, LightningModule, "cfg.model")
 
@@ -218,6 +222,27 @@ def require_type(
         raise TypeError(f"{name} must instantiate {expected_type.__name__}, " f"got {type(value).__name__}.")
 
     return cast(T, value)
+
+
+def _build_policy(policy_cfg: DictConfig) -> ForwardPolicy:
+    interaction = hydra.utils.instantiate(policy_cfg.stop_head.interaction)
+    stop_head = hydra.utils.instantiate(
+        policy_cfg.stop_head,
+        interaction=interaction,
+    )
+    edge_head = hydra.utils.instantiate(
+        policy_cfg.edge_head,
+        interaction=interaction,
+    )
+    cache_builder = hydra.utils.instantiate(policy_cfg.cache_builder)
+    state_encoder = hydra.utils.instantiate(policy_cfg.state_encoder)
+    policy = ForwardPolicy(
+        cache_builder=cache_builder,
+        state_encoder=state_encoder,
+        stop_head=stop_head,
+        edge_head=edge_head,
+    )
+    return require_type(policy, ForwardPolicy, "cfg.model.policy")
 
 
 __all__ = [

@@ -13,20 +13,25 @@ from src.weaver.state import ExpansionBatch, StateBatch
 
 def test_state_advance_canonicalizes_edge_order() -> None:
     graph = _graph([(0, 1), (0, 2)])
-    del graph
 
-    root = StateBatch.initial(graph_ids=torch.tensor([0, 0]), budget=2)
+    root = StateBatch.initial(
+        graph_ids=torch.tensor([0, 0]),
+        budget=2,
+        graph_context=graph,
+    )
     first = root.advance(
         ExpansionBatch(
             state_ids=torch.tensor([0, 1]),
             edge_ids=torch.tensor([0, 1]),
-        )
+        ),
+        graph_context=graph,
     )
     second = first.advance(
         ExpansionBatch(
             state_ids=torch.tensor([0, 1]),
             edge_ids=torch.tensor([1, 0]),
-        )
+        ),
+        graph_context=graph,
     )
 
     assert second.edge_count.tolist() == [2, 2]
@@ -34,35 +39,44 @@ def test_state_advance_canonicalizes_edge_order() -> None:
 
 
 def test_state_advance_rejects_duplicate_edge() -> None:
-    root = StateBatch.initial(graph_ids=torch.tensor([0]), budget=2)
+    graph = _graph([(0, 1), (0, 2)])
+    root = StateBatch.initial(
+        graph_ids=torch.tensor([0]),
+        budget=2,
+        graph_context=graph,
+    )
     state = root.advance(
         ExpansionBatch(
             state_ids=torch.tensor([0]),
             edge_ids=torch.tensor([0]),
-        )
+        ),
+        graph_context=graph,
     )
 
-    with pytest.raises(ValueError, match="duplicate selected edges"):
+    with pytest.raises(ValueError, match="already selected edge"):
         state.advance(
             ExpansionBatch(
                 state_ids=torch.tensor([0]),
                 edge_ids=torch.tensor([0]),
-            )
+            ),
+            graph_context=graph,
         )
 
 def test_backward_counts_independent_valid_parents() -> None:
     graph = _graph([(0, 1), (0, 2)])
-    parent = StateBatch(
+    parent = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[0, -1]], dtype=torch.long),
         edge_count=torch.tensor([1]),
         budget=2,
+        graph_context=graph,
     )
-    child = StateBatch(
+    child = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[0, 1]], dtype=torch.long),
         edge_count=torch.tensor([2]),
         budget=2,
+        graph_context=graph,
     )
 
     log_prob = canonical_backward_log_prob(
@@ -79,11 +93,12 @@ def test_backward_counts_independent_valid_parents() -> None:
 
 def test_edge_flow_matching_backward_count_matches_policy_backward() -> None:
     graph = _graph([(0, 1), (0, 2)])
-    child = StateBatch(
+    child = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[0, 1]], dtype=torch.long),
         edge_count=torch.tensor([2]),
         budget=2,
+        graph_context=graph,
     )
 
     counts = count_legal_backward_parents(
@@ -96,17 +111,19 @@ def test_edge_flow_matching_backward_count_matches_policy_backward() -> None:
 
 def test_backward_excludes_illegal_disconnected_parent() -> None:
     graph = _graph([(0, 1), (1, 2)])
-    parent = StateBatch(
+    parent = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[0, -1]], dtype=torch.long),
         edge_count=torch.tensor([1]),
         budget=2,
+        graph_context=graph,
     )
-    child = StateBatch(
+    child = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[0, 1]], dtype=torch.long),
         edge_count=torch.tensor([2]),
         budget=2,
+        graph_context=graph,
     )
 
     log_prob = canonical_backward_log_prob(
@@ -123,17 +140,19 @@ def test_backward_excludes_illegal_disconnected_parent() -> None:
 
 def test_backward_validation_rejects_wrong_parent() -> None:
     graph = _graph([(0, 1), (0, 2)])
-    wrong_parent = StateBatch(
+    wrong_parent = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[1, -1]], dtype=torch.long),
         edge_count=torch.tensor([1]),
         budget=2,
+        graph_context=graph,
     )
-    child = StateBatch(
+    child = StateBatch.from_selected_edges(
         graph_ids=torch.tensor([0]),
         edge_ids=torch.tensor([[0, 1]], dtype=torch.long),
         edge_count=torch.tensor([2]),
         budget=2,
+        graph_context=graph,
     )
 
     with pytest.raises(ValueError, match="child minus action edge"):

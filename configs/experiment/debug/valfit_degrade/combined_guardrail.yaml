@@ -1,0 +1,34 @@
+# @package _global_
+
+defaults:
+  - /experiment/debug/valfit
+  - _self_
+
+task_name: valfit_degrade_combined_guardrail
+experiment_name: valfit_degrade_combined_guardrail
+
+tags:
+  - valfit_degrade
+  - combined
+  - guardrail
+
+notes: >
+  Combines the three main interventions from the degradation analysis:
+  softer stop-favoring reward, weaker terminal fitting, and broader replay.
+  This is the highest-leverage candidate for removing late-stage decline.
+
+logger:
+  name: ${experiment_name}-${dataset.name}-${now:%Y%m%d-%H%M%S}
+  group: valfit_degrade
+  tags: ${tags}
+
+model:
+  reward_model:
+    edge_cost: 0.05
+    fail_cost: 3.0
+  objective:
+    terminal_weight: 0.5
+  runner:
+    replay_source:
+      top_k_per_state: 4
+      max_transitions_per_graph: 256

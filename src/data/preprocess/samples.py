@@ -48,11 +48,13 @@ class PreparedSample:
     edge_relation_catalog_ids: torch.Tensor  # [num_edges], aligned with edge_index columns
 
     node_target_distance: torch.Tensor  # [num_nodes]
-    weak_replay_edge_ids: torch.Tensor  # [num_weak_edges]
-    weak_replay_edge_weight: torch.Tensor  # [num_weak_edges]
-    witness_path_edge_ids: torch.Tensor  # [num_witness_edges]
-    witness_path_edge_path_ids: torch.Tensor  # [num_witness_edges]
-    witness_path_target_node_ids: torch.Tensor  # [num_witness_paths]
+    replay_candidate_edge_ids: torch.Tensor  # [num_candidate_edges]
+    replay_candidate_ptr: torch.Tensor  # [num_candidates + 1]
+    replay_candidate_target_positions: torch.Tensor  # [num_candidate_target_refs]
+    replay_candidate_target_ptr: torch.Tensor  # [num_candidates + 1]
+    replay_edge_to_candidate_ids: torch.Tensor  # [num_edge_candidate_refs]
+    replay_edge_to_candidate_ptr: torch.Tensor  # [num_edges + 1]
+    replay_path_truncated: torch.Tensor  # scalar {0,1}
 
     def storage_key(self) -> str:
         return f"{self.dataset}/{self.split}/{self.question_id}"
@@ -70,9 +72,11 @@ class PreparedSample:
             SampleFields.TARGET_NODE_IDS: self.target_node_ids.long().contiguous(),
             SampleFields.REACHABLE_TARGET_NODE_IDS: self.reachable_target_node_ids.long().contiguous(),
             SampleFields.NODE_TARGET_DISTANCE: self.node_target_distance.long().contiguous(),
-            SampleFields.WEAK_REPLAY_EDGE_IDS: self.weak_replay_edge_ids.long().contiguous(),
-            SampleFields.WEAK_REPLAY_EDGE_WEIGHT: self.weak_replay_edge_weight.float().contiguous(),
-            SampleFields.WITNESS_PATH_EDGE_IDS: self.witness_path_edge_ids.long().contiguous(),
-            SampleFields.WITNESS_PATH_EDGE_PATH_IDS: self.witness_path_edge_path_ids.long().contiguous(),
-            SampleFields.WITNESS_PATH_TARGET_NODE_IDS: self.witness_path_target_node_ids.long().contiguous(),
+            SampleFields.REPLAY_CANDIDATE_EDGE_IDS: self.replay_candidate_edge_ids.long().contiguous(),
+            SampleFields.REPLAY_CANDIDATE_PTR: self.replay_candidate_ptr.long().contiguous(),
+            SampleFields.REPLAY_CANDIDATE_TARGET_POSITIONS: self.replay_candidate_target_positions.long().contiguous(),
+            SampleFields.REPLAY_CANDIDATE_TARGET_PTR: self.replay_candidate_target_ptr.long().contiguous(),
+            SampleFields.REPLAY_EDGE_TO_CANDIDATE_IDS: self.replay_edge_to_candidate_ids.long().contiguous(),
+            SampleFields.REPLAY_EDGE_TO_CANDIDATE_PTR: self.replay_edge_to_candidate_ptr.long().contiguous(),
+            SampleFields.REPLAY_PATH_TRUNCATED: self.replay_path_truncated.long().contiguous(),
         }

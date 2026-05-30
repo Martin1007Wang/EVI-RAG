@@ -106,6 +106,7 @@ def valid_predecessor_count(
             state=child_state,
             row=int(row),
             edge_id=int(edge_id),
+            graph_context=graph_context,
         )
         if _edge_is_forward_legal(
             parent=parent,
@@ -142,6 +143,7 @@ def validate_canonical_transitions(
             state=child_state,
             row=row,
             edge_id=action_edge_id,
+            graph_context=graph_context,
         )
         if not state_rows_equal(
             left=parent_state,

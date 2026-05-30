@@ -128,6 +128,7 @@ class RetrievalDataModule(LightningDataModule):
             num_workers=num_workers,
             collate_fn=self.collator,
             pin_memory=loader.pin_memory,
+            prefetch_factor=loader.prefetch_factor if num_workers > 0 else None,
             persistent_workers=num_workers > 0,
             drop_last=loader.drop_last if training else False,
         )

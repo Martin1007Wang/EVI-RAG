@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from src.data.schema import RetrievalBatch
+from src.data.schema import ReplayProgramBatch, RetrievalBatch
 
 Tensor = torch.Tensor
 
@@ -171,7 +171,6 @@ class TargetContext:
     Coordinates:
     - target_mask[n] is indexed by batch-physical node id.
     - node_target_distance[n] is indexed by batch-physical node id.
-    - shortest_path_edge_mask[e] is indexed by batch-physical edge id.
     - reachable_target_node_ids are batch-physical node ids grouped by graph.
     """
 
@@ -181,12 +180,7 @@ class TargetContext:
     target_count_by_graph: Tensor  # [G]
 
     node_target_distance: Tensor  # [N]
-    shortest_path_edge_mask: Tensor  # [E]
-    shortest_path_edge_weight: Tensor  # [E]
-    witness_path_edge_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    witness_path_edge_path_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    witness_path_target_node_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    witness_path_target_graph_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    anchor_target_count_by_graph: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
 
     @classmethod
     def from_batch(
@@ -237,20 +231,12 @@ class TargetContext:
             dtype=torch.long,
         )
 
-        shortest_path_edge_mask, shortest_path_edge_weight = build_shortest_path_edge_labels(
-            batch=batch,
-            graph_context=graph_context,
-            target_count_by_graph=target_count_by_graph,
-        )
-        witness_path_edge_ids, witness_path_edge_path_ids, witness_path_target_node_ids = build_witness_path_labels(
-            batch=batch,
-            graph_context=graph_context,
-        )
-        witness_path_target_graph_ids = (
-            graph_context.node_to_graph.index_select(0, witness_path_target_node_ids)
-            if int(witness_path_target_node_ids.numel()) > 0
-            else torch.empty(0, dtype=torch.long, device=graph_context.device)
-        )
+        anchor_target_count_by_graph = torch.bincount(
+            graph_context.node_to_graph.index_select(0, graph_context.anchor_node_ids[target_mask.index_select(0, graph_context.anchor_node_ids)])
+            if int(graph_context.anchor_node_ids.numel()) > 0
+            else torch.empty(0, dtype=torch.long, device=graph_context.device),
+            minlength=int(graph_context.num_graphs),
+        ).to(dtype=torch.long)
 
         if validate:
             _validate_target_context_tensors(
@@ -259,12 +245,6 @@ class TargetContext:
                 reachable_target_node_ids_ptr=target_ptr,
                 target_count_by_graph=target_count_by_graph,
                 node_target_distance=node_target_distance,
-                shortest_path_edge_mask=shortest_path_edge_mask,
-                shortest_path_edge_weight=shortest_path_edge_weight,
-                witness_path_edge_ids=witness_path_edge_ids,
-                witness_path_edge_path_ids=witness_path_edge_path_ids,
-                witness_path_target_node_ids=witness_path_target_node_ids,
-                witness_path_target_graph_ids=witness_path_target_graph_ids,
                 graph_context=graph_context,
             )
 
@@ -274,12 +254,7 @@ class TargetContext:
             reachable_target_node_ids_ptr=target_ptr,
             target_count_by_graph=target_count_by_graph,
             node_target_distance=node_target_distance,
-            shortest_path_edge_mask=shortest_path_edge_mask,
-            shortest_path_edge_weight=shortest_path_edge_weight,
-            witness_path_edge_ids=witness_path_edge_ids,
-            witness_path_edge_path_ids=witness_path_edge_path_ids,
-            witness_path_target_node_ids=witness_path_target_node_ids,
-            witness_path_target_graph_ids=witness_path_target_graph_ids,
+            anchor_target_count_by_graph=anchor_target_count_by_graph,
         )
 
     @property
@@ -289,6 +264,51 @@ class TargetContext:
     @property
     def valid_graph_mask(self) -> Tensor:
         return self.target_count_by_graph.gt(0)
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayContext:
+    candidate_edge_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    candidate_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
+    candidate_target_positions: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    candidate_target_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
+    edge_to_candidate_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    edge_to_candidate_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
+    candidate_graph_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
+    path_truncated_by_graph: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+
+    @classmethod
+    def from_batch(
+        cls,
+        *,
+        batch: RetrievalBatch,
+        graph_context: GraphContext,
+        target_context: TargetContext,
+        validate: bool = False,
+    ) -> "ReplayContext":
+        program = getattr(batch, "replay_program", None)
+        if not isinstance(program, ReplayProgramBatch):
+            raise TypeError("batch.replay_program must be a ReplayProgramBatch.")
+
+        replay = cls(
+            candidate_edge_ids=program.candidate_edge_ids.to(dtype=torch.long).contiguous(),
+            candidate_ptr=program.candidate_ptr.to(dtype=torch.long).contiguous(),
+            candidate_target_positions=program.candidate_target_positions.to(dtype=torch.long).contiguous(),
+            candidate_target_ptr=program.candidate_target_ptr.to(dtype=torch.long).contiguous(),
+            edge_to_candidate_ids=program.edge_to_candidate_ids.to(dtype=torch.long).contiguous(),
+            edge_to_candidate_ptr=program.edge_to_candidate_ptr.to(dtype=torch.long).contiguous(),
+            candidate_graph_ptr=program.candidate_graph_ptr.to(dtype=torch.long).contiguous(),
+            path_truncated_by_graph=program.path_truncated_by_graph.to(dtype=torch.long).contiguous(),
+        )
+
+        if validate:
+            _validate_replay_context_tensors(
+                replay_context=replay,
+                graph_context=graph_context,
+                target_context=target_context,
+            )
+
+        return replay
 
 
 def infer_edge_to_graph(
@@ -479,132 +499,6 @@ def build_ptr_from_counts(
     return ptr
 
 
-def build_shortest_path_edge_labels(
-    *,
-    batch: RetrievalBatch,
-    graph_context: GraphContext,
-    target_count_by_graph: Tensor,
-) -> tuple[Tensor, Tensor]:
-    weak_edge_ids = getattr(batch, "weak_replay_edge_ids", None)
-    weak_edge_batch = getattr(batch, "weak_replay_edge_ids_batch", None)
-    weak_edge_weight = getattr(batch, "weak_replay_edge_weight", None)
-    del target_count_by_graph
-    if weak_edge_ids is None or weak_edge_batch is None or weak_edge_weight is None:
-        raise KeyError("weak replay edge labels are required in RetrievalBatch.")
-    return build_weak_replay_edge_labels(
-        local_edge_ids=weak_edge_ids,
-        edge_graph_ids=weak_edge_batch,
-        edge_weight=weak_edge_weight,
-        graph_context=graph_context,
-    )
-
-
-def build_weak_replay_edge_labels(
-    *,
-    local_edge_ids: Tensor,
-    edge_graph_ids: Tensor,
-    edge_weight: Tensor,
-    graph_context: GraphContext,
-) -> tuple[Tensor, Tensor]:
-    local_edge_ids = local_edge_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-    edge_graph_ids = edge_graph_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-    edge_weight = edge_weight.to(device=graph_context.device, dtype=torch.float32).view(-1)
-    if int(local_edge_ids.numel()) != int(edge_graph_ids.numel()):
-        raise ValueError("weak_replay_edge_ids and weak_replay_edge_ids_batch length mismatch.")
-    if int(local_edge_ids.numel()) != int(edge_weight.numel()):
-        raise ValueError("weak_replay_edge_ids and weak_replay_edge_weight length mismatch.")
-    mask = torch.zeros(int(graph_context.num_edges), dtype=torch.bool, device=graph_context.device)
-    weight = torch.zeros(int(graph_context.num_edges), dtype=torch.float32, device=graph_context.device)
-    if int(local_edge_ids.numel()) == 0:
-        return mask, weight
-    starts = graph_context.edge_ptr.index_select(0, edge_graph_ids)
-    ends = graph_context.edge_ptr.index_select(0, edge_graph_ids + 1)
-    edge_count = ends - starts
-    outside = local_edge_ids.lt(0) | local_edge_ids.ge(edge_count)
-    if bool(outside.any()):
-        first = int(outside.nonzero(as_tuple=False).flatten()[0].item())
-        raise ValueError(
-            "weak_replay_edge_ids contains an id outside its graph edge range: "
-            f"graph_id={int(edge_graph_ids[first].item())}, "
-            f"local_edge_id={int(local_edge_ids[first].item())}."
-        )
-    physical_edge_ids = starts + local_edge_ids
-    mask[physical_edge_ids] = True
-    weight.scatter_reduce_(
-        dim=0,
-        index=physical_edge_ids,
-        src=edge_weight.clamp_min(0.0),
-        reduce="amax",
-        include_self=True,
-    )
-    return mask, weight
-
-
-def build_witness_path_labels(
-    *,
-    batch: RetrievalBatch,
-    graph_context: GraphContext,
-) -> tuple[Tensor, Tensor, Tensor]:
-    local_edge_ids = getattr(batch, "witness_path_edge_ids", None)
-    edge_graph_ids = getattr(batch, "witness_path_edge_ids_batch", None)
-    path_ids = getattr(batch, "witness_path_edge_path_ids", None)
-    target_node_ids = getattr(batch, "witness_path_target_node_ids", None)
-    if (
-        local_edge_ids is None
-        or edge_graph_ids is None
-        or path_ids is None
-        or target_node_ids is None
-    ):
-        raise KeyError("witness path replay fields are required in RetrievalBatch.")
-
-    local_edge_ids = local_edge_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-    edge_graph_ids = edge_graph_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-    path_ids = path_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-    target_node_ids = target_node_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-
-    if int(local_edge_ids.numel()) != int(edge_graph_ids.numel()):
-        raise ValueError("witness_path_edge_ids and witness_path_edge_ids_batch length mismatch.")
-    if int(local_edge_ids.numel()) != int(path_ids.numel()):
-        raise ValueError("witness_path_edge_ids and witness_path_edge_path_ids length mismatch.")
-
-    physical_edge_ids = _physical_edge_ids_from_local_ids(
-        local_edge_ids=local_edge_ids,
-        edge_graph_ids=edge_graph_ids,
-        graph_context=graph_context,
-        field_name="witness_path_edge_ids",
-    )
-
-    return (
-        physical_edge_ids.contiguous(),
-        path_ids.contiguous(),
-        target_node_ids.contiguous(),
-    )
-
-
-def _physical_edge_ids_from_local_ids(
-    *,
-    local_edge_ids: Tensor,
-    edge_graph_ids: Tensor,
-    graph_context: GraphContext,
-    field_name: str,
-) -> Tensor:
-    if int(local_edge_ids.numel()) == 0:
-        return torch.empty(0, dtype=torch.long, device=graph_context.device)
-
-    starts = graph_context.edge_ptr.index_select(0, edge_graph_ids)
-    ends = graph_context.edge_ptr.index_select(0, edge_graph_ids + 1)
-    edge_count = ends - starts
-    outside = local_edge_ids.lt(0) | local_edge_ids.ge(edge_count)
-    if bool(outside.any()):
-        first = int(outside.nonzero(as_tuple=False).flatten()[0].item())
-        raise ValueError(
-            f"{field_name} contains an id outside its graph edge range: "
-            f"graph_id={int(edge_graph_ids[first].item())}, "
-            f"local_edge_id={int(local_edge_ids[first].item())}."
-        )
-    return starts + local_edge_ids
-
-
 def _validate_target_context_tensors(
     *,
     target_mask: Tensor,
@@ -612,8 +506,6 @@ def _validate_target_context_tensors(
     reachable_target_node_ids_ptr: Tensor,
     target_count_by_graph: Tensor,
     node_target_distance: Tensor,
-    shortest_path_edge_mask: Tensor,
-    shortest_path_edge_weight: Tensor,
     graph_context: GraphContext,
 ) -> None:
     if target_mask.ndim != 1:
@@ -660,20 +552,66 @@ def _validate_target_context_tensors(
             "node_target_distance length must equal num_nodes: " f"{int(node_target_distance.numel())} vs {int(graph_context.num_nodes)}."
         )
 
-    if shortest_path_edge_mask.ndim != 1:
-        raise ValueError("shortest_path_edge_mask must have shape [E], " f"got {tuple(shortest_path_edge_mask.shape)}.")
+def _validate_replay_context_tensors(
+    *,
+    replay_context: ReplayContext,
+    graph_context: GraphContext,
+    target_context: TargetContext,
+) -> None:
+    if replay_context.candidate_edge_ids.ndim != 1:
+        raise ValueError("candidate_edge_ids must have shape [C_edges].")
+    if replay_context.candidate_ptr.ndim != 1:
+        raise ValueError("candidate_ptr must have shape [C + 1].")
+    if replay_context.candidate_target_positions.ndim != 1:
+        raise ValueError("candidate_target_positions must have shape [C_targets].")
+    if replay_context.candidate_target_ptr.ndim != 1:
+        raise ValueError("candidate_target_ptr must have shape [C + 1].")
+    if replay_context.edge_to_candidate_ids.ndim != 1:
+        raise ValueError("edge_to_candidate_ids must have shape [R].")
+    if replay_context.edge_to_candidate_ptr.ndim != 1:
+        raise ValueError("edge_to_candidate_ptr must have shape [E + 1].")
+    if replay_context.candidate_graph_ptr.ndim != 1:
+        raise ValueError("candidate_graph_ptr must have shape [G + 1].")
+    if replay_context.path_truncated_by_graph.ndim != 1:
+        raise ValueError("path_truncated_by_graph must have shape [G].")
 
-    if int(shortest_path_edge_mask.numel()) != int(graph_context.num_edges):
-        raise ValueError(
-            "shortest_path_edge_mask length must equal num_edges: " f"{int(shortest_path_edge_mask.numel())} vs {int(graph_context.num_edges)}."
+    candidate_count = int(replay_context.candidate_ptr.numel()) - 1
+    if candidate_count < 0:
+        raise ValueError("candidate_ptr must contain at least one element.")
+    if int(replay_context.candidate_target_ptr.numel()) != candidate_count + 1:
+        raise ValueError("candidate_target_ptr length must match candidate count.")
+    if int(replay_context.candidate_ptr[-1].item()) != int(replay_context.candidate_edge_ids.numel()):
+        raise ValueError("candidate_ptr must terminate at candidate_edge_ids length.")
+    if int(replay_context.candidate_target_ptr[-1].item()) != int(replay_context.candidate_target_positions.numel()):
+        raise ValueError("candidate_target_ptr must terminate at candidate_target_positions length.")
+    if int(replay_context.edge_to_candidate_ptr.numel()) != int(graph_context.num_edges) + 1:
+        raise ValueError("edge_to_candidate_ptr length must equal num_edges + 1.")
+    if int(replay_context.edge_to_candidate_ptr[-1].item()) != int(replay_context.edge_to_candidate_ids.numel()):
+        raise ValueError("edge_to_candidate_ptr must terminate at edge_to_candidate_ids length.")
+    if int(replay_context.candidate_graph_ptr.numel()) != int(graph_context.num_graphs) + 1:
+        raise ValueError("candidate_graph_ptr length must equal num_graphs + 1.")
+    if int(replay_context.candidate_graph_ptr[-1].item()) != candidate_count:
+        raise ValueError("candidate_graph_ptr must terminate at candidate count.")
+    if int(replay_context.path_truncated_by_graph.numel()) != int(graph_context.num_graphs):
+        raise ValueError("path_truncated_by_graph length must equal num_graphs.")
+
+    _validate_id_range(
+        ids=replay_context.candidate_edge_ids,
+        upper=int(graph_context.num_edges),
+        name="candidate_edge_ids",
+    )
+    if int(replay_context.candidate_target_positions.numel()) > 0:
+        max_targets = int(target_context.reachable_target_node_ids.numel())
+        _validate_id_range(
+            ids=replay_context.candidate_target_positions,
+            upper=max(max_targets, 1),
+            name="candidate_target_positions",
         )
-
-    if shortest_path_edge_weight.ndim != 1:
-        raise ValueError("shortest_path_edge_weight must have shape [E], " f"got {tuple(shortest_path_edge_weight.shape)}.")
-
-    if int(shortest_path_edge_weight.numel()) != int(graph_context.num_edges):
-        raise ValueError(
-            "shortest_path_edge_weight length must equal num_edges: " f"{int(shortest_path_edge_weight.numel())} vs {int(graph_context.num_edges)}."
+    if int(replay_context.edge_to_candidate_ids.numel()) > 0:
+        _validate_id_range(
+            ids=replay_context.edge_to_candidate_ids,
+            upper=max(candidate_count, 1),
+            name="edge_to_candidate_ids",
         )
 
 

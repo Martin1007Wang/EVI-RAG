@@ -148,20 +148,21 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
                 "splits": source_splits,
                 "column_map": column_map,
             },
-                "preprocess": {
+            "preprocess": {
                 "dedup_edges": bool(preprocess_cfg.get("dedup_edges", True)),
                 "remove_self_loops": bool(preprocess_cfg.get("remove_self_loops", True)),
                 "validate_graph_alignment": bool(preprocess_cfg.get("validate_graph_alignment", False)),
                 "progress_bar": bool(preprocess_cfg.get("progress_bar", True)),
                 "stream_chunk_size": chunk_size,
                 "map_size_gb": float(preprocess_cfg.get("map_size_gb", 128.0)),
-                    "commit_frequency": int(preprocess_cfg.get("commit_frequency", 1000)),
-                    "weak_replay_labels": {
-                        "kind": "witness_path_v1",
-                        "path_policy": "deterministic_single_shortest_per_target",
-                    },
-                    "entity_typing": {"non_text_prefixes": list(entity_text_policy.non_text_prefixes)},
+                "commit_frequency": int(preprocess_cfg.get("commit_frequency", 1000)),
+                "replay_program": {
+                    "kind": "replay_program_v3",
+                    "path_policy": "deterministic_shortest_k",
+                    "max_paths_per_target": 64,
                 },
+                "entity_typing": {"non_text_prefixes": list(entity_text_policy.non_text_prefixes)},
+            },
             "encoder": dict(encoder_provenance),
         },
     ) as materializer:

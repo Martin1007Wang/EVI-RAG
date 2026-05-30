@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from src.graph.segments import segment_logsumexp
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.feature import FeatureBank
 from src.weaver.objectives.transition_batch import (
@@ -370,7 +371,6 @@ def terminal_edge_reward_matching(
 
     reward_output = _call_reward(
         reward_model=reward_model,
-        graph_context=graph_context,
         target_context=target_context,
         state=transitions.state,
     )
@@ -423,8 +423,8 @@ def state_log_flow_from_policy_output(
     This is the outgoing state flow induced by STOP plus legal EXPAND actions.
     """
 
-    stop_log_flow = _get_stop_log_flow(policy_output)
-    edge_log_flow = _get_edge_log_flow(policy_output)
+    stop_log_flow = _get_stop_log_flow(policy_output).float()
+    edge_log_flow = _get_edge_log_flow(policy_output).float()
 
     action_space = _get_action_space(
         policy_output=policy_output,
@@ -607,64 +607,6 @@ def masked_mean_or_zero(values: Tensor, mask: Tensor) -> Tensor:
 
     return values[mask].mean()
 
-
-def segment_logsumexp(
-    *,
-    values: Tensor,
-    segment_ids: Tensor,
-    num_segments: int,
-) -> Tensor:
-    """
-    Segment logsumexp.
-
-    Returns out[s] = logsumexp(values[k] where segment_ids[k] == s).
-
-    Empty segments receive -inf.
-    """
-
-    num_segments = int(num_segments)
-
-    if values.ndim != 1:
-        raise ValueError(f"values must have shape [N], got {tuple(values.shape)}.")
-    if segment_ids.ndim != 1:
-        raise ValueError(f"segment_ids must have shape [N], got {tuple(segment_ids.shape)}.")
-    if int(values.numel()) != int(segment_ids.numel()):
-        raise ValueError("values and segment_ids must have the same length.")
-
-    out = torch.full(
-        (num_segments,),
-        -torch.inf,
-        dtype=values.dtype,
-        device=values.device,
-    )
-
-    if int(values.numel()) == 0:
-        return out
-
-    segment_ids = segment_ids.to(device=values.device, dtype=torch.long)
-
-    max_per_segment = out.clone()
-    max_per_segment.scatter_reduce_(
-        dim=0,
-        index=segment_ids,
-        src=values,
-        reduce="amax",
-        include_self=True,
-    )
-
-    shifted = values - max_per_segment.index_select(0, segment_ids)
-    exp_shifted = shifted.exp()
-
-    sum_per_segment = torch.zeros(
-        (num_segments,),
-        dtype=values.dtype,
-        device=values.device,
-    )
-    sum_per_segment.scatter_add_(0, segment_ids, exp_shifted)
-
-    return max_per_segment + sum_per_segment.clamp_min(torch.finfo(values.dtype).tiny).log()
-
-
 def _gather_edge_log_flow(
     *,
     policy_output: object,
@@ -746,13 +688,20 @@ def _call_policy(
     graph_context: GraphContext,
     state: StateBatch,
 ) -> object:
-    action_space = state.action_space(graph_context)
-    return policy(
-        features=features,
-        state=state,
-        context=graph_context,
-        action_space=action_space,
-    )
+    try:
+        return policy(
+            features=features,
+            state=state,
+            graph_context=graph_context,
+        )
+    except TypeError:
+        action_space = state.action_space(graph_context)
+        return policy(
+            features=features,
+            state=state,
+            context=graph_context,
+            action_space=action_space,
+        )
 
 
 def _gather_edge_log_flow_chunked(
@@ -938,13 +887,11 @@ def _iter_state_chunks(
 def _call_reward(
     *,
     reward_model: nn.Module,
-    graph_context: GraphContext,
     target_context: TargetContext,
     state: StateBatch,
 ) -> object:
     return reward_model(
         state=state,
-        graph_context=graph_context,
         target_context=target_context,
     )
 

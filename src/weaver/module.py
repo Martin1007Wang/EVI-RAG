@@ -11,7 +11,7 @@ from src.data.schema import RetrievalBatch
 from src.eval.rollout import evaluate_rollout_samples
 from src.training.logging import Scalar
 from src.training.optimization import configure_optimization
-from src.weaver.context import GraphContext, TargetContext
+from src.weaver.context import GraphContext, ReplayContext, TargetContext
 from src.weaver.feature import FeatureEncoder, FeatureBank
 from src.weaver.policy import ForwardPolicy
 from src.weaver.rollout.runner import RolloutRunner, TrainRolloutBatch
@@ -27,6 +27,7 @@ from src.weaver.objectives import (
 class StepInputs:
     graph: GraphContext
     target: TargetContext
+    replay: ReplayContext
     features: FeatureBank
 
 
@@ -81,12 +82,14 @@ class WeaverModule(LightningModule):
                 policy=self.policy,
                 context=inputs.graph,
                 target_context=inputs.target,
+                replay_context=inputs.replay,
                 features=inputs.features,
                 budget=self.budget,
             )
         efm_batch = build_edge_flow_matching_batch(
             policy_trajectories=rollout.trajectories,
             replay_transitions=rollout.replay_transitions,
+            graph_context=inputs.graph,
         )
 
         output = self.objective(
@@ -98,12 +101,17 @@ class WeaverModule(LightningModule):
             nonterminal=efm_batch.nonterminal,
             terminal=efm_batch.terminal,
         )
+        reward_metrics = self._train_reward_metrics(
+            target=inputs.target,
+            terminal=efm_batch.terminal,
+        )
         loss = output.require_loss()
         self._log_train(
             batch=batch,
             output=output,
             rollout=rollout,
             efm_metrics=transition_source_counts(batch=efm_batch),
+            reward_metrics=reward_metrics,
         )
         return loss
 
@@ -183,11 +191,19 @@ class WeaverModule(LightningModule):
         target = TargetContext.from_batch(
             batch=batch,
             graph_context=graph,
+            validate=self.validate_batch_coordinates,
+        )
+        replay = ReplayContext.from_batch(
+            batch=batch,
+            graph_context=graph,
+            target_context=target,
+            validate=self.validate_batch_coordinates,
         )
         features = self.feature_encoder(batch)
         return StepInputs(
             graph=graph,
             target=target,
+            replay=replay,
             features=features,
         )
 
@@ -198,6 +214,7 @@ class WeaverModule(LightningModule):
         output: ObjectiveOutput,
         rollout: TrainRolloutBatch,
         efm_metrics: Mapping[str, float],
+        reward_metrics: Mapping[str, float],
     ) -> None:
         self.log(
             "train/loss",
@@ -211,6 +228,7 @@ class WeaverModule(LightningModule):
         scalar_metrics: dict[str, float] = {f"train/{k}": float(v) for k, v in output.detached_metrics().items()}
         scalar_metrics.update({f"train/rollout/{k}": float(v.detach()) for k, v in rollout.metrics.items()})
         scalar_metrics.update({f"train/{k}": float(v) for k, v in efm_metrics.items()})
+        scalar_metrics.update({f"train/{k}": float(v) for k, v in reward_metrics.items()})
         self.log_dict(
             scalar_metrics,
             batch_size=batch.num_graphs_total,
@@ -218,6 +236,24 @@ class WeaverModule(LightningModule):
             on_epoch=True,
             sync_dist=True,
         )
+
+    def _train_reward_metrics(
+        self,
+        *,
+        target: TargetContext,
+        terminal,
+    ) -> Mapping[str, float]:
+        if terminal is None or terminal.num_transitions == 0:
+            return {}
+        with torch.no_grad():
+            reward_output = self.reward_model(
+                state=terminal.state,
+                target_context=target,
+            )
+        return {
+            str(name): float(value.detach())
+            for name, value in reward_output.metrics.items()
+        }
 
     def _log_eval(
         self,

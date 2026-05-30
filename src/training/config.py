@@ -58,6 +58,7 @@ class LoaderConfig:
     eval_batch_size: int
     num_workers: int
     eval_num_workers: int
+    prefetch_factor: int
     pin_memory: bool
     train_shuffle: bool
     drop_last: bool
@@ -375,6 +376,10 @@ def build_retrieval_data_config(cfg: DictConfig) -> RetrievalDataConfig:
         eval_batch_size=eval_batch_size,
         num_workers=num_workers,
         eval_num_workers=eval_num_workers,
+        prefetch_factor=positive_int(
+            datamodule_cfg.get("prefetch_factor", 2),
+            "datamodule.prefetch_factor",
+        ),
         pin_memory=boolean(
             datamodule_cfg.get("pin_memory", True),
             "datamodule.pin_memory",

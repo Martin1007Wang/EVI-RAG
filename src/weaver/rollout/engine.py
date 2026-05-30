@@ -25,7 +25,9 @@ class RolloutEngine:
         state = StateBatch.initial(
             graph_ids=graph_ids,
             budget=budget,
+            graph_context=context,
         )
+        cache = policy.compute_cache(features)
         num_rows = state.num_states
         edge_ids = torch.full(
             (num_rows, budget),
@@ -78,7 +80,6 @@ class RolloutEngine:
             if int(decision_rows.numel()) == 0:
                 continue
             decision_state = state.take(decision_rows)
-            action_space = decision_state.action_space(context)
             local_rows = torch.arange(
                 decision_state.num_states,
                 dtype=torch.long,
@@ -87,15 +88,20 @@ class RolloutEngine:
             policy_out = policy(
                 features=features,
                 state=decision_state,
-                context=context,
-                action_space=action_space,
+                graph_context=context,
+                cache=cache,
             )
-            action_edge_ids = policy_out.sample(rows=local_rows)
+            sampled = policy_out.sample(rows=local_rows)
+            action_edge_ids = sampled.edge_ids
             action_logp = policy_out.gather_log_prob(
                 row_ids=local_rows,
                 edge_ids=action_edge_ids,
             ).float()
-            no_frontier = action_space.expand_count.eq(0)
+            frontier_size = torch.bincount(
+                policy_out.frontier.row_ids,
+                minlength=decision_state.num_states,
+            )
+            no_frontier = frontier_size.eq(0)
             invalid_expand = no_frontier & action_edge_ids.ge(0)
             if bool(invalid_expand.any()):
                 raise RuntimeError("Policy sampled EXPAND for a row with no legal expansion.")
@@ -125,7 +131,8 @@ class RolloutEngine:
                 ExpansionBatch(
                     state_ids=expand_rows,
                     edge_ids=expand_edges,
-                )
+                ),
+                graph_context=context,
             )
         unfinished = stop_reason.lt(0)
         stop_reason[unfinished] = int(BUDGET)

@@ -12,18 +12,24 @@ class SampleFields:
         "reachable_target_node_ids"  # LongTensor [num_reachable_targets]
     )
     NODE_TARGET_DISTANCE = "node_target_distance"  # LongTensor [num_nodes]
-    WEAK_REPLAY_EDGE_IDS = (
-        "weak_replay_edge_ids"  # LongTensor [num_weak_edges], graph-local edge ids
+    REPLAY_CANDIDATE_EDGE_IDS = (
+        "replay_candidate_edge_ids"  # LongTensor [num_candidate_edges], graph-local edge ids
     )
-    WEAK_REPLAY_EDGE_WEIGHT = (
-        "weak_replay_edge_weight"  # FloatTensor [num_weak_edges]
+    REPLAY_CANDIDATE_PTR = (
+        "replay_candidate_ptr"  # LongTensor [num_candidates + 1], CSR pointer into replay_candidate_edge_ids
     )
-    WITNESS_PATH_EDGE_IDS = (
-        "witness_path_edge_ids"  # LongTensor [num_witness_edges], graph-local edge ids
+    REPLAY_CANDIDATE_TARGET_POSITIONS = (
+        "replay_candidate_target_positions"  # LongTensor [num_candidate_target_refs], reachable-target positions per candidate
     )
-    WITNESS_PATH_EDGE_PATH_IDS = (
-        "witness_path_edge_path_ids"  # LongTensor [num_witness_edges], graph-local path ids
+    REPLAY_CANDIDATE_TARGET_PTR = (
+        "replay_candidate_target_ptr"  # LongTensor [num_candidates + 1], CSR pointer into replay_candidate_target_positions
     )
-    WITNESS_PATH_TARGET_NODE_IDS = (
-        "witness_path_target_node_ids"  # LongTensor [num_witness_paths], sample-local node ids
+    REPLAY_EDGE_TO_CANDIDATE_IDS = (
+        "replay_edge_to_candidate_ids"  # LongTensor [num_edge_candidate_refs], graph-local candidate ids
+    )
+    REPLAY_EDGE_TO_CANDIDATE_PTR = (
+        "replay_edge_to_candidate_ptr"  # LongTensor [num_edges + 1], CSR pointer into replay_edge_to_candidate_ids
+    )
+    REPLAY_PATH_TRUNCATED = (
+        "replay_path_truncated"  # scalar BoolTensor serialized as LongTensor {0,1}
     )

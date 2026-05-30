@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -20,8 +21,8 @@ After collation:
 - anchor_node_ids / target_node_ids / reachable_target_node_ids contain
   batch-physical node ids.
 - node_entity_catalog_ids / edge_relation_catalog_ids remain global catalog ids.
-- weak_replay_edge_ids remain graph-local edge ids and must be converted with
-  their follow_batch graph ids before use.
+- replay_program is assembled explicitly by RetrievalCollator and does not rely
+  on PyG's implicit batching semantics.
 
 Do not add edge_batch as a required truth source. Infer edge_to_graph from:
 
@@ -36,7 +37,6 @@ _NODE_INDEX_KEYS = frozenset(
         SampleFields.ANCHOR_NODE_IDS,
         SampleFields.TARGET_NODE_IDS,
         SampleFields.REACHABLE_TARGET_NODE_IDS,
-        SampleFields.WITNESS_PATH_TARGET_NODE_IDS,
     }
 )
 
@@ -60,27 +60,39 @@ _FLAT_SUPERVISION_KEYS = frozenset(
     }
 )
 
-_LOCAL_WEAK_REPLAY_KEYS = frozenset(
-    {
-        SampleFields.WEAK_REPLAY_EDGE_IDS,
-        SampleFields.WEAK_REPLAY_EDGE_WEIGHT,
-        SampleFields.WITNESS_PATH_EDGE_IDS,
-    }
-)
-
 _LOCAL_PATH_ID_KEYS = frozenset(
-    {
-        SampleFields.WITNESS_PATH_EDGE_PATH_IDS,
-    }
+    {}
 )
 
 _RUNTIME_ONLY_NO_INCREMENT_KEYS = frozenset(
     {
-        "node_target_shortest_path_edge_mask_flat",
     }
 )
 
-_NO_INCREMENT_KEYS = _GLOBAL_ID_KEYS | _COUNT_KEYS | _FLAT_SUPERVISION_KEYS | _LOCAL_WEAK_REPLAY_KEYS | _RUNTIME_ONLY_NO_INCREMENT_KEYS
+_NO_INCREMENT_KEYS = _GLOBAL_ID_KEYS | _COUNT_KEYS | _FLAT_SUPERVISION_KEYS | _RUNTIME_ONLY_NO_INCREMENT_KEYS
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayProgramSample:
+    candidate_edge_ids_local: torch.Tensor
+    candidate_ptr: torch.Tensor
+    candidate_target_positions: torch.Tensor
+    candidate_target_ptr: torch.Tensor
+    edge_to_candidate_ids_local: torch.Tensor
+    edge_to_candidate_ptr: torch.Tensor
+    path_truncated: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayProgramBatch:
+    candidate_edge_ids: torch.Tensor
+    candidate_ptr: torch.Tensor
+    candidate_target_positions: torch.Tensor
+    candidate_target_ptr: torch.Tensor
+    edge_to_candidate_ids: torch.Tensor
+    edge_to_candidate_ptr: torch.Tensor
+    candidate_graph_ptr: torch.Tensor
+    path_truncated_by_graph: torch.Tensor
 
 
 def _num_nodes(data: Any) -> int:
@@ -104,14 +116,6 @@ def _num_edges(data: Any) -> int:
     raise ValueError("edge_index or num_edges is required to infer edge count.")
 
 
-def _num_witness_paths(data: Any) -> int:
-    if hasattr(data, SampleFields.WITNESS_PATH_TARGET_NODE_IDS):
-        value = getattr(data, SampleFields.WITNESS_PATH_TARGET_NODE_IDS)
-        if value is not None:
-            return int(torch.as_tensor(value).numel())
-    return 0
-
-
 def _retrieval_increment(data: Any, key: str) -> int | None:
     """
     Return a custom PyG batching increment for known retrieval fields.
@@ -121,9 +125,6 @@ def _retrieval_increment(data: Any, key: str) -> int | None:
 
     if key in _NODE_INDEX_KEYS:
         return _num_nodes(data)
-
-    if key in _LOCAL_PATH_ID_KEYS:
-        return _num_witness_paths(data)
 
     if key in _NO_INCREMENT_KEYS:
         return 0
@@ -139,17 +140,13 @@ class RetrievalData(Data):
     - edge_index uses sample-local node ids.
     - anchor_node_ids / target_node_ids / reachable_target_node_ids use
       sample-local node ids.
-    - weak_replay_edge_ids uses sample-local edge ids and is intentionally not
-      incremented by PyG; use weak_replay_edge_ids_batch for graph ids.
-    - witness_path_edge_ids uses sample-local edge ids and is intentionally not
-      incremented by PyG; use witness_path_edge_ids_batch for graph ids.
-    - witness_path_edge_path_ids uses graph-local path ids and is incremented by
-      the number of witness paths in the sample.
-
+    - replay_program uses sample-local replay CSR coordinates.
     Global-id fields:
     - node_entity_catalog_ids
     - edge_relation_catalog_ids
     """
+
+    replay_program: ReplayProgramSample
 
     def __inc__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         increment = _retrieval_increment(self, key)
@@ -178,8 +175,7 @@ class RetrievalBatch(Batch):
     - target / reachable target fields
     - node-target shortest-path materialized tensors
 
-    Weak replay edge labels remain graph-local and are converted explicitly by
-    TargetContext before loss code uses them.
+    Replay program is attached explicitly as a ReplayProgramBatch.
     """
 
     ptr: torch.Tensor
@@ -197,11 +193,7 @@ class RetrievalBatch(Batch):
 
     node_target_distance: torch.Tensor
 
-    weak_replay_edge_ids: torch.Tensor
-    weak_replay_edge_weight: torch.Tensor
-    witness_path_edge_ids: torch.Tensor
-    witness_path_edge_path_ids: torch.Tensor
-    witness_path_target_node_ids: torch.Tensor
+    replay_program: ReplayProgramBatch
 
     def __cat_dim__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         return super().__cat_dim__(key, value, *args, **kwargs)  # type: ignore[attr-defined]
@@ -358,6 +350,8 @@ def _validate_node_id_tensor(
 
 
 __all__ = [
+    "ReplayProgramBatch",
+    "ReplayProgramSample",
     "RetrievalData",
     "RetrievalBatch",
     "validate_retrieval_batch",

@@ -8,10 +8,8 @@ from .ops import (
 from .paths import (
     AnchorPathLabels,
     PathLabels,
-    TargetPathLabels,
     compute_anchor_path_labels,
     compute_path_labels,
-    compute_target_path_labels,
     node_target_unreachable_distance,
     unreachable_distance,
 )
@@ -23,13 +21,11 @@ from .masks import (
 __all__ = [
     "AnchorPathLabels",
     "PathLabels",
-    "TargetPathLabels",
     "anchor_node_mask",
     "build_local_graph",
     "check_edge_index",
     "compute_anchor_path_labels",
     "compute_path_labels",
-    "compute_target_path_labels",
     "node_target_unreachable_distance",
     "node_mask_from_ids",
     "rebuild_active_nodes",

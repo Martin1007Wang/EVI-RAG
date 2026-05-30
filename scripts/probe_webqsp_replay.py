@@ -18,7 +18,7 @@ from src.weaver.feature import (
     select_node_model,
     select_query_model,
 )
-from src.weaver.nn.state_encoder import SegmentTokenPool
+from src.weaver.nn.state_statistics import SegmentTokenPool
 from src.weaver.rollout.replay import (
     build_replay_target_views,
     initial_state_for_graph_ids,

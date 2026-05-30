@@ -13,7 +13,7 @@ from src.data.tensor_table import read_table
 from src.utils.lmdb_utils import deserialize_sample
 
 from .artifacts import MaterializationArtifact
-from .schema.batch import RetrievalData
+from .schema.batch import ReplayProgramSample, RetrievalData
 from .schema.fields import SampleFields
 
 
@@ -78,7 +78,6 @@ class RetrievalDataset(Dataset):
         split: str,
         lmdb_readahead: bool = False,
         max_readers: int = 256,
-        require_witness_paths: bool = False,
     ) -> None:
         super().__init__()
 
@@ -90,11 +89,9 @@ class RetrievalDataset(Dataset):
 
         self.lmdb_readahead = bool(lmdb_readahead)
         self.max_readers = int(max_readers)
-        self.require_witness_paths = bool(require_witness_paths)
         if self.max_readers <= 0:
             raise ValueError("max_readers must be positive")
-        if self.require_witness_paths:
-            _require_witness_path_materialization(self.materialization)
+        _require_replay_program_materialization(self.materialization)
 
         paths = self.materialization.require_split(self.split)
         self.lmdb_path = paths.lmdb
@@ -190,11 +187,7 @@ def _build_retrieval_data(
         dtype=torch.long,
     )
 
-    weak_replay_edge_ids, weak_replay_edge_weight = _weak_replay_fields(
-        raw=raw,
-        sample_id=sample_id,
-    )
-    witness_path_edge_ids, witness_path_edge_path_ids, witness_path_target_node_ids = _witness_path_fields(
+    replay_program = _replay_program_fields(
         raw=raw,
         sample_id=sample_id,
     )
@@ -210,11 +203,7 @@ def _build_retrieval_data(
         target_node_ids=target_node_ids,
         reachable_target_node_ids=reachable_target_node_ids,
         node_target_distance=node_target_distance,
-        weak_replay_edge_ids=weak_replay_edge_ids,
-        weak_replay_edge_weight=weak_replay_edge_weight,
-        witness_path_edge_ids=witness_path_edge_ids,
-        witness_path_edge_path_ids=witness_path_edge_path_ids,
-        witness_path_target_node_ids=witness_path_target_node_ids,
+        replay_program=replay_program,
     )
 
 
@@ -254,91 +243,91 @@ def _optional_tensor(
     return _tensor(value, dtype=dtype)
 
 
-def _weak_replay_fields(
+def _replay_program_fields(
     *,
     raw: Mapping[str, Any],
     sample_id: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    edge_ids = raw.get(SampleFields.WEAK_REPLAY_EDGE_IDS)
-    weight = raw.get(SampleFields.WEAK_REPLAY_EDGE_WEIGHT)
-    if edge_ids is None or weight is None:
-        raise KeyError(f"{sample_id}: missing weak replay edge labels")
+) -> ReplayProgramSample:
+    edge_ids = raw.get(SampleFields.REPLAY_CANDIDATE_EDGE_IDS)
+    candidate_ptr = raw.get(SampleFields.REPLAY_CANDIDATE_PTR)
+    candidate_target_positions = raw.get(SampleFields.REPLAY_CANDIDATE_TARGET_POSITIONS)
+    candidate_target_ptr = raw.get(SampleFields.REPLAY_CANDIDATE_TARGET_PTR)
+    edge_to_candidate_ids = raw.get(SampleFields.REPLAY_EDGE_TO_CANDIDATE_IDS)
+    edge_to_candidate_ptr = raw.get(SampleFields.REPLAY_EDGE_TO_CANDIDATE_PTR)
+    path_truncated = raw.get(SampleFields.REPLAY_PATH_TRUNCATED)
+    if (
+        edge_ids is None
+        or candidate_ptr is None
+        or candidate_target_positions is None
+        or candidate_target_ptr is None
+        or edge_to_candidate_ids is None
+        or edge_to_candidate_ptr is None
+        or path_truncated is None
+    ):
+        raise KeyError(f"{sample_id}: missing replay program")
     edge_tensor = _tensor(edge_ids, dtype=torch.long).view(-1)
-    weight_tensor = _tensor(weight, dtype=torch.float32).view(-1)
-    if int(edge_tensor.numel()) != int(weight_tensor.numel()):
+    candidate_ptr_tensor = _tensor(candidate_ptr, dtype=torch.long).view(-1)
+    candidate_target_positions_tensor = _tensor(candidate_target_positions, dtype=torch.long).view(-1)
+    candidate_target_ptr_tensor = _tensor(candidate_target_ptr, dtype=torch.long).view(-1)
+    edge_to_candidate_tensor = _tensor(edge_to_candidate_ids, dtype=torch.long).view(-1)
+    edge_to_candidate_ptr_tensor = _tensor(edge_to_candidate_ptr, dtype=torch.long).view(-1)
+    path_truncated_tensor = _tensor(path_truncated, dtype=torch.long).view(())
+    if int(candidate_ptr_tensor.numel()) == 0:
+        raise ValueError(f"{sample_id}: replay_candidate_ptr must contain at least the zero offset")
+    candidate_count = int(candidate_ptr_tensor.numel()) - 1
+    if int(candidate_target_ptr_tensor.numel()) != int(candidate_ptr_tensor.numel()):
         raise ValueError(
-            f"{sample_id}: weak replay edge fields length mismatch: "
-            f"edge_ids={int(edge_tensor.numel())}, weight={int(weight_tensor.numel())}"
+            f"{sample_id}: replay candidate fields length mismatch: "
+            f"candidate_ptr={candidate_count}, candidate_target_ptr={max(int(candidate_target_ptr_tensor.numel()) - 1, 0)}"
         )
-    return (
-        edge_tensor.contiguous(),
-        weight_tensor.contiguous(),
+    if int(candidate_ptr_tensor[-1].item()) != int(edge_tensor.numel()):
+        raise ValueError(
+            f"{sample_id}: replay candidate ptr does not terminate at edge list length: "
+            f"ptr_end={int(candidate_ptr_tensor[-1].item())}, edge_ids={int(edge_tensor.numel())}"
+        )
+    if int(candidate_target_ptr_tensor[-1].item()) != int(candidate_target_positions_tensor.numel()):
+        raise ValueError(
+            f"{sample_id}: replay candidate target ptr does not terminate at target position list length: "
+            f"ptr_end={int(candidate_target_ptr_tensor[-1].item())}, target_positions={int(candidate_target_positions_tensor.numel())}"
+        )
+    return ReplayProgramSample(
+        candidate_edge_ids_local=edge_tensor.contiguous(),
+        candidate_ptr=candidate_ptr_tensor.contiguous(),
+        candidate_target_positions=candidate_target_positions_tensor.contiguous(),
+        candidate_target_ptr=candidate_target_ptr_tensor.contiguous(),
+        edge_to_candidate_ids_local=edge_to_candidate_tensor.contiguous(),
+        edge_to_candidate_ptr=edge_to_candidate_ptr_tensor.contiguous(),
+        path_truncated=path_truncated_tensor.contiguous(),
     )
 
 
-def _witness_path_fields(
-    *,
-    raw: Mapping[str, Any],
-    sample_id: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    edge_ids = raw.get(SampleFields.WITNESS_PATH_EDGE_IDS)
-    path_ids = raw.get(SampleFields.WITNESS_PATH_EDGE_PATH_IDS)
-    target_node_ids = raw.get(SampleFields.WITNESS_PATH_TARGET_NODE_IDS)
-    if edge_ids is None or path_ids is None or target_node_ids is None:
-        raise KeyError(f"{sample_id}: missing witness path replay fields")
-
-    edge_tensor = _tensor(edge_ids, dtype=torch.long).view(-1)
-    path_tensor = _tensor(path_ids, dtype=torch.long).view(-1)
-    target_tensor = _tensor(target_node_ids, dtype=torch.long).view(-1)
-
-    if int(edge_tensor.numel()) != int(path_tensor.numel()):
-        raise ValueError(
-            f"{sample_id}: witness path edge fields length mismatch: "
-            f"edge_ids={int(edge_tensor.numel())}, path_ids={int(path_tensor.numel())}"
-        )
-    if int(path_tensor.numel()) > 0:
-        min_path = int(path_tensor.min().item())
-        max_path = int(path_tensor.max().item())
-        if min_path < 0 or max_path >= int(target_tensor.numel()):
-            raise ValueError(
-                f"{sample_id}: witness path ids outside target range: "
-                f"min={min_path}, max={max_path}, num_paths={int(target_tensor.numel())}"
-            )
-
-    return (
-        edge_tensor.contiguous(),
-        path_tensor.contiguous(),
-        target_tensor.contiguous(),
-    )
-
-
-def _require_witness_path_materialization(materialization: MaterializationArtifact) -> None:
+def _require_replay_program_materialization(materialization: MaterializationArtifact) -> None:
     provenance = materialization.provenance
     if not isinstance(provenance, Mapping):
         raise ValueError(
-            "Materialization is missing provenance for witness-path replay. "
-            "Re-run preprocessing to produce witness_path_v1 labels."
+            "Materialization is missing provenance for replay program. "
+            "Re-run preprocessing to produce replay_program_v3."
         )
 
     preprocess = provenance.get("preprocess")
     if not isinstance(preprocess, Mapping):
         raise ValueError(
-            "Materialization provenance is missing preprocess metadata for witness-path replay. "
-            "Re-run preprocessing to produce witness_path_v1 labels."
+            "Materialization provenance is missing preprocess metadata for replay program. "
+            "Re-run preprocessing to produce replay_program_v3."
         )
 
-    weak_replay = preprocess.get("weak_replay_labels")
-    if not isinstance(weak_replay, Mapping):
+    replay_program = preprocess.get("replay_program")
+    if not isinstance(replay_program, Mapping):
         raise ValueError(
-            "Materialization provenance is missing weak_replay_labels metadata. "
-            "Re-run preprocessing to produce witness_path_v1 labels."
+            "Materialization provenance is missing replay_program metadata. "
+            "Re-run preprocessing to produce replay_program_v3."
         )
 
-    kind = weak_replay.get("kind")
-    if kind != "witness_path_v1":
+    kind = replay_program.get("kind")
+    if kind not in {"replay_program_v3"}:
         raise ValueError(
-            "Materialization weak replay labels are incompatible with witness-path replay: "
-            f"found {kind!r}, expected 'witness_path_v1'. Re-run preprocessing."
+            "Materialization replay program is incompatible with current runtime: "
+            f"found {kind!r}, expected 'replay_program_v3'. Re-run preprocessing."
         )
 
 

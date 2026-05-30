@@ -85,6 +85,16 @@ def _validate_segmented_inputs(
                 )
 
 
+def _segment_compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    return torch.promote_types(dtype, torch.float32)
+
+
+def _segment_compute_values(values: torch.Tensor) -> tuple[torch.Tensor, torch.dtype]:
+    original_dtype = values.dtype
+    compute_dtype = _segment_compute_dtype(original_dtype)
+    return values.to(dtype=compute_dtype), original_dtype
+
+
 def scatter_log_softmax(
     logits: torch.Tensor,
     segment_ids: torch.Tensor,
@@ -103,14 +113,14 @@ def scatter_log_softmax(
         num_segments=int(num_segments),
     )
     if logits.numel() == 0:
-        return logits.new_empty((0,))
+        return logits.new_empty((0,), dtype=torch.float32)
     log_z = segment_logsumexp(
         values=logits,
         segment_ids=segment_ids,
         num_segments=int(num_segments),
     )
     return subtract_log_normalizer(
-        values=logits,
+        values=logits.to(dtype=log_z.dtype),
         log_normalizer=log_z.index_select(0, segment_ids),
     )
 
@@ -170,8 +180,11 @@ def segment_logsumexp(
     segment_ids: torch.Tensor,
     num_segments: int,
 ) -> torch.Tensor:
+    segment_ids = segment_ids.to(device=values.device, dtype=torch.long).view(-1)
     if values.numel() == 0:
-        return values.new_full((int(num_segments),), -torch.inf)
+        return values.new_full((int(num_segments),), -torch.inf, dtype=torch.float32)
+
+    values, _ = _segment_compute_values(values)
 
     max_values = values.new_full((int(num_segments),), -torch.inf).scatter_reduce(
         0,
@@ -205,7 +218,7 @@ def segment_softmax(
     num_segments: int,
 ) -> torch.Tensor:
     if values.numel() == 0:
-        return values
+        return values.new_empty((0,), dtype=torch.float32)
 
     segment_ids = segment_ids.to(device=values.device, dtype=torch.long).view(-1)
     log_probs = scatter_log_softmax(

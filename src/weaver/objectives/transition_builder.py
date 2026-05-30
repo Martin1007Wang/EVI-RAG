@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
+from src.weaver.context import GraphContext
 from src.weaver.objectives.transition_batch import (
     EdgeFlowMatchingBatch,
     NonterminalTransitionBatch,
@@ -27,10 +28,12 @@ class ReplayTransitionStats:
 def build_edge_flow_matching_batches_from_trajectories(
     *,
     trajectories: TrajectoryBatch,
+    graph_context: GraphContext,
 ) -> tuple[NonterminalTransitionBatch | None, TerminalTransitionBatch | None]:
     batch = build_edge_flow_matching_batch(
         policy_trajectories=trajectories,
         replay_transitions=None,
+        graph_context=graph_context,
     )
     return batch.nonterminal, batch.terminal
 
@@ -39,12 +42,15 @@ def build_edge_flow_matching_batch(
     *,
     policy_trajectories: TrajectoryBatch,
     replay_transitions: NonterminalTransitionBatch | None,
+    graph_context: GraphContext,
 ) -> EdgeFlowMatchingBatch:
     policy_nonterminal = build_policy_nonterminal_transitions(
         trajectories=policy_trajectories,
+        graph_context=graph_context,
     )
     policy_terminal = build_policy_terminal_transitions(
         trajectories=policy_trajectories,
+        graph_context=graph_context,
     )
     replay_terminal = build_replay_terminal_transitions(
         nonterminal=replay_transitions,
@@ -63,56 +69,63 @@ def build_edge_flow_matching_batch(
 def build_policy_nonterminal_transitions(
     *,
     trajectories: TrajectoryBatch,
+    graph_context: GraphContext,
 ) -> NonterminalTransitionBatch | None:
     if int(trajectories.num_trajectories) == 0:
         return None
 
-    device = trajectories.device
     budget = int(trajectories.budget)
-
-    parent_states: list[StateBatch] = []
-    edge_ids: list[int] = []
-
-    for row in range(int(trajectories.num_trajectories)):
-        state = StateBatch.initial(
-            graph_ids=trajectories.graph_ids[row : row + 1],
-            budget=budget,
-        )
-        edge_count = int(trajectories.edge_count[row].item())
-        for step in range(edge_count):
-            edge_id = int(trajectories.edge_ids[row, step].item())
-            if edge_id < 0:
-                raise ValueError(
-                    "Trajectory edge prefix contains negative edge id "
-                    f"at row={row}, step={step}."
-                )
-            parent_states.append(state)
-            edge_ids.append(edge_id)
-            state = state.advance(
-                ExpansionBatch(
-                    state_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    edge_ids=torch.tensor([edge_id], dtype=torch.long, device=device),
-                )
-            )
-
-    if not parent_states:
+    counts = trajectories.edge_count.to(dtype=torch.long)
+    total = int(counts.sum().item())
+    if total == 0:
         return None
-
-    edge_tensor = torch.tensor(edge_ids, dtype=torch.long, device=device)
+    row_ids = torch.repeat_interleave(
+        torch.arange(int(trajectories.num_trajectories), device=trajectories.device, dtype=torch.long),
+        counts,
+        output_size=total,
+    )
+    prefix_lens = torch.cat(
+        [
+            torch.arange(int(count.item()), device=trajectories.device, dtype=torch.long)
+            for count in counts
+            if int(count.item()) > 0
+        ],
+        dim=0,
+    )
+    parent_edge_ids = torch.full(
+        (total, budget),
+        -1,
+        dtype=torch.long,
+        device=trajectories.device,
+    )
+    edge_tensor = trajectories.edge_ids[trajectories.valid_edge_mask()]
+    for slot in range(budget):
+        mask = prefix_lens.gt(slot)
+        if not bool(mask.any()):
+            continue
+        parent_edge_ids[mask, slot] = trajectories.edge_ids.index_select(0, row_ids[mask])[:, slot]
+    parent_state = StateBatch.from_selected_edges(
+        graph_ids=trajectories.graph_ids.index_select(0, row_ids),
+        edge_ids=parent_edge_ids,
+        edge_count=prefix_lens,
+        budget=budget,
+        graph_context=graph_context,
+    )
     source = torch.full(
         (int(edge_tensor.numel()),),
         int(TransitionSource.POLICY),
         dtype=torch.long,
-        device=device,
+        device=trajectories.device,
     )
     return NonterminalTransitionBatch(
-        parent_state=cat_state_batches(parent_states),
+        parent_state=parent_state,
         parent_state_ids=torch.arange(
             int(edge_tensor.numel()),
             dtype=torch.long,
-            device=device,
+            device=trajectories.device,
         ),
         edge_ids=edge_tensor,
+        graph_context=graph_context,
         source=source,
     )
 
@@ -120,45 +133,49 @@ def build_policy_nonterminal_transitions(
 def build_policy_terminal_transitions(
     *,
     trajectories: TrajectoryBatch,
+    graph_context: GraphContext,
 ) -> TerminalTransitionBatch | None:
     if int(trajectories.num_trajectories) == 0:
         return None
 
-    device = trajectories.device
     budget = int(trajectories.budget)
-    terminal_states: list[StateBatch] = []
-
-    for row in range(int(trajectories.num_trajectories)):
-        state = StateBatch.initial(
-            graph_ids=trajectories.graph_ids[row : row + 1],
-            budget=budget,
-        )
-        edge_count = int(trajectories.edge_count[row].item())
-        for step in range(edge_count):
-            terminal_states.append(state)
-            edge_id = int(trajectories.edge_ids[row, step].item())
-            if edge_id < 0:
-                raise ValueError(
-                    "Trajectory edge prefix contains negative edge id "
-                    f"at row={row}, step={step}."
-                )
-            state = state.advance(
-                ExpansionBatch(
-                    state_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    edge_ids=torch.tensor([edge_id], dtype=torch.long, device=device),
-                )
-            )
-        terminal_states.append(state)
-
-    if not terminal_states:
-        return None
-
-    state = cat_state_batches(terminal_states)
+    prefix_counts = trajectories.edge_count.to(dtype=torch.long) + 1
+    total = int(prefix_counts.sum().item())
+    row_ids = torch.repeat_interleave(
+        torch.arange(int(trajectories.num_trajectories), device=trajectories.device, dtype=torch.long),
+        prefix_counts,
+        output_size=total,
+    )
+    prefix_lens = torch.cat(
+        [
+            torch.arange(int(count.item()) + 1, device=trajectories.device, dtype=torch.long)
+            for count in trajectories.edge_count
+        ],
+        dim=0,
+    )
+    state_edge_ids = torch.full(
+        (total, budget),
+        -1,
+        dtype=torch.long,
+        device=trajectories.device,
+    )
+    for slot in range(budget):
+        mask = prefix_lens.gt(slot)
+        if not bool(mask.any()):
+            continue
+        state_edge_ids[mask, slot] = trajectories.edge_ids.index_select(0, row_ids[mask])[:, slot]
+    state = StateBatch.from_selected_edges(
+        graph_ids=trajectories.graph_ids.index_select(0, row_ids),
+        edge_ids=state_edge_ids,
+        edge_count=prefix_lens,
+        budget=budget,
+        graph_context=graph_context,
+    )
     source = torch.full(
         (int(state.num_states),),
         int(TransitionSource.POLICY),
         dtype=torch.long,
-        device=device,
+        device=trajectories.device,
     )
     return TerminalTransitionBatch(state=state, source=source)
 
@@ -238,6 +255,7 @@ def concat_nonterminal_transition_batches(
         parent_state_ids=torch.cat(parent_state_ids, dim=0),
         edge_ids=torch.cat(edge_ids, dim=0),
         child_state=cat_state_batches(child_states) if has_child_state else None,
+        graph_context=first.graph_context if hasattr(first, "graph_context") else None,
         log_backward=torch.cat(log_backward, dim=0) if has_log_backward else None,
         source=torch.cat(sources, dim=0) if has_source else None,
     )

@@ -121,7 +121,10 @@ def rollout_eval_tensors(
     device = torch.device("cpu")
     num_graphs = int(batch.num_graphs)
 
-    terminal_state = terminal_state_from_trajectories(trajectories)
+    terminal_state = terminal_state_from_trajectories(
+        trajectories,
+        graph_context=context,
+    )
 
     node_masks, edge_masks = stacked_terminal_masks(
         state=terminal_state,
@@ -176,6 +179,8 @@ def rollout_eval_tensors(
 
 def terminal_state_from_trajectories(
     trajectories: TrajectoryBatch,
+    *,
+    graph_context: GraphContext,
 ) -> StateBatch:
     """
     Zero-replay conversion from trajectory records to terminal StateBatch.
@@ -185,11 +190,12 @@ def terminal_state_from_trajectories(
     """
 
     return canonicalize_state_batch(
-        StateBatch(
+        StateBatch.from_selected_edges(
             graph_ids=trajectories.graph_ids,
             edge_ids=trajectories.edge_ids,
             edge_count=trajectories.edge_count,
             budget=int(trajectories.budget),
+            graph_context=graph_context,
         )
     )
 

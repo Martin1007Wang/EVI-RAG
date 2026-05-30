@@ -10,26 +10,45 @@ feature_encoder:
   entity_text_semantic_table: null
   text_row_by_entity_id: null
   relation_semantic_table: null
+  hidden_dim: ${model.hidden_dim}
   non_text_node_init_std: 0.02
+  normalize_inputs: true
 
 policy:
   _target_: src.weaver.policy.ForwardPolicy
-  action_hidden_dim: null
-  semantic_relation_weight: 1.0
-  semantic_dst_weight: 0.5
-  edge_residual_weight: 0.25
-  frontier_size_correction: 1.0
-  state_encoder:
-    _target_: src.weaver.nn.state_encoder.StateEncoder
+
+  cache_builder:
+    _target_: src.weaver.nn.PolicyCacheBuilder
     hidden_dim: ${model.hidden_dim}
+
+  state_encoder:
+    _target_: src.weaver.nn.StateEncoder
+    hidden_dim: ${model.hidden_dim}
+    max_budget: ${model.budget}
+
+  stop_head:
+    _target_: src.weaver.policy.forward.StopFlowHead
+    hidden_dim: ${model.hidden_dim}
+    interaction:
+      _target_: src.weaver.policy.forward.LowRankInteraction
+      hidden_dim: ${model.hidden_dim}
+      rank: 64
+    initial_bias: -4.0
+
+  edge_head:
+    _target_: src.weaver.policy.forward.EdgeFlowHead
+    hidden_dim: ${model.hidden_dim}
+    interaction: ${model.policy.stop_head.interaction}
+    initial_bias: 0.0
 
 reward_model:
   _target_: src.weaver.reward.EvidenceSubgraphReward
-  beta: 2.0
-  epsilon: 1.0e-6
-  answer_weight: 1.0
-  edge_cost: 0.05
-  reward_temperature: 1.0
+  eps: 1.0
+  answer_weight: 6.0
+  coverage_weight: 1.0
+  edge_cost: 0.15
+  fail_cost: 6.0
+  answer_prize: 2.0
   
 objective:
   _target_: src.weaver.objectives.EdgeFlowMatchingObjective
@@ -46,13 +65,11 @@ runner:
     _target_: src.weaver.rollout.engine.RolloutEngine
 
   replay_source:
-    _target_: src.weaver.rollout.replay.WeakTransitionSource
-    max_depth: ${model.budget}
-    mode: positive_frontier
+    _target_: src.weaver.rollout.replay.ReplaySource
+    # With train_policy_rollouts=8, budget=8, top_k_per_state=2, the worst-case
+    # relabel count per graph is 8 * 8 * 2 = 128, so this cap avoids truncation.
     max_transitions_per_graph: 128
-    max_states_per_graph: 64
-    sample_by: weak_weight
-    max_positive_edges_per_state: 8
+    top_k_per_state: 2
   train_policy_rollouts: 8
   eval_rollouts: 8
 

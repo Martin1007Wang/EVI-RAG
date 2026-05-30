@@ -6,12 +6,13 @@ default_root_dir: ${paths.output_dir}
 accelerator: gpu
 devices: 1
 precision: bf16-mixed
+strategy: auto
 
 min_epochs: 0
 max_epochs: -1
 max_steps: 100000
 
-accumulate_grad_batches: 1
+accumulate_grad_batches: 4
 benchmark: true
 
 val_check_interval: null

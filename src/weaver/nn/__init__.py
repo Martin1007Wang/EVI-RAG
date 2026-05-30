@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from .edge_encoder import EdgeEncoder
-from ..feature import FeatureBank, FeatureEncoder
-from .state_encoder import StateEncoder
+from .encoding import (
+    PolicyCache,
+    PolicyCacheBuilder,
+    StateEncoder,
+    StateEncoding,
+)
 
 __all__ = [
-    "EdgeEncoder",
-    "FeatureBank",
-    "FeatureEncoder",
+    "PolicyCache",
+    "PolicyCacheBuilder",
     "StateEncoder",
+    "StateEncoding",
 ]

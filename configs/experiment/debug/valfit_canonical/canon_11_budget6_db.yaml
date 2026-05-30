@@ -24,5 +24,6 @@ logger:
 
 model:
   budget: 6
-    weak_replay_source:
-      budget: ${model.budget}
+  runner:
+    replay_source:
+      max_depth: ${model.budget}

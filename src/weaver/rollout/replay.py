@@ -4,35 +4,24 @@ from dataclasses import dataclass
 
 import torch
 
-from src.weaver.context import GraphContext, TargetContext
-from src.weaver.objectives.transition_batch import (
-    NonterminalTransitionBatch,
-    TransitionSource,
-)
+from src.weaver.context import GraphContext, ReplayContext, TargetContext
+from src.weaver.objectives.transition_batch import NonterminalTransitionBatch, TransitionSource
 from src.weaver.objectives.transition_builder import ReplayTransitionStats
-from src.weaver.state import ActionSpace, ExpansionBatch, StateBatch, cat_state_batches
+from src.weaver.state import ExpansionBatch, StateBatch, cat_state_batches
 
 Tensor = torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class WeakTransitionSourceOutput:
+class ReplaySourceOutput:
     nonterminal: NonterminalTransitionBatch | None
     stats: ReplayTransitionStats
 
 
 @dataclass(frozen=True, slots=True)
-class WeakTransitionSource:
-    """
-    Build bounded weak-supervision nonterminal transitions.
-    """
-
-    max_depth: int
-    mode: str = "positive_frontier"
+class ReplaySource:
     max_transitions_per_graph: int = 128
-    max_states_per_graph: int = 64
-    sample_by: str = "weak_weight"
-    max_positive_edges_per_state: int | None = 8
+    top_k_per_state: int = 2
 
     @torch.no_grad()
     def collect(
@@ -40,18 +29,31 @@ class WeakTransitionSource:
         *,
         graph_context: GraphContext,
         target_context: TargetContext,
+        replay_context: ReplayContext,
         initial_state: StateBatch,
-    ) -> WeakTransitionSourceOutput:
-        if int(self.max_depth) < 0:
-            raise ValueError("max_depth must be nonnegative.")
-        if self.mode != "positive_frontier":
-            raise ValueError(f"Unsupported replay mode: {self.mode!r}.")
+    ) -> ReplaySourceOutput:
         if int(self.max_transitions_per_graph) < 0:
             raise ValueError("max_transitions_per_graph must be nonnegative.")
-        if int(self.max_states_per_graph) <= 0:
-            raise ValueError("max_states_per_graph must be positive.")
+        if int(self.top_k_per_state) <= 0:
+            raise ValueError("top_k_per_state must be positive.")
         if int(self.max_transitions_per_graph) == 0:
-            return WeakTransitionSourceOutput(
+            return ReplaySourceOutput(
+                nonterminal=None,
+                stats=ReplayTransitionStats(
+                    prefix_count=int(initial_state.num_states),
+                    positive_transition_count=0,
+                    prefix_with_positive_rate=0.0,
+                    mean_positive_edges_per_prefix=0.0,
+                ),
+            )
+
+        replay_program = _decode_replay_program(
+            replay_context=replay_context,
+            num_edges=int(graph_context.num_edges),
+        )
+        prefix_count = int(initial_state.num_states)
+        if prefix_count == 0:
+            return ReplaySourceOutput(
                 nonterminal=None,
                 stats=ReplayTransitionStats(
                     prefix_count=0,
@@ -61,83 +63,28 @@ class WeakTransitionSource:
                 ),
             )
 
-        frontier = initial_state
-        emitted_parent_states: list[StateBatch] = []
-        emitted_parent_ids: list[Tensor] = []
-        emitted_edge_ids: list[Tensor] = []
-        emitted_child_states: list[StateBatch] = []
-        prefix_count = 0
-        prefix_with_positive = 0
-        positive_transition_count = 0
-        emitted_by_graph: dict[int, int] = {}
-
-        for _ in range(int(self.max_depth)):
-            if int(frontier.num_states) == 0:
-                break
-
-            action_space = frontier.action_space(graph_context)
-            positive = target_context.shortest_path_edge_mask.index_select(
-                0,
-                action_space.expand_edge_ids,
-            )
-
-            if int(action_space.num_states) > 0:
-                prefix_count += int(action_space.num_states)
-
-            if not bool(positive.any()):
-                break
-
-            selected_state_ids, selected_edge_ids = _select_positive_expansions(
-                action_space=action_space,
-                positive_mask=positive,
-                edge_weight=target_context.shortest_path_edge_weight,
-                max_positive_edges_per_state=self.max_positive_edges_per_state,
-                sample_by=self.sample_by,
-            )
-
-            if int(selected_edge_ids.numel()) == 0:
-                break
-
-            selected_state_ids, selected_edge_ids = _cap_positive_transitions_per_graph(
-                frontier=frontier,
-                state_ids=selected_state_ids,
-                edge_ids=selected_edge_ids,
-                remaining_budget_per_graph=_remaining_transition_budget(
-                    frontier=frontier,
-                    emitted_by_graph=emitted_by_graph,
-                    max_transitions_per_graph=int(self.max_transitions_per_graph),
-                ),
-            )
-
-            if int(selected_edge_ids.numel()) == 0:
-                break
-
-            local_positive_states = torch.unique(selected_state_ids)
-            prefix_with_positive += int(local_positive_states.numel())
-            positive_transition_count += int(selected_edge_ids.numel())
-            for graph_id in frontier.graph_ids.index_select(0, selected_state_ids).tolist():
-                emitted_by_graph[int(graph_id)] = emitted_by_graph.get(int(graph_id), 0) + 1
-
-            child = frontier.branch(
-                ExpansionBatch(
-                    state_ids=selected_state_ids,
-                    edge_ids=selected_edge_ids,
-                )
-            )
-
-            emitted_parent_states.append(frontier)
-            emitted_parent_ids.append(selected_state_ids)
-            emitted_edge_ids.append(selected_edge_ids)
-            emitted_child_states.append(child)
-
-            frontier = _prune_positive_frontier(
-                child=child,
-                max_states_per_graph=int(self.max_states_per_graph),
-                edge_weight=target_context.shortest_path_edge_weight,
-            )
-
-        if not emitted_parent_states:
-            return WeakTransitionSourceOutput(
+        action_space = initial_state.action_space(graph_context)
+        selected_state_ids, selected_edge_ids = _select_replay_expansions(
+            frontier=initial_state,
+            graph_context=graph_context,
+            target_context=target_context,
+            replay_program=replay_program,
+            action_space=action_space,
+            top_k_per_state=int(self.top_k_per_state),
+        )
+        prefix_with_positive = int(torch.unique(selected_state_ids).numel()) if int(selected_state_ids.numel()) > 0 else 0
+        selected_state_ids, selected_edge_ids = _cap_positive_transitions_per_graph(
+            frontier=initial_state,
+            state_ids=selected_state_ids,
+            edge_ids=selected_edge_ids,
+            remaining_budget_per_graph=_remaining_transition_budget(
+                frontier=initial_state,
+                emitted_by_graph={},
+                max_transitions_per_graph=int(self.max_transitions_per_graph),
+            ),
+        )
+        if int(selected_edge_ids.numel()) == 0:
+            return ReplaySourceOutput(
                 nonterminal=None,
                 stats=ReplayTransitionStats(
                     prefix_count=prefix_count,
@@ -147,44 +94,41 @@ class WeakTransitionSource:
                 ),
             )
 
-        parent_state = cat_state_batches(emitted_parent_states)
-        parent_state_ids = []
-        offset = 0
-        for state_batch, ids in zip(emitted_parent_states, emitted_parent_ids, strict=True):
-            parent_state_ids.append(ids + int(offset))
-            offset += int(state_batch.num_states)
-        edge_ids = torch.cat(emitted_edge_ids, dim=0)
-        child_state = cat_state_batches(emitted_child_states)
+        prefix_with_positive = int(torch.unique(selected_state_ids).numel())
+        positive_transition_count = int(selected_edge_ids.numel())
+        child_state = initial_state.branch(
+            ExpansionBatch(state_ids=selected_state_ids, edge_ids=selected_edge_ids),
+            graph_context=graph_context,
+        )
         source = torch.full(
-            (int(edge_ids.numel()),),
+            (positive_transition_count,),
             int(TransitionSource.WEAK_REPLAY),
             dtype=torch.long,
-            device=parent_state.device,
+            device=initial_state.device,
         )
-
-        return WeakTransitionSourceOutput(
+        return ReplaySourceOutput(
             nonterminal=NonterminalTransitionBatch(
-                parent_state=parent_state,
-                parent_state_ids=torch.cat(parent_state_ids, dim=0),
-                edge_ids=edge_ids,
+                parent_state=initial_state,
+                parent_state_ids=selected_state_ids,
+                edge_ids=selected_edge_ids,
                 child_state=child_state,
+                graph_context=graph_context,
                 source=source,
             ),
             stats=ReplayTransitionStats(
                 prefix_count=prefix_count,
                 positive_transition_count=positive_transition_count,
-                prefix_with_positive_rate=(
-                    float(prefix_with_positive) / float(prefix_count)
-                    if prefix_count > 0
-                    else 0.0
-                ),
-                mean_positive_edges_per_prefix=(
-                    float(positive_transition_count) / float(prefix_with_positive)
-                    if prefix_with_positive > 0
-                    else 0.0
-                ),
+                prefix_with_positive_rate=(float(prefix_with_positive) / float(prefix_count) if prefix_count > 0 else 0.0),
+                mean_positive_edges_per_prefix=(float(positive_transition_count) / float(prefix_with_positive) if prefix_with_positive > 0 else 0.0),
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodedReplayProgram:
+    candidate_edges: tuple[tuple[int, ...], ...]
+    candidate_target_positions: tuple[tuple[int, ...], ...]
+    edge_to_candidate_ids: tuple[tuple[int, ...], ...]
 
 
 def initial_replay_state_batch(
@@ -195,79 +139,180 @@ def initial_replay_state_batch(
 ) -> StateBatch:
     valid_graph_ids = target_context.valid_graph_mask.nonzero(as_tuple=False).flatten()
     return StateBatch.initial(
-        graph_ids=valid_graph_ids.to(
-            device=graph_context.device,
-            dtype=torch.long,
-        ),
+        graph_ids=valid_graph_ids.to(device=graph_context.device, dtype=torch.long),
         budget=int(budget),
+        graph_context=graph_context,
     )
 
 
-def _select_positive_expansions(
+def _decode_replay_program(
     *,
-    action_space: ActionSpace,
-    positive_mask: Tensor,
-    edge_weight: Tensor,
-    max_positive_edges_per_state: int | None,
-    sample_by: str,
-) -> tuple[Tensor, Tensor]:
-    candidate_rows = positive_mask.nonzero(as_tuple=False).flatten()
-    if int(candidate_rows.numel()) == 0:
-        empty = torch.empty(0, dtype=torch.long, device=positive_mask.device)
-        return empty, empty
-
-    state_ids = action_space.expand_state_ids.index_select(0, candidate_rows)
-    edge_ids = action_space.expand_edge_ids.index_select(0, candidate_rows)
-    if max_positive_edges_per_state is None:
-        return state_ids, edge_ids
-
-    max_edges = int(max_positive_edges_per_state)
-    if max_edges <= 0:
-        empty = torch.empty(0, dtype=torch.long, device=positive_mask.device)
-        return empty, empty
-
-    kept_state_ids: list[Tensor] = []
-    kept_edge_ids: list[Tensor] = []
-    num_states = int(action_space.num_states)
-    for state_id in range(num_states):
-        rows = state_ids.eq(state_id).nonzero(as_tuple=False).flatten()
-        if int(rows.numel()) == 0:
-            continue
-        state_edge_ids = edge_ids.index_select(0, rows)
-        weights = edge_weight.index_select(0, state_edge_ids)
-        keep = _sample_positive_rows(
-            rows=rows,
-            weights=weights,
-            max_edges=max_edges,
-            sample_by=sample_by,
+    replay_context: ReplayContext,
+    num_edges: int,
+) -> _DecodedReplayProgram:
+    candidate_edges: list[tuple[int, ...]] = []
+    candidate_ptr = replay_context.candidate_ptr.tolist()
+    candidate_edge_ids = replay_context.candidate_edge_ids.tolist()
+    candidate_target_positions: list[tuple[int, ...]] = []
+    candidate_target_ptr = replay_context.candidate_target_ptr.tolist()
+    flat_candidate_target_positions = replay_context.candidate_target_positions.tolist()
+    for candidate_id in range(max(len(candidate_ptr) - 1, 0)):
+        start = int(candidate_ptr[candidate_id])
+        end = int(candidate_ptr[candidate_id + 1])
+        candidate_edges.append(tuple(int(edge_id) for edge_id in candidate_edge_ids[start:end]))
+        target_start = int(candidate_target_ptr[candidate_id])
+        target_end = int(candidate_target_ptr[candidate_id + 1])
+        candidate_target_positions.append(
+            tuple(int(pos) for pos in flat_candidate_target_positions[target_start:target_end])
         )
-        kept_state_ids.append(state_ids.index_select(0, keep))
-        kept_edge_ids.append(edge_ids.index_select(0, keep))
 
-    if not kept_state_ids:
-        empty = torch.empty(0, dtype=torch.long, device=positive_mask.device)
-        return empty, empty
-    return torch.cat(kept_state_ids, dim=0), torch.cat(kept_edge_ids, dim=0)
+    edge_to_candidate_ids: list[tuple[int, ...]] = []
+    edge_candidate_ptr = replay_context.edge_to_candidate_ptr.tolist()
+    edge_candidate_ids = replay_context.edge_to_candidate_ids.tolist()
+    if len(edge_candidate_ptr) == 0:
+        edge_candidate_ptr = [0] * (int(num_edges) + 1)
+    for edge_id in range(int(num_edges)):
+        start = int(edge_candidate_ptr[edge_id])
+        end = int(edge_candidate_ptr[edge_id + 1])
+        edge_to_candidate_ids.append(tuple(int(candidate_id) for candidate_id in edge_candidate_ids[start:end]))
+
+    return _DecodedReplayProgram(
+        candidate_edges=tuple(candidate_edges),
+        candidate_target_positions=tuple(candidate_target_positions),
+        edge_to_candidate_ids=tuple(edge_to_candidate_ids),
+    )
 
 
-def _sample_positive_rows(
+def _select_replay_expansions(
     *,
-    rows: Tensor,
-    weights: Tensor,
-    max_edges: int,
-    sample_by: str,
-) -> Tensor:
-    if sample_by not in {"weak_weight", "uniform"}:
-        raise ValueError(f"Unsupported replay sampling rule: {sample_by!r}.")
-    if int(rows.numel()) <= max_edges:
-        return rows
-    if sample_by == "uniform":
-        order = torch.randperm(int(rows.numel()), device=rows.device)
-        return rows.index_select(0, order[:max_edges])
+    frontier: StateBatch,
+    graph_context: GraphContext,
+    target_context: TargetContext,
+    replay_program: _DecodedReplayProgram,
+    action_space,
+    top_k_per_state: int,
+) -> tuple[Tensor, Tensor]:
+    kept_state_ids: list[int] = []
+    kept_edge_ids: list[int] = []
+    for state_id in range(int(action_space.num_states)):
+        start = int(action_space.expand_ptr[state_id].item())
+        end = int(action_space.expand_ptr[state_id + 1].item())
+        if start >= end:
+            continue
+        legal_edges = action_space.expand_edge_ids[start:end]
+        ranked_edges = _rank_replay_edges_for_state(
+            frontier=frontier,
+            graph_context=graph_context,
+            state_id=state_id,
+            legal_edge_ids=legal_edges,
+            target_context=target_context,
+            replay_program=replay_program,
+        )
+        if not ranked_edges:
+            continue
+        ranked_edges = ranked_edges[: int(top_k_per_state)]
+        kept_state_ids.extend([state_id] * len(ranked_edges))
+        kept_edge_ids.extend(ranked_edges)
 
-    _, order = torch.sort(weights, descending=True, stable=True)
-    selected_rows = rows.index_select(0, order[:max_edges])
-    return torch.sort(selected_rows).values
+    if not kept_edge_ids:
+        empty = torch.empty(0, dtype=torch.long, device=frontier.device)
+        return empty, empty
+
+    return (
+        torch.tensor(kept_state_ids, dtype=torch.long, device=frontier.device),
+        torch.tensor(kept_edge_ids, dtype=torch.long, device=frontier.device),
+    )
+
+
+def _rank_replay_edges_for_state(
+    *,
+    frontier: StateBatch,
+    graph_context: GraphContext,
+    state_id: int,
+    legal_edge_ids: Tensor,
+    target_context: TargetContext,
+    replay_program: _DecodedReplayProgram,
+) -> list[int]:
+    budget_left = int(frontier.budget_left[state_id].item())
+    if budget_left <= 0:
+        return []
+
+    selected_count = int(frontier.edge_count[state_id].item())
+    selected_edges = {
+        int(edge_id)
+        for edge_id in frontier.selected_edge_ids[state_id, :selected_count].tolist()
+        if int(edge_id) >= 0
+    }
+    covered_positions = _covered_target_positions_for_state(
+        frontier=frontier,
+        graph_context=graph_context,
+        state_id=state_id,
+        target_context=target_context,
+    )
+
+    scored: list[tuple[tuple[int, int, int, int], int]] = []
+    for edge_id in legal_edge_ids.tolist():
+        edge_id = int(edge_id)
+        candidate_ids = replay_program.edge_to_candidate_ids[edge_id] if edge_id < len(replay_program.edge_to_candidate_ids) else tuple()
+        if not candidate_ids:
+            continue
+        best_score: tuple[int, int, int, int] | None = None
+        for candidate_id in candidate_ids:
+            if candidate_id >= len(replay_program.candidate_edges):
+                continue
+            candidate_edges = replay_program.candidate_edges[candidate_id]
+            if edge_id not in candidate_edges:
+                continue
+            residual_edges = [candidate_edge for candidate_edge in candidate_edges if candidate_edge not in selected_edges]
+            if len(residual_edges) > budget_left:
+                continue
+            cover_gain = _cover_gain(
+                covered_positions=covered_positions,
+                candidate_target_positions=replay_program.candidate_target_positions[candidate_id],
+            )
+            if cover_gain <= 0 and edge_id in selected_edges:
+                continue
+            shared_trunk = -candidate_edges.index(edge_id)
+            residual_len = len(residual_edges)
+            score = (cover_gain, shared_trunk, -residual_len, -edge_id)
+            if best_score is None or score > best_score:
+                best_score = score
+        if best_score is not None:
+            scored.append((best_score, edge_id))
+
+    scored.sort(reverse=True)
+    return [edge_id for _, edge_id in scored]
+
+
+def _covered_target_positions_for_state(
+    *,
+    frontier: StateBatch,
+    graph_context: GraphContext,
+    state_id: int,
+    target_context: TargetContext,
+) -> frozenset[int]:
+    active = frontier.active_node_index(graph_context)
+    active_rows = active.row_ids.eq(int(state_id))
+    covered: set[int] = set()
+    if not bool(active_rows.any()):
+        return frozenset()
+    active_nodes = active.node_ids[active_rows]
+    for pos, node_id in enumerate(target_context.reachable_target_node_ids.tolist()):
+        if bool(active_nodes.eq(int(node_id)).any()):
+            covered.add(int(pos))
+    return frozenset(covered)
+
+
+def _cover_gain(
+    *,
+    covered_positions: frozenset[int],
+    candidate_target_positions: tuple[int, ...],
+) -> int:
+    gain = 0
+    for pos in candidate_target_positions:
+        if int(pos) not in covered_positions:
+            gain += 1
+    return gain
 
 
 def _remaining_transition_budget(
@@ -278,10 +323,7 @@ def _remaining_transition_budget(
 ) -> dict[int, int]:
     remaining: dict[int, int] = {}
     for graph_id in torch.unique(frontier.graph_ids).tolist():
-        remaining[int(graph_id)] = max(
-            0,
-            int(max_transitions_per_graph) - int(emitted_by_graph.get(int(graph_id), 0)),
-        )
+        remaining[int(graph_id)] = max(0, int(max_transitions_per_graph) - int(emitted_by_graph.get(int(graph_id), 0)))
     return remaining
 
 
@@ -295,7 +337,6 @@ def _cap_positive_transitions_per_graph(
     if int(state_ids.numel()) == 0:
         empty = torch.empty(0, dtype=torch.long, device=frontier.device)
         return empty, empty
-
     keep_rows: list[int] = []
     for row in range(int(state_ids.numel())):
         state_id = int(state_ids[row].item())
@@ -305,61 +346,15 @@ def _cap_positive_transitions_per_graph(
             continue
         keep_rows.append(row)
         remaining_budget_per_graph[graph_id] = remaining - 1
-
     if not keep_rows:
         empty = torch.empty(0, dtype=torch.long, device=frontier.device)
         return empty, empty
-
     keep = torch.tensor(keep_rows, dtype=torch.long, device=frontier.device)
-    return (
-        state_ids.index_select(0, keep),
-        edge_ids.index_select(0, keep),
-    )
-
-
-def _prune_positive_frontier(
-    *,
-    child: StateBatch,
-    max_states_per_graph: int,
-    edge_weight: Tensor,
-) -> StateBatch:
-    keep_rows: list[int] = []
-    rows_by_graph: dict[int, list[tuple[float, int]]] = {}
-
-    for row in range(int(child.num_states)):
-        graph_id = int(child.graph_ids[row].item())
-        edge_count = int(child.edge_count[row].item())
-        selected = child.edge_ids[row, :edge_count]
-        score = float(edge_weight.index_select(0, selected).sum().item()) if edge_count > 0 else 0.0
-        rows_by_graph.setdefault(graph_id, []).append((-score, row))
-
-    for graph_id, scored_rows in rows_by_graph.items():
-        scored_rows.sort()
-        seen: set[tuple[int, ...]] = set()
-        kept = 0
-        for _, row in scored_rows:
-            if kept >= max_states_per_graph:
-                break
-            edge_count = int(child.edge_count[row].item())
-            key = tuple(int(v) for v in child.edge_ids[row, :edge_count].tolist())
-            if key in seen:
-                continue
-            seen.add(key)
-            keep_rows.append(row)
-            kept += 1
-        del graph_id
-
-    if not keep_rows:
-        return StateBatch.initial(
-            graph_ids=torch.empty(0, dtype=torch.long, device=child.device),
-            budget=int(child.budget),
-        )
-
-    return child.take(torch.tensor(keep_rows, dtype=torch.long, device=child.device))
+    return state_ids.index_select(0, keep), edge_ids.index_select(0, keep)
 
 
 __all__ = [
-    "WeakTransitionSource",
-    "WeakTransitionSourceOutput",
+    "ReplaySource",
+    "ReplaySourceOutput",
     "initial_replay_state_batch",
 ]

@@ -5,13 +5,22 @@ from typing import Any
 
 import torch
 
-from .schema.batch import RetrievalBatch
+from .schema.batch import ReplayProgramBatch, ReplayProgramSample, RetrievalBatch
 from .schema.fields import SampleFields
 
 _DEFAULT_FOLLOW_BATCH = (
     SampleFields.REACHABLE_TARGET_NODE_IDS,
-    SampleFields.WEAK_REPLAY_EDGE_IDS,
-    SampleFields.WITNESS_PATH_EDGE_IDS,
+)
+
+_REPLAY_EXCLUDE_KEYS = (
+    SampleFields.REPLAY_CANDIDATE_EDGE_IDS,
+    SampleFields.REPLAY_CANDIDATE_PTR,
+    SampleFields.REPLAY_CANDIDATE_TARGET_POSITIONS,
+    SampleFields.REPLAY_CANDIDATE_TARGET_PTR,
+    SampleFields.REPLAY_EDGE_TO_CANDIDATE_IDS,
+    SampleFields.REPLAY_EDGE_TO_CANDIDATE_PTR,
+    SampleFields.REPLAY_PATH_TRUNCATED,
+    "replay_program",
 )
 
 
@@ -53,6 +62,10 @@ class RetrievalCollator:
         batch.sample_id = [str(sample.sample_id) for sample in samples]
         batch.question_emb = stack_question_embeddings(samples)
         batch.edge_batch = edge_batch_from_node_batch(batch)
+        batch.replay_program = build_replay_program_batch(
+            samples=samples,
+            batch=batch,
+        )
 
         return batch
 
@@ -61,6 +74,9 @@ def _exclude_question_embedding(exclude_keys: Sequence[str]) -> list[str]:
     keys = list(exclude_keys)
     if SampleFields.QUESTION_EMB not in keys:
         keys.append(SampleFields.QUESTION_EMB)
+    for key in _REPLAY_EXCLUDE_KEYS:
+        if key not in keys:
+            keys.append(key)
     return keys
 
 
@@ -116,3 +132,91 @@ def edge_batch_from_node_batch(batch: RetrievalBatch) -> torch.Tensor:
         raise ValueError("edge_index contains cross-graph edges after batching.")
 
     return src_graph.contiguous()
+
+
+def build_replay_program_batch(
+    *,
+    samples: Sequence[Any],
+    batch: RetrievalBatch,
+) -> ReplayProgramBatch:
+    device = batch.edge_index.device
+    sample_programs = [_sample_replay_program(sample) for sample in samples]
+
+    candidate_edge_chunks: list[torch.Tensor] = []
+    candidate_ptr_parts = [0]
+    candidate_target_position_chunks: list[torch.Tensor] = []
+    candidate_target_ptr_parts = [0]
+    edge_to_candidate_id_chunks: list[torch.Tensor] = []
+    edge_to_candidate_ptr_parts = [0]
+    candidate_graph_ptr_parts = [0]
+    path_truncated_values: list[int] = []
+
+    edge_offset = 0
+    candidate_offset = 0
+    total_candidate_edges = 0
+    total_candidate_targets = 0
+    total_edge_candidate_refs = 0
+    total_candidates = 0
+
+    for graph_id, (sample, program) in enumerate(zip(samples, sample_programs, strict=True)):
+        num_edges = int(sample.num_edges)
+        local_candidate_count = int(program.candidate_ptr.numel()) - 1
+
+        if int(program.candidate_edge_ids_local.numel()) > 0:
+            candidate_edge_chunks.append(
+                program.candidate_edge_ids_local.to(device=device, dtype=torch.long) + int(edge_offset)
+            )
+        if int(program.candidate_target_positions.numel()) > 0:
+            candidate_target_position_chunks.append(
+                program.candidate_target_positions.to(device=device, dtype=torch.long)
+            )
+        if int(program.edge_to_candidate_ids_local.numel()) > 0:
+            edge_to_candidate_id_chunks.append(
+                program.edge_to_candidate_ids_local.to(device=device, dtype=torch.long) + int(candidate_offset)
+            )
+
+        candidate_ptr_parts.extend(
+            int(total_candidate_edges) + int(value)
+            for value in program.candidate_ptr.to(dtype=torch.long).tolist()[1:]
+        )
+        candidate_target_ptr_parts.extend(
+            int(total_candidate_targets) + int(value)
+            for value in program.candidate_target_ptr.to(dtype=torch.long).tolist()[1:]
+        )
+        edge_to_candidate_ptr_parts.extend(
+            int(total_edge_candidate_refs) + int(value)
+            for value in program.edge_to_candidate_ptr.to(dtype=torch.long).tolist()[1:]
+        )
+        candidate_graph_ptr_parts.append(int(candidate_offset) + int(local_candidate_count))
+        path_truncated_values.append(int(program.path_truncated.item()))
+
+        total_candidate_edges += int(program.candidate_edge_ids_local.numel())
+        total_candidate_targets += int(program.candidate_target_positions.numel())
+        total_edge_candidate_refs += int(program.edge_to_candidate_ids_local.numel())
+        total_candidates += int(local_candidate_count)
+        edge_offset += int(num_edges)
+        candidate_offset += int(local_candidate_count)
+
+    return ReplayProgramBatch(
+        candidate_edge_ids=_cat_or_empty(candidate_edge_chunks, device=device),
+        candidate_ptr=torch.tensor(candidate_ptr_parts, dtype=torch.long, device=device).contiguous(),
+        candidate_target_positions=_cat_or_empty(candidate_target_position_chunks, device=device),
+        candidate_target_ptr=torch.tensor(candidate_target_ptr_parts, dtype=torch.long, device=device).contiguous(),
+        edge_to_candidate_ids=_cat_or_empty(edge_to_candidate_id_chunks, device=device),
+        edge_to_candidate_ptr=torch.tensor(edge_to_candidate_ptr_parts, dtype=torch.long, device=device).contiguous(),
+        candidate_graph_ptr=torch.tensor(candidate_graph_ptr_parts, dtype=torch.long, device=device).contiguous(),
+        path_truncated_by_graph=torch.tensor(path_truncated_values, dtype=torch.long, device=device).contiguous(),
+    )
+
+
+def _sample_replay_program(sample: Any) -> ReplayProgramSample:
+    program = getattr(sample, "replay_program", None)
+    if not isinstance(program, ReplayProgramSample):
+        raise TypeError("sample.replay_program must be a ReplayProgramSample.")
+    return program
+
+
+def _cat_or_empty(chunks: Sequence[torch.Tensor], *, device: torch.device) -> torch.Tensor:
+    if not chunks:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return torch.cat(tuple(chunk.contiguous() for chunk in chunks), dim=0).contiguous()

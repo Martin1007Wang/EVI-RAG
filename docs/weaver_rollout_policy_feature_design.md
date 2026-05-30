@@ -126,75 +126,52 @@ log P_F(STOP | z) = stop_log_flow - state_log_flow
 
 ## 6. Edge action log-flow
 
-每条 edge 先计算 semantic prior：
+当前实现先把每条 frontier edge 变成 typed edge token：
 
 ```text
-s_sem(q,e) =
-    α <q, rel(e)> + β 1[dst has text] <q, dst(e)>
+t_e = LN(W_q q + W_src h_src + W_rel h_rel + W_dst h_dst)
 ```
 
-然后计算状态依赖 residual：
+state 表示来自 selected evidence edge set 的 query-conditioned attention pooling：
 
 ```text
-rθ(z,e) =
-MLPθ([query_h[row], selected_h[row], active_h[row], budget_h[row], edge_h])
+h_z = AttnPool_q({t_e : e in E_z})
 ```
 
-raw edge score：
+空 state 不走 scalar summary，而是走 learned root / anchor-conditioned root fallback。
+
+frontier action 表示是当前 edge token 与 state 表示的交互：
 
 ```text
-edge_raw_score = sθ(z,e) = s_sem(q,e) + rθ(z,e)
+h_{z,e} = LN(t_e + U h_z + V(t_e ⊙ U h_z))
 ```
 
-最后做 reference-measure correction：
+最终：
 
 ```text
-edge_log_flow = qθ(z,e) = edge_raw_score - log |Frontier(z)|
+edge_log_flow = qθ(z,e) = edge_head(h_{z,e})
 ```
 
 `edge_log_flow` 是 primitive edge action log-flow，不是 conditional edge logit。
 
-## 7. 为什么需要 `- log |Frontier(z)|`
+## 7. 为什么当前主线改成统一表示
 
-如果直接使用 `edge_raw_score` 聚合 continue flow：
+结构信息只通过 selected edge set、frontier 和图上的 gather/scatter 进入模型，不再把
+`degree`、`frontier size`、`coverage gain`、`redundancy` 等 scalar 作为主干输入。
 
-```text
-continue_log_flow = logsumexp_e edge_raw_score
-```
-
-当所有 edge 分数近似相同：
+主干只保留三个对象：
 
 ```text
-edge_raw_score = c
+t_e
+h_z
+h_{z,e}
 ```
 
-则：
-
-```text
-continue_log_flow = c + log |Frontier(z)|
-```
-
-frontier 越大，continue mass 天然越大。这会把节点度数或 frontier size 误当成继续扩展证据。
-
-修正后：
-
-```text
-continue_log_flow =
-logsumexp_e [edge_raw_score - log |Frontier(z)|]
-= logmeanexp_e edge_raw_score
-```
-
-当所有 edge 质量相同时：
-
-```text
-continue_log_flow = c
-```
-
-边多不会自动压制 STOP。
+budget 仍然属于 rollout / finite-horizon 约束，而不是单独拼接到 heuristic scalar stack。
 
 ## 8. Continue flow 是派生量
 
-当前实现没有独立 continuation head。
+当前实现没有独立 continuation head，也没有 lookahead continuation prior。
 
 ```text
 continue_log_flow = Cθ(z) = logsumexp_{e in Frontier(z)} edge_log_flow(z,e)
@@ -487,6 +464,8 @@ frontier_summary_top_k
 raw_continuation_log_flow
 edge_action_log_flow = continuation_log_flow + edge_log_prob
 behavior_action_log_prob in rollout result/tape
+ContinuationOperator
+GraphPotentials.continuation
 ```
 
 改名：
@@ -507,4 +486,3 @@ budget_h
 BackwardPolicy
 selected_edge_ids as single truth
 ```
-

@@ -7,10 +7,11 @@ from src.weaver.context import GraphContext
 from src.weaver.feature import FeatureBank
 from src.weaver.objectives.transition_batch import NonterminalTransitionBatch
 from src.weaver.policy import ForwardPolicy
-from src.weaver.rollout.replay import WeakTransitionSource, initial_replay_state_batch
+from src.weaver.rollout.replay import ReplaySource
 from src.weaver.rollout.engine import RolloutEngine
 from src.weaver.rollout.trajectory import TrajectoryBatch
-from src.weaver.context import TargetContext
+from src.weaver.context import ReplayContext, TargetContext
+from src.weaver.state import ExpansionBatch, StateBatch, cat_state_batches
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,13 +37,12 @@ class RolloutRunner:
         *,
         engine: RolloutEngine,
         train_policy_rollouts: int,
-        replay_source: WeakTransitionSource | None = None,
-        weak_replay_source: WeakTransitionSource | None = None,
+        replay_source: ReplaySource | None = None,
         eval_rollouts: int = 1,
     ) -> None:
         self.engine = engine
         self.train_policy_rollouts = int(train_policy_rollouts)
-        self.replay_source = replay_source if replay_source is not None else weak_replay_source
+        self.replay_source = replay_source
         self.eval_rollouts_count = int(eval_rollouts)
 
         if self.train_policy_rollouts < 0:
@@ -57,6 +57,7 @@ class RolloutRunner:
         policy: ForwardPolicy,
         context: GraphContext,
         target_context: TargetContext,
+        replay_context: ReplayContext,
         features: FeatureBank,
         budget: int,
     ) -> TrainRolloutBatch:
@@ -71,14 +72,15 @@ class RolloutRunner:
         replay_transitions = None
         replay_stats = None
         if self.replay_source is not None:
+            replay_initial_state = _policy_prefix_states(
+                trajectories=trajectories,
+                graph_context=context,
+            )
             replay = self.replay_source.collect(
                 graph_context=context,
                 target_context=target_context,
-                initial_state=initial_replay_state_batch(
-                    graph_context=context,
-                    target_context=target_context,
-                    budget=budget,
-                ),
+                replay_context=replay_context,
+                initial_state=replay_initial_state,
             )
             replay_transitions = replay.nonterminal
             replay_stats = replay.stats
@@ -146,6 +148,60 @@ class RolloutRunner:
             graph_ids=graph_ids,
             budget=budget,
         )
+
+
+def _policy_prefix_states(
+    *,
+    trajectories: TrajectoryBatch,
+    graph_context: GraphContext,
+) -> StateBatch:
+    if int(trajectories.num_trajectories) == 0:
+        return StateBatch.initial(
+            graph_ids=torch.empty(0, dtype=torch.long, device=graph_context.device),
+            budget=int(trajectories.budget),
+            graph_context=graph_context,
+        )
+    budget = int(trajectories.budget)
+
+    counts = trajectories.edge_count.to(dtype=torch.long)
+    prefix_total = int(counts.sum().item())
+    if prefix_total == 0:
+        return StateBatch.initial(
+            graph_ids=torch.empty(0, dtype=torch.long, device=graph_context.device),
+            budget=budget,
+            graph_context=graph_context,
+        )
+    row_ids = torch.repeat_interleave(
+        torch.arange(int(trajectories.num_trajectories), device=trajectories.device, dtype=torch.long),
+        counts,
+        output_size=prefix_total,
+    )
+    prefix_lens = torch.cat(
+        [
+            torch.arange(int(count.item()), device=trajectories.device, dtype=torch.long)
+            for count in counts
+            if int(count.item()) > 0
+        ],
+        dim=0,
+    )
+    prefix_edge_ids = torch.full(
+        (prefix_total, budget),
+        -1,
+        dtype=torch.long,
+        device=trajectories.device,
+    )
+    for slot in range(budget):
+        mask = prefix_lens.gt(slot)
+        if not bool(mask.any()):
+            continue
+        prefix_edge_ids[mask, slot] = trajectories.edge_ids.index_select(0, row_ids[mask])[:, slot]
+    return StateBatch.from_selected_edges(
+        graph_ids=trajectories.graph_ids.index_select(0, row_ids),
+        edge_ids=prefix_edge_ids,
+        edge_count=prefix_lens,
+        budget=budget,
+        graph_context=graph_context,
+    )
 
 def _train_rollout_metrics(
     *,
@@ -231,6 +287,7 @@ def concat_trajectory_batches(
 __all__ = [
     "TrainRolloutBatch",
     "RolloutRunner",
+    "_policy_prefix_states",
     "concat_trajectory_batches",
     "repeated_graph_ids",
 ]
