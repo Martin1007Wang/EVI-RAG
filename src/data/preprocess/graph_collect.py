@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import torch
 from src.graph.ops import build_local_graph
-from src.graph.oracle_replay import build_replay_program
+from src.graph.oracle_replay import build_replay_bank
 from src.graph.paths import compute_path_labels
 from .samples import PreparedSample, RawSample, SplitFilter
 from .catalog import CatalogBuilder
@@ -38,6 +38,7 @@ def prepare_sample(
     dedup_edges: bool = True,
     remove_self_loops: bool = True,
     validate_alignment: bool = True,
+    replay_bank_config: dict[str, int] | None = None,
     stats: GraphCollectStats | None = None,
 ) -> PreparedSample | None:
     stats = stats or GraphCollectStats()
@@ -96,11 +97,15 @@ def prepare_sample(
     ):
         stats.no_reachable_answer += 1
         return None
-    replay_program = build_replay_program(
+    if replay_bank_config is None:
+        raise ValueError("replay_bank_config is required.")
+    replay_bank = build_replay_bank(
         edge_index=edge_index,
         anchor_node_ids=anchor_node_ids,
         reachable_target_node_ids=path_labels.reachable_target_node_ids,
         num_nodes=num_nodes,
+        sample_id=f"{sample.dataset}/{sample.split}/{sample.question_id}",
+        **replay_bank_config,
     )
     node_entity_catalog_ids, edge_relation_catalog_ids = _build_graph_catalog_ids(
         graph_edges=graph_edges,
@@ -124,13 +129,8 @@ def prepare_sample(
         node_entity_catalog_ids=node_entity_catalog_ids,
         edge_relation_catalog_ids=edge_relation_catalog_ids,
         node_target_distance=path_labels.node_target_distance,
-        replay_candidate_edge_ids=replay_program.candidate_edge_ids,
-        replay_candidate_ptr=replay_program.candidate_ptr,
-        replay_candidate_target_positions=replay_program.candidate_target_positions,
-        replay_candidate_target_ptr=replay_program.candidate_target_ptr,
-        replay_edge_to_candidate_ids=replay_program.edge_to_candidate_ids,
-        replay_edge_to_candidate_ptr=replay_program.edge_to_candidate_ptr,
-        replay_path_truncated=torch.as_tensor(int(replay_program.path_truncated), dtype=torch.long),
+        replay_bank_edge_ids=replay_bank.edge_ids,
+        replay_bank_edge_count=replay_bank.edge_count,
     )
 
 

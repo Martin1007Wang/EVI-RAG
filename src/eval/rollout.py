@@ -20,7 +20,7 @@ from src.weaver.rollout.trajectory import (
     SRC_POLICY,
     TrajectoryBatch,
 )
-from src.weaver.state import StateBatch, canonicalize_state_batch
+from src.weaver.state import StateBatch
 
 Tensor = torch.Tensor
 
@@ -189,14 +189,12 @@ def terminal_state_from_trajectories(
     terminal selected-edge representation.
     """
 
-    return canonicalize_state_batch(
-        StateBatch.from_selected_edges(
-            graph_ids=trajectories.graph_ids,
-            edge_ids=trajectories.edge_ids,
-            edge_count=trajectories.edge_count,
-            budget=int(trajectories.budget),
-            graph_context=graph_context,
-        )
+    return StateBatch.from_selected_edges(
+        graph_ids=trajectories.graph_ids,
+        edge_ids=trajectories.edge_ids,
+        edge_count=trajectories.edge_count,
+        budget=int(trajectories.budget),
+        graph_context=graph_context,
     )
 
 
@@ -608,6 +606,9 @@ def terminal_matrices(
     - policy_stop: trajectory ended because policy sampled STOP;
     - no_frontier_stop: trajectory ended because no legal expansion existed;
     - budget_boundary: trajectory ended because expansion budget was exhausted.
+
+    All three cases are terminal trajectories. The split is retained for
+    diagnostics only.
 
     If policy_only=True, policy_stop only counts trajectories whose source is
     SRC_POLICY. Use this when trajectories may mix policy/replay/oracle rows.

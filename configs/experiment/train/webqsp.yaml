@@ -11,12 +11,18 @@ defaults:
 task_name: train_webqsp
 
 logger:
-  tags: [weaver, edge_flow_matching, webqsp]
+  tags: [weaver, detailed_balance, webqsp]
 
 trainer:
-  max_steps: 20000
+  max_epochs: 10000
+  max_steps: -1
   val_check_interval: null
   check_val_every_n_epoch: 1
+
+model:
+  runner:
+    replay_source:
+      anneal_steps: 20000
 
 callbacks:
   early_stopping:

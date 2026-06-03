@@ -30,17 +30,17 @@ except ModuleNotFoundError:
         values = src.new_full((size,), -torch.inf)
         if src.numel() > 0:
             values.scatter_reduce_(0, index, src, reduce="amax", include_self=True)
-        positions = torch.full((size,), -1, dtype=torch.long, device=src.device)
+        positions = torch.full((size,), src.numel(), dtype=torch.long, device=src.device)
         if src.numel() > 0:
             pos = torch.arange(src.numel(), dtype=torch.long, device=src.device)
             is_max = src.eq(values.index_select(0, index))
             candidates = torch.where(is_max, pos, torch.full_like(pos, src.numel()))
             positions.scatter_reduce_(0, index, candidates, reduce="amin", include_self=True)
-            positions = torch.where(
-                positions.eq(src.numel()),
-                torch.full_like(positions, -1),
-                positions,
-            )
+        positions = torch.where(
+            positions.eq(src.numel()),
+            torch.full_like(positions, -1),
+            positions,
+        )
         return values, positions
 
 

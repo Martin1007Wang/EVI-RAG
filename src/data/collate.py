@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from .schema.batch import ReplayProgramBatch, ReplayProgramSample, RetrievalBatch
+from .schema.batch import ReplayBankBatch, ReplayBankSample, RetrievalBatch
 from .schema.fields import SampleFields
 
 _DEFAULT_FOLLOW_BATCH = (
@@ -13,14 +13,9 @@ _DEFAULT_FOLLOW_BATCH = (
 )
 
 _REPLAY_EXCLUDE_KEYS = (
-    SampleFields.REPLAY_CANDIDATE_EDGE_IDS,
-    SampleFields.REPLAY_CANDIDATE_PTR,
-    SampleFields.REPLAY_CANDIDATE_TARGET_POSITIONS,
-    SampleFields.REPLAY_CANDIDATE_TARGET_PTR,
-    SampleFields.REPLAY_EDGE_TO_CANDIDATE_IDS,
-    SampleFields.REPLAY_EDGE_TO_CANDIDATE_PTR,
-    SampleFields.REPLAY_PATH_TRUNCATED,
-    "replay_program",
+    SampleFields.REPLAY_BANK_EDGE_IDS,
+    SampleFields.REPLAY_BANK_EDGE_COUNT,
+    "replay_bank",
 )
 
 
@@ -35,7 +30,7 @@ class RetrievalCollator:
 
     Non-responsibilities:
     - no schema fallback
-    - no legacy field handling
+    - no deprecated field handling
     - no mask construction
     - no path recomputation
     """
@@ -62,7 +57,7 @@ class RetrievalCollator:
         batch.sample_id = [str(sample.sample_id) for sample in samples]
         batch.question_emb = stack_question_embeddings(samples)
         batch.edge_batch = edge_batch_from_node_batch(batch)
-        batch.replay_program = build_replay_program_batch(
+        batch.replay_bank = build_replay_bank_batch(
             samples=samples,
             batch=batch,
         )
@@ -134,89 +129,38 @@ def edge_batch_from_node_batch(batch: RetrievalBatch) -> torch.Tensor:
     return src_graph.contiguous()
 
 
-def build_replay_program_batch(
+def build_replay_bank_batch(
     *,
     samples: Sequence[Any],
     batch: RetrievalBatch,
-) -> ReplayProgramBatch:
+) -> ReplayBankBatch:
     device = batch.edge_index.device
-    sample_programs = [_sample_replay_program(sample) for sample in samples]
-
-    candidate_edge_chunks: list[torch.Tensor] = []
-    candidate_ptr_parts = [0]
-    candidate_target_position_chunks: list[torch.Tensor] = []
-    candidate_target_ptr_parts = [0]
-    edge_to_candidate_id_chunks: list[torch.Tensor] = []
-    edge_to_candidate_ptr_parts = [0]
-    candidate_graph_ptr_parts = [0]
-    path_truncated_values: list[int] = []
-
+    sample_banks = [_sample_replay_bank(sample) for sample in samples]
+    edge_chunks: list[torch.Tensor] = []
+    count_chunks: list[torch.Tensor] = []
     edge_offset = 0
-    candidate_offset = 0
-    total_candidate_edges = 0
-    total_candidate_targets = 0
-    total_edge_candidate_refs = 0
-    total_candidates = 0
-
-    for graph_id, (sample, program) in enumerate(zip(samples, sample_programs, strict=True)):
+    shape = sample_banks[0].edge_ids_local.shape
+    count_shape = sample_banks[0].edge_count.shape
+    for sample, bank in zip(samples, sample_banks, strict=True):
         num_edges = int(sample.num_edges)
-        local_candidate_count = int(program.candidate_ptr.numel()) - 1
-
-        if int(program.candidate_edge_ids_local.numel()) > 0:
-            candidate_edge_chunks.append(
-                program.candidate_edge_ids_local.to(device=device, dtype=torch.long) + int(edge_offset)
-            )
-        if int(program.candidate_target_positions.numel()) > 0:
-            candidate_target_position_chunks.append(
-                program.candidate_target_positions.to(device=device, dtype=torch.long)
-            )
-        if int(program.edge_to_candidate_ids_local.numel()) > 0:
-            edge_to_candidate_id_chunks.append(
-                program.edge_to_candidate_ids_local.to(device=device, dtype=torch.long) + int(candidate_offset)
-            )
-
-        candidate_ptr_parts.extend(
-            int(total_candidate_edges) + int(value)
-            for value in program.candidate_ptr.to(dtype=torch.long).tolist()[1:]
-        )
-        candidate_target_ptr_parts.extend(
-            int(total_candidate_targets) + int(value)
-            for value in program.candidate_target_ptr.to(dtype=torch.long).tolist()[1:]
-        )
-        edge_to_candidate_ptr_parts.extend(
-            int(total_edge_candidate_refs) + int(value)
-            for value in program.edge_to_candidate_ptr.to(dtype=torch.long).tolist()[1:]
-        )
-        candidate_graph_ptr_parts.append(int(candidate_offset) + int(local_candidate_count))
-        path_truncated_values.append(int(program.path_truncated.item()))
-
-        total_candidate_edges += int(program.candidate_edge_ids_local.numel())
-        total_candidate_targets += int(program.candidate_target_positions.numel())
-        total_edge_candidate_refs += int(program.edge_to_candidate_ids_local.numel())
-        total_candidates += int(local_candidate_count)
+        if bank.edge_ids_local.shape != shape or bank.edge_count.shape != count_shape:
+            raise ValueError("All replay banks in a batch must have the same shape.")
+        local_edge_ids = bank.edge_ids_local.to(device=device, dtype=torch.long)
+        valid_local_edge_ids = local_edge_ids[local_edge_ids.ge(0)]
+        if bool(valid_local_edge_ids.ge(num_edges).any()):
+            raise ValueError("replay bank contains an edge id outside the sample-local edge range.")
+        edge_chunks.append(torch.where(local_edge_ids.ge(0), local_edge_ids + edge_offset, local_edge_ids))
+        count_chunks.append(bank.edge_count.to(device=device, dtype=torch.long))
         edge_offset += int(num_edges)
-        candidate_offset += int(local_candidate_count)
 
-    return ReplayProgramBatch(
-        candidate_edge_ids=_cat_or_empty(candidate_edge_chunks, device=device),
-        candidate_ptr=torch.tensor(candidate_ptr_parts, dtype=torch.long, device=device).contiguous(),
-        candidate_target_positions=_cat_or_empty(candidate_target_position_chunks, device=device),
-        candidate_target_ptr=torch.tensor(candidate_target_ptr_parts, dtype=torch.long, device=device).contiguous(),
-        edge_to_candidate_ids=_cat_or_empty(edge_to_candidate_id_chunks, device=device),
-        edge_to_candidate_ptr=torch.tensor(edge_to_candidate_ptr_parts, dtype=torch.long, device=device).contiguous(),
-        candidate_graph_ptr=torch.tensor(candidate_graph_ptr_parts, dtype=torch.long, device=device).contiguous(),
-        path_truncated_by_graph=torch.tensor(path_truncated_values, dtype=torch.long, device=device).contiguous(),
+    return ReplayBankBatch(
+        edge_ids=torch.stack(edge_chunks, dim=0).contiguous(),
+        edge_count=torch.stack(count_chunks, dim=0).contiguous(),
     )
 
 
-def _sample_replay_program(sample: Any) -> ReplayProgramSample:
-    program = getattr(sample, "replay_program", None)
-    if not isinstance(program, ReplayProgramSample):
-        raise TypeError("sample.replay_program must be a ReplayProgramSample.")
-    return program
-
-
-def _cat_or_empty(chunks: Sequence[torch.Tensor], *, device: torch.device) -> torch.Tensor:
-    if not chunks:
-        return torch.empty(0, dtype=torch.long, device=device)
-    return torch.cat(tuple(chunk.contiguous() for chunk in chunks), dim=0).contiguous()
+def _sample_replay_bank(sample: Any) -> ReplayBankSample:
+    bank = getattr(sample, "replay_bank", None)
+    if not isinstance(bank, ReplayBankSample):
+        raise TypeError("sample.replay_bank must be a ReplayBankSample.")
+    return bank

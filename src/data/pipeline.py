@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,7 @@ from omegaconf import DictConfig
 from .preprocess.catalog import CatalogBuilder, EntityTextPolicy
 from .preprocess.graph_collect import GraphCollectStats, prepare_sample
 from .preprocess.materialize import Materializer
+from .preprocess.relation_neighborhood import build_relation_neighborhood_semantic_table
 from .preprocess.samples import SplitFilter
 from .preprocess.source import iter_samples
 from .preprocess.text_encode import TextEncoder, encode_text_table, text_encoder_provenance
@@ -53,6 +54,13 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
         str(k): str(v) for k, v in _mapping(dataset_cfg.get("column_map", {}), "dataset.column_map").items()
     }
     encoder_cfg = _mapping(preprocess_cfg.get("encoder"), "preprocess.encoder")
+    replay_bank_config = {
+        str(key): int(value)
+        for key, value in _mapping(
+            preprocess_cfg.get("replay_bank"),
+            "preprocess.replay_bank",
+        ).items()
+    }
     sample_iter_factory = lambda: iter_samples(
         dataset=dataset_name,
         split_mapping=source_splits,
@@ -69,6 +77,7 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
         dedup_edges=bool(preprocess_cfg.get("dedup_edges", True)),
         remove_self_loops=bool(preprocess_cfg.get("remove_self_loops", True)),
         validate_graph_alignment=bool(preprocess_cfg.get("validate_graph_alignment", False)),
+        replay_bank_config=replay_bank_config,
     )
     if scan.stats.kept <= 0:
         raise RuntimeError("No valid samples after graph collection.")
@@ -123,6 +132,17 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
         tokenizer_revision=encoder_provenance["tokenizer_revision"],
         max_length=encoder_provenance["max_length"],
     )
+    entity_relation_neighborhood_semantic_table, relation_neighborhood_row_by_entity_id = (
+        build_relation_neighborhood_semantic_table(
+            prepared_samples=scan.prepared_samples,
+            catalog=catalog,
+            relation_semantic_table=relation_semantic_table,
+        )
+    )
+    catalog = replace(
+        catalog,
+        relation_neighborhood_row_by_entity_id=relation_neighborhood_row_by_entity_id,
+    )
 
     prepared_samples = scan.prepared_samples
     split_counts = dict(scan.split_counts)
@@ -134,6 +154,7 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
         question_dim=question_dim,
         catalog=catalog,
         entity_text_semantic_table=entity_text_semantic_table,
+        entity_relation_neighborhood_semantic_table=entity_relation_neighborhood_semantic_table,
         relation_semantic_table=relation_semantic_table,
         metadata_dir=paths.metadata_dir,
         overwrite=bool(preprocess_cfg.get("overwrite_lmdb", False)),
@@ -156,12 +177,20 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
                 "stream_chunk_size": chunk_size,
                 "map_size_gb": float(preprocess_cfg.get("map_size_gb", 128.0)),
                 "commit_frequency": int(preprocess_cfg.get("commit_frequency", 1000)),
-                "replay_program": {
-                    "kind": "replay_program_v3",
-                    "path_policy": "deterministic_shortest_k",
-                    "max_paths_per_target": 64,
+                "replay": {
+                    "kind": "replay_bank_v1",
+                    "scope": "all_reachable_anchor_answer_pairs",
+                    "path_scope": "exact_shortest",
+                    "slack": 0,
+                    **replay_bank_config,
                 },
                 "entity_typing": {"non_text_prefixes": list(entity_text_policy.non_text_prefixes)},
+                "relation_neighborhood": {
+                    "kind": "incident_relation_set_mean_l2_v1",
+                    "scope": "all_retained_graphs",
+                    "direction": "merged",
+                    "deduplication": "relation_type_per_entity",
+                },
             },
             "encoder": dict(encoder_provenance),
         },
@@ -213,6 +242,7 @@ def _scan_samples(
     dedup_edges: bool,
     remove_self_loops: bool,
     validate_graph_alignment: bool,
+    replay_bank_config: dict[str, int],
 ) -> _ScannedSamples:
     catalog = CatalogBuilder()
     prepared_samples: list[Any] = []
@@ -226,6 +256,7 @@ def _scan_samples(
             dedup_edges=dedup_edges,
             remove_self_loops=remove_self_loops,
             validate_alignment=validate_graph_alignment,
+            replay_bank_config=replay_bank_config,
             stats=stats,
         )
         if prepared is None:

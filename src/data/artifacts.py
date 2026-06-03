@@ -27,6 +27,7 @@ class MaterializationArtifact:
     materialization_dir: Path
     catalog: Path
     entity_text_semantic_table: TensorTable
+    entity_relation_neighborhood_semantic_table: TensorTable
     relation_semantic_table: TensorTable
     question_texts: Path | None
     splits: dict[str, SplitArtifacts]
@@ -82,6 +83,11 @@ def parse_materialization_artifact(
 
     catalogs_payload = mapping(payload, "catalogs", path)
     embeddings_payload = mapping(payload, "embeddings", path)
+    if "entity_relation_neighborhood_semantic_table" not in embeddings_payload:
+        raise ValueError(
+            "Materialization is missing entity_relation_neighborhood_semantic_table. "
+            "Re-run preprocessing to rebuild MID relation-neighborhood features."
+        )
     debug_payload = mapping(payload, "debug", path) if "debug" in payload else {}
     splits_payload = mapping(payload, "splits", path)
 
@@ -128,6 +134,14 @@ def parse_materialization_artifact(
             entry=mapping(embeddings_payload, "entity_text_semantic_table", path),
             metadata_dir=root,
         ),
+        entity_relation_neighborhood_semantic_table=tensor_table_from_manifest(
+            entry=mapping(
+                embeddings_payload,
+                "entity_relation_neighborhood_semantic_table",
+                path,
+            ),
+            metadata_dir=root,
+        ),
         relation_semantic_table=tensor_table_from_manifest(
             entry=mapping(embeddings_payload, "relation_semantic_table", path),
             metadata_dir=root,
@@ -160,6 +174,10 @@ def canonicalize_materialization_manifest_payload(
             "entity_text_semantic_table": _tensor_table_entry_for_manifest(
                 root=manifest.materialization_dir,
                 table=manifest.entity_text_semantic_table,
+            ),
+            "entity_relation_neighborhood_semantic_table": _tensor_table_entry_for_manifest(
+                root=manifest.materialization_dir,
+                table=manifest.entity_relation_neighborhood_semantic_table,
             ),
             "relation_semantic_table": _tensor_table_entry_for_manifest(
                 root=manifest.materialization_dir,

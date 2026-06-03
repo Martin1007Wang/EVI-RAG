@@ -21,6 +21,15 @@ progress_bar: true
 stream_chunk_size: 4096
 commit_frequency: 1000
 
+replay_bank:
+  max_budget: 8
+  round_variants: 8
+  trajectories_per_graph: 4
+  beam_width: 32
+  path_variants_per_pair: 2
+  max_expansions_per_state: 32
+  seed: 42
+
 encoder:
   model_name: BAAI/bge-large-en-v1.5
   revision: d4aa6901d3a41ba39fb536a557fa166f842b0e09

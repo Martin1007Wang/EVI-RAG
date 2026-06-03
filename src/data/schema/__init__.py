@@ -1,9 +1,9 @@
-from .batch import ReplayProgramBatch, ReplayProgramSample, RetrievalBatch, RetrievalData, validate_retrieval_batch
+from .batch import ReplayBankBatch, ReplayBankSample, RetrievalBatch, RetrievalData, validate_retrieval_batch
 from .fields import SampleFields
 
 __all__ = [
-    "ReplayProgramBatch",
-    "ReplayProgramSample",
+    "ReplayBankBatch",
+    "ReplayBankSample",
     "RetrievalBatch",
     "RetrievalData",
     "SampleFields",

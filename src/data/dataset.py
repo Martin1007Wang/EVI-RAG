@@ -13,7 +13,7 @@ from src.data.tensor_table import read_table
 from src.utils.lmdb_utils import deserialize_sample
 
 from .artifacts import MaterializationArtifact
-from .schema.batch import ReplayProgramSample, RetrievalData
+from .schema.batch import ReplayBankSample, RetrievalData
 from .schema.fields import SampleFields
 
 
@@ -91,7 +91,7 @@ class RetrievalDataset(Dataset):
         self.max_readers = int(max_readers)
         if self.max_readers <= 0:
             raise ValueError("max_readers must be positive")
-        _require_replay_program_materialization(self.materialization)
+        _require_replay_materialization(self.materialization)
 
         paths = self.materialization.require_split(self.split)
         self.lmdb_path = paths.lmdb
@@ -187,7 +187,7 @@ def _build_retrieval_data(
         dtype=torch.long,
     )
 
-    replay_program = _replay_program_fields(
+    replay_bank = _replay_bank_fields(
         raw=raw,
         sample_id=sample_id,
     )
@@ -203,7 +203,7 @@ def _build_retrieval_data(
         target_node_ids=target_node_ids,
         reachable_target_node_ids=reachable_target_node_ids,
         node_target_distance=node_target_distance,
-        replay_program=replay_program,
+        replay_bank=replay_bank,
     )
 
 
@@ -243,91 +243,48 @@ def _optional_tensor(
     return _tensor(value, dtype=dtype)
 
 
-def _replay_program_fields(
+def _replay_bank_fields(
     *,
     raw: Mapping[str, Any],
     sample_id: str,
-) -> ReplayProgramSample:
-    edge_ids = raw.get(SampleFields.REPLAY_CANDIDATE_EDGE_IDS)
-    candidate_ptr = raw.get(SampleFields.REPLAY_CANDIDATE_PTR)
-    candidate_target_positions = raw.get(SampleFields.REPLAY_CANDIDATE_TARGET_POSITIONS)
-    candidate_target_ptr = raw.get(SampleFields.REPLAY_CANDIDATE_TARGET_PTR)
-    edge_to_candidate_ids = raw.get(SampleFields.REPLAY_EDGE_TO_CANDIDATE_IDS)
-    edge_to_candidate_ptr = raw.get(SampleFields.REPLAY_EDGE_TO_CANDIDATE_PTR)
-    path_truncated = raw.get(SampleFields.REPLAY_PATH_TRUNCATED)
-    if (
-        edge_ids is None
-        or candidate_ptr is None
-        or candidate_target_positions is None
-        or candidate_target_ptr is None
-        or edge_to_candidate_ids is None
-        or edge_to_candidate_ptr is None
-        or path_truncated is None
-    ):
-        raise KeyError(f"{sample_id}: missing replay program")
-    edge_tensor = _tensor(edge_ids, dtype=torch.long).view(-1)
-    candidate_ptr_tensor = _tensor(candidate_ptr, dtype=torch.long).view(-1)
-    candidate_target_positions_tensor = _tensor(candidate_target_positions, dtype=torch.long).view(-1)
-    candidate_target_ptr_tensor = _tensor(candidate_target_ptr, dtype=torch.long).view(-1)
-    edge_to_candidate_tensor = _tensor(edge_to_candidate_ids, dtype=torch.long).view(-1)
-    edge_to_candidate_ptr_tensor = _tensor(edge_to_candidate_ptr, dtype=torch.long).view(-1)
-    path_truncated_tensor = _tensor(path_truncated, dtype=torch.long).view(())
-    if int(candidate_ptr_tensor.numel()) == 0:
-        raise ValueError(f"{sample_id}: replay_candidate_ptr must contain at least the zero offset")
-    candidate_count = int(candidate_ptr_tensor.numel()) - 1
-    if int(candidate_target_ptr_tensor.numel()) != int(candidate_ptr_tensor.numel()):
-        raise ValueError(
-            f"{sample_id}: replay candidate fields length mismatch: "
-            f"candidate_ptr={candidate_count}, candidate_target_ptr={max(int(candidate_target_ptr_tensor.numel()) - 1, 0)}"
-        )
-    if int(candidate_ptr_tensor[-1].item()) != int(edge_tensor.numel()):
-        raise ValueError(
-            f"{sample_id}: replay candidate ptr does not terminate at edge list length: "
-            f"ptr_end={int(candidate_ptr_tensor[-1].item())}, edge_ids={int(edge_tensor.numel())}"
-        )
-    if int(candidate_target_ptr_tensor[-1].item()) != int(candidate_target_positions_tensor.numel()):
-        raise ValueError(
-            f"{sample_id}: replay candidate target ptr does not terminate at target position list length: "
-            f"ptr_end={int(candidate_target_ptr_tensor[-1].item())}, target_positions={int(candidate_target_positions_tensor.numel())}"
-        )
-    return ReplayProgramSample(
-        candidate_edge_ids_local=edge_tensor.contiguous(),
-        candidate_ptr=candidate_ptr_tensor.contiguous(),
-        candidate_target_positions=candidate_target_positions_tensor.contiguous(),
-        candidate_target_ptr=candidate_target_ptr_tensor.contiguous(),
-        edge_to_candidate_ids_local=edge_to_candidate_tensor.contiguous(),
-        edge_to_candidate_ptr=edge_to_candidate_ptr_tensor.contiguous(),
-        path_truncated=path_truncated_tensor.contiguous(),
+)-> ReplayBankSample:
+    required = (
+        SampleFields.REPLAY_BANK_EDGE_IDS,
+        SampleFields.REPLAY_BANK_EDGE_COUNT,
+    )
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise KeyError(f"{sample_id}: missing replay bank fields: {missing!r}")
+    return ReplayBankSample(
+        edge_ids_local=_tensor(raw[required[0]], dtype=torch.long),
+        edge_count=_tensor(raw[required[1]], dtype=torch.long),
     )
 
 
-def _require_replay_program_materialization(materialization: MaterializationArtifact) -> None:
+def _require_replay_materialization(materialization: MaterializationArtifact) -> None:
     provenance = materialization.provenance
     if not isinstance(provenance, Mapping):
         raise ValueError(
-            "Materialization is missing provenance for replay program. "
-            "Re-run preprocessing to produce replay_program_v3."
+            "Materialization is missing provenance for replay. Re-run preprocessing to produce replay_bank_v1."
         )
 
     preprocess = provenance.get("preprocess")
     if not isinstance(preprocess, Mapping):
         raise ValueError(
-            "Materialization provenance is missing preprocess metadata for replay program. "
-            "Re-run preprocessing to produce replay_program_v3."
+            "Materialization provenance is missing preprocess metadata for replay. Re-run preprocessing to produce replay_bank_v1."
         )
 
-    replay_program = preprocess.get("replay_program")
-    if not isinstance(replay_program, Mapping):
+    replay = preprocess.get("replay")
+    if not isinstance(replay, Mapping):
         raise ValueError(
-            "Materialization provenance is missing replay_program metadata. "
-            "Re-run preprocessing to produce replay_program_v3."
+            "Materialization provenance is missing replay metadata. Re-run preprocessing to produce replay_bank_v1."
         )
 
-    kind = replay_program.get("kind")
-    if kind not in {"replay_program_v3"}:
+    kind = replay.get("kind")
+    if kind not in {"replay_bank_v1"}:
         raise ValueError(
-            "Materialization replay program is incompatible with current runtime: "
-            f"found {kind!r}, expected 'replay_program_v3'. Re-run preprocessing."
+            "Materialization replay payload is incompatible with current runtime: "
+            f"found {kind!r}, expected 'replay_bank_v1'. Re-run preprocessing."
         )
 
 

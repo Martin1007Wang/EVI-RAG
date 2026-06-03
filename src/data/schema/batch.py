@@ -21,7 +21,7 @@ After collation:
 - anchor_node_ids / target_node_ids / reachable_target_node_ids contain
   batch-physical node ids.
 - node_entity_catalog_ids / edge_relation_catalog_ids remain global catalog ids.
-- replay_program is assembled explicitly by RetrievalCollator and does not rely
+- replay_bank is assembled explicitly by RetrievalCollator and does not rely
   on PyG's implicit batching semantics.
 
 Do not add edge_batch as a required truth source. Infer edge_to_graph from:
@@ -73,26 +73,21 @@ _NO_INCREMENT_KEYS = _GLOBAL_ID_KEYS | _COUNT_KEYS | _FLAT_SUPERVISION_KEYS | _R
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayProgramSample:
-    candidate_edge_ids_local: torch.Tensor
-    candidate_ptr: torch.Tensor
-    candidate_target_positions: torch.Tensor
-    candidate_target_ptr: torch.Tensor
-    edge_to_candidate_ids_local: torch.Tensor
-    edge_to_candidate_ptr: torch.Tensor
-    path_truncated: torch.Tensor
+class ReplayBankSample:
+    edge_ids_local: torch.Tensor
+    edge_count: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayProgramBatch:
-    candidate_edge_ids: torch.Tensor
-    candidate_ptr: torch.Tensor
-    candidate_target_positions: torch.Tensor
-    candidate_target_ptr: torch.Tensor
-    edge_to_candidate_ids: torch.Tensor
-    edge_to_candidate_ptr: torch.Tensor
-    candidate_graph_ptr: torch.Tensor
-    path_truncated_by_graph: torch.Tensor
+class ReplayBankBatch:
+    edge_ids: torch.Tensor
+    edge_count: torch.Tensor
+
+    def to(self, device: torch.device | str, **kwargs: Any) -> "ReplayBankBatch":
+        return ReplayBankBatch(
+            edge_ids=self.edge_ids.to(device=device, **kwargs),
+            edge_count=self.edge_count.to(device=device, **kwargs),
+        )
 
 
 def _num_nodes(data: Any) -> int:
@@ -140,13 +135,13 @@ class RetrievalData(Data):
     - edge_index uses sample-local node ids.
     - anchor_node_ids / target_node_ids / reachable_target_node_ids use
       sample-local node ids.
-    - replay_program uses sample-local replay CSR coordinates.
+    - replay_bank uses sample-local edge ids and fixed bank coordinates.
     Global-id fields:
     - node_entity_catalog_ids
     - edge_relation_catalog_ids
     """
 
-    replay_program: ReplayProgramSample
+    replay_bank: ReplayBankSample
 
     def __inc__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         increment = _retrieval_increment(self, key)
@@ -175,7 +170,7 @@ class RetrievalBatch(Batch):
     - target / reachable target fields
     - node-target shortest-path materialized tensors
 
-    Replay program is attached explicitly as a ReplayProgramBatch.
+    Replay bank is attached explicitly as a ReplayBankBatch.
     """
 
     ptr: torch.Tensor
@@ -193,7 +188,7 @@ class RetrievalBatch(Batch):
 
     node_target_distance: torch.Tensor
 
-    replay_program: ReplayProgramBatch
+    replay_bank: ReplayBankBatch
 
     def __cat_dim__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         return super().__cat_dim__(key, value, *args, **kwargs)  # type: ignore[attr-defined]
@@ -350,8 +345,8 @@ def _validate_node_id_tensor(
 
 
 __all__ = [
-    "ReplayProgramBatch",
-    "ReplayProgramSample",
+    "ReplayBankBatch",
+    "ReplayBankSample",
     "RetrievalData",
     "RetrievalBatch",
     "validate_retrieval_batch",

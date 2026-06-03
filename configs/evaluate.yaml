@@ -11,11 +11,13 @@ defaults:
   - logger: wandb
   - ckpt: default
   - _self_
+  - profiler: null
   - experiment: null
 
 task_name: evaluate
 seed: 42
 print_config: false
+profiler: null
 
 validate: true
 test: true

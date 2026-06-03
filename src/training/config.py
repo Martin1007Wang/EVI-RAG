@@ -30,6 +30,8 @@ _STALE_MATERIALIZED_PATH_KEYS = frozenset(
 class ModelResources:
     entity_text_semantic_table: torch.Tensor
     text_row_by_entity_id: torch.Tensor
+    entity_relation_neighborhood_semantic_table: torch.Tensor
+    relation_neighborhood_row_by_entity_id: torch.Tensor
     relation_semantic_table: torch.Tensor
     debug_lookup: DebugLookup | None = None
 
@@ -451,11 +453,16 @@ def load_model_resources(
     relation_semantic_table = read_table(
         materialization.relation_semantic_table,
     )
+    entity_relation_neighborhood_semantic_table = read_table(
+        materialization.entity_relation_neighborhood_semantic_table,
+    )
     catalog = Catalog.load(materialization.catalog)
 
     return validate_model_resources(
         entity_text_semantic_table=entity_text_semantic_table,
         text_row_by_entity_id=catalog.entity_text_row_by_entity_id.long().contiguous(),
+        entity_relation_neighborhood_semantic_table=entity_relation_neighborhood_semantic_table,
+        relation_neighborhood_row_by_entity_id=catalog.relation_neighborhood_row_by_entity_id.long().contiguous(),
         relation_semantic_table=relation_semantic_table,
         debug_lookup=DebugLookup(
             catalog=catalog,
@@ -484,6 +491,8 @@ def validate_model_resources(
     *,
     entity_text_semantic_table: torch.Tensor,
     text_row_by_entity_id: torch.Tensor,
+    entity_relation_neighborhood_semantic_table: torch.Tensor,
+    relation_neighborhood_row_by_entity_id: torch.Tensor,
     relation_semantic_table: torch.Tensor,
     debug_lookup: DebugLookup | None = None,
 ) -> ModelResources:
@@ -495,12 +504,20 @@ def validate_model_resources(
 
     if relation_semantic_table.ndim != 2:
         raise ValueError("relation_semantic_table must be 2D, " f"got shape={tuple(relation_semantic_table.shape)}.")
+    if entity_relation_neighborhood_semantic_table.ndim != 2:
+        raise ValueError("entity_relation_neighborhood_semantic_table must be 2D, " f"got shape={tuple(entity_relation_neighborhood_semantic_table.shape)}.")
+    if relation_neighborhood_row_by_entity_id.ndim != 1:
+        raise ValueError("relation_neighborhood_row_by_entity_id must be 1D, " f"got shape={tuple(relation_neighborhood_row_by_entity_id.shape)}.")
 
     entity_dim = int(entity_text_semantic_table.size(1))
     relation_dim = int(relation_semantic_table.size(1))
-    if entity_dim != relation_dim:
+    neighborhood_dim = int(entity_relation_neighborhood_semantic_table.size(1))
+    if entity_dim != relation_dim or entity_dim != neighborhood_dim:
         raise ValueError(
-            "Embedding dimension mismatch: " f"entity_text_semantic_table dim={entity_dim}, " f"relation_semantic_table dim={relation_dim}."
+            "Embedding dimension mismatch: "
+            f"entity_text_semantic_table dim={entity_dim}, "
+            f"entity_relation_neighborhood_semantic_table dim={neighborhood_dim}, "
+            f"relation_semantic_table dim={relation_dim}."
         )
 
     _validate_l2_normalized_rows(
@@ -511,24 +528,39 @@ def validate_model_resources(
         relation_semantic_table,
         name="relation_semantic_table",
     )
+    _validate_l2_normalized_rows(
+        entity_relation_neighborhood_semantic_table,
+        name="entity_relation_neighborhood_semantic_table",
+    )
 
-    if text_row_by_entity_id.numel() > 0:
-        min_id = int(text_row_by_entity_id.min().item())
-        max_id = int(text_row_by_entity_id.max().item())
-
-        if min_id < -1:
-            raise ValueError("text_row_by_entity_id must contain -1 or nonnegative text ids, " f"got min={min_id}.")
-
-        if max_id >= int(entity_text_semantic_table.size(0)):
-            raise ValueError(
-                "text_row_by_entity_id contains text ids outside "
-                "entity_text_semantic_table: "
-                f"max={max_id}, table_size={int(entity_text_semantic_table.size(0))}."
-            )
+    _validate_entity_row_map(
+        text_row_by_entity_id,
+        table_rows=int(entity_text_semantic_table.size(0)),
+        name="text_row_by_entity_id",
+    )
+    if relation_neighborhood_row_by_entity_id.numel() != text_row_by_entity_id.numel():
+        raise ValueError(
+            "relation_neighborhood_row_by_entity_id must have the same number of "
+            "entries as text_row_by_entity_id."
+        )
+    _validate_entity_row_map(
+        relation_neighborhood_row_by_entity_id,
+        table_rows=int(entity_relation_neighborhood_semantic_table.size(0)),
+        name="relation_neighborhood_row_by_entity_id",
+    )
+    missing_node_feature = text_row_by_entity_id.lt(0) & relation_neighborhood_row_by_entity_id.lt(0)
+    if bool(missing_node_feature.any()):
+        missing_entity_ids = missing_node_feature.nonzero(as_tuple=True)[0].tolist()
+        raise ValueError(
+            "Every entity must have a text or relation-neighborhood feature; "
+            f"missing catalog entity ids: {missing_entity_ids}."
+        )
 
     return ModelResources(
         entity_text_semantic_table=entity_text_semantic_table.contiguous(),
         text_row_by_entity_id=text_row_by_entity_id.contiguous(),
+        entity_relation_neighborhood_semantic_table=entity_relation_neighborhood_semantic_table.contiguous(),
+        relation_neighborhood_row_by_entity_id=relation_neighborhood_row_by_entity_id.contiguous(),
         relation_semantic_table=relation_semantic_table.contiguous(),
         debug_lookup=debug_lookup,
     )
@@ -626,6 +658,25 @@ def _validate_l2_normalized_rows(
         f"row {row} has norm={norm:.6g}. Rebuild embeddings with "
         "`preprocess_command dataset=<name>`."
     )
+
+
+def _validate_entity_row_map(
+    row_map: torch.Tensor,
+    *,
+    table_rows: int,
+    name: str,
+) -> None:
+    if row_map.numel() == 0:
+        return
+    min_id = int(row_map.min().item())
+    max_id = int(row_map.max().item())
+    if min_id < -1:
+        raise ValueError(f"{name} must contain -1 or nonnegative row ids, got min={min_id}.")
+    if max_id >= int(table_rows):
+        raise ValueError(
+            f"{name} contains row ids outside its semantic table: "
+            f"max={max_id}, table_size={int(table_rows)}."
+        )
 
 
 def positive_int(value: Any, name: str) -> int:

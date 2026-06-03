@@ -12,7 +12,6 @@ class ObjectiveOutput:
     loss: torch.Tensor
     metrics: dict[str, Scalar]
     num_states: int
-    per_unit_loss: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         require_scalar_tensor(self.loss, name="ObjectiveOutput.loss")
@@ -20,8 +19,6 @@ class ObjectiveOutput:
             raise ValueError("ObjectiveOutput.num_states must be nonnegative.")
         for key, value in self.metrics.items():
             validate_scalar(value, name=f"ObjectiveOutput.metrics[{key!r}]")
-        if self.per_unit_loss is not None and self.per_unit_loss.ndim == 0:
-            raise ValueError("ObjectiveOutput.per_unit_loss must be non-scalar or None.")
 
     def require_loss(self) -> torch.Tensor:
         """Return the live loss Tensor for .backward()."""

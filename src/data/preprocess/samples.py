@@ -48,13 +48,8 @@ class PreparedSample:
     edge_relation_catalog_ids: torch.Tensor  # [num_edges], aligned with edge_index columns
 
     node_target_distance: torch.Tensor  # [num_nodes]
-    replay_candidate_edge_ids: torch.Tensor  # [num_candidate_edges]
-    replay_candidate_ptr: torch.Tensor  # [num_candidates + 1]
-    replay_candidate_target_positions: torch.Tensor  # [num_candidate_target_refs]
-    replay_candidate_target_ptr: torch.Tensor  # [num_candidates + 1]
-    replay_edge_to_candidate_ids: torch.Tensor  # [num_edge_candidate_refs]
-    replay_edge_to_candidate_ptr: torch.Tensor  # [num_edges + 1]
-    replay_path_truncated: torch.Tensor  # scalar {0,1}
+    replay_bank_edge_ids: torch.Tensor  # [max_budget + 1, variants, slots, max_budget]
+    replay_bank_edge_count: torch.Tensor  # [max_budget + 1, variants, slots]
 
     def storage_key(self) -> str:
         return f"{self.dataset}/{self.split}/{self.question_id}"
@@ -72,11 +67,6 @@ class PreparedSample:
             SampleFields.TARGET_NODE_IDS: self.target_node_ids.long().contiguous(),
             SampleFields.REACHABLE_TARGET_NODE_IDS: self.reachable_target_node_ids.long().contiguous(),
             SampleFields.NODE_TARGET_DISTANCE: self.node_target_distance.long().contiguous(),
-            SampleFields.REPLAY_CANDIDATE_EDGE_IDS: self.replay_candidate_edge_ids.long().contiguous(),
-            SampleFields.REPLAY_CANDIDATE_PTR: self.replay_candidate_ptr.long().contiguous(),
-            SampleFields.REPLAY_CANDIDATE_TARGET_POSITIONS: self.replay_candidate_target_positions.long().contiguous(),
-            SampleFields.REPLAY_CANDIDATE_TARGET_PTR: self.replay_candidate_target_ptr.long().contiguous(),
-            SampleFields.REPLAY_EDGE_TO_CANDIDATE_IDS: self.replay_edge_to_candidate_ids.long().contiguous(),
-            SampleFields.REPLAY_EDGE_TO_CANDIDATE_PTR: self.replay_edge_to_candidate_ptr.long().contiguous(),
-            SampleFields.REPLAY_PATH_TRUNCATED: self.replay_path_truncated.long().contiguous(),
+            SampleFields.REPLAY_BANK_EDGE_IDS: self.replay_bank_edge_ids.long().contiguous(),
+            SampleFields.REPLAY_BANK_EDGE_COUNT: self.replay_bank_edge_count.long().contiguous(),
         }

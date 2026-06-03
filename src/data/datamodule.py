@@ -23,7 +23,7 @@ class RetrievalDataModule(LightningDataModule):
     - no runtime sample filtering;
     - no sample deserialization logic;
     - no graph/path recomputation;
-    - no broad legacy schema handling.
+    - no broad deprecated schema handling.
     """
 
     def __init__(

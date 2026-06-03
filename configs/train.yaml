@@ -7,17 +7,18 @@ defaults:
   - datamodule: default
   - model: weaver
   - trainer: gpu
-  - /profiler: null
   - callbacks: train
   - logger: wandb
   - ckpt: default
   - _self_
+  - profiler: null
   - experiment: null
 
 task_name: train
 seed: 42
 print_config: false
 test_after_fit: false
+profiler: null
 
 fit_ckpt_path: ${ckpt.fit}
 pretrained_ckpt_path: ${ckpt.pretrained}

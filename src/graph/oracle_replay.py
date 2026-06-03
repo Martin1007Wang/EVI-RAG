@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import deque
 from dataclasses import dataclass
+import hashlib
 
 import torch
 
@@ -11,334 +12,331 @@ Tensor = torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayProgram:
-    candidate_edge_ids: Tensor
-    candidate_ptr: Tensor
-    candidate_target_positions: Tensor
-    candidate_target_ptr: Tensor
-    edge_to_candidate_ids: Tensor
-    edge_to_candidate_ptr: Tensor
-    path_truncated: bool = False
+class ShortestPathDag:
+    pair_anchor_node_ids: Tensor
+    pair_target_node_ids: Tensor
+    pair_distance: Tensor
+    pair_edge_ids: Tensor
+    pair_edge_depth: Tensor
+    pair_edge_ptr: Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class PathCandidate:
-    edge_ids: tuple[int, ...]
-    edge_bits: int
-    covered_target_bits: int
+class ReplayBank:
+    edge_ids: Tensor
+    edge_count: Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class OracleTerminalSet:
-    edge_masks: tuple[int, ...]
-    covered_count: int
-    used_edges: int
+class _Candidate:
+    edges: frozenset[int]
+    targets: frozenset[int]
+    pairs: frozenset[int]
 
 
-def build_replay_program(
+@dataclass(frozen=True, slots=True)
+class _CandidatePath:
+    edges: frozenset[int]
+    targets: frozenset[int]
+
+
+def build_shortest_path_dag(
     *,
     edge_index: Tensor,
     anchor_node_ids: Tensor,
     reachable_target_node_ids: Tensor,
     num_nodes: int,
-    max_paths_per_target: int = 64,
-) -> ReplayProgram:
-    targets = [int(x) for x in reachable_target_node_ids.view(-1).tolist()]
-    anchors = [int(x) for x in anchor_node_ids.view(-1).tolist()]
-    if not targets or not anchors or int(num_nodes) <= 0:
-        return ReplayProgram(
-            candidate_edge_ids=torch.empty(0, dtype=torch.long),
-            candidate_ptr=torch.zeros(1, dtype=torch.long),
-            candidate_target_positions=torch.empty(0, dtype=torch.long),
-            candidate_target_ptr=torch.zeros(1, dtype=torch.long),
-            edge_to_candidate_ids=torch.empty(0, dtype=torch.long),
-            edge_to_candidate_ptr=torch.zeros(int(edge_index.size(1)) + 1, dtype=torch.long),
-            path_truncated=False,
-        )
+) -> ShortestPathDag:
+    edge_index = edge_index.to(dtype=torch.long, device="cpu").contiguous()
+    anchors = _unique_valid(anchor_node_ids, num_nodes=num_nodes)
+    targets = _unique_valid(reachable_target_node_ids, num_nodes=num_nodes)
+    outgoing = _adjacency(edge_index=edge_index, num_nodes=num_nodes, reverse=False)
+    incoming = _adjacency(edge_index=edge_index, num_nodes=num_nodes, reverse=True)
 
-    distances = torch.tensor(
-        [_bfs_reverse(edge_index=edge_index, start=target, num_nodes=int(num_nodes)) for target in targets],
+    pair_anchors: list[int] = []
+    pair_targets: list[int] = []
+    pair_distances: list[int] = []
+    flat_edge_ids: list[int] = []
+    flat_edge_depths: list[int] = []
+    edge_ptr = [0]
+
+    forward_by_anchor = {anchor: _bfs(outgoing, anchor) for anchor in anchors}
+    backward_by_target = {target: _bfs(incoming, target) for target in targets}
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+    for anchor in anchors:
+        forward = forward_by_anchor[anchor]
+        for target in targets:
+            distance = int(forward[target])
+            if distance == unreachable_distance:
+                continue
+            backward = backward_by_target[target]
+            dag_edges = [
+                (int(forward[u]), edge_id)
+                for edge_id, (u, v) in enumerate(zip(src, dst, strict=True))
+                if int(forward[u]) != unreachable_distance
+                and int(backward[v]) != unreachable_distance
+                and int(forward[u]) + 1 + int(backward[v]) == distance
+            ]
+            dag_edges.sort()
+            pair_anchors.append(anchor)
+            pair_targets.append(target)
+            pair_distances.append(distance)
+            flat_edge_depths.extend(depth for depth, _ in dag_edges)
+            flat_edge_ids.extend(edge_id for _, edge_id in dag_edges)
+            edge_ptr.append(len(flat_edge_ids))
+
+    return ShortestPathDag(
+        pair_anchor_node_ids=_long(pair_anchors),
+        pair_target_node_ids=_long(pair_targets),
+        pair_distance=_long(pair_distances),
+        pair_edge_ids=_long(flat_edge_ids),
+        pair_edge_depth=_long(flat_edge_depths),
+        pair_edge_ptr=_long(edge_ptr),
+    )
+
+
+def build_replay_bank(
+    *,
+    edge_index: Tensor,
+    anchor_node_ids: Tensor,
+    reachable_target_node_ids: Tensor,
+    num_nodes: int,
+    sample_id: str,
+    max_budget: int,
+    round_variants: int,
+    trajectories_per_graph: int,
+    beam_width: int,
+    path_variants_per_pair: int,
+    max_expansions_per_state: int,
+    seed: int,
+) -> ReplayBank:
+    max_budget = int(max_budget)
+    round_variants = int(round_variants)
+    trajectories_per_graph = int(trajectories_per_graph)
+    for name, value in (
+        ("max_budget", max_budget),
+        ("round_variants", round_variants),
+        ("trajectories_per_graph", trajectories_per_graph),
+        ("beam_width", beam_width),
+        ("path_variants_per_pair", path_variants_per_pair),
+        ("max_expansions_per_state", max_expansions_per_state),
+    ):
+        if int(value) <= 0 and name != "max_budget":
+            raise ValueError(f"{name} must be positive.")
+        if name == "max_budget" and int(value) < 0:
+            raise ValueError("max_budget must be nonnegative.")
+
+    edge_index = edge_index.to(dtype=torch.long, device="cpu").contiguous()
+    anchors = set(_unique_valid(anchor_node_ids, num_nodes=num_nodes))
+    targets = set(_unique_valid(reachable_target_node_ids, num_nodes=num_nodes))
+    dag = build_shortest_path_dag(
+        edge_index=edge_index,
+        anchor_node_ids=anchor_node_ids,
+        reachable_target_node_ids=reachable_target_node_ids,
+        num_nodes=num_nodes,
+    )
+    edge_ids = torch.full(
+        (max_budget + 1, round_variants, trajectories_per_graph, max_budget),
+        -1,
         dtype=torch.long,
     )
-    outgoing = outgoing_edges_by_src(edge_index=edge_index, num_nodes=int(num_nodes))
-    target_pos_by_node = {node: pos for pos, node in enumerate(targets)}
-
-    candidate_edges: list[tuple[int, ...]] = []
-    candidate_target_positions: list[tuple[int, ...]] = []
-    truncated = False
-    seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
-
-    for target_pos in range(len(targets)):
-        target_candidates = 0
-        anchor_order = sorted(
-            (
-                int(distances[target_pos, anchor].item()),
-                int(anchor),
-            )
-            for anchor in anchors
-            if 0 <= int(anchor) < int(num_nodes)
-            and int(distances[target_pos, anchor].item()) != unreachable_distance
-        )
-        for distance, anchor in anchor_order:
-            if distance == 0:
-                continue
-            remaining = int(max_paths_per_target) - int(target_candidates)
-            if remaining <= 0:
-                truncated = True
-                break
-            paths, hit_limit = enumerate_shortest_paths(
-                outgoing=outgoing,
-                distances=distances[target_pos],
-                anchor=int(anchor),
-                limit=int(remaining),
-            )
-            truncated = truncated or hit_limit
-            target_candidates += len(paths)
-            for edge_tuple, node_tuple in paths:
-                covered_target_ids = tuple(
-                    sorted(
-                        {
-                            int(node)
-                            for node in node_tuple
-                            if int(node) in target_pos_by_node
-                        }
-                    )
+    edge_count = torch.full(
+        (max_budget + 1, round_variants, trajectories_per_graph),
+        -1,
+        dtype=torch.long,
+    )
+    paths_by_variant = [
+        [
+            [
+                _CandidatePath(
+                    edges=frozenset(path),
+                    targets=frozenset(_covered_targets(edges=frozenset(path), anchors=anchors, targets=targets, edge_index=edge_index)),
                 )
-                covered_target_pos = tuple(
-                    sorted(int(target_pos_by_node[int(node_id)]) for node_id in covered_target_ids)
+                for path in _pair_path_variants(
+                    dag=dag,
+                    edge_index=edge_index,
+                    pair_id=pair_id,
+                    limit=int(path_variants_per_pair),
+                    token=_token(seed, sample_id, variant, pair_id),
                 )
-                key = (tuple(edge_tuple), covered_target_ids)
-                if key in seen:
+            ]
+            for pair_id in range(int(dag.pair_distance.numel()))
+        ]
+        for variant in range(round_variants)
+    ]
+    for budget in range(max_budget + 1):
+        for variant in range(round_variants):
+            candidates = _plan_candidates(
+                dag=dag,
+                anchors=anchors,
+                targets=targets,
+                sample_id=sample_id,
+                replay_round=variant,
+                budget=budget,
+                trajectories_per_graph=trajectories_per_graph,
+                beam_width=int(beam_width),
+                max_expansions_per_state=int(max_expansions_per_state),
+                seed=int(seed),
+                paths_by_pair=paths_by_variant[variant],
+            )
+            for slot, candidate in enumerate(candidates):
+                ordered = _frontier_legal_order(
+                    edge_ids=candidate.edges,
+                    anchors=anchors,
+                    edge_index=edge_index,
+                    token=_token(seed, sample_id, variant, slot),
+                )
+                if ordered is None:
                     continue
-                seen.add(key)
-                candidate_edges.append(tuple(int(edge_id) for edge_id in edge_tuple))
-                candidate_target_positions.append(covered_target_pos)
-
-    flat_candidate_edge_ids: list[int] = []
-    candidate_ptr = [0]
-    flat_candidate_target_positions: list[int] = []
-    candidate_target_ptr = [0]
-    edge_to_candidate_lists: list[list[int]] = [[] for _ in range(int(edge_index.size(1)))]
-    for candidate_id, edge_tuple in enumerate(candidate_edges):
-        flat_candidate_edge_ids.extend(edge_tuple)
-        candidate_ptr.append(len(flat_candidate_edge_ids))
-        flat_candidate_target_positions.extend(candidate_target_positions[candidate_id])
-        candidate_target_ptr.append(len(flat_candidate_target_positions))
-        for edge_id in edge_tuple:
-            edge_to_candidate_lists[int(edge_id)].append(int(candidate_id))
-
-    edge_to_candidate_ids: list[int] = []
-    edge_to_candidate_ptr = [0]
-    for candidate_ids in edge_to_candidate_lists:
-        edge_to_candidate_ids.extend(candidate_ids)
-        edge_to_candidate_ptr.append(len(edge_to_candidate_ids))
-
-    return ReplayProgram(
-        candidate_edge_ids=torch.tensor(flat_candidate_edge_ids, dtype=torch.long).contiguous()
-        if flat_candidate_edge_ids
-        else torch.empty(0, dtype=torch.long),
-        candidate_ptr=torch.tensor(candidate_ptr, dtype=torch.long).contiguous(),
-        candidate_target_positions=torch.tensor(flat_candidate_target_positions, dtype=torch.long).contiguous()
-        if flat_candidate_target_positions
-        else torch.empty(0, dtype=torch.long),
-        candidate_target_ptr=torch.tensor(candidate_target_ptr, dtype=torch.long).contiguous(),
-        edge_to_candidate_ids=torch.tensor(edge_to_candidate_ids, dtype=torch.long).contiguous()
-        if edge_to_candidate_ids
-        else torch.empty(0, dtype=torch.long),
-        edge_to_candidate_ptr=torch.tensor(edge_to_candidate_ptr, dtype=torch.long).contiguous(),
-        path_truncated=bool(truncated),
-    )
+                if ordered:
+                    edge_ids[budget, variant, slot, : len(ordered)] = torch.tensor(ordered)
+                edge_count[budget, variant, slot] = len(ordered)
+    return ReplayBank(edge_ids=edge_ids.contiguous(), edge_count=edge_count.contiguous())
 
 
-def build_path_candidates_from_local_labels(
+def _plan_candidates(
     *,
-    candidate_edge_ids: Tensor,
-    candidate_edge_candidate_ids: Tensor,
-    candidate_target_node_ids: Tensor,
-    candidate_target_candidate_ids: Tensor,
-    reachable_target_node_ids: Tensor,
-) -> tuple[list[PathCandidate], int]:
-    target_nodes = [int(x) for x in reachable_target_node_ids.view(-1).tolist()]
-    target_pos_by_node = {node: pos for pos, node in enumerate(target_nodes)}
-    initial_target_bits = 0
-
-    edge_groups = _group_ids_by_candidate(
-        values=candidate_edge_ids,
-        candidate_ids=candidate_edge_candidate_ids,
-    )
-    target_groups = _group_ids_by_candidate(
-        values=candidate_target_node_ids,
-        candidate_ids=candidate_target_candidate_ids,
-    )
-    num_candidates = max(len(edge_groups), len(target_groups))
-    out: list[PathCandidate] = []
-    for candidate_id in range(num_candidates):
-        edge_tuple = tuple(edge_groups[candidate_id]) if candidate_id < len(edge_groups) else tuple()
-        target_ids = tuple(target_groups[candidate_id]) if candidate_id < len(target_groups) else tuple()
-        if not edge_tuple:
-            continue
-        covered_bits = 0
-        for node_id in target_ids:
-            pos = target_pos_by_node.get(int(node_id))
-            if pos is not None:
-                covered_bits |= 1 << pos
-        out.append(
-            PathCandidate(
-                edge_ids=edge_tuple,
-                edge_bits=edge_bits(edge_tuple),
-                covered_target_bits=covered_bits,
-            )
-        )
-
-    for node_id in target_nodes:
-        if int(node_id) in target_pos_by_node:
-            pos = target_pos_by_node[int(node_id)]
-            del pos
-    return out, initial_target_bits
-
-
-def optimal_terminal_edge_masks(
-    *,
-    candidates: list[PathCandidate],
-    initial_target_bits: int,
-    target_count: int,
+    dag: ShortestPathDag,
+    anchors: set[int],
+    targets: set[int],
+    sample_id: str,
+    replay_round: int,
     budget: int,
-    max_dp_states: int = 200_000,
-) -> OracleTerminalSet:
-    states: set[tuple[int, int]] = {(0, int(initial_target_bits))}
-    for candidate in candidates:
-        next_states = set(states)
-        for edge_mask, covered_bits in states:
-            new_edge_mask = edge_mask | int(candidate.edge_bits)
-            if new_edge_mask.bit_count() > int(budget):
-                continue
-            new_covered = covered_bits | int(candidate.covered_target_bits)
-            next_states.add((new_edge_mask, new_covered))
-        if len(next_states) > int(max_dp_states):
-            break
-        states = next_states
-
-    best_cover = -1
-    best_used = 0
-    best_masks: list[int] = []
-    for edge_mask, covered_bits in states:
-        edge_count = edge_mask.bit_count()
-        if edge_count > int(budget):
-            continue
-        cover_count = int(covered_bits.bit_count())
-        if cover_count > best_cover or (cover_count == best_cover and edge_count < best_used):
-            best_cover = cover_count
-            best_used = edge_count
-            best_masks = [int(edge_mask)]
-        elif cover_count == best_cover and edge_count == best_used:
-            best_masks.append(int(edge_mask))
-
-    if best_cover < 0:
-        best_cover = int(initial_target_bits).bit_count()
-        best_used = 0
-        best_masks = [0]
-
-    return OracleTerminalSet(
-        edge_masks=tuple(sorted(set(best_masks))),
-        covered_count=min(int(best_cover), int(target_count)),
-        used_edges=int(best_used),
-    )
+    trajectories_per_graph: int,
+    beam_width: int,
+    max_expansions_per_state: int,
+    seed: int,
+    paths_by_pair: list[list[_CandidatePath]],
+) -> list[_Candidate]:
+    initial_targets = targets & anchors
+    root = _Candidate(edges=frozenset(), targets=frozenset(initial_targets), pairs=frozenset())
+    beam = [root]
+    pool: dict[frozenset[int], _Candidate] = {root.edges: root} if initial_targets else {}
+    for _ in range(max(int(budget), 1)):
+        expanded = list(beam)
+        for state in beam:
+            additions: list[_Candidate] = []
+            for pair_id in range(int(dag.pair_distance.numel())):
+                if pair_id in state.pairs:
+                    continue
+                for path in paths_by_pair[pair_id]:
+                    edges = state.edges | path.edges
+                    if len(edges) > budget:
+                        continue
+                    covered = state.targets | path.targets
+                    if covered == state.targets:
+                        continue
+                    additions.append(_Candidate(edges=edges, targets=frozenset(covered), pairs=state.pairs | {pair_id}))
+            additions.sort(key=lambda item: _quality_key(item, token=_token(seed, sample_id, replay_round, len(state.edges))))
+            expanded.extend(additions[:max_expansions_per_state])
+        dedup = {item.edges: item for item in expanded}
+        beam = sorted(dedup.values(), key=lambda item: _quality_key(item, token=_token(seed, sample_id, replay_round, len(item.edges))))[:beam_width]
+        for item in beam:
+            if item.targets - initial_targets:
+                pool[item.edges] = item
+    return _diverse_top_k(list(pool.values()), limit=trajectories_per_graph, token=_token(seed, sample_id, replay_round))
 
 
-def enumerate_shortest_paths(
-    *,
-    outgoing: list[list[tuple[int, int]]],
-    distances: Tensor,
-    anchor: int,
-    limit: int,
-) -> tuple[list[tuple[tuple[int, ...], tuple[int, ...]]], bool]:
-    out: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    hit_limit = False
+def _pair_path_variants(*, dag: ShortestPathDag, edge_index: Tensor, pair_id: int, limit: int, token: int) -> list[tuple[int, ...]]:
+    start = int(dag.pair_edge_ptr[pair_id].item())
+    end = int(dag.pair_edge_ptr[pair_id + 1].item())
+    target = int(dag.pair_target_node_ids[pair_id].item())
+    by_src: dict[int, list[int]] = {}
+    for edge_id in dag.pair_edge_ids[start:end].tolist():
+        by_src.setdefault(int(edge_index[0, edge_id].item()), []).append(int(edge_id))
+    out: list[tuple[int, ...]] = []
 
-    def dfs(node: int, edge_path: tuple[int, ...], node_path: tuple[int, ...]) -> None:
-        nonlocal hit_limit
-        if len(out) >= int(limit):
-            hit_limit = True
+    def visit(node: int, path: tuple[int, ...]) -> None:
+        if len(out) >= limit:
             return
-        distance = int(distances[node].item())
-        if distance == 0:
-            out.append((edge_path, node_path))
+        if node == target:
+            out.append(path)
             return
-        if distance == unreachable_distance:
-            return
-        for edge_id, dst in outgoing[node]:
-            dst_distance = int(distances[dst].item())
-            if dst_distance != distance - 1:
-                continue
-            dfs(
-                int(dst),
-                (*edge_path, int(edge_id)),
-                (*node_path, int(dst)),
-            )
-            if hit_limit:
-                return
+        for edge_id in sorted(by_src.get(node, ()), key=lambda value: _stable_rank(token, value)):
+            visit(int(edge_index[1, edge_id].item()), (*path, edge_id))
 
-    dfs(int(anchor), (), (int(anchor),))
-    return out, hit_limit
-
-
-def outgoing_edges_by_src(*, edge_index: Tensor, num_nodes: int) -> list[list[tuple[int, int]]]:
-    outgoing: list[list[tuple[int, int]]] = [[] for _ in range(int(num_nodes))]
-    edge_index = edge_index.to(dtype=torch.long, device="cpu").contiguous()
-    for edge_id in range(int(edge_index.size(1))):
-        src = int(edge_index[0, edge_id].item())
-        dst = int(edge_index[1, edge_id].item())
-        outgoing[src].append((int(edge_id), int(dst)))
-    return outgoing
-
-
-def edge_bits(edge_ids: Iterable[int]) -> int:
-    bits = 0
-    for edge_id in edge_ids:
-        bits |= 1 << int(edge_id)
-    return bits
-
-
-def _group_ids_by_candidate(*, values: Tensor, candidate_ids: Tensor) -> list[list[int]]:
-    if int(values.numel()) == 0:
-        return []
-    max_id = int(candidate_ids.max().item()) + 1
-    out: list[list[int]] = [[] for _ in range(max_id)]
-    for value, candidate_id in zip(values.tolist(), candidate_ids.tolist(), strict=True):
-        out[int(candidate_id)].append(int(value))
+    visit(int(dag.pair_anchor_node_ids[pair_id].item()), tuple())
     return out
 
 
-def _bfs_reverse(*, edge_index: Tensor, start: int, num_nodes: int) -> list[int]:
-    reverse: list[list[int]] = [[] for _ in range(int(num_nodes))]
-    edge_index = edge_index.to(dtype=torch.long, device="cpu").contiguous()
-    for edge_id in range(int(edge_index.size(1))):
-        src = int(edge_index[0, edge_id].item())
-        dst = int(edge_index[1, edge_id].item())
-        reverse[dst].append(int(src))
+def _diverse_top_k(candidates: list[_Candidate], *, limit: int, token: int) -> list[_Candidate]:
+    selected: list[_Candidate] = []
+    remaining = list(candidates)
+    while remaining and len(selected) < limit:
+        def key(item: _Candidate) -> tuple[int, int, int, int, int]:
+            overlap = max((len(item.edges & prior.edges) for prior in selected), default=0)
+            pair_overlap = max((len(item.pairs & prior.pairs) for prior in selected), default=0)
+            return (-len(item.targets), len(item.edges), overlap, pair_overlap, _stable_rank(token, *sorted(item.edges)))
+        remaining.sort(key=key)
+        selected.append(remaining.pop(0))
+    return selected
 
-    dist = [unreachable_distance] * int(num_nodes)
-    dist[int(start)] = 0
-    queue = [int(start)]
-    head = 0
-    while head < len(queue):
-        node = queue[head]
-        head += 1
-        next_dist = dist[node] + 1
-        for prev in reverse[node]:
-            if dist[prev] != unreachable_distance:
+
+def _quality_key(item: _Candidate, *, token: int) -> tuple[int, int, int]:
+    return (-len(item.targets), len(item.edges), _stable_rank(token, *sorted(item.edges)))
+
+
+def _frontier_legal_order(*, edge_ids: frozenset[int], anchors: set[int], edge_index: Tensor, token: int) -> list[int] | None:
+    active = set(anchors)
+    remaining = set(edge_ids)
+    ordered: list[int] = []
+    while remaining:
+        legal = [edge_id for edge_id in remaining if int(edge_index[0, edge_id].item()) in active]
+        if not legal:
+            return None
+        edge_id = min(legal, key=lambda value: _stable_rank(token, value))
+        ordered.append(edge_id)
+        active.add(int(edge_index[1, edge_id].item()))
+        remaining.remove(edge_id)
+    return ordered
+
+
+def _covered_targets(*, edges: frozenset[int], anchors: set[int], targets: set[int], edge_index: Tensor) -> set[int]:
+    nodes = set(anchors)
+    for edge_id in edges:
+        nodes.add(int(edge_index[0, edge_id].item()))
+        nodes.add(int(edge_index[1, edge_id].item()))
+    return nodes & targets
+
+
+def _token(*parts: object) -> int:
+    return int.from_bytes(hashlib.sha256("|".join(str(part) for part in parts).encode("utf-8")).digest()[:8], "big")
+
+
+def _stable_rank(token: int, *values: int) -> int:
+    return _token(token, *values)
+
+
+def _unique_valid(node_ids: Tensor, *, num_nodes: int) -> list[int]:
+    return sorted({int(node) for node in node_ids.view(-1).tolist() if 0 <= int(node) < int(num_nodes)})
+
+
+def _adjacency(*, edge_index: Tensor, num_nodes: int, reverse: bool) -> list[list[int]]:
+    adjacency: list[list[int]] = [[] for _ in range(int(num_nodes))]
+    for src, dst in zip(edge_index[0].tolist(), edge_index[1].tolist(), strict=True):
+        u, v = (int(dst), int(src)) if reverse else (int(src), int(dst))
+        adjacency[u].append(v)
+    return adjacency
+
+
+def _bfs(adjacency: list[list[int]], start: int) -> list[int]:
+    distances = [unreachable_distance] * len(adjacency)
+    distances[int(start)] = 0
+    queue: deque[int] = deque([int(start)])
+    while queue:
+        node = queue.popleft()
+        next_distance = distances[node] + 1
+        for neighbor in adjacency[node]:
+            if distances[neighbor] != unreachable_distance:
                 continue
-            dist[prev] = next_dist
-            queue.append(int(prev))
-    return dist
+            distances[neighbor] = next_distance
+            queue.append(neighbor)
+    return distances
 
 
-__all__ = [
-    "ReplayProgram",
-    "OracleTerminalSet",
-    "PathCandidate",
-    "build_replay_program",
-    "build_path_candidates_from_local_labels",
-    "edge_bits",
-    "optimal_terminal_edge_masks",
-]
+def _long(values: list[int]) -> Tensor:
+    return torch.tensor(values, dtype=torch.long).contiguous()
+
+
+__all__ = ["ReplayBank", "ShortestPathDag", "build_replay_bank", "build_shortest_path_dag"]

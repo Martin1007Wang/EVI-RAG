@@ -1,266 +1,251 @@
 from __future__ import annotations
 
-import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 
-from src.graph.segments import segment_logsumexp, segment_softmax
-from src.weaver.feature import FeaturePack
-from src.weaver.nn import (
-    PolicyCache,
-    PolicyCacheBuilder,
-    StateEncoder,
-)
 from src.weaver.context import GraphContext
-from src.weaver.state import FrontierEncoding, StateBatch, frontier_from_graph
+from src.weaver.feature import FeaturePack, StateEncoder
+from src.weaver.state import (
+    FrontierEncoding,
+    NodeSelection,
+    StateBatch,
+    frontier_from_graph,
+)
 
-from .output import PolicyOutput
-
-Tensor = torch.Tensor
+from .output import PolicyOutput, STOP_EDGE_ID
 
 
-class LowRankInteraction(nn.Module):
-    def __init__(
+@dataclass(frozen=True, slots=True)
+class PolicyCache:
+    question_h_by_graph: torch.Tensor  # [G, H]
+    edge_h: torch.Tensor  # [E, H]
+    relation_h: torch.Tensor  # [E, H]  relation 特征，供 Path1 使用
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyActionSpace:
+    active: NodeSelection
+    frontier: FrontierEncoding
+
+
+class StateFlowHead(nn.Module):
+    """state_h → log F(s)，用于 trajectory balance。"""
+
+    def __init__(self, *, state_dim: int) -> None:
+        super().__init__()
+        head_dim = min(int(state_dim), 256)
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, head_dim, bias=False),
+            nn.LayerNorm(head_dim),
+            nn.SiLU(),
+            nn.Linear(head_dim, 1, bias=True),
+        )
+
+    def forward(self, *, state_h: torch.Tensor) -> torch.Tensor:  # [S]
+        return self.net(state_h).squeeze(-1)
+
+
+class FlowEstimator(nn.Module):
+    """
+    Unified edge and STOP scorer in the shared hidden space.
+    """
+
+    def __init__(self, *, hidden_dim: int, relation_lambda: float = 0.5) -> None:
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive.")
+
+        self.hidden_dim = hidden_dim
+        self.scale = hidden_dim ** -0.5
+        self.relation_lambda = float(relation_lambda)
+
+        self.marginal_mlp = nn.Sequential(
+            nn.Linear(3 * hidden_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1, bias=True),
+        )
+        self.stop_head = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1, bias=True),
+        )
+
+    def score_edges(
         self,
         *,
-        hidden_dim: int,
-        rank: int = 64,
-    ) -> None:
-        super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        self.rank = int(rank)
-        self.left_norm = nn.LayerNorm(self.hidden_dim)
-        self.right_norm = nn.LayerNorm(self.hidden_dim)
-        self.left_proj = nn.Linear(self.hidden_dim, self.rank, bias=False)
-        self.right_proj = nn.Linear(self.hidden_dim, self.rank, bias=False)
-        self.out = nn.Linear(self.rank, 1, bias=False)
-        nn.init.zeros_(self.out.weight)
+        question_h: torch.Tensor,
+        state_h: torch.Tensor,
+        frontier_edge_h: torch.Tensor,
+        frontier_relation_h: torch.Tensor,
+    ) -> torch.Tensor:
+        relation_score = (question_h * frontier_relation_h).sum(dim=-1) * self.scale
+        edge_score = (question_h * frontier_edge_h).sum(dim=-1) * self.scale
+        phi_relation = relation_score + self.relation_lambda * edge_score
+        phi_mgn = self.marginal_mlp(
+            torch.cat([state_h, frontier_edge_h, state_h * frontier_edge_h], dim=-1)
+        ).squeeze(-1)
+        return phi_relation + phi_mgn
+
+    def score_stop(
+        self,
+        *,
+        question_h: torch.Tensor,
+        state_h: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.stop_head(torch.cat([state_h, question_h], dim=-1)).squeeze(-1)
 
     def forward(
         self,
         *,
-        left_h: torch.Tensor,
-        right_h: torch.Tensor,
-    ) -> torch.Tensor:
-        left = self.left_proj(self.left_norm(left_h.float()))
-        right = self.right_proj(self.right_norm(right_h.float()))
-        return self.out(left * right).squeeze(-1)
-
-
-class EdgeFlowHead(nn.Module):
-    def __init__(
-        self,
-        *,
-        hidden_dim: int,
-        interaction: LowRankInteraction,
-        initial_bias: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.edge_unary = nn.Linear(hidden_dim, 1)
-        self.interaction = interaction
-        nn.init.zeros_(self.edge_unary.weight)
-        nn.init.constant_(self.edge_unary.bias, float(initial_bias))
-
-    def forward(
-        self,
-        *,
-        state_selected_h: torch.Tensor,
-        edge_h: torch.Tensor,
-    ) -> torch.Tensor:
-        edge_h = edge_h.float()
-        unary = self.edge_unary(edge_h).squeeze(-1)
-        cross = self.interaction(left_h=state_selected_h, right_h=edge_h)
-        return unary + cross
-
-
-class StopFlowHead(nn.Module):
-    def __init__(
-        self,
-        *,
-        hidden_dim: int,
-        interaction: LowRankInteraction,
-        initial_bias: float = -4.0,
-    ) -> None:
-        super().__init__()
-        self.sel_unary = nn.Linear(hidden_dim, 1)
-        self.frontier_unary = nn.Linear(hidden_dim, 1)
-        self.interaction = interaction
-        self.bias = nn.Parameter(torch.tensor(float(initial_bias), dtype=torch.float32))
-        nn.init.zeros_(self.sel_unary.weight)
-        nn.init.zeros_(self.sel_unary.bias)
-        nn.init.zeros_(self.frontier_unary.weight)
-        nn.init.zeros_(self.frontier_unary.bias)
-
-    def forward(
-        self,
-        *,
-        state_selected_h: torch.Tensor,
-        state_frontier_h: torch.Tensor,
-    ) -> torch.Tensor:
-        selected_h = state_selected_h.float()
-        frontier_h = state_frontier_h.float()
-        sel_term = self.sel_unary(selected_h).squeeze(-1)
-        frontier_penalty = torch.nn.functional.softplus(
-            self.frontier_unary(frontier_h).squeeze(-1)
-        ) - math.log(2.0)
-        cross_term = self.interaction(left_h=selected_h, right_h=frontier_h)
-        return self.bias + sel_term - frontier_penalty + cross_term
+        question_h: torch.Tensor,
+        state_h: torch.Tensor,
+        frontier_edge_h: torch.Tensor,
+        frontier_relation_h: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.score_edges(
+                question_h=question_h,
+                state_h=state_h,
+                frontier_edge_h=frontier_edge_h,
+                frontier_relation_h=frontier_relation_h,
+            ),
+            self.score_stop(question_h=question_h, state_h=state_h),
+        )
 
 
 class ForwardPolicy(nn.Module):
+    """GFlowNet forward policy for KG subgraph retrieval.
+
+        数据流：
+        FeaturePack
+          ├─ question_h  [G, H]   问题嵌入
+          ├─ edge_h   [E, H]   边特征（EdgeEncoder 输出，已含 src/relation/dst）
+          └─ relation_h [E, H]   relation 特征（FeatureEncoder 输出，Path1 专用）
+
+        每步 forward：
+          1. build_cache：缓存 question_h / edge_h / relation_h（batch 内不变）
+          2. prepare_action_space：构建 frontier edges
+          3. StateEncoder（逐 state 调用）：
+               CrossAttn(question_h, selected_edge_h) + fusion → state_h
+          4. FlowEstimator：
+               Path1: question_h · relation_h + λ · question_h · edge_h  → φ_relation [E]
+               Path2: MLP([s, e, s⊙e])                                    → φ_mgn [E]
+               STOP:  MLP([s, question])                                   → stop  [S]
+          5. 组装 PolicyOutput
+    """
+
     def __init__(
         self,
         *,
-        cache_builder: PolicyCacheBuilder,
         state_encoder: StateEncoder,
-        stop_head: StopFlowHead,
-        edge_head: EdgeFlowHead,
+        flow_estimator: FlowEstimator,
+        state_flow_head: StateFlowHead,
     ) -> None:
         super().__init__()
-        if stop_head.interaction is not edge_head.interaction:
-            raise ValueError("stop_head and edge_head must share the same interaction module.")
-        self.cache_builder = cache_builder
         self.state_encoder = state_encoder
-        self.stop_head = stop_head
-        self.edge_head = edge_head
+        self.flow_estimator = flow_estimator
+        self.state_flow_head = state_flow_head
 
-    def compute_cache(self, features: FeaturePack) -> PolicyCache:
-        return self.cache_builder(features)
+    # ------------------------------------------------------------------
+    def build_cache(self, features: FeaturePack) -> PolicyCache:
+        return PolicyCache(
+            question_h_by_graph=features.question_h.float(),
+            edge_h=features.edge_h.float(),
+            relation_h=features.relation_h.float(),
+        )
 
+    def prepare_action_space(self, *, state: StateBatch, graph_context: GraphContext) -> PolicyActionSpace:
+        active = state.active_node_index(graph_context)
+        frontier = frontier_from_graph(state=state, graph=graph_context, active=active)
+        return PolicyActionSpace(
+            active=active,
+            frontier=frontier,
+        )
+
+    # ------------------------------------------------------------------
     def forward(
         self,
         *,
         state: StateBatch,
         features: FeaturePack,
-        graph_context: GraphContext | None = None,
-        remaining_budget: torch.Tensor | None = None,
+        graph_context: GraphContext,
         cache: PolicyCache | None = None,
-        potentials: PolicyCache | None = None,
+        action_space: PolicyActionSpace | None = None,
+        compute_log_flow: bool = False,
     ) -> PolicyOutput:
         if cache is None:
-            cache = potentials
-        if cache is None:
-            cache = self.compute_cache(features)
+            cache = self.build_cache(features)
+        if action_space is None:
+            action_space = self.prepare_action_space(state=state, graph_context=graph_context)
 
-        if remaining_budget is None:
-            remaining_budget = state.budget_left
+        frontier = action_space.frontier
+        S = state.num_states
+        dev = state.device
 
-        if graph_context is not None:
-            frontier = frontier_from_graph(
-                state=state,
-                graph=graph_context,
-                remaining_budget=remaining_budget,
-            )
-        else:
-            frontier = state.frontier(
-                edge_src=features.edge_src,
-                edge_dst=features.edge_dst,
-                remaining_budget=remaining_budget,
-            )
+        # ── per-state question_h ───────────────────────────────────
+        # state.graph_ids: [S]，每个 state 归属的 graph
+        question_h_per_state = cache.question_h_by_graph.index_select(0, state.graph_ids)  # [S, H]
 
-        state_encoding = self.state_encoder(
-            state=state,
-            cache=cache,
-            frontier=frontier,
-            remaining_budget=remaining_budget,
+        # ── StateEncoder：逐 state 编码（简化版 StateEncoder 是单 state 接口）
+        # 批量处理：对每个 state 单独调用，收集结果
+        state_h_list: list[torch.Tensor] = []
+        selected = state.selected_edge_index()  # (row_ids [E_sel], edge_ids [E_sel])
+
+        for i in range(S):
+            # 取当前 state i 的已选边
+            mask = selected.row_ids == i
+            sel_edge_h = cache.edge_h.index_select(0, selected.edge_ids[mask]) if mask.any() else None
+            state_h_i = self.state_encoder(
+                question_h=question_h_per_state[i],  # [H] 或 [1, H]
+                selected_edge_h=sel_edge_h,  # [E_i, H] 或 None
+            )  # [1, H]
+            state_h_list.append(state_h_i)
+
+        state_h = torch.cat(state_h_list, dim=0)  # [S, H]
+
+        # ── frontier edge 特征 ─────────────────────────────────────
+        f_edge_ids = frontier.edge_ids  # [F]
+        frontier_edge_h = cache.edge_h.index_select(0, f_edge_ids)  # [F, H]
+        frontier_relation_h = cache.relation_h.index_select(0, f_edge_ids)  # [F, H]
+
+        # ── FlowEstimator：批量打分 ────────────────────────────────
+        # state_h[frontier.row_ids]：把每条 frontier 边映射到对应 state 的 state_h
+        edge_logits = self.flow_estimator.score_edges(
+            question_h=question_h_per_state.index_select(0, frontier.row_ids),  # [F, H]
+            state_h=state_h.index_select(0, frontier.row_ids),  # [F, H]
+            frontier_edge_h=frontier_edge_h,  # [F, H]
+            frontier_relation_h=frontier_relation_h,  # [F, H]
+        )  # edge_logits: [F]
+
+        stop_logits = self.flow_estimator.score_stop(
+            question_h=question_h_per_state,
+            state_h=state_h,
         )
-        state_selected_h = state_encoding.state_selected_h.float()
 
-        frontier_selected_h = state_selected_h.index_select(0, frontier.row_ids)
-        frontier_edge_h = cache.edge_h.index_select(0, frontier.edge_ids).float()
-        edge_log_flow = self.edge_head(
-            state_selected_h=frontier_selected_h,
-            edge_h=frontier_edge_h,
-        ).float()
-        state_frontier_h = _pool_frontier_opportunities(
-            edge_log_flow=edge_log_flow,
-            edge_h=frontier_edge_h,
-            frontier=frontier,
-            num_states=state.num_states,
-            hidden_dim=state_selected_h.size(-1),
-        )
-        stop_log_flow = self.stop_head(
-            state_selected_h=state_selected_h,
-            state_frontier_h=state_frontier_h,
-        ).float()
+        # ── state flow（trajectory balance）───────────────────────
+        log_flow = self.state_flow_head(state_h=state_h).float() if compute_log_flow else None
 
-        continue_log_flow = _continue_log_flow_from_frontier(
-            edge_log_flow=edge_log_flow,
-            frontier=frontier,
-            num_states=state.num_states,
-        )
-        state_log_flow = torch.logaddexp(
-            stop_log_flow,
-            continue_log_flow,
-        )
+        # ── 组装 PolicyOutput ──────────────────────────────────────
+        rows = torch.arange(S, dtype=torch.long, device=dev)
 
         return PolicyOutput(
-            state_log_flow=state_log_flow,
-            stop_log_flow=stop_log_flow,
-            continue_log_flow=continue_log_flow,
-            edge_log_flow=edge_log_flow,
+            action_logits=torch.cat([stop_logits.float(), edge_logits.float()]),
+            action_row_ids=torch.cat([rows, frontier.row_ids]),
+            action_edge_ids=torch.cat([torch.full_like(rows, STOP_EDGE_ID), f_edge_ids]),
             frontier=frontier,
-            state_selected_h=state_selected_h,
-            state_frontier_h=state_frontier_h,
+            log_flow=log_flow,
         )
-
-
-def _pool_frontier_opportunities(
-    *,
-    edge_log_flow: Tensor,
-    edge_h: Tensor,
-    frontier: FrontierEncoding,
-    num_states: int,
-    hidden_dim: int,
-) -> Tensor:
-    if int(edge_log_flow.numel()) == 0:
-        return torch.zeros(
-            (num_states, hidden_dim),
-            dtype=torch.float32,
-            device=frontier.remaining_budget.device,
-        )
-    weights = segment_softmax(
-        edge_log_flow,
-        segment_ids=frontier.row_ids,
-        num_segments=num_states,
-    ).view(-1, 1)
-    out = torch.zeros(
-        (num_states, hidden_dim),
-        dtype=torch.float32,
-        device=edge_h.device,
-    )
-    out.scatter_add_(
-        0,
-        frontier.row_ids.view(-1, 1).expand(-1, hidden_dim),
-        edge_h.float() * weights,
-    )
-    return out
-
-
-def _continue_log_flow_from_frontier(
-    *,
-    edge_log_flow: Tensor,
-    frontier: FrontierEncoding,
-    num_states: int,
-) -> Tensor:
-    if int(edge_log_flow.numel()) == 0:
-        return torch.full(
-            (num_states,),
-            float("-inf"),
-            dtype=torch.float32,
-            device=frontier.remaining_budget.device,
-        )
-    return segment_logsumexp(
-        values=edge_log_flow,
-        segment_ids=frontier.row_ids,
-        num_segments=num_states,
-    )
 
 
 __all__ = [
-    "EdgeFlowHead",
+    "FlowEstimator",
     "ForwardPolicy",
-    "LowRankInteraction",
-    "StopFlowHead",
+    "PolicyActionSpace",
+    "PolicyCache",
+    "StateFlowHead",
 ]

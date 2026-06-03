@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 
 from src.weaver.context import GraphContext
-from src.weaver.feature import FeatureBank
-from src.weaver.policy import STOP_EDGE_ID, ForwardPolicy
+from src.weaver.feature import FeaturePack
+from src.weaver.policy import STOP_EDGE_ID, ForwardPolicy, PolicyCache
 from src.weaver.state import ExpansionBatch, StateBatch
 
 from .trajectory import (
@@ -17,7 +17,16 @@ from .trajectory import (
 
 class RolloutEngine:
     @torch.no_grad()
-    def sample(self, *, policy: ForwardPolicy, context: GraphContext, features: FeatureBank, graph_ids: torch.Tensor, budget: int) -> TrajectoryBatch:
+    def sample(
+        self,
+        *,
+        policy: ForwardPolicy,
+        context: GraphContext,
+        features: FeaturePack,
+        cache: PolicyCache,
+        graph_ids: torch.Tensor,
+        budget: int,
+    ) -> TrajectoryBatch:
         graph_ids = graph_ids.to(
             device=context.device,
             dtype=torch.long,
@@ -27,7 +36,6 @@ class RolloutEngine:
             budget=budget,
             graph_context=context,
         )
-        cache = policy.compute_cache(features)
         num_rows = state.num_states
         edge_ids = torch.full(
             (num_rows, budget),
@@ -87,16 +95,13 @@ class RolloutEngine:
             )
             policy_out = policy(
                 features=features,
+                cache=cache,
                 state=decision_state,
                 graph_context=context,
-                cache=cache,
             )
             sampled = policy_out.sample(rows=local_rows)
             action_edge_ids = sampled.edge_ids
-            action_logp = policy_out.gather_log_prob(
-                row_ids=local_rows,
-                edge_ids=action_edge_ids,
-            ).float()
+            action_logp = sampled.log_prob.float()
             frontier_size = torch.bincount(
                 policy_out.frontier.row_ids,
                 minlength=decision_state.num_states,
@@ -133,6 +138,7 @@ class RolloutEngine:
                     edge_ids=expand_edges,
                 ),
                 graph_context=context,
+                trusted=True,
             )
         unfinished = stop_reason.lt(0)
         stop_reason[unfinished] = int(BUDGET)

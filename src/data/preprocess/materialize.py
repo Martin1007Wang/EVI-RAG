@@ -46,6 +46,7 @@ class Materializer:
         question_dim: int,
         catalog: Catalog,
         entity_text_semantic_table: torch.Tensor,
+        entity_relation_neighborhood_semantic_table: torch.Tensor,
         relation_semantic_table: torch.Tensor,
         metadata_dir: Path,
         overwrite: bool = True,
@@ -57,6 +58,7 @@ class Materializer:
         self.question_dim = int(question_dim)
         self.catalog = catalog
         self.entity_text_semantic_table = entity_text_semantic_table
+        self.entity_relation_neighborhood_semantic_table = entity_relation_neighborhood_semantic_table
         self.relation_semantic_table = relation_semantic_table
         self.metadata_dir = Path(metadata_dir)
         self.overwrite = bool(overwrite)
@@ -69,6 +71,7 @@ class Materializer:
             question_dim=self.question_dim,
             catalog=self.catalog,
             entity_text_semantic_table=self.entity_text_semantic_table,
+            entity_relation_neighborhood_semantic_table=self.entity_relation_neighborhood_semantic_table,
             relation_semantic_table=self.relation_semantic_table,
             map_size_bytes=self.map_size_bytes,
             commit_frequency=self.commit_frequency,
@@ -91,6 +94,7 @@ class Materializer:
         self._rows_written: dict[str, int] = {split: 0 for split in self.split_expected}
         self._question_text_by_sample_id: dict[str, str] = {}
         self._entity_text_table: TensorTable | None = None
+        self._entity_relation_neighborhood_table: TensorTable | None = None
         self._relation_table: TensorTable | None = None
         self._closed = False
 
@@ -219,6 +223,10 @@ class Materializer:
             self.tmp_embeddings_dir / "entity_text_semantic_table.f32",
             self.entity_text_semantic_table,
         )
+        self._entity_relation_neighborhood_table = write_table(
+            self.tmp_embeddings_dir / "entity_relation_neighborhood_semantic_table.f32",
+            self.entity_relation_neighborhood_semantic_table,
+        )
         self._relation_table = write_table(
             self.tmp_embeddings_dir / "relation_semantic_table.f32",
             self.relation_semantic_table,
@@ -295,6 +303,11 @@ class Materializer:
         entity_table = _published_table(
             _require_table(self._entity_text_table), self.tmp_dir, self.generation_dir
         )
+        entity_relation_neighborhood_table = _published_table(
+            _require_table(self._entity_relation_neighborhood_table),
+            self.tmp_dir,
+            self.generation_dir,
+        )
         relation_table = _published_table(
             _require_table(self._relation_table), self.tmp_dir, self.generation_dir
         )
@@ -324,6 +337,9 @@ class Materializer:
             "embeddings": {
                 "entity_text_semantic_table": _tensor_entry(
                     entity_table, self.generation_dir
+                ),
+                "entity_relation_neighborhood_semantic_table": _tensor_entry(
+                    entity_relation_neighborhood_table, self.generation_dir
                 ),
                 "relation_semantic_table": _tensor_entry(
                     relation_table, self.generation_dir
@@ -355,6 +371,7 @@ def _validate_inputs(
     question_dim: int,
     catalog: Catalog,
     entity_text_semantic_table: torch.Tensor,
+    entity_relation_neighborhood_semantic_table: torch.Tensor,
     relation_semantic_table: torch.Tensor,
     map_size_bytes: int,
     commit_frequency: int,
@@ -370,6 +387,7 @@ def _validate_inputs(
 
     catalog.validate_embeddings(
         entity_text_semantic_table=entity_text_semantic_table,
+        entity_relation_neighborhood_semantic_table=entity_relation_neighborhood_semantic_table,
         relation_semantic_table=relation_semantic_table,
     )
     if int(entity_text_semantic_table.size(1)) != question_dim:
@@ -381,6 +399,11 @@ def _validate_inputs(
         raise ValueError(
             "relation_semantic_table dim mismatch: "
             f"got {int(relation_semantic_table.size(1))}, expected {question_dim}."
+        )
+    if int(entity_relation_neighborhood_semantic_table.size(1)) != question_dim:
+        raise ValueError(
+            "entity_relation_neighborhood_semantic_table dim mismatch: "
+            f"got {int(entity_relation_neighborhood_semantic_table.size(1))}, expected {question_dim}."
         )
 
 

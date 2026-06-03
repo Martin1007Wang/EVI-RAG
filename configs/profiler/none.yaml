@@ -1,1 +1,3 @@
-# 空文件，表示不使用 profiler
+# @package _global_
+
+profiler: null

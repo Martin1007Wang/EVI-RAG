@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from src.data.schema import ReplayProgramBatch, RetrievalBatch
+from src.data.schema import ReplayBankBatch, RetrievalBatch
 
 Tensor = torch.Tensor
 
@@ -16,18 +16,10 @@ class DirectedAdjacencyIndex:
 
     out_ptr / edge_ids_by_src:
         edge ids grouped by source node.
-
-    in_ptr / edge_ids_by_dst:
-        edge ids grouped by destination node.
-
-    Incoming edges are original physical KG edge ids.
-    No inverse edges are fabricated.
     """
 
     out_ptr: Tensor
     edge_ids_by_src: Tensor
-    in_ptr: Tensor
-    edge_ids_by_dst: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,14 +260,8 @@ class TargetContext:
 
 @dataclass(frozen=True, slots=True)
 class ReplayContext:
-    candidate_edge_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    candidate_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
-    candidate_target_positions: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    candidate_target_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
-    edge_to_candidate_ids: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
-    edge_to_candidate_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
-    candidate_graph_ptr: Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
-    path_truncated_by_graph: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    edge_ids: Tensor
+    edge_count: Tensor
 
     @classmethod
     def from_batch(
@@ -286,26 +272,26 @@ class ReplayContext:
         target_context: TargetContext,
         validate: bool = False,
     ) -> "ReplayContext":
-        program = getattr(batch, "replay_program", None)
-        if not isinstance(program, ReplayProgramBatch):
-            raise TypeError("batch.replay_program must be a ReplayProgramBatch.")
+        del target_context
+        bank = getattr(batch, "replay_bank", None)
+        if not isinstance(bank, ReplayBankBatch):
+            raise TypeError("batch.replay_bank must be a ReplayBankBatch.")
 
         replay = cls(
-            candidate_edge_ids=program.candidate_edge_ids.to(dtype=torch.long).contiguous(),
-            candidate_ptr=program.candidate_ptr.to(dtype=torch.long).contiguous(),
-            candidate_target_positions=program.candidate_target_positions.to(dtype=torch.long).contiguous(),
-            candidate_target_ptr=program.candidate_target_ptr.to(dtype=torch.long).contiguous(),
-            edge_to_candidate_ids=program.edge_to_candidate_ids.to(dtype=torch.long).contiguous(),
-            edge_to_candidate_ptr=program.edge_to_candidate_ptr.to(dtype=torch.long).contiguous(),
-            candidate_graph_ptr=program.candidate_graph_ptr.to(dtype=torch.long).contiguous(),
-            path_truncated_by_graph=program.path_truncated_by_graph.to(dtype=torch.long).contiguous(),
+            edge_ids=bank.edge_ids.to(
+                device=graph_context.device,
+                dtype=torch.long,
+            ).contiguous(),
+            edge_count=bank.edge_count.to(
+                device=graph_context.device,
+                dtype=torch.long,
+            ).contiguous(),
         )
 
         if validate:
             _validate_replay_context_tensors(
                 replay_context=replay,
                 graph_context=graph_context,
-                target_context=target_context,
             )
 
         return replay
@@ -360,17 +346,9 @@ def build_directed_adjacency_index(
         num_nodes=int(num_nodes),
     )
 
-    in_ptr, edge_ids_by_dst = build_node_to_edge_csr(
-        node_ids=edge_index[1],
-        edge_ids=edge_ids,
-        num_nodes=int(num_nodes),
-    )
-
     return DirectedAdjacencyIndex(
         out_ptr=out_ptr,
         edge_ids_by_src=edge_ids_by_src,
-        in_ptr=in_ptr,
-        edge_ids_by_dst=edge_ids_by_dst,
     )
 
 
@@ -556,63 +534,35 @@ def _validate_replay_context_tensors(
     *,
     replay_context: ReplayContext,
     graph_context: GraphContext,
-    target_context: TargetContext,
 ) -> None:
-    if replay_context.candidate_edge_ids.ndim != 1:
-        raise ValueError("candidate_edge_ids must have shape [C_edges].")
-    if replay_context.candidate_ptr.ndim != 1:
-        raise ValueError("candidate_ptr must have shape [C + 1].")
-    if replay_context.candidate_target_positions.ndim != 1:
-        raise ValueError("candidate_target_positions must have shape [C_targets].")
-    if replay_context.candidate_target_ptr.ndim != 1:
-        raise ValueError("candidate_target_ptr must have shape [C + 1].")
-    if replay_context.edge_to_candidate_ids.ndim != 1:
-        raise ValueError("edge_to_candidate_ids must have shape [R].")
-    if replay_context.edge_to_candidate_ptr.ndim != 1:
-        raise ValueError("edge_to_candidate_ptr must have shape [E + 1].")
-    if replay_context.candidate_graph_ptr.ndim != 1:
-        raise ValueError("candidate_graph_ptr must have shape [G + 1].")
-    if replay_context.path_truncated_by_graph.ndim != 1:
-        raise ValueError("path_truncated_by_graph must have shape [G].")
-
-    candidate_count = int(replay_context.candidate_ptr.numel()) - 1
-    if candidate_count < 0:
-        raise ValueError("candidate_ptr must contain at least one element.")
-    if int(replay_context.candidate_target_ptr.numel()) != candidate_count + 1:
-        raise ValueError("candidate_target_ptr length must match candidate count.")
-    if int(replay_context.candidate_ptr[-1].item()) != int(replay_context.candidate_edge_ids.numel()):
-        raise ValueError("candidate_ptr must terminate at candidate_edge_ids length.")
-    if int(replay_context.candidate_target_ptr[-1].item()) != int(replay_context.candidate_target_positions.numel()):
-        raise ValueError("candidate_target_ptr must terminate at candidate_target_positions length.")
-    if int(replay_context.edge_to_candidate_ptr.numel()) != int(graph_context.num_edges) + 1:
-        raise ValueError("edge_to_candidate_ptr length must equal num_edges + 1.")
-    if int(replay_context.edge_to_candidate_ptr[-1].item()) != int(replay_context.edge_to_candidate_ids.numel()):
-        raise ValueError("edge_to_candidate_ptr must terminate at edge_to_candidate_ids length.")
-    if int(replay_context.candidate_graph_ptr.numel()) != int(graph_context.num_graphs) + 1:
-        raise ValueError("candidate_graph_ptr length must equal num_graphs + 1.")
-    if int(replay_context.candidate_graph_ptr[-1].item()) != candidate_count:
-        raise ValueError("candidate_graph_ptr must terminate at candidate count.")
-    if int(replay_context.path_truncated_by_graph.numel()) != int(graph_context.num_graphs):
-        raise ValueError("path_truncated_by_graph length must equal num_graphs.")
-
-    _validate_id_range(
-        ids=replay_context.candidate_edge_ids,
-        upper=int(graph_context.num_edges),
-        name="candidate_edge_ids",
-    )
-    if int(replay_context.candidate_target_positions.numel()) > 0:
-        max_targets = int(target_context.reachable_target_node_ids.numel())
-        _validate_id_range(
-            ids=replay_context.candidate_target_positions,
-            upper=max(max_targets, 1),
-            name="candidate_target_positions",
-        )
-    if int(replay_context.edge_to_candidate_ids.numel()) > 0:
-        _validate_id_range(
-            ids=replay_context.edge_to_candidate_ids,
-            upper=max(candidate_count, 1),
-            name="edge_to_candidate_ids",
-        )
+    if replay_context.edge_ids.ndim != 5:
+        raise ValueError("replay edge_ids must have shape [G, budgets, variants, slots, max_budget].")
+    if replay_context.edge_count.ndim != 4:
+        raise ValueError("replay edge_count must have shape [G, budgets, variants, slots].")
+    if replay_context.edge_ids.shape[:-1] != replay_context.edge_count.shape:
+        raise ValueError("replay edge_ids and edge_count shapes disagree.")
+    if int(replay_context.edge_ids.size(0)) != int(graph_context.num_graphs):
+        raise ValueError("replay bank graph dimension must equal graph_context.num_graphs.")
+    if int(replay_context.edge_ids.size(1)) != int(replay_context.edge_ids.size(4)) + 1:
+        raise ValueError("replay bank budgets dimension must equal max_budget + 1.")
+    if int(replay_context.edge_ids.size(2)) <= 0 or int(replay_context.edge_ids.size(3)) <= 0:
+        raise ValueError("replay bank must contain at least one variant and one slot.")
+    valid_ids = replay_context.edge_ids[replay_context.edge_ids.ge(0)]
+    _validate_id_range(ids=valid_ids, upper=int(graph_context.num_edges), name="replay_bank_edge_ids")
+    if bool(replay_context.edge_count.lt(-1).any()):
+        raise ValueError("replay edge_count must use -1 for unused slots.")
+    budget = torch.arange(int(replay_context.edge_count.size(1)), device=replay_context.edge_count.device).view(1, -1, 1, 1)
+    if bool(replay_context.edge_count.gt(budget).any()):
+        raise ValueError("replay edge_count cannot exceed its bank budget.")
+    position = torch.arange(int(replay_context.edge_ids.size(4)), device=replay_context.edge_ids.device).view(1, 1, 1, 1, -1)
+    selected = position.lt(replay_context.edge_count.unsqueeze(-1))
+    if bool(replay_context.edge_ids[selected].lt(0).any()) or bool(replay_context.edge_ids[~selected].ge(0).any()):
+        raise ValueError("replay edge_ids must use nonnegative prefixes with -1 padding.")
+    graph_ids = torch.arange(int(graph_context.num_graphs), device=graph_context.device).view(-1, 1, 1, 1, 1)
+    if bool(
+        graph_context.edge_to_graph.index_select(0, valid_ids).ne(graph_ids.expand_as(replay_context.edge_ids)[replay_context.edge_ids.ge(0)]).any()
+    ):
+        raise ValueError("replay bank edges must belong to their graph.")
 
 
 def _validate_graph_inputs(

@@ -30,6 +30,7 @@ class Catalog:
     relation_labels: list[str]
     entity_text_labels: list[str]
     entity_text_row_by_entity_id: torch.Tensor
+    relation_neighborhood_row_by_entity_id: torch.Tensor
     relation_text_labels: list[str]
     _entity_to_id: Mapping[str, int] = field(init=False, repr=False)
     _relation_to_id: Mapping[str, int] = field(init=False, repr=False)
@@ -71,16 +72,25 @@ class Catalog:
         self,
         *,
         entity_text_semantic_table: torch.Tensor,
+        entity_relation_neighborhood_semantic_table: torch.Tensor,
         relation_semantic_table: torch.Tensor,
     ) -> None:
         if entity_text_semantic_table.ndim != 2:
             raise ValueError("entity_text_semantic_table must be 2D")
         if relation_semantic_table.ndim != 2:
             raise ValueError("relation_semantic_table must be 2D")
+        if entity_relation_neighborhood_semantic_table.ndim != 2:
+            raise ValueError("entity_relation_neighborhood_semantic_table must be 2D")
         if int(entity_text_semantic_table.size(0)) != len(self.entity_text_labels):
             raise ValueError("entity_text_semantic_table rows must equal len(entity_text_labels)")
         if int(relation_semantic_table.size(0)) != len(self.relation_labels):
             raise ValueError("relation_semantic_table rows must equal len(relation_labels)")
+        _validate_row_map(
+            self.relation_neighborhood_row_by_entity_id,
+            num_entities=self.num_entities,
+            num_rows=int(entity_relation_neighborhood_semantic_table.size(0)),
+            name="relation_neighborhood_row_by_entity_id",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +98,7 @@ class Catalog:
             "relation_labels": list(self.relation_labels),
             "entity_text_labels": list(self.entity_text_labels),
             "entity_text_row_by_entity_id": self.entity_text_row_by_entity_id.long().contiguous().cpu(),
+            "relation_neighborhood_row_by_entity_id": self.relation_neighborhood_row_by_entity_id.long().contiguous().cpu(),
             "relation_text_labels": list(self.relation_text_labels),
         }
 
@@ -102,6 +113,7 @@ class Catalog:
             relation_labels=[str(x) for x in payload["relation_labels"]],
             entity_text_labels=[str(x) for x in payload["entity_text_labels"]],
             entity_text_row_by_entity_id=payload["entity_text_row_by_entity_id"].long(),
+            relation_neighborhood_row_by_entity_id=payload["relation_neighborhood_row_by_entity_id"].long(),
             relation_text_labels=[str(x) for x in payload["relation_text_labels"]],
         )
 
@@ -145,6 +157,11 @@ class CatalogBuilder:
             relation_labels=relation_labels,
             entity_text_labels=entity_text_labels,
             entity_text_row_by_entity_id=entity_text_row_by_entity_id,
+            relation_neighborhood_row_by_entity_id=torch.full(
+                (len(entity_labels),),
+                -1,
+                dtype=torch.long,
+            ),
             relation_text_labels=[relation_text_label(label) for label in relation_labels],
         )
 
@@ -385,3 +402,20 @@ __all__ = [
     "load_question_text_by_sample_id",
     "relation_text_label",
 ]
+
+
+def _validate_row_map(
+    row_map: torch.Tensor,
+    *,
+    num_entities: int,
+    num_rows: int,
+    name: str,
+) -> None:
+    if row_map.ndim != 1 or int(row_map.numel()) != int(num_entities):
+        raise ValueError(f"{name} must have shape [{num_entities}].")
+    if row_map.numel() == 0:
+        return
+    min_id = int(row_map.min().item())
+    max_id = int(row_map.max().item())
+    if min_id < -1 or max_id >= int(num_rows):
+        raise ValueError(f"{name} must contain -1 or valid semantic table row ids.")

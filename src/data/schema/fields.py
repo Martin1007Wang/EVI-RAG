@@ -12,24 +12,5 @@ class SampleFields:
         "reachable_target_node_ids"  # LongTensor [num_reachable_targets]
     )
     NODE_TARGET_DISTANCE = "node_target_distance"  # LongTensor [num_nodes]
-    REPLAY_CANDIDATE_EDGE_IDS = (
-        "replay_candidate_edge_ids"  # LongTensor [num_candidate_edges], graph-local edge ids
-    )
-    REPLAY_CANDIDATE_PTR = (
-        "replay_candidate_ptr"  # LongTensor [num_candidates + 1], CSR pointer into replay_candidate_edge_ids
-    )
-    REPLAY_CANDIDATE_TARGET_POSITIONS = (
-        "replay_candidate_target_positions"  # LongTensor [num_candidate_target_refs], reachable-target positions per candidate
-    )
-    REPLAY_CANDIDATE_TARGET_PTR = (
-        "replay_candidate_target_ptr"  # LongTensor [num_candidates + 1], CSR pointer into replay_candidate_target_positions
-    )
-    REPLAY_EDGE_TO_CANDIDATE_IDS = (
-        "replay_edge_to_candidate_ids"  # LongTensor [num_edge_candidate_refs], graph-local candidate ids
-    )
-    REPLAY_EDGE_TO_CANDIDATE_PTR = (
-        "replay_edge_to_candidate_ptr"  # LongTensor [num_edges + 1], CSR pointer into replay_edge_to_candidate_ids
-    )
-    REPLAY_PATH_TRUNCATED = (
-        "replay_path_truncated"  # scalar BoolTensor serialized as LongTensor {0,1}
-    )
+    REPLAY_BANK_EDGE_IDS = "replay_bank_edge_ids"
+    REPLAY_BANK_EDGE_COUNT = "replay_bank_edge_count"

@@ -5,11 +5,12 @@ from dataclasses import dataclass
 import torch
 
 # --------------------------------------------------------------------------- #
-#  Stop-reason codes                                                           #
+#  Terminal-kind codes                                                         #
 # --------------------------------------------------------------------------- #
 POLICY_STOP: int = 0
 NO_FRONTIER: int = 1
 BUDGET: int = 2
+EXTERNAL_TERMINAL: int = 3
 
 # --------------------------------------------------------------------------- #
 #  Source codes                                                                #
@@ -20,7 +21,7 @@ SRC_REPLAY: int = 1
 # Canonical dtypes — change here to propagate everywhere
 _LONG = torch.long  # graph_ids, edge_ids, edge_count
 _FLOAT = torch.float32  # edge_logp, stop_logp  (swap to bfloat16 if needed)
-_REASON = torch.uint8  # stop_reason: 3 values → uint8 saves 7 bytes/elem
+_REASON = torch.uint8  # terminal kind: 4 values → uint8 saves space
 _SOURCE = torch.bool  # source: 0=policy, 1=replay → bool is 1 byte/elem
 
 
@@ -35,9 +36,12 @@ class TrajectoryBatch:
     edge_ids   [T, B]   physical KG edge indices; padding cells are -1
     edge_logp  [T, B]   policy log-prob per edge step; padding cells are 0.0
     edge_count [T]      number of valid (non-padding) edge steps
-    stop_reason[T]      uint8  — POLICY_STOP / NO_FRONTIER / BUDGET
-    stop_logp  [T]      log-prob of the STOP token (0.0 for boundary stops)
+    stop_reason[T]      uint8  — POLICY_STOP / NO_FRONTIER / BUDGET / EXTERNAL_TERMINAL
+    stop_logp  [T]      log-prob of the sampled STOP token; 0.0 for forced terminals
     source     [T]      bool   — False = SRC_POLICY, True = SRC_REPLAY
+
+    Every row is a completed trajectory. stop_reason explains why it terminated.
+    Only POLICY_STOP and NO_FRONTIER contribute trainable STOP terms.
 
     This object is a record, not a state machine.
     State reconstruction belongs in rollout/transition utilities.
@@ -50,6 +54,49 @@ class TrajectoryBatch:
     stop_reason: torch.Tensor  # [T]   uint8
     stop_logp: torch.Tensor  # [T]   float
     source: torch.Tensor  # [T]   bool
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        _check_1d_long(self.graph_ids, "graph_ids")
+        _check_2d_long(self.edge_ids, "edge_ids")
+        _check_2d_float(self.edge_logp, "edge_logp")
+        _check_1d_long(self.edge_count, "edge_count")
+        _check_1d_uint8(self.stop_reason, "stop_reason")
+        _check_1d_float(self.stop_logp, "stop_logp")
+        _check_1d_bool(self.source, "source")
+
+        num_trajectories = int(self.graph_ids.numel())
+        budget = int(self.edge_ids.size(1))
+        if self.edge_ids.shape != (num_trajectories, budget):
+            raise ValueError("edge_ids must have shape [num_trajectories, budget].")
+        if self.edge_logp.shape != self.edge_ids.shape:
+            raise ValueError("edge_logp must match edge_ids shape.")
+        for name, value in (
+            ("edge_count", self.edge_count),
+            ("stop_reason", self.stop_reason),
+            ("stop_logp", self.stop_logp),
+            ("source", self.source),
+        ):
+            if int(value.numel()) != num_trajectories:
+                raise ValueError(f"{name} must have one value per trajectory.")
+            if value.device != self.device:
+                raise ValueError(f"{name} must be on the same device as graph_ids.")
+        if self.edge_ids.device != self.device or self.edge_logp.device != self.device:
+            raise ValueError("edge_ids and edge_logp must be on the same device as graph_ids.")
+        if bool(self.edge_count.lt(0).any()) or bool(self.edge_count.gt(budget).any()):
+            raise ValueError("edge_count must be in [0, budget].")
+        if bool(self.stop_reason.gt(int(EXTERNAL_TERMINAL)).any()):
+            raise ValueError("stop_reason contains an unknown terminal kind.")
+
+        valid = self.valid_edge_mask()
+        if bool(self.edge_ids[valid].lt(0).any()):
+            raise ValueError("valid edge_ids must be nonnegative.")
+        if bool(self.edge_ids[~valid].ne(-1).any()):
+            raise ValueError("padding edge_ids must be -1.")
+        if bool(self.edge_logp[~valid].ne(0.0).any()):
+            raise ValueError("padding edge_logp values must be 0.0.")
 
     # ---------------------------------------------------------------------- #
     #  Shape / device / dtype accessors                                       #
@@ -77,6 +124,41 @@ class TrajectoryBatch:
     def is_replay(self) -> torch.Tensor:
         """Boolean mask [T], True where source == SRC_REPLAY."""
         return self.source
+
+    @property
+    def is_policy_stop(self) -> torch.Tensor:
+        """Boolean mask [T], True where the policy explicitly sampled STOP."""
+        return self.stop_reason.eq(int(POLICY_STOP))
+
+    @property
+    def is_no_frontier(self) -> torch.Tensor:
+        """Boolean mask [T], True where expansion was impossible before budget exhaustion."""
+        return self.stop_reason.eq(int(NO_FRONTIER))
+
+    @property
+    def is_budget_boundary(self) -> torch.Tensor:
+        """Boolean mask [T], True where the budget constraint forced termination."""
+        return self.stop_reason.eq(int(BUDGET))
+
+    @property
+    def is_external_terminal(self) -> torch.Tensor:
+        """Boolean mask [T], True where the terminal came from external replay data."""
+        return self.stop_reason.eq(int(EXTERNAL_TERMINAL))
+
+    @property
+    def has_trainable_stop(self) -> torch.Tensor:
+        """Boolean mask [T], True where terminal STOP should contribute to the objective."""
+        return self.is_policy_stop | self.is_no_frontier
+
+    @property
+    def is_forced_terminal(self) -> torch.Tensor:
+        """Boolean mask [T], True for terminals without a trainable STOP decision."""
+        return self.is_budget_boundary | self.is_external_terminal
+
+    @property
+    def terminal_kind(self) -> torch.Tensor:
+        """Alias for stop_reason to make terminal provenance explicit at call sites."""
+        return self.stop_reason
 
     # ---------------------------------------------------------------------- #
     #  Masking                                                                #
@@ -203,8 +285,23 @@ def _check_2d_float(value: torch.Tensor, name: str) -> None:
         raise TypeError(f"{name} must be floating-point.")
 
 
+def _check_1d_uint8(value: torch.Tensor, name: str) -> None:
+    if value.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, got shape {tuple(value.shape)}.")
+    if value.dtype != torch.uint8:
+        raise TypeError(f"{name} must be torch.uint8.")
+
+
+def _check_1d_bool(value: torch.Tensor, name: str) -> None:
+    if value.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, got shape {tuple(value.shape)}.")
+    if value.dtype != torch.bool:
+        raise TypeError(f"{name} must be torch.bool.")
+
+
 __all__ = [
     "BUDGET",
+    "EXTERNAL_TERMINAL",
     "NO_FRONTIER",
     "POLICY_STOP",
     "SRC_POLICY",

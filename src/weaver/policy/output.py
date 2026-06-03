@@ -1,233 +1,135 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
+from src.graph.segments import sample_segmented_positions, segment_logsumexp
 from src.weaver.state import FrontierEncoding
 
 STOP_EDGE_ID = -1
-INVALID_FRONTIER_POS = -1
-
-
-def sample_gumbel_like(x: torch.Tensor) -> torch.Tensor:
-    u = torch.rand_like(x).clamp_(1e-6, 1.0 - 1e-6)
-    return -torch.log(-torch.log(u))
 
 
 @dataclass(frozen=True, slots=True)
 class SampledAction:
-    row_ids: torch.Tensor  # [B]
-    edge_ids: torch.Tensor  # [B], STOP = -1
-    frontier_pos: torch.Tensor  # [B], STOP = -1
-    log_prob: torch.Tensor  # [B]
-    action_log_flow: torch.Tensor  # [B]
+    row_ids: torch.Tensor
+    edge_ids: torch.Tensor
+    log_prob: torch.Tensor
 
     @property
     def is_stop(self) -> torch.Tensor:
-        return self.edge_ids.eq(int(STOP_EDGE_ID))
-
-    @property
-    def is_expand(self) -> torch.Tensor:
-        return ~self.is_stop
+        return self.edge_ids.eq(STOP_EDGE_ID)
 
 
 @dataclass(frozen=True, slots=True)
 class PolicyOutput:
-    state_log_flow: torch.Tensor  # [S]
-    stop_log_flow: torch.Tensor  # [S]
-    continue_log_flow: torch.Tensor  # [S]
-    edge_log_flow: torch.Tensor  # [F]
+    action_logits: torch.Tensor  # [S + F]
+    action_row_ids: torch.Tensor  # [S + F]
+    action_edge_ids: torch.Tensor  # [S + F], STOP = -1
     frontier: FrontierEncoding
-    state_selected_h: torch.Tensor | None = None  # [S, H]
-    state_frontier_h: torch.Tensor | None = None  # [S, H]
+    log_flow: torch.Tensor | None  # [S], training-only
+    _log_partition: torch.Tensor = field(init=False, repr=False)
+    _action_log_prob: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        flow_dtype = torch.float32
-        if self.state_log_flow.dtype != flow_dtype:
-            object.__setattr__(self, "state_log_flow", self.state_log_flow.to(dtype=flow_dtype))
-        if self.stop_log_flow.dtype != flow_dtype:
-            object.__setattr__(self, "stop_log_flow", self.stop_log_flow.to(dtype=flow_dtype))
-        if self.continue_log_flow.dtype != flow_dtype:
-            object.__setattr__(self, "continue_log_flow", self.continue_log_flow.to(dtype=flow_dtype))
-        if self.edge_log_flow.dtype != flow_dtype:
-            object.__setattr__(self, "edge_log_flow", self.edge_log_flow.to(dtype=flow_dtype))
+        log_partition = segment_logsumexp(
+            values=self.action_logits.float(),
+            segment_ids=self.action_row_ids,
+            num_segments=self.num_states,
+        )
+        object.__setattr__(self, "_log_partition", log_partition)
+        object.__setattr__(
+            self,
+            "_action_log_prob",
+            self.action_logits.float() - log_partition.index_select(0, self.action_row_ids),
+        )
 
     @property
     def device(self) -> torch.device:
-        return self.state_log_flow.device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.state_log_flow.dtype
+        return self.action_logits.device
 
     @property
     def num_states(self) -> int:
-        return int(self.state_log_flow.numel())
+        if int(self.action_row_ids.numel()) == 0:
+            return 0
+        return int(self.action_row_ids.max().item()) + 1
 
     @property
-    def num_expand_actions(self) -> int:
-        return int(self.edge_log_flow.numel())
+    def log_partition(self) -> torch.Tensor:
+        return self._log_partition
+
+    @property
+    def action_log_prob(self) -> torch.Tensor:
+        return self._action_log_prob
+
+    @property
+    def forced_terminal_mask(self) -> torch.Tensor:
+        frontier_count = torch.bincount(self.frontier.row_ids, minlength=self.num_states)
+        return frontier_count.eq(0)
+
+    def require_log_flow(self) -> torch.Tensor:
+        if self.log_flow is None:
+            raise RuntimeError("log_flow was not computed. Call policy with compute_log_flow=True.")
+        return self.log_flow
+
+    def gather_log_prob(self, *, row_ids: torch.Tensor, edge_ids: torch.Tensor) -> torch.Tensor:
+        positions = _find_actions(
+            num_states=self.num_states,
+            frontier=self.frontier,
+            row_ids=row_ids,
+            edge_ids=edge_ids,
+        )
+        return self.action_log_prob.index_select(0, positions)
 
     def sample(self, *, rows: torch.Tensor) -> SampledAction:
         rows = rows.to(device=self.device, dtype=torch.long).view(-1)
-        if int(rows.numel()) == 0:
-            empty_long = torch.empty(0, dtype=torch.long, device=self.device)
-            empty_float = torch.empty(0, dtype=self.dtype, device=self.device)
-            return SampledAction(
-                row_ids=empty_long,
-                edge_ids=empty_long,
-                frontier_pos=empty_long,
-                log_prob=empty_float,
-                action_log_flow=empty_float,
-            )
-
-        stop_score = self.stop_log_flow.index_select(0, rows) + sample_gumbel_like(
-            self.stop_log_flow.index_select(0, rows)
+        pos = sample_segmented_positions(
+            logits=self.action_logits,
+            segment_ids=self.action_row_ids,
+            num_segments=self.num_states,
+            active_segments=rows,
+            temperature=1.0,
         )
-
-        expand_mask = self.frontier.row_ids.unsqueeze(0).eq(rows.unsqueeze(1))
-        best_edge_score = torch.full_like(stop_score, float("-inf"))
-        best_frontier_pos = torch.full_like(rows, int(INVALID_FRONTIER_POS))
-
-        if self.num_expand_actions > 0:
-            edge_score = self.edge_log_flow + sample_gumbel_like(self.edge_log_flow)
-            for i in range(int(rows.numel())):
-                pos = expand_mask[i].nonzero(as_tuple=True)[0]
-                if int(pos.numel()) == 0:
-                    continue
-                scores = edge_score.index_select(0, pos)
-                best = int(torch.argmax(scores).item())
-                best_edge_score[i] = scores[best]
-                best_frontier_pos[i] = pos[best]
-
-        is_stop = stop_score >= best_edge_score
-        edge_ids = torch.full_like(rows, int(STOP_EDGE_ID))
-        action_log_flow = self.stop_log_flow.index_select(0, rows)
-        log_prob = action_log_flow - self.state_log_flow.index_select(0, rows)
-
-        expand_rows = (~is_stop).nonzero(as_tuple=True)[0]
-        if int(expand_rows.numel()) > 0:
-            chosen_pos = best_frontier_pos.index_select(0, expand_rows)
-            edge_ids[expand_rows] = self.frontier.edge_ids.index_select(0, chosen_pos)
-            action_log_flow[expand_rows] = self.edge_log_flow.index_select(0, chosen_pos)
-            log_prob[expand_rows] = action_log_flow.index_select(0, expand_rows) - self.state_log_flow.index_select(
-                0,
-                rows.index_select(0, expand_rows),
-            )
-
-        frontier_pos = torch.where(
-            is_stop,
-            torch.full_like(best_frontier_pos, int(INVALID_FRONTIER_POS)),
-            best_frontier_pos,
-        )
-
         return SampledAction(
             row_ids=rows,
-            edge_ids=edge_ids,
-            frontier_pos=frontier_pos,
-            log_prob=log_prob,
-            action_log_flow=action_log_flow,
+            edge_ids=self.action_edge_ids.index_select(0, pos),
+            log_prob=self.action_log_prob.index_select(0, pos),
         )
 
-    def gather_log_prob(
-        self,
-        *,
-        row_ids: torch.Tensor,
-        edge_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        row_ids = row_ids.to(device=self.device, dtype=torch.long).view(-1)
-        edge_ids = edge_ids.to(device=self.device, dtype=torch.long).view(-1)
 
-        out = self.stop_log_flow.index_select(0, row_ids) - self.state_log_flow.index_select(0, row_ids)
-        expand = edge_ids.ge(0)
-        if bool(expand.any()):
-            pos = find_frontier_positions(
-                frontier_row_ids=self.frontier.row_ids,
-                frontier_edge_ids=self.frontier.edge_ids,
-                query_row_ids=row_ids[expand],
-                query_edge_ids=edge_ids[expand],
-            )
-            out[expand] = self.edge_log_flow.index_select(0, pos) - self.state_log_flow.index_select(0, row_ids[expand])
-        return out
-
-    def gather_action_log_flow(
-        self,
-        *,
-        row_ids: torch.Tensor,
-        edge_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        row_ids = row_ids.to(device=self.device, dtype=torch.long).view(-1)
-        edge_ids = edge_ids.to(device=self.device, dtype=torch.long).view(-1)
-        out = self.stop_log_flow.index_select(0, row_ids)
-        expand = edge_ids.ge(0)
-        if bool(expand.any()):
-            pos = find_frontier_positions(
-                frontier_row_ids=self.frontier.row_ids,
-                frontier_edge_ids=self.frontier.edge_ids,
-                query_row_ids=row_ids[expand],
-                query_edge_ids=edge_ids[expand],
-            )
-            out[expand] = self.edge_log_flow.index_select(0, pos)
-        return out
-
-
-def find_frontier_positions(
+def _find_actions(
     *,
-    frontier_row_ids: torch.Tensor,
-    frontier_edge_ids: torch.Tensor,
-    query_row_ids: torch.Tensor,
-    query_edge_ids: torch.Tensor,
-) -> torch.Tensor:
-    if int(query_row_ids.numel()) != int(query_edge_ids.numel()):
-        raise ValueError("query_row_ids and query_edge_ids must have the same length.")
-    if int(query_row_ids.numel()) == 0:
-        return torch.empty(0, dtype=torch.long, device=frontier_row_ids.device)
-
-    base = int(frontier_edge_ids.max().item()) + 2 if int(frontier_edge_ids.numel()) > 0 else 1
-    frontier_keys = frontier_row_ids * base + frontier_edge_ids
-    query_keys = query_row_ids.to(device=frontier_row_ids.device) * base + query_edge_ids.to(device=frontier_edge_ids.device)
-
-    sorted_keys, order = torch.sort(frontier_keys)
-    pos = torch.searchsorted(sorted_keys, query_keys)
-    if bool(pos.ge(sorted_keys.numel()).any()):
-        raise ValueError("Some requested expansion actions are not legal in the frontier.")
-    matched = sorted_keys.index_select(0, pos)
-    if not bool(matched.eq(query_keys).all()):
-        raise ValueError("Some requested expansion actions are not legal in the frontier.")
-    return order.index_select(0, pos)
-
-
-def gather_stop_log_prob(
-    *,
-    output: PolicyOutput,
+    num_states: int,
+    frontier: FrontierEncoding,
     row_ids: torch.Tensor,
+    edge_ids: torch.Tensor,
 ) -> torch.Tensor:
-    return output.stop_log_flow.index_select(0, row_ids) - output.state_log_flow.index_select(0, row_ids)
+    row_ids = row_ids.to(device=frontier.row_ids.device, dtype=torch.long).view(-1)
+    edge_ids = edge_ids.to(device=frontier.edge_ids.device, dtype=torch.long).view(-1)
+    if int(row_ids.numel()) != int(edge_ids.numel()):
+        raise ValueError("row_ids and edge_ids must have the same length.")
+    if int(row_ids.numel()) == 0:
+        return row_ids
+    if bool(row_ids.lt(0).any()) or bool(row_ids.ge(int(num_states)).any()):
+        raise ValueError("requested action row must be in range.")
+    stop = edge_ids.eq(STOP_EDGE_ID)
+    positions = row_ids.clone()
+    if bool((~stop).any()):
+        requested_rows = row_ids[~stop]
+        requested_edges = edge_ids[~stop]
+        if bool(requested_edges.lt(0).any()):
+            raise ValueError("requested edge action must be STOP or nonnegative.")
+        upper = torch.cat([frontier.edge_ids, requested_edges]).max().add(1)
+        frontier_keys = frontier.row_ids * upper + frontier.edge_ids
+        requested_keys = requested_rows * upper + requested_edges
+        frontier_positions = torch.searchsorted(frontier_keys, requested_keys)
+        in_range = frontier_positions.lt(int(frontier_keys.numel()))
+        legal = torch.zeros_like(in_range)
+        legal[in_range] = frontier_keys.index_select(0, frontier_positions[in_range]).eq(requested_keys[in_range])
+        if not bool(legal.all()):
+            raise ValueError("requested action must be uniquely legal.")
+        positions[~stop] = int(num_states) + frontier_positions
+    return positions
 
 
-def gather_expand_log_prob(
-    *,
-    output: PolicyOutput,
-    action_row_ids: torch.Tensor,
-    action_edge_ids: torch.Tensor,
-) -> torch.Tensor:
-    pos = find_frontier_positions(
-        frontier_row_ids=output.frontier.row_ids,
-        frontier_edge_ids=output.frontier.edge_ids,
-        query_row_ids=action_row_ids,
-        query_edge_ids=action_edge_ids,
-    )
-    return output.edge_log_flow.index_select(0, pos) - output.state_log_flow.index_select(0, action_row_ids)
-
-
-__all__ = [
-    "INVALID_FRONTIER_POS",
-    "PolicyOutput",
-    "STOP_EDGE_ID",
-    "SampledAction",
-    "find_frontier_positions",
-    "gather_expand_log_prob",
-    "gather_stop_log_prob",
-    "sample_gumbel_like",
-]
+__all__ = ["PolicyOutput", "STOP_EDGE_ID", "SampledAction"]

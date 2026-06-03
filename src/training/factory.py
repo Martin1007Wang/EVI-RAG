@@ -68,10 +68,20 @@ def build_model(
     cfg: DictConfig,
     resources: Any,
 ) -> LightningModule:
+    resolved_model_cfg = OmegaConf.to_container(
+        cfg.model,
+        resolve=True,
+        throw_on_missing=True,
+    )
+    if not isinstance(resolved_model_cfg, dict):
+        raise TypeError(f"cfg.model must resolve to dict, got {type(resolved_model_cfg).__name__}.")
+
     feature_encoder_obj = hydra.utils.instantiate(
         cfg.model.feature_encoder,
         entity_text_semantic_table=resources.entity_text_semantic_table,
         text_row_by_entity_id=resources.text_row_by_entity_id,
+        entity_relation_neighborhood_semantic_table=resources.entity_relation_neighborhood_semantic_table,
+        relation_neighborhood_row_by_entity_id=resources.relation_neighborhood_row_by_entity_id,
         relation_semantic_table=resources.relation_semantic_table,
     )
     feature_encoder = require_type(
@@ -82,10 +92,21 @@ def build_model(
 
     policy = _build_policy(cfg.model.policy)
 
+    model_cfg = {
+        "_target_": resolved_model_cfg["_target_"],
+        "budget": resolved_model_cfg["budget"],
+        "hidden_dim": resolved_model_cfg["hidden_dim"],
+        "feature_encoder": feature_encoder,
+        "policy": policy,
+        "terminal_reward_model": resolved_model_cfg["terminal_reward_model"],
+        "objective": resolved_model_cfg["objective"],
+        "runner": resolved_model_cfg["runner"],
+        "optimization": resolved_model_cfg["optimization"],
+        "evaluation": resolved_model_cfg["evaluation"],
+        "validate_batch_coordinates": resolved_model_cfg["validate_batch_coordinates"],
+    }
     model_obj = hydra.utils.instantiate(
-        cfg.model,
-        feature_encoder=feature_encoder,
-        policy=policy,
+        model_cfg,
     )
     module = require_type(model_obj, LightningModule, "cfg.model")
 
@@ -130,10 +151,9 @@ def _normalized_stages(stage: str | tuple[str, ...]) -> tuple[str, ...]:
 
 
 def build_trainer(cfg: DictConfig) -> Trainer:
-    profiler = (
-        hydra.utils.instantiate(cfg.profiler)
-        if OmegaConf.is_missing(cfg, "profiler") is False and cfg.profiler is not None and "_target_" in cfg.profiler
-        else None
+    profiler = _instantiate_optional_component(
+        OmegaConf.select(cfg, "profiler", default=None),
+        "cfg.profiler",
     )
 
     trainer = hydra.utils.instantiate(
@@ -144,6 +164,24 @@ def build_trainer(cfg: DictConfig) -> Trainer:
     )
 
     return require_type(trainer, Trainer, "cfg.trainer")
+
+
+def _instantiate_optional_component(
+    config: DictConfig | None,
+    name: str,
+) -> Any | None:
+    if config is None:
+        return None
+
+    if not isinstance(config, DictConfig):
+        raise TypeError(
+            f"{name} must be a DictConfig or null, got {type(config).__name__}."
+        )
+
+    if "_target_" not in config:
+        raise ValueError(f"{name} must be null or contain '_target_'.")
+
+    return hydra.utils.instantiate(config)
 
 
 def instantiate_list(
@@ -189,6 +227,16 @@ def model_resource_kwargs(resources: Any) -> dict[str, Any]:
             "text_row_by_entity_id",
             torch.Tensor,
         ),
+        "entity_relation_neighborhood_semantic_table": require_attr(
+            resources,
+            "entity_relation_neighborhood_semantic_table",
+            torch.Tensor,
+        ),
+        "relation_neighborhood_row_by_entity_id": require_attr(
+            resources,
+            "relation_neighborhood_row_by_entity_id",
+            torch.Tensor,
+        ),
         "relation_semantic_table": require_attr(
             resources,
             "relation_semantic_table",
@@ -225,24 +273,25 @@ def require_type(
 
 
 def _build_policy(policy_cfg: DictConfig) -> ForwardPolicy:
-    interaction = hydra.utils.instantiate(policy_cfg.stop_head.interaction)
-    stop_head = hydra.utils.instantiate(
-        policy_cfg.stop_head,
-        interaction=interaction,
+    resolved_policy_cfg = OmegaConf.to_container(
+        policy_cfg,
+        resolve=True,
+        throw_on_missing=True,
     )
-    edge_head = hydra.utils.instantiate(
-        policy_cfg.edge_head,
-        interaction=interaction,
+    if not isinstance(resolved_policy_cfg, dict):
+        raise TypeError(f"cfg.model.policy must resolve to dict, got {type(resolved_policy_cfg).__name__}.")
+
+    policy_model_cfg = {
+        "_target_": resolved_policy_cfg["_target_"],
+        "state_encoder": resolved_policy_cfg["state_encoder"],
+        "flow_estimator": resolved_policy_cfg["flow_estimator"],
+        "state_flow_head": resolved_policy_cfg["state_flow_head"],
+    }
+    return require_type(
+        hydra.utils.instantiate(policy_model_cfg),
+        ForwardPolicy,
+        "cfg.model.policy",
     )
-    cache_builder = hydra.utils.instantiate(policy_cfg.cache_builder)
-    state_encoder = hydra.utils.instantiate(policy_cfg.state_encoder)
-    policy = ForwardPolicy(
-        cache_builder=cache_builder,
-        state_encoder=state_encoder,
-        stop_head=stop_head,
-        edge_head=edge_head,
-    )
-    return require_type(policy, ForwardPolicy, "cfg.model.policy")
 
 
 __all__ = [

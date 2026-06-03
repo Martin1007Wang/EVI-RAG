@@ -25,7 +25,7 @@ def test_reward_uses_canonical_state_from_selected_edges() -> None:
         edge_cost=0.5,
         fail_cost=0.0,
         answer_prize=1.0,
-    )(state=state, target_context=target)
+    )(state=state, target_context=target, graph_context=graph)
 
     assert reward.edge_count.tolist() == [2.0]
     assert reward.target_recall.tolist() == [1.0]
@@ -50,7 +50,7 @@ def test_reward_handles_missing_targets_without_nan() -> None:
         edge_cost=0.25,
         fail_cost=2.0,
         answer_prize=1.0,
-    )(state=state, target_context=target)
+    )(state=state, target_context=target, graph_context=graph)
 
     assert reward.valid_mask.tolist() == [False]
     assert reward.success_mask.tolist() == [False]
@@ -71,8 +71,6 @@ def _graph() -> GraphContext:
         adjacency=DirectedAdjacencyIndex(
             out_ptr=torch.tensor([0, 2, 2, 2], dtype=torch.long),
             edge_ids_by_src=torch.tensor([0, 1], dtype=torch.long),
-            in_ptr=torch.tensor([0, 0, 1, 2], dtype=torch.long),
-            edge_ids_by_dst=torch.tensor([0, 1], dtype=torch.long),
         ),
         num_nodes=3,
         num_edges=2,

@@ -3,73 +3,53 @@
 _target_: src.weaver.module.WeaverModule
 
 budget: 8
-hidden_dim: 1024
+sem_dim: 1024
+hidden_dim: 512
 
 feature_encoder:
   _target_: src.weaver.feature.FeatureEncoder
   entity_text_semantic_table: null
   text_row_by_entity_id: null
+  entity_relation_neighborhood_semantic_table: null
+  relation_neighborhood_row_by_entity_id: null
   relation_semantic_table: null
+  sem_dim: ${model.sem_dim}
   hidden_dim: ${model.hidden_dim}
-  non_text_node_init_std: 0.02
-  normalize_inputs: true
 
 policy:
   _target_: src.weaver.policy.ForwardPolicy
-
-  cache_builder:
-    _target_: src.weaver.nn.PolicyCacheBuilder
-    hidden_dim: ${model.hidden_dim}
-
   state_encoder:
-    _target_: src.weaver.nn.StateEncoder
+    _target_: src.weaver.feature.StateEncoder
     hidden_dim: ${model.hidden_dim}
-    max_budget: ${model.budget}
-
-  stop_head:
-    _target_: src.weaver.policy.forward.StopFlowHead
+  flow_estimator:
+    _target_: src.weaver.policy.FlowEstimator
     hidden_dim: ${model.hidden_dim}
-    interaction:
-      _target_: src.weaver.policy.forward.LowRankInteraction
-      hidden_dim: ${model.hidden_dim}
-      rank: 64
-    initial_bias: -4.0
+    relation_lambda: 0.5
+  state_flow_head:
+    _target_: src.weaver.policy.StateFlowHead
+    state_dim: ${model.hidden_dim}
 
-  edge_head:
-    _target_: src.weaver.policy.forward.EdgeFlowHead
-    hidden_dim: ${model.hidden_dim}
-    interaction: ${model.policy.stop_head.interaction}
-    initial_bias: 0.0
-
-reward_model:
-  _target_: src.weaver.reward.EvidenceSubgraphReward
+terminal_reward_model:
+  _target_: src.weaver.reward.TerminalRewardModel
   eps: 1.0
   answer_weight: 6.0
   coverage_weight: 1.0
   edge_cost: 0.15
   fail_cost: 6.0
   answer_prize: 2.0
-  
+
 objective:
-  _target_: src.weaver.objectives.EdgeFlowMatchingObjective
-  nonterminal_weight: 1.0
-  terminal_weight: 1.0
-  residual_loss: huber
-  huber_delta: 2.0
-  backward_kernel: uniform_parent
-  policy_state_chunk_size: 8
+  _target_: src.weaver.objectives.SubTrajectoryBalanceObjective
+  subtb_lambda: 1.0
+  max_subtrajectory_length: null
 
 runner:
   _target_: src.weaver.rollout.runner.RolloutRunner
   engine:
     _target_: src.weaver.rollout.engine.RolloutEngine
-
   replay_source:
     _target_: src.weaver.rollout.replay.ReplaySource
-    # With train_policy_rollouts=8, budget=8, top_k_per_state=2, the worst-case
-    # relabel count per graph is 8 * 8 * 2 = 128, so this cap avoids truncation.
-    max_transitions_per_graph: 128
-    top_k_per_state: 2
+    anneal_steps: null
   train_policy_rollouts: 8
   eval_rollouts: 8
 
