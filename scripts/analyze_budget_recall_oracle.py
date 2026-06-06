@@ -202,11 +202,19 @@ def analyze_sample(
             b_cover100=math.nan,
         )
 
+    node_target_distances_flat = getattr(
+        sample,
+        "node_target_distances_flat",
+        getattr(sample, "node_target_distance", None),
+    )
+    if node_target_distances_flat is None:
+        raise AttributeError("sample must provide node_target_distances_flat or node_target_distance.")
+
     candidates, initial_target_bits, path_truncated = build_path_candidates(
         edge_index=sample.edge_index,
         anchor_node_ids=sample.anchor_node_ids,
         reachable_target_node_ids=sample.reachable_target_node_ids,
-        node_target_distances_flat=sample.node_target_distances_flat,
+        node_target_distances_flat=node_target_distances_flat,
         num_nodes=int(sample.num_nodes),
         max_paths_per_target=int(max_paths_per_target),
     )
@@ -275,11 +283,13 @@ def build_path_candidates(
     targets = [int(x) for x in reachable_target_node_ids.view(-1).tolist()]
     target_pos_by_node = {node: pos for pos, node in enumerate(targets)}
     anchors = [int(x) for x in anchor_node_ids.view(-1).tolist()]
-    distances = node_target_distances_flat.to(dtype=torch.long, device="cpu").view(
-        len(targets),
-        int(num_nodes),
-    )
     outgoing = outgoing_edges_by_src(edge_index=edge_index, num_nodes=int(num_nodes))
+    distances = target_distance_matrix(
+        edge_index=edge_index,
+        targets=targets,
+        num_nodes=int(num_nodes),
+        node_target_distances_flat=node_target_distances_flat,
+    )
 
     initial_bits = 0
     for anchor in anchors:
@@ -622,6 +632,50 @@ def outgoing_edges_by_src(
         dst = int(edge_index[1, edge_id].item())
         outgoing[src].append((int(edge_id), dst))
     return outgoing
+
+
+def target_distance_matrix(
+    *,
+    edge_index: torch.Tensor,
+    targets: list[int],
+    num_nodes: int,
+    node_target_distances_flat: torch.Tensor,
+) -> torch.Tensor:
+    distances_flat = node_target_distances_flat.to(dtype=torch.long, device="cpu")
+    if int(distances_flat.numel()) == len(targets) * int(num_nodes):
+        return distances_flat.view(len(targets), int(num_nodes))
+
+    incoming: list[list[int]] = [[] for _ in range(int(num_nodes))]
+    edge_index = edge_index.to(dtype=torch.long, device="cpu").contiguous()
+    for edge_id in range(int(edge_index.size(1))):
+        src = int(edge_index[0, edge_id].item())
+        dst = int(edge_index[1, edge_id].item())
+        incoming[dst].append(src)
+
+    rows: list[torch.Tensor] = []
+    for target in targets:
+        rows.append(single_target_distances(incoming=incoming, target=int(target)))
+    return torch.stack(rows, dim=0) if rows else torch.empty((0, int(num_nodes)), dtype=torch.long)
+
+
+def single_target_distances(*, incoming: list[list[int]], target: int) -> torch.Tensor:
+    distances = [UNREACHABLE] * len(incoming)
+    if not (0 <= int(target) < len(incoming)):
+        return torch.tensor(distances, dtype=torch.long)
+
+    queue = [int(target)]
+    distances[int(target)] = 0
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        next_distance = distances[node] + 1
+        for src in incoming[node]:
+            if distances[src] != UNREACHABLE:
+                continue
+            distances[src] = next_distance
+            queue.append(src)
+    return torch.tensor(distances, dtype=torch.long)
 
 
 def target_bits_for_nodes(

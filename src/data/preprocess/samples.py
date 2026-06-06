@@ -43,13 +43,16 @@ class PreparedSample:
     anchor_node_ids: torch.Tensor  # [num_anchors]
     target_node_ids: torch.Tensor  # [num_answers_in_graph]
     reachable_target_node_ids: torch.Tensor  # [num_reachable_targets]
+    reachable_target_max_distance: int
 
     node_entity_catalog_ids: torch.Tensor  # [num_nodes]
     edge_relation_catalog_ids: torch.Tensor  # [num_edges], aligned with edge_index columns
 
     node_target_distance: torch.Tensor  # [num_nodes]
-    replay_bank_edge_ids: torch.Tensor  # [max_budget + 1, variants, slots, max_budget]
-    replay_bank_edge_count: torch.Tensor  # [max_budget + 1, variants, slots]
+    edge_on_shortest_path: torch.Tensor  # [num_edges]
+    replay_bank_edge_ids: torch.Tensor  # [variants, slots, max_edges]
+    replay_bank_edge_count: torch.Tensor  # [variants, slots]
+    replay_bank_priority: torch.Tensor  # [variants, slots]
 
     def storage_key(self) -> str:
         return f"{self.dataset}/{self.split}/{self.question_id}"
@@ -66,7 +69,13 @@ class PreparedSample:
             SampleFields.ANCHOR_NODE_IDS: self.anchor_node_ids.long().contiguous(),
             SampleFields.TARGET_NODE_IDS: self.target_node_ids.long().contiguous(),
             SampleFields.REACHABLE_TARGET_NODE_IDS: self.reachable_target_node_ids.long().contiguous(),
+            SampleFields.REACHABLE_TARGET_MAX_DISTANCE: torch.as_tensor(
+                self.reachable_target_max_distance,
+                dtype=torch.long,
+            ),
             SampleFields.NODE_TARGET_DISTANCE: self.node_target_distance.long().contiguous(),
+            SampleFields.EDGE_ON_SHORTEST_PATH: self.edge_on_shortest_path.bool().contiguous(),
             SampleFields.REPLAY_BANK_EDGE_IDS: self.replay_bank_edge_ids.long().contiguous(),
             SampleFields.REPLAY_BANK_EDGE_COUNT: self.replay_bank_edge_count.long().contiguous(),
+            SampleFields.REPLAY_BANK_PRIORITY: self.replay_bank_priority.float().contiguous(),
         }

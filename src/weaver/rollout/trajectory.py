@@ -9,7 +9,7 @@ import torch
 # --------------------------------------------------------------------------- #
 POLICY_STOP: int = 0
 NO_FRONTIER: int = 1
-BUDGET: int = 2
+BUDGET_TRUNCATED: int = 2
 EXTERNAL_TERMINAL: int = 3
 
 # --------------------------------------------------------------------------- #
@@ -36,12 +36,13 @@ class TrajectoryBatch:
     edge_ids   [T, B]   physical KG edge indices; padding cells are -1
     edge_logp  [T, B]   policy log-prob per edge step; padding cells are 0.0
     edge_count [T]      number of valid (non-padding) edge steps
-    stop_reason[T]      uint8  — POLICY_STOP / NO_FRONTIER / BUDGET / EXTERNAL_TERMINAL
+    stop_reason[T]      uint8  — POLICY_STOP / NO_FRONTIER / BUDGET_TRUNCATED / EXTERNAL_TERMINAL
     stop_logp  [T]      log-prob of the sampled STOP token; 0.0 for forced terminals
     source     [T]      bool   — False = SRC_POLICY, True = SRC_REPLAY
 
     Every row is a completed trajectory. stop_reason explains why it terminated.
-    Only POLICY_STOP and NO_FRONTIER contribute trainable STOP terms.
+    POLICY_STOP, BUDGET_TRUNCATED, and EXTERNAL_TERMINAL contribute trainable STOP terms.
+    NO_FRONTIER is structural-only.
 
     This object is a record, not a state machine.
     State reconstruction belongs in rollout/transition utilities.
@@ -136,9 +137,9 @@ class TrajectoryBatch:
         return self.stop_reason.eq(int(NO_FRONTIER))
 
     @property
-    def is_budget_boundary(self) -> torch.Tensor:
-        """Boolean mask [T], True where the budget constraint forced termination."""
-        return self.stop_reason.eq(int(BUDGET))
+    def is_budget_truncated(self) -> torch.Tensor:
+        """Boolean mask [T], True where the edge budget truncated the row."""
+        return self.stop_reason.eq(int(BUDGET_TRUNCATED))
 
     @property
     def is_external_terminal(self) -> torch.Tensor:
@@ -148,12 +149,17 @@ class TrajectoryBatch:
     @property
     def has_trainable_stop(self) -> torch.Tensor:
         """Boolean mask [T], True where terminal STOP should contribute to the objective."""
-        return self.is_policy_stop | self.is_no_frontier
+        return self.is_policy_stop | self.is_budget_truncated | self.is_external_terminal
+
+    @property
+    def has_terminal_reward(self) -> torch.Tensor:
+        """Boolean mask [T], True where terminal reward should anchor the objective."""
+        return self.is_policy_stop | self.is_no_frontier | self.is_budget_truncated | self.is_external_terminal
 
     @property
     def is_forced_terminal(self) -> torch.Tensor:
         """Boolean mask [T], True for terminals without a trainable STOP decision."""
-        return self.is_budget_boundary | self.is_external_terminal
+        return self.is_no_frontier | self.is_budget_truncated | self.is_external_terminal
 
     @property
     def terminal_kind(self) -> torch.Tensor:
@@ -300,7 +306,7 @@ def _check_1d_bool(value: torch.Tensor, name: str) -> None:
 
 
 __all__ = [
-    "BUDGET",
+    "BUDGET_TRUNCATED",
     "EXTERNAL_TERMINAL",
     "NO_FRONTIER",
     "POLICY_STOP",

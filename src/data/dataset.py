@@ -186,6 +186,14 @@ def _build_retrieval_data(
         raw[SampleFields.NODE_TARGET_DISTANCE],
         dtype=torch.long,
     )
+    edge_on_shortest_path = _tensor(
+        raw[SampleFields.EDGE_ON_SHORTEST_PATH],
+        dtype=torch.bool,
+    )
+    reachable_target_max_distance = _tensor(
+        raw[SampleFields.REACHABLE_TARGET_MAX_DISTANCE],
+        dtype=torch.long,
+    )
 
     replay_bank = _replay_bank_fields(
         raw=raw,
@@ -203,6 +211,8 @@ def _build_retrieval_data(
         target_node_ids=target_node_ids,
         reachable_target_node_ids=reachable_target_node_ids,
         node_target_distance=node_target_distance,
+        edge_on_shortest_path=edge_on_shortest_path,
+        reachable_target_max_distance=reachable_target_max_distance,
         replay_bank=replay_bank,
     )
 
@@ -251,6 +261,7 @@ def _replay_bank_fields(
     required = (
         SampleFields.REPLAY_BANK_EDGE_IDS,
         SampleFields.REPLAY_BANK_EDGE_COUNT,
+        SampleFields.REPLAY_BANK_PRIORITY,
     )
     missing = [key for key in required if key not in raw]
     if missing:
@@ -258,6 +269,7 @@ def _replay_bank_fields(
     return ReplayBankSample(
         edge_ids_local=_tensor(raw[required[0]], dtype=torch.long),
         edge_count=_tensor(raw[required[1]], dtype=torch.long),
+        priority=_tensor(raw[required[2]], dtype=torch.float32),
     )
 
 
@@ -265,26 +277,26 @@ def _require_replay_materialization(materialization: MaterializationArtifact) ->
     provenance = materialization.provenance
     if not isinstance(provenance, Mapping):
         raise ValueError(
-            "Materialization is missing provenance for replay. Re-run preprocessing to produce replay_bank_v1."
+            "Materialization is missing provenance for replay/path labels. Re-run preprocessing."
         )
 
     preprocess = provenance.get("preprocess")
     if not isinstance(preprocess, Mapping):
         raise ValueError(
-            "Materialization provenance is missing preprocess metadata for replay. Re-run preprocessing to produce replay_bank_v1."
+            "Materialization provenance is missing preprocess metadata for replay/path labels. Re-run preprocessing."
         )
 
     replay = preprocess.get("replay")
     if not isinstance(replay, Mapping):
         raise ValueError(
-            "Materialization provenance is missing replay metadata. Re-run preprocessing to produce replay_bank_v1."
+            "Materialization provenance is missing replay metadata. Re-run preprocessing."
         )
 
     kind = replay.get("kind")
-    if kind not in {"replay_bank_v1"}:
+    if kind not in {"replay_bank_v4"}:
         raise ValueError(
             "Materialization replay payload is incompatible with current runtime: "
-            f"found {kind!r}, expected 'replay_bank_v1'. Re-run preprocessing."
+            f"found {kind!r}, expected 'replay_bank_v4'. Re-run preprocessing."
         )
 
 

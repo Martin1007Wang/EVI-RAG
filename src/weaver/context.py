@@ -172,6 +172,8 @@ class TargetContext:
     target_count_by_graph: Tensor  # [G]
 
     node_target_distance: Tensor  # [N]
+    edge_on_shortest_path: Tensor  # [E]
+    target_max_distance_by_graph: Tensor  # [G]
     anchor_target_count_by_graph: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
 
     @classmethod
@@ -222,6 +224,14 @@ class TargetContext:
             device=graph_context.device,
             dtype=torch.long,
         )
+        edge_on_shortest_path = batch.edge_on_shortest_path.to(
+            device=graph_context.device,
+            dtype=torch.bool,
+        )
+        target_max_distance_by_graph = batch.reachable_target_max_distance.to(
+            device=graph_context.device,
+            dtype=torch.long,
+        ).view(-1)
 
         anchor_target_count_by_graph = torch.bincount(
             graph_context.node_to_graph.index_select(0, graph_context.anchor_node_ids[target_mask.index_select(0, graph_context.anchor_node_ids)])
@@ -237,6 +247,8 @@ class TargetContext:
                 reachable_target_node_ids_ptr=target_ptr,
                 target_count_by_graph=target_count_by_graph,
                 node_target_distance=node_target_distance,
+                edge_on_shortest_path=edge_on_shortest_path,
+                target_max_distance_by_graph=target_max_distance_by_graph,
                 graph_context=graph_context,
             )
 
@@ -246,6 +258,8 @@ class TargetContext:
             reachable_target_node_ids_ptr=target_ptr,
             target_count_by_graph=target_count_by_graph,
             node_target_distance=node_target_distance,
+            edge_on_shortest_path=edge_on_shortest_path,
+            target_max_distance_by_graph=target_max_distance_by_graph,
             anchor_target_count_by_graph=anchor_target_count_by_graph,
         )
 
@@ -262,6 +276,7 @@ class TargetContext:
 class ReplayContext:
     edge_ids: Tensor
     edge_count: Tensor
+    priority: Tensor
 
     @classmethod
     def from_batch(
@@ -285,6 +300,10 @@ class ReplayContext:
             edge_count=bank.edge_count.to(
                 device=graph_context.device,
                 dtype=torch.long,
+            ).contiguous(),
+            priority=bank.priority.to(
+                device=graph_context.device,
+                dtype=torch.float32,
             ).contiguous(),
         )
 
@@ -484,6 +503,8 @@ def _validate_target_context_tensors(
     reachable_target_node_ids_ptr: Tensor,
     target_count_by_graph: Tensor,
     node_target_distance: Tensor,
+    edge_on_shortest_path: Tensor,
+    target_max_distance_by_graph: Tensor,
     graph_context: GraphContext,
 ) -> None:
     if target_mask.ndim != 1:
@@ -529,36 +550,51 @@ def _validate_target_context_tensors(
         raise ValueError(
             "node_target_distance length must equal num_nodes: " f"{int(node_target_distance.numel())} vs {int(graph_context.num_nodes)}."
         )
+    if edge_on_shortest_path.ndim != 1:
+        raise ValueError("edge_on_shortest_path must have shape [E], " f"got {tuple(edge_on_shortest_path.shape)}.")
+    if edge_on_shortest_path.dtype != torch.bool:
+        raise TypeError("edge_on_shortest_path must have dtype torch.bool, " f"got {edge_on_shortest_path.dtype}.")
+    if int(edge_on_shortest_path.numel()) != int(graph_context.num_edges):
+        raise ValueError(
+            "edge_on_shortest_path length must equal num_edges: " f"{int(edge_on_shortest_path.numel())} vs {int(graph_context.num_edges)}."
+        )
+    if target_max_distance_by_graph.ndim != 1:
+        raise ValueError(
+            "target_max_distance_by_graph must have shape [G], "
+            f"got {tuple(target_max_distance_by_graph.shape)}."
+        )
+    if int(target_max_distance_by_graph.numel()) != int(graph_context.num_graphs):
+        raise ValueError(
+            "target_max_distance_by_graph length must equal num_graphs: "
+            f"{int(target_max_distance_by_graph.numel())} vs {int(graph_context.num_graphs)}."
+        )
 
 def _validate_replay_context_tensors(
     *,
     replay_context: ReplayContext,
     graph_context: GraphContext,
 ) -> None:
-    if replay_context.edge_ids.ndim != 5:
-        raise ValueError("replay edge_ids must have shape [G, budgets, variants, slots, max_budget].")
-    if replay_context.edge_count.ndim != 4:
-        raise ValueError("replay edge_count must have shape [G, budgets, variants, slots].")
+    if replay_context.edge_ids.ndim != 4:
+        raise ValueError("replay edge_ids must have shape [G, variants, slots, max_edges].")
+    if replay_context.edge_count.ndim != 3:
+        raise ValueError("replay edge_count must have shape [G, variants, slots].")
     if replay_context.edge_ids.shape[:-1] != replay_context.edge_count.shape:
         raise ValueError("replay edge_ids and edge_count shapes disagree.")
     if int(replay_context.edge_ids.size(0)) != int(graph_context.num_graphs):
         raise ValueError("replay bank graph dimension must equal graph_context.num_graphs.")
-    if int(replay_context.edge_ids.size(1)) != int(replay_context.edge_ids.size(4)) + 1:
-        raise ValueError("replay bank budgets dimension must equal max_budget + 1.")
-    if int(replay_context.edge_ids.size(2)) <= 0 or int(replay_context.edge_ids.size(3)) <= 0:
+    if int(replay_context.edge_ids.size(1)) <= 0 or int(replay_context.edge_ids.size(2)) <= 0:
         raise ValueError("replay bank must contain at least one variant and one slot.")
     valid_ids = replay_context.edge_ids[replay_context.edge_ids.ge(0)]
     _validate_id_range(ids=valid_ids, upper=int(graph_context.num_edges), name="replay_bank_edge_ids")
     if bool(replay_context.edge_count.lt(-1).any()):
         raise ValueError("replay edge_count must use -1 for unused slots.")
-    budget = torch.arange(int(replay_context.edge_count.size(1)), device=replay_context.edge_count.device).view(1, -1, 1, 1)
-    if bool(replay_context.edge_count.gt(budget).any()):
-        raise ValueError("replay edge_count cannot exceed its bank budget.")
-    position = torch.arange(int(replay_context.edge_ids.size(4)), device=replay_context.edge_ids.device).view(1, 1, 1, 1, -1)
+    if bool(replay_context.edge_count.gt(int(replay_context.edge_ids.size(3))).any()):
+        raise ValueError("replay edge_count cannot exceed replay max_edges.")
+    position = torch.arange(int(replay_context.edge_ids.size(3)), device=replay_context.edge_ids.device).view(1, 1, 1, -1)
     selected = position.lt(replay_context.edge_count.unsqueeze(-1))
     if bool(replay_context.edge_ids[selected].lt(0).any()) or bool(replay_context.edge_ids[~selected].ge(0).any()):
         raise ValueError("replay edge_ids must use nonnegative prefixes with -1 padding.")
-    graph_ids = torch.arange(int(graph_context.num_graphs), device=graph_context.device).view(-1, 1, 1, 1, 1)
+    graph_ids = torch.arange(int(graph_context.num_graphs), device=graph_context.device).view(-1, 1, 1, 1)
     if bool(
         graph_context.edge_to_graph.index_select(0, valid_ids).ne(graph_ids.expand_as(replay_context.edge_ids)[replay_context.edge_ids.ge(0)]).any()
     ):

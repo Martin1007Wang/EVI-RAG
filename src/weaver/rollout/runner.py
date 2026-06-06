@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from src.weaver.context import GraphContext
 from src.weaver.feature import FeaturePack
-from src.weaver.policy import ForwardPolicy, PolicyCache
+from src.weaver.policy import ForwardPolicy, PolicyInput
 from src.weaver.rollout.replay import ReplaySource
 from src.weaver.rollout.engine import RolloutEngine
 from src.weaver.rollout.trajectory import TrajectoryBatch
@@ -57,7 +57,7 @@ class RolloutRunner:
         target_context: TargetContext,
         replay_context: ReplayContext,
         features: FeaturePack,
-        cache: PolicyCache,
+        policy_input: PolicyInput,
         budget: int,
         global_step: int = 0,
         replay_round: int = 0,
@@ -66,17 +66,18 @@ class RolloutRunner:
             policy=policy,
             context=context,
             features=features,
-            cache=cache,
+            policy_input=policy_input,
             num_rollouts=self.train_policy_rollouts,
             budget=budget,
         )
 
         replay_trajectories = TrajectoryBatch.empty(device=context.device, budget=budget)
-        replay_weight = torch.tensor(0.0, device=context.device)
+        replay_fraction = torch.tensor(0.0, device=context.device)
         replay_raw_count = 0
+        replay_priority_mean = torch.tensor(0.0, device=context.device)
         if self.replay_source is not None:
-            replay_weight = torch.tensor(
-                float(self.replay_source.replay_weight(global_step=global_step)),
+            replay_fraction = torch.tensor(
+                float(self.replay_source.current_fraction()),
                 dtype=torch.float32,
                 device=context.device,
             )
@@ -90,9 +91,11 @@ class RolloutRunner:
                 target_context=target_context,
                 replay_context=replay_context,
                 budget=budget,
-                global_step=int(global_step),
                 replay_round=int(replay_round),
             )
+            valid_priority = replay_context.priority[replay_context.edge_count.ge(0) & replay_context.edge_count.le(budget)]
+            if int(valid_priority.numel()) > 0:
+                replay_priority_mean = valid_priority.float().mean()
         all_trajectories = concat_trajectory_batches(
             [trajectories, replay_trajectories],
             device=context.device,
@@ -107,8 +110,9 @@ class RolloutRunner:
             device=context.device,
             context=context,
             target_context=target_context,
-            replay_weight=replay_weight,
+            replay_fraction=replay_fraction,
             replay_raw_count=replay_raw_count,
+            replay_priority_mean=replay_priority_mean,
         )
 
         return TrainRolloutBatch(
@@ -123,19 +127,82 @@ class RolloutRunner:
         policy: ForwardPolicy,
         context: GraphContext,
         features: FeaturePack,
-        cache: PolicyCache,
+        policy_input: PolicyInput,
         budget: int,
         num_rollouts: int | None = None,
+        diversity_edge_penalty: float = 0.0,
     ) -> TrajectoryBatch:
         count = self.eval_rollouts_count if num_rollouts is None else int(num_rollouts)
+        if float(diversity_edge_penalty) > 0.0:
+            return self.diverse_policy_rollouts(
+                policy=policy,
+                context=context,
+                features=features,
+                policy_input=policy_input,
+                num_rollouts=count,
+                budget=budget,
+                edge_penalty=float(diversity_edge_penalty),
+            )
         return self.policy_rollouts(
             policy=policy,
             context=context,
             features=features,
-            cache=cache,
+            policy_input=policy_input,
             num_rollouts=count,
             budget=budget,
         )
+
+    @torch.no_grad()
+    def diverse_policy_rollouts(
+        self,
+        *,
+        policy: ForwardPolicy,
+        context: GraphContext,
+        features: FeaturePack,
+        policy_input: PolicyInput,
+        num_rollouts: int,
+        budget: int,
+        edge_penalty: float,
+    ) -> TrajectoryBatch:
+        num_rollouts = int(num_rollouts)
+        if num_rollouts == 0:
+            return TrajectoryBatch.empty(
+                device=context.device,
+                budget=budget,
+            )
+        edge_use_count = torch.zeros(int(context.num_edges), dtype=torch.float32, device=context.device)
+        batches: list[TrajectoryBatch] = []
+        graph_ids = repeated_graph_ids(
+            num_graphs=int(context.num_graphs),
+            repeats=1,
+            device=context.device,
+        )
+        for _ in range(num_rollouts):
+            trajectories = self.engine.sample(
+                policy=policy,
+                context=context,
+                features=features,
+                policy_input=policy_input,
+                graph_ids=graph_ids,
+                budget=budget,
+                edge_logit_bias=-float(edge_penalty) * edge_use_count,
+            )
+            batches.append(trajectories)
+            selected = trajectories.edge_ids[trajectories.valid_edge_mask()]
+            if int(selected.numel()) > 0:
+                edge_use_count.scatter_add_(
+                    0,
+                    selected,
+                    torch.ones_like(selected, dtype=torch.float32),
+                )
+        combined = concat_trajectory_batches(
+            batches,
+            device=context.device,
+            budget=budget,
+        )
+        if int(combined.num_trajectories) == 0:
+            return combined
+        return combined.select_rows(torch.argsort(combined.graph_ids, stable=True))
 
     @torch.no_grad()
     def policy_rollouts(
@@ -144,7 +211,7 @@ class RolloutRunner:
         policy: ForwardPolicy,
         context: GraphContext,
         features: FeaturePack,
-        cache: PolicyCache,
+        policy_input: PolicyInput,
         num_rollouts: int,
         budget: int,
     ) -> TrajectoryBatch:
@@ -163,7 +230,7 @@ class RolloutRunner:
             policy=policy,
             context=context,
             features=features,
-            cache=cache,
+            policy_input=policy_input,
             graph_ids=graph_ids,
             budget=budget,
         )
@@ -175,8 +242,9 @@ def _train_rollout_metrics(
     device: torch.device,
     context: GraphContext,
     target_context: TargetContext,
-    replay_weight: torch.Tensor,
+    replay_fraction: torch.Tensor,
     replay_raw_count: int,
+    replay_priority_mean: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     if int(trajectories.num_trajectories) == 0:
         num_policy = 0
@@ -208,6 +276,11 @@ def _train_rollout_metrics(
         ),
         dim=0,
     )
+    policy_mask = trajectories.is_policy
+    budget_truncated = (trajectories.is_budget_truncated & policy_mask).sum().item() if int(trajectories.num_trajectories) > 0 else 0
+    model_stop = (trajectories.is_policy_stop & policy_mask).sum().item() if int(trajectories.num_trajectories) > 0 else 0
+    structural_stop = (trajectories.is_no_frontier & policy_mask).sum().item() if int(trajectories.num_trajectories) > 0 else 0
+    denom = float(max(num_policy, 1))
     return {
         "num_trajectories": torch.tensor(
             float(trajectories.num_trajectories),
@@ -218,10 +291,11 @@ def _train_rollout_metrics(
             device=device,
         ),
         "num_replay_trajectories": torch.tensor(float(num_replay), device=device),
-        "replay_weight": replay_weight,
+        "replay_fraction": replay_fraction,
         "replay_raw_trajectory_count": torch.tensor(float(replay_raw_count), device=device),
         "replay_kept_trajectory_count": torch.tensor(float(num_replay), device=device),
         "replay/trajectory_count": torch.tensor(float(num_replay), device=device),
+        "replay/priority_mean": replay_priority_mean,
         "replay/edge_count_mean": replay_edge_counts.float().mean() if int(replay_edge_counts.numel()) > 0 else torch.tensor(0.0, device=device),
         "replay/coverage_recall_mean": replay_recall,
         "replay/unique_edge_set_rate": torch.tensor(float(replay_sets.size(0)) / float(max(num_replay, 1)), device=device),
@@ -231,6 +305,10 @@ def _train_rollout_metrics(
             1.0 - float(replay_graph_count) / float(max(int(context.num_graphs), 1)),
             device=device,
         ),
+        "terminal/budget_truncated_rate": torch.tensor(float(budget_truncated) / denom, device=device),
+        "terminal/model_stop_rate": torch.tensor(float(model_stop) / denom, device=device),
+        "terminal/structural_stop_rate": torch.tensor(float(structural_stop) / denom, device=device),
+        "terminal/budget_truncated_count": torch.tensor(float(budget_truncated), device=device),
     }
 
 

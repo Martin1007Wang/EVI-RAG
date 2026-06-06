@@ -27,7 +27,8 @@ class PolicyOutput:
     action_row_ids: torch.Tensor  # [S + F]
     action_edge_ids: torch.Tensor  # [S + F], STOP = -1
     frontier: FrontierEncoding
-    log_flow: torch.Tensor | None  # [S], training-only
+    log_flow_base: torch.Tensor | None  # [S], f_theta(s), training-only
+    state_h: torch.Tensor | None = None  # [S, H], training-only reuse path
     _log_partition: torch.Tensor = field(init=False, repr=False)
     _action_log_prob: torch.Tensor = field(init=False, repr=False)
 
@@ -67,10 +68,15 @@ class PolicyOutput:
         frontier_count = torch.bincount(self.frontier.row_ids, minlength=self.num_states)
         return frontier_count.eq(0)
 
-    def require_log_flow(self) -> torch.Tensor:
-        if self.log_flow is None:
-            raise RuntimeError("log_flow was not computed. Call policy with compute_log_flow=True.")
-        return self.log_flow
+    def require_log_flow_base(self) -> torch.Tensor:
+        if self.log_flow_base is None:
+            raise RuntimeError("log_flow_base was not computed. Call policy with compute_log_flow=True.")
+        return self.log_flow_base
+
+    def require_state_h(self) -> torch.Tensor:
+        if self.state_h is None:
+            raise RuntimeError("state_h was not retained. Call policy with compute_log_flow=True.")
+        return self.state_h
 
     def gather_log_prob(self, *, row_ids: torch.Tensor, edge_ids: torch.Tensor) -> torch.Tensor:
         positions = _find_actions(
@@ -90,6 +96,13 @@ class PolicyOutput:
             active_segments=rows,
             temperature=1.0,
         )
+        if bool(pos.lt(0).any()) or bool(pos.ge(int(self.action_edge_ids.numel())).any()):
+            raise RuntimeError(
+                "sample_segmented_positions returned invalid action positions: "
+                f"min={int(pos.min().item()) if int(pos.numel()) > 0 else 'n/a'}, "
+                f"max={int(pos.max().item()) if int(pos.numel()) > 0 else 'n/a'}, "
+                f"num_actions={int(self.action_edge_ids.numel())}."
+            )
         return SampledAction(
             row_ids=rows,
             edge_ids=self.action_edge_ids.index_select(0, pos),

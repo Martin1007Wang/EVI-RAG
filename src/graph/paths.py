@@ -14,6 +14,8 @@ node_target_unreachable_distance = 1_000_000_000
 class PathLabels:
     reachable_target_node_ids: torch.Tensor
     node_target_distance: torch.Tensor
+    edge_on_shortest_path: torch.Tensor
+    reachable_target_max_distance: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,17 @@ def compute_path_labels(
             node_target_distances_flat=node_target_distances_flat,
             num_targets=num_targets,
             num_nodes=num_nodes,
+        ),
+        edge_on_shortest_path=_edge_on_shortest_paths(
+            graph=graph,
+            anchors=anchors,
+            reachable_targets=reachable_targets,
+            target_distances_flat=node_target_distances_flat,
+            anchor_distances=anchor_distances,
+        ),
+        reachable_target_max_distance=_reachable_target_max_distance(
+            reachable_targets=reachable_targets,
+            anchor_distances=anchor_distances,
         ),
     )
 
@@ -242,6 +255,41 @@ def _nearest_target_distance(
     return distances.min(dim=0).values.long().contiguous()
 
 
+def _edge_on_shortest_paths(
+    *,
+    graph: _Graph,
+    anchors: Sequence[int],
+    reachable_targets: torch.Tensor,
+    target_distances_flat: torch.Tensor,
+    anchor_distances: Sequence[Sequence[int]] | None,
+) -> torch.Tensor:
+    if graph.num_edges == 0:
+        return torch.empty((0,), dtype=torch.bool)
+    if not anchors or int(reachable_targets.numel()) == 0 or not anchor_distances:
+        return torch.zeros((graph.num_edges,), dtype=torch.bool)
+
+    target_distances = target_distances_flat.view(int(reachable_targets.numel()), -1)
+    labels = torch.zeros((graph.num_edges,), dtype=torch.bool)
+    for anchor_dist in anchor_distances:
+        src_distance = torch.tensor(
+            [anchor_dist[src] for src in graph.src],
+            dtype=torch.long,
+        )
+        for target_pos, target in enumerate(reachable_targets.tolist()):
+            shortest = int(anchor_dist[int(target)])
+            if shortest == unreachable_distance:
+                continue
+            dist_to_target = target_distances[target_pos]
+            dst_to_target = dist_to_target.index_select(0, graph.dst_tensor)
+            on_path = (
+                src_distance.ne(unreachable_distance)
+                & dst_to_target.ne(unreachable_distance)
+                & (src_distance + 1 + dst_to_target).eq(shortest)
+            )
+            labels |= on_path
+    return labels.contiguous()
+
+
 def _bfs(adjacency: list[list[int]], start: int) -> list[int]:
     dist = [unreachable_distance] * len(adjacency)
     dist[start] = 0
@@ -274,6 +322,25 @@ def _empty_target_labels() -> tuple[torch.Tensor, torch.Tensor]:
         torch.empty((0,), dtype=torch.long),
         torch.empty((0,), dtype=torch.long),
     )
+
+
+def _reachable_target_max_distance(
+    *,
+    reachable_targets: torch.Tensor,
+    anchor_distances: Sequence[Sequence[int]] | None,
+) -> int:
+    if int(reachable_targets.numel()) == 0 or not anchor_distances:
+        return 0
+
+    max_distance = 0
+    for target in reachable_targets.tolist():
+        best = min(
+            (dist[int(target)] for dist in anchor_distances if dist[int(target)] != unreachable_distance),
+            default=unreachable_distance,
+        )
+        if best != unreachable_distance:
+            max_distance = max(max_distance, int(best))
+    return max_distance
 
 
 def _empty_anchor_labels() -> AnchorPathLabels:

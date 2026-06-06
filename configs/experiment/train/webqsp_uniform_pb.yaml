@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - /experiment/train/webqsp
+  - _self_
+
+task_name: train_webqsp_uniform_pb
+
+logger:
+  tags: [weaver, detailed_balance, webqsp, uniform_pb]
+
+model:
+  policy:
+    backward_policy:
+      _target_: src.weaver.policy.UniformBackwardPolicy

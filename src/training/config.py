@@ -217,8 +217,6 @@ class EvalRuntimeConfig:
 @dataclass(frozen=True, slots=True)
 class TrainingRuntimeConfig:
     manual_accumulate_grad_batches: int
-    gradient_clip_val: float
-    gradient_clip_algorithm: str
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -227,20 +225,6 @@ class TrainingRuntimeConfig:
             positive_int(
                 self.manual_accumulate_grad_batches,
                 "manual_accumulate_grad_batches",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "gradient_clip_val",
-            non_negative_float(self.gradient_clip_val, "gradient_clip_val"),
-        )
-        object.__setattr__(
-            self,
-            "gradient_clip_algorithm",
-            one_of(
-                self.gradient_clip_algorithm,
-                "gradient_clip_algorithm",
-                {"norm", "value"},
             ),
         )
 

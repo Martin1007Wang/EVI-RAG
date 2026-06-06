@@ -22,7 +22,7 @@ trainer:
 model:
   runner:
     replay_source:
-      anneal_steps: 20000
+      threshold: 0.8
 
 callbacks:
   early_stopping:

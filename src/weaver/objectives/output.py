@@ -10,7 +10,7 @@ from src.utils.scalars import Scalar, detach_scalar, require_scalar_tensor, vali
 @dataclass(frozen=True, slots=True)
 class ObjectiveOutput:
     loss: torch.Tensor
-    metrics: dict[str, Scalar]
+    metrics: dict[str, float]
     num_states: int
 
     def __post_init__(self) -> None:

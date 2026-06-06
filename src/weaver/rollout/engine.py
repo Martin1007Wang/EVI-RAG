@@ -4,11 +4,11 @@ import torch
 
 from src.weaver.context import GraphContext
 from src.weaver.feature import FeaturePack
-from src.weaver.policy import STOP_EDGE_ID, ForwardPolicy, PolicyCache
+from src.weaver.policy import STOP_EDGE_ID, ForwardPolicy, PolicyInput, PolicyOutput
 from src.weaver.state import ExpansionBatch, StateBatch
 
 from .trajectory import (
-    BUDGET,
+    BUDGET_TRUNCATED,
     NO_FRONTIER,
     POLICY_STOP,
     TrajectoryBatch,
@@ -23,9 +23,10 @@ class RolloutEngine:
         policy: ForwardPolicy,
         context: GraphContext,
         features: FeaturePack,
-        cache: PolicyCache,
+        policy_input: PolicyInput,
         graph_ids: torch.Tensor,
         budget: int,
+        edge_logit_bias: torch.Tensor | None = None,
     ) -> TrajectoryBatch:
         graph_ids = graph_ids.to(
             device=context.device,
@@ -82,7 +83,33 @@ class RolloutEngine:
             budget_mask = active_edge_count.ge(budget)
             budget_rows = active_rows[budget_mask]
             if int(budget_rows.numel()) > 0:
-                stop_reason[budget_rows] = int(BUDGET)
+                budget_state = state.take(budget_rows)
+                budget_policy_out = policy(
+                    features=features,
+                    policy_input=policy_input,
+                    state=budget_state,
+                    graph_context=context,
+                )
+                if edge_logit_bias is not None:
+                    budget_policy_out = _apply_edge_logit_bias(
+                        output=budget_policy_out,
+                        edge_logit_bias=edge_logit_bias,
+                    )
+                local_budget_rows = torch.arange(
+                    budget_state.num_states,
+                    dtype=torch.long,
+                    device=context.device,
+                )
+                stop_logp[budget_rows] = budget_policy_out.gather_log_prob(
+                    row_ids=local_budget_rows,
+                    edge_ids=torch.full(
+                        (budget_state.num_states,),
+                        STOP_EDGE_ID,
+                        dtype=torch.long,
+                        device=context.device,
+                    ),
+                ).float()
+                stop_reason[budget_rows] = int(BUDGET_TRUNCATED)
                 done[budget_rows] = True
             decision_rows = active_rows[~budget_mask]
             if int(decision_rows.numel()) == 0:
@@ -95,10 +122,15 @@ class RolloutEngine:
             )
             policy_out = policy(
                 features=features,
-                cache=cache,
+                policy_input=policy_input,
                 state=decision_state,
                 graph_context=context,
             )
+            if edge_logit_bias is not None:
+                policy_out = _apply_edge_logit_bias(
+                    output=policy_out,
+                    edge_logit_bias=edge_logit_bias,
+                )
             sampled = policy_out.sample(rows=local_rows)
             action_edge_ids = sampled.edge_ids
             action_logp = sampled.log_prob.float()
@@ -141,7 +173,7 @@ class RolloutEngine:
                 trusted=True,
             )
         unfinished = stop_reason.lt(0)
-        stop_reason[unfinished] = int(BUDGET)
+        stop_reason[unfinished] = int(BUDGET_TRUNCATED)
         return TrajectoryBatch(
             graph_ids=graph_ids,
             edge_ids=edge_ids,
@@ -155,3 +187,26 @@ class RolloutEngine:
                 device=context.device,
             ),
         )
+
+
+def _apply_edge_logit_bias(
+    *,
+    output: PolicyOutput,
+    edge_logit_bias: torch.Tensor,
+) -> PolicyOutput:
+    edge_logit_bias = edge_logit_bias.to(device=output.device, dtype=output.action_logits.dtype).view(-1)
+    expand = output.action_edge_ids.ge(0)
+    if not bool(expand.any()):
+        return output
+    if bool(output.action_edge_ids[expand].ge(int(edge_logit_bias.numel())).any()):
+        raise ValueError("edge_logit_bias must have one value per graph edge.")
+    logits = output.action_logits.clone()
+    logits[expand] = logits[expand] + edge_logit_bias.index_select(0, output.action_edge_ids[expand])
+    return type(output)(
+        action_logits=logits,
+        action_row_ids=output.action_row_ids,
+        action_edge_ids=output.action_edge_ids,
+        frontier=output.frontier,
+        log_flow_base=output.log_flow_base,
+        state_h=output.state_h,
+    )

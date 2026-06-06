@@ -126,11 +126,14 @@ def prepare_sample(
         anchor_node_ids=anchor_node_ids,
         target_node_ids=target_node_ids,
         reachable_target_node_ids=path_labels.reachable_target_node_ids,
+        reachable_target_max_distance=path_labels.reachable_target_max_distance,
         node_entity_catalog_ids=node_entity_catalog_ids,
         edge_relation_catalog_ids=edge_relation_catalog_ids,
         node_target_distance=path_labels.node_target_distance,
+        edge_on_shortest_path=path_labels.edge_on_shortest_path,
         replay_bank_edge_ids=replay_bank.edge_ids,
         replay_bank_edge_count=replay_bank.edge_count,
+        replay_bank_priority=replay_bank.priority,
     )
 
 

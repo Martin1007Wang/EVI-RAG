@@ -57,6 +57,7 @@ _COUNT_KEYS = frozenset(
 _FLAT_SUPERVISION_KEYS = frozenset(
     {
         SampleFields.NODE_TARGET_DISTANCE,
+        SampleFields.REACHABLE_TARGET_MAX_DISTANCE,
     }
 )
 
@@ -76,17 +77,20 @@ _NO_INCREMENT_KEYS = _GLOBAL_ID_KEYS | _COUNT_KEYS | _FLAT_SUPERVISION_KEYS | _R
 class ReplayBankSample:
     edge_ids_local: torch.Tensor
     edge_count: torch.Tensor
+    priority: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayBankBatch:
     edge_ids: torch.Tensor
     edge_count: torch.Tensor
+    priority: torch.Tensor
 
     def to(self, device: torch.device | str, **kwargs: Any) -> "ReplayBankBatch":
         return ReplayBankBatch(
             edge_ids=self.edge_ids.to(device=device, **kwargs),
             edge_count=self.edge_count.to(device=device, **kwargs),
+            priority=self.priority.to(device=device, **kwargs),
         )
 
 
@@ -187,6 +191,8 @@ class RetrievalBatch(Batch):
     reachable_target_node_ids: torch.Tensor
 
     node_target_distance: torch.Tensor
+    edge_on_shortest_path: torch.Tensor
+    reachable_target_max_distance: torch.Tensor
 
     replay_bank: ReplayBankBatch
 

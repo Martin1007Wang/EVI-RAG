@@ -138,12 +138,18 @@ def build_replay_bank_batch(
     sample_banks = [_sample_replay_bank(sample) for sample in samples]
     edge_chunks: list[torch.Tensor] = []
     count_chunks: list[torch.Tensor] = []
+    priority_chunks: list[torch.Tensor] = []
     edge_offset = 0
     shape = sample_banks[0].edge_ids_local.shape
     count_shape = sample_banks[0].edge_count.shape
+    priority_shape = sample_banks[0].priority.shape
     for sample, bank in zip(samples, sample_banks, strict=True):
         num_edges = int(sample.num_edges)
-        if bank.edge_ids_local.shape != shape or bank.edge_count.shape != count_shape:
+        if (
+            bank.edge_ids_local.shape != shape
+            or bank.edge_count.shape != count_shape
+            or bank.priority.shape != priority_shape
+        ):
             raise ValueError("All replay banks in a batch must have the same shape.")
         local_edge_ids = bank.edge_ids_local.to(device=device, dtype=torch.long)
         valid_local_edge_ids = local_edge_ids[local_edge_ids.ge(0)]
@@ -151,11 +157,13 @@ def build_replay_bank_batch(
             raise ValueError("replay bank contains an edge id outside the sample-local edge range.")
         edge_chunks.append(torch.where(local_edge_ids.ge(0), local_edge_ids + edge_offset, local_edge_ids))
         count_chunks.append(bank.edge_count.to(device=device, dtype=torch.long))
+        priority_chunks.append(bank.priority.to(device=device, dtype=torch.float32))
         edge_offset += int(num_edges)
 
     return ReplayBankBatch(
         edge_ids=torch.stack(edge_chunks, dim=0).contiguous(),
         edge_count=torch.stack(count_chunks, dim=0).contiguous(),
+        priority=torch.stack(priority_chunks, dim=0).contiguous(),
     )
 
 

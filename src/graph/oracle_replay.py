@@ -25,6 +25,7 @@ class ShortestPathDag:
 class ReplayBank:
     edge_ids: Tensor
     edge_count: Tensor
+    priority: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +104,8 @@ def build_replay_bank(
     reachable_target_node_ids: Tensor,
     num_nodes: int,
     sample_id: str,
-    max_budget: int,
+    max_edges: int | None = None,
+    max_budget: int | None = None,
     round_variants: int,
     trajectories_per_graph: int,
     beam_width: int,
@@ -111,21 +113,27 @@ def build_replay_bank(
     max_expansions_per_state: int,
     seed: int,
 ) -> ReplayBank:
-    max_budget = int(max_budget)
+    if max_edges is None:
+        if max_budget is None:
+            raise ValueError("max_edges is required.")
+        max_edges = int(max_budget)
+    elif max_budget is not None and int(max_budget) != int(max_edges):
+        raise ValueError("max_budget and max_edges must agree when both are provided.")
+    max_edges = int(max_edges)
     round_variants = int(round_variants)
     trajectories_per_graph = int(trajectories_per_graph)
     for name, value in (
-        ("max_budget", max_budget),
+        ("max_edges", max_edges),
         ("round_variants", round_variants),
         ("trajectories_per_graph", trajectories_per_graph),
         ("beam_width", beam_width),
         ("path_variants_per_pair", path_variants_per_pair),
         ("max_expansions_per_state", max_expansions_per_state),
     ):
-        if int(value) <= 0 and name != "max_budget":
+        if int(value) <= 0 and name != "max_edges":
             raise ValueError(f"{name} must be positive.")
-        if name == "max_budget" and int(value) < 0:
-            raise ValueError("max_budget must be nonnegative.")
+        if name == "max_edges" and int(value) < 0:
+            raise ValueError("max_edges must be nonnegative.")
 
     edge_index = edge_index.to(dtype=torch.long, device="cpu").contiguous()
     anchors = set(_unique_valid(anchor_node_ids, num_nodes=num_nodes))
@@ -137,14 +145,19 @@ def build_replay_bank(
         num_nodes=num_nodes,
     )
     edge_ids = torch.full(
-        (max_budget + 1, round_variants, trajectories_per_graph, max_budget),
+        (round_variants, trajectories_per_graph, max_edges),
         -1,
         dtype=torch.long,
     )
     edge_count = torch.full(
-        (max_budget + 1, round_variants, trajectories_per_graph),
+        (round_variants, trajectories_per_graph),
         -1,
         dtype=torch.long,
+    )
+    priority = torch.full(
+        (round_variants, trajectories_per_graph),
+        float("-inf"),
+        dtype=torch.float32,
     )
     paths_by_variant = [
         [
@@ -165,34 +178,41 @@ def build_replay_bank(
         ]
         for variant in range(round_variants)
     ]
-    for budget in range(max_budget + 1):
-        for variant in range(round_variants):
-            candidates = _plan_candidates(
-                dag=dag,
+    for variant in range(round_variants):
+        candidates = _plan_candidates(
+            dag=dag,
+            anchors=anchors,
+            targets=targets,
+            sample_id=sample_id,
+            replay_round=variant,
+            budget=max_edges,
+            trajectories_per_graph=trajectories_per_graph,
+            beam_width=int(beam_width),
+            max_expansions_per_state=int(max_expansions_per_state),
+            seed=int(seed),
+            paths_by_pair=paths_by_variant[variant],
+        )
+        selected = _select_submodular_set(
+            candidates=candidates,
+            anchors=anchors,
+            targets=targets,
+            limit=trajectories_per_graph,
+            token=_token(seed, sample_id, variant),
+        )
+        for slot, (candidate, score) in enumerate(selected):
+            ordered = _frontier_legal_order(
+                edge_ids=candidate.edges,
                 anchors=anchors,
-                targets=targets,
-                sample_id=sample_id,
-                replay_round=variant,
-                budget=budget,
-                trajectories_per_graph=trajectories_per_graph,
-                beam_width=int(beam_width),
-                max_expansions_per_state=int(max_expansions_per_state),
-                seed=int(seed),
-                paths_by_pair=paths_by_variant[variant],
+                edge_index=edge_index,
+                token=_token(seed, sample_id, variant, slot),
             )
-            for slot, candidate in enumerate(candidates):
-                ordered = _frontier_legal_order(
-                    edge_ids=candidate.edges,
-                    anchors=anchors,
-                    edge_index=edge_index,
-                    token=_token(seed, sample_id, variant, slot),
-                )
-                if ordered is None:
-                    continue
-                if ordered:
-                    edge_ids[budget, variant, slot, : len(ordered)] = torch.tensor(ordered)
-                edge_count[budget, variant, slot] = len(ordered)
-    return ReplayBank(edge_ids=edge_ids.contiguous(), edge_count=edge_count.contiguous())
+            if ordered is None:
+                continue
+            if ordered:
+                edge_ids[variant, slot, : len(ordered)] = torch.tensor(ordered)
+            edge_count[variant, slot] = len(ordered)
+            priority[variant, slot] = float(score)
+    return ReplayBank(edge_ids=edge_ids.contiguous(), edge_count=edge_count.contiguous(), priority=priority.contiguous())
 
 
 def _plan_candidates(
@@ -235,7 +255,7 @@ def _plan_candidates(
         for item in beam:
             if item.targets - initial_targets:
                 pool[item.edges] = item
-    return _diverse_top_k(list(pool.values()), limit=trajectories_per_graph, token=_token(seed, sample_id, replay_round))
+    return list(pool.values())
 
 
 def _pair_path_variants(*, dag: ShortestPathDag, edge_index: Tensor, pair_id: int, limit: int, token: int) -> list[tuple[int, ...]]:
@@ -271,6 +291,72 @@ def _diverse_top_k(candidates: list[_Candidate], *, limit: int, token: int) -> l
         remaining.sort(key=key)
         selected.append(remaining.pop(0))
     return selected
+
+
+def _select_submodular_set(
+    *,
+    candidates: list[_Candidate],
+    anchors: set[int],
+    targets: set[int],
+    limit: int,
+    token: int,
+) -> list[tuple[_Candidate, float]]:
+    remaining = list(candidates)
+    selected: list[_Candidate] = []
+    selected_with_gain: list[tuple[_Candidate, float]] = []
+    if limit <= 0:
+        return selected_with_gain
+    quality_weight = 1.0
+    diversity_weight = 0.75
+    length_weight = 0.25
+    best_similarity = [0.0] * len(remaining)
+    covered_lengths: set[int] = set()
+    while remaining and len(selected) < limit:
+        best_idx = -1
+        best_gain = float("-inf")
+        for idx, item in enumerate(remaining):
+            gain = quality_weight * _quality_score(item=item, anchors=anchors, targets=targets)
+            gain += diversity_weight * _diversity_gain(candidate=item, universe=remaining, current_best=best_similarity)
+            gain += length_weight * (0.0 if len(item.edges) in covered_lengths else 1.0)
+            gain += 1.0e-6 / float(_stable_rank(token, *sorted(item.edges)) + 1)
+            if gain > best_gain:
+                best_idx = idx
+                best_gain = gain
+        chosen = remaining.pop(best_idx)
+        selected.append(chosen)
+        selected_with_gain.append((chosen, float(best_gain)))
+        covered_lengths.add(len(chosen.edges))
+        for idx, candidate in enumerate(remaining):
+            best_similarity[idx] = max(
+                best_similarity[idx],
+                _edge_jaccard(candidate.edges, chosen.edges),
+            )
+    return selected_with_gain
+
+
+def _quality_score(*, item: _Candidate, anchors: set[int], targets: set[int]) -> float:
+    answer_count = float(len(item.targets))
+    target_count = float(max(len(targets), 1))
+    recall = answer_count / target_count
+    coverage = torch.log(torch.tensor(answer_count * torch.exp(torch.tensor(2.0)).item() + 1.0)).item()
+    return 6.0 * recall + coverage - 0.15 * float(len(item.edges))
+
+
+def _diversity_gain(*, candidate: _Candidate, universe: list[_Candidate], current_best: list[float]) -> float:
+    gain = 0.0
+    for idx, item in enumerate(universe):
+        sim = _edge_jaccard(candidate.edges, item.edges)
+        gain += max(0.0, sim - current_best[idx])
+    return gain
+
+
+def _edge_jaccard(lhs: frozenset[int], rhs: frozenset[int]) -> float:
+    if not lhs and not rhs:
+        return 1.0
+    union = lhs | rhs
+    if not union:
+        return 0.0
+    return float(len(lhs & rhs)) / float(len(union))
 
 
 def _quality_key(item: _Candidate, *, token: int) -> tuple[int, int, int]:

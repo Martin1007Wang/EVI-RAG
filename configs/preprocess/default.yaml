@@ -22,7 +22,7 @@ stream_chunk_size: 4096
 commit_frequency: 1000
 
 replay_bank:
-  max_budget: 8
+  max_edges: 8
   round_variants: 8
   trajectories_per_graph: 4
   beam_width: 32

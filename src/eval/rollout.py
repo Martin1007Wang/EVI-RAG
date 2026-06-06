@@ -8,13 +8,17 @@ import torch
 from src.data.schema import RetrievalBatch
 from src.eval.aggregation import grouped_sample_ids, trajectory_row_matrix
 from src.eval.compactness import per_graph_counts
-from src.eval.retrieval import mean_over_valid_graphs, safe_divide, safe_f1
-from src.eval.targets import eval_target_node_mask
+from src.eval.retrieval import (
+    mean_over_valid_graphs,
+    safe_divide,
+    safe_f1,
+    target_nodes_for_retrieval,
+)
 from src.graph.masks import anchor_node_mask
 from src.utils.scatter import scatter_sum
 from src.weaver.context import GraphContext
 from src.weaver.rollout.trajectory import (
-    BUDGET,
+    BUDGET_TRUNCATED,
     NO_FRONTIER,
     POLICY_STOP,
     SRC_POLICY,
@@ -46,7 +50,7 @@ class RolloutEvalTensors:
 
     policy_stop: Tensor
     no_frontier_stop: Tensor
-    budget_boundary: Tensor
+    budget_truncated: Tensor
     terminal_step: Tensor
 
     valid_graph_mask: Tensor
@@ -154,7 +158,7 @@ def rollout_eval_tensors(
         num_graphs=num_graphs,
     )
 
-    policy_stop, no_frontier_stop, budget_boundary = terminal_matrices(
+    policy_stop, no_frontier_stop, budget_truncated = terminal_matrices(
         trajectories=trajectories,
         num_graphs=num_graphs,
     )
@@ -170,7 +174,7 @@ def rollout_eval_tensors(
         trajectory_len=trajectory_len,
         policy_stop=policy_stop,
         no_frontier_stop=no_frontier_stop,
-        budget_boundary=budget_boundary,
+        budget_truncated=budget_truncated,
         terminal_step=terminal_step,
         valid_graph_mask=valid_graph_mask,
         budget=int(trajectories.budget),
@@ -275,17 +279,17 @@ def selected_edge_pairs(state: StateBatch) -> tuple[Tensor, Tensor]:
     """
 
     num_states = int(state.num_states)
-    budget = int(state.budget)
+    edge_capacity = int(state.edge_capacity)
 
-    if num_states == 0 or budget == 0:
+    if num_states == 0 or edge_capacity == 0:
         empty = torch.empty(0, dtype=torch.long, device=state.device)
         return empty, empty
 
     steps = torch.arange(
-        budget,
+        edge_capacity,
         dtype=torch.long,
         device=state.device,
-    ).view(1, budget)
+    ).view(1, edge_capacity)
 
     valid = steps.lt(state.edge_count.view(num_states, 1))
     edge_ids = state.edge_ids[valid]
@@ -324,10 +328,11 @@ def retrieval_from_masks(
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
 
-    target_nodes = eval_target_node_mask(
-        batch,
+    target_nodes = target_nodes_for_retrieval(
+        batch=batch,
         device=device,
         use_reachable_targets=use_reachable_targets,
+        exclude_anchors=exclude_anchors_from_retrieved,
     )
 
     retrieved_nodes = node_masks
@@ -475,14 +480,12 @@ def answer_support_probability(
     device = tensors.node_masks.device
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
-    targets = eval_target_node_mask(
-        batch,
+    targets = target_nodes_for_retrieval(
+        batch=batch,
         device=device,
         use_reachable_targets=use_reachable_targets,
+        exclude_anchors=exclude_anchors_from_retrieved,
     )
-
-    if exclude_anchors_from_retrieved:
-        targets = targets & ~anchor_node_mask(batch, device=device)
 
     support = tensors.node_masks.float().mean(dim=0)
 
@@ -514,6 +517,8 @@ def terminal_metrics(
 
     hit = stats["hit"]
     continued = stats["continued"]
+    wasted_edges = stats["wasted_edges"]
+    selected_edges = stats["edge_count"]
     valid = tensors.valid_graph_mask
 
     return {
@@ -525,8 +530,8 @@ def terminal_metrics(
             tensors.no_frontier_stop,
             valid,
         ),
-        "terminal/budget_boundary_rate": mean_over_valid_graphs(
-            tensors.budget_boundary,
+        "terminal/budget_truncated_rate": mean_over_valid_graphs(
+            tensors.budget_truncated,
             valid,
         ),
         "terminal/policy_terminal_rate": mean_over_valid_graphs(
@@ -534,12 +539,16 @@ def terminal_metrics(
             valid,
         ),
         "terminal/forced_terminal_rate": mean_over_valid_graphs(
-            tensors.no_frontier_stop + tensors.budget_boundary,
+            tensors.no_frontier_stop + tensors.budget_truncated,
             valid,
         ),
         "terminal/hit_then_continue_rate": _mean_hit_values(
             continued.float(),
             hit,
+            valid,
+        ),
+        "terminal/wasted_edge_rate": mean_over_valid_graphs(
+            safe_divide(wasted_edges, selected_edges),
             valid,
         ),
         "terminal/stop_after_hit_rate": _mean_hit_values(
@@ -605,7 +614,7 @@ def terminal_matrices(
     Outputs:
     - policy_stop: trajectory ended because policy sampled STOP;
     - no_frontier_stop: trajectory ended because no legal expansion existed;
-    - budget_boundary: trajectory ended because expansion budget was exhausted.
+    - budget_truncated: trajectory hit the hard edge budget before model STOP.
 
     All three cases are terminal trajectories. The split is retained for
     diagnostics only.
@@ -621,7 +630,7 @@ def terminal_matrices(
 
     policy_stop = trajectories.stop_reason.eq(int(POLICY_STOP))
     no_frontier_stop = trajectories.stop_reason.eq(int(NO_FRONTIER))
-    budget_boundary = trajectories.stop_reason.eq(int(BUDGET))
+    budget_truncated = trajectories.stop_reason.eq(int(BUDGET_TRUNCATED))
 
     if policy_only:
         policy_source = trajectories.source.eq(int(SRC_POLICY))
@@ -640,7 +649,7 @@ def terminal_matrices(
         ).to(device=torch.device("cpu"), dtype=torch.float32),
         trajectory_row_matrix(
             trajectories,
-            budget_boundary.float(),
+            budget_truncated.float(),
             num_graphs=int(num_graphs),
         ).to(device=torch.device("cpu"), dtype=torch.float32),
     )
@@ -665,19 +674,30 @@ def hit_terminal_stats(
         (num_samples, num_graphs),
         dtype=torch.bool,
     )
+    wasted_edges = torch.zeros(
+        (num_samples, num_graphs),
+        dtype=torch.float32,
+    )
+    selected_edge_count = torch.zeros(
+        (num_samples, num_graphs),
+        dtype=torch.float32,
+    )
 
     if int(trajectories.num_trajectories) == 0:
         return {
             "hit": hit,
             "continued": continued,
+            "wasted_edges": wasted_edges,
+            "edge_count": selected_edge_count,
         }
 
     device = torch.device("cpu")
 
-    targets = eval_target_node_mask(
-        batch,
+    targets = target_nodes_for_retrieval(
+        batch=batch,
         device=device,
         use_reachable_targets=True,
+        exclude_anchors=True,
     )
     anchors = anchor_node_mask(
         batch,
@@ -719,7 +739,7 @@ def hit_terminal_stats(
         graph_nodes = node_batch.eq(graph_id)
         active = anchors & graph_nodes
 
-        seen_hit = bool((active & targets & graph_nodes).any())
+        seen_hit = bool(((active & ~anchors) & targets & graph_nodes).any())
         expanded_after_hit = False
 
         for step in range(int(edge_count[row].item())):
@@ -730,18 +750,22 @@ def hit_terminal_stats(
 
             if seen_hit:
                 expanded_after_hit = True
+                wasted_edges[sample_id, graph_id] += 1.0
 
             active[edge_index[0, edge_id]] = True
             active[edge_index[1, edge_id]] = True
 
-            seen_hit = seen_hit or bool((active & targets & graph_nodes).any())
+            seen_hit = seen_hit or bool((((active & ~anchors) & targets) & graph_nodes).any())
 
         hit[sample_id, graph_id] = seen_hit
         continued[sample_id, graph_id] = expanded_after_hit
+        selected_edge_count[sample_id, graph_id] = float(edge_count[row].item())
 
     return {
         "hit": hit,
         "continued": continued,
+        "wasted_edges": wasted_edges,
+        "edge_count": selected_edge_count,
     }
 
 

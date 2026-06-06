@@ -1,32 +1,41 @@
-# @package dataset
+# @package _global_
 
-name: webqsp
-dataset_family: kgqa
-dataset_scope: webqsp
-dataset_source: hf
-hf_dataset: rmanluo/RoG-webqsp
-hf_revision: c0632533135a06f8c5d536b420deec5fcb5c58f3
+dataset:
+  name: webqsp
+  dataset_family: kgqa
+  dataset_scope: webqsp
+  dataset_source: hf
+  hf_dataset: rmanluo/RoG-webqsp
+  hf_revision: c0632533135a06f8c5d536b420deec5fcb5c58f3
 
-entity_typing:
-  non_text_prefixes: ["m.", "g."]
+  entity_typing:
+    non_text_prefixes: ["m.", "g."]
 
-splits:
-  train: train
-  validation: validation
-  test: test
+  splits:
+    train: train
+    validation: validation
+    test: test
 
-root_dir: ${paths.data_dir}/${dataset.name}
-artifact_dir: ${dataset.root_dir}/artifacts
+  root_dir: ${paths.data_dir}/${dataset.name}
+  artifact_dir: ${dataset.root_dir}/artifacts
 
-paths:
-  raw_dir: ${dataset.root_dir}/raw
-  metadata_dir: ${dataset.root_dir}/metadata
-  embeddings_dir: ${dataset.root_dir}/embeddings
+  paths:
+    raw_dir: ${dataset.root_dir}/raw
+    metadata_dir: ${dataset.root_dir}/metadata
+    embeddings_dir: ${dataset.root_dir}/embeddings
 
-column_map:
-  question_id_field: id
-  question_field: question
-  answer_text_field: answer
-  question_entity_field: q_entity
-  answer_entity_field: a_entity
-  graph_field: graph
+  column_map:
+    question_id_field: id
+    question_field: question
+    answer_text_field: answer
+    question_entity_field: q_entity
+    answer_entity_field: a_entity
+    graph_field: graph
+
+model:
+  optimization:
+    scheduler:
+      type: warmup_cosine
+      interval: step
+      warmup_ratio: 0.1
+      eta_min: 3.0e-5

@@ -98,7 +98,7 @@ def build_model(
         "hidden_dim": resolved_model_cfg["hidden_dim"],
         "feature_encoder": feature_encoder,
         "policy": policy,
-        "terminal_reward_model": resolved_model_cfg["terminal_reward_model"],
+        "reward_model": resolved_model_cfg["reward_model"],
         "objective": resolved_model_cfg["objective"],
         "runner": resolved_model_cfg["runner"],
         "optimization": resolved_model_cfg["optimization"],
@@ -174,9 +174,7 @@ def _instantiate_optional_component(
         return None
 
     if not isinstance(config, DictConfig):
-        raise TypeError(
-            f"{name} must be a DictConfig or null, got {type(config).__name__}."
-        )
+        raise TypeError(f"{name} must be a DictConfig or null, got {type(config).__name__}.")
 
     if "_target_" not in config:
         raise ValueError(f"{name} must be null or contain '_target_'.")
@@ -286,6 +284,7 @@ def _build_policy(policy_cfg: DictConfig) -> ForwardPolicy:
         "state_encoder": resolved_policy_cfg["state_encoder"],
         "flow_estimator": resolved_policy_cfg["flow_estimator"],
         "state_flow_head": resolved_policy_cfg["state_flow_head"],
+        "backward_policy": resolved_policy_cfg.get("backward_policy"),
     }
     return require_type(
         hydra.utils.instantiate(policy_model_cfg),

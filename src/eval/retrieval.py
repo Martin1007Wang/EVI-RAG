@@ -19,6 +19,23 @@ def batch_num_graphs(batch: RetrievalBatch) -> int:
     return int(batch.num_graphs)
 
 
+def target_nodes_for_retrieval(
+    *,
+    batch: RetrievalBatch,
+    device: torch.device,
+    use_reachable_targets: bool,
+    exclude_anchors: bool,
+) -> torch.Tensor:
+    target_nodes = eval_target_node_mask(
+        batch,
+        device=device,
+        use_reachable_targets=use_reachable_targets,
+    )
+    if exclude_anchors:
+        target_nodes = target_nodes & ~anchor_node_mask(batch, device=device)
+    return target_nodes
+
+
 def compute_node_retrieval_matrix(
     rollouts: TrajectoryBatch,
     batch: RetrievalBatch,
@@ -51,10 +68,11 @@ def compute_node_retrieval_matrix(
     num_rollouts = _num_samples(rollouts, num_graphs=num_graphs)
 
     node_batch = batch.batch.to(device=device, dtype=torch.long)
-    target_nodes = eval_target_node_mask(
-        batch,
+    target_nodes = target_nodes_for_retrieval(
+        batch=batch,
         device=device,
         use_reachable_targets=use_reachable_targets,
+        exclude_anchors=exclude_anchors_from_retrieved,
     )
 
     terminal_nodes, _ = stacked_subgraph_masks(
@@ -76,7 +94,7 @@ def compute_node_retrieval_matrix(
     else:
         retrieved_nodes = terminal_nodes
 
-    hit_nodes = terminal_nodes & target_nodes.unsqueeze(0)
+    hit_nodes = retrieved_nodes & target_nodes.unsqueeze(0)
     expanded_node_batch = _rollout_graph_index(
         node_batch=node_batch,
         num_rollouts=num_rollouts,
@@ -193,4 +211,5 @@ __all__ = [
     "mean_over_valid_graphs",
     "safe_divide",
     "safe_f1",
+    "target_nodes_for_retrieval",
 ]

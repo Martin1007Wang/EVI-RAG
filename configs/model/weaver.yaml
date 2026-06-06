@@ -25,23 +25,28 @@ policy:
     _target_: src.weaver.policy.FlowEstimator
     hidden_dim: ${model.hidden_dim}
     relation_lambda: 0.5
+    stop_initial_bias: 1.5
   state_flow_head:
     _target_: src.weaver.policy.StateFlowHead
     state_dim: ${model.hidden_dim}
+  backward_policy:
+    _target_: src.weaver.policy.UniformBackwardPolicy
+    hidden_dim: ${model.hidden_dim}
+    relation_lambda: 0.5
 
-terminal_reward_model:
-  _target_: src.weaver.reward.TerminalRewardModel
-  eps: 1.0
-  answer_weight: 6.0
-  coverage_weight: 1.0
-  edge_cost: 0.15
-  fail_cost: 6.0
-  answer_prize: 2.0
+reward_model:
+  _target_: src.weaver.reward.EvidenceStateScorer
+  fail_cost: 1.0
+  alpha: 0.1
+  budget: ${model.budget}
 
 objective:
-  _target_: src.weaver.objectives.SubTrajectoryBalanceObjective
-  subtb_lambda: 1.0
-  max_subtrajectory_length: null
+  _target_: src.weaver.objectives.ForwardLookingSubTBObjective
+  subtb_lambda: 0.9
+  terminal_loss_weight: 2.0
+  path_nce_weight: 0.0
+  path_nce_temperature: 1.0
+
 
 runner:
   _target_: src.weaver.rollout.runner.RolloutRunner
@@ -49,23 +54,31 @@ runner:
     _target_: src.weaver.rollout.engine.RolloutEngine
   replay_source:
     _target_: src.weaver.rollout.replay.ReplaySource
-    anneal_steps: null
+    metric_name: val/rollout_union@8/recall
+    threshold: 0.8
   train_policy_rollouts: 8
   eval_rollouts: 8
 
 optimization:
   optimizer:
     type: adamw
-    lr: 1.0e-4
-    weight_decay: 0.01
+    lr: 3.0e-4
+    weight_decay: 0.05
     betas: [0.9, 0.999]
+    eps: 1.0e-8
     no_decay_on_bias_and_norm: true
-  scheduler: null
 
+  scheduler:
+    type: warmup_cosine
+    interval: step
+    warmup_ratio: 0.1
+    eta_min: 3.0e-5
+    
 evaluation:
   k_windows: [1, 2, 4, 8]
   exclude_anchors_from_retrieved: true
   use_reachable_targets: true
   enable_terminal_diagnostics: true
+  diversity_edge_penalty: 0.0
 
 validate_batch_coordinates: false

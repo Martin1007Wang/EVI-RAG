@@ -23,6 +23,7 @@ class ExpansionBatch:
 class FrontierEncoding:
     row_ids: Tensor  # [F]
     edge_ids: Tensor  # [F]
+    graph_ids: Tensor  # [F]
 
     @property
     def num_actions(self) -> int:
@@ -46,7 +47,6 @@ class StateBatch:
     graph_ids: Tensor  # [S]
     edge_ids: Tensor  # [S, B], sorted ascending with -1 padding
     edge_count: Tensor  # [S]
-    budget: int  # Shared batch width; per-state budgets are not part of StateBatch.
 
     @classmethod
     def initial(
@@ -57,13 +57,13 @@ class StateBatch:
         graph_context: GraphContext,
     ) -> StateBatch:
         graph_ids = graph_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
-        budget = int(budget)
-        if budget < 0:
-            raise ValueError("budget must be nonnegative.")
+        edge_capacity = int(budget)
+        if edge_capacity < 0:
+            raise ValueError("edge capacity must be nonnegative.")
         return cls(
             graph_ids=graph_ids,
             edge_ids=torch.full(
-                (int(graph_ids.numel()), budget),
+                (int(graph_ids.numel()), edge_capacity),
                 -1,
                 dtype=torch.long,
                 device=graph_context.device,
@@ -73,7 +73,6 @@ class StateBatch:
                 dtype=torch.long,
                 device=graph_context.device,
             ),
-            budget=budget,
         )
 
     @classmethod
@@ -89,15 +88,17 @@ class StateBatch:
         graph_ids = graph_ids.to(device=graph_context.device, dtype=torch.long).view(-1)
         edge_ids = edge_ids.to(device=graph_context.device, dtype=torch.long)
         edge_count = edge_count.to(device=graph_context.device, dtype=torch.long).view(-1)
-        budget = int(budget)
-        if edge_ids.shape != (int(graph_ids.numel()), budget):
-            raise ValueError("edge_ids must have shape [num_states, budget].")
+        edge_capacity = int(edge_ids.size(1)) if edge_ids.ndim == 2 else int(budget)
+        if int(budget) != edge_capacity:
+            raise ValueError("budget must match edge_ids storage width.")
+        if edge_ids.shape != (int(graph_ids.numel()), edge_capacity):
+            raise ValueError("edge_ids must have shape [num_states, edge_capacity].")
         if int(edge_count.numel()) != int(graph_ids.numel()):
             raise ValueError("edge_count must have one value per state.")
-        if bool(edge_count.lt(0).any()) or bool(edge_count.gt(budget).any()):
-            raise ValueError("edge_count must be in [0, budget].")
+        if bool(edge_count.lt(0).any()) or bool(edge_count.gt(edge_capacity).any()):
+            raise ValueError("edge_count must be in [0, edge_capacity].")
 
-        valid = _prefix_mask(edge_count, budget)
+        valid = _prefix_mask(edge_count, edge_capacity)
         selected = edge_ids[valid]
         if bool(selected.lt(0).any()):
             raise ValueError("selected edge ids must be nonnegative.")
@@ -113,7 +114,7 @@ class StateBatch:
         if selected.numel() and not bool(graph_context.edge_to_graph.index_select(0, selected).eq(graph_ids.index_select(0, selected_rows)).all()):
             raise ValueError("selected edges must belong to the state graph.")
 
-        state = cls(graph_ids=graph_ids, edge_ids=out, edge_count=edge_count, budget=budget)
+        state = cls(graph_ids=graph_ids, edge_ids=out, edge_count=edge_count)
         if not bool(state.root_reachable_mask(graph_context).all()):
             raise ValueError("selected edge set must be root-reachable.")
         return state
@@ -127,8 +128,8 @@ class StateBatch:
         return int(self.graph_ids.numel())
 
     @property
-    def budget_left(self) -> Tensor:
-        return int(self.budget) - self.edge_count
+    def edge_capacity(self) -> int:
+        return int(self.edge_ids.size(1))
 
     def take(self, rows: Tensor) -> StateBatch:
         rows = rows.to(device=self.device, dtype=torch.long).view(-1)
@@ -136,11 +137,10 @@ class StateBatch:
             graph_ids=self.graph_ids.index_select(0, rows),
             edge_ids=self.edge_ids.index_select(0, rows),
             edge_count=self.edge_count.index_select(0, rows),
-            budget=int(self.budget),
         )
 
     def selected_edge_index(self) -> EdgeSelection:
-        valid = _prefix_mask(self.edge_count, int(self.budget))
+        valid = _prefix_mask(self.edge_count, self.edge_capacity)
         rows = valid.nonzero(as_tuple=True)[0]
         return EdgeSelection(row_ids=rows, edge_ids=self.edge_ids[valid])
 
@@ -155,13 +155,11 @@ class StateBatch:
         self,
         *,
         graph_context: GraphContext,
-        remaining_budget: Tensor | None = None,
         active: NodeSelection | None = None,
     ) -> FrontierEncoding:
         return frontier_from_graph(
             state=self,
             graph=graph_context,
-            remaining_budget=remaining_budget,
             active=active,
         )
 
@@ -195,8 +193,8 @@ class StateBatch:
             raise ValueError("advance() requires unique state rows.")
         if int(rows.numel()) == 0:
             return self
-        if bool(self.budget_left.index_select(0, rows).le(0).any()):
-            raise ValueError("advance() received a state with no remaining budget.")
+        if bool(self.edge_count.index_select(0, rows).ge(self.edge_capacity).any()):
+            raise ValueError("advance() received a state with no remaining edge storage capacity.")
 
         if not trusted:
             frontier = frontier_from_graph(state=self.take(rows), graph=graph_context)
@@ -218,7 +216,6 @@ class StateBatch:
             graph_ids=self.graph_ids,
             edge_ids=next_ids,
             edge_count=next_count,
-            budget=int(self.budget),
         )
 
     def root_reachable_mask(self, graph: GraphContext) -> Tensor:
@@ -233,30 +230,34 @@ def frontier_from_graph(
     *,
     state: StateBatch,
     graph: GraphContext,
-    remaining_budget: Tensor | None = None,
     active: NodeSelection | None = None,
 ) -> FrontierEncoding:
-    remaining_budget = state.budget_left if remaining_budget is None else remaining_budget
-    remaining_budget = remaining_budget.to(device=state.device, dtype=torch.long).view(-1)
-    if int(remaining_budget.numel()) != state.num_states:
-        raise ValueError("remaining_budget must have one value per state.")
-
     active = state.active_node_index(graph) if active is None else active
+    expandable = state.edge_count.lt(state.edge_capacity)
+    if int(active.row_ids.numel()) > 0:
+        keep_active = expandable.index_select(0, active.row_ids)
+        active = NodeSelection(
+            row_ids=active.row_ids[keep_active],
+            node_ids=active.node_ids[keep_active],
+        )
+    if int(active.row_ids.numel()) == 0:
+        empty = torch.empty(0, dtype=torch.long, device=state.device)
+        return FrontierEncoding(empty, empty, empty)
     counts = graph.adjacency.out_ptr.index_select(0, active.node_ids + 1) - graph.adjacency.out_ptr.index_select(0, active.node_ids)
     total = int(counts.sum().item())
     if total == 0:
         empty = torch.empty(0, dtype=torch.long, device=state.device)
-        return FrontierEncoding(empty, empty)
+        return FrontierEncoding(empty, empty, empty)
     rows = torch.repeat_interleave(active.row_ids, counts, output_size=total)
     positions = torch.repeat_interleave(graph.adjacency.out_ptr.index_select(0, active.node_ids), counts, output_size=total) + _segment_arange(counts)
     edges = graph.adjacency.edge_ids_by_src.index_select(0, positions)
     selected = state.edge_ids.index_select(0, rows)
-    valid = _prefix_mask(state.edge_count.index_select(0, rows), int(state.budget))
-    keep = remaining_budget.index_select(0, rows).gt(0) & ~(selected.eq(edges.view(-1, 1)) & valid).any(dim=1)
+    valid = _prefix_mask(state.edge_count.index_select(0, rows), state.edge_capacity)
+    keep = ~(selected.eq(edges.view(-1, 1)) & valid).any(dim=1)
     rows, edges = rows[keep], edges[keep]
     if int(edges.numel()) == 0:
         empty = torch.empty(0, dtype=torch.long, device=state.device)
-        return FrontierEncoding(empty, empty)
+        return FrontierEncoding(empty, empty, empty)
     keys = rows * max(int(graph.num_edges), 1) + edges
     order = torch.argsort(keys)
     keep = torch.ones(int(order.numel()), dtype=torch.bool, device=state.device)
@@ -266,7 +267,8 @@ def frontier_from_graph(
     order = order[keep]
     rows = rows.index_select(0, order)
     edges = edges.index_select(0, order)
-    return FrontierEncoding(rows, edges)
+    graph_ids = state.graph_ids.index_select(0, rows)
+    return FrontierEncoding(rows, edges, graph_ids)
 
 
 def remove_selected_edge(
@@ -289,7 +291,6 @@ def remove_selected_edge(
         graph_ids=child.graph_ids,
         edge_ids=edge_ids,
         edge_count=torch.tensor([int(remaining.numel())], dtype=torch.long, device=state.device),
-        budget=int(child.budget),
     )
 
 

@@ -34,12 +34,8 @@ class SubTBBatch:
     step_parent_state_ids: torch.Tensor
     step_edge_ids: torch.Tensor
     terminal_state_ids: torch.Tensor
-    terminal_step_by_traj: torch.Tensor
-    terminal_kind_by_traj: torch.Tensor
-    trainable_terminal_mask: torch.Tensor
-    terminal_stop_action_mask: torch.Tensor
-    policy_transition_terms: SubTBTermTable
-    replay_transition_terms: SubTBTermTable
+    terminal_trainable_stop_mask: torch.Tensor
+    transition_terms: SubTBTermTable
     terminal_terms: SubTBTermTable
 
 
@@ -47,7 +43,6 @@ def prepare_subtb_batch(
     *,
     trajectories: TrajectoryBatch,
     graph_context: GraphContext,
-    max_subtrajectory_length: int | None = None,
 ) -> SubTBBatch:
     budget = int(trajectories.budget)
     device = trajectories.device
@@ -97,27 +92,18 @@ def prepare_subtb_batch(
     terminal_step_by_traj = trajectories.edge_count.to(dtype=torch.long)
     traj_rows = torch.arange(trajectory_count, device=device)
     terminal_state_ids = prefix_state_ids[traj_rows, terminal_step_by_traj]
-    terminal_kind_by_traj = trajectories.terminal_kind.to(dtype=torch.long)
-    trainable_terminal_mask = trajectories.has_trainable_stop
-    terminal_stop_action_mask = trainable_terminal_mask | trajectories.is_external_terminal
+    terminal_reward_mask = trajectories.has_terminal_reward
+    terminal_trainable_stop_mask = trajectories.has_trainable_stop
 
-    policy_transition_terms = _build_transition_terms(
+    transition_terms = _build_transition_terms(
         prefix_state_ids=prefix_state_ids,
         lengths=terminal_step_by_traj,
-        row_mask=trajectories.is_policy,
-        max_subtrajectory_length=max_subtrajectory_length,
-    )
-    replay_transition_terms = _build_transition_terms(
-        prefix_state_ids=prefix_state_ids,
-        lengths=terminal_step_by_traj,
-        row_mask=trajectories.is_replay,
-        max_subtrajectory_length=max_subtrajectory_length,
+        row_mask=trajectories.is_policy | trajectories.is_replay,
     )
     terminal_terms = _build_terminal_terms(
         prefix_state_ids=prefix_state_ids,
         lengths=terminal_step_by_traj,
-        row_mask=torch.ones_like(trainable_terminal_mask, dtype=torch.bool),
-        max_subtrajectory_length=max_subtrajectory_length,
+        row_mask=terminal_reward_mask,
     )
 
     return SubTBBatch(
@@ -130,12 +116,8 @@ def prepare_subtb_batch(
         step_parent_state_ids=step_parent_state_ids,
         step_edge_ids=step_edge_ids,
         terminal_state_ids=terminal_state_ids,
-        terminal_step_by_traj=terminal_step_by_traj,
-        terminal_kind_by_traj=terminal_kind_by_traj,
-        trainable_terminal_mask=trainable_terminal_mask,
-        terminal_stop_action_mask=terminal_stop_action_mask,
-        policy_transition_terms=policy_transition_terms,
-        replay_transition_terms=replay_transition_terms,
+        terminal_trainable_stop_mask=terminal_trainable_stop_mask,
+        transition_terms=transition_terms,
         terminal_terms=terminal_terms,
     )
 
@@ -145,16 +127,13 @@ def _build_transition_terms(
     prefix_state_ids: torch.Tensor,
     lengths: torch.Tensor,
     row_mask: torch.Tensor,
-    max_subtrajectory_length: int | None,
 ) -> SubTBTermTable:
     width = int(prefix_state_ids.size(1))
     steps = torch.arange(width, dtype=torch.long, device=prefix_state_ids.device)
     start_grid = steps.view(1, width, 1)
     end_grid = steps.view(1, 1, width)
     span = end_grid - start_grid
-    valid = row_mask.view(-1, 1, 1) & span.gt(0) & end_grid.le(lengths.view(-1, 1, 1) - 1)
-    if max_subtrajectory_length is not None:
-        valid = valid & span.le(int(max_subtrajectory_length))
+    valid = row_mask.view(-1, 1, 1) & span.gt(0) & end_grid.le(lengths.view(-1, 1, 1))
 
     traj_ids, start_steps, end_steps = valid.nonzero(as_tuple=True)
     return SubTBTermTable(
@@ -172,14 +151,11 @@ def _build_terminal_terms(
     prefix_state_ids: torch.Tensor,
     lengths: torch.Tensor,
     row_mask: torch.Tensor,
-    max_subtrajectory_length: int | None,
 ) -> SubTBTermTable:
     width = int(prefix_state_ids.size(1))
     start_grid = torch.arange(width, dtype=torch.long, device=prefix_state_ids.device).view(1, width)
     span = lengths.view(-1, 1) - start_grid
     valid = row_mask.view(-1, 1) & span.ge(0)
-    if max_subtrajectory_length is not None:
-        valid = valid & span.le(int(max_subtrajectory_length))
 
     traj_ids, start_steps = valid.nonzero(as_tuple=True)
     end_steps = lengths.index_select(0, traj_ids)
