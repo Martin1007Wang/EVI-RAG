@@ -7,7 +7,14 @@ from .backward import (
     uniform_backward_log_prob,
 )
 from .edge_scorer import QuestionConditionedEdgeScorer
-from .forward import FlowEstimator, ForwardPolicy, PolicyActionSpace, PolicyInput, StateFlowHead
+from .forward import (
+    FlowEstimator,
+    ForwardPolicy,
+    FrontierPruningConfig,
+    PolicyActionSpace,
+    PolicyInput,
+    StateFlowHead,
+)
 from .output import PolicyOutput, STOP_EDGE_ID
 
 __all__ = [
@@ -16,6 +23,7 @@ __all__ = [
     "UniformBackwardPolicy",
     "FlowEstimator",
     "ForwardPolicy",
+    "FrontierPruningConfig",
     "PolicyOutput",
     "PolicyActionSpace",
     "PolicyInput",

@@ -75,7 +75,7 @@ class BackwardPolicyOutput:
 class BackwardPolicy(nn.Module):
     """Parameterized P_B(parent | child) over removable child edges."""
 
-    def __init__(self, *, hidden_dim: int, relation_lambda: float = 0.5) -> None:
+    def __init__(self, *, hidden_dim: int) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim)
         if hidden_dim <= 0:
@@ -83,7 +83,6 @@ class BackwardPolicy(nn.Module):
         self.hidden_dim = hidden_dim
         self.edge_scorer = QuestionConditionedEdgeScorer(
             hidden_dim=hidden_dim,
-            relation_lambda=relation_lambda,
         )
 
     def forward(
@@ -92,14 +91,12 @@ class BackwardPolicy(nn.Module):
         child_state_h: Tensor,
         question_h_by_graph: Tensor,
         edge_h: Tensor,
-        relation_h: Tensor,
         removable: FrontierEncoding,
     ) -> BackwardPolicyOutput:
         logits = self.score_edges(
             child_state_h=child_state_h,
             question_h_by_graph=question_h_by_graph,
             edge_h=edge_h,
-            relation_h=relation_h,
             removable=removable,
         )
         return BackwardPolicyOutput(
@@ -115,19 +112,16 @@ class BackwardPolicy(nn.Module):
         child_state_h: Tensor,
         question_h_by_graph: Tensor,
         edge_h: Tensor,
-        relation_h: Tensor,
         removable: FrontierEncoding,
     ) -> Tensor:
         if int(removable.edge_ids.numel()) == 0:
             return child_state_h.new_empty((0,), dtype=torch.float32)
         state_part = child_state_h.index_select(0, removable.row_ids)
         edge_part = edge_h.index_select(0, removable.edge_ids)
-        relation_part = relation_h.index_select(0, removable.edge_ids)
         question_part = question_h_by_graph.index_select(0, removable.graph_ids)
         phi_align = self.edge_scorer.score_alignment(
             question_h=question_part,
             edge_h=edge_part,
-            relation_h=relation_part,
         )
         phi_state = self.edge_scorer.score_state(state_h=state_part, edge_h=edge_part)
         return phi_align + phi_state
@@ -136,9 +130,9 @@ class BackwardPolicy(nn.Module):
 class UniformBackwardPolicy(nn.Module):
     """Uniform P_B(parent | child) over removable child edges."""
 
-    def __init__(self, *, hidden_dim: object = None, relation_lambda: object = None) -> None:
+    def __init__(self, *, hidden_dim: object = None) -> None:
         super().__init__()
-        del hidden_dim, relation_lambda
+        del hidden_dim
 
     def forward(
         self,
@@ -146,10 +140,9 @@ class UniformBackwardPolicy(nn.Module):
         child_state_h: Tensor,
         question_h_by_graph: Tensor,
         edge_h: Tensor,
-        relation_h: Tensor,
         removable: FrontierEncoding,
     ) -> BackwardPolicyOutput:
-        del question_h_by_graph, edge_h, relation_h
+        del question_h_by_graph, edge_h
         return BackwardPolicyOutput(
             action_logits=child_state_h.new_zeros((int(removable.edge_ids.numel()),), dtype=torch.float32),
             action_row_ids=removable.row_ids,

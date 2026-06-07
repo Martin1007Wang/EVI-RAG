@@ -11,19 +11,10 @@ defaults:
 task_name: train_webqsp
 
 logger:
-  tags: [weaver, detailed_balance, webqsp]
+  tags: [weaver, subtb, webqsp, learned_backward, replay_aware]
 
 trainer:
   max_epochs: 10000
   max_steps: -1
   val_check_interval: null
   check_val_every_n_epoch: 1
-
-model:
-  runner:
-    replay_source:
-      threshold: 0.8
-
-callbacks:
-  early_stopping:
-    patience: 20

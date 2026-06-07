@@ -217,7 +217,7 @@ def test_forward_looking_subtb_uses_stable_quadratic_penalty_for_large_residuals
     assert output.metrics["objective/subtb_transition_abs_residual_max"] == pytest.approx(60.0)
 
 
-def test_forward_looking_subtb_terminal_term_uses_log_reward_and_stop_mask() -> None:
+def test_forward_looking_subtb_terminal_term_uses_log_reward_and_end_state_stop() -> None:
     batch = SubTBBatch(
         trajectories=_trajectory_batch(),
         states=_state_batch(),
@@ -258,12 +258,12 @@ def test_forward_looking_subtb_terminal_term_uses_log_reward_and_stop_mask() -> 
     output = ForwardLookingSubTBObjective()(batch=batch, scores=scores, reward=reward)
 
     residual_stop = 0.2 + 0.7 + 0.4 - 0.2 - 1.4
-    residual_forced = 0.2 + 0.25 + 0.0 - 0.15 - (-0.5)
+    residual_forced = 0.2 + 0.25 - 1.1 - 0.15 - (-0.5)
     expected_loss = 2.0 * (_squared_residual(residual_stop) + _squared_residual(residual_forced)) / (2.0 * 2.0)
     assert torch.isclose(output.loss, torch.tensor(expected_loss))
     assert output.metrics["objective/subtb_terminal_abs_residual_mean"] == pytest.approx((abs(residual_stop) + abs(residual_forced)) / 2.0)
-    assert output.metrics["objective/subtb_terminal_abs_residual_p95"] == pytest.approx(0.775)
-    assert output.metrics["objective/subtb_terminal_abs_residual_max"] == pytest.approx(0.8)
+    assert output.metrics["objective/subtb_terminal_abs_residual_p95"] == pytest.approx(0.3)
+    assert output.metrics["objective/subtb_terminal_abs_residual_max"] == pytest.approx(0.3)
 
 
 def test_forward_looking_subtb_terminal_stop_metric_ignores_invalid_terminal_states() -> None:
@@ -368,8 +368,55 @@ def test_prepare_subtb_batch_merges_policy_and_replay_terms() -> None:
     batch = prepare_subtb_batch(trajectories=trajectories, graph_context=graph_context)
 
     assert batch.transition_terms.num_terms == 5
-    assert batch.terminal_terms.num_terms == 8
-    assert torch.equal(batch.terminal_trainable_stop_mask, _bool([True, False, True, True]))
+    assert batch.terminal_terms.num_terms == 9
+    assert torch.equal(batch.terminal_trainable_stop_mask, _bool([True, True, True, False]))
+    assert torch.equal(batch.terminal_terms.traj_ids, _long([0, 0, 0, 0, 0, 1, 1, 2, 2]))
+    assert torch.equal(batch.terminal_terms.start_steps, _long([0, 0, 1, 1, 2, 0, 1, 0, 1]))
+    assert torch.equal(batch.terminal_terms.end_steps, _long([1, 2, 1, 2, 2, 1, 1, 1, 1]))
+
+
+def test_forward_looking_subtb_trains_stop_on_nonfinal_prefix_state() -> None:
+    batch = SubTBBatch(
+        trajectories=_trajectory_batch(),
+        states=_state_batch(),
+        prefix_state_ids=_long([[0, 1, 2], [0, 1, -1]]),
+        valid_steps=_bool([[True, True], [True, False]]),
+        step_traj_ids=_long([0, 0, 1]),
+        step_ids=_long([0, 1, 0]),
+        step_parent_state_ids=_long([0, 1, 0]),
+        step_edge_ids=_long([0, 1, 0]),
+        terminal_state_ids=_long([2, 1]),
+        terminal_trainable_stop_mask=_bool([True, True]),
+        transition_terms=SubTBTermTable(
+            traj_ids=torch.empty(0, dtype=torch.long),
+            start_steps=torch.empty(0, dtype=torch.long),
+            end_steps=torch.empty(0, dtype=torch.long),
+            start_state_ids=torch.empty(0, dtype=torch.long),
+            end_state_ids=torch.empty(0, dtype=torch.long),
+            lambda_exponent=torch.empty(0, dtype=torch.long),
+        ),
+        terminal_terms=SubTBTermTable(
+            traj_ids=_long([0]),
+            start_steps=_long([1]),
+            end_steps=_long([1]),
+            start_state_ids=_long([1]),
+            end_state_ids=_long([1]),
+            lambda_exponent=_long([0]),
+        ),
+    )
+    reward = _reward(log_reward=[0.0, -0.5, 1.4], terminal_valid_mask=[False, True, True])
+    scores = _scores(
+        log_flow=[0.2, 0.6, 1.0],
+        terminal_stop_logp_by_traj=[0.0, 0.0],
+        stop_log_prob_by_state=[-1.2, -0.7, 0.4],
+        forward_prefix_by_traj=[[0.0, 0.3, 0.7], [0.0, 0.25, 0.25]],
+        backward_prefix_by_traj=[[0.0, 0.1, 0.2], [0.0, 0.15, 0.15]],
+    )
+
+    output = ForwardLookingSubTBObjective()(batch=batch, scores=scores, reward=reward)
+
+    residual = 0.6 - 0.7 - (-0.5)
+    assert torch.isclose(output.loss, torch.tensor(_squared_residual(residual)))
 
 
 def test_scoring_like_contract_requires_reward_state_potential_for_log_flow() -> None:
@@ -418,7 +465,7 @@ def test_budget_truncated_stop_mask_includes_stop_log_prob() -> None:
 
     output = ForwardLookingSubTBObjective()(batch=batch, scores=scores, reward=reward)
 
-    residual = 0.3 + 0.25 + 1.3 - 0.15 - (-0.5)
+    residual = 0.3 + 0.25 - 1.3 - 0.15 - (-0.5)
     expected_loss = 2.0 * _squared_residual(residual) / (2.0 * 1.0)
     assert torch.isclose(output.loss, torch.tensor(expected_loss))
 
@@ -463,7 +510,7 @@ def test_external_terminal_stop_mask_includes_stop_log_prob() -> None:
 
     output = ForwardLookingSubTBObjective()(batch=batch, scores=scores, reward=reward)
 
-    residual = 0.3 + 0.25 + 1.3 - 0.15 - (-0.5)
+    residual = 0.3 + 0.25 - 1.3 - 0.15 - (-0.5)
     expected_loss = 2.0 * _squared_residual(residual) / (2.0 * 1.0)
     assert torch.isclose(output.loss, torch.tensor(expected_loss))
 
@@ -509,7 +556,7 @@ def test_forward_looking_subtb_terminal_loss_weight_reweights_base_loss() -> Non
     output = ForwardLookingSubTBObjective(terminal_loss_weight=2.0)(batch=batch, scores=scores, reward=reward)
 
     transition_residual = 0.2 + 0.5 - 0.1 - 0.7
-    terminal_residual = 0.2 + 0.7 + 0.4 - 0.2 - 1.0
+    terminal_residual = 0.2 + 0.7 + 0.1 - 0.2 - 1.0
     expected_numerator = _squared_residual(transition_residual) + 2.0 * _squared_residual(terminal_residual)
     expected_denominator = 1.0 + 2.0 * 1.0
     expected_loss = expected_numerator / expected_denominator
@@ -630,9 +677,10 @@ def test_forward_looking_subtb_adds_path_nce_loss() -> None:
     assert frontier_log_prob.grad[1].item() > 0.0
 
 
-def test_flow_estimator_continue_decision_is_rank_offset_invariant() -> None:
+def test_flow_estimator_flat_energy_continue_mass_tracks_edge_energy_offset() -> None:
     torch.manual_seed(0)
     estimator = FlowEstimator(hidden_dim=4)
+    estimator.eval()
     state_h = torch.randn(1, 4)
     frontier_edge_h = torch.randn(2, 4)
     frontier_row_ids = torch.tensor([0, 0], dtype=torch.long)
@@ -652,7 +700,16 @@ def test_flow_estimator_continue_decision_is_rank_offset_invariant() -> None:
     )
 
     assert torch.allclose(stop_logits, shifted_stop_logits, atol=1.0e-6)
-    assert torch.allclose(edge_logits, shifted_edge_logits, atol=1.0e-6)
+    assert torch.allclose(shifted_edge_logits, edge_logits + 7.0, atol=1.0e-6)
+    base_continue = torch.logsumexp(edge_logits, dim=0) - torch.logsumexp(
+        torch.cat([stop_logits, edge_logits]),
+        dim=0,
+    )
+    shifted_continue = torch.logsumexp(shifted_edge_logits, dim=0) - torch.logsumexp(
+        torch.cat([shifted_stop_logits, shifted_edge_logits]),
+        dim=0,
+    )
+    assert shifted_continue > base_continue
 
 
 def test_flow_estimator_initializes_stop_head_bias() -> None:
@@ -661,7 +718,7 @@ def test_flow_estimator_initializes_stop_head_bias() -> None:
     assert estimator.stop_head[-1].bias.detach().item() == pytest.approx(1.5)
 
 
-def test_flow_estimator_continue_summary_detaches_rank_probabilities() -> None:
+def test_flow_estimator_edge_energy_backpropagates_through_alignment_mass() -> None:
     torch.manual_seed(0)
     estimator = FlowEstimator(hidden_dim=4)
     state_h = torch.randn(1, 4)
@@ -678,7 +735,8 @@ def test_flow_estimator_continue_summary_detaches_rank_probabilities() -> None:
     edge_logits.logsumexp(dim=0).backward()
 
     assert align_score.grad is not None
-    assert torch.allclose(align_score.grad, torch.zeros_like(align_score.grad), atol=1.0e-6)
+    assert torch.count_nonzero(align_score.grad).item() == int(align_score.numel())
+    assert torch.all(align_score.grad.gt(0.0))
 
 
 def test_forward_looking_subtb_detaches_terminal_log_reward_from_training_graph() -> None:

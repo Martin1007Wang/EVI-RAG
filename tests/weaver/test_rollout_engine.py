@@ -43,6 +43,7 @@ def test_rollout_engine_records_policy_stop_log_prob_for_budget_truncation() -> 
         entity_h=torch.randn(graph.num_nodes, hidden_dim),
         edge_h=torch.randn(graph.num_edges, hidden_dim),
         relation_h=torch.randn(graph.num_edges, hidden_dim),
+        frontier_prune_score=torch.randn(graph.num_edges, dtype=torch.float32),
     )
     policy_input = policy.build_policy_input(features, graph_context=graph)
 

@@ -326,7 +326,12 @@ class WeaverModule(LightningModule):
             trajectories=trajectories,
             graph_context=graph,
         )
-        action_space = self.policy.prepare_action_space(state=prepared.states, graph_context=graph)
+        action_space = self.policy.prepare_action_space(
+            state=prepared.states,
+            graph_context=graph,
+            policy_input=policy_input,
+            training=True,
+        )
         reward = self.reward_model(
             state=prepared.states,
             target_context=target,
@@ -340,7 +345,6 @@ class WeaverModule(LightningModule):
             policy_input=policy_input,
             graph_context=graph,
             reward=reward,
-            action_space=action_space,
         )
         path_gold_mask = _build_path_gold_mask(
             scores=scores,

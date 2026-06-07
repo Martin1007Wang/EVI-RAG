@@ -34,6 +34,8 @@ dataset:
 
 model:
   optimization:
+    optimizer:
+      lr: 2.0e-4
     scheduler:
       type: warmup_cosine
       interval: step

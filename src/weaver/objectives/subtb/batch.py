@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -37,6 +37,27 @@ class SubTBBatch:
     terminal_trainable_stop_mask: torch.Tensor
     transition_terms: SubTBTermTable
     terminal_terms: SubTBTermTable
+    step_child_state_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.long))
+    onpolicy_transition_terms: SubTBTermTable | None = None
+    replay_transition_terms: SubTBTermTable | None = None
+    onpolicy_terminal_terms: SubTBTermTable | None = None
+    replay_terminal_terms: SubTBTermTable | None = None
+
+    def __post_init__(self) -> None:
+        if self.onpolicy_transition_terms is None:
+            object.__setattr__(self, "onpolicy_transition_terms", self.transition_terms)
+        if self.replay_transition_terms is None:
+            object.__setattr__(self, "replay_transition_terms", _empty_terms(device=self.prefix_state_ids.device))
+        if self.onpolicy_terminal_terms is None:
+            object.__setattr__(self, "onpolicy_terminal_terms", self.terminal_terms)
+        if self.replay_terminal_terms is None:
+            object.__setattr__(self, "replay_terminal_terms", _empty_terms(device=self.prefix_state_ids.device))
+        if int(self.step_child_state_ids.numel()) == 0 and int(self.step_traj_ids.numel()) > 0:
+            object.__setattr__(
+                self,
+                "step_child_state_ids",
+                self.prefix_state_ids[self.step_traj_ids, self.step_ids + 1],
+            )
 
 
 def prepare_subtb_batch(
@@ -77,33 +98,56 @@ def prepare_subtb_batch(
         step_traj_ids = torch.empty(0, dtype=torch.long, device=device)
         step_ids = torch.empty(0, dtype=torch.long, device=device)
         step_parent_state_ids = torch.empty(0, dtype=torch.long, device=device)
+        step_child_state_ids = torch.empty(0, dtype=torch.long, device=device)
         step_edge_ids = torch.empty(0, dtype=torch.long, device=device)
     else:
         step_traj_ids = step_positions[:, 0]
         step_ids = step_positions[:, 1]
         step_parent_state_ids = prefix_state_ids[step_traj_ids, step_ids]
+        step_child_state_ids = prefix_state_ids[step_traj_ids, step_ids + 1]
         step_edge_ids = trajectories.edge_ids[step_traj_ids, step_ids]
         order = torch.argsort(step_parent_state_ids)
         step_traj_ids = step_traj_ids.index_select(0, order)
         step_ids = step_ids.index_select(0, order)
         step_parent_state_ids = step_parent_state_ids.index_select(0, order)
+        step_child_state_ids = step_child_state_ids.index_select(0, order)
         step_edge_ids = step_edge_ids.index_select(0, order)
 
     terminal_step_by_traj = trajectories.edge_count.to(dtype=torch.long)
     traj_rows = torch.arange(trajectory_count, device=device)
     terminal_state_ids = prefix_state_ids[traj_rows, terminal_step_by_traj]
-    terminal_reward_mask = trajectories.has_terminal_reward
-    terminal_trainable_stop_mask = trajectories.has_trainable_stop
+    trajectory_rows = trajectories.is_policy | trajectories.is_replay
+    terminal_trainable_stop_mask = states.edge_count.index_select(0, terminal_state_ids).gt(0)
 
     transition_terms = _build_transition_terms(
         prefix_state_ids=prefix_state_ids,
         lengths=terminal_step_by_traj,
-        row_mask=trajectories.is_policy | trajectories.is_replay,
+        row_mask=trajectory_rows,
+    )
+    onpolicy_transition_terms = _build_transition_terms(
+        prefix_state_ids=prefix_state_ids,
+        lengths=terminal_step_by_traj,
+        row_mask=trajectories.is_policy,
+    )
+    replay_transition_terms = _build_transition_terms(
+        prefix_state_ids=prefix_state_ids,
+        lengths=terminal_step_by_traj,
+        row_mask=trajectories.is_replay,
     )
     terminal_terms = _build_terminal_terms(
         prefix_state_ids=prefix_state_ids,
         lengths=terminal_step_by_traj,
-        row_mask=terminal_reward_mask,
+        row_mask=trajectory_rows,
+    )
+    onpolicy_terminal_terms = _build_terminal_terms(
+        prefix_state_ids=prefix_state_ids,
+        lengths=terminal_step_by_traj,
+        row_mask=trajectories.is_policy,
+    )
+    replay_terminal_terms = _build_terminal_terms(
+        prefix_state_ids=prefix_state_ids,
+        lengths=terminal_step_by_traj,
+        row_mask=trajectories.is_replay,
     )
 
     return SubTBBatch(
@@ -114,11 +158,16 @@ def prepare_subtb_batch(
         step_traj_ids=step_traj_ids,
         step_ids=step_ids,
         step_parent_state_ids=step_parent_state_ids,
+        step_child_state_ids=step_child_state_ids,
         step_edge_ids=step_edge_ids,
         terminal_state_ids=terminal_state_ids,
         terminal_trainable_stop_mask=terminal_trainable_stop_mask,
         transition_terms=transition_terms,
         terminal_terms=terminal_terms,
+        onpolicy_transition_terms=onpolicy_transition_terms,
+        replay_transition_terms=replay_transition_terms,
+        onpolicy_terminal_terms=onpolicy_terminal_terms,
+        replay_terminal_terms=replay_terminal_terms,
     )
 
 
@@ -153,18 +202,30 @@ def _build_terminal_terms(
     row_mask: torch.Tensor,
 ) -> SubTBTermTable:
     width = int(prefix_state_ids.size(1))
-    start_grid = torch.arange(width, dtype=torch.long, device=prefix_state_ids.device).view(1, width)
-    span = lengths.view(-1, 1) - start_grid
-    valid = row_mask.view(-1, 1) & span.ge(0)
+    steps = torch.arange(width, dtype=torch.long, device=prefix_state_ids.device)
+    start_grid = steps.view(1, width, 1)
+    end_grid = steps.view(1, 1, width)
+    span = end_grid - start_grid
+    valid = row_mask.view(-1, 1, 1) & span.ge(0) & end_grid.le(lengths.view(-1, 1, 1)) & end_grid.gt(0)
 
-    traj_ids, start_steps = valid.nonzero(as_tuple=True)
-    end_steps = lengths.index_select(0, traj_ids)
-    end_state_ids = prefix_state_ids[traj_ids, end_steps]
+    traj_ids, start_steps, end_steps = valid.nonzero(as_tuple=True)
     return SubTBTermTable(
         traj_ids=traj_ids,
         start_steps=start_steps,
         end_steps=end_steps,
         start_state_ids=prefix_state_ids[traj_ids, start_steps],
-        end_state_ids=end_state_ids,
+        end_state_ids=prefix_state_ids[traj_ids, end_steps],
         lambda_exponent=(end_steps - start_steps).clamp_min(1) - 1,
+    )
+
+
+def _empty_terms(*, device: torch.device) -> SubTBTermTable:
+    empty = torch.empty(0, dtype=torch.long, device=device)
+    return SubTBTermTable(
+        traj_ids=empty,
+        start_steps=empty,
+        end_steps=empty,
+        start_state_ids=empty,
+        end_state_ids=empty,
+        lambda_exponent=empty,
     )

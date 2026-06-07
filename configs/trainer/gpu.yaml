@@ -8,8 +8,8 @@ devices: 1
 precision: bf16-mixed
 strategy: auto
 
-min_epochs: 0
-max_epochs: -1
+max_epochs: 10000
+
 max_steps: 100000
 
 accumulate_grad_batches: 4

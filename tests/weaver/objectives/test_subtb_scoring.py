@@ -72,6 +72,7 @@ def test_score_subtb_batch_rebuilds_policy_input_for_training_gradients() -> Non
         entity_h=torch.randn(3, hidden_dim, requires_grad=True),
         edge_h=torch.randn(2, hidden_dim, requires_grad=True),
         relation_h=torch.randn(2, hidden_dim, requires_grad=True),
+        frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
     trajectories = TrajectoryBatch(
         graph_ids=torch.tensor([0], dtype=torch.long),
@@ -116,10 +117,9 @@ def test_score_subtb_batch_rebuilds_policy_input_for_training_gradients() -> Non
     assert not scores.backward_step_log_prob.requires_grad
     assert features.question_h.grad is not None
     assert features.edge_h.grad is not None
-    assert features.relation_h.grad is not None
     assert torch.count_nonzero(features.question_h.grad).item() > 0
     assert torch.count_nonzero(features.edge_h.grad).item() > 0
-    assert torch.count_nonzero(features.relation_h.grad).item() > 0
+    assert features.relation_h.grad is None
 
 
 def test_forward_policy_masks_stop_on_empty_states_with_frontier() -> None:
@@ -132,6 +132,7 @@ def test_forward_policy_masks_stop_on_empty_states_with_frontier() -> None:
         entity_h=torch.randn(3, hidden_dim),
         edge_h=torch.randn(2, hidden_dim),
         relation_h=torch.randn(2, hidden_dim),
+        frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
     state = StateBatch.initial(
         graph_ids=torch.tensor([0], dtype=torch.long),
@@ -160,6 +161,7 @@ def test_score_subtb_batch_detaches_reward_state_potential_from_training_graph()
         entity_h=torch.randn(3, hidden_dim, requires_grad=True),
         edge_h=torch.randn(2, hidden_dim, requires_grad=True),
         relation_h=torch.randn(2, hidden_dim, requires_grad=True),
+        frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
     trajectories = TrajectoryBatch(
         graph_ids=torch.tensor([0], dtype=torch.long),
@@ -207,6 +209,7 @@ def test_score_subtb_batch_uses_uniform_backward_without_training_gradients() ->
         entity_h=torch.randn(3, hidden_dim, requires_grad=True),
         edge_h=torch.randn(2, hidden_dim, requires_grad=True),
         relation_h=torch.randn(2, hidden_dim, requires_grad=True),
+        frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
     trajectories = TrajectoryBatch(
         graph_ids=torch.tensor([0], dtype=torch.long),

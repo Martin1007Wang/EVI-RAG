@@ -11,10 +11,11 @@ class FeaturePack:
     batch 内所有特征的统一容器，所有张量均已投影到 hidden_dim 空间。
 
     字段语义：
-      question_h  [G, H]  — 投影后问题嵌入（G = batch 内图数量）
-      entity_h    [N, H]  — 投影后实体嵌入（N = batch 内节点数，含 CVT fallback）
-      edge_h      [E, H]  — EdgeEncoder 输出（含 src/rel/dst 三路融合）
-      relation_h  [E, H]  — 纯关系语义，按边展开，FlowEstimator Path1 专用
+    question_h  [G, H]  — 投影后问题嵌入（G = batch 内图数量）
+    entity_h    [N, H]  — 投影后实体嵌入（N = batch 内节点数，含 CVT fallback）
+    edge_h      [E, H]  — EdgeEncoder 输出（含 src/rel/dst 三路融合）
+      relation_h  [E, H]  — 纯关系语义，按边展开，供 EdgeEncoder 使用
+    frontier_prune_score [E] — 原始 question/relation 语义空间上的静态剪枝分数
 
     注：device 字段已删除。任何 tensor 字段本身携带 .device 属性；
         存储冗余字段会引入一致性隐患（tensor 迁移后 device 字段不自动更新）。
@@ -25,6 +26,7 @@ class FeaturePack:
     entity_h: torch.Tensor  # [N, H]
     edge_h: torch.Tensor  # [E, H]
     relation_h: torch.Tensor  # [E, H]
+    frontier_prune_score: torch.Tensor  # [E]
 
 
 class EdgeEncoder(nn.Module):
@@ -341,6 +343,12 @@ class FeatureEncoder(nn.Module):
         )
         unique_relation_h = self.relation_norm(self.relation_proj(unique_relation_sem))
         relation_h = unique_relation_h.index_select(0, inverse_relation_ids)
+        frontier_prune_score = question_sem.index_select(
+            0,
+            batch.edge_graph_ids.long(),
+        ).mul(
+            self.relation_semantic_table.index_select(0, relation_ids),
+        ).sum(dim=-1)
 
         src_h = entity_h.index_select(0, edge_src)  # [E, H]
         dst_h = entity_h.index_select(0, edge_dst)  # [E, H]
@@ -351,6 +359,7 @@ class FeatureEncoder(nn.Module):
             entity_h=entity_h,
             edge_h=edge_h,
             relation_h=relation_h,
+            frontier_prune_score=frontier_prune_score,
         )
 
 

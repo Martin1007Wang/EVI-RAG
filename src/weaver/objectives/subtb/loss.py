@@ -27,6 +27,8 @@ class ForwardLookingSubTBObjective(nn.Module):
         *,
         subtb_lambda: float = 1.0,
         terminal_loss_weight: float = 2.0,
+        replay_loss_weight: float = 0.25,
+        backward_aux_weight: float = 0.1,
         path_nce_weight: float = 0.1,
         path_nce_temperature: float = 1.0,
     ) -> None:
@@ -35,10 +37,16 @@ class ForwardLookingSubTBObjective(nn.Module):
         if self.subtb_lambda < 0.0:
             raise ValueError("subtb_lambda must be nonnegative.")
         self.terminal_loss_weight = float(terminal_loss_weight)
+        self.replay_loss_weight = float(replay_loss_weight)
+        self.backward_aux_weight = float(backward_aux_weight)
         self.path_nce_weight = float(path_nce_weight)
         self.path_nce_temperature = float(path_nce_temperature)
         if self.terminal_loss_weight < 0.0:
             raise ValueError("terminal_loss_weight must be nonnegative.")
+        if self.replay_loss_weight < 0.0:
+            raise ValueError("replay_loss_weight must be nonnegative.")
+        if self.backward_aux_weight < 0.0:
+            raise ValueError("backward_aux_weight must be nonnegative.")
         if self.path_nce_weight < 0.0:
             raise ValueError("path_nce_weight must be nonnegative.")
         if self.path_nce_temperature <= 0.0:
@@ -56,16 +64,30 @@ class ForwardLookingSubTBObjective(nn.Module):
         del global_step
         forward_prefix_by_traj = _prefix_sums(scores.step_log_prob)
         backward_prefix_by_traj = _prefix_sums(scores.backward_step_log_prob)
-        transition_loss, transition_weight, transition_stats = _transition_terms(
-            terms=batch.transition_terms,
+        onpolicy_transition_loss, onpolicy_transition_weight, onpolicy_transition_stats = _transition_terms(
+            terms=batch.onpolicy_transition_terms,
             scores=scores,
             forward_prefix_by_traj=forward_prefix_by_traj,
             backward_prefix_by_traj=backward_prefix_by_traj,
             subtb_lambda=self.subtb_lambda,
         )
-        terminal_loss, terminal_weight, terminal_stats = _terminal_terms(
-            terms=batch.terminal_terms,
-            batch=batch,
+        replay_transition_loss, replay_transition_weight, replay_transition_stats = _transition_terms(
+            terms=batch.replay_transition_terms,
+            scores=scores,
+            forward_prefix_by_traj=forward_prefix_by_traj,
+            backward_prefix_by_traj=backward_prefix_by_traj,
+            subtb_lambda=self.subtb_lambda,
+        )
+        onpolicy_terminal_loss, onpolicy_terminal_weight, onpolicy_terminal_stats = _terminal_terms(
+            terms=batch.onpolicy_terminal_terms,
+            scores=scores,
+            reward=reward,
+            forward_prefix_by_traj=forward_prefix_by_traj,
+            backward_prefix_by_traj=backward_prefix_by_traj,
+            subtb_lambda=self.subtb_lambda,
+        )
+        replay_terminal_loss, replay_terminal_weight, replay_terminal_stats = _terminal_terms(
+            terms=batch.replay_terminal_terms,
             scores=scores,
             reward=reward,
             forward_prefix_by_traj=forward_prefix_by_traj,
@@ -77,27 +99,36 @@ class ForwardLookingSubTBObjective(nn.Module):
             gold_mask=path_gold_mask,
             temperature=self.path_nce_temperature,
         )
+        backward_aux_loss, backward_aux_count = _backward_aux_terms(
+            batch=batch,
+            scores=scores,
+        )
 
-        total_loss = transition_loss + self.terminal_loss_weight * terminal_loss
-        total_weight = transition_weight + self.terminal_loss_weight * terminal_weight
-        base_loss = total_loss / total_weight.clamp_min(1.0)
-        loss = base_loss + self.path_nce_weight * path_nce_loss
+        onpolicy_total_loss = onpolicy_transition_loss + self.terminal_loss_weight * onpolicy_terminal_loss
+        onpolicy_total_weight = onpolicy_transition_weight + self.terminal_loss_weight * onpolicy_terminal_weight
+        replay_total_loss = replay_transition_loss + self.terminal_loss_weight * replay_terminal_loss
+        replay_total_weight = replay_transition_weight + self.terminal_loss_weight * replay_terminal_weight
+        onpolicy_base_loss = onpolicy_total_loss / onpolicy_total_weight.clamp_min(1.0)
+        replay_base_loss = replay_total_loss / replay_total_weight.clamp_min(1.0)
+        base_loss = onpolicy_base_loss + self.replay_loss_weight * replay_base_loss
+        loss = base_loss + self.backward_aux_weight * backward_aux_loss + self.path_nce_weight * path_nce_loss
 
-        terminal_valid_by_traj = reward.terminal_valid_mask.index_select(0, batch.terminal_state_ids)
-        terminal_stop_metric_mask = batch.terminal_trainable_stop_mask & terminal_valid_by_traj
+        terminal_stop_metric_mask = reward.terminal_valid_mask & batch.states.edge_count.gt(0)
         stop_log_prob_terminal = scores.stop_log_prob_by_state.index_select(
             0,
-            batch.terminal_state_ids[terminal_stop_metric_mask],
+            terminal_stop_metric_mask.nonzero(as_tuple=False).flatten(),
         )
         backward_metric_values = scores.backward_step_log_prob[batch.valid_steps]
 
         metrics: dict[str, float] = {
             "objective/loss": float(loss.detach()),
             "objective/base_loss": float(base_loss.detach()),
+            "objective/onpolicy_base_loss": float(onpolicy_base_loss.detach()),
+            "objective/replay_base_loss": float(replay_base_loss.detach()),
             "objective/state_count": float(batch.states.num_states),
             "objective/trajectory_count": float(batch.trajectories.num_trajectories),
-            "objective/transition_term_count": float(batch.transition_terms.num_terms),
-            "objective/terminal_term_count": float(batch.terminal_terms.num_terms),
+            "objective/transition_term_count": float(batch.onpolicy_transition_terms.num_terms + batch.replay_transition_terms.num_terms),
+            "objective/terminal_term_count": float(batch.onpolicy_terminal_terms.num_terms + batch.replay_terminal_terms.num_terms),
             "objective/frontier_size_total": float(scores.frontier_count.sum().item()),
             "objective/frontier_size_max": float(scores.frontier_count.max().item()) if int(scores.frontier_count.numel()) else 0.0,
             "objective/frontier_size_mean": _mean(scores.frontier_count),
@@ -106,19 +137,24 @@ class ForwardLookingSubTBObjective(nn.Module):
             "objective/terminal_stop_log_prob_mean": _mean(stop_log_prob_terminal),
             "objective/forward_log_prob_mean": _mean(scores.step_log_prob[batch.valid_steps]),
             "objective/backward_log_prob_abs_mean": _abs_mean(backward_metric_values),
-            "objective/subtb_transition_abs_residual_mean": _stats_mean(transition_stats),
-            "objective/subtb_transition_abs_residual_p95": transition_stats.abs_p95,
-            "objective/subtb_transition_abs_residual_max": transition_stats.abs_max,
-            "objective/subtb_terminal_abs_residual_mean": _stats_mean(terminal_stats),
-            "objective/subtb_terminal_abs_residual_p95": terminal_stats.abs_p95,
-            "objective/subtb_terminal_abs_residual_max": terminal_stats.abs_max,
+            "objective/subtb_transition_abs_residual_mean": _merge_stats_mean(onpolicy_transition_stats, replay_transition_stats),
+            "objective/subtb_transition_abs_residual_p95": max(onpolicy_transition_stats.abs_p95, replay_transition_stats.abs_p95),
+            "objective/subtb_transition_abs_residual_max": max(onpolicy_transition_stats.abs_max, replay_transition_stats.abs_max),
+            "objective/subtb_terminal_abs_residual_mean": _merge_stats_mean(onpolicy_terminal_stats, replay_terminal_stats),
+            "objective/subtb_terminal_abs_residual_p95": max(onpolicy_terminal_stats.abs_p95, replay_terminal_stats.abs_p95),
+            "objective/subtb_terminal_abs_residual_max": max(onpolicy_terminal_stats.abs_max, replay_terminal_stats.abs_max),
             "objective/terminal_loss_weight": float(self.terminal_loss_weight),
+            "objective/replay_loss_weight": float(self.replay_loss_weight),
+            "objective/backward_aux_loss": float(backward_aux_loss.detach()),
+            "objective/backward_aux_weight": float(self.backward_aux_weight),
+            "objective/backward_aux_count": float(backward_aux_count),
             "objective/path_nce_loss": float(path_nce_loss.detach()),
             "objective/path_nce_weight": float(self.path_nce_weight),
             "objective/path_nce_temperature": float(self.path_nce_temperature),
             "objective/path_nce_state_count": float(path_nce_stats[0]),
             "objective/path_nce_positive_count": float(path_nce_stats[1]),
-            "objective/terminal_stop_trainable_count": float(batch.terminal_trainable_stop_mask.sum().item()),
+            "objective/terminal_stop_trainable_count": float(terminal_stop_metric_mask.sum().item()),
+            "objective/terminal_stop_legal_state_count": float(terminal_stop_metric_mask.sum().item()),
             "objective/terminal_budget_truncated_count": float(batch.trajectories.is_budget_truncated.sum().item()),
             "objective/terminal_external_count": float(batch.trajectories.is_external_terminal.sum().item()),
         }
@@ -163,7 +199,6 @@ def _transition_terms(
 def _terminal_terms(
     *,
     terms: SubTBTermTable,
-    batch: SubTBBatch,
     scores: SubTBPolicyScores,
     reward: EvidenceStateScoreOutput,
     forward_prefix_by_traj: torch.Tensor,
@@ -196,13 +231,7 @@ def _terminal_terms(
         - backward_prefix_by_traj[traj_ids, start_steps]
     )
 
-    terminal_stop_logp = scores.terminal_stop_logp_by_traj.index_select(0, traj_ids)
-    train_stop = batch.terminal_trainable_stop_mask.index_select(0, traj_ids)
-    terminal_action_logp = torch.where(
-        train_stop,
-        terminal_stop_logp,
-        terminal_stop_logp.new_zeros(terminal_stop_logp.shape),
-    )
+    terminal_action_logp = scores.stop_log_prob_by_state.index_select(0, end_state_ids)
 
     terminal_log_reward = reward.log_reward.detach().float().index_select(0, end_state_ids)
     residual = (
@@ -268,6 +297,22 @@ def _path_nce_terms(
     return loss.mean(), (int(rows.numel()), int(gold_mask[trainable_mask].sum().item()))
 
 
+def _backward_aux_terms(
+    *,
+    batch: SubTBBatch,
+    scores: SubTBPolicyScores,
+) -> tuple[torch.Tensor, int]:
+    if scores.backward_aux_logprob is None or int(scores.backward_aux_logprob.numel()) == 0:
+        zero = scores.log_flow.sum() * 0.0
+        return zero, 0
+    onpolicy_mask = batch.trajectories.is_policy.index_select(0, batch.step_traj_ids)
+    if not bool(onpolicy_mask.any()):
+        zero = scores.log_flow.sum() * 0.0
+        return zero, 0
+    selected = scores.backward_aux_logprob[onpolicy_mask]
+    return -selected.mean(), int(selected.numel())
+
+
 def _lambda_weight(*, reference: torch.Tensor, exponents: torch.Tensor, subtb_lambda: float) -> torch.Tensor:
     if subtb_lambda == 1.0:
         return reference.new_ones(int(exponents.numel()))
@@ -296,6 +341,12 @@ def _empty_residual_stats() -> ResidualStats:
 
 def _stats_mean(stats: ResidualStats) -> float:
     return stats.abs_sum / float(stats.count) if stats.count > 0 else 0.0
+
+
+def _merge_stats_mean(left: ResidualStats, right: ResidualStats) -> float:
+    total_abs = left.abs_sum + right.abs_sum
+    total_count = left.count + right.count
+    return total_abs / float(total_count) if total_count > 0 else 0.0
 
 
 def _abs_mean(value: torch.Tensor) -> float:

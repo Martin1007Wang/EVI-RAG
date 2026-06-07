@@ -41,8 +41,8 @@ class TrajectoryBatch:
     source     [T]      bool   — False = SRC_POLICY, True = SRC_REPLAY
 
     Every row is a completed trajectory. stop_reason explains why it terminated.
-    POLICY_STOP, BUDGET_TRUNCATED, and EXTERNAL_TERMINAL contribute trainable STOP terms.
-    NO_FRONTIER is structural-only.
+    stop_reason records trajectory provenance only. The objective decides STOP
+    training from state legality, not from this terminal kind.
 
     This object is a record, not a state machine.
     State reconstruction belongs in rollout/transition utilities.
@@ -148,7 +148,7 @@ class TrajectoryBatch:
 
     @property
     def has_trainable_stop(self) -> torch.Tensor:
-        """Boolean mask [T], True where terminal STOP should contribute to the objective."""
+        """Compatibility mask for endpoint STOP provenance diagnostics."""
         return self.is_policy_stop | self.is_budget_truncated | self.is_external_terminal
 
     @property

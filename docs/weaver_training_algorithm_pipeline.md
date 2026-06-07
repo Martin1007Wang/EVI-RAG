@@ -38,17 +38,21 @@
 - `StateEncoder` 不再 mean-pool active nodes，而是用 `question_h` 对 selected edges 做 cross-attention；空状态有可学习 `empty_state_emb`。
 - 前向边打分和后向删边打分都使用 question-conditioned edge scorer，但 forward / backward 参数独立。
 - backward 不再是 `-log(1 + |S_z|)`，也不是简单 `-log(edge_count)`；合法 predecessor 取决于删除后是否仍 root-reachable，以及被删边的 `src` 是否在 parent active set 中。
-- reward 当前是 forward-looking 形式：dense potential 用 non-anchor target recall，terminal log reward 用 `2h/(n_Y + |S_z|) - fail_cost * 1[h=0]`。
+- reward 当前是 forward-looking 形式：terminal reward 用 `log(eps + recall)` 加 compactness cost，dense potential 用 non-anchor active node 到 target 的 bounded proximity 加同样 cost；`fail_cost` 已移除。
 - replay 是预处理生成的弱监督 replay bank，不是在线缓存，也不是 runtime 根据当前模型重新搜索 oracle。
+- frontier pruning 默认开启，基于原始 BGE question-relation dot score 静态剪枝；训练时会保留 recorded trajectory edges，避免 SubTB scoring 找不到 replay / rollout 中的动作。
+- backward policy 默认是 learned question-conditioned scorer；SubTB residual 使用它的 log-prob 数值但 detach，不通过 residual 训练 backward。默认 `backward_aux_weight = 0.0`，所以 backward head 当前不接收训练梯度。
 
 默认模型配置来自 [configs/model/weaver.yaml](/mnt/wangjingxiong/EVI-RAG/configs/model/weaver.yaml:1)：
 
 - `budget: 8`
 - `hidden_dim: 512`
-- `relation_lambda: 0.5`
-- `train_policy_rollouts: 8`
-- `eval_rollouts: 8`
-- `subtb_lambda: 1.0`
+- `train_policy_rollouts: 16`
+- `eval_rollouts: 32`
+- `subtb_lambda: 0.9`
+- `terminal_loss_weight: 2.0`
+- `replay_loss_weight: 0.25`
+- `path_nce_weight: 0.0`
 
 ## 2. 端到端入口
 
@@ -386,6 +390,7 @@ question_h  [G, H]
 entity_h    [N, H]
 edge_h      [E, H]
 relation_h  [E, H]
+frontier_prune_score [E]
 ```
 
 其中 `G` 是 batch 内 graph 数，`N` 是 batch-physical node 数，`E` 是 batch-physical edge 数，`H` 是 `hidden_dim`。
@@ -441,7 +446,7 @@ edge_h(e) = LN(W_e [src_h(e) || relation_h(e) || dst_h(e)])
 
 `relation_h != edge_h`：
 
-- `relation_h` 用于 question-relation predicate alignment。
+- `relation_h` 用于构造三元组级 `edge_h`；frontier pruning 的 question-relation 对齐使用原始 `relation_semantic_table`，不是投影后的 `relation_h`。
 - `edge_h` 包含 src / relation / dst 三路融合，用于状态条件的边际贡献估计。
 
 ## 7. 前向 policy
@@ -459,10 +464,11 @@ edge_h(e) = LN(W_e [src_h(e) || relation_h(e) || dst_h(e)])
 ```text
 question_h_by_graph = features.question_h.float()
 edge_h              = features.edge_h.float()
-relation_h          = features.relation_h.float()
+frontier_prune_score = features.frontier_prune_score.float()
+align_score         = scorer(question_h_by_edge, edge_h)
 ```
 
-rollout、SubTB scoring、backward scoring 都复用这个 cache。
+`align_score` 是当前 policy 参数下的 question-edge alignment，若传入 `graph_context` 会预先算好并缓存。rollout 可以复用 no-grad cache；SubTB scoring 会从带梯度的 `FeaturePack` 重新构造 fresh `PolicyInput`，避免复用 rollout cache 导致梯度断开。
 
 ### 7.2 StateEncoder
 
@@ -505,8 +511,7 @@ forward 和 backward 都使用 `QuestionConditionedEdgeScorer` 这一结构，�
 
 ```text
 phi_align(e)
-  = (question_h · relation_h(e)) / sqrt(H)
-  + λ (question_h · edge_h(e)) / sqrt(H)
+  = (question_h · edge_h(e)) / sqrt(H)
 
 phi_state(z, e)
   = MLP([state_h(z)
@@ -516,16 +521,22 @@ phi_state(z, e)
 rank_logit(z, e) = phi_align(e) + phi_state(z, e)
 ```
 
-其中默认 `λ = 0.5`。
-
 两个路径的职责：
 
-- `question_h · relation_h`：问题和谓词类型的直接对齐。
-- `question_h · edge_h`：问题和完整三元组语义的直接对齐。
+- `question_h · edge_h`：问题和完整三元组 edge 表示的直接对齐。
 - `state_h ⊙ edge_h`：当前 selected subgraph 和候选边的兼容性。
 - `phi_state` 当前不直接使用 `question_h ⊙ edge_h`；问题影响通过 `state_h` 间接传递。
 
-### 7.4 STOP / CONTINUE 分解
+frontier pruning 使用单独的静态分数：
+
+```text
+frontier_prune_score(e)
+  = question_emb(g(e)) · relation_semantic_table(rel(e))
+```
+
+它工作在原始 L2-normalized 语义空间上，不依赖可训练投影层。
+
+### 7.4 STOP / edge flat energy
 
 STOP 只依赖 state：
 
@@ -533,32 +544,28 @@ STOP 只依赖 state：
 stop_logit(z) = StopHead(state_h(z))
 ```
 
-CONTINUE 显式看当前 frontier 的 soft summary 和 frontier size：
+每条 edge action 直接使用 flat energy：
 
 ```text
-rank_prob(e | z) = softmax_e(rank_logit(z, e)), e ∈ C(z)
-frontier_summary(z) = Σ_e rank_prob(e | z) * edge_h(e)
-
-continue_logit(z) =
-    ContinueHead([state_h(z) || stop_gradient(frontier_summary(z)) || log1p(|C(z)|)])
+edge_logit(z, e) = align_scale * a(q, e) + c_theta(z, e)
 ```
 
-最终每条边动作的 logit 是：
+其中 `v_theta(z, e)` 由两路 edge scorer 相加：
 
 ```text
-edge_logit(z, e) =
-    continue_logit(z)
-  + rank_logit(z, e)
-  - logsumexp_{e' ∈ C(z)} rank_logit(z, e')
+v_theta(z, e) = align_scale * φ_align(q, edge_h(e)) + φ_state(state_h(z), edge_h(e))
 ```
 
 因此：
 
-- `rank_logit` 只决定 frontier 内部边排序。
-- 所有边动作的总 logit 质量由 `continue_logit` 控制。
-- STOP-vs-CONTINUE 不受 rank logits 整体平移影响。
+- STOP 和每条 frontier edge 在同一个 action softmax 里竞争。
+- `CONTINUE` 不是显式采样 token；它的概率质量是所有 edge action 概率之和。
+- STOP-vs-CONTINUE 由 `stop_logit(z)` 和 `logsumexp_{e ∈ C(z)} edge_logit(z,e)` 共同决定。
+- edge logits 的整体平移会改变 STOP-vs-CONTINUE，这是 flat energy 的预期行为。
 - 当前 STOP 不显式看 frontier summary，不拼接 question，因为 question 已经进入 `state_h`。
 - 如果 frontier 为空，`FlowEstimator` 返回空 edge logits 和全零 stop logits；该 state 的唯一动作是 STOP。
+- 如果 root state 有非空 frontier，STOP logit 会被置为 `-1e9`，防止空证据子图立即停止。
+- `frontier_size_correction` 默认 `0.0`；若设为正值，会从 edge logits 中减去 `frontier_size_correction * log |C(z)|`。
 
 ### 7.5 State flow
 
@@ -580,6 +587,14 @@ log F(z) = log F_base(z) + state_potential(z)
 
 ```text
 P_F(. | z) = softmax({stop_logit(z)} ∪ {edge_logit(z, e) : e ∈ C(z)})
+```
+
+对应的隐式 continue mass 是：
+
+```text
+P_F(CONTINUE | z) =
+    Σ_e exp(edge_logit(z, e))
+  / (exp(stop_logit(z)) + Σ_e exp(edge_logit(z, e)))
 ```
 
 `PolicyOutput` 把所有 action logits flatten 成：
@@ -618,23 +633,16 @@ iff
 5. 检查 removed edge 的 `src` 是否在 parent active nodes 内。
 6. 输出 `FrontierEncoding(row_ids, edge_ids, graph_ids)` 形式的 removable action space。
 
-`legal_predecessor_count()` 是当前 SubTB 训练的 backward distribution 基础：
-
-```text
-log P_B(z | z') = -log legal_predecessor_count(z')
-```
-
-也就是说 backward 只依赖合法 predecessor 个数，不依赖 `StateEncoder` / `FeatureEncoder` 的可训练表示。
+`legal_predecessor_count()` 和 `uniform_backward_log_prob()` 仍保留给 uniform backward 消融，但默认训练配置不走 uniform backward。
 
 ### 8.2 Learned backward distribution
 
-`BackwardPolicy` 仍保留给消融实验。它的参数化形式是：
+默认 `BackwardPolicy` 的参数化形式是：
 
 ```text
 P_B(z | z')
   = softmax_e {
-      (question_h · relation_h(e)) / sqrt(H)
-      + λ (question_h · edge_h(e)) / sqrt(H)
+      (question_h · edge_h(e)) / sqrt(H)
       + MLP_B([state_h(z')
                || edge_h(e)
                || state_h(z') ⊙ edge_h(e)])
@@ -648,7 +656,14 @@ P_B(z | z')
 - question 按 removable action 的 `graph_ids` 展开。
 - softmax 在每个 child state 的 removable edges 内分段归一化。
 - `BackwardPolicy` 和 forward `FlowEstimator` 不共享 scorer 参数。
-- 默认配置和 SubTB scoring 路径不使用该 learned backward policy。
+- `score_subtb_batch()` 会对每个 trajectory step 的 actual parent edge gather learned backward log-prob。
+
+当前默认目标的一个重要梯度边界：
+
+- `backward_step_log_prob` 写入 SubTB residual 后会被 detach。
+- `backward_aux_weight = 0.0`，因此 auxiliary `-log P_B` 也不参与 loss。
+- 所以 learned backward 当前影响 residual 数值和诊断指标，但默认不会被训练更新。
+- 若把 `backward_aux_weight` 设为正数，auxiliary loss 会只在 on-policy steps 上训练 backward head。
 
 ### 8.3 STOP 的 backward 概率
 
@@ -696,11 +711,13 @@ source：
 - `SRC_POLICY = 0`
 - `SRC_REPLAY = 1`
 
-`has_trainable_stop`：
+`has_trainable_stop` 当前只保留作 endpoint provenance 兼容/诊断字段：
 
 ```text
-POLICY_STOP or EXTERNAL_TERMINAL
+POLICY_STOP or BUDGET_TRUNCATED or EXTERNAL_TERMINAL
 ```
+
+训练 objective 不再用该字段决定 terminal equation。STOP 训练由 state legality 决定。
 
 `is_forced_terminal`：
 
@@ -837,7 +854,8 @@ edge_logit_bias[e] = - diversity_edge_penalty * edge_use_count[e]
 
 - rollout 采样不回传梯度。
 - replay 采样不回传梯度。
-- objective 阶段会对 unique states 重新跑 policy，因此 policy / feature encoder / state flow 可获得梯度；backward 使用 uniform predecessor probability，不训练共享表示。
+- objective 阶段会对 unique states 重新跑 policy，因此 feature encoder、forward policy、state flow 可获得梯度。
+- backward log-prob 来自 learned backward head，但写入 SubTB residual 前会 detach；默认 `backward_aux_weight = 0.0`，所以 backward head 当前不获得训练梯度。
 - reward model 当前 `forward()` 是 `@torch.no_grad()`，reward 不学习参数。
 
 ## 11. SubTB batch 构造
@@ -897,20 +915,18 @@ terminal_state_ids = prefix_state_ids[traj, edge_count]
 terminal_kind_by_traj = stop_reason
 ```
 
-两个重要 mask：
+endpoint metadata：
 
 ```text
-terminal_reward_mask = POLICY_STOP or NO_FRONTIER or BUDGET_TRUNCATED or EXTERNAL_TERMINAL
-terminal_trainable_stop_mask = POLICY_STOP or EXTERNAL_TERMINAL
+terminal_state_ids = prefix_state_ids[traj, edge_count]
+terminal_trainable_stop_mask = edge_count(terminal_state) > 0
 ```
 
 含义：
 
-- `terminal_reward_mask` 决定哪些 rows 构建 terminal reward SubTB terms。
-- `terminal_trainable_stop_mask` 决定 terminal residual 中是否加 STOP log-prob。
-- `NO_FRONTIER` 是结构性 forced terminal，有 terminal reward，但不训练 STOP log-prob。
-- `BUDGET_TRUNCATED` 是 hard budget 截断，会进入 terminal reward terms，并使用当前 policy 的 terminal STOP log-prob 训练 STOP。
-- `EXTERNAL_TERMINAL` 进入 terminal reward terms，也用当前 policy 的 STOP log-prob 训练 replay 终点停止。
+- `terminal_trainable_stop_mask` 是 endpoint 兼容/诊断字段，不决定 loss 公式。
+- `NO_FRONTIER`、`BUDGET_TRUNCATED`、`EXTERNAL_TERMINAL` 只记录轨迹来源，不改变 STOP terminal boundary。
+- terminal reward terms 对 policy/replay rows 的所有非空 prefix endpoint 构建。
 
 ### 11.4 Transition terms
 
@@ -932,20 +948,20 @@ trajectories.is_policy | trajectories.is_replay
 
 ### 11.5 Terminal terms
 
-terminal terms 只对 `terminal_reward_mask` 为真的 rows 构建。对轨迹长度 `T`，枚举：
+terminal terms 对 policy/replay rows 的所有非空 prefix endpoint 构建。对轨迹长度 `T`，枚举：
 
 ```text
-start = 0..T
-end = T
+0 <= start <= end <= T
+end > 0
 ```
 
-`lambda_exponent = max(T - start, 1) - 1`。
+`lambda_exponent = max(end - start, 1) - 1`。
 
 因此：
 
-- zero-edge `POLICY_STOP` / `NO_FRONTIER` 会有 terminal term row；但 `EvidenceStateScorer.terminal_valid_mask` 要求 nonempty，loss 计算时会过滤掉 terminal-invalid row。
-- `BUDGET_TRUNCATED` 会有 terminal reward term，且 terminal STOP 会训练。
-- replay `EXTERNAL_TERMINAL` 会有 terminal reward term，且 terminal STOP 会训练。
+- zero-edge trajectories 不产生 terminal term，因为空 evidence subgraph 不是合法 STOP reward target。
+- 任意非空 prefix state 只要 `EvidenceStateScorer.terminal_valid_mask=True`，都会训练 STOP boundary。
+- replay prefix 使用当前 policy 的 edge log-prob 和 STOP log-prob 重新打分，不使用历史 policy logits。
 
 ## 12. SubTB scoring
 
@@ -995,7 +1011,7 @@ forward_prefix_by_traj[:, k] = sum_{t < k} step_log_prob[:, t]
 如果 batch 中存在 edge steps，则：
 
 1. 为所有 non-root child states 枚举合法 removable predecessors。
-2. 使用 uniform backward probability：`log P_B(parent | child) = -log(num_legal_predecessors(child))`。
+2. 用 learned `BackwardPolicy` 对 removable edges 做分段 softmax。
 3. 对 trajectory 实际走过的 child state gather：
 
 ```text
@@ -1010,16 +1026,17 @@ backward_prefix_by_traj[:, 0] = 0
 backward_prefix_by_traj[:, k] = sum_{t < k} backward_step_logp[:, t]
 ```
 
-### 12.3 Terminal STOP scores
+实现上 `backward_step_logp` 会 detach 后进入 SubTB residual，因此 residual 不反向训练 backward head。`backward_aux_logprob` 仍保留；只有 `backward_aux_weight > 0` 时才会训练 backward head。
 
-每条 trajectory 的 terminal STOP log-prob：
+### 12.3 STOP scores
+
+每个 unique state 都有当前 policy 下的 STOP log-prob：
 
 ```text
-terminal_stop_logp_by_traj =
-    stop_log_prob_by_state[terminal_state_ids]
+stop_log_prob_by_state[z] = log P_F(STOP | z)
 ```
 
-是否在 terminal residual 中使用，由 `terminal_trainable_stop_mask` 决定。
+terminal residual 总是使用 end state 的 `stop_log_prob_by_state[end_state_id]`，再由 `EvidenceStateScorer.terminal_valid_mask` 过滤非法 STOP reward target。
 
 ## 13. Terminal reward
 
@@ -1028,84 +1045,125 @@ terminal_stop_logp_by_traj =
 对任一 state `z`：
 
 ```text
-answer_count(z)   = |(X_z \ anchors) ∩ Y_reachable|
-candidate_count(z)= |X_z|
-target_count(z)   = |Y_reachable \ anchors|
-recall(z)         = answer_count(z) / max(target_count(z), 1)
-precision(z)      = answer_count(z) / max(edge_count(z), 1)
-success(z)        = 1[answer_count(z) > 0 and target_count(z) > 0]
-edge_count(z)     = |S_z|
-dist_score(v)     = clamp(1 - node_target_distance(v) / (d_max(z) + 1), min=0)
-coverage(z)       = sum_{v in X_z \ anchors} dist_score(v) / max(target_count(z), 1)
-compactness(z)    = alpha * edge_count(z) / budget
-state_potential(z)= coverage(z) - compactness(z)
-terminal_quality(z)= recall(z) - compactness(z)
-remaining_reward(z)= terminal_quality(z) - fail_cost * 1[answer_count(z) = 0] - state_potential(z)
+answer_count(z)    = |X_z ∩ (Y_reachable \ anchors)|
+candidate_count(z) = |X_z|
+target_count(z)    = |Y_reachable \ anchors|
+recall(z)          = answer_count(z) / max(target_count(z), 1)
+precision(z)       = answer_count(z) / max(edge_count(z), 1)
+success(z)         = 1[answer_count(z) > 0 and target_count(z) > 0]
+terminal_valid(z)  = 1[target_count(z) > 0 and edge_count(z) > 0]
+edge_count(z)      = |S_z|
 ```
 
-最终：
+terminal reward 的 beta-free utility：
 
 ```text
-log R(z) = terminal_quality(z) - fail_cost * 1[answer_count(z) = 0]
-         = state_potential(z) + remaining_reward(z)
+compactness(z) = edge_cost_lambda * edge_count(z) / budget
+U_rec(z)       = log(reward_epsilon + recall(z)) - log(1 + reward_epsilon)
+U_R(z)         = U_rec(z) - compactness(z)
+raw_log_R(z)   = reward_beta * U_R(z)
 ```
 
-这里的 `state_potential` 是 FL-GFN 的 dense shaping term。当前 canonical state 保证 selected-edge set root-reachable，因此 active nodes 默认都从 anchor 有向可达；reward 只需排除 anchors 本身，不再额外判断 reachable。实现把 shaped flow 写成：
+若 `center_log_reward = true`，会在同一 graph 的 terminal-valid states 内做 max-centering：
 
 ```text
-log F(z) = log F_base(z) + state_potential(z)
+log R(z) = raw_log_R(z) - max_{z' in same graph, terminal_valid(z')} raw_log_R(z')
 ```
 
-因此 terminal reward 必须重参为：
+否则 `log R(z) = raw_log_R(z)`。invalid terminal rows 保持有限的 0 值，并由 `terminal_valid_mask` 在 terminal residual 中过滤。
+
+dense forward-looking potential 使用 bounded target proximity：
 
 ```text
-log R(z) = state_potential(z) + remaining_reward(z)
+Prox(z) =
+  max_{x in X_z \ anchors}
+    clamp(1 - d(x, Y) / (d_max(g) + 1), 0, 1)
+
+U_Psi(z) = Prox(z) - compactness(z)
+Psi(z)   = reward_beta * U_Psi(z)
 ```
 
-这样 transition 中的 `state_potential` 差分会 telescope；compactness 惩罚在每一步 transition residual 中出现，并在 terminal residual 里精确消去。
+实现把 shaped flow 写成：
+
+```text
+log F(z) = log F_base(z) + Psi(z)
+remaining_log_reward(z) = log R(z) - Psi(z)
+```
+
+但当前 terminal residual 直接使用 `log R(z)`，`remaining_log_reward` 主要作为诊断字段。root / empty / invalid-target states 的 `Psi(z)` 为 0。
 
 默认配置：
 
-- `fail_cost = 1.0`
+- `reward_beta = 3.0`
+- `edge_cost_lambda = 0.5`
+- `reward_epsilon = 1.0e-4`
+- `center_log_reward = true`
 
 reward 指标：
 
+- `reward/beta`
+- `reward/edge_cost_lambda`
+- `reward/epsilon`
+- `reward/center_log_reward`
 - `reward/log_reward_mean`
 - `reward/log_reward_std`
 - `reward/log_reward_min`
 - `reward/log_reward_max`
+- `reward/log_reward_uncentered_mean`
+- `reward/reward_shift_mean`
 - `reward/potential_mean`
 - `reward/potential_std`
+- `reward/proximity_potential_mean`
 - `reward/residual_mean`
 - `reward/residual_std`
 - `reward/recall_mean`
+- `reward/terminal_recall_mean`
 - `reward/precision_mean`
+- `reward/terminal_precision_mean`
 - `reward/terminal_quality_mean`
 - `reward/edge_count_mean`
+- `reward/terminal_edge_count_mean`
 - `reward/hit_rate`
 - `reward/valid_rate`
 - `reward/terminal_valid_rate`
 - `reward/target_hit_per_edge`
+- `reward/terminal_target_hit_per_edge`
 
 ## 14. SubTrajectory Balance objective
 
 `ForwardLookingSubTBObjective` 在 [src/weaver/objectives/subtb/loss.py](/mnt/wangjingxiong/EVI-RAG/src/weaver/objectives/subtb/loss.py:1)。
 
-总损失由加权 FL-SubTB base loss 和最短路径边 InfoNCE 辅助项组成：
+总损失由 on-policy FL-SubTB、replay FL-SubTB，以及可选辅助项组成：
 
 ```text
-base_loss =
+onpolicy_base_loss =
     (
-        transition_loss
-      + terminal_loss_weight * terminal_loss
+        onpolicy_transition_loss
+      + terminal_loss_weight * onpolicy_terminal_loss
     )
   / max(
-        transition_weight
-      + terminal_loss_weight * terminal_weight,
+        onpolicy_transition_weight
+      + terminal_loss_weight * onpolicy_terminal_weight,
         1,
     )
 
-loss = base_loss + path_nce_weight * path_nce_loss
+replay_base_loss =
+    (
+        replay_transition_loss
+      + terminal_loss_weight * replay_terminal_loss
+    )
+  / max(
+        replay_transition_weight
+      + terminal_loss_weight * replay_terminal_weight,
+        1,
+    )
+
+base_loss = onpolicy_base_loss + replay_loss_weight * replay_base_loss
+
+loss =
+    base_loss
+  + backward_aux_weight * backward_aux_loss
+  + path_nce_weight * path_nce_loss
 ```
 
 ### 14.1 Transition residual
@@ -1142,7 +1200,7 @@ transition residual：
 F(s_i) * Π P_F = F(s_j) * Π P_B
 ```
 
-policy trajectories 和 replay trajectories 都会产生 transition residual；当前实现只记录合并后的 transition residual 统计。
+policy trajectories 和 replay trajectories 都会产生 transition residual；实现会分别构造 on-policy / replay term tables 并分别归一，再用 `replay_loss_weight` 把 replay base loss 加到总 loss。
 
 ### 14.2 Terminal residual
 
@@ -1157,29 +1215,26 @@ terminal residual：
 ```text
 δ_terminal(i) =
     log F(s_i)
-  + log P_F(a_i, ..., a_{T-1})
-  + terminal_action_logp
-  - log P_B(s_i, ..., s_{T-1} | s_{i+1}, ..., s_T)
-  - log R(s_T)
+  + log P_F(a_i, ..., a_{j-1})
+  + log P_F(STOP | s_j)
+  - log P_B(s_i, ..., s_{j-1} | s_{i+1}, ..., s_j)
+  - log R(s_j)
 ```
-
-其中：
 
 ```text
-terminal_action_logp =
-    log P_F(STOP | s_T)   if terminal_trainable_stop_mask
-    0                     otherwise
+0 <= i <= j <= T
+j > 0
 ```
 
-terminal terms 为 `terminal_reward_mask` rows 构建。`BUDGET_TRUNCATED` 不再被跳过：hard budget 只禁止继续 expand，terminal state 通过 `R(s_T)` 进入 FL-GFN terminal balance，并使用当前 policy 的 STOP log-prob 训练 STOP。`EXTERNAL_TERMINAL` 同样用当前 policy 的 STOP log-prob 训练 replay 终点停止。
+terminality 是 state-action pair `(z, STOP)` 的属性，不由 trajectory provenance 决定。同一个 canonical state 不会因为这次来自 policy STOP、budget、no-frontier 或 replay endpoint 而切换成 `log F(z)=log R(z)`。
 
 ### 14.3 λ 加权
 
-transition / terminal residual 先用 span 做指数加权，再进入 Shifted-Cosh penalty：
+transition / terminal residual 先用 span 做指数加权，再进入平方 penalty：
 
 ```text
 weight = subtb_lambda ^ lambda_exponent
-phi(delta) = exp(delta) + exp(-delta) - 2
+phi(delta) = delta^2
 ```
 
 transition term：
@@ -1194,26 +1249,22 @@ terminal term：
 lambda_exponent = max(end - start, 1) - 1
 ```
 
-默认 `subtb_lambda = 1.0`，即所有 span 等权。
+默认 `subtb_lambda = 0.9`，长 span 会按指数略微降权。
 
 transition / terminal 两类 residual 分别按 `weight * phi(residual)` 累加。`terminal_loss_weight` 只在最终聚合时放大 terminal residual 的总 loss 和总 weight。
 
-最终 base loss 用两类项的加权总 loss 除以加权总 weight：
+onpolicy_base_loss 和 replay_base_loss 分别归一；总 base loss 再加权合并：
 
 ```text
-base_loss =
-    (
-        transition_loss
-      + terminal_loss_weight * terminal_loss
-    )
-  / max(
-        transition_weight
-      + terminal_loss_weight * terminal_weight,
-        1,
-    )
+base_loss = onpolicy_base_loss + replay_loss_weight * replay_base_loss
 ```
 
-当前实现还有一个额外的最短路径边 InfoNCE 辅助损失：预处理标记每条边是否位于任一 anchor-answer 最短路径集合上，训练时对每个 frontier row 的多正样本集合做 `-logsumexp(pos) + logsumexp(all)`。该项只监督 frontier 内边排序；已经命中答案的 state 不再使用该辅助监督。replay 轨迹仍通过 SubTB transition terms 和 terminal reward terms 参与训练，且 `EXTERNAL_TERMINAL` 会用当前 policy 的 terminal STOP log-prob 训练 replay 终点停止。
+当前实现还保留两个可选辅助项：
+
+- `path_nce_loss`：预处理标记每条边是否位于任一 anchor-answer 最短路径集合上，训练时对每个 frontier row 的多正样本集合做 `logsumexp(all) - logsumexp(pos)`。该项只监督 frontier 内边排序；已经命中答案的 state 不再使用该辅助监督。默认 `path_nce_weight = 0.0`，因此不影响训练。
+- `backward_aux_loss`：on-policy steps 上的 `-log P_B(parent | child)`。默认 `backward_aux_weight = 0.0`，因此不训练 backward head。
+
+replay 轨迹仍通过 SubTB transition terms 和 terminal reward terms 参与训练，且 `EXTERNAL_TERMINAL` 会用当前 policy 的 terminal STOP log-prob 训练 replay 终点停止。
 
 ## 15. 训练日志
 
@@ -1227,6 +1278,9 @@ base_loss =
 重要 objective 指标：
 
 - `objective/loss`
+- `objective/base_loss`
+- `objective/onpolicy_base_loss`
+- `objective/replay_base_loss`
 - `objective/state_count`
 - `objective/trajectory_count`
 - `objective/transition_term_count`
@@ -1240,8 +1294,17 @@ base_loss =
 - `objective/forward_log_prob_mean`
 - `objective/backward_log_prob_abs_mean`
 - `objective/subtb_transition_abs_residual_mean`
+- `objective/subtb_transition_abs_residual_p95`
+- `objective/subtb_transition_abs_residual_max`
 - `objective/subtb_terminal_abs_residual_mean`
+- `objective/subtb_terminal_abs_residual_p95`
+- `objective/subtb_terminal_abs_residual_max`
 - `objective/terminal_loss_weight`
+- `objective/replay_loss_weight`
+- `objective/backward_aux_loss`
+- `objective/backward_aux_weight`
+- `objective/path_nce_loss`
+- `objective/path_nce_weight`
 - `objective/terminal_stop_trainable_count`
 - `objective/terminal_budget_truncated_count`
 - `objective/terminal_external_count`
@@ -1392,14 +1455,14 @@ union_edge_mask@k = any(edge_masks[:k])
 ```text
 在 canonical multi-source root-reachable edge-set 状态空间上，
 用 question-conditioned forward policy 逐步扩展证据子图，
-用 uniform backward probability、state flow 和 terminal reward 构成 SubTrajectory Balance 约束，
+用 learned-but-detached backward probability、state flow 和 terminal reward 构成 SubTrajectory Balance 约束，
 再用 replay bank 的弱监督轨迹给早期训练提供额外 SubTB 约束。
 ```
 
 更具体地说：
 
 - forward 决定推理时怎样从 anchors 扩展边或停止。
-- backward 只在训练中为 SubTB 提供 parent-child uniform 反向概率。
+- backward 只在训练中为 SubTB 提供 parent-child 反向概率；默认 residual 中 detach，辅助训练权重为 0。
 - state flow 只在训练中承载 GFlowNet 的流一致性。
 - reward 只评价 terminal canonical state。
 - replay 只提供预处理 oracle trajectories，不是在线缓存。

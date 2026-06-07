@@ -10,7 +10,7 @@ from src.weaver.rollout.replay import ReplaySource
 from src.weaver.rollout.engine import RolloutEngine
 from src.weaver.rollout.trajectory import TrajectoryBatch
 from src.weaver.context import ReplayContext, TargetContext
-from src.weaver.state import StateBatch
+from src.weaver.state import ExpansionBatch, StateBatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,15 +36,23 @@ class RolloutRunner:
         engine: RolloutEngine,
         train_policy_rollouts: int,
         replay_source: ReplaySource | None = None,
+        replay_keep_ratio: float = 0.5,
+        min_replay_per_graph: int = 1,
         eval_rollouts: int = 1,
     ) -> None:
         self.engine = engine
         self.train_policy_rollouts = int(train_policy_rollouts)
         self.replay_source = replay_source
+        self.replay_keep_ratio = float(replay_keep_ratio)
+        self.min_replay_per_graph = int(min_replay_per_graph)
         self.eval_rollouts_count = int(eval_rollouts)
 
         if self.train_policy_rollouts < 0:
             raise ValueError("train_policy_rollouts must be non-negative.")
+        if not 0.0 < self.replay_keep_ratio <= 1.0:
+            raise ValueError("replay_keep_ratio must be in (0, 1].")
+        if self.min_replay_per_graph < 0:
+            raise ValueError("min_replay_per_graph must be non-negative.")
         if self.eval_rollouts_count < 0:
             raise ValueError("eval_rollouts must be non-negative.")
 
@@ -75,6 +83,8 @@ class RolloutRunner:
         replay_fraction = torch.tensor(0.0, device=context.device)
         replay_raw_count = 0
         replay_priority_mean = torch.tensor(0.0, device=context.device)
+        replay_filtered_count = 0
+        replay_mean_forward_support = torch.tensor(0.0, dtype=torch.float32, device=context.device)
         if self.replay_source is not None:
             replay_fraction = torch.tensor(
                 float(self.replay_source.current_fraction()),
@@ -92,6 +102,15 @@ class RolloutRunner:
                 replay_context=replay_context,
                 budget=budget,
                 replay_round=int(replay_round),
+            )
+            replay_trajectories, replay_mean_forward_support, replay_filtered_count = _filter_replay_by_policy_support(
+                trajectories=replay_trajectories,
+                policy=policy,
+                context=context,
+                features=features,
+                policy_input=policy_input,
+                keep_ratio=self.replay_keep_ratio,
+                min_keep_per_graph=self.min_replay_per_graph,
             )
             valid_priority = replay_context.priority[replay_context.edge_count.ge(0) & replay_context.edge_count.le(budget)]
             if int(valid_priority.numel()) > 0:
@@ -113,6 +132,8 @@ class RolloutRunner:
             replay_fraction=replay_fraction,
             replay_raw_count=replay_raw_count,
             replay_priority_mean=replay_priority_mean,
+            replay_filtered_count=replay_filtered_count,
+            replay_mean_forward_support=replay_mean_forward_support,
         )
 
         return TrainRolloutBatch(
@@ -245,6 +266,8 @@ def _train_rollout_metrics(
     replay_fraction: torch.Tensor,
     replay_raw_count: int,
     replay_priority_mean: torch.Tensor,
+    replay_filtered_count: int,
+    replay_mean_forward_support: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     if int(trajectories.num_trajectories) == 0:
         num_policy = 0
@@ -296,6 +319,9 @@ def _train_rollout_metrics(
         "replay_kept_trajectory_count": torch.tensor(float(num_replay), device=device),
         "replay/trajectory_count": torch.tensor(float(num_replay), device=device),
         "replay/priority_mean": replay_priority_mean,
+        "replay/filtered_trajectory_count": torch.tensor(float(replay_filtered_count), device=device),
+        "replay/support_rate": torch.tensor(float(num_replay) / float(max(replay_raw_count, 1)), device=device),
+        "replay/mean_forward_support": replay_mean_forward_support,
         "replay/edge_count_mean": replay_edge_counts.float().mean() if int(replay_edge_counts.numel()) > 0 else torch.tensor(0.0, device=device),
         "replay/coverage_recall_mean": replay_recall,
         "replay/unique_edge_set_rate": torch.tensor(float(replay_sets.size(0)) / float(max(num_replay, 1)), device=device),
@@ -366,6 +392,101 @@ def _replay_states(*, trajectories: TrajectoryBatch, context: GraphContext) -> S
         budget=trajectories.budget,
         graph_context=context,
     )
+
+
+@torch.no_grad()
+def _filter_replay_by_policy_support(
+    *,
+    trajectories: TrajectoryBatch,
+    policy: ForwardPolicy,
+    context: GraphContext,
+    features: FeaturePack,
+    policy_input: PolicyInput,
+    keep_ratio: float,
+    min_keep_per_graph: int,
+) -> tuple[TrajectoryBatch, torch.Tensor, int]:
+    if int(trajectories.num_trajectories) == 0:
+        zero = torch.tensor(0.0, dtype=torch.float32, device=context.device)
+        return trajectories, zero, 0
+    support = _trajectory_forward_support(
+        trajectories=trajectories,
+        policy=policy,
+        context=context,
+        features=features,
+        policy_input=policy_input,
+    )
+    keep_rows: list[torch.Tensor] = []
+    filtered = 0
+    for graph_id in torch.unique(trajectories.graph_ids).tolist():
+        local_rows = trajectories.graph_ids.eq(int(graph_id)).nonzero(as_tuple=False).flatten()
+        if int(local_rows.numel()) == 0:
+            continue
+        local_support = support.index_select(0, local_rows)
+        order = torch.argsort(local_support, descending=True, stable=True)
+        keep_count = max(int(min_keep_per_graph), int(round(float(local_rows.numel()) * float(keep_ratio))))
+        keep_count = min(keep_count, int(local_rows.numel()))
+        kept = local_rows.index_select(0, order[:keep_count])
+        keep_rows.append(kept)
+        filtered += int(local_rows.numel()) - keep_count
+    if not keep_rows:
+        zero = torch.tensor(0.0, dtype=torch.float32, device=context.device)
+        return TrajectoryBatch.empty(device=context.device, budget=trajectories.budget), zero, int(trajectories.num_trajectories)
+    kept_rows = torch.cat(keep_rows)
+    kept_rows = kept_rows.index_select(0, torch.argsort(kept_rows, stable=True))
+    kept = trajectories.select_rows(kept_rows)
+    mean_support = support.index_select(0, kept_rows).mean() if int(kept_rows.numel()) > 0 else torch.tensor(0.0, dtype=torch.float32, device=context.device)
+    return kept, mean_support, filtered
+
+
+@torch.no_grad()
+def _trajectory_forward_support(
+    *,
+    trajectories: TrajectoryBatch,
+    policy: ForwardPolicy,
+    context: GraphContext,
+    features: FeaturePack,
+    policy_input: PolicyInput,
+) -> torch.Tensor:
+    if int(trajectories.num_trajectories) == 0:
+        return torch.empty(0, dtype=torch.float32, device=context.device)
+    budget = int(trajectories.budget)
+    state = StateBatch.initial(
+        graph_ids=trajectories.graph_ids,
+        budget=budget,
+        graph_context=context,
+    )
+    traj_logp = torch.zeros(int(trajectories.num_trajectories), dtype=torch.float32, device=context.device)
+    active = torch.ones(int(trajectories.num_trajectories), dtype=torch.bool, device=context.device)
+    for step in range(budget):
+        active_rows = active.nonzero(as_tuple=False).flatten()
+        if int(active_rows.numel()) == 0:
+            break
+        take_mask = trajectories.edge_count.index_select(0, active_rows).gt(step)
+        if not bool(take_mask.any()):
+            break
+        rows = active_rows[take_mask]
+        output = policy(
+            state=state.take(rows),
+            features=features,
+            graph_context=context,
+            policy_input=policy_input,
+        )
+        edge_ids = trajectories.edge_ids.index_select(0, rows)[:, step]
+        traj_logp[rows] += output.gather_log_prob(
+            row_ids=torch.arange(rows.numel(), dtype=torch.long, device=context.device),
+            edge_ids=edge_ids,
+        )
+        state = state.advance(
+            ExpansionBatch(
+                state_ids=rows,
+                edge_ids=edge_ids,
+            ),
+            graph_context=context,
+            trusted=True,
+        )
+        active[rows] = trajectories.edge_count.index_select(0, rows).gt(step + 1)
+    denom = trajectories.edge_count.clamp_min(1).float()
+    return traj_logp / denom
 
 
 def _unique_node_count_by_graph(*, graph_ids: torch.Tensor, node_ids: torch.Tensor, num_graphs: int, num_nodes: int) -> torch.Tensor:

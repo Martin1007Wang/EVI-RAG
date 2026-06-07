@@ -15,35 +15,64 @@ feature_encoder:
   relation_semantic_table: null
   sem_dim: ${model.sem_dim}
   hidden_dim: ${model.hidden_dim}
-
+  
 policy:
   _target_: src.weaver.policy.ForwardPolicy
+  frontier_pruning:
+    _target_: src.weaver.policy.FrontierPruningConfig
+    enabled: true
+    threshold: 0.4
+    min_keep_per_state: 32
+    apply_train: true
+    apply_eval: true
+    keep_recorded_edges_in_train: true
+
   state_encoder:
     _target_: src.weaver.feature.StateEncoder
     hidden_dim: ${model.hidden_dim}
+
   flow_estimator:
     _target_: src.weaver.policy.FlowEstimator
     hidden_dim: ${model.hidden_dim}
-    relation_lambda: 0.5
-    stop_initial_bias: 1.5
+
+    # Flat action energy:
+    #   L_e(z) = align_scale * a(q,e) + c_theta(z,e)
+    # No frontier-internal normalization.
+    align_scale_init: 1.0
+
+    # 0.0 = flat-sum:
+    #   continue mass uses sum_e exp(L_e)
+    frontier_size_correction: 0.0
+
+    # In flat policy STOP directly competes with all edge energies.
+    # 0.0 is safer than the old 1.5.
+    stop_initial_bias: 0.0
+
+    edge_state_hidden_dim: 256
+    edge_dropout: 0.1
+
   state_flow_head:
     _target_: src.weaver.policy.StateFlowHead
     state_dim: ${model.hidden_dim}
+
   backward_policy:
-    _target_: src.weaver.policy.UniformBackwardPolicy
+    _target_: src.weaver.policy.BackwardPolicy
     hidden_dim: ${model.hidden_dim}
-    relation_lambda: 0.5
 
 reward_model:
   _target_: src.weaver.reward.EvidenceStateScorer
-  fail_cost: 1.0
-  alpha: 0.1
+  reward_beta: 3.0
+  edge_cost_lambda: 0.5
+  reward_epsilon: 1.0e-4
+  center_log_reward: true
   budget: ${model.budget}
 
 objective:
   _target_: src.weaver.objectives.ForwardLookingSubTBObjective
   subtb_lambda: 0.9
   terminal_loss_weight: 2.0
+  replay_loss_weight: 0.25
+  backward_aux_weight: 0.0
   path_nce_weight: 0.0
   path_nce_temperature: 1.0
 
@@ -56,8 +85,10 @@ runner:
     _target_: src.weaver.rollout.replay.ReplaySource
     metric_name: val/rollout_union@8/recall
     threshold: 0.8
-  train_policy_rollouts: 8
-  eval_rollouts: 8
+  replay_keep_ratio: 0.5
+  min_replay_per_graph: 1
+  train_policy_rollouts: 16
+  eval_rollouts: 32
 
 optimization:
   optimizer:
