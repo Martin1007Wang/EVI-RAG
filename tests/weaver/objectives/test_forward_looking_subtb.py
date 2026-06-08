@@ -677,39 +677,27 @@ def test_forward_looking_subtb_adds_path_nce_loss() -> None:
     assert frontier_log_prob.grad[1].item() > 0.0
 
 
-def test_flow_estimator_flat_energy_continue_mass_tracks_edge_energy_offset() -> None:
+def test_flow_estimator_stop_logits_do_not_depend_on_frontier_edge_features() -> None:
     torch.manual_seed(0)
     estimator = FlowEstimator(hidden_dim=4)
     estimator.eval()
     state_h = torch.randn(1, 4)
     frontier_edge_h = torch.randn(2, 4)
     frontier_row_ids = torch.tensor([0, 0], dtype=torch.long)
-    align_score = torch.tensor([0.2, -0.4], dtype=torch.float32)
 
     edge_logits, stop_logits = estimator(
         state_h=state_h,
         frontier_row_ids=frontier_row_ids,
         frontier_edge_h=frontier_edge_h,
-        frontier_align_score=align_score,
     )
     shifted_edge_logits, shifted_stop_logits = estimator(
         state_h=state_h,
         frontier_row_ids=frontier_row_ids,
-        frontier_edge_h=frontier_edge_h,
-        frontier_align_score=align_score + 7.0,
+        frontier_edge_h=frontier_edge_h + 7.0,
     )
 
     assert torch.allclose(stop_logits, shifted_stop_logits, atol=1.0e-6)
-    assert torch.allclose(shifted_edge_logits, edge_logits + 7.0, atol=1.0e-6)
-    base_continue = torch.logsumexp(edge_logits, dim=0) - torch.logsumexp(
-        torch.cat([stop_logits, edge_logits]),
-        dim=0,
-    )
-    shifted_continue = torch.logsumexp(shifted_edge_logits, dim=0) - torch.logsumexp(
-        torch.cat([shifted_stop_logits, shifted_edge_logits]),
-        dim=0,
-    )
-    assert shifted_continue > base_continue
+    assert shifted_edge_logits.shape == edge_logits.shape
 
 
 def test_flow_estimator_initializes_stop_head_bias() -> None:
@@ -718,25 +706,22 @@ def test_flow_estimator_initializes_stop_head_bias() -> None:
     assert estimator.stop_head[-1].bias.detach().item() == pytest.approx(1.5)
 
 
-def test_flow_estimator_edge_energy_backpropagates_through_alignment_mass() -> None:
+def test_flow_estimator_edge_energy_backpropagates_through_frontier_edge_features() -> None:
     torch.manual_seed(0)
     estimator = FlowEstimator(hidden_dim=4)
     state_h = torch.randn(1, 4)
-    frontier_edge_h = torch.randn(2, 4)
+    frontier_edge_h = torch.randn(2, 4, requires_grad=True)
     frontier_row_ids = torch.tensor([0, 0], dtype=torch.long)
-    align_score = torch.tensor([0.2, -0.4], dtype=torch.float32, requires_grad=True)
 
     edge_logits, _ = estimator(
         state_h=state_h,
         frontier_row_ids=frontier_row_ids,
         frontier_edge_h=frontier_edge_h,
-        frontier_align_score=align_score,
     )
     edge_logits.logsumexp(dim=0).backward()
 
-    assert align_score.grad is not None
-    assert torch.count_nonzero(align_score.grad).item() == int(align_score.numel())
-    assert torch.all(align_score.grad.gt(0.0))
+    assert frontier_edge_h.grad is not None
+    assert torch.count_nonzero(frontier_edge_h.grad).item() > 0
 
 
 def test_forward_looking_subtb_detaches_terminal_log_reward_from_training_graph() -> None:

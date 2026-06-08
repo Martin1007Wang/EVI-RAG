@@ -22,7 +22,7 @@ from src.training.checkpoint import load_checkpoint_weights
 from src.training.factory import build_model, prepare_training_components
 from src.weaver.context import GraphContext, TargetContext
 from src.weaver.objectives.subtb.batch import prepare_subtb_batch
-from src.weaver.objectives.subtb.scoring import score_subtb_batch
+from src.weaver.objectives.subtb.scoring import combine_subtb_scores, score_forward_subtb_batch
 from src.weaver.policy import STOP_EDGE_ID
 from src.weaver.rollout.trajectory import BUDGET_TRUNCATED, POLICY_STOP, TrajectoryBatch
 from src.weaver.state import ExpansionBatch, StateBatch
@@ -149,9 +149,9 @@ def diagnose_batch(
     num_rollouts: int,
 ) -> BatchDiagnostic:
     contexts = model._build_step_contexts(batch)
-    inputs = model._build_policy_inputs_from_graph(batch=batch, graph=contexts.graph)
+    inputs = model._build_forward_policy_inputs_from_graph(batch=batch, graph=contexts.graph)
     trajectories = model.runner.eval_rollouts(
-        policy=model.policy,
+        policy=model.forward_policy,
         context=contexts.graph,
         features=inputs.features,
         policy_input=inputs.policy_input,
@@ -241,8 +241,8 @@ def first_action_diagnostics(
         budget=int(budget),
         graph_context=graph,
     )
-    action_space = model.policy.prepare_action_space(state=state, graph_context=graph)
-    output = model.policy(
+    action_space = model.forward_policy.prepare_action_space(state=state, graph_context=graph)
+    output = model.forward_policy(
         state=state,
         features=features,
         graph_context=graph,
@@ -365,21 +365,26 @@ def stop_prefix_diagnostics(
     batch,
 ) -> tuple[StopResidualStats, list[dict[str, Any]]]:
     prepared = prepare_subtb_batch(trajectories=trajectories, graph_context=graph)
-    action_space = model.policy.prepare_action_space(state=prepared.states, graph_context=graph)
+    action_space = model.forward_policy.prepare_action_space(state=prepared.states, graph_context=graph)
     reward = model.reward_model(
         state=prepared.states,
         target_context=target,
         graph_context=graph,
         active=action_space.active,
     )
-    scores = score_subtb_batch(
+    forward_scores = score_forward_subtb_batch(
         batch=prepared,
-        policy=model.policy,
+        policy=model.forward_policy,
         features=features,
         policy_input=policy_input,
         graph_context=graph,
         reward=reward,
         action_space=action_space,
+    )
+    zero_backward = torch.zeros_like(prepared.trajectories.edge_logp, dtype=torch.float32)
+    scores = combine_subtb_scores(
+        forward_scores=forward_scores,
+        backward_step_log_prob=zero_backward,
     )
     valid = reward.terminal_valid_mask.detach()
     residual = scores.log_flow[valid] + scores.stop_log_prob_by_state[valid] - reward.log_reward.detach().float()[valid]

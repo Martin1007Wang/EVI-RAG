@@ -7,7 +7,11 @@ from torch import nn
 
 from src.graph.segments import segment_log_softmax, segment_logsumexp
 from src.weaver.context import GraphContext
-from src.weaver.state import FrontierEncoding, StateBatch, root_reachable_mask_from_edges
+from src.weaver.state import (
+    FrontierEncoding,
+    StateBatch,
+    root_reachable_mask_from_edges,
+)
 
 from .edge_scorer import QuestionConditionedEdgeScorer
 from .output import STOP_EDGE_ID
@@ -23,7 +27,9 @@ class BackwardPolicyOutput:
     num_states: int
 
     @classmethod
-    def stop_action(cls, *, num_states: int, device: torch.device) -> BackwardPolicyOutput:
+    def stop_action(
+        cls, *, num_states: int, device: torch.device
+    ) -> BackwardPolicyOutput:
         empty = torch.empty(0, dtype=torch.long, device=device)
         return cls(
             action_logits=empty.to(dtype=torch.float32),
@@ -49,8 +55,12 @@ class BackwardPolicyOutput:
         )
 
     def gather_log_prob(self, *, row_ids: Tensor, edge_ids: Tensor) -> Tensor:
-        row_ids = row_ids.to(device=self.action_row_ids.device, dtype=torch.long).view(-1)
-        edge_ids = edge_ids.to(device=self.action_edge_ids.device, dtype=torch.long).view(-1)
+        row_ids = row_ids.to(device=self.action_row_ids.device, dtype=torch.long).view(
+            -1
+        )
+        edge_ids = edge_ids.to(
+            device=self.action_edge_ids.device, dtype=torch.long
+        ).view(-1)
         if int(row_ids.numel()) != int(edge_ids.numel()):
             raise ValueError("row_ids and edge_ids must have the same length.")
         if int(row_ids.numel()) == 0:
@@ -95,7 +105,6 @@ class BackwardPolicy(nn.Module):
     ) -> BackwardPolicyOutput:
         logits = self.score_edges(
             child_state_h=child_state_h,
-            question_h_by_graph=question_h_by_graph,
             edge_h=edge_h,
             removable=removable,
         )
@@ -110,21 +119,19 @@ class BackwardPolicy(nn.Module):
         self,
         *,
         child_state_h: Tensor,
-        question_h_by_graph: Tensor,
         edge_h: Tensor,
         removable: FrontierEncoding,
     ) -> Tensor:
+        # align_score removed: backward policy should be conditioned on
+        # child state only, not re-biased by query-relation similarity.
         if int(removable.edge_ids.numel()) == 0:
             return child_state_h.new_empty((0,), dtype=torch.float32)
         state_part = child_state_h.index_select(0, removable.row_ids)
         edge_part = edge_h.index_select(0, removable.edge_ids)
-        question_part = question_h_by_graph.index_select(0, removable.graph_ids)
-        phi_align = self.edge_scorer.score_alignment(
-            question_h=question_part,
+        return self.edge_scorer.score_state(
+            state_h=state_part,
             edge_h=edge_part,
-        )
-        phi_state = self.edge_scorer.score_state(state_h=state_part, edge_h=edge_part)
-        return phi_align + phi_state
+        ).float()
 
 
 class UniformBackwardPolicy(nn.Module):
@@ -144,7 +151,9 @@ class UniformBackwardPolicy(nn.Module):
     ) -> BackwardPolicyOutput:
         del question_h_by_graph, edge_h
         return BackwardPolicyOutput(
-            action_logits=child_state_h.new_zeros((int(removable.edge_ids.numel()),), dtype=torch.float32),
+            action_logits=child_state_h.new_zeros(
+                (int(removable.edge_ids.numel()),), dtype=torch.float32
+            ),
             action_row_ids=removable.row_ids,
             action_edge_ids=removable.edge_ids,
             num_states=int(child_state_h.size(0)),
@@ -169,7 +178,11 @@ def removable_edges(
     the parent state.
     """
     width = int(child_state.edge_capacity)
-    valid = torch.arange(width, device=child_state.device).view(1, -1).lt(child_state.edge_count.view(-1, 1))
+    valid = (
+        torch.arange(width, device=child_state.device)
+        .view(1, -1)
+        .lt(child_state.edge_count.view(-1, 1))
+    )
     child_rows, remove_pos = valid.nonzero(as_tuple=True)
     if int(child_rows.numel()) == 0:
         empty = torch.empty(0, dtype=torch.long, device=child_state.device)
@@ -177,9 +190,13 @@ def removable_edges(
 
     removed_edges = child_state.edge_ids[child_rows, remove_pos]
     parent_edges = child_state.edge_ids.index_select(0, child_rows).clone()
-    parent_edges[torch.arange(int(child_rows.numel()), device=child_state.device), remove_pos] = -1
+    parent_edges[
+        torch.arange(int(child_rows.numel()), device=child_state.device), remove_pos
+    ] = -1
     sentinel = max(int(graph_context.num_edges), 1)
-    parent_edges = torch.sort(torch.where(parent_edges.lt(0), sentinel, parent_edges), dim=1).values
+    parent_edges = torch.sort(
+        torch.where(parent_edges.lt(0), sentinel, parent_edges), dim=1
+    ).values
     parent_edges = torch.where(parent_edges.eq(sentinel), -1, parent_edges)
     parent_count = child_state.edge_count.index_select(0, child_rows) - 1
     parent_graph_ids = child_state.graph_ids.index_select(0, child_rows)
@@ -198,7 +215,10 @@ def removable_edges(
     node_span = max(int(graph_context.num_nodes), 1)
     active_keys = active.row_ids * node_span + active.node_ids
     removed_src = graph_context.edge_src.index_select(0, removed_edges)
-    request_keys = torch.arange(int(child_rows.numel()), device=child_state.device) * node_span + removed_src
+    request_keys = (
+        torch.arange(int(child_rows.numel()), device=child_state.device) * node_span
+        + removed_src
+    )
     legal = root_reachable & torch.isin(request_keys, active_keys)
     return FrontierEncoding(
         row_ids=child_rows[legal],
@@ -216,7 +236,9 @@ def legal_predecessor_count(
         child_state=child_state,
         graph_context=graph_context,
     )
-    counts = torch.zeros(child_state.num_states, dtype=torch.long, device=child_state.device)
+    counts = torch.zeros(
+        child_state.num_states, dtype=torch.long, device=child_state.device
+    )
     if int(removable.row_ids.numel()) == 0:
         return counts
     legal = torch.ones_like(removable.row_ids, dtype=torch.long)
@@ -233,7 +255,9 @@ def uniform_backward_log_prob(
         graph_context=graph_context,
     )
     if bool(counts.le(0).any()):
-        raise ValueError("Every child state must have a legal root-reachable predecessor.")
+        raise ValueError(
+            "Every child state must have a legal root-reachable predecessor."
+        )
     return -torch.log(counts.float())
 
 
@@ -278,7 +302,9 @@ def _find_removable_actions(
     in_range = positions.lt(int(sorted_keys.numel()))
     clamped = positions.clamp_max(max(int(sorted_keys.numel()) - 1, 0))
     legal = torch.zeros_like(in_range)
-    legal[in_range] = sorted_keys.index_select(0, clamped[in_range]).eq(requested_keys[in_range])
+    legal[in_range] = sorted_keys.index_select(0, clamped[in_range]).eq(
+        requested_keys[in_range]
+    )
     if not bool(legal.all()):
         raise ValueError("requested backward action must be uniquely removable.")
     return order.index_select(0, positions)

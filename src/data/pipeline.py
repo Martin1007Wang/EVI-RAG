@@ -178,7 +178,7 @@ def run_preprocess_pipeline(raw_cfg: DictConfig) -> PreprocessResult:
                 "map_size_gb": float(preprocess_cfg.get("map_size_gb", 128.0)),
                 "commit_frequency": int(preprocess_cfg.get("commit_frequency", 1000)),
                 "replay": {
-                    "kind": "replay_bank_v4",
+                    "kind": "replay_bank_v5",
                     "scope": "all_reachable_anchor_answer_pairs",
                     "path_scope": "exact_shortest",
                     "edge_label": "anchor_answer_shortest_path_union",

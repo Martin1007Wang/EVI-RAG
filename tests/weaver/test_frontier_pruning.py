@@ -5,7 +5,7 @@ import torch
 from src.weaver.context import DirectedAdjacencyIndex, GraphContext
 from src.weaver.feature import FeaturePack, StateEncoder
 from src.weaver.objectives.subtb.batch import prepare_subtb_batch
-from src.weaver.objectives.subtb.scoring import score_subtb_batch
+from src.weaver.objectives.subtb.scoring import score_forward_subtb_batch
 from src.weaver.policy import FlowEstimator, ForwardPolicy, FrontierPruningConfig, StateFlowHead
 from src.weaver.reward import EvidenceStateScoreOutput
 from src.weaver.rollout.trajectory import POLICY_STOP, TrajectoryBatch
@@ -166,7 +166,7 @@ def test_score_subtb_batch_keeps_recorded_training_edge_even_if_below_threshold(
     )
     reward = _reward_output(batch.states.num_states)
 
-    scores = score_subtb_batch(
+    scores = score_forward_subtb_batch(
         batch=batch,
         policy=policy,
         features=features,
@@ -178,3 +178,87 @@ def test_score_subtb_batch_keeps_recorded_training_edge_even_if_below_threshold(
     root_row = int(batch.step_parent_state_ids[0].item())
     root_frontier_edges = scores.frontier_edge_ids[scores.frontier_row_ids.eq(root_row)]
     assert bool(root_frontier_edges.eq(1).any())
+
+
+def test_score_subtb_batch_uses_full_legal_frontier_when_scoring_pruning_disabled() -> None:
+    torch.manual_seed(0)
+    graph = _graph_context()
+    policy = _policy(hidden_dim=4)
+    features = _features()
+    policy_input = policy.build_policy_input(features, graph_context=graph, compute_align_score=False)
+    trajectories = TrajectoryBatch(
+        graph_ids=torch.tensor([0], dtype=torch.long),
+        edge_ids=torch.tensor([[1]], dtype=torch.long),
+        edge_logp=torch.zeros((1, 1), dtype=torch.float32),
+        edge_count=torch.tensor([1], dtype=torch.long),
+        stop_reason=torch.tensor([POLICY_STOP], dtype=torch.uint8),
+        stop_logp=torch.zeros(1, dtype=torch.float32),
+        source=torch.tensor([False]),
+    )
+    batch = prepare_subtb_batch(
+        trajectories=trajectories,
+        graph_context=graph,
+    )
+    reward = _reward_output(batch.states.num_states)
+
+    pruned_action_space = policy.prepare_action_space(
+        state=batch.states,
+        graph_context=graph,
+        policy_input=policy_input,
+        training=True,
+    )
+    pruned_root_edges = pruned_action_space.frontier.edge_ids[
+        pruned_action_space.frontier.row_ids.eq(int(batch.step_parent_state_ids[0].item()))
+    ]
+    assert not bool(pruned_root_edges.eq(1).any())
+
+    scores = score_forward_subtb_batch(
+        batch=batch,
+        policy=policy,
+        features=features,
+        policy_input=policy_input,
+        graph_context=graph,
+        reward=reward,
+        action_space=pruned_action_space,
+    )
+
+    root_row = int(batch.step_parent_state_ids[0].item())
+    root_frontier_edges = scores.frontier_edge_ids[scores.frontier_row_ids.eq(root_row)]
+    assert bool(root_frontier_edges.eq(1).any())
+
+
+def test_prepare_action_space_applies_pruning_during_scoring_only_when_enabled() -> None:
+    graph = _graph_context()
+    base_policy = _policy(hidden_dim=4)
+    policy = ForwardPolicy(
+        state_encoder=base_policy.state_encoder,
+        flow_estimator=base_policy.flow_estimator,
+        state_flow_head=base_policy.state_flow_head,
+        frontier_pruning=FrontierPruningConfig(
+            enabled=True,
+            threshold=0.95,
+            min_keep_per_state=1,
+            apply_train=True,
+            apply_eval=True,
+            apply_scoring=True,
+            keep_recorded_edges_in_train=True,
+        ),
+    )
+    features = _features()
+    policy_input = policy.build_policy_input(features, graph_context=graph, compute_align_score=False)
+    root = StateBatch.initial(
+        graph_ids=torch.tensor([0], dtype=torch.long),
+        budget=2,
+        graph_context=graph,
+    )
+
+    action_space = policy.prepare_action_space(
+        state=root,
+        graph_context=graph,
+        policy_input=policy_input,
+        training=True,
+        scoring=True,
+    )
+
+    assert int(action_space.frontier.edge_ids.numel()) == 1
+    assert int(action_space.frontier.edge_ids[0].item()) == 2

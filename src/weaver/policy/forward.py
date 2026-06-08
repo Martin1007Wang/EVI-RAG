@@ -14,7 +14,6 @@ from src.weaver.state import (
     frontier_from_graph,
 )
 
-from .backward import BackwardPolicy, BackwardPolicyOutput, removable_edges
 from .edge_scorer import QuestionConditionedEdgeScorer
 from .output import PolicyOutput, STOP_EDGE_ID
 
@@ -24,7 +23,9 @@ class PolicyInput:
     question_h_by_graph: torch.Tensor  # [G, H]
     edge_h: torch.Tensor  # [E, H]
     frontier_prune_score: torch.Tensor | None = None  # [E]
-    align_score: torch.Tensor | None = None  # [E]
+    # align_score removed: query-relation similarity is consumed exclusively
+    # by frontier pruning; using it again in edge scoring causes double-biasing
+    # and suppresses GFlowNet exploration diversity.
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,7 @@ class FrontierPruningConfig:
     min_keep_per_state: int = 0
     apply_train: bool = False
     apply_eval: bool = False
+    apply_scoring: bool = False
     keep_recorded_edges_in_train: bool = True
 
 
@@ -60,11 +62,7 @@ class StateFlowHead(nn.Module):
             nn.Linear(head_dim, 1, bias=True),
         )
 
-    def forward(
-        self,
-        *,
-        state_h: torch.Tensor,
-    ) -> torch.Tensor:  # [S]
+    def forward(self, *, state_h: torch.Tensor) -> torch.Tensor:  # [S]
         return self.net(state_h.float()).squeeze(-1)
 
 
@@ -80,13 +78,13 @@ class FlowEstimator(nn.Module):
 
         L_STOP(z) = stop_head(h_z)
 
-        L_e(z) = align_scale * a(q,e)
-               + c_theta(z,e)
+        L_e(z) = c_theta(z, e)
                - beta * log |C(z)|
 
     where beta = frontier_size_correction.
 
-    No frontier-internal normalization is performed.
+    align_score is no longer used here. Query-relation similarity is consumed
+    exclusively by frontier pruning upstream to avoid double-biasing.
 
     Final policy is computed outside this module by PolicyOutput:
 
@@ -102,7 +100,6 @@ class FlowEstimator(nn.Module):
         *,
         hidden_dim: int,
         stop_initial_bias: float = 0.0,
-        align_scale_init: float = 1.0,
         frontier_size_correction: float = 0.0,
         edge_state_hidden_dim: int | None = None,
         edge_dropout: float = 0.1,
@@ -126,7 +123,7 @@ class FlowEstimator(nn.Module):
             dropout=edge_dropout,
         )
 
-        self.align_scale = nn.Parameter(torch.tensor(float(align_scale_init), dtype=torch.float32))
+        # align_scale removed along with align_score channel.
 
         self.stop_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim, bias=False),
@@ -141,19 +138,13 @@ class FlowEstimator(nn.Module):
         *,
         state_h: torch.Tensor,  # [F, H]
         frontier_edge_h: torch.Tensor,  # [F, H]
-        frontier_align_score: torch.Tensor,  # [F]
     ) -> torch.Tensor:  # [F]
-        phi_state = self.edge_scorer.score_state(
+        return self.edge_scorer.score_state(
             state_h=state_h,
             edge_h=frontier_edge_h,
-        )
-        return self.align_scale * frontier_align_score.float() + phi_state.float()
+        ).float()
 
-    def score_stop(
-        self,
-        *,
-        state_h: torch.Tensor,  # [S, H]
-    ) -> torch.Tensor:  # [S]
+    def score_stop(self, *, state_h: torch.Tensor) -> torch.Tensor:  # [S] -> [S]
         return self.stop_head(state_h.float()).squeeze(-1)
 
     def forward(
@@ -162,10 +153,8 @@ class FlowEstimator(nn.Module):
         state_h: torch.Tensor,  # [S, H]
         frontier_row_ids: torch.Tensor,  # [F]
         frontier_edge_h: torch.Tensor,  # [F, H]
-        frontier_align_score: torch.Tensor,  # [F]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         S = int(state_h.size(0))
-        device = state_h.device
 
         stop_logits = state_h.new_zeros((S,), dtype=torch.float32)
 
@@ -177,18 +166,23 @@ class FlowEstimator(nn.Module):
         edge_logits = self.score_edges(
             state_h=state_h.index_select(0, frontier_row_ids),
             frontier_edge_h=frontier_edge_h,
-            frontier_align_score=frontier_align_score,
-        ).float()
+        )
 
         frontier_count = torch.bincount(frontier_row_ids, minlength=S)
 
         if self.frontier_size_correction != 0.0:
-            count = frontier_count.index_select(0, frontier_row_ids).clamp_min(1).float()
+            count = (
+                frontier_count.index_select(0, frontier_row_ids).clamp_min(1).float()
+            )
             edge_logits = edge_logits - self.frontier_size_correction * count.log()
 
         has_frontier = frontier_count.gt(0)
         if bool(has_frontier.any()):
-            stop_logits[has_frontier] = self.score_stop(state_h=state_h.index_select(0, has_frontier.nonzero(as_tuple=False).flatten())).float()
+            stop_logits[has_frontier] = self.score_stop(
+                state_h=state_h.index_select(
+                    0, has_frontier.nonzero(as_tuple=False).flatten()
+                )
+            ).float()
 
         _require_finite(edge_logits, "edge_logits")
         _require_finite(stop_logits, "stop_logits")
@@ -203,9 +197,9 @@ class ForwardPolicy(nn.Module):
     Data flow:
 
       FeaturePack:
-        question_h  [G, H]
-        edge_h      [E, H]
-        frontier_prune_score [E]
+        question_h           [G, H]
+        edge_h               [E, H]
+        frontier_prune_score [E]   <- query-relation similarity, pruning only
 
       StateEncoder:
         question_h_per_state + selected_edge_h -> state_h [S, H]
@@ -215,12 +209,11 @@ class ForwardPolicy(nn.Module):
             L_STOP(z) = MLP_stop(h_z)
 
         Edge action:
-            L_e(z) = align_scale * a(q,e)
-                   + c_theta(z,e)
+            L_e(z) = c_theta(z, e)
                    - beta * log |C(z)|
 
       PolicyOutput:
-        action_logits = [STOP logits, edge logits]
+        action_logits  = [STOP logits, edge logits]
         action_row_ids = [state rows, frontier row ids]
         action_edge_ids = [-1, physical edge ids]
 
@@ -235,14 +228,12 @@ class ForwardPolicy(nn.Module):
         state_encoder: StateEncoder,
         flow_estimator: FlowEstimator,
         state_flow_head: StateFlowHead,
-        backward_policy: BackwardPolicy | None = None,
         frontier_pruning: FrontierPruningConfig | None = None,
     ) -> None:
         super().__init__()
         self.state_encoder = state_encoder
         self.flow_estimator = flow_estimator
         self.state_flow_head = state_flow_head
-        self.backward_policy = backward_policy or BackwardPolicy(hidden_dim=flow_estimator.hidden_dim)
         self.frontier_pruning = frontier_pruning or FrontierPruningConfig()
 
     def build_policy_input(
@@ -250,52 +241,17 @@ class ForwardPolicy(nn.Module):
         features: FeaturePack,
         graph_context: GraphContext | None = None,
         *,
-        compute_align_score: bool = True,
+        compute_align_score: bool = False,  # retained for call-site compat, ignored
     ) -> PolicyInput:
         return PolicyInput(
             question_h_by_graph=features.question_h.float(),
             edge_h=features.edge_h.float(),
-            frontier_prune_score=features.frontier_prune_score.float(),
-            align_score=(
-                self._compute_align_score(
-                    features=features,
-                    graph_context=graph_context,
-                )
-                if graph_context is not None and compute_align_score
+            frontier_prune_score=(
+                features.frontier_prune_score.float()
+                if features.frontier_prune_score is not None
                 else None
             ),
         )
-
-    def _compute_align_score(
-        self,
-        *,
-        features: FeaturePack,
-        graph_context: GraphContext,
-    ) -> torch.Tensor:  # [E]
-        edge_graph_ids = graph_context.edge_to_graph.to(
-            device=features.edge_h.device,
-            dtype=torch.long,
-        )
-        question_h = features.question_h.float().index_select(0, edge_graph_ids)
-
-        return self.flow_estimator.edge_scorer.score_alignment(
-            question_h=question_h,
-            edge_h=features.edge_h.float(),
-        )
-
-    def _resolve_align_score(
-        self,
-        *,
-        policy_input: PolicyInput,
-        features: FeaturePack,
-        graph_context: GraphContext,
-    ) -> torch.Tensor:
-        if policy_input.align_score is None:
-            return self._compute_align_score(
-                features=features,
-                graph_context=graph_context,
-            )
-        return policy_input.align_score
 
     def prepare_action_space(
         self,
@@ -304,6 +260,7 @@ class ForwardPolicy(nn.Module):
         graph_context: GraphContext,
         policy_input: PolicyInput | None = None,
         training: bool = False,
+        scoring: bool = False,
         recorded_edge_ids_by_state: torch.Tensor | None = None,
     ) -> PolicyActionSpace:
         active = state.active_node_index(graph_context)
@@ -315,9 +272,9 @@ class ForwardPolicy(nn.Module):
         frontier = self._maybe_prune_frontier(
             frontier=frontier,
             state=state,
-            graph_context=graph_context,
             policy_input=policy_input,
             training=training,
+            scoring=scoring,
             recorded_edge_ids_by_state=recorded_edge_ids_by_state,
         )
         return PolicyActionSpace(active=active, frontier=frontier)
@@ -327,13 +284,15 @@ class ForwardPolicy(nn.Module):
         *,
         frontier: FrontierEncoding,
         state: StateBatch,
-        graph_context: GraphContext,
         policy_input: PolicyInput | None,
         training: bool,
+        scoring: bool,
         recorded_edge_ids_by_state: torch.Tensor | None,
     ) -> FrontierEncoding:
         cfg = self.frontier_pruning
         if not cfg.enabled:
+            return frontier
+        if scoring and not cfg.apply_scoring:
             return frontier
         if training and not cfg.apply_train:
             return frontier
@@ -344,32 +303,28 @@ class ForwardPolicy(nn.Module):
         if policy_input is None:
             return frontier
 
-        row_ids = frontier.row_ids
-        edge_ids = frontier.edge_ids
-        graph_ids = frontier.graph_ids
-        question_h = policy_input.question_h_by_graph.index_select(0, graph_ids).float()
         prune_scores = policy_input.frontier_prune_score
         if prune_scores is None:
             return frontier
+
+        row_ids = frontier.row_ids
+        edge_ids = frontier.edge_ids
         relation_scores = prune_scores.index_select(0, edge_ids).float()
 
         keep_mask = relation_scores.ge(float(cfg.threshold))
-        if int(cfg.min_keep_per_state) > 0:
-            keep_mask = keep_mask | _topk_keep_mask(
-                row_ids=row_ids,
-                scores=relation_scores,
-                num_states=state.num_states,
-                k=int(cfg.min_keep_per_state),
-            )
-        else:
-            keep_mask = keep_mask | _topk_keep_mask(
-                row_ids=row_ids,
-                scores=relation_scores,
-                num_states=state.num_states,
-                k=1,
-            )
+        k = int(cfg.min_keep_per_state) if int(cfg.min_keep_per_state) > 0 else 1
+        keep_mask = keep_mask | _topk_keep_mask(
+            row_ids=row_ids,
+            scores=relation_scores,
+            num_states=state.num_states,
+            k=k,
+        )
 
-        if training and cfg.keep_recorded_edges_in_train and recorded_edge_ids_by_state is not None:
+        if (
+            training
+            and cfg.keep_recorded_edges_in_train
+            and recorded_edge_ids_by_state is not None
+        ):
             keep_mask = keep_mask | _recorded_edge_keep_mask(
                 frontier=frontier,
                 recorded_edge_ids_by_state=recorded_edge_ids_by_state,
@@ -380,7 +335,7 @@ class ForwardPolicy(nn.Module):
         return FrontierEncoding(
             row_ids=row_ids[keep_mask],
             edge_ids=edge_ids[keep_mask],
-            graph_ids=graph_ids[keep_mask],
+            graph_ids=frontier.graph_ids[keep_mask],
         )
 
     def _build_state_h_batched(
@@ -399,7 +354,6 @@ class ForwardPolicy(nn.Module):
             is_empty = torch.ones(S, dtype=torch.bool, device=device)
             dummy_kv = torch.zeros(S, 1, H, device=device)
             full_mask = torch.ones(S, 1, dtype=torch.bool, device=device)
-
             state_h = self.state_encoder(
                 question_h=question_h_per_state,
                 selected_edge_h=dummy_kv,
@@ -411,21 +365,27 @@ class ForwardPolicy(nn.Module):
 
         _validate_row_ids(selected_row_ids, upper=S, name="selected_row_ids")
 
-        # StateBatch usually emits row-sorted selected edges. Do not rely on that.
         order = torch.argsort(selected_row_ids, stable=True)
         selected_row_ids = selected_row_ids.index_select(0, order)
         selected_edge_ids = selected_edge_ids.index_select(0, order)
 
-        edge_counts = torch.bincount(selected_row_ids, minlength=S)  # [S]
+        edge_counts = torch.bincount(selected_row_ids, minlength=S)
         L_max = int(edge_counts.max().item())
         is_empty = edge_counts.eq(0)
 
         state_offsets = torch.zeros(S + 1, dtype=torch.long, device=device)
         state_offsets[1:] = edge_counts.cumsum(0)
 
-        local_pos = torch.arange(selected_row_ids.numel(), device=device) - state_offsets.index_select(0, selected_row_ids)
+        local_pos = torch.arange(
+            selected_row_ids.numel(), device=device
+        ) - state_offsets.index_select(0, selected_row_ids)
 
-        if bool((local_pos.lt(0) | local_pos.ge(edge_counts.index_select(0, selected_row_ids))).any()):
+        if bool(
+            (
+                local_pos.lt(0)
+                | local_pos.ge(edge_counts.index_select(0, selected_row_ids))
+            ).any()
+        ):
             raise ValueError("Failed to construct local selected-edge positions.")
 
         padded = torch.zeros(S, L_max, H, device=device)
@@ -475,8 +435,7 @@ class ForwardPolicy(nn.Module):
         _validate_row_ids(frontier.row_ids, upper=S, name="frontier.row_ids")
 
         question_h_per_state = policy_input.question_h_by_graph.index_select(
-            0,
-            state.graph_ids,
+            0, state.graph_ids
         )  # [S, H]
 
         selected = state.selected_edge_index()
@@ -493,24 +452,14 @@ class ForwardPolicy(nn.Module):
         f_edge_ids = frontier.edge_ids
         frontier_edge_h = policy_input.edge_h.index_select(0, f_edge_ids)
 
-        align_score = self._resolve_align_score(
-            policy_input=policy_input,
-            features=features,
-            graph_context=graph_context,
-        )
-        frontier_align_score = align_score.index_select(0, f_edge_ids)
-
         edge_logits, stop_logits = self.flow_estimator(
             state_h=state_h,
             frontier_row_ids=frontier.row_ids,
             frontier_edge_h=frontier_edge_h,
-            frontier_align_score=frontier_align_score,
         )
 
         frontier_count = torch.bincount(frontier.row_ids, minlength=S)
 
-        # Optional structural constraint:
-        # root states with non-empty frontier cannot STOP immediately.
         empty_with_frontier = state.edge_count.eq(0) & frontier_count.gt(0)
         if bool(empty_with_frontier.any()):
             stop_logits = stop_logits.clone()
@@ -528,63 +477,20 @@ class ForwardPolicy(nn.Module):
 
         return PolicyOutput(
             action_logits=torch.cat(
-                [
-                    stop_logits.float(),
-                    edge_logits.float(),
-                ],
+                [stop_logits.float(), edge_logits.float()],
                 dim=0,
             ),
             action_row_ids=torch.cat(
-                [
-                    rows,
-                    frontier.row_ids,
-                ],
+                [rows, frontier.row_ids],
                 dim=0,
             ),
             action_edge_ids=torch.cat(
-                [
-                    torch.full_like(rows, STOP_EDGE_ID),
-                    f_edge_ids,
-                ],
+                [torch.full_like(rows, STOP_EDGE_ID), f_edge_ids],
                 dim=0,
             ),
             frontier=frontier,
             log_flow_base=log_flow_base,
             state_h=state_h if compute_log_flow else None,
-        )
-
-    def score_backward(
-        self,
-        *,
-        child_state: StateBatch,
-        graph_context: GraphContext,
-        policy_input: PolicyInput,
-        forward_output: PolicyOutput,
-    ) -> BackwardPolicyOutput:
-        child_state_h = forward_output.require_state_h()
-
-        if int(child_state_h.size(0)) != int(child_state.num_states):
-            raise ValueError("forward_output.state_h must have one row per child state.")
-
-        removable = removable_edges(
-            child_state=child_state,
-            graph_context=graph_context,
-        )
-
-        counts = torch.bincount(
-            removable.row_ids,
-            minlength=child_state.num_states,
-        )
-        non_root = child_state.edge_count.gt(0)
-
-        if bool(counts[non_root].le(0).any()):
-            raise ValueError("Every non-root child state must have a removable predecessor.")
-
-        return self.backward_policy(
-            child_state_h=child_state_h,
-            question_h_by_graph=policy_input.question_h_by_graph,
-            edge_h=policy_input.edge_h,
-            removable=removable,
         )
 
 
@@ -595,8 +501,6 @@ __all__ = [
     "PolicyActionSpace",
     "PolicyInput",
     "StateFlowHead",
-    "BackwardPolicy",
-    "BackwardPolicyOutput",
 ]
 
 
@@ -615,7 +519,9 @@ def _topk_keep_mask(
         if int(positions.numel()) == 0:
             continue
         take = min(int(k), int(positions.numel()))
-        top_positions = torch.topk(scores.index_select(0, positions), k=take, largest=True, sorted=False).indices
+        top_positions = torch.topk(
+            scores.index_select(0, positions), k=take, largest=True, sorted=False
+        ).indices
         keep[positions.index_select(0, top_positions)] = True
     return keep
 
@@ -626,11 +532,16 @@ def _recorded_edge_keep_mask(
     recorded_edge_ids_by_state: torch.Tensor,
 ) -> torch.Tensor:
     keep = torch.zeros_like(frontier.edge_ids, dtype=torch.bool)
-    if int(frontier.edge_ids.numel()) == 0 or int(recorded_edge_ids_by_state.numel()) == 0:
+    if (
+        int(frontier.edge_ids.numel()) == 0
+        or int(recorded_edge_ids_by_state.numel()) == 0
+    ):
         return keep
     valid_recorded = recorded_edge_ids_by_state.ge(0)
     for row in torch.unique(frontier.row_ids).tolist():
-        frontier_positions = torch.nonzero(frontier.row_ids.eq(row), as_tuple=False).flatten()
+        frontier_positions = torch.nonzero(
+            frontier.row_ids.eq(row), as_tuple=False
+        ).flatten()
         recorded = recorded_edge_ids_by_state[row]
         recorded = recorded[valid_recorded[row]]
         if int(frontier_positions.numel()) == 0 or int(recorded.numel()) == 0:
@@ -649,19 +560,16 @@ def _validate_row_ids(
 ) -> None:
     if int(row_ids.numel()) == 0:
         return
-
     if bool(row_ids.lt(0).any()) or bool(row_ids.ge(int(upper)).any()):
         bad = ((row_ids.lt(0)) | (row_ids.ge(int(upper)))).nonzero(as_tuple=False)[:8]
-        raise ValueError(f"{name} contains out-of-range rows; sample positions={bad.tolist()}.")
+        raise ValueError(
+            f"{name} contains out-of-range rows; sample positions={bad.tolist()}."
+        )
 
 
-def _require_finite(
-    tensor: torch.Tensor,
-    name: str,
-) -> None:
+def _require_finite(tensor: torch.Tensor, name: str) -> None:
     if bool(torch.isfinite(tensor).all()):
         return
-
     bad = (~torch.isfinite(tensor)).nonzero(as_tuple=False)
     preview = bad[:8].tolist()
     raise ValueError(f"{name} contains non-finite values at indices {preview}.")

@@ -12,21 +12,15 @@ class QuestionConditionedEdgeScorer(nn.Module):
     """
     Edge action energy scorer.
 
-    It exposes two terms:
+    Exposes two terms:
 
       1. score_alignment(q, e):
-           static query-edge alignment.
-           Independent of state z, so it can be precomputed per (G, q).
+           Static query-edge alignment, used exclusively by frontier pruning.
+           NOT used in edge scoring to avoid double-biasing.
 
       2. score_state(z, e):
-           state-conditioned edge compatibility.
-           Depends on current selected-edge state h_z.
-
-    Final edge energy is assembled in FlowEstimator:
-
-        L_e(z) = align_scale * score_alignment(q, e) + score_state(z, e)
-
-    No frontier-internal normalization is performed here.
+           State-conditioned edge compatibility (the sole scoring signal).
+           c_theta(z, e) = MLP([h_z || h_e || h_z * h_e])
     """
 
     def __init__(
@@ -35,6 +29,7 @@ class QuestionConditionedEdgeScorer(nn.Module):
         hidden_dim: int,
         state_hidden_dim: int | None = None,
         dropout: float = 0.1,
+        interaction_dim: int = 64,
     ) -> None:
         super().__init__()
 
@@ -45,15 +40,16 @@ class QuestionConditionedEdgeScorer(nn.Module):
         self.hidden_dim = hidden_dim
 
         inner_dim = int(state_hidden_dim or min(hidden_dim, 256))
-
+        self.interaction_dim = interaction_dim
+        self.state_proj = nn.Linear(hidden_dim, interaction_dim, bias=False)
+        self.edge_proj = nn.Linear(hidden_dim, interaction_dim, bias=False)
         self.state_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3, inner_dim, bias=False),
+            nn.Linear(hidden_dim * 2 + interaction_dim, inner_dim, bias=False),
             nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Dropout(float(dropout)),
             nn.Linear(inner_dim, 1, bias=True),
         )
-
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -63,45 +59,7 @@ class QuestionConditionedEdgeScorer(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def score_alignment(
-        self,
-        *,
-        question_h: Tensor,  # [E, H]
-        edge_h: Tensor,  # [E, H]
-    ) -> Tensor:  # [E]
-        """
-        Static query-edge alignment:
-
-            a(q,e) = <q, h_e> / sqrt(H)
-
-        This does not depend on state z.
-        """
-        if question_h.shape != edge_h.shape:
-            raise ValueError("question_h and edge_h must have the same shape.")
-
-        scale = 1.0 / math.sqrt(float(self.hidden_dim))
-        return (question_h.float() * edge_h.float()).sum(dim=-1) * scale
-
-    def score_state(
-        self,
-        *,
-        state_h: Tensor,  # [F, H]
-        edge_h: Tensor,  # [F, H]
-    ) -> Tensor:  # [F]
-        """
-        State-conditioned edge energy:
-
-            c_theta(z,e) = MLP([h_z || h_e || h_z * h_e])
-        """
-        if state_h.shape != edge_h.shape:
-            raise ValueError("state_h and edge_h must have the same shape.")
-
-        x = torch.cat(
-            [
-                state_h.float(),
-                edge_h.float(),
-                state_h.float() * edge_h.float(),
-            ],
-            dim=-1,
-        )
+    def score_state(self, *, state_h, edge_h):
+        interaction = self.state_proj(state_h) * self.edge_proj(edge_h)  # [F, d]
+        x = torch.cat([state_h, edge_h, interaction], dim=-1)
         return self.state_mlp(x).squeeze(-1)

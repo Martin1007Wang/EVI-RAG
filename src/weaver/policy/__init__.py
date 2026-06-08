@@ -6,6 +6,7 @@ from .backward import (
     removable_edges,
     uniform_backward_log_prob,
 )
+from .backward_model import BackwardPolicyInput, BackwardScoringModel
 from .edge_scorer import QuestionConditionedEdgeScorer
 from .forward import (
     FlowEstimator,
@@ -19,7 +20,9 @@ from .output import PolicyOutput, STOP_EDGE_ID
 
 __all__ = [
     "BackwardPolicy",
+    "BackwardPolicyInput",
     "BackwardPolicyOutput",
+    "BackwardScoringModel",
     "UniformBackwardPolicy",
     "FlowEstimator",
     "ForwardPolicy",

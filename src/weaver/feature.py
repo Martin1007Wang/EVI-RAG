@@ -93,6 +93,7 @@ class StateEncoder(nn.Module):
             num_heads=num_heads,
             batch_first=True,
             bias=False,
+            dropout=0.1,  # 作用在 attention weights，而不是 attn 输出
         )
         # 空状态（edge_count=0）的可学习表示
         self.empty_state_emb = nn.Parameter(torch.empty(hidden_dim))
@@ -118,7 +119,9 @@ class StateEncoder(nn.Module):
                 selected_edge_h=selected_edge_h,
             )
         if selected_edge_h is None:
-            raise ValueError("selected_edge_h must be provided for batched state encoding.")
+            raise ValueError(
+                "selected_edge_h must be provided for batched state encoding."
+            )
         return self.forward_batched(
             question_h=question_h,
             selected_edge_h=selected_edge_h,
@@ -172,11 +175,15 @@ class StateEncoder(nn.Module):
         question_h = question_h.float().reshape(1, self.hidden_dim)
         if selected_edge_h is None or int(selected_edge_h.numel()) == 0:
             selected = question_h.new_zeros((1, 1, self.hidden_dim))
-            key_padding_mask = torch.ones((1, 1), dtype=torch.bool, device=question_h.device)
+            key_padding_mask = torch.ones(
+                (1, 1), dtype=torch.bool, device=question_h.device
+            )
             is_empty = torch.ones((1,), dtype=torch.bool, device=question_h.device)
         else:
             selected = selected_edge_h.float().reshape(1, -1, self.hidden_dim)
-            key_padding_mask = torch.zeros((1, int(selected.size(1))), dtype=torch.bool, device=question_h.device)
+            key_padding_mask = torch.zeros(
+                (1, int(selected.size(1))), dtype=torch.bool, device=question_h.device
+            )
             is_empty = torch.zeros((1,), dtype=torch.bool, device=question_h.device)
         return self.forward_batched(
             question_h=question_h,
@@ -343,12 +350,16 @@ class FeatureEncoder(nn.Module):
         )
         unique_relation_h = self.relation_norm(self.relation_proj(unique_relation_sem))
         relation_h = unique_relation_h.index_select(0, inverse_relation_ids)
-        frontier_prune_score = question_sem.index_select(
-            0,
-            batch.edge_graph_ids.long(),
-        ).mul(
-            self.relation_semantic_table.index_select(0, relation_ids),
-        ).sum(dim=-1)
+        frontier_prune_score = (
+            question_sem.index_select(
+                0,
+                batch.edge_graph_ids.long(),
+            )
+            .mul(
+                self.relation_semantic_table.index_select(0, relation_ids),
+            )
+            .sum(dim=-1)
+        )
 
         src_h = entity_h.index_select(0, edge_src)  # [E, H]
         dst_h = entity_h.index_select(0, edge_dst)  # [E, H]

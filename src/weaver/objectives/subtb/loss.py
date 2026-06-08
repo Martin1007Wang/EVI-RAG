@@ -28,7 +28,6 @@ class ForwardLookingSubTBObjective(nn.Module):
         subtb_lambda: float = 1.0,
         terminal_loss_weight: float = 2.0,
         replay_loss_weight: float = 0.25,
-        backward_aux_weight: float = 0.1,
         path_nce_weight: float = 0.1,
         path_nce_temperature: float = 1.0,
     ) -> None:
@@ -38,15 +37,12 @@ class ForwardLookingSubTBObjective(nn.Module):
             raise ValueError("subtb_lambda must be nonnegative.")
         self.terminal_loss_weight = float(terminal_loss_weight)
         self.replay_loss_weight = float(replay_loss_weight)
-        self.backward_aux_weight = float(backward_aux_weight)
         self.path_nce_weight = float(path_nce_weight)
         self.path_nce_temperature = float(path_nce_temperature)
         if self.terminal_loss_weight < 0.0:
             raise ValueError("terminal_loss_weight must be nonnegative.")
         if self.replay_loss_weight < 0.0:
             raise ValueError("replay_loss_weight must be nonnegative.")
-        if self.backward_aux_weight < 0.0:
-            raise ValueError("backward_aux_weight must be nonnegative.")
         if self.path_nce_weight < 0.0:
             raise ValueError("path_nce_weight must be nonnegative.")
         if self.path_nce_temperature <= 0.0:
@@ -99,10 +95,6 @@ class ForwardLookingSubTBObjective(nn.Module):
             gold_mask=path_gold_mask,
             temperature=self.path_nce_temperature,
         )
-        backward_aux_loss, backward_aux_count = _backward_aux_terms(
-            batch=batch,
-            scores=scores,
-        )
 
         onpolicy_total_loss = onpolicy_transition_loss + self.terminal_loss_weight * onpolicy_terminal_loss
         onpolicy_total_weight = onpolicy_transition_weight + self.terminal_loss_weight * onpolicy_terminal_weight
@@ -111,7 +103,7 @@ class ForwardLookingSubTBObjective(nn.Module):
         onpolicy_base_loss = onpolicy_total_loss / onpolicy_total_weight.clamp_min(1.0)
         replay_base_loss = replay_total_loss / replay_total_weight.clamp_min(1.0)
         base_loss = onpolicy_base_loss + self.replay_loss_weight * replay_base_loss
-        loss = base_loss + self.backward_aux_weight * backward_aux_loss + self.path_nce_weight * path_nce_loss
+        loss = base_loss + self.path_nce_weight * path_nce_loss
 
         terminal_stop_metric_mask = reward.terminal_valid_mask & batch.states.edge_count.gt(0)
         stop_log_prob_terminal = scores.stop_log_prob_by_state.index_select(
@@ -145,9 +137,6 @@ class ForwardLookingSubTBObjective(nn.Module):
             "objective/subtb_terminal_abs_residual_max": max(onpolicy_terminal_stats.abs_max, replay_terminal_stats.abs_max),
             "objective/terminal_loss_weight": float(self.terminal_loss_weight),
             "objective/replay_loss_weight": float(self.replay_loss_weight),
-            "objective/backward_aux_loss": float(backward_aux_loss.detach()),
-            "objective/backward_aux_weight": float(self.backward_aux_weight),
-            "objective/backward_aux_count": float(backward_aux_count),
             "objective/path_nce_loss": float(path_nce_loss.detach()),
             "objective/path_nce_weight": float(self.path_nce_weight),
             "objective/path_nce_temperature": float(self.path_nce_temperature),
@@ -295,22 +284,6 @@ def _path_nce_terms(
     rows = trainable_rows.nonzero(as_tuple=False).flatten()
     loss = all_log_z.index_select(0, rows) - positive_log_z.index_select(0, rows)
     return loss.mean(), (int(rows.numel()), int(gold_mask[trainable_mask].sum().item()))
-
-
-def _backward_aux_terms(
-    *,
-    batch: SubTBBatch,
-    scores: SubTBPolicyScores,
-) -> tuple[torch.Tensor, int]:
-    if scores.backward_aux_logprob is None or int(scores.backward_aux_logprob.numel()) == 0:
-        zero = scores.log_flow.sum() * 0.0
-        return zero, 0
-    onpolicy_mask = batch.trajectories.is_policy.index_select(0, batch.step_traj_ids)
-    if not bool(onpolicy_mask.any()):
-        zero = scores.log_flow.sum() * 0.0
-        return zero, 0
-    selected = scores.backward_aux_logprob[onpolicy_mask]
-    return -selected.mean(), int(selected.numel())
 
 
 def _lambda_weight(*, reference: torch.Tensor, exponents: torch.Tensor, subtb_lambda: float) -> torch.Tensor:

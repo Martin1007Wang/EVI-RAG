@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 
 from src.weaver.context import DirectedAdjacencyIndex, GraphContext
 from src.weaver.feature import FeaturePack, StateEncoder
 from src.weaver.objectives.subtb.batch import prepare_subtb_batch
-from src.weaver.objectives.subtb.scoring import score_subtb_batch
-from src.weaver.policy import FlowEstimator, ForwardPolicy, StateFlowHead
+from src.weaver.objectives.subtb.scoring import (
+    combine_subtb_scores,
+    score_backward_step_log_probs,
+    score_forward_subtb_batch,
+)
+from src.weaver.policy import (
+    BackwardPolicy,
+    BackwardScoringModel,
+    FlowEstimator,
+    ForwardPolicy,
+    StateFlowHead,
+)
 from src.weaver.reward import EvidenceStateScoreOutput
 from src.weaver.rollout.trajectory import POLICY_STOP, TrajectoryBatch
 from src.weaver.state import StateBatch
@@ -32,11 +44,18 @@ def _graph_context() -> GraphContext:
     )
 
 
-def _policy(hidden_dim: int) -> ForwardPolicy:
+def _forward_policy(hidden_dim: int) -> ForwardPolicy:
     return ForwardPolicy(
         state_encoder=StateEncoder(hidden_dim=hidden_dim, num_heads=1),
         flow_estimator=FlowEstimator(hidden_dim=hidden_dim),
         state_flow_head=StateFlowHead(state_dim=hidden_dim),
+    )
+
+
+def _backward_model(hidden_dim: int) -> BackwardScoringModel:
+    return BackwardScoringModel(
+        state_encoder=StateEncoder(hidden_dim=hidden_dim, num_heads=1),
+        backward_policy=BackwardPolicy(hidden_dim=hidden_dim),
     )
 
 
@@ -62,19 +81,8 @@ def _reward_output(*, state_potential: torch.Tensor, log_reward: torch.Tensor, t
     )
 
 
-def test_score_subtb_batch_rebuilds_policy_input_for_training_gradients() -> None:
-    torch.manual_seed(0)
-    graph = _graph_context()
-    hidden_dim = 4
-    policy = _policy(hidden_dim)
-    features = FeaturePack(
-        question_h=torch.randn(1, hidden_dim, requires_grad=True),
-        entity_h=torch.randn(3, hidden_dim, requires_grad=True),
-        edge_h=torch.randn(2, hidden_dim, requires_grad=True),
-        relation_h=torch.randn(2, hidden_dim, requires_grad=True),
-        frontier_prune_score=torch.randn(2, dtype=torch.float32),
-    )
-    trajectories = TrajectoryBatch(
+def _trajectory() -> TrajectoryBatch:
+    return TrajectoryBatch(
         graph_ids=torch.tensor([0], dtype=torch.long),
         edge_ids=torch.tensor([[0]], dtype=torch.long),
         edge_logp=torch.zeros((1, 1), dtype=torch.float32),
@@ -83,8 +91,22 @@ def test_score_subtb_batch_rebuilds_policy_input_for_training_gradients() -> Non
         stop_logp=torch.zeros(1, dtype=torch.float32),
         source=torch.tensor([False]),
     )
+
+
+def test_score_forward_subtb_batch_rebuilds_policy_input_for_training_gradients() -> None:
+    torch.manual_seed(0)
+    graph = _graph_context()
+    hidden_dim = 4
+    policy = _forward_policy(hidden_dim)
+    features = FeaturePack(
+        question_h=torch.randn(1, hidden_dim, requires_grad=True),
+        entity_h=torch.randn(3, hidden_dim, requires_grad=True),
+        edge_h=torch.randn(2, hidden_dim, requires_grad=True),
+        relation_h=torch.randn(2, hidden_dim, requires_grad=True),
+        frontier_prune_score=torch.randn(2, dtype=torch.float32),
+    )
     batch = prepare_subtb_batch(
-        trajectories=trajectories,
+        trajectories=_trajectory(),
         graph_context=graph,
     )
     reward = _reward_output(
@@ -96,7 +118,7 @@ def test_score_subtb_batch_rebuilds_policy_input_for_training_gradients() -> Non
     with torch.no_grad():
         stale_policy_input = policy.build_policy_input(features, graph_context=graph)
 
-    scores = score_subtb_batch(
+    scores = score_forward_subtb_batch(
         batch=batch,
         policy=policy,
         features=features,
@@ -108,13 +130,11 @@ def test_score_subtb_batch_rebuilds_policy_input_for_training_gradients() -> Non
         scores.log_flow.sum()
         + scores.stop_log_prob_by_state.sum()
         + scores.step_log_prob.sum()
-        + scores.backward_step_log_prob.sum()
         + scores.terminal_stop_logp_by_traj.sum()
         + scores.frontier_log_prob.sum()
     )
     loss.backward()
 
-    assert not scores.backward_step_log_prob.requires_grad
     assert features.question_h.grad is not None
     assert features.edge_h.grad is not None
     assert torch.count_nonzero(features.question_h.grad).item() > 0
@@ -126,7 +146,7 @@ def test_forward_policy_masks_stop_on_empty_states_with_frontier() -> None:
     torch.manual_seed(0)
     graph = _graph_context()
     hidden_dim = 4
-    policy = _policy(hidden_dim)
+    policy = _forward_policy(hidden_dim)
     features = FeaturePack(
         question_h=torch.randn(1, hidden_dim),
         entity_h=torch.randn(3, hidden_dim),
@@ -151,11 +171,11 @@ def test_forward_policy_masks_stop_on_empty_states_with_frontier() -> None:
     assert output.action_logits[0].item() == -1.0e9
 
 
-def test_score_subtb_batch_detaches_reward_state_potential_from_training_graph() -> None:
+def test_score_forward_subtb_batch_detaches_reward_state_potential_from_training_graph() -> None:
     torch.manual_seed(0)
     graph = _graph_context()
     hidden_dim = 4
-    policy = _policy(hidden_dim)
+    policy = _forward_policy(hidden_dim)
     features = FeaturePack(
         question_h=torch.randn(1, hidden_dim, requires_grad=True),
         entity_h=torch.randn(3, hidden_dim, requires_grad=True),
@@ -163,17 +183,8 @@ def test_score_subtb_batch_detaches_reward_state_potential_from_training_graph()
         relation_h=torch.randn(2, hidden_dim, requires_grad=True),
         frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
-    trajectories = TrajectoryBatch(
-        graph_ids=torch.tensor([0], dtype=torch.long),
-        edge_ids=torch.tensor([[0]], dtype=torch.long),
-        edge_logp=torch.zeros((1, 1), dtype=torch.float32),
-        edge_count=torch.tensor([1], dtype=torch.long),
-        stop_reason=torch.tensor([POLICY_STOP], dtype=torch.uint8),
-        stop_logp=torch.zeros(1, dtype=torch.float32),
-        source=torch.tensor([False]),
-    )
     batch = prepare_subtb_batch(
-        trajectories=trajectories,
+        trajectories=_trajectory(),
         graph_context=graph,
     )
     state_potential = torch.randn(batch.states.num_states, dtype=torch.float32, requires_grad=True)
@@ -186,7 +197,7 @@ def test_score_subtb_batch_detaches_reward_state_potential_from_training_graph()
     with torch.no_grad():
         stale_policy_input = policy.build_policy_input(features, graph_context=graph)
 
-    scores = score_subtb_batch(
+    scores = score_forward_subtb_batch(
         batch=batch,
         policy=policy,
         features=features,
@@ -199,11 +210,17 @@ def test_score_subtb_batch_detaches_reward_state_potential_from_training_graph()
     assert state_potential.grad is None
 
 
-def test_score_subtb_batch_uses_uniform_backward_without_training_gradients() -> None:
+def test_score_backward_step_log_probs_produces_gradients_for_online_model_only() -> None:
     torch.manual_seed(0)
     graph = _graph_context()
     hidden_dim = 4
-    policy = _policy(hidden_dim)
+    batch = prepare_subtb_batch(
+        trajectories=_trajectory(),
+        graph_context=graph,
+    )
+    online_model = _backward_model(hidden_dim)
+    target_model = copy.deepcopy(online_model)
+    target_model.requires_grad_(False)
     features = FeaturePack(
         question_h=torch.randn(1, hidden_dim, requires_grad=True),
         entity_h=torch.randn(3, hidden_dim, requires_grad=True),
@@ -211,34 +228,75 @@ def test_score_subtb_batch_uses_uniform_backward_without_training_gradients() ->
         relation_h=torch.randn(2, hidden_dim, requires_grad=True),
         frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
-    trajectories = TrajectoryBatch(
-        graph_ids=torch.tensor([0], dtype=torch.long),
-        edge_ids=torch.tensor([[0]], dtype=torch.long),
-        edge_logp=torch.zeros((1, 1), dtype=torch.float32),
-        edge_count=torch.tensor([1], dtype=torch.long),
-        stop_reason=torch.tensor([POLICY_STOP], dtype=torch.uint8),
-        stop_logp=torch.zeros(1, dtype=torch.float32),
-        source=torch.tensor([False]),
-    )
-    batch = prepare_subtb_batch(
-        trajectories=trajectories,
+
+    online_scores = score_backward_step_log_probs(
+        batch=batch,
+        model=online_model,
+        features=features,
         graph_context=graph,
+    )
+    online_scores[batch.valid_steps].sum().backward()
+    assert any(param.grad is not None for param in online_model.parameters())
+
+    target_features = FeaturePack(
+        question_h=features.question_h.detach().clone().requires_grad_(True),
+        entity_h=features.entity_h.detach().clone().requires_grad_(True),
+        edge_h=features.edge_h.detach().clone().requires_grad_(True),
+        relation_h=features.relation_h.detach().clone().requires_grad_(True),
+        frontier_prune_score=features.frontier_prune_score.detach().clone(),
+    )
+    with torch.no_grad():
+        target_scores = score_backward_step_log_probs(
+            batch=batch,
+            model=target_model,
+            features=target_features,
+            graph_context=graph,
+        )
+    assert not target_scores.requires_grad
+
+
+def test_combine_subtb_scores_preserves_forward_values_and_injects_backward_steps() -> None:
+    torch.manual_seed(0)
+    graph = _graph_context()
+    hidden_dim = 4
+    batch = prepare_subtb_batch(
+        trajectories=_trajectory(),
+        graph_context=graph,
+    )
+    policy = _forward_policy(hidden_dim)
+    backward_model = _backward_model(hidden_dim)
+    features = FeaturePack(
+        question_h=torch.randn(1, hidden_dim, requires_grad=True),
+        entity_h=torch.randn(3, hidden_dim, requires_grad=True),
+        edge_h=torch.randn(2, hidden_dim, requires_grad=True),
+        relation_h=torch.randn(2, hidden_dim, requires_grad=True),
+        frontier_prune_score=torch.randn(2, dtype=torch.float32),
     )
     reward = _reward_output(
         state_potential=torch.zeros(batch.states.num_states, dtype=torch.float32),
         log_reward=torch.zeros(batch.states.num_states, dtype=torch.float32),
         terminal_valid_mask=torch.ones(batch.states.num_states, dtype=torch.bool),
     )
-    policy_input = policy.build_policy_input(features, graph_context=graph)
-
-    scores = score_subtb_batch(
+    forward_scores = score_forward_subtb_batch(
         batch=batch,
         policy=policy,
         features=features,
-        policy_input=policy_input,
+        policy_input=policy.build_policy_input(features, graph_context=graph),
         graph_context=graph,
         reward=reward,
     )
+    backward_step_logp = score_backward_step_log_probs(
+        batch=batch,
+        model=backward_model,
+        features=features,
+        graph_context=graph,
+    ).detach()
 
-    assert torch.equal(scores.backward_step_log_prob[batch.valid_steps], torch.zeros(1))
-    assert not scores.backward_step_log_prob.requires_grad
+    scores = combine_subtb_scores(
+        forward_scores=forward_scores,
+        backward_step_log_prob=backward_step_logp,
+    )
+
+    assert torch.equal(scores.log_flow, forward_scores.log_flow)
+    assert torch.equal(scores.step_log_prob, forward_scores.step_log_prob)
+    assert torch.equal(scores.backward_step_log_prob, backward_step_logp)

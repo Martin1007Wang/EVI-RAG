@@ -208,6 +208,14 @@ def build_replay_bank(
             )
             if ordered is None:
                 continue
+            _validate_replay_trajectory(
+                ordered=ordered,
+                anchors=anchors,
+                edge_index=edge_index,
+                sample_id=sample_id,
+                replay_round=variant,
+                slot=slot,
+            )
             if ordered:
                 edge_ids[variant, slot, : len(ordered)] = torch.tensor(ordered)
             edge_count[variant, slot] = len(ordered)
@@ -376,6 +384,28 @@ def _frontier_legal_order(*, edge_ids: frozenset[int], anchors: set[int], edge_i
         active.add(int(edge_index[1, edge_id].item()))
         remaining.remove(edge_id)
     return ordered
+
+
+def _validate_replay_trajectory(
+    *,
+    ordered: list[int],
+    anchors: set[int],
+    edge_index: Tensor,
+    sample_id: str,
+    replay_round: int,
+    slot: int,
+) -> None:
+    active = set(anchors)
+    for step, edge_id in enumerate(ordered):
+        src = int(edge_index[0, edge_id].item())
+        dst = int(edge_index[1, edge_id].item())
+        if src not in active:
+            raise ValueError(
+                "Replay trajectory is not frontier-legal: "
+                f"sample_id={sample_id}, replay_round={replay_round}, slot={slot}, "
+                f"step={step}, edge_id={edge_id}, src={src}, active={sorted(active)}."
+            )
+        active.add(dst)
 
 
 def _covered_targets(*, edges: frozenset[int], anchors: set[int], targets: set[int], edge_index: Tensor) -> set[int]:

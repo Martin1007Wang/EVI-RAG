@@ -15,7 +15,7 @@ from .config import (
     validate_retrieval_data_config,
 )
 from src.weaver.feature import FeatureEncoder
-from src.weaver.policy import ForwardPolicy
+from src.weaver.policy import BackwardScoringModel, ForwardPolicy
 
 T = TypeVar("T")
 
@@ -76,28 +76,44 @@ def build_model(
     if not isinstance(resolved_model_cfg, dict):
         raise TypeError(f"cfg.model must resolve to dict, got {type(resolved_model_cfg).__name__}.")
 
-    feature_encoder_obj = hydra.utils.instantiate(
-        cfg.model.feature_encoder,
+    forward_feature_encoder_obj = hydra.utils.instantiate(
+        cfg.model.forward_feature_encoder,
         entity_text_semantic_table=resources.entity_text_semantic_table,
         text_row_by_entity_id=resources.text_row_by_entity_id,
         entity_relation_neighborhood_semantic_table=resources.entity_relation_neighborhood_semantic_table,
         relation_neighborhood_row_by_entity_id=resources.relation_neighborhood_row_by_entity_id,
         relation_semantic_table=resources.relation_semantic_table,
     )
-    feature_encoder = require_type(
-        feature_encoder_obj,
+    forward_feature_encoder = require_type(
+        forward_feature_encoder_obj,
         FeatureEncoder,
-        "cfg.model.feature_encoder",
+        "cfg.model.forward_feature_encoder",
+    )
+    backward_feature_encoder_obj = hydra.utils.instantiate(
+        cfg.model.backward_feature_encoder,
+        entity_text_semantic_table=resources.entity_text_semantic_table,
+        text_row_by_entity_id=resources.text_row_by_entity_id,
+        entity_relation_neighborhood_semantic_table=resources.entity_relation_neighborhood_semantic_table,
+        relation_neighborhood_row_by_entity_id=resources.relation_neighborhood_row_by_entity_id,
+        relation_semantic_table=resources.relation_semantic_table,
+    )
+    backward_feature_encoder = require_type(
+        backward_feature_encoder_obj,
+        FeatureEncoder,
+        "cfg.model.backward_feature_encoder",
     )
 
-    policy = _build_policy(cfg.model.policy)
+    forward_policy = _build_forward_policy(cfg.model.forward_policy)
+    backward_policy = _build_backward_policy(cfg.model.backward_policy)
 
     model_cfg = {
         "_target_": resolved_model_cfg["_target_"],
         "budget": resolved_model_cfg["budget"],
         "hidden_dim": resolved_model_cfg["hidden_dim"],
-        "feature_encoder": feature_encoder,
-        "policy": policy,
+        "forward_feature_encoder": forward_feature_encoder,
+        "backward_feature_encoder": backward_feature_encoder,
+        "forward_policy": forward_policy,
+        "backward_policy": backward_policy,
         "reward_model": resolved_model_cfg["reward_model"],
         "objective": resolved_model_cfg["objective"],
         "runner": resolved_model_cfg["runner"],
@@ -270,26 +286,47 @@ def require_type(
     return cast(T, value)
 
 
-def _build_policy(policy_cfg: DictConfig) -> ForwardPolicy:
+def _build_forward_policy(policy_cfg: DictConfig) -> ForwardPolicy:
     resolved_policy_cfg = OmegaConf.to_container(
         policy_cfg,
         resolve=True,
         throw_on_missing=True,
     )
     if not isinstance(resolved_policy_cfg, dict):
-        raise TypeError(f"cfg.model.policy must resolve to dict, got {type(resolved_policy_cfg).__name__}.")
+        raise TypeError(f"cfg.model.forward_policy must resolve to dict, got {type(resolved_policy_cfg).__name__}.")
 
     policy_model_cfg = {
         "_target_": resolved_policy_cfg["_target_"],
         "state_encoder": resolved_policy_cfg["state_encoder"],
         "flow_estimator": resolved_policy_cfg["flow_estimator"],
         "state_flow_head": resolved_policy_cfg["state_flow_head"],
-        "backward_policy": resolved_policy_cfg.get("backward_policy"),
+        "frontier_pruning": resolved_policy_cfg.get("frontier_pruning"),
     }
     return require_type(
         hydra.utils.instantiate(policy_model_cfg),
         ForwardPolicy,
-        "cfg.model.policy",
+        "cfg.model.forward_policy",
+    )
+
+
+def _build_backward_policy(policy_cfg: DictConfig) -> BackwardScoringModel:
+    resolved_policy_cfg = OmegaConf.to_container(
+        policy_cfg,
+        resolve=True,
+        throw_on_missing=True,
+    )
+    if not isinstance(resolved_policy_cfg, dict):
+        raise TypeError(f"cfg.model.backward_policy must resolve to dict, got {type(resolved_policy_cfg).__name__}.")
+
+    policy_model_cfg = {
+        "_target_": resolved_policy_cfg["_target_"],
+        "state_encoder": resolved_policy_cfg["state_encoder"],
+        "backward_policy": resolved_policy_cfg["backward_policy"],
+    }
+    return require_type(
+        hydra.utils.instantiate(policy_model_cfg),
+        BackwardScoringModel,
+        "cfg.model.backward_policy",
     )
 
 

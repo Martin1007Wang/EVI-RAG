@@ -293,10 +293,10 @@ def _require_replay_materialization(materialization: MaterializationArtifact) ->
         )
 
     kind = replay.get("kind")
-    if kind not in {"replay_bank_v4"}:
+    if kind not in {"replay_bank_v5"}:
         raise ValueError(
             "Materialization replay payload is incompatible with current runtime: "
-            f"found {kind!r}, expected 'replay_bank_v4'. Re-run preprocessing."
+            f"found {kind!r}, expected 'replay_bank_v5'. Re-run preprocessing."
         )
 
 

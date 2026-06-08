@@ -62,7 +62,7 @@ def test_evidence_state_score_uses_distance_coverage_potential_and_terminal_reca
         edge_count=torch.tensor([0, 1, 2], dtype=torch.long),
     )
 
-    output = EvidenceStateScorer(fail_cost=1.5, alpha=0.3, budget=2)(
+    output = EvidenceStateScorer(budget=2)(
         state=state,
         target_context=target_context,
         graph_context=graph_context,
@@ -70,11 +70,11 @@ def test_evidence_state_score_uses_distance_coverage_potential_and_terminal_reca
 
     assert torch.equal(output.answer_count, torch.tensor([0.0, 0.0, 1.0]))
     assert torch.equal(output.target_count, torch.tensor([1.0, 1.0, 1.0]))
-    assert torch.allclose(output.state_potential, torch.tensor([0.0, 0.51666665, 1.3666667]))
-    assert torch.allclose(output.terminal_quality, torch.tensor([0.0, -0.15, 0.7]))
-    assert torch.allclose(output.log_reward, torch.tensor([-1.5, -1.65, 0.7]))
-    assert torch.allclose(output.remaining_log_reward, torch.tensor([-1.5, -2.1666667, -0.6666667]))
-    assert torch.equal(output.raw_log_reward, output.log_reward)
+    assert torch.allclose(output.state_potential, torch.tensor([0.0, 1.25, 1.5]))
+    assert torch.allclose(output.terminal_quality, torch.tensor([-9.2104406, -9.4604406, -0.5]))
+    assert torch.allclose(output.log_reward, torch.tensor([0.0, -26.881321, 0.0]))
+    assert torch.allclose(output.remaining_log_reward, torch.tensor([0.0, -28.131321, -1.5]))
+    assert torch.allclose(output.raw_log_reward, torch.tensor([0.0, -28.381321, -1.5]))
     assert torch.equal(output.terminal_valid_mask, torch.tensor([False, True, True]))
     assert "reward/residual_mean" in output.metrics
 
@@ -88,12 +88,12 @@ def test_evidence_state_score_excludes_anchor_target_hits() -> None:
         edge_count=torch.tensor([0, 1], dtype=torch.long),
     )
 
-    output = EvidenceStateScorer(fail_cost=1.5, alpha=0.3, budget=2)(
+    output = EvidenceStateScorer(budget=2)(
         state=state,
         target_context=target_context,
         graph_context=graph_context,
     )
 
-    assert torch.equal(output.state_potential, torch.tensor([0.0, -0.15]))
-    assert torch.equal(output.log_reward, torch.tensor([-1.5, -1.65]))
+    assert torch.equal(output.state_potential, torch.tensor([0.0, 0.0]))
+    assert torch.equal(output.log_reward, torch.tensor([0.0, 0.0]))
     assert torch.equal(output.terminal_valid_mask, torch.tensor([False, False]))

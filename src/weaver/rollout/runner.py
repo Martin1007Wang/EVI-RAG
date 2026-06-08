@@ -465,13 +465,21 @@ def _trajectory_forward_support(
         if not bool(take_mask.any()):
             break
         rows = active_rows[take_mask]
+        edge_ids = trajectories.edge_ids.index_select(0, rows)[:, step]
+        action_space = policy.prepare_action_space(
+            state=state.take(rows),
+            graph_context=context,
+            policy_input=policy_input,
+            training=True,
+            recorded_edge_ids_by_state=edge_ids.view(-1, 1),
+        )
         output = policy(
             state=state.take(rows),
             features=features,
             graph_context=context,
             policy_input=policy_input,
+            action_space=action_space,
         )
-        edge_ids = trajectories.edge_ids.index_select(0, rows)[:, step]
         traj_logp[rows] += output.gather_log_prob(
             row_ids=torch.arange(rows.numel(), dtype=torch.long, device=context.device),
             edge_ids=edge_ids,

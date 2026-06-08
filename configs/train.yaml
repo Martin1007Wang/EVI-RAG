@@ -17,7 +17,7 @@ defaults:
 task_name: train
 seed: 42
 print_config: false
-test_after_fit: false
+test_after_fit: true
 profiler: null
 
 fit_ckpt_path: ${ckpt.fit}
